@@ -15,6 +15,7 @@
 #[allow(dead_code)]
 pub mod marshal;
 pub mod nodes;
+pub mod process;
 pub mod signal;
 
 pub use nodes::VirtualNode;
@@ -97,6 +98,15 @@ impl Loader {
     /// script can reference.
     pub fn set_global<T: mlua::IntoLua>(&self, name: &str, value: T) -> mlua::Result<()> {
         self.lua.globals().set(name, value)
+    }
+
+    /// Registers the `process` global table (`process.run`/`ProcessHandle:kill()`,
+    /// build-steps.md Phase 15 item 1) onto this `Loader`'s own VM -- the same "expose a bit of
+    /// Lua for a caller outside this module" shape as [`Self::set_global`]/[`Self::create_table`],
+    /// needed here because registering a whole table-with-a-closure can't go through either of
+    /// those alone.
+    pub fn register_process(&self, registry: process::ProcessRegistry) -> mlua::Result<()> {
+        process::register(&self.lua, registry)
     }
 
     /// Converts a JSON value into the equivalent Lua value, on this `Loader`'s own `Lua` state (a

@@ -127,6 +127,38 @@ pub struct PromoteGeneration {
     pub surface_id: String,
 }
 
+/// Which of a `process.run`-spawned child's streams one [`ProcessOutputLine`] came from. A real
+/// enum, not a bare `"stdout"`/`"stderr"` string tag -- this codebase's Baseline Smells reject
+/// that as Primitive Obsession, and [`ReevaluateReport`] already sets the "real enum" precedent
+/// for a wire-level tag like this.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProcessStream {
+    Stdout,
+    Stderr,
+}
+
+/// Supervisor -> Renderer: one line of a `process.run`-spawned child's stdout/stderr
+/// (`docs/oblisk-supervisor-services-dbus.md` § 12's "No Lua Blockage" half; `oblisk-idl-api-
+/// specs.md` § 3.2/3.3). `id` is the same value the Renderer assigned in the `"process"`/`"run"`
+/// `CommandEnvelope.id` that spawned it -- see docs/adr/0026 for why the id is assigned
+/// client-side rather than handed back by the Supervisor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessOutputLine {
+    pub id: u64,
+    pub stream: ProcessStream,
+    pub line: String,
+}
+
+/// Supervisor -> Renderer: `id`'s `process.run`-spawned child has exited. `code` is absent
+/// exactly when [`std::process::ExitStatus::code()`] itself would return `None` -- killed by
+/// signal (`process_handle:kill()`, or a superseded generation's own § 12 reap), or never spawned
+/// at all (a `process.run` whose underlying spawn failed).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessExited {
+    pub id: u64,
+    pub code: Option<i32>,
+}
+
 /// Every frame the Supervisor can push to a Renderer connection, adjacently tagged so a single
 /// read loop can dispatch on `kind` without the connection needing a separate channel per
 /// message shape. `content = "data"` (not internally-tagged) because [`ReevaluateReport`] is
@@ -140,6 +172,8 @@ pub enum SupervisorFrame {
     ActivateDraw(ActivateDraw),
     DeselectInput(DeselectInput),
     PromoteGeneration(PromoteGeneration),
+    ProcessOutput(ProcessOutputLine),
+    ProcessExited(ProcessExited),
 }
 
 /// Every frame a Renderer connection can send to the Supervisor, same tagging scheme as
@@ -352,6 +386,28 @@ mod tests {
 
         let parsed: RendererFrame = serde_json::from_value(wire).unwrap();
         assert_eq!(parsed, frame);
+    }
+
+    #[test]
+    fn supervisor_frame_process_output_is_adjacently_tagged() {
+        let frame = SupervisorFrame::ProcessOutput(ProcessOutputLine { id: 3, stream: ProcessStream::Stdout, line: "hello".to_string() });
+        let wire = serde_json::to_value(&frame).unwrap();
+        assert_eq!(wire, serde_json::json!({ "kind": "ProcessOutput", "data": { "id": 3, "stream": "Stdout", "line": "hello" } }));
+
+        let parsed: SupervisorFrame = serde_json::from_value(wire).unwrap();
+        assert_eq!(parsed, frame);
+    }
+
+    #[test]
+    fn supervisor_frame_process_exited_is_adjacently_tagged() {
+        for code in [Some(3), None] {
+            let frame = SupervisorFrame::ProcessExited(ProcessExited { id: 3, code });
+            let wire = serde_json::to_value(&frame).unwrap();
+            assert_eq!(wire, serde_json::json!({ "kind": "ProcessExited", "data": { "id": 3, "code": code } }));
+
+            let parsed: SupervisorFrame = serde_json::from_value(wire).unwrap();
+            assert_eq!(parsed, frame);
+        }
     }
 
     #[test]

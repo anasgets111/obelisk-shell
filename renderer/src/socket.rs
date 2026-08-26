@@ -64,8 +64,8 @@ use std::path::{Path, PathBuf};
 
 use shared::framing::{self, write_json_frame};
 use shared::{
-    ActivateDraw, ApplyPendingReload, ConnectionHandshake, DeselectInput, PresentationEvidence, PromoteGeneration, ReadySignal, ReevaluateReport,
-    ReevaluateRequest, RendererFrame, StateSnapshot, SupervisorFrame,
+    ActivateDraw, ApplyPendingReload, CommandEnvelope, ConnectionHandshake, DeselectInput, PresentationEvidence, ProcessExited, ProcessOutputLine,
+    PromoteGeneration, ReadySignal, ReevaluateReport, ReevaluateRequest, RendererFrame, StateSnapshot, SupervisorFrame,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
@@ -73,6 +73,7 @@ use tokio::sync::mpsc;
 
 use crate::layout::node::SurfaceTopology;
 use crate::layout::{self, Scene};
+use crate::lua::process::ProcessRegistry;
 use crate::lua::signal::LiveSignalHandle;
 use crate::lua::{self, Loader};
 use crate::text::shaping::ShapingHandle;
@@ -151,11 +152,19 @@ struct RendererClient {
     shaping: ShapingHandle,
     audio_handle: LiveSignalHandle,
     rescue_handle: LiveSignalHandle,
+    process_registry: ProcessRegistry,
     state: ReloadState,
 }
 
 impl RendererClient {
-    fn new(loader: Loader, shell_lua_path: PathBuf, shaping: ShapingHandle, audio_handle: LiveSignalHandle, rescue_handle: LiveSignalHandle) -> Self {
+    fn new(
+        loader: Loader,
+        shell_lua_path: PathBuf,
+        shaping: ShapingHandle,
+        audio_handle: LiveSignalHandle,
+        rescue_handle: LiveSignalHandle,
+        process_registry: ProcessRegistry,
+    ) -> Self {
         Self {
             loader,
             shell_lua_path,
@@ -163,6 +172,7 @@ impl RendererClient {
             shaping,
             audio_handle,
             rescue_handle,
+            process_registry,
             state: ReloadState { applied_topology: None, pending: None },
         }
     }
@@ -275,6 +285,7 @@ impl RendererClient {
         ready_rx: &mut mpsc::UnboundedReceiver<Vec<String>>,
         presented_rx: &mut mpsc::UnboundedReceiver<PresentationEvidence>,
         activate_tx: &std::sync::mpsc::Sender<u64>,
+        process_outbound_rx: &mut mpsc::UnboundedReceiver<CommandEnvelope>,
     ) where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
@@ -306,6 +317,12 @@ impl RendererClient {
                     Ok(SupervisorFrame::PromoteGeneration(PromoteGeneration { surface_id })) => {
                         eprintln!("control-socket client: PromoteGeneration({surface_id}) received (no real focus wiring yet)");
                     }
+                    Ok(SupervisorFrame::ProcessOutput(ProcessOutputLine { id, stream, line })) => {
+                        self.process_registry.dispatch_output(id, stream, line);
+                    }
+                    Ok(SupervisorFrame::ProcessExited(ProcessExited { id, code })) => {
+                        self.process_registry.dispatch_exit(id, code);
+                    }
                     Err(err) => {
                         eprintln!("control-socket client: connection ended: {err}");
                         break;
@@ -319,6 +336,11 @@ impl RendererClient {
                 Some(evidence) = presented_rx.recv() => {
                     if let Err(err) = write_json_frame(write_half, &RendererFrame::PresentationEvidence(evidence)).await {
                         eprintln!("control-socket client: failed to send PresentationEvidence: {err}");
+                    }
+                }
+                Some(envelope) = process_outbound_rx.recv() => {
+                    if let Err(err) = write_json_frame(write_half, &RendererFrame::Command(envelope)).await {
+                        eprintln!("control-socket client: failed to send a process Command: {err}");
                     }
                 }
             }
@@ -377,13 +399,19 @@ async fn run(
             return;
         }
     };
+    let (process_outbound_tx, mut process_outbound_rx) = mpsc::unbounded_channel();
+    let process_registry = ProcessRegistry::new(generation_id, process_outbound_tx);
+    if let Err(err) = loader.register_process(process_registry.clone()) {
+        eprintln!("control-socket client: failed to register the process global: {err}");
+        return;
+    }
 
     let shaping = ShapingHandle::spawn();
-    let mut client = RendererClient::new(loader, shell_lua_path, shaping, audio_handle, rescue_handle);
+    let mut client = RendererClient::new(loader, shell_lua_path, shaping, audio_handle, rescue_handle, process_registry);
     client.run_startup_evaluation();
 
     let (mut read_half, mut write_half) = stream.into_split();
-    client.dispatch_loop(&mut read_half, &mut write_half, &mut ready_rx, &mut presented_rx, &activate_tx).await;
+    client.dispatch_loop(&mut read_half, &mut write_half, &mut ready_rx, &mut presented_rx, &activate_tx, &mut process_outbound_rx).await;
 }
 
 /// Builds the `{ is_rescue, error_log }` table and registers it as the ad-hoc `rescue` global
@@ -491,7 +519,12 @@ mod tests {
         let (audio_signal, audio_handle) = lua::signal::Signal::new_live(mlua::Value::Nil);
         loader.set_global("audio", audio_signal).unwrap();
         let rescue_handle = register_rescue_signal(&loader).unwrap();
-        RendererClient::new(loader, shell_lua_path.to_path_buf(), ShapingHandle::spawn(), audio_handle, rescue_handle)
+        // None of this file's tests exercise process.run itself (see lua/process.rs's own tests
+        // for that) -- a throwaway channel is enough to satisfy RendererClient's shape.
+        let (process_tx, _process_rx) = mpsc::unbounded_channel();
+        let process_registry = ProcessRegistry::new(0, process_tx);
+        loader.register_process(process_registry.clone()).unwrap();
+        RendererClient::new(loader, shell_lua_path.to_path_buf(), ShapingHandle::spawn(), audio_handle, rescue_handle, process_registry)
     }
 
     #[test]
@@ -699,8 +732,11 @@ mod tests {
         let (_ready_tx, mut ready_rx) = mpsc::unbounded_channel();
         let (_presented_tx, mut presented_rx) = mpsc::unbounded_channel();
         let (activate_tx, _activate_rx) = std::sync::mpsc::channel();
+        let (_process_tx, mut process_outbound_rx) = mpsc::unbounded_channel();
 
-        client.dispatch_loop(&mut server_read, &mut server_write, &mut ready_rx, &mut presented_rx, &activate_tx).await;
+        client
+            .dispatch_loop(&mut server_read, &mut server_write, &mut ready_rx, &mut presented_rx, &activate_tx, &mut process_outbound_rx)
+            .await;
 
         let frame: RendererFrame = read_json_frame(&mut wire).await.unwrap();
         assert_eq!(frame, RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence: 1 }));
@@ -721,8 +757,11 @@ mod tests {
         let (_ready_tx, mut ready_rx) = mpsc::unbounded_channel();
         let (_presented_tx, mut presented_rx) = mpsc::unbounded_channel();
         let (activate_tx, activate_rx) = std::sync::mpsc::channel();
+        let (_process_tx, mut process_outbound_rx) = mpsc::unbounded_channel();
 
-        client.dispatch_loop(&mut server_read, &mut server_write, &mut ready_rx, &mut presented_rx, &activate_tx).await;
+        client
+            .dispatch_loop(&mut server_read, &mut server_write, &mut ready_rx, &mut presented_rx, &activate_tx, &mut process_outbound_rx)
+            .await;
 
         assert_eq!(activate_rx.try_recv(), Ok(42));
     }
@@ -749,8 +788,11 @@ mod tests {
         let (_ready_tx, mut ready_rx) = mpsc::unbounded_channel();
         let (_presented_tx, mut presented_rx) = mpsc::unbounded_channel();
         let (activate_tx, _activate_rx) = std::sync::mpsc::channel();
+        let (_process_tx, mut process_outbound_rx) = mpsc::unbounded_channel();
 
-        client.dispatch_loop(&mut server_read, &mut server_write, &mut ready_rx, &mut presented_rx, &activate_tx).await;
+        client
+            .dispatch_loop(&mut server_read, &mut server_write, &mut ready_rx, &mut presented_rx, &activate_tx, &mut process_outbound_rx)
+            .await;
 
         let frame: RendererFrame = read_json_frame(&mut wire).await.unwrap();
         assert_eq!(frame, RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 9 }));
@@ -768,12 +810,14 @@ mod tests {
         let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
         let (_presented_tx, mut presented_rx) = mpsc::unbounded_channel();
         let (activate_tx, _activate_rx) = std::sync::mpsc::channel();
+        let (_process_tx, mut process_outbound_rx) = mpsc::unbounded_channel();
         ready_tx.send(vec!["main_bar".to_string(), "overlay_canvas".to_string()]).unwrap();
 
         // Run dispatch_loop concurrently with reading its response -- the read half never
         // produces anything here, so dispatch_loop would otherwise run forever; a timeout bounds
         // the test instead of relying on a second frame to end the loop.
-        let dispatch = client.dispatch_loop(&mut server_read, &mut server_write, &mut ready_rx, &mut presented_rx, &activate_tx);
+        let dispatch =
+            client.dispatch_loop(&mut server_read, &mut server_write, &mut ready_rx, &mut presented_rx, &activate_tx, &mut process_outbound_rx);
         let read_response = read_json_frame::<_, RendererFrame>(&mut wire);
         let frame = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             tokio::select! {
@@ -799,9 +843,11 @@ mod tests {
         let (_ready_tx, mut ready_rx) = mpsc::unbounded_channel();
         let (presented_tx, mut presented_rx) = mpsc::unbounded_channel();
         let (activate_tx, _activate_rx) = std::sync::mpsc::channel();
+        let (_process_tx, mut process_outbound_rx) = mpsc::unbounded_channel();
         presented_tx.send(PresentationEvidence { nonce: 7, surface_id: "wallpaper_layer@DP-1".to_string() }).unwrap();
 
-        let dispatch = client.dispatch_loop(&mut server_read, &mut server_write, &mut ready_rx, &mut presented_rx, &activate_tx);
+        let dispatch =
+            client.dispatch_loop(&mut server_read, &mut server_write, &mut ready_rx, &mut presented_rx, &activate_tx, &mut process_outbound_rx);
         let read_response = read_json_frame::<_, RendererFrame>(&mut wire);
         let frame = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             tokio::select! {
@@ -813,5 +859,100 @@ mod tests {
         .expect("a PresentationEvidence frame must arrive before the timeout");
 
         assert_eq!(frame, RendererFrame::PresentationEvidence(PresentationEvidence { nonce: 7, surface_id: "wallpaper_layer@DP-1".to_string() }));
+    }
+
+    #[tokio::test]
+    async fn dispatch_loop_writes_a_queued_process_command_frame_over_the_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top" }"#);
+        let mut client = test_client(&path);
+
+        let (mut wire, server) = tokio::io::duplex(4096);
+        let (mut server_read, mut server_write) = tokio::io::split(server);
+
+        let (_ready_tx, mut ready_rx) = mpsc::unbounded_channel();
+        let (_presented_tx, mut presented_rx) = mpsc::unbounded_channel();
+        let (activate_tx, _activate_rx) = std::sync::mpsc::channel();
+        let (process_tx, mut process_outbound_rx) = mpsc::unbounded_channel();
+        process_tx
+            .send(CommandEnvelope {
+                jsonrpc: "2.0".to_string(),
+                method: "ExecuteCommand".to_string(),
+                params: shared::CommandParams {
+                    generation_id: 0,
+                    capability: "process".to_string(),
+                    action: "run".to_string(),
+                    arguments: vec![serde_json::json!("echo"), serde_json::json!(["hi"])],
+                    expected_revision: 0,
+                },
+                id: 1,
+            })
+            .unwrap();
+
+        let dispatch =
+            client.dispatch_loop(&mut server_read, &mut server_write, &mut ready_rx, &mut presented_rx, &activate_tx, &mut process_outbound_rx);
+        let read_response = read_json_frame::<_, RendererFrame>(&mut wire);
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::select! {
+                _ = dispatch => unreachable!("dispatch_loop must not return on its own in this test"),
+                frame = read_response => frame.unwrap(),
+            }
+        })
+        .await
+        .expect("a process Command frame must arrive before the timeout");
+
+        match frame {
+            RendererFrame::Command(envelope) => {
+                assert_eq!(envelope.params.capability, "process");
+                assert_eq!(envelope.params.action, "run");
+                assert_eq!(envelope.id, 1);
+            }
+            other => panic!("expected Command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_loop_routes_process_output_and_exit_frames_to_the_registered_lua_callbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top" }"#);
+        let mut client = test_client(&path);
+        // Register real out_cb/exit_cb through the real process.run global, exactly as
+        // `renderer/src/lua/process.rs`'s own tests do -- the id (0, the first call on a fresh
+        // registry) is what the inbound frames below address.
+        client
+            .loader
+            .evaluate(
+                r#"
+                process.run("cmd", {}, function(line, stream) probe_line = line; probe_stream = stream end, function(code) probe_code = code end)
+                return surface { id = "bar", layer = "Top" }
+                "#,
+            )
+            .unwrap();
+
+        let (mut wire, server) = tokio::io::duplex(4096);
+        let (mut server_read, mut server_write) = tokio::io::split(server);
+        write_json_frame(&mut wire, &SupervisorFrame::ProcessOutput(ProcessOutputLine { id: 0, stream: shared::ProcessStream::Stdout, line: "hello".to_string() }))
+            .await
+            .unwrap();
+        write_json_frame(&mut wire, &SupervisorFrame::ProcessExited(ProcessExited { id: 0, code: Some(3) })).await.unwrap();
+        wire.shutdown().await.unwrap();
+
+        let (_ready_tx, mut ready_rx) = mpsc::unbounded_channel();
+        let (_presented_tx, mut presented_rx) = mpsc::unbounded_channel();
+        let (activate_tx, _activate_rx) = std::sync::mpsc::channel();
+        let (_process_tx, mut process_outbound_rx) = mpsc::unbounded_channel();
+
+        client
+            .dispatch_loop(&mut server_read, &mut server_write, &mut ready_rx, &mut presented_rx, &activate_tx, &mut process_outbound_rx)
+            .await;
+
+        let output = client
+            .loader
+            .evaluate(r#"return surface { id = "bar", layer = "Top", line = probe_line, stream = probe_stream, code = probe_code }"#)
+            .unwrap();
+        let props = &output.surfaces[0].properties;
+        assert_eq!(props.get("line").unwrap().as_string().unwrap().to_string_lossy(), "hello");
+        assert_eq!(props.get("stream").unwrap().as_string().unwrap().to_string_lossy(), "stdout");
+        assert_eq!(props.get("code").unwrap().as_integer().unwrap(), 3);
     }
 }

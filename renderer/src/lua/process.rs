@@ -1,0 +1,287 @@
+//! `process` global table and `ProcessHandle` userdata (`oblisk-idl-api-specs.md` § 3.2/3.3,
+//! `docs/oblisk-supervisor-services-dbus.md` § 12, build-steps.md Phase 15 item 1, docs/adr/0026).
+//!
+//! `process.run(cmd, args, out_cb, exit_cb)` executes on the same thread `renderer/src/socket.rs`'s
+//! `dispatch_loop` runs on, but synchronously, with no `&mut write_half` in scope -- so it can't
+//! write the outbound `"process"`/`"run"` `CommandEnvelope` directly. [`ProcessRegistry`] instead
+//! queues it onto an `mpsc::UnboundedSender<CommandEnvelope>` that `dispatch_loop` drains in its
+//! own `tokio::select!`, the same "queue it, let the owning loop actually write it" shape as every
+//! other outbound frame in this codebase.
+//!
+//! `Rc<RefCell<_>>`, not `Arc<Mutex<_>>` -- [`ProcessRegistry`] is confined to the one socket
+//! thread, matching `lua::signal::Signal::Live` and `supervisor/src/audio/mixer.rs`'s
+//! `Rc<RefCell<MixerState>>`.
+//!
+//! Callback calling convention (not pinned down by the spec docs, decided here -- see
+//! docs/adr/0026): `out_cb(line, stream)` with `stream` the Lua string `"stdout"`/`"stderr"` (the
+//! wire type stays a real `shared::ProcessStream` enum; Lua itself has no enums, so a plain string
+//! is the idiomatic callback argument shape). `exit_cb(code)` with `code` an integer or `nil`,
+//! `Option<i32>`'s own natural `IntoLua` mapping.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use mlua::{Function, Lua, UserData, UserDataMethods};
+use shared::{CommandEnvelope, CommandParams, ProcessStream};
+use tokio::sync::mpsc::UnboundedSender;
+
+/// One `process.run` call's registered Lua callbacks, kept until its matching
+/// `SupervisorFrame::ProcessExited` arrives.
+struct PendingProcess {
+    out_cb: Function,
+    exit_cb: Function,
+}
+
+/// Registers `process.run`'s pending callbacks, assigns each call's `CommandEnvelope.id`
+/// (docs/adr/0026: the Renderer assigns it, not the Supervisor, so `process.run` can return a
+/// `ProcessHandle` synchronously), and queues outbound `"process"` commands.
+#[derive(Clone)]
+pub struct ProcessRegistry(Rc<RefCell<Inner>>);
+
+struct Inner {
+    generation_id: u32,
+    next_id: u64,
+    pending: HashMap<u64, PendingProcess>,
+    outbound_tx: UnboundedSender<CommandEnvelope>,
+}
+
+fn process_command(generation_id: u32, action: &str, arguments: Vec<serde_json::Value>, id: u64) -> CommandEnvelope {
+    CommandEnvelope {
+        jsonrpc: "2.0".to_string(),
+        method: "ExecuteCommand".to_string(),
+        params: CommandParams { generation_id, capability: "process".to_string(), action: action.to_string(), arguments, expected_revision: 0 },
+        id,
+    }
+}
+
+impl ProcessRegistry {
+    /// `generation_id` is this Renderer's own generation id (`OBLISK_GENERATION_ID`), stamped
+    /// into every outbound `CommandEnvelope`. `outbound_tx` is drained by `dispatch_loop`.
+    pub fn new(generation_id: u32, outbound_tx: UnboundedSender<CommandEnvelope>) -> Self {
+        ProcessRegistry(Rc::new(RefCell::new(Inner { generation_id, next_id: 0, pending: HashMap::new(), outbound_tx })))
+    }
+
+    fn allocate_id(&self) -> u64 {
+        let mut inner = self.0.borrow_mut();
+        let id = inner.next_id;
+        inner.next_id += 1;
+        id
+    }
+
+    fn send(&self, envelope: CommandEnvelope) {
+        let id = envelope.id;
+        let action = envelope.params.action.clone();
+        if self.0.borrow().outbound_tx.send(envelope).is_err() {
+            eprintln!("process.{action}(id={id}): failed to queue request, the control-socket writer is gone");
+        }
+    }
+
+    fn run(&self, cmd: String, args: Vec<String>, out_cb: Function, exit_cb: Function) -> ProcessHandle {
+        let id = self.allocate_id();
+        self.0.borrow_mut().pending.insert(id, PendingProcess { out_cb, exit_cb });
+        let generation_id = self.0.borrow().generation_id;
+        self.send(process_command(generation_id, "run", vec![serde_json::json!(cmd), serde_json::json!(args)], id));
+        ProcessHandle { id, registry: self.clone() }
+    }
+
+    fn kill(&self, id: u64) {
+        let generation_id = self.0.borrow().generation_id;
+        self.send(process_command(generation_id, "kill", Vec::new(), id));
+    }
+
+    /// `SupervisorFrame::ProcessOutput` dispatch (`renderer/src/socket.rs`'s `dispatch_loop`):
+    /// invokes `id`'s registered `out_cb`. A stale/unknown `id` (a frame arriving for a since-
+    /// forgotten generation, or a wire desync) is silently ignored -- this codebase's established
+    /// tolerance for a frame that doesn't match any live state, matching `SocketCandidateLink`'s
+    /// own "log and drop" precedent one layer up.
+    pub fn dispatch_output(&self, id: u64, stream: ProcessStream, line: String) {
+        let out_cb = self.0.borrow().pending.get(&id).map(|p| p.out_cb.clone());
+        let Some(out_cb) = out_cb else { return };
+        if let Err(err) = out_cb.call::<()>((line, stream_name(stream))) {
+            eprintln!("process.run(id={id}): out_cb raised an error: {err}");
+        }
+    }
+
+    /// `SupervisorFrame::ProcessExited` dispatch: invokes `id`'s registered `exit_cb` and forgets
+    /// the id -- the callback pair's last use, matching `ProcessHandle`'s own lifetime (the
+    /// Supervisor's registry entry is gone by the time this frame is sent, see docs/adr/0026).
+    pub fn dispatch_exit(&self, id: u64, code: Option<i32>) {
+        let exit_cb = self.0.borrow_mut().pending.remove(&id).map(|p| p.exit_cb);
+        let Some(exit_cb) = exit_cb else { return };
+        if let Err(err) = exit_cb.call::<()>(code) {
+            eprintln!("process.run(id={id}): exit_cb raised an error: {err}");
+        }
+    }
+}
+
+fn stream_name(stream: ProcessStream) -> &'static str {
+    match stream {
+        ProcessStream::Stdout => "stdout",
+        ProcessStream::Stderr => "stderr",
+    }
+}
+
+/// The opaque `ProcessHandle` userdata § 3.3 hands back to Lua.
+pub struct ProcessHandle {
+    id: u64,
+    registry: ProcessRegistry,
+}
+
+impl UserData for ProcessHandle {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("kill", |_, this, ()| {
+            this.registry.kill(this.id);
+            Ok(())
+        });
+    }
+}
+
+/// Registers the `process` global table with `process.run(cmd, args, out_cb, exit_cb)`. `mlua`'s
+/// own argument type-checking on this closure's signature is § 3.2's validation ("`cmd` is
+/// string, `args` array table of strings, callbacks are Lua functions") in full.
+pub fn register(lua: &Lua, registry: ProcessRegistry) -> mlua::Result<()> {
+    let table = lua.create_table()?;
+    table.set(
+        "run",
+        lua.create_function(move |_, (cmd, args, out_cb, exit_cb): (String, Vec<String>, Function, Function)| {
+            Ok(registry.run(cmd, args, out_cb, exit_cb))
+        })?,
+    )?;
+    lua.globals().set("process", table)
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc;
+
+    use super::*;
+
+    fn lua_with_process(generation_id: u32) -> (Lua, ProcessRegistry, mpsc::UnboundedReceiver<CommandEnvelope>) {
+        let lua = Lua::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let registry = ProcessRegistry::new(generation_id, tx);
+        register(&lua, registry.clone()).unwrap();
+        (lua, registry, rx)
+    }
+
+    #[test]
+    fn process_run_returns_a_handle_and_queues_a_well_formed_run_command() {
+        let (lua, _registry, mut rx) = lua_with_process(4);
+
+        lua.load(r#"handle = process.run("echo", {"hi"}, function() end, function() end)"#).exec().unwrap();
+
+        let envelope = rx.try_recv().expect("a run command must have been queued");
+        assert_eq!(envelope.params.generation_id, 4);
+        assert_eq!(envelope.params.capability, "process");
+        assert_eq!(envelope.params.action, "run");
+        assert_eq!(envelope.params.arguments, vec![serde_json::json!("echo"), serde_json::json!(["hi"])]);
+        assert_eq!(envelope.id, 0, "the first process.run call on a fresh registry gets id 0");
+
+        let is_userdata: bool = lua.load("return type(handle) == \"userdata\"").eval().unwrap();
+        assert!(is_userdata, "process.run must return a userdata ProcessHandle");
+    }
+
+    #[test]
+    fn each_process_run_call_gets_a_distinct_monotonic_id() {
+        let (lua, _registry, mut rx) = lua_with_process(0);
+
+        lua.load(r#"process.run("a", {}, function() end, function() end)"#).exec().unwrap();
+        lua.load(r#"process.run("b", {}, function() end, function() end)"#).exec().unwrap();
+
+        assert_eq!(rx.try_recv().unwrap().id, 0);
+        assert_eq!(rx.try_recv().unwrap().id, 1);
+    }
+
+    #[test]
+    fn process_handle_kill_queues_a_kill_command_with_no_arguments_carrying_the_same_id() {
+        let (lua, _registry, mut rx) = lua_with_process(4);
+
+        lua.load(r#"handle = process.run("sleep", {"5"}, function() end, function() end); handle:kill()"#).exec().unwrap();
+
+        let run_envelope = rx.try_recv().unwrap();
+        let kill_envelope = rx.try_recv().expect("a kill command must have been queued");
+        assert_eq!(kill_envelope.params.capability, "process");
+        assert_eq!(kill_envelope.params.action, "kill");
+        assert_eq!(kill_envelope.params.arguments, Vec::<serde_json::Value>::new());
+        assert_eq!(kill_envelope.id, run_envelope.id);
+    }
+
+    #[test]
+    fn process_run_rejects_a_non_function_callback() {
+        let (lua, _registry, _rx) = lua_with_process(0);
+
+        let err = lua.load(r#"process.run("echo", {}, "not a function", function() end)"#).exec().unwrap_err();
+        assert!(err.to_string().contains("function"), "expected a type error mentioning function, got: {err}");
+    }
+
+    #[test]
+    fn process_run_rejects_a_non_string_cmd() {
+        let (lua, _registry, _rx) = lua_with_process(0);
+
+        // A table, not a number -- mlua's `String` extraction follows Lua's own `lua_tolstring`
+        // numeric-coercion rule (`42` -> `"42"`), which isn't the gap this test is after; a table
+        // has no such coercion and must still be rejected.
+        let err = lua.load(r#"process.run({}, {}, function() end, function() end)"#).exec().unwrap_err();
+        assert!(err.to_string().contains("string"), "expected a type error mentioning string, got: {err}");
+    }
+
+    /// Reads a probe global back out after a callback pushed into it -- callbacks are called with
+    /// no other observable side channel, so this is the standard way this codebase's Lua tests
+    /// (`renderer/src/socket.rs`'s `rescue_state`) confirm a callback actually ran with the right
+    /// arguments.
+    fn probe_table(lua: &Lua) -> mlua::Table {
+        lua.load("probe = probe or {}; return probe").eval().unwrap()
+    }
+
+    #[test]
+    fn dispatch_output_invokes_the_registered_out_cb_with_line_and_stream() {
+        let (lua, registry, _rx) = lua_with_process(0);
+        lua.load(r#"process.run("cmd", {}, function(line, stream) probe = { line = line, stream = stream } end, function() end)"#)
+            .exec()
+            .unwrap();
+
+        registry.dispatch_output(0, ProcessStream::Stdout, "hello".to_string());
+
+        let probe = probe_table(&lua);
+        assert_eq!(probe.get::<String>("line").unwrap(), "hello");
+        assert_eq!(probe.get::<String>("stream").unwrap(), "stdout");
+
+        registry.dispatch_output(0, ProcessStream::Stderr, "oops".to_string());
+        let probe = probe_table(&lua);
+        assert_eq!(probe.get::<String>("stream").unwrap(), "stderr");
+    }
+
+    #[test]
+    fn dispatch_output_on_an_unknown_id_is_silently_ignored() {
+        let (_lua, registry, _rx) = lua_with_process(0);
+        registry.dispatch_output(99, ProcessStream::Stdout, "unheard".to_string());
+    }
+
+    #[test]
+    fn dispatch_exit_invokes_the_registered_exit_cb_with_the_code_then_forgets_the_id() {
+        let (lua, registry, _rx) = lua_with_process(0);
+        lua.load(r#"process.run("cmd", {}, function() end, function(code) probe = { code = code } end)"#).exec().unwrap();
+
+        registry.dispatch_exit(0, Some(3));
+        let probe = probe_table(&lua);
+        assert_eq!(probe.get::<i64>("code").unwrap(), 3);
+
+        // A second exit report for the same id (e.g. a stray duplicate) must not fire exit_cb
+        // again -- dispatch_exit already forgot it.
+        lua.load("probe = nil").exec().unwrap();
+        registry.dispatch_exit(0, Some(99));
+        let is_nil: bool = lua.load("return probe == nil").eval().unwrap();
+        assert!(is_nil, "a second dispatch_exit for an already-dispatched id must be a no-op");
+    }
+
+    #[test]
+    fn dispatch_exit_passes_nil_for_an_absent_code() {
+        let (lua, registry, _rx) = lua_with_process(0);
+        lua.load(r#"process.run("cmd", {}, function() end, function(code) probe = { is_nil = code == nil } end)"#).exec().unwrap();
+
+        registry.dispatch_exit(0, None);
+        let probe = probe_table(&lua);
+        assert!(probe.get::<bool>("is_nil").unwrap(), "a killed-by-signal exit must pass nil, not a synthesized code");
+    }
+}

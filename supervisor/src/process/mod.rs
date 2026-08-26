@@ -16,7 +16,7 @@
 //! uses that instead of hand-rolling the same `setpgid` call through `unsafe` `pre_exec`.
 
 use std::io;
-use std::process::ExitStatus;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use nix::errno::Errno;
@@ -92,6 +92,22 @@ pub fn spawn_group_leader(cmd: &str, args: &[String], envs: &[(String, String)])
     Command::new(cmd).args(args).envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str()))).process_group(0).spawn()
 }
 
+/// Identical to [`spawn_group_leader`] except stdout/stderr are piped instead of inherited --
+/// `process.run`'s real requirement (build-steps.md Phase 15 item 1, docs/adr/0026): the
+/// Supervisor reads the child's output itself to forward it as `SupervisorFrame::ProcessOutput`
+/// lines, rather than let it reach the Supervisor's own terminal like every `spawn_group_leader`
+/// caller (the boot Renderer spawn, every PBA candidate spawn) still needs to. Stdin stays
+/// inherited, matching `spawn_group_leader`; nothing in this phase's spec asks for piped stdin.
+pub fn spawn_group_leader_piped(cmd: &str, args: &[String], envs: &[(String, String)]) -> io::Result<Child> {
+    Command::new(cmd)
+        .args(args)
+        .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+}
+
 /// How [`reap_process_group`] recovered `child`'s process group.
 #[derive(Debug)]
 pub enum ReapOutcome {
@@ -141,7 +157,6 @@ pub async fn reap_process_group(child: &mut Child, grace: Duration) -> io::Resul
 #[cfg(test)]
 mod tests {
     use std::os::unix::process::ExitStatusExt;
-    use std::process::Stdio;
 
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -295,5 +310,36 @@ mod tests {
 
         let gone = wait_until(Duration::from_millis(500), || !proc_exists(grandchild_pid)).await;
         assert!(gone, "grandchild (pid {grandchild_pid}) should be gone after killpg reached the whole group");
+    }
+
+    #[tokio::test]
+    async fn spawn_group_leader_piped_also_puts_the_child_in_its_own_process_group() {
+        // The piped variant must not have silently dropped the process-group behavior the whole
+        // primitive exists for -- same assertion as spawn_group_leader's own coverage.
+        let mut child = spawn_group_leader_piped("sh", &sh_args("sleep 5"), &[]).expect("failed to spawn");
+        let child_pid = child.id().expect("freshly spawned child has a pid");
+
+        let child_pgid = nix::unistd::getpgid(Some(Pid::from_raw(child_pid as i32))).expect("getpgid on the child");
+        let our_pgid = nix::unistd::getpgrp();
+        assert_ne!(child_pgid, our_pgid, "child should not inherit the test process's own group");
+
+        reap_process_group(&mut child, Duration::from_millis(200)).await.expect("cleanup reap failed");
+    }
+
+    #[tokio::test]
+    async fn spawn_group_leader_piped_pipes_stdout_and_stderr_separately_with_the_real_exit_code() {
+        let mut child =
+            spawn_group_leader_piped("sh", &sh_args("echo line1; echo line2 >&2; exit 3"), &[]).expect("failed to spawn");
+
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
+
+        let stdout_line = BufReader::new(stdout).lines().next_line().await.unwrap().unwrap();
+        let stderr_line = BufReader::new(stderr).lines().next_line().await.unwrap().unwrap();
+        assert_eq!(stdout_line, "line1");
+        assert_eq!(stderr_line, "line2");
+
+        let status = child.wait().await.expect("wait failed");
+        assert_eq!(status.code(), Some(3));
     }
 }
