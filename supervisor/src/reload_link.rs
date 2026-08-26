@@ -11,6 +11,8 @@
 //! `ReevaluateReport` from the still-authoritative generation, both plausible mid-handshake) is
 //! logged and dropped, not routed anywhere else.
 
+use std::time::Duration;
+
 use shared::{ActivateDraw, ReadySignal, RendererFrame, StateSnapshot, SupervisorFrame};
 use tokio::sync::mpsc;
 
@@ -80,11 +82,33 @@ impl SocketCandidateLink<'_> {
     }
 }
 
+/// How long to wait between retries of a `send_frame` that failed because the Candidate hasn't
+/// registered a connection yet -- see [`SocketCandidateLink::push_state_snapshot`].
+const CONNECTION_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
 impl CandidateLink for SocketCandidateLink<'_> {
     type Error = SocketLinkError;
 
+    /// Retries on `SendFrameError::NoConnection`, rather than failing on the first attempt: the
+    /// Candidate was *just* spawned by `process::spawn_group_leader` a moment before `run_pba`
+    /// calls this, and real process/Wayland/EGL/Lua-VM startup plus the initial socket connect
+    /// and handshake take real wall-clock time -- there is no synchronization point that
+    /// guarantees the Candidate has registered with `GenerationRegistry` yet. Unbounded on its
+    /// own, but safe: `drive_handshake` wraps this whole call in one `timeout(ready_timeout, ..)`.
+    /// Found live (a real spawned process racing a real socket connect) rather than in review --
+    /// this module's own tests, and `reload.rs`'s `FakeCandidateLink`, never modeled a
+    /// not-yet-connected Candidate, since a fake registers instantly.
     async fn push_state_snapshot(&mut self, snapshot: &StateSnapshot) -> Result<(), Self::Error> {
-        self.registry.send_frame(self.candidate_generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone())).map_err(SocketLinkError::Send)
+        let frame = SupervisorFrame::StateSnapshot(snapshot.clone());
+        loop {
+            match self.registry.send_frame(self.candidate_generation_id, &frame) {
+                Ok(()) => return Ok(()),
+                Err(crate::socket::SendFrameError::NoConnection { .. }) => {
+                    tokio::time::sleep(CONNECTION_RETRY_INTERVAL).await;
+                }
+                Err(err) => return Err(SocketLinkError::Send(err)),
+            }
+        }
     }
 
     async fn recv_ready_signal(&mut self) -> Result<Vec<String>, Self::Error> {
@@ -155,6 +179,33 @@ mod tests {
         link.push_state_snapshot(&snapshot()).await.expect("send must succeed");
 
         let payload = rx.recv().await.expect("frame must have been queued");
+        let frame: SupervisorFrame = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(frame, SupervisorFrame::StateSnapshot(snapshot()));
+    }
+
+    /// Regression test: found running Phase 14 live against a real spawned Candidate process
+    /// (not a fake) for the first time -- `push_state_snapshot` used to fail immediately with
+    /// `NoConnection` because it ran before the just-spawned Candidate had finished starting up
+    /// and registering its connection.
+    #[tokio::test]
+    async fn push_state_snapshot_retries_until_the_candidate_connection_registers() {
+        let registry = GenerationRegistry::default();
+        let (_inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        let mut link = SocketCandidateLink { registry: registry.clone(), candidate_generation_id: 9, inbound: &mut inbound_rx };
+
+        let late_registry = registry.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(CONNECTION_RETRY_INTERVAL * 3).await;
+            late_registry.register(9, tx);
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), link.push_state_snapshot(&snapshot()))
+            .await
+            .expect("must not hang forever waiting for the connection")
+            .expect("must eventually succeed once the connection registers");
+
+        let payload = rx.recv().await.expect("frame must have been queued once the connection existed");
         let frame: SupervisorFrame = serde_json::from_slice(&payload).unwrap();
         assert_eq!(frame, SupervisorFrame::StateSnapshot(snapshot()));
     }
