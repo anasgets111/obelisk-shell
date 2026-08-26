@@ -252,6 +252,25 @@ async fn reap_generations_processes(processes: &mut LiveProcesses, generation_id
     }
 }
 
+/// Every still-tracked `process.run` child, regardless of which generation spawned it -- the
+/// shutdown-time counterpart to `reap_generations_processes`' narrower per-generation sweep.
+/// Without this, a `SIGINT`/`SIGTERM`'d Supervisor previously left every live `process.run` child
+/// (and the authoritative Renderer itself, reaped separately by `main`'s own shutdown sequence)
+/// orphaned -- confirmed live: Ctrl-C during `cargo run -p supervisor` killed the Supervisor
+/// instantly (no signal handler existed at all) while its boot-spawned Renderer, in its own
+/// process group since Phase 7 specifically so it survives ambient signals, kept running headless
+/// forever.
+async fn reap_all_processes(processes: &mut LiveProcesses) {
+    let ids: Vec<(u32, u64)> = processes.keys().copied().collect();
+    for key in ids {
+        if let Some(mut child) = processes.remove(&key)
+            && let Err(err) = process::reap_process_group(&mut child, process::DEFAULT_REAP_GRACE).await
+        {
+            eprintln!("failed to reap process {key:?} on shutdown: {err}");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let connection = zbus::Connection::system().await?;
@@ -294,8 +313,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // this loop for reaping and registry cleanup.
     let mut processes: LiveProcesses = HashMap::new();
     let (process_done_tx, mut process_done) = tokio::sync::mpsc::unbounded_channel::<(u32, u64)>();
+    // No handler at all previously meant Ctrl-C killed the Supervisor on the spot, leaving the
+    // Renderer (a different process group by design, Phase 7) orphaned and running headless --
+    // confirmed live. `SIGTERM` gets the same treatment: a process manager stopping this unit
+    // sends `SIGTERM`, not `SIGINT`.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("SIGINT received, shutting down");
+                break;
+            }
+            _ = sigterm.recv() => {
+                eprintln!("SIGTERM received, shutting down");
+                break;
+            }
             Some(challenge) = challenges.recv() => {
                 eprintln!("polkit authentication challenge received: {challenge:?}");
             }
@@ -486,6 +518,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             else => break,
         }
     }
+
+    // Shutdown, reached from the signal arms above or `else => break` (every channel closed):
+    // reap the authoritative Renderer and every still-live `process.run` child rather than exit
+    // out from under them. `reap_process_group` is SIGTERM-then-SIGKILL (process::DEFAULT_REAP_GRACE),
+    // the same grace this codebase already gives every other reap.
+    if let Err(err) = process::reap_process_group(&mut authoritative.child, process::DEFAULT_REAP_GRACE).await {
+        eprintln!("failed to reap authoritative generation {}'s renderer on shutdown: {err}", authoritative.generation_id);
+    }
+    reap_all_processes(&mut processes).await;
     Ok(())
 }
 
@@ -643,5 +684,34 @@ mod tests {
         })
         .await;
         assert!(gone.is_ok(), "process {pid} should be gone after the supersede-time reap, not just removed from the registry");
+    }
+
+    #[tokio::test]
+    async fn reap_all_processes_reaps_every_generations_entries() {
+        let mut processes: LiveProcesses = HashMap::new();
+        spawn_and_register_process(&mut processes, 1, 1, "sh", &sh_args("sleep 5"));
+        spawn_and_register_process(&mut processes, 2, 1, "sh", &sh_args("sleep 5"));
+
+        reap_all_processes(&mut processes).await;
+
+        assert!(processes.is_empty(), "shutdown must reap every tracked process, not just one generation's");
+    }
+
+    #[tokio::test]
+    async fn reap_all_processes_actually_kills_the_processes_not_just_the_registry_entries() {
+        let mut processes: LiveProcesses = HashMap::new();
+        spawn_and_register_process(&mut processes, 1, 1, "sh", &sh_args("sleep 5"));
+        spawn_and_register_process(&mut processes, 2, 1, "sh", &sh_args("sleep 5"));
+        let pids: Vec<u32> = processes.values().map(|child| child.id().expect("freshly spawned child has a pid")).collect();
+
+        reap_all_processes(&mut processes).await;
+
+        let gone = tokio::time::timeout(Duration::from_millis(500), async {
+            while pids.iter().any(|pid| Path::new(&format!("/proc/{pid}")).exists()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(gone.is_ok(), "every reaped process should actually be gone from /proc, not just removed from the registry");
     }
 }
