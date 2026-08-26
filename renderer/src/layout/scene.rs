@@ -171,7 +171,7 @@ impl Scene {
 
 fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
     match kind {
-        "surface" | "rect" | "row" | "column" | "text" | "icon" | "button" => Ok(()),
+        "surface" | "rect" | "row" | "column" | "text" | "icon" | "button" | "textfield" => Ok(()),
         other => Err(LayoutError::UnsupportedNodeKind(other.to_string())),
     }
 }
@@ -179,13 +179,23 @@ fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
 /// Dispatches to the right raw property (`child` for `surface`, `children` for the container
 /// kinds, none for leaves) -- only called after [`ensure_supported_kind`] already validated
 /// `node.kind`, so the fallback arm is unreachable, not a silent default.
+///
+/// `textfield` (`oblisk-idl-api-specs.md` § 5.2 item 8) is a leaf like `text`/`icon`: it never
+/// takes `children`. Its own properties (`mask_character`, `secure_submit`, `on_change`,
+/// `on_submit`) ride along unvalidated in `RetainedNode.properties`, same as `button`'s
+/// `on_click` -- no GPU painting or `wp-text-input-v3` wiring reads them from the scene graph
+/// yet (build-steps.md Phase 15 item 2 scopes this to a valid, parseable node kind; the protocol
+/// state itself lives entirely outside the scene graph, on `App` in `renderer/src/wayland/mod.rs`
+/// -- ADR-0009 named this a `TextInputService`, but this slice inlined the fields onto `App`
+/// directly rather than extracting that type; see that file's own `bind_text_input` doc comment
+/// for the upgrade path).
 fn children_of(node: &VirtualNode) -> Result<Vec<VirtualNode>, LayoutError> {
     match node.kind.as_str() {
         "surface" => Ok(node::parse_single_child(&node.properties, "child")?
             .into_iter()
             .collect()),
         "rect" | "row" | "column" | "button" => node::parse_children(&node.properties),
-        "text" | "icon" => Ok(Vec::new()),
+        "text" | "icon" | "textfield" => Ok(Vec::new()),
         other => unreachable!("ensure_supported_kind already rejected `{other}`"),
     }
 }
@@ -875,9 +885,30 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) =
-            surface_from(r#"surface { id = "bar", child = row { children = { textfield {} } } }"#);
+            surface_from(r#"surface { id = "bar", child = row { children = { list {} } } }"#);
         let err = scene.apply(&[surface], full(), &shaping).unwrap_err();
-        assert!(matches!(err, LayoutError::UnsupportedNodeKind(k) if k == "textfield"));
+        assert!(matches!(err, LayoutError::UnsupportedNodeKind(k) if k == "list"));
+    }
+
+    #[test]
+    fn textfield_is_a_supported_leaf_kind_carrying_its_properties_unvalidated() {
+        // build-steps.md Phase 15 item 2 / ADR-0027: `textfield` becomes a valid, parseable
+        // scene-node kind here; no GPU painting or `wp-text-input-v3` wiring reads its
+        // properties from the scene graph in this slice (see `children_of`'s doc comment).
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"surface { id = "bar", child = row { children = { textfield { mask_character = "*", secure_submit = { capability = "polkit", action = "authenticate" } } } } }"#,
+        );
+        scene.apply(&[surface], full(), &shaping).unwrap();
+
+        let field = &scene.surface("bar").unwrap().children[0].children[0];
+        assert_eq!(field.kind, "textfield");
+        assert!(field.children.is_empty(), "textfield is a leaf, never a container");
+        assert_eq!(
+            field.properties.get("mask_character").unwrap().as_string().unwrap().to_string_lossy(),
+            "*"
+        );
     }
 
     #[test]

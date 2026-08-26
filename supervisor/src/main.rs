@@ -16,7 +16,7 @@ use dbus::polkit::{AGENT_OBJECT_PATH, AuthenticationAgent, current_session_subje
 use reload_link::SocketCandidateLink;
 use shared::{
     ApplyPendingReload, DeselectInput, ProcessExited, ProcessOutputLine, ProcessStream, PromoteGeneration, RendererFrame, ReevaluateReport,
-    ReevaluateRequest, SupervisorFrame,
+    ReevaluateRequest, SupervisorFrame, Zeroize,
 };
 use tokio::io::AsyncBufReadExt;
 use tokio::process::{Child, ChildStderr, ChildStdout};
@@ -460,6 +460,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 RendererFrame::ReevaluateReport(ReevaluateReport::Failed { sequence, error }) => {
                     eprintln!("generation {}'s shell.lua re-evaluation (sequence {sequence}) failed: {error}", inbound.generation_id);
+                }
+                RendererFrame::SecureSubmit(mut submit) => {
+                    // build-steps.md Phase 15 item 2 closes ADR-0015 item 2 (the textfield/IPC
+                    // half only) -- this is deliberately still just a channel-forward-and-log
+                    // placeholder, the same discipline this codebase already uses for
+                    // `challenges.recv()` above. Phase 15 item 3 (docs/adr/0028) is the separate,
+                    // later pass that actually drives PAM with this secret; do not wire it to
+                    // `dbus::polkit::AuthenticationAgent` here.
+                    //
+                    // Never log the secret itself -- only its length -- and log before zeroizing
+                    // it, not after (a post-zeroize log would just print the byte count of an
+                    // already-cleared buffer, which happens to be correct here since `len()` is
+                    // read first, but doing the read before the clear keeps that order honest).
+                    eprintln!(
+                        "generation {}'s secure_submit received: capability={:?} action={:?} secret_len={}",
+                        submit.generation_id,
+                        submit.capability,
+                        submit.action,
+                        submit.secret.len()
+                    );
+                    submit.secret.zeroize();
                 }
             },
             else => break,

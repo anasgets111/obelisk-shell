@@ -159,6 +159,22 @@ pub struct ProcessExited {
     pub code: Option<i32>,
 }
 
+/// Renderer -> Supervisor: one completed `textfield` `secure_submit` (build-steps.md Phase 15
+/// item 2; ADR-0005/ADR-0009/ADR-0027). `secret` is the accumulated `wp-text-input-v3` input,
+/// read once from a `shared::SecureBuffer` via its one sanctioned read (`expose_secret`) --
+/// never routed through [`CommandParams::arguments`], whose `Vec<serde_json::Value>` would leave
+/// an intermediate plaintext copy `.zeroize()` can never reach (ADR-0027, ADR-0014). The
+/// Renderer's socket thread calls `.zeroize()` on the source `SecureBuffer` immediately after
+/// writing this frame -- see `renderer/src/socket.rs`'s `dispatch_loop`, not this type, which is
+/// just the wire shape.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecureSubmit {
+    pub generation_id: u32,
+    pub capability: String,
+    pub action: String,
+    pub secret: Vec<u8>,
+}
+
 /// Every frame the Supervisor can push to a Renderer connection, adjacently tagged so a single
 /// read loop can dispatch on `kind` without the connection needing a separate channel per
 /// message shape. `content = "data"` (not internally-tagged) because [`ReevaluateReport`] is
@@ -188,6 +204,7 @@ pub enum RendererFrame {
     ReevaluateReport(ReevaluateReport),
     ReadySignal(ReadySignal),
     PresentationEvidence(PresentationEvidence),
+    SecureSubmit(SecureSubmit),
 }
 
 /// `~/.config/oblisk/`, resolved via `$XDG_CONFIG_HOME` falling back to `$HOME/.config` (XDG
@@ -383,6 +400,27 @@ mod tests {
         let frame = RendererFrame::PresentationEvidence(PresentationEvidence { nonce: 7, surface_id: "wallpaper_layer@DP-1".to_string() });
         let wire = serde_json::to_value(&frame).unwrap();
         assert_eq!(wire, serde_json::json!({ "kind": "PresentationEvidence", "data": { "nonce": 7, "surface_id": "wallpaper_layer@DP-1" } }));
+
+        let parsed: RendererFrame = serde_json::from_value(wire).unwrap();
+        assert_eq!(parsed, frame);
+    }
+
+    #[test]
+    fn renderer_frame_secure_submit_is_adjacently_tagged() {
+        let frame = RendererFrame::SecureSubmit(SecureSubmit {
+            generation_id: 4,
+            capability: "polkit".to_string(),
+            action: "authenticate".to_string(),
+            secret: b"hunter2".to_vec(),
+        });
+        let wire = serde_json::to_value(&frame).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "kind": "SecureSubmit",
+                "data": { "generation_id": 4, "capability": "polkit", "action": "authenticate", "secret": [104, 117, 110, 116, 101, 114, 50] }
+            })
+        );
 
         let parsed: RendererFrame = serde_json::from_value(wire).unwrap();
         assert_eq!(parsed, frame);

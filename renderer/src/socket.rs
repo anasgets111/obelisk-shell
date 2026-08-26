@@ -46,26 +46,27 @@
 //! ceiling, same reasoning, symmetric on this side).
 //!
 //! Real PBA handshake wiring (build-steps.md Phase 14, § 15.2-15.3, closing docs/adr/0019 items
-//! 1/3/6): [`spawn_client`] gains three channel endpoints bridging this thread to the Wayland/EGL
-//! thread (`crate::wayland`, see `main.rs`'s doc comment for the three channels' roles).
-//! `ready_rx`/`presented_rx` are plain `std::sync::mpsc::Receiver`s -- not directly pollable from
-//! an async task -- so each is bridged into a `tokio::sync::mpsc` channel via its own dedicated
-//! `std::thread` looping `.recv()`-and-forward, this project's established bridging idiom (see
-//! `text::shaping`'s worker thread). `activate_tx` is a `std::sync::mpsc::Sender`, whose `.send()`
-//! is synchronous and non-blocking -- callable directly from async code, no bridging needed.
-//! [`RendererClient::dispatch_loop`] then `tokio::select!`s over the wire read half and both
-//! bridged channels: `SupervisorFrame::ActivateDraw` forwards its nonce to `activate_tx`;
+//! 1/3/6; Phase 15 item 2 adds the fourth): [`spawn_client`] gains four channel endpoints
+//! bridging this thread to the Wayland/EGL thread (`crate::wayland`, see `main.rs`'s doc comment
+//! for all four channels' roles). `ready_rx`/`presented_rx`/`secure_submit_rx` are plain
+//! `std::sync::mpsc::Receiver`s -- not directly pollable from an async task -- so each is
+//! bridged into a `tokio::sync::mpsc` channel via its own dedicated `std::thread` looping
+//! `.recv()`-and-forward, this project's established bridging idiom (see `text::shaping`'s
+//! worker thread). `activate_tx` is a `std::sync::mpsc::Sender`, whose `.send()` is synchronous
+//! and non-blocking -- callable directly from async code, no bridging needed.
+//! [`RendererClient::dispatch_loop`] then `tokio::select!`s over the wire read half and all three
+//! bridged receivers: `SupervisorFrame::ActivateDraw` forwards its nonce to `activate_tx`;
 //! `DeselectInput`/`PromoteGeneration` are real, received, and currently logged only (no real
-//! input-region/focus machinery exists yet to hand them to -- docs/adr/0025 item 4); the ready
-//! and presented channels are written back out as `RendererFrame::ReadySignal`/
-//! `PresentationEvidence`.
+//! input-region/focus machinery exists yet to hand them to -- docs/adr/0025 item 4); the ready,
+//! presented, and secure_submit channels are written back out as `RendererFrame::ReadySignal`/
+//! `PresentationEvidence`/`SecureSubmit`.
 
 use std::path::{Path, PathBuf};
 
 use shared::framing::{self, write_json_frame};
 use shared::{
     ActivateDraw, ApplyPendingReload, CommandEnvelope, ConnectionHandshake, DeselectInput, PresentationEvidence, ProcessExited, ProcessOutputLine,
-    PromoteGeneration, ReadySignal, ReevaluateReport, ReevaluateRequest, RendererFrame, StateSnapshot, SupervisorFrame,
+    PromoteGeneration, ReadySignal, ReevaluateReport, ReevaluateRequest, RendererFrame, SecureSubmit, StateSnapshot, SupervisorFrame, Zeroize,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
@@ -77,6 +78,7 @@ use crate::lua::process::ProcessRegistry;
 use crate::lua::signal::LiveSignalHandle;
 use crate::lua::{self, Loader};
 use crate::text::shaping::ShapingHandle;
+use crate::wayland::SecureSubmitPayload;
 
 /// Real per-output pixel dimensions aren't threaded from Wayland into this thread yet (see
 /// docs/adr/0023 item 6) -- `wayland::mod`'s output/surface objects live on the main thread,
@@ -97,12 +99,14 @@ async fn connect_and_handshake(path: &Path, generation_id: u32) -> Result<UnixSt
 
 /// Spawns the dedicated connect-and-hold-open thread. Connection failures (no Supervisor
 /// listening yet, wrong path) are logged, not fatal -- build-steps.md doesn't yet define a
-/// startup-ordering guarantee between the two processes. `ready_rx`/`presented_rx`/`activate_tx`
-/// are the Wayland-thread bridging channels -- see the module doc comment.
+/// startup-ordering guarantee between the two processes.
+/// `ready_rx`/`presented_rx`/`activate_tx`/`secure_submit_rx` are the Wayland-thread bridging
+/// channels -- see the module doc comment.
 pub fn spawn_client(
     ready_rx: std::sync::mpsc::Receiver<Vec<String>>,
     presented_rx: std::sync::mpsc::Receiver<PresentationEvidence>,
     activate_tx: std::sync::mpsc::Sender<u64>,
+    secure_submit_rx: std::sync::mpsc::Receiver<SecureSubmitPayload>,
 ) {
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread().enable_io().build() {
@@ -112,7 +116,7 @@ pub fn spawn_client(
                 return;
             }
         };
-        runtime.block_on(run(ready_rx, presented_rx, activate_tx));
+        runtime.block_on(run(ready_rx, presented_rx, activate_tx, secure_submit_rx));
     });
 }
 
@@ -154,6 +158,21 @@ struct RendererClient {
     rescue_handle: LiveSignalHandle,
     process_registry: ProcessRegistry,
     state: ReloadState,
+    /// Tags every `RendererFrame::SecureSubmit` this connection writes (build-steps.md Phase 15
+    /// item 2) -- the Wayland thread doesn't know it (see the module doc comment), so it's kept
+    /// here alongside the rest of this connection's own identity instead of threaded through
+    /// `dispatch_loop`'s parameter list as a ninth argument.
+    generation_id: u32,
+}
+
+/// `dispatch_loop`'s bridged-channel endpoints, bundled into one parameter instead of five
+/// separate ones (mirrors [`RendererClient`]'s own reasoning for bundling its 6-7 pieces).
+struct DispatchChannels<'a> {
+    ready_rx: &'a mut mpsc::UnboundedReceiver<Vec<String>>,
+    presented_rx: &'a mut mpsc::UnboundedReceiver<PresentationEvidence>,
+    activate_tx: &'a std::sync::mpsc::Sender<u64>,
+    process_outbound_rx: &'a mut mpsc::UnboundedReceiver<CommandEnvelope>,
+    secure_submit_rx: &'a mut mpsc::UnboundedReceiver<SecureSubmitPayload>,
 }
 
 impl RendererClient {
@@ -164,6 +183,7 @@ impl RendererClient {
         audio_handle: LiveSignalHandle,
         rescue_handle: LiveSignalHandle,
         process_registry: ProcessRegistry,
+        generation_id: u32,
     ) -> Self {
         Self {
             loader,
@@ -174,6 +194,7 @@ impl RendererClient {
             rescue_handle,
             process_registry,
             state: ReloadState { applied_topology: None, pending: None },
+            generation_id,
         }
     }
 
@@ -271,25 +292,19 @@ impl RendererClient {
 
     /// Reads `shared::SupervisorFrame`s off `read_half` until the connection ends, dispatching
     /// each to `apply_state_snapshot`/`handle_reevaluate`/`handle_apply_pending`/`activate_tx`
-    /// (`ActivateDraw`) -- and, alongside the read half, writes out whatever arrives on the
-    /// bridged `ready_rx`/`presented_rx` channels as `ReadySignal`/`PresentationEvidence`
-    /// frames (build-steps.md Phase 14). A frame that fails to decode is a transport-level
-    /// failure here (this connection has exactly one sender, the Supervisor, and a fixed set of
-    /// message shapes -- a bad frame means the two sides have desynced, not a stray bad actor),
-    /// unlike an `ApplyPendingReload` sequence mismatch, which is an expected, recoverable race,
-    /// not a decode failure.
-    async fn dispatch_loop<R, W>(
-        &mut self,
-        read_half: &mut R,
-        write_half: &mut W,
-        ready_rx: &mut mpsc::UnboundedReceiver<Vec<String>>,
-        presented_rx: &mut mpsc::UnboundedReceiver<PresentationEvidence>,
-        activate_tx: &std::sync::mpsc::Sender<u64>,
-        process_outbound_rx: &mut mpsc::UnboundedReceiver<CommandEnvelope>,
-    ) where
+    /// (`ActivateDraw`) -- and, alongside the read half, writes out whatever arrives on
+    /// `channels`' bridged receivers as `ReadySignal`/`PresentationEvidence`/`Command`/
+    /// `SecureSubmit` frames (build-steps.md Phase 14; Phase 15 item 2). A frame that fails to
+    /// decode is a transport-level failure here (this connection has exactly one sender, the
+    /// Supervisor, and a fixed set of message shapes -- a bad frame means the two sides have
+    /// desynced, not a stray bad actor), unlike an `ApplyPendingReload` sequence mismatch, which
+    /// is an expected, recoverable race, not a decode failure.
+    async fn dispatch_loop<R, W>(&mut self, read_half: &mut R, write_half: &mut W, channels: DispatchChannels<'_>)
+    where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
+        let DispatchChannels { ready_rx, presented_rx, activate_tx, process_outbound_rx, secure_submit_rx } = channels;
         loop {
             tokio::select! {
                 frame = framing::read_json_frame::<_, SupervisorFrame>(read_half) => match frame {
@@ -343,6 +358,34 @@ impl RendererClient {
                         eprintln!("control-socket client: failed to send a process Command: {err}");
                     }
                 }
+                Some(mut payload) = secure_submit_rx.recv() => {
+                    // The one sanctioned read (ADR-0005/ADR-0027): performed here, as close as
+                    // possible to the actual wire write, then both the source buffer and this
+                    // call's own plaintext copy are `.zeroize()`'d immediately after that write
+                    // completes -- not left to `Drop` alone.
+                    //
+                    // ponytail: this reaches every copy this call site controls, not every copy
+                    // that exists. `write_json_frame` -> `serde_json::to_vec` (and its mirror,
+                    // `read_json_frame` -> `serde_json::from_slice`, on the Supervisor's read
+                    // side) allocate their own JSON-encoded buffers internally and drop them
+                    // unscrubbed; reaching those would mean a custom, non-JSON wire path for this
+                    // one frame variant, which is more than this slice's scope. `SecureBuffer`'s
+                    // own module doc already frames the "sanctioned read" as building the
+                    // outgoing envelope, not chasing every downstream allocation past it.
+                    let mut frame = RendererFrame::SecureSubmit(SecureSubmit {
+                        generation_id: self.generation_id,
+                        capability: payload.capability,
+                        action: payload.action,
+                        secret: payload.buffer.expose_secret().to_vec(),
+                    });
+                    if let Err(err) = write_json_frame(write_half, &frame).await {
+                        eprintln!("control-socket client: failed to send a SecureSubmit: {err}");
+                    }
+                    if let RendererFrame::SecureSubmit(inner) = &mut frame {
+                        inner.secret.zeroize();
+                    }
+                    payload.buffer.zeroize();
+                }
             }
         }
     }
@@ -352,9 +395,11 @@ async fn run(
     ready_rx: std::sync::mpsc::Receiver<Vec<String>>,
     presented_rx: std::sync::mpsc::Receiver<PresentationEvidence>,
     activate_tx: std::sync::mpsc::Sender<u64>,
+    secure_submit_rx: std::sync::mpsc::Receiver<SecureSubmitPayload>,
 ) {
     let mut ready_rx = bridge_to_tokio(ready_rx);
     let mut presented_rx = bridge_to_tokio(presented_rx);
+    let mut secure_submit_rx = bridge_to_tokio(secure_submit_rx);
 
     let path = match shared::control_socket_path() {
         Ok(path) => path,
@@ -407,11 +452,18 @@ async fn run(
     }
 
     let shaping = ShapingHandle::spawn();
-    let mut client = RendererClient::new(loader, shell_lua_path, shaping, audio_handle, rescue_handle, process_registry);
+    let mut client = RendererClient::new(loader, shell_lua_path, shaping, audio_handle, rescue_handle, process_registry, generation_id);
     client.run_startup_evaluation();
 
     let (mut read_half, mut write_half) = stream.into_split();
-    client.dispatch_loop(&mut read_half, &mut write_half, &mut ready_rx, &mut presented_rx, &activate_tx, &mut process_outbound_rx).await;
+    let channels = DispatchChannels {
+        ready_rx: &mut ready_rx,
+        presented_rx: &mut presented_rx,
+        activate_tx: &activate_tx,
+        process_outbound_rx: &mut process_outbound_rx,
+        secure_submit_rx: &mut secure_submit_rx,
+    };
+    client.dispatch_loop(&mut read_half, &mut write_half, channels).await;
 }
 
 /// Builds the `{ is_rescue, error_log }` table and registers it as the ad-hoc `rescue` global
@@ -524,7 +576,7 @@ mod tests {
         let (process_tx, _process_rx) = mpsc::unbounded_channel();
         let process_registry = ProcessRegistry::new(0, process_tx);
         loader.register_process(process_registry.clone()).unwrap();
-        RendererClient::new(loader, shell_lua_path.to_path_buf(), ShapingHandle::spawn(), audio_handle, rescue_handle, process_registry)
+        RendererClient::new(loader, shell_lua_path.to_path_buf(), ShapingHandle::spawn(), audio_handle, rescue_handle, process_registry, 0)
     }
 
     #[test]
@@ -733,9 +785,16 @@ mod tests {
         let (_presented_tx, mut presented_rx) = mpsc::unbounded_channel();
         let (activate_tx, _activate_rx) = std::sync::mpsc::channel();
         let (_process_tx, mut process_outbound_rx) = mpsc::unbounded_channel();
+        let (_secure_submit_tx, mut secure_submit_rx) = mpsc::unbounded_channel();
 
         client
-            .dispatch_loop(&mut server_read, &mut server_write, &mut ready_rx, &mut presented_rx, &activate_tx, &mut process_outbound_rx)
+            .dispatch_loop(&mut server_read, &mut server_write, DispatchChannels {
+                ready_rx: &mut ready_rx,
+                presented_rx: &mut presented_rx,
+                activate_tx: &activate_tx,
+                process_outbound_rx: &mut process_outbound_rx,
+                secure_submit_rx: &mut secure_submit_rx,
+            })
             .await;
 
         let frame: RendererFrame = read_json_frame(&mut wire).await.unwrap();
@@ -758,9 +817,16 @@ mod tests {
         let (_presented_tx, mut presented_rx) = mpsc::unbounded_channel();
         let (activate_tx, activate_rx) = std::sync::mpsc::channel();
         let (_process_tx, mut process_outbound_rx) = mpsc::unbounded_channel();
+        let (_secure_submit_tx, mut secure_submit_rx) = mpsc::unbounded_channel();
 
         client
-            .dispatch_loop(&mut server_read, &mut server_write, &mut ready_rx, &mut presented_rx, &activate_tx, &mut process_outbound_rx)
+            .dispatch_loop(&mut server_read, &mut server_write, DispatchChannels {
+                ready_rx: &mut ready_rx,
+                presented_rx: &mut presented_rx,
+                activate_tx: &activate_tx,
+                process_outbound_rx: &mut process_outbound_rx,
+                secure_submit_rx: &mut secure_submit_rx,
+            })
             .await;
 
         assert_eq!(activate_rx.try_recv(), Ok(42));
@@ -789,9 +855,16 @@ mod tests {
         let (_presented_tx, mut presented_rx) = mpsc::unbounded_channel();
         let (activate_tx, _activate_rx) = std::sync::mpsc::channel();
         let (_process_tx, mut process_outbound_rx) = mpsc::unbounded_channel();
+        let (_secure_submit_tx, mut secure_submit_rx) = mpsc::unbounded_channel();
 
         client
-            .dispatch_loop(&mut server_read, &mut server_write, &mut ready_rx, &mut presented_rx, &activate_tx, &mut process_outbound_rx)
+            .dispatch_loop(&mut server_read, &mut server_write, DispatchChannels {
+                ready_rx: &mut ready_rx,
+                presented_rx: &mut presented_rx,
+                activate_tx: &activate_tx,
+                process_outbound_rx: &mut process_outbound_rx,
+                secure_submit_rx: &mut secure_submit_rx,
+            })
             .await;
 
         let frame: RendererFrame = read_json_frame(&mut wire).await.unwrap();
@@ -811,13 +884,20 @@ mod tests {
         let (_presented_tx, mut presented_rx) = mpsc::unbounded_channel();
         let (activate_tx, _activate_rx) = std::sync::mpsc::channel();
         let (_process_tx, mut process_outbound_rx) = mpsc::unbounded_channel();
+        let (_secure_submit_tx, mut secure_submit_rx) = mpsc::unbounded_channel();
         ready_tx.send(vec!["main_bar".to_string(), "overlay_canvas".to_string()]).unwrap();
 
         // Run dispatch_loop concurrently with reading its response -- the read half never
         // produces anything here, so dispatch_loop would otherwise run forever; a timeout bounds
         // the test instead of relying on a second frame to end the loop.
         let dispatch =
-            client.dispatch_loop(&mut server_read, &mut server_write, &mut ready_rx, &mut presented_rx, &activate_tx, &mut process_outbound_rx);
+            client.dispatch_loop(&mut server_read, &mut server_write, DispatchChannels {
+                ready_rx: &mut ready_rx,
+                presented_rx: &mut presented_rx,
+                activate_tx: &activate_tx,
+                process_outbound_rx: &mut process_outbound_rx,
+                secure_submit_rx: &mut secure_submit_rx,
+            });
         let read_response = read_json_frame::<_, RendererFrame>(&mut wire);
         let frame = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             tokio::select! {
@@ -844,10 +924,17 @@ mod tests {
         let (presented_tx, mut presented_rx) = mpsc::unbounded_channel();
         let (activate_tx, _activate_rx) = std::sync::mpsc::channel();
         let (_process_tx, mut process_outbound_rx) = mpsc::unbounded_channel();
+        let (_secure_submit_tx, mut secure_submit_rx) = mpsc::unbounded_channel();
         presented_tx.send(PresentationEvidence { nonce: 7, surface_id: "wallpaper_layer@DP-1".to_string() }).unwrap();
 
         let dispatch =
-            client.dispatch_loop(&mut server_read, &mut server_write, &mut ready_rx, &mut presented_rx, &activate_tx, &mut process_outbound_rx);
+            client.dispatch_loop(&mut server_read, &mut server_write, DispatchChannels {
+                ready_rx: &mut ready_rx,
+                presented_rx: &mut presented_rx,
+                activate_tx: &activate_tx,
+                process_outbound_rx: &mut process_outbound_rx,
+                secure_submit_rx: &mut secure_submit_rx,
+            });
         let read_response = read_json_frame::<_, RendererFrame>(&mut wire);
         let frame = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             tokio::select! {
@@ -859,6 +946,60 @@ mod tests {
         .expect("a PresentationEvidence frame must arrive before the timeout");
 
         assert_eq!(frame, RendererFrame::PresentationEvidence(PresentationEvidence { nonce: 7, surface_id: "wallpaper_layer@DP-1".to_string() }));
+    }
+
+    #[tokio::test]
+    async fn dispatch_loop_writes_a_secure_submit_frame_reading_the_buffer_before_zeroizing_it() {
+        // build-steps.md Phase 15 item 2 / ADR-0005/ADR-0027: the wire frame carries the exact
+        // secret the Wayland thread accumulated, tagged with the connection's own generation_id
+        // (not something the Wayland thread knows -- see the module doc comment).
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top" }"#);
+        let mut client = test_client(&path);
+        client.generation_id = 4;
+
+        let (mut wire, server) = tokio::io::duplex(4096);
+        let (mut server_read, mut server_write) = tokio::io::split(server);
+
+        let (_ready_tx, mut ready_rx) = mpsc::unbounded_channel();
+        let (_presented_tx, mut presented_rx) = mpsc::unbounded_channel();
+        let (activate_tx, _activate_rx) = std::sync::mpsc::channel();
+        let (_process_tx, mut process_outbound_rx) = mpsc::unbounded_channel();
+        let (secure_submit_tx, mut secure_submit_rx) = mpsc::unbounded_channel();
+        let mut buffer = shared::SecureBuffer::new();
+        buffer.push_str("hunter2");
+        secure_submit_tx.send(SecureSubmitPayload { capability: "polkit".to_string(), action: "authenticate".to_string(), buffer }).unwrap();
+
+        let dispatch = client.dispatch_loop(
+            &mut server_read,
+            &mut server_write,
+            DispatchChannels {
+                ready_rx: &mut ready_rx,
+                presented_rx: &mut presented_rx,
+                activate_tx: &activate_tx,
+                process_outbound_rx: &mut process_outbound_rx,
+                secure_submit_rx: &mut secure_submit_rx,
+            },
+        );
+        let read_response = read_json_frame::<_, RendererFrame>(&mut wire);
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::select! {
+                _ = dispatch => unreachable!("dispatch_loop must not return on its own in this test"),
+                frame = read_response => frame.unwrap(),
+            }
+        })
+        .await
+        .expect("a SecureSubmit frame must arrive before the timeout");
+
+        assert_eq!(
+            frame,
+            RendererFrame::SecureSubmit(SecureSubmit {
+                generation_id: 4,
+                capability: "polkit".to_string(),
+                action: "authenticate".to_string(),
+                secret: b"hunter2".to_vec(),
+            })
+        );
     }
 
     #[tokio::test]
@@ -874,6 +1015,7 @@ mod tests {
         let (_presented_tx, mut presented_rx) = mpsc::unbounded_channel();
         let (activate_tx, _activate_rx) = std::sync::mpsc::channel();
         let (process_tx, mut process_outbound_rx) = mpsc::unbounded_channel();
+        let (_secure_submit_tx, mut secure_submit_rx) = mpsc::unbounded_channel();
         process_tx
             .send(CommandEnvelope {
                 jsonrpc: "2.0".to_string(),
@@ -890,7 +1032,13 @@ mod tests {
             .unwrap();
 
         let dispatch =
-            client.dispatch_loop(&mut server_read, &mut server_write, &mut ready_rx, &mut presented_rx, &activate_tx, &mut process_outbound_rx);
+            client.dispatch_loop(&mut server_read, &mut server_write, DispatchChannels {
+                ready_rx: &mut ready_rx,
+                presented_rx: &mut presented_rx,
+                activate_tx: &activate_tx,
+                process_outbound_rx: &mut process_outbound_rx,
+                secure_submit_rx: &mut secure_submit_rx,
+            });
         let read_response = read_json_frame::<_, RendererFrame>(&mut wire);
         let frame = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             tokio::select! {
@@ -941,9 +1089,16 @@ mod tests {
         let (_presented_tx, mut presented_rx) = mpsc::unbounded_channel();
         let (activate_tx, _activate_rx) = std::sync::mpsc::channel();
         let (_process_tx, mut process_outbound_rx) = mpsc::unbounded_channel();
+        let (_secure_submit_tx, mut secure_submit_rx) = mpsc::unbounded_channel();
 
         client
-            .dispatch_loop(&mut server_read, &mut server_write, &mut ready_rx, &mut presented_rx, &activate_tx, &mut process_outbound_rx)
+            .dispatch_loop(&mut server_read, &mut server_write, DispatchChannels {
+                ready_rx: &mut ready_rx,
+                presented_rx: &mut presented_rx,
+                activate_tx: &activate_tx,
+                process_outbound_rx: &mut process_outbound_rx,
+                secure_submit_rx: &mut secure_submit_rx,
+            })
             .await;
 
         let output = client

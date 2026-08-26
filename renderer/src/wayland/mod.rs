@@ -4,9 +4,11 @@ use std::error::Error;
 use std::ffi::c_void;
 
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
+use smithay_client_toolkit::dispatch2::Dispatch2;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::presentation_time::{PresentTime, PresentationTimeHandler, PresentationTimeState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
+use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
     LayerSurfaceConfigure,
@@ -14,11 +16,15 @@ use smithay_client_toolkit::shell::wlr_layer::{
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::{delegate_registry, registry_handlers};
 use khronos_egl::Surface as EglSurface;
-use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_output, wl_surface};
+use wayland_client::globals::{registry_queue_init, GlobalList};
+use wayland_client::protocol::{wl_output, wl_seat, wl_surface};
 use wayland_client::{Connection, Proxy, QueueHandle, WEnum};
 use wayland_egl::WlEglSurface;
 use wayland_protocols::wp::presentation_time::client::wp_presentation_feedback;
+use wayland_protocols::wp::text_input::zv3::client::{
+    zwp_text_input_manager_v3::{self, ZwpTextInputManagerV3},
+    zwp_text_input_v3::{self, ZwpTextInputV3},
+};
 
 use crate::text::atlas::TextPainter;
 use crate::text::shaping::{ShapeRequest, ShapingHandle};
@@ -41,6 +47,26 @@ impl SurfaceRole {
         }
     }
 }
+
+/// Cross-thread payload for one completed `secure_submit` (build-steps.md Phase 15 item 2;
+/// ADR-0005/ADR-0027): the accumulated `shared::SecureBuffer` travels to the socket thread
+/// intact, not as a pre-copied `Vec<u8>` -- the socket thread performs the one sanctioned read
+/// (`expose_secret`) and the explicit `.zeroize()` as close as possible to the actual socket
+/// write (`renderer/src/socket.rs`'s `dispatch_loop`), since this thread has no socket to write
+/// to and `generation_id` isn't known here either (see `socket.rs`'s `generation_id_from_env`).
+pub struct SecureSubmitPayload {
+    pub capability: String,
+    pub action: String,
+    pub buffer: shared::SecureBuffer,
+}
+
+/// ponytail: no real per-`textfield` focus/attribution exists yet (see `App::bind_text_input`'s
+/// own `ponytail` comment) -- every `secure_submit` completed this way is attributed to this
+/// fixed placeholder until real focus wiring can read the specific `textfield` node's own
+/// `secure_submit = { capability, action }` table (`oblisk-idl-api-specs.md` § 5.2 item 8) and
+/// thread it across the same Wayland-thread/socket-thread boundary this channel already crosses.
+const PLACEHOLDER_SECURE_SUBMIT_CAPABILITY: &str = "unknown";
+const PLACEHOLDER_SECURE_SUBMIT_ACTION: &str = "unknown";
 
 /// A live window surface bound to the shared EGL context, once its first configure
 /// has arrived. Holds the native window alongside the EGL surface: per wayland-egl's
@@ -81,6 +107,7 @@ pub struct App {
     registry_state: RegistryState,
     output_state: OutputState,
     compositor_state: CompositorState,
+    seat_state: SeatState,
     layer_shell: LayerShell,
     egl: egl::EglState,
     gl: Option<glow::Context>,
@@ -106,12 +133,24 @@ pub struct App {
     /// drives one handshake at a time (docs/adr/0025 item 5), so one field, not a per-surface
     /// map, is enough.
     active_nonce: Option<u64>,
+    /// Kept alive for the object's whole lifetime (never read again after
+    /// [`App::bind_text_input`] enables it) -- dropping the proxy would destroy the protocol
+    /// object, same reasoning `BoundSurface`'s `#[allow(dead_code)]` fields already document.
+    #[allow(dead_code)]
+    text_input: Option<ZwpTextInputV3>,
+    text_input_pending: TextInputPending,
+    /// Accumulates committed `wp-text-input-v3` edits until a protocol-native `ACTION_SUBMIT`
+    /// completes them (build-steps.md Phase 15 item 2; ADR-0005/ADR-0009/ADR-0027) -- never
+    /// surfaced to Lua.
+    secure_buffer: shared::SecureBuffer,
+    secure_submit_tx: std::sync::mpsc::Sender<SecureSubmitPayload>,
 }
 
 pub fn run(
     ready_tx: std::sync::mpsc::Sender<Vec<String>>,
     presented_tx: std::sync::mpsc::Sender<shared::PresentationEvidence>,
     activate_rx: std::sync::mpsc::Receiver<u64>,
+    secure_submit_tx: std::sync::mpsc::Sender<SecureSubmitPayload>,
 ) -> Result<(), Box<dyn Error>> {
     let conn = Connection::connect_to_env()?;
     let (globals, mut event_queue) = registry_queue_init::<App>(&conn)?;
@@ -120,6 +159,7 @@ pub fn run(
     let compositor_state = CompositorState::bind(&globals, &qh)?;
     let layer_shell = LayerShell::bind(&globals, &qh)?;
     let output_state = OutputState::new(&globals, &qh);
+    let seat_state = SeatState::new(&globals, &qh);
     let registry_state = RegistryState::new(&globals);
     // Stable protocol, no `staging`/`unstable` Cargo feature needed -- `PresentationTimeState::
     // bind` tolerates a compositor that doesn't advertise it (later `feedback()` calls fail with
@@ -134,6 +174,7 @@ pub fn run(
         registry_state,
         output_state,
         compositor_state,
+        seat_state,
         layer_shell,
         egl: egl_state,
         gl: None,
@@ -148,17 +189,22 @@ pub fn run(
         presentation_time,
         queue_handle: qh.clone(),
         active_nonce: None,
+        text_input: None,
+        text_input_pending: TextInputPending::default(),
+        secure_buffer: shared::SecureBuffer::new(),
+        secure_submit_tx,
     };
 
-    // Outputs arrive as a burst of registry + wl_output events after binding; two
-    // roundtrips is enough to have the full initial output list before we create
-    // one wallpaper_layer surface per monitor.
+    // Outputs (and the seat) arrive as a burst of registry + wl_seat/wl_output events after
+    // binding; two roundtrips is enough to have both the full initial output list (before we
+    // create one wallpaper_layer surface per monitor) and the seat `bind_text_input` needs.
     event_queue.roundtrip(&mut app)?;
     event_queue.roundtrip(&mut app)?;
 
     app.create_main_bar(&qh);
     app.create_overlay_canvas(&qh);
     app.create_wallpaper_layers(&qh);
+    app.bind_text_input(&globals, &qh);
 
     // Replaces `event_queue.blocking_dispatch(&mut app)?` (used through Phase 13): a real
     // Wayland event might not arrive for a long time after `ActivateDraw` is sent, since nothing
@@ -195,6 +241,62 @@ pub fn run(
     Ok(())
 }
 
+/// One `zwp_text_input_v3`'s double-buffered pending edit -- the protocol's own rule that
+/// `preedit_string`/`commit_string`/`delete_surrounding_text`/`action` events only take effect on
+/// the next `done` (`done`'s own description: "This event replaces the current state with the
+/// pending state"). Kept separate from the real `Dispatch2` impl below so it's unit-testable
+/// without a live Wayland connection -- this file has no headless Wayland test harness (see
+/// `wallpaper_surface_id`'s doc comment for the same reasoning).
+#[derive(Default)]
+struct TextInputPending {
+    commit: Option<String>,
+    submit: bool,
+}
+
+impl TextInputPending {
+    fn on_commit_string(&mut self, text: Option<String>) {
+        self.commit = text;
+    }
+
+    fn on_action_submit(&mut self) {
+        self.submit = true;
+    }
+
+    /// `done`: takes the completed edit and resets pending state for the next cycle.
+    fn take_done(&mut self) -> TextInputEdit {
+        TextInputEdit { commit: self.commit.take(), submit: std::mem::take(&mut self.submit) }
+    }
+}
+
+/// One completed `done` cycle's edit (ADR-0027's `TextInputEdit` shape, borrowed from
+/// Noctalia's `TextInputEdit`) -- this slice only threads `commit`/`submit` through to
+/// `shared::SecureBuffer`; see [`apply_edit`]'s doc comment for `preedit`/delete-surrounding-text.
+struct TextInputEdit {
+    commit: Option<String>,
+    submit: bool,
+}
+
+/// Applies one completed edit to `buffer` (ADR-0027, ADR-0009's diff-based edit model): only
+/// `commit_string`'s final text is pushed. `preedit_string`'s transient composition text is
+/// deliberately never pushed here -- real IME composition revises or clears a preedit before it
+/// commits, and an append-only `SecureBuffer` has no way to "undo" a stale revision; pushing
+/// every intermediate preedit would corrupt the secret with duplicated composition fragments.
+///
+/// ponytail: `delete_surrounding_text` (backspace) isn't applied either -- `shared::SecureBuffer`
+/// (ADR-0014) is append-only by design, with zero production callers (and so no truncate method)
+/// until this slice. Upgrade path: give `SecureBuffer` a zeroize-on-shrink truncate method
+/// (tested the same allocator-hook way `push_str`'s growth path already is in
+/// `shared/tests/secure_buffer_growth_zeroizes.rs`) and apply `before_length`/`after_length` here
+/// once it exists.
+///
+/// Returns whether this edit's `action` was `ACTION_SUBMIT`.
+fn apply_edit(buffer: &mut shared::SecureBuffer, edit: TextInputEdit) -> bool {
+    if let Some(commit) = edit.commit {
+        buffer.push_str(&commit);
+    }
+    edit.submit
+}
+
 /// One `wallpaper_layer` instance's surface_id: `"wallpaper_layer@{name}"` when the compositor
 /// reports a real output name, `"wallpaper_layer@output-{index}"` (a stable positional fallback)
 /// when it doesn't. Pure so it's directly unit-testable -- `wayland/mod.rs` otherwise has no
@@ -215,6 +317,16 @@ struct LayerSpec<'a> {
     anchor: Anchor,
     size: (u32, u32),
     exclusive_zone: i32,
+    /// `None` for `main_bar`/`wallpaper_layer` -- neither ever hosts interactive content.
+    /// `overlay_canvas` needs `OnDemand`: `zwp_text_input_v3`'s `enter` event (and so
+    /// `bind_text_input`'s whole `secure_submit` path) never fires on a surface the
+    /// compositor won't hand keyboard focus to in the first place, confirmed live against a
+    /// real compositor (`niri msg layers` reported `Keyboard interactivity: none` on all
+    /// three before this field existed). `OnDemand`, not `Exclusive`: the shell shouldn't
+    /// steal focus from whatever's behind it just for existing -- ADR-0027's still-open
+    /// per-`textfield` focus/hit-test system is what will eventually decide *when* to ask
+    /// for it, this only makes asking possible.
+    keyboard_interactivity: KeyboardInteractivity,
 }
 
 impl App {
@@ -233,7 +345,7 @@ impl App {
         layer.set_anchor(spec.anchor);
         layer.set_size(spec.size.0, spec.size.1);
         layer.set_exclusive_zone(spec.exclusive_zone);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        layer.set_keyboard_interactivity(spec.keyboard_interactivity);
         layer
     }
 
@@ -247,6 +359,7 @@ impl App {
                 anchor: Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
                 size: (0, 32),
                 exclusive_zone: 32,
+                keyboard_interactivity: KeyboardInteractivity::None,
             },
         );
         layer.commit();
@@ -271,6 +384,7 @@ impl App {
                 anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
                 size: (0, 0),
                 exclusive_zone: 0,
+                keyboard_interactivity: KeyboardInteractivity::OnDemand,
             },
         );
 
@@ -319,6 +433,7 @@ impl App {
                     anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
                     size: (0, 0),
                     exclusive_zone: 0,
+                    keyboard_interactivity: KeyboardInteractivity::None,
                 },
             );
             layer.commit();
@@ -612,6 +727,162 @@ impl App {
 
         self.surfaces[index].bound = Some(BoundSurface { egl_surface, native_window });
     }
+
+    /// Binds `zwp_text_input_manager_v3`, creates one `zwp_text_input_v3` for this seat, and
+    /// `enable()`s it unconditionally (build-steps.md Phase 15 item 2; ADR-0009, ADR-0027).
+    ///
+    /// ponytail: no real per-`textfield` keyboard-focus system exists yet -- this codebase has
+    /// none anywhere, matching `create_wallpaper_layers`'s own disclosed-simplification style.
+    /// A real implementation would call `enable()`/`disable()` in response to the compositor's
+    /// own `enter`/`leave` events on the specific surface a Lua-authored `textfield` occupies
+    /// (`overlay_canvas`, since that's where interactive scene content will eventually live),
+    /// and would thread that `textfield` node's own `secure_submit = { capability, action }`
+    /// table through to `finish_secure_submit` instead of the fixed placeholder there. Upgrade
+    /// path: build that focus system (a click/hit-test pass over the retained `Scene`, plus
+    /// wiring `enter`/`leave` here) once a later phase needs it -- out of scope for this slice.
+    ///
+    /// A compositor with no seat, or no `zwp_text_input_manager_v3` global, leaves `text_input`
+    /// `None` -- logged, not fatal, same tolerance `PresentationTimeState::bind` already applies
+    /// to an optional protocol.
+    ///
+    /// ponytail: ADR-0009 names the Wayland-thread protocol owner a `TextInputService`; this
+    /// slice inlines its state (`text_input`, `text_input_pending`, `secure_buffer`) directly
+    /// onto `App` instead of extracting that type, since `App` is still this thread's only
+    /// `Dispatch` target. Upgrade path: pull these fields and their `Dispatch2` impls into a real
+    /// `TextInputService` type once a second consumer (or the focus system above) needs to own
+    /// it independently of `App`.
+    fn bind_text_input(&mut self, globals: &GlobalList, qh: &QueueHandle<App>) {
+        let Some(seat) = self.seat_state.seats().next() else {
+            eprintln!("[oblisk-renderer] no wl_seat advertised; secure_submit textfields will never receive input");
+            return;
+        };
+
+        // Bound up to v2, not v1: the `action` event this module's whole submit detection
+        // depends on (`handle_text_input_event`'s `Action::Submit` match) is `since="2"` in the
+        // protocol XML. `GlobalList::bind` negotiates `min(advertised, version_end)`, so binding
+        // `1..=1` silently caps every object this manager creates at v1 -- a compositor would
+        // never send `action` at all, and no `textfield` would ever submit.
+        let manager = match globals.bind::<ZwpTextInputManagerV3, App, TextInputManagerData>(qh, 1..=2, TextInputManagerData) {
+            Ok(manager) => manager,
+            Err(e) => {
+                log_bind_failure(SurfaceRole::OverlayCanvas, "zwp_text_input_manager_v3::bind", e);
+                return;
+            }
+        };
+
+        let text_input = manager.get_text_input(&seat, qh, TextInputData);
+        // ADR-0005's amendment (ADR-0009): tell the compositor/IME this field is sensitive,
+        // independent of and in addition to the Lua-boundary protection -- skips logging,
+        // autocorrect, and clipboard-history capture on a well-behaved IME. Set unconditionally
+        // rather than gated on a specific node's `mask_character`: this slice's only consumer of
+        // `zwp_text_input_v3` at all is the secure_submit path (no generic `on_change` frontend
+        // exists yet), so every text-input session bound here already is one.
+        text_input.set_content_type(zwp_text_input_v3::ContentHint::SensitiveData, zwp_text_input_v3::ContentPurpose::Password);
+        text_input.enable();
+        text_input.commit();
+        self.text_input = Some(text_input);
+    }
+
+    /// Dispatches one raw `zwp_text_input_v3` event (called from [`TextInputData`]'s
+    /// [`Dispatch2`] impl below): accumulates `commit_string`/`action` into
+    /// [`TextInputPending`], and on `done`, applies the completed edit and finalizes a
+    /// `secure_submit` if it carried `ACTION_SUBMIT`.
+    fn handle_text_input_event(&mut self, event: zwp_text_input_v3::Event) {
+        match event {
+            zwp_text_input_v3::Event::CommitString { text } => self.text_input_pending.on_commit_string(text),
+            zwp_text_input_v3::Event::Action { action, .. } => {
+                if matches!(action, WEnum::Value(zwp_text_input_v3::Action::Submit)) {
+                    self.text_input_pending.on_action_submit();
+                }
+            }
+            zwp_text_input_v3::Event::Done { .. } => {
+                let edit = self.text_input_pending.take_done();
+                if apply_edit(&mut self.secure_buffer, edit) {
+                    self.finish_secure_submit();
+                }
+            }
+            // `preedit_string`/`delete_surrounding_text`: acknowledged but not durably applied
+            // to `secure_buffer` -- see `apply_edit`'s doc comment. `enter`/`leave`/`language`
+            // don't affect the accumulated secret.
+            _ => {}
+        }
+    }
+
+    /// A completed `secure_submit`: hands the accumulated buffer to the socket thread over
+    /// `secure_submit_tx` and starts a fresh, empty buffer for the next entry. The buffer itself
+    /// is `.zeroize()`'d by the socket thread immediately after the wire write completes
+    /// (ADR-0005/ADR-0027), not here -- see `SecureSubmitPayload`'s doc comment.
+    fn finish_secure_submit(&mut self) {
+        let buffer = std::mem::take(&mut self.secure_buffer);
+        let payload = SecureSubmitPayload {
+            capability: PLACEHOLDER_SECURE_SUBMIT_CAPABILITY.to_string(),
+            action: PLACEHOLDER_SECURE_SUBMIT_ACTION.to_string(),
+            buffer,
+        };
+        if let Err(e) = self.secure_submit_tx.send(payload) {
+            eprintln!("[oblisk-renderer] failed to send SecureSubmit to the socket thread: {e}");
+        }
+    }
+}
+
+/// Zero-sized user-data marker for `zwp_text_input_v3`, following
+/// `smithay_client_toolkit::globals::GlobalData`'s own convention (ADR-0009: a hand-written
+/// `Dispatch` for text-input that slots into the same [`delegate_dispatch2!`] blanket every
+/// other SCTK subsystem in this file already uses). `GlobalData` itself is SCTK's own foreign
+/// type and can't be reused here -- orphan rules block implementing the foreign [`Dispatch2`]
+/// trait for it against a foreign interface type this crate didn't define -- so this crate needs
+/// its own marker types.
+struct TextInputData;
+
+impl Dispatch2<ZwpTextInputV3, App> for TextInputData {
+    fn event(
+        &self,
+        state: &mut App,
+        _proxy: &ZwpTextInputV3,
+        event: zwp_text_input_v3::Event,
+        _conn: &Connection,
+        _qh: &QueueHandle<App>,
+    ) {
+        state.handle_text_input_event(event);
+    }
+}
+
+/// Marker for `zwp_text_input_manager_v3`, which never sends any events (see the XML: only
+/// `destroy`/`get_text_input` requests, no `<event>`) -- generic over `D` since nothing here
+/// touches `App` specifically, matching SCTK's own `GlobalData` impls for similar zero-event
+/// managers.
+struct TextInputManagerData;
+
+impl<D> Dispatch2<ZwpTextInputManagerV3, D> for TextInputManagerData {
+    fn event(
+        &self,
+        _state: &mut D,
+        _proxy: &ZwpTextInputManagerV3,
+        _event: zwp_text_input_manager_v3::Event,
+        _conn: &Connection,
+        _qh: &QueueHandle<D>,
+    ) {
+        // No `<event>` in this interface's XML at all -- the generated `Event` enum is
+        // `#[non_exhaustive]` (future protocol versions might add one), not truly uninhabited,
+        // so this can't be an empty `match event {}`; this can never actually fire at version 1.
+        unreachable!("zwp_text_input_manager_v3 (version 1) has no events to dispatch")
+    }
+}
+
+impl SeatHandler for App {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
+
+    // No pointer/keyboard/touch object is ever created from any capability -- `bind_text_input`
+    // only needs the bare `wl_seat` itself to call `get_text_input(seat)` (ADR-0009: SCTK's
+    // `seat` module is standard infrastructure here, not a design point).
+    fn new_capability(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat, _capability: Capability) {}
+    fn remove_capability(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat, _capability: Capability) {}
+
+    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
 }
 
 impl PresentationTimeHandler for App {
@@ -810,7 +1081,7 @@ impl ProvidesRegistryState for App {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 delegate_registry!(App);
@@ -830,5 +1101,58 @@ mod tests {
     fn wallpaper_surface_id_falls_back_to_a_stable_index_when_name_is_none() {
         assert_eq!(wallpaper_surface_id(None, 0), "wallpaper_layer@output-0");
         assert_eq!(wallpaper_surface_id(None, 2), "wallpaper_layer@output-2");
+    }
+
+    #[test]
+    fn text_input_pending_take_done_returns_and_resets_the_pending_commit() {
+        let mut pending = TextInputPending::default();
+        pending.on_commit_string(Some("h".to_string()));
+
+        let edit = pending.take_done();
+        assert_eq!(edit.commit.as_deref(), Some("h"));
+        assert!(!edit.submit);
+
+        let next = pending.take_done();
+        assert_eq!(next.commit, None, "done must reset pending state for the next cycle");
+        assert!(!next.submit);
+    }
+
+    #[test]
+    fn text_input_pending_take_done_reports_a_pending_submit_action() {
+        let mut pending = TextInputPending::default();
+        pending.on_action_submit();
+
+        let edit = pending.take_done();
+        assert!(edit.submit);
+
+        let next = pending.take_done();
+        assert!(!next.submit, "done must reset the pending submit flag for the next cycle");
+    }
+
+    #[test]
+    fn apply_edit_pushes_commit_text_into_the_secure_buffer_and_reports_submit() {
+        let mut buffer = shared::SecureBuffer::new();
+        let submit = apply_edit(&mut buffer, TextInputEdit { commit: Some("hunter2".to_string()), submit: true });
+        assert_eq!(buffer.expose_secret(), b"hunter2");
+        assert!(submit);
+    }
+
+    #[test]
+    fn apply_edit_accumulates_across_multiple_commit_string_batches() {
+        let mut buffer = shared::SecureBuffer::new();
+        apply_edit(&mut buffer, TextInputEdit { commit: Some("hunter".to_string()), submit: false });
+        apply_edit(&mut buffer, TextInputEdit { commit: Some("2".to_string()), submit: false });
+        assert_eq!(buffer.expose_secret(), b"hunter2");
+    }
+
+    #[test]
+    fn apply_edit_with_no_commit_text_leaves_the_buffer_unchanged_and_reports_no_submit() {
+        let mut buffer = shared::SecureBuffer::new();
+        buffer.push_str("existing");
+
+        let submit = apply_edit(&mut buffer, TextInputEdit { commit: None, submit: false });
+
+        assert_eq!(buffer.expose_secret(), b"existing");
+        assert!(!submit);
     }
 }
