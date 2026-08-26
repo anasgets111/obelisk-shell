@@ -311,7 +311,9 @@ A fast-reconciling virtual repeater element.
 An IME-aware native input field mapped directly to Rust-owned `wp-text-input-v3`.
 *   `placeholder`: `string`
 *   `mask_character`: `string` (Capped at 1 byte; if specified, hides typed input)
+*   `secure_submit`: `table` (`{ capability, action }`; see § 5's `textfield` glossary entry in `CONTEXT.md`. Only meaningful alongside `mask_character` -- without it, a masked field's value is unreadable from Lua entirely)
 *   `on_change`: `function` (Lua callback executed on each committed edit batch from `wp-text-input-v3`, not per keystroke; IME composition is not character-by-character. Key events are swallowed inside Rust's memory blocks during sensitive lock states)
+*   `on_submit`: `function` (Fires on `zwp_text_input_v3`'s protocol-native `submit` action, e.g. Enter -- IME-correct, not a raw keystroke check. Takes the committed text as its one argument, *except* when both `mask_character` and `secure_submit` are set: fires with no argument, since the Renderer's IPC layer attaches the native input buffer directly to the named capability/action envelope instead. docs/adr/0005, docs/adr/0027)
 
 ## 6. Top-Level Window Surface Nodes
 
