@@ -84,10 +84,13 @@ struct Authoritative {
 }
 
 /// Every `process.run`-spawned child still tracked, keyed by the generation that spawned it and
-/// the `CommandEnvelope.id` the Renderer assigned it (docs/adr/0026). A plain local, not an
-/// `Arc<Mutex<...>>` -- mutated only from inside `main()`'s own `select!` arms, matching every
-/// other piece of cross-task state in this file (ADR-0018's promised upgrade path).
-type ProcessRegistry = HashMap<(u32, u64), Child>;
+/// the `CommandEnvelope.id` the Renderer assigned it (docs/adr/0026). A plain local, mutated only
+/// from inside `main()`'s own `select!` arms -- not behind a mutex itself, matching every other
+/// piece of cross-task *spawn-tracking* state in this file (ADR-0018's promised upgrade path).
+/// (`socket::GenerationRegistry`'s own `connections` map is a pre-existing `Arc<Mutex<...>>`,
+/// unrelated to this registry -- that one's shared across the listener's accept loop and every
+/// connection task, a different problem than this one solves.)
+type LiveProcesses = HashMap<(u32, u64), Child>;
 
 /// Parses `process.run`'s `CommandEnvelope.params.arguments` -- `[cmd, args]`, `cmd` a string and
 /// `args` an array of strings, the shape `renderer/src/lua/process.rs`'s `ProcessRegistry::run`
@@ -106,7 +109,7 @@ fn process_run_args(arguments: &[serde_json::Value]) -> Option<(String, Vec<Stri
 /// returns `None` on spawn failure -- the caller still owes Lua a `ProcessExited` with an absent
 /// code (§ 12).
 fn spawn_and_register_process(
-    processes: &mut ProcessRegistry,
+    processes: &mut LiveProcesses,
     generation_id: u32,
     id: u64,
     cmd: &str,
@@ -197,7 +200,7 @@ enum KillOutcome {
 /// `reap_process_group`'s returned `ExitStatus` already carries the real code (`None` here in the
 /// ordinary case, since `SIGTERM`/`SIGKILL` are signal deaths), reused directly so a killed
 /// process's `exit_cb` still fires with an honest code instead of a synthesized one.
-async fn kill_registered_process(processes: &mut ProcessRegistry, generation_id: u32, id: u64) -> KillOutcome {
+async fn kill_registered_process(processes: &mut LiveProcesses, generation_id: u32, id: u64) -> KillOutcome {
     let Some(mut child) = processes.remove(&(generation_id, id)) else {
         return KillOutcome::NotRegistered;
     };
@@ -210,19 +213,27 @@ async fn kill_registered_process(processes: &mut ProcessRegistry, generation_id:
     }
 }
 
-/// `process_done`'s handler: `stream_process_output` already reported that `(generation_id, id)`'s
-/// streams closed, meaning the process has exited or is exiting right now -- `wait()` is safe to
-/// await inline here rather than a real block. Returns the real exit code, or `None` if nothing
-/// was registered (a `kill` that raced the same exit already removed it) or the wait itself
-/// failed (logged).
-async fn reap_exited_process(processes: &mut ProcessRegistry, generation_id: u32, id: u64) -> Option<Option<i32>> {
-    let mut child = processes.remove(&(generation_id, id))?;
+/// `process_done`'s handler, fast half: `stream_process_output` reported that `(generation_id,
+/// id)`'s streams closed. Only removes the registry entry -- never awaits -- so it's safe to call
+/// directly inside `main()`'s `select!` (see [`wait_and_report_exit`] for why the actual `wait()`
+/// must not happen here).
+fn take_exited_process(processes: &mut LiveProcesses, generation_id: u32, id: u64) -> Option<Child> {
+    processes.remove(&(generation_id, id))
+}
+
+/// `process_done`'s handler, slow half: waits for `child`'s real exit and reports it to Lua via
+/// `registry`. Always run as a detached `tokio::spawn`ed task, never awaited inline inside
+/// `main()`'s `select!` -- both piped streams closing only means the process *stopped writing to
+/// them*, not that it has exited: a process can close or redirect its own stdout/stderr (a
+/// daemonizing child, `exec 1>&- 2>&-`, dup2 onto `/dev/null`) while continuing to run
+/// indefinitely. `child.wait()` in that case never returns, and awaiting it inline in `main()`'s
+/// single top-level `select!` would starve every other arm -- every inbound command, every
+/// reload, every generation swap -- for as long as that process keeps running (Correctness
+/// review, docs/adr/0026 addendum).
+async fn wait_and_report_exit(registry: socket::GenerationRegistry, generation_id: u32, id: u64, mut child: Child) {
     match child.wait().await {
-        Ok(status) => Some(status.code()),
-        Err(err) => {
-            eprintln!("failed to wait on exited process {id} (generation {generation_id}): {err}");
-            None
-        }
+        Ok(status) => send_frame_logged(&registry, generation_id, &SupervisorFrame::ProcessExited(ProcessExited { id, code: status.code() })),
+        Err(err) => eprintln!("failed to wait on exited process {id} (generation {generation_id}): {err}"),
     }
 }
 
@@ -230,7 +241,7 @@ async fn reap_exited_process(processes: &mut ProcessRegistry, generation_id: u32
 /// Lua spawned -- not just its own Renderer process (`CONTEXT.md`'s Generation swap). No
 /// `ProcessExited` is sent for these: the superseded generation's own connection is being torn
 /// down in the same swap, so there's no live Lua VM left to receive it.
-async fn reap_generations_processes(processes: &mut ProcessRegistry, generation_id: u32) {
+async fn reap_generations_processes(processes: &mut LiveProcesses, generation_id: u32) {
     let stale_ids: Vec<(u32, u64)> = processes.keys().filter(|(entry_generation_id, _)| *entry_generation_id == generation_id).copied().collect();
     for key in stale_ids {
         if let Some(mut child) = processes.remove(&key)
@@ -281,7 +292,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Every `process.run`-spawned child still tracked (docs/adr/0026), plus the channel
     // `stream_process_output`'s background tasks use to report a naturally-exited process back to
     // this loop for reaping and registry cleanup.
-    let mut processes: ProcessRegistry = HashMap::new();
+    let mut processes: LiveProcesses = HashMap::new();
     let (process_done_tx, mut process_done) = tokio::sync::mpsc::unbounded_channel::<(u32, u64)>();
     loop {
         tokio::select! {
@@ -304,8 +315,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 send_frame_logged(&registry, authoritative.generation_id, &SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: next_sequence }));
             }
             Some((generation_id, id)) = process_done.recv() => {
-                if let Some(code) = reap_exited_process(&mut processes, generation_id, id).await {
-                    send_frame_logged(&registry, generation_id, &SupervisorFrame::ProcessExited(ProcessExited { id, code }));
+                // The wait itself must never block this select! -- see wait_and_report_exit's
+                // own doc comment -- so only the fast, synchronous removal happens inline here.
+                if let Some(child) = take_exited_process(&mut processes, generation_id, id) {
+                    tokio::spawn(wait_and_report_exit(registry.clone(), generation_id, id, child));
                 }
             }
             Some(inbound) = inbound_frames.recv() => match inbound.frame {
@@ -326,7 +339,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 send_frame_logged(&registry, generation_id, &SupervisorFrame::ProcessExited(ProcessExited { id, code: None }));
                             }
                         },
-                        None => eprintln!("malformed process.run command from generation {generation_id}: {:?}", envelope.params.arguments),
+                        None => {
+                            eprintln!("malformed process.run command from generation {generation_id}: {:?}", envelope.params.arguments);
+                            // Lua's ProcessHandle is already waiting on `id`'s exit_cb -- with no
+                            // process ever spawned, nothing else will ever report this id done, so
+                            // this is what stops it leaking `pending`'s callback pair forever on
+                            // the Renderer side (Correctness review, docs/adr/0026 addendum).
+                            send_frame_logged(&registry, generation_id, &SupervisorFrame::ProcessExited(ProcessExited { id, code: None }));
+                        }
                     }
                 }
                 RendererFrame::Command(envelope) if envelope.params.capability == "process" && envelope.params.action == "kill" => {
@@ -336,7 +356,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         KillOutcome::Reaped(code) => {
                             send_frame_logged(&registry, generation_id, &SupervisorFrame::ProcessExited(ProcessExited { id, code }));
                         }
-                        KillOutcome::NotRegistered | KillOutcome::ReapFailed => {}
+                        KillOutcome::ReapFailed => {
+                            // The registry entry is already removed by this point (see
+                            // kill_registered_process) and the OS-level reap failure is already
+                            // logged -- no future event will ever report this id done, so this is
+                            // what stops it leaking `pending`'s callback pair forever on the
+                            // Renderer side (Correctness review, docs/adr/0026 addendum). The real
+                            // exit code is unknowable here; `None` is honest, not synthesized.
+                            send_frame_logged(&registry, generation_id, &SupervisorFrame::ProcessExited(ProcessExited { id, code: None }));
+                        }
+                        KillOutcome::NotRegistered => {}
                     }
                 }
                 RendererFrame::Command(envelope) => {
@@ -479,7 +508,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_and_register_process_registers_a_successful_spawn_and_returns_piped_handles() {
-        let mut processes: ProcessRegistry = HashMap::new();
+        let mut processes: LiveProcesses = HashMap::new();
         let handles = spawn_and_register_process(&mut processes, 1, 7, "true", &[]);
         assert!(handles.is_some());
         assert!(processes.contains_key(&(1, 7)));
@@ -487,7 +516,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_and_register_process_registers_nothing_on_a_spawn_failure() {
-        let mut processes: ProcessRegistry = HashMap::new();
+        let mut processes: LiveProcesses = HashMap::new();
         let handles = spawn_and_register_process(&mut processes, 1, 7, "/no/such/binary", &[]);
         assert!(handles.is_none());
         assert!(!processes.contains_key(&(1, 7)));
@@ -495,7 +524,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_process_output_forwards_both_streams_then_the_real_exit_code_arrives_via_wait() {
-        let mut processes: ProcessRegistry = HashMap::new();
+        let mut processes: LiveProcesses = HashMap::new();
         let (stdout, stderr) =
             spawn_and_register_process(&mut processes, 1, 9, "sh", &sh_args("echo out1; echo err1 >&2; exit 3")).unwrap();
         let (registry, mut rx) = registry_with_connection(1);
@@ -514,13 +543,40 @@ mod tests {
         assert!(lines.iter().any(|l| l.id == 9 && l.stream == ProcessStream::Stderr && l.line == "err1"));
 
         // stream_process_output never learns the exit code itself (it doesn't own the Child) --
-        // its real caller, main()'s process_done arm, gets it via reap_exited_process.
-        assert_eq!(reap_exited_process(&mut processes, 1, 9).await, Some(Some(3)));
+        // main()'s process_done arm takes the Child (take_exited_process) and hands it to a
+        // detached task (wait_and_report_exit) for the real wait, never inline.
+        let mut child = take_exited_process(&mut processes, 1, 9).expect("process must still be registered");
+        assert_eq!(child.wait().await.unwrap().code(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn take_exited_process_on_an_unregistered_id_returns_none() {
+        let mut processes: LiveProcesses = HashMap::new();
+        assert!(take_exited_process(&mut processes, 1, 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn wait_and_report_exit_sends_the_real_exit_code_back_to_the_generation_that_spawned_it() {
+        let mut processes: LiveProcesses = HashMap::new();
+        spawn_and_register_process(&mut processes, 1, 9, "sh", &sh_args("exit 7"));
+        let child = take_exited_process(&mut processes, 1, 9).unwrap();
+        let (registry, mut rx) = registry_with_connection(1);
+
+        wait_and_report_exit(registry, 1, 9, child).await;
+
+        let payload = rx.try_recv().expect("a ProcessExited frame must have been sent");
+        match serde_json::from_slice::<SupervisorFrame>(&payload).unwrap() {
+            SupervisorFrame::ProcessExited(ProcessExited { id, code }) => {
+                assert_eq!(id, 9);
+                assert_eq!(code, Some(7));
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
     }
 
     #[tokio::test]
     async fn kill_registered_process_reaps_and_reports_a_signal_death() {
-        let mut processes: ProcessRegistry = HashMap::new();
+        let mut processes: LiveProcesses = HashMap::new();
         spawn_and_register_process(&mut processes, 1, 3, "sh", &sh_args("sleep 5"));
         assert!(processes.contains_key(&(1, 3)));
 
@@ -533,19 +589,13 @@ mod tests {
 
     #[tokio::test]
     async fn kill_registered_process_on_an_unregistered_id_is_a_silent_no_op() {
-        let mut processes: ProcessRegistry = HashMap::new();
+        let mut processes: LiveProcesses = HashMap::new();
         assert!(matches!(kill_registered_process(&mut processes, 1, 99).await, KillOutcome::NotRegistered));
     }
 
     #[tokio::test]
-    async fn reap_exited_process_on_an_unregistered_id_returns_none() {
-        let mut processes: ProcessRegistry = HashMap::new();
-        assert_eq!(reap_exited_process(&mut processes, 1, 1).await, None);
-    }
-
-    #[tokio::test]
     async fn reap_generations_processes_reaps_only_the_matching_generations_entries() {
-        let mut processes: ProcessRegistry = HashMap::new();
+        let mut processes: LiveProcesses = HashMap::new();
         spawn_and_register_process(&mut processes, 1, 1, "sh", &sh_args("sleep 5"));
         spawn_and_register_process(&mut processes, 2, 1, "sh", &sh_args("sleep 5"));
 
@@ -559,7 +609,7 @@ mod tests {
 
     #[tokio::test]
     async fn reap_generations_processes_actually_kills_the_process_not_just_the_registry_entry() {
-        let mut processes: ProcessRegistry = HashMap::new();
+        let mut processes: LiveProcesses = HashMap::new();
         spawn_and_register_process(&mut processes, 1, 1, "sh", &sh_args("sleep 5"));
         let pid = processes.get(&(1, 1)).unwrap().id().expect("freshly spawned child has a pid");
 

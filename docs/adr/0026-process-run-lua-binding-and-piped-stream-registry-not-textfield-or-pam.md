@@ -58,11 +58,14 @@ later `"kill"` (`process_handle:kill()`) carry the same `id`, keying the Supervi
 alongside `generation_id`.
 
 **Supervisor-side registry is channel-actor, not a shared mutex.** Every cross-task/cross-thread
-piece of state so far (`challenges`, `audio_apps`, `reload_events`, `inbound_frames`) funnels
-into `main()`'s single `tokio::select!` via an mpsc channel; there is no `Arc<Mutex<...>>`
-anywhere in this codebase. `processes: HashMap<(u32, u64), tokio::process::Child>` (keyed by
-`generation_id`, `id`) lives as a plain local in `main()`, mutated only from inside `main()`'s own
-`select!` arms -- the same shape ADR-0018 explicitly left for this phase's real caller to invent.
+piece of *spawn-tracking* state so far (`challenges`, `audio_apps`, `reload_events`,
+`inbound_frames`) funnels into `main()`'s single `tokio::select!` via an mpsc channel, not a
+shared mutex (`socket::GenerationRegistry`'s own `connections` map is a pre-existing
+`Arc<Mutex<...>>`, but it solves a different problem -- sharing live connections across the
+listener's accept loop and every connection task -- not spawn-tracking). `processes:
+HashMap<(u32, u64), tokio::process::Child>` (keyed by `generation_id`, `id`) lives as a plain
+local in `main()`, mutated only from inside `main()`'s own `select!` arms -- the same shape
+ADR-0018 explicitly left for this phase's real caller to invent.
 
 **Piped stdio needs a new spawn primitive, not a change to `spawn_group_leader`.**
 `process::spawn_group_leader` inherits stdio today, load-bearing for the boot Renderer spawn and
@@ -220,3 +223,29 @@ This does not contradict `docs/oblisk-supervisor-services-dbus.md` § 12, `docs/
 specs.md` § 3.2/3.3, or ADR-0018: all describe the target shape this phase now delivers in full for
 `process.run`/stream piping specifically, while leaving `textfield`/PAM exactly where ADR-0015 and
 build-steps.md's own Phase 15 item 3 text already left them.
+
+## Addendum (review fixes)
+
+Two Correctness findings, both confirmed and fixed:
+
+- **`stream_process_output`'s EOF-based completion signal doesn't mean the process has exited.** A
+  process can close or redirect its own stdout/stderr while continuing to run (a daemonizing
+  child, `exec 1>&- 2>&-`). The original `process_done` handler awaited `child.wait()` inline
+  inside `main()`'s single top-level `select!`, so such a process would wedge the entire
+  Supervisor -- every inbound command, every reload, every generation swap -- for as long as it
+  kept running. Fixed by splitting `process_done`'s handler in two: `take_exited_process` (sync,
+  removes the registry entry, safe inline) and `wait_and_report_exit` (the actual `wait()`,
+  always run as a detached `tokio::spawn`ed task reporting back via a cloned
+  `GenerationRegistry`, the same shape `stream_process_output` itself already uses).
+- **Two paths never sent `ProcessExited`, leaking the Renderer-side pending callback pair
+  forever**: a malformed `process.run` command (parse failure in `process_run_args`), and
+  `KillOutcome::ReapFailed` (the registry entry is already removed before the reap attempt, so no
+  later event could ever report this id done either). Both now send `ProcessExited { code: None }`
+  -- an honest "never really ran" / "unknown outcome" signal, not a synthesized code.
+
+One Standards finding, fixed: the claim "there is no `Arc<Mutex<...>>` anywhere in this codebase"
+(both here and in `main.rs`'s doc comments) was false -- `socket::GenerationRegistry`'s own
+`connections` map already is one, predating this phase. Reworded to the narrower, true claim:
+no *spawn-tracking* state uses a shared mutex. Also renamed `main.rs`'s `ProcessRegistry` type
+alias to `LiveProcesses` -- it collided in name (across crates, so it still compiled) with
+`renderer/src/lua/process.rs`'s unrelated `ProcessRegistry` (the pending-callback registry).
