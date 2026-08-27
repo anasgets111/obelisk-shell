@@ -207,6 +207,24 @@ pub enum RendererFrame {
     SecureSubmit(SecureSubmit),
 }
 
+/// The Supervisor's own PAM worker subprocess's one-shot result, written once to the
+/// worker's stdout as a single `shared::framing` JSON frame when its PAM conversation ends
+/// (ADR-0028) -- never reused as a `RendererFrame`/`SupervisorFrame` variant; this crosses a
+/// completely different process boundary (Supervisor <-> its own re-exec'd PAM worker, not
+/// Supervisor <-> Renderer). Mirrors Quickshell's own PAM exit-code taxonomy (ADR-0028), minus
+/// its `OtherError` case: every failure that isn't a PAM-level outcome (spawn failure, a pipe
+/// I/O error, a wedged worker timing out, an undecodable frame) surfaces as an `io::Result::Err`
+/// from `supervisor::pam_worker::exchange_over` instead, outside this enum entirely -- there's
+/// no code path left that would ever construct a sixth "something else went wrong" variant here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PamOutcome {
+    Success,
+    StartFailed(String),
+    AuthFailed,
+    MaxTries,
+    PamError(String),
+}
+
 /// `~/.config/oblisk/`, resolved via `$XDG_CONFIG_HOME` falling back to `$HOME/.config` (XDG
 /// Base Directory order), hand-rolled rather than a new `dirs`-style dependency -- same
 /// one-function reasoning `control_socket_path` already used for `$XDG_RUNTIME_DIR`. Both
@@ -445,6 +463,15 @@ mod tests {
 
             let parsed: SupervisorFrame = serde_json::from_value(wire).unwrap();
             assert_eq!(parsed, frame);
+        }
+    }
+
+    #[test]
+    fn pam_outcome_round_trips_a_unit_and_a_data_carrying_variant() {
+        for outcome in [PamOutcome::AuthFailed, PamOutcome::StartFailed("pam_start failed".to_string())] {
+            let wire = serde_json::to_value(&outcome).unwrap();
+            let parsed: PamOutcome = serde_json::from_value(wire).unwrap();
+            assert_eq!(parsed, outcome);
         }
     }
 

@@ -6,7 +6,8 @@ edition = "2024"
 [dependencies]
 futures-util = "0.3.34"
 inotify = "0.11.5"
-nix = { version = "0.31.3", features = ["process", "signal"] }
+nix = { version = "0.31.3", features = ["process", "signal", "user"] }
+nonstick = "0.1.2"
 pipewire = "0.10.1"
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }

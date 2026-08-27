@@ -1,5 +1,6 @@
 mod audio;
 mod dbus;
+mod pam_worker;
 mod process;
 mod reload;
 mod reload_link;
@@ -271,14 +272,28 @@ async fn reap_all_processes(processes: &mut LiveProcesses) {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+/// Branches into the PAM worker's own minimal, tokio-free code path (ADR-0028) before falling
+/// through to the normal Supervisor. This must run *before* any D-Bus/tokio-runtime/audio-thread
+/// setup -- `run_supervisor`'s `tokio::runtime::Runtime::new()` (equivalent to what
+/// `#[tokio::main]`'s default multi-thread flavor built) must not even be constructed on the
+/// worker path.
+fn main() -> Result<(), Box<dyn Error>> {
+    if std::env::var_os("OBLISK_PAM_WORKER").is_some() {
+        return pam_worker::run_worker();
+    }
+    tokio::runtime::Runtime::new()?.block_on(run_supervisor())
+}
+
+async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     let connection = zbus::Connection::system().await?;
     let subject = current_session_subject()?;
 
     let (tx, mut challenges) = tokio::sync::mpsc::unbounded_channel();
     let agent = AuthenticationAgent::new(tx);
     register_agent(&connection, agent, &subject, "en_US.UTF-8", AGENT_OBJECT_PATH).await?;
+    // Long-lived proxy for responding to polkitd later, once a pending challenge's PAM
+    // conversation finishes (docs/adr/0028) -- built once here rather than per-challenge.
+    let authority = zbus_polkit::policykit1::AuthorityProxy::new(&connection).await?;
 
     let (audio_tx, mut audio_apps) = tokio::sync::mpsc::unbounded_channel();
     // pipewire-rs's event loop is Rc-based and single-threaded (not Send) -- it needs its
@@ -308,6 +323,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut last_audio_snapshot: Option<shared::StateSnapshot> = None;
     let mut audio_revision: u32 = 0;
 
+    // The most recently received polkit challenge awaiting a secure_submit(polkit, authenticate)
+    // reply, if any -- same "only the most recent one matters" simplification as
+    // `last_audio_snapshot`, for the same reason: this codebase has no multi-challenge queue or
+    // UI to disambiguate between concurrent auth prompts, so keeping only the latest is the
+    // correct minimal behavior, not a missing feature.
+    let mut pending_challenge: Option<dbus::polkit::BeginAuthenticationCall> = None;
+
     // Every `process.run`-spawned child still tracked (docs/adr/0026), plus the channel
     // `stream_process_output`'s background tasks use to report a naturally-exited process back to
     // this loop for reaping and registry cleanup.
@@ -330,6 +352,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             Some(challenge) = challenges.recv() => {
                 eprintln!("polkit authentication challenge received: {challenge:?}");
+                pending_challenge = Some(challenge);
             }
             Some(apps) = audio_apps.recv() => {
                 audio_revision += 1;
@@ -493,13 +516,37 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 RendererFrame::ReevaluateReport(ReevaluateReport::Failed { sequence, error }) => {
                     eprintln!("generation {}'s shell.lua re-evaluation (sequence {sequence}) failed: {error}", inbound.generation_id);
                 }
+                RendererFrame::SecureSubmit(mut submit) if submit.capability == "polkit" && submit.action == "authenticate" => {
+                    // build-steps.md Phase 15 item 3 (docs/adr/0028): the polkit-routed case,
+                    // now driven for real via pam_worker::drive_pam_and_respond. This guarded
+                    // arm must come before the catch-all SecureSubmit arm below (match arms are
+                    // tried in order) so a polkit authenticate submit is routed here instead of
+                    // falling through to the generic log-and-drop.
+                    match pending_challenge.take() {
+                        Some(challenge) => {
+                            // mem::take moves the plaintext bytes out for drive_pam_and_respond
+                            // to own and zeroize on every return path (see its own doc comment)
+                            // -- it leaves submit.secret as an empty Vec (Default), which holds
+                            // no plaintext, so there is nothing left in `submit` to zeroize.
+                            let secret = std::mem::take(&mut submit.secret);
+                            pam_worker::drive_pam_and_respond(&authority, challenge, secret).await;
+                        }
+                        None => {
+                            eprintln!(
+                                "generation {}'s secure_submit(polkit, authenticate) arrived with no pending polkit challenge; dropping",
+                                submit.generation_id
+                            );
+                            submit.secret.zeroize();
+                        }
+                    }
+                }
                 RendererFrame::SecureSubmit(mut submit) => {
                     // build-steps.md Phase 15 item 2 closes ADR-0015 item 2 (the textfield/IPC
                     // half only) -- this is deliberately still just a channel-forward-and-log
                     // placeholder, the same discipline this codebase already uses for
-                    // `challenges.recv()` above. Phase 15 item 3 (docs/adr/0028) is the separate,
-                    // later pass that actually drives PAM with this secret; do not wire it to
-                    // `dbus::polkit::AuthenticationAgent` here.
+                    // `challenges.recv()` above. The `("polkit", "authenticate")` case is now
+                    // handled by the guarded arm above (docs/adr/0028, Phase 15 item 3); this
+                    // fallback covers every other capability/action, none of which exist yet.
                     //
                     // Never log the secret itself -- only its length -- and log before zeroizing
                     // it, not after (a post-zeroize log would just print the byte count of an

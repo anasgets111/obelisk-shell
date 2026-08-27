@@ -108,6 +108,25 @@ pub fn spawn_group_leader_piped(cmd: &str, args: &[String], envs: &[(String, Str
         .spawn()
 }
 
+/// Identical to [`spawn_group_leader`] except stdin and stdout are piped instead of
+/// inherited. `dbus::polkit`'s PAM worker (ADR-0028, build-steps.md Phase 15 item 3) is this
+/// variant's first caller: it writes the captured password to the worker's stdin once (then
+/// closes the write half so the worker's read hits EOF), and reads exactly one
+/// `shared::PamOutcome` frame back over stdout. Stderr stays inherited, not piped -- unlike
+/// `spawn_group_leader_piped`'s stdout/stderr, a PAM worker's stderr is operator-facing
+/// diagnostic noise (the worker's own `eprintln!`s), not wire protocol; piping and relaying
+/// it would just be a second, redundant channel back to the same terminal `spawn_group_leader`
+/// already reaches directly.
+pub fn spawn_group_leader_stdio_piped(cmd: &str, args: &[String], envs: &[(String, String)]) -> io::Result<Child> {
+    Command::new(cmd)
+        .args(args)
+        .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+}
+
 /// How [`reap_process_group`] recovered `child`'s process group.
 #[derive(Debug)]
 pub enum ReapOutcome {
@@ -341,5 +360,37 @@ mod tests {
 
         let status = child.wait().await.expect("wait failed");
         assert_eq!(status.code(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn spawn_group_leader_stdio_piped_also_puts_the_child_in_its_own_process_group() {
+        // The stdin/stdout-piped variant must not have silently dropped the process-group
+        // behavior the whole primitive exists for -- same assertion as spawn_group_leader's and
+        // spawn_group_leader_piped's own coverage.
+        let mut child = spawn_group_leader_stdio_piped("sh", &sh_args("cat"), &[]).expect("failed to spawn");
+        let child_pid = child.id().expect("freshly spawned child has a pid");
+
+        let child_pgid = nix::unistd::getpgid(Some(Pid::from_raw(child_pid as i32))).expect("getpgid on the child");
+        let our_pgid = nix::unistd::getpgrp();
+        assert_ne!(child_pgid, our_pgid, "child should not inherit the test process's own group");
+
+        reap_process_group(&mut child, Duration::from_millis(200)).await.expect("cleanup reap failed");
+    }
+
+    #[tokio::test]
+    async fn spawn_group_leader_stdio_piped_pipes_stdin_and_stdout_with_the_real_exit_code() {
+        let mut child = spawn_group_leader_stdio_piped("sh", &sh_args("cat"), &[]).expect("failed to spawn");
+
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        let stdout = child.stdout.take().expect("stdout was piped");
+
+        tokio::io::AsyncWriteExt::write_all(&mut stdin, b"hello\n").await.expect("write to stdin failed");
+        drop(stdin); // closes the write half so `cat`'s read hits EOF and it exits
+
+        let echoed = BufReader::new(stdout).lines().next_line().await.unwrap().unwrap();
+        assert_eq!(echoed, "hello");
+
+        let status = child.wait().await.expect("wait failed");
+        assert!(status.success());
     }
 }

@@ -52,13 +52,34 @@ pub fn current_session_subject() -> Result<Subject, std::env::VarError> {
 }
 
 /// One `BeginAuthentication` call as polkitd sent it, parsed off the wire.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is deliberately not derived (unlike most other wire-shaped structs in this codebase):
+/// `identities`' `OwnedValue` can hold a `zvariant::Value::F64`, and `f64` only implements
+/// `PartialEq`, not `Eq`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct BeginAuthenticationCall {
     pub action_id: String,
     pub message: String,
     pub icon_name: String,
     pub details: HashMap<String, String>,
     pub cookie: String,
+    pub identities: Vec<(String, HashMap<String, OwnedValue>)>,
+}
+
+/// The uid to authenticate as and to report back via `AuthenticationAgentResponse2`, parsed
+/// from `BeginAuthentication`'s own `identities` list. Per `Identity`'s doc comment (this
+/// module, `zbus_polkit`'s own source): a `unix-user` identity carries its uid under the
+/// `"uid"` key, typed `uint32`.
+///
+/// ponytail: takes the *first* `unix-user` identity in the list, not all of them. polkitd can
+/// list multiple identities that could satisfy an action (e.g. every member of `wheel`) --
+/// picking one to authenticate as is normally a user-facing choice (an identity picker), which
+/// doesn't exist here: this codebase's only `secure_submit` UI is a single password field with
+/// no picker. First-match is the simplest correct behavior until a picker exists to make the
+/// choice meaningful; see this ADR's upgrade path (docs/adr/0028) for where that UI would need
+/// to attach.
+pub fn first_unix_user_uid(identities: &[(String, HashMap<String, OwnedValue>)]) -> Option<u32> {
+    identities.iter().find(|(kind, _)| kind == "unix-user").and_then(|(_, details)| details.get("uid")).and_then(|v| u32::try_from(v.clone()).ok())
 }
 
 /// `org.freedesktop.PolicyKit1.AuthenticationAgent`, the interface polkitd calls back into
@@ -89,11 +110,11 @@ impl AuthenticationAgent {
         icon_name: String,
         details: HashMap<String, String>,
         cookie: String,
-        _identities: Vec<(String, HashMap<String, OwnedValue>)>,
+        identities: Vec<(String, HashMap<String, OwnedValue>)>,
     ) {
         // A dropped receiver just means whoever should have consumed this challenge isn't
         // listening (e.g. mid-shutdown); not a reason to fail the D-Bus call.
-        let _ = self.challenges.send(BeginAuthenticationCall { action_id, message, icon_name, details, cookie });
+        let _ = self.challenges.send(BeginAuthenticationCall { action_id, message, icon_name, details, cookie, identities });
     }
 
     async fn cancel_authentication(&self, _cookie: String) {
@@ -228,7 +249,9 @@ mod tests {
             .expect("failed to build a p2p proxy to the agent");
 
         let details: HashMap<String, String> = HashMap::from([("polkit.gettext_domain".to_string(), "polkit".to_string())]);
-        let identities: Vec<(String, HashMap<String, OwnedValue>)> = Vec::new();
+        let identity_details: HashMap<String, OwnedValue> =
+            HashMap::from([("uid".to_string(), OwnedValue::try_from(Value::from(1000u32)).unwrap())]);
+        let identities: Vec<(String, HashMap<String, OwnedValue>)> = vec![("unix-user".to_string(), identity_details)];
         proxy
             .call_method(
                 "BeginAuthentication",
@@ -243,6 +266,7 @@ mod tests {
         assert_eq!(received.icon_name, "dialog-password");
         assert_eq!(received.cookie, "cookie-123");
         assert_eq!(received.details.get("polkit.gettext_domain").map(String::as_str), Some("polkit"));
+        assert_eq!(first_unix_user_uid(&received.identities), Some(1000), "identities must be forwarded, not discarded");
     }
 
     #[tokio::test]
@@ -270,5 +294,37 @@ mod tests {
             .call_method("CancelAuthentication", &("cookie-123",))
             .await
             .expect("CancelAuthentication call should succeed");
+    }
+
+    fn unix_user_identity(uid: u32) -> (String, HashMap<String, OwnedValue>) {
+        ("unix-user".to_string(), HashMap::from([("uid".to_string(), OwnedValue::try_from(Value::from(uid)).unwrap())]))
+    }
+
+    #[test]
+    fn first_unix_user_uid_is_none_for_an_empty_list() {
+        assert_eq!(first_unix_user_uid(&[]), None);
+    }
+
+    #[test]
+    fn first_unix_user_uid_is_none_when_only_a_unix_group_is_present() {
+        let group = ("unix-group".to_string(), HashMap::from([("gid".to_string(), OwnedValue::try_from(Value::from(100u32)).unwrap())]));
+        assert_eq!(first_unix_user_uid(&[group]), None);
+    }
+
+    #[test]
+    fn first_unix_user_uid_returns_the_uid_of_a_unix_user_identity() {
+        assert_eq!(first_unix_user_uid(&[unix_user_identity(1000)]), Some(1000));
+    }
+
+    #[test]
+    fn first_unix_user_uid_is_none_when_the_unix_user_entry_is_missing_the_uid_key() {
+        let malformed = ("unix-user".to_string(), HashMap::new());
+        assert_eq!(first_unix_user_uid(&[malformed]), None);
+    }
+
+    #[test]
+    fn first_unix_user_uid_returns_the_first_unix_user_entrys_uid_when_multiple_are_present() {
+        let identities = [unix_user_identity(1000), unix_user_identity(2000)];
+        assert_eq!(first_unix_user_uid(&identities), Some(1000), "must take the first identity, not just any of them");
     }
 }
