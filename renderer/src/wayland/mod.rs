@@ -528,6 +528,9 @@ impl App {
             }
         };
 
+        // SAFETY: `native_window.ptr()` is a live `wl_egl_window*` just constructed above by
+        // `WlEglSurface::new`, matching `self.egl.display`/`self.egl.config`'s own platform --
+        // exactly the handle `eglCreateWindowSurface` requires.
         let egl_surface = unsafe {
             self.egl.instance.create_window_surface(
                 self.egl.display,
@@ -556,6 +559,10 @@ impl App {
             return;
         }
 
+        // SAFETY: `glow::Context::from_loader_function`'s contract is that a GL context is
+        // current on this thread for the lifetime of the returned `Context` -- guaranteed here
+        // by the `eglMakeCurrent` call directly above, on this same single-threaded dispatch
+        // loop, with no other context switch between the two.
         let gl = self.gl.get_or_insert_with(|| unsafe {
             glow::Context::from_loader_function(|s| {
                 self.egl
@@ -565,6 +572,9 @@ impl App {
             })
         });
 
+        // SAFETY: every `glow::HasContext` method call requires a current GL context matching
+        // `gl`'s own loader -- the `eglMakeCurrent` above is that context, and it's the only one
+        // live on this thread.
         unsafe {
             use glow::HasContext;
             gl.clear_color(0.0, 0.0, 0.0, 0.0);
@@ -669,6 +679,9 @@ impl App {
             }
         };
 
+        // SAFETY: `native_window.ptr()` is a live `wl_egl_window*` just constructed above by
+        // `WlEglSurface::new`, matching `self.egl.display`/`self.egl.config`'s own platform --
+        // exactly the handle `eglCreateWindowSurface` requires.
         let egl_surface = unsafe {
             self.egl.instance.create_window_surface(self.egl.display, self.egl.config, native_window.ptr() as *mut c_void, None)
         };
@@ -687,10 +700,17 @@ impl App {
             return;
         }
 
+        // SAFETY: `glow::Context::from_loader_function`'s contract is that a GL context is
+        // current on this thread for the lifetime of the returned `Context` -- guaranteed here
+        // by the `eglMakeCurrent` call directly above, on this same single-threaded dispatch
+        // loop, with no other context switch between the two.
         let gl = self.gl.get_or_insert_with(|| unsafe {
             glow::Context::from_loader_function(|s| self.egl.instance.get_proc_address(s).map_or(std::ptr::null(), |f| f as *const c_void))
         });
 
+        // SAFETY: every `glow::HasContext` method call requires a current GL context matching
+        // `gl`'s own loader -- the `eglMakeCurrent` above is that context, and it's the only one
+        // live on this thread.
         unsafe {
             use glow::HasContext;
             gl.clear_color(0.0, 0.0, 0.0, 0.0);

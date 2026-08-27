@@ -359,8 +359,7 @@ impl NetworkController {
         // left to `Drop` alone (ADR-0005/ADR-0014). `dict` borrows from `intent` and is fully
         // consumed by the call above, so this is the first point it's safe to mutate.
         if let Some(psk) = intent.psk.as_mut() {
-            // SAFETY: overwriting with zero bytes keeps the `String` valid UTF-8.
-            unsafe { psk.as_bytes_mut() }.zeroize();
+            psk.zeroize();
         }
         result?;
         Ok(())

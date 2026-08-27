@@ -100,7 +100,7 @@ mod tests {
 
         assert!(buf.is_empty());
         assert_eq!(buf.expose_secret(), b"");
-        // Safety: `buf.bytes` still owns this allocation (zeroize does not deallocate,
+        // SAFETY: `buf.bytes` still owns this allocation (zeroize does not deallocate,
         // only clears), so the pointer and capacity captured above are still valid to
         // read as plain bytes.
         let backing = unsafe { std::slice::from_raw_parts(ptr, capacity) };
