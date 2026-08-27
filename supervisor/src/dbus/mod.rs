@@ -6,6 +6,7 @@ pub mod bluetooth;
 pub mod idle;
 pub mod network;
 pub mod polkit;
+mod shm_icons;
 pub mod tray;
 
 /// Shared `arguments: [en]` boolean-argument parse for `*:set_*_enabled(en)`-style write actions

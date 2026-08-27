@@ -36,6 +36,8 @@ use zbus::fdo::RequestNameFlags;
 use zbus::names::{BusName, OwnedUniqueName, WellKnownName};
 use zbus::zvariant::{Array, Dict, OwnedObjectPath, OwnedValue, Signature, Str, StructureBuilder, Type, Value};
 
+use super::shm_icons::{self, PngEncodeError};
+
 /// Well-known bus name and object path this controller hosts `org.kde.StatusNotifierWatcher` at
 /// (docs/oblisk-supervisor-services-dbus.md §2's literal path).
 const WATCHER_BUS_NAME: &str = "org.kde.StatusNotifierWatcher";
@@ -347,21 +349,6 @@ fn resolve_icon_source(icon_name: &str, pixmaps: &[IconPixmap]) -> IconSource {
     }
 }
 
-#[derive(Debug)]
-enum PngEncodeError {
-    Png(png::EncodingError),
-}
-
-impl std::fmt::Display for PngEncodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Png(err) => write!(f, "{err}"),
-        }
-    }
-}
-
-impl std::error::Error for PngEncodeError {}
-
 /// Encodes a bounds-checked ARGB32 (network byte order: A, R, G, B per pixel) buffer to a PNG
 /// byte stream via the `png` crate (ADR-0031: pure Rust, encode-only, minimal dependency tree).
 fn encode_argb32_to_png(width: u32, height: u32, argb: &[u8]) -> Result<Vec<u8>, PngEncodeError> {
@@ -385,21 +372,13 @@ fn encode_argb32_to_png(width: u32, height: u32, argb: &[u8]) -> Result<Vec<u8>,
     Ok(buffer)
 }
 
-/// `/dev/shm/oblisk-$UID/tray` (ADR-0031: fixes the original spec doc's missing-`$UID` path).
-fn tray_icon_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(format!("/dev/shm/oblisk-{}/tray", nix::unistd::Uid::current()))
-}
-
 /// Writes `pixmap` (already bounds-checked) as a PNG to
-/// `/dev/shm/oblisk-$UID/tray/{sanitized_unique_name}.png`, creating the directory tree if
-/// missing. Same path overwritten in place on every call -- no cache-busting (ADR-0031).
+/// `/dev/shm/oblisk-$UID/tray/{sanitized_unique_name}.png` ([`shm_icons::write_png`]), creating the
+/// directory tree if missing. Same path overwritten in place on every call -- no cache-busting
+/// (ADR-0031).
 fn write_icon_png(sanitized_unique_name: &str, pixmap: &IconPixmap) -> std::io::Result<String> {
-    let dir = tray_icon_dir();
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{sanitized_unique_name}.png"));
     let png_bytes = encode_argb32_to_png(pixmap.width as u32, pixmap.height as u32, &pixmap.bytes).map_err(std::io::Error::other)?;
-    std::fs::write(&path, png_bytes)?;
-    Ok(path.to_string_lossy().into_owned())
+    shm_icons::write_png("tray", &format!("{sanitized_unique_name}.png"), &png_bytes)
 }
 
 // -------------------------------------------------------------------------------------------
