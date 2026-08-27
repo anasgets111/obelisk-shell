@@ -524,10 +524,10 @@ against a fake. This phase gives them their first real implementation and their 
 
 ### Phase 16: D-Bus & Hardware Backend Controllers
 
-Notifications (§ 1), Tray (§ 2), MPRIS (§ 3), NetworkManager (§ 4), BlueZ (§ 5), idle (§ 7,
-ADR-0032 — split into two named sub-items below), telemetry (§ 11), and power/thermals (§ 13) all
-follow the pattern already proven twice in this codebase, `dbus::polkit` (D-Bus proxy/agent
-registration) and `audio::mixer` (event-driven
+Notifications (§ 1, ADR-0033 — expanded scope and one sub-item split out below), Tray (§ 2), MPRIS
+(§ 3), NetworkManager (§ 4), BlueZ (§ 5), idle (§ 7, ADR-0032 — split into two named sub-items
+below), telemetry (§ 11), and power/thermals (§ 13) all follow the pattern already proven twice in
+this codebase, `dbus::polkit` (D-Bus proxy/agent registration) and `audio::mixer` (event-driven
 listener thread), and are TDD-able against real fixtures per `oblisk-tdd-test-harness.md` (p2p
 D-Bus connections, real sysfs roots), no mocks needed. Use `#[zbus::interface]`, not
 `#[dbus_interface]`; ADR-0013 already documents why the latter doesn't exist in the zbus version
@@ -544,6 +544,19 @@ notify's Wayland-specific setup work:
 - **Idle inhibit**. `org.freedesktop.login1.Manager.Inhibit` on the already-open system D-Bus
   connection NetworkManager/BlueZ/polkit already share. Needs neither a new connection nor the
   `"staging"` feature gate.
+
+Notifications (§ 1) grew past what the services doc specs — ADR-0033 adds an allowlist-parsed
+`body-markup`/`body-hyperlinks`/`body-images` span grammar, Lua-configured per-urgency sound, and a
+real do-not-disturb backend, none of which either spec doc names. Build the Supervisor-side
+controller (D-Bus server, sanitizer/allowlist parser, SHM icon spooling, sound trigger, DND state)
+as one Phase 16 slice like every other controller here — but the matching renderer-side span
+*rendering* (bold/italic weight, clickable hyperlink regions, inline image layout) is its own
+later slice, not part of this one:
+- **Notifications body-span rendering**. First real consumer of ADR-0012's FemtoVG glyph-atlas
+  work — no rich-text/span support exists in the renderer's text pipeline yet. Sequence after
+  Phase 12 (retained scene) and whatever slice lands ADR-0012's glyph atlas; until then, Lua
+  receives correct `NotificationSpan` data with no widget yet able to render it as anything but
+  flattened text.
 
 Two exceptions worth building on their own track instead of folding into the general D-Bus
 pattern above:

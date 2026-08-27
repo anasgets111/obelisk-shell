@@ -99,3 +99,15 @@ _Avoid_: idle timeout, inactivity timer
 **Idle inhibit**:
 A generation-scoped refcount that, above zero, holds one `org.freedesktop.login1.Manager.Inhibit(what="idle")` file descriptor open, blocking the system's own auto-suspend. The same per-generation reset that clears idle thresholds on reload or crash zeros this count too; the fd closes the instant the count returns to zero.
 _Avoid_: wake lock, keep-awake handle
+
+**Notification urgency**:
+The `low`/`normal`/`critical` tier carried by every fed notification, read from the sender's `urgency` hint. Critical bypasses both do-not-disturb and the sender's `expire_timeout`, staying until dismissed instead of expiring or being silenced.
+_Avoid_: priority, severity
+
+**Do-not-disturb**:
+A Supervisor-held global toggle (not per-generation) that gates notification sound playback only; `notifications.feed` keeps receiving every notification regardless of its state. Critical-urgency notifications bypass it. Lives in Supervisor memory and resets on Supervisor restart until the XDG atomic state manager exists to persist it.
+_Avoid_: focus mode, silent mode, mute
+
+**Notification body span**:
+One allowlisted markup run inside a sanitized notification body: a text run carrying `{text, bold, italic, underline, href}`, or an image run carrying `{image_path}` resolved through the path-trust validator shared with action-icon names (an allowlisted-directory check, not full XDG theme resolution). The sanitizer emits an array of these instead of collapsing markup to flat text; every construct outside the five allowlisted tags (`<b>`, `<i>`, `<u>`, `<a href>`, `<img src>`) is rejected exactly as the prior flat-text sanitizer rejected all markup.
+_Avoid_: rich text, HTML fragment
