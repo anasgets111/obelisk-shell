@@ -13,6 +13,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use dbus::bluetooth::{self, BluetoothController, BluetoothSignal};
 use dbus::network::{self, NetworkController, NetworkSignal, PendingNetworkConnect};
 use dbus::polkit::{AGENT_OBJECT_PATH, AuthenticationAgent, current_session_subject, register_agent};
 use reload_link::SocketCandidateLink;
@@ -97,6 +98,28 @@ fn push_network_snapshot(
             last_snapshots.insert("network".to_string(), snapshot);
         }
         Err(err) => eprintln!("failed to serialize network StateSnapshot: {err}"),
+    }
+}
+
+/// Bumps `"bluetooth"`'s revision and pushes `state` as a fresh `StateSnapshot` to the
+/// authoritative generation -- mirrors [`push_network_snapshot`] exactly (docs/adr/0030 needs
+/// zero new plumbing beyond a fresh capability name flowing through ADR-0029's already-generic
+/// `revisions`/`last_snapshots` maps).
+fn push_bluetooth_snapshot(
+    registry: &socket::GenerationRegistry,
+    generation_id: u32,
+    revisions: &mut HashMap<String, u32>,
+    last_snapshots: &mut HashMap<String, shared::StateSnapshot>,
+    state: &bluetooth::BluetoothState,
+) {
+    let revision = bump_revision(revisions, "bluetooth");
+    match serde_json::to_value(state) {
+        Ok(payload) => {
+            let snapshot = shared::StateSnapshot { capability: "bluetooth".to_string(), revision, payload };
+            send_frame_logged(registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
+            last_snapshots.insert("bluetooth".to_string(), snapshot);
+        }
+        Err(err) => eprintln!("failed to serialize bluetooth StateSnapshot: {err}"),
     }
 }
 
@@ -346,6 +369,15 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     }
     let mut network_state = network::NetworkState::default();
 
+    // BlueZ runs on the same system bus too (docs/adr/0030). Unlike NetworkController, the
+    // channel is threaded into the constructor itself rather than exposed via a
+    // `*_signal_source()` getter spawned separately afterward -- see BluetoothController::new's
+    // own doc comment for why (startup hydration itself needs it, not just the forwarders spawned
+    // after construction).
+    let (bluetooth_signal_tx, mut bluetooth_signals) = tokio::sync::mpsc::unbounded_channel::<BluetoothSignal>();
+    let bluetooth = BluetoothController::new(connection.clone(), bluetooth_signal_tx).await;
+    let mut bluetooth_state = bluetooth::BluetoothState::default();
+
     let (audio_tx, mut audio_apps) = tokio::sync::mpsc::unbounded_channel();
     // pipewire-rs's event loop is Rc-based and single-threaded (not Send) -- it needs its
     // own OS thread, not a tokio task.
@@ -436,6 +468,22 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 }
                 network_state.available_networks = network.build_available_networks().await;
                 push_network_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &network_state);
+            }
+            Some(signal) = bluetooth_signals.recv() => {
+                // No debounce (docs/adr/0030, matching ADR-0029): every relevant event fully
+                // re-derives the affected part of the state from scratch.
+                match signal {
+                    BluetoothSignal::AdapterChanged => {
+                        bluetooth_state.enabled = bluetooth.read_enabled().await;
+                        bluetooth_state.discovering = bluetooth.read_discovering().await;
+                    }
+                    BluetoothSignal::DeviceRegistryChanged => {
+                        let (connected_devices, discovered_devices) = bluetooth.build_device_lists().await;
+                        bluetooth_state.connected_devices = connected_devices;
+                        bluetooth_state.discovered_devices = discovered_devices;
+                    }
+                }
+                push_bluetooth_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &bluetooth_state);
             }
             Some(()) = reload_events.recv() => {
                 next_sequence += 1;
@@ -564,6 +612,82 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                         }
                         None => eprintln!(
                             "malformed network.forget command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "bluetooth" && envelope.params.action == "set_enabled" => {
+                    match bluetooth::parse_bool_arg(&envelope.params.arguments) {
+                        Some(enabled) => {
+                            let controller = bluetooth.clone();
+                            tokio::spawn(async move { controller.set_enabled(enabled).await; });
+                        }
+                        None => eprintln!(
+                            "malformed bluetooth.set_enabled command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "bluetooth" && envelope.params.action == "start_discovery" => {
+                    // discovered_devices clears immediately, before the D-Bus call's own
+                    // completion (docs/adr/0030, matching NM's scanning = true immediate-flip
+                    // pattern) -- the actual StartDiscovery call is what must be tokio::spawn'ed,
+                    // not this local state flip.
+                    bluetooth_state.discovered_devices = Vec::new();
+                    push_bluetooth_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &bluetooth_state);
+                    let controller = bluetooth.clone();
+                    tokio::spawn(async move { controller.start_discovery().await; });
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "bluetooth" && envelope.params.action == "stop_discovery" => {
+                    // The last discovered_devices snapshot stays visible (docs/adr/0030) -- no
+                    // local state mutation here, only the D-Bus call.
+                    let controller = bluetooth.clone();
+                    tokio::spawn(async move { controller.stop_discovery().await; });
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "bluetooth" && envelope.params.action == "pair" => {
+                    match bluetooth::parse_mac_arg(&envelope.params.arguments) {
+                        Some(mac) => {
+                            let controller = bluetooth.clone();
+                            tokio::spawn(async move { controller.pair(&mac).await; });
+                        }
+                        None => eprintln!(
+                            "malformed bluetooth.pair command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "bluetooth" && envelope.params.action == "connect" => {
+                    match bluetooth::parse_mac_arg(&envelope.params.arguments) {
+                        Some(mac) => {
+                            let controller = bluetooth.clone();
+                            tokio::spawn(async move { controller.connect(&mac).await; });
+                        }
+                        None => eprintln!(
+                            "malformed bluetooth.connect command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "bluetooth" && envelope.params.action == "disconnect" => {
+                    match bluetooth::parse_mac_arg(&envelope.params.arguments) {
+                        Some(mac) => {
+                            let controller = bluetooth.clone();
+                            tokio::spawn(async move { controller.disconnect(&mac).await; });
+                        }
+                        None => eprintln!(
+                            "malformed bluetooth.disconnect command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "bluetooth" && envelope.params.action == "forget" => {
+                    match bluetooth::parse_mac_arg(&envelope.params.arguments) {
+                        Some(mac) => {
+                            let controller = bluetooth.clone();
+                            tokio::spawn(async move { controller.forget(&mac).await; });
+                        }
+                        None => eprintln!(
+                            "malformed bluetooth.forget command from generation {}: {:?}",
                             envelope.params.generation_id, envelope.params.arguments
                         ),
                     }

@@ -240,10 +240,10 @@ fn build_connection_dict(intent: &ConnectionIntent) -> HashMap<&str, HashMap<&st
 }
 
 /// `network:set_networking_enabled(en)`'s `arguments: [en]` -- shares `main.rs`'s
-/// `process_run_args`-style "parse or log and drop" convention.
-pub fn parse_bool_arg(arguments: &[serde_json::Value]) -> Option<bool> {
-    arguments.first()?.as_bool()
-}
+/// `process_run_args`-style "parse or log and drop" convention. Defined once in `dbus` (shared
+/// with `bluetooth::parse_bool_arg`) and re-exported here so `network::parse_bool_arg` keeps
+/// working unchanged at every call site.
+pub use crate::dbus::parse_bool_arg;
 
 /// `network:connect(ssid, hidden)`'s `arguments: [ssid, hidden]`.
 pub fn parse_connect_args(arguments: &[serde_json::Value]) -> Option<(String, bool)> {
