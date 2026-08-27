@@ -62,6 +62,14 @@ fn is_current_reload(report_sequence: u64, next_sequence: u64) -> bool {
 /// either hand-wrote its own `if let Err(err) = ... { eprintln!(...) }` (duplicated three times)
 /// or, for the Swap messages, silently discarded the `Result` with `let _ =` entirely (Standards
 /// + Correctness review: the only sends in this function whose failure went unlogged).
+///
+/// A `NoConnection` failure here is logged and dropped, not retried -- still possible for a
+/// one-off frame sent to a generation that's simply disconnected. The boot-time version of this
+/// (`network`'s/`bluetooth`'s controllers can start pushing before the boot Renderer's connection
+/// even exists, since they're constructed before `socket::spawn_listener` runs) no longer loses
+/// state permanently: the `connected.recv()` arm in `run_supervisor`'s main loop replays
+/// `last_snapshots` to a generation the instant it registers, so anything captured before that
+/// point still arrives.
 fn send_frame_logged(registry: &socket::GenerationRegistry, generation_id: u32, frame: &SupervisorFrame) {
     if let Err(err) = registry.send_frame(generation_id, frame) {
         eprintln!("failed to push {frame:?} to generation {generation_id}: {err}");
@@ -354,6 +362,11 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
 
     // NetworkManager runs on the same system bus as polkit -- reuses `connection` rather than
     // opening a second one (build-steps.md Phase 16; docs/adr/0029).
+    //
+    // This and `BluetoothController::new` below both construct (and can start hydrating/pushing)
+    // before `socket::spawn_listener` runs further down -- any push that lands before the boot
+    // Renderer's connection registers gets replayed once it does, by the `connected.recv()` arm
+    // in this function's main loop (see `send_frame_logged`'s doc comment).
     let network = NetworkController::new(connection.clone()).await?;
     // The Wi-Fi signal forwarder task (see its own doc comment for why this is a separate task
     // rather than raw signal streams merged directly into this function's own `select!`) needs
@@ -384,7 +397,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     std::thread::spawn(move || audio::mixer::run(audio_tx));
 
     let socket_path = shared::control_socket_path()?;
-    let (registry, mut inbound_frames) = socket::spawn_listener(&socket_path)?;
+    let (registry, mut inbound_frames, mut connected) = socket::spawn_listener(&socket_path)?;
 
     let config_dir = shared::config_dir()?;
     let mut reload_events = watcher::spawn_watcher(&config_dir, RELOAD_DEBOUNCE)?;
@@ -446,6 +459,24 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
             Some(challenge) = challenges.recv() => {
                 eprintln!("polkit authentication challenge received: {challenge:?}");
                 pending_challenge = Some(challenge);
+            }
+            Some(generation_id) = connected.recv() => {
+                // Only the authoritative generation needs a replay: a PBA candidate's connection
+                // (a different `generation_id`) already gets its hydration explicitly from
+                // `run_pba`'s own `snapshots` argument (docs/adr/0029), and replaying here too
+                // would just be redundant, not wrong -- restricting to authoritative keeps this
+                // arm from doing anything during a live PBA handshake it isn't part of.
+                //
+                // Fixes the boot-time race `send_frame_logged`'s doc comment used to describe:
+                // `network`'s/`bluetooth`'s controllers can start pushing before this connection
+                // exists; whatever they'd already captured in `last_snapshots` by the time it
+                // registers gets delivered right now instead of staying lost until some
+                // unrelated later event happens to push a fresh snapshot.
+                if generation_id == authoritative.generation_id {
+                    for snapshot in last_snapshots.values() {
+                        send_frame_logged(&registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
+                    }
+                }
             }
             Some(apps) = audio_apps.recv() => {
                 let revision = bump_revision(&mut revisions, "audio");
@@ -871,6 +902,9 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
         eprintln!("failed to reap authoritative generation {}'s renderer on shutdown: {err}", authoritative.generation_id);
     }
     reap_all_processes(&mut processes).await;
+    // Best-effort: `socket::bind`'s own stale-file removal covers a missed unlink (a crash,
+    // `SIGKILL`) on the *next* boot regardless, so a failure here isn't fatal to anything.
+    let _ = std::fs::remove_file(&socket_path);
     Ok(())
 }
 

@@ -132,8 +132,10 @@ impl GenerationRegistry {
 }
 
 /// Binds the listener at `path`, first removing a stale socket file left behind by an
-/// unclean prior shutdown -- `UnixListener::bind` fails with `AddrInUse` on an existing path
-/// otherwise, which would brick every restart after a crash.
+/// unclean prior shutdown (a crash, `SIGKILL`) -- `UnixListener::bind` fails with `AddrInUse` on
+/// an existing path otherwise, which would brick every restart. `main.rs`'s own clean-shutdown
+/// path (`SIGINT`/`SIGTERM`) unlinks `path` itself on the way out, so this is defense-in-depth
+/// for the unclean case, not the only cleanup path.
 fn bind(path: &Path) -> Result<UnixListener, io::Error> {
     if path.exists() {
         std::fs::remove_file(path)?;
@@ -141,13 +143,22 @@ fn bind(path: &Path) -> Result<UnixListener, io::Error> {
     UnixListener::bind(path)
 }
 
-/// Binds the control socket at `path` and spawns the accept loop as a background task.
-/// Returns the [`GenerationRegistry`] (to address specific generations later) and a channel
-/// receiving every inbound frame, decoded and tagged with its sender's generation.
-pub fn spawn_listener(path: &Path) -> Result<(GenerationRegistry, mpsc::UnboundedReceiver<InboundFrame>), io::Error> {
+/// Binds the control socket at `path` and spawns the accept loop as a background task. Returns
+/// the [`GenerationRegistry`] (to address specific generations later), a channel receiving every
+/// inbound frame decoded and tagged with its sender's generation, and a channel receiving each
+/// `generation_id` the instant its connection finishes registering.
+///
+/// That third channel exists so `main.rs` can replay a capability's already-known
+/// `StateSnapshot`s to a generation the moment it connects -- otherwise a push attempted between
+/// a controller hydrating (e.g. `NetworkController`/`BluetoothController::new`, both constructed
+/// before this function even runs) and the boot Renderer's own connection completing would hit
+/// [`SendFrameError::NoConnection`] and be dropped, not just delayed, with nothing to ever
+/// re-deliver it if no later event happens to push a fresh snapshot.
+pub fn spawn_listener(path: &Path) -> Result<(GenerationRegistry, mpsc::UnboundedReceiver<InboundFrame>, mpsc::UnboundedReceiver<u32>), io::Error> {
     let listener = bind(path)?;
     let registry = GenerationRegistry::default();
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+    let (connected_tx, connected_rx) = mpsc::unbounded_channel();
 
     let accept_registry = registry.clone();
     tokio::spawn(async move {
@@ -156,8 +167,9 @@ pub fn spawn_listener(path: &Path) -> Result<(GenerationRegistry, mpsc::Unbounde
                 Ok((stream, _addr)) => {
                     let registry = accept_registry.clone();
                     let inbound_tx = inbound_tx.clone();
+                    let connected_tx = connected_tx.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = handle_connection(stream, registry, inbound_tx).await {
+                        if let Err(err) = handle_connection(stream, registry, inbound_tx, connected_tx).await {
                             eprintln!("control-socket connection ended: {err}");
                         }
                     });
@@ -174,13 +186,18 @@ pub fn spawn_listener(path: &Path) -> Result<(GenerationRegistry, mpsc::Unbounde
         }
     });
 
-    Ok((registry, inbound_rx))
+    Ok((registry, inbound_rx, connected_rx))
 }
 
 /// Reads the connection's handshake, registers it, then loops decoding inbound frames as
 /// `RendererFrame` and forwarding them, while a second task drains anything queued for this
 /// generation via [`GenerationRegistry::send_to`] out over the write half.
-async fn handle_connection(stream: UnixStream, registry: GenerationRegistry, inbound_tx: UnboundedSender<InboundFrame>) -> Result<(), FramingError> {
+async fn handle_connection(
+    stream: UnixStream,
+    registry: GenerationRegistry,
+    inbound_tx: UnboundedSender<InboundFrame>,
+    connected_tx: UnboundedSender<u32>,
+) -> Result<(), FramingError> {
     let (mut read_half, mut write_half) = stream.into_split();
 
     let handshake: ConnectionHandshake = framing::read_json_frame(&mut read_half).await?;
@@ -188,6 +205,9 @@ async fn handle_connection(stream: UnixStream, registry: GenerationRegistry, inb
 
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let token = registry.register(generation_id, outbound_tx);
+    // Best-effort: if `main.rs`'s receiver has already been dropped (e.g. mid-shutdown), there's
+    // no snapshot replay to do for a connection that's about to be torn down anyway.
+    let _ = connected_tx.send(generation_id);
 
     let writer = tokio::spawn(async move {
         while let Some(payload) = outbound_rx.recv().await {
@@ -266,7 +286,7 @@ mod tests {
     async fn spawn_listener_registers_two_simultaneous_connections_by_generation_id() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("oblisk-shell.sock");
-        let (registry, _inbound) = spawn_listener(&path).unwrap();
+        let (registry, _inbound, _connected) = spawn_listener(&path).unwrap();
 
         let mut client_a = UnixStream::connect(&path).await.unwrap();
         framing::write_json_frame(&mut client_a, &ConnectionHandshake { generation_id: 1 }).await.unwrap();
@@ -284,10 +304,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_listener_reports_a_generation_id_on_the_connected_channel_once_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oblisk-shell.sock");
+        let (_registry, _inbound, mut connected) = spawn_listener(&path).unwrap();
+
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        framing::write_json_frame(&mut client, &ConnectionHandshake { generation_id: 7 }).await.unwrap();
+
+        assert_eq!(connected.recv().await, Some(7), "the connected channel must report the handshake's generation_id");
+    }
+
+    #[tokio::test]
     async fn spawn_listener_forwards_a_decoded_command_envelope_tagged_with_its_generation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("oblisk-shell.sock");
-        let (_registry, mut inbound) = spawn_listener(&path).unwrap();
+        let (_registry, mut inbound, _connected) = spawn_listener(&path).unwrap();
 
         let mut client = UnixStream::connect(&path).await.unwrap();
         framing::write_json_frame(&mut client, &ConnectionHandshake { generation_id: 5 }).await.unwrap();
@@ -325,7 +357,7 @@ mod tests {
     async fn spawn_listener_forwards_a_decoded_reevaluate_report_tagged_with_its_generation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("oblisk-shell.sock");
-        let (_registry, mut inbound) = spawn_listener(&path).unwrap();
+        let (_registry, mut inbound, _connected) = spawn_listener(&path).unwrap();
 
         let mut client = UnixStream::connect(&path).await.unwrap();
         framing::write_json_frame(&mut client, &ConnectionHandshake { generation_id: 5 }).await.unwrap();
