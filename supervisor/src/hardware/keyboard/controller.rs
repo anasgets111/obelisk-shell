@@ -10,6 +10,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::StreamExt;
 
 use super::backlight::{KbdBacklightProxy, percent_from_raw, raw_from_percent};
+use super::layout::{CompositorKind, CompositorLink, HyprlandLink, NiriLink, detect_compositor};
 use super::locks::{read_led_on, resolve_lock_leds};
 
 /// `oblisk.keyboard`'s combined payload. `backlight_pct` is `-1` (the same "sentinel, not a
@@ -17,22 +18,27 @@ use super::locks::{read_led_on, resolve_lock_leds};
 /// machine has no keyboard-backlight hardware for UPower to report on. `caps_lock`/`num_lock`/
 /// `scroll_lock` have no equivalent sentinel (a bare `bool` has no "unavailable" value) --
 /// they default `false` and stay there, logged once, if neither evdev nor sysfs resolves.
+/// `active_layout` defaults to an empty string (the IDL declares it a plain, non-nullable
+/// `string` -- ADR-0034), `active_layout_index`/`layout_count` default `0`, when neither
+/// compositor is detected.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct KeyboardState {
     pub backlight_pct: i32,
     pub caps_lock: bool,
     pub num_lock: bool,
     pub scroll_lock: bool,
+    pub active_layout: String,
+    pub active_layout_index: u32,
+    pub layout_count: u32,
 }
 
 impl Default for KeyboardState {
     fn default() -> Self {
-        Self { backlight_pct: -1, caps_lock: false, num_lock: false, scroll_lock: false }
+        Self { backlight_pct: -1, caps_lock: false, num_lock: false, scroll_lock: false, active_layout: String::new(), active_layout_index: 0, layout_count: 0 }
     }
 }
 
-/// One shared signal, `Changed` only (mirrors `SysinfoSignal`) -- layout will send the same
-/// variant once it joins.
+/// One shared signal, `Changed` only (mirrors `SysinfoSignal`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyboardSignal {
     Changed,
@@ -44,6 +50,12 @@ pub enum KeyboardSignal {
 /// `backlight::raw_from_percent`, the one place that actually needs the bound).
 pub fn parse_set_backlight_args(arguments: &[serde_json::Value]) -> Option<u64> {
     arguments.first()?.as_u64()
+}
+
+/// `keyboard:switch_layout(index)`'s `arguments: [index]` -- mirrors `parse_set_backlight_args`'s
+/// single-numeric-argument shape.
+pub fn parse_switch_layout_args(arguments: &[serde_json::Value]) -> Option<usize> {
+    arguments.first()?.as_u64().map(|v| v as usize)
 }
 
 /// Either a live UPower `KbdBacklight` object with its `GetMaxBrightness()` cached at
@@ -64,6 +76,7 @@ enum Backlight {
 pub struct KeyboardController {
     state: Arc<Mutex<KeyboardState>>,
     backlight: Arc<Backlight>,
+    layout: Arc<Option<Box<dyn CompositorLink>>>,
 }
 
 impl KeyboardController {
@@ -76,11 +89,28 @@ impl KeyboardController {
     /// delegates to. `leds_root` (real default `/sys/class/leds`) is the lock-state sysfs
     /// fallback's root, injected rather than hardcoded (`docs/oblisk-tdd-test-harness.md`'s
     /// mandate, the same convention `sysinfo`'s `proc_root`/`hwmon_root` already established).
+    /// Layout picks one [`CompositorLink`] implementor via [`detect_compositor`]'s env-var probe
+    /// -- `None` (degraded, `active_layout` stays the empty-string default) if neither compositor
+    /// is detected.
     pub async fn new(system_bus: zbus::Connection, leds_root: &Path, events_tx: UnboundedSender<KeyboardSignal>) -> Self {
         let state = Arc::new(Mutex::new(KeyboardState::default()));
         let backlight = resolve_backlight(&system_bus, &state, events_tx.clone()).await;
-        resolve_locks(leds_root, &state, events_tx).await;
-        Self { state, backlight: Arc::new(backlight) }
+        resolve_locks(leds_root, &state, events_tx.clone()).await;
+        let layout: Option<Box<dyn CompositorLink>> = match detect_compositor() {
+            Some(CompositorKind::Hyprland) => {
+                let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").expect("detect_compositor already confirmed this env var is set");
+                Some(Box::new(HyprlandLink::new(signature, Arc::clone(&state), events_tx.clone())))
+            }
+            Some(CompositorKind::Niri) => NiriLink::new(Arc::clone(&state), events_tx.clone()).map(|link| Box::new(link) as Box<dyn CompositorLink>),
+            None => {
+                eprintln!("keyboard: neither HYPRLAND_INSTANCE_SIGNATURE nor NIRI_SOCKET is set; layout reporting disabled for this run");
+                None
+            }
+        };
+        if let Some(link) = &layout {
+            eprintln!("keyboard: detected {:?} for layout tracking", link.kind());
+        }
+        Self { state, backlight: Arc::new(backlight), layout: Arc::new(layout) }
     }
 
     /// `keyboard:set_backlight(pct)`. A silent no-op (logged once per call, matching
@@ -99,6 +129,17 @@ impl KeyboardController {
         // the same "state changes flow through the signal, not the write call" shape every other
         // controller in this codebase already uses (e.g. `BluetoothController::set_enabled`
         // doesn't touch `BluetoothState` itself either).
+    }
+
+    /// `keyboard:switch_layout(index)`. A no-op (logged) when neither compositor was detected --
+    /// same posture as `set_backlight`'s missing-hardware path. Synchronous, not `async`
+    /// (`CompositorLink::switch_layout` itself is synchronous, fire-and-forget -- see the
+    /// trait's own doc comment).
+    pub fn switch_layout(&self, index: usize) {
+        match self.layout.as_ref() {
+            Some(link) => link.switch_layout(index),
+            None => eprintln!("keyboard: switch_layout called but no compositor was detected; ignored"),
+        }
     }
 
     pub fn snapshot(&self) -> KeyboardState {
@@ -280,6 +321,22 @@ mod tests {
 
     #[test]
     fn keyboard_state_default_is_the_unavailable_sentinel() {
-        assert_eq!(KeyboardState::default(), KeyboardState { backlight_pct: -1, caps_lock: false, num_lock: false, scroll_lock: false });
+        assert_eq!(
+            KeyboardState::default(),
+            KeyboardState { backlight_pct: -1, caps_lock: false, num_lock: false, scroll_lock: false, active_layout: String::new(), active_layout_index: 0, layout_count: 0 }
+        );
+    }
+
+    #[test]
+    fn parse_switch_layout_args_reads_the_first_argument_as_an_index() {
+        let args = vec![serde_json::json!(1)];
+        assert_eq!(parse_switch_layout_args(&args), Some(1));
+    }
+
+    #[test]
+    fn parse_switch_layout_args_is_none_for_an_empty_or_wrong_typed_argument() {
+        assert_eq!(parse_switch_layout_args(&[]), None);
+        let args = vec![serde_json::json!("not a number")];
+        assert_eq!(parse_switch_layout_args(&args), None);
     }
 }

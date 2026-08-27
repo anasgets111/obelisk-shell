@@ -10,6 +10,7 @@ evdev = { version = "0.13.2", features = ["tokio"] }
 futures-util = "0.3.34"
 hound = "3.5.1"
 inotify = "0.11.5"
+niri-ipc = "26.4.0"
 nix = { version = "0.31.3", features = ["process", "signal", "user"] }
 nonstick = "0.1.2"
 pipewire = "0.10.1"

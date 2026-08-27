@@ -725,6 +725,15 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                         ),
                     }
                 }
+                RendererFrame::Command(envelope) if envelope.params.capability == "keyboard" && envelope.params.action == "switch_layout" => {
+                    match keyboard::parse_switch_layout_args(&envelope.params.arguments) {
+                        Some(index) => keyboard.switch_layout(index),
+                        None => eprintln!(
+                            "malformed keyboard.switch_layout command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
                 RendererFrame::Command(envelope) if envelope.params.capability == "updates" && envelope.params.action == "configure" => {
                     match updates::parse_configure_args(&envelope.params.arguments) {
                         Some(interval_secs) => updates.configure(interval_secs),
