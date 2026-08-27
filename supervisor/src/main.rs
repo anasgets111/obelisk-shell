@@ -8,6 +8,7 @@ mod reload;
 mod reload_link;
 mod snapshot;
 mod socket;
+mod updates;
 mod watcher;
 
 use std::collections::HashMap;
@@ -25,6 +26,7 @@ use hardware::idle::{self, IdleController};
 use hardware::keyboard::{self, KeyboardController, KeyboardSignal};
 use hardware::sysinfo::{self, SysinfoController, SysinfoSignal};
 use privacy::{PrivacyController, PrivacySignal};
+use updates::{UpdatesController, UpdatesSignal};
 use process::registry::{
     KillOutcome, LiveProcesses, kill_registered_process, process_run_args, reap_all_processes, reap_generations_processes,
     spawn_and_register_process, stream_process_output, take_exited_process, wait_and_report_exit,
@@ -36,7 +38,7 @@ use shared::{
 };
 use snapshot::{
     bump_revision, push_bluetooth_snapshot, push_keyboard_snapshot, push_network_snapshot, push_notifications_snapshot, push_privacy_snapshot, push_sysinfo_snapshot,
-    push_tray_snapshot,
+    push_tray_snapshot, push_updates_snapshot,
 };
 
 /// How long the Watcher waits after the *last* relevant `shell.lua` change before dispatching a
@@ -248,6 +250,14 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     let (privacy_signal_tx, mut privacy_signals) = tokio::sync::mpsc::unbounded_channel::<PrivacySignal>();
     let privacy = PrivacyController::new(PathBuf::from("/proc"), &PathBuf::from("/sys/class/video4linux"), video_sources, privacy_signal_tx);
 
+    // updates capability (docs/adr/0034): `alpm`-based Arch update checking and installation,
+    // fully separate from sysinfo's own scheduler (same interval-suspend-at-zero shape, zero
+    // shared code -- the ADR's own instruction). No D-Bus, no degrade-to-inert path -- a missing/
+    // unparseable /etc/pacman.conf degrades in place to an empty repo list, surfaced as
+    // `check_error` on the first check rather than failing construction.
+    let (updates_signal_tx, mut updates_signals) = tokio::sync::mpsc::unbounded_channel::<UpdatesSignal>();
+    let updates = UpdatesController::new(PathBuf::from("/etc/pacman.conf"), PathBuf::from("/var/lib/pacman"), updates_signal_tx);
+
     let config_dir = shared::config_dir()?;
     let mut reload_events = watcher::spawn_watcher(&config_dir, RELOAD_DEBOUNCE)?;
     let mut next_sequence: u64 = 0;
@@ -413,6 +423,12 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 // Same no-debounce, full-re-derive shape as sysinfo/keyboard above.
                 let state = privacy.snapshot();
                 push_privacy_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &state);
+            }
+            Some(UpdatesSignal::Changed) = updates_signals.recv() => {
+                // Same no-debounce, full-re-derive shape as sysinfo/keyboard/privacy above --
+                // fires after both a periodic check and an install's progress updates.
+                let state = updates.snapshot();
+                push_updates_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &state);
             }
             Some(()) = reload_events.recv() => {
                 next_sequence += 1;
@@ -708,6 +724,19 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                             envelope.params.generation_id, envelope.params.arguments
                         ),
                     }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "updates" && envelope.params.action == "configure" => {
+                    match updates::parse_configure_args(&envelope.params.arguments) {
+                        Some(interval_secs) => updates.configure(interval_secs),
+                        None => eprintln!(
+                            "malformed updates.configure command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "updates" && envelope.params.action == "install" => {
+                    let controller = updates.clone();
+                    tokio::spawn(async move { controller.install().await; });
                 }
                 RendererFrame::Command(envelope) if envelope.params.capability == "notifications" && envelope.params.action == "dismiss" => {
                     match notifications::parse_dismiss_args(&envelope.params.arguments) {

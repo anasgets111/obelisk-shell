@@ -10,6 +10,7 @@ use shared::SupervisorFrame;
 use crate::dbus::{bluetooth, network, notifications, tray};
 use crate::hardware::{keyboard, sysinfo};
 use crate::privacy;
+use crate::updates;
 use crate::{send_frame_logged, socket};
 
 /// Bumps and returns `capability`'s own state-version counter (ADR-0004; docs/adr/0029
@@ -173,5 +174,25 @@ pub(crate) fn push_privacy_snapshot(
             last_snapshots.insert("privacy".to_string(), snapshot);
         }
         Err(err) => eprintln!("failed to serialize privacy StateSnapshot: {err}"),
+    }
+}
+
+/// Bumps `"updates"`'s revision and pushes `state` as a fresh `StateSnapshot` to the
+/// authoritative generation -- mirrors [`push_privacy_snapshot`] exactly (docs/adr/0034).
+pub(crate) fn push_updates_snapshot(
+    registry: &socket::GenerationRegistry,
+    generation_id: u32,
+    revisions: &mut HashMap<String, u32>,
+    last_snapshots: &mut HashMap<String, shared::StateSnapshot>,
+    state: &updates::UpdatesState,
+) {
+    let revision = bump_revision(revisions, "updates");
+    match serde_json::to_value(state) {
+        Ok(payload) => {
+            let snapshot = shared::StateSnapshot { capability: "updates".to_string(), revision, payload };
+            send_frame_logged(registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
+            last_snapshots.insert("updates".to_string(), snapshot);
+        }
+        Err(err) => eprintln!("failed to serialize updates StateSnapshot: {err}"),
     }
 }

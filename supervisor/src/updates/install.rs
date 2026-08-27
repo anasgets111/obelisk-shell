@@ -1,0 +1,120 @@
+//! `updates:install()` for `oblisk.updates` (ADR-0034): runs `pkexec pacman -Syu --noconfirm`
+//! via `process::spawn_group_leader_piped`, routing privilege elevation through Oblisk's
+//! already-registered polkit agent (`dbus::polkit`, Phase 5) -- `pkexec` itself is what talks
+//! to polkit and triggers our own agent's interactive prompt, not a manual `CheckAuthorization`
+//! call from this code (ADR-0034: "routes through Oblisk's existing polkit agent... not a new
+//! escalation mechanism"). Runs the real system `pacman` against the real `/etc/pacman.conf`
+//! and `/var/lib/pacman` as root -- unlike `check.rs`'s read-only `alpm` sync against a
+//! throwaway copy, install is the real, system-modifying operation, so there is no throwaway
+//! anything here.
+//!
+//! Progress parsing (`parse_install_step`) is best-effort against pacman's well-known real
+//! stdout format (`"(2/5) installing nss (3.127-1 -> 3.128-1)"`) -- not independently
+//! live-verified end-to-end against a real privileged run in this session: an actual system
+//! upgrade is exactly the kind of hard-to-reverse action this session doesn't take without the
+//! user's own hands on the keyboard for the polkit password prompt. Same honestly-flagged-gap
+//! posture ADR-0034's own `alpm`/`fakeroot` verification already sets a precedent for ("not
+//! independently confirmed against libalpm's C source... flagged, not blocking") -- a wrong
+//! progress-line match only misses a cosmetic UI update, never affects whether the install
+//! itself succeeds (that's read from the real process exit status, not the parsed lines).
+
+/// One parsed `(current/total) installing|upgrading|reinstalling <package> ...` line from
+/// `pacman`'s real install-phase output. `None` for every other line (database-sync messages,
+/// download progress bars, blank lines) -- `run_install`'s reader just leaves the previous
+/// progress in place for those, rather than treating "didn't match" as an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallStep {
+    pub current: u32,
+    pub total: u32,
+    pub package: String,
+}
+
+pub fn parse_install_step(line: &str) -> Option<InstallStep> {
+    let rest = line.trim().strip_prefix('(')?;
+    let (counts, rest) = rest.split_once(')')?;
+    let (current, total) = counts.split_once('/')?;
+    let current: u32 = current.trim().parse().ok()?;
+    let total: u32 = total.trim().parse().ok()?;
+    let rest = rest.trim();
+    let rest = rest.strip_prefix("installing ").or_else(|| rest.strip_prefix("upgrading ")).or_else(|| rest.strip_prefix("reinstalling "))?;
+    let package = rest.split_whitespace().next()?.to_string();
+    Some(InstallStep { current, total, package })
+}
+
+/// Whether `package_names` includes a Linux kernel package (`linux`, or `linux-<variant>` such
+/// as `linux-lts`/`linux-zen`/`linux-hardened`) -- the common desktop-tooling heuristic for
+/// "this update needs a reboot to take effect" (ADR-0034's `rebootRequired`, borrowed from the
+/// dotfiles' `UpdateService.qml`). A heuristic, not an authoritative signal (a firmware or glibc
+/// update can also warrant a reboot without a kernel package being involved) -- documented as
+/// such, not treated as exhaustive.
+pub fn needs_reboot(package_names: &[String]) -> bool {
+    package_names.iter().any(|name| name == "linux" || name.starts_with("linux-"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- parse_install_step ----
+
+    #[test]
+    fn parse_install_step_reads_a_real_installing_line() {
+        let step = parse_install_step("(2/5) installing nss (3.127-1 -> 3.128-1)").expect("should parse");
+        assert_eq!(step, InstallStep { current: 2, total: 5, package: "nss".to_string() });
+    }
+
+    #[test]
+    fn parse_install_step_reads_an_upgrading_line() {
+        let step = parse_install_step("(1/3) upgrading ca-certificates-mozilla").expect("should parse");
+        assert_eq!(step, InstallStep { current: 1, total: 3, package: "ca-certificates-mozilla".to_string() });
+    }
+
+    #[test]
+    fn parse_install_step_reads_a_reinstalling_line() {
+        let step = parse_install_step("(1/1) reinstalling linux").expect("should parse");
+        assert_eq!(step, InstallStep { current: 1, total: 1, package: "linux".to_string() });
+    }
+
+    #[test]
+    fn parse_install_step_is_none_for_a_database_sync_line() {
+        assert!(parse_install_step(":: Synchronizing package databases...").is_none());
+    }
+
+    #[test]
+    fn parse_install_step_is_none_for_a_download_progress_line() {
+        assert!(parse_install_step("nss-3.128-1-x86_64  1811951 KiB  4.05 MiB/s 00:00:03 [#####] 100%").is_none());
+    }
+
+    #[test]
+    fn parse_install_step_is_none_for_a_blank_line() {
+        assert!(parse_install_step("").is_none());
+    }
+
+    #[test]
+    fn parse_install_step_is_none_for_malformed_counts() {
+        assert!(parse_install_step("(a/b) installing nss").is_none());
+    }
+
+    // ---- needs_reboot ----
+
+    #[test]
+    fn needs_reboot_is_true_for_the_base_linux_package() {
+        assert!(needs_reboot(&["linux".to_string(), "nss".to_string()]));
+    }
+
+    #[test]
+    fn needs_reboot_is_true_for_a_linux_variant_package() {
+        assert!(needs_reboot(&["linux-zen".to_string()]));
+    }
+
+    #[test]
+    fn needs_reboot_is_false_with_no_kernel_package() {
+        assert!(!needs_reboot(&["nss".to_string(), "gnome-autoar".to_string()]));
+    }
+
+    #[test]
+    fn needs_reboot_does_not_false_positive_on_a_name_merely_starting_with_linux() {
+        // No hyphen after "linux" -- not the kernel-variant naming convention, must not match.
+        assert!(!needs_reboot(&["linuxfoo".to_string()]));
+    }
+}
