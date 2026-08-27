@@ -37,8 +37,8 @@ use shared::{
     Zeroize,
 };
 use snapshot::{
-    bump_revision, push_bluetooth_snapshot, push_keyboard_snapshot, push_network_snapshot, push_notifications_snapshot, push_privacy_snapshot, push_sysinfo_snapshot,
-    push_tray_snapshot, push_updates_snapshot,
+    bump_revision, push_bluetooth_snapshot, push_keyboard_snapshot, push_mpris_snapshot, push_network_snapshot, push_notifications_snapshot, push_privacy_snapshot,
+    push_sysinfo_snapshot, push_tray_snapshot, push_updates_snapshot,
 };
 
 /// How long the Watcher waits after the *last* relevant `shell.lua` change before dispatching a
@@ -203,6 +203,20 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
         Err(err) => {
             eprintln!("notifications: failed to connect to the session bus; notifications server disabled for this run: {err}");
             NotificationsController::inert(notifications_signal_tx, sound_tx.clone())
+        }
+    };
+
+    // MPRIS (docs/oblisk-supervisor-services-dbus.md §3; ADR-0036): its own, separate session-bus
+    // connection, same reasoning as tray/notifications above -- a session-bus protocol, distinct
+    // from every system-bus controller. `MprisController::new` is not `async` (unlike
+    // `TrayController::new`/`NotificationsController::new`): it spawns discovery as a background
+    // task and returns immediately, same shape as `IdleController`/`SysinfoController`.
+    let (mpris_signal_tx, mut mpris_signals) = tokio::sync::mpsc::unbounded_channel::<dbus::mpris::MprisSignal>();
+    let mpris = match zbus::Connection::session().await {
+        Ok(mpris_connection) => dbus::mpris::MprisController::new(mpris_connection, mpris_signal_tx),
+        Err(err) => {
+            eprintln!("mpris: failed to connect to the session bus; player discovery disabled for this run: {err}");
+            dbus::mpris::MprisController::inert(mpris_signal_tx)
         }
     };
 
@@ -382,6 +396,14 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 // snapshot of already-live data, no further D-Bus round trip needed here.
                 let tray_state = tray.build_state();
                 push_tray_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &tray_state);
+            }
+            Some(dbus::mpris::MprisSignal::Changed) = mpris_signals.recv() => {
+                // No debounce (ADR-0036, matching tray/bluetooth/network's own precedent): every
+                // registry entry driving this signal is already fully recomputed by its own
+                // forwarder task before the signal was sent -- build_state is a synchronous
+                // snapshot of already-live data, no further D-Bus round trip needed here.
+                let mpris_state = mpris.build_state();
+                push_mpris_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &mpris_state);
             }
             Some(NotificationsSignal::Changed) = notifications_signals.recv() => {
                 // No debounce (ADR-0033, matching ADR-0029/0030/0031): every mutation (Notify,
@@ -730,6 +752,42 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                         Some(index) => keyboard.switch_layout(index),
                         None => eprintln!(
                             "malformed keyboard.switch_layout command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "mpris" && envelope.params.action == "control" => {
+                    match dbus::mpris::parse_control_args(&envelope.params.arguments) {
+                        Some((id, cmd)) => {
+                            let controller = mpris.clone();
+                            tokio::spawn(async move { controller.control(&id, &cmd).await; });
+                        }
+                        None => eprintln!(
+                            "malformed mpris.control command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "mpris" && envelope.params.action == "seek" => {
+                    match dbus::mpris::parse_seek_args(&envelope.params.arguments) {
+                        Some((id, pos_us)) => {
+                            let controller = mpris.clone();
+                            tokio::spawn(async move { controller.seek(&id, pos_us).await; });
+                        }
+                        None => eprintln!(
+                            "malformed mpris.seek command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "mpris" && envelope.params.action == "seek_relative" => {
+                    match dbus::mpris::parse_seek_relative_args(&envelope.params.arguments) {
+                        Some((id, off)) => {
+                            let controller = mpris.clone();
+                            tokio::spawn(async move { controller.seek_relative(&id, off).await; });
+                        }
+                        None => eprintln!(
+                            "malformed mpris.seek_relative command from generation {}: {:?}",
                             envelope.params.generation_id, envelope.params.arguments
                         ),
                     }

@@ -1,10 +1,11 @@
 //! NetworkManager, BlueZ, MPRIS, and Polkit D-Bus interfaces (build-steps.md §1). `polkit`
-//! (Phase 5), `network` (Phase 16), and `bluetooth` (docs/adr/0030) exist so far; MPRIS is a
-//! later phase. `idle` used to live here but moved to `hardware::idle` -- it's majority
+//! (Phase 5), `network` (Phase 16), `bluetooth` (docs/adr/0030), and `mpris` (docs/adr/0036)
+//! exist so far. `idle` used to live here but moved to `hardware::idle` -- it's majority
 //! Wayland-protocol code with one D-Bus proxy riding along, not a D-Bus interface in its own
 //! right (see `hardware/mod.rs`'s doc comment).
 
 pub mod bluetooth;
+pub mod mpris;
 pub mod network;
 pub mod notifications;
 pub mod polkit;

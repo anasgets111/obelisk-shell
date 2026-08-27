@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use shared::SupervisorFrame;
 
-use crate::dbus::{bluetooth, network, notifications, tray};
+use crate::dbus::{bluetooth, mpris, network, notifications, tray};
 use crate::hardware::{keyboard, sysinfo};
 use crate::privacy;
 use crate::updates;
@@ -87,6 +87,28 @@ pub(crate) fn push_tray_snapshot(
             last_snapshots.insert("tray".to_string(), snapshot);
         }
         Err(err) => eprintln!("failed to serialize tray StateSnapshot: {err}"),
+    }
+}
+
+/// Bumps `"mpris"`'s revision and pushes `state` as a fresh `StateSnapshot` to the authoritative
+/// generation -- mirrors [`push_tray_snapshot`] exactly (ADR-0036 needs zero new plumbing beyond
+/// a fresh capability name flowing through ADR-0029's already-generic `revisions`/
+/// `last_snapshots` maps).
+pub(crate) fn push_mpris_snapshot(
+    registry: &socket::GenerationRegistry,
+    generation_id: u32,
+    revisions: &mut HashMap<String, u32>,
+    last_snapshots: &mut HashMap<String, shared::StateSnapshot>,
+    state: &mpris::MprisState,
+) {
+    let revision = bump_revision(revisions, "mpris");
+    match serde_json::to_value(state) {
+        Ok(payload) => {
+            let snapshot = shared::StateSnapshot { capability: "mpris".to_string(), revision, payload };
+            send_frame_logged(registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
+            last_snapshots.insert("mpris".to_string(), snapshot);
+        }
+        Err(err) => eprintln!("failed to serialize mpris StateSnapshot: {err}"),
     }
 }
 
