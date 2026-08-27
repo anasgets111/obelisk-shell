@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use dbus::bluetooth::{self, BluetoothController, BluetoothSignal};
-use dbus::network::{self, NetworkController, NetworkSignal, PendingNetworkConnect};
+use dbus::network::{self, NetworkController, NetworkSignal};
 use dbus::notifications::{self, NotificationsController, NotificationsSignal};
 use dbus::polkit::{AGENT_OBJECT_PATH, AuthenticationAgent, current_session_subject, register_agent};
 use dbus::tray::{self, TrayController, TraySignal};
@@ -27,19 +27,12 @@ use hardware::keyboard::{self, KeyboardController, KeyboardSignal};
 use hardware::sysinfo::{self, SysinfoController, SysinfoSignal};
 use privacy::{PrivacyController, PrivacySignal};
 use updates::{UpdatesController, UpdatesSignal};
-use process::registry::{
-    KillOutcome, LiveProcesses, kill_registered_process, process_run_args, reap_all_processes, reap_generations_processes,
-    spawn_and_register_process, stream_process_output, take_exited_process, wait_and_report_exit,
-};
+use process::registry::{LiveProcesses, reap_all_processes, reap_generations_processes, take_exited_process, wait_and_report_exit};
 use reload_link::SocketCandidateLink;
 use shared::{
-    ApplyPendingReload, DeselectInput, ProcessExited, PromoteGeneration, RendererFrame, ReevaluateReport, ReevaluateRequest, SupervisorFrame,
-    Zeroize,
+    ApplyPendingReload, DeselectInput, PromoteGeneration, RendererFrame, ReevaluateReport, ReevaluateRequest, SupervisorFrame, Zeroize,
 };
-use snapshot::{
-    bump_revision, push_bluetooth_snapshot, push_keyboard_snapshot, push_mpris_snapshot, push_network_snapshot, push_notifications_snapshot, push_privacy_snapshot,
-    push_sysinfo_snapshot, push_tray_snapshot, push_updates_snapshot,
-};
+use snapshot::push_snapshot;
 
 /// How long the Watcher waits after the *last* relevant `shell.lua` change before dispatching a
 /// reload -- coalesces an editor's multi-event save into a single round trip. Fixed, not
@@ -82,6 +75,21 @@ fn send_frame_logged(registry: &socket::GenerationRegistry, generation_id: u32, 
     if let Err(err) = registry.send_frame(generation_id, frame) {
         eprintln!("failed to push {frame:?} to generation {generation_id}: {err}");
     }
+}
+
+/// The one malformed-arguments log line every capability's `dispatch` adapter shares (ADR-0037)
+/// -- same wording the old per-arm `eprintln!`s each hand-rolled.
+pub(crate) fn log_malformed_command(params: &shared::CommandParams) {
+    eprintln!(
+        "malformed {}.{} command from generation {}: {:?}",
+        params.capability, params.action, params.generation_id, params.arguments
+    );
+}
+
+/// [`log_malformed_command`]'s sibling for a `dispatch` adapter's unmatched-action fallback --
+/// the capability name comes from the envelope, not a hand-typed prefix.
+pub(crate) fn log_unknown_action(params: &shared::CommandParams) {
+    eprintln!("{}: unknown action {:?} from generation {}", params.capability, params.action, params.generation_id);
 }
 
 /// Resolves the Renderer binary's path as a sibling of the currently-running Supervisor binary
@@ -133,29 +141,19 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     // before `socket::spawn_listener` runs further down -- any push that lands before the boot
     // Renderer's connection registers gets replayed once it does, by the `connected.recv()` arm
     // in this function's main loop (see `send_frame_logged`'s doc comment).
-    let network = NetworkController::new(connection.clone()).await?;
-    // The Wi-Fi signal forwarder task (see its own doc comment for why this is a separate task
-    // rather than raw signal streams merged directly into this function's own `select!`) needs
-    // its own clone of the sender; `network_signal_tx` is kept alive here even when there's no
-    // Wi-Fi device so the channel never closes (a closed channel would make `.recv()` resolve to
-    // `None` on every poll below, busy-looping that arm instead of idling).
+    // The channel is threaded into the constructor (ADR-0037, matching BluetoothController's
+    // shape below): the controller spawns the Wi-Fi signal forwarder itself and keeps a sender
+    // clone alive even when there's no Wi-Fi device, so the channel never closes (a closed
+    // channel would make `.recv()` resolve to `None` on every poll below, busy-looping that arm
+    // instead of idling).
     let (network_signal_tx, mut network_signals) = tokio::sync::mpsc::unbounded_channel::<NetworkSignal>();
-    match network.wifi_signal_source() {
-        Some(wireless) => network::spawn_wifi_signal_forwarder(wireless, network_signal_tx),
-        None => {
-            eprintln!("network: no Wi-Fi device found; scan/access-point events are disabled for this session");
-        }
-    }
-    let mut network_state = network::NetworkState::default();
+    let network = NetworkController::new(connection.clone(), network_signal_tx).await?;
 
-    // BlueZ runs on the same system bus too (docs/adr/0030). Unlike NetworkController, the
-    // channel is threaded into the constructor itself rather than exposed via a
-    // `*_signal_source()` getter spawned separately afterward -- see BluetoothController::new's
-    // own doc comment for why (startup hydration itself needs it, not just the forwarders spawned
-    // after construction).
+    // BlueZ runs on the same system bus too (docs/adr/0030). The channel is threaded into the
+    // constructor -- see BluetoothController::new's own doc comment for why (startup hydration
+    // itself needs it, not just the forwarders spawned after construction).
     let (bluetooth_signal_tx, mut bluetooth_signals) = tokio::sync::mpsc::unbounded_channel::<BluetoothSignal>();
     let bluetooth = BluetoothController::new(connection.clone(), bluetooth_signal_tx).await;
-    let mut bluetooth_state = bluetooth::BluetoothState::default();
 
     // The tray host is a *session*-bus protocol (org.kde.StatusNotifierItem/Watcher and
     // com.canonical.dbusmenu are session-bus conventions by construction -- every real tray item,
@@ -304,10 +302,6 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     // UI to disambiguate between concurrent auth prompts, so keeping only the latest is the
     // correct minimal behavior, not a missing feature.
     let mut pending_challenge: Option<dbus::polkit::BeginAuthenticationCall> = None;
-    // The most recently received network:connect(ssid, hidden) intent awaiting a matching
-    // secure_submit(network, connect) reply, if any -- mirrors `pending_challenge` above
-    // (ADR-0028's pattern, extended to network by ADR-0029).
-    let mut pending_network_connect: Option<PendingNetworkConnect> = None;
 
     // Every `process.run`-spawned child still tracked (docs/adr/0026), plus the channel
     // `stream_process_output`'s background tasks use to report a naturally-exited process back to
@@ -352,42 +346,17 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 }
             }
             Some(apps) = audio_apps.recv() => {
-                let revision = bump_revision(&mut revisions, "audio");
-                match serde_json::to_value(&apps) {
-                    Ok(payload) => {
-                        let snapshot = shared::StateSnapshot { capability: "audio".to_string(), revision, payload };
-                        send_frame_logged(&registry, authoritative.generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
-                        last_snapshots.insert("audio".to_string(), snapshot);
-                    }
-                    Err(err) => eprintln!("failed to serialize audio StateSnapshot: {err}"),
-                }
+                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "audio", &apps);
             }
             Some(signal) = network_signals.recv() => {
-                // No debounce (docs/adr/0029): every relevant event fully re-derives the AP list
-                // from scratch and pushes a fresh StateSnapshot, even a burst of several in a
-                // row from one completed scan -- `revision` already makes an intermediate push
-                // harmless.
-                if signal == NetworkSignal::ScanCompleted {
-                    network_state.scanning = false;
-                }
-                network_state.available_networks = network.build_available_networks().await;
-                push_network_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &network_state);
+                // The controller owns the signal's state semantics (ADR-0037) -- this arm only
+                // pushes whatever state the signal produced.
+                let state = network.handle_signal(signal).await;
+                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "network", &state);
             }
             Some(signal) = bluetooth_signals.recv() => {
-                // No debounce (docs/adr/0030, matching ADR-0029): every relevant event fully
-                // re-derives the affected part of the state from scratch.
-                match signal {
-                    BluetoothSignal::AdapterChanged => {
-                        bluetooth_state.enabled = bluetooth.read_enabled().await;
-                        bluetooth_state.discovering = bluetooth.read_discovering().await;
-                    }
-                    BluetoothSignal::DeviceRegistryChanged => {
-                        let (connected_devices, discovered_devices) = bluetooth.build_device_lists().await;
-                        bluetooth_state.connected_devices = connected_devices;
-                        bluetooth_state.discovered_devices = discovered_devices;
-                    }
-                }
-                push_bluetooth_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &bluetooth_state);
+                let state = bluetooth.handle_signal(signal).await;
+                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "bluetooth", &state);
             }
             Some(TraySignal::RegistryChanged) = tray_signals.recv() => {
                 // No debounce (docs/adr/0031, matching ADR-0029/0030): the registry entry
@@ -395,7 +364,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 // sent it (see dbus::tray's module doc comment) -- build_state is a synchronous
                 // snapshot of already-live data, no further D-Bus round trip needed here.
                 let tray_state = tray.build_state();
-                push_tray_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &tray_state);
+                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "tray", &tray_state);
             }
             Some(dbus::mpris::MprisSignal::Changed) = mpris_signals.recv() => {
                 // No debounce (ADR-0036, matching tray/bluetooth/network's own precedent): every
@@ -403,7 +372,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 // forwarder task before the signal was sent -- build_state is a synchronous
                 // snapshot of already-live data, no further D-Bus round trip needed here.
                 let mpris_state = mpris.build_state();
-                push_mpris_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &mpris_state);
+                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "mpris", &mpris_state);
             }
             Some(NotificationsSignal::Changed) = notifications_signals.recv() => {
                 // No debounce (ADR-0033, matching ADR-0029/0030/0031): every mutation (Notify,
@@ -411,7 +380,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 // notifications.feed/notifications.dnd from already-live state -- build_state is a
                 // synchronous snapshot, no further D-Bus round trip needed here.
                 let notifications_state = notifications.build_state();
-                push_notifications_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &notifications_state);
+                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "notifications", &notifications_state);
             }
             Some(event) = idle_signals.recv() => {
                 // Unlike tray/network/bluetooth (always pushed to the single authoritative
@@ -433,24 +402,24 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 // lock -- this arm only needs to clone the current combined state and push it
                 // (docs/adr/0035).
                 let state = sysinfo.snapshot();
-                push_sysinfo_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &state);
+                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "sysinfo", &state);
             }
             Some(KeyboardSignal::Changed) = keyboard_signals.recv() => {
                 // Same no-debounce, full-re-derive shape as sysinfo above -- the backlight
                 // forwarder already wrote `backlight_pct` under its own lock before signaling.
                 let state = keyboard.snapshot();
-                push_keyboard_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &state);
+                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "keyboard", &state);
             }
             Some(PrivacySignal::Changed) = privacy_signals.recv() => {
                 // Same no-debounce, full-re-derive shape as sysinfo/keyboard above.
                 let state = privacy.snapshot();
-                push_privacy_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &state);
+                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "privacy", &state);
             }
             Some(UpdatesSignal::Changed) = updates_signals.recv() => {
                 // Same no-debounce, full-re-derive shape as sysinfo/keyboard/privacy above --
                 // fires after both a periodic check and an install's progress updates.
                 let state = updates.snapshot();
-                push_updates_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &state);
+                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "updates", &state);
             }
             Some(()) = reload_events.recv() => {
                 next_sequence += 1;
@@ -464,392 +433,22 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 }
             }
             Some(inbound) = inbound_frames.recv() => match inbound.frame {
-                RendererFrame::Command(envelope) if envelope.params.capability == "process" && envelope.params.action == "run" => {
-                    let generation_id = envelope.params.generation_id;
-                    let id = envelope.id;
-                    match process_run_args(&envelope.params.arguments) {
-                        Some((cmd, args)) => match spawn_and_register_process(&mut processes, generation_id, id, &cmd, &args) {
-                            Some((stdout, stderr)) => {
-                                let task_registry = registry.clone();
-                                let task_done_tx = process_done_tx.clone();
-                                tokio::spawn(async move {
-                                    stream_process_output(&task_registry, generation_id, id, stdout, stderr).await;
-                                    let _ = task_done_tx.send((generation_id, id));
-                                });
-                            }
-                            None => {
-                                send_frame_logged(&registry, generation_id, &SupervisorFrame::ProcessExited(ProcessExited { id, code: None }));
-                            }
-                        },
-                        None => {
-                            eprintln!("malformed process.run command from generation {generation_id}: {:?}", envelope.params.arguments);
-                            // Lua's ProcessHandle is already waiting on `id`'s exit_cb -- with no
-                            // process ever spawned, nothing else will ever report this id done, so
-                            // this is what stops it leaking `pending`'s callback pair forever on
-                            // the Renderer side (Correctness review, docs/adr/0026 addendum).
-                            send_frame_logged(&registry, generation_id, &SupervisorFrame::ProcessExited(ProcessExited { id, code: None }));
-                        }
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "process" && envelope.params.action == "kill" => {
-                    let generation_id = envelope.params.generation_id;
-                    let id = envelope.id;
-                    match kill_registered_process(&mut processes, generation_id, id).await {
-                        KillOutcome::Reaped(code) => {
-                            send_frame_logged(&registry, generation_id, &SupervisorFrame::ProcessExited(ProcessExited { id, code }));
-                        }
-                        KillOutcome::ReapFailed => {
-                            // The registry entry is already removed by this point (see
-                            // kill_registered_process) and the OS-level reap failure is already
-                            // logged -- no future event will ever report this id done, so this is
-                            // what stops it leaking `pending`'s callback pair forever on the
-                            // Renderer side (Correctness review, docs/adr/0026 addendum). The real
-                            // exit code is unknowable here; `None` is honest, not synthesized.
-                            send_frame_logged(&registry, generation_id, &SupervisorFrame::ProcessExited(ProcessExited { id, code: None }));
-                        }
-                        KillOutcome::NotRegistered => {}
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "network" && envelope.params.action == "set_networking_enabled" => {
-                    match network::parse_bool_arg(&envelope.params.arguments) {
-                        Some(enabled) => {
-                            let controller = network.clone();
-                            tokio::spawn(async move { controller.set_networking_enabled(enabled).await; });
-                        }
-                        None => eprintln!(
-                            "malformed network.set_networking_enabled command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "network" && envelope.params.action == "set_wifi_enabled" => {
-                    match network::parse_bool_arg(&envelope.params.arguments) {
-                        Some(enabled) => {
-                            let controller = network.clone();
-                            tokio::spawn(async move { controller.set_wifi_enabled(enabled).await; });
-                        }
-                        None => eprintln!(
-                            "malformed network.set_wifi_enabled command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "network" && envelope.params.action == "set_ethernet_enabled" => {
-                    match network::parse_bool_arg(&envelope.params.arguments) {
-                        Some(enabled) => {
-                            let controller = network.clone();
-                            tokio::spawn(async move { controller.set_ethernet_enabled(enabled).await; });
-                        }
-                        None => eprintln!(
-                            "malformed network.set_ethernet_enabled command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "network" && envelope.params.action == "scan" => {
-                    // "network.scanning" flips to true on initiation, not once RequestScan's
-                    // D-Bus round trip completes (docs/oblisk-supervisor-services-dbus.md §4.2)
-                    // -- the actual call is what ADR-0029 says must be tokio::spawn'ed, not this
-                    // local state flip. Only when a Wi-Fi device actually exists, though
-                    // (Correctness review): with none, `NetworkController::scan` silently no-ops
-                    // and no `ScanCompleted` signal will ever arrive (no wifi_signal_forwarder was
-                    // spawned for this session either) to flip `scanning` back to `false` --
-                    // leaving it stuck `true` forever.
-                    if network.has_wifi_device() {
-                        network_state.scanning = true;
-                        push_network_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &network_state);
-                    }
-                    let controller = network.clone();
-                    tokio::spawn(async move { controller.scan().await; });
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "network" && envelope.params.action == "connect" => {
-                    match network::parse_connect_args(&envelope.params.arguments) {
-                        Some((ssid, hidden)) => pending_network_connect = Some(PendingNetworkConnect { ssid, hidden }),
-                        None => eprintln!(
-                            "malformed network.connect command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "network" && envelope.params.action == "forget" => {
-                    match network::parse_ssid_arg(&envelope.params.arguments) {
-                        Some(ssid) => {
-                            let controller = network.clone();
-                            tokio::spawn(async move { controller.forget(&ssid).await; });
-                        }
-                        None => eprintln!(
-                            "malformed network.forget command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "bluetooth" && envelope.params.action == "set_enabled" => {
-                    match bluetooth::parse_bool_arg(&envelope.params.arguments) {
-                        Some(enabled) => {
-                            let controller = bluetooth.clone();
-                            tokio::spawn(async move { controller.set_enabled(enabled).await; });
-                        }
-                        None => eprintln!(
-                            "malformed bluetooth.set_enabled command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "bluetooth" && envelope.params.action == "start_discovery" => {
-                    // discovered_devices clears immediately, before the D-Bus call's own
-                    // completion (docs/adr/0030, matching NM's scanning = true immediate-flip
-                    // pattern) -- the actual StartDiscovery call is what must be tokio::spawn'ed,
-                    // not this local state flip.
-                    bluetooth_state.discovered_devices = Vec::new();
-                    push_bluetooth_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &bluetooth_state);
-                    let controller = bluetooth.clone();
-                    tokio::spawn(async move { controller.start_discovery().await; });
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "bluetooth" && envelope.params.action == "stop_discovery" => {
-                    // The last discovered_devices snapshot stays visible (docs/adr/0030) -- no
-                    // local state mutation here, only the D-Bus call.
-                    let controller = bluetooth.clone();
-                    tokio::spawn(async move { controller.stop_discovery().await; });
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "bluetooth" && envelope.params.action == "pair" => {
-                    match bluetooth::parse_mac_arg(&envelope.params.arguments) {
-                        Some(mac) => {
-                            let controller = bluetooth.clone();
-                            tokio::spawn(async move { controller.pair(&mac).await; });
-                        }
-                        None => eprintln!(
-                            "malformed bluetooth.pair command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "bluetooth" && envelope.params.action == "connect" => {
-                    match bluetooth::parse_mac_arg(&envelope.params.arguments) {
-                        Some(mac) => {
-                            let controller = bluetooth.clone();
-                            tokio::spawn(async move { controller.connect(&mac).await; });
-                        }
-                        None => eprintln!(
-                            "malformed bluetooth.connect command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "bluetooth" && envelope.params.action == "disconnect" => {
-                    match bluetooth::parse_mac_arg(&envelope.params.arguments) {
-                        Some(mac) => {
-                            let controller = bluetooth.clone();
-                            tokio::spawn(async move { controller.disconnect(&mac).await; });
-                        }
-                        None => eprintln!(
-                            "malformed bluetooth.disconnect command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "bluetooth" && envelope.params.action == "forget" => {
-                    match bluetooth::parse_mac_arg(&envelope.params.arguments) {
-                        Some(mac) => {
-                            let controller = bluetooth.clone();
-                            tokio::spawn(async move { controller.forget(&mac).await; });
-                        }
-                        None => eprintln!(
-                            "malformed bluetooth.forget command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "tray" && envelope.params.action == "activate" => {
-                    match tray::parse_activate_args(&envelope.params.arguments) {
-                        Some((id, x, y)) => {
-                            let controller = tray.clone();
-                            tokio::spawn(async move { controller.activate(&id, x, y).await; });
-                        }
-                        None => eprintln!(
-                            "malformed tray.activate command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "tray" && envelope.params.action == "activate_menu_item" => {
-                    match tray::parse_activate_menu_item_args(&envelope.params.arguments) {
-                        Some((id, menu_item_id)) => {
-                            let controller = tray.clone();
-                            tokio::spawn(async move { controller.activate_menu_item(&id, menu_item_id).await; });
-                        }
-                        None => eprintln!(
-                            "malformed tray.activate_menu_item command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "tray" && envelope.params.action == "menu_will_show" => {
-                    match tray::parse_menu_will_show_args(&envelope.params.arguments) {
-                        Some((id, submenu_id)) => {
-                            let controller = tray.clone();
-                            tokio::spawn(async move { controller.menu_will_show(&id, submenu_id).await; });
-                        }
-                        None => eprintln!(
-                            "malformed tray.menu_will_show command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "idle" && envelope.params.action == "register" => {
-                    match idle::parse_register_args(&envelope.params.arguments) {
-                        Some(sec) => {
-                            let controller = idle.clone();
-                            let generation_id = envelope.params.generation_id;
-                            tokio::spawn(async move { controller.register_threshold(generation_id, sec).await; });
-                        }
-                        None => eprintln!(
-                            "malformed idle.register command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "idle" && envelope.params.action == "inhibit" => {
-                    match idle::parse_inhibit_args(&envelope.params.arguments) {
-                        Some(reason) => {
-                            let controller = idle.clone();
-                            let generation_id = envelope.params.generation_id;
-                            tokio::spawn(async move { controller.inhibit(generation_id, &reason).await; });
-                        }
-                        None => eprintln!(
-                            "malformed idle.inhibit command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "idle" && envelope.params.action == "release_inhibit" => {
-                    let controller = idle.clone();
-                    let generation_id = envelope.params.generation_id;
-                    tokio::spawn(async move { controller.release_inhibit(generation_id).await; });
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "sysinfo" && envelope.params.action == "configure" => {
-                    match sysinfo::parse_configure_args(&envelope.params.arguments) {
-                        Some(cfg) => sysinfo.configure(cfg),
-                        None => eprintln!(
-                            "malformed sysinfo.configure command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "keyboard" && envelope.params.action == "set_backlight" => {
-                    match keyboard::parse_set_backlight_args(&envelope.params.arguments) {
-                        Some(pct) => {
-                            let controller = keyboard.clone();
-                            tokio::spawn(async move { controller.set_backlight(pct).await; });
-                        }
-                        None => eprintln!(
-                            "malformed keyboard.set_backlight command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "keyboard" && envelope.params.action == "switch_layout" => {
-                    match keyboard::parse_switch_layout_args(&envelope.params.arguments) {
-                        Some(index) => keyboard.switch_layout(index),
-                        None => eprintln!(
-                            "malformed keyboard.switch_layout command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "mpris" && envelope.params.action == "control" => {
-                    match dbus::mpris::parse_control_args(&envelope.params.arguments) {
-                        Some((id, cmd)) => {
-                            let controller = mpris.clone();
-                            tokio::spawn(async move { controller.control(&id, &cmd).await; });
-                        }
-                        None => eprintln!(
-                            "malformed mpris.control command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "mpris" && envelope.params.action == "seek" => {
-                    match dbus::mpris::parse_seek_args(&envelope.params.arguments) {
-                        Some((id, pos_us)) => {
-                            let controller = mpris.clone();
-                            tokio::spawn(async move { controller.seek(&id, pos_us).await; });
-                        }
-                        None => eprintln!(
-                            "malformed mpris.seek command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "mpris" && envelope.params.action == "seek_relative" => {
-                    match dbus::mpris::parse_seek_relative_args(&envelope.params.arguments) {
-                        Some((id, off)) => {
-                            let controller = mpris.clone();
-                            tokio::spawn(async move { controller.seek_relative(&id, off).await; });
-                        }
-                        None => eprintln!(
-                            "malformed mpris.seek_relative command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "updates" && envelope.params.action == "configure" => {
-                    match updates::parse_configure_args(&envelope.params.arguments) {
-                        Some(interval_secs) => updates.configure(interval_secs),
-                        None => eprintln!(
-                            "malformed updates.configure command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "updates" && envelope.params.action == "install" => {
-                    let controller = updates.clone();
-                    tokio::spawn(async move { controller.install().await; });
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "notifications" && envelope.params.action == "dismiss" => {
-                    match notifications::parse_dismiss_args(&envelope.params.arguments) {
-                        Some(id) => {
-                            let controller = notifications.clone();
-                            tokio::spawn(async move { controller.dismiss(id).await; });
-                        }
-                        None => eprintln!(
-                            "malformed notifications.dismiss command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "notifications" && envelope.params.action == "reply" => {
-                    match notifications::parse_reply_args(&envelope.params.arguments) {
-                        Some((id, text)) => {
-                            let controller = notifications.clone();
-                            tokio::spawn(async move { controller.reply(id, text).await; });
-                        }
-                        None => eprintln!(
-                            "malformed notifications.reply command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "notifications" && envelope.params.action == "set_sound" => {
-                    match notifications::parse_set_sound_args(&envelope.params.arguments) {
-                        Some((urgency, path)) => notifications.set_sound(urgency, &path),
-                        None => eprintln!(
-                            "malformed notifications.set_sound command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) if envelope.params.capability == "notifications" && envelope.params.action == "set_dnd" => {
-                    match dbus::parse_bool_arg(&envelope.params.arguments) {
-                        Some(enabled) => notifications.set_dnd(enabled),
-                        None => eprintln!(
-                            "malformed notifications.set_dnd command from generation {}: {:?}",
-                            envelope.params.generation_id, envelope.params.arguments
-                        ),
-                    }
-                }
-                RendererFrame::Command(envelope) => {
-                    eprintln!("inbound command from generation {}: {:?}", inbound.generation_id, envelope);
-                }
+                RendererFrame::Command(envelope) => match envelope.params.capability.as_str() {
+                    // One arm per capability: each capability's own `dispatch` adapter owns its
+                    // action match, argument parse, and write-action spawn (ADR-0037), so a new
+                    // action never touches this file. Static calls, no registry, no trait.
+                    "process" => process::registry::dispatch(&mut processes, &registry, &process_done_tx, &envelope).await,
+                    "network" => network::dispatch(&network, &envelope),
+                    "bluetooth" => bluetooth::dispatch(&bluetooth, &envelope),
+                    "tray" => tray::dispatch(&tray, &envelope),
+                    "idle" => idle::dispatch(&idle, &envelope),
+                    "sysinfo" => sysinfo::dispatch(&sysinfo, &envelope),
+                    "keyboard" => keyboard::dispatch(&keyboard, &envelope),
+                    "mpris" => dbus::mpris::dispatch(&mpris, &envelope),
+                    "updates" => updates::dispatch(&updates, &envelope),
+                    "notifications" => notifications::dispatch(&notifications, &envelope),
+                    _ => eprintln!("inbound command from generation {}: {:?}", inbound.generation_id, envelope),
+                },
                 RendererFrame::ReadySignal(_) | RendererFrame::PresentationEvidence(_) => {
                     // Both only matter mid-handshake, where `SocketCandidateLink` reads them
                     // directly off `inbound_frames` itself (see `TopologyChanged` below, and
@@ -972,7 +571,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                     // wpa-psk password (NetworkController::connect decides which). Must come
                     // before the catch-all SecureSubmit arm below, same ordering reason as the
                     // polkit arm.
-                    match pending_network_connect.take() {
+                    match network.take_connect_intent() {
                         Some(pending) => {
                             // mem::take moves the plaintext bytes out for NetworkController::connect
                             // to own and zeroize on every return path (see its own doc comment) --

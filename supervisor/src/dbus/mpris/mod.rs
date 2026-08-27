@@ -26,4 +26,36 @@ pub mod player;
 pub mod proxies;
 pub mod watcher;
 
-pub use controller::{MprisController, MprisSignal, MprisState, parse_control_args, parse_seek_args, parse_seek_relative_args};
+pub use controller::{MprisController, MprisSignal, parse_control_args, parse_seek_args, parse_seek_relative_args};
+
+/// `oblisk.mpris`'s action dispatch (ADR-0037): owns the action match, argument parse, and
+/// write-action spawn for every `mpris` `CommandEnvelope` -- `main.rs` routes the whole
+/// capability here with one arm. Write actions are `tokio::spawn`ed rather than awaited inline
+/// (ADR-0036/ADR-0029).
+pub fn dispatch(controller: &MprisController, envelope: &shared::CommandEnvelope) {
+    let params = &envelope.params;
+    match params.action.as_str() {
+        "control" => match parse_control_args(&params.arguments) {
+            Some((id, cmd)) => {
+                let controller = controller.clone();
+                tokio::spawn(async move { controller.control(&id, &cmd).await; });
+            }
+            None => crate::log_malformed_command(params),
+        },
+        "seek" => match parse_seek_args(&params.arguments) {
+            Some((id, pos_us)) => {
+                let controller = controller.clone();
+                tokio::spawn(async move { controller.seek(&id, pos_us).await; });
+            }
+            None => crate::log_malformed_command(params),
+        },
+        "seek_relative" => match parse_seek_relative_args(&params.arguments) {
+            Some((id, off)) => {
+                let controller = controller.clone();
+                tokio::spawn(async move { controller.seek_relative(&id, off).await; });
+            }
+            None => crate::log_malformed_command(params),
+        },
+        _ => crate::log_unknown_action(params),
+    }
+}

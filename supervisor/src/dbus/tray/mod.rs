@@ -121,6 +121,38 @@ pub fn parse_menu_will_show_args(arguments: &[serde_json::Value]) -> Option<(Str
     parse_activate_menu_item_args(arguments)
 }
 
+/// `oblisk.tray`'s action dispatch (ADR-0037): owns the action match, argument parse, and
+/// write-action spawn for every `tray` `CommandEnvelope` -- `main.rs` routes the whole
+/// capability here with one arm. Write actions are `tokio::spawn`ed rather than awaited inline
+/// (ADR-0031/ADR-0029).
+pub fn dispatch(controller: &TrayController, envelope: &shared::CommandEnvelope) {
+    let params = &envelope.params;
+    match params.action.as_str() {
+        "activate" => match parse_activate_args(&params.arguments) {
+            Some((id, x, y)) => {
+                let controller = controller.clone();
+                tokio::spawn(async move { controller.activate(&id, x, y).await; });
+            }
+            None => crate::log_malformed_command(params),
+        },
+        "activate_menu_item" => match parse_activate_menu_item_args(&params.arguments) {
+            Some((id, menu_item_id)) => {
+                let controller = controller.clone();
+                tokio::spawn(async move { controller.activate_menu_item(&id, menu_item_id).await; });
+            }
+            None => crate::log_malformed_command(params),
+        },
+        "menu_will_show" => match parse_menu_will_show_args(&params.arguments) {
+            Some((id, submenu_id)) => {
+                let controller = controller.clone();
+                tokio::spawn(async move { controller.menu_will_show(&id, submenu_id).await; });
+            }
+            None => crate::log_malformed_command(params),
+        },
+        _ => crate::log_unknown_action(params),
+    }
+}
+
 
 /// Shared by every submodule's own `#[cfg(test)]` -- see [`p2p_pair`] for why this lives here
 /// instead of being copied into each one.

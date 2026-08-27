@@ -160,8 +160,8 @@ struct RendererClient {
     scene: Scene,
     shaping: ShapingHandle,
     /// One live Lua signal per capability seen so far, keyed by `StateSnapshot.capability`
-    /// (docs/adr/0029) -- `"audio"`, `"network"`, `"bluetooth"`, and `"tray"` are seeded at
-    /// construction (see `new`'s doc comment); any other capability's global is registered
+    /// (docs/adr/0029) -- every `shared::CAPABILITIES` roster name is seeded at construction
+    /// (ADR-0037; see `new`'s doc comment); an unrostered capability's global is registered
     /// lazily, on the first `StateSnapshot` that names it, by `apply_state_snapshot`. `RefCell`,
     /// not `&mut self`: `apply_state_snapshot` is called through a `&self` receiver (see its own
     /// doc comment for why), and this is the one piece of `RendererClient` state that read path
@@ -188,51 +188,39 @@ struct DispatchChannels<'a> {
 }
 
 impl RendererClient {
-    // 10 parameters: one more than the pre-tray shape now that `tray`, like `audio`/`network`/
-    // `bluetooth`, is pre-seeded (docs/adr/0031 -- the NetworkManager PR initially missed
-    // pre-seeding "network" and it was caught in review as a real spec gap; not repeating that
-    // miss here) -- not worth inventing a bundling struct for a one-off constructor already
-    // called from exactly two places (`run` and this module's own `test_client`).
-    #[allow(clippy::too_many_arguments)]
+    /// Every `shared::CAPABILITIES` roster name is pre-seeded here (not left to
+    /// `apply_state_snapshot`'s lazy path) so a `shell.lua` that reads any rostered capability's
+    /// global before its first real push still gets a live signal (reading `nil` inside it)
+    /// instead of an undefined-global Lua error and rescue -- ADR-0037's uniform
+    /// nil-until-hydrated contract. The previous hand-listed four-name seed (audio/network/
+    /// bluetooth/tray) froze at ADR-0031 while six more capabilities landed, exactly the drift a
+    /// hand-list guarantees; the roster is the single source both processes share.
+    /// `capability_signal`'s lazy path stays as the fallback for unrostered names.
     fn new(
         loader: Loader,
         shell_lua_path: PathBuf,
         shaping: ShapingHandle,
-        audio_handle: LiveSignalHandle,
-        network_handle: LiveSignalHandle,
-        bluetooth_handle: LiveSignalHandle,
-        tray_handle: LiveSignalHandle,
         rescue_handle: LiveSignalHandle,
         process_registry: ProcessRegistry,
         generation_id: u32,
-    ) -> Self {
-        // "audio" is pre-seeded (not left to apply_state_snapshot's lazy path) so a `shell.lua`
-        // that reads `audio:get()` before the first real push still gets a live signal (reading
-        // `nil` inside it) instead of an undefined-global Lua error -- the same guarantee the
-        // pre-Phase-16 hardcoded registration gave. "network", "bluetooth", and "tray" are
-        // pre-seeded too (docs/adr/0029, docs/adr/0030, docs/adr/0031): they're the other known,
-        // always-present capabilities as of this diff, and without this a `shell.lua` referencing
-        // any of these globals before its Supervisor-side controller's first event ever fires
-        // would hit the same undefined-global Lua error, not merely read `nil`. Any capability
-        // beyond these four only starts existing once its first StateSnapshot actually arrives,
-        // via `capability_signal`'s lazy path below.
-        let capability_signals = RefCell::new(HashMap::from([
-            ("audio".to_string(), audio_handle),
-            ("network".to_string(), network_handle),
-            ("bluetooth".to_string(), bluetooth_handle),
-            ("tray".to_string(), tray_handle),
-        ]));
-        Self {
+    ) -> mlua::Result<Self> {
+        let mut seeded = HashMap::new();
+        for capability in shared::CAPABILITIES {
+            let (signal, handle) = lua::signal::Signal::new_live(mlua::Value::Nil);
+            loader.set_global(capability, signal)?;
+            seeded.insert((*capability).to_string(), handle);
+        }
+        Ok(Self {
             loader,
             shell_lua_path,
             scene: Scene::new(),
             shaping,
-            capability_signals,
+            capability_signals: RefCell::new(seeded),
             rescue_handle,
             process_registry,
             state: ReloadState { applied_topology: None, pending: None },
             generation_id,
-        }
+        })
     }
 
     fn set_rescue_state(&self, is_rescue: bool, error_log: &str) {
@@ -498,26 +486,6 @@ async fn run(
             return;
         }
     };
-    let (signal, audio_handle) = lua::signal::Signal::new_live(mlua::Value::Nil);
-    if let Err(err) = loader.set_global("audio", signal) {
-        eprintln!("control-socket client: failed to register the audio signal: {err}");
-        return;
-    }
-    let (network_signal, network_handle) = lua::signal::Signal::new_live(mlua::Value::Nil);
-    if let Err(err) = loader.set_global("network", network_signal) {
-        eprintln!("control-socket client: failed to register the network signal: {err}");
-        return;
-    }
-    let (bluetooth_signal, bluetooth_handle) = lua::signal::Signal::new_live(mlua::Value::Nil);
-    if let Err(err) = loader.set_global("bluetooth", bluetooth_signal) {
-        eprintln!("control-socket client: failed to register the bluetooth signal: {err}");
-        return;
-    }
-    let (tray_signal, tray_handle) = lua::signal::Signal::new_live(mlua::Value::Nil);
-    if let Err(err) = loader.set_global("tray", tray_signal) {
-        eprintln!("control-socket client: failed to register the tray signal: {err}");
-        return;
-    }
     let rescue_handle = match register_rescue_signal(&loader) {
         Ok(handle) => handle,
         Err(err) => {
@@ -533,18 +501,13 @@ async fn run(
     }
 
     let shaping = ShapingHandle::spawn();
-    let mut client = RendererClient::new(
-        loader,
-        shell_lua_path,
-        shaping,
-        audio_handle,
-        network_handle,
-        bluetooth_handle,
-        tray_handle,
-        rescue_handle,
-        process_registry,
-        generation_id,
-    );
+    let mut client = match RendererClient::new(loader, shell_lua_path, shaping, rescue_handle, process_registry, generation_id) {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!("control-socket client: failed to seed the capability roster's signals: {err}");
+            return;
+        }
+    };
     client.run_startup_evaluation();
 
     let (mut read_half, mut write_half) = stream.into_split();
@@ -660,32 +623,13 @@ mod tests {
 
     fn test_client(shell_lua_path: &std::path::Path) -> RendererClient {
         let loader = Loader::new().unwrap();
-        let (audio_signal, audio_handle) = lua::signal::Signal::new_live(mlua::Value::Nil);
-        loader.set_global("audio", audio_signal).unwrap();
-        let (network_signal, network_handle) = lua::signal::Signal::new_live(mlua::Value::Nil);
-        loader.set_global("network", network_signal).unwrap();
-        let (bluetooth_signal, bluetooth_handle) = lua::signal::Signal::new_live(mlua::Value::Nil);
-        loader.set_global("bluetooth", bluetooth_signal).unwrap();
-        let (tray_signal, tray_handle) = lua::signal::Signal::new_live(mlua::Value::Nil);
-        loader.set_global("tray", tray_signal).unwrap();
         let rescue_handle = register_rescue_signal(&loader).unwrap();
         // None of this file's tests exercise process.run itself (see lua/process.rs's own tests
         // for that) -- a throwaway channel is enough to satisfy RendererClient's shape.
         let (process_tx, _process_rx) = mpsc::unbounded_channel();
         let process_registry = ProcessRegistry::new(0, process_tx);
         loader.register_process(process_registry.clone()).unwrap();
-        RendererClient::new(
-            loader,
-            shell_lua_path.to_path_buf(),
-            ShapingHandle::spawn(),
-            audio_handle,
-            network_handle,
-            bluetooth_handle,
-            tray_handle,
-            rescue_handle,
-            process_registry,
-            0,
-        )
+        RendererClient::new(loader, shell_lua_path.to_path_buf(), ShapingHandle::spawn(), rescue_handle, process_registry, 0).unwrap()
     }
 
     #[test]
@@ -702,18 +646,35 @@ mod tests {
     }
 
     #[test]
-    fn apply_state_snapshot_lazily_registers_a_new_capabilitys_live_signal() {
-        // docs/adr/0029: a capability other than "audio"/"network"/"bluetooth"/"tray"
-        // (docs/adr/0030, docs/adr/0031) has no pre-registered global -- the first StateSnapshot
-        // naming it must create the Lua global on the spot, not error.
+    fn apply_state_snapshot_lazily_registers_an_unrostered_capabilitys_live_signal() {
+        // docs/adr/0029: a capability outside shared::CAPABILITIES (ADR-0037) has no
+        // pre-registered global -- the first StateSnapshot naming it must create the Lua global
+        // on the spot, not error.
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let client = test_client(&missing);
+        assert!(!shared::CAPABILITIES.contains(&"workspace"), "this test needs a genuinely unrostered name");
+
+        let snapshot = StateSnapshot { capability: "workspace".to_string(), revision: 1, payload: serde_json::json!({ "active": 2 }) };
+        client.apply_state_snapshot(snapshot).unwrap();
+
+        let output = client.loader.evaluate(r#"return surface { id = "bar", layer = "Top", active = workspace:get().active }"#).unwrap();
+        assert_eq!(output.surfaces[0].properties.get("active").unwrap().as_integer(), Some(2));
+    }
+
+    #[test]
+    fn every_rostered_capabilitys_global_exists_and_reads_nil_before_its_first_snapshot() {
+        // ADR-0037's uniform contract: a shell.lua reading any rostered capability at boot --
+        // before the Supervisor's first push, or forever for a dormant one like sysinfo -- gets
+        // a live signal reading nil, never an undefined-global error into rescue. This is the
+        // regression the frozen four-name hand-list allowed six times in a row.
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let client = test_client(&missing);
 
-        let snapshot = StateSnapshot { capability: "mpris".to_string(), revision: 1, payload: serde_json::json!({ "playing": true }) };
-        client.apply_state_snapshot(snapshot).unwrap();
-
-        let output = client.loader.evaluate(r#"return surface { id = "bar", layer = "Top", playing = mpris:get().playing }"#).unwrap();
-        assert_eq!(output.surfaces[0].properties.get("playing").unwrap().as_boolean(), Some(true));
+        for capability in shared::CAPABILITIES {
+            let probe = format!(r#"return surface {{ id = "bar", layer = "Top", is_nil = {capability}:get() == nil }}"#);
+            let output = client.loader.evaluate(&probe).unwrap_or_else(|err| panic!("rostered capability {capability:?} has no live global: {err}"));
+            assert_eq!(output.surfaces[0].properties.get("is_nil").unwrap().as_boolean(), Some(true), "{capability} should read nil before its first snapshot");
+        }
     }
 
     #[test]

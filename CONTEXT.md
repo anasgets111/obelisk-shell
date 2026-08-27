@@ -88,6 +88,10 @@ _Avoid_: module, service, backend
 A capability's state-version counter. A stale revision fails the write.
 _Avoid_: version, sequence number
 
+**Capability roster**:
+The `shared`-crate constant naming every snapshot-hydrated capability. Each rostered name's Lua global exists from a generation's first evaluation and reads `nil` until its first dependency snapshot arrives (ADR-0037).
+_Avoid_: pre-seed list, known capabilities
+
 **Secure submit**:
 A `textfield` property naming the capability/action that receives a masked field's native input buffer directly, bypassing Lua. Without it, a masked field's value is unreadable from Lua entirely.
 _Avoid_: secure handle, password callback

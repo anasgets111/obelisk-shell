@@ -94,6 +94,13 @@ pub enum BluetoothSignal {
     /// A device was added to or removed from the registry, or one of a tracked device's own
     /// `Connected`/`Paired`/`Name`/`Battery1.Percentage` properties changed.
     DeviceRegistryChanged,
+    /// Sent by [`BluetoothController::clear_discovered`], not a forwarder: a
+    /// `bluetooth:start_discovery()` was just dispatched and `discovered_devices` must clear
+    /// immediately, before `StartDiscovery`'s D-Bus round trip completes (docs/adr/0030,
+    /// matching NM's `scanning = true` immediate-flip pattern). A distinct variant, not
+    /// [`DeviceRegistryChanged`](Self::DeviceRegistryChanged): a full registry re-derivation
+    /// here would instantly undo the clear it exists to perform.
+    DiscoveryCleared,
 }
 
 /// Failure modes a `bluetooth:*` write action can hit before ever reaching BlueZ itself. Logged
@@ -149,6 +156,62 @@ pub use crate::dbus::parse_bool_arg;
 /// `bluetooth:pair(mac)` / `connect(mac)` / `disconnect(mac)` / `forget(mac)`'s `arguments: [mac]`.
 pub fn parse_mac_arg(arguments: &[serde_json::Value]) -> Option<String> {
     Some(arguments.first()?.as_str()?.to_string())
+}
+
+/// `oblisk.bluetooth`'s action dispatch (ADR-0037): owns the action match, argument parse, and
+/// write-action spawn for every `bluetooth` `CommandEnvelope` -- `main.rs` routes the whole
+/// capability here with one arm. Write actions are `tokio::spawn`ed rather than awaited inline
+/// (ADR-0030/ADR-0029). `stop_discovery` mutates no local state on purpose: the last
+/// `discovered_devices` snapshot stays visible (ADR-0030).
+pub fn dispatch(controller: &BluetoothController, envelope: &shared::CommandEnvelope) {
+    let params = &envelope.params;
+    match params.action.as_str() {
+        "set_enabled" => match parse_bool_arg(&params.arguments) {
+            Some(enabled) => {
+                let controller = controller.clone();
+                tokio::spawn(async move { controller.set_enabled(enabled).await; });
+            }
+            None => crate::log_malformed_command(params),
+        },
+        "start_discovery" => {
+            controller.clear_discovered();
+            let controller = controller.clone();
+            tokio::spawn(async move { controller.start_discovery().await; });
+        }
+        "stop_discovery" => {
+            let controller = controller.clone();
+            tokio::spawn(async move { controller.stop_discovery().await; });
+        }
+        "pair" => match parse_mac_arg(&params.arguments) {
+            Some(mac) => {
+                let controller = controller.clone();
+                tokio::spawn(async move { controller.pair(&mac).await; });
+            }
+            None => crate::log_malformed_command(params),
+        },
+        "connect" => match parse_mac_arg(&params.arguments) {
+            Some(mac) => {
+                let controller = controller.clone();
+                tokio::spawn(async move { controller.connect(&mac).await; });
+            }
+            None => crate::log_malformed_command(params),
+        },
+        "disconnect" => match parse_mac_arg(&params.arguments) {
+            Some(mac) => {
+                let controller = controller.clone();
+                tokio::spawn(async move { controller.disconnect(&mac).await; });
+            }
+            None => crate::log_malformed_command(params),
+        },
+        "forget" => match parse_mac_arg(&params.arguments) {
+            Some(mac) => {
+                let controller = controller.clone();
+                tokio::spawn(async move { controller.forget(&mac).await; });
+            }
+            None => crate::log_malformed_command(params),
+        },
+        _ => crate::log_unknown_action(params),
+    }
 }
 
 

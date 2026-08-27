@@ -37,3 +37,33 @@ pub mod inhibit;
 pub mod notify;
 
 pub use controller::{IdleController, parse_inhibit_args, parse_register_args};
+
+/// `oblisk.idle`'s action dispatch (ADR-0037): owns the action match, argument parse, and
+/// write-action spawn for every `idle` `CommandEnvelope` -- `main.rs` routes the whole
+/// capability here with one arm. Every action carries the registering generation's own id
+/// (ADR-0032/ADR-0006: a registration belongs to the generation that made it).
+pub fn dispatch(controller: &IdleController, envelope: &shared::CommandEnvelope) {
+    let params = &envelope.params;
+    let generation_id = params.generation_id;
+    match params.action.as_str() {
+        "register" => match parse_register_args(&params.arguments) {
+            Some(sec) => {
+                let controller = controller.clone();
+                tokio::spawn(async move { controller.register_threshold(generation_id, sec).await; });
+            }
+            None => crate::log_malformed_command(params),
+        },
+        "inhibit" => match parse_inhibit_args(&params.arguments) {
+            Some(reason) => {
+                let controller = controller.clone();
+                tokio::spawn(async move { controller.inhibit(generation_id, &reason).await; });
+            }
+            None => crate::log_malformed_command(params),
+        },
+        "release_inhibit" => {
+            let controller = controller.clone();
+            tokio::spawn(async move { controller.release_inhibit(generation_id).await; });
+        }
+        _ => crate::log_unknown_action(params),
+    }
+}

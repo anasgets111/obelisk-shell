@@ -10,7 +10,7 @@ use zbus::zvariant::OwnedObjectPath;
 use super::agent::register_agent_best_effort;
 use super::proxies::{Adapter1Proxy, Battery1Proxy, Device1Proxy, bind_adapter, bind_object_manager, subscribe_object_manager};
 use super::registry::{DeviceRegistry, register_device, spawn_adapter_signal_forwarder, spawn_object_manager_forwarder};
-use super::{BluetoothActionError, BluetoothSignal, ConnectedDevice, DiscoveredDevice, class_to_category};
+use super::{BluetoothActionError, BluetoothSignal, BluetoothState, ConnectedDevice, DiscoveredDevice, class_to_category};
 
 // ---------------------------------------------------------------------------------------------
 // Controller.
@@ -24,6 +24,14 @@ use super::{BluetoothActionError, BluetoothSignal, ConnectedDevice, DiscoveredDe
 pub struct BluetoothController {
     adapter: Option<Adapter1Proxy<'static>>,
     devices: DeviceRegistry,
+    /// `oblisk.bluetooth`'s own push state (ADR-0037 moved it out of `main.rs`'s loop-locals) --
+    /// mutated only by [`handle_signal`](Self::handle_signal), which the main loop's one
+    /// bluetooth select arm drives. `Mutex` because the controller is `Clone`; never held across
+    /// an await.
+    state: Arc<Mutex<BluetoothState>>,
+    /// Clone of the signal channel's sender: lets [`clear_discovered`](Self::clear_discovered)
+    /// route its immediate clear through the same FIFO as the forwarders' real signals.
+    events: UnboundedSender<BluetoothSignal>,
 }
 
 impl BluetoothController {
@@ -91,16 +99,52 @@ impl BluetoothController {
             eprintln!("bluetooth: no adapter found; bluetooth.enabled/discovering will stay false for this session");
         }
         if let Some((added, removed)) = object_manager_streams {
-            spawn_object_manager_forwarder(connection.clone(), added, removed, devices.clone(), events);
+            spawn_object_manager_forwarder(connection.clone(), added, removed, devices.clone(), events.clone());
         }
 
         register_agent_best_effort(&connection).await;
 
-        Self { adapter, devices }
+        Self { adapter, devices, state: Arc::new(Mutex::new(BluetoothState::default())), events }
+    }
+
+    /// Applies one [`BluetoothSignal`] to the controller-owned [`BluetoothState`] and returns
+    /// the updated state for the main loop's one bluetooth arm to push (docs/adr/0030, matching
+    /// ADR-0029: no debounce -- every relevant event fully re-derives the affected part of the
+    /// state from scratch).
+    pub async fn handle_signal(&self, signal: BluetoothSignal) -> BluetoothState {
+        match signal {
+            BluetoothSignal::AdapterChanged => {
+                let enabled = self.read_enabled().await;
+                let discovering = self.read_discovering().await;
+                let mut state = self.state.lock().unwrap();
+                state.enabled = enabled;
+                state.discovering = discovering;
+                state.clone()
+            }
+            BluetoothSignal::DeviceRegistryChanged => {
+                let (connected_devices, discovered_devices) = self.build_device_lists().await;
+                let mut state = self.state.lock().unwrap();
+                state.connected_devices = connected_devices;
+                state.discovered_devices = discovered_devices;
+                state.clone()
+            }
+            BluetoothSignal::DiscoveryCleared => {
+                let mut state = self.state.lock().unwrap();
+                state.discovered_devices = Vec::new();
+                state.clone()
+            }
+        }
+    }
+
+    /// The immediate half of `bluetooth:start_discovery()`: queues
+    /// [`BluetoothSignal::DiscoveryCleared`] so `discovered_devices` clears on initiation, not
+    /// once `StartDiscovery`'s D-Bus round trip completes (docs/adr/0030).
+    pub fn clear_discovered(&self) {
+        let _ = self.events.send(BluetoothSignal::DiscoveryCleared);
     }
 
     /// Live `Powered` read, `false` (not an error) with no adapter present.
-    pub async fn read_enabled(&self) -> bool {
+    async fn read_enabled(&self) -> bool {
         match &self.adapter {
             Some(adapter) => adapter.powered().await.unwrap_or(false),
             None => false,
@@ -108,7 +152,7 @@ impl BluetoothController {
     }
 
     /// Live `Discovering` read, `false` (not an error) with no adapter present.
-    pub async fn read_discovering(&self) -> bool {
+    async fn read_discovering(&self) -> bool {
         match &self.adapter {
             Some(adapter) => adapter.discovering().await.unwrap_or(false),
             None => false,
@@ -135,7 +179,7 @@ impl BluetoothController {
     /// proves visibly wrong on real hardware, is tracking a "first seen while discovering"
     /// timestamp or set that's cleared/reset on `start_discovery()`, so this list can be scoped to
     /// only the current session's newly-seen devices instead of the entire registry.
-    pub async fn build_device_lists(&self) -> (Vec<ConnectedDevice>, Vec<DiscoveredDevice>) {
+    async fn build_device_lists(&self) -> (Vec<ConnectedDevice>, Vec<DiscoveredDevice>) {
         let snapshot: Vec<(String, Device1Proxy<'static>, Option<Battery1Proxy<'static>>)> = {
             let guard = self.devices.lock().unwrap();
             guard.values().map(|entry| (entry.mac.clone(), entry.device.clone(), entry.battery.clone())).collect()
@@ -184,10 +228,10 @@ impl BluetoothController {
         }
     }
 
-    /// `bluetooth:start_discovery()`'s D-Bus half. The `discovered_devices` clear-and-push
-    /// (ADR-0030) happens in `main.rs`, immediately, before this is even spawned -- mirrors
-    /// `dbus::network::NetworkController::scan`'s own split between the immediate local flip and
-    /// the D-Bus call proper.
+    /// `bluetooth:start_discovery()`'s D-Bus half. The `discovered_devices` clear
+    /// (ADR-0030) happens via [`clear_discovered`](Self::clear_discovered), immediately, before
+    /// this is even spawned -- mirrors `dbus::network::NetworkController::scan`'s own split
+    /// between the immediate local flip and the D-Bus call proper.
     pub async fn start_discovery(&self) {
         let Some(adapter) = &self.adapter else {
             eprintln!("bluetooth: start_discovery() failed: {}", BluetoothActionError::NoAdapter);

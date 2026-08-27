@@ -19,6 +19,18 @@ pub fn control_socket_path() -> io::Result<PathBuf> {
     Ok(PathBuf::from(runtime_dir).join("oblisk-shell.sock"))
 }
 
+/// The capability roster (ADR-0037; CONTEXT.md's Capability roster entry): every
+/// snapshot-hydrated capability name. The Renderer seeds one live Lua signal per rostered name
+/// at construction, so each global exists from a generation's first evaluation and reads `nil`
+/// until its first `StateSnapshot` arrives -- uniformly, including `sysinfo`, which stays `nil`
+/// indefinitely until `sysinfo:configure` wakes its dormant pollers. The Supervisor's
+/// `push_snapshot` debug-asserts membership, so a capability added there without a roster entry
+/// fails on its first push in development instead of as an undefined-global error in a user's
+/// `shell.lua` at boot. `idle` is deliberately absent: it's event-shaped, not snapshot state
+/// (ADR-0032).
+pub const CAPABILITIES: &[&str] =
+    &["audio", "network", "bluetooth", "tray", "notifications", "mpris", "sysinfo", "keyboard", "privacy", "updates"];
+
 /// Guarded JSON-RPC 2.0 envelope wrapping a Lua write action.
 /// See docs/oblisk-idl-api-specs.md §7.2.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

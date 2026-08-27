@@ -36,6 +36,38 @@ pub mod sound;
 pub use controller::{NotificationsController, parse_dismiss_args, parse_reply_args, parse_set_sound_args};
 pub use sound::run_sound_player;
 
+/// `oblisk.notifications`'s action dispatch (ADR-0037): `dismiss`/`reply` emit D-Bus signals and
+/// get `tokio::spawn`ed (ADR-0029); `set_sound`/`set_dnd` only write Supervisor-held state under
+/// its lock (ADR-0033), so they run inline.
+pub fn dispatch(controller: &NotificationsController, envelope: &shared::CommandEnvelope) {
+    let params = &envelope.params;
+    match params.action.as_str() {
+        "dismiss" => match parse_dismiss_args(&params.arguments) {
+            Some(id) => {
+                let controller = controller.clone();
+                tokio::spawn(async move { controller.dismiss(id).await; });
+            }
+            None => crate::log_malformed_command(params),
+        },
+        "reply" => match parse_reply_args(&params.arguments) {
+            Some((id, text)) => {
+                let controller = controller.clone();
+                tokio::spawn(async move { controller.reply(id, text).await; });
+            }
+            None => crate::log_malformed_command(params),
+        },
+        "set_sound" => match parse_set_sound_args(&params.arguments) {
+            Some((urgency, path)) => controller.set_sound(urgency, &path),
+            None => crate::log_malformed_command(params),
+        },
+        "set_dnd" => match crate::dbus::parse_bool_arg(&params.arguments) {
+            Some(enabled) => controller.set_dnd(enabled),
+            None => crate::log_malformed_command(params),
+        },
+        _ => crate::log_unknown_action(params),
+    }
+}
+
 /// Well-known bus name and object path this controller hosts `org.freedesktop.Notifications` at
 /// (the base freedesktop notification spec's own fixed path).
 pub const NOTIFICATIONS_BUS_NAME: &str = "org.freedesktop.Notifications";

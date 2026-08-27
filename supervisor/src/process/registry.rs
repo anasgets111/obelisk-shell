@@ -34,6 +34,61 @@ pub(crate) fn process_run_args(arguments: &[serde_json::Value]) -> Option<(Strin
     Some((cmd, args))
 }
 
+/// The `process` capability's action dispatch (ADR-0037): owns the action match, argument
+/// parse, and spawn for `process.run`/`process.kill` -- `main.rs` routes the whole capability
+/// here with one arm. `async` (unlike the other capabilities' dispatchers) because `kill`'s reap
+/// must complete before its `ProcessExited` report goes out.
+pub(crate) async fn dispatch(
+    processes: &mut LiveProcesses,
+    registry: &socket::GenerationRegistry,
+    process_done_tx: &tokio::sync::mpsc::UnboundedSender<(u32, u64)>,
+    envelope: &shared::CommandEnvelope,
+) {
+    let generation_id = envelope.params.generation_id;
+    let id = envelope.id;
+    match envelope.params.action.as_str() {
+        "run" => match process_run_args(&envelope.params.arguments) {
+            Some((cmd, args)) => match spawn_and_register_process(processes, generation_id, id, &cmd, &args) {
+                Some((stdout, stderr)) => {
+                    let task_registry = registry.clone();
+                    let task_done_tx = process_done_tx.clone();
+                    tokio::spawn(async move {
+                        stream_process_output(&task_registry, generation_id, id, stdout, stderr).await;
+                        let _ = task_done_tx.send((generation_id, id));
+                    });
+                }
+                None => {
+                    send_frame_logged(registry, generation_id, &SupervisorFrame::ProcessExited(ProcessExited { id, code: None }));
+                }
+            },
+            None => {
+                eprintln!("malformed process.run command from generation {generation_id}: {:?}", envelope.params.arguments);
+                // Lua's ProcessHandle is already waiting on `id`'s exit_cb -- with no
+                // process ever spawned, nothing else will ever report this id done, so
+                // this is what stops it leaking `pending`'s callback pair forever on
+                // the Renderer side (Correctness review, docs/adr/0026 addendum).
+                send_frame_logged(registry, generation_id, &SupervisorFrame::ProcessExited(ProcessExited { id, code: None }));
+            }
+        },
+        "kill" => match kill_registered_process(processes, generation_id, id).await {
+            KillOutcome::Reaped(code) => {
+                send_frame_logged(registry, generation_id, &SupervisorFrame::ProcessExited(ProcessExited { id, code }));
+            }
+            KillOutcome::ReapFailed => {
+                // The registry entry is already removed by this point (see
+                // kill_registered_process) and the OS-level reap failure is already
+                // logged -- no future event will ever report this id done, so this is
+                // what stops it leaking `pending`'s callback pair forever on the
+                // Renderer side (Correctness review, docs/adr/0026 addendum). The real
+                // exit code is unknowable here; `None` is honest, not synthesized.
+                send_frame_logged(registry, generation_id, &SupervisorFrame::ProcessExited(ProcessExited { id, code: None }));
+            }
+            KillOutcome::NotRegistered => {}
+        },
+        _ => crate::log_unknown_action(&envelope.params),
+    }
+}
+
 /// `("process", "run")`'s spawn step: pipes stdout/stderr (`super::spawn_group_leader_piped`),
 /// takes the piped handles off the `Child` before registering it, so `processes` can keep owning
 /// the `Child` (for `kill`/supersede-reap) while a separate task reads its output. Logs and

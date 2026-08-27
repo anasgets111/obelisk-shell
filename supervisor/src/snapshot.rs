@@ -1,16 +1,12 @@
-//! The `push_*_snapshot` family: one near-identical function per capability, each doing
-//! "bump this capability's revision counter, serialize, send, record in `last_snapshots`".
-//! Extracted out of `main.rs` so each new capability's own copy of this pattern doesn't keep
-//! padding that file (docs/adr/0029's `revisions`/`last_snapshots` maps).
+//! The one snapshot-push path (ADR-0037): bump the capability's revision counter, serialize,
+//! send to the authoritative generation, record in `last_snapshots`. Replaces the previous
+//! one-near-identical-function-per-capability family (docs/adr/0029's `revisions`/
+//! `last_snapshots` maps) -- the capability name was the only real datum ever varying.
 
 use std::collections::HashMap;
 
 use shared::SupervisorFrame;
 
-use crate::dbus::{bluetooth, mpris, network, notifications, tray};
-use crate::hardware::{keyboard, sysinfo};
-use crate::privacy;
-use crate::updates;
 use crate::{send_frame_logged, socket};
 
 /// Bumps and returns `capability`'s own state-version counter (ADR-0004; docs/adr/0029
@@ -23,198 +19,30 @@ pub(crate) fn bump_revision(revisions: &mut HashMap<String, u32>, capability: &s
     *revision
 }
 
-/// Bumps `"network"`'s revision and pushes `state` as a fresh `StateSnapshot` to the
-/// authoritative generation -- the one place every network-capability push in `run_supervisor`'s
-/// `select!` goes through, so the bump-then-serialize-then-send sequence only lives once. Also
-/// records the pushed snapshot in `last_snapshots` (docs/adr/0029), the same per-capability
-/// hydration map a freshly-promoted PBA candidate is seeded from.
-pub(crate) fn push_network_snapshot(
+/// Bumps `capability`'s revision and pushes `state` as a fresh `StateSnapshot` to the
+/// authoritative generation, recording it in `last_snapshots` (docs/adr/0029), the same
+/// per-capability hydration map a freshly-promoted PBA candidate is seeded from. The
+/// `debug_assert` is ADR-0037's roster check: a capability pushed here but missing from
+/// `shared::CAPABILITIES` would boot with no pre-seeded Lua global on the Renderer side.
+pub(crate) fn push_snapshot(
     registry: &socket::GenerationRegistry,
     generation_id: u32,
     revisions: &mut HashMap<String, u32>,
     last_snapshots: &mut HashMap<String, shared::StateSnapshot>,
-    state: &network::NetworkState,
+    capability: &str,
+    state: &impl serde::Serialize,
 ) {
-    let revision = bump_revision(revisions, "network");
+    debug_assert!(
+        shared::CAPABILITIES.contains(&capability),
+        "capability {capability:?} pushes snapshots but is missing from shared::CAPABILITIES (ADR-0037)"
+    );
+    let revision = bump_revision(revisions, capability);
     match serde_json::to_value(state) {
         Ok(payload) => {
-            let snapshot = shared::StateSnapshot { capability: "network".to_string(), revision, payload };
+            let snapshot = shared::StateSnapshot { capability: capability.to_string(), revision, payload };
             send_frame_logged(registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
-            last_snapshots.insert("network".to_string(), snapshot);
+            last_snapshots.insert(capability.to_string(), snapshot);
         }
-        Err(err) => eprintln!("failed to serialize network StateSnapshot: {err}"),
-    }
-}
-
-/// Bumps `"bluetooth"`'s revision and pushes `state` as a fresh `StateSnapshot` to the
-/// authoritative generation -- mirrors [`push_network_snapshot`] exactly (docs/adr/0030 needs
-/// zero new plumbing beyond a fresh capability name flowing through ADR-0029's already-generic
-/// `revisions`/`last_snapshots` maps).
-pub(crate) fn push_bluetooth_snapshot(
-    registry: &socket::GenerationRegistry,
-    generation_id: u32,
-    revisions: &mut HashMap<String, u32>,
-    last_snapshots: &mut HashMap<String, shared::StateSnapshot>,
-    state: &bluetooth::BluetoothState,
-) {
-    let revision = bump_revision(revisions, "bluetooth");
-    match serde_json::to_value(state) {
-        Ok(payload) => {
-            let snapshot = shared::StateSnapshot { capability: "bluetooth".to_string(), revision, payload };
-            send_frame_logged(registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
-            last_snapshots.insert("bluetooth".to_string(), snapshot);
-        }
-        Err(err) => eprintln!("failed to serialize bluetooth StateSnapshot: {err}"),
-    }
-}
-
-/// Bumps `"tray"`'s revision and pushes `state` as a fresh `StateSnapshot` to the authoritative
-/// generation -- mirrors [`push_bluetooth_snapshot`] exactly (docs/adr/0031 needs zero new
-/// plumbing beyond a fresh capability name flowing through ADR-0029's already-generic
-/// `revisions`/`last_snapshots` maps).
-pub(crate) fn push_tray_snapshot(
-    registry: &socket::GenerationRegistry,
-    generation_id: u32,
-    revisions: &mut HashMap<String, u32>,
-    last_snapshots: &mut HashMap<String, shared::StateSnapshot>,
-    state: &tray::TrayState,
-) {
-    let revision = bump_revision(revisions, "tray");
-    match serde_json::to_value(state) {
-        Ok(payload) => {
-            let snapshot = shared::StateSnapshot { capability: "tray".to_string(), revision, payload };
-            send_frame_logged(registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
-            last_snapshots.insert("tray".to_string(), snapshot);
-        }
-        Err(err) => eprintln!("failed to serialize tray StateSnapshot: {err}"),
-    }
-}
-
-/// Bumps `"mpris"`'s revision and pushes `state` as a fresh `StateSnapshot` to the authoritative
-/// generation -- mirrors [`push_tray_snapshot`] exactly (ADR-0036 needs zero new plumbing beyond
-/// a fresh capability name flowing through ADR-0029's already-generic `revisions`/
-/// `last_snapshots` maps).
-pub(crate) fn push_mpris_snapshot(
-    registry: &socket::GenerationRegistry,
-    generation_id: u32,
-    revisions: &mut HashMap<String, u32>,
-    last_snapshots: &mut HashMap<String, shared::StateSnapshot>,
-    state: &mpris::MprisState,
-) {
-    let revision = bump_revision(revisions, "mpris");
-    match serde_json::to_value(state) {
-        Ok(payload) => {
-            let snapshot = shared::StateSnapshot { capability: "mpris".to_string(), revision, payload };
-            send_frame_logged(registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
-            last_snapshots.insert("mpris".to_string(), snapshot);
-        }
-        Err(err) => eprintln!("failed to serialize mpris StateSnapshot: {err}"),
-    }
-}
-
-/// Bumps `"notifications"`'s revision and pushes `state` as a fresh `StateSnapshot` to the
-/// authoritative generation -- mirrors [`push_tray_snapshot`] exactly (ADR-0033: "reuses
-/// `StateSnapshot`, no new `SupervisorFrame` variant", same proven shape as tray/network/bluetooth).
-pub(crate) fn push_notifications_snapshot(
-    registry: &socket::GenerationRegistry,
-    generation_id: u32,
-    revisions: &mut HashMap<String, u32>,
-    last_snapshots: &mut HashMap<String, shared::StateSnapshot>,
-    state: &notifications::NotificationsState,
-) {
-    let revision = bump_revision(revisions, "notifications");
-    match serde_json::to_value(state) {
-        Ok(payload) => {
-            let snapshot = shared::StateSnapshot { capability: "notifications".to_string(), revision, payload };
-            send_frame_logged(registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
-            last_snapshots.insert("notifications".to_string(), snapshot);
-        }
-        Err(err) => eprintln!("failed to serialize notifications StateSnapshot: {err}"),
-    }
-}
-
-/// Bumps `"sysinfo"`'s revision and pushes `state` as a fresh `StateSnapshot` to the
-/// authoritative generation -- mirrors [`push_notifications_snapshot`] exactly. `revision`
-/// bumps once per push regardless of which of the three underlying tasks (cpu; ram+swap;
-/// temp_cores+temp_gpu) actually changed the field that triggered it (docs/adr/0035:
-/// `bump_revision`'s existing per-capability, not per-field, granularity applies unchanged
-/// even with three independent producers writing into this one capability's state).
-pub(crate) fn push_sysinfo_snapshot(
-    registry: &socket::GenerationRegistry,
-    generation_id: u32,
-    revisions: &mut HashMap<String, u32>,
-    last_snapshots: &mut HashMap<String, shared::StateSnapshot>,
-    state: &sysinfo::SysinfoState,
-) {
-    let revision = bump_revision(revisions, "sysinfo");
-    match serde_json::to_value(state) {
-        Ok(payload) => {
-            let snapshot = shared::StateSnapshot { capability: "sysinfo".to_string(), revision, payload };
-            send_frame_logged(registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
-            last_snapshots.insert("sysinfo".to_string(), snapshot);
-        }
-        Err(err) => eprintln!("failed to serialize sysinfo StateSnapshot: {err}"),
-    }
-}
-
-/// Bumps `"keyboard"`'s revision and pushes `state` as a fresh `StateSnapshot` to the
-/// authoritative generation -- mirrors [`push_sysinfo_snapshot`] exactly (docs/adr/0034).
-/// Backlight and lock state are the producers wired in so far; layout will bump the same
-/// per-capability revision through this same helper once it joins.
-pub(crate) fn push_keyboard_snapshot(
-    registry: &socket::GenerationRegistry,
-    generation_id: u32,
-    revisions: &mut HashMap<String, u32>,
-    last_snapshots: &mut HashMap<String, shared::StateSnapshot>,
-    state: &keyboard::KeyboardState,
-) {
-    let revision = bump_revision(revisions, "keyboard");
-    match serde_json::to_value(state) {
-        Ok(payload) => {
-            let snapshot = shared::StateSnapshot { capability: "keyboard".to_string(), revision, payload };
-            send_frame_logged(registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
-            last_snapshots.insert("keyboard".to_string(), snapshot);
-        }
-        Err(err) => eprintln!("failed to serialize keyboard StateSnapshot: {err}"),
-    }
-}
-
-/// Bumps `"privacy"`'s revision and pushes `state` as a fresh `StateSnapshot` to the
-/// authoritative generation -- mirrors [`push_keyboard_snapshot`] exactly (docs/adr/0034).
-pub(crate) fn push_privacy_snapshot(
-    registry: &socket::GenerationRegistry,
-    generation_id: u32,
-    revisions: &mut HashMap<String, u32>,
-    last_snapshots: &mut HashMap<String, shared::StateSnapshot>,
-    state: &privacy::PrivacyState,
-) {
-    let revision = bump_revision(revisions, "privacy");
-    match serde_json::to_value(state) {
-        Ok(payload) => {
-            let snapshot = shared::StateSnapshot { capability: "privacy".to_string(), revision, payload };
-            send_frame_logged(registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
-            last_snapshots.insert("privacy".to_string(), snapshot);
-        }
-        Err(err) => eprintln!("failed to serialize privacy StateSnapshot: {err}"),
-    }
-}
-
-/// Bumps `"updates"`'s revision and pushes `state` as a fresh `StateSnapshot` to the
-/// authoritative generation -- mirrors [`push_privacy_snapshot`] exactly (docs/adr/0034).
-pub(crate) fn push_updates_snapshot(
-    registry: &socket::GenerationRegistry,
-    generation_id: u32,
-    revisions: &mut HashMap<String, u32>,
-    last_snapshots: &mut HashMap<String, shared::StateSnapshot>,
-    state: &updates::UpdatesState,
-) {
-    let revision = bump_revision(revisions, "updates");
-    match serde_json::to_value(state) {
-        Ok(payload) => {
-            let snapshot = shared::StateSnapshot { capability: "updates".to_string(), revision, payload };
-            send_frame_logged(registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
-            last_snapshots.insert("updates".to_string(), snapshot);
-        }
-        Err(err) => eprintln!("failed to serialize updates StateSnapshot: {err}"),
+        Err(err) => eprintln!("failed to serialize {capability} StateSnapshot: {err}"),
     }
 }
