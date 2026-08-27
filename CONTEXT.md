@@ -37,7 +37,7 @@ Resetting the Lua VM and re-running the config inside the current generation, wi
 _Avoid_: hot-reload, live patch
 
 **Dependency snapshot**:
-The Supervisor-owned system-state payload (`shared::StateSnapshot`: revision plus JSON payload) pushed to a generation so its loader hydrates signals without live-querying NetworkManager, BlueZ, or PipeWire itself. The same snapshot type hydrates a candidate's first evaluation and an in-place reload's re-evaluation.
+The Supervisor-owned system-state payload (`shared::StateSnapshot`: capability, revision, and JSON payload) pushed to a generation so its loader hydrates signals without live-querying NetworkManager, BlueZ, or PipeWire itself. The same snapshot type hydrates a candidate's first evaluation and an in-place reload's re-evaluation. One payload per capability, routed to that capability's own live Lua signal by name (ADR-0029).
 _Avoid_: state snapshot, hydration payload
 
 **Loader**:

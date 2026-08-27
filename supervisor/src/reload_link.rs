@@ -98,17 +98,25 @@ impl CandidateLink for SocketCandidateLink<'_> {
     /// Found live (a real spawned process racing a real socket connect) rather than in review --
     /// this module's own tests, and `reload.rs`'s `FakeCandidateLink`, never modeled a
     /// not-yet-connected Candidate, since a fake registers instantly.
-    async fn push_state_snapshot(&mut self, snapshot: &StateSnapshot) -> Result<(), Self::Error> {
-        let frame = SupervisorFrame::StateSnapshot(snapshot.clone());
-        loop {
-            match self.registry.send_frame(self.candidate_generation_id, &frame) {
-                Ok(()) => return Ok(()),
-                Err(crate::socket::SendFrameError::NoConnection { .. }) => {
-                    tokio::time::sleep(CONNECTION_RETRY_INTERVAL).await;
+    ///
+    /// Sends one `StateSnapshot` frame per entry in `snapshots` (docs/adr/0029: every known
+    /// capability, not just audio) -- the retry-on-`NoConnection` loop only matters for the
+    /// first frame in practice, since a successful send means the Candidate is registered and
+    /// every later frame in the same batch will succeed immediately too.
+    async fn push_state_snapshot(&mut self, snapshots: &[StateSnapshot]) -> Result<(), Self::Error> {
+        for snapshot in snapshots {
+            let frame = SupervisorFrame::StateSnapshot(snapshot.clone());
+            loop {
+                match self.registry.send_frame(self.candidate_generation_id, &frame) {
+                    Ok(()) => break,
+                    Err(crate::socket::SendFrameError::NoConnection { .. }) => {
+                        tokio::time::sleep(CONNECTION_RETRY_INTERVAL).await;
+                    }
+                    Err(err) => return Err(SocketLinkError::Send(err)),
                 }
-                Err(err) => return Err(SocketLinkError::Send(err)),
             }
         }
+        Ok(())
     }
 
     async fn recv_ready_signal(&mut self) -> Result<Vec<String>, Self::Error> {
@@ -143,7 +151,7 @@ mod tests {
     use crate::socket::InboundFrame;
 
     fn snapshot() -> StateSnapshot {
-        StateSnapshot { revision: 1, payload: serde_json::json!({}) }
+        StateSnapshot { capability: "audio".to_string(), revision: 1, payload: serde_json::json!({}) }
     }
 
     fn command_frame() -> RendererFrame {
@@ -176,7 +184,7 @@ mod tests {
         let (_inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
         let mut link = SocketCandidateLink { registry, candidate_generation_id: 9, inbound: &mut inbound_rx };
 
-        link.push_state_snapshot(&snapshot()).await.expect("send must succeed");
+        link.push_state_snapshot(&[snapshot()]).await.expect("send must succeed");
 
         let payload = rx.recv().await.expect("frame must have been queued");
         let frame: SupervisorFrame = serde_json::from_slice(&payload).unwrap();
@@ -200,7 +208,7 @@ mod tests {
             late_registry.register(9, tx);
         });
 
-        tokio::time::timeout(Duration::from_secs(2), link.push_state_snapshot(&snapshot()))
+        tokio::time::timeout(Duration::from_secs(2), link.push_state_snapshot(&[snapshot()]))
             .await
             .expect("must not hang forever waiting for the connection")
             .expect("must eventually succeed once the connection registers");

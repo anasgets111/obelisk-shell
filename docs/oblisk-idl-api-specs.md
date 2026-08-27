@@ -195,7 +195,7 @@ All write actions are serialized as JSON-RPC 2.0 payloads over the private Unix 
 | `network:set_wifi_enabled(en)` | `capability: "network", action: "set_wifi_enabled", arguments: [en]`<br>**Validation**: `en` is boolean. |
 | `network:set_ethernet_enabled(en)` | `capability: "network", action: "set_ethernet_enabled", arguments: [en]`<br>**Validation**: `en` is boolean. |
 | `network:scan()` | `capability: "network", action: "scan", arguments: []`<br>**Validation**: Triggers asynchronous AP scanning. |
-| `network:connect(ssid, pwd, hid)` | `capability: "network", action: "connect", arguments: [ssid, pwd, hid]`<br>**Validation**: `ssid` is string. `pwd` is string (nil for open). `hid` is boolean (true for hidden). |
+| `network:connect(ssid, hidden)` | `capability: "network", action: "connect", arguments: [ssid, hidden]`<br>**Validation**: `ssid` is string. `hidden` is boolean (true for hidden). The password never travels as a Lua argument -- it follows as a `secure_submit(network, connect)` (ADR-0005/ADR-0029); an empty secret means an open network. |
 | `network:forget(ssid)` | `capability: "network", action: "forget", arguments: [ssid]`<br>**Validation**: Deletes NM profile. |
 | `bluetooth:set_enabled(en)` | `capability: "bluetooth", action: "set_enabled", arguments: [en]`<br>**Validation**: `en` is boolean. |
 | `bluetooth:start_discovery()` | `capability: "bluetooth", action: "start_discovery", arguments: []` |

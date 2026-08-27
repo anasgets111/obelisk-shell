@@ -13,6 +13,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use dbus::network::{self, NetworkController, NetworkSignal, PendingNetworkConnect};
 use dbus::polkit::{AGENT_OBJECT_PATH, AuthenticationAgent, current_session_subject, register_agent};
 use reload_link::SocketCandidateLink;
 use shared::{
@@ -63,6 +64,39 @@ fn is_current_reload(report_sequence: u64, next_sequence: u64) -> bool {
 fn send_frame_logged(registry: &socket::GenerationRegistry, generation_id: u32, frame: &SupervisorFrame) {
     if let Err(err) = registry.send_frame(generation_id, frame) {
         eprintln!("failed to push {frame:?} to generation {generation_id}: {err}");
+    }
+}
+
+/// Bumps and returns `capability`'s own state-version counter (ADR-0004; docs/adr/0029
+/// generalizes the old single `audio_revision: u32` into this map, keyed by capability name).
+/// Starts at `1` for a capability's first-ever push, matching the old `audio_revision`'s own
+/// `0`-initialized-then-pre-incremented behavior.
+fn bump_revision(revisions: &mut HashMap<String, u32>, capability: &str) -> u32 {
+    let revision = revisions.entry(capability.to_string()).or_insert(0);
+    *revision += 1;
+    *revision
+}
+
+/// Bumps `"network"`'s revision and pushes `state` as a fresh `StateSnapshot` to the
+/// authoritative generation -- the one place every network-capability push in `run_supervisor`'s
+/// `select!` goes through, so the bump-then-serialize-then-send sequence only lives once. Also
+/// records the pushed snapshot in `last_snapshots` (docs/adr/0029), the same per-capability
+/// hydration map a freshly-promoted PBA candidate is seeded from.
+fn push_network_snapshot(
+    registry: &socket::GenerationRegistry,
+    generation_id: u32,
+    revisions: &mut HashMap<String, u32>,
+    last_snapshots: &mut HashMap<String, shared::StateSnapshot>,
+    state: &network::NetworkState,
+) {
+    let revision = bump_revision(revisions, "network");
+    match serde_json::to_value(state) {
+        Ok(payload) => {
+            let snapshot = shared::StateSnapshot { capability: "network".to_string(), revision, payload };
+            send_frame_logged(registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
+            last_snapshots.insert("network".to_string(), snapshot);
+        }
+        Err(err) => eprintln!("failed to serialize network StateSnapshot: {err}"),
     }
 }
 
@@ -295,6 +329,23 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     // conversation finishes (docs/adr/0028) -- built once here rather than per-challenge.
     let authority = zbus_polkit::policykit1::AuthorityProxy::new(&connection).await?;
 
+    // NetworkManager runs on the same system bus as polkit -- reuses `connection` rather than
+    // opening a second one (build-steps.md Phase 16; docs/adr/0029).
+    let network = NetworkController::new(connection.clone()).await?;
+    // The Wi-Fi signal forwarder task (see its own doc comment for why this is a separate task
+    // rather than raw signal streams merged directly into this function's own `select!`) needs
+    // its own clone of the sender; `network_signal_tx` is kept alive here even when there's no
+    // Wi-Fi device so the channel never closes (a closed channel would make `.recv()` resolve to
+    // `None` on every poll below, busy-looping that arm instead of idling).
+    let (network_signal_tx, mut network_signals) = tokio::sync::mpsc::unbounded_channel::<NetworkSignal>();
+    match network.wifi_signal_source() {
+        Some(wireless) => network::spawn_wifi_signal_forwarder(wireless, network_signal_tx),
+        None => {
+            eprintln!("network: no Wi-Fi device found; scan/access-point events are disabled for this session");
+        }
+    }
+    let mut network_state = network::NetworkState::default();
+
     let (audio_tx, mut audio_apps) = tokio::sync::mpsc::unbounded_channel();
     // pipewire-rs's event loop is Rc-based and single-threaded (not Send) -- it needs its
     // own OS thread, not a tokio task.
@@ -317,11 +368,17 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     let mut authoritative = Authoritative { generation_id: 0, child: boot_child };
     let mut next_generation_id: u32 = 1;
 
-    // The last audio `StateSnapshot` pushed to the authoritative generation, reused to hydrate a
-    // fresh Candidate's first evaluation (§ 15.2 point 1) -- or a fresh revision-0 empty one if
-    // none has ever been pushed yet.
-    let mut last_audio_snapshot: Option<shared::StateSnapshot> = None;
-    let mut audio_revision: u32 = 0;
+    // The last `StateSnapshot` pushed for each capability to the authoritative generation, keyed
+    // by capability name -- reused to hydrate a fresh Candidate's first evaluation with every
+    // capability's latest known state (§ 15.2 point 1; docs/adr/0029 generalizes the old
+    // single-slot `last_audio_snapshot: Option<StateSnapshot>` now that a second capability
+    // (`network`) pushes `StateSnapshot`s too). A capability with no entry yet simply isn't
+    // pushed to a fresh Candidate -- there's nothing to hydrate it with.
+    let mut last_snapshots: HashMap<String, shared::StateSnapshot> = HashMap::new();
+    // Every capability's own state-version counter (ADR-0004), keyed by name -- generalizes the
+    // pre-Phase-16 single `audio_revision: u32` now that a second capability (`network`) pushes
+    // `StateSnapshot`s too (docs/adr/0029).
+    let mut revisions: HashMap<String, u32> = HashMap::new();
 
     // The most recently received polkit challenge awaiting a secure_submit(polkit, authenticate)
     // reply, if any -- same "only the most recent one matters" simplification as
@@ -329,6 +386,10 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     // UI to disambiguate between concurrent auth prompts, so keeping only the latest is the
     // correct minimal behavior, not a missing feature.
     let mut pending_challenge: Option<dbus::polkit::BeginAuthenticationCall> = None;
+    // The most recently received network:connect(ssid, hidden) intent awaiting a matching
+    // secure_submit(network, connect) reply, if any -- mirrors `pending_challenge` above
+    // (ADR-0028's pattern, extended to network by ADR-0029).
+    let mut pending_network_connect: Option<PendingNetworkConnect> = None;
 
     // Every `process.run`-spawned child still tracked (docs/adr/0026), plus the channel
     // `stream_process_output`'s background tasks use to report a naturally-exited process back to
@@ -355,15 +416,26 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 pending_challenge = Some(challenge);
             }
             Some(apps) = audio_apps.recv() => {
-                audio_revision += 1;
+                let revision = bump_revision(&mut revisions, "audio");
                 match serde_json::to_value(&apps) {
                     Ok(payload) => {
-                        let snapshot = shared::StateSnapshot { revision: audio_revision, payload };
+                        let snapshot = shared::StateSnapshot { capability: "audio".to_string(), revision, payload };
                         send_frame_logged(&registry, authoritative.generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
-                        last_audio_snapshot = Some(snapshot);
+                        last_snapshots.insert("audio".to_string(), snapshot);
                     }
                     Err(err) => eprintln!("failed to serialize audio StateSnapshot: {err}"),
                 }
+            }
+            Some(signal) = network_signals.recv() => {
+                // No debounce (docs/adr/0029): every relevant event fully re-derives the AP list
+                // from scratch and pushes a fresh StateSnapshot, even a burst of several in a
+                // row from one completed scan -- `revision` already makes an intermediate push
+                // harmless.
+                if signal == NetworkSignal::ScanCompleted {
+                    network_state.scanning = false;
+                }
+                network_state.available_networks = network.build_available_networks().await;
+                push_network_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &network_state);
             }
             Some(()) = reload_events.recv() => {
                 next_sequence += 1;
@@ -423,6 +495,79 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                         KillOutcome::NotRegistered => {}
                     }
                 }
+                RendererFrame::Command(envelope) if envelope.params.capability == "network" && envelope.params.action == "set_networking_enabled" => {
+                    match network::parse_bool_arg(&envelope.params.arguments) {
+                        Some(enabled) => {
+                            let controller = network.clone();
+                            tokio::spawn(async move { controller.set_networking_enabled(enabled).await; });
+                        }
+                        None => eprintln!(
+                            "malformed network.set_networking_enabled command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "network" && envelope.params.action == "set_wifi_enabled" => {
+                    match network::parse_bool_arg(&envelope.params.arguments) {
+                        Some(enabled) => {
+                            let controller = network.clone();
+                            tokio::spawn(async move { controller.set_wifi_enabled(enabled).await; });
+                        }
+                        None => eprintln!(
+                            "malformed network.set_wifi_enabled command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "network" && envelope.params.action == "set_ethernet_enabled" => {
+                    match network::parse_bool_arg(&envelope.params.arguments) {
+                        Some(enabled) => {
+                            let controller = network.clone();
+                            tokio::spawn(async move { controller.set_ethernet_enabled(enabled).await; });
+                        }
+                        None => eprintln!(
+                            "malformed network.set_ethernet_enabled command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "network" && envelope.params.action == "scan" => {
+                    // "network.scanning" flips to true on initiation, not once RequestScan's
+                    // D-Bus round trip completes (docs/oblisk-supervisor-services-dbus.md §4.2)
+                    // -- the actual call is what ADR-0029 says must be tokio::spawn'ed, not this
+                    // local state flip. Only when a Wi-Fi device actually exists, though
+                    // (Correctness review): with none, `NetworkController::scan` silently no-ops
+                    // and no `ScanCompleted` signal will ever arrive (no wifi_signal_forwarder was
+                    // spawned for this session either) to flip `scanning` back to `false` --
+                    // leaving it stuck `true` forever.
+                    if network.has_wifi_device() {
+                        network_state.scanning = true;
+                        push_network_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &network_state);
+                    }
+                    let controller = network.clone();
+                    tokio::spawn(async move { controller.scan().await; });
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "network" && envelope.params.action == "connect" => {
+                    match network::parse_connect_args(&envelope.params.arguments) {
+                        Some((ssid, hidden)) => pending_network_connect = Some(PendingNetworkConnect { ssid, hidden }),
+                        None => eprintln!(
+                            "malformed network.connect command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "network" && envelope.params.action == "forget" => {
+                    match network::parse_ssid_arg(&envelope.params.arguments) {
+                        Some(ssid) => {
+                            let controller = network.clone();
+                            tokio::spawn(async move { controller.forget(&ssid).await; });
+                        }
+                        None => eprintln!(
+                            "malformed network.forget command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
                 RendererFrame::Command(envelope) => {
                     eprintln!("inbound command from generation {}: {:?}", inbound.generation_id, envelope);
                 }
@@ -458,10 +603,12 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                         ("OBLISK_GENERATION_ID".to_string(), candidate_generation_id.to_string()),
                         ("OBLISK_PBA_CANDIDATE".to_string(), "1".to_string()),
                     ];
-                    let snapshot = last_audio_snapshot.clone().unwrap_or(shared::StateSnapshot { revision: 0, payload: serde_json::json!({}) });
+                    // Every capability's latest known snapshot hydrates the fresh Candidate's
+                    // first evaluation (§ 15.2 point 1; docs/adr/0029), not just audio's.
+                    let snapshots: Vec<shared::StateSnapshot> = last_snapshots.values().cloned().collect();
                     let mut link = SocketCandidateLink { registry: registry.clone(), candidate_generation_id, inbound: &mut inbound_frames };
 
-                    match reload::run_pba(&renderer_path_str, &[], &candidate_envs, &mut link, &snapshot, sequence, PBA_TIMINGS).await {
+                    match reload::run_pba(&renderer_path_str, &[], &candidate_envs, &mut link, &snapshots, sequence, PBA_TIMINGS).await {
                         Ok(outcome) => {
                             for surface_id in &outcome.promoted_surfaces {
                                 send_frame_logged(&registry, authoritative.generation_id, &SupervisorFrame::DeselectInput(DeselectInput { surface_id: surface_id.clone() }));
@@ -540,13 +687,39 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                         }
                     }
                 }
+                RendererFrame::SecureSubmit(mut submit) if submit.capability == "network" && submit.action == "connect" => {
+                    // ADR-0029: the network-routed case, mirroring the polkit arm above exactly
+                    // -- an empty secret means an open network, a non-empty one becomes the
+                    // wpa-psk password (NetworkController::connect decides which). Must come
+                    // before the catch-all SecureSubmit arm below, same ordering reason as the
+                    // polkit arm.
+                    match pending_network_connect.take() {
+                        Some(pending) => {
+                            // mem::take moves the plaintext bytes out for NetworkController::connect
+                            // to own and zeroize on every return path (see its own doc comment) --
+                            // it leaves submit.secret as an empty Vec (Default), which holds no
+                            // plaintext, so there is nothing left in `submit` to zeroize.
+                            let secret = std::mem::take(&mut submit.secret);
+                            let controller = network.clone();
+                            tokio::spawn(async move { controller.connect(pending, secret).await; });
+                        }
+                        None => {
+                            eprintln!(
+                                "generation {}'s secure_submit(network, connect) arrived with no pending network connect intent; dropping",
+                                submit.generation_id
+                            );
+                            submit.secret.zeroize();
+                        }
+                    }
+                }
                 RendererFrame::SecureSubmit(mut submit) => {
                     // build-steps.md Phase 15 item 2 closes ADR-0015 item 2 (the textfield/IPC
                     // half only) -- this is deliberately still just a channel-forward-and-log
                     // placeholder, the same discipline this codebase already uses for
-                    // `challenges.recv()` above. The `("polkit", "authenticate")` case is now
-                    // handled by the guarded arm above (docs/adr/0028, Phase 15 item 3); this
-                    // fallback covers every other capability/action, none of which exist yet.
+                    // `challenges.recv()` above. The `("polkit", "authenticate")` and
+                    // `("network", "connect")` cases are now handled by the guarded arms above
+                    // (docs/adr/0028 Phase 15 item 3; docs/adr/0029); this fallback covers every
+                    // other capability/action, none of which exist yet.
                     //
                     // Never log the secret itself -- only its length -- and log before zeroizing
                     // it, not after (a post-zeroize log would just print the byte count of an

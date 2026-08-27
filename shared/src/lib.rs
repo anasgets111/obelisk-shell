@@ -39,9 +39,13 @@ pub struct CommandParams {
 }
 
 /// Emitted by the Supervisor on system changes to hydrate active Lua signals.
-/// `revision` is the capability's state-version counter (see ADR-0004).
+/// `capability` names which live Lua signal this hydrates (e.g. `"audio"`, `"network"`) --
+/// `renderer/src/socket.rs`'s `apply_state_snapshot` routes by this field instead of hardcoding
+/// one global signal (docs/adr/0029; `CONTEXT.md`'s Capability/Dependency snapshot entries).
+/// `revision` is that capability's own state-version counter (see ADR-0004).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StateSnapshot {
+    pub capability: String,
     pub revision: u32,
     pub payload: serde_json::Value,
 }
@@ -281,14 +285,24 @@ mod tests {
     #[test]
     fn state_snapshot_round_trips() {
         let snapshot = StateSnapshot {
+            capability: "audio".to_string(),
             revision: 42,
             payload: serde_json::json!({"volume": 0.75}),
         };
 
         let wire = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(wire, serde_json::json!({ "capability": "audio", "revision": 42, "payload": {"volume": 0.75} }));
         let parsed: StateSnapshot = serde_json::from_value(wire).unwrap();
-        assert_eq!(parsed.revision, snapshot.revision);
-        assert_eq!(parsed.payload, snapshot.payload);
+        assert_eq!(parsed, snapshot);
+    }
+
+    #[test]
+    fn state_snapshot_routes_by_capability_not_just_payload_shape() {
+        // ADR-0029: two capabilities can carry structurally identical payloads -- `capability`
+        // is what tells them apart, not the payload's own shape.
+        let audio = StateSnapshot { capability: "audio".to_string(), revision: 1, payload: serde_json::json!({}) };
+        let network = StateSnapshot { capability: "network".to_string(), revision: 1, payload: serde_json::json!({}) };
+        assert_ne!(audio, network);
     }
 
     #[test]
@@ -303,9 +317,16 @@ mod tests {
 
     #[test]
     fn supervisor_frame_state_snapshot_is_adjacently_tagged() {
-        let frame = SupervisorFrame::StateSnapshot(StateSnapshot { revision: 1, payload: serde_json::json!({"volume": 0.5}) });
+        let frame = SupervisorFrame::StateSnapshot(StateSnapshot {
+            capability: "audio".to_string(),
+            revision: 1,
+            payload: serde_json::json!({"volume": 0.5}),
+        });
         let wire = serde_json::to_value(&frame).unwrap();
-        assert_eq!(wire, serde_json::json!({ "kind": "StateSnapshot", "data": { "revision": 1, "payload": {"volume": 0.5} } }));
+        assert_eq!(
+            wire,
+            serde_json::json!({ "kind": "StateSnapshot", "data": { "capability": "audio", "revision": 1, "payload": {"volume": 0.5} } })
+        );
 
         let parsed: SupervisorFrame = serde_json::from_value(wire).unwrap();
         assert_eq!(parsed, frame);

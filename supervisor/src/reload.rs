@@ -51,10 +51,11 @@ pub trait CandidateLink {
     /// What a control-link call can fail with.
     type Error: std::fmt::Debug;
 
-    /// § 15.2 point 1 / build-steps.md step 2 ("State Hydration"): push the pre-cached state
-    /// snapshot down to the Candidate so it can hydrate its signals without querying the system
-    /// itself.
-    async fn push_state_snapshot(&mut self, snapshot: &shared::StateSnapshot) -> Result<(), Self::Error>;
+    /// § 15.2 point 1 / build-steps.md step 2 ("State Hydration"): push every pre-cached
+    /// per-capability state snapshot down to the Candidate so it can hydrate its signals without
+    /// querying the system itself (docs/adr/0029 generalizes this from a single audio-only
+    /// snapshot to one per known capability).
+    async fn push_state_snapshot(&mut self, snapshots: &[shared::StateSnapshot]) -> Result<(), Self::Error>;
 
     /// § 15.2 points 2-3 / build-steps.md step 3 ("Null-Buffer Staging"): block until the
     /// Candidate signals it has completed its Wayland layer-shell handshake and committed its
@@ -142,12 +143,12 @@ pub struct PbaOutcome {
 /// `expected`'s order once every one has reported.
 async fn drive_handshake<L: CandidateLink>(
     link: &mut L,
-    snapshot: &shared::StateSnapshot,
+    snapshots: &[shared::StateSnapshot],
     nonce: u64,
     ready_timeout: Duration,
     evidence_timeout: Duration,
 ) -> Result<Vec<String>, PbaFailure<L::Error>> {
-    timeout(ready_timeout, link.push_state_snapshot(snapshot))
+    timeout(ready_timeout, link.push_state_snapshot(snapshots))
         .await
         .map_err(|_elapsed| PbaFailure::Timeout { stage: Stage::StateHydration })?
         .map_err(|source| PbaFailure::Link { stage: Stage::StateHydration, source })?;
@@ -229,13 +230,13 @@ pub async fn run_pba<L: CandidateLink>(
     candidate_args: &[String],
     candidate_envs: &[(String, String)],
     link: &mut L,
-    snapshot: &shared::StateSnapshot,
+    snapshots: &[shared::StateSnapshot],
     nonce: u64,
     timings: PbaTimings,
 ) -> Result<PbaOutcome, PbaFailure<L::Error>> {
     let mut candidate = process::spawn_group_leader(candidate_cmd, candidate_args, candidate_envs).map_err(PbaFailure::SpawnFailed)?;
 
-    match drive_handshake(link, snapshot, nonce, timings.ready_timeout, timings.evidence_timeout).await {
+    match drive_handshake(link, snapshots, nonce, timings.ready_timeout, timings.evidence_timeout).await {
         Ok(promoted_surfaces) => Ok(PbaOutcome { candidate, promoted_surfaces }),
         Err(failure) => Err(abort_candidate(&mut candidate, timings.reap_grace, failure).await),
     }
@@ -253,7 +254,7 @@ mod tests {
     }
 
     fn sample_snapshot() -> shared::StateSnapshot {
-        shared::StateSnapshot { revision: 1, payload: serde_json::json!({}) }
+        shared::StateSnapshot { capability: "audio".to_string(), revision: 1, payload: serde_json::json!({}) }
     }
 
     fn proc_exists(pid: i32) -> bool {
@@ -350,7 +351,7 @@ mod tests {
     impl CandidateLink for FakeCandidateLink {
         type Error = FakeLinkError;
 
-        async fn push_state_snapshot(&mut self, _snapshot: &shared::StateSnapshot) -> Result<(), Self::Error> {
+        async fn push_state_snapshot(&mut self, _snapshots: &[shared::StateSnapshot]) -> Result<(), Self::Error> {
             self.record("push_state_snapshot");
             self.run_step(&self.hydration).await
         }
@@ -396,7 +397,7 @@ mod tests {
             &sh_args("sleep 30"),
             &[],
             &mut link,
-            &sample_snapshot(),
+            &[sample_snapshot()],
             42,
             timings(SHORT_DEADLINE, SHORT_DEADLINE),
         )
@@ -431,7 +432,7 @@ mod tests {
             &sh_args("sleep 30"),
             &[],
             &mut link,
-            &sample_snapshot(),
+            &[sample_snapshot()],
             43,
             timings(SHORT_DEADLINE, SHORT_DEADLINE),
         )
@@ -451,7 +452,7 @@ mod tests {
             &sh_args("sleep 30"),
             &[],
             &mut link,
-            &sample_snapshot(),
+            &[sample_snapshot()],
             1,
             timings(Duration::from_millis(30), SHORT_DEADLINE),
         )
@@ -470,7 +471,7 @@ mod tests {
             &sh_args("sleep 30"),
             &[],
             &mut link,
-            &sample_snapshot(),
+            &[sample_snapshot()],
             2,
             timings(SHORT_DEADLINE, Duration::from_millis(30)),
         )
@@ -495,7 +496,7 @@ mod tests {
             &sh_args("sleep 30"),
             &[],
             &mut link,
-            &sample_snapshot(),
+            &[sample_snapshot()],
             6,
             timings(Duration::from_millis(30), SHORT_DEADLINE),
         )
@@ -520,7 +521,7 @@ mod tests {
             &sh_args("sleep 30"),
             &[],
             &mut link,
-            &sample_snapshot(),
+            &[sample_snapshot()],
             7,
             timings(SHORT_DEADLINE, Duration::from_millis(30)),
         )
@@ -569,7 +570,7 @@ mod tests {
             &sh_args(&format!("echo $$ > {}; exec sleep 30", pidfile.display())),
             &[],
             &mut link,
-            &sample_snapshot(),
+            &[sample_snapshot()],
             3,
             timings(Duration::from_millis(30), SHORT_DEADLINE),
         )
@@ -603,7 +604,7 @@ mod tests {
             &sh_args(&format!("echo $$ > {}; exec sleep 30", pidfile.display())),
             &[],
             &mut link,
-            &sample_snapshot(),
+            &[sample_snapshot()],
             8,
             timings(SHORT_DEADLINE, Duration::from_millis(60)),
         )
@@ -630,7 +631,7 @@ mod tests {
             &sh_args("sleep 30"),
             &[],
             &mut link,
-            &sample_snapshot(),
+            &[sample_snapshot()],
             9,
             timings(SHORT_DEADLINE, SHORT_DEADLINE),
         )
@@ -656,7 +657,7 @@ mod tests {
             &sh_args("sleep 30"),
             &[],
             &mut link,
-            &sample_snapshot(),
+            &[sample_snapshot()],
             10,
             timings(SHORT_DEADLINE, SHORT_DEADLINE),
         )
@@ -680,7 +681,7 @@ mod tests {
             &sh_args("sleep 30"),
             &[],
             &mut link,
-            &sample_snapshot(),
+            &[sample_snapshot()],
             4,
             timings(SHORT_DEADLINE, SHORT_DEADLINE),
         )
@@ -704,7 +705,7 @@ mod tests {
             &sh_args("sleep 30"),
             &[],
             &mut link,
-            &sample_snapshot(),
+            &[sample_snapshot()],
             11,
             timings(SHORT_DEADLINE, SHORT_DEADLINE),
         )
@@ -728,7 +729,7 @@ mod tests {
             &[],
             &[],
             &mut link,
-            &sample_snapshot(),
+            &[sample_snapshot()],
             5,
             timings(SHORT_DEADLINE, SHORT_DEADLINE),
         )

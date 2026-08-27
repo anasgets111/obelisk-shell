@@ -14,8 +14,10 @@
 //!
 //! Real `shell.lua` reload flow (build-steps.md Phase 13; `CONTEXT.md`, Watcher/Rollback/
 //! In-place reload/Generation swap; docs/adr/0024): a `shared::StateSnapshot` push only
-//! hydrates the live `audio` signal now -- it no longer triggers any Lua evaluation, unlike
-//! Phase 11's proof-of-wiring hack. Evaluation is driven by the Supervisor's own
+//! hydrates that snapshot's own `capability`-named live signal now (docs/adr/0029; created
+//! lazily on first sight of a new capability name, see `apply_state_snapshot`) -- it no longer
+//! triggers any Lua evaluation, unlike Phase 11's proof-of-wiring hack. Evaluation is driven by
+//! the Supervisor's own
 //! `shared::SupervisorFrame::Reevaluate`, sent after its `inotify` watch on
 //! `~/.config/oblisk/` detects a debounced edit to `shell.lua`:
 //!
@@ -61,6 +63,8 @@
 //! presented, and secure_submit channels are written back out as `RendererFrame::ReadySignal`/
 //! `PresentationEvidence`/`SecureSubmit`.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use shared::framing::{self, write_json_frame};
@@ -154,7 +158,13 @@ struct RendererClient {
     shell_lua_path: PathBuf,
     scene: Scene,
     shaping: ShapingHandle,
-    audio_handle: LiveSignalHandle,
+    /// One live Lua signal per capability seen so far, keyed by `StateSnapshot.capability`
+    /// (docs/adr/0029) -- `"audio"` is seeded at construction (see `new`'s doc comment); any
+    /// other capability's global is registered lazily, on the first `StateSnapshot` that names
+    /// it, by `apply_state_snapshot`. `RefCell`, not `&mut self`: `apply_state_snapshot` is
+    /// called through a `&self` receiver (see its own doc comment for why), and this is the one
+    /// piece of `RendererClient` state that read path needs to mutate.
+    capability_signals: RefCell<HashMap<String, LiveSignalHandle>>,
     rescue_handle: LiveSignalHandle,
     process_registry: ProcessRegistry,
     state: ReloadState,
@@ -176,21 +186,38 @@ struct DispatchChannels<'a> {
 }
 
 impl RendererClient {
+    // 8 parameters: one more than the pre-Phase-16 shape now that `network`, like `audio`, is
+    // pre-seeded (docs/adr/0029, Spec review) -- not worth inventing a bundling struct for a
+    // one-off constructor already called from exactly two places (`run` and this module's own
+    // `test_client`).
+    #[allow(clippy::too_many_arguments)]
     fn new(
         loader: Loader,
         shell_lua_path: PathBuf,
         shaping: ShapingHandle,
         audio_handle: LiveSignalHandle,
+        network_handle: LiveSignalHandle,
         rescue_handle: LiveSignalHandle,
         process_registry: ProcessRegistry,
         generation_id: u32,
     ) -> Self {
+        // "audio" is pre-seeded (not left to apply_state_snapshot's lazy path) so a `shell.lua`
+        // that reads `audio:get()` before the first real push still gets a live signal (reading
+        // `nil` inside it) instead of an undefined-global Lua error -- the same guarantee the
+        // pre-Phase-16 hardcoded registration gave. "network" is pre-seeded too (docs/adr/0029,
+        // Spec review): it's the other known, always-present capability as of this diff, and
+        // without this a `shell.lua` referencing the global `network` before the Supervisor's
+        // first NetworkManager event ever fires would hit the same undefined-global Lua error,
+        // not merely read `nil`. Any capability beyond these two only starts existing once its
+        // first StateSnapshot actually arrives, via `capability_signal`'s lazy path below.
+        let capability_signals =
+            RefCell::new(HashMap::from([("audio".to_string(), audio_handle), ("network".to_string(), network_handle)]));
         Self {
             loader,
             shell_lua_path,
             scene: Scene::new(),
             shaping,
-            audio_handle,
+            capability_signals,
             rescue_handle,
             process_registry,
             state: ReloadState { applied_topology: None, pending: None },
@@ -205,12 +232,31 @@ impl RendererClient {
         }
     }
 
-    /// `StateSnapshot` pushes only hydrate the live `audio` signal now -- no Lua evaluation runs
-    /// from this path any more (see the module doc comment).
+    /// `StateSnapshot` pushes only hydrate `snapshot.capability`'s own live signal now -- no Lua
+    /// evaluation runs from this path any more (see the module doc comment). `&self`, not `&mut
+    /// self`: this is called from `dispatch_loop`'s read arm, which only holds a shared
+    /// reference into `RendererClient` at that point (mirrors why `LiveSignalHandle` itself uses
+    /// `Rc<RefCell<_>>` internally) -- `capability_signals`' own `RefCell` is what makes the
+    /// lazy-registration path below possible without upgrading every caller to `&mut self`.
     fn apply_state_snapshot(&self, snapshot: StateSnapshot) -> mlua::Result<()> {
         let value = self.loader.to_lua_value(&snapshot.payload)?;
-        self.audio_handle.set(value);
+        let handle = self.capability_signal(&snapshot.capability)?;
+        handle.set(value);
         Ok(())
+    }
+
+    /// Looks up `capability`'s live signal, registering a fresh one (initial value `nil`) as a
+    /// new Lua global named `capability` the first time this capability is ever seen
+    /// (docs/adr/0029). Every later `StateSnapshot` for the same capability reuses the same
+    /// handle instead of re-registering the global on every push.
+    fn capability_signal(&self, capability: &str) -> mlua::Result<LiveSignalHandle> {
+        if let Some(handle) = self.capability_signals.borrow().get(capability) {
+            return Ok(handle.clone());
+        }
+        let (signal, handle) = lua::signal::Signal::new_live(mlua::Value::Nil);
+        self.loader.set_global(capability, signal)?;
+        self.capability_signals.borrow_mut().insert(capability.to_string(), handle.clone());
+        Ok(handle)
     }
 
     /// Evaluates `shell.lua` once at startup and applies it directly -- no round trip through the
@@ -437,6 +483,11 @@ async fn run(
         eprintln!("control-socket client: failed to register the audio signal: {err}");
         return;
     }
+    let (network_signal, network_handle) = lua::signal::Signal::new_live(mlua::Value::Nil);
+    if let Err(err) = loader.set_global("network", network_signal) {
+        eprintln!("control-socket client: failed to register the network signal: {err}");
+        return;
+    }
     let rescue_handle = match register_rescue_signal(&loader) {
         Ok(handle) => handle,
         Err(err) => {
@@ -452,7 +503,8 @@ async fn run(
     }
 
     let shaping = ShapingHandle::spawn();
-    let mut client = RendererClient::new(loader, shell_lua_path, shaping, audio_handle, rescue_handle, process_registry, generation_id);
+    let mut client =
+        RendererClient::new(loader, shell_lua_path, shaping, audio_handle, network_handle, rescue_handle, process_registry, generation_id);
     client.run_startup_evaluation();
 
     let (mut read_half, mut write_half) = stream.into_split();
@@ -570,13 +622,24 @@ mod tests {
         let loader = Loader::new().unwrap();
         let (audio_signal, audio_handle) = lua::signal::Signal::new_live(mlua::Value::Nil);
         loader.set_global("audio", audio_signal).unwrap();
+        let (network_signal, network_handle) = lua::signal::Signal::new_live(mlua::Value::Nil);
+        loader.set_global("network", network_signal).unwrap();
         let rescue_handle = register_rescue_signal(&loader).unwrap();
         // None of this file's tests exercise process.run itself (see lua/process.rs's own tests
         // for that) -- a throwaway channel is enough to satisfy RendererClient's shape.
         let (process_tx, _process_rx) = mpsc::unbounded_channel();
         let process_registry = ProcessRegistry::new(0, process_tx);
         loader.register_process(process_registry.clone()).unwrap();
-        RendererClient::new(loader, shell_lua_path.to_path_buf(), ShapingHandle::spawn(), audio_handle, rescue_handle, process_registry, 0)
+        RendererClient::new(
+            loader,
+            shell_lua_path.to_path_buf(),
+            ShapingHandle::spawn(),
+            audio_handle,
+            network_handle,
+            rescue_handle,
+            process_registry,
+            0,
+        )
     }
 
     #[test]
@@ -584,12 +647,46 @@ mod tests {
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let client = test_client(&missing);
 
-        let snapshot = StateSnapshot { revision: 1, payload: serde_json::json!({ "app_name": "Zen" }) };
+        let snapshot = StateSnapshot { capability: "audio".to_string(), revision: 1, payload: serde_json::json!({ "app_name": "Zen" }) };
         client.apply_state_snapshot(snapshot).unwrap();
 
         let output = client.loader.evaluate(r#"return surface { id = "bar", layer = "Top", app_name = audio:get().app_name }"#).unwrap();
         let app_name = output.surfaces[0].properties.get("app_name").unwrap().as_string().unwrap().to_string_lossy();
         assert_eq!(app_name, "Zen");
+    }
+
+    #[test]
+    fn apply_state_snapshot_lazily_registers_a_new_capabilitys_live_signal() {
+        // docs/adr/0029: a capability other than "audio"/"network" has no pre-registered global
+        // -- the first StateSnapshot naming it must create the Lua global on the spot, not error.
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let client = test_client(&missing);
+
+        let snapshot = StateSnapshot { capability: "bluetooth".to_string(), revision: 1, payload: serde_json::json!({ "scanning": true }) };
+        client.apply_state_snapshot(snapshot).unwrap();
+
+        let output = client.loader.evaluate(r#"return surface { id = "bar", layer = "Top", scanning = bluetooth:get().scanning }"#).unwrap();
+        assert_eq!(output.surfaces[0].properties.get("scanning").unwrap().as_boolean(), Some(true));
+    }
+
+    #[test]
+    fn apply_state_snapshot_reuses_the_same_signal_across_repeated_pushes_for_one_capability() {
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let client = test_client(&missing);
+
+        client
+            .apply_state_snapshot(StateSnapshot { capability: "network".to_string(), revision: 1, payload: serde_json::json!({ "scanning": true }) })
+            .unwrap();
+        client
+            .apply_state_snapshot(StateSnapshot { capability: "network".to_string(), revision: 2, payload: serde_json::json!({ "scanning": false }) })
+            .unwrap();
+
+        let output = client.loader.evaluate(r#"return surface { id = "bar", layer = "Top", scanning = network:get().scanning }"#).unwrap();
+        assert_eq!(
+            output.surfaces[0].properties.get("scanning").unwrap().as_boolean(),
+            Some(false),
+            "the second push must update the same registered global, not fail or create a second one"
+        );
     }
 
     #[test]
