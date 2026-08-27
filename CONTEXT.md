@@ -111,3 +111,11 @@ _Avoid_: focus mode, silent mode, mute
 **Notification body span**:
 One allowlisted markup run inside a sanitized notification body: a text run carrying `{text, bold, italic, underline, href}`, or an image run carrying `{image_path}` resolved through the path-trust validator shared with action-icon names (an allowlisted-directory check, not full XDG theme resolution). The sanitizer emits an array of these instead of collapsing markup to flat text; every construct outside the five allowlisted tags (`<b>`, `<i>`, `<u>`, `<a href>`, `<img src>`) is rejected exactly as the prior flat-text sanitizer rejected all markup.
 _Avoid_: rich text, HTML fragment
+
+**Primary keyboard**:
+The one input device Oblisk reads `oblisk.keyboard`'s per-key state from (backlight, lock LEDs, active layout), chosen once at Supervisor startup rather than tracked per-device. Matches the IDL's own singular `active_layout: string` declaration and every reference implementation checked.
+_Avoid_: main keyboard, active keyboard
+
+**Compositor link**:
+The trait behind `keyboard.active_layout`/`keyboard:switch_layout`, one implementor per compositor (Hyprland, Niri). The Supervisor picks an implementor at startup by probing `$HYPRLAND_INSTANCE_SIGNATURE`/`$NIRI_SOCKET`. Scoped deliberately to what keyboard layout needs today, not widened to guess the still-undesigned workspace adaptor's (§10) eventual method surface — whether that trait extends this one or defines its own is an open question, not settled here.
+_Avoid_: workspace adaptor (a different, still-unbuilt trait), compositor adapter
