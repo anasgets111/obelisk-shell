@@ -3,6 +3,7 @@
 //! later phase.
 
 pub mod bluetooth;
+pub mod idle;
 pub mod network;
 pub mod polkit;
 pub mod tray;

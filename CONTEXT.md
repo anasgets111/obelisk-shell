@@ -91,3 +91,11 @@ _Avoid_: version, sequence number
 **Secure submit**:
 A `textfield` property naming the capability/action that receives a masked field's native input buffer directly, bypassing Lua. Without it, a masked field's value is unreadable from Lua entirely.
 _Avoid_: secure handle, password callback
+
+**Idle threshold**:
+A Lua-registered duration, in seconds, that fires a matched `idled`/`resumed` event pair through the `idle` capability. The Supervisor holds one `ext_idle_notification_v1` listener per distinct duration on its own Wayland connection (Lock authority's sibling), fanning that listener's events out to every registration sharing the duration.
+_Avoid_: idle timeout, inactivity timer
+
+**Idle inhibit**:
+A generation-scoped refcount that, above zero, holds one `org.freedesktop.login1.Manager.Inhibit(what="idle")` file descriptor open, blocking the system's own auto-suspend. The same per-generation reset that clears idle thresholds on reload or crash zeros this count too; the fd closes the instant the count returns to zero.
+_Avoid_: wake lock, keep-awake handle

@@ -69,8 +69,9 @@ use std::path::{Path, PathBuf};
 
 use shared::framing::{self, write_json_frame};
 use shared::{
-    ActivateDraw, ApplyPendingReload, CommandEnvelope, ConnectionHandshake, DeselectInput, PresentationEvidence, ProcessExited, ProcessOutputLine,
-    PromoteGeneration, ReadySignal, ReevaluateReport, ReevaluateRequest, RendererFrame, SecureSubmit, StateSnapshot, SupervisorFrame, Zeroize,
+    ActivateDraw, ApplyPendingReload, CommandEnvelope, ConnectionHandshake, DeselectInput, IdleEvent, PresentationEvidence, ProcessExited,
+    ProcessOutputLine, PromoteGeneration, ReadySignal, ReevaluateReport, ReevaluateRequest, RendererFrame, SecureSubmit, StateSnapshot,
+    SupervisorFrame, Zeroize,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
@@ -392,6 +393,16 @@ impl RendererClient {
                     }
                     Ok(SupervisorFrame::ProcessExited(ProcessExited { id, code })) => {
                         self.process_registry.dispatch_exit(id, code);
+                    }
+                    Ok(SupervisorFrame::IdleEvent(IdleEvent { generation_id, threshold_sec, state })) => {
+                        // Real, received, currently-inert: no Lua-side `register_threshold`
+                        // callback registry exists yet to dispatch this to -- ADR-0032's
+                        // Supervisor-side controller and wire types are this slice's scope; the
+                        // Renderer-side `on_idle`/`on_resume` callback lookup is a later phase.
+                        eprintln!(
+                            "control-socket client: IdleEvent(generation={generation_id}, threshold_sec={threshold_sec}, state={state:?}) \
+                             received (no Lua callback registry wired yet)"
+                        );
                     }
                     Err(err) => {
                         eprintln!("control-socket client: connection ended: {err}");

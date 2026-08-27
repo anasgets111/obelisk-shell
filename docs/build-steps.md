@@ -524,15 +524,26 @@ against a fake. This phase gives them their first real implementation and their 
 
 ### Phase 16: D-Bus & Hardware Backend Controllers
 
-Notifications (§ 1), Tray (§ 2), MPRIS (§ 3), NetworkManager (§ 4), BlueZ (§ 5), idle capability
-(§ 7), telemetry (§ 11), and power/thermals (§ 13) all follow the pattern already proven twice in
-this codebase, `dbus::polkit` (D-Bus proxy/agent registration) and `audio::mixer` (event-driven
+Notifications (§ 1), Tray (§ 2), MPRIS (§ 3), NetworkManager (§ 4), BlueZ (§ 5), idle (§ 7,
+ADR-0032 — split into two named sub-items below), telemetry (§ 11), and power/thermals (§ 13) all
+follow the pattern already proven twice in this codebase, `dbus::polkit` (D-Bus proxy/agent
+registration) and `audio::mixer` (event-driven
 listener thread), and are TDD-able against real fixtures per `oblisk-tdd-test-harness.md` (p2p
 D-Bus connections, real sysfs roots), no mocks needed. Use `#[zbus::interface]`, not
 `#[dbus_interface]`; ADR-0013 already documents why the latter doesn't exist in the zbus version
 this workspace actually depends on. None of these block each other; sequence them by product
 priority once Phase 11's transport makes any of them worth building. Building a backend before
 that just repeats ADR-0015/0017's `eprintln!`-dead-end pattern a third time.
+
+Idle (§ 7) is one controller sharing generation-scoped cleanup, but ADR-0032 splits it into two
+named sub-items because its two halves don't share a transport — don't assume inhibit inherits
+notify's Wayland-specific setup work:
+- **Idle notify**. `ext_idle_notifier_v1` on the Supervisor's own dedicated Wayland connection (a
+  sibling to lock authority's own dedicated connection, ADR-0010). Needs the `wayland-protocols`
+  `"staging"` Cargo feature gate.
+- **Idle inhibit**. `org.freedesktop.login1.Manager.Inhibit` on the already-open system D-Bus
+  connection NetworkManager/BlueZ/polkit already share. Needs neither a new connection nor the
+  `"staging"` feature gate.
 
 Two exceptions worth building on their own track instead of folding into the general D-Bus
 pattern above:

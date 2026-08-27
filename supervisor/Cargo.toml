@@ -21,7 +21,7 @@ tokio = { version = "1.53.1", features = ["full"] }
 tokio-stream = "0.1.19"
 udev = "0.9.3"
 wayland-client = "0.31.15"
-wayland-protocols = { version = "0.32.13", features = ["client"] }
+wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
 zbus = { version = "5.19.0", features = ["tokio"] }
 zbus_polkit = { version = "5.0.0", default-features = false, features = ["tokio"] }
 

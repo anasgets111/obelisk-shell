@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use dbus::bluetooth::{self, BluetoothController, BluetoothSignal};
+use dbus::idle::{self, IdleController};
 use dbus::network::{self, NetworkController, NetworkSignal, PendingNetworkConnect};
 use dbus::polkit::{AGENT_OBJECT_PATH, AuthenticationAgent, current_session_subject, register_agent};
 use dbus::tray::{self, TrayController, TraySignal};
@@ -39,15 +40,6 @@ const RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 /// superseded-generation reap below.
 const PBA_TIMINGS: reload::PbaTimings =
     reload::PbaTimings { ready_timeout: Duration::from_secs(2), evidence_timeout: Duration::from_secs(3), reap_grace: process::DEFAULT_REAP_GRACE };
-
-/// ADR-0006: an in-place reload must drop any Supervisor-held registrations tied to
-/// `generation_id` before the fresh evaluation is applied, so a re-issued `idle:register_threshold`
-/// (etc.) reads as a replacement, not a duplicate leak. No capability registers anything against
-/// a `generation_id` yet -- the D-Bus/hardware controllers that would populate this (Phase 16)
-/// don't exist -- so this is a real, called, currently-empty seam, matching this codebase's
-/// established real-but-unwired precedent (`socket::GenerationRegistry` itself sat exactly like
-/// this through Phase 9-10, see docs/adr/0020). See docs/adr/0024 item 2.
-fn reset_registrations(_generation_id: u32) {}
 
 /// Whether an `Unchanged` report's `sequence` still names the most recently sent `Reevaluate`
 /// (`next_sequence`). A mismatch means a newer `Reevaluate` has already been sent for this
@@ -444,6 +436,20 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     let socket_path = shared::control_socket_path()?;
     let (registry, mut inbound_frames, mut connected) = socket::spawn_listener(&socket_path)?;
 
+    // Idle capability (docs/oblisk-supervisor-services-dbus.md §7; ADR-0032): notify rides its
+    // own dedicated Wayland connection (ADR-0010's sibling to lock authority -- idle authority
+    // must survive a Renderer crash or reload too), inhibit rides the same system-bus
+    // `connection` NetworkManager/BlueZ/polkit already share (no new connection, no degrade path
+    // -- ADR-0032). Constructed after `socket::spawn_listener`, not before: `IdleController::new`
+    // itself returns immediately (notify setup runs in its own `spawn_blocking`-wrapped,
+    // timeout-bounded background task -- see `dbus::idle`'s module doc comment for the live-
+    // observed hang this defends against), but this ordering is kept as a second, independent
+    // guarantee that a future change to that constructor can't silently reintroduce a control-
+    // socket-blocking boot dependency. Unlike tray, there's no fallible outer `match` here since
+    // inhibit always constructs successfully against an already-established connection.
+    let (idle_signal_tx, mut idle_signals) = tokio::sync::mpsc::unbounded_channel::<shared::IdleEvent>();
+    let idle = IdleController::new(connection.clone(), idle_signal_tx).await;
+
     let config_dir = shared::config_dir()?;
     let mut reload_events = watcher::spawn_watcher(&config_dir, RELOAD_DEBOUNCE)?;
     let mut next_sequence: u64 = 0;
@@ -568,6 +574,19 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 // snapshot of already-live data, no further D-Bus round trip needed here.
                 let tray_state = tray.build_state();
                 push_tray_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &tray_state);
+            }
+            Some(event) = idle_signals.recv() => {
+                // Unlike tray/network/bluetooth (always pushed to the single authoritative
+                // generation), an idle event is routed to whichever generation actually made the
+                // `register_threshold` call that's now firing (`event.generation_id`) -- ADR-0006's
+                // "a registration belongs to the generation that made it" framing, and the only
+                // sensible target when a superseded (non-authoritative) generation still holds a
+                // live threshold registration. Dispatched straight as an `IdleEvent`, not through
+                // the `StateSnapshot`/`revision` signal-table path (ADR-0032: idle is
+                // event-shaped, not pollable state). `dbus::idle` already builds `shared::IdleEvent`
+                // directly (no intermediate signal type to relabel -- Standards review), so this
+                // arm just routes it.
+                send_frame_logged(&registry, event.generation_id, &SupervisorFrame::IdleEvent(event));
             }
             Some(()) = reload_events.recv() => {
                 next_sequence += 1;
@@ -812,6 +831,37 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                         ),
                     }
                 }
+                RendererFrame::Command(envelope) if envelope.params.capability == "idle" && envelope.params.action == "register" => {
+                    match idle::parse_register_args(&envelope.params.arguments) {
+                        Some(sec) => {
+                            let controller = idle.clone();
+                            let generation_id = envelope.params.generation_id;
+                            tokio::spawn(async move { controller.register_threshold(generation_id, sec).await; });
+                        }
+                        None => eprintln!(
+                            "malformed idle.register command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "idle" && envelope.params.action == "inhibit" => {
+                    match idle::parse_inhibit_args(&envelope.params.arguments) {
+                        Some(reason) => {
+                            let controller = idle.clone();
+                            let generation_id = envelope.params.generation_id;
+                            tokio::spawn(async move { controller.inhibit(generation_id, &reason).await; });
+                        }
+                        None => eprintln!(
+                            "malformed idle.inhibit command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "idle" && envelope.params.action == "release_inhibit" => {
+                    let controller = idle.clone();
+                    let generation_id = envelope.params.generation_id;
+                    tokio::spawn(async move { controller.release_inhibit(generation_id).await; });
+                }
                 RendererFrame::Command(envelope) => {
                     eprintln!("inbound command from generation {}: {:?}", inbound.generation_id, envelope);
                 }
@@ -825,7 +875,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 }
                 RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence }) => {
                     if is_current_reload(sequence, next_sequence) {
-                        reset_registrations(inbound.generation_id);
+                        idle.reset_registrations(inbound.generation_id).await;
                         send_frame_logged(&registry, inbound.generation_id, &SupervisorFrame::ApplyPendingReload(ApplyPendingReload { sequence }));
                     } else {
                         eprintln!(

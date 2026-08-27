@@ -141,6 +141,34 @@ pub enum ProcessStream {
     Stderr,
 }
 
+/// Supervisor -> Renderer: `"idled"` or `"resumed"`, one `ext_idle_notification_v1` event
+/// (docs/adr/0032). A real enum, not a bare string tag -- [`ProcessStream`]'s own doc comment
+/// already sets this codebase's "Baseline Smells reject that as Primitive Obsession" precedent
+/// for a wire-level state tag like this one. `#[serde(rename)]` on each variant, not the derived
+/// `Idled`/`Resumed`, because ADR-0032 pins the wire value to the protocol's own lowercase event
+/// names (`"idled"`/`"resumed"`), not Rust's PascalCase variant spelling.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum IdleState {
+    #[serde(rename = "idled")]
+    Idled,
+    #[serde(rename = "resumed")]
+    Resumed,
+}
+
+/// Supervisor -> Renderer: one `ext_idle_notification_v1` `idled`/`resumed` event, fanned out to
+/// `generation_id` (docs/adr/0032; CONTEXT.md's Idle threshold entry). `threshold_sec` is the
+/// distinct duration this event's listener was created for -- the Renderer looks up its own
+/// registered callback by this value. Dispatched straight to that callback, not through the
+/// `StateSnapshot`/`revision` signal-table path: idle is event-shaped, not pollable state
+/// (ADR-0032's own reasoning for why this needed a new `SupervisorFrame` variant instead of
+/// reusing `StateSnapshot`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IdleEvent {
+    pub generation_id: u32,
+    pub threshold_sec: u64,
+    pub state: IdleState,
+}
+
 /// Supervisor -> Renderer: one line of a `process.run`-spawned child's stdout/stderr
 /// (`docs/oblisk-supervisor-services-dbus.md` § 12's "No Lua Blockage" half; `oblisk-idl-api-
 /// specs.md` § 3.2/3.3). `id` is the same value the Renderer assigned in the `"process"`/`"run"`
@@ -194,6 +222,7 @@ pub enum SupervisorFrame {
     PromoteGeneration(PromoteGeneration),
     ProcessOutput(ProcessOutputLine),
     ProcessExited(ProcessExited),
+    IdleEvent(IdleEvent),
 }
 
 /// Every frame a Renderer connection can send to the Supervisor, same tagging scheme as
@@ -481,6 +510,21 @@ mod tests {
             let frame = SupervisorFrame::ProcessExited(ProcessExited { id: 3, code });
             let wire = serde_json::to_value(&frame).unwrap();
             assert_eq!(wire, serde_json::json!({ "kind": "ProcessExited", "data": { "id": 3, "code": code } }));
+
+            let parsed: SupervisorFrame = serde_json::from_value(wire).unwrap();
+            assert_eq!(parsed, frame);
+        }
+    }
+
+    #[test]
+    fn supervisor_frame_idle_event_is_adjacently_tagged() {
+        for (state, wire_state) in [(IdleState::Idled, "idled"), (IdleState::Resumed, "resumed")] {
+            let frame = SupervisorFrame::IdleEvent(IdleEvent { generation_id: 4, threshold_sec: 30, state });
+            let wire = serde_json::to_value(&frame).unwrap();
+            assert_eq!(
+                wire,
+                serde_json::json!({ "kind": "IdleEvent", "data": { "generation_id": 4, "threshold_sec": 30, "state": wire_state } })
+            );
 
             let parsed: SupervisorFrame = serde_json::from_value(wire).unwrap();
             assert_eq!(parsed, frame);
