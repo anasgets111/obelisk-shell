@@ -1,5 +1,6 @@
 mod audio;
 mod dbus;
+mod hardware;
 mod pam_worker;
 mod process;
 mod reload;
@@ -14,11 +15,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use dbus::bluetooth::{self, BluetoothController, BluetoothSignal};
-use dbus::idle::{self, IdleController};
 use dbus::network::{self, NetworkController, NetworkSignal, PendingNetworkConnect};
 use dbus::notifications::{self, NotificationsController, NotificationsSignal};
 use dbus::polkit::{AGENT_OBJECT_PATH, AuthenticationAgent, current_session_subject, register_agent};
 use dbus::tray::{self, TrayController, TraySignal};
+use hardware::idle::{self, IdleController};
 use reload_link::SocketCandidateLink;
 use shared::{
     ApplyPendingReload, DeselectInput, ProcessExited, ProcessOutputLine, ProcessStream, PromoteGeneration, RendererFrame, ReevaluateReport,
@@ -483,7 +484,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     // `connection` NetworkManager/BlueZ/polkit already share (no new connection, no degrade path
     // -- ADR-0032). Constructed after `socket::spawn_listener`, not before: `IdleController::new`
     // itself returns immediately (notify setup runs in its own `spawn_blocking`-wrapped,
-    // timeout-bounded background task -- see `dbus::idle`'s module doc comment for the live-
+    // timeout-bounded background task -- see `hardware::idle`'s module doc comment for the live-
     // observed hang this defends against), but this ordering is kept as a second, independent
     // guarantee that a future change to that constructor can't silently reintroduce a control-
     // socket-blocking boot dependency. Unlike tray, there's no fallible outer `match` here since
@@ -632,7 +633,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 // sensible target when a superseded (non-authoritative) generation still holds a
                 // live threshold registration. Dispatched straight as an `IdleEvent`, not through
                 // the `StateSnapshot`/`revision` signal-table path (ADR-0032: idle is
-                // event-shaped, not pollable state). `dbus::idle` already builds `shared::IdleEvent`
+                // event-shaped, not pollable state). `hardware::idle` already builds `shared::IdleEvent`
                 // directly (no intermediate signal type to relabel -- Standards review), so this
                 // arm just routes it.
                 send_frame_logged(&registry, event.generation_id, &SupervisorFrame::IdleEvent(event));
