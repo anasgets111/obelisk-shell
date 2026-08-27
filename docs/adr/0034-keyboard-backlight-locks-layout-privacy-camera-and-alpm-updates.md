@@ -171,8 +171,26 @@ missing-capability path in this codebase.
 `active_layout` as a singular string, and Noctalia tracks main-device only — no reason to
 diverge into per-device tracking. Write is `keyboard:switch_layout(index)` alone; no separate
 next/prev actions, since `active_layout_index` + `layout_count` in the read signal let Lua
-compute cycling itself. Both compositors natively support index-based selection already
-(confirmed, not assumed), so this isn't extra implementation cost.
+compute cycling itself. Both compositors natively support index-based *write* selection already
+(confirmed, not assumed: `hyprctl switchxkblayout <device> <index>` and niri's
+`{"SwitchLayout":{"layout":{"Index":<index>}}}` both take a real index), so switching isn't
+extra implementation cost.
+
+**Correction (Spec review, implementation round): reading `active_layout_index` back is not
+symmetric between the two compositors, and Lua-side cycling only actually works on Niri today.**
+Niri's `KeyboardLayouts` event gives a names list plus a current index directly — trivial to
+mirror into `active_layout_index`. Hyprland's `hyprctl -j devices` gives only `active_keymap` (a
+human-readable name, e.g. `"English (US)"`) and `layout` (a comma-separated XKB-code list, e.g.
+`"us,ara"`), with no code↔name correlation table in the JSON to place `active_keymap` at a
+position in `layout`. So on Hyprland, `active_layout_index` cannot be derived from anything
+`hyprctl` reports and is left at its last-known value (`0` until the user manually confirms
+otherwise on their own machine) — `layout_count` is still accurate (Hyprland does report the
+configured layout count correctly), but Lua's "compute cycling from index + count" strategy
+silently can't cycle correctly on Hyprland as shipped. This is a disclosed, structural gap, not
+a bug to fix later: closing it needs either a Hyprland-side config convention Oblisk can rely on
+(a fixed layout order Oblisk itself controls, matching XKB variant strings against configured XKB
+layouts) or an upstream Hyprland IPC change, neither of which exists today. Flagged for the user
+to verify and, if it matters to them, address on their own Hyprland machine.
 
 **Module layout: a new `supervisor/src/hardware/` tree, sibling to `dbus/`.** None of these
 five are D-Bus interfaces (only backlight even touches D-Bus, and only as one client among
