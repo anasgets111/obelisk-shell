@@ -21,6 +21,7 @@ use dbus::notifications::{self, NotificationsController, NotificationsSignal};
 use dbus::polkit::{AGENT_OBJECT_PATH, AuthenticationAgent, current_session_subject, register_agent};
 use dbus::tray::{self, TrayController, TraySignal};
 use hardware::idle::{self, IdleController};
+use hardware::sysinfo::{self, SysinfoController, SysinfoSignal};
 use process::registry::{
     KillOutcome, LiveProcesses, kill_registered_process, process_run_args, reap_all_processes, reap_generations_processes,
     spawn_and_register_process, stream_process_output, take_exited_process, wait_and_report_exit,
@@ -30,7 +31,7 @@ use shared::{
     ApplyPendingReload, DeselectInput, ProcessExited, PromoteGeneration, RendererFrame, ReevaluateReport, ReevaluateRequest, SupervisorFrame,
     Zeroize,
 };
-use snapshot::{bump_revision, push_bluetooth_snapshot, push_network_snapshot, push_notifications_snapshot, push_tray_snapshot};
+use snapshot::{bump_revision, push_bluetooth_snapshot, push_network_snapshot, push_notifications_snapshot, push_sysinfo_snapshot, push_tray_snapshot};
 
 /// How long the Watcher waits after the *last* relevant `shell.lua` change before dispatching a
 /// reload -- coalesces an editor's multi-event save into a single round trip. Fixed, not
@@ -211,6 +212,15 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     let (idle_signal_tx, mut idle_signals) = tokio::sync::mpsc::unbounded_channel::<shared::IdleEvent>();
     let idle = IdleController::new(connection.clone(), idle_signal_tx).await;
 
+    // sysinfo capability (docs/oblisk-supervisor-services-dbus.md §11; docs/oblisk-hardware-
+    // event-pipeline.md §7; docs/adr/0035): three independently-configurable, watch-driven
+    // poll tasks, all starting dormant -- nothing polls `/proc`/`/sys` until Lua calls
+    // `sysinfo:configure` at least once. No D-Bus connection, no degrade-to-inert path (unlike
+    // tray/notifications/idle-notify above) -- pure sysfs/procfs parsing always succeeds at
+    // construction time regardless of what the real filesystem happens to expose.
+    let (sysinfo_signal_tx, mut sysinfo_signals) = tokio::sync::mpsc::unbounded_channel::<SysinfoSignal>();
+    let sysinfo = SysinfoController::new(PathBuf::from("/proc"), PathBuf::from("/sys/class/hwmon"), sysinfo_signal_tx);
+
     let config_dir = shared::config_dir()?;
     let mut reload_events = watcher::spawn_watcher(&config_dir, RELOAD_DEBOUNCE)?;
     let mut next_sequence: u64 = 0;
@@ -356,6 +366,15 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 // directly (no intermediate signal type to relabel -- Standards review), so this
                 // arm just routes it.
                 send_frame_logged(&registry, event.generation_id, &SupervisorFrame::IdleEvent(event));
+            }
+            Some(SysinfoSignal::Changed) = sysinfo_signals.recv() => {
+                // No debounce (matching tray/network/bluetooth/notifications' own precedent):
+                // whichever of the three tasks (cpu; ram+swap; temp_cores+temp_gpu) just
+                // ticked already wrote its own field(s) into the shared state under its own
+                // lock -- this arm only needs to clone the current combined state and push it
+                // (docs/adr/0035).
+                let state = sysinfo.snapshot();
+                push_sysinfo_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &state);
             }
             Some(()) = reload_events.recv() => {
                 next_sequence += 1;
@@ -630,6 +649,15 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                     let controller = idle.clone();
                     let generation_id = envelope.params.generation_id;
                     tokio::spawn(async move { controller.release_inhibit(generation_id).await; });
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "sysinfo" && envelope.params.action == "configure" => {
+                    match sysinfo::parse_configure_args(&envelope.params.arguments) {
+                        Some(cfg) => sysinfo.configure(cfg),
+                        None => eprintln!(
+                            "malformed sysinfo.configure command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
                 }
                 RendererFrame::Command(envelope) if envelope.params.capability == "notifications" && envelope.params.action == "dismiss" => {
                     match notifications::parse_dismiss_args(&envelope.params.arguments) {

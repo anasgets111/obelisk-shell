@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use shared::SupervisorFrame;
 
 use crate::dbus::{bluetooth, network, notifications, tray};
+use crate::hardware::sysinfo;
 use crate::{send_frame_logged, socket};
 
 /// Bumps and returns `capability`'s own state-version counter (ADR-0004; docs/adr/0029
@@ -105,5 +106,29 @@ pub(crate) fn push_notifications_snapshot(
             last_snapshots.insert("notifications".to_string(), snapshot);
         }
         Err(err) => eprintln!("failed to serialize notifications StateSnapshot: {err}"),
+    }
+}
+
+/// Bumps `"sysinfo"`'s revision and pushes `state` as a fresh `StateSnapshot` to the
+/// authoritative generation -- mirrors [`push_notifications_snapshot`] exactly. `revision`
+/// bumps once per push regardless of which of the three underlying tasks (cpu; ram+swap;
+/// temp_cores+temp_gpu) actually changed the field that triggered it (docs/adr/0035:
+/// `bump_revision`'s existing per-capability, not per-field, granularity applies unchanged
+/// even with three independent producers writing into this one capability's state).
+pub(crate) fn push_sysinfo_snapshot(
+    registry: &socket::GenerationRegistry,
+    generation_id: u32,
+    revisions: &mut HashMap<String, u32>,
+    last_snapshots: &mut HashMap<String, shared::StateSnapshot>,
+    state: &sysinfo::SysinfoState,
+) {
+    let revision = bump_revision(revisions, "sysinfo");
+    match serde_json::to_value(state) {
+        Ok(payload) => {
+            let snapshot = shared::StateSnapshot { capability: "sysinfo".to_string(), revision, payload };
+            send_frame_logged(registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
+            last_snapshots.insert("sysinfo".to_string(), snapshot);
+        }
+        Err(err) => eprintln!("failed to serialize sysinfo StateSnapshot: {err}"),
     }
 }
