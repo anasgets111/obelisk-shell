@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use shared::SupervisorFrame;
 
 use crate::dbus::{bluetooth, network, notifications, tray};
-use crate::hardware::sysinfo;
+use crate::hardware::{keyboard, sysinfo};
 use crate::{send_frame_logged, socket};
 
 /// Bumps and returns `capability`'s own state-version counter (ADR-0004; docs/adr/0029
@@ -130,5 +130,27 @@ pub(crate) fn push_sysinfo_snapshot(
             last_snapshots.insert("sysinfo".to_string(), snapshot);
         }
         Err(err) => eprintln!("failed to serialize sysinfo StateSnapshot: {err}"),
+    }
+}
+
+/// Bumps `"keyboard"`'s revision and pushes `state` as a fresh `StateSnapshot` to the
+/// authoritative generation -- mirrors [`push_sysinfo_snapshot`] exactly (docs/adr/0034).
+/// Backlight is the only producer wired in so far; locks and layout will bump the same
+/// per-capability revision through this same helper once they join.
+pub(crate) fn push_keyboard_snapshot(
+    registry: &socket::GenerationRegistry,
+    generation_id: u32,
+    revisions: &mut HashMap<String, u32>,
+    last_snapshots: &mut HashMap<String, shared::StateSnapshot>,
+    state: &keyboard::KeyboardState,
+) {
+    let revision = bump_revision(revisions, "keyboard");
+    match serde_json::to_value(state) {
+        Ok(payload) => {
+            let snapshot = shared::StateSnapshot { capability: "keyboard".to_string(), revision, payload };
+            send_frame_logged(registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
+            last_snapshots.insert("keyboard".to_string(), snapshot);
+        }
+        Err(err) => eprintln!("failed to serialize keyboard StateSnapshot: {err}"),
     }
 }
