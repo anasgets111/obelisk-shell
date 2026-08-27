@@ -166,6 +166,27 @@ The active Renderer process populates the global `oblisk` state tree with the fo
 *   `power.on_battery`: `boolean` (True if running on battery power)
 *   `power.energy_rate`: `number` (Active battery discharge or charge rate in Watts, floating-point)
 
+### 2.14 Tray State (`oblisk.tray`) (docs/adr/0031)
+*   `tray.items`: `table` (Array of registered `StatusNotifierItem` tray icons):
+    *   Tray Item object:
+        *   `id`: `string` (Stable id -- the sanitized D-Bus unique name of the registering process, e.g. `"1.234"`)
+        *   `name`: `string` (Display name -- `Title`, falling back to `Id` when empty)
+        *   `icon_name`: `string` (Theme icon name, or `nil` if an `icon_path` is set instead -- exactly one of the two is ever populated)
+        *   `icon_path`: `string` (Asset path to a decoded, bounds-checked PNG spooled to `/dev/shm`, or `nil` if `icon_name` is set instead)
+        *   `tooltip`: `string` (Flattened tooltip title+text, or `nil` if the item has none)
+        *   `status`: `string` (SNI status string, e.g. `"Active"`, `"Passive"`, `"NeedsAttention"`)
+        *   `item_is_menu`: `boolean` (True if this item must show its menu instead of activating on click)
+        *   `menu`: `table` (Array of top-level Menu Item objects, or `nil` if this item has no `com.canonical.dbusmenu` menu):
+            *   Menu Item object:
+                *   `id`: `integer` (DBusMenu-assigned item id, needed for `tray:activate_menu_item`/`tray:menu_will_show`)
+                *   `menu_type`: `string` (`"standard"` or `"separator"`)
+                *   `label`: `string` (Menu entry text, or `nil`)
+                *   `enabled`: `boolean`
+                *   `icon_name`: `string` (Theme icon name, or `nil`)
+                *   `toggle_type`: `string` (`"checkmark"`, `"radio"`, or `nil` if not a toggle entry)
+                *   `toggle_state`: `integer` (DBusMenu's own `-1`/`0`/`1`, or `nil` if not a toggle entry)
+                *   `children`: `table` (Array of nested Menu Item objects, recursive, empty if none)
+
 ---
 
 ## 3. Command Execution Protocol (Write Path)
@@ -216,6 +237,9 @@ All write actions are serialized as JSON-RPC 2.0 payloads over the private Unix 
 | `sysinfo:configure(cfg)` | `capability: "sysinfo", action: "configure", arguments: [cfg]`<br>**Validation**: `cfg` is dictionary containing integers `cpu_interval`, `ram_interval`, `temp_interval` in seconds. An interval of `0` suspends the matching monitor thread. |
 | `power:set_profile(p)` | `capability: "power", action: "set_profile", arguments: [p]`<br>**Validation**: `p` is string matching active host profiles. |
 | `process.run(cmd, args, out_cb, exit_cb)`| *Internal non-blocking shell fork* returning `ProcessHandle`. <br>**Validation**: `cmd` is string, `args` array table of strings, callbacks are Lua functions. |
+| `tray:activate(id, x, y)` | `capability: "tray", action: "activate", arguments: [id, x, y]`<br>**Validation**: `id` is string, `x`/`y` are integers. No-ops (does not call the real `Activate`) when the item's `item_is_menu` is `true` (docs/adr/0031). |
+| `tray:activate_menu_item(id, menu_item_id)` | `capability: "tray", action: "activate_menu_item", arguments: [id, menu_item_id]`<br>**Validation**: `id` is string, `menu_item_id` is integer matching a `menu[].id` from `tray.items`. |
+| `tray:menu_will_show(id, submenu_id)` | `capability: "tray", action: "menu_will_show", arguments: [id, submenu_id]`<br>**Validation**: `id` is string, `submenu_id` is integer. Fires DBusMenu's `AboutToShow` and refreshes `tray.items[].menu` before Lua renders it -- required for correctness with apps that populate submenus lazily (docs/adr/0031). |
 
 ### 3.3 The Non-Blocking Process Control Handle (`ProcessHandle`)
 The `process.run` function yields an opaque `ProcessHandle` object to Lua:

@@ -16,6 +16,7 @@ use std::time::Duration;
 use dbus::bluetooth::{self, BluetoothController, BluetoothSignal};
 use dbus::network::{self, NetworkController, NetworkSignal, PendingNetworkConnect};
 use dbus::polkit::{AGENT_OBJECT_PATH, AuthenticationAgent, current_session_subject, register_agent};
+use dbus::tray::{self, TrayController, TraySignal};
 use reload_link::SocketCandidateLink;
 use shared::{
     ApplyPendingReload, DeselectInput, ProcessExited, ProcessOutputLine, ProcessStream, PromoteGeneration, RendererFrame, ReevaluateReport,
@@ -128,6 +129,28 @@ fn push_bluetooth_snapshot(
             last_snapshots.insert("bluetooth".to_string(), snapshot);
         }
         Err(err) => eprintln!("failed to serialize bluetooth StateSnapshot: {err}"),
+    }
+}
+
+/// Bumps `"tray"`'s revision and pushes `state` as a fresh `StateSnapshot` to the authoritative
+/// generation -- mirrors [`push_bluetooth_snapshot`] exactly (docs/adr/0031 needs zero new
+/// plumbing beyond a fresh capability name flowing through ADR-0029's already-generic
+/// `revisions`/`last_snapshots` maps).
+fn push_tray_snapshot(
+    registry: &socket::GenerationRegistry,
+    generation_id: u32,
+    revisions: &mut HashMap<String, u32>,
+    last_snapshots: &mut HashMap<String, shared::StateSnapshot>,
+    state: &tray::TrayState,
+) {
+    let revision = bump_revision(revisions, "tray");
+    match serde_json::to_value(state) {
+        Ok(payload) => {
+            let snapshot = shared::StateSnapshot { capability: "tray".to_string(), revision, payload };
+            send_frame_logged(registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
+            last_snapshots.insert("tray".to_string(), snapshot);
+        }
+        Err(err) => eprintln!("failed to serialize tray StateSnapshot: {err}"),
     }
 }
 
@@ -391,6 +414,28 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     let bluetooth = BluetoothController::new(connection.clone(), bluetooth_signal_tx).await;
     let mut bluetooth_state = bluetooth::BluetoothState::default();
 
+    // The tray host is a *session*-bus protocol (org.kde.StatusNotifierItem/Watcher and
+    // com.canonical.dbusmenu are session-bus conventions by construction -- every real tray item,
+    // nm-applet/Discord/Slack/etc., registers there, never on the system bus): docs/oblisk-
+    // supervisor-services-dbus.md Sec.2 and this module's own doc comment. Unlike NetworkManager/
+    // BlueZ/polkit above, which are genuine system-bus services and correctly share `connection`,
+    // the tray host needs its own, separate session-bus connection -- reusing the system-bus
+    // `connection` here would silently make it watch a bus no real tray item ever registers on.
+    // Mirrors BluetoothController's own "thread the channel into the constructor" shape (not a
+    // separate `*_signal_source()` getter) -- item hydration at registration time needs it
+    // immediately, same reasoning as BlueZ's device registry. A session bus genuinely not being
+    // available in some environment degrades to `TrayController::inert` rather than aborting
+    // Supervisor boot -- same "degrade to inert" precedent `BluetoothController::new`/
+    // `TrayController::new` already established for a missing daemon/lost `RequestName` race.
+    let (tray_signal_tx, mut tray_signals) = tokio::sync::mpsc::unbounded_channel::<TraySignal>();
+    let tray = match zbus::Connection::session().await {
+        Ok(tray_connection) => TrayController::new(tray_connection, tray_signal_tx).await,
+        Err(err) => {
+            eprintln!("tray: failed to connect to the session bus; tray host disabled for this run: {err}");
+            TrayController::inert(tray_signal_tx)
+        }
+    };
+
     let (audio_tx, mut audio_apps) = tokio::sync::mpsc::unbounded_channel();
     // pipewire-rs's event loop is Rc-based and single-threaded (not Send) -- it needs its
     // own OS thread, not a tokio task.
@@ -515,6 +560,14 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                     }
                 }
                 push_bluetooth_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &bluetooth_state);
+            }
+            Some(TraySignal::RegistryChanged) = tray_signals.recv() => {
+                // No debounce (docs/adr/0031, matching ADR-0029/0030): the registry entry
+                // driving this signal is already fully recomputed by the forwarder task that
+                // sent it (see dbus::tray's module doc comment) -- build_state is a synchronous
+                // snapshot of already-live data, no further D-Bus round trip needed here.
+                let tray_state = tray.build_state();
+                push_tray_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &tray_state);
             }
             Some(()) = reload_events.recv() => {
                 next_sequence += 1;
@@ -719,6 +772,42 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                         }
                         None => eprintln!(
                             "malformed bluetooth.forget command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "tray" && envelope.params.action == "activate" => {
+                    match tray::parse_activate_args(&envelope.params.arguments) {
+                        Some((id, x, y)) => {
+                            let controller = tray.clone();
+                            tokio::spawn(async move { controller.activate(&id, x, y).await; });
+                        }
+                        None => eprintln!(
+                            "malformed tray.activate command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "tray" && envelope.params.action == "activate_menu_item" => {
+                    match tray::parse_activate_menu_item_args(&envelope.params.arguments) {
+                        Some((id, menu_item_id)) => {
+                            let controller = tray.clone();
+                            tokio::spawn(async move { controller.activate_menu_item(&id, menu_item_id).await; });
+                        }
+                        None => eprintln!(
+                            "malformed tray.activate_menu_item command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "tray" && envelope.params.action == "menu_will_show" => {
+                    match tray::parse_menu_will_show_args(&envelope.params.arguments) {
+                        Some((id, submenu_id)) => {
+                            let controller = tray.clone();
+                            tokio::spawn(async move { controller.menu_will_show(&id, submenu_id).await; });
+                        }
+                        None => eprintln!(
+                            "malformed tray.menu_will_show command from generation {}: {:?}",
                             envelope.params.generation_id, envelope.params.arguments
                         ),
                     }

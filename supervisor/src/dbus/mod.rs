@@ -5,6 +5,7 @@
 pub mod bluetooth;
 pub mod network;
 pub mod polkit;
+pub mod tray;
 
 /// Shared `arguments: [en]` boolean-argument parse for `*:set_*_enabled(en)`-style write actions
 /// -- `network::parse_bool_arg` and `bluetooth::parse_bool_arg` both re-export this rather than
