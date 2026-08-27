@@ -16,6 +16,7 @@ use std::time::Duration;
 use dbus::bluetooth::{self, BluetoothController, BluetoothSignal};
 use dbus::idle::{self, IdleController};
 use dbus::network::{self, NetworkController, NetworkSignal, PendingNetworkConnect};
+use dbus::notifications::{self, NotificationsController, NotificationsSignal};
 use dbus::polkit::{AGENT_OBJECT_PATH, AuthenticationAgent, current_session_subject, register_agent};
 use dbus::tray::{self, TrayController, TraySignal};
 use reload_link::SocketCandidateLink;
@@ -143,6 +144,27 @@ fn push_tray_snapshot(
             last_snapshots.insert("tray".to_string(), snapshot);
         }
         Err(err) => eprintln!("failed to serialize tray StateSnapshot: {err}"),
+    }
+}
+
+/// Bumps `"notifications"`'s revision and pushes `state` as a fresh `StateSnapshot` to the
+/// authoritative generation -- mirrors [`push_tray_snapshot`] exactly (ADR-0033: "reuses
+/// `StateSnapshot`, no new `SupervisorFrame` variant", same proven shape as tray/network/bluetooth).
+fn push_notifications_snapshot(
+    registry: &socket::GenerationRegistry,
+    generation_id: u32,
+    revisions: &mut HashMap<String, u32>,
+    last_snapshots: &mut HashMap<String, shared::StateSnapshot>,
+    state: &notifications::NotificationsState,
+) {
+    let revision = bump_revision(revisions, "notifications");
+    match serde_json::to_value(state) {
+        Ok(payload) => {
+            let snapshot = shared::StateSnapshot { capability: "notifications".to_string(), revision, payload };
+            send_frame_logged(registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
+            last_snapshots.insert("notifications".to_string(), snapshot);
+        }
+        Err(err) => eprintln!("failed to serialize notifications StateSnapshot: {err}"),
     }
 }
 
@@ -433,6 +455,25 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     // own OS thread, not a tokio task.
     std::thread::spawn(move || audio::mixer::run(audio_tx));
 
+    // Notifications (docs/oblisk-supervisor-services-dbus.md §1; ADR-0033): its own, separate
+    // session-bus connection, independent of tray's -- a real desktop might already run mako/dunst
+    // owning org.freedesktop.Notifications, a genuine "someone else already provides this" outcome
+    // this controller degrades to inert for (`RequestName`'s `DoNotQueue` flag), not a dual-role
+    // dance like tray's. The sound-playback thread is a second, unrelated "own OS thread" for the
+    // same "pipewire-rs's loop is `!Send`" reason as `audio::mixer::run` above -- a different
+    // pipewire-rs API surface (a playback `pw::stream::Stream`, not a registry listener), so it
+    // gets its own dedicated thread rather than sharing the mixer's.
+    let (sound_tx, sound_rx) = std::sync::mpsc::channel::<PathBuf>();
+    std::thread::spawn(move || notifications::run_sound_player(sound_rx));
+    let (notifications_signal_tx, mut notifications_signals) = tokio::sync::mpsc::unbounded_channel::<NotificationsSignal>();
+    let notifications = match zbus::Connection::session().await {
+        Ok(notifications_connection) => NotificationsController::new(notifications_connection, notifications_signal_tx, sound_tx.clone()).await,
+        Err(err) => {
+            eprintln!("notifications: failed to connect to the session bus; notifications server disabled for this run: {err}");
+            NotificationsController::inert(notifications_signal_tx, sound_tx.clone())
+        }
+    };
+
     let socket_path = shared::control_socket_path()?;
     let (registry, mut inbound_frames, mut connected) = socket::spawn_listener(&socket_path)?;
 
@@ -574,6 +615,14 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 // snapshot of already-live data, no further D-Bus round trip needed here.
                 let tray_state = tray.build_state();
                 push_tray_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &tray_state);
+            }
+            Some(NotificationsSignal::Changed) = notifications_signals.recv() => {
+                // No debounce (ADR-0033, matching ADR-0029/0030/0031): every mutation (Notify,
+                // dismiss, reply, set_dnd, expiry firing, FIFO eviction) fully re-derives
+                // notifications.feed/notifications.dnd from already-live state -- build_state is a
+                // synchronous snapshot, no further D-Bus round trip needed here.
+                let notifications_state = notifications.build_state();
+                push_notifications_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &notifications_state);
             }
             Some(event) = idle_signals.recv() => {
                 // Unlike tray/network/bluetooth (always pushed to the single authoritative
@@ -861,6 +910,48 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                     let controller = idle.clone();
                     let generation_id = envelope.params.generation_id;
                     tokio::spawn(async move { controller.release_inhibit(generation_id).await; });
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "notifications" && envelope.params.action == "dismiss" => {
+                    match notifications::parse_dismiss_args(&envelope.params.arguments) {
+                        Some(id) => {
+                            let controller = notifications.clone();
+                            tokio::spawn(async move { controller.dismiss(id).await; });
+                        }
+                        None => eprintln!(
+                            "malformed notifications.dismiss command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "notifications" && envelope.params.action == "reply" => {
+                    match notifications::parse_reply_args(&envelope.params.arguments) {
+                        Some((id, text)) => {
+                            let controller = notifications.clone();
+                            tokio::spawn(async move { controller.reply(id, text).await; });
+                        }
+                        None => eprintln!(
+                            "malformed notifications.reply command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "notifications" && envelope.params.action == "set_sound" => {
+                    match notifications::parse_set_sound_args(&envelope.params.arguments) {
+                        Some((urgency, path)) => notifications.set_sound(urgency, &path),
+                        None => eprintln!(
+                            "malformed notifications.set_sound command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
+                }
+                RendererFrame::Command(envelope) if envelope.params.capability == "notifications" && envelope.params.action == "set_dnd" => {
+                    match dbus::parse_bool_arg(&envelope.params.arguments) {
+                        Some(enabled) => notifications.set_dnd(enabled),
+                        None => eprintln!(
+                            "malformed notifications.set_dnd command from generation {}: {:?}",
+                            envelope.params.generation_id, envelope.params.arguments
+                        ),
+                    }
                 }
                 RendererFrame::Command(envelope) => {
                     eprintln!("inbound command from generation {}: {:?}", inbound.generation_id, envelope);

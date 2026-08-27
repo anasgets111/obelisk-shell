@@ -5,6 +5,7 @@
 pub mod bluetooth;
 pub mod idle;
 pub mod network;
+pub mod notifications;
 pub mod polkit;
 mod shm_icons;
 pub mod tray;
