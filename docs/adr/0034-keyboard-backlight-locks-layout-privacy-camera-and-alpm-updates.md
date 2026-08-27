@@ -36,27 +36,63 @@ unbuilt) grows to hold `backlight_pct`, `caps_lock`, `num_lock`, `scroll_lock`,
 `updates:install()` and `updates:configure({interval})`). Matches every existing precedent
 (`oblisk.battery`, `oblisk.audio`) — domain-named, never lumped.
 
-**Keyboard backlight rides UPower, not sysfs.** `org.freedesktop.UPower.KbdBacklight`
-(`EnumerateKbdBacklights`/`GetBrightness`/`SetBrightness`/`SetPercentage`), event-driven via
-`BrightnessChanged` + `DeviceAdded`/`DeviceRemoved`. Beats the sysfs+100ms-poll+`brightnessctl`
-approach the dotfiles use — no polling, no permission workaround, UPower already runs
-privileged. Reuses the already-open system D-Bus connection NetworkManager/BlueZ/polkit/idle
+**Keyboard backlight rides UPower, not sysfs.** `org.freedesktop.UPower.KbdBacklight`. Live
+`busctl --system introspect` against this dev machine (verified, not assumed from UPower's
+docs) found a narrower real interface than first proposed: a single fixed object at
+`/org/freedesktop/UPower/KbdBacklight` — `GetBrightness() -> i`, `GetMaxBrightness() -> i`,
+`SetBrightness(i)`, signal `BrightnessChanged(i)` (plus `BrightnessChangedWithSource(i, s)`,
+unused — nothing here needs the source string). No `EnumerateKbdBacklights`, no
+`SetPercentage`, no `DeviceAdded`/`DeviceRemoved` — those don't exist on this UPower version;
+there is exactly one keyboard-backlight object, not a registry of them, so there's nothing to
+enumerate or hotplug. `GetMaxBrightness()` is read once at controller construction (the same
+resolve-once precedent ADR-0035's hwmon chip resolution and `IdleController`'s degrade-once
+already established) and cached — a keyboard's brightness step count doesn't change at
+runtime. `backlight_pct` is derived Supervisor-side as `round(100 * brightness / max)`
+(round-half-away-from-zero, matching ADR-0035's `round_milli_c` precedent) since the D-Bus
+interface itself has no percent notion, only a raw `[0, max]` scale — this machine reports
+`max = 3`, so real hardware can be this coarse. `keyboard:set_backlight(pct)` converts the
+other direction (`round(pct * max / 100)`, clamped to `[0, max]`) and calls `SetBrightness`.
+A machine with no keyboard backlight at all fails the constructor's `GetMaxBrightness()` call
+(no such D-Bus object) — degrades to `backlight_pct = -1` (the same "sentinel, not a fabricated
+zero" convention `temp_gpu` already established), logged once, `set_backlight` becomes a
+no-op. Reuses the already-open system D-Bus connection NetworkManager/BlueZ/polkit/idle-inhibit
 share (same precedent `docs/build-steps.md`:544 already established for idle inhibit).
-Normalized to a `[0,100]` percent, matching the existing screen-backlight convention
-(`oblisk-hardware-event-pipeline.md` §1.2).
 
-**Keyboard lock state revises §5's own sourcing — and the first-choice fallback was wrong.**
-§5 currently specs `caps_lock` via compositor socket interception. Real-world check: Hyprland's
-own `hyprctl devices -j` has no `scrollLock` field at all, so that route caps out at caps+num
-on Hyprland alone and is compositor-specific besides. Real fix: sysfs LED nodes primary
-(`/sys/class/leds/*::{caps,num,scroll}lock/brightness`, inotify-watched), with **direct evdev
-`EV_LED` reads** (pure-Rust `evdev` crate, matching this codebase's `hound`/`png`
-pure-Rust-over-FFI preference) as the fallback when no matching LED sysfs node exists — both
-compositor-agnostic. The first fallback idea proposed here, `wl_keyboard.modifiers`'s
-`mods_locked` bitmask, was checked and rejected: that event is gated by Wayland surface focus,
-and the Supervisor is a background daemon, not a focused surface — it would never fire. Waybar's
-own `keyboard_state.cpp`, the most widely-deployed implementation of this exact feature, uses
-evdev for precisely this reason; confirmed, not assumed.
+**Keyboard lock state revises §5's own sourcing — and both the first- and second-choice
+mechanisms were wrong, in different ways.** §5 currently specs `caps_lock` via compositor
+socket interception. Real-world check: Hyprland's own `hyprctl devices -j` has no `scrollLock`
+field at all, so that route caps out at caps+num on Hyprland alone and is compositor-specific
+besides. The first fallback idea proposed here, `wl_keyboard.modifiers`'s `mods_locked`
+bitmask, was checked and rejected: that event is gated by Wayland surface focus, and the
+Supervisor is a background daemon, not a focused surface — it would never fire.
+
+The next idea — sysfs LED nodes (`/sys/class/leds/*::{caps,num,scroll}lock/brightness`)
+primary, inotify-watched for live updates, evdev `EV_LED` as the fallback only when no
+matching LED sysfs node exists — turned out backwards on the one point that matters most:
+**live-tested on this dev machine (physically toggling Caps Lock twice, watched with
+`inotifywait -m`), the sysfs `brightness` file's value genuinely changed (`0`→`1`→`0`,
+confirmed by direct reads) but fired *zero* inotify `MODIFY` events.** This kernel's
+`input_leds` driver (the one that creates these LED classdevices from a keyboard's `EV_LED`
+capability) doesn't call `sysfs_notify()` when it drives a brightness change itself — inotify
+on this path is silently dead, not a corner case. Direct evdev `EV_LED` reads (pure-Rust
+`evdev` crate, matching this codebase's `hound`/`png` pure-Rust-over-FFI preference) don't have
+this problem: the event stream *is* the kernel's own live-notification mechanism for exactly
+this state, the same signal that drives the LED hardware in the first place — confirmed
+reliable by the same live toggle test. Waybar's own `keyboard_state.cpp`, the most widely-
+deployed implementation of this exact feature, already uses evdev for precisely this reason.
+
+**Fixed design: evdev is primary, sysfs is a static (non-live) fallback, not the reverse.**
+`evdev::Device::open` on the keyboard device (selected by `supported_leds()` capability —
+whichever device reports `LED_CAPSL`) gives both the initial state (`get_led_state()`) and
+every live change (`into_event_stream()`'s `EV_LED` events, whose own carried value needs no
+re-read) in one mechanism. Sysfs stays in the design for the one thing it's actually good at —
+permission: this dev machine's LED `brightness` files are root-owned but world-*readable*
+(`-rw-r--r--`), needing no group membership at all, while `/dev/input/eventN` needs `input`
+group or `uaccess` (confirmed present and sufficient on this machine, but per the ADR's own
+Consequences section, not guaranteed everywhere). If evdev can't be opened (permission denied,
+or no LED-capable device found), sysfs is read once at construction for a best-effort static
+initial value — real state, just frozen after boot, degrading gracefully rather than reporting
+nothing. If neither resolves, all three lock fields default `false`, logged once.
 
 **Camera privacy: kernel-level detection primary, PipeWire supplementary — the reverse of the
 first proposal.** Initial research read Noctalia's PipeWire `Video/Source` node classification
