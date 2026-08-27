@@ -89,6 +89,12 @@ use tokio::sync::mpsc::UnboundedSender;
 /// not just `build-steps.md`'s text -- see the module doc comment.
 const STREAM_OUTPUT_AUDIO: &str = "Stream/Output/Audio";
 
+/// `media.class` value a camera-capture PipeWire node carries (docs/adr/0034). Tracked here,
+/// not a second PipeWire connection, purely as a name-enrichment source for `oblisk.privacy`'s
+/// camera detection -- PipeWire only sees the portal-routed subset of camera users (ADR-0034),
+/// so this is supplementary to that capability's own kernel-level detection, never primary.
+const VIDEO_SOURCE: &str = "Video/Source";
+
 /// One playback stream node PipeWire has advertised, filtered to
 /// `media.class == "Stream/Output/Audio"` and resolved to its owning process.
 ///
@@ -138,6 +144,26 @@ fn is_stream_output_audio(props: &impl PropsLookup) -> bool {
     props.get_prop(*keys::MEDIA_CLASS) == Some(STREAM_OUTPUT_AUDIO)
 }
 
+/// Which of the two node kinds this listener tracks a `global` event as, decided once at
+/// `global` time and carried into the bound node's `info` closure -- an `info` event's own
+/// props dict can be empty (a state-only change, see the module doc comment), so the kind can't
+/// be re-derived from every `info` call, only remembered from the classification made here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeKind {
+    Audio,
+    Video,
+}
+
+/// Classifies a `global` event's properties by `media.class`, or `None` for anything neither
+/// half of this listener cares about (sinks, sources, non-stream nodes, etc.).
+fn classify(props: &impl PropsLookup) -> Option<NodeKind> {
+    match props.get_prop(*keys::MEDIA_CLASS) {
+        Some(STREAM_OUTPUT_AUDIO) => Some(NodeKind::Audio),
+        Some(VIDEO_SOURCE) => Some(NodeKind::Video),
+        _ => None,
+    }
+}
+
 /// Parses `props` into a [`ParsedStream`] if it's a `Stream/Output/Audio` node with a valid
 /// `application.process.id`. `None` for anything else (sinks, sources, non-audio streams, or
 /// a stream missing or mangling the pid -- including a stream node PipeWire hasn't finished
@@ -183,7 +209,9 @@ fn apply_info_event(apps: &mut AudioApps, node_id: u32, has_props_change: bool, 
     }
     match props.and_then(|props| build_app_stream(node_id, props)) {
         Some(app) => apps.upsert(app),
-        None => apps.remove(node_id),
+        None => {
+            apps.remove(node_id);
+        }
     }
 }
 
@@ -217,47 +245,130 @@ impl AudioApps {
     }
 }
 
-/// Shared state the registry/node listener closures mutate: the running app list, plus the
-/// bound `Node` proxies (and their listeners) that keep property-change events flowing, plus
-/// where updated snapshots get sent. Held for the thread's whole lifetime -- see the `run`
-/// doc comment for what a graceful shutdown would need that doesn't exist yet.
-struct MixerState {
-    apps: AudioApps,
-    nodes: HashMap<u32, (pw::node::Node, pw::node::NodeListener)>,
-    updates: UnboundedSender<Vec<AppStream>>,
+/// One `Video/Source` node PipeWire has advertised, resolved just enough for `oblisk.privacy`'s
+/// name-enrichment (docs/adr/0034): `pid` is what a kernel-detected `/dev/videoN` opener's own
+/// pid gets matched against; `app_name` is the nicer name PipeWire supplies for the match. No
+/// `process_name` field (unlike [`AppStream`]) -- `oblisk.privacy`'s own `/proc/{pid}/comm`
+/// fallback already covers that case for pids PipeWire doesn't see at all, so resolving it here
+/// too would be redundant work this capability never reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VideoSourceApp {
+    pub node_id: u32,
+    pub pid: i32,
+    pub app_name: Option<String>,
 }
 
-impl MixerState {
-    fn publish(&self) {
-        // A dropped receiver means nothing is draining yet, or the process is mid-shutdown
-        // -- not a reason to stop tracking streams.
-        let _ = self.updates.send(self.apps.snapshot());
+/// Parses `props` into a [`VideoSourceApp`] if it's a `Video/Source` node with a valid
+/// `application.process.id` -- mirrors [`parse_stream_props`]'s shape exactly, one field
+/// simpler.
+fn parse_video_source_props(node_id: u32, props: &impl PropsLookup) -> Option<VideoSourceApp> {
+    if props.get_prop(*keys::MEDIA_CLASS) != Some(VIDEO_SOURCE) {
+        return None;
+    }
+    let pid = props.get_prop(*keys::APP_PROCESS_ID)?.parse().ok()?;
+    let app_name = props.get_prop(*keys::APP_NAME).map(str::to_string);
+    Some(VideoSourceApp { node_id, pid, app_name })
+}
+
+/// Applies one bound `Video/Source` node's `info` event -- mirrors [`apply_info_event`]'s
+/// props-change gating exactly (same PipeWire event-ordering quirks, see the module doc
+/// comment; nothing about that behavior is specific to the audio case).
+fn apply_video_info_event(sources: &mut VideoSourceApps, node_id: u32, has_props_change: bool, props: Option<&impl PropsLookup>) {
+    if !has_props_change {
+        return;
+    }
+    match props.and_then(|props| parse_video_source_props(node_id, props)) {
+        Some(source) => sources.upsert(source),
+        None => {
+            sources.remove(node_id);
+        }
     }
 }
 
-/// Runs the PipeWire registry listener until the process exits, sending an updated snapshot
-/// of [`AppStream`]s over `updates` on every node-added, node-properties-changed, or
-/// node-removed event. Blocks the calling thread -- call from a dedicated
+/// Live `Video/Source` node list, keyed by PipeWire node id -- mirrors [`AudioApps`]'s shape
+/// exactly (duplicated rather than made generic over the two: this codebase's own precedent
+/// for two near-identical small collections is to keep them boring and separate, e.g.
+/// `hardware::sysinfo::controller`'s three near-identical task-loop functions).
+#[derive(Debug, Default)]
+pub struct VideoSourceApps {
+    sources: HashMap<u32, VideoSourceApp>,
+}
+
+impl VideoSourceApps {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn upsert(&mut self, source: VideoSourceApp) {
+        self.sources.insert(source.node_id, source);
+    }
+
+    /// Returns whether an entry was actually present and removed -- lets `global_remove` (which
+    /// doesn't know in advance whether a removed node id was an audio stream or a video source)
+    /// decide which of the two update channels to publish on, without tracking node kind
+    /// separately from which collection holds it.
+    pub fn remove(&mut self, node_id: u32) -> bool {
+        self.sources.remove(&node_id).is_some()
+    }
+
+    pub fn snapshot(&self) -> Vec<VideoSourceApp> {
+        let mut sources: Vec<VideoSourceApp> = self.sources.values().cloned().collect();
+        sources.sort_by_key(|source| source.node_id);
+        sources
+    }
+}
+
+/// Shared state the registry/node listener closures mutate: the running app/video-source lists,
+/// plus the bound `Node` proxies (and their listeners) that keep property-change events
+/// flowing, plus where updated snapshots get sent. Held for the thread's whole lifetime -- see
+/// the `run` doc comment for what a graceful shutdown would need that doesn't exist yet.
+struct MixerState {
+    apps: AudioApps,
+    video_sources: VideoSourceApps,
+    nodes: HashMap<u32, (pw::node::Node, pw::node::NodeListener)>,
+    updates: UnboundedSender<Vec<AppStream>>,
+    video_updates: UnboundedSender<Vec<VideoSourceApp>>,
+}
+
+impl MixerState {
+    /// A dropped receiver means nothing is draining yet, or the process is mid-shutdown -- not
+    /// a reason to stop tracking streams.
+    fn publish_audio(&self) {
+        let _ = self.updates.send(self.apps.snapshot());
+    }
+
+    fn publish_video(&self) {
+        let _ = self.video_updates.send(self.video_sources.snapshot());
+    }
+}
+
+/// Runs the PipeWire registry listener until the process exits, sending an updated snapshot of
+/// [`AppStream`]s over `updates` on every audio node-added/-properties-changed/-removed event,
+/// and an updated snapshot of [`VideoSourceApp`]s over `video_updates` on the equivalent video
+/// events (docs/adr/0034) -- one PipeWire connection, two independent capabilities' worth of
+/// data, each publishing only on its own changes (never a video change triggering an audio
+/// republish or vice versa). Blocks the calling thread -- call from a dedicated
 /// `std::thread::spawn`, never from an async task: `pipewire-rs`'s event loop and the
 /// `Rc`-based listener state here are single-threaded and non-`Send`.
 ///
 /// `updates` only reaches a log line in `main()` for now, not Lua -- see
-/// docs/adr/0017-audio-apps-lua-ipc-push-deferred.md for why and what unblocks it.
+/// docs/adr/0017-audio-apps-lua-ipc-push-deferred.md for why and what unblocks it. `video_updates`
+/// feeds `privacy::PrivacyController`'s name-enrichment (docs/adr/0034), not a log line.
 ///
 /// ponytail: no shutdown path -- `main_loop.run()` returns only when the process exits.
 /// Phase 7/8's reload orchestrator is what would give this a `main_loop.quit()` trigger to
 /// react to; nothing calls for that yet.
 ///
 /// Logs and returns if PipeWire can't be reached at all (no `pipewire` daemon running)
-/// rather than panicking: audio tracking is one optional subsystem, not a reason to take the
-/// whole supervisor down.
-pub fn run(updates: UnboundedSender<Vec<AppStream>>) {
-    if let Err(err) = run_inner(updates) {
+/// rather than panicking: audio/video-source tracking is one optional subsystem, not a reason
+/// to take the whole supervisor down.
+pub fn run(updates: UnboundedSender<Vec<AppStream>>, video_updates: UnboundedSender<Vec<VideoSourceApp>>) {
+    if let Err(err) = run_inner(updates, video_updates) {
         eprintln!("pipewire registry listener stopped: {err}");
     }
 }
 
-fn run_inner(updates: UnboundedSender<Vec<AppStream>>) -> Result<(), pw::Error> {
+fn run_inner(updates: UnboundedSender<Vec<AppStream>>, video_updates: UnboundedSender<Vec<VideoSourceApp>>) -> Result<(), pw::Error> {
     pw::init();
 
     let main_loop = pw::main_loop::MainLoopRc::new(None)?;
@@ -265,7 +376,7 @@ fn run_inner(updates: UnboundedSender<Vec<AppStream>>) -> Result<(), pw::Error> 
     let core = context.connect_rc(None)?;
     let registry = core.get_registry_rc()?;
 
-    let state = Rc::new(RefCell::new(MixerState { apps: AudioApps::new(), nodes: HashMap::new(), updates }));
+    let state = Rc::new(RefCell::new(MixerState { apps: AudioApps::new(), video_sources: VideoSourceApps::new(), nodes: HashMap::new(), updates, video_updates }));
 
     // Weak, not a clone of `registry` itself: the listener this builds is a hook stored on
     // `registry`'s own C object, so a strong `RegistryRc` captured here would keep itself
@@ -285,8 +396,20 @@ fn run_inner(updates: UnboundedSender<Vec<AppStream>>) -> Result<(), pw::Error> 
         .global_remove(move |id| {
             let mut state = state_for_remove.borrow_mut();
             state.nodes.remove(&id);
+            // Audio publishes unconditionally on every removal, exactly matching this
+            // capability's pre-existing, already-shipped behavior (Spec review: an earlier
+            // version of this diff made this conditional on `id` actually having been a
+            // tracked audio stream, which is a real behavior change to `oblisk.audio`'s publish
+            // cadence -- ADR-0034 scopes this whole extension as name-enrichment for privacy
+            // only, not a change to already-shipped audio semantics, however arguably-better
+            // that change might be on its own). Video is new code with no prior behavior to
+            // preserve, so it publishes only when `id` actually was a tracked video source --
+            // see `VideoSourceApps::remove`'s doc comment.
             state.apps.remove(id);
-            state.publish();
+            state.publish_audio();
+            if state.video_sources.remove(id) {
+                state.publish_video();
+            }
         })
         .register();
 
@@ -294,20 +417,19 @@ fn run_inner(updates: UnboundedSender<Vec<AppStream>>) -> Result<(), pw::Error> 
     Ok(())
 }
 
-/// Handles one registry `global` event: filters to `Stream/Output/Audio` nodes by their
-/// already-known properties, then binds the node so its `info` event -- gated to only the
-/// calls that actually carry a props change, see the module doc comment -- extracts the pid,
-/// resolves the process name, and keeps the app list current. Doesn't require the full parse
-/// to succeed here: `application.process.id` can still be missing at `global` time (see the
-/// module doc comment) and shows up in a later `info` call instead.
+/// Handles one registry `global` event: classifies it by `media.class` (audio stream, video
+/// source, or neither -- see [`classify`]), then binds the node so its `info` event -- gated to
+/// only the calls that actually carry a props change, see the module doc comment -- extracts
+/// the pid, resolves whatever this kind needs, and keeps the matching list current. Doesn't
+/// require the full parse to succeed here: `application.process.id` can still be missing at
+/// `global` time (see the module doc comment) and shows up in a later `info` call instead.
 fn on_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryRc, obj: &GlobalObject<&DictRef>) {
     if obj.type_ != ObjectType::Node {
         return;
     }
-    let is_audio_stream = obj.props.is_some_and(is_stream_output_audio);
-    if !is_audio_stream {
+    let Some(kind) = obj.props.and_then(classify) else {
         return;
-    }
+    };
 
     let node: pw::node::Node = match registry.bind(obj) {
         Ok(node) => node,
@@ -320,8 +442,16 @@ fn on_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryR
         .info(move |info| {
             let mut state_mut = state_for_info.borrow_mut();
             let has_props_change = info.change_mask().contains(pw::node::NodeChangeMask::PROPS);
-            apply_info_event(&mut state_mut.apps, node_id, has_props_change, info.props());
-            state_mut.publish();
+            match kind {
+                NodeKind::Audio => {
+                    apply_info_event(&mut state_mut.apps, node_id, has_props_change, info.props());
+                    state_mut.publish_audio();
+                }
+                NodeKind::Video => {
+                    apply_video_info_event(&mut state_mut.video_sources, node_id, has_props_change, info.props());
+                    state_mut.publish_video();
+                }
+            }
         })
         .register();
 
@@ -331,6 +461,96 @@ fn on_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `Video/Source` node's properties, shaped after real `pw-dump` output for a portal-
+    /// routed camera stream (`application.process.id`/`application.name` on the node, same
+    /// convention `zen_browser_stream_props` already established for audio streams).
+    fn camera_stream_props() -> HashMap<String, String> {
+        HashMap::from([
+            ("media.class".to_string(), "Video/Source".to_string()),
+            ("application.name".to_string(), "Firefox".to_string()),
+            ("application.process.id".to_string(), "42".to_string()),
+            ("node.name".to_string(), "Firefox".to_string()),
+        ])
+    }
+
+    // ---- classify ----
+
+    #[test]
+    fn classify_recognizes_an_audio_stream() {
+        assert_eq!(classify(&zen_browser_stream_props()), Some(NodeKind::Audio));
+    }
+
+    #[test]
+    fn classify_recognizes_a_video_source() {
+        assert_eq!(classify(&camera_stream_props()), Some(NodeKind::Video));
+    }
+
+    #[test]
+    fn classify_is_none_for_an_unrelated_media_class() {
+        let props = HashMap::from([("media.class".to_string(), "Audio/Sink".to_string())]);
+        assert_eq!(classify(&props), None);
+    }
+
+    // ---- parse_video_source_props ----
+
+    #[test]
+    fn parse_video_source_props_matches_a_real_video_source_node() {
+        let source = parse_video_source_props(7, &camera_stream_props()).expect("should parse as a video source");
+        assert_eq!(source, VideoSourceApp { node_id: 7, pid: 42, app_name: Some("Firefox".to_string()) });
+    }
+
+    #[test]
+    fn parse_video_source_props_rejects_a_non_video_source_media_class() {
+        assert!(parse_video_source_props(7, &zen_browser_stream_props()).is_none());
+    }
+
+    #[test]
+    fn parse_video_source_props_rejects_a_stream_missing_the_pid() {
+        let props = HashMap::from([("media.class".to_string(), "Video/Source".to_string())]);
+        assert!(parse_video_source_props(7, &props).is_none());
+    }
+
+    // ---- VideoSourceApps ----
+
+    #[test]
+    fn video_source_apps_upsert_then_snapshot_returns_the_source() {
+        let mut sources = VideoSourceApps::new();
+        let source = VideoSourceApp { node_id: 1, pid: 42, app_name: Some("Firefox".to_string()) };
+        sources.upsert(source.clone());
+        assert_eq!(sources.snapshot(), vec![source]);
+    }
+
+    #[test]
+    fn video_source_apps_remove_reports_whether_an_entry_was_present() {
+        let mut sources = VideoSourceApps::new();
+        sources.upsert(VideoSourceApp { node_id: 1, pid: 42, app_name: None });
+        assert!(sources.remove(1));
+        assert!(!sources.remove(1), "already removed -- nothing left to remove");
+    }
+
+    // ---- apply_video_info_event ----
+
+    #[test]
+    fn apply_video_info_event_ignores_a_state_only_event() {
+        let mut sources = VideoSourceApps::new();
+        apply_video_info_event(&mut sources, 1, true, Some(&camera_stream_props()));
+        let empty: HashMap<String, String> = HashMap::new();
+        apply_video_info_event(&mut sources, 1, false, Some(&empty));
+        assert_eq!(sources.snapshot().len(), 1, "a non-PROPS info event must not drop an already-tracked source");
+    }
+
+    #[test]
+    fn apply_video_info_event_removes_when_a_props_bearing_event_no_longer_parses() {
+        let mut sources = VideoSourceApps::new();
+        apply_video_info_event(&mut sources, 1, true, Some(&camera_stream_props()));
+        assert_eq!(sources.snapshot().len(), 1);
+
+        let non_video_props = HashMap::from([("media.class".to_string(), "Audio/Sink".to_string())]);
+        apply_video_info_event(&mut sources, 1, true, Some(&non_video_props));
+
+        assert!(sources.snapshot().is_empty());
+    }
 
     /// A real `Stream/Output/Audio` node's properties, recorded via `pw-dump` from a Zen
     /// browser playback stream routed through `pipewire-pulse` on a live system -- not

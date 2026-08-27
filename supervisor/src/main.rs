@@ -2,6 +2,7 @@ mod audio;
 mod dbus;
 mod hardware;
 mod pam_worker;
+mod privacy;
 mod process;
 mod reload;
 mod reload_link;
@@ -23,6 +24,7 @@ use dbus::tray::{self, TrayController, TraySignal};
 use hardware::idle::{self, IdleController};
 use hardware::keyboard::{self, KeyboardController, KeyboardSignal};
 use hardware::sysinfo::{self, SysinfoController, SysinfoSignal};
+use privacy::{PrivacyController, PrivacySignal};
 use process::registry::{
     KillOutcome, LiveProcesses, kill_registered_process, process_run_args, reap_all_processes, reap_generations_processes,
     spawn_and_register_process, stream_process_output, take_exited_process, wait_and_report_exit,
@@ -32,7 +34,10 @@ use shared::{
     ApplyPendingReload, DeselectInput, ProcessExited, PromoteGeneration, RendererFrame, ReevaluateReport, ReevaluateRequest, SupervisorFrame,
     Zeroize,
 };
-use snapshot::{bump_revision, push_bluetooth_snapshot, push_keyboard_snapshot, push_network_snapshot, push_notifications_snapshot, push_sysinfo_snapshot, push_tray_snapshot};
+use snapshot::{
+    bump_revision, push_bluetooth_snapshot, push_keyboard_snapshot, push_network_snapshot, push_notifications_snapshot, push_privacy_snapshot, push_sysinfo_snapshot,
+    push_tray_snapshot,
+};
 
 /// How long the Watcher waits after the *last* relevant `shell.lua` change before dispatching a
 /// reload -- coalesces an editor's multi-event save into a single round trip. Fixed, not
@@ -173,9 +178,12 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     };
 
     let (audio_tx, mut audio_apps) = tokio::sync::mpsc::unbounded_channel();
+    // `video_tx` feeds `oblisk.privacy`'s PipeWire name-enrichment (docs/adr/0034) -- the same
+    // registry thread, one PipeWire connection, not a second one.
+    let (video_tx, video_sources) = tokio::sync::mpsc::unbounded_channel();
     // pipewire-rs's event loop is Rc-based and single-threaded (not Send) -- it needs its
     // own OS thread, not a tokio task.
-    std::thread::spawn(move || audio::mixer::run(audio_tx));
+    std::thread::spawn(move || audio::mixer::run(audio_tx, video_tx));
 
     // Notifications (docs/oblisk-supervisor-services-dbus.md §1; ADR-0033): its own, separate
     // session-bus connection, independent of tray's -- a real desktop might already run mako/dunst
@@ -232,6 +240,13 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     // new` itself, not a fallible outer `match`.
     let (keyboard_signal_tx, mut keyboard_signals) = tokio::sync::mpsc::unbounded_channel::<KeyboardSignal>();
     let keyboard = KeyboardController::new(connection.clone(), &PathBuf::from("/sys/class/leds"), keyboard_signal_tx).await;
+
+    // privacy capability (docs/adr/0034): kernel-level /dev/videoN opener detection via inotify
+    // OPEN/CLOSE plus a /proc fd-scan, enriched by `video_sources` (the mixer thread's
+    // Video/Source feed constructed above). No D-Bus, no degrade-to-inert path -- an empty
+    // /sys/class/video4linux (no camera hardware) degrades in place to an empty camera_users.
+    let (privacy_signal_tx, mut privacy_signals) = tokio::sync::mpsc::unbounded_channel::<PrivacySignal>();
+    let privacy = PrivacyController::new(PathBuf::from("/proc"), &PathBuf::from("/sys/class/video4linux"), video_sources, privacy_signal_tx);
 
     let config_dir = shared::config_dir()?;
     let mut reload_events = watcher::spawn_watcher(&config_dir, RELOAD_DEBOUNCE)?;
@@ -393,6 +408,11 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 // forwarder already wrote `backlight_pct` under its own lock before signaling.
                 let state = keyboard.snapshot();
                 push_keyboard_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &state);
+            }
+            Some(PrivacySignal::Changed) = privacy_signals.recv() => {
+                // Same no-debounce, full-re-derive shape as sysinfo/keyboard above.
+                let state = privacy.snapshot();
+                push_privacy_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, &state);
             }
             Some(()) = reload_events.recv() => {
                 next_sequence += 1;

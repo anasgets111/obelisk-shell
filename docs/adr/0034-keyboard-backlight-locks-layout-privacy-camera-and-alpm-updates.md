@@ -210,5 +210,13 @@ decision's own scope.
   repo-only, matching the only real prior art found anywhere.
 - `camera_users` naming could get richer (desktop-file-ID matching instead of raw
   `/proc/<pid>/comm`) if the plain-`comm` name proves too unfriendly in practice.
+- The `/sys/class/video4linux/video<n>/streaming` fast-path flag: implemented as a `/proc`
+  fd-scan only (verified live end-to-end on this dev machine: real inotify `OPEN`/`CLOSE`
+  events on `/dev/video0`, a real opener correctly detected and named). This machine's real UVC
+  webcam doesn't expose the `streaming` attribute despite kernel 7.1, so the flag couldn't be
+  verified live and was dropped rather than shipped untested — the fd-scan is sufficient on its
+  own regardless, since `camera_users` needs real opener pids either way. Worth adding as a
+  cheap early-exit skip-the-scan optimization on hardware that does expose it, once such a
+  machine is available to verify against.
 - Workspace adaptor (§10), once designed, decides whether it extends `CompositorLink` or
   defines its own trait alongside it.
