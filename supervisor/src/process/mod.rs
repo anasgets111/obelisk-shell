@@ -24,6 +24,8 @@ use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use tokio::process::{Child, Command};
 
+pub mod registry;
+
 /// What a `wait()` `timeout()`'s elapsed deadline turns out to mean once a following,
 /// non-blocking `try_wait()` is consulted.
 #[derive(Debug, PartialEq, Eq)]
