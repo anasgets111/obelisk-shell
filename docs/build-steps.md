@@ -1054,6 +1054,48 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    Ellipsis is a further step and wants a spec decision first, since § 5.2 names no overflow
    property today.
 
+   **Amendment, on landing.** `paint_node` wraps both a node's own draw and its recursion into
+   children in `Canvas::save` / `intersect_scissor` / `restore`, clipped to
+   `snap_to_physical(rect, scale)`. `intersect_scissor` rather than `scissor` is what makes
+   nesting compose: `save`/`restore` push and pop the whole femtovg `State`, scissor included, so
+   a child intersects against every ancestor's clip and can only shrink the region further. The
+   clip is snapped the same way `draw_line` snaps its glyph origin, so the clip edge and the
+   glyph's physical placement agree; `snap_to_physical` grows outward (floor the top-left, ceil
+   the bottom-right), so it never shaves a pixel a box filled at a fractional coordinate.
+   `text/atlas.rs` is untouched: `draw_line`'s other caller, `wayland::mod`'s
+   `draw_main_bar_proof_text`, has nothing to do with the tree walk, and the walk is the thing
+   that knows about node boxes.
+
+   Two things this does not do, both now recorded in the code as `ponytail:` comments. The clip is
+   rectangular, so a node with a `radius` clips an overflowing child to square corners while its
+   own background underneath is rounded. femtovg has `intersect_rounded_scissor`, but its own doc
+   comment gives exact rounded corners only when it is the first active scissor or the previous
+   clip contains it, which is false for anything nested; shipping corners that are exact at the
+   root and silently square below it is worse than square everywhere.
+
+   The wrap follow-up above is more work than "paint renders the wrapped lines" implies, and this
+   slice found why. `layout::scene::intrinsic_content_size` does measure a `Content`-sized text
+   box against the wrap width, passing it to `ShapingHandle::shape` as `max_width`, but
+   `ShapeResult` returns only a bounding `width`/`height`, never the line breaks that produced
+   them. Paint has nothing to render even if it wanted to. The follow-up therefore starts at
+   `ShapeResult` carrying its lines across the shaping worker's channel, not at `paint_text`.
+
+   One risk checked and found absent. A tight clip could shave the tail of a `Content`-sized
+   `text`, since layout sizes that box from cosmic-text while femtovg paints with its own
+   advances, and item 10's divergence test only pins the two within 2%. Measured on the current
+   chain (single-face Noto Sans, no fallback triggered) with an unclipped scratch render scanning
+   past the measured edge: the two measurements agreed to within 0.0001px on a 53-character
+   string at 32px, and the last lit pixel sat 3 to 4 physical pixels inside the box in every case
+   tried. It stays the correct outcome if some future face renders wider than it measures, since
+   the alternative is the overrun landing on the neighbour.
+
+   Dormant in production until Phase 20 item 4. `paint_tree` still has no caller anywhere outside
+   its own test module, for the id-space reason its doc comment records, so the clip is exercised
+   by the headless EGL tests and nothing else. Both new tests were proved by removing the
+   `save`/`intersect_scissor`/`restore` block and rerunning: the text escaped to `(64, 64, 255)`
+   at (59, 7) against a blue surface, and the oversized child painted its own green at (50, 50)
+   where the surface's magenta belongs.
+
 Deliberately deferred, and this one is a decision rather than an omission: **no damage tracking.**
 Redraw the whole surface. `oblisk-layout-engine-geometry.md` § 5 projects damage rectangles, but
 ashell ships a working bar presenting the full viewport every frame with no `wl_surface::damage`

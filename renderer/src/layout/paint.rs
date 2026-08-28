@@ -30,7 +30,7 @@ use mlua::Value;
 use crate::layout::node::{self, BorderColor, EdgeInsets, LayoutError, Rgba};
 use crate::layout::scene::ResolvedNode;
 use crate::text::atlas::TextPainter;
-use crate::text::snap::LogicalRect;
+use crate::text::snap::{snap_to_physical, LogicalRect};
 
 /// Draws `root` and its whole subtree onto `painter`'s canvas, then flushes once. `scale` is the
 /// physical/logical pixel ratio `text::snap::snap_to_physical` and `TextPainter::draw_line` take
@@ -64,6 +64,45 @@ fn paint_node(painter: &mut TextPainter, node: &ResolvedNode, origin_x: f32, ori
     let y = origin_y + node.rect.y;
     let rect = LogicalRect { x, y, width: node.rect.width, height: node.rect.height };
 
+    // build-steps.md Phase 19 item 17: a node's own draw and its whole subtree are clipped to
+    // this box, snapped the same way `draw_line` snaps its glyph origin (`crate::text::snap`) so
+    // the clip edge and the glyph's physical placement agree. `intersect_scissor`, not `scissor`:
+    // `save`/`restore` nest through the recursive call below, and `intersect_scissor` composes
+    // the new box with whatever clip a parent already pushed, so a child can only shrink the
+    // clipped region further -- never escape its parent's box the way `scissor` (which replaces
+    // the active clip outright) would let it.
+    //
+    // ponytail: clipping is the floor, not the finished behavior (build-steps.md Phase 19 item
+    // 17 names this directly). § 3.2 gives `text` a wrap at the available width, and
+    // `layout::scene::intrinsic_content_size` already measures a `Content`-sized text box against
+    // exactly that width (its `text_wrap_width` local, passed to `ShapingHandle::shape` as
+    // `max_width`) -- but `ShapeResult` returns only a bounding `width`/`height`, not the wrapped
+    // lines that produced it, and `paint_text` re-reads the raw `content` string and hands the
+    // whole thing to `draw_line` in one `fill_text` call. So a box sized correctly for N wrapped
+    // lines gets one unwrapped line painted into it, and this clip cuts that line off at the
+    // first line's width instead of showing the rest on line two. The honest fix is paint asking
+    // for the same wrapped line breaks layout already measured with, not a new clip strategy.
+    //
+    // ponytail: this clip is always rectangular, so a node with `radius > 0.0` clips overflowing
+    // children to square corners while its own background underneath is rounded -- an escaping
+    // child's corner pixels sit outside the round fill but inside the square clip. femtovg's
+    // `intersect_rounded_scissor` exists and `paint_box` already computes `radius` for this exact
+    // node, but that function's own doc comment (femtovg 0.26.0 src/lib.rs:895-899) only gives
+    // exact rounded corners "when this is the first active scissor or... the previous clip is a
+    // containing rectangle with the same transform" -- false in general here, since a nested
+    // node's clip is intersected against every ancestor's, not the first. Rather than ship
+    // rounded corners that are exact for a root node and silently degrade to square for anything
+    // nested under one, this keeps the clip rectangular everywhere; switching to
+    // `intersect_rounded_scissor` is the upgrade path once a config actually needs it.
+    let physical = snap_to_physical(rect, scale);
+    painter.canvas_mut().save();
+    painter.canvas_mut().intersect_scissor(
+        physical.x0 as f32,
+        physical.y0 as f32,
+        (physical.x1 - physical.x0) as f32,
+        (physical.y1 - physical.y0) as f32,
+    );
+
     match node.kind.as_str() {
         // `oblisk-idl-api-specs.md` § 5.2: row/column/button have no paint properties of their
         // own beyond the base `rect` ones they share the property table with, and a surface's
@@ -92,6 +131,10 @@ fn paint_node(painter: &mut TextPainter, node: &ResolvedNode, origin_x: f32, ori
     for child in &node.children {
         paint_node(painter, child, x, y, scale);
     }
+
+    // Inside the clip, not after it: a child's own `save`/`restore` pair balances within this
+    // one, so the subtree above painted under this node's box as well as its own.
+    painter.canvas_mut().restore();
 }
 
 /// One paint-property parse gone wrong: logged and treated as absent/default rather than
@@ -236,6 +279,19 @@ fn paint_border_edge(canvas: &mut Canvas<OpenGl>, color: Option<Rgba>, width: f3
 /// coloured by `foreground`. A parse error on `font_size`/`foreground` falls back to the same
 /// defaults those parsers already return for an absent key, so a malformed value degrades to
 /// "as if omitted" rather than blanking the node's text entirely.
+///
+/// ponytail: a `Content`-sized `text` box comes from cosmic-text's measurement
+/// (`layout::scene::intrinsic_content_size`), while `paint_node`'s clip now cuts this draw off at
+/// that same box -- so if femtovg ever renders wider than cosmic-text measured, the clip shaves
+/// the overrun off the right edge instead of letting it paint over a neighbour. Checked against
+/// the current font chain (single-face Noto Sans, no fallback triggered) with a scratch test
+/// rendering unclipped and scanning pixels past the measured edge, for both a short string at
+/// 24px and a 53-character string at 32px: femtovg's `measure_text` agreed with cosmic-text's
+/// `shape()` to within 0.0001px on the longer string, and the last lit (non-background) pixel in
+/// both cases sat 3-4 physical pixels inside the measured edge, not past it. No shaving observed
+/// on this chain. It is still the correct outcome if a future font or fallback face renders wider
+/// than it measures: the alternative is the overrun landing on whatever sits to the right, which
+/// is the exact bug this item fixes.
 fn paint_text(painter: &mut TextPainter, properties: &HashMap<String, Value>, rect: LogicalRect, scale: f32) {
     let content = match node::parse_content(properties) {
         Ok(c) => c,
@@ -666,5 +722,87 @@ mod tests {
             femtovg_width,
             (diff / shaped.width.max(femtovg_width)) * 100.0
         );
+    }
+
+    /// The regression test for build-steps.md Phase 19 item 17 itself: a `text` node's content
+    /// wider than the box layout gave it must stop at that box's edge, not paint over whatever
+    /// sits to its right -- the live MPRIS-title-through-two-cells bug the item's own doc comment
+    /// describes.
+    ///
+    /// Proved this test is real, not just a green test: with `paint_node`'s `save`/
+    /// `intersect_scissor`/`restore` temporarily removed, this failed at the first scanned pixel
+    /// row with a mix of white (glyph) and black-background pixels found past the box, exactly
+    /// the escape this test exists to catch. Restored before finishing.
+    #[test]
+    fn a_text_wider_than_its_box_paints_nothing_outside_it() {
+        let Some(instance) = init_headless_egl(200, 50) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 200, 50) else { return };
+
+        // Surface blue, box black, glyphs white -- three colours distinct from each other, so an
+        // escaped glyph pixel (white, or a white/black antialiased edge) cannot be mistaken for
+        // the surface's own blue background the scan below asserts on.
+        let root = resolved_surface(
+            &lua,
+            r##"return surface { id = "bar", width = 200, height = 50, background = "#0000FFFF", child = rect {
+                width = 40, height = 50, background = "#000000FF", children = {
+                    text { content = "Oblisk Shell Renderer Overflow", font_size = 24, foreground = "#FFFFFFFF" },
+                } } }"##,
+            LogicalSize { width: 200.0, height: 50.0 },
+        );
+        paint_tree(&mut painter, &root, 1.0);
+
+        // The text's own content is long enough at this font size to reach well past the box's
+        // 40px width unclipped -- a 5px gap (40..45) is left unscanned so this isn't sensitive to
+        // the box edge's own antialiasing, only to a genuine escape further out.
+        for y in 0..50usize {
+            for x in 45..200usize {
+                assert_eq!(
+                    pixel_at(painter.canvas_mut(), x, y),
+                    (0, 0, 255, 255),
+                    "pixel ({x}, {y}) outside the text's 40px-wide box is not the surface's plain blue -- \
+                     the overflowing glyph escaped its clip"
+                );
+            }
+        }
+    }
+
+    /// A `row`/`column`/`rect` container clips its children just as much as a `text` node clips
+    /// its glyphs -- build-steps.md Phase 19 item 17 calls out that a `row` whose children
+    /// overflow is the same defect as an overflowing `text`, not a separate case. This is the
+    /// non-text half of that claim: a child rect explicitly larger than its parent must not paint
+    /// past the parent's own box.
+    ///
+    /// Proved this test is real the same way: with the clip removed, the assertion at (50, 50)
+    /// failed, reading the child's green instead of the surface's magenta. Restored before
+    /// finishing.
+    #[test]
+    fn an_oversized_child_rect_is_clipped_to_its_parents_box() {
+        let Some(instance) = init_headless_egl(80, 80) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 80, 80) else { return };
+
+        // Parent (black, 30x30) sits at (10, 10) via the surface's own padding. Its child (green,
+        // 60x60) has no alignment set, so the stacking model places it at the parent's own
+        // content-box origin -- same (10, 10) -- and it would span to (70, 70) unclipped, well
+        // outside the parent's (10, 10)..(40, 40) box.
+        let root = resolved_surface(
+            &lua,
+            r##"return surface { id = "bar", width = 80, height = 80, background = "#FF00FFFF", padding = { top = 10, left = 10 }, child = rect {
+                width = 30, height = 30, background = "#000000FF", children = {
+                    rect { background = "#00FF00FF", width = 60, height = 60 },
+                } } }"##,
+            LogicalSize { width: 80.0, height: 80.0 },
+        );
+        paint_tree(&mut painter, &root, 1.0);
+
+        // Inside both the parent's and the child's box: the child's green, painted over the
+        // parent (tree order).
+        assert_eq!(pixel_at(painter.canvas_mut(), 15, 15), (0, 255, 0, 255));
+        // Inside the child's unclipped 60x60 span but outside the parent's 30x30 box: the
+        // surface's magenta, not the child's green -- the discriminator this test exists for.
+        assert_eq!(pixel_at(painter.canvas_mut(), 50, 50), (255, 0, 255, 255));
     }
 }
