@@ -441,7 +441,9 @@ pub fn parse_size_mode(
     }
     Err(invalid(
         property,
-        format!("expected a number, \"Fill\", or a \"NN%\" string, got {value:?}"),
+        format!(
+            "expected a number, \"Fill\", or a \"NN%\" string (Content sizing has no literal -- omit the property instead), got {value:?}"
+        ),
     ))
 }
 
@@ -465,6 +467,13 @@ pub fn parse_size_mode(
 /// spanning the whole pass rather than one per `get_value` call, which would subsume the
 /// per-property budget multiplication [`resolve_properties`]'s own `ponytail:` records; not built
 /// here.
+///
+/// Scalar shorthand -- a bare number broadcasts to all four edges -- used to live only in front of
+/// `border_width` (docs/build-steps.md Phase 19 item 15: item 6's second commit added it there and
+/// nowhere else). Moved in here so `margin` and `padding` get it from the same place instead of two
+/// more copies of the same wrapper. It carries no range check of its own: see
+/// [`check_geometry_range`]'s doc comment for why `border_width` keeps a bound this function does
+/// not apply to `margin`/`padding`.
 pub fn parse_edge_insets(
     properties: &HashMap<String, Value>,
     property: &str,
@@ -472,10 +481,18 @@ pub fn parse_edge_insets(
     let Some(value) = properties.get(property) else {
         return Ok(EdgeInsets::default());
     };
+    if let Some(n) = value_as_f32(property, value)? {
+        return Ok(EdgeInsets {
+            top: n,
+            right: n,
+            bottom: n,
+            left: n,
+        });
+    }
     let Value::Table(table) = value else {
         return Err(invalid(
             property,
-            format!("expected a table, got {value:?}"),
+            format!("expected a number or a table, got {value:?}"),
         ));
     };
     let edge = |key: &str| -> Result<f32, LayoutError> {
@@ -535,6 +552,21 @@ pub fn parse_background(properties: &HashMap<String, Value>) -> Result<Option<Rg
 /// the Wayland dispatch thread. `[0, 8192]` alone doesn't make that reachability obvious, which is
 /// worth spelling out here so a future reader doesn't widen the bound without knowing why it was
 /// chosen.
+///
+/// **Decision (docs/build-steps.md Phase 19 item 15): this bound stays private to `radius` and
+/// `border_width`, not extended to `margin`/`padding` when the latter two picked up
+/// [`parse_edge_insets`]'s scalar shorthand.** § 5.1's base property table gives `margin` and
+/// `padding` no "Valid Range" entry at all -- unlike `width`/`height`, whose row spells out
+/// `[0, 8192]` -- so nothing in the spec asks for a bound here. `parse_edge_insets` never checked a
+/// range before this change either; margin and padding both already accepted an out-of-range value,
+/// including negative, since the function only rejected the wrong Lua type. `layout::scene`'s
+/// `position_children` reads a negative margin the same way CSS does: it is subtracted into a
+/// child's footprint and slot size on the main and cross axis, so `margin = -8` deliberately pulls a
+/// child closer to (or over) its neighbor. That is layout math, not a femtovg stroke input, and
+/// nothing in `position_children` special-cases a negative or reads the value as anything other than
+/// an offset -- no crash mode like `border_width`'s curve-divisions blowup applies here. So a config
+/// relying on negative margin to overlap or tighten siblings keeps working exactly as before: this
+/// slice only adds the scalar shorthand to `margin`/`padding`, and adds no new restriction on either.
 fn check_geometry_range(property: &str, n: f32) -> Result<(), LayoutError> {
     if !(0.0..=8192.0).contains(&n) {
         return Err(invalid(
@@ -635,36 +667,18 @@ pub fn parse_border_color(properties: &HashMap<String, Value>) -> Result<BorderC
 }
 
 /// `rect.border_width` (§ 5.2 item 1), reusing [`EdgeInsets`] rather than a new per-edge type since
-/// the shape (four `f32`, default 0) is already exactly that. A bare number broadcasts to all four
-/// edges; a table delegates to [`parse_edge_insets`], which already defaults an absent edge to 0.
+/// the shape (four `f32`, default 0) is already exactly that. Both the scalar and table forms
+/// (docs/build-steps.md Phase 19 item 15) come straight from [`parse_edge_insets`], which also
+/// defaults an absent edge to 0; the one thing this wrapper still adds is the `[0, 8192]` range
+/// check, run on every edge of the result. That check stays here rather than moving into
+/// `parse_edge_insets` itself -- see [`check_geometry_range`]'s doc comment for why `margin`/
+/// `padding` don't get it.
 pub fn parse_border_width(properties: &HashMap<String, Value>) -> Result<EdgeInsets, LayoutError> {
-    let Some(value) = properties.get("border_width") else {
-        return Ok(EdgeInsets::default());
-    };
-    if let Some(n) = value_as_f32("border_width", value)? {
+    let insets = parse_edge_insets(properties, "border_width")?;
+    for n in [insets.top, insets.right, insets.bottom, insets.left] {
         check_geometry_range("border_width", n)?;
-        return Ok(EdgeInsets {
-            top: n,
-            right: n,
-            bottom: n,
-            left: n,
-        });
     }
-    if matches!(value, Value::Table(_)) {
-        // The range check runs here, on each edge of the result, rather than inside
-        // `parse_edge_insets` itself: that function is shared with `margin`/`padding`, which have
-        // no such bound (a real gap, but a different property set with its own callers -- not
-        // widened here).
-        let insets = parse_edge_insets(properties, "border_width")?;
-        for n in [insets.top, insets.right, insets.bottom, insets.left] {
-            check_geometry_range("border_width", n)?;
-        }
-        return Ok(insets);
-    }
-    Err(invalid(
-        "border_width",
-        format!("expected a number or a table, got {value:?}"),
-    ))
+    Ok(insets)
 }
 
 pub fn parse_align(
@@ -1055,6 +1069,24 @@ mod tests {
     }
 
     #[test]
+    fn height_content_error_names_omission_as_the_spelling() {
+        // Catches the message regressing to listing every mode except the one whose spelling is
+        // "leave the property out" -- docs/build-steps.md Phase 19 item 15. `"Content"` is not a
+        // valid literal, so an author reaching for it here needs the error itself to say so.
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", height = "Content" }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_size_mode(&props, "height").unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "height" && detail.contains("omit the property")),
+            "must name omission as how Content sizing is spelled: {err}"
+        );
+    }
+
+    #[test]
     fn margin_reads_named_edges_defaulting_absent_ones_to_zero() {
         let lua = lua();
         let table: mlua::Table = lua
@@ -1071,6 +1103,96 @@ mod tests {
                 bottom: 0.0,
                 left: 2.0
             }
+        );
+    }
+
+    #[test]
+    fn padding_reads_named_edges_defaulting_absent_ones_to_zero() {
+        // Same table form as `margin`'s equivalent test, on the sibling property that shares
+        // `parse_edge_insets` -- proves the shorthand added below is additive, not a replacement.
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", padding = { top = 4, left = 2 } }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let insets = parse_edge_insets(&props, "padding").unwrap();
+        assert_eq!(
+            insets,
+            EdgeInsets {
+                top: 4.0,
+                right: 0.0,
+                bottom: 0.0,
+                left: 2.0
+            }
+        );
+    }
+
+    #[test]
+    fn margin_scalar_broadcasts_to_all_four_edges() {
+        // The change itself: `margin = 10` used to be rejected as "expected a table". Catches the
+        // shorthand not reaching `margin` when it moved off `border_width`'s private wrapper.
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", margin = 10 }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        assert_eq!(
+            parse_edge_insets(&props, "margin").unwrap(),
+            EdgeInsets { top: 10.0, right: 10.0, bottom: 10.0, left: 10.0 }
+        );
+    }
+
+    #[test]
+    fn padding_scalar_broadcasts_to_all_four_edges() {
+        // Same change as `margin`'s scalar test, on the other property named in item 15.
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", padding = 10 }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        assert_eq!(
+            parse_edge_insets(&props, "padding").unwrap(),
+            EdgeInsets { top: 10.0, right: 10.0, bottom: 10.0, left: 10.0 }
+        );
+    }
+
+    #[test]
+    fn margin_negative_value_is_accepted() {
+        // The range-check decision, tested directly: `border_width` rejects a value outside
+        // [0, 8192] (see `a_negative_border_width_is_rejected`), but `margin` never gained that
+        // check when it gained the scalar shorthand -- `position_children` (layout/scene.rs) reads
+        // a negative margin as a deliberate pull toward a neighbor, the same as CSS. Catches the
+        // range check leaking from `parse_border_width` into the shared `parse_edge_insets` and
+        // breaking that pattern.
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", margin = -10 }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        assert_eq!(
+            parse_edge_insets(&props, "margin").unwrap(),
+            EdgeInsets { top: -10.0, right: -10.0, bottom: -10.0, left: -10.0 }
+        );
+    }
+
+    #[test]
+    fn padding_negative_value_is_accepted() {
+        // Same decision as `margin_negative_value_is_accepted`, on `padding`. `padding` has no
+        // established use for a negative value the way `margin` does, but the two share
+        // `parse_edge_insets` and the decision covers the property, not a specific config pattern.
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", padding = -10 }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        assert_eq!(
+            parse_edge_insets(&props, "padding").unwrap(),
+            EdgeInsets { top: -10.0, right: -10.0, bottom: -10.0, left: -10.0 }
         );
     }
 
