@@ -119,6 +119,76 @@ fn invalid(property: &str, detail: impl Into<String>) -> LayoutError {
     }
 }
 
+/// Longest prefix of a rejected value's `Debug` form this file will ever put in an error message.
+/// 200 bytes, not `marshal::MAX_STRING_BYTES` (64KB): that cap answers "how much of a *string
+/// property* is a legitimate value," a config author's call about the accepted path. This one
+/// answers "how much of a rejected value belongs in one line of `rescue`'s `error_log` (§ 2.10),"
+/// a much smaller budget -- a human scrolling past it needs enough bytes to recognize the value,
+/// not a paste buffer, and even a 64KB truncated dump would still read as a bad log line even
+/// though it would no longer reintroduce the pathological allocation this exists to stop.
+const MAX_ERROR_VALUE_PREVIEW_BYTES: usize = 200;
+
+/// Renders a `Value` for an [`invalid`] detail without ever formatting its `Debug` form in full
+/// first (docs/build-steps.md Phase 19 item 13). `format!("{value:?}")` on an oversized
+/// `Value::String` allocates and escapes the whole thing before any truncation could run --
+/// `rect { radius = string.rep("x", 20 * 1024 * 1024) }` would format 20 MB on the Wayland
+/// dispatch thread before the error even reaches `rescue`. `marshal::check_string`'s 64KB cap
+/// never runs on this path, because it lives in [`checked_string`], which a value rejected for
+/// having the wrong *type* never reaches.
+///
+/// Measured on this machine, formatting a Lua string of each size against this function:
+///
+/// | size | `format!("{value:?}")` | this function |
+/// |---|---|---|
+/// | 1 MB | 1.64 ms | 0.0088 ms |
+/// | 20 MB | 23.96 ms | 0.0057 ms |
+/// | 100 MB | 93.88 ms | 0.0061 ms |
+///
+/// The right-hand column being flat is the point, and is what separates this from a helper that
+/// formats first and truncates after: cost here is a function of the cap, not of the input. The
+/// left-hand column is why it matters at all. 23.96 ms is more than a whole frame at 60fps, and
+/// build-steps.md Phase 19 item 6's third commit made this per-frame rather than per-apply:
+/// `layout::paint` is the first thing that ever validates a `background` or a `radius`, and it
+/// does so while drawing, on the Wayland dispatch thread. One `background = 5` in one node used
+/// to pay that on every frame.
+///
+/// A timing assertion is not the regression test for this. A naive format-then-truncate still
+/// came in under a 50 ms bound at 20 MB, so a threshold loose enough to be stable on other
+/// hardware is too loose to catch the bug. What catches it deterministically is that a
+/// format-then-truncate cannot report the value's true length, which
+/// `oversized_string_property_error_still_names_type_and_shows_a_recognizable_prefix` asserts on.
+///
+/// Checked against mlua 0.12's actual `Debug` impls (`value.rs`, `table.rs`, `function.rs`,
+/// `userdata.rs`, `string.rs`, `thread.rs`, `types.rs`) rather than assumed: `Value::String` is
+/// the only unbounded case. `Value::fmt`'s non-alternate branch writes `String({s:?})`, and
+/// `LuaString`'s own `Debug` formats every byte of the string, escaped, whether as a `str` or as
+/// `bstr::BStr`. Every other variant that can hold non-trivial data (`Table`, `Function`,
+/// `Thread`, `UserData`) instead derives or hand-writes `debug_tuple(...).field(&self.0)` over a
+/// `ValueRef`, whose own `Debug` is `Ref({:p})` -- a fixed-width pointer, regardless of how large
+/// the table is or how many upvalues the closure carries. `Integer`/`Number`/`Boolean`/`Nil`/
+/// `LightUserData` are already bounded by their own type. So only the `String` arm needs a
+/// separate path here; every other variant formats exactly as it always has.
+fn preview_for_error(value: &Value) -> String {
+    let Value::String(s) = value else {
+        return format!("{value:?}");
+    };
+    // `as_bytes()` borrows the Lua string's own buffer -- no copy, no escaping -- so measuring its
+    // length is the O(1) check that has to run *before* any formatting decision, not after.
+    let bytes = s.as_bytes();
+    let total_len = bytes.len();
+    if total_len <= MAX_ERROR_VALUE_PREVIEW_BYTES {
+        return format!("{value:?}");
+    }
+    // Slice first, format second: only the bounded prefix is ever handed to a `Debug`-style
+    // formatter, so a 20 MB string costs this function O(200 bytes), not O(len). The prefix is
+    // rendered lossily on purpose -- this is a log preview, not an equality key, and slicing raw
+    // bytes at a fixed offset can land mid-codepoint.
+    let prefix = String::from_utf8_lossy(&bytes[..MAX_ERROR_VALUE_PREVIEW_BYTES]);
+    format!(
+        "String({prefix:?}...) -- {total_len} bytes total, truncated to the first {MAX_ERROR_VALUE_PREVIEW_BYTES} here"
+    )
+}
+
 /// Runs a numeric `Value` through the marshalling boundary (`lua::marshal`, ADR-0044 decision 1)
 /// before this parser's own application-level range checks (e.g. `parse_size_mode`'s `[0, 8192]`)
 /// ever see it -- catches a NaN/Inf `f64` `Number` or an out-of-2^53-range `Integer`, whether it
@@ -442,7 +512,8 @@ pub fn parse_size_mode(
     Err(invalid(
         property,
         format!(
-            "expected a number, \"Fill\", or a \"NN%\" string (Content sizing has no literal -- omit the property instead), got {value:?}"
+            "expected a number, \"Fill\", or a \"NN%\" string (Content sizing has no literal -- omit the property instead), got {}",
+            preview_for_error(value)
         ),
     ))
 }
@@ -492,7 +563,7 @@ pub fn parse_edge_insets(
     let Value::Table(table) = value else {
         return Err(invalid(
             property,
-            format!("expected a number or a table, got {value:?}"),
+            format!("expected a number or a table, got {}", preview_for_error(value)),
         ));
     };
     let edge = |key: &str| -> Result<f32, LayoutError> {
@@ -511,7 +582,10 @@ pub fn parse_edge_insets(
                 "{property}.{key}"
             ))),
             other => value_as_f32(property, &other)?.ok_or_else(|| {
-                invalid(property, format!("`{key}` must be a number, got {other:?}"))
+                invalid(
+                    property,
+                    format!("`{key}` must be a number, got {}", preview_for_error(&other)),
+                )
             }),
         }
     };
@@ -533,7 +607,7 @@ pub fn parse_background(properties: &HashMap<String, Value>) -> Result<Option<Rg
     let Value::String(s) = value else {
         return Err(invalid(
             "background",
-            format!("expected a string, got {value:?}"),
+            format!("expected a string, got {}", preview_for_error(value)),
         ));
     };
     let s = checked_string("background", s)?;
@@ -585,7 +659,7 @@ pub fn parse_radius(properties: &HashMap<String, Value>) -> Result<f32, LayoutEr
         return Ok(0.0);
     };
     let n = value_as_f32("radius", value)?
-        .ok_or_else(|| invalid("radius", format!("expected a number, got {value:?}")))?;
+        .ok_or_else(|| invalid("radius", format!("expected a number, got {}", preview_for_error(value))))?;
     check_geometry_range("radius", n)?;
     Ok(n)
 }
@@ -621,7 +695,7 @@ pub fn parse_border_color(properties: &HashMap<String, Value>) -> Result<BorderC
     let Value::Table(table) = value else {
         return Err(invalid(
             "border_color",
-            format!("expected a string or a table, got {value:?}"),
+            format!("expected a string or a table, got {}", preview_for_error(value)),
         ));
     };
     // ponytail: `table.get` is metamethod-aware, the same hole [`parse_edge_insets`]'s `ponytail:`
@@ -654,7 +728,7 @@ pub fn parse_border_color(properties: &HashMap<String, Value>) -> Result<BorderC
             }
             other => Err(invalid(
                 "border_color",
-                format!("`{key}` must be a hex colour string, got {other:?}"),
+                format!("`{key}` must be a hex colour string, got {}", preview_for_error(&other)),
             )),
         }
     };
@@ -691,7 +765,7 @@ pub fn parse_align(
     let Value::String(s) = value else {
         return Err(invalid(
             property,
-            format!("expected a string, got {value:?}"),
+            format!("expected a string, got {}", preview_for_error(value)),
         ));
     };
     match checked_string(property, s)?.as_str() {
@@ -711,7 +785,7 @@ pub fn parse_visible(properties: &HashMap<String, Value>) -> Result<bool, Layout
         Value::Boolean(b) => Ok(*b),
         other => Err(invalid(
             "visible",
-            format!("expected a boolean, got {other:?}"),
+            format!("expected a boolean, got {}", preview_for_error(other)),
         )),
     }
 }
@@ -721,7 +795,7 @@ pub fn parse_spacing(properties: &HashMap<String, Value>) -> Result<f32, LayoutE
         return Ok(0.0);
     };
     value_as_f32("spacing", value)?
-        .ok_or_else(|| invalid("spacing", format!("expected a number, got {value:?}")))
+        .ok_or_else(|| invalid("spacing", format!("expected a number, got {}", preview_for_error(value))))
 }
 
 /// Absent `content` defaults to the empty string. It used to be required, but decision 1's nil
@@ -744,7 +818,7 @@ pub fn parse_content(properties: &HashMap<String, Value>) -> Result<String, Layo
         Value::String(s) => checked_string("content", s),
         other => Err(invalid(
             "content",
-            format!("expected a string, got {other:?}"),
+            format!("expected a string, got {}", preview_for_error(other)),
         )),
     }
 }
@@ -764,7 +838,7 @@ pub fn parse_foreground(properties: &HashMap<String, Value>) -> Result<Rgba, Lay
     let Value::String(s) = value else {
         return Err(invalid(
             "foreground",
-            format!("expected a string, got {value:?}"),
+            format!("expected a string, got {}", preview_for_error(value)),
         ));
     };
     let s = checked_string("foreground", s)?;
@@ -776,7 +850,7 @@ pub fn parse_font_size(properties: &HashMap<String, Value>) -> Result<f32, Layou
         return Ok(12.0);
     };
     value_as_f32("font_size", value)?
-        .ok_or_else(|| invalid("font_size", format!("expected a number, got {value:?}")))
+        .ok_or_else(|| invalid("font_size", format!("expected a number, got {}", preview_for_error(value))))
 }
 
 /// Absent `size` defaults to 12.0, same rationale and same amendment as [`parse_content`]
@@ -796,7 +870,8 @@ pub fn parse_icon_size(properties: &HashMap<String, Value>) -> Result<f32, Layou
     let Some(value) = properties.get("size") else {
         return Ok(12.0);
     };
-    value_as_f32("size", value)?.ok_or_else(|| invalid("size", format!("expected a number, got {value:?}")))
+    value_as_f32("size", value)?
+        .ok_or_else(|| invalid("size", format!("expected a number, got {}", preview_for_error(value))))
 }
 
 /// Shared shape behind [`parse_surface_id`]/[`parse_layer`]/[`parse_monitor`]: fetch `property`,
@@ -813,7 +888,7 @@ fn parse_string_property(properties: &HashMap<String, Value>, property: &str, de
     reject_signal_in_structural_field(property, value)?;
     match value {
         Value::String(s) => Ok(s.to_string_lossy()),
-        other => Err(invalid(property, format!("expected a string, got {other:?}"))),
+        other => Err(invalid(property, format!("expected a string, got {}", preview_for_error(other)))),
     }
 }
 
@@ -861,7 +936,7 @@ pub fn parse_node_id(properties: &HashMap<String, Value>) -> Result<Option<Strin
             .to_str()
             .map(|s| Some(s.to_string()))
             .map_err(|_| invalid("id", "must be valid UTF-8 -- an id is compared for equality, so it cannot be converted lossily")),
-        other => Err(invalid("id", format!("expected a string, got {other:?}"))),
+        other => Err(invalid("id", format!("expected a string, got {}", preview_for_error(other)))),
     }
 }
 
@@ -889,14 +964,17 @@ pub fn parse_anchor(properties: &HashMap<String, Value>) -> Result<Anchor, Layou
     };
     reject_signal_in_structural_field("anchor", value)?;
     let Value::Table(table) = value else {
-        return Err(invalid("anchor", format!("expected a table, got {value:?}")));
+        return Err(invalid("anchor", format!("expected a table, got {}", preview_for_error(value))));
     };
     let edge = |key: &str| -> Result<bool, LayoutError> {
         let v: Value = table.get(key).map_err(|e| invalid("anchor", e.to_string()))?;
         match v {
             Value::Nil => Ok(false),
             Value::Boolean(b) => Ok(b),
-            other => Err(invalid("anchor", format!("`{key}` must be a boolean, got {other:?}"))),
+            other => Err(invalid(
+                "anchor",
+                format!("`{key}` must be a boolean, got {}", preview_for_error(&other)),
+            )),
         }
     };
     Ok(Anchor { top: edge("top")?, right: edge("right")?, bottom: edge("bottom")?, left: edge("left")? })
@@ -942,7 +1020,7 @@ pub fn parse_single_child(
     let Value::Table(table) = value else {
         return Err(invalid(
             property,
-            format!("expected a node table, got {value:?}"),
+            format!("expected a node table, got {}", preview_for_error(value)),
         ));
     };
     let node = deserialize_lua_table(table).map_err(|e| invalid(property, e.to_string()))?;
@@ -957,7 +1035,7 @@ pub fn parse_children(properties: &HashMap<String, Value>) -> Result<Vec<Virtual
     let Value::Table(table) = value else {
         return Err(invalid(
             "children",
-            format!("expected an array table, got {value:?}"),
+            format!("expected an array table, got {}", preview_for_error(value)),
         ));
     };
     let mut children = Vec::new();
@@ -2185,5 +2263,93 @@ mod tests {
                 "the same broken config must always name the same property, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn oversized_string_property_error_message_is_bounded() {
+        // Catches docs/build-steps.md Phase 19 item 13's actual defect: before the fix, this
+        // error's `detail` was exactly as long as the offending Lua string (20 MB), because
+        // `format!("{value:?}")` formatted the whole thing into the message. A config author
+        // scrolling `rescue`'s error_log should see a short line, not a 20 MB one.
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", radius = string.rep("Q", 20 * 1024 * 1024) }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_radius(&props).unwrap_err();
+        let LayoutError::InvalidProperty { property, detail } = &err else {
+            panic!("expected InvalidProperty, got {err}");
+        };
+        assert_eq!(property, "radius");
+        assert!(
+            detail.len() < 1024,
+            "a 20 MB input must not produce a multi-megabyte error message, got {} bytes",
+            detail.len()
+        );
+    }
+
+    #[test]
+    fn oversized_string_property_error_still_names_type_and_shows_a_recognizable_prefix() {
+        // The length bound above is satisfiable by a helper that just drops all the diagnostic
+        // content, which would be a worse fix than the bug: a config author staring at the log
+        // needs to be able to tell "my string was too long" apart from "my string was the wrong
+        // type entirely." This checks the truncated message still carries the original type tag,
+        // a recognizable prefix of the actual bytes, and the real (untruncated) length.
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", radius = string.rep("Q", 20 * 1024 * 1024) }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_radius(&props).unwrap_err();
+        let LayoutError::InvalidProperty { detail, .. } = &err else {
+            panic!("expected InvalidProperty, got {err}");
+        };
+        assert!(detail.contains("expected a number"), "{detail}");
+        assert!(detail.contains("String("), "must still name the rejected type: {detail}");
+        assert!(detail.contains("QQQ"), "must show a recognizable prefix of the value: {detail}");
+        assert!(
+            detail.contains(&(20 * 1024 * 1024).to_string()),
+            "must state the real length, or a truncated preview reads as the whole value: {detail}"
+        );
+    }
+
+    #[test]
+    fn short_string_property_error_message_is_unchanged() {
+        // The `Value::String` arm is the only one this fix touches (see `preview_for_error`'s doc
+        // comment for why). This pins that an ordinary short string, well under the 200-byte
+        // preview cap, still renders exactly as mlua's own `Debug` would have before the fix --
+        // the common case pays nothing for the oversized-input guard.
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", radius = "banana" }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_radius(&props).unwrap_err();
+        let LayoutError::InvalidProperty { detail, .. } = &err else {
+            panic!("expected InvalidProperty, got {err}");
+        };
+        assert_eq!(detail, "expected a number, got String(\"banana\")");
+    }
+
+    #[test]
+    fn non_string_variant_error_message_is_unchanged() {
+        // The helper has to pass every other `Value` variant through unchanged -- this is the
+        // "shown to work across the match, not just the string case" coverage. `Boolean`'s Debug
+        // is bounded by construction, so the fix has no work to do here; pinning the exact string
+        // proves `preview_for_error` really does fall through rather than reformatting it.
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", radius = true }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_radius(&props).unwrap_err();
+        let LayoutError::InvalidProperty { detail, .. } = &err else {
+            panic!("expected InvalidProperty, got {err}");
+        };
+        assert_eq!(detail, "expected a number, got Boolean(true)");
     }
 }
