@@ -902,6 +902,21 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    `load_font_file`/`load_fonts_dir`. This is the single largest lever on the memory budget, and it
    also removes most of the roughly one second `FontSystem::new()` currently costs, since that time
    is mostly cold-cache I/O over fonts the shell never draws with.
+
+   It is also a correctness item, which only became visible once item 6 put real text on a real
+   screen. Measurement and paint resolve a font independently and are not resolving the same one.
+   `text::shaping::shape` measures with cosmic-text under `Attrs::new()`, which asks for
+   `Family::SansSerif` and then runs cosmic-text's own per-glyph fallback. `default_font_bytes`,
+   which is what FemtoVG actually rasterizes with, runs its own `fontdb` query for `SansSerif` and,
+   when that misses, falls back to `db.faces().next()`: literally the first face in scan order. Its
+   own `ponytail:` comment already called that fallback a placeholder for a real policy.
+
+   Measured on this dev machine: the `SansSerif` query misses, so paint drew every glyph in
+   **Adwaita Mono** while layout had measured in a proportional face. A `text` node's box came out
+   roughly 30% narrower than the glyphs drawn into it, so the bar's media cell overlapped the two
+   cells to its right. One font, resolved once and shared by both paths, is what fixes this; a
+   config-declared family is what makes that resolution deterministic instead of dependent on font
+   scan order.
 11. **Atlas eviction** (ADR-0043). femtovg allocates 512x512 RGBA8 atlas pages, one mebibyte each,
    grows the list without bound, and frees them only on an explicit `clear()`. Clear at a
    page-count threshold on an idle frame and let it rebuild. Mark it `ponytail:`, naming the
@@ -978,6 +993,22 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    `serialize_none_to_null(false)` and its unit-variant sibling are the switch. Mapping to `nil`
    also erases the key from the table, which is the semantics a config wants and the one every
    `x or default` idiom in Lua already assumes.
+17. **Clip a node's paint to its own box.** `TextPainter::draw_line` calls `fill_text` with no
+   scissor, so a `text` whose content is wider than the rect layout gave it paints straight over
+   whatever sits to its right. Seen on a real bar: the media cell's title ran through the two cells
+   after it, and both were legible through each other.
+
+   Item 10 is the reason the overflow was that large here, but fixing the font does not close this.
+   A `text` bound to a capability is exactly the case where content length is not the config's to
+   control: an MPRIS title is whatever the player reports, and no font choice makes an arbitrary
+   string fit a fixed cell. `femtovg::Canvas` has `scissor`/`reset_scissor`, so this is a clip
+   around each node's draw rather than new machinery.
+
+   Clipping is the floor, not the finished behavior. § 3.2 gives `text` a wrap at the available
+   width, which layout already measures with (`text_wrap_width`), so the honest fix is for paint to
+   render the same wrapped lines layout measured rather than one unwrapped line that gets cut off.
+   Ellipsis is a further step and wants a spec decision first, since § 5.2 names no overflow
+   property today.
 
 Deliberately deferred, and this one is a decision rather than an omission: **no damage tracking.**
 Redraw the whole surface. `oblisk-layout-engine-geometry.md` § 5 projects damage rectangles, but
