@@ -273,7 +273,7 @@ mod tests {
     use crate::lua::nodes::{deserialize_lua_table, register_node_constructors};
     use crate::lua::signal;
     use crate::layout::scene::{LogicalSize, Scene};
-    use crate::text::shaping::ShapingHandle;
+    use crate::text::shaping::{ShapeRequest, ShapingHandle};
 
     // `EGL_PLATFORM_SURFACELESS_MESA` -- not in khronos-egl 6.0.0's constant list (confirmed by
     // reading its source; the crate ships no `PLATFORM_*` constants at all), so this is the raw
@@ -374,15 +374,16 @@ mod tests {
     }
 
     /// Builds a `TextPainter` against `instance`'s already-current context -- same
-    /// `default_font_bytes` source `wayland::mod`'s own `draw_main_bar_proof_text` uses, so this
-    /// harness draws with the exact font cosmic-text shaped against.
+    /// `font_chain_bytes` source `wayland::mod`'s own `draw_main_bar_proof_text` uses, so this
+    /// harness draws with the exact declared font chain cosmic-text shaped against
+    /// (docs/adr/0043 decision 2).
     fn text_painter(instance: &egl::Instance<egl::Static>, shaping: &ShapingHandle, width: u32, height: u32) -> Option<TextPainter> {
-        let font_bytes = shaping.default_font_bytes();
+        let font_chain_bytes = shaping.font_chain_bytes();
         TextPainter::new(
             |s| instance.get_proc_address(s).map_or(std::ptr::null(), |f| f as *const c_void),
             width,
             height,
-            &font_bytes,
+            &font_chain_bytes,
         )
         .map_err(|e| eprintln!("EGL init failed, skip: FemtoVG init: {e}"))
         .ok()
@@ -610,5 +611,60 @@ mod tests {
         // One pixel outside the rect's own box: the surface's red. A stroke drawn on the box edge
         // rather than inset by half its width would have painted half of itself out here.
         assert_eq!(pixel_at(painter.canvas_mut(), 9, 30), (255, 0, 0, 255));
+    }
+
+    /// The regression test for docs/build-steps.md Phase 19 item 10 / docs/adr/0043 decision 2:
+    /// measurement (`ShapingHandle::shape`, cosmic-text) and paint (`TextPainter`, femtovg) must
+    /// resolve the same font, or a `text` node's laid-out box and its painted glyphs disagree.
+    /// Measured live on the dev machine before this fix: cosmic-text measured under
+    /// `Family::SansSerif` while paint's own separate `fontdb` query missed that alias and fell
+    /// back to the first face in scan order (Adwaita Mono) -- a `text` node's box came out
+    /// roughly 30% narrower than the glyphs drawn into it.
+    ///
+    /// Both sides now measure/paint the exact same declared chain
+    /// (`ShapingHandle::font_chain_bytes`), so this compares cosmic-text's `shape()` against
+    /// femtovg's own `measure_text` for the identical string at the identical size and asserts
+    /// they land within 2% -- not exact equality, since the two shapers round glyph advances
+    /// slightly differently even reading the same font file.
+    ///
+    /// What this actually covers, stated plainly rather than implied: it catches paint and
+    /// measurement loading two *different font sets* -- confirmed real by temporarily having
+    /// `TextPainter` load `font_chain_bytes()[1..]` (dropping the chain's first entry) instead
+    /// of the full chain, which produced a 61.6% divergence and failed here as expected. It does
+    /// *not* catch `shape()` asking for the wrong family while both sides still load the *same*
+    /// set: today's default chain resolves to exactly one Latin-covering face (`Noto Sans CJK
+    /// JP` misses on every machine this has been run on), so cosmic-text's own per-run fallback
+    /// converges on that one face regardless of which family `shape()` names -- confirmed by
+    /// temporarily reverting `shape()` to bare `Attrs::new()`, which left this test green.
+    /// `text::shaping::tests::shape_measures_under_the_family_it_is_given` is what covers that
+    /// second case: it holds one `FontSystem` fixed over a database with two distinct Latin
+    /// faces and varies only the family argument `shape()` is given.
+    #[test]
+    fn femtovg_and_cosmic_text_measure_the_same_string_to_the_same_width() {
+        let Some(instance) = init_headless_egl(400, 60) else { return };
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 400, 60) else { return };
+
+        const TEXT: &str = "Oblisk Shell Renderer";
+        const FONT_SIZE: f32 = 24.0;
+
+        let shaped = shaping.shape(ShapeRequest { text: TEXT.into(), font_size: FONT_SIZE, line_height: FONT_SIZE * 1.2, max_width: None });
+
+        let mut paint = Paint::color(Color::black());
+        paint.set_font(painter.fonts());
+        paint.set_font_size(FONT_SIZE);
+        let metrics = painter.canvas_mut().measure_text(0.0, 0.0, TEXT, &paint).expect("measure_text should succeed with the chain fonts loaded");
+        let femtovg_width = metrics.width();
+
+        let tolerance = shaped.width.max(femtovg_width) * 0.02;
+        let diff = (shaped.width - femtovg_width).abs();
+        assert!(
+            diff <= tolerance,
+            "cosmic-text measured {} but femtovg measured {} for the same string at the same size -- \
+             a {:.1}% divergence, over the 2% tolerance, meaning the two are not resolving the same font",
+            shaped.width,
+            femtovg_width,
+            (diff / shaped.width.max(femtovg_width)) * 100.0
+        );
     }
 }

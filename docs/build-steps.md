@@ -917,6 +917,50 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    cells to its right. One font, resolved once and shared by both paths, is what fixes this; a
    config-declared family is what makes that resolution deterministic instead of dependent on font
    scan order.
+
+   Built in two commits. The first is the resolver and the shared chain, which is what closes the
+   correctness half; the second is the Lua `fonts = {...}` declaration ADR-0043 decision 2 writes
+   out, still to come. The split is because the declaration has an unsettled question the resolver
+   does not: a config returns a table of surfaces today, so there is nowhere for a top-level
+   `fonts` table to go without changing that return shape, and neither this phase nor Phase 26 owns
+   that decision. Until it lands the chain is a constant, `["sans-serif", "Noto Sans CJK JP",
+   "Noto Color Emoji"]`, which is the shape ADR-0043 names as what the default config ships.
+
+   The resolver is fontconfig, through one `fc-match` subprocess per chain entry. This is worth
+   recording because ADR-0043's "load the declared families through `load_font_file`" understates
+   the problem: `fontdb` has no family-name to file index, and `load_system_fonts()` *is* that
+   index, so a declared family name cannot be resolved by fontdb alone. fontconfig already holds
+   that index and already encodes the system's own font policy, which is a better answer than the
+   `db.faces().next()` scan order this replaces.
+
+   fontconfig substitutes rather than failing, so a miss has to be detected by comparing the
+   returned family against the request rather than by exit status. `fc-match "ZZ No Such Family"`
+   exits 0 and returns Noto Sans. The generic aliases (`sans-serif`, `serif`, `monospace`,
+   `cursive`, `fantasy`) are exempt, since substitution is the whole point for those.
+
+   One known limitation, found on this dev machine and left unbuilt. A family that *is* installed
+   but that a user's own fontconfig rules strongly substitute away reads as a miss and gets
+   dropped, so declaring it yields nothing rather than the wrong font. The machine had a
+   `~/.config/fontconfig/fonts.conf` prepending an Arabic naskh face with `binding="strong"` for
+   anything fontconfig classified as generic sans-serif, which caught `Noto Sans`, and the file was
+   removed rather than worked around. The fix if this ever matters is `fc-match -s`, which prints
+   the full ranked list: the substitution is the head, and the requested family sits below it in
+   fontconfig's own weight and style ranking, so walking the list to the first family that matches
+   the request defeats the substitution while keeping the ranking. `fc-list` is the wrong tool for
+   it, since it does not rank (`fc-list "Noto Sans" file` returned 72 faces headed by
+   `NotoSans-SemiCondensedExtraBold`).
+
+   Two things this item does not deliver. `femtovg::add_font_mem` takes no face index and always
+   loads face 0, so a weight or style living only inside a `.ttc` is unreachable: `Inter.ttc` holds
+   36 fonts and only the first is addressable. Harmless today because nothing selects a weight or
+   style anywhere in the crate, and `add_shared_font_with_index` is the fix when something does.
+   And the divergence test cannot see the original bug any more, which is worth stating rather than
+   leaving to be rediscovered: once the chain resolves to a single Latin-covering face, every
+   resolution path converges on it, so reverting `shape()` to `Family::SansSerif` leaves the test
+   green. It still catches paint and measurement loading different font *sets*, measured at 61.6%
+   divergence when the painter was handed the chain minus its first entry. A separate test holds
+   one `FontSystem` fixed and varies only the family argument (241.08 against 302.4, and both
+   241.08 when the argument is ignored) to cover what the first one no longer can.
 11. **Atlas eviction** (ADR-0043). femtovg allocates 512x512 RGBA8 atlas pages, one mebibyte each,
    grows the list without bound, and frees them only on an explicit `clear()`. Clear at a
    page-count threshold on an idle frame and let it rebuild. Mark it `ponytail:`, naming the

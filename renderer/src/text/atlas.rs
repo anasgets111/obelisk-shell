@@ -21,28 +21,38 @@ use crate::layout::node::Rgba;
 
 use super::snap::{snap_to_physical, LogicalRect};
 
-/// A FemtoVG canvas bound to the calling thread's current EGL/GL context, with one
-/// loaded font ready to draw with.
+/// A FemtoVG canvas bound to the calling thread's current EGL/GL context, with the declared
+/// font chain loaded and ready to draw with.
 pub struct TextPainter {
     canvas: Canvas<OpenGl>,
-    font: FontId,
+    fonts: Vec<FontId>,
 }
 
 impl TextPainter {
     /// `load_fn` must resolve GL function pointers against a context that's already
     /// current on this thread -- FemtoVG doesn't make any context current itself, it
     /// only calls GL through the pointers it's given.
+    ///
+    /// `font_chain_bytes` is `ShapingHandle::font_chain_bytes()`'s own output, in the same
+    /// chain order cosmic-text shaped against -- loading it here rather than doing FemtoVG's
+    /// own font discovery is the other half of docs/adr/0043 decision 2's fix: measurement and
+    /// paint resolve the one declared chain, not two independently-discovered fonts that can
+    /// disagree (see `text::shaping`'s module doc comment for the bug this replaces). Errors if
+    /// the slice is empty -- `draw_line` cannot fall back to a font it was never given.
     pub fn new(
         load_fn: impl FnMut(&str) -> *const c_void,
         width: u32,
         height: u32,
-        font_bytes: &[u8],
+        font_chain_bytes: &[Vec<u8>],
     ) -> Result<Self, Box<dyn Error>> {
+        if font_chain_bytes.is_empty() {
+            return Err("TextPainter::new requires at least one loaded font".into());
+        }
         let renderer = unsafe { OpenGl::new_from_function(load_fn)? };
         let mut canvas = Canvas::new(renderer)?;
         canvas.set_size(width, height, 1.0);
-        let font = canvas.add_font_mem(font_bytes)?;
-        Ok(Self { canvas, font })
+        let fonts = font_chain_bytes.iter().map(|bytes| canvas.add_font_mem(bytes)).collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { canvas, fonts })
     }
 
     /// Updates the canvas's viewport to match the surface's current size. Cheap and
@@ -60,6 +70,16 @@ impl TextPainter {
         &mut self.canvas
     }
 
+    /// The loaded chain's `FontId`s, in chain order -- the test seam `layout::paint`'s
+    /// divergence test uses to build its own `Paint` and call `canvas_mut().measure_text` with
+    /// the exact fonts `draw_line` itself paints with, so that test can compare femtovg's
+    /// measurement against `ShapingHandle::shape`'s. `draw_line` itself reaches `self.fonts`
+    /// directly and has no need of this; it exists for that one test caller.
+    #[cfg(test)]
+    pub fn fonts(&self) -> &[FontId] {
+        &self.fonts
+    }
+
     /// Draws `text` with its snapped top-left corner at `rect`'s origin (build-steps.md
     /// Phase 4, point 3) in `color`. Does not flush or swap buffers -- `layout::paint`'s tree
     /// walk draws a whole surface's worth of nodes onto this same canvas and flushes once at
@@ -71,7 +91,11 @@ impl TextPainter {
         // `Rgba`'s four `f32` fields exist precisely so `Color::rgbaf` takes them with no
         // conversion (see that struct's own doc comment in `layout::node`).
         let mut paint = Paint::color(Color::rgbaf(color.r, color.g, color.b, color.a));
-        paint.set_font(&[self.font]);
+        // The whole chain, in chain order: FemtoVG's `set_font` does its own per-glyph
+        // fallback across the slice it's given, so this is what carries the declared fallback
+        // chain (a CJK codepoint a UI font lacks, an emoji neither covers) into paint, the same
+        // way cosmic-text's own shaping already falls back across `db`'s loaded faces.
+        paint.set_font(&self.fonts);
         paint.set_font_size(font_size);
         // FemtoVG's fill_text baseline follows the HTML5 Canvas API it's modeled on
         // (see femtovg's crate-level docs): y is the text baseline, not the box top,

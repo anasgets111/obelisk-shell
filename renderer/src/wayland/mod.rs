@@ -1076,12 +1076,12 @@ fn draw_main_bar_proof_text(
     });
 
     if text_painter.is_none() {
-        let font_bytes = shaping.default_font_bytes();
+        let font_chain_bytes = shaping.font_chain_bytes();
         let painter = TextPainter::new(
             |s| egl.instance.get_proc_address(s).map_or(std::ptr::null(), |f| f as *const c_void),
             width as u32,
             height as u32,
-            &font_bytes,
+            &font_chain_bytes,
         );
         match painter {
             Ok(p) => *text_painter = Some(p),
