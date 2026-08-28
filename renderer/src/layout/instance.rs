@@ -77,6 +77,57 @@ pub fn expand_instances(specs: &[PanelSpec], outputs: &[OutputGeometry]) -> Vec<
     instances
 }
 
+/// What one output change does to a live generation's surface instances (docs/adr/0038 decision 3:
+/// "monitor hotplug adds and removes instances in place, with no generation swap"), computed by
+/// [`reconcile_instances`].
+///
+/// Three fields rather than one merged list because the caller does three different things with
+/// them: `added` needs a `zwlr_layer_surface_v1` built for it, `removed` needs one destroyed, and
+/// `instances` is the whole new set for `crate::socket::RendererClient::set_instances` to resolve
+/// against. An instance in neither `added` nor `removed` is deliberately untouched -- its surface
+/// keeps its EGL binding, its configure history, and its place on screen.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstanceReconcile {
+    /// Every instance that should exist after the change, in `fresh` order.
+    pub instances: Vec<SurfaceInstance>,
+    pub added: Vec<SurfaceInstance>,
+    /// `instance_id`s whose surface must be destroyed.
+    pub removed: Vec<String>,
+}
+
+/// Diffs the instance set a generation is currently resolving against the one
+/// [`expand_instances`] produces from the outputs now connected.
+///
+/// A retained instance is carried over from `current` **unchanged**, and that is the one thing
+/// this does that a plain re-expansion cannot. `expand_instances` seeds `available` from the
+/// output's own logical size; `crate::socket::RendererClient::set_instance_size` has since
+/// replaced it with the size the compositor actually configured that surface to (a bar's 1920x32,
+/// not its output's 1920x1080). Handing the re-expanded size back would resolve every surviving
+/// surface against its whole output until the next `configure`, and a surface whose size did not
+/// change gets no further configure at all, so it would simply stay wrong.
+///
+/// Pure, and testable for exactly the reason the module doc gives: `crate::wayland` has no
+/// headless harness, and this is where the add/remove/retain decision actually lives.
+pub fn reconcile_instances(current: &[SurfaceInstance], fresh: &[SurfaceInstance]) -> InstanceReconcile {
+    let mut instances = Vec::with_capacity(fresh.len());
+    let mut added = Vec::new();
+    for instance in fresh {
+        match current.iter().find(|existing| existing.instance_id == instance.instance_id) {
+            Some(existing) => instances.push(existing.clone()),
+            None => {
+                instances.push(instance.clone());
+                added.push(instance.clone());
+            }
+        }
+    }
+    let removed = current
+        .iter()
+        .filter(|existing| !fresh.iter().any(|instance| instance.instance_id == existing.instance_id))
+        .map(|existing| existing.instance_id.clone())
+        .collect();
+    InstanceReconcile { instances, added, removed }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +206,98 @@ mod tests {
             instances.iter().map(|i| i.instance_id.as_str()).collect::<Vec<_>>(),
             ["bar@eDP-1", "bar@DP-1", "dock@DP-1"]
         );
+    }
+
+    fn configured(instance_id: &str, declared_id: &str, output_name: &str, width: f32, height: f32) -> SurfaceInstance {
+        SurfaceInstance {
+            instance_id: instance_id.to_string(),
+            declared_id: declared_id.to_string(),
+            output: output_name.to_string(),
+            available: LogicalSize { width, height },
+        }
+    }
+
+    #[test]
+    fn a_plugged_in_monitor_adds_one_instance_and_leaves_the_existing_one_alone() {
+        let current = [configured("bar@eDP-1", "bar", "eDP-1", 1920.0, 32.0)];
+        let fresh = expand_instances(&[spec("bar", "All")], &[output("eDP-1", 1920.0, 1080.0), output("DP-1", 3840.0, 2160.0)]);
+
+        let reconcile = reconcile_instances(&current, &fresh);
+
+        assert_eq!(reconcile.added.iter().map(|i| i.instance_id.as_str()).collect::<Vec<_>>(), ["bar@DP-1"]);
+        assert!(reconcile.removed.is_empty());
+        assert_eq!(reconcile.instances.iter().map(|i| i.instance_id.as_str()).collect::<Vec<_>>(), ["bar@eDP-1", "bar@DP-1"]);
+    }
+
+    #[test]
+    fn a_retained_instance_keeps_the_size_the_compositor_configured_not_the_outputs_logical_size() {
+        // The whole reason this is not just `expand_instances`'s output. `expand_instances` seeds
+        // `available` from the output's logical size, and `RendererClient::set_instance_size`
+        // replaced it with the 1920x32 the compositor granted this bar. Handing the re-expanded
+        // 1920x1080 back would resolve the bar at full screen height until its next `configure`,
+        // and a surface whose size did not change gets no further configure at all.
+        let current = [configured("bar@eDP-1", "bar", "eDP-1", 1920.0, 32.0)];
+        let fresh = expand_instances(&[spec("bar", "All")], &[output("eDP-1", 1920.0, 1080.0)]);
+
+        let reconcile = reconcile_instances(&current, &fresh);
+
+        assert_eq!(reconcile.instances, current);
+        assert!(reconcile.added.is_empty());
+        assert!(reconcile.removed.is_empty());
+    }
+
+    #[test]
+    fn an_unplugged_monitor_removes_only_its_own_instance() {
+        let current = [
+            configured("bar@eDP-1", "bar", "eDP-1", 1920.0, 32.0),
+            configured("bar@DP-1", "bar", "DP-1", 3840.0, 48.0),
+        ];
+        let fresh = expand_instances(&[spec("bar", "All")], &[output("eDP-1", 1920.0, 1080.0)]);
+
+        let reconcile = reconcile_instances(&current, &fresh);
+
+        assert_eq!(reconcile.removed, ["bar@DP-1"]);
+        assert!(reconcile.added.is_empty());
+        assert_eq!(reconcile.instances, [current[0].clone()]);
+    }
+
+    #[test]
+    fn every_output_going_away_removes_every_instance_and_leaves_none() {
+        // A laptop lid closing with nothing else attached. The generation survives with no
+        // surfaces rather than exiting -- docs/adr/0038 decision 3 handles hotplug in place, and
+        // the outputs coming back is another output change, not a new generation.
+        let current = [
+            configured("bar@eDP-1", "bar", "eDP-1", 1920.0, 32.0),
+            configured("dock@eDP-1", "dock", "eDP-1", 64.0, 1080.0),
+        ];
+
+        let reconcile = reconcile_instances(&current, &[]);
+
+        assert_eq!(reconcile.removed, ["bar@eDP-1", "dock@eDP-1"]);
+        assert!(reconcile.added.is_empty());
+        assert!(reconcile.instances.is_empty());
+    }
+
+    #[test]
+    fn a_swap_of_one_monitor_for_another_adds_and_removes_in_the_same_pass() {
+        let current = [configured("bar@eDP-1", "bar", "eDP-1", 1920.0, 32.0)];
+        let fresh = expand_instances(&[spec("bar", "All")], &[output("DP-1", 3840.0, 2160.0)]);
+
+        let reconcile = reconcile_instances(&current, &fresh);
+
+        assert_eq!(reconcile.added.iter().map(|i| i.instance_id.as_str()).collect::<Vec<_>>(), ["bar@DP-1"]);
+        assert_eq!(reconcile.removed, ["bar@eDP-1"]);
+        assert_eq!(reconcile.instances.iter().map(|i| i.instance_id.as_str()).collect::<Vec<_>>(), ["bar@DP-1"]);
+    }
+
+    #[test]
+    fn a_first_expansion_against_an_empty_current_set_is_all_added() {
+        let fresh = expand_instances(&[spec("bar", "All")], &[output("eDP-1", 1920.0, 1080.0)]);
+
+        let reconcile = reconcile_instances(&[], &fresh);
+
+        assert_eq!(reconcile.added, fresh);
+        assert_eq!(reconcile.instances, fresh);
+        assert!(reconcile.removed.is_empty());
     }
 }

@@ -1289,6 +1289,32 @@ reconfiguration, and destruction from the evaluated topology instead.
    convention `supervisor/src/reload.rs` already carries through the PBA handshake for wallpaper.
    `OutputHandler` is already implemented, so monitor hotplug adds and removes surface instances for
    any surface targeting `"All"`.
+
+   > Built. Three things the plan did not anticipate, two of which were latent bugs the hotplug
+   > path would have walked straight into.
+   >
+   > **`zwlr_layer_surface_v1::closed` set `self.exit`.** The compositor sends that event when the
+   > output a surface is on is destroyed, so unplugging one external display would have killed a
+   > shell still painting on the laptop panel -- the exact opposite of decision 3's "in place, with
+   > no generation swap". It destroys that one surface now. Defensible while one hardcoded bar was
+   > the only surface; wrong the moment a config declares N of them across M monitors.
+   >
+   > **Dropping a `TrackedSurface` frees neither the EGL surface nor, in the right order, the
+   > Wayland ones.** `khronos_egl::Surface` is a plain copyable handle with no `Drop`, so
+   > `eglDestroySurface` has to be called by hand or every unplugged monitor leaks one; and
+   > `TrackedSurface` declares `layer` before `bound`, so a plain drop would destroy the
+   > `wl_surface` out from under the `wl_egl_window` still pointing at it. `destroy_surface_by_id`
+   > does all three explicitly, outermost first. Reading `egl_surface` also took its
+   > `#[allow(dead_code)]` off: the workspace total drops from 12 to 11.
+   >
+   > **`smithay_client_toolkit` calls `output_destroyed` *before* removing the output from its own
+   > `OutputState`.** A plain read of `outputs()` from inside that callback still lists the monitor
+   > that just went away, so it is excluded by identity through an explicit `departing` argument.
+   >
+   > No live coverage: this machine has one output. The add/remove/retain decision is a pure
+   > function (`layout::instance::reconcile_instances`) and is tested directly, including the
+   > all-outputs-gone case; everything downstream of it -- surface creation on a new monitor,
+   > teardown on a departing one -- has never run against a compositor.
 3. **Three new `surface` properties**: `namespace` (the layer-shell namespace compositor rules match
    on, hardcoded per role today), `keyboard_interactivity` (`"None"`/`"OnDemand"`/`"Exclusive"`,
    without which a launcher cannot take typing), and `margin` (anchor offsets, which padding cannot
@@ -1355,6 +1381,39 @@ reconfiguration, and destruction from the evaluated topology instead.
    than pushed by the Supervisor, and it stays out of `shared::CAPABILITIES`. An output change
    re-enters the existing reload path (re-evaluate, diff topology, report to the Supervisor), adding
    a trigger rather than a second reload mechanism.
+
+   > Built, as a bare `screens` global rather than `oblisk.screens`: no `oblisk` namespace table
+   > exists in this VM and every signal that does is a bare global, which
+   > `register_rescue_signal`'s doc comment already records as a divergence from ADR-0022. One
+   > signal is not a reason to build a namespace table; it moves with all of them when the full
+   > `oblisk.*` tree is built.
+   >
+   > **The trigger could not be a `ReevaluateReport`.** `supervisor/src/main.rs`'s
+   > `is_current_reload` drops any report whose sequence is not the one it most recently sent, so
+   > a Renderer that fabricated a sequence would have its own report discarded as stale. The new
+   > frame is `RendererFrame::RequestReload`, which asks the Supervisor to *start* a cycle; it
+   > lands on the same `begin_reload` the watcher's own trigger now calls. The sequence stays
+   > Supervisor-owned and the whole existing path is untouched, which is what decision 4 asks for.
+   >
+   > **The seed has to beat the evaluation, and the initial output burst beats both.** A config's
+   > top-level `for _, screen in ipairs(screens:get())` runs during `run_startup_evaluation`, so
+   > seeding afterwards would declare no per-monitor panels at all. The two roundtrips `run`
+   > already does are what make the list available that early -- but they also *dispatch*
+   > `OutputHandler`, so the handler fires before there is any evaluation to expand or surface to
+   > reconcile. It updates the signal from there (which is the seed) and returns; a
+   > `startup_complete` flag gates the rest. Without it every boot spent one whole redundant
+   > evaluate/report/apply round trip on a `RequestReload` sent before the config had been read.
+   >
+   > **A retained instance must keep the size the compositor gave it**, not the output's logical
+   > size a re-expansion re-seeds it with. A surface whose size did not change gets no further
+   > `configure`, so handing back the re-expanded value would resolve a bar at full screen height
+   > permanently. That is why `reconcile_instances` carries entries over from the current set
+   > rather than returning `expand_instances`'s output directly.
+   >
+   > Verified live on one output: the dev config, copied and given a cell that loops over
+   > `screens`, renders `eDP-1 1920x1200 @60.001Hz x1` -- the connector name, the logical size, the
+   > millihertz-to-Hz division keeping its fraction, and the scale. The output-*change* half has no
+   > live coverage on a single-display machine.
 
 Deliberately deferred: xdg-shell toplevels and xdg-popup, both with reasoning recorded in ADR-0038.
 ashell ships without popups and hand-rolls dropdown menus as ordinary layer surfaces with computed

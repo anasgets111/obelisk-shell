@@ -210,6 +210,15 @@ pub struct RendererClient {
     /// needs to mutate.
     capability_signals: RefCell<HashMap<String, LiveSignalHandle>>,
     rescue_handle: LiveSignalHandle,
+    /// The ad-hoc `screens` global's handle (docs/adr/0041 decision 2) -- Renderer-sourced, so it
+    /// is deliberately not in `capability_signals` above and deliberately not in
+    /// `shared::CAPABILITIES` either. See [`register_screens_signal`].
+    screens_handle: LiveSignalHandle,
+    /// What `screens_handle` currently holds, mirrored as JSON so [`Self::set_screens`] can tell a
+    /// real output change from a re-push of the same list -- exactly `rescue_state`'s job below,
+    /// and load-bearing for the same reason plus one more: an unchanged re-push would also ask the
+    /// Supervisor for a reload cycle it has no reason to run.
+    screens_payload: serde_json::Value,
     /// What `rescue_handle` currently holds, mirrored here as a plain tuple so
     /// [`Self::set_rescue_state`] can tell a real change from a no-op rewrite -- see its doc
     /// comment. Seeded to match `register_rescue_signal`'s initial `{ is_rescue = false,
@@ -218,8 +227,10 @@ pub struct RendererClient {
     process_registry: ProcessRegistry,
     /// The scene-dirty flag (ADR-0044 decision 2, `CONTEXT.md`'s Dirty scene entry). Cloned into
     /// every `LiveSignalHandle` this client hands out (the roster seed, the lazy
-    /// `capability_signal` path, and `rescue_handle`), so a `set` on any of them marks this same
-    /// flag. `re_resolve_if_dirty` is the only reader: it checks and clears it in one step.
+    /// `capability_signal` path, `rescue_handle`, and `screens_handle`), so a `set` on any of them
+    /// marks this same flag. Two readers, both of which check and clear in one step:
+    /// `re_resolve_if_dirty`, and `apply_instances` -- which is itself a full resolve against
+    /// every current value, so a mark made before it has already been satisfied by it.
     dirty: DirtyFlag,
     state: ReloadState,
     /// Where a `ReevaluateReport` goes: the socket thread's [`pump`] drains this and writes each
@@ -255,7 +266,7 @@ impl RendererClient {
         let process_registry = ProcessRegistry::new(generation_id, outbound_tx.clone());
         loader.register_process(process_registry.clone()).map_err(|err| format!("failed to register the process global: {err}"))?;
         let client = Self::new(loader, shell_lua_path, shaping, outbound_tx, rescue_handle, process_registry, dirty)
-            .map_err(|err| format!("failed to seed the capability roster's signals: {err}"))?;
+            .map_err(|err| format!("failed to seed the capability roster's and `screens` signals: {err}"))?;
         Ok(client)
     }
 
@@ -282,6 +293,15 @@ impl RendererClient {
             loader.set_global(capability, signal)?;
             seeded.insert((*capability).to_string(), handle);
         }
+        // Registered here rather than in `start` alongside `rescue` only to keep this
+        // constructor's argument list under clippy's limit; it belongs with the roster seed
+        // either way, since both exist so a `shell.lua` reading the global before its first real
+        // value gets a live signal rather than an undefined-global error. Seeded to an empty list
+        // (not `nil`) so a config that loops over `screens` iterates zero times rather than
+        // erroring, and set through `new_live`'s initial value rather than a `set` so seeding it
+        // does not mark the scene dirty before anything has ever been applied.
+        let screens_payload = serde_json::Value::Array(Vec::new());
+        let screens_handle = register_screens_signal(&loader, dirty.clone(), &screens_payload)?;
         Ok(Self {
             shell_lua_path,
             scene: Scene::new(),
@@ -289,6 +309,8 @@ impl RendererClient {
             shaping,
             capability_signals: RefCell::new(seeded),
             rescue_handle,
+            screens_handle,
+            screens_payload,
             // Matches the table `register_rescue_signal` already put in the signal.
             rescue_state: (false, String::new()),
             process_registry,
@@ -401,10 +423,84 @@ impl RendererClient {
     }
 
     /// Replaces the `(surface, output)` pairs this generation resolves against
-    /// (`layout::instance::expand_instances`'s output). Called once from `crate::wayland::run`
-    /// between the startup evaluation and the first apply.
+    /// (`layout::instance::expand_instances`'s output). Called from `crate::wayland::run` between
+    /// the startup evaluation and the first apply, and again from `crate::wayland::App`'s
+    /// `OutputHandler` on every monitor hotplug (docs/adr/0038 decision 3).
     pub fn set_instances(&mut self, instances: Vec<SurfaceInstance>) {
         self.instances = instances;
+    }
+
+    /// The set [`Self::set_instances`] last stored, so `crate::wayland::App` can diff a fresh
+    /// expansion against it (`layout::instance::reconcile_instances`) without keeping a second
+    /// copy that could drift from this one.
+    pub fn instances(&self) -> &[SurfaceInstance] {
+        &self.instances
+    }
+
+    /// The `panel` specs of the evaluation currently applied, re-parsed from the retained
+    /// `applied_output` rather than re-read from `shell.lua`.
+    ///
+    /// This is what a monitor hotplug expands against (docs/adr/0038 decision 3): the declared set
+    /// is unchanged by an output appearing, so the specs already in hand are exactly the right
+    /// ones, and re-evaluating the file here would both cost an evaluation and race the
+    /// `Reevaluate` the Supervisor is about to send anyway (docs/adr/0041 decision 4).
+    ///
+    /// Empty when nothing has ever applied (a startup evaluation that failed), which is the
+    /// honest answer: there are no declared surfaces to expand, so a hotplug adds none.
+    pub fn applied_panel_specs(&self) -> Vec<PanelSpec> {
+        let Some(output) = self.state.applied_output.as_ref() else {
+            return Vec::new();
+        };
+        match panel_specs(output) {
+            Ok(specs) => specs,
+            Err(err) => {
+                // Unreachable in practice -- `applied_output` is only ever stored after
+                // `panel_specs` already succeeded on it -- but a panic here would take down a
+                // shell that is painting fine, over an output event.
+                eprintln!("control-socket client: the applied evaluation's panel specs no longer parse: {err}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Asks the Supervisor to start a reload cycle (docs/adr/0041 decision 4). Sent when the
+    /// output list changed, because a config that loops over `screens` declares a different set of
+    /// surfaces before and after, which is a topology change and so a generation swap
+    /// (docs/adr/0041 decision 3) -- a decision only the Supervisor makes.
+    ///
+    /// Carries no sequence: `supervisor/src/main.rs` owns `next_sequence` and drops any report
+    /// that does not name the one it most recently sent, so this asks it to *begin* a cycle rather
+    /// than fabricating one. Everything after that -- the `Reevaluate` coming back, the topology
+    /// diff, the verdict -- is the existing path unchanged.
+    pub fn request_reload(&self) {
+        if let Err(err) = self.outbound_tx.send(RendererFrame::RequestReload) {
+            eprintln!("control-socket client: failed to request a reload after an output change: {err}");
+        }
+    }
+
+    /// Pushes the `screens` signal's new value (docs/adr/0041 decision 2) and reports whether it
+    /// actually changed.
+    ///
+    /// The early return is the same correctness rule `set_rescue_state` documents, with one extra
+    /// consequence: `update_output` fires for changes this signal does not carry, and re-pushing
+    /// an identical list would both mark the scene dirty for nothing and -- since the caller gates
+    /// [`Self::request_reload`] on this return value -- ask the Supervisor for a reload cycle no
+    /// output change justifies.
+    pub fn set_screens(&mut self, payload: serde_json::Value) -> bool {
+        if self.screens_payload == payload {
+            return false;
+        }
+        match self.loader.to_lua_value(&payload) {
+            Ok(value) => {
+                self.screens_handle.set(value);
+                self.screens_payload = payload;
+                true
+            }
+            Err(err) => {
+                eprintln!("control-socket client: failed to convert the screen list to a Lua value: {err}");
+                false
+            }
+        }
     }
 
     /// One instance's `available` size, replaced by the size the compositor actually configured
@@ -452,6 +548,17 @@ impl RendererClient {
                 // being true.
                 self.scene.release_all_retired();
                 self.set_rescue_state(false, "");
+                // This apply resolved against every signal's *current* value, so anything marked
+                // dirty before it is already accounted for -- notably `crate::wayland::run`'s
+                // `set_screens` seed, which must run before the startup evaluation (docs/adr/0041
+                // decision 2: a config looping over `screens` at startup would otherwise see an
+                // empty list) and which marks the flag like any other live-signal write. Without
+                // this, a clean startup would enter its poll loop dirty and buy one whole
+                // redundant `Scene::apply` before drawing anything.
+                //
+                // Only on success: a failed apply leaves the prior state standing, and the flag
+                // with it, so whatever marked it is still picked up by the next apply that works.
+                self.dirty.take();
                 true
             }
             Err(err) => {
@@ -765,6 +872,7 @@ fn frame_label(frame: &RendererFrame) -> &'static str {
         RendererFrame::ReevaluateReport(_) => "ReevaluateReport",
         RendererFrame::Command(_) => "Command",
         RendererFrame::SecureSubmit(_) => "SecureSubmit",
+        RendererFrame::RequestReload => "RequestReload",
     }
 }
 
@@ -775,6 +883,25 @@ fn register_rescue_signal(loader: &Loader, dirty: DirtyFlag) -> mlua::Result<Liv
     let table = rescue_table(loader, false, "")?;
     let (signal, handle) = lua::signal::Signal::new_live(mlua::Value::Table(table), dirty);
     loader.set_global("rescue", signal)?;
+    Ok(handle)
+}
+
+/// Registers the reactive `screens` signal (docs/adr/0041 decision 2), seeded with `initial`.
+///
+/// **A bare global, not `oblisk.screens`.** ADR-0041 writes the name with its namespace, but no
+/// `oblisk` table exists in this VM yet and every signal that does exist is a bare global
+/// (`audio`, `network`, `rescue`) -- see [`register_rescue_signal`], which records the same
+/// divergence. One signal is not a reason to introduce a namespace table; `screens` moves under
+/// the full `oblisk.*` signal tree when that tree is built, along with all of them.
+///
+/// Deliberately outside `shared::CAPABILITIES` and outside `capability_signals`, which is the
+/// first exception to the shape ADR-0037 established and is stated as such in ADR-0041 decision 2:
+/// this is sourced in the Renderer from `smithay_client_toolkit`'s `OutputState`, not pushed by
+/// the Supervisor as a `StateSnapshot`, so the roster (which is the Supervisor's own dispatch and
+/// push list) has nothing to say about it.
+fn register_screens_signal(loader: &Loader, dirty: DirtyFlag, initial: &serde_json::Value) -> mlua::Result<LiveSignalHandle> {
+    let (signal, handle) = lua::signal::Signal::new_live(loader.to_lua_value(initial)?, dirty);
+    loader.set_global("screens", signal)?;
     Ok(handle)
 }
 
@@ -1532,6 +1659,143 @@ mod tests {
 
         assert!(client.scene.surface("bar@TEST").is_some(), "startup must have applied");
         assert!(!client.dirty.take(), "an apply that succeeded resolved every signal at its current value, so nothing is stale");
+    }
+
+    /// `screens_payload`'s shape, hand-written here so these tests do not depend on
+    /// `crate::wayland` (which needs a live compositor to produce one).
+    fn screens_json(names: &[&str]) -> serde_json::Value {
+        serde_json::Value::Array(
+            names
+                .iter()
+                .map(|name| serde_json::json!({ "name": name, "width": 1920, "height": 1080, "scale": 1, "refresh": 60.0 }))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_config_looping_over_screens_declares_one_panel_per_connected_output() {
+        // docs/adr/0041 decision 1: no `variants` primitive, because Lua already has `for`. This
+        // is the whole feature -- if the seed did not land before the evaluation, the loop would
+        // run zero times and the config would declare nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(
+            dir.path(),
+            r#"
+            local panels = {}
+            for _, screen in ipairs(screens:get()) do
+                panels[#panels + 1] = panel { id = "bar@" .. screen.name, layer = "Top", monitor = screen.name }
+            end
+            return panels
+            "#,
+        );
+        let (mut client, _outbound_rx) = test_client(&path);
+
+        assert!(client.set_screens(screens_json(&["eDP-1", "DP-1"])));
+        let specs = client.run_startup_evaluation().expect("the config must evaluate");
+
+        assert_eq!(specs.iter().map(|spec| spec.topology.id.as_str()).collect::<Vec<_>>(), ["bar@eDP-1", "bar@DP-1"]);
+        assert_eq!(specs[1].topology.monitor, "DP-1");
+    }
+
+    #[test]
+    fn a_config_reading_screens_before_any_output_is_known_sees_an_empty_list_not_a_nil() {
+        // The seeded value `RendererClient::new` puts in the signal. A `nil` here would make
+        // `ipairs` error and drop a config that never did anything wrong straight into rescue.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(
+            dir.path(),
+            r#"return panel { id = "bar", layer = "Top", child = text { content = "screens: " .. #screens:get() } }"#,
+        );
+        let (mut client, _outbound_rx) = test_client(&path);
+
+        assert!(run_startup(&mut client), "an unseeded `screens` must not fail the evaluation");
+        let tree = client.scene.surface("bar@TEST").unwrap();
+        assert_eq!(tree.children[0].properties.get("content").unwrap().as_string().unwrap().to_string_lossy(), "screens: 0");
+    }
+
+    #[test]
+    fn set_screens_repeating_the_same_list_reports_no_change_and_leaves_the_scene_clean() {
+        // `update_output` fires for changes `screens` does not carry, and the caller gates both
+        // the surface reconcile and `request_reload` on this return value -- an unchanged re-push
+        // must not buy a `Scene::apply` or a Supervisor round trip.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
+        let (mut client, _outbound_rx) = test_client(&path);
+        client.set_screens(screens_json(&["eDP-1"]));
+        run_startup(&mut client);
+
+        assert!(!client.set_screens(screens_json(&["eDP-1"])), "the same list is not an output change");
+        assert!(!client.dirty.take(), "and must not mark the scene dirty");
+    }
+
+    #[test]
+    fn a_real_output_change_marks_the_scene_dirty_so_a_config_reading_screens_re_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(
+            dir.path(),
+            r#"return panel { id = "bar", layer = "Top", child = text { content = computed({screens}, function(list) return "n=" .. #list end) } }"#,
+        );
+        let (mut client, _outbound_rx) = test_client(&path);
+        client.set_screens(screens_json(&["eDP-1"]));
+        run_startup(&mut client);
+        let content = |client: &RendererClient| {
+            client.scene.surface("bar@TEST").unwrap().children[0].properties.get("content").unwrap().as_string().unwrap().to_string_lossy()
+        };
+        assert_eq!(content(&client), "n=1");
+
+        assert!(client.set_screens(screens_json(&["eDP-1", "DP-1"])), "a monitor appearing is an output change");
+        assert!(client.re_resolve_if_dirty(), "and the scene must re-resolve against it without re-reading shell.lua");
+        assert_eq!(content(&client), "n=2");
+    }
+
+    #[test]
+    fn seeding_screens_before_the_startup_apply_still_leaves_the_scene_flag_clear() {
+        // The seed is an ordinary live-signal write, so it marks the flag like any other; the
+        // apply that immediately follows it resolved against that very value, so entering the
+        // poll loop dirty would buy one whole redundant `Scene::apply` before anything is drawn.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", child = text { content = "hi" } }"#);
+        let (mut client, _outbound_rx) = test_client(&path);
+
+        assert!(client.set_screens(screens_json(&["eDP-1"])));
+        assert!(run_startup(&mut client));
+
+        assert!(!client.dirty.take(), "the startup apply already resolved against the seeded screen list");
+    }
+
+    #[test]
+    fn applied_panel_specs_returns_the_applied_declarations_without_reading_shell_lua_again() {
+        // What a monitor hotplug re-expands against (docs/adr/0038 decision 3). Re-reading the
+        // file here would cost an evaluation and race the `Reevaluate` the Supervisor is about to
+        // send anyway, so the file is deleted mid-test to prove it is never touched.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", monitor = "All" }"#);
+        let (mut client, _outbound_rx) = test_client(&path);
+        run_startup(&mut client);
+        std::fs::remove_file(&path).unwrap();
+
+        let specs = client.applied_panel_specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].topology.id, "bar");
+        assert_eq!(specs[0].topology.monitor, "All");
+    }
+
+    #[test]
+    fn applied_panel_specs_is_empty_when_no_evaluation_has_ever_applied() {
+        // A startup evaluation that failed declares nothing, so a hotplug adds no instance --
+        // the honest answer rather than a panic on an output event.
+        let (client, _outbound_rx) = test_client(std::path::Path::new("/no/such/shell.lua"));
+        assert!(client.applied_panel_specs().is_empty());
+    }
+
+    #[test]
+    fn request_reload_queues_the_frame_the_supervisor_starts_a_cycle_from() {
+        // docs/adr/0041 decision 4: the Renderer asks for a cycle rather than fabricating a
+        // sequence, because `supervisor/src/main.rs`'s `is_current_reload` would drop the report
+        // of any sequence it did not itself send.
+        let (client, mut outbound_rx) = test_client(std::path::Path::new("/no/such/shell.lua"));
+        client.request_reload();
+        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::RequestReload);
     }
 
     #[test]

@@ -29,7 +29,7 @@ use wayland_protocols::wp::text_input::zv3::client::{
 use shared::{PresentationEvidence, ReadySignal, RendererFrame, SecureSubmit, SupervisorFrame, Zeroize};
 
 use crate::layout;
-use crate::layout::instance::{OutputGeometry, SurfaceInstance, expand_instances};
+use crate::layout::instance::{OutputGeometry, SurfaceInstance, expand_instances, reconcile_instances};
 use crate::layout::node::{self, LayerKind, PanelSpec, SizeMode};
 use crate::socket::RendererClient;
 use crate::text::atlas::TextPainter;
@@ -48,8 +48,13 @@ const PLACEHOLDER_SECURE_SUBMIT_ACTION: &str = "unknown";
 /// has arrived. Holds the native window alongside the EGL surface: per wayland-egl's
 /// contract, `WlEglSurface` must outlive the EGL surface built from it -- fields are
 /// declared in the order Rust drops them (top to bottom), so `egl_surface` goes first.
+///
+/// That order is a necessary condition, not a sufficient one. `khronos_egl::Surface` is a plain
+/// copyable handle with no `Drop` of its own, so dropping this struct destroys the
+/// `wl_egl_window` and nothing else; the matching `eglDestroySurface` is
+/// [`App::destroy_surface_by_id`]'s job, which is why that is the only sanctioned way to retire
+/// a bound surface.
 struct BoundSurface {
-    #[allow(dead_code)]
     egl_surface: EglSurface,
     #[allow(dead_code)]
     native_window: WlEglSurface,
@@ -154,6 +159,16 @@ pub struct App {
     /// Set once [`App::maybe_send_ready_signal`] has sent `ReadySignal` -- a one-time signal,
     /// never resent even if a later spurious configure re-triggers the check.
     ready_signal_sent: bool,
+    /// Set once [`run`]'s startup sequence has evaluated the config and built its surfaces.
+    ///
+    /// The initial `wl_output` burst is dispatched inside `run`'s own two roundtrips, so
+    /// `OutputHandler` fires *before* any of that -- which is exactly what seeds the `screens`
+    /// signal in time for the evaluation to loop over it (docs/adr/0041 decision 2), and equally
+    /// exactly why [`App::handle_output_change`] must not do the rest of its job that early:
+    /// there is no evaluation to expand, no surface to reconcile, and asking the Supervisor to
+    /// reload a generation that has not applied anything yet buys one whole redundant evaluate/
+    /// report/apply round trip on every boot.
+    startup_complete: bool,
     /// Every frame this thread sends the Supervisor goes here; the socket thread's `pump` drains
     /// it and writes each one to the wire (docs/adr/0039). `UnboundedSender::send` is
     /// synchronous and non-blocking, so it's safe to call from inside a `Dispatch` callback.
@@ -230,6 +245,7 @@ pub fn run(
         exit: false,
         is_pba_candidate,
         ready_signal_sent: false,
+        startup_complete: false,
         outbound_tx,
         generation_id,
         presentation_time,
@@ -258,8 +274,16 @@ pub fn run(
     // `text` node's shaping blocks on `ShapingHandle::shape` until the worker's `FontSystem::new()`
     // finishes, eating into that same 2s budget. The § 15.2 ordering (evaluate before bind) is
     // required, not incidental, so this stays sequential -- not a fix, just the accepted cost.
+    //
+    // The `screens` seed goes *before* the evaluation, not after, and that ordering is the whole
+    // point of the signal (docs/adr/0041 decision 2): a config's top-level `for _, screen in
+    // ipairs(screens:get())` loop runs during this evaluation, so a list seeded afterwards would
+    // declare no per-monitor panels at all on the first pass. The two roundtrips above are what
+    // make the real list available this early.
+    let screens = app.screens(None);
+    let outputs = geometries_from(&screens);
+    app.client.set_screens(screens_payload(&screens));
     let specs = app.client.run_startup_evaluation().unwrap_or_default();
-    let outputs = app.output_geometries();
     let instances = expand_instances(&specs, &outputs);
     for spec in &specs {
         if spec.topology.monitor != "All" && !outputs.iter().any(|output| output.name == spec.topology.monitor) {
@@ -289,6 +313,9 @@ pub fn run(
     }
 
     app.create_panels(&qh, &specs, &instances);
+    // From here on an output event owns the whole job: there is an evaluation to expand and
+    // surfaces to reconcile against it (see `App::startup_complete`).
+    app.startup_complete = true;
     app.bind_text_input(&globals, &qh);
 
     // Replaces `event_queue.blocking_dispatch(&mut app)?` (used through Phase 13): a real
@@ -627,44 +654,131 @@ struct LayerSpec<'a> {
     keyboard_interactivity: KeyboardInteractivity,
 }
 
+/// One connected output, exactly as `wl_output` reports it (docs/adr/0041 decision 2). This is the
+/// single source both consumers read: the `screens` Lua signal a config loops over to declare
+/// per-monitor panels, and the [`OutputGeometry`] list `layout::instance::expand_instances` matches
+/// `monitor` against. Two sources would let a config's own arithmetic and the engine's layout
+/// disagree about how large a monitor is.
+#[derive(Debug, Clone, PartialEq)]
+struct Screen {
+    name: String,
+    width: i32,
+    height: i32,
+    scale: i32,
+    /// Hz. `wl_output`'s `mode` event reports millihertz, which is not the unit anyone writes a
+    /// config against, so the division happens once here rather than in every config.
+    refresh: f64,
+}
+
+/// The `smithay_client_toolkit::output::OutputInfo` fields [`screen_entry`] reads, lifted off it
+/// by [`App::screens`].
+///
+/// A separate struct rather than the real thing because `OutputInfo` is `#[non_exhaustive]` with
+/// no public constructor: a function taking one could never be built in a unit test, and every
+/// decision in this conversion (the `logical_size` fallback, millihertz to Hz, the positional name
+/// fallback) is exactly what wants testing in a file with no headless Wayland harness.
+struct OutputFacts {
+    name: Option<String>,
+    logical_size: Option<(i32, i32)>,
+    /// The *current* `Mode`'s `(dimensions, refresh_rate)`, or `None` for an output advertising no
+    /// current mode. Both fields come from the same mode, so they travel together rather than as
+    /// two `Option`s that could disagree about which mode they describe.
+    current_mode: Option<((i32, i32), i32)>,
+    scale_factor: i32,
+}
+
+/// One output's `screens` entry, or `None` for an output whose size cannot be known.
+///
+/// `logical_size` first (`xdg_output`/`wl_output` v4's compositor-space size, which is what a layer
+/// surface's own coordinates are in), falling back to the current `Mode`'s `dimensions` for a
+/// compositor that reports no logical size. An output with neither yields nothing rather than a
+/// default, since a made-up size would resolve every surface on that monitor against a fiction --
+/// the caller logs the miss, the same split `layout::instance::expand_instances` already uses.
+///
+/// ponytail: a nameless output (a compositor below `wl_output` v4) takes a positional
+/// `"output-{index}"` id, carried over from the deleted `wallpaper_surface_id`. It keeps the shell
+/// working there, at the cost that `monitor = "DP-1"` can never match on such a compositor -- the
+/// config has no name to write. Upgrade path: none available client-side; the name genuinely does
+/// not exist.
+fn screen_entry(index: usize, facts: &OutputFacts) -> Option<Screen> {
+    let (width, height) = facts.logical_size.or_else(|| facts.current_mode.map(|(dimensions, _)| dimensions))?;
+    Some(Screen {
+        name: facts.name.clone().unwrap_or_else(|| format!("output-{index}")),
+        width,
+        height,
+        scale: facts.scale_factor,
+        // `Mode`'s own docs already allow a zero refresh rate ("if an output has no correct
+        // refresh rate, such as a virtual output"), so an output with no current mode reads the
+        // same way rather than needing a nil case every config would have to guard.
+        refresh: facts.current_mode.map_or(0.0, |(_, rate)| f64::from(rate) / 1000.0),
+    })
+}
+
+/// The `screens` signal's payload: § 2.9's per-output fields as a JSON array, pushed into Lua
+/// through the same `Loader::to_lua_value` every capability's `StateSnapshot` goes through
+/// (docs/adr/0041 decision 2 -- Renderer-sourced, but not a second marshalling path).
+fn screens_payload(screens: &[Screen]) -> serde_json::Value {
+    serde_json::Value::Array(
+        screens
+            .iter()
+            .map(|screen| {
+                serde_json::json!({
+                    "name": screen.name,
+                    "width": screen.width,
+                    "height": screen.height,
+                    "scale": screen.scale,
+                    "refresh": screen.refresh,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The same screen list as `layout::instance` needs it: a name to match `monitor` against and a
+/// logical size to seed each instance's `available` with.
+fn geometries_from(screens: &[Screen]) -> Vec<OutputGeometry> {
+    screens
+        .iter()
+        .map(|screen| OutputGeometry {
+            name: screen.name.clone(),
+            size: layout::LogicalSize { width: screen.width as f32, height: screen.height as f32 },
+        })
+        .collect()
+}
+
 impl App {
-    /// Every connected output as `layout::instance` sees it: a name to match `monitor` against and
-    /// a logical size to seed each instance's `available` with.
+    /// Every connected output as [`Screen`] describes it, skipping (with a log) any whose size
+    /// `wl_output` cannot answer for.
     ///
-    /// `logical_size` first (`xdg_output`/`wl_output` v4's compositor-space size, which is what a
-    /// layer surface's own coordinates are in), falling back to the current `Mode`'s `dimensions`
-    /// for a compositor that reports no logical size. An output with neither is skipped with a
-    /// log rather than defaulted, since a made-up size would resolve every surface on that monitor
-    /// against a fiction.
-    ///
-    /// ponytail: a nameless output (a compositor below `wl_output` v4) takes a positional
-    /// `"output-{index}"` id, carried over from the deleted `wallpaper_surface_id`. It keeps the
-    /// shell working there, at the cost that `monitor = "DP-1"` can never match on such a
-    /// compositor -- the config has no name to write. Upgrade path: none available client-side;
-    /// the name genuinely does not exist.
-    fn output_geometries(&self) -> Vec<OutputGeometry> {
-        let mut geometries = Vec::new();
+    /// `departing` is the output an `output_destroyed` event is announcing, which must be excluded
+    /// by hand: `smithay_client_toolkit`'s `remove_global` calls `OutputHandler::output_destroyed`
+    /// *before* removing the output from its own `OutputState`, so a plain read of `outputs()` from
+    /// inside that callback still lists the monitor that just went away. `None` everywhere else.
+    fn screens(&self, departing: Option<&wl_output::WlOutput>) -> Vec<Screen> {
+        let mut screens = Vec::new();
         for (index, output) in self.output_state.outputs().enumerate() {
+            if departing == Some(&output) {
+                continue;
+            }
             let Some(info) = self.output_state.info(&output) else {
                 eprintln!("[oblisk-renderer] output {index} advertised no info yet; no surface created on it");
                 continue;
             };
-            let dimensions = info
-                .logical_size
-                .or_else(|| info.modes.iter().find(|mode| mode.current).map(|mode| mode.dimensions));
-            let Some((width, height)) = dimensions else {
-                eprintln!(
+            let facts = OutputFacts {
+                name: info.name.clone(),
+                logical_size: info.logical_size,
+                current_mode: info.modes.iter().find(|mode| mode.current).map(|mode| (mode.dimensions, mode.refresh_rate)),
+                scale_factor: info.scale_factor,
+            };
+            match screen_entry(index, &facts) {
+                Some(screen) => screens.push(screen),
+                None => eprintln!(
                     "[oblisk-renderer] output {:?} reports neither a logical size nor a current mode; no surface created on it",
                     info.name.as_deref().unwrap_or("<unnamed>")
-                );
-                continue;
-            };
-            geometries.push(OutputGeometry {
-                name: info.name.clone().unwrap_or_else(|| format!("output-{index}")),
-                size: layout::LogicalSize { width: width as f32, height: height as f32 },
-            });
+                ),
+            }
         }
-        geometries
+        screens
     }
 
     /// Creates and configures (but does not commit) a layer-shell surface.
@@ -699,14 +813,13 @@ impl App {
     /// `instances` and `specs` come from the same evaluation, so an instance whose declared id has
     /// no spec cannot happen; it is skipped with a log rather than panicking, on the same
     /// "keep the shell up" principle as every other failure in this file.
+    ///
+    /// Called with the whole instance set at startup and with only the *added* instances on a
+    /// monitor hotplug (see [`App::handle_output_change`]) -- the same function either way, since
+    /// "build a layer surface for this instance" is the same job in both.
     fn create_panels(&mut self, qh: &QueueHandle<App>, specs: &[PanelSpec], instances: &[SurfaceInstance]) {
-        // ponytail: a fixed output snapshot, taken once at startup (see `run`). Monitor hotplug
-        // therefore adds no instance and removes none, so a monitor plugged in after boot gets no
-        // surface and an unplugged one's surface is never torn down. docs/adr/0038 decision 3 says
-        // this must happen in place with no generation swap; build-steps.md Phase 20 item 6
-        // (`oblisk.screens`, docs/adr/0041) is where the trigger lands, because that is what makes
-        // the output list a reactive Lua signal and re-enters the existing reload path. Until then
-        // `OutputHandler::new_output`/`output_destroyed` stay empty on purpose.
+        // Re-read per call rather than snapshotted once at startup: this now also runs from an
+        // output event, where the whole point is that the output list has just changed.
         let outputs: HashMap<String, wl_output::WlOutput> = self
             .output_state
             .outputs()
@@ -781,6 +894,101 @@ impl App {
                 configured_size: (0, 0),
             });
         }
+    }
+
+    /// One `wl_output` appeared, changed, or went away (build-steps.md Phase 20 items 2 and 6).
+    /// Two jobs, one handler, because one event owes both.
+    ///
+    /// First, the `screens` signal (docs/adr/0041 decision 2). Everything below is gated on that
+    /// push reporting a real change: `update_output` also fires for things `screens` does not
+    /// carry, and re-running the rest for one of those would rebuild nothing and ask the
+    /// Supervisor for a reload cycle no output change justifies.
+    ///
+    /// Second, the instance set (docs/adr/0038 decision 3). A `monitor = "All"` declaration expands
+    /// to one instance per output, so an output appearing adds an instance and one going away
+    /// removes it, **in place with no generation swap** -- plugging in a monitor is not a config
+    /// edit, and the set of *declared* surfaces has not moved.
+    ///
+    /// Finally [`crate::socket::RendererClient::request_reload`], which is the other half and the
+    /// one this cannot do itself: a config that loops over `screens` declares genuinely different
+    /// surface ids before and after, which is a topology change and so a generation swap
+    /// (docs/adr/0041 decision 3). Only the Supervisor decides that. The two do not conflict --
+    /// a candidate builds its own surface set from its own evaluation, so whatever this reconciled
+    /// here is discarded along with the rest of this generation if a swap does happen.
+    ///
+    /// ponytail: an output change landing inside a PBA Candidate's own ready window is not
+    /// handled. `maybe_send_ready_signal` announces the surfaces this process will present exactly
+    /// once, so a surface added after that point would present evidence the Supervisor never
+    /// expected (`PbaFailure::UnexpectedEvidence`), and a `RequestReload` sent while a handshake
+    /// is draining `inbound_frames` is logged and skipped by `SocketCandidateLink::recv_matching`.
+    /// The window is the seconds of `PBA_TIMINGS`, and the fix is a Candidate deferring output
+    /// changes the way `apply_visibility` already defers `visible`; not built until a hotplug
+    /// during a swap is something anyone has actually hit.
+    fn handle_output_change(&mut self, qh: &QueueHandle<App>, departing: Option<&wl_output::WlOutput>) {
+        let screens = self.screens(departing);
+        if !self.client.set_screens(screens_payload(&screens)) || !self.startup_complete {
+            // The signal is pushed either way -- seeding it from the initial output burst is the
+            // point (see `App::startup_complete`) -- but nothing below it applies yet.
+            return;
+        }
+        eprintln!("[oblisk-renderer] outputs changed: {:?}", screens.iter().map(|s| s.name.as_str()).collect::<Vec<_>>());
+
+        let specs = self.client.applied_panel_specs();
+        let fresh = expand_instances(&specs, &geometries_from(&screens));
+        let reconcile = reconcile_instances(self.client.instances(), &fresh);
+
+        for instance_id in &reconcile.removed {
+            self.destroy_surface_by_id(instance_id);
+        }
+        // A surviving surface's `output_size` is the basis a `SizeMode::Percent` resolves against,
+        // so a mode change that resized the monitor under it has to move it -- `fresh` carries the
+        // output's *current* logical size, while the instance set deliberately keeps the size the
+        // compositor configured each surface to (see `reconcile_instances`).
+        for instance in &fresh {
+            if let Some(tracked) = self.surfaces.iter_mut().find(|s| s.surface_id == instance.instance_id) {
+                tracked.output_size = instance.available;
+            }
+        }
+        // Before `create_panels`, which reads the scene by instance id to decide a new surface's
+        // starting `visible`.
+        self.client.set_instances(reconcile.instances);
+        self.create_panels(qh, &specs, &reconcile.added);
+        self.client.request_reload();
+    }
+
+    /// Destroys one surface instance: its `zwlr_layer_surface_v1`, its `wl_surface`, its
+    /// `wl_egl_window`, and its EGL surface (docs/adr/0038 decision 3's removal half). A no-op for
+    /// an id this process has no surface for, which is the normal case for the second of the two
+    /// events an unplugged monitor produces -- `zwlr_layer_surface_v1::closed` and
+    /// `OutputHandler::output_destroyed` both arrive, in either order, and whichever comes first
+    /// does the work.
+    ///
+    /// Teardown runs outermost-first, and the two explicit `drop`s below are what make that so
+    /// rather than leaving it to `TrackedSurface`'s field order (which declares `layer` before
+    /// `bound`, so a plain drop would destroy the `wl_surface` out from under the
+    /// `wl_egl_window` still pointing at it):
+    ///
+    /// 1. `eglDestroySurface`, by hand, because `khronos_egl::Surface` is a plain copyable handle
+    ///    with no `Drop` -- without this every unplugged monitor leaks one EGL surface. It has to
+    ///    be first, since [`BoundSurface`]'s own contract is that the `WlEglSurface` outlives the
+    ///    EGL surface built from it.
+    /// 2. `BoundSurface`'s drop, which is `wl_egl_window_destroy`.
+    /// 3. `LayerSurface`'s drop, which destroys the `zwlr_layer_surface_v1` and then the
+    ///    `wl_surface` (in that order, which is the layer-shell protocol's own requirement and
+    ///    `smithay_client_toolkit`'s job, not this function's).
+    fn destroy_surface_by_id(&mut self, instance_id: &str) {
+        let Some(index) = self.surfaces.iter().position(|s| s.surface_id == instance_id) else {
+            return;
+        };
+        let TrackedSurface { layer, bound, surface_id, .. } = self.surfaces.remove(index);
+        if let Some(bound) = bound.as_ref()
+            && let Err(err) = self.egl.instance.destroy_surface(self.egl.display, bound.egl_surface)
+        {
+            log_bind_failure(&surface_id, "eglDestroySurface", err);
+        }
+        drop(bound);
+        drop(layer);
+        eprintln!("[oblisk-renderer] {surface_id} destroyed: its output is gone");
     }
 
     /// One `configure`: record the size the compositor chose, tell the retained scene about it,
@@ -1708,24 +1916,52 @@ impl OutputHandler for App {
         &mut self.output_state
     }
 
-    // ponytail: all three stay empty, so monitor hotplug adds and removes no surface instance --
-    // a monitor plugged in after boot gets no surface, and an unplugged one's surface is never
-    // torn down. docs/adr/0038 decision 3 is explicit that this must happen *in place*, with no
-    // generation swap, since plugging in a monitor is not a config edit and the set of declared
-    // surfaces does not change. The trigger for it is build-steps.md Phase 20 item 6
-    // (`oblisk.screens`, docs/adr/0041): exposing the output list to Lua as a reactive signal is
-    // what makes an output change re-enter the existing reload path (re-evaluate, diff topology,
-    // report to the Supervisor) rather than needing a second reload mechanism invented here. So
-    // these are left empty deliberately, not forgotten.
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+    // All three do the same two things, because one `wl_output` event owes both: update the
+    // `screens` signal, then ask for a re-evaluation (docs/adr/0041 decisions 2 and 4). See
+    // [`App::handle_output_change`].
+    fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        self.handle_output_change(qh, None);
+    }
+
+    // Not only a mode or scale change: `smithay_client_toolkit` also routes an output's *first*
+    // `xdg_output` arrival here rather than to `new_output` when the `wl_output` was already
+    // known, so this is a real path for a monitor's size becoming knowable, not just for one
+    // changing.
+    fn update_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        self.handle_output_change(qh, None);
+    }
+
+    fn output_destroyed(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        // Passed through explicitly because `smithay_client_toolkit`'s `remove_global` calls this
+        // *before* removing the output from its own `OutputState` -- a plain read of `outputs()`
+        // from in here still lists the monitor that just went away, so it has to be excluded by
+        // identity (see [`App::screens`]).
+        self.handle_output_change(qh, Some(&output));
     }
 }
 
 impl LayerShellHandler for App {
-    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
-        self.exit = true;
+    /// `zwlr_layer_surface_v1::closed` means *this* surface is gone and must be destroyed -- the
+    /// compositor sends it when the output the surface was on is destroyed, which is exactly
+    /// docs/adr/0038 decision 3's removal half arriving by the layer-shell route instead of the
+    /// `wl_output` one. It is not a shutdown signal.
+    ///
+    /// This used to set `self.exit`, which was defensible while one hardcoded bar was the only
+    /// surface and is not once a config declares N of them across M monitors: unplugging one
+    /// external display would have killed a shell still painting on the laptop panel, which is
+    /// precisely the generation-swap-free in-place handling the ADR forbids swapping for.
+    ///
+    /// ponytail: a compositor that closes *every* surface therefore leaves this process alive with
+    /// nothing on screen rather than exiting. That is the right answer for the hotplug case (the
+    /// monitors coming back is another output change, not a new generation) and the wrong one for
+    /// a compositor shutting down -- which in practice drops the Wayland connection a moment
+    /// later, and `run`'s `dispatch_pending` fails out of the loop on its own. Upgrade path: exit
+    /// on a `closed` that no output change explains, which needs the two events correlated.
+    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
+        let Some(surface_id) = self.surfaces.iter().find(|s| &s.layer == layer).map(|s| s.surface_id.clone()) else {
+            return;
+        };
+        self.destroy_surface_by_id(&surface_id);
     }
 
     fn configure(
@@ -1848,6 +2084,106 @@ mod tests {
             width: SizeMode::Fill,
             height: SizeMode::Pixels(32.0),
         }
+    }
+
+    fn facts(name: Option<&str>) -> OutputFacts {
+        OutputFacts {
+            name: name.map(str::to_string),
+            logical_size: Some((1920, 1080)),
+            current_mode: Some(((1920, 1080), 60_000)),
+            scale_factor: 1,
+        }
+    }
+
+    #[test]
+    fn a_screens_entry_reports_the_logical_size_in_preference_to_the_current_modes_dimensions() {
+        // A 3840x2160 panel driven at scale 2 is 1920x1080 of compositor space, which is the
+        // coordinate system a layer surface's own geometry is in -- so the mode's raw dimensions
+        // would put a config's own arithmetic on a different grid than the engine's.
+        let mut facts = facts(Some("eDP-1"));
+        facts.logical_size = Some((1920, 1080));
+        facts.current_mode = Some(((3840, 2160), 60_000));
+        facts.scale_factor = 2;
+
+        let screen = screen_entry(0, &facts).expect("a logical size is enough on its own");
+        assert_eq!((screen.width, screen.height), (1920, 1080));
+        assert_eq!(screen.scale, 2);
+    }
+
+    #[test]
+    fn a_screens_entry_falls_back_to_the_current_modes_dimensions_when_no_logical_size_is_reported() {
+        // A compositor below wl_output v4, or one that has not sent an xdg_output yet.
+        let mut facts = facts(Some("eDP-1"));
+        facts.logical_size = None;
+        facts.current_mode = Some(((1366, 768), 60_000));
+
+        let screen = screen_entry(0, &facts).expect("the current mode is the documented fallback");
+        assert_eq!((screen.width, screen.height), (1366, 768));
+    }
+
+    #[test]
+    fn an_output_reporting_neither_a_logical_size_nor_a_current_mode_yields_no_screen_at_all() {
+        // Not defaulted to some invented size: every surface on that monitor would then resolve
+        // against a fiction, and the caller logs the miss instead.
+        let mut facts = facts(Some("eDP-1"));
+        facts.logical_size = None;
+        facts.current_mode = None;
+
+        assert!(screen_entry(0, &facts).is_none());
+    }
+
+    #[test]
+    fn refresh_reaches_lua_in_hertz_although_wl_output_reports_millihertz() {
+        assert_eq!(screen_entry(0, &facts(Some("eDP-1"))).unwrap().refresh, 60.0);
+
+        // A real 144Hz panel's advertised rate is not a round number, so the division must keep
+        // its fraction rather than truncating to an integer.
+        let mut odd = facts(Some("DP-1"));
+        odd.current_mode = Some(((2560, 1440), 143_868));
+        assert_eq!(screen_entry(0, &odd).unwrap().refresh, 143.868);
+    }
+
+    #[test]
+    fn a_screen_sized_from_its_logical_size_alone_reports_a_refresh_of_zero() {
+        // `Mode`'s own docs allow a zero refresh rate for a virtual output, so zero is already
+        // this field's "no real answer" value -- an output with no current mode at all reads the
+        // same way rather than needing a separate nil case a config would have to guard.
+        let mut facts = facts(Some("HEADLESS-1"));
+        facts.current_mode = None;
+        assert_eq!(screen_entry(0, &facts).unwrap().refresh, 0.0);
+    }
+
+    #[test]
+    fn an_unnamed_output_takes_its_positional_id_so_the_shell_still_works_below_wl_output_v4() {
+        let screen = screen_entry(2, &facts(None)).unwrap();
+        assert_eq!(screen.name, "output-2");
+    }
+
+    #[test]
+    fn the_screens_payload_is_the_array_of_field_tables_a_config_loops_over() {
+        let screens = [
+            screen_entry(0, &facts(Some("eDP-1"))).unwrap(),
+            screen_entry(1, &facts(Some("DP-1"))).unwrap(),
+        ];
+
+        assert_eq!(
+            screens_payload(&screens),
+            serde_json::json!([
+                { "name": "eDP-1", "width": 1920, "height": 1080, "scale": 1, "refresh": 60.0 },
+                { "name": "DP-1", "width": 1920, "height": 1080, "scale": 1, "refresh": 60.0 },
+            ])
+        );
+    }
+
+    #[test]
+    fn instance_expansion_reads_the_same_screen_list_the_signal_does() {
+        // One source, two consumers (docs/adr/0041 decision 2): a `monitor` match and a `screens`
+        // entry must never be able to disagree about which monitors exist or how large they are.
+        let screens = [screen_entry(0, &facts(Some("eDP-1"))).unwrap()];
+        assert_eq!(
+            geometries_from(&screens),
+            [OutputGeometry { name: "eDP-1".to_string(), size: layout::LogicalSize { width: 1920.0, height: 1080.0 } }]
+        );
     }
 
     fn output_1080p() -> layout::LogicalSize {

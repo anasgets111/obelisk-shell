@@ -58,6 +58,22 @@ fn is_current_reload(report_sequence: u64, next_sequence: u64) -> bool {
     report_sequence == next_sequence
 }
 
+/// Starts one reload cycle on `generation_id`: bump the sequence this Supervisor owns and send
+/// the `Reevaluate` carrying it. Everything downstream -- the Renderer's own topology diff, the
+/// `Unchanged`/`TopologyChanged`/`Failed` verdict, and the in-place-versus-swap decision this
+/// file makes from it -- is unchanged (docs/adr/0024, docs/adr/0041 decision 4).
+///
+/// Two triggers reach it, and that is the only reason it is a function rather than two inline
+/// statements: the `inotify` watcher's debounced file change, and (since docs/adr/0041 decision 4)
+/// a Renderer's `RendererFrame::RequestReload` after a `wl_output` appeared or disappeared. The
+/// sequence stays here in both cases -- `is_current_reload` above rejects any report that does not
+/// name the most recently sent one, so a Renderer that fabricated its own would have its report
+/// dropped as stale.
+fn begin_reload(registry: &socket::GenerationRegistry, generation_id: u32, next_sequence: &mut u64) {
+    *next_sequence += 1;
+    send_frame_logged(registry, generation_id, &SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: *next_sequence }));
+}
+
 /// Sends `frame` to `generation_id`, logging (not propagating) a failure. The one place every
 /// `SupervisorFrame` send in this file's main loop goes through -- previously each call site
 /// either hand-wrote its own `if let Err(err) = ... { eprintln!(...) }` (duplicated three times)
@@ -422,8 +438,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "updates", &state);
             }
             Some(()) = reload_events.recv() => {
-                next_sequence += 1;
-                send_frame_logged(&registry, authoritative.generation_id, &SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: next_sequence }));
+                begin_reload(&registry, authoritative.generation_id, &mut next_sequence);
             }
             Some((generation_id, id)) = process_done.recv() => {
                 // The wait itself must never block this select! -- see wait_and_report_exit's
@@ -456,6 +471,16 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                     // *outside* any in-flight handshake this Supervisor is currently driving --
                     // stale, or a wire-protocol desync -- logged, not fatal.
                     eprintln!("generation {}'s handshake frame arrived outside any in-flight PBA handshake; dropping: {:?}", inbound.generation_id, inbound.frame);
+                }
+                RendererFrame::RequestReload => {
+                    // docs/adr/0041 decision 4's "only new thing is the trigger": a `wl_output`
+                    // appeared or disappeared, so the config has to be re-evaluated in case it
+                    // loops over `screens`. Deliberately the same call the watcher arm above
+                    // makes, on `authoritative.generation_id` rather than `inbound.generation_id`
+                    // -- a superseded generation still holding a connection open must not be able
+                    // to start a cycle, and the authoritative one is the only one whose scene the
+                    // reload path would apply to anyway.
+                    begin_reload(&registry, authoritative.generation_id, &mut next_sequence);
                 }
                 RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence }) => {
                     if is_current_reload(sequence, next_sequence) {
@@ -641,4 +666,39 @@ mod tests {
         assert!(!is_current_reload(3, 4), "a report for an older sequence than the last-sent one must be stale");
     }
 
+    #[test]
+    fn begin_reload_bumps_the_supervisor_owned_sequence_and_sends_the_reevaluate_carrying_it() {
+        let registry = socket::GenerationRegistry::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.register(7, tx);
+        let mut next_sequence = 0;
+
+        // Both triggers -- the watcher's file change and a Renderer's `RequestReload` after a
+        // `wl_output` change (docs/adr/0041 decision 4) -- reach this same call, so two of them
+        // must produce two distinct, increasing sequences rather than repeating one.
+        begin_reload(&registry, 7, &mut next_sequence);
+        begin_reload(&registry, 7, &mut next_sequence);
+
+        assert_eq!(next_sequence, 2);
+        let sent: Vec<SupervisorFrame> =
+            std::iter::from_fn(|| rx.try_recv().ok()).map(|payload| serde_json::from_slice(&payload).unwrap()).collect();
+        assert_eq!(
+            sent,
+            vec![
+                SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: 1 }),
+                SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: 2 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn begin_reload_still_advances_the_sequence_when_the_generation_has_no_connection() {
+        // `send_frame_logged` logs and drops a `NoConnection` failure. The sequence must advance
+        // anyway, or a later report from a generation that reconnects could collide with a
+        // sequence `is_current_reload` has already accepted.
+        let registry = socket::GenerationRegistry::default();
+        let mut next_sequence = 41;
+        begin_reload(&registry, 7, &mut next_sequence);
+        assert_eq!(next_sequence, 42);
+    }
 }

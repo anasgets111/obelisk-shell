@@ -257,6 +257,21 @@ pub enum RendererFrame {
     ReadySignal(ReadySignal),
     PresentationEvidence(PresentationEvidence),
     SecureSubmit(SecureSubmit),
+    /// Asks the Supervisor to *start* a reload cycle for this generation: bump the sequence it
+    /// owns and send the [`ReevaluateRequest`] carrying it (docs/adr/0041 decision 4).
+    ///
+    /// Carries no sequence, and that is the point. The Supervisor is the only holder of
+    /// `next_sequence`, and `supervisor/src/main.rs`'s `is_current_reload` drops any report whose
+    /// sequence is not the one it most recently sent -- so a Renderer that fabricated one would
+    /// have its own `ReevaluateReport` discarded as stale. This asks for a cycle instead of
+    /// starting one, which keeps the whole existing reload path (evaluate, diff topology, report
+    /// `Unchanged`/`TopologyChanged`/`Failed`, Supervisor decides in-place versus swap) intact
+    /// with a second trigger rather than a second mechanism.
+    ///
+    /// Named for what it is rather than for its cause: the `inotify` watcher's own trigger is the
+    /// same request arriving by a different route, and a `wl_output` change (this variant's first
+    /// caller, `renderer/src/wayland/mod.rs`'s `OutputHandler`) is only the second one.
+    RequestReload,
 }
 
 /// The Supervisor's own PAM worker subprocess's one-shot result, written once to the
@@ -521,6 +536,19 @@ mod tests {
 
         let parsed: RendererFrame = serde_json::from_value(wire).unwrap();
         assert_eq!(parsed, frame);
+    }
+
+    #[test]
+    fn renderer_frame_request_reload_is_a_bare_kind_with_no_data() {
+        // The one payload-free frame either direction has, so the adjacent tagging is worth
+        // pinning: serde omits `data` entirely for a unit variant, and the decoder must accept
+        // that shape (docs/adr/0041 decision 4 -- the sequence stays the Supervisor's, so there
+        // is nothing for this frame to carry).
+        let wire = serde_json::to_value(RendererFrame::RequestReload).unwrap();
+        assert_eq!(wire, serde_json::json!({ "kind": "RequestReload" }));
+
+        let parsed: RendererFrame = serde_json::from_value(wire).unwrap();
+        assert_eq!(parsed, RendererFrame::RequestReload);
     }
 
     #[test]
