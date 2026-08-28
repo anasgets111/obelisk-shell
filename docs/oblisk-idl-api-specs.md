@@ -348,14 +348,14 @@ Arranges children vertically.
 
 #### 4. `text`
 Draws shaped unicode glyph text via `cosmic-text`.
-*   `content`: `string` / `Signal` (The string text to display)
+*   `content`: `string` / `Signal` (The string text to display. Defaults to `""`, so a `text` bound to a capability signal renders empty until that signal's first push rather than rejecting the tree at boot, ADR-0044)
 *   `font_size`: `integer` (Defaults to `12`)
 *   `foreground`: `string` (Hex-color code)
 
 #### 5. `icon`
 Draws a system SVG/PNG icon.
 *   `name`: `string` / `Signal` (The theme name, e.g., `"audio-volume-high"`)
-*   `size`: `integer` (Bounding box diameter)
+*   `size`: `integer` (Bounding box diameter. Defaults to `12`, matching `text`'s `font_size`, for the same boot reason as `content`)
 
 #### 6. `button`
 Receives input focus and pointer events.

@@ -484,9 +484,21 @@ pub fn parse_spacing(properties: &HashMap<String, Value>) -> Result<f32, LayoutE
         .ok_or_else(|| invalid("spacing", format!("expected a number, got {value:?}")))
 }
 
+/// Absent `content` defaults to the empty string. It used to be required, but decision 1's nil
+/// rule (docs/adr/0044) means a `text` bound to a bare, not-yet-pushed capability signal --
+/// `text { content = oblisk.mpris.title }`, the ADR's headline example -- resolves `content` to
+/// absent at boot, since every rostered signal reads `nil` until its first `StateSnapshot` and
+/// `run_startup_evaluation` runs before the poll loop drains one. Rejecting that would reject the
+/// whole tree and boot a blank shell. Once nil means absent, the parser cannot tell that state
+/// apart from an omitted key anyway, so a default is the only option, not one of several. See
+/// docs/adr/0044's amendment banner for the full argument, and build-steps.md Phase 19 item 6.
+///
+/// Accepted cost: a misspelled `content` key now renders an empty node instead of being rejected.
+/// That is the better failure for a shell that has to boot, and `oblisk.rescue` still exists for
+/// the failures that matter.
 pub fn parse_content(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     let Some(value) = properties.get("content") else {
-        return Err(invalid("content", "text node requires `content`"));
+        return Ok(String::new());
     };
     match value {
         Value::String(s) => checked_string("content", s),
@@ -505,9 +517,22 @@ pub fn parse_font_size(properties: &HashMap<String, Value>) -> Result<f32, Layou
         .ok_or_else(|| invalid("font_size", format!("expected a number, got {value:?}")))
 }
 
+/// Absent `size` defaults to 12.0, same rationale and same amendment as [`parse_content`]
+/// (docs/adr/0044's amendment banner, build-steps.md Phase 19 item 6): `icon` was the second
+/// property the amendment names as still failing after decision 1's nil rule alone. The rule is
+/// decision 1's, amended, not decision 2's -- decision 2 is the dirty flag, and landing it is only
+/// what exposed the gap.
+///
+/// Carries the same accepted cost as [`parse_content`], stated separately because it is a separate
+/// property a config can misspell: `icon { sizee = 24 }` now renders a 12.0-sized icon instead of
+/// being rejected.
+/// `oblisk-idl-api-specs.md` § 5.2 documents `size` with no default of its own, so the number is
+/// picked to match this file's own convention instead: it is [`parse_font_size`]'s default,
+/// making `text` and `icon` -- the two leaf kinds sized by one numeric property -- agree, so an
+/// icon dropped inline with default-sized text lands at the same visual scale.
 pub fn parse_icon_size(properties: &HashMap<String, Value>) -> Result<f32, LayoutError> {
     let Some(value) = properties.get("size") else {
-        return Err(invalid("size", "icon node requires `size`"));
+        return Ok(12.0);
     };
     value_as_f32("size", value)?.ok_or_else(|| invalid("size", format!("expected a number, got {value:?}")))
 }
@@ -844,12 +869,12 @@ mod tests {
     }
 
     #[test]
-    fn text_content_is_required() {
+    fn text_content_absent_defaults_to_the_empty_string() {
+        // docs/adr/0044's amendment banner: `content` used to be required, but a `text` bound to a
+        // not-yet-pushed capability signal resolves to absent (decision 1's nil rule) and must
+        // still apply at boot, so absence now takes an empty-string default instead of erroring.
         let props = HashMap::new();
-        assert!(matches!(
-            parse_content(&props).unwrap_err(),
-            LayoutError::InvalidProperty { .. }
-        ));
+        assert_eq!(parse_content(&props).unwrap(), "");
     }
 
     #[test]
@@ -949,26 +974,15 @@ mod tests {
         assert_eq!(parse_font_size(&props_with_nil_signal(&lua, "text", "font_size")).unwrap(), 12.0);
         assert!(parse_single_child(&props_with_nil_signal(&lua, "surface", "child"), "child").unwrap().is_none());
         assert!(parse_children(&props_with_nil_signal(&lua, "row", "children")).unwrap().is_empty());
-    }
-
-    #[test]
-    fn a_signal_resolving_to_nil_reports_a_required_property_as_missing_not_as_a_bad_value() {
-        // The other half of the same rule: `content`/`size` have no default, so "absent" is still
-        // an error for them -- but it must be the *missing property* error a literal omission
-        // raises, not "expected a string, got Nil". Both spellings of absence agree, which is the
-        // consistency argument the rule rests on (a Lua table cannot store a `nil`, so
-        // `content = nil` never reaches the property map at all).
-        let lua = lua();
-        let content_err = parse_content(&props_with_nil_signal(&lua, "text", "content")).unwrap_err();
-        assert!(
-            matches!(&content_err, LayoutError::InvalidProperty { property, detail } if property == "content" && detail == "text node requires `content`"),
-            "got: {content_err}"
-        );
-        let size_err = parse_icon_size(&props_with_nil_signal(&lua, "icon", "size")).unwrap_err();
-        assert!(
-            matches!(&size_err, LayoutError::InvalidProperty { property, detail } if property == "size" && detail == "icon node requires `size`"),
-            "got: {size_err}"
-        );
+        // `content` and `size` joined this list under docs/adr/0044's amendment banner: they used
+        // to be the two properties this rule could not cover, because each was required and had no
+        // default of its own -- see the deleted
+        // `a_signal_resolving_to_nil_reports_a_required_property_as_missing_not_as_a_bad_value` test.
+        // Without a default here, `text { content = oblisk.mpris.title }` (ADR-0044's headline
+        // example) still rejects the whole tree at boot, since every rostered signal reads `nil`
+        // until its first `StateSnapshot`.
+        assert_eq!(parse_content(&props_with_nil_signal(&lua, "text", "content")).unwrap(), "");
+        assert_eq!(parse_icon_size(&props_with_nil_signal(&lua, "icon", "size")).unwrap(), 12.0);
     }
 
     #[test]
@@ -1026,12 +1040,11 @@ mod tests {
     }
 
     #[test]
-    fn icon_size_is_required() {
+    fn icon_size_absent_defaults_to_twelve() {
+        // Same amendment as `content` (docs/adr/0044): `size` used to be required. Default value
+        // matches `parse_font_size`'s own default -- see `parse_icon_size`'s doc comment for why.
         let props = HashMap::new();
-        assert!(matches!(
-            parse_icon_size(&props).unwrap_err(),
-            LayoutError::InvalidProperty { .. }
-        ));
+        assert_eq!(parse_icon_size(&props).unwrap(), 12.0);
     }
 
     #[test]

@@ -1156,6 +1156,27 @@ mod tests {
     }
 
     #[test]
+    fn a_text_node_bound_to_a_bare_rostered_signal_applies_at_startup_with_no_push_at_all() {
+        // ADR-0044's headline example, and the reason build-steps.md Phase 19 item 6 gives
+        // `content` a default: `text { content = oblisk.mpris.title }` must apply at boot even
+        // though `title` still reads `nil` here, same as the sibling test above for `visible` and
+        // `children`. Before item 6, `content` had no default and this rejected the whole tree.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top", child = text { content = audio } }"#);
+        let (mut client, _outbound_rx) = test_client(&path);
+
+        client.run_startup_evaluation();
+
+        let bar = client.scene.surface("bar").expect("a bare rostered signal on `content` must not stop the config applying");
+        assert_eq!(
+            layout::node::parse_content(&bar.children[0].properties).unwrap(),
+            "",
+            "`content = audio` with audio still nil must take parse_content's default"
+        );
+        assert_eq!(rescue_state(&client.loader), (false, String::new()), "a startup that applies must not be in rescue");
+    }
+
+    #[test]
     fn a_push_arriving_before_the_first_successful_apply_is_not_consumed_and_lost() {
         // `applied_output` is checked *before* the flag is taken: with nothing to re-resolve
         // against there is nothing this call can do with the flag, so consuming it would silently
