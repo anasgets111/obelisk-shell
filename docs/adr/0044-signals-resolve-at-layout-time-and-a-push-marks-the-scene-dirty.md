@@ -1,5 +1,15 @@
 # Signals resolve at layout time, and a push marks the scene dirty
 
+> Decision 1 has a carve-out it did not state: the four `SurfaceTopology` fields (`id`, `layer`,
+> `anchor`, `monitor`) keep rejecting a `Signal` rather than resolving it. Topology is computed at
+> evaluation time so `handle_reevaluate` can diff it against `applied_topology` and choose a
+> generation swap or an in-place reload, which is ADR-0001's split. A signal in one of those fields
+> would resolve once for that comparison and then change underneath the live generation, so a
+> surface could move layer or monitor with no swap and the decision would stand on a value that no
+> longer holds. Every other property resolves as this decision describes. `build-steps.md` Phase 19
+> item 1's "delete `reject_signal` and its twelve call sites" is amended to the same effect: the
+> helper survives, renamed, for those fields alone.
+
 Nothing connects a capability's state to the screen. Three facts, each defensible alone, combine
 into a shell that cannot react to anything:
 

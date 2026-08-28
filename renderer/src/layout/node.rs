@@ -3,17 +3,30 @@
 //! left every property as a raw `mlua::Value` -- this module is the "actual consumer that needs
 //! typed, validated properties" that file's own doc comment named as Phase 12's job.
 //!
-//! Every parser here treats a `Value::UserData` (an unread `Signal`, § 1.2) as an error rather
-//! than resolving it: a `Signal` that lands in a geometry-affecting property slot means
-//! `shell.lua` returned the handle itself instead of calling `:get()` on it first. Auto-resolving
-//! it here would mean re-evaluating on every layout pass with no cache-invalidation story --
-//! that's the Watcher's territory (`CONTEXT.md`, Watcher; Phase 13), not this parser's.
+//! Most parsers here resolve a `Value::UserData` holding a `Signal` (§ 1.2) instead of rejecting
+//! it (build-steps.md Phase 19 item 1, ADR-0044 decision 1, `CONTEXT.md`'s Signal resolution
+//! entry): `resolve_property` reads the signal's current value through
+//! [`crate::lua::signal::Signal::get_value`] and the caller then applies its own type's usual
+//! rules to that value, exactly as it would to a literal. This resolves exactly once -- if the
+//! result is itself a `Signal` (a fresh `Value::UserData`), that's an error rather than a second
+//! read. That guard only stops a signal resolving directly to another signal; it is not a
+//! recursion bound, and it does nothing for a computed signal whose getter returns a fresh table
+//! on every call (e.g. a `children` signal that builds new node tables each read), which still
+//! recurses as deep as the getter wants to go, through `resolve_and_reconcile` and
+//! `deserialize_lua_table`, until the process aborts on a stack overflow rather than returning a
+//! `LayoutError`. A bounded depth cap is build-steps.md Phase 19 item 3's job, not this one's.
+//!
+//! [`SurfaceTopology`]'s four fields (`parse_surface_id`/`parse_layer`/`parse_anchor`/
+//! `parse_monitor`) are the one carve-out and keep rejecting a `Signal` outright -- see
+//! [`reject_signal_in_topology_field`]'s doc comment for why.
 
 use std::collections::HashMap;
 
-use mlua::Value;
+use mlua::{Lua, Value};
 
+use crate::lua::marshal;
 use crate::lua::nodes::{VirtualNode, deserialize_lua_table};
+use crate::lua::signal::Signal;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SizeMode {
@@ -69,17 +82,101 @@ fn invalid(property: &str, detail: impl Into<String>) -> LayoutError {
     }
 }
 
-fn value_as_f32(value: &Value) -> Option<f32> {
+/// Runs a numeric `Value` through the marshalling boundary (`lua::marshal`, ADR-0044 decision 1)
+/// before this parser's own application-level range checks (e.g. `parse_size_mode`'s `[0, 8192]`)
+/// ever see it -- catches a NaN/Inf `f64` `Number` or an out-of-2^53-range `Integer`, whether it
+/// arrived as a literal or came out of resolving a `Signal` via [`resolve_property`]: both are
+/// equally Lua-authored values crossing into Rust, exactly what `marshal::check_number`/
+/// `check_integer` were written to guard (`renderer/src/lua/marshal.rs`'s module doc comment).
+///
+/// `marshal::check_number` alone isn't sufficient here, though: it only guards the `f64`
+/// representation, and a finite `f64` like `1e300` sails through it and then overflows to
+/// `f32::INFINITY` on the narrowing cast below. A caller with no further range check (e.g.
+/// `parse_spacing`) would otherwise hand that `Inf` straight into layout arithmetic -- `inf * 0.0`
+/// is `NaN`, and `snap_to_physical`'s final `as i32` silently saturates a `NaN` rect to `0` instead
+/// of ever raising an error. So the finiteness check re-runs after the cast, on the `f32`, naming
+/// the same property a non-finite literal would.
+fn value_as_f32(property: &str, value: &Value) -> Result<Option<f32>, LayoutError> {
     match value {
-        Value::Integer(i) => Some(*i as f32),
-        Value::Number(n) => Some(*n as f32),
-        _ => None,
+        Value::Integer(i) => {
+            let checked = marshal::check_integer(*i).map_err(|e| invalid(property, e.to_string()))?;
+            Ok(Some(checked as f32))
+        }
+        Value::Number(n) => {
+            let checked = marshal::check_number(*n).map_err(|e| invalid(property, e.to_string()))?;
+            let narrowed = checked as f32;
+            if !narrowed.is_finite() {
+                return Err(invalid(
+                    property,
+                    format!("must be finite, got {checked} which overflows f32 to {narrowed}"),
+                ));
+            }
+            Ok(Some(narrowed))
+        }
+        _ => Ok(None),
     }
 }
 
-/// A `Signal` userdata landing in a geometry slot is rejected, not auto-resolved -- see the
-/// module doc comment.
-fn reject_signal(property: &str, value: &Value) -> Result<(), LayoutError> {
+/// Runs a Lua string through `marshal::check_string`'s 64KB cap and returns the owned `String` --
+/// same "literal and resolved-`Signal` values share one check" reasoning as [`value_as_f32`].
+fn checked_string(property: &str, s: &mlua::LuaString) -> Result<String, LayoutError> {
+    let s = s.to_string_lossy();
+    marshal::check_string(&s).map_err(|e| invalid(property, e.to_string()))?;
+    Ok(s)
+}
+
+/// Resolves `properties[property]` (build-steps.md Phase 19 item 1, ADR-0044 decision 1,
+/// `CONTEXT.md`'s Signal resolution entry): a `Value::UserData` wrapping a `Signal` is read
+/// through `Signal::get_value` and the *result* returned in its place, under the same rules the
+/// caller would then apply to a literal; every other value passes through unchanged.
+///
+/// Resolves exactly once. If the result is itself a `Signal`, that's an error rather than a
+/// second read. That only stops a signal resolving directly to another signal, not a getter that
+/// recurses some other way (see this module's doc comment); a bounded recursion cap is
+/// build-steps.md Phase 19 item 3's job, not this function's.
+///
+/// `None` means the property was absent; callers keep their own default-handling for that case,
+/// same as every caller did before this function existed.
+fn resolve_property(
+    properties: &HashMap<String, Value>,
+    property: &str,
+    lua: &Lua,
+) -> Result<Option<Value>, LayoutError> {
+    let Some(value) = properties.get(property) else {
+        return Ok(None);
+    };
+    let Value::UserData(ud) = value else {
+        return Ok(Some(value.clone()));
+    };
+    let signal = ud
+        .borrow::<Signal>()
+        .map_err(|_| invalid(property, format!("expected a plain value or a Signal, got {value:?}")))?;
+    let resolved = signal
+        .get_value(lua)
+        .map_err(|e| invalid(property, format!("Signal getter failed: {e}")))?;
+    if matches!(resolved, Value::UserData(_)) {
+        return Err(invalid(
+            property,
+            "a Signal resolved to another Signal -- resolution happens exactly once, not to a fixed point",
+        ));
+    }
+    Ok(Some(resolved))
+}
+
+/// The one carve-out from decision 1's "parsers resolve a `Signal`" rule: [`SurfaceTopology`]'s
+/// four fields (`parse_surface_id`/`parse_layer`/`parse_anchor`/`parse_monitor`) keep rejecting
+/// one outright, the same way every parser used to (this function used to be named
+/// `reject_signal` and back every one of them).
+///
+/// `surface_topology` runs on every `Scene::apply` so `renderer/src/socket.rs`'s
+/// `handle_reevaluate` can diff it against `applied_topology` and choose swap-versus-in-place
+/// (ADR-0001). A `Signal` in one of these four fields would resolve once for that comparison and
+/// then be free to change inside the live generation afterwards: a surface could move layer or
+/// monitor with no swap, and the swap-versus-in-place decision would already have been made
+/// against a value that no longer holds by the time anything acted on it. ADR-0044 decision 1
+/// doesn't carve this out explicitly -- it's a gap in the ADR, not a case the ADR considered and
+/// rejected.
+fn reject_signal_in_topology_field(property: &str, value: &Value) -> Result<(), LayoutError> {
     if matches!(value, Value::UserData(_)) {
         return Err(LayoutError::UnsupportedSignalProperty(property.to_string()));
     }
@@ -110,12 +207,12 @@ fn parse_percent(s: &str) -> Option<f32> {
 pub fn parse_size_mode(
     properties: &HashMap<String, Value>,
     property: &str,
+    lua: &Lua,
 ) -> Result<SizeMode, LayoutError> {
-    let Some(value) = properties.get(property) else {
+    let Some(value) = resolve_property(properties, property, lua)? else {
         return Ok(SizeMode::Content);
     };
-    reject_signal(property, value)?;
-    if let Some(n) = value_as_f32(value) {
+    if let Some(n) = value_as_f32(property, &value)? {
         if !(0.0..=8192.0).contains(&n) {
             return Err(invalid(
                 property,
@@ -124,8 +221,8 @@ pub fn parse_size_mode(
         }
         return Ok(SizeMode::Pixels(n));
     }
-    if let Value::String(s) = value {
-        let s = s.to_string_lossy();
+    if let Value::String(s) = &value {
+        let s = checked_string(property, s)?;
         if s == "Fill" {
             return Ok(SizeMode::Fill);
         }
@@ -142,12 +239,12 @@ pub fn parse_size_mode(
 pub fn parse_edge_insets(
     properties: &HashMap<String, Value>,
     property: &str,
+    lua: &Lua,
 ) -> Result<EdgeInsets, LayoutError> {
-    let Some(value) = properties.get(property) else {
+    let Some(value) = resolve_property(properties, property, lua)? else {
         return Ok(EdgeInsets::default());
     };
-    reject_signal(property, value)?;
-    let Value::Table(table) = value else {
+    let Value::Table(table) = &value else {
         return Err(invalid(
             property,
             format!("expected a table, got {value:?}"),
@@ -159,7 +256,7 @@ pub fn parse_edge_insets(
             .map_err(|e| invalid(property, e.to_string()))?;
         match v {
             Value::Nil => Ok(0.0),
-            other => value_as_f32(&other).ok_or_else(|| {
+            other => value_as_f32(property, &other)?.ok_or_else(|| {
                 invalid(property, format!("`{key}` must be a number, got {other:?}"))
             }),
         }
@@ -175,18 +272,18 @@ pub fn parse_edge_insets(
 pub fn parse_align(
     properties: &HashMap<String, Value>,
     property: &str,
+    lua: &Lua,
 ) -> Result<Align, LayoutError> {
-    let Some(value) = properties.get(property) else {
+    let Some(value) = resolve_property(properties, property, lua)? else {
         return Ok(Align::Start);
     };
-    reject_signal(property, value)?;
-    let Value::String(s) = value else {
+    let Value::String(s) = &value else {
         return Err(invalid(
             property,
             format!("expected a string, got {value:?}"),
         ));
     };
-    match s.to_string_lossy().as_ref() {
+    match checked_string(property, s)?.as_str() {
         "Start" => Ok(Align::Start),
         "Center" => Ok(Align::Center),
         "End" => Ok(Align::End),
@@ -195,13 +292,12 @@ pub fn parse_align(
     }
 }
 
-pub fn parse_visible(properties: &HashMap<String, Value>) -> Result<bool, LayoutError> {
-    let Some(value) = properties.get("visible") else {
+pub fn parse_visible(properties: &HashMap<String, Value>, lua: &Lua) -> Result<bool, LayoutError> {
+    let Some(value) = resolve_property(properties, "visible", lua)? else {
         return Ok(true);
     };
-    reject_signal("visible", value)?;
     match value {
-        Value::Boolean(b) => Ok(*b),
+        Value::Boolean(b) => Ok(b),
         other => Err(invalid(
             "visible",
             format!("expected a boolean, got {other:?}"),
@@ -209,22 +305,20 @@ pub fn parse_visible(properties: &HashMap<String, Value>) -> Result<bool, Layout
     }
 }
 
-pub fn parse_spacing(properties: &HashMap<String, Value>) -> Result<f32, LayoutError> {
-    let Some(value) = properties.get("spacing") else {
+pub fn parse_spacing(properties: &HashMap<String, Value>, lua: &Lua) -> Result<f32, LayoutError> {
+    let Some(value) = resolve_property(properties, "spacing", lua)? else {
         return Ok(0.0);
     };
-    reject_signal("spacing", value)?;
-    value_as_f32(value)
+    value_as_f32("spacing", &value)?
         .ok_or_else(|| invalid("spacing", format!("expected a number, got {value:?}")))
 }
 
-pub fn parse_content(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
-    let value = properties
-        .get("content")
-        .ok_or_else(|| invalid("content", "text node requires `content`"))?;
-    reject_signal("content", value)?;
-    match value {
-        Value::String(s) => Ok(s.to_string_lossy()),
+pub fn parse_content(properties: &HashMap<String, Value>, lua: &Lua) -> Result<String, LayoutError> {
+    let Some(value) = resolve_property(properties, "content", lua)? else {
+        return Err(invalid("content", "text node requires `content`"));
+    };
+    match &value {
+        Value::String(s) => checked_string("content", s),
         other => Err(invalid(
             "content",
             format!("expected a string, got {other:?}"),
@@ -232,21 +326,19 @@ pub fn parse_content(properties: &HashMap<String, Value>) -> Result<String, Layo
     }
 }
 
-pub fn parse_font_size(properties: &HashMap<String, Value>) -> Result<f32, LayoutError> {
-    let Some(value) = properties.get("font_size") else {
+pub fn parse_font_size(properties: &HashMap<String, Value>, lua: &Lua) -> Result<f32, LayoutError> {
+    let Some(value) = resolve_property(properties, "font_size", lua)? else {
         return Ok(12.0);
     };
-    reject_signal("font_size", value)?;
-    value_as_f32(value)
+    value_as_f32("font_size", &value)?
         .ok_or_else(|| invalid("font_size", format!("expected a number, got {value:?}")))
 }
 
-pub fn parse_icon_size(properties: &HashMap<String, Value>) -> Result<f32, LayoutError> {
-    let value = properties
-        .get("size")
-        .ok_or_else(|| invalid("size", "icon node requires `size`"))?;
-    reject_signal("size", value)?;
-    value_as_f32(value).ok_or_else(|| invalid("size", format!("expected a number, got {value:?}")))
+pub fn parse_icon_size(properties: &HashMap<String, Value>, lua: &Lua) -> Result<f32, LayoutError> {
+    let Some(value) = resolve_property(properties, "size", lua)? else {
+        return Err(invalid("size", "icon node requires `size`"));
+    };
+    value_as_f32("size", &value)?.ok_or_else(|| invalid("size", format!("expected a number, got {value:?}")))
 }
 
 /// Shared shape behind [`parse_surface_id`]/[`parse_layer`]/[`parse_monitor`]: fetch `property`,
@@ -260,7 +352,7 @@ fn parse_string_property(properties: &HashMap<String, Value>, property: &str, de
             None => return Err(invalid(property, format!("surface node requires `{property}`"))),
         },
     };
-    reject_signal(property, value)?;
+    reject_signal_in_topology_field(property, value)?;
     match value {
         Value::String(s) => Ok(s.to_string_lossy()),
         other => Err(invalid(property, format!("expected a string, got {other:?}"))),
@@ -293,7 +385,7 @@ pub fn parse_anchor(properties: &HashMap<String, Value>) -> Result<Anchor, Layou
     let Some(value) = properties.get("anchor") else {
         return Ok(Anchor::default());
     };
-    reject_signal("anchor", value)?;
+    reject_signal_in_topology_field("anchor", value)?;
     let Value::Table(table) = value else {
         return Err(invalid("anchor", format!("expected a table, got {value:?}")));
     };
@@ -341,12 +433,12 @@ pub fn surface_topology(properties: &HashMap<String, Value>) -> Result<SurfaceTo
 pub fn parse_single_child(
     properties: &HashMap<String, Value>,
     property: &str,
+    lua: &Lua,
 ) -> Result<Option<VirtualNode>, LayoutError> {
-    let Some(value) = properties.get(property) else {
+    let Some(value) = resolve_property(properties, property, lua)? else {
         return Ok(None);
     };
-    reject_signal(property, value)?;
-    let Value::Table(table) = value else {
+    let Value::Table(table) = &value else {
         return Err(invalid(
             property,
             format!("expected a node table, got {value:?}"),
@@ -359,12 +451,12 @@ pub fn parse_single_child(
 /// An array-of-nodes property (`rect`/`row`/`column`/`button.children`).
 pub fn parse_children(
     properties: &HashMap<String, Value>,
+    lua: &Lua,
 ) -> Result<Vec<VirtualNode>, LayoutError> {
-    let Some(value) = properties.get("children") else {
+    let Some(value) = resolve_property(properties, "children", lua)? else {
         return Ok(Vec::new());
     };
-    reject_signal("children", value)?;
-    let Value::Table(table) = value else {
+    let Value::Table(table) = &value else {
         return Err(invalid(
             "children",
             format!("expected an array table, got {value:?}"),
@@ -394,7 +486,7 @@ mod tests {
     #[test]
     fn width_absent_is_content() {
         let props = HashMap::new();
-        assert_eq!(parse_size_mode(&props, "width").unwrap(), SizeMode::Content);
+        assert_eq!(parse_size_mode(&props, "width", &lua()).unwrap(), SizeMode::Content);
     }
 
     #[test]
@@ -406,7 +498,7 @@ mod tests {
             .unwrap();
         let props = props_from_table(&table);
         assert_eq!(
-            parse_size_mode(&props, "width").unwrap(),
+            parse_size_mode(&props, "width", &lua).unwrap(),
             SizeMode::Pixels(32.0)
         );
     }
@@ -419,7 +511,7 @@ mod tests {
             .eval()
             .unwrap();
         let props = props_from_table(&table);
-        assert_eq!(parse_size_mode(&props, "width").unwrap(), SizeMode::Fill);
+        assert_eq!(parse_size_mode(&props, "width", &lua).unwrap(), SizeMode::Fill);
     }
 
     #[test]
@@ -431,7 +523,7 @@ mod tests {
             .unwrap();
         let props = props_from_table(&table);
         assert_eq!(
-            parse_size_mode(&props, "width").unwrap(),
+            parse_size_mode(&props, "width", &lua).unwrap(),
             SizeMode::Percent(0.5)
         );
     }
@@ -445,7 +537,7 @@ mod tests {
             .unwrap();
         let props = props_from_table(&table);
         assert!(matches!(
-            parse_size_mode(&props, "width").unwrap_err(),
+            parse_size_mode(&props, "width", &lua).unwrap_err(),
             LayoutError::InvalidProperty { .. }
         ));
     }
@@ -459,7 +551,7 @@ mod tests {
             .unwrap();
         let props = props_from_table(&table);
         assert!(matches!(
-            parse_size_mode(&props, "width").unwrap_err(),
+            parse_size_mode(&props, "width", &lua).unwrap_err(),
             LayoutError::InvalidProperty { .. }
         ));
     }
@@ -473,7 +565,7 @@ mod tests {
             .unwrap();
         let props = props_from_table(&table);
         assert!(matches!(
-            parse_size_mode(&props, "width").unwrap_err(),
+            parse_size_mode(&props, "width", &lua).unwrap_err(),
             LayoutError::InvalidProperty { .. }
         ));
     }
@@ -486,7 +578,7 @@ mod tests {
             .eval()
             .unwrap();
         let props = props_from_table(&table);
-        let insets = parse_edge_insets(&props, "margin").unwrap();
+        let insets = parse_edge_insets(&props, "margin", &lua).unwrap();
         assert_eq!(
             insets,
             EdgeInsets {
@@ -512,27 +604,30 @@ mod tests {
                 .eval()
                 .unwrap();
             let props = props_from_table(&table);
-            assert_eq!(parse_align(&props, "align_h").unwrap(), expected);
+            assert_eq!(parse_align(&props, "align_h", &lua).unwrap(), expected);
         }
     }
 
     #[test]
     fn visible_absent_defaults_true() {
         let props = HashMap::new();
-        assert!(parse_visible(&props).unwrap());
+        assert!(parse_visible(&props, &lua()).unwrap());
     }
 
     #[test]
-    fn a_signal_userdata_in_a_geometry_slot_is_rejected() {
+    fn a_signal_userdata_in_a_geometry_slot_resolves_to_its_current_value() {
+        // Replaces the old "rejected" test (docs/adr/0044 decision 1): `visible` is not a
+        // topology field, so it now resolves a `Signal` instead of erroring on one.
         let lua = lua();
         crate::lua::signal::register(&lua).unwrap();
-        let signal = crate::lua::signal::Signal::new_live(Value::Boolean(true)).0;
+        let signal = crate::lua::signal::Signal::new_live(Value::Boolean(false)).0;
         let table = lua.create_table().unwrap();
         table.set("kind", "rect").unwrap();
         table.set("visible", signal).unwrap();
         let node = deserialize_lua_table(&table).unwrap();
         assert!(
-            matches!(parse_visible(&node.properties).unwrap_err(), LayoutError::UnsupportedSignalProperty(p) if p == "visible")
+            !parse_visible(&node.properties, &lua).unwrap(),
+            "must read the signal's current value, not error on the handle"
         );
     }
 
@@ -540,22 +635,128 @@ mod tests {
     fn text_content_is_required() {
         let props = HashMap::new();
         assert!(matches!(
-            parse_content(&props).unwrap_err(),
+            parse_content(&props, &lua()).unwrap_err(),
             LayoutError::InvalidProperty { .. }
+        ));
+    }
+
+    #[test]
+    fn a_signal_resolving_to_a_string_satisfies_content() {
+        // ADR-0044 decision 1, step 1: a Signal wrapping "hello" parses as "hello".
+        let lua = lua();
+        crate::lua::signal::register(&lua).unwrap();
+        let hello = lua.create_string("hello").unwrap();
+        let signal = crate::lua::signal::Signal::new_live(Value::String(hello)).0;
+        let table = lua.create_table().unwrap();
+        table.set("kind", "text").unwrap();
+        table.set("content", signal).unwrap();
+        let node = deserialize_lua_table(&table).unwrap();
+        assert_eq!(parse_content(&node.properties, &lua).unwrap(), "hello");
+    }
+
+    #[test]
+    fn a_signal_resolving_to_a_table_reports_the_same_error_a_literal_table_would() {
+        let lua = lua();
+        crate::lua::signal::register(&lua).unwrap();
+
+        let literal_table: mlua::Table = lua.load(r#"return { kind = "text", content = {} }"#).eval().unwrap();
+        let literal_props = props_from_table(&literal_table);
+        let literal_err = parse_content(&literal_props, &lua).unwrap_err();
+
+        let signal = crate::lua::signal::Signal::new_live(Value::Table(lua.create_table().unwrap())).0;
+        let table = lua.create_table().unwrap();
+        table.set("kind", "text").unwrap();
+        table.set("content", signal).unwrap();
+        let node = deserialize_lua_table(&table).unwrap();
+        let signal_err = parse_content(&node.properties, &lua).unwrap_err();
+
+        for err in [&literal_err, &signal_err] {
+            assert!(matches!(
+                err,
+                LayoutError::InvalidProperty { property, detail }
+                    if property == "content" && detail.starts_with("expected a string")
+            ));
+        }
+    }
+
+    #[test]
+    fn a_signal_resolving_to_another_signal_is_an_error() {
+        // ADR-0044 decision 1's "resolve exactly once": a Signal whose value is itself a Signal
+        // userdata is an error, not a second read to a fixed point.
+        let lua = lua();
+        crate::lua::signal::register(&lua).unwrap();
+        let inner = crate::lua::signal::Signal::new_live(Value::Integer(5)).0;
+        let inner_userdata = lua.create_userdata(inner).unwrap();
+        let outer = crate::lua::signal::Signal::new_live(Value::UserData(inner_userdata)).0;
+        let table = lua.create_table().unwrap();
+        table.set("kind", "text").unwrap();
+        table.set("font_size", outer).unwrap();
+        let node = deserialize_lua_table(&table).unwrap();
+        assert!(matches!(
+            parse_font_size(&node.properties, &lua).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "font_size"
+        ));
+    }
+
+    #[test]
+    fn spacing_of_1e300_is_rejected_instead_of_overflowing_to_inf() {
+        // CONFIRMED finding: marshal::check_number(1e300) is Ok (1e300 is a finite f64), but the
+        // very next line's `as f32` saturates it to f32::INFINITY. `spacing` has no range check
+        // of its own (unlike `parse_size_mode`'s `[0, 8192]`), so without this fix the Inf sails
+        // through to `intrinsic_content_size`'s `spacing * visible.len().saturating_sub(1) as f32`
+        // -- `inf * 0.0` is `NaN`, silently producing NaN geometry instead of a LayoutError.
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "row", spacing = 1e300 }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        assert!(matches!(
+            parse_spacing(&props, &lua).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "spacing"
+        ));
+    }
+
+    #[test]
+    fn font_size_of_1e300_is_rejected_instead_of_overflowing_to_inf() {
+        // Same defeated-guard bug as spacing, on a different unranged property: `font_size`
+        // reaching `shaping.shape` as Inf would compute `line_height = inf * 1.2` instead of
+        // erroring.
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "text", font_size = 1e300 }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        assert!(matches!(
+            parse_font_size(&props, &lua).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "font_size"
         ));
     }
 
     #[test]
     fn font_size_absent_defaults_to_twelve() {
         let props = HashMap::new();
-        assert_eq!(parse_font_size(&props).unwrap(), 12.0);
+        assert_eq!(parse_font_size(&props, &lua()).unwrap(), 12.0);
+    }
+
+    #[test]
+    fn a_signal_resolving_to_a_number_satisfies_font_size_through_marshals_check_number() {
+        let lua = lua();
+        crate::lua::signal::register(&lua).unwrap();
+        let signal = crate::lua::signal::Signal::new_live(Value::Number(18.0)).0;
+        let table = lua.create_table().unwrap();
+        table.set("kind", "text").unwrap();
+        table.set("font_size", signal).unwrap();
+        let node = deserialize_lua_table(&table).unwrap();
+        assert_eq!(parse_font_size(&node.properties, &lua).unwrap(), 18.0);
     }
 
     #[test]
     fn icon_size_is_required() {
         let props = HashMap::new();
         assert!(matches!(
-            parse_icon_size(&props).unwrap_err(),
+            parse_icon_size(&props, &lua()).unwrap_err(),
             LayoutError::InvalidProperty { .. }
         ));
     }
@@ -568,7 +769,7 @@ mod tests {
             .eval()
             .unwrap();
         let props = props_from_table(&table);
-        let children = parse_children(&props).unwrap();
+        let children = parse_children(&props, &lua).unwrap();
         assert_eq!(children.len(), 2);
         assert_eq!(children[0].kind, "text");
         assert_eq!(
@@ -591,14 +792,14 @@ mod tests {
             .eval()
             .unwrap();
         let props = props_from_table(&table);
-        let child = parse_single_child(&props, "child").unwrap();
+        let child = parse_single_child(&props, "child", &lua).unwrap();
         assert_eq!(child.unwrap().kind, "rect");
     }
 
     #[test]
     fn parse_single_child_absent_is_none() {
         let props = HashMap::new();
-        assert!(parse_single_child(&props, "child").unwrap().is_none());
+        assert!(parse_single_child(&props, "child", &lua()).unwrap().is_none());
     }
 
     #[test]

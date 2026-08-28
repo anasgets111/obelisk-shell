@@ -1,5 +1,20 @@
 # Lua loader ships without retained-scene reconciliation or signal memoization
 
+> The 5ms CPU cap cannot bound a deepening recursion, and Phase 19 item 1's review measured it. Each
+> nested `call_with_cpu_cap` pushes its own deadline, and the instruction hook reads `stack.last()`,
+> the innermost and therefore always the freshest. A recursion that keeps nesting keeps pushing later
+> deadlines, so the check provably never fires and the process dies of stack exhaustion instead.
+> Reading `stack.last()` was deliberate and its stated reason still holds: a finished inner call must
+> hand enforcement back to the outer one rather than erase it. The mistake is that the innermost
+> deadline is also the most generous. Checking the minimum of the stack keeps the hand-back property
+> and makes the budget apply to the whole nest, which is what "5ms" was meant to mean.
+>
+> Two further gaps, same review. The cap is per `get_value` call, so one layout pass reading four
+> signal-valued properties grants four independent budgets rather than one. And `remove_hook` runs
+> when `get_value` returns, so a resolved table's `__index` metamethod executes with no hook at all:
+> a `__index` of `while true do end` hangs unkillably. Both are `build-steps.md` Phase 19 items 3
+> and 5.
+
 Phase 10's title ("Lua VM Bootstrap & the Loader") and its build-steps.md text scope a real
 `mlua` VM instantiation and the loader: Lua evaluation of `shell.lua` into a node tree and
 surface topology (`CONTEXT.md`, Loader). Matching that scope, this phase does not build:

@@ -665,16 +665,27 @@ the moment this lands.
 ### Phase 19: Signal Reactivity and the Paint Pass
 
 The first phase that puts Lua-driven content on screen, and the first where that content changes on
-its own. Items 1 through 4 implement ADR-0044 and ADR-0045 and are verifiable with no EGL at all:
+its own. Items 1 through 5 implement ADR-0044 and ADR-0045 and are verifiable with no EGL at all:
 push a snapshot, assert the resolved `ResolvedNode` tree changed. Items 5 onward turn a resolved
-tree into pixels. Build them in that order, since item 8's gating condition is item 2's output.
+tree into pixels. Build them in that order, since item 9's gating condition is item 2's output.
 
-1. **Resolve `Signal` properties instead of rejecting them** (ADR-0044 decision 1). Delete
-   `layout/node.rs`'s `reject_signal` and its twelve call sites. Where a parser finds a `Signal`
-   userdata, call `get()` and parse the result under the rules it already applies to a literal. Take
-   `#[allow(dead_code)]` off `lua/marshal.rs` and run a resolved value through
+1. **Resolve `Signal` properties instead of rejecting them** (ADR-0044 decision 1). Where a parser
+   finds a `Signal` userdata, call `get()` and parse the result under the rules it already applies
+   to a literal. Resolve exactly once: a signal resolving to another signal is an error, not a
+   second read, because chasing it to a fixed point is an unbounded loop on a cyclic construction.
+   Take `#[allow(dead_code)]` off `lua/marshal.rs` and run a resolved value through
    `check_number`/`check_integer`/`check_string`: this is the Lua-authored value crossing into Rust
    that those functions were written for, and until now nothing called them.
+
+   `reject_signal` does not go away entirely. The four `SurfaceTopology` fields (`id`, `layer`,
+   `anchor`, `monitor`) keep rejecting, because topology is computed at evaluation time for
+   `handle_reevaluate` to diff against `applied_topology`, and a field that changes after that
+   comparison would let a surface move layer or monitor with no generation swap (ADR-0001). The
+   helper survives for those, renamed to say so. See ADR-0044's amendment banner.
+
+   Resolving runs Lua, since a `computed` signal calls its closure, so the parsers need a `&Lua`
+   threaded down through `Scene::apply`'s call chain. That is what routes the call through
+   ADR-0021's 5ms hook rather than around it.
 2. **The dirty flag** (ADR-0044 decision 2). `LiveSignalHandle::set` marks the scene dirty. Hold the
    last evaluation's `LoadOutput` and re-run `Scene::apply` against it when the flag is set, without
    running `shell.lua`. Mark it `ponytail:`, naming the ceiling: one flag for the whole scene, so a
@@ -685,25 +696,68 @@ tree into pixels. Build them in that order, since item 8's gating condition is i
    2^53 and says nothing about table shape. Cap depth at a constant, return a `LayoutError`, and let
    the existing rescue path report it. Item 2 makes this reachable far more often, since a cyclic
    tree now re-resolves on every push rather than once per config edit.
+
+   Item 1's review confirmed two more entrances to the same abort, and neither is caught by
+   anything that exists. A computed signal in `children` that returns a fresh table per read
+   (`deep = computed({}, function() return { rect { children = deep } } end)`) builds an infinitely
+   deep tree: item 1's "resolved to another `Signal`" guard never fires, because every result is a
+   `Table`, and the recursion is pure Rust, so Lua's own `LUAI_MAXCCALLS` never accumulates. It
+   aborts at an 8 MiB stack. A self-referential or mutually recursive computed
+   (`a = computed({}, function() return b:get() end)` and back) does the same through
+   `Signal::get_value`, and merely assigning the handle to a property now triggers it where it used
+   to need an explicit `:get()` in `shell.lua`.
+
+   ADR-0021's 5ms cap cannot stop either, and this is a flaw in the cap rather than a gap in its
+   coverage: every nesting level calls `push_deadline`, and the instruction hook reads
+   `stack.last()`, which is always the innermost and always fresh. Monotonically deepening recursion
+   provably never trips it. Reading the *outermost* deadline instead would make the budget apply to
+   the whole nest, which is what it was meant to bound. Decide that with the depth cap, since a
+   depth counter alone leaves the cap still unable to bound a wide-but-shallow evaluation. See
+   ADR-0021's amendment banner.
 4. **Reconcile by `id`, not by position alone** (ADR-0045). `Scene`'s § 4 matching pairs a parent's
    children by index, so inserting a node above a sibling shifts every node below it onto the wrong
    retained counterpart. Add an optional `id` base property on every node kind, pair identified
    children first within one parent, then fall back to today's positional rule for the rest. Reject
    duplicate ids among siblings as a `LayoutError`. This matters here rather than later because
    item 2 turns reconciliation from a per-edit event into a per-push one.
-5. **Per-node drawing.** `rect` (background, `radius`, per-edge `border_color`/`border_width`) and
+5. **Resolve each property once per pass.** Item 1's review measured one `Scene::apply` over
+   `surface > row > rect` and found `margin` resolved four times (the parent loop, both
+   `intrinsic_content_size` folds, and `position_children`), `align_v` and `spacing` twice each,
+   `visible` and `width` once. They are independent `Signal::get_value` calls, so a closure that is
+   not a pure function of unchanged state answers differently within a single pass.
+
+   That is a real geometry bug, not just waste. With `m = computed({}, function() n = n + 1; return
+   { left = n } end)`, a row measured `width == 12` from the second read and positioned its child at
+   `x == 4` from the fourth, so a 10-wide child spans 4..14 inside a 12-wide parent. `scene.rs`'s own
+   comment states the invariant this breaks: the sizing pass and the positioning pass "must agree, or
+   a child would be sized to fit but then overlap or leave a gap once positioned". `os.clock()`,
+   `math.random`, or any accumulator upvalue reaches it.
+
+   It also multiplies cost. ADR-0021's cap is per `get_value` call, so four resolves buy four
+   independent 5ms budgets: 100 margined nodes whose closures sit near the cap is a 2 second freeze
+   of the Wayland dispatch thread, measured at 47ms for 20 such nodes today. And a resolved table's
+   `__index` runs once per read entirely outside the cap, since `call_with_cpu_cap` removes the hook
+   when `get_value` returns while `parse_edge_insets` reads four keys afterwards through
+   metamethod-aware `Table::get`. A `__index` of `while true do end` hangs unkillably.
+
+   Resolve every property of a node once, at the top of its reconcile, and have the sizing and
+   positioning passes read those values rather than the raw `mlua::Value`s. This is not the
+   memoization ADR-0044 decision 3 rejects: that is about caching *across* pushes, and this caches
+   nothing beyond the pass it happens in. One pass, one answer per property, which is what makes the
+   resolved tree a snapshot rather than four disagreeing reads.
+6. **Per-node drawing.** `rect` (background, `radius`, per-edge `border_color`/`border_width`) and
    `text` (reuse `TextPainter`, already a FemtoVG `Canvas<OpenGl>` with `resize` per frame, and
    `text/shaping.rs`'s existing off-thread shaping). `row`/`column`/`button` are containers with no
    paint of their own beyond their `rect` properties. Draw in tree order so the stacking model
    ADR-0023 item 4 already implements resolves overlaps the way layout resolved them.
-6. **Snapping.** Reuse `text/snap.rs`'s `snap_to_physical` and `snap_border_to_physical`. The second
+7. **Snapping.** Reuse `text/snap.rs`'s `snap_to_physical` and `snap_border_to_physical`. The second
    has had no caller since Phase 4 and this is what it was written for: a border snapped to whole
    physical pixels instead of straddling two (`oblisk-layout-engine-geometry.md` § 5).
-7. **One canvas, many surfaces.** All surfaces share one EGL context, so one `TextPainter` serves
+8. **One canvas, many surfaces.** All surfaces share one EGL context, so one `TextPainter` serves
    all of them: make the surface's EGL surface current, `resize` the canvas to that surface, draw,
    swap. Verify FemtoVG tolerates the surface switch under a shared context before assuming it; if
    it does not, one canvas per surface is the fallback, not a redesign.
-8. **Frame-callback scheduling.** Request `wl_surface::frame()` and redraw only when both a frame
+9. **Frame-callback scheduling.** Request `wl_surface::frame()` and redraw only when both a frame
    callback has arrived and item 2's re-resolve produced a different result for that surface, rather
    than on the current 15ms poll timeout in `wayland::run`'s loop. ashell's `src/application.rs` does
    exactly this with a `frame_pending` flag and reports an idle cost of zero, which is the target:
@@ -711,12 +765,12 @@ tree into pixels. Build them in that order, since item 8's gating condition is i
    next to the first rather than replacing it: an animation repaints whether or not a signal changed,
    and that is the one thing here that would be a redesign rather than an addition if the condition
    is hardcoded to "the scene changed".
-9. **Declared fonts, not discovered ones** (ADR-0043). Do not call `load_system_fonts()`. Load the
+10. **Declared fonts, not discovered ones** (ADR-0043). Do not call `load_system_fonts()`. Load the
    families the config names plus its declared fallback chain, through `fontdb`'s
    `load_font_file`/`load_fonts_dir`. This is the single largest lever on the memory budget, and it
    also removes most of the roughly one second `FontSystem::new()` currently costs, since that time
    is mostly cold-cache I/O over fonts the shell never draws with.
-10. **Atlas eviction** (ADR-0043). femtovg allocates 512x512 RGBA8 atlas pages, one mebibyte each,
+11. **Atlas eviction** (ADR-0043). femtovg allocates 512x512 RGBA8 atlas pages, one mebibyte each,
    grows the list without bound, and frees them only on an explicit `clear()`. Clear at a
    page-count threshold on an idle frame and let it rebuild. Mark it `ponytail:`, naming the
    ceiling: a whole-cache drop rather than an LRU, because femtovg exposes no per-glyph eviction.
@@ -1004,7 +1058,7 @@ Quickshell has `EasingCurve` and `ElapsedTimer` in `core/` and inherits QML's `B
 `NumberAnimation`, and `Transition` on top. Matching that is a real body of work and it is not
 scheduled here, because a shell without animation is functional and nothing is blocked.
 
-One constraint does need respecting now, in Phase 19 item 8. Frame gating is written as "repaint when
+One constraint does need respecting now, in Phase 19 item 9. Frame gating is written as "repaint when
 the scene changed", which is one reason to wake. An animation is a second reason, orthogonal to the
 first: a running animation must repaint whether or not a signal changed. Build the gate so a second
 reason can be added rather than replacing the condition, and this stays an additive change instead of

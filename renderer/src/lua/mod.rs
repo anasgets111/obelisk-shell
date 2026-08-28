@@ -8,11 +8,9 @@
 //! Renderer's own startup evaluation and every Supervisor-triggered `Reevaluate` round trip call
 //! it, replacing Phase 11's hardcoded proof-of-wiring literal.
 
-// ponytail: only `signal::Signal::try_new_direct` calls into this module, and that function has
-// no production caller yet either (see its own doc comment) -- exercised by tests only. Matches
-// `supervisor/src/socket.rs`'s `GenerationRegistry::send_to` precedent: a real, tested,
-// currently-uncalled piece gets one scoped `#[allow(dead_code)]`, not a blanket one.
-#[allow(dead_code)]
+// `#[allow(dead_code)]` came off here per ADR-0044 decision 1: `layout::node`'s property parsers
+// now run every resolved value through `check_number`/`check_integer`/`check_string` (build-steps.md
+// Phase 19 item 1), so this module has a real production caller, not just its own tests.
 pub mod marshal;
 pub mod nodes;
 pub mod process;
@@ -89,6 +87,14 @@ impl Loader {
     /// signal) without reaching into a private `Lua` field.
     pub fn create_table(&self) -> mlua::Result<Table> {
         self.lua.create_table()
+    }
+
+    /// The `Lua` state itself, for a caller that needs to resolve a `Signal` (ADR-0044 decision
+    /// 1). `layout::Scene::apply` and everything it calls need this to reach
+    /// `signal::Signal::get_value`, which takes `&Lua` rather than recovering one from `self`
+    /// (see that method's doc comment).
+    pub fn lua(&self) -> &Lua {
+        &self.lua
     }
 
     /// Registers `value` as a global Lua name, visible to every later `evaluate` call on this

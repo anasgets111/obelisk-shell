@@ -90,7 +90,16 @@ impl Signal {
         (Signal(SignalKind::Live(Rc::clone(&cell))), LiveSignalHandle(cell))
     }
 
-    fn get_value(&self, lua: &Lua) -> mlua::Result<Value> {
+    /// Reads this signal's current value (ADR-0044 decision 1, `CONTEXT.md`'s Signal resolution
+    /// entry). `pub(crate)`, not private: `layout::node`'s property parsers call this directly to
+    /// resolve a `Signal` userdata found in a property slot, instead of rejecting it -- the same
+    /// method `Signal::get`'s Lua-facing method already calls, just reachable from Rust now too.
+    /// `&Lua` is threaded in rather than recovered from `self`, because a `Computed` signal's
+    /// closure runs through `call_with_cpu_cap`, which needs a real `Lua` to install its
+    /// instruction-count hook on -- mlua 0.12 exposes no way to recover a `Lua` from an
+    /// `AnyUserData`/`Value` (checked the vendored source under `~/.cargo/registry`; no such
+    /// accessor exists), so there is nothing to recover it from.
+    pub(crate) fn get_value(&self, lua: &Lua) -> mlua::Result<Value> {
         match &self.0 {
             SignalKind::Direct(value) => Ok(value.clone()),
             SignalKind::Live(cell) => Ok(cell.borrow().clone()),

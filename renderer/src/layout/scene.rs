@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use mlua::Value;
+use mlua::{Lua, Value};
 
 use crate::layout::node::{self, Align, EdgeInsets, LayoutError, SizeMode};
 use crate::lua::nodes::VirtualNode;
@@ -38,6 +38,10 @@ pub struct ResolvedNode {
 
 /// One retained node: `ResolvedNode`'s geometry plus the `NodeId` identity that lets the next
 /// `Scene::apply` decide whether to reuse it or retire it.
+///
+/// `Clone` exists solely for `Scene::apply`'s rollback snapshot (see its doc comment) -- nothing
+/// else in this module needs to duplicate a retained subtree.
+#[derive(Clone)]
 struct RetainedNode {
     id: NodeId,
     kind: String,
@@ -93,18 +97,63 @@ impl Scene {
     /// id present in the retained scene but absent from `fresh_surfaces` this cycle is left
     /// untouched: a `surface` disappearing entirely is a topology change (`CONTEXT.md`), handled
     /// by a generation swap, not this in-place apply.
+    ///
+    /// Rolls back to exactly its pre-call state on `Err` (`CONTEXT.md`, Rollback; `socket.rs`'s
+    /// `handle_reevaluate` already assumes this -- it deliberately leaves `applied_topology`
+    /// unchanged on a failed apply). Before property resolve could call back into Lua (ADR-0044
+    /// decision 1), every property was an inert `mlua::Value`, so a config that applied once
+    /// always applied again and a plain remove-then-insert-per-surface loop was safe. Now a
+    /// Signal getter can fail at any depth inside `resolve_and_reconcile`, partway through
+    /// mutating `self.next_id` (`alloc_id`) and `self.retiring` (`retire_child_first`), and
+    /// partway through a multi-surface `fresh_surfaces` list. Snapshotting `surfaces`/`next_id`/
+    /// `retiring` up front and restoring the snapshot wholesale on any error is the smallest
+    /// change that actually holds the invariant for all three -- `resolve_and_reconcile` still
+    /// takes retained state by value and still mutates `next_id`/`retiring` as it walks, so
+    /// nothing short of restoring a pre-walk snapshot undoes that once an error has propagated
+    /// up from an arbitrary depth.
+    ///
+    /// ponytail: the snapshot is taken unconditionally, so every apply deep-clones the retained
+    /// tree whether or not anything fails, and item 2's dirty flag turns that into once per
+    /// capability push rather than once per config edit. The clone is structural (a
+    /// `RetainedNode`'s `mlua::Value` properties are refcount bumps, not deep copies), so it is
+    /// O(nodes), not O(Lua heap). Item 5 is the real fix: resolving every property once up front
+    /// means the fallible work finishes before any of `next_id`/`retiring`/`surfaces` is touched,
+    /// and a walk that cannot fail partway needs no snapshot at all.
     pub fn apply(
         &mut self,
         fresh_surfaces: &[VirtualNode],
         available: LogicalSize,
         shaping: &ShapingHandle,
+        lua: &Lua,
     ) -> Result<(), LayoutError> {
+        let next_id_snapshot = self.next_id;
+        let retiring_snapshot_len = self.retiring.len();
+        let surfaces_snapshot = self.surfaces.clone();
+
         for fresh in fresh_surfaces {
-            let key = node::parse_surface_id(&fresh.properties)?;
-            let existing = self.surfaces.remove(&key);
-            let reconciled = resolve_and_reconcile(self, existing, fresh, available, shaping, None, None)?;
-            self.surfaces.insert(key, reconciled);
+            if let Err(err) = self.apply_one_surface(fresh, available, shaping, lua) {
+                self.surfaces = surfaces_snapshot;
+                self.next_id = next_id_snapshot;
+                self.retiring.truncate(retiring_snapshot_len);
+                return Err(err);
+            }
         }
+        Ok(())
+    }
+
+    /// One surface's worth of `apply`'s loop body, split out so `apply` can wrap it in a single
+    /// early-return-on-error site instead of duplicating the rollback at every `?`.
+    fn apply_one_surface(
+        &mut self,
+        fresh: &VirtualNode,
+        available: LogicalSize,
+        shaping: &ShapingHandle,
+        lua: &Lua,
+    ) -> Result<(), LayoutError> {
+        let key = node::parse_surface_id(&fresh.properties)?;
+        let existing = self.surfaces.remove(&key);
+        let reconciled = resolve_and_reconcile(self, existing, fresh, available, shaping, None, None, lua)?;
+        self.surfaces.insert(key, reconciled);
         Ok(())
     }
 
@@ -189,12 +238,12 @@ fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
 /// -- ADR-0009 named this a `TextInputService`, but this slice inlined the fields onto `App`
 /// directly rather than extracting that type; see that file's own `bind_text_input` doc comment
 /// for the upgrade path).
-fn children_of(node: &VirtualNode) -> Result<Vec<VirtualNode>, LayoutError> {
+fn children_of(node: &VirtualNode, lua: &Lua) -> Result<Vec<VirtualNode>, LayoutError> {
     match node.kind.as_str() {
-        "surface" => Ok(node::parse_single_child(&node.properties, "child")?
+        "surface" => Ok(node::parse_single_child(&node.properties, "child", lua)?
             .into_iter()
             .collect()),
-        "rect" | "row" | "column" | "button" => node::parse_children(&node.properties),
+        "rect" | "row" | "column" | "button" => node::parse_children(&node.properties, lua),
         "text" | "icon" | "textfield" => Ok(Vec::new()),
         other => unreachable!("ensure_supported_kind already rejected `{other}`"),
     }
@@ -224,21 +273,22 @@ fn stretch_forced_size(
     own_width_known: Option<f32>,
     own_height_known: Option<f32>,
     margined_budget: LogicalSize,
+    lua: &Lua,
 ) -> Result<(Option<f32>, Option<f32>), LayoutError> {
     match parent_kind {
         "row" => {
-            let cross = node::parse_align(child_properties, "align_v")?;
+            let cross = node::parse_align(child_properties, "align_v", lua)?;
             let forced_h = (cross == Align::Stretch && own_height_known.is_some()).then_some(margined_budget.height);
             Ok((None, forced_h))
         }
         "column" => {
-            let cross = node::parse_align(child_properties, "align_h")?;
+            let cross = node::parse_align(child_properties, "align_h", lua)?;
             let forced_w = (cross == Align::Stretch && own_width_known.is_some()).then_some(margined_budget.width);
             Ok((forced_w, None))
         }
         "rect" | "button" | "surface" => {
-            let align_h = node::parse_align(child_properties, "align_h")?;
-            let align_v = node::parse_align(child_properties, "align_v")?;
+            let align_h = node::parse_align(child_properties, "align_h", lua)?;
+            let align_v = node::parse_align(child_properties, "align_v", lua)?;
             let forced_w = (align_h == Align::Stretch && own_width_known.is_some()).then_some(margined_budget.width);
             let forced_h = (align_v == Align::Stretch && own_height_known.is_some()).then_some(margined_budget.height);
             Ok((forced_w, forced_h))
@@ -260,6 +310,10 @@ fn stretch_forced_size(
 /// case, and always the case when the parent's own axis is itself `Content`-sized, since its
 /// final size isn't known until after its children resolve) falls back to the usual
 /// `width`/`height`-mode resolution.
+// Eight parameters, but each is load-bearing for this single recursive pass (§ 3's "single...
+// pass", see the module doc comment); splitting them into a struct would just be a bag carrying
+// the same eight fields through the same one caller.
+#[allow(clippy::too_many_arguments)]
 fn resolve_and_reconcile(
     scene: &mut Scene,
     retained: Option<RetainedNode>,
@@ -268,6 +322,7 @@ fn resolve_and_reconcile(
     shaping: &ShapingHandle,
     forced_width: Option<f32>,
     forced_height: Option<f32>,
+    lua: &Lua,
 ) -> Result<RetainedNode, LayoutError> {
     ensure_supported_kind(&fresh.kind)?;
 
@@ -275,10 +330,10 @@ fn resolve_and_reconcile(
     let old_children = retained.map(|r| r.children).unwrap_or_default();
     let id = id.unwrap_or_else(|| scene.alloc_id());
 
-    let padding = node::parse_edge_insets(&fresh.properties, "padding")?;
-    let visible = node::parse_visible(&fresh.properties)?;
-    let width_mode = node::parse_size_mode(&fresh.properties, "width")?;
-    let height_mode = node::parse_size_mode(&fresh.properties, "height")?;
+    let padding = node::parse_edge_insets(&fresh.properties, "padding", lua)?;
+    let visible = node::parse_visible(&fresh.properties, lua)?;
+    let width_mode = node::parse_size_mode(&fresh.properties, "width", lua)?;
+    let height_mode = node::parse_size_mode(&fresh.properties, "height", lua)?;
 
     let own_width_known = forced_width.or_else(|| resolve_non_content(width_mode, available.width));
     let own_height_known = forced_height.or_else(|| resolve_non_content(height_mode, available.height));
@@ -301,7 +356,7 @@ fn resolve_and_reconcile(
         height: own_height_known.map_or(0.0, |h| (h - padding.top - padding.bottom).max(0.0)),
     };
 
-    let fresh_children = children_of(fresh)?;
+    let fresh_children = children_of(fresh, lua)?;
     let mut old_iter = old_children.into_iter();
     let mut new_children = Vec::with_capacity(fresh_children.len());
     for fresh_child in &fresh_children {
@@ -318,7 +373,7 @@ fn resolve_and_reconcile(
         // § 3.1: a child's own margin comes out of the same available-space budget its parent's
         // padding already inset -- subtracted here, per child, since each child can carry a
         // different margin.
-        let child_margin = node::parse_edge_insets(&fresh_child.properties, "margin")?;
+        let child_margin = node::parse_edge_insets(&fresh_child.properties, "margin", lua)?;
         let margined_budget = LogicalSize {
             width: (child_budget.width - child_margin.left - child_margin.right).max(0.0),
             height: (child_budget.height - child_margin.top - child_margin.bottom).max(0.0),
@@ -329,6 +384,7 @@ fn resolve_and_reconcile(
             own_width_known,
             own_height_known,
             margined_budget,
+            lua,
         )?;
 
         new_children.push(resolve_and_reconcile(
@@ -339,6 +395,7 @@ fn resolve_and_reconcile(
             shaping,
             child_forced_width,
             child_forced_height,
+            lua,
         )?);
     }
     // Fresh list shorter than the retained one: everything left over was removed this cycle.
@@ -346,7 +403,7 @@ fn resolve_and_reconcile(
         scene.retire_child_first(leftover);
     }
 
-    let intrinsic = intrinsic_content_size(fresh, &new_children, text_wrap_width, shaping)?;
+    let intrinsic = intrinsic_content_size(fresh, &new_children, text_wrap_width, shaping, lua)?;
     let own_width = own_width_known.unwrap_or(intrinsic.width);
     let own_height = own_height_known.unwrap_or(intrinsic.height);
     let size = LogicalSize {
@@ -354,7 +411,7 @@ fn resolve_and_reconcile(
         height: own_height,
     };
 
-    position_children(fresh, &mut new_children, size, padding, own_width_known, own_height_known)?;
+    position_children(fresh, &mut new_children, size, padding, own_width_known, own_height_known, lua)?;
 
     Ok(RetainedNode {
         id,
@@ -379,11 +436,12 @@ fn intrinsic_content_size(
     children: &[RetainedNode],
     text_wrap_width: f32,
     shaping: &ShapingHandle,
+    lua: &Lua,
 ) -> Result<LogicalSize, LayoutError> {
     match node.kind.as_str() {
         "text" => {
-            let content = node::parse_content(&node.properties)?;
-            let font_size = node::parse_font_size(&node.properties)?;
+            let content = node::parse_content(&node.properties, lua)?;
+            let font_size = node::parse_font_size(&node.properties, lua)?;
             // A wrap width of 0 means nothing is known yet (a Content-sized text inside a
             // Content-sized ancestor with no room resolved so far) -- treat that as unconstrained
             // rather than forcing every word onto its own line.
@@ -400,7 +458,7 @@ fn intrinsic_content_size(
             })
         }
         "icon" => {
-            let size = node::parse_icon_size(&node.properties)?;
+            let size = node::parse_icon_size(&node.properties, lua)?;
             Ok(LogicalSize {
                 width: size,
                 height: size,
@@ -408,7 +466,7 @@ fn intrinsic_content_size(
         }
         "rect" if children.is_empty() => Ok(LogicalSize::default()),
         "row" => {
-            let spacing = node::parse_spacing(&node.properties)?;
+            let spacing = node::parse_spacing(&node.properties, lua)?;
             let visible: Vec<&RetainedNode> = children.iter().filter(|c| c.visible).collect();
             // § 3.1: a child's margin travels with it -- its footprint on the row's main axis is
             // its own width plus its margin, matching `position_children`'s identical footprint
@@ -416,32 +474,32 @@ fn intrinsic_content_size(
             // leave a gap once positioned).
             let width = visible
                 .iter()
-                .map(|c| Ok(c.rect.width + node::parse_edge_insets(&c.properties, "margin")?.horizontal()))
+                .map(|c| Ok(c.rect.width + node::parse_edge_insets(&c.properties, "margin", lua)?.horizontal()))
                 .collect::<Result<Vec<f32>, LayoutError>>()?
                 .into_iter()
                 .sum::<f32>()
                 + spacing * visible.len().saturating_sub(1) as f32;
             let height = visible
                 .iter()
-                .map(|c| Ok(c.rect.height + node::parse_edge_insets(&c.properties, "margin")?.vertical()))
+                .map(|c| Ok(c.rect.height + node::parse_edge_insets(&c.properties, "margin", lua)?.vertical()))
                 .collect::<Result<Vec<f32>, LayoutError>>()?
                 .into_iter()
                 .fold(0.0_f32, f32::max);
             Ok(LogicalSize { width, height })
         }
         "column" => {
-            let spacing = node::parse_spacing(&node.properties)?;
+            let spacing = node::parse_spacing(&node.properties, lua)?;
             let visible: Vec<&RetainedNode> = children.iter().filter(|c| c.visible).collect();
             let height = visible
                 .iter()
-                .map(|c| Ok(c.rect.height + node::parse_edge_insets(&c.properties, "margin")?.vertical()))
+                .map(|c| Ok(c.rect.height + node::parse_edge_insets(&c.properties, "margin", lua)?.vertical()))
                 .collect::<Result<Vec<f32>, LayoutError>>()?
                 .into_iter()
                 .sum::<f32>()
                 + spacing * visible.len().saturating_sub(1) as f32;
             let width = visible
                 .iter()
-                .map(|c| Ok(c.rect.width + node::parse_edge_insets(&c.properties, "margin")?.horizontal()))
+                .map(|c| Ok(c.rect.width + node::parse_edge_insets(&c.properties, "margin", lua)?.horizontal()))
                 .collect::<Result<Vec<f32>, LayoutError>>()?
                 .into_iter()
                 .fold(0.0_f32, f32::max);
@@ -455,13 +513,13 @@ fn intrinsic_content_size(
             let visible: Vec<&RetainedNode> = children.iter().filter(|c| c.visible).collect();
             let width = visible
                 .iter()
-                .map(|c| Ok(c.rect.width + node::parse_edge_insets(&c.properties, "margin")?.horizontal()))
+                .map(|c| Ok(c.rect.width + node::parse_edge_insets(&c.properties, "margin", lua)?.horizontal()))
                 .collect::<Result<Vec<f32>, LayoutError>>()?
                 .into_iter()
                 .fold(0.0_f32, f32::max);
             let height = visible
                 .iter()
-                .map(|c| Ok(c.rect.height + node::parse_edge_insets(&c.properties, "margin")?.vertical()))
+                .map(|c| Ok(c.rect.height + node::parse_edge_insets(&c.properties, "margin", lua)?.vertical()))
                 .collect::<Result<Vec<f32>, LayoutError>>()?
                 .into_iter()
                 .fold(0.0_f32, f32::max);
@@ -494,6 +552,7 @@ fn position_children(
     padding: EdgeInsets,
     own_width_known: Option<f32>,
     own_height_known: Option<f32>,
+    lua: &Lua,
 ) -> Result<(), LayoutError> {
     let content_x = padding.left;
     let content_y = padding.top;
@@ -502,13 +561,13 @@ fn position_children(
 
     let margins: Vec<EdgeInsets> = children
         .iter()
-        .map(|c| node::parse_edge_insets(&c.properties, "margin"))
+        .map(|c| node::parse_edge_insets(&c.properties, "margin", lua))
         .collect::<Result<_, _>>()?;
 
     match node.kind.as_str() {
         "row" => {
-            let spacing = node::parse_spacing(&node.properties)?;
-            let main_align = node::parse_align(&node.properties, "align_h")?;
+            let spacing = node::parse_spacing(&node.properties, lua)?;
+            let main_align = node::parse_align(&node.properties, "align_h", lua)?;
             let visible_indices: Vec<usize> = children
                 .iter()
                 .enumerate()
@@ -529,7 +588,7 @@ fn position_children(
                 Align::End => spare,
             };
             for &i in &visible_indices {
-                let cross_align = node::parse_align(&children[i].properties, "align_v")?;
+                let cross_align = node::parse_align(&children[i].properties, "align_v", lua)?;
                 let slot_h = (content_height - margins[i].top - margins[i].bottom).max(0.0);
                 let child_h = children[i].rect.height;
                 let y = cross_axis_offset(cross_align, slot_h, child_h);
@@ -542,8 +601,8 @@ fn position_children(
             }
         }
         "column" => {
-            let spacing = node::parse_spacing(&node.properties)?;
-            let main_align = node::parse_align(&node.properties, "align_v")?;
+            let spacing = node::parse_spacing(&node.properties, lua)?;
+            let main_align = node::parse_align(&node.properties, "align_v", lua)?;
             let visible_indices: Vec<usize> = children
                 .iter()
                 .enumerate()
@@ -562,7 +621,7 @@ fn position_children(
                 Align::End => spare,
             };
             for &i in &visible_indices {
-                let cross_align = node::parse_align(&children[i].properties, "align_h")?;
+                let cross_align = node::parse_align(&children[i].properties, "align_h", lua)?;
                 let slot_w = (content_width - margins[i].left - margins[i].right).max(0.0);
                 let child_w = children[i].rect.width;
                 let x = cross_axis_offset(cross_align, slot_w, child_w);
@@ -582,8 +641,8 @@ fn position_children(
                 if !child.visible {
                     continue;
                 }
-                let align_h = node::parse_align(&child.properties, "align_h")?;
-                let align_v = node::parse_align(&child.properties, "align_v")?;
+                let align_h = node::parse_align(&child.properties, "align_h", lua)?;
+                let align_v = node::parse_align(&child.properties, "align_v", lua)?;
                 let slot_w = (content_width - margins[i].left - margins[i].right).max(0.0);
                 let slot_h = (content_height - margins[i].top - margins[i].bottom).max(0.0);
                 let x = cross_axis_offset(align_h, slot_w, child.rect.width);
@@ -645,12 +704,35 @@ mod tests {
     }
 
     #[test]
+    fn a_signal_valued_width_resolves_to_its_current_value_in_the_resolved_node() {
+        // The Scene::apply seam (ADR-0044 decision 1): a Signal in a geometry slot must reach
+        // the ResolvedNode's rect, not error the whole apply.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua).unwrap();
+        let signal = crate::lua::signal::Signal::new_live(Value::Integer(40)).0;
+        lua.globals().set("w", signal).unwrap();
+        let table: mlua::Table = lua
+            .load(r#"return surface { id = "bar", child = rect { width = w, height = 20 } }"#)
+            .eval()
+            .unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+
+        scene.apply(&[surface], full(), &shaping, &lua).unwrap();
+
+        let child = &scene.surface("bar").unwrap().children[0];
+        assert_eq!(child.rect.width, 40.0, "a Signal-valued width must resolve at layout time");
+    }
+
+    #[test]
     fn a_pixels_sized_rect_resolves_to_its_explicit_size() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) =
             surface_from(r#"surface { id = "bar", child = rect { width = 40, height = 20 } }"#);
-        scene.apply(&[surface], full(), &shaping).unwrap();
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let root = scene.surface("bar").unwrap();
         let child = &root.children[0];
         assert_eq!(child.rect.width, 40.0);
@@ -662,7 +744,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(r#"surface { id = "bar", child = rect {} }"#);
-        scene.apply(&[surface], full(), &shaping).unwrap();
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let child = &scene.surface("bar").unwrap().children[0];
         assert_eq!(child.rect.width, 0.0);
         assert_eq!(child.rect.height, 0.0);
@@ -675,7 +757,7 @@ mod tests {
         let (_lua, surface) = surface_from(
             r#"surface { id = "bar", width = 1000, height = 500, child = rect { width = "Fill", height = "Fill" } }"#,
         );
-        scene.apply(&[surface], full(), &shaping).unwrap();
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let child = &scene.surface("bar").unwrap().children[0];
         assert_eq!(child.rect.width, 1000.0);
         assert_eq!(child.rect.height, 500.0);
@@ -688,7 +770,7 @@ mod tests {
         let (_lua, surface) = surface_from(
             r#"surface { id = "bar", width = 1000, height = 500, child = rect { width = "50%" } }"#,
         );
-        scene.apply(&[surface], full(), &shaping).unwrap();
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let child = &scene.surface("bar").unwrap().children[0];
         assert_eq!(child.rect.width, 500.0);
     }
@@ -701,7 +783,7 @@ mod tests {
         let (_lua, surface) = surface_from(
             r#"surface { id = "bar", child = row { spacing = 5, children = { rect { width = 10, height = 8 }, rect { width = 10, height = 4 } } } }"#,
         );
-        scene.apply(&[surface], full(), &shaping).unwrap();
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let row = &scene.surface("bar").unwrap().children[0];
         assert_eq!(row.rect.width, 25.0, "10 + 10 + 5 spacing");
         assert_eq!(row.rect.height, 8.0, "max of children's heights");
@@ -714,7 +796,7 @@ mod tests {
         let (_lua, surface) = surface_from(
             r#"surface { id = "bar", child = column { spacing = 3, children = { rect { width = 6, height = 10 }, rect { width = 9, height = 10 } } } }"#,
         );
-        scene.apply(&[surface], full(), &shaping).unwrap();
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let column = &scene.surface("bar").unwrap().children[0];
         assert_eq!(column.rect.height, 23.0, "10 + 10 + 3 spacing");
         assert_eq!(column.rect.width, 9.0, "max of children's widths");
@@ -730,7 +812,7 @@ mod tests {
         let (_lua, surface) = surface_from(
             r#"surface { id = "bar", child = row { children = { rect { width = 10, height = 10, margin = { left = 4, right = 4 } } } } }"#,
         );
-        scene.apply(&[surface], full(), &shaping).unwrap();
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let row = &scene.surface("bar").unwrap().children[0];
         assert_eq!(row.rect.width, 18.0, "10 + 4 + 4 margin");
         assert_eq!(row.children[0].rect.x, 4.0, "the child's own margin.left offsets it inward");
@@ -746,7 +828,7 @@ mod tests {
                 rect { width = 10, height = 10 },
             } } }"#,
         );
-        scene.apply(&[surface], full(), &shaping).unwrap();
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let row = &scene.surface("bar").unwrap().children[0];
         assert_eq!(
             row.children[1].rect.x, 15.0,
@@ -768,7 +850,7 @@ mod tests {
                 } },
             } } }"#,
         );
-        scene.apply(&[surface], full(), &shaping).unwrap();
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let row = &scene.surface("bar").unwrap().children[0];
         let stretched = &row.children[0];
         assert_eq!(stretched.rect.height, 50.0, "stretched to the row's full height");
@@ -787,7 +869,7 @@ mod tests {
         let (_lua, surface) = surface_from(
             r#"surface { id = "bar", child = row { children = { rect { width = 10, height = 10 }, rect { width = 10, height = 10 } } } }"#,
         );
-        scene.apply(&[surface], full(), &shaping).unwrap();
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let row = &scene.surface("bar").unwrap().children[0];
         assert_eq!(row.children[0].rect.x, 0.0);
         assert_eq!(row.children[1].rect.x, 10.0);
@@ -800,7 +882,7 @@ mod tests {
         let (_lua, surface) = surface_from(
             r#"surface { id = "bar", width = 100, height = 20, child = row { width = "Fill", align_h = "End", children = { rect { width = 10, height = 10 } } } }"#,
         );
-        scene.apply(&[surface], full(), &shaping).unwrap();
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let row = &scene.surface("bar").unwrap().children[0];
         assert_eq!(row.children[0].rect.x, 90.0);
     }
@@ -812,7 +894,7 @@ mod tests {
         let (_lua, surface) = surface_from(
             r#"surface { id = "bar", width = 100, height = 50, child = row { height = "Fill", children = { rect { width = 10, height = 5, align_v = "Stretch" } } } }"#,
         );
-        scene.apply(&[surface], full(), &shaping).unwrap();
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let row = &scene.surface("bar").unwrap().children[0];
         assert_eq!(row.children[0].rect.height, 50.0);
     }
@@ -827,7 +909,7 @@ mod tests {
                 rect { width = 20, height = 20, align_h = "End", align_v = "End" },
             } } }"#,
         );
-        scene.apply(&[surface], full(), &shaping).unwrap();
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let outer = &scene.surface("bar").unwrap().children[0];
         assert_eq!(outer.children[0].rect.x, 0.0);
         assert_eq!(outer.children[1].rect.x, 80.0);
@@ -844,7 +926,7 @@ mod tests {
                 rect { width = 10, height = 10 },
             } } }"#,
         );
-        scene.apply(&[surface], full(), &shaping).unwrap();
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let row = &scene.surface("bar").unwrap().children[0];
         assert_eq!(
             row.rect.width, 10.0,
@@ -862,7 +944,7 @@ mod tests {
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) =
             surface_from(r#"surface { id = "bar", child = text { content = "Oblisk" } }"#);
-        scene.apply(&[surface], full(), &shaping).unwrap();
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let text = &scene.surface("bar").unwrap().children[0];
         assert!(text.rect.width > 0.0);
         assert_eq!(
@@ -877,7 +959,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(r#"surface { id = "bar", child = list {} }"#);
-        let err = scene.apply(&[surface], full(), &shaping).unwrap_err();
+        let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
         assert!(matches!(err, LayoutError::UnsupportedNodeKind(k) if k == "list"));
     }
 
@@ -887,7 +969,7 @@ mod tests {
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) =
             surface_from(r#"surface { id = "bar", child = row { children = { list {} } } }"#);
-        let err = scene.apply(&[surface], full(), &shaping).unwrap_err();
+        let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
         assert!(matches!(err, LayoutError::UnsupportedNodeKind(k) if k == "list"));
     }
 
@@ -901,7 +983,7 @@ mod tests {
         let (_lua, surface) = surface_from(
             r#"surface { id = "bar", child = row { children = { textfield { mask_character = "*", secure_submit = { capability = "polkit", action = "authenticate" } } } } }"#,
         );
-        scene.apply(&[surface], full(), &shaping).unwrap();
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
 
         let field = &scene.surface("bar").unwrap().children[0].children[0];
         assert_eq!(field.kind, "textfield");
@@ -913,12 +995,70 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_apply_leaves_the_scene_exactly_as_it_was() {
+        // The rollback invariant this fix establishes: `Scene::apply` returning `Err` must not
+        // observably mutate the `Scene` at all. Apply a good tree, capture its `NodeId`s, then
+        // apply a tree whose property resolve fails partway (a Signal getter erroring, ADR-0044
+        // decision 1) and assert everything -- surfaces, `NodeId`s, `retiring`, `next_id` -- is
+        // unchanged. Checking only `surfaces` wouldn't catch a `next_id` bump or a stray
+        // `retiring` entry left over from the aborted pass.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua1, surface_v1) = surface_from(
+            r#"surface { id = "bar", child = row { children = {
+                rect { width = 10, height = 10 },
+                rect { width = 20, height = 20 },
+            } } }"#,
+        );
+        scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
+
+        let ids_before: Vec<NodeId> = {
+            let root = scene.surfaces.get("bar").unwrap();
+            let row = &root.children[0];
+            vec![root.id, row.id, row.children[0].id, row.children[1].id]
+        };
+        let next_id_before = scene.next_id;
+        let retiring_before = scene.retiring_ids();
+
+        // A getter that errors on read: `resolve_property` propagates that as `LayoutError`
+        // partway through resolving the row's second child's `width`, after the first child (and
+        // the row/surface's own properties) already resolved successfully this pass.
+        let lua2 = mlua::Lua::new();
+        register_node_constructors(&lua2).unwrap();
+        crate::lua::signal::register(&lua2).unwrap();
+        let table: mlua::Table = lua2
+            .load(
+                r#"
+                local bad_width = computed({}, function() error("boom") end)
+                return surface { id = "bar", child = row { children = {
+                    rect { width = 10, height = 10 },
+                    rect { width = bad_width, height = 20 },
+                } } }
+                "#,
+            )
+            .eval()
+            .unwrap();
+        let surface_v2 = deserialize_lua_table(&table).unwrap();
+
+        let err = scene.apply(&[surface_v2], full(), &shaping, &lua2).unwrap_err();
+        assert!(matches!(err, LayoutError::InvalidProperty { property, .. } if property == "width"));
+
+        let root = scene.surfaces.get("bar").unwrap();
+        let row = &root.children[0];
+        let ids_after = vec![root.id, row.id, row.children[0].id, row.children[1].id];
+        assert_eq!(ids_after, ids_before, "NodeIds must be stable across a failed apply, not reallocated");
+        assert_eq!(scene.next_id, next_id_before, "next_id must not be left bumped by the aborted pass");
+        assert_eq!(scene.retiring_ids(), retiring_before, "retiring must not gain entries from the aborted pass");
+        assert_eq!(row.children[1].rect.width, 20.0, "the first tree's geometry must still be intact");
+    }
+
+    #[test]
     fn reapplying_the_same_shape_at_the_same_index_reuses_the_node_id() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) =
             surface_from(r#"surface { id = "bar", child = rect { width = 10, height = 10 } }"#);
-        scene.apply(&[surface_v1], full(), &shaping).unwrap();
+        scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
         let first_id = {
             let key = "bar";
             scene.surfaces.get(key).unwrap().children[0].id
@@ -926,7 +1066,7 @@ mod tests {
 
         let (_lua2, surface_v2) =
             surface_from(r#"surface { id = "bar", child = rect { width = 99, height = 99 } }"#);
-        scene.apply(&[surface_v2], full(), &shaping).unwrap();
+        scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
         let second_id = scene.surfaces.get("bar").unwrap().children[0].id;
 
         assert_eq!(
@@ -946,12 +1086,12 @@ mod tests {
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) =
             surface_from(r#"surface { id = "bar", child = rect { width = 10, height = 10 } }"#);
-        scene.apply(&[surface_v1], full(), &shaping).unwrap();
+        scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
         assert!(scene.retiring_ids().is_empty());
 
         let (_lua2, surface_v2) =
             surface_from(r#"surface { id = "bar", child = text { content = "hi" } }"#);
-        scene.apply(&[surface_v2], full(), &shaping).unwrap();
+        scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
 
         assert_eq!(scene.surface("bar").unwrap().children[0].kind, "text");
         assert_eq!(
@@ -968,12 +1108,12 @@ mod tests {
         let (_lua1, surface_v1) = surface_from(
             r#"surface { id = "bar", child = row { children = { rect { width = 1, height = 1 }, rect { width = 2, height = 2 } } } }"#,
         );
-        scene.apply(&[surface_v1], full(), &shaping).unwrap();
+        scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
 
         let (_lua2, surface_v2) = surface_from(
             r#"surface { id = "bar", child = row { children = { rect { width = 1, height = 1 } } } }"#,
         );
-        scene.apply(&[surface_v2], full(), &shaping).unwrap();
+        scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
 
         assert_eq!(scene.surface("bar").unwrap().children[0].children.len(), 1);
         assert_eq!(scene.retiring_ids().len(), 1);
@@ -986,14 +1126,14 @@ mod tests {
         let (_lua1, surface_v1) = surface_from(
             r#"surface { id = "bar", child = row { children = { rect { width = 1, height = 1, children = { rect { width = 1, height = 1 } } } } } }"#,
         );
-        scene.apply(&[surface_v1], full(), &shaping).unwrap();
+        scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
         let outer_id = scene.surfaces.get("bar").unwrap().children[0].children[0].id;
         let inner_id = scene.surfaces.get("bar").unwrap().children[0].children[0].children[0].id;
 
         // Remove the whole subtree by shrinking the row to zero children.
         let (_lua2, surface_v2) =
             surface_from(r#"surface { id = "bar", child = row { children = {} } }"#);
-        scene.apply(&[surface_v2], full(), &shaping).unwrap();
+        scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
 
         let order = scene.retiring_ids();
         let inner_pos = order.iter().position(|id| *id == inner_id).unwrap();
@@ -1010,10 +1150,10 @@ mod tests {
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) =
             surface_from(r#"surface { id = "bar", child = rect { width = 1, height = 1 } }"#);
-        scene.apply(&[surface_v1], full(), &shaping).unwrap();
+        scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
         let (_lua2, surface_v2) =
             surface_from(r#"surface { id = "bar", child = text { content = "x" } }"#);
-        scene.apply(&[surface_v2], full(), &shaping).unwrap();
+        scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
 
         let id = scene.retiring_ids()[0];
         assert!(scene.release(id));

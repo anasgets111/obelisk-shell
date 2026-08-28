@@ -280,7 +280,7 @@ impl RendererClient {
     /// of the statements in `crate::wayland::run`.
     pub fn run_startup_evaluation(&mut self) {
         match evaluate_and_topology(&self.loader, &self.shell_lua_path) {
-            Ok((output, topology)) => match self.scene.apply(&output.surfaces, PLACEHOLDER_OUTPUT_SIZE, &self.shaping) {
+            Ok((output, topology)) => match self.scene.apply(&output.surfaces, PLACEHOLDER_OUTPUT_SIZE, &self.shaping, self.loader.lua()) {
                 Ok(()) => {
                     log_applied_surfaces(&self.scene, &output);
                     self.set_rescue_state(false, "");
@@ -385,7 +385,7 @@ impl RendererClient {
             return;
         }
         let (_, output, topology) = self.state.pending.take().expect("just confirmed Some above");
-        match self.scene.apply(&output.surfaces, PLACEHOLDER_OUTPUT_SIZE, &self.shaping) {
+        match self.scene.apply(&output.surfaces, PLACEHOLDER_OUTPUT_SIZE, &self.shaping, self.loader.lua()) {
             Ok(()) => {
                 log_applied_surfaces(&self.scene, &output);
                 self.state.applied_topology = Some(topology);
