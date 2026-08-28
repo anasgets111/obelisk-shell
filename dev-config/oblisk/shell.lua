@@ -4,9 +4,11 @@
 -- Watcher's in-place reload (Phase 13). Changing a surface's `id`/`layer`/`anchor`/`monitor`
 -- instead drives a full PBA generation swap (§ 15.2).
 --
--- Paint properties (`background`, `radius`, `border_color`, `border_width`, `foreground`) parse
--- but do not draw yet: Phase 19 item 6's third commit is what walks the resolved tree into
--- FemtoVG. They are written here now so that commit has a real config to prove itself against.
+-- Every field below now decides what the compositor sees (Phase 20, ADR-0038): editing a `layer`
+-- restacks the surface, a `namespace` is what a Hyprland `layerrule` matches on, and `exclusive`
+-- reserves screen area. Changing `id`/`layer`/`anchor`/`monitor`/`namespace` is a topology change
+-- and drives a full PBA generation swap; changing `margin`/`keyboard_interactivity`/`exclusive`/
+-- a size is a value change and reloads in place.
 
 local BG = "#1e1e2eff"
 local FG = "#cdd6f4ff"
@@ -114,16 +116,18 @@ end), "#f38ba8ff")
 -- Two surfaces, because one surface cannot catch a whole class of bug: the applied-scene log
 -- named every surface by its kind (the literal string "panel") until a second one made that
 -- visible, and a candidate that fails to build a scene still gets promoted, which only shows up
--- when a config is big enough to get wrong. `notification_area` has no `wl_surface` behind it
--- yet, so it resolves and reconciles without appearing on screen -- Phase 20 item 4 is what
--- deletes `SurfaceRole` and makes the config's ids the same id space the compositor sees.
+-- when a config is big enough to get wrong. Both get a real `zwlr_layer_surface_v1` now, one per
+-- monitor each, addressed as `"bar@{output}"` and `"notification_area@{output}"`.
 return {
     panel {
         id = "bar",
         layer = "Top",
         anchor = { top = true, left = true, right = true },
+        -- Reserves 32px of screen area along the anchored (top) edge. The zone is derived from
+        -- the height the compositor actually configures, so it stays right if this changes.
+        exclusive = true,
         width = "Fill",
-        height = "Fill",
+        height = 32,
         child = row {
             width = "Fill",
             height = "Fill",
@@ -138,7 +142,12 @@ return {
         id = "notification_area",
         layer = "Overlay",
         anchor = { top = true, right = true },
+        -- Anchored to one corner, so it reserves nothing and floats over whatever is behind it.
+        margin = { top = 12, right = 12 },
+        -- Both axes explicit, and they have to be: layer-shell only lets the compositor pick an
+        -- axis whose two edges are both anchored, and this surface anchors one corner.
         width = 380,
+        height = 60,
         child = column {
             spacing = 6,
             padding = { top = 8, right = 10, bottom = 8, left = 10 },

@@ -1277,6 +1277,40 @@ reconfiguration, and destruction from the evaluated topology instead.
    belongs rather than in Phase 18: deleting `SurfaceRole` is what collapses the Lua `id` space and
    the Wayland `surface_id` space into one, and until they are one there is no surface a size
    lookup could hit.
+
+   > Built, with four things this text did not anticipate.
+   >
+   > **A size of `0` is a protocol error unless both edges of that axis are anchored.** The XML is
+   > explicit: "You must set your anchor to opposite edges in the dimensions you omit; not doing so
+   > is a protocol error." Mapping `"Fill"` to `0` puts that under config control for the first
+   > time, so `panel { anchor = { top = true }, height = "Fill" }` would kill the Wayland connection
+   > and take the whole shell down with nothing on screen to say why. A pure `ambiguous_zero_axis`
+   > check refuses that one surface and logs the axis instead. Both dev-config panels tripped it as
+   > written.
+   >
+   > **The exclusive zone is derived on configure, not at creation.** § 6.1 gives `exclusive` as a
+   > boolean but the protocol wants an integer. Deriving it at creation means guessing the size the
+   > compositor will pick; deriving it from the configured size is one rule that is always right,
+   > and layer-shell permits changing the zone on a live surface. A corner anchor gets `0`, since it
+   > satisfies neither "exactly one vertical edge" nor its mirror.
+   >
+   > **The first apply resolves against the output's logical size.** § 15.2 forces evaluation before
+   > binding, so nothing is configured yet, but `OutputInfo::logical_size` is already known from the
+   > two roundtrips `run()` already does. That resolve is validation and is never painted: a
+   > candidate null-buffers first, and non-candidate mode's first draw is on first configure, after
+   > the real size has arrived.
+   >
+   > **`applied_topology` changed meaning, and it is now the more accurate one.** It was "the
+   > topology that was successfully applied to the scene"; it is now "the topology this generation's
+   > surfaces were built from", recorded on a successful evaluation. That is the question the diff
+   > is actually asking once surfaces come from the evaluation. Under the old rule, a startup whose
+   > apply failed would apply a later topology-changing edit *in place*, into surfaces the config no
+   > longer describes.
+   >
+   > Phase 19 item 8 landed here too, and could not have landed anywhere else: deleting
+   > `SurfaceRole` deletes `draw_main_bar_proof_text`'s only condition, so `paint_tree` had to
+   > become the draw path in the same commit. Its shared-context assumption is verified rather than
+   > assumed, by a headless test driving one `TextPainter` across two EGL surfaces.
 5. **Push input regions.** `layout::overlay_input_regions` has been correct and tested since Phase
    12 with no caller (ADR-0023 item 5). Wire it per surface, not just for one overlay: it is a no-op
    for a tightly-sized bar and load-bearing for any surface larger than its visible content.

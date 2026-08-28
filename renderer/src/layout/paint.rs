@@ -37,15 +37,13 @@ use crate::text::snap::{snap_border_band, snap_to_physical, LogicalRect};
 /// everywhere else in this crate -- every existing call site in `wayland::mod` hardcodes `1.0`
 /// today, and this function makes no different assumption.
 ///
-/// ponytail: no production caller yet. `socket.rs`'s `RendererClient` keys a `Scene` by the `id`
-/// a config writes (`"bar"`); `wayland::mod` keys a `wl_surface` by `SurfaceRole::label()`
-/// (`"main_bar"`, `"overlay_canvas"`, `"wallpaper_layer@{output}"`). Those two id spaces don't
-/// overlap, so there is no surface whose retained tree a lookup could find -- see `socket.rs`'s
-/// `PLACEHOLDER_OUTPUT_SIZE` doc comment for the fuller account. Any mapping between the two id
-/// spaces invented here would be policy build-steps.md Phase 20 item 4 deletes outright, once it
-/// removes `SurfaceRole` and makes the ids one space; that is this function's first real caller.
-/// Exercised by this module's own headless-EGL tests only.
-#[allow(dead_code)]
+/// `crate::wayland::App::paint_surface` is the production caller, since build-steps.md Phase 20
+/// item 4. It could not exist before: `socket.rs`'s `RendererClient` keyed a `Scene` by the `id` a
+/// config writes (`"bar"`) while `wayland::mod` keyed a `wl_surface` by a fixed Rust-owned role's
+/// label (`"main_bar"`, `"overlay_canvas"`, `"wallpaper_layer@{output}"`), and those two id spaces
+/// did not overlap at all, so there was no surface whose retained tree a lookup could find.
+/// Deleting that role enum (docs/adr/0038 decision 1) is what made them one space, and that is
+/// what took this function's `#[allow(dead_code)]` off.
 pub fn paint_tree(painter: &mut TextPainter, root: &ResolvedNode, scale: f32) {
     paint_node(painter, root, 0.0, 0.0, scale);
     painter.canvas_mut().flush();
@@ -359,6 +357,7 @@ mod tests {
 
     use crate::lua::nodes::{deserialize_lua_table, register_node_constructors};
     use crate::lua::signal;
+    use crate::layout::instance::SurfaceInstance;
     use crate::layout::scene::{LogicalSize, Scene};
     use crate::text::shaping::{ShapeRequest, ShapingHandle};
 
@@ -461,9 +460,8 @@ mod tests {
     }
 
     /// Builds a `TextPainter` against `instance`'s already-current context -- same
-    /// `font_chain_bytes` source `wayland::mod`'s own `draw_main_bar_proof_text` uses, so this
-    /// harness draws with the exact declared font chain cosmic-text shaped against
-    /// (docs/adr/0043 decision 2).
+    /// `font_chain_bytes` source `wayland::mod`'s own `paint_surface` uses, so this harness draws
+    /// with the exact declared font chain cosmic-text shaped against (docs/adr/0043 decision 2).
     fn text_painter(instance: &egl::Instance<egl::Static>, shaping: &ShapingHandle, width: u32, height: u32) -> Option<TextPainter> {
         let font_chain_bytes = shaping.font_chain_bytes();
         TextPainter::new(
@@ -487,8 +485,14 @@ mod tests {
         let surface = deserialize_lua_table(&table).unwrap();
         let shaping = ShapingHandle::spawn();
         let mut scene = Scene::new();
-        scene.apply(&[surface], size, &shaping, lua).unwrap();
-        scene.surface("bar").unwrap()
+        let instances = [SurfaceInstance {
+            instance_id: "bar@TEST".to_string(),
+            declared_id: "bar".to_string(),
+            output: "TEST".to_string(),
+            available: size,
+        }];
+        scene.apply(&[surface], &instances, &shaping, lua).unwrap();
+        scene.surface("bar@TEST").unwrap()
     }
 
     /// `#RRGGBBAA` at logical `(x, y)` from `canvas.screenshot()` -- femtovg's own `Canvas::
@@ -500,6 +504,128 @@ mod tests {
         let image = canvas.screenshot().expect("screenshot reads back the pbuffer's own framebuffer");
         let px = image[(x, y)];
         (px.r, px.g, px.b, px.a)
+    }
+
+    /// A second, self-contained EGL harness returning the pieces [`init_headless_egl`] hides, so
+    /// one context can be made current against two different draw surfaces. Only
+    /// [`one_canvas_draws_correctly_across_two_surfaces_sharing_one_context`] needs this.
+    #[allow(clippy::type_complexity)]
+    fn init_headless_egl_two_surfaces(
+        width: i32,
+        height: i32,
+    ) -> Option<(egl::Instance<egl::Static>, egl::Display, egl::Context, egl::Surface, egl::Surface)> {
+        let instance = egl::Instance::new(egl::Static);
+
+        // SAFETY: same contract as `init_headless_egl`'s own call -- `PLATFORM_SURFACELESS_MESA`
+        // needs no native display handle, and `DEFAULT_DISPLAY` (null) is its documented argument.
+        let display = match unsafe { instance.get_platform_display(PLATFORM_SURFACELESS_MESA, egl::DEFAULT_DISPLAY, &[egl::ATTRIB_NONE]) } {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("EGL init failed, skip: eglGetPlatformDisplay(SURFACELESS_MESA): {e}");
+                return None;
+            }
+        };
+        if let Err(e) = instance.initialize(display) {
+            eprintln!("EGL init failed, skip: eglInitialize: {e}");
+            return None;
+        }
+        if let Err(e) = instance.bind_api(egl::OPENGL_ES_API) {
+            eprintln!("EGL init failed, skip: eglBindAPI(OPENGL_ES_API): {e}");
+            return None;
+        }
+        let attribs = [
+            egl::SURFACE_TYPE, egl::PBUFFER_BIT,
+            egl::RENDERABLE_TYPE, egl::OPENGL_ES3_BIT,
+            egl::RED_SIZE, 8, egl::GREEN_SIZE, 8, egl::BLUE_SIZE, 8, egl::ALPHA_SIZE, 8,
+            egl::NONE,
+        ];
+        let config = match instance.choose_first_config(display, &attribs) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                eprintln!("EGL init failed, skip: no EGL config satisfies PBUFFER+GLES3+8-bit-RGBA");
+                return None;
+            }
+            Err(e) => {
+                eprintln!("EGL init failed, skip: eglChooseConfig: {e}");
+                return None;
+            }
+        };
+        let pbuffer_attribs = [egl::WIDTH, width, egl::HEIGHT, height, egl::NONE];
+        let mut surfaces = Vec::new();
+        for _ in 0..2 {
+            match instance.create_pbuffer_surface(display, config, &pbuffer_attribs) {
+                Ok(s) => surfaces.push(s),
+                Err(e) => {
+                    eprintln!("EGL init failed, skip: eglCreatePbufferSurface: {e}");
+                    return None;
+                }
+            }
+        }
+        let context_attribs = [egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE];
+        let context = match instance.create_context(display, config, None, &context_attribs) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("EGL init failed, skip: eglCreateContext: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = instance.make_current(display, Some(surfaces[0]), Some(surfaces[0]), Some(context)) {
+            eprintln!("EGL init failed, skip: eglMakeCurrent: {e}");
+            return None;
+        }
+        Some((instance, display, context, surfaces[0], surfaces[1]))
+    }
+
+    #[test]
+    fn one_canvas_draws_correctly_across_two_surfaces_sharing_one_context() {
+        // build-steps.md Phase 19 item 8 asks this to be verified rather than assumed, because
+        // `crate::wayland::App::paint_surface` rests on it: one `TextPainter` serves every layer
+        // surface, made current in turn against a shared EGL context. The EGL reasoning is that a
+        // context owns its GL objects (textures, shaders, femtovg's glyph atlas) while a surface
+        // is only the framebuffer, so switching the draw surface leaves the canvas valid and only
+        // the viewport (`Canvas::set_size`, via `TextPainter::resize`) is per surface.
+        //
+        // Proved three ways here, since the failure modes differ: the second surface must draw
+        // correctly at all (the canvas survived the switch), it must draw at *its own* size (the
+        // resize took effect), and the first surface's framebuffer must be untouched by the
+        // second's draw (they are genuinely separate framebuffers, not one canvas overwriting).
+        // If a live run ever contradicts this, one canvas per surface is the fallback.
+        let Some((instance, display, context, first, second)) = init_headless_egl_two_surfaces(64, 64) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 64, 64) else { return };
+
+        let red = resolved_surface(
+            &lua,
+            r##"return panel { id = "bar", width = 64, height = 64, child = rect { width = "Fill", height = "Fill", background = "#FF0000FF" } }"##,
+            LogicalSize { width: 64.0, height: 64.0 },
+        );
+        painter.resize(64, 64);
+        paint_tree(&mut painter, &red, 1.0);
+        assert_eq!(pixel_at(painter.canvas_mut(), 32, 32), (255, 0, 0, 255));
+
+        // The same canvas, a different draw surface, a different size.
+        instance.make_current(display, Some(second), Some(second), Some(context)).expect("switching the draw surface");
+        let green = resolved_surface(
+            &lua,
+            r##"return panel { id = "bar", width = 32, height = 32, child = rect { width = "Fill", height = "Fill", background = "#00FF00FF" } }"##,
+            LogicalSize { width: 32.0, height: 32.0 },
+        );
+        painter.resize(32, 32);
+        paint_tree(&mut painter, &green, 1.0);
+        assert_eq!(
+            pixel_at(painter.canvas_mut(), 16, 16),
+            (0, 255, 0, 255),
+            "the shared canvas must still draw correctly after eglMakeCurrent moved it to another surface"
+        );
+
+        instance.make_current(display, Some(first), Some(first), Some(context)).expect("switching back");
+        painter.resize(64, 64);
+        assert_eq!(
+            pixel_at(painter.canvas_mut(), 32, 32),
+            (255, 0, 0, 255),
+            "the first surface's own framebuffer must be untouched by what was drawn into the second"
+        );
     }
 
     #[test]

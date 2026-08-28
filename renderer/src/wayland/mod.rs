@@ -1,9 +1,10 @@
 pub mod egl;
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::c_void;
 
-use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
+use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::dispatch2::Dispatch2;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::presentation_time::{PresentTime, PresentationTimeHandler, PresentationTimeState};
@@ -27,28 +28,12 @@ use wayland_protocols::wp::text_input::zv3::client::{
 };
 use shared::{PresentationEvidence, ReadySignal, RendererFrame, SecureSubmit, SupervisorFrame, Zeroize};
 
+use crate::layout;
+use crate::layout::instance::{OutputGeometry, SurfaceInstance, expand_instances};
+use crate::layout::node::{self, LayerKind, PanelSpec, SizeMode};
 use crate::socket::RendererClient;
 use crate::text::atlas::TextPainter;
-use crate::text::shaping::{ShapeRequest, ShapingHandle};
-use crate::text::snap::LogicalRect;
-
-/// The three static surfaces from ADR-0007 / build-steps.md Phase 3, point 4.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SurfaceRole {
-    MainBar,
-    OverlayCanvas,
-    WallpaperLayer,
-}
-
-impl SurfaceRole {
-    fn label(self) -> &'static str {
-        match self {
-            SurfaceRole::MainBar => "main_bar",
-            SurfaceRole::OverlayCanvas => "overlay_canvas",
-            SurfaceRole::WallpaperLayer => "wallpaper_layer",
-        }
-    }
-}
+use crate::text::shaping::ShapingHandle;
 
 /// ponytail: no real per-`textfield` focus/attribution exists yet (see `App::bind_text_input`'s
 /// own `ponytail` comment) -- every `secure_submit` completed this way is attributed to this
@@ -71,19 +56,28 @@ struct BoundSurface {
 }
 
 /// Logs an EGL/Wayland bind-time failure in a consistent shape across `bind_and_clear`'s
-/// fallible steps.
-fn log_bind_failure(role: SurfaceRole, stage: &str, err: impl std::fmt::Display) {
-    eprintln!("[oblisk-renderer] {}: {stage} failed: {err}", role.label());
+/// fallible steps. Takes the surface id rather than a role since docs/adr/0038 deleted the roles:
+/// the id is `"{id}@{output}"`, which names the config's own surface *and* the monitor it failed
+/// on, where a role could name neither.
+fn log_bind_failure(surface_id: &str, stage: &str, err: impl std::fmt::Display) {
+    eprintln!("[oblisk-renderer] {surface_id}: {stage} failed: {err}");
 }
 
 struct TrackedSurface {
-    role: SurfaceRole,
     layer: LayerSurface,
     bound: Option<BoundSurface>,
-    /// § 15's "surface_id": `role.label()` for `main_bar`/`overlay_canvas`,
-    /// `"wallpaper_layer@{name}"` per wallpaper instance -- resolved once at creation time (see
-    /// [`create_wallpaper_layers`](App::create_wallpaper_layers)), not recomputed later.
+    /// § 15's "surface_id", and since docs/adr/0038 the *instance* id
+    /// (`layout::instance::SurfaceInstance::instance_id`): `"{id}@{output}"`, built from the
+    /// config's own `id`. This is the one id space Lua, the retained `Scene`, this `wl_surface`,
+    /// and the PBA handshake all share -- before this it was a fixed Rust-owned role's label, which
+    /// overlapped none of them, which is why `layout::paint::paint_tree` had no caller.
     surface_id: String,
+    /// The declared `anchor`, kept so [`App::apply_exclusive_zone`] can decide which axis this
+    /// surface reserves along once a `configure` says how large it actually is.
+    anchor: node::Anchor,
+    /// § 6.1's `exclusive`. The zone itself is derived at configure time, not stored: see
+    /// [`exclusive_zone_for`].
+    exclusive: bool,
     /// Set once this surface's null buffer has been committed (PBA candidate mode only, § 15.2
     /// points 2-3). Irrelevant, always `false`, outside candidate mode.
     null_buffered: bool,
@@ -207,15 +201,16 @@ pub fn run(
     };
 
     // Outputs (and the seat) arrive as a burst of registry + wl_seat/wl_output events after
-    // binding; two roundtrips is enough to have both the full initial output list (before we
-    // create one wallpaper_layer surface per monitor) and the seat `bind_text_input` needs.
+    // binding; two roundtrips is enough to have both the full initial output list (which
+    // `expand_instances` below turns a `monitor = "All"` declaration into one surface per monitor
+    // from) and the seat `bind_text_input` needs.
     event_queue.roundtrip(&mut app)?;
     event_queue.roundtrip(&mut app)?;
 
-    // `oblisk-supervisor-services-dbus.md` § 15.2's Candidate order, which on one thread is just
-    // the order of these statements: evaluate shell.lua, bind the layer-shell surfaces, commit
-    // null buffers (in `bind_and_clear`'s candidate branch), signal ready
-    // (`maybe_send_ready_signal`).
+    // `oblisk-supervisor-services-dbus.md` § 15.2's Candidate order made literal, which on one
+    // thread is just the order of these statements: evaluate shell.lua, bind the layer-shell
+    // surfaces the evaluation declared (docs/adr/0038 decision 1), commit null buffers (in
+    // `bind_and_clear`'s candidate branch), signal ready (`maybe_send_ready_signal`).
     //
     // ponytail: this runs inside the PBA ready window -- no layer surface exists until it
     // returns, so `maybe_send_ready_signal` cannot fire until after this call, and the
@@ -223,11 +218,37 @@ pub fn run(
     // `text` node's shaping blocks on `ShapingHandle::shape` until the worker's `FontSystem::new()`
     // finishes, eating into that same 2s budget. The § 15.2 ordering (evaluate before bind) is
     // required, not incidental, so this stays sequential -- not a fix, just the accepted cost.
-    app.client.run_startup_evaluation();
+    let specs = app.client.run_startup_evaluation().unwrap_or_default();
+    let outputs = app.output_geometries();
+    let instances = expand_instances(&specs, &outputs);
+    for spec in &specs {
+        if spec.topology.monitor != "All" && !outputs.iter().any(|output| output.name == spec.topology.monitor) {
+            // `expand_instances` is pure and returns nothing for a miss; the log belongs here,
+            // where the real output list is, so a config naming an unplugged monitor says so once
+            // at startup rather than silently producing no surface.
+            eprintln!(
+                "[oblisk-renderer] surface {:?} targets monitor {:?}, which is not connected; no surface created for it",
+                spec.topology.id, spec.topology.monitor
+            );
+        }
+    }
+    app.client.set_instances(instances.clone());
+    // The first resolve, and it is validation rather than anything anyone sees. § 15.2 forces
+    // evaluation before binding, so no surface has been configured yet and there is no configured
+    // size to resolve against -- each instance uses its *output's* logical size instead, which the
+    // two roundtrips above already know. Nothing paints this: a Candidate null-buffers before it
+    // draws anything, and non-candidate mode's first draw happens on first configure, which is
+    // after `set_instance_size` has replaced the size with the one the compositor chose. So a bar
+    // is briefly resolved at full screen height here and never once painted that way.
+    //
+    // Both ways this can fail -- the evaluation itself, or the apply -- already logged their own
+    // specific error and set `oblisk.rescue` inside `RendererClient`, so this line only adds the
+    // consequence a reader needs from out here.
+    if !app.client.apply_instances() {
+        eprintln!("[oblisk-renderer] no scene was applied at startup; surfaces still bind, and paint nothing until a reload or a push produces one");
+    }
 
-    app.create_main_bar(&qh);
-    app.create_overlay_canvas(&qh);
-    app.create_wallpaper_layers(&qh);
+    app.create_panels(&qh, &specs, &instances);
     app.bind_text_input(&globals, &qh);
 
     // Replaces `event_queue.blocking_dispatch(&mut app)?` (used through Phase 13): a real
@@ -281,7 +302,16 @@ pub fn run(
         // dirty flag repeatedly while draining, but `DirtyFlag::take` only reports it once, so
         // this coalesces the whole burst into a single `Scene::apply` per poll turn instead of one
         // per pushed frame -- and, per the comment above, it lands before this turn's draw.
-        app.client.re_resolve_if_dirty();
+        //
+        // A re-resolve that actually changed the retained scene is repainted immediately. This is
+        // *not* build-steps.md Phase 19 item 9's frame gating, and the two must not be confused:
+        // item 9 is `wl_surface::frame()` plus a `frame_pending` flag, so the loop blocks when
+        // nothing is happening instead of waking on the 15ms poll below. This is the other half --
+        // the one that makes a capability push actually reach the screen at all, rather than
+        // stopping at a resolved tree in memory. Item 9 still has to be built on top of it.
+        if app.client.re_resolve_if_dirty() {
+            app.repaint_bound_surfaces();
+        }
         for nonce in draw_nonces {
             app.activate_draw(nonce);
             if app.exit {
@@ -312,8 +342,9 @@ pub fn run(
 /// `preedit_string`/`commit_string`/`delete_surrounding_text`/`action` events only take effect on
 /// the next `done` (`done`'s own description: "This event replaces the current state with the
 /// pending state"). Kept separate from the real `Dispatch2` impl below so it's unit-testable
-/// without a live Wayland connection -- this file has no headless Wayland test harness (see
-/// `wallpaper_surface_id`'s doc comment for the same reasoning).
+/// without a live Wayland connection -- this file has no headless Wayland test harness, which is
+/// why the config-facing enums live in `layout` and only the pure mappings (`layer_for`,
+/// `anchor_for`, `keyboard_interactivity_for`, `exclusive_zone_for`) live here.
 #[derive(Default)]
 struct TextInputPending {
     commit: Option<String>,
@@ -364,234 +395,351 @@ fn apply_edit(buffer: &mut shared::SecureBuffer, edit: TextInputEdit) -> bool {
     edit.submit
 }
 
-/// One `wallpaper_layer` instance's surface_id: `"wallpaper_layer@{name}"` when the compositor
-/// reports a real output name, `"wallpaper_layer@output-{index}"` (a stable positional fallback)
-/// when it doesn't. Pure so it's directly unit-testable -- `wayland/mod.rs` otherwise has no
-/// test seam (Wayland-protocol-integration code with no headless test harness in this repo).
-fn wallpaper_surface_id(name: Option<&str>, index: usize) -> String {
-    match name {
-        Some(name) => format!("wallpaper_layer@{name}"),
-        None => format!("wallpaper_layer@output-{index}"),
+/// `layout`'s `LayerKind` to the protocol's own stacking level. Pure, and one of the four
+/// `wayland/mod.rs` seams that is unit-testable at all -- everything around it needs a live
+/// compositor, which is exactly why the config-facing enums live in `layout` and only the mapping
+/// lives here.
+fn layer_for(kind: LayerKind) -> Layer {
+    match kind {
+        LayerKind::Background => Layer::Background,
+        LayerKind::Bottom => Layer::Bottom,
+        LayerKind::Top => Layer::Top,
+        LayerKind::Overlay => Layer::Overlay,
+    }
+}
+
+/// § 6.1's four `anchor` edge booleans to the protocol's bitflags.
+fn anchor_for(anchor: node::Anchor) -> Anchor {
+    let mut flags = Anchor::empty();
+    flags.set(Anchor::TOP, anchor.top);
+    flags.set(Anchor::BOTTOM, anchor.bottom);
+    flags.set(Anchor::LEFT, anchor.left);
+    flags.set(Anchor::RIGHT, anchor.right);
+    flags
+}
+
+/// § 6.1's `keyboard_interactivity` to the protocol's own field. Note what this replaced: every
+/// surface used to take a hardcoded mode per Rust-owned role, so a launcher wanting `Exclusive`
+/// and an OSD wanting `None` could not coexist (docs/adr/0038's rejected-alternative list names
+/// this as the second reason the fixed role set had to go).
+fn keyboard_interactivity_for(mode: node::KeyboardInteractivity) -> KeyboardInteractivity {
+    match mode {
+        node::KeyboardInteractivity::None => KeyboardInteractivity::None,
+        node::KeyboardInteractivity::OnDemand => KeyboardInteractivity::OnDemand,
+        node::KeyboardInteractivity::Exclusive => KeyboardInteractivity::Exclusive,
+    }
+}
+
+/// One axis of `zwlr_layer_surface_v1::set_size`, resolved against that axis of the output.
+///
+/// `0` is the protocol's own "the anchors decide this axis" convention, which is what both
+/// `SizeMode::Fill` and `SizeMode::Content` mean here. `Content` reaching this is the ordinary
+/// case rather than an edge one -- it is `parse_size_mode`'s answer for an omitted `width`/
+/// `height`, and a surface has no content size at creation time anyway, since nothing has been
+/// measured and no output has been configured. A percent is the one form that needs the output,
+/// which is why this takes it.
+fn layer_extent_for(mode: SizeMode, output_extent: f32) -> u32 {
+    match mode {
+        SizeMode::Fill | SizeMode::Content => 0,
+        SizeMode::Pixels(px) => px.max(0.0) as u32,
+        SizeMode::Percent(fraction) => (output_extent * fraction).max(0.0) as u32,
+    }
+}
+
+/// The axis, if any, on which this surface's `set_size` would be a protocol error.
+///
+/// `zwlr_layer_surface_v1::set_size`: "If you pass 0 for either value, the compositor will assign
+/// it... You must set your anchor to opposite edges in the dimensions you omit; not doing so is a
+/// protocol error." A protocol error kills the whole Wayland connection, and therefore the whole
+/// shell -- so a config writing `panel { anchor = { top = true }, height = "Fill" }` would take
+/// the Renderer down with no recoverable failure and nothing on screen to say why.
+///
+/// Nothing checked this before docs/adr/0038, because every size was a Rust constant chosen to be
+/// valid. Now the config picks it, which makes this a trust boundary. The answer is to refuse the
+/// one surface with a log naming the axis, not to invent a size for it: guessing the output extent
+/// would silently give a config author a full-screen bar where they asked for an auto-sized one,
+/// and they would have no idea why.
+fn ambiguous_zero_axis(size: (u32, u32), anchor: node::Anchor) -> Option<&'static str> {
+    if size.0 == 0 && !(anchor.left && anchor.right) {
+        return Some("width");
+    }
+    if size.1 == 0 && !(anchor.top && anchor.bottom) {
+        return Some("height");
+    }
+    None
+}
+
+/// The exclusive zone for a surface the config marked `exclusive`, derived from the size the
+/// compositor actually configured rather than guessed at creation time (build-steps.md Phase 20
+/// item 4). That is the whole reason this is a configure-time computation: at `get_layer_surface`
+/// time a `"Fill"`-sized bar has no height yet, so any zone set there would be a guess the
+/// compositor then contradicts.
+///
+/// One rule, on whichever axis the anchor pins the surface to a single edge: anchored top or
+/// bottom but not both reserves its configured height; left or right but not both reserves its
+/// width. Everything else is `0`, and that covers three shapes for the same reason -- a surface
+/// anchored on all four edges, one anchored on none, and one anchored to a single *corner* all
+/// leave the edge to reserve against genuinely ambiguous, and the protocol's own exclusive-zone
+/// wording only defines the strip cases. A bar (`top`, `left`, `right`) is the common case and
+/// lands on the height branch: it is pinned vertically to one edge and spans horizontally.
+fn exclusive_zone_for(anchor: node::Anchor, configured_size: (u32, u32)) -> i32 {
+    let (width, height) = configured_size;
+    let one_vertical_edge = anchor.top != anchor.bottom;
+    let one_horizontal_edge = anchor.left != anchor.right;
+    match (one_vertical_edge, one_horizontal_edge) {
+        (true, false) => height as i32,
+        (false, true) => width as i32,
+        _ => 0,
     }
 }
 
 /// Parameters for [`App::spawn_layer`]; bundled so the helper stays under clippy's
-/// argument-count limit while still taking each of the three surfaces' divergent bits.
+/// argument-count limit while still taking each surface's divergent bits.
 struct LayerSpec<'a> {
     layer_type: Layer,
-    name: &'a str,
-    output: Option<&'a wl_output::WlOutput>,
+    /// The compositor-visible namespace (§ 6.1's `namespace`, defaulting to `"oblisk-{id}"`),
+    /// which is what a `layerrule` matches on.
+    namespace: &'a str,
+    /// Always `Some` since docs/adr/0038 decision 3: one surface is created per
+    /// `(surface, output)` pair, so the output is never the compositor's to pick.
+    output: &'a wl_output::WlOutput,
     anchor: Anchor,
     size: (u32, u32),
-    exclusive_zone: i32,
-    /// `None` for `main_bar`/`wallpaper_layer` -- neither ever hosts interactive content.
-    /// `overlay_canvas` needs `OnDemand`: `zwp_text_input_v3`'s `enter` event (and so
-    /// `bind_text_input`'s whole `secure_submit` path) never fires on a surface the
-    /// compositor won't hand keyboard focus to in the first place, confirmed live against a
-    /// real compositor (`niri msg layers` reported `Keyboard interactivity: none` on all
-    /// three before this field existed). `OnDemand`, not `Exclusive`: the shell shouldn't
-    /// steal focus from whatever's behind it just for existing -- ADR-0027's still-open
-    /// per-`textfield` focus/hit-test system is what will eventually decide *when* to ask
-    /// for it, this only makes asking possible.
+    margin: node::EdgeInsets,
     keyboard_interactivity: KeyboardInteractivity,
 }
 
 impl App {
-    /// Creates and configures (but does not commit) a layer-shell surface. The three
-    /// static surfaces share this skeleton; each call site handles its own divergent
-    /// setup (overlay's input region, wallpaper's per-output loop) before committing.
+    /// Every connected output as `layout::instance` sees it: a name to match `monitor` against and
+    /// a logical size to seed each instance's `available` with.
+    ///
+    /// `logical_size` first (`xdg_output`/`wl_output` v4's compositor-space size, which is what a
+    /// layer surface's own coordinates are in), falling back to the current `Mode`'s `dimensions`
+    /// for a compositor that reports no logical size. An output with neither is skipped with a
+    /// log rather than defaulted, since a made-up size would resolve every surface on that monitor
+    /// against a fiction.
+    ///
+    /// ponytail: a nameless output (a compositor below `wl_output` v4) takes a positional
+    /// `"output-{index}"` id, carried over from the deleted `wallpaper_surface_id`. It keeps the
+    /// shell working there, at the cost that `monitor = "DP-1"` can never match on such a
+    /// compositor -- the config has no name to write. Upgrade path: none available client-side;
+    /// the name genuinely does not exist.
+    fn output_geometries(&self) -> Vec<OutputGeometry> {
+        let mut geometries = Vec::new();
+        for (index, output) in self.output_state.outputs().enumerate() {
+            let Some(info) = self.output_state.info(&output) else {
+                eprintln!("[oblisk-renderer] output {index} advertised no info yet; no surface created on it");
+                continue;
+            };
+            let dimensions = info
+                .logical_size
+                .or_else(|| info.modes.iter().find(|mode| mode.current).map(|mode| mode.dimensions));
+            let Some((width, height)) = dimensions else {
+                eprintln!(
+                    "[oblisk-renderer] output {:?} reports neither a logical size nor a current mode; no surface created on it",
+                    info.name.as_deref().unwrap_or("<unnamed>")
+                );
+                continue;
+            };
+            geometries.push(OutputGeometry {
+                name: info.name.clone().unwrap_or_else(|| format!("output-{index}")),
+                size: layout::LogicalSize { width: width as f32, height: height as f32 },
+            });
+        }
+        geometries
+    }
+
+    /// Creates and configures (but does not commit) a layer-shell surface.
     fn spawn_layer(&mut self, qh: &QueueHandle<App>, spec: LayerSpec) -> LayerSurface {
         let surface = self.compositor_state.create_surface(qh);
         let layer = self.layer_shell.create_layer_surface(
             qh,
             surface,
             spec.layer_type,
-            Some(spec.name),
-            spec.output,
+            Some(spec.namespace),
+            Some(spec.output),
         );
         layer.set_anchor(spec.anchor);
         layer.set_size(spec.size.0, spec.size.1);
-        layer.set_exclusive_zone(spec.exclusive_zone);
         layer.set_keyboard_interactivity(spec.keyboard_interactivity);
+        layer.set_margin(
+            spec.margin.top as i32,
+            spec.margin.right as i32,
+            spec.margin.bottom as i32,
+            spec.margin.left as i32,
+        );
+        // No `set_exclusive_zone` here: it is derived from the size the compositor picks, at
+        // configure time -- see `exclusive_zone_for`.
         layer
     }
 
-    fn create_main_bar(&mut self, qh: &QueueHandle<App>) {
-        let layer = self.spawn_layer(
-            qh,
-            LayerSpec {
-                layer_type: Layer::Top,
-                name: "oblisk-main-bar",
-                output: None,
-                anchor: Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
-                size: (0, 32),
-                exclusive_zone: 32,
-                keyboard_interactivity: KeyboardInteractivity::None,
-            },
-        );
-        layer.commit();
+    /// One `zwlr_layer_surface_v1` per surface instance, built from the evaluation that declared
+    /// it (docs/adr/0038 decision 1, build-steps.md Phase 20 items 1 and 2). This replaced
+    /// `create_main_bar`/`create_overlay_canvas`/`create_wallpaper_layers`, which ran *before* any
+    /// Lua had been evaluated and discarded every field the config wrote.
+    ///
+    /// `instances` and `specs` come from the same evaluation, so an instance whose declared id has
+    /// no spec cannot happen; it is skipped with a log rather than panicking, on the same
+    /// "keep the shell up" principle as every other failure in this file.
+    fn create_panels(&mut self, qh: &QueueHandle<App>, specs: &[PanelSpec], instances: &[SurfaceInstance]) {
+        // ponytail: a fixed output snapshot, taken once at startup (see `run`). Monitor hotplug
+        // therefore adds no instance and removes none, so a monitor plugged in after boot gets no
+        // surface and an unplugged one's surface is never torn down. docs/adr/0038 decision 3 says
+        // this must happen in place with no generation swap; build-steps.md Phase 20 item 6
+        // (`oblisk.screens`, docs/adr/0041) is where the trigger lands, because that is what makes
+        // the output list a reactive Lua signal and re-enters the existing reload path. Until then
+        // `OutputHandler::new_output`/`output_destroyed` stay empty on purpose.
+        let outputs: HashMap<String, wl_output::WlOutput> = self
+            .output_state
+            .outputs()
+            .enumerate()
+            .filter_map(|(index, output)| {
+                let info = self.output_state.info(&output)?;
+                Some((info.name.clone().unwrap_or_else(|| format!("output-{index}")), output))
+            })
+            .collect();
 
-        self.surfaces.push(TrackedSurface {
-            role: SurfaceRole::MainBar,
-            layer,
-            bound: None,
-            surface_id: SurfaceRole::MainBar.label().to_string(),
-            null_buffered: false,
-            configured_size: (0, 0),
-        });
-    }
-
-    fn create_overlay_canvas(&mut self, qh: &QueueHandle<App>) {
-        let layer = self.spawn_layer(
-            qh,
-            LayerSpec {
-                layer_type: Layer::Overlay,
-                name: "oblisk-overlay-canvas",
-                output: None,
-                anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
-                size: (0, 0),
-                exclusive_zone: 0,
-                keyboard_interactivity: KeyboardInteractivity::OnDemand,
-            },
-        );
-
-        // build-steps.md Phase 3, point 4: commit an empty input region on boot so
-        // clicks pass through to windows below until a Lua-authored overlay child
-        // claims a bounding box (later phase). The region is destroyed immediately
-        // after the request; wl_surface.set_input_region copies its contents.
-        // overlay_canvas's entire purpose is this click-through guarantee, so a
-        // failure here is as fatal as an EGL bind failure, not a silent no-op.
-        match Region::new(&self.compositor_state) {
-            Ok(region) => layer.set_input_region(Some(region.wl_region())),
-            Err(e) => {
-                log_bind_failure(SurfaceRole::OverlayCanvas, "wl_compositor::create_region", e);
-                self.exit = true;
-                return;
+        for instance in instances {
+            let Some(spec) = specs.iter().find(|spec| spec.topology.id == instance.declared_id) else {
+                eprintln!("[oblisk-renderer] instance {:?} has no matching declaration; skipping", instance.instance_id);
+                continue;
+            };
+            let Some(output) = outputs.get(&instance.output) else {
+                eprintln!("[oblisk-renderer] instance {:?} names an output that has since gone; skipping", instance.instance_id);
+                continue;
+            };
+            let size = (
+                layer_extent_for(spec.width, instance.available.width),
+                layer_extent_for(spec.height, instance.available.height),
+            );
+            if let Some(axis) = ambiguous_zero_axis(size, spec.topology.anchor) {
+                eprintln!(
+                    "[oblisk-renderer] surface {:?} leaves its {axis} to the compositor without anchoring both {axis} edges, \
+                     which layer-shell rejects as a protocol error; no surface created. Give it an explicit {axis}, or anchor both edges.",
+                    instance.instance_id
+                );
+                continue;
             }
-        }
-
-        layer.commit();
-
-        self.surfaces.push(TrackedSurface {
-            role: SurfaceRole::OverlayCanvas,
-            layer,
-            bound: None,
-            surface_id: SurfaceRole::OverlayCanvas.label().to_string(),
-            null_buffered: false,
-            configured_size: (0, 0),
-        });
-    }
-
-    fn create_wallpaper_layers(&mut self, qh: &QueueHandle<App>) {
-        // ponytail: fixed two-roundtrip output snapshot (see run()), no dynamic
-        // add/remove -- an output that appears after boot never gets a wallpaper_layer,
-        // and a removed output's surface is never torn down. Upgrade path: wire
-        // OutputHandler::new_output/output_destroyed to spawn/despawn wallpaper_layer
-        // surfaces as outputs come and go instead of enumerating once here.
-        for (index, output) in self.output_state.outputs().collect::<Vec<_>>().into_iter().enumerate() {
-            let name = self.output_state.info(&output).and_then(|info| info.name);
-            let surface_id = wallpaper_surface_id(name.as_deref(), index);
             let layer = self.spawn_layer(
                 qh,
                 LayerSpec {
-                    layer_type: Layer::Background,
-                    name: "oblisk-wallpaper",
-                    output: Some(&output),
-                    anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
-                    size: (0, 0),
-                    exclusive_zone: 0,
-                    keyboard_interactivity: KeyboardInteractivity::None,
+                    layer_type: layer_for(spec.topology.layer),
+                    namespace: &spec.topology.namespace,
+                    output,
+                    anchor: anchor_for(spec.topology.anchor),
+                    size,
+                    margin: spec.margin,
+                    keyboard_interactivity: keyboard_interactivity_for(spec.keyboard_interactivity),
                 },
             );
             layer.commit();
 
             self.surfaces.push(TrackedSurface {
-                role: SurfaceRole::WallpaperLayer,
                 layer,
                 bound: None,
-                surface_id,
+                surface_id: instance.instance_id.clone(),
+                anchor: spec.topology.anchor,
+                exclusive: spec.exclusive,
                 null_buffered: false,
                 configured_size: (0, 0),
             });
         }
     }
 
-    /// First configure for a surface: bind its wl_egl_window to a real EGL window
-    /// surface against the shared context, make it current, and prove the pipeline
-    /// is live with one clear + swap. No draw loop -- that's Phase 4.
+    /// One `configure`: record the size the compositor chose, tell the retained scene about it,
+    /// derive the exclusive zone from it, bind EGL if this surface has not been bound yet, and
+    /// paint.
     ///
     /// PBA candidate mode (`self.is_pba_candidate`, build-steps.md Phase 14, § 15.2 points 2-3)
-    /// branches here instead: a first configure commits a null buffer directly on the raw
-    /// `wl_surface` rather than binding EGL at all -- the Candidate stays invisible, occupying
-    /// zero on-screen coordinates, until [`App::activate_draw`] does the real EGL bind later.
-    /// Non-candidate mode (today's existing behavior) is entirely unaffected by this branch.
+    /// stops after the null buffer instead: a first configure commits a null buffer directly on
+    /// the raw `wl_surface` rather than binding EGL at all -- the Candidate stays invisible,
+    /// occupying zero on-screen coordinates, until [`App::activate_draw`] does the real EGL bind
+    /// later.
     fn bind_and_clear(&mut self, layer: &LayerSurface, width: u32, height: u32) {
-        let Some(tracked) = self.surfaces.iter_mut().find(|s| &s.layer == layer) else {
+        let Some(index) = self.surfaces.iter().position(|s| &s.layer == layer) else {
             return;
         };
 
+        self.surfaces[index].configured_size = (width, height);
+        // Only here does a real size for this instance exist (build-steps.md Phase 20 item 4,
+        // closing docs/adr/0023 item 6): the startup resolve used the whole output's size, and
+        // this replaces it with what the compositor actually granted, marking the scene dirty so
+        // the next poll turn re-resolves against it.
+        //
+        // So the `paint_surface` at the bottom of this function draws the *previous* resolve, and
+        // `run`'s loop repaints with the corrected one on the very next turn -- `dispatch_pending`
+        // and `re_resolve_if_dirty` are two statements apart, so that is sub-frame, not a visible
+        // lag. Re-resolving here instead would run one whole `Scene::apply` per configure in a
+        // startup burst rather than one for the burst, which is the coalescing ADR-0044 decision 2
+        // built the flag for.
+        self.client.set_instance_size(
+            &self.surfaces[index].surface_id,
+            layout::LogicalSize { width: width as f32, height: height as f32 },
+        );
+        self.apply_exclusive_zone(index);
+
         if self.is_pba_candidate {
-            tracked.configured_size = (width, height);
-            if !tracked.null_buffered {
+            if !self.surfaces[index].null_buffered {
                 // verified against wayland_client::protocol::wl_surface::WlSurface's generated
                 // API: `attach(&self, buffer: Option<&wl_buffer::WlBuffer>, x: i32, y: i32)`,
                 // `commit(&self)`.
-                tracked.layer.wl_surface().attach(None, 0, 0);
-                tracked.layer.wl_surface().commit();
-                tracked.null_buffered = true;
+                self.surfaces[index].layer.wl_surface().attach(None, 0, 0);
+                self.surfaces[index].layer.wl_surface().commit();
+                self.surfaces[index].null_buffered = true;
             }
             self.maybe_send_ready_signal();
             return;
         }
 
+        if !self.ensure_bound(index) {
+            return;
+        }
+        // A repeat configure carrying a new size (a mode change, an exclusive zone shifting a
+        // neighbour) has to move the `wl_egl_window` too, or the surface keeps rendering into a
+        // buffer sized at its first configure while the canvas draws at the new one. This is
+        // `wayland-egl`'s own resize request, not a rebind: the `WlEglSurface` and the EGL surface
+        // built from it both stay valid. It went unnoticed before docs/adr/0038 only because the
+        // one surface that drew anything drew a fixed proof string; the resized frame is real
+        // content now.
+        if let Some(bound) = self.surfaces[index].bound.as_ref() {
+            bound.native_window.resize(width.max(1) as i32, height.max(1) as i32, 0, 0);
+        }
+        self.paint_surface(index);
+    }
+
+    /// `set_exclusive_zone` for a surface the config marked `exclusive`, computed from the size
+    /// the compositor just configured (see [`exclusive_zone_for`]) and committed so the
+    /// compositor acts on it. A non-exclusive surface is left alone entirely: the protocol's
+    /// default zone is already 0, so setting it would be a no-op request per configure.
+    fn apply_exclusive_zone(&mut self, index: usize) {
+        let tracked = &self.surfaces[index];
+        if !tracked.exclusive {
+            return;
+        }
+        let zone = exclusive_zone_for(tracked.anchor, tracked.configured_size);
+        tracked.layer.set_exclusive_zone(zone);
+        tracked.layer.commit();
+    }
+
+    /// Creates this surface's `wl_egl_window` and EGL window surface against the shared context if
+    /// it has none yet, and initializes the process-wide `glow` context on the first one. Returns
+    /// whether the surface is bound afterwards; a failure is fatal (`self.exit`), exactly as it
+    /// was before this was factored out of `bind_and_clear`.
+    fn ensure_bound(&mut self, index: usize) -> bool {
+        if self.surfaces[index].bound.is_some() {
+            return true;
+        }
+        let surface_id = self.surfaces[index].surface_id.clone();
+        let (width, height) = self.surfaces[index].configured_size;
         let width = width.max(1) as i32;
         let height = height.max(1) as i32;
 
-        if let Some(egl_surface) = tracked.bound.as_ref().map(|b| b.egl_surface) {
-            // Repeat configure (e.g. a resize) on an already-bound surface. The
-            // wl_egl_window/EGL surface were created once and don't need recreating,
-            // but only main_bar has per-frame state (the FemtoVG canvas) that must
-            // track the new size -- the other two surfaces have nothing left to do.
-            if tracked.role != SurfaceRole::MainBar {
-                return;
-            }
-            let role = tracked.role;
-
-            // Another surface's own bind_and_clear may have made a different EGL
-            // surface current on this thread since main_bar's last draw -- the
-            // context is shared across all three surfaces, so it must be
-            // re-established here rather than assumed still current.
-            if let Err(e) = self.egl.instance.make_current(
-                self.egl.display,
-                Some(egl_surface),
-                Some(egl_surface),
-                Some(self.egl.context),
-            ) {
-                log_bind_failure(role, "eglMakeCurrent", e);
-                self.exit = true;
-                return;
-            }
-
-            if !draw_main_bar_proof_text(&self.shaping, &self.egl, &mut self.text_painter, width, height) {
-                self.exit = true;
-                return;
-            }
-
-            if let Err(e) = self.egl.instance.swap_buffers(self.egl.display, egl_surface) {
-                log_bind_failure(role, "eglSwapBuffers", e);
-                self.exit = true;
-                return;
-            }
-
-            return;
-        }
-
-        let native_window = match WlEglSurface::new(layer.wl_surface().id(), width, height) {
+        let native_window = match WlEglSurface::new(self.surfaces[index].layer.wl_surface().id(), width, height) {
             Ok(w) => w,
             Err(e) => {
-                log_bind_failure(tracked.role, "WlEglSurface::new", e);
+                log_bind_failure(&surface_id, "WlEglSurface::new", e);
                 self.exit = true;
-                return;
+                return false;
             }
         };
 
@@ -609,9 +757,9 @@ impl App {
         let egl_surface = match egl_surface {
             Ok(s) => s,
             Err(e) => {
-                log_bind_failure(tracked.role, "eglCreateWindowSurface", e);
+                log_bind_failure(&surface_id, "eglCreateWindowSurface", e);
                 self.exit = true;
-                return;
+                return false;
             }
         };
 
@@ -621,16 +769,16 @@ impl App {
             Some(egl_surface),
             Some(self.egl.context),
         ) {
-            log_bind_failure(tracked.role, "eglMakeCurrent", e);
+            log_bind_failure(&surface_id, "eglMakeCurrent", e);
             self.exit = true;
-            return;
+            return false;
         }
 
         // SAFETY: `glow::Context::from_loader_function`'s contract is that a GL context is
         // current on this thread for the lifetime of the returned `Context` -- guaranteed here
         // by the `eglMakeCurrent` call directly above, on this same single-threaded dispatch
         // loop, with no other context switch between the two.
-        let gl = self.gl.get_or_insert_with(|| unsafe {
+        self.gl.get_or_insert_with(|| unsafe {
             glow::Context::from_loader_function(|s| {
                 self.egl
                     .instance
@@ -639,48 +787,113 @@ impl App {
             })
         });
 
-        // SAFETY: every `glow::HasContext` method call requires a current GL context matching
-        // `gl`'s own loader -- the `eglMakeCurrent` above is that context, and it's the only one
-        // live on this thread.
-        unsafe {
-            use glow::HasContext;
-            gl.clear_color(0.0, 0.0, 0.0, 0.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-        }
+        eprintln!("[oblisk-renderer] {surface_id} up: {width}x{height}, EGL context current");
+        self.surfaces[index].bound = Some(BoundSurface { egl_surface, native_window });
+        true
+    }
 
-        // Phase 4 integration proof, main_bar only: shape+draw one static string to
-        // prove the cosmic-text/FemtoVG pipeline is live end to end. No draw loop or
-        // Lua-driven content -- that's a future scene-graph phase.
-        if tracked.role == SurfaceRole::MainBar {
-            // Free function, not a `&mut self` method: `tracked` is still borrowed from
-            // `self.surfaces` here, so this takes the three disjoint fields it actually
-            // needs directly, rather than the whole `self` a method call would require.
-            // Safe to build/use a FemtoVG `Canvas` here: dispatch is single-threaded, the
-            // `eglMakeCurrent` a few lines above is the only context switch on this
-            // thread, and this branch only ever runs for `main_bar`, so the context
-            // that's current at this point is always the one `text_painter` was built
-            // against -- no other surface's `bind_and_clear` can interleave here.
-            if !draw_main_bar_proof_text(&self.shaping, &self.egl, &mut self.text_painter, width, height) {
-                self.exit = true;
-                return;
-            }
-        }
+    /// Draws one bound surface's whole retained tree (build-steps.md Phase 19 items 6 and 8):
+    /// make its EGL surface current, resize the shared canvas to it, clear, walk the resolved tree
+    /// with [`layout::paint::paint_tree`], and swap.
+    ///
+    /// **One `TextPainter` serves every surface**, and that is the item 8 claim this is the first
+    /// production code to rest on. All surfaces share one EGL context; under EGL a context owns
+    /// its GL objects while a surface is only the framebuffer being drawn into, so
+    /// `eglMakeCurrent` with a different draw surface leaves the canvas's textures, shaders and
+    /// glyph atlas valid. What genuinely is per surface is the canvas's *viewport*, which is what
+    /// `TextPainter::resize` (and so `Canvas::set_size`) sets on every call here. If a live run
+    /// ever shows otherwise, one canvas per surface is the fallback, not a redesign.
+    ///
+    /// A surface whose instance has no resolved tree (an evaluation that failed to apply, or an
+    /// instance the scene has not resolved yet) is cleared and swapped, not skipped: the buffer
+    /// still has to be attached or the compositor keeps showing the last frame.
+    ///
+    /// ponytail: the paint scale is hardcoded `1.0`. Nothing calls `wl_surface::set_buffer_scale`
+    /// and the `wl_egl_window` is sized in the logical pixels `configure` reports, so on a HiDPI
+    /// output the whole shell renders at scale 1 and the compositor upscales it. The upgrade path
+    /// is all three together -- `set_buffer_scale`, a `WlEglSurface::resize` to the scaled
+    /// physical size, and this argument -- since passing a scale here alone would snap geometry to
+    /// a physical grid the framebuffer does not have.
+    fn paint_surface(&mut self, index: usize) {
+        let Some(egl_surface) = self.surfaces[index].bound.as_ref().map(|b| b.egl_surface) else {
+            return;
+        };
+        let surface_id = self.surfaces[index].surface_id.clone();
+        let (width, height) = self.surfaces[index].configured_size;
+        let (width, height) = (width.max(1), height.max(1));
 
-        if let Err(e) = self.egl.instance.swap_buffers(self.egl.display, egl_surface) {
-            log_bind_failure(tracked.role, "eglSwapBuffers", e);
+        // Another surface's own paint may have made a different EGL surface current on this
+        // thread since this one last drew -- the context is shared across every surface, so it is
+        // re-established here rather than assumed still current.
+        if let Err(e) = self.egl.instance.make_current(
+            self.egl.display,
+            Some(egl_surface),
+            Some(egl_surface),
+            Some(self.egl.context),
+        ) {
+            log_bind_failure(&surface_id, "eglMakeCurrent", e);
             self.exit = true;
             return;
         }
 
-        eprintln!(
-            "[oblisk-renderer] {} up: {width}x{height}, EGL context current, buffer cleared+swapped",
-            tracked.role.label()
-        );
+        // SAFETY: every `glow::HasContext` method call requires a current GL context matching
+        // `gl`'s own loader -- the `eglMakeCurrent` above is that context, and it's the only one
+        // live on this thread.
+        if let Some(gl) = self.gl.as_ref() {
+            unsafe {
+                use glow::HasContext;
+                gl.clear_color(0.0, 0.0, 0.0, 0.0);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+        }
 
-        tracked.bound = Some(BoundSurface {
-            egl_surface,
-            native_window,
-        });
+        if self.text_painter.is_none() {
+            let font_chain_bytes = self.shaping.font_chain_bytes();
+            match TextPainter::new(
+                |s| self.egl.instance.get_proc_address(s).map_or(std::ptr::null(), |f| f as *const c_void),
+                width,
+                height,
+                &font_chain_bytes,
+            ) {
+                Ok(painter) => self.text_painter = Some(painter),
+                Err(e) => {
+                    log_bind_failure(&surface_id, "FemtoVG init", e);
+                    self.exit = true;
+                    return;
+                }
+            }
+        }
+
+        // Owned (`Scene::surface` clones into a `ResolvedNode`), so the immutable borrow of
+        // `self.client` ends before `self.text_painter` is borrowed mutably below.
+        let tree = self.client.scene().surface(&surface_id);
+        if let Some(painter) = self.text_painter.as_mut() {
+            painter.resize(width, height);
+            if let Some(tree) = tree.as_ref() {
+                layout::paint::paint_tree(painter, tree, 1.0);
+            }
+        }
+
+        if let Err(e) = self.egl.instance.swap_buffers(self.egl.display, egl_surface) {
+            log_bind_failure(&surface_id, "eglSwapBuffers", e);
+            self.exit = true;
+        }
+    }
+
+    /// Repaints every surface that has been bound, after a re-resolve actually changed the scene.
+    /// Every surface, not the changed ones: ADR-0044 decision 2's dirty flag is one flag for the
+    /// whole scene, so which surfaces changed is not information this process has (that flag's own
+    /// `ponytail:` records the same ceiling).
+    fn repaint_bound_surfaces(&mut self) {
+        for index in 0..self.surfaces.len() {
+            if self.surfaces[index].bound.is_none() {
+                continue;
+            }
+            self.paint_surface(index);
+            if self.exit {
+                return;
+            }
+        }
     }
 
     /// § 15.2 points 2-3: once every tracked surface has committed its null buffer, computes
@@ -723,74 +936,19 @@ impl App {
         self.is_pba_candidate = false;
     }
 
-    /// One tracked surface's `ActivateDraw` response: the same EGL-bind-and-clear (main_bar
-    /// also draws the proof text) `bind_and_clear`'s non-candidate first-configure path does,
-    /// plus a `wp_presentation_feedback` request placed immediately before `swap_buffers` so it
-    /// associates with the commit `swap_buffers` performs. Indexes into `self.surfaces` rather
-    /// than holding a `&mut TrackedSurface` across the whole body -- this needs `&mut self` for
-    /// EGL/GL state and `self.text_painter` at several points, which a held borrow of one
-    /// surface would conflict with (same reasoning `draw_main_bar_proof_text` already documents
-    /// for the analogous first-configure path).
+    /// One tracked surface's `ActivateDraw` response: the same EGL bind
+    /// [`App::bind_and_clear`]'s non-candidate path does, plus a `wp_presentation_feedback`
+    /// request placed before the paint so it associates with the commit `swap_buffers` performs.
+    /// Indexes into `self.surfaces` rather than holding a `&mut TrackedSurface` across the whole
+    /// body -- this needs `&mut self` for EGL/GL state and `self.text_painter` at several points,
+    /// which a held borrow of one surface would conflict with.
     fn activate_draw_one(&mut self, index: usize, nonce: u64) {
-        let role = self.surfaces[index].role;
-        let (width, height) = self.surfaces[index].configured_size;
-        let width = width.max(1) as i32;
-        let height = height.max(1) as i32;
-
-        let native_window = match WlEglSurface::new(self.surfaces[index].layer.wl_surface().id(), width, height) {
-            Ok(w) => w,
-            Err(e) => {
-                log_bind_failure(role, "WlEglSurface::new", e);
-                self.exit = true;
-                return;
-            }
-        };
-
-        // SAFETY: `native_window.ptr()` is a live `wl_egl_window*` just constructed above by
-        // `WlEglSurface::new`, matching `self.egl.display`/`self.egl.config`'s own platform --
-        // exactly the handle `eglCreateWindowSurface` requires.
-        let egl_surface = unsafe {
-            self.egl.instance.create_window_surface(self.egl.display, self.egl.config, native_window.ptr() as *mut c_void, None)
-        };
-        let egl_surface = match egl_surface {
-            Ok(s) => s,
-            Err(e) => {
-                log_bind_failure(role, "eglCreateWindowSurface", e);
-                self.exit = true;
-                return;
-            }
-        };
-
-        if let Err(e) = self.egl.instance.make_current(self.egl.display, Some(egl_surface), Some(egl_surface), Some(self.egl.context)) {
-            log_bind_failure(role, "eglMakeCurrent", e);
-            self.exit = true;
+        if !self.ensure_bound(index) {
             return;
         }
 
-        // SAFETY: `glow::Context::from_loader_function`'s contract is that a GL context is
-        // current on this thread for the lifetime of the returned `Context` -- guaranteed here
-        // by the `eglMakeCurrent` call directly above, on this same single-threaded dispatch
-        // loop, with no other context switch between the two.
-        let gl = self.gl.get_or_insert_with(|| unsafe {
-            glow::Context::from_loader_function(|s| self.egl.instance.get_proc_address(s).map_or(std::ptr::null(), |f| f as *const c_void))
-        });
-
-        // SAFETY: every `glow::HasContext` method call requires a current GL context matching
-        // `gl`'s own loader -- the `eglMakeCurrent` above is that context, and it's the only one
-        // live on this thread.
-        unsafe {
-            use glow::HasContext;
-            gl.clear_color(0.0, 0.0, 0.0, 0.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-        }
-
-        if role == SurfaceRole::MainBar && !draw_main_bar_proof_text(&self.shaping, &self.egl, &mut self.text_painter, width, height) {
-            self.exit = true;
-            return;
-        }
-
-        // § 15.3 point 2: request presentation feedback before swap_buffers, so the request
-        // associates with the commit swap_buffers performs -- confirmed against
+        // § 15.3 point 2: request presentation feedback before the commit `paint_surface`'s
+        // `swap_buffers` performs, so the request associates with it -- confirmed against
         // `wayland-client-0.31.15`'s own client examples' placement convention; verify with
         // `WAYLAND_DEBUG=1` during a manual smoke test that `feedback` appears on the wire
         // before the corresponding `commit`.
@@ -798,21 +956,19 @@ impl App {
             // Not fatal to the whole candidate -- the Supervisor's evidence_timeout is what
             // catches a surface that never presents (docs/adr/0025 item 6); don't invent a
             // second failure-reporting path here.
-            log_bind_failure(role, "wp_presentation::feedback", e);
+            log_bind_failure(&self.surfaces[index].surface_id.clone(), "wp_presentation::feedback", e);
         }
 
-        if let Err(e) = self.egl.instance.swap_buffers(self.egl.display, egl_surface) {
-            log_bind_failure(role, "eglSwapBuffers", e);
-            self.exit = true;
+        self.paint_surface(index);
+        if self.exit {
             return;
         }
 
+        let (width, height) = self.surfaces[index].configured_size;
         eprintln!(
             "[oblisk-renderer] {} activated: {width}x{height}, presentation feedback requested (nonce={nonce})",
-            self.surfaces[index].role.label()
+            self.surfaces[index].surface_id
         );
-
-        self.surfaces[index].bound = Some(BoundSurface { egl_surface, native_window });
     }
 
     /// Binds `zwp_text_input_manager_v3`, creates one `zwp_text_input_v3` for this seat, and
@@ -852,7 +1008,7 @@ impl App {
         let manager = match globals.bind::<ZwpTextInputManagerV3, App, TextInputManagerData>(qh, 1..=2, TextInputManagerData) {
             Ok(manager) => manager,
             Err(e) => {
-                log_bind_failure(SurfaceRole::OverlayCanvas, "zwp_text_input_manager_v3::bind", e);
+                log_bind_failure("<text-input>", "zwp_text_input_manager_v3::bind", e);
                 return;
             }
         };
@@ -921,8 +1077,7 @@ impl App {
 /// immediately after its wire write (`crate::socket`'s `pump`); that is as close to the write as
 /// this side of the channel can get, and it is where the pre-ADR-0039 code did it too.
 ///
-/// A free function, not a `&mut self` method, for the same reason `wallpaper_surface_id` and
-/// `apply_edit` are: it makes the whole read/zeroize contract directly unit-testable, which
+/// A free function, not a `&mut self` method, for the same reason `apply_edit` is: it makes the whole read/zeroize contract directly unit-testable, which
 /// nothing involving a live `wl_surface` is.
 fn secure_submit_frame(generation_id: u32, capability: &str, action: &str, buffer: &mut shared::SecureBuffer) -> RendererFrame {
     let frame = RendererFrame::SecureSubmit(SecureSubmit {
@@ -1051,74 +1206,6 @@ impl App {
     }
 }
 
-/// Phase 4 integration proof: shape a static string off-thread via cosmic-text, then
-/// rasterize+draw it with FemtoVG, snapping its box to physical pixels. A free
-/// function taking each field it needs directly (see the one call site in
-/// `bind_and_clear`) rather than a `&mut self` method, so it doesn't need the whole
-/// `App` borrowed while a `TrackedSurface` from `self.surfaces` is still live there.
-/// Returns `false` on a FemtoVG init failure, so the caller can treat it exactly like
-/// every other EGL/GL bind failure in this file (fatal, not logged-and-ignored).
-fn draw_main_bar_proof_text(
-    shaping: &ShapingHandle,
-    egl: &egl::EglState,
-    text_painter: &mut Option<TextPainter>,
-    width: i32,
-    height: i32,
-) -> bool {
-    const PROOF_TEXT: &str = "Oblisk";
-    const FONT_SIZE: f32 = 14.0;
-
-    let shaped = shaping.shape(ShapeRequest {
-        text: PROOF_TEXT.into(),
-        font_size: FONT_SIZE,
-        line_height: FONT_SIZE * 1.2,
-        max_width: None,
-    });
-
-    if text_painter.is_none() {
-        let font_chain_bytes = shaping.font_chain_bytes();
-        let painter = TextPainter::new(
-            |s| egl.instance.get_proc_address(s).map_or(std::ptr::null(), |f| f as *const c_void),
-            width as u32,
-            height as u32,
-            &font_chain_bytes,
-        );
-        match painter {
-            Ok(p) => *text_painter = Some(p),
-            Err(e) => {
-                log_bind_failure(SurfaceRole::MainBar, "FemtoVG init", e);
-                return false;
-            }
-        }
-    }
-
-    if let Some(painter) = text_painter.as_mut() {
-        // The surface can resize after the painter was first built; refresh the
-        // canvas's viewport every frame rather than trusting the size from init.
-        painter.resize(width as u32, height as u32);
-        painter.draw_line(
-            PROOF_TEXT,
-            LogicalRect { x: 8.0, y: 0.0, width: shaped.width, height: shaped.height },
-            FONT_SIZE,
-            1.0,
-            // White: the exact color `draw_line` used to hardcode internally, unchanged now that
-            // it takes one -- this proof-of-wiring call has no `layout::node` property to read a
-            // real `foreground` from.
-            crate::layout::node::Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
-        );
-        // `draw_line` no longer flushes for itself (build-steps.md Phase 19 item 6): a real tree
-        // walk flushes once for a whole surface's worth of nodes, and this lone proof-of-wiring
-        // call is its own whole walk, so it flushes right here instead.
-        painter.canvas_mut().flush();
-        eprintln!(
-            "[oblisk-renderer] main_bar: shaped \"{PROOF_TEXT}\" to {}x{} (logical), drew+flushed via FemtoVG",
-            shaped.width, shaped.height
-        );
-    }
-
-    true
-}
-
 impl CompositorHandler for App {
     fn scale_factor_changed(
         &mut self,
@@ -1171,6 +1258,15 @@ impl OutputHandler for App {
         &mut self.output_state
     }
 
+    // ponytail: all three stay empty, so monitor hotplug adds and removes no surface instance --
+    // a monitor plugged in after boot gets no surface, and an unplugged one's surface is never
+    // torn down. docs/adr/0038 decision 3 is explicit that this must happen *in place*, with no
+    // generation swap, since plugging in a monitor is not a config edit and the set of declared
+    // surfaces does not change. The trigger for it is build-steps.md Phase 20 item 6
+    // (`oblisk.screens`, docs/adr/0041): exposing the output list to Lua as a reactive signal is
+    // what makes an output change re-enter the existing reload path (re-evaluate, diff topology,
+    // report to the Supervisor) rather than needing a second reload mechanism invented here. So
+    // these are left empty deliberately, not forgotten.
     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
@@ -1210,15 +1306,81 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wallpaper_surface_id_uses_the_real_output_name_when_present() {
-        assert_eq!(wallpaper_surface_id(Some("DP-1"), 0), "wallpaper_layer@DP-1");
-        assert_eq!(wallpaper_surface_id(Some("eDP-1"), 3), "wallpaper_layer@eDP-1");
+    fn every_layer_kind_maps_to_its_protocol_level() {
+        assert_eq!(layer_for(LayerKind::Background), Layer::Background);
+        assert_eq!(layer_for(LayerKind::Bottom), Layer::Bottom);
+        assert_eq!(layer_for(LayerKind::Top), Layer::Top);
+        assert_eq!(layer_for(LayerKind::Overlay), Layer::Overlay);
     }
 
     #[test]
-    fn wallpaper_surface_id_falls_back_to_a_stable_index_when_name_is_none() {
-        assert_eq!(wallpaper_surface_id(None, 0), "wallpaper_layer@output-0");
-        assert_eq!(wallpaper_surface_id(None, 2), "wallpaper_layer@output-2");
+    fn anchor_booleans_map_to_the_matching_bitflags() {
+        assert_eq!(anchor_for(node::Anchor::default()), Anchor::empty());
+        assert_eq!(
+            anchor_for(node::Anchor { top: true, right: true, bottom: false, left: true }),
+            Anchor::TOP | Anchor::RIGHT | Anchor::LEFT,
+            "the ordinary bar shape: pinned to the top, spanning both sides"
+        );
+        assert_eq!(
+            anchor_for(node::Anchor { top: true, right: true, bottom: true, left: true }),
+            Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT
+        );
+    }
+
+    #[test]
+    fn every_keyboard_interactivity_maps_to_its_protocol_mode() {
+        assert_eq!(keyboard_interactivity_for(node::KeyboardInteractivity::None), KeyboardInteractivity::None);
+        assert_eq!(keyboard_interactivity_for(node::KeyboardInteractivity::OnDemand), KeyboardInteractivity::OnDemand);
+        assert_eq!(keyboard_interactivity_for(node::KeyboardInteractivity::Exclusive), KeyboardInteractivity::Exclusive);
+    }
+
+    #[test]
+    fn layer_extent_maps_fill_and_content_to_the_protocols_zero_and_resolves_a_percent() {
+        assert_eq!(layer_extent_for(SizeMode::Fill, 1920.0), 0, "`Fill` means the anchors decide, which the protocol spells 0");
+        assert_eq!(layer_extent_for(SizeMode::Content, 1920.0), 0, "an omitted width has no measured content at creation time either");
+        assert_eq!(layer_extent_for(SizeMode::Pixels(32.0), 1920.0), 32);
+        assert_eq!(layer_extent_for(SizeMode::Percent(0.5), 1920.0), 960);
+    }
+
+    #[test]
+    fn a_zero_axis_is_only_legal_when_both_of_that_axiss_edges_are_anchored() {
+        // The `set_size` protocol-error rule. Getting this wrong kills the whole connection, so a
+        // config that trips it must be refused per surface instead.
+        let bar = node::Anchor { top: true, right: true, bottom: false, left: true };
+        assert_eq!(ambiguous_zero_axis((0, 32), bar), None, "width 0 is fine: left and right are both anchored");
+        assert_eq!(ambiguous_zero_axis((0, 0), bar), Some("height"), "height 0 with only the top edge anchored is the protocol error");
+
+        let corner = node::Anchor { top: true, right: true, bottom: false, left: false };
+        assert_eq!(ambiguous_zero_axis((0, 40), corner), Some("width"));
+        assert_eq!(ambiguous_zero_axis((380, 40), corner), None, "an explicit size on both axes is always legal");
+
+        let full = node::Anchor { top: true, right: true, bottom: true, left: true };
+        assert_eq!(ambiguous_zero_axis((0, 0), full), None, "a fullscreen surface may leave both axes to the compositor");
+    }
+
+    #[test]
+    fn an_exclusive_bar_reserves_its_configured_height_and_a_dock_its_width() {
+        // Derived from the size the compositor granted, which is why this is a configure-time
+        // computation: at creation a `"Fill"`-sized bar has no height to reserve.
+        let bar = node::Anchor { top: true, right: true, bottom: false, left: true };
+        assert_eq!(exclusive_zone_for(bar, (1920, 32)), 32);
+
+        let bottom_dock = node::Anchor { top: false, right: true, bottom: true, left: true };
+        assert_eq!(exclusive_zone_for(bottom_dock, (1920, 48)), 48);
+
+        let side_dock = node::Anchor { top: true, right: false, bottom: true, left: true };
+        assert_eq!(exclusive_zone_for(side_dock, (64, 1080)), 64);
+    }
+
+    #[test]
+    fn an_ambiguously_anchored_surface_reserves_nothing() {
+        // All four edges, none of them, and a single corner: in each case there is no one edge to
+        // reserve against, and the protocol's exclusive-zone wording only defines the strip cases.
+        let all = node::Anchor { top: true, right: true, bottom: true, left: true };
+        assert_eq!(exclusive_zone_for(all, (1920, 1080)), 0);
+        assert_eq!(exclusive_zone_for(node::Anchor::default(), (400, 300)), 0);
+        let corner = node::Anchor { top: true, right: false, bottom: false, left: true };
+        assert_eq!(exclusive_zone_for(corner, (400, 300)), 0);
     }
 
     #[test]

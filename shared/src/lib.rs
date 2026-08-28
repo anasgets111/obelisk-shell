@@ -292,9 +292,11 @@ const DEV_CONFIG_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../dev-config
 /// A debug build looks in the workspace's `dev-config/oblisk/` first, so `cargo run -p supervisor`
 /// boots against the tracked dev config with no environment set up. Before this, a bare
 /// `cargo run` read `~/.config/oblisk/shell.lua`, which does not exist on a developer's machine,
-/// and the run came up with no config at all: the surfaces still appeared, because they are
-/// created from `SurfaceRole` rather than from the config, so the only symptom was one
-/// `failed to read shell.lua` line in a wall of startup logging.
+/// and the run came up with no config at all. The surfaces still appeared, because at the time
+/// they were created from a fixed Rust-owned role set rather than from the config, so the only
+/// symptom was one `failed to read shell.lua` line in a wall of startup logging. docs/adr/0038
+/// closed that hole from the other end: a config that fails to load now produces no surfaces at
+/// all, which is loud.
 ///
 /// `$XDG_CONFIG_HOME` still wins in both builds, which is what makes the dev branch safe to add
 /// rather than a second source of truth: it is how a debug build tests against a real config

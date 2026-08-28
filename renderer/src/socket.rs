@@ -44,12 +44,21 @@
 //!    Supervisor sends back `ApplyPendingReload` for that same sequence -- never eagerly,
 //!    since a `TopologyChanged` verdict must leave this generation's own scene untouched (that
 //!    case is a generation swap, a different generation's job, Phase 14).
-//! 3. `applied_topology` is `None` until an evaluation is actually applied (nothing yet, or the
-//!    prior applied evaluation was superseded by rescue -- see below). `handle_reevaluate` treats
-//!    `None` as "safe to apply", not as an empty topology to diff against: after a startup
-//!    failure there's nothing to protect, so the next successful evaluation -- whether it's the
-//!    file the user just fixed, or the same one retried -- must be able to recover, not be
-//!    permanently misclassified as `TopologyChanged` (which nothing here ever applies).
+//! 3. `applied_topology` is the topology this generation's *surfaces were built from*, and it is
+//!    `None` only when no evaluation has produced one (first boot, or a startup evaluation that
+//!    failed). Since docs/adr/0038 that is the evaluation's topology, recorded in
+//!    [`RendererClient::run_startup_evaluation`], not the applied scene's: `crate::wayland::run`
+//!    creates one layer surface per declared `(panel, output)` pair straight from those specs, so
+//!    the surfaces exist whether or not the tree inside them resolved. Before that the surfaces
+//!    were a fixed Rust-owned set with no relation to the topology at all, and tying this field to
+//!    a successful apply was the only proxy available. Now the thing the diff is really asking is
+//!    "do the surfaces that exist still match what the config declares", and that is this field.
+//!
+//!    `handle_reevaluate` treats `None` as "safe to apply", not as an empty topology to diff
+//!    against: after a startup failure there's nothing to protect, so the next successful
+//!    evaluation -- whether it's the file the user just fixed, or the same one retried -- must be
+//!    able to recover, not be permanently misclassified as `TopologyChanged` (which nothing here
+//!    ever applies).
 //! 4. An evaluation failure sets the ad-hoc `rescue` global's `is_rescue`/`error_log` fields
 //!    (mirrors the ad-hoc `audio` global, ADR-0022's precedent -- not the full `oblisk.*`
 //!    signal tree) and leaves the prior applied scene untouched (`CONTEXT.md`'s Rollback).
@@ -87,26 +96,13 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
-use crate::layout::node::SurfaceTopology;
+use crate::layout::instance::SurfaceInstance;
+use crate::layout::node::{PanelSpec, SurfaceTopology};
 use crate::layout::{self, Scene};
 use crate::lua::process::ProcessRegistry;
 use crate::lua::signal::{DirtyFlag, LiveSignalHandle};
 use crate::lua::{self, Loader};
 use crate::text::shaping::ShapingHandle;
-
-/// Every surface still resolves against one hardcoded size instead of its own configured one
-/// (docs/adr/0023 item 6, docs/adr/0039 decision 4).
-///
-/// ponytail: the sizes are reachable now, but not yet attributable. ADR-0039 decision 4 assumed
-/// "on the same thread" was the whole blocker; it is not. `Scene` keys surfaces by the `id` a
-/// config writes (`dev-config/oblisk/shell.lua` says `"bar"`), while `crate::wayland` hardcodes
-/// `TrackedSurface::surface_id` from `SurfaceRole::label()` (`"main_bar"`, `"overlay_canvas"`,
-/// `"wallpaper_layer@{output}"`). Those two id spaces have no overlap at all, so there is no
-/// surface whose configured size a lookup could find, and any fallback for the misses would be a
-/// mapping policy invented here and deleted by ADR-0038. Phase 20 item 4 moves the default
-/// surfaces into Lua and deletes `SurfaceRole`, which is what makes the ids one space; the
-/// per-surface size threads in there, against real correspondence rather than a guess.
-const PLACEHOLDER_OUTPUT_SIZE: layout::LogicalSize = layout::LogicalSize { width: 1920.0, height: 40.0 };
 
 /// This Renderer's own generation id (`OBLISK_GENERATION_ID`, defaulting to `0`). Read once in
 /// `main`, then handed to both threads -- the socket thread stamps it into the handshake, the
@@ -140,17 +136,22 @@ pub fn spawn_client(generation_id: u32, inbound_tx: std::sync::mpsc::Sender<Supe
     });
 }
 
-/// One connection's reload bookkeeping. `applied_topology` is `None` until an evaluation is
-/// actually applied to the `Scene` -- see the module doc comment point 3 for why that's not the
-/// same thing as an empty topology. `pending` holds the evaluated-but-not-yet-applied output
-/// (and its already-computed topology, so `handle_apply_pending` doesn't need to recompute it)
-/// between a `Reevaluate` that reported `Unchanged` and its matching `ApplyPendingReload`.
+/// One connection's reload bookkeeping. `applied_topology` is the topology this generation's
+/// surfaces were built from, `None` only when no evaluation has produced one -- see the module
+/// doc comment point 3 for why that's not the same thing as an empty topology, and for why
+/// docs/adr/0038 moved it off "successfully applied" and onto "successfully evaluated". `pending`
+/// holds the evaluated-but-not-yet-applied output (and its already-computed topology, so
+/// `handle_apply_pending` doesn't need to recompute it) between a `Reevaluate` that reported
+/// `Unchanged` and its matching `ApplyPendingReload`.
 ///
-/// `applied_output` is the last evaluation actually applied to the `Scene` -- ADR-0044 decision
-/// 2's re-resolve target. Set alongside `applied_topology`, on the same two successful-apply
-/// paths (`RendererClient::run_startup_evaluation`, `RendererClient::handle_apply_pending`) and
-/// never on a failed one. Kept alive past the evaluation that produced it, rather than dropped
-/// once applied, so every later push can resolve against it without re-running `shell.lua`.
+/// `applied_output` is the evaluation later re-resolves run against -- ADR-0044 decision 2's
+/// re-resolve target. `handle_apply_pending` sets it only on a successful apply;
+/// `run_startup_evaluation` sets it on a successful evaluation, because the caller needs its
+/// surfaces bound before anything can be resolved at all (§ 15.2's evaluate-then-bind order). The
+/// two rules agree in the only case where both could fire, since an in-place reload happens only
+/// after the diff already found the topology unchanged. Kept alive past the evaluation that
+/// produced it, rather than dropped once applied, so every later push can resolve against it
+/// without re-running `shell.lua`.
 ///
 /// What makes that safe is a *drop-order* obligation, not a lifetime the values enforce for
 /// themselves, and ADR-0044 decision 4 states the mechanism backwards (its own amendment says so).
@@ -189,6 +190,13 @@ struct ReloadState {
 pub struct RendererClient {
     shell_lua_path: PathBuf,
     scene: Scene,
+    /// The `(surface, output)` pairs this generation is currently resolving
+    /// (`CONTEXT.md`, Surface instance; `layout::instance::expand_instances`). Owned here rather
+    /// than passed per call because three separate paths need the same set --
+    /// [`Self::apply_instances`] at startup, [`Self::handle_apply_pending`] on an in-place reload,
+    /// and [`Self::re_resolve_if_dirty`] on every capability push -- and only `crate::wayland`
+    /// knows the outputs they were expanded from.
+    instances: Vec<SurfaceInstance>,
     /// A clone of the one `ShapingHandle` `crate::wayland::App` also holds -- one worker thread
     /// and one `FontSystem` for the whole process (docs/adr/0023 item 8, closed by docs/adr/0039
     /// decision 3), instead of the second `FontSystem::new()`'s ~1s startup this used to pay.
@@ -277,6 +285,7 @@ impl RendererClient {
         Ok(Self {
             shell_lua_path,
             scene: Scene::new(),
+            instances: Vec::new(),
             shaping,
             capability_signals: RefCell::new(seeded),
             rescue_handle,
@@ -350,40 +359,115 @@ impl RendererClient {
 
     /// Evaluates `shell.lua` once at startup and applies it directly -- no round trip through the
     /// Supervisor needed, since there's no prior applied scene to protect yet (build-steps.md
-    /// Phase 13). Leaves `state.applied_topology` at `None` on any failure: a startup failure
-    /// leaves the shell blank (docs/adr/0024 item 4) -- `CONTEXT.md`'s Rollback guarantee is
-    /// about a *re*-evaluation keeping its prior scene, and there is no prior scene on first
+    /// Phase 13). Leaves `state.applied_topology` at `None` when the *evaluation* fails: a startup
+    /// failure leaves the shell blank (docs/adr/0024 item 4) -- `CONTEXT.md`'s Rollback guarantee
+    /// is about a *re*-evaluation keeping its prior scene, and there is no prior scene on first
     /// boot. Because `None` also means "safe to apply" (not "topology []"), a later successful
     /// `Reevaluate` can still recover from this state instead of being stuck forever.
+    ///
+    /// A failed *apply* no longer clears it, which is the one behavior this split moved rather
+    /// than preserved. That is the correct side of the line since docs/adr/0038: the caller has
+    /// already bound one layer surface per declared `(panel, output)` pair by then, so those
+    /// surfaces exist and a later edit that changes the topology genuinely needs a new generation
+    /// to build a different set. The old rule would have applied that edit in place, into surfaces
+    /// the config no longer describes. See the module doc comment point 3.
     ///
     /// Runs before any layer surface is bound (`oblisk-supervisor-services-dbus.md` § 15.2's
     /// order: evaluate, bind, null-buffer, signal ready), which on one thread is just the order
     /// of the statements in `crate::wayland::run`.
-    pub fn run_startup_evaluation(&mut self) {
-        match evaluate_and_topology(&self.loader, &self.shell_lua_path) {
-            Ok((output, topology)) => match self.scene.apply(&output.surfaces, PLACEHOLDER_OUTPUT_SIZE, &self.shaping, self.loader.lua()) {
-                Ok(()) => {
-                    log_applied_surfaces(&self.scene, &output);
-                    // Nothing holds a lease, so nothing can be holding a subtree this apply
-                    // retired -- see `Scene::release_all_retired`, including when that stops
-                    // being true.
-                    self.scene.release_all_retired();
-                    self.set_rescue_state(false, "");
-                    self.state.applied_topology = Some(topology);
-                    // ADR-0044 decision 2: hold the evaluation that was actually applied, so a
-                    // later push can re-resolve against it without re-running shell.lua.
-                    self.state.applied_output = Some(output);
-                }
-                Err(err) => {
-                    eprintln!("control-socket client: startup shell.lua evaluated but failed to apply to the scene: {err}");
-                    self.set_rescue_state(true, &err.to_string());
-                }
-            },
+    ///
+    /// Split from the scene apply since build-steps.md Phase 20, and the split is forced by that
+    /// same § 15.2 ordering rather than chosen: the caller needs the returned [`PanelSpec`]s to
+    /// expand into surface instances (`layout::instance::expand_instances`) *before* there is
+    /// anything to resolve a tree against, so evaluation has to hand its result back rather than
+    /// consume it. [`Self::apply_instances`] is the other half.
+    ///
+    /// Returns `None` when the evaluation itself failed, with rescue set exactly as before.
+    pub fn run_startup_evaluation(&mut self) -> Option<Vec<PanelSpec>> {
+        match evaluate_and_specs(&self.loader, &self.shell_lua_path) {
+            Ok((output, specs)) => {
+                self.state.applied_topology = Some(specs.iter().map(|spec| spec.topology.clone()).collect());
+                // ADR-0044 decision 2: hold the evaluation that was actually applied, so a
+                // later push can re-resolve against it without re-running shell.lua.
+                self.state.applied_output = Some(output);
+                Some(specs)
+            }
             Err(err) => {
                 eprintln!("control-socket client: startup shell.lua evaluation failed: {err}");
                 self.set_rescue_state(true, &err.to_string());
+                None
             }
         }
+    }
+
+    /// Replaces the `(surface, output)` pairs this generation resolves against
+    /// (`layout::instance::expand_instances`'s output). Called once from `crate::wayland::run`
+    /// between the startup evaluation and the first apply.
+    pub fn set_instances(&mut self, instances: Vec<SurfaceInstance>) {
+        self.instances = instances;
+    }
+
+    /// One instance's `available` size, replaced by the size the compositor actually configured
+    /// that surface to, and the scene marked dirty so the next poll turn re-resolves it
+    /// (build-steps.md Phase 20 item 4, closing docs/adr/0023 item 6).
+    ///
+    /// Reuses the one [`DirtyFlag`] ADR-0044 decision 2 already established rather than adding a
+    /// second "something changed" mechanism next to it: a configure and a capability push both
+    /// mean the same thing to the scene, that the resolved geometry no longer matches its inputs.
+    /// An unknown `instance_id` is ignored -- a `configure` for a surface no instance names should
+    /// not exist, and silently doing nothing is better than marking the whole scene dirty over it.
+    pub fn set_instance_size(&mut self, instance_id: &str, size: layout::LogicalSize) {
+        let Some(instance) = self.instances.iter_mut().find(|i| i.instance_id == instance_id) else {
+            return;
+        };
+        if instance.available == size {
+            // Same early return, for the same reason, as `set_rescue_state`'s: a configure that
+            // repeats a size the scene already resolved against must not claim the scene changed,
+            // or every duplicate configure buys a whole `Scene::apply`.
+            return;
+        }
+        instance.available = size;
+        self.dirty.mark();
+    }
+
+    /// Resolves the last evaluation against the current instance set, setting rescue on failure.
+    /// The second half of [`Self::run_startup_evaluation`]'s split; returns whether the apply
+    /// succeeded, so the caller (`crate::wayland::run`) can tell a Candidate that must exit from
+    /// one that may carry on.
+    ///
+    /// Takes no instance argument on purpose: [`Self::set_instances`] is the one place the set is
+    /// written, and the same stored set is what [`Self::re_resolve_if_dirty`] and
+    /// [`Self::handle_apply_pending`] resolve against. Two sources for it would let a startup
+    /// apply and a later push disagree about which surfaces exist.
+    pub fn apply_instances(&mut self) -> bool {
+        let Some(output) = self.state.applied_output.as_ref() else {
+            return false;
+        };
+        let applied = self.scene.apply(&output.surfaces, &self.instances, &self.shaping, self.loader.lua());
+        match applied {
+            Ok(()) => {
+                log_applied_surfaces(&self.scene, &self.instances);
+                // Nothing holds a lease, so nothing can be holding a subtree this apply
+                // retired -- see `Scene::release_all_retired`, including when that stops
+                // being true.
+                self.scene.release_all_retired();
+                self.set_rescue_state(false, "");
+                true
+            }
+            Err(err) => {
+                eprintln!("control-socket client: startup shell.lua evaluated but failed to apply to the scene: {err}");
+                self.set_rescue_state(true, &err.to_string());
+                false
+            }
+        }
+    }
+
+    /// The retained scene, for `crate::wayland::App::paint_surface` to look one instance's
+    /// resolved tree up in by the same `"{id}@{output}"` id its `TrackedSurface` carries. Private
+    /// until docs/adr/0038 deleted the fixed role enum and made those two id spaces one -- before that
+    /// there was no surface a lookup could hit (build-steps.md Phase 19 item 6).
+    pub fn scene(&self) -> &Scene {
+        &self.scene
     }
 
     /// Handles one inbound `SupervisorFrame`, decoded off the wire by [`pump`] and handed over by
@@ -434,13 +518,21 @@ impl RendererClient {
 
     /// Runs one `Reevaluate` request: evaluates `shell.lua`, classifies the result against
     /// `state.applied_topology`, updates `state.pending` and the rescue signal, and queues the
-    /// verdict on the outbound channel. `applied_topology == None` (nothing ever applied, e.g.
-    /// after a startup or prior reload failure) is treated as "not changed" -- there's nothing to
-    /// protect, so the fresh evaluation is safe to stage as `pending` -- see the module doc
-    /// comment point 3.
+    /// verdict on the outbound channel. `applied_topology == None` (no evaluation has produced
+    /// one, e.g. after a startup evaluation failure) is treated as "not changed" -- there's
+    /// nothing to protect, so the fresh evaluation is safe to stage as `pending` -- see the module
+    /// doc comment point 3.
+    ///
+    /// The diff reads `PanelSpec::topology` and nothing else, which is the swap-versus-in-place
+    /// split itself (docs/adr/0038 decision 2, `CONTEXT.md`'s Topology change/Value change): an
+    /// edit to `margin`, `keyboard_interactivity`, `exclusive`, or a size is a request layer-shell
+    /// accepts on a live surface, so it must report `Unchanged` and reload in place rather than
+    /// respawning the process. Comparing whole specs would make every one of those a generation
+    /// swap.
     fn handle_reevaluate(&mut self, request: ReevaluateRequest) {
-        let report = match evaluate_and_topology(&self.loader, &self.shell_lua_path) {
-            Ok((output, topology)) => {
+        let report = match evaluate_and_specs(&self.loader, &self.shell_lua_path) {
+            Ok((output, specs)) => {
+                let topology: Vec<SurfaceTopology> = specs.iter().map(|spec| spec.topology.clone()).collect();
                 self.set_rescue_state(false, "");
                 let topology_changed = self.state.applied_topology.as_ref().is_some_and(|applied| applied != &topology);
                 if topology_changed {
@@ -473,13 +565,17 @@ impl RendererClient {
             return;
         }
         let (_, output, topology) = self.state.pending.take().expect("just confirmed Some above");
-        match self.scene.apply(&output.surfaces, PLACEHOLDER_OUTPUT_SIZE, &self.shaping, self.loader.lua()) {
+        match self.scene.apply(&output.surfaces, &self.instances, &self.shaping, self.loader.lua()) {
             Ok(()) => {
-                log_applied_surfaces(&self.scene, &output);
+                log_applied_surfaces(&self.scene, &self.instances);
                 self.scene.release_all_retired();
+                // Both fields, on a successful apply only. `run_startup_evaluation` sets them a
+                // step earlier, on a successful evaluation, because § 15.2 makes it hand its
+                // specs back before any surface exists to resolve against. The two rules cannot
+                // disagree here: an `ApplyPendingReload` only ever follows an `Unchanged` verdict,
+                // which the diff reached by finding this exact topology already stored.
                 self.state.applied_topology = Some(topology);
-                // ADR-0044 decision 2: same rule as `run_startup_evaluation` -- only a successful
-                // apply becomes the re-resolve target.
+                // ADR-0044 decision 2's re-resolve target.
                 self.state.applied_output = Some(output);
             }
             Err(err) => eprintln!("control-socket client: ApplyPendingReload's stored evaluation failed to apply: {err}"),
@@ -499,12 +595,11 @@ impl RendererClient {
     /// `DirtyFlag::take` collapses however many pushes arrived in that drain into a single `true`,
     /// so a burst of `StateSnapshot`s costs one re-resolve, not one per push.
     ///
-    /// The resolved tree stops here, in memory. This damages no surface and requests no frame, so
-    /// a push that changes geometry does not yet reach the screen on its own -- that is correct
-    /// for this slice, not an oversight: the paint pass that consumes the retained scene is
-    /// build-steps.md Phase 19 items 6 through 11, and `RendererClient::scene` is deliberately
-    /// still private with no accessor until there is a consumer to hand it to.
-    pub fn re_resolve_if_dirty(&mut self) {
+    /// Returns whether it actually re-resolved, which is what tells `crate::wayland::run`'s poll
+    /// loop whether to repaint. `false` covers both "nothing was dirty" and "the re-resolve
+    /// failed and the prior scene still stands", and both mean the same thing to the caller:
+    /// nothing on screen needs redrawing.
+    pub fn re_resolve_if_dirty(&mut self) -> bool {
         // `applied_output` is checked *before* the flag is taken, and that order is the whole
         // point. With nothing to re-resolve against (startup failed, or no reload has ever
         // landed) there is nothing this call can do, so consuming the flag would silently discard
@@ -512,13 +607,13 @@ impl RendererClient {
         // swallowed every subsequent push and stayed blank until an inotify edit forced a
         // re-evaluation. Left set, the flag is picked up by whatever applies next.
         let Some(output) = self.state.applied_output.as_ref() else {
-            return;
+            return false;
         };
         // Read and clear in one step, on the path that actually acts on it.
         if !self.dirty.take() {
-            return;
+            return false;
         }
-        let applied = self.scene.apply(&output.surfaces, PLACEHOLDER_OUTPUT_SIZE, &self.shaping, self.loader.lua());
+        let applied = self.scene.apply(&output.surfaces, &self.instances, &self.shaping, self.loader.lua());
         if let Err(err) = applied {
             // `Scene::apply` rolls back to its exact pre-call state on error (see its own doc
             // comment), so the prior good scene is still applied and still on screen. This is
@@ -535,13 +630,14 @@ impl RendererClient {
             // channel for "a pushed value was rejected", separate from "the config didn't
             // evaluate" -- not built here since nothing has needed it yet.
             eprintln!("control-socket client: dirty-scene re-resolve failed, keeping the prior scene: {err}");
-            return;
+            return false;
         }
         // The one path where an undrained lease bag actually leaks at cadence: a re-resolve that
         // shortens a `children` list retires the tail on every poll turn that carries a push.
         // Same "nothing holds a lease" argument as the other two apply sites -- see
         // `Scene::release_all_retired`.
         self.scene.release_all_retired();
+        true
     }
 }
 
@@ -671,17 +767,21 @@ fn rescue_table(loader: &Loader, is_rescue: bool, error_log: &str) -> mlua::Resu
     Ok(table)
 }
 
-/// `output.surfaces`' topology fingerprint, order-sensitive (`CONTEXT.md`, Topology change). A
-/// surface whose topology fields don't type-check fails with [`lua::LoaderError::InvalidTopology`]
-/// -- a distinct message from an actual top-level-return shape error, since conflating the two
-/// (as an earlier version of this function did) produced a misleading `rescue.error_log`.
-fn surfaces_topology(output: &lua::LoadOutput) -> Result<Vec<SurfaceTopology>, lua::LoaderError> {
-    let mut topology = Vec::with_capacity(output.surfaces.len());
+/// Every declared `panel`'s full layer-surface spec, in declaration order (§ 6.1,
+/// build-steps.md Phase 20 item 3). Was `surfaces_topology`, returning only the swap fingerprint;
+/// it returns the whole spec now because `crate::wayland` needs the rest of it to *create* the
+/// surfaces, while `handle_reevaluate` still diffs `PanelSpec::topology` alone.
+///
+/// A surface whose fields don't type-check fails with [`lua::LoaderError::InvalidTopology`] -- a
+/// distinct message from an actual top-level-return shape error, since conflating the two (as an
+/// earlier version of this function did) produced a misleading `rescue.error_log`.
+fn panel_specs(output: &lua::LoadOutput) -> Result<Vec<PanelSpec>, lua::LoaderError> {
+    let mut specs = Vec::with_capacity(output.surfaces.len());
     for surface in &output.surfaces {
-        let fingerprint = layout::node::surface_topology(&surface.properties).map_err(|err| lua::LoaderError::InvalidTopology(err.to_string()))?;
-        topology.push(fingerprint);
+        let spec = layout::node::panel_spec(&surface.properties).map_err(|err| lua::LoaderError::InvalidTopology(err.to_string()))?;
+        specs.push(spec);
     }
-    Ok(topology)
+    Ok(specs)
 }
 
 // ponytail: this top-level evaluation is uncapped, unlike a `computed`/`map` closure's 5ms hook
@@ -691,36 +791,34 @@ fn surfaces_topology(output: &lua::LoadOutput) -> Result<Vec<SurfaceTopology>, l
 // with no configure handling and no way to set `app.exit` until it returns -- `while true do end`
 // in `shell.lua` wedges the whole process. Upgrade path: extend ADR-0021's hook to cover
 // `Loader::evaluate_file` itself, not just the closures it registers.
-fn evaluate_and_topology(loader: &Loader, shell_lua_path: &Path) -> Result<(lua::LoadOutput, Vec<SurfaceTopology>), lua::LoaderError> {
+fn evaluate_and_specs(loader: &Loader, shell_lua_path: &Path) -> Result<(lua::LoadOutput, Vec<PanelSpec>), lua::LoaderError> {
     let output = loader.evaluate_file(shell_lua_path)?;
-    let topology = surfaces_topology(&output)?;
-    Ok((output, topology))
+    let specs = panel_specs(&output)?;
+    Ok((output, specs))
 }
 
-/// Logs each surface's resolved geometry after a successful `scene.apply` -- diagnostic
-/// visibility only, matching Phase 12's original `apply_to_scene` logging.
-fn log_applied_surfaces(scene: &Scene, output: &lua::LoadOutput) {
-    for surface in &output.surfaces {
-        // The `id`, not `surface.kind`. Every surface's kind is the literal string "panel"
-        // (docs/adr/0040), so naming the kind here printed `surface "panel"` on every line and told a reader with
-        // more than one surface nothing about which one they were looking at (found live against
-        // dev-config). Splitting the two failure cases apart is the same fix: the old single arm
-        // said "has no resolvable `id`" for a surface whose id parsed fine but was missing from
-        // the scene, which is a different fault with a different cause.
-        let Ok(id) = layout::node::parse_surface_id(&surface.properties) else {
-            eprintln!("layout resolved but a surface has no resolvable `id`");
-            continue;
-        };
-        match scene.surface(&id) {
+/// Logs each surface *instance*'s resolved geometry after a successful `scene.apply` --
+/// diagnostic visibility only, matching Phase 12's original `apply_to_scene` logging.
+///
+/// Iterates instances rather than declared surfaces since build-steps.md Phase 20 item 2: one
+/// declared surface can be several instances, each resolved against a different size, so a
+/// per-declaration line would print one of them and hide the rest. The instance id is also
+/// exactly the key `Scene::surface` takes, which is what removes the old "has no resolvable `id`"
+/// arm -- an instance id is already parsed and already unique by the time it reaches here.
+fn log_applied_surfaces(scene: &Scene, instances: &[SurfaceInstance]) {
+    for instance in instances {
+        match scene.surface(&instance.instance_id) {
             Some(r) => eprintln!(
-                "layout resolved: surface {id:?} kind={} rect={:?} visible={} children={} properties={}",
+                "layout resolved: surface {:?} on {:?} kind={} rect={:?} visible={} children={} properties={}",
+                instance.instance_id,
+                instance.output,
                 r.kind,
                 r.rect,
                 r.visible,
                 r.children.len(),
                 r.properties.len()
             ),
-            None => eprintln!("layout resolved but surface {id:?} is absent from the applied scene"),
+            None => eprintln!("layout resolved but surface {:?} is absent from the applied scene", instance.instance_id),
         }
     }
 }
@@ -728,6 +826,8 @@ fn log_applied_surfaces(scene: &Scene, output: &lua::LoadOutput) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::instance::{OutputGeometry, expand_instances};
+    use crate::layout::node::LayerKind;
     use shared::framing::read_json_frame;
     use shared::{ActivateDraw, CommandEnvelope, PresentationEvidence, ReadySignal, SecureSubmit};
     use tokio::io::AsyncWriteExt;
@@ -785,6 +885,38 @@ mod tests {
         let client = RendererClient::new(loader, shell_lua_path.to_path_buf(), ShapingHandle::spawn(), outbound_tx, rescue_handle, process_registry, dirty)
             .unwrap();
         (client, outbound_rx)
+    }
+
+    /// The one output every fixture below resolves against: `expand_instances` needs a real
+    /// output list, and a single 1920x1080 `"TEST"` monitor keeps the instance ids readable
+    /// (`"bar@TEST"`) while still exercising the real expansion path.
+    fn test_outputs() -> Vec<OutputGeometry> {
+        vec![OutputGeometry { name: "TEST".to_string(), size: layout::LogicalSize { width: 1920.0, height: 1080.0 } }]
+    }
+
+    /// `crate::wayland::run`'s whole startup sequence in one call (`oblisk-supervisor-services-dbus.md`
+    /// § 15.2's Candidate order): evaluate, expand the specs into instances, store them, apply.
+    /// Returns whether the apply succeeded, the same thing `apply_instances` reports.
+    fn run_startup(client: &mut RendererClient) -> bool {
+        let Some(specs) = client.run_startup_evaluation() else {
+            return false;
+        };
+        let instances = expand_instances(&specs, &test_outputs());
+        client.set_instances(instances);
+        client.apply_instances()
+    }
+
+    /// The instance set for a config that declares exactly `ids`, for the tests that seed
+    /// `state.pending` by hand instead of going through [`run_startup`].
+    fn instances_for(ids: &[&str]) -> Vec<SurfaceInstance> {
+        ids.iter()
+            .map(|id| SurfaceInstance {
+                instance_id: format!("{id}@TEST"),
+                declared_id: (*id).to_string(),
+                output: "TEST".to_string(),
+                available: layout::LogicalSize { width: 1920.0, height: 1080.0 },
+            })
+            .collect()
     }
 
     /// The one frame `client` queued on its outbound channel, or a panic naming what was missing
@@ -864,9 +996,9 @@ mod tests {
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, _outbound_rx) = test_client(&path);
 
-        client.run_startup_evaluation();
+        run_startup(&mut client);
 
-        assert!(client.scene.surface("bar").is_some());
+        assert!(client.scene.surface("bar@TEST").is_some());
         assert_eq!(client.state.applied_topology.as_ref().map(Vec::len), Some(1));
         assert_eq!(rescue_state(&client.loader), (false, String::new()));
     }
@@ -877,10 +1009,10 @@ mod tests {
         let missing = dir.path().join("shell.lua");
         let (mut client, _outbound_rx) = test_client(&missing);
 
-        client.run_startup_evaluation();
+        run_startup(&mut client);
 
         assert!(client.state.applied_topology.is_none());
-        assert!(client.scene.surface("bar").is_none());
+        assert!(client.scene.surface("bar@TEST").is_none());
         let (is_rescue, error_log) = rescue_state(&client.loader);
         assert!(is_rescue);
         assert!(!error_log.is_empty());
@@ -895,7 +1027,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("shell.lua");
         let (mut client, mut outbound_rx) = test_client(&missing);
-        client.run_startup_evaluation();
+        run_startup(&mut client);
         assert!(client.state.applied_topology.is_none(), "startup must have failed (no file yet)");
 
         write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
@@ -914,7 +1046,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
-        client.state.applied_topology = Some(surfaces_topology(&client.loader.evaluate_file(&path).unwrap()).unwrap());
+        client.state.applied_topology =
+            Some(panel_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap().into_iter().map(|spec| spec.topology).collect());
 
         client.handle_reevaluate(ReevaluateRequest { sequence: 5 });
 
@@ -929,12 +1062,129 @@ mod tests {
         let (mut client, mut outbound_rx) = test_client(&path);
         // Seed a *different* applied topology (a different id) so the fresh evaluation reads as changed.
         client.state.applied_topology =
-            Some(vec![SurfaceTopology { id: "other".to_string(), layer: "Top".to_string(), anchor: Default::default(), monitor: "All".to_string() }]);
+            Some(vec![SurfaceTopology { id: "other".to_string(), layer: LayerKind::Top, anchor: Default::default(), monitor: "All".to_string(), namespace: "oblisk-other".to_string() }]);
 
         client.handle_reevaluate(ReevaluateRequest { sequence: 1 });
 
         assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence: 1 }));
         assert!(client.state.pending.is_none(), "a topology-changed generation must not stage a pending apply");
+    }
+
+    #[test]
+    fn editing_only_the_in_place_panel_fields_reports_unchanged_and_reloads_in_place() {
+        // docs/adr/0038 decision 2 and `CONTEXT.md`'s Value change entry: `margin`, exclusive
+        // zone, `keyboard_interactivity` and size are all requests layer-shell accepts on a live
+        // surface, so editing one must reload in place. The diff therefore reads
+        // `PanelSpec::topology` alone -- comparing whole specs would turn every one of these into
+        // a generation swap, respawning the process to nudge a bar 4px sideways.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(
+            dir.path(),
+            r#"return panel { id = "bar", layer = "Top", margin = { left = 4 }, keyboard_interactivity = "None", exclusive = false, height = 32 }"#,
+        );
+        let (mut client, mut outbound_rx) = test_client(&path);
+        client.state.applied_topology =
+            Some(panel_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap().into_iter().map(|spec| spec.topology).collect());
+
+        // Every in-place field changed at once; every topology field left alone.
+        write_shell_lua(
+            dir.path(),
+            r#"return panel { id = "bar", layer = "Top", margin = { left = 40 }, keyboard_interactivity = "Exclusive", exclusive = true, height = 48 }"#,
+        );
+        client.handle_reevaluate(ReevaluateRequest { sequence: 7 });
+
+        assert_eq!(
+            queued_frame(&mut outbound_rx),
+            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 7 }),
+            "margin/keyboard_interactivity/exclusive/size are in-place fields and must not trigger a generation swap"
+        );
+        assert!(client.state.pending.is_some(), "an Unchanged verdict must stage the fresh evaluation for ApplyPendingReload");
+    }
+
+    #[test]
+    fn editing_only_the_namespace_reports_topology_changed() {
+        // The other side of the same line. `get_layer_surface` fixes the namespace at creation and
+        // no request changes it on a live surface, so a namespace edit needs a new surface, which
+        // means a new generation (`CONTEXT.md`, Topology change).
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
+        let (mut client, mut outbound_rx) = test_client(&path);
+        client.state.applied_topology =
+            Some(panel_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap().into_iter().map(|spec| spec.topology).collect());
+
+        write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", namespace = "my-bar" }"#);
+        client.handle_reevaluate(ReevaluateRequest { sequence: 8 });
+
+        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence: 8 }));
+        assert!(client.state.pending.is_none());
+    }
+
+    #[test]
+    fn set_instance_size_replaces_one_instances_available_size_and_marks_the_scene_dirty() {
+        // build-steps.md Phase 20 item 4: a `configure` is what finally makes the configured size
+        // reachable, and it reuses ADR-0044 decision 2's one dirty flag rather than adding a
+        // second "something changed" mechanism next to it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", width = "Fill", height = "Fill" }"#);
+        let (mut client, _outbound_rx) = test_client(&path);
+        assert!(run_startup(&mut client), "startup must have applied");
+        assert!(!client.dirty.take(), "a clean startup leaves the flag clear");
+        assert_eq!(client.scene.surface("bar@TEST").unwrap().rect.height, 1080.0, "the first resolve uses the output's own size");
+
+        client.set_instance_size("bar@TEST", layout::LogicalSize { width: 1920.0, height: 32.0 });
+
+        assert!(client.re_resolve_if_dirty(), "a new configured size must mark the scene dirty and re-resolve");
+        assert_eq!(
+            client.scene.surface("bar@TEST").unwrap().rect.height,
+            32.0,
+            "the surface must now resolve against the size the compositor actually configured, not the whole output"
+        );
+    }
+
+    #[test]
+    fn set_instance_size_repeating_the_current_size_does_not_mark_the_scene_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", width = "Fill", height = "Fill" }"#);
+        let (mut client, _outbound_rx) = test_client(&path);
+        assert!(run_startup(&mut client));
+
+        client.set_instance_size("bar@TEST", layout::LogicalSize { width: 1920.0, height: 1080.0 });
+        assert!(!client.dirty.take(), "a duplicate configure carrying the size already resolved against changes nothing");
+
+        client.set_instance_size("no-such-surface@TEST", layout::LogicalSize { width: 10.0, height: 10.0 });
+        assert!(!client.dirty.take(), "a configure for a surface no instance names must not dirty the whole scene");
+    }
+
+    #[test]
+    fn one_surface_on_two_outputs_resolves_two_trees_against_two_different_sizes() {
+        // The reason the retained scene keys by instance (`layout::scene::Scene`'s doc comment):
+        // `monitor = "All"` across a laptop panel and a 4K external is two configured sizes, and
+        // one tree per declared surface could only ever serve one of them.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", width = "Fill", height = "Fill" }"#);
+        let (mut client, _outbound_rx) = test_client(&path);
+
+        let specs = client.run_startup_evaluation().expect("the fixture evaluates");
+        let outputs = vec![
+            OutputGeometry { name: "eDP-1".to_string(), size: layout::LogicalSize { width: 1920.0, height: 1080.0 } },
+            OutputGeometry { name: "DP-1".to_string(), size: layout::LogicalSize { width: 3840.0, height: 2160.0 } },
+        ];
+        client.set_instances(expand_instances(&specs, &outputs));
+        assert!(client.apply_instances());
+
+        assert_eq!(client.scene.surface("bar@eDP-1").unwrap().rect.width, 1920.0);
+        assert_eq!(client.scene.surface("bar@DP-1").unwrap().rect.width, 3840.0);
+    }
+
+    #[test]
+    fn a_panel_naming_an_unplugged_monitor_gets_no_instance_and_no_resolved_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", monitor = "HDMI-A-9" }"#);
+        let (mut client, _outbound_rx) = test_client(&path);
+
+        assert!(run_startup(&mut client), "an unmatched monitor is not an apply failure -- there is simply nothing to resolve");
+        assert!(client.scene.surface("bar@TEST").is_none());
+        assert!(client.instances.is_empty());
     }
 
     #[test]
@@ -983,12 +1233,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, _outbound_rx) = test_client(&path);
-        let (output, topology) = evaluate_and_topology(&client.loader, &path).unwrap();
-        client.state.pending = Some((3, output, topology));
+        let (output, specs) = evaluate_and_specs(&client.loader, &path).unwrap();
+        client.set_instances(instances_for(&["bar"]));
+        client.state.pending = Some((3, output, specs.into_iter().map(|spec| spec.topology).collect()));
 
         client.handle_apply_pending(ApplyPendingReload { sequence: 3 });
 
-        assert!(client.scene.surface("bar").is_some());
+        assert!(client.scene.surface("bar@TEST").is_some());
         assert!(client.state.pending.is_none());
         assert_eq!(client.state.applied_topology.as_ref().map(Vec::len), Some(1));
     }
@@ -998,12 +1249,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, _outbound_rx) = test_client(&path);
-        let (output, topology) = evaluate_and_topology(&client.loader, &path).unwrap();
-        client.state.pending = Some((3, output, topology));
+        let (output, specs) = evaluate_and_specs(&client.loader, &path).unwrap();
+        client.set_instances(instances_for(&["bar"]));
+        client.state.pending = Some((3, output, specs.into_iter().map(|spec| spec.topology).collect()));
 
         client.handle_apply_pending(ApplyPendingReload { sequence: 99 });
 
-        assert!(client.scene.surface("bar").is_none(), "a stale ApplyPendingReload must not apply");
+        assert!(client.scene.surface("bar@TEST").is_none(), "a stale ApplyPendingReload must not apply");
         assert!(client.state.pending.is_some(), "the still-current pending evaluation must survive a mismatched Apply");
     }
 
@@ -1034,8 +1286,8 @@ mod tests {
         client
             .apply_state_snapshot(StateSnapshot { capability: "workspace".to_string(), revision: 1, payload: serde_json::json!(true) })
             .unwrap();
-        client.run_startup_evaluation();
-        assert!(client.scene.surface("bar").unwrap().visible, "startup must have applied the pushed initial value");
+        run_startup(&mut client);
+        assert!(client.scene.surface("bar@TEST").unwrap().visible, "startup must have applied the pushed initial value");
 
         // Break the file so a real re-evaluation would fail -- proves the second half: the
         // re-resolve below reads the pushed value straight off the retained tree's live signal,
@@ -1047,7 +1299,7 @@ mod tests {
             .unwrap();
         client.re_resolve_if_dirty();
 
-        assert!(!client.scene.surface("bar").unwrap().visible, "the re-resolve must reflect the pushed value");
+        assert!(!client.scene.surface("bar@TEST").unwrap().visible, "the re-resolve must reflect the pushed value");
         assert_eq!(
             rescue_state(&client.loader),
             (false, String::new()),
@@ -1063,13 +1315,13 @@ mod tests {
         client
             .apply_state_snapshot(StateSnapshot { capability: "workspace".to_string(), revision: 1, payload: serde_json::json!(true) })
             .unwrap();
-        client.run_startup_evaluation();
+        run_startup(&mut client);
         client
             .apply_state_snapshot(StateSnapshot { capability: "workspace".to_string(), revision: 2, payload: serde_json::json!(false) })
             .unwrap();
 
         client.re_resolve_if_dirty();
-        assert!(!client.scene.surface("bar").unwrap().visible, "the first re-resolve must apply the pushed value");
+        assert!(!client.scene.surface("bar@TEST").unwrap().visible, "the first re-resolve must apply the pushed value");
         assert!(!client.dirty.take(), "re_resolve_if_dirty must clear the flag it consumed");
 
         // Replace `applied_output` directly (bypassing the push path, which would re-mark dirty)
@@ -1077,12 +1329,12 @@ mod tests {
         // call did any work at all, this would be visible; a true no-op leaves the scene exactly
         // as the first resolve left it.
         let poisoned_path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", visible = true }"#);
-        let (poisoned_output, _) = evaluate_and_topology(&client.loader, &poisoned_path).unwrap();
+        let (poisoned_output, _) = evaluate_and_specs(&client.loader, &poisoned_path).unwrap();
         client.state.applied_output = Some(poisoned_output);
 
         client.re_resolve_if_dirty();
         assert!(
-            !client.scene.surface("bar").unwrap().visible,
+            !client.scene.surface("bar@TEST").unwrap().visible,
             "with nothing pushed since, a second re-resolve must do no work at all, even though a different applied_output is now in place"
         );
     }
@@ -1115,8 +1367,8 @@ mod tests {
         client
             .apply_state_snapshot(StateSnapshot { capability: "workspace".to_string(), revision: 1, payload: serde_json::json!(true) })
             .unwrap();
-        client.run_startup_evaluation();
-        assert!(client.scene.surface("bar").unwrap().visible);
+        run_startup(&mut client);
+        assert!(client.scene.surface("bar@TEST").unwrap().visible);
         assert_eq!(rescue_state(&client.loader), (false, String::new()));
 
         // `visible` requires a boolean (`parse_visible`); a table makes the re-resolve fail.
@@ -1131,7 +1383,7 @@ mod tests {
         client.re_resolve_if_dirty();
 
         assert!(
-            client.scene.surface("bar").unwrap().visible,
+            client.scene.surface("bar@TEST").unwrap().visible,
             "Scene::apply rolls back to its pre-call state on error, so the prior good scene must survive"
         );
         assert_eq!(
@@ -1155,9 +1407,9 @@ mod tests {
         );
         let (mut client, _outbound_rx) = test_client(&path);
 
-        client.run_startup_evaluation();
+        run_startup(&mut client);
 
-        let bar = client.scene.surface("bar").expect("a bare rostered signal must not stop the config applying");
+        let bar = client.scene.surface("bar@TEST").expect("a bare rostered signal must not stop the config applying");
         assert!(bar.visible, "`visible = audio` with audio still nil must take parse_visible's default");
         assert!(bar.children[0].children.is_empty(), "`children = tray` with tray still nil must take parse_children's default");
         assert_eq!(rescue_state(&client.loader), (false, String::new()), "a startup that applies must not be in rescue");
@@ -1173,9 +1425,9 @@ mod tests {
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", child = text { content = audio } }"#);
         let (mut client, _outbound_rx) = test_client(&path);
 
-        client.run_startup_evaluation();
+        run_startup(&mut client);
 
-        let bar = client.scene.surface("bar").expect("a bare rostered signal on `content` must not stop the config applying");
+        let bar = client.scene.surface("bar@TEST").expect("a bare rostered signal on `content` must not stop the config applying");
         assert_eq!(
             layout::node::parse_content(&bar.children[0].properties).unwrap(),
             "",
@@ -1192,7 +1444,7 @@ mod tests {
         // later push, and the shell stayed blank until an inotify edit forced a re-evaluation.
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let (mut client, _outbound_rx) = test_client(&missing);
-        client.run_startup_evaluation();
+        run_startup(&mut client);
         assert!(client.state.applied_output.is_none(), "startup must have failed (no file)");
 
         client
@@ -1224,8 +1476,8 @@ mod tests {
             "#,
         );
         let (mut client, _outbound_rx) = test_client(&path);
-        client.run_startup_evaluation();
-        assert!(client.scene.surface("bar").is_some(), "startup must have applied");
+        run_startup(&mut client);
+        assert!(client.scene.surface("bar@TEST").is_some(), "startup must have applied");
 
         for revision in 1..=20 {
             let count = if revision % 2 == 0 { 1 } else { 3 };
@@ -1235,7 +1487,7 @@ mod tests {
             client.re_resolve_if_dirty();
         }
 
-        assert_eq!(client.scene.surface("bar").unwrap().children[0].children.len(), 1, "the last push shrank the row back to one child");
+        assert_eq!(client.scene.surface("bar@TEST").unwrap().children[0].children.len(), 1, "the last push shrank the row back to one child");
         assert!(
             client.scene.retiring_ids().is_empty(),
             "a successful apply must drain the lease bag, since nothing holds a lease today; got {} entries after 20 re-resolves",
@@ -1253,9 +1505,9 @@ mod tests {
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", child = text { content = "hi" } }"#);
         let (mut client, _outbound_rx) = test_client(&path);
 
-        client.run_startup_evaluation();
+        run_startup(&mut client);
 
-        assert!(client.scene.surface("bar").is_some(), "startup must have applied");
+        assert!(client.scene.surface("bar@TEST").is_some(), "startup must have applied");
         assert!(!client.dirty.take(), "an apply that succeeded resolved every signal at its current value, so nothing is stale");
     }
 
@@ -1269,7 +1521,7 @@ mod tests {
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
         client.state.applied_topology =
-            Some(vec![SurfaceTopology { id: "other".to_string(), layer: "Top".to_string(), anchor: Default::default(), monitor: "All".to_string() }]);
+            Some(vec![SurfaceTopology { id: "other".to_string(), layer: LayerKind::Top, anchor: Default::default(), monitor: "All".to_string(), namespace: "oblisk-other".to_string() }]);
 
         client.handle_reevaluate(ReevaluateRequest { sequence: 1 });
 
@@ -1286,7 +1538,7 @@ mod tests {
         // dispatch/queue path, not `handle_reevaluate`'s own classification logic (already
         // covered by the tests above).
         client.state.applied_topology =
-            Some(vec![SurfaceTopology { id: "other".to_string(), layer: "Top".to_string(), anchor: Default::default(), monitor: "All".to_string() }]);
+            Some(vec![SurfaceTopology { id: "other".to_string(), layer: LayerKind::Top, anchor: Default::default(), monitor: "All".to_string(), namespace: "oblisk-other".to_string() }]);
 
         assert_eq!(client.handle_frame(SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: 1 })), None);
 

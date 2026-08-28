@@ -27,10 +27,13 @@
 //! (build-steps.md Phase 19 item 3), so it is a rejected config rather than the stack overflow it
 //! used to be.
 //!
-//! [`SurfaceTopology`]'s four fields (`parse_surface_id`/`parse_layer`/`parse_anchor`/
-//! `parse_monitor`) and every node's optional `id` (`parse_node_id`, docs/adr/0045 decision 1)
-//! are the carve-outs and keep rejecting a `Signal` outright -- see
-//! [`reject_signal_in_structural_field`]'s doc comment for why.
+//! [`SurfaceTopology`]'s five fields (`parse_surface_id`/`parse_layer`/`parse_anchor`/
+//! `parse_monitor`/`parse_namespace`) and every node's optional `id` (`parse_node_id`,
+//! docs/adr/0045 decision 1) are the carve-outs and keep rejecting a `Signal` outright -- see
+//! [`reject_signal_in_structural_field`]'s doc comment for why. A `panel`'s remaining § 6.1
+//! properties (`keyboard_interactivity`, `exclusive`, `margin`, `width`/`height`) are *not*
+//! carve-outs: layer-shell accepts each of them on a live surface, so a `Signal` in one resolves
+//! normally.
 
 use std::collections::{HashMap, HashSet};
 
@@ -112,7 +115,10 @@ pub enum LayoutError {
     TreeTooDeep { kind: String, depth: u32, max: u32 },
 }
 
-fn invalid(property: &str, detail: impl Into<String>) -> LayoutError {
+/// `pub(crate)` rather than private since build-steps.md Phase 20 item 4: `layout::scene`'s
+/// `Scene::apply_one_instance` raises an `id`-scoped error for an instance naming an undeclared
+/// surface, and every other `InvalidProperty` in this crate is built here rather than by hand.
+pub(crate) fn invalid(property: &str, detail: impl Into<String>) -> LayoutError {
     LayoutError::InvalidProperty {
         property: property.to_string(),
         detail: detail.into(),
@@ -288,15 +294,24 @@ fn parse_hex_color(property: &str, s: &str) -> Result<Rgba, LayoutError> {
 /// Kind-aware, because a skip is only sound where a parser actually runs to do the rejecting.
 /// `id` is skipped on every kind: [`parse_node_id`] reads it on every node and [`parse_surface_id`]
 /// on a surface root, so a `Signal` in it is refused wherever it appears. `layer`/`anchor`/
-/// `monitor` are read by [`surface_topology`] alone, which `layout::scene`'s
+/// `monitor`/`namespace` are read by [`surface_topology`] alone, which `layout::scene`'s
 /// `Scene::apply_one_surface` calls on top-level surfaces and nowhere else -- so on a `rect` no
 /// parser ever looks at them, and skipping them there would copy a live `Signal` handle straight
 /// into `layout::scene::RetainedNode::properties` with nothing left to reject it. That would
 /// falsify the "never a `Signal`" invariant `layout::scene::ResolvedNode::properties` documents and
 /// hands to the paint stage, which is told it may read a colour or a radius off the map directly.
-/// Below a surface these three are ordinary properties and resolve like any other.
+/// Below a surface these four are ordinary properties and resolve like any other.
+///
+/// `namespace` joins the carve-out for the same protocol reason `monitor` is already in it
+/// (`CONTEXT.md`, Topology change): `zwlr_layer_shell_v1::get_layer_surface` fixes a namespace at
+/// creation and no request changes it on a live surface, so a value that could drift after the
+/// topology diff would leave the compositor matching rules (Hyprland's `layerrule`) against a
+/// string the config no longer says. The in-place `panel` fields -- `keyboard_interactivity`,
+/// `exclusive`, `margin`, `width`/`height` -- are deliberately *not* here: layer-shell permits
+/// changing each of them on a live surface, so a `Signal` in one resolves normally
+/// (docs/adr/0044 decision 1) and the next pass simply applies the new value.
 fn is_structural_property(kind: &str, property: &str) -> bool {
-    property == "id" || (kind == "panel" && matches!(property, "layer" | "anchor" | "monitor"))
+    property == "id" || (kind == "panel" && matches!(property, "layer" | "anchor" | "monitor" | "namespace"))
 }
 
 /// One node's raw property map with every `Signal` replaced by its current value (build-steps.md
@@ -427,14 +442,14 @@ pub fn resolve_properties(
     Ok(resolved)
 }
 
-/// The carve-outs from decision 1's "parsers resolve a `Signal`" rule: [`SurfaceTopology`]'s four
-/// fields (`parse_surface_id`/`parse_layer`/`parse_anchor`/`parse_monitor`) and every node's
-/// optional `id` ([`parse_node_id`], docs/adr/0045 decision 1) keep rejecting one outright, the
-/// same way every parser used to (this function used to be named `reject_signal` and back every
-/// one of them, then narrowed to the topology fields alone -- ADR-0044's amendment banner --
-/// before widening again here to cover `id`).
+/// The carve-outs from decision 1's "parsers resolve a `Signal`" rule: [`SurfaceTopology`]'s five
+/// fields (`parse_surface_id`/`parse_layer`/`parse_anchor`/`parse_monitor`/`parse_namespace`) and
+/// every node's optional `id` ([`parse_node_id`], docs/adr/0045 decision 1) keep rejecting one
+/// outright, the same way every parser used to (this function used to be named `reject_signal` and
+/// back every one of them, then narrowed to the topology fields alone -- ADR-0044's amendment
+/// banner -- before widening again here to cover `id`).
 ///
-/// The unifying reason, which is why these five and nothing else: each is read exactly once per
+/// The unifying reason, which is why these six and nothing else: each is read exactly once per
 /// evaluation and a *structural* decision is then made from it and acted on -- where a surface is
 /// placed, or which retained node a fresh one is. A `Signal` is free to change between passes, so
 /// admitting one here would leave a decision already taken resting on a value that no longer
@@ -452,7 +467,7 @@ pub fn resolve_properties(
 /// not a case the ADR considered and rejected.
 ///
 /// This only works because [`resolve_properties`] copies the keys [`is_structural_property`] names
-/// through raw: these five parsers are the only ones that read the un-resolved value, and they have
+/// through raw: these six parsers are the only ones that read the un-resolved value, and they have
 /// to, since a resolved signal is indistinguishable from a literal by the time it reaches a map.
 /// That skip is scoped to the kind whose parsers actually run, which is what keeps "copied through
 /// raw" from meaning "never checked by anyone" -- see [`is_structural_property`].
@@ -944,12 +959,40 @@ pub fn parse_node_id(properties: &HashMap<String, Value>) -> Result<Option<Strin
     }
 }
 
+/// § 6.1's `layer`, the layer-shell stacking level a `panel` is created on. `layout`'s own enum
+/// rather than smithay-client-toolkit's `Layer`, for the same reason [`KeyboardInteractivity`]
+/// below is: this module stays free of Wayland types, and `crate::wayland` maps it at its one call
+/// site (build-steps.md Phase 20 item 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerKind {
+    Background,
+    Bottom,
+    Top,
+    Overlay,
+}
+
 /// § 6.1's `layer` (`"Background"`/`"Bottom"`/`"Top"`/`"Overlay"`). Required, same shape as
-/// [`parse_surface_id`] -- every existing fixture in this repo already sets it. Stored as a raw
-/// string, not a validated enum: Phase 13 only needs it for topology-diff equality (`CONTEXT.md`,
-/// Topology change), not for binding a real `zwlr_layer_surface_v1` yet -- see docs/adr/0024.
-pub fn parse_layer(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
-    parse_string_property(properties, "layer", None)
+/// [`parse_surface_id`] -- every existing fixture in this repo already sets it.
+///
+/// **Validating since build-steps.md Phase 20.** This used to return the raw `String`, on the
+/// stated grounds that Phase 13 only needed it for topology-diff equality (`CONTEXT.md`, Topology
+/// change) and nothing bound a real `zwlr_layer_surface_v1` with it -- see docs/adr/0024. Phase 20
+/// is what makes that false: `crate::wayland::App::create_panels` now creates one layer surface per
+/// instance straight from this value (docs/adr/0038 decision 1), so an unrecognized string is a
+/// config error the author must see rather than a silent fall to some default layer. A typo'd
+/// `layer = "Toop"` that quietly stacked a bar on `Background` would be a far worse failure than a
+/// rejected config, because nothing on screen would say why.
+pub fn parse_layer(properties: &HashMap<String, Value>) -> Result<LayerKind, LayoutError> {
+    match parse_string_property(properties, "layer", None)?.as_str() {
+        "Background" => Ok(LayerKind::Background),
+        "Bottom" => Ok(LayerKind::Bottom),
+        "Top" => Ok(LayerKind::Top),
+        "Overlay" => Ok(LayerKind::Overlay),
+        other => Err(invalid(
+            "layer",
+            format!("unknown layer `{other}` -- expected \"Background\", \"Bottom\", \"Top\", or \"Overlay\""),
+        )),
+    }
 }
 
 /// § 6.1's `anchor` table (`{ top, bottom, left, right }` edge booleans). Same default-to-zero
@@ -991,24 +1034,146 @@ pub fn parse_monitor(properties: &HashMap<String, Value>) -> Result<String, Layo
     parse_string_property(properties, "monitor", Some("All"))
 }
 
-/// A surface's topology-relevant fields (`CONTEXT.md`, Topology change: "adds, removes, or
-/// changes the layer, anchor, or monitor target of a top-level `surface` node"). Structural
-/// equality on `Vec<SurfaceTopology>` (order-sensitive) is the Renderer's own topology diff --
-/// see `renderer/src/socket.rs`.
+/// § 6.1's `namespace`: the layer-shell namespace string the compositor sees, and the key its own
+/// rules match on (Hyprland's `layerrule` for blur and animations). Defaults to `"oblisk-{id}"`,
+/// which is what makes every `panel` addressable from a compositor config without the author
+/// having to name one -- before docs/adr/0038 this was hardcoded per Rust-owned role
+/// (`"oblisk-main-bar"`, `"oblisk-overlay-canvas"`, `"oblisk-wallpaper"`) and a user could not
+/// write a rule against their own panel at all.
+///
+/// A [`SurfaceTopology`] field, not an in-place one: `get_layer_surface` takes the namespace at
+/// creation and the protocol has no request to change it afterwards, so an edit to it is a
+/// generation swap (`CONTEXT.md`, Topology change).
+pub fn parse_namespace(properties: &HashMap<String, Value>, id: &str) -> Result<String, LayoutError> {
+    let default = format!("oblisk-{id}");
+    parse_string_property(properties, "namespace", Some(&default))
+}
+
+/// § 6.1's `keyboard_interactivity`, mapping one-for-one onto layer-shell's own field.
+/// `layout`-owned rather than reusing smithay-client-toolkit's identical enum so this module keeps
+/// no Wayland dependency; `crate::wayland::keyboard_interactivity_for` maps it at the single call
+/// site that binds a surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyboardInteractivity {
+    /// § 6.1's default: the surface never receives key events.
+    #[default]
+    None,
+    OnDemand,
+    Exclusive,
+}
+
+/// § 6.1's `keyboard_interactivity` (`"None"` (default) / `"OnDemand"` / `"Exclusive"`). An
+/// in-place field, deliberately outside [`SurfaceTopology`] and outside
+/// [`is_structural_property`]'s carve-out: `zwlr_layer_surface_v1::set_keyboard_interactivity` is
+/// valid on a live surface, so a `Signal` here resolves like any other property
+/// (docs/adr/0044 decision 1) and an edit to it is a value change, not a swap.
+pub fn parse_keyboard_interactivity(properties: &HashMap<String, Value>) -> Result<KeyboardInteractivity, LayoutError> {
+    let Some(value) = properties.get("keyboard_interactivity") else {
+        return Ok(KeyboardInteractivity::None);
+    };
+    let Value::String(s) = value else {
+        return Err(invalid(
+            "keyboard_interactivity",
+            format!("expected a string, got {}", preview_for_error(value)),
+        ));
+    };
+    match checked_string("keyboard_interactivity", s)?.as_str() {
+        "None" => Ok(KeyboardInteractivity::None),
+        "OnDemand" => Ok(KeyboardInteractivity::OnDemand),
+        "Exclusive" => Ok(KeyboardInteractivity::Exclusive),
+        other => Err(invalid(
+            "keyboard_interactivity",
+            format!("unknown keyboard interactivity `{other}` -- expected \"None\", \"OnDemand\", or \"Exclusive\""),
+        )),
+    }
+}
+
+/// § 6.1's `exclusive`: "Reserves physical screen area for bar if true". Default `false`, so an
+/// undeclared panel floats over whatever is behind it rather than pushing windows aside.
+///
+/// In-place, same as [`parse_keyboard_interactivity`]: `set_exclusive_zone` is valid on a live
+/// surface. The *zone* itself is not computed here -- `crate::wayland` derives it at configure
+/// time from the size the compositor actually chose, which is the only point a real number exists.
+pub fn parse_exclusive(properties: &HashMap<String, Value>) -> Result<bool, LayoutError> {
+    let Some(value) = properties.get("exclusive") else {
+        return Ok(false);
+    };
+    match value {
+        Value::Boolean(b) => Ok(*b),
+        other => Err(invalid(
+            "exclusive",
+            format!("expected a boolean, got {}", preview_for_error(other)),
+        )),
+    }
+}
+
+/// A surface's topology-relevant fields (`CONTEXT.md`, Topology change: a config edit that adds or
+/// removes a top-level `surface` node, or changes its layer, anchor, monitor target, or
+/// namespace). Structural equality on `Vec<SurfaceTopology>` (order-sensitive) is the Renderer's
+/// own topology diff -- see `renderer/src/socket.rs`.
+///
+/// This is the whole of the swap fingerprint, and [`PanelSpec`]'s other fields are deliberately
+/// not in it: `margin`, `keyboard_interactivity`, `exclusive`, `width` and `height` are all
+/// requests layer-shell accepts on a live surface, so changing one reloads in place
+/// (docs/adr/0038 decision 2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurfaceTopology {
     pub id: String,
-    pub layer: String,
+    pub layer: LayerKind,
     pub anchor: Anchor,
     pub monitor: String,
+    pub namespace: String,
 }
 
 pub fn surface_topology(properties: &HashMap<String, Value>) -> Result<SurfaceTopology, LayoutError> {
+    let id = parse_surface_id(properties)?;
+    let namespace = parse_namespace(properties, &id)?;
     Ok(SurfaceTopology {
-        id: parse_surface_id(properties)?,
+        id,
         layer: parse_layer(properties)?,
         anchor: parse_anchor(properties)?,
         monitor: parse_monitor(properties)?,
+        namespace,
+    })
+}
+
+/// Everything one `zwlr_layer_surface_v1` needs, read off a `panel` node's properties in one pass
+/// (§ 6.1, build-steps.md Phase 20 item 3). `crate::socket`'s `panel_specs` builds one per declared
+/// surface; `layout::instance::expand_instances` turns them into per-output instances, and
+/// `crate::wayland::App::create_panels` is what actually binds them.
+///
+/// The split between `topology` and the rest is the swap-versus-in-place split itself, so it is
+/// worth reading as one: `renderer/src/socket.rs`'s `handle_reevaluate` diffs *only* `topology`,
+/// which is why editing a `margin` reloads in place while editing a `layer` respawns the process.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PanelSpec {
+    /// The swap fingerprint: id, layer, anchor, monitor, namespace.
+    pub topology: SurfaceTopology,
+    pub keyboard_interactivity: KeyboardInteractivity,
+    pub exclusive: bool,
+    /// § 6.1's `margin`, which on a `panel` root is the layer-shell **anchor offset** -- how far
+    /// the surface itself sits from the edges it is anchored to -- not layout spacing between the
+    /// root and its child. There is no conflict with layout's own reading of the property because
+    /// layout never reads it here: `layout::scene`'s `Scene::apply_one_surface` passes `None` for
+    /// both parent-margin arguments when it resolves a surface root, so a root's `margin` is
+    /// consumed by nobody but this field. Below a root it stays ordinary layout margin, parsed by
+    /// the same [`parse_edge_insets`] and consumed by the parent's child loop.
+    pub margin: EdgeInsets,
+    /// § 6.1's `width`/`height`, which become the layer-shell `set_size` request rather than a
+    /// layout constraint of their own. `SizeMode::Fill` is the protocol's `0` ("the anchors
+    /// decide"); a percent resolves against the output, at the one call site that knows it.
+    pub width: SizeMode,
+    pub height: SizeMode,
+}
+
+pub fn panel_spec(properties: &HashMap<String, Value>) -> Result<PanelSpec, LayoutError> {
+    Ok(PanelSpec {
+        topology: surface_topology(properties)?,
+        keyboard_interactivity: parse_keyboard_interactivity(properties)?,
+        exclusive: parse_exclusive(properties)?,
+        margin: parse_edge_insets(properties, "margin")?,
+        width: parse_size_mode(properties, "width")?,
+        height: parse_size_mode(properties, "height")?,
     })
 }
 
@@ -1651,11 +1816,32 @@ mod tests {
     }
 
     #[test]
-    fn layer_reads_the_string() {
+    fn layer_reads_each_of_the_four_protocol_levels() {
         let lua = lua();
-        let table: mlua::Table = lua.load(r#"return { kind = "panel", layer = "Top" }"#).eval().unwrap();
+        for (text, expected) in [
+            ("Background", LayerKind::Background),
+            ("Bottom", LayerKind::Bottom),
+            ("Top", LayerKind::Top),
+            ("Overlay", LayerKind::Overlay),
+        ] {
+            let table: mlua::Table = lua.load(format!(r#"return {{ kind = "panel", layer = "{text}" }}"#)).eval().unwrap();
+            let props = props_from_table(&table);
+            assert_eq!(parse_layer(&props).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_layer_is_a_config_error_not_a_silent_default() {
+        // build-steps.md Phase 20 item 3: this used to return the raw string, so a typo reached
+        // the topology diff intact and nothing ever validated it. Now `create_panels` binds a real
+        // `zwlr_layer_surface_v1` with it, and a typo that quietly stacked a bar on the wrong
+        // layer would be a worse failure than a rejected config -- nothing on screen would say why.
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "panel", layer = "Toop" }"#).eval().unwrap();
         let props = props_from_table(&table);
-        assert_eq!(parse_layer(&props).unwrap(), "Top");
+        let err = parse_layer(&props).unwrap_err();
+        assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "layer"), "got {err}");
+        assert!(err.to_string().contains("Toop"), "the message must name the value the config wrote: {err}");
     }
 
     #[test]
@@ -1687,10 +1873,10 @@ mod tests {
     }
 
     #[test]
-    fn surface_topology_combines_id_layer_anchor_and_monitor() {
+    fn surface_topology_combines_id_layer_anchor_monitor_and_namespace() {
         let lua = lua();
         let table: mlua::Table = lua
-            .load(r#"return { kind = "panel", id = "bar", layer = "Top", anchor = { top = true }, monitor = "eDP-1" }"#)
+            .load(r#"return { kind = "panel", id = "bar", layer = "Top", anchor = { top = true }, monitor = "eDP-1", namespace = "my-bar" }"#)
             .eval()
             .unwrap();
         let props = props_from_table(&table);
@@ -1699,11 +1885,157 @@ mod tests {
             topology,
             SurfaceTopology {
                 id: "bar".to_string(),
-                layer: "Top".to_string(),
+                layer: LayerKind::Top,
                 anchor: Anchor { top: true, right: false, bottom: false, left: false },
                 monitor: "eDP-1".to_string(),
+                namespace: "my-bar".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn namespace_absent_defaults_to_oblisk_dash_id() {
+        // § 6.1: "Defaults to `oblisk-{id}`". Before docs/adr/0038 the namespace was hardcoded per
+        // Rust-owned role, so no compositor rule could name a user's own panel.
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "panel", id = "launcher", layer = "Overlay" }"#).eval().unwrap();
+        let props = props_from_table(&table);
+        assert_eq!(parse_namespace(&props, "launcher").unwrap(), "oblisk-launcher");
+        assert_eq!(surface_topology(&props).unwrap().namespace, "oblisk-launcher");
+    }
+
+    #[test]
+    fn a_signal_in_namespace_on_a_panel_is_rejected_like_every_other_topology_field() {
+        // `get_layer_surface` fixes the namespace at creation and no request changes it on a live
+        // surface, so it is a topology field by protocol (`CONTEXT.md`, Topology change) and a
+        // handle that could drift after the diff has nothing left to re-check it.
+        let lua = lua();
+        crate::lua::signal::register(&lua).unwrap();
+        let signal = crate::lua::signal::Signal::new_live(Value::String(lua.create_string("x").unwrap()), crate::lua::signal::DirtyFlag::new()).0;
+        lua.globals().set("ns", signal).unwrap();
+        let table: mlua::Table = lua.load(r#"return { kind = "panel", id = "bar", layer = "Top", namespace = ns }"#).eval().unwrap();
+        let props = props_from_table(&table);
+        // `resolve_properties` must have copied it through raw for the parser to see a handle.
+        let resolved = resolve_properties(&props, "panel", &lua).unwrap();
+        assert!(matches!(parse_namespace(&resolved, "bar").unwrap_err(), LayoutError::UnsupportedSignalProperty(p) if p == "namespace"));
+    }
+
+    #[test]
+    fn keyboard_interactivity_absent_defaults_to_none() {
+        let props = HashMap::new();
+        assert_eq!(parse_keyboard_interactivity(&props).unwrap(), KeyboardInteractivity::None);
+    }
+
+    #[test]
+    fn keyboard_interactivity_reads_each_of_the_three_protocol_modes() {
+        let lua = lua();
+        for (text, expected) in [
+            ("None", KeyboardInteractivity::None),
+            ("OnDemand", KeyboardInteractivity::OnDemand),
+            ("Exclusive", KeyboardInteractivity::Exclusive),
+        ] {
+            let table: mlua::Table = lua.load(format!(r#"return {{ kind = "panel", keyboard_interactivity = "{text}" }}"#)).eval().unwrap();
+            let props = props_from_table(&table);
+            assert_eq!(parse_keyboard_interactivity(&props).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_keyboard_interactivity_is_rejected() {
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "panel", keyboard_interactivity = "Always" }"#).eval().unwrap();
+        let props = props_from_table(&table);
+        assert!(matches!(parse_keyboard_interactivity(&props).unwrap_err(), LayoutError::InvalidProperty { property, .. } if property == "keyboard_interactivity"));
+    }
+
+    #[test]
+    fn a_signal_in_keyboard_interactivity_resolves_rather_than_being_rejected() {
+        // The other side of the namespace test: layer-shell's `set_keyboard_interactivity` is
+        // valid on a live surface, so this is an in-place field and a `Signal` in it is legal
+        // (docs/adr/0044 decision 1). A launcher flipping focus mode from Lua is the point.
+        let lua = lua();
+        crate::lua::signal::register(&lua).unwrap();
+        let signal = crate::lua::signal::Signal::new_live(Value::String(lua.create_string("Exclusive").unwrap()), crate::lua::signal::DirtyFlag::new()).0;
+        lua.globals().set("mode", signal).unwrap();
+        let table: mlua::Table = lua.load(r#"return { kind = "panel", id = "bar", layer = "Top", keyboard_interactivity = mode }"#).eval().unwrap();
+        let props = props_from_table(&table);
+        let resolved = resolve_properties(&props, "panel", &lua).unwrap();
+        assert_eq!(parse_keyboard_interactivity(&resolved).unwrap(), KeyboardInteractivity::Exclusive);
+    }
+
+    #[test]
+    fn exclusive_absent_defaults_to_false() {
+        let props = HashMap::new();
+        assert!(!parse_exclusive(&props).unwrap());
+    }
+
+    #[test]
+    fn exclusive_reads_the_boolean_and_rejects_anything_else() {
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "panel", exclusive = true }"#).eval().unwrap();
+        assert!(parse_exclusive(&props_from_table(&table)).unwrap());
+
+        let bad: mlua::Table = lua.load(r#"return { kind = "panel", exclusive = 32 }"#).eval().unwrap();
+        assert!(matches!(parse_exclusive(&props_from_table(&bad)).unwrap_err(), LayoutError::InvalidProperty { property, .. } if property == "exclusive"));
+    }
+
+    #[test]
+    fn panel_spec_reads_every_layer_surface_field_in_one_pass() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(
+                r#"return { kind = "panel", id = "dock", layer = "Bottom", anchor = { bottom = true },
+                   monitor = "DP-1", namespace = "my-dock", keyboard_interactivity = "OnDemand",
+                   exclusive = true, margin = { top = 4, left = 8 }, width = "Fill", height = 48 }"#,
+            )
+            .eval()
+            .unwrap();
+        let spec = panel_spec(&props_from_table(&table)).unwrap();
+
+        assert_eq!(spec.topology.id, "dock");
+        assert_eq!(spec.topology.layer, LayerKind::Bottom);
+        assert_eq!(spec.topology.anchor, Anchor { top: false, right: false, bottom: true, left: false });
+        assert_eq!(spec.topology.monitor, "DP-1");
+        assert_eq!(spec.topology.namespace, "my-dock");
+        assert_eq!(spec.keyboard_interactivity, KeyboardInteractivity::OnDemand);
+        assert!(spec.exclusive);
+        assert_eq!(spec.margin, EdgeInsets { top: 4.0, right: 0.0, bottom: 0.0, left: 8.0 });
+        assert_eq!(spec.width, SizeMode::Fill);
+        assert_eq!(spec.height, SizeMode::Pixels(48.0));
+    }
+
+    #[test]
+    fn a_panel_roots_margin_is_the_anchor_offset_and_no_layout_pass_consumes_it() {
+        // build-steps.md Phase 20 item 3 item 4: on a `panel` root, `margin` means the layer-shell
+        // anchor offset, not layout spacing -- and there is no conflict with layout's own reading
+        // of the property because `layout::scene::Scene::apply_one_surface` passes `None` for both
+        // parent-margin arguments when it resolves a root, so nothing in layout consumes it. This
+        // proves the second half directly: an 80-wide root with a large `margin` still resolves to
+        // exactly 80 wide at exactly (0, 0), while `panel_spec` reads the same value as the offset.
+        let lua = mlua::Lua::new();
+        crate::lua::nodes::register_node_constructors(&lua).unwrap();
+        let table: mlua::Table = lua
+            .load(r#"return panel { id = "bar", layer = "Top", width = 80, height = 20, margin = { top = 12, left = 30 } }"#)
+            .eval()
+            .unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+
+        let spec = panel_spec(&surface.properties).unwrap();
+        assert_eq!(spec.margin, EdgeInsets { top: 12.0, right: 0.0, bottom: 0.0, left: 30.0 });
+
+        let mut scene = crate::layout::Scene::new();
+        let shaping = crate::text::shaping::ShapingHandle::spawn();
+        let instances = vec![crate::layout::instance::SurfaceInstance {
+            instance_id: "bar@TEST".to_string(),
+            declared_id: "bar".to_string(),
+            output: "TEST".to_string(),
+            available: crate::layout::LogicalSize { width: 1000.0, height: 500.0 },
+        }];
+        scene.apply(&[surface], &instances, &shaping, &lua).unwrap();
+
+        let root = scene.surface("bar@TEST").unwrap();
+        assert_eq!((root.rect.x, root.rect.y), (0.0, 0.0), "a root's margin must not offset it inside its own surface");
+        assert_eq!((root.rect.width, root.rect.height), (80.0, 20.0), "a root's margin must not shrink it either");
     }
 
     #[test]
@@ -1723,7 +2055,7 @@ mod tests {
     #[test]
     fn a_signal_userdata_in_node_id_is_rejected() {
         // docs/adr/0045 decision 1: id is a reconcile identity, decided once at match time, so it
-        // rejects a Signal the same way SurfaceTopology's four fields already do.
+        // rejects a Signal the same way SurfaceTopology's five fields already do.
         let lua = lua();
         crate::lua::signal::register(&lua).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::Boolean(true), crate::lua::signal::DirtyFlag::new()).0;

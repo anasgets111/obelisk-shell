@@ -207,7 +207,11 @@ impl DirtyFlag {
         Self(Rc::new(Cell::new(false)))
     }
 
-    fn mark(&self) {
+    /// `pub(crate)` since build-steps.md Phase 20 item 4: a `configure` carrying a new size for one
+    /// surface instance means exactly what a capability push means -- the resolved geometry no
+    /// longer matches its inputs -- so `crate::socket::RendererClient::set_instance_size` marks
+    /// this same flag rather than adding a second mechanism beside it (ADR-0044 decision 2).
+    pub(crate) fn mark(&self) {
         self.0.set(true);
     }
 
