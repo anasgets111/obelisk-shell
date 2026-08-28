@@ -16,6 +16,7 @@
 //! input-region computation is pure but not yet wired to a live `wl_surface::set_input_region`
 //! call; the lease/retiring mechanism has no real GPU resource to guard yet.
 
+pub mod hit;
 pub mod instance;
 pub mod node;
 pub mod paint;

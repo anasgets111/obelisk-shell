@@ -104,6 +104,32 @@ end
 local notifs = cell(label(notifications, notification_summary))
 local notification_feed = cell(label(notifications, notification_summary))
 
+-- Phase 21 item 1's live proof: a `button` whose `on_click` changes what a `text` paints, which is
+-- the whole point of routing pointer events at all.
+--
+-- The counter is a plain Lua upvalue read back through a zero-dependency `computed`, not a signal
+-- the handler writes, because there is no writable signal to write: ADR-0044 decision 5's
+-- `state(name, initial)` is not built yet. What makes the new count appear is the Renderer marking
+-- the scene dirty once `on_click` returns (`RendererClient::mark_scene_dirty`), so the next poll
+-- turn re-resolves this `computed` and repaints. `rect` is the button's own rect in this surface's
+-- logical coordinates (ADR-0050 decision 3) -- Phase 22's `popup` is what really wants it; this
+-- prints it so a live session can check it against where the button is actually drawn.
+local clicks = 0
+
+local click_button = button {
+    width = 86,
+    height = 24,
+    background = "#313244ff",
+    radius = 4,
+    on_click = function(rect)
+        clicks = clicks + 1
+        print(string.format("[shell.lua] click %d, button rect %.0f,%.0f %.0fx%.0f", clicks, rect.x, rect.y, rect.width, rect.height))
+    end,
+    children = { cell(computed({}, function()
+        return string.format("clicks %d", clicks)
+    end), ACCENT) },
+}
+
 -- Only rendered when the config itself has failed, so `rescue` is the one signal whose absence is
 -- the healthy case (§ 2.10).
 local rescue_cell = cell(label(rescue, function(r)
@@ -135,7 +161,7 @@ return {
             padding = { left = 12, right = 12, top = 4, bottom = 4 },
             spacing = 8,
             align_v = "Center",
-            children = { clock, net, bt, kbd, media, sound, tray_cell, notifs, rescue_cell },
+            children = { clock, net, bt, kbd, media, sound, tray_cell, notifs, click_button, rescue_cell },
         },
     },
     panel {

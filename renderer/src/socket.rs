@@ -577,6 +577,33 @@ impl RendererClient {
         &self.scene
     }
 
+    /// This generation's `Lua`, for building the one argument `button`'s `on_click` takes
+    /// (docs/adr/0050 decision 3). `crate::wayland::App` holds the resolved tree's
+    /// `mlua::Function` but no VM to construct a `Table` in, and every other value it hands Lua
+    /// today it got *from* Lua -- this is the first one it makes.
+    ///
+    /// Narrower than it looks: `Loader::lua` has been public within the crate all along, and the
+    /// only thing this adds is a path to it that does not make `loader` itself public. Callers
+    /// must not hold the borrow across the Lua call it feeds; see
+    /// [`crate::wayland::App::fire_on_click`].
+    pub fn lua(&self) -> &mlua::Lua {
+        self.loader.lua()
+    }
+
+    /// Marks the scene dirty from outside a live-signal write, so the next poll turn re-resolves
+    /// (ADR-0044 decision 2). The one caller is a `button`'s `on_click` having just run.
+    ///
+    /// ponytail: unconditional, because Rust cannot see what the handler touched. ADR-0044
+    /// decision 5's `state(name, initial)` -- the writable, Lua-facing signal whose own `:set()`
+    /// would mark this flag -- is not built yet, so today a handler's only way to change what is
+    /// painted is to mutate a Lua upvalue a `computed` reads, which marks nothing. The ceiling is
+    /// one wasted `Scene::apply` per click on a handler that wrote nothing; a click is a discrete
+    /// human action, so that is a resolve per click, not per frame. Drop this call once `state`
+    /// exists and every path a handler can change the scene through marks the flag itself.
+    pub fn mark_scene_dirty(&self) {
+        self.dirty.mark();
+    }
+
     /// Handles one inbound `SupervisorFrame`, decoded off the wire by [`pump`] and handed over by
     /// `crate::wayland::run`'s poll loop.
     ///

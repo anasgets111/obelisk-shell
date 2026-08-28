@@ -9,6 +9,7 @@ use smithay_client_toolkit::dispatch2::Dispatch2;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::presentation_time::{PresentTime, PresentationTimeHandler, PresentationTimeState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
+use smithay_client_toolkit::seat::pointer::{BTN_LEFT, PointerEvent, PointerEventKind, PointerHandler};
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
@@ -17,8 +18,9 @@ use smithay_client_toolkit::shell::wlr_layer::{
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::{delegate_registry, registry_handlers};
 use khronos_egl::Surface as EglSurface;
+use mlua::{Function, Lua, Table, Value};
 use wayland_client::globals::{registry_queue_init, GlobalList};
-use wayland_client::protocol::{wl_output, wl_seat, wl_surface};
+use wayland_client::protocol::{wl_output, wl_pointer, wl_seat, wl_surface};
 use wayland_client::{Connection, Proxy, QueueHandle, WEnum};
 use wayland_egl::WlEglSurface;
 use wayland_protocols::wp::presentation_time::client::wp_presentation_feedback;
@@ -34,6 +36,7 @@ use crate::layout::node::{self, LayerKind, PanelSpec, SizeMode};
 use crate::socket::RendererClient;
 use crate::text::atlas::TextPainter;
 use crate::text::shaping::ShapingHandle;
+use crate::text::snap::LogicalRect;
 
 /// ponytail: no real per-`textfield` focus/attribution exists yet (see `App::bind_text_input`'s
 /// own `ponytail` comment) -- every `secure_submit` completed this way is attributed to this
@@ -191,6 +194,16 @@ pub struct App {
     /// object, same reasoning `BoundSurface`'s `#[allow(dead_code)]` fields already document.
     #[allow(dead_code)]
     text_input: Option<ZwpTextInputV3>,
+    /// The seat's pointer, once it advertised one (build-steps.md Phase 21 item 1). Kept alive
+    /// for the same reason `text_input` is -- dropping the proxy destroys the protocol object,
+    /// and with it every `enter`/`press`/`release` this shell is interactive because of.
+    ///
+    /// One, not one per seat: `bind_text_input` already takes `seats().next()`, so this whole
+    /// file is single-seat, and a second seat's pointer would need a second `armed` beside it
+    /// rather than sharing this one.
+    pointer: Option<wl_pointer::WlPointer>,
+    /// The press waiting for its release, if any (docs/adr/0050 decision 2, [`ArmedClick`]).
+    armed: Option<ArmedClick>,
     text_input_pending: TextInputPending,
     /// Accumulates committed `wp-text-input-v3` edits until a protocol-native `ACTION_SUBMIT`
     /// completes them (build-steps.md Phase 15 item 2; ADR-0005/ADR-0009/ADR-0027) -- never
@@ -252,6 +265,8 @@ pub fn run(
         queue_handle: qh.clone(),
         active_nonce: None,
         text_input: None,
+        pointer: None,
+        armed: None,
         text_input_pending: TextInputPending::default(),
         secure_buffer: shared::SecureBuffer::new(),
     };
@@ -418,8 +433,9 @@ pub fn run(
 /// the next `done` (`done`'s own description: "This event replaces the current state with the
 /// pending state"). Kept separate from the real `Dispatch2` impl below so it's unit-testable
 /// without a live Wayland connection -- this file has no headless Wayland test harness, which is
-/// why the config-facing enums live in `layout` and only the pure mappings (`layer_for`,
-/// `anchor_for`, `keyboard_interactivity_for`, `exclusive_zone_for`) live here.
+/// why the config-facing enums live in `layout` and only pure functions (the `layer_for` through
+/// `exclusive_zone_for` block below, and docs/adr/0050's click-decision functions beside them)
+/// live here.
 #[derive(Default)]
 struct TextInputPending {
     commit: Option<String>,
@@ -470,7 +486,7 @@ fn apply_edit(buffer: &mut shared::SecureBuffer, edit: TextInputEdit) -> bool {
     edit.submit
 }
 
-/// `layout`'s `LayerKind` to the protocol's own stacking level. Pure, and one of the four
+/// `layout`'s `LayerKind` to the protocol's own stacking level. Pure, and one of the
 /// `wayland/mod.rs` seams that is unit-testable at all -- everything around it needs a live
 /// compositor, which is exactly why the config-facing enums live in `layout` and only the mapping
 /// lives here.
@@ -566,6 +582,77 @@ fn exclusive_zone_for(anchor: node::Anchor, configured_size: (u32, u32)) -> i32 
         (false, true) => width as i32,
         _ => 0,
     }
+}
+
+/// One press waiting for its release (docs/adr/0050 decision 2): a click is a press *and* a
+/// release on the same node, so that a user who presses a button, notices the mistake and drags
+/// off it releases harmlessly.
+///
+/// "Same node" is this pair and not a node identity, because a `ResolvedNode` has none --
+/// `NodeId` lives on `RetainedNode` and does not survive `to_resolved`. The rect is the proxy, and
+/// the case it gets "wrong" it gets right anyway: a re-resolve between press and release that
+/// moves the button cancels the click, which is what a real identity would also answer for a
+/// button that moved out from under the pointer.
+#[derive(Debug, Clone, PartialEq)]
+struct ArmedClick {
+    instance_id: String,
+    rect: LogicalRect,
+}
+
+/// The innermost `button` in a [`layout::hit::hit_path`] result carrying a callable `on_click`, as
+/// that button's absolute rect and its function (docs/adr/0050 decision 1).
+///
+/// Scans from the deep end, which is the whole reason hit-testing returns a path: the deepest node
+/// under the pointer is normally the `button`'s `text` child, and it has no `on_click`. A `button`
+/// without one is transparent to this scan rather than a barrier, so a plain `button` nested inside
+/// a handled one still lets the outer one fire.
+///
+/// `on_click` must be a `Value::Function`. Anything else the config wrote under that key -- a
+/// string, a table -- is simply not a click handler; `layout::node` has no parser for the key
+/// (§ 5.2 leaves it opaque, docs/adr/0021 item 2), so this predicate is the only place its type is
+/// ever checked.
+fn clickable_button<'a>(path: &[&'a layout::ResolvedNode]) -> Option<(LogicalRect, &'a Function)> {
+    path.iter().enumerate().rev().find_map(|(depth, node)| {
+        if node.kind != "button" {
+            return None;
+        }
+        let Some(Value::Function(on_click)) = node.properties.get("on_click") else {
+            return None;
+        };
+        Some((layout::hit::absolute_rect(&path[..=depth])?, on_click))
+    })
+}
+
+/// Whether a release on `instance_id`, over the button at `released_on`, completes `armed`
+/// (docs/adr/0050 decision 2).
+///
+/// Both halves have to be a *button* hit, not merely the same coordinates: a release that lands in
+/// the armed rect but on something that is no longer a handled button (the config re-resolved and
+/// put a plain `rect` there) is not the click the press started. `released_on` is therefore
+/// [`clickable_button`]'s answer for the release, not the raw pointer position.
+fn release_completes_click(armed: Option<&ArmedClick>, instance_id: &str, released_on: Option<LogicalRect>) -> bool {
+    match (armed, released_on) {
+        (Some(armed), Some(rect)) => armed.instance_id == instance_id && armed.rect == rect,
+        _ => false,
+    }
+}
+
+/// `on_click`'s single argument: the button's rect as `{ x, y, width, height }` in its surface's
+/// logical coordinates (docs/adr/0050 decision 3).
+///
+/// The rect travels *to* the callback, not back from it. § 6's `popup` entry and docs/adr/0040
+/// both say the anchor rect is "passed straight from the rect `button`'s `on_click` hands back",
+/// which read as a Rust-side return value would be unimplementable -- the engine does not know
+/// which `popup` a click was meant to open, and it already has the button's rect. "Hands back"
+/// is the round trip through the config: `on_click = function(rect) menu_anchor:set(rect) end`,
+/// with the `popup` declaring `anchor_rect = menu_anchor` (build-steps.md Phase 22 item 2).
+fn rect_table(lua: &Lua, rect: LogicalRect) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("x", rect.x)?;
+    table.set("y", rect.y)?;
+    table.set("width", rect.width)?;
+    table.set("height", rect.height)?;
+    Ok(table)
 }
 
 /// The surface ids a PBA Candidate both announces in its `ReadySignal` and then draws on
@@ -1723,6 +1810,55 @@ impl App {
             eprintln!("[oblisk-renderer] failed to queue SecureSubmit for the socket thread: {e}");
         }
     }
+
+    /// The handled `button` under a pointer event on surface `index`, as its absolute rect and a
+    /// clone of its `on_click` (docs/adr/0050 decision 1). `None` if the point misses every one.
+    ///
+    /// `position` is surface-local and *logical*, which is the space `layout::hit` walks
+    /// `ResolvedNode::rect` in, so there is no conversion here at all. That holds only while
+    /// `paint_surface` paints at scale `1.0` and nothing calls `wl_surface::set_buffer_scale`;
+    /// docs/adr/0050's consequences name this as the third caller the HiDPI change from Phase 20
+    /// has to move together with `paint_surface` and `apply_input_region`.
+    ///
+    /// Owned on the way out, both halves. `Scene::surface` clones into a `ResolvedNode` (the same
+    /// property `paint_surface` relies on), so the borrow of `self.client` ends on that line, and
+    /// the `Function` is cloned out of the local tree before it is dropped.
+    fn button_under(&self, index: usize, position: (f64, f64)) -> Option<(LogicalRect, Function)> {
+        let tree = self.client.scene().surface(&self.surfaces[index].surface_id)?;
+        let point = layout::hit::LogicalPoint { x: position.0 as f32, y: position.1 as f32 };
+        let path = layout::hit::hit_path(&tree, point);
+        clickable_button(&path).map(|(rect, on_click)| (rect, on_click.clone()))
+    }
+
+    /// Calls one `button`'s `on_click` with its rect (docs/adr/0050 decision 3) and marks the
+    /// scene dirty.
+    ///
+    /// A raise is logged against the surface it happened on and swallowed. A broken `on_click` is
+    /// a config bug, and a config bug must not take a shell that is otherwise painting down with
+    /// it; docs/adr/0046's rescue path is for an evaluation that failed, not for one misbehaving
+    /// handler, so this deliberately does not set `self.exit` and deliberately does not enter
+    /// rescue.
+    ///
+    /// The dirty mark is not conditional on the call succeeding: a handler that raised halfway
+    /// may already have written whatever it wrote. Nothing re-resolves here -- `run`'s poll loop
+    /// calls `dispatch_pending` (which is where this runs) at the top of the same turn whose
+    /// `re_resolve_if_dirty`/`repaint_mapped_surfaces` pair then picks the mark up, so a click is
+    /// on screen one turn later without this function knowing anything about painting.
+    fn fire_on_click(&mut self, instance_id: &str, rect: LogicalRect, on_click: &Function) {
+        // The table is built and the `&Lua` borrow released before the call, so no borrow of
+        // `self.client` is live while Lua runs inside it.
+        let argument = match rect_table(self.client.lua(), rect) {
+            Ok(table) => table,
+            Err(e) => {
+                eprintln!("[oblisk-renderer] {instance_id}: could not build on_click's rect argument: {e}");
+                return;
+            }
+        };
+        if let Err(e) = on_click.call::<()>(argument) {
+            eprintln!("[oblisk-renderer] {instance_id}: on_click raised, ignoring it: {e}");
+        }
+        self.client.mark_scene_dirty();
+    }
 }
 
 /// Builds one `RendererFrame::SecureSubmit` out of `buffer` (build-steps.md Phase 15 item 2;
@@ -1799,13 +1935,92 @@ impl SeatHandler for App {
 
     fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
 
-    // No pointer/keyboard/touch object is ever created from any capability -- `bind_text_input`
-    // only needs the bare `wl_seat` itself to call `get_text_input(seat)` (ADR-0009: SCTK's
-    // `seat` module is standard infrastructure here, not a design point).
-    fn new_capability(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat, _capability: Capability) {}
-    fn remove_capability(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat, _capability: Capability) {}
+    /// Pointer only. `bind_text_input` needs the bare `wl_seat` rather than a capability, and no
+    /// keyboard or touch object is created from one either -- keyboard focus is build-steps.md
+    /// Phase 21 item 2, and § 5.2 has no touch-specific property for a third to serve.
+    ///
+    /// Idempotent by the `is_some` guard, not by trusting the compositor: `wl_seat::capabilities`
+    /// is a full re-statement of the current set on every change, so a seat that gains a keyboard
+    /// re-announces its pointer, and SCTK turns each announcement into this call. Creating a
+    /// second `wl_pointer` there would leave two objects delivering the same events into one
+    /// `armed` slot.
+    fn new_capability(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, capability: Capability) {
+        if !matches!(capability, Capability::Pointer) || self.pointer.is_some() {
+            return;
+        }
+        match self.seat_state.get_pointer(qh, &seat) {
+            Ok(pointer) => self.pointer = Some(pointer),
+            // Not fatal: a shell with no pointer still paints, still reloads, and still takes
+            // `wp-text-input-v3` input. Only `on_click` stops working, which is what this says.
+            Err(e) => eprintln!("[oblisk-renderer] wl_seat::get_pointer failed; no button's on_click will ever fire: {e}"),
+        }
+    }
+
+    fn remove_capability(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat, capability: Capability) {
+        if !matches!(capability, Capability::Pointer) {
+            return;
+        }
+        // A pointer that is gone will never send the `release` this press was waiting for, which
+        // is the same reason `leave` clears it (docs/adr/0050 decision 2).
+        self.armed = None;
+        if let Some(pointer) = self.pointer.take() {
+            // `wl_pointer::release` is `since="3"`; below that the destructor does not exist and
+            // dropping the proxy is the whole cleanup. Same guard SCTK's own `ThemedPointer::drop`
+            // applies (src/seat/pointer/mod.rs:572).
+            if pointer.version() >= 3 {
+                pointer.release();
+            }
+        }
+    }
 
     fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
+}
+
+/// Pointer input to `on_click` (build-steps.md Phase 21 item 1, docs/adr/0050).
+///
+/// No `delegate_pointer!` call accompanies this, and adding one would not compile: this SCTK has
+/// no such macro, and `PointerData<U>` carries a blanket `Dispatch2<WlPointer, D>` impl
+/// (src/seat/pointer/mod.rs:209) that the file-wide `delegate_dispatch2!(App)` at the bottom
+/// already turns into the `Dispatch<WlPointer, PointerData<()>>` half of `get_pointer`'s bound.
+/// This trait is the only half left to supply.
+impl PointerHandler for App {
+    fn pointer_frame(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _pointer: &wl_pointer::WlPointer, events: &[PointerEvent]) {
+        for event in events {
+            // A surface this process does not own: a `wl_pointer` is per seat, not per surface,
+            // and nothing stops the compositor from having delivered an event for a surface that
+            // has since been destroyed by a `visible` flip or an output change.
+            let Some(index) = self.surfaces.iter().position(|s| s.layer.wl_surface() == &event.surface) else {
+                continue;
+            };
+            match event.kind {
+                // `BTN_LEFT` alone (docs/adr/0050 decision 2). A right-click has no meaning in the
+                // IDL, and inventing one here would be policy no config could override.
+                PointerEventKind::Press { button: BTN_LEFT, .. } => {
+                    let instance_id = self.surfaces[index].surface_id.clone();
+                    self.armed = self.button_under(index, event.position).map(|(rect, _)| ArmedClick { instance_id, rect });
+                }
+                PointerEventKind::Release { button: BTN_LEFT, .. } => {
+                    let instance_id = self.surfaces[index].surface_id.clone();
+                    let hit = self.button_under(index, event.position);
+                    let fires = release_completes_click(self.armed.as_ref(), &instance_id, hit.as_ref().map(|(rect, _)| *rect));
+                    // Unconditionally, and before the call: a release ends this press whether or
+                    // not it fired, and a handler that re-enters here must not find it still set.
+                    self.armed = None;
+                    if let Some((rect, on_click)) = hit.filter(|_| fires) {
+                        self.fire_on_click(&instance_id, rect, &on_click);
+                    }
+                }
+                // The pointer left the surface, so the release (if it ever comes) lands somewhere
+                // else. This is the drag-off-and-cancel decision 2 is built around.
+                PointerEventKind::Leave { .. } => self.armed = None,
+                // `Enter`/`Motion`/`Axis`: nothing in § 5.2 reads hover or scroll yet, and a
+                // motion that leaves the armed rect deliberately does *not* disarm -- dragging
+                // back onto the button and releasing still clicks it, which is what every toolkit
+                // does.
+                _ => {}
+            }
+        }
+    }
 }
 
 impl PresentationTimeHandler for App {
@@ -2358,5 +2573,94 @@ mod tests {
 
         assert_eq!(buffer.expose_secret(), b"existing");
         assert!(!submit);
+    }
+
+    fn hit_node(lua: &Lua, kind: &str, (x, y, width, height): (f32, f32, f32, f32), on_click: bool) -> layout::ResolvedNode {
+        let mut properties = HashMap::new();
+        if on_click {
+            properties.insert("on_click".to_string(), Value::Function(lua.create_function(|_, ()| Ok(())).unwrap()));
+        }
+        layout::ResolvedNode {
+            kind: kind.to_string(),
+            rect: LogicalRect { x, y, width, height },
+            visible: true,
+            properties,
+            children: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_innermost_handled_button_under_the_pointer_is_the_one_that_would_fire() {
+        // The shape decision 1 exists for: the deepest node is the `text`, and the outer `row`
+        // is not a button, so only the middle node answers.
+        let lua = Lua::new();
+        let mut button = hit_node(&lua, "button", (10.0, 4.0, 40.0, 24.0), true);
+        button.children.push(hit_node(&lua, "text", (6.0, 5.0, 28.0, 14.0), false));
+        let mut row = hit_node(&lua, "row", (0.0, 0.0, 100.0, 32.0), false);
+        row.children.push(button);
+        let mut root = hit_node(&lua, "panel", (0.0, 0.0, 100.0, 32.0), false);
+        root.children.push(row);
+
+        let path = layout::hit::hit_path(&root, layout::hit::LogicalPoint { x: 20.0, y: 12.0 });
+        let (rect, _) = clickable_button(&path).expect("the button carries an on_click");
+        assert_eq!(rect, LogicalRect { x: 10.0, y: 4.0, width: 40.0, height: 24.0 });
+    }
+
+    #[test]
+    fn a_button_with_no_on_click_is_transparent_rather_than_a_barrier() {
+        // An unhandled `button` nested inside a handled one must not swallow the click: the scan
+        // keeps walking outwards past it.
+        let lua = Lua::new();
+        let inner = hit_node(&lua, "button", (5.0, 2.0, 20.0, 20.0), false);
+        let mut outer = hit_node(&lua, "button", (10.0, 4.0, 40.0, 24.0), true);
+        outer.children.push(inner);
+        let mut root = hit_node(&lua, "panel", (0.0, 0.0, 100.0, 32.0), false);
+        root.children.push(outer);
+
+        let path = layout::hit::hit_path(&root, layout::hit::LogicalPoint { x: 20.0, y: 12.0 });
+        assert_eq!(path.len(), 3, "the inner button is still on the path");
+        let (rect, _) = clickable_button(&path).expect("the outer button carries the on_click");
+        assert_eq!(rect, LogicalRect { x: 10.0, y: 4.0, width: 40.0, height: 24.0 });
+    }
+
+    #[test]
+    fn an_on_click_that_is_not_a_function_is_not_a_click_handler() {
+        // Nothing in `layout::node` parses this key (§ 5.2 leaves it opaque), so a config writing
+        // `on_click = "quit"` reaches here as a string and must simply not fire.
+        let lua = Lua::new();
+        let mut button = hit_node(&lua, "button", (0.0, 0.0, 40.0, 24.0), false);
+        button.properties.insert("on_click".to_string(), Value::String(lua.create_string("quit").unwrap()));
+        let mut root = hit_node(&lua, "panel", (0.0, 0.0, 100.0, 32.0), false);
+        root.children.push(button);
+
+        let path = layout::hit::hit_path(&root, layout::hit::LogicalPoint { x: 20.0, y: 12.0 });
+        assert!(clickable_button(&path).is_none());
+    }
+
+    #[test]
+    fn a_release_fires_only_over_the_same_surface_and_the_same_rect_the_press_armed() {
+        let rect = LogicalRect { x: 10.0, y: 4.0, width: 40.0, height: 24.0 };
+        let moved = LogicalRect { x: 11.0, y: 4.0, width: 40.0, height: 24.0 };
+        let armed = ArmedClick { instance_id: "bar@eDP-1".to_string(), rect };
+
+        assert!(release_completes_click(Some(&armed), "bar@eDP-1", Some(rect)));
+        // Dragged off the button, then released: the release hits no button at all.
+        assert!(!release_completes_click(Some(&armed), "bar@eDP-1", None));
+        // Dragged onto a different button on the same surface.
+        assert!(!release_completes_click(Some(&armed), "bar@eDP-1", Some(moved)));
+        // Same button geometry, different surface -- two panels can resolve identical rects.
+        assert!(!release_completes_click(Some(&armed), "notification_area@eDP-1", Some(rect)));
+        // A release with nothing armed (a press that hit no button, or a `leave` in between).
+        assert!(!release_completes_click(None, "bar@eDP-1", Some(rect)));
+    }
+
+    #[test]
+    fn on_clicks_argument_is_the_buttons_rect_as_four_named_fields() {
+        let lua = Lua::new();
+        let table = rect_table(&lua, LogicalRect { x: 10.5, y: 4.0, width: 40.0, height: 24.0 }).unwrap();
+        assert_eq!(table.get::<f32>("x").unwrap(), 10.5);
+        assert_eq!(table.get::<f32>("y").unwrap(), 4.0);
+        assert_eq!(table.get::<f32>("width").unwrap(), 40.0);
+        assert_eq!(table.get::<f32>("height").unwrap(), 24.0);
     }
 }
