@@ -32,7 +32,7 @@
 //! are the carve-outs and keep rejecting a `Signal` outright -- see
 //! [`reject_signal_in_structural_field`]'s doc comment for why.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use mlua::{Lua, Value};
 
@@ -128,6 +128,10 @@ fn invalid(property: &str, detail: impl Into<String>) -> LayoutError {
 /// though it would no longer reintroduce the pathological allocation this exists to stop.
 const MAX_ERROR_VALUE_PREVIEW_BYTES: usize = 200;
 
+/// `pub(crate)` rather than private: `layout::scene`'s `list` node (build-steps.md Phase 19 item
+/// 12) rejects a bad `source`/`itemfn`/`key` value from outside this module and needs the same
+/// bounded preview, not a second copy of this truncation logic.
+///
 /// Renders a `Value` for an [`invalid`] detail without ever formatting its `Debug` form in full
 /// first (docs/build-steps.md Phase 19 item 13). `format!("{value:?}")` on an oversized
 /// `Value::String` allocates and escapes the whole thing before any truncation could run --
@@ -168,7 +172,7 @@ const MAX_ERROR_VALUE_PREVIEW_BYTES: usize = 200;
 /// the table is or how many upvalues the closure carries. `Integer`/`Number`/`Boolean`/`Nil`/
 /// `LightUserData` are already bounded by their own type. So only the `String` arm needs a
 /// separate path here; every other variant formats exactly as it always has.
-fn preview_for_error(value: &Value) -> String {
+pub(crate) fn preview_for_error(value: &Value) -> String {
     let Value::String(s) = value else {
         return format!("{value:?}");
     };
@@ -1042,6 +1046,110 @@ pub fn parse_children(properties: &HashMap<String, Value>) -> Result<Vec<Virtual
     for entry in table.sequence_values::<mlua::Table>() {
         let entry = entry.map_err(|e| invalid("children", e.to_string()))?;
         let node = deserialize_lua_table(&entry).map_err(|e| invalid("children", e.to_string()))?;
+        children.push(node);
+    }
+    Ok(children)
+}
+
+/// A `list` node's children (`oblisk-idl-api-specs.md` § 5.2 item 7, docs/adr/0045 decision 3,
+/// build-steps.md Phase 19 item 12). Parallels [`parse_children`]'s role for
+/// `rect`/`row`/`column`/`button`, but a `list`'s children are never a literal Lua table: they are
+/// generated here, once per element of `source`, by calling `itemfn(element)` and deserializing
+/// the node table it returns the same way a literal child table is deserialized.
+///
+/// `source` arrives already resolved. `resolve_properties` treats it like any other
+/// non-structural property, so a `Signal` there was read exactly once before this function ever
+/// runs (build-steps.md Phase 19 item 1) -- nothing here re-reads it, which is what "resolve
+/// through the existing Signal machinery" means: there is no second mechanism to build.
+///
+/// Without `key`, a generated child gets no `id` at all, so
+/// `layout::scene::pair_children_by_id_then_position` matches list items by position -- the same
+/// rule an id-less literal child already gets, and exactly what decision 3 specifies. With `key`,
+/// `key(element)` -- called on the source element, never on the node `itemfn` built, so a key is
+/// computable without building anything -- becomes that child's `id`, overwriting whatever `id`
+/// `itemfn`'s own node table carried: a list item's identity belongs to the list, and honoring an
+/// inner `id` instead would let two items that happen to declare the same one collide.
+///
+/// Duplicate keys are rejected here, before any `id` reaches `pair_children_by_id_then_position`,
+/// so that function's own "duplicate id" message stays about a literal sibling `id` and a list
+/// author gets a message naming `key`, the property they actually wrote.
+///
+/// ponytail: `key` makes *reconciliation* cheap, not *evaluation*. This calls `itemfn` for every
+/// element on every resolve, so a 30-item tray builds 30 fresh nodes each time, and
+/// `pair_children_by_id_then_position` then matches 29 of them to retained nodes and throws the
+/// fresh ones away. § 5.2 calls `list` a "fast-reconciling virtual repeater", and the reconciling
+/// half is what ADR-0045 delivered; the repeater half still re-runs a Lua closure per item per
+/// pass. `resolve_and_reconcile` runs per `Scene::apply`, which ADR-0044 decision 2's dirty flag
+/// made per poll turn rather than per config edit, so this is the same cadence change item 14's
+/// text-reshaping `ponytail:` records against `intrinsic_content_size`.
+///
+/// The fix is to compute keys first and skip `itemfn` for an element whose key already matches a
+/// retained child, which is what makes it a virtual repeater rather than a loop. It is not built
+/// here because this function cannot see the retained children: `children_of` hands it only the
+/// fresh node's own properties, and giving it the retained side means changing that signature and
+/// the two other `children_of` arms with it. Worth doing when a real config drives a list from a
+/// capability that pushes often, not before.
+pub fn parse_list_children(properties: &HashMap<String, Value>) -> Result<Vec<VirtualNode>, LayoutError> {
+    let source_value = properties
+        .get("source")
+        .ok_or_else(|| invalid("source", "required for `list`, got nothing"))?;
+    let Value::Table(source) = source_value else {
+        return Err(invalid(
+            "source",
+            format!("expected an array table, got {}", preview_for_error(source_value)),
+        ));
+    };
+
+    let itemfn = match properties.get("itemfn") {
+        Some(Value::Function(f)) => f,
+        Some(other) => return Err(invalid("itemfn", format!("expected a function, got {}", preview_for_error(other)))),
+        None => return Err(invalid("itemfn", "required for `list`, got nothing")),
+    };
+
+    let key_fn = match properties.get("key") {
+        Some(Value::Function(f)) => Some(f),
+        Some(other) => return Err(invalid("key", format!("expected a function, got {}", preview_for_error(other)))),
+        None => None,
+    };
+
+    let mut children = Vec::new();
+    let mut seen_keys: HashSet<String> = HashSet::new();
+    for element in source.sequence_values::<Value>() {
+        let element = element.map_err(|e| invalid("source", e.to_string()))?;
+
+        let built = itemfn
+            .call::<Value>(element.clone())
+            .map_err(|e| invalid("itemfn", e.to_string()))?;
+        let Value::Table(built_table) = built else {
+            return Err(invalid(
+                "itemfn",
+                format!("expected a node table, got {}", preview_for_error(&built)),
+            ));
+        };
+        let mut node = deserialize_lua_table(&built_table).map_err(|e| invalid("itemfn", e.to_string()))?;
+
+        if let Some(key_fn) = key_fn {
+            let key_value = key_fn.call::<Value>(element).map_err(|e| invalid("key", e.to_string()))?;
+            let Value::String(key_str) = key_value else {
+                return Err(invalid(
+                    "key",
+                    format!("expected key(item) to return a string, got {}", preview_for_error(&key_value)),
+                ));
+            };
+            let key_text = key_str.to_str().map(|s| s.to_string()).map_err(|_| {
+                invalid(
+                    "key",
+                    "must be valid UTF-8 -- a key is compared for equality, so it cannot be converted lossily",
+                )
+            })?;
+            if !seen_keys.insert(key_text.clone()) {
+                return Err(invalid("key", format!("duplicate key `{key_text}` among list items")));
+            }
+            // The key wins over any `id` the node itemfn built already carried -- see this
+            // function's doc comment.
+            node.properties.insert("id".to_string(), Value::String(key_str));
+        }
+
         children.push(node);
     }
     Ok(children)

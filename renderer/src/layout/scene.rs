@@ -319,7 +319,7 @@ impl Scene {
 
 fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
     match kind {
-        "surface" | "rect" | "row" | "column" | "text" | "icon" | "button" | "textfield" => Ok(()),
+        "surface" | "rect" | "row" | "column" | "text" | "icon" | "button" | "list" | "textfield" => Ok(()),
         other => Err(LayoutError::UnsupportedNodeKind(other.to_string())),
     }
 }
@@ -336,7 +336,7 @@ fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
 /// 64 times against a 64-level cap, because the parent at the last admitted level resolved the
 /// child's whole property map -- running its `children` closure -- before recursing into the check
 /// that refused that child. The kind case is worse than one wasted level: every property getter of
-/// a `kind = "list"` node ran, arbitrary Lua side effects for a node that never entered the
+/// an unsupported-kind node ran, arbitrary Lua side effects for a node that never entered the
 /// accepted tree.
 ///
 /// `depth` is the level the node being checked would occupy, so a parent at `depth` checks its
@@ -383,6 +383,10 @@ fn children_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Vec<Vi
             .into_iter()
             .collect()),
         "rect" | "row" | "column" | "button" => node::parse_children(properties),
+        // ADR-0045 decision 3, build-steps.md Phase 19 item 12: a `list`'s children don't exist
+        // as a literal Lua table -- they're generated from `source`, one per element, which is
+        // why this is its own parser rather than a `parse_children` variant.
+        "list" => node::parse_list_children(properties),
         "text" | "icon" | "textfield" => Ok(Vec::new()),
         other => unreachable!("ensure_supported_kind already rejected `{other}`"),
     }
@@ -772,7 +776,23 @@ fn intrinsic_content_size(
                 .fold(0.0_f32, f32::max);
             Ok(LogicalSize { width, height })
         }
-        "column" => {
+        // `list` sizes exactly like `column` -- ADR-0045 decision 3 and § 5.2 item 7 say nothing
+        // about a list's geometry, only its reconciliation, so this is this slice's own
+        // interpretation, the same way ADR-0023 item 4 labels the stacking model as one. Sharing
+        // `column`'s arm rather than duplicating its body is deliberate: the two are the same
+        // vertical-stack formula, and a future divergence should be a real design decision, not
+        // drift between two copies nobody remembers to keep in sync.
+        //
+        // ponytail: no horizontal list. A repeated tray (icons flowing left to right) can't be
+        // expressed today, and neither upgrade path is built because both cost more than this
+        // slice needs. A `direction` property on `list` would invent API § 5.2 doesn't have --
+        // `list`'s own spec entry lists only `source`/`itemfn`/`key`. Splicing a list's generated
+        // children into its *parent's* child list -- a true repeater, which would inherit
+        // whichever direction that parent already lays out in -- conflicts with ADR-0045's "a
+        // node is identified by its position in one parent's child list": a spliced list has no
+        // single parent's child list to hold a position in, so that ADR would need amending
+        // first, not just this code.
+        "column" | "list" => {
             let spacing = node::parse_spacing(properties)?;
             let visible: Vec<&RetainedNode> = children.iter().filter(|c| c.visible).collect();
             let height = visible
@@ -885,7 +905,10 @@ fn position_children(
                 cursor += footprints[i] + spacing;
             }
         }
-        "column" => {
+        // `list` positions exactly like `column` -- see `intrinsic_content_size`'s matching arm
+        // for why this is a labeled interpretation rather than a spec requirement, and for the
+        // no-horizontal-list ponytail.
+        "column" | "list" => {
             let spacing = node::parse_spacing(properties)?;
             let main_align = node::parse_align(properties, "align_v")?;
             let visible_indices: Vec<usize> = children
@@ -1303,9 +1326,13 @@ mod tests {
     fn an_unsupported_top_level_kind_is_rejected() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        let (_lua, surface) = surface_from(r#"surface { id = "bar", child = list {} }"#);
+        // `list` used to be this fixture's example kind, back when it was registered as a Lua
+        // constructor but rejected by `ensure_supported_kind` (build-steps.md Phase 19 item 12).
+        // It is a real kind now, so a raw table naming a kind no constructor registers at all is
+        // what "unsupported" actually means going forward.
+        let (_lua, surface) = surface_from(r#"surface { id = "bar", child = { kind = "banana" } }"#);
         let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
-        assert!(matches!(err, LayoutError::UnsupportedNodeKind(k) if k == "list"));
+        assert!(matches!(err, LayoutError::UnsupportedNodeKind(k) if k == "banana"));
     }
 
     #[test]
@@ -1313,9 +1340,9 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) =
-            surface_from(r#"surface { id = "bar", child = row { children = { list {} } } }"#);
+            surface_from(r#"surface { id = "bar", child = row { children = { { kind = "banana" } } } }"#);
         let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
-        assert!(matches!(err, LayoutError::UnsupportedNodeKind(k) if k == "list"));
+        assert!(matches!(err, LayoutError::UnsupportedNodeKind(k) if k == "banana"));
     }
 
     #[test]
@@ -2199,7 +2226,7 @@ mod tests {
                 ran = false
                 local w = computed({}, function() ran = true; return 10 end)
                 return surface { id = "bar", child = row { children = {
-                    { kind = "list", width = w },
+                    { kind = "banana", width = w },
                 } } }
                 "#,
             )
@@ -2210,7 +2237,7 @@ mod tests {
         let err = scene.apply(&[surface], full(), &shaping, &lua).unwrap_err();
 
         assert!(
-            matches!(&err, LayoutError::UnsupportedNodeKind(kind) if kind == "list"),
+            matches!(&err, LayoutError::UnsupportedNodeKind(kind) if kind == "banana"),
             "the error must be unchanged by moving the check earlier: {err:?}"
         );
         assert!(
@@ -2269,5 +2296,251 @@ mod tests {
                 y1: 10
             }
         );
+    }
+
+    #[test]
+    fn a_list_resolves_one_child_per_source_element_in_source_order() {
+        // build-steps.md Phase 19 item 12: `list` expands `source` via `itemfn`, one child per
+        // element, in the order `source` lists them -- catches both "list is still rejected as an
+        // unsupported kind" and a `children_of` arm that drops or reorders elements.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"surface { id = "bar", child = list {
+                source = { 10, 20, 30 },
+                itemfn = function(item) return rect { width = item, height = 5 } end,
+            } }"#,
+        );
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
+        let list = &scene.surface("bar").unwrap().children[0];
+        assert_eq!(list.children.len(), 3);
+        assert_eq!(list.children[0].rect.width, 10.0);
+        assert_eq!(list.children[1].rect.width, 20.0);
+        assert_eq!(list.children[2].rect.width, 30.0);
+    }
+
+    #[test]
+    fn a_list_with_key_keeps_existing_items_node_ids_when_a_new_element_is_inserted_at_the_front() {
+        // The reason this item exists (docs/adr/0045 decision 3): `key(element)` becomes the
+        // generated child's `id`, so `pair_children_by_id_then_position` (ADR-0045 decisions 1-2)
+        // pairs list items by key rather than by index -- an insertion at the front must not
+        // shift every existing item onto the wrong retained node.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let itemfn = r#"function(item) return rect { width = item.n, height = 1 } end"#;
+        let key = r#"function(item) return item.id end"#;
+        let (_lua1, surface_v1) = surface_from(&format!(
+            r#"surface {{ id = "bar", child = list {{
+                source = {{ {{ id = "a", n = 1 }}, {{ id = "b", n = 2 }}, {{ id = "c", n = 3 }} }},
+                key = {key},
+                itemfn = {itemfn},
+            }} }}"#
+        ));
+        scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
+        let (a_id, b_id, c_id) = {
+            let list = &scene.surfaces.get("bar").unwrap().children[0].children;
+            (list[0].id, list[1].id, list[2].id)
+        };
+
+        let (_lua2, surface_v2) = surface_from(&format!(
+            r#"surface {{ id = "bar", child = list {{
+                source = {{ {{ id = "z", n = 9 }}, {{ id = "a", n = 1 }}, {{ id = "b", n = 2 }}, {{ id = "c", n = 3 }} }},
+                key = {key},
+                itemfn = {itemfn},
+            }} }}"#
+        ));
+        scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
+        let list = &scene.surfaces.get("bar").unwrap().children[0].children;
+
+        assert_eq!(list.len(), 4);
+        assert_eq!(list[1].id, a_id, "a kept its retained node despite z inserted above it");
+        assert_eq!(list[2].id, b_id, "b kept its retained node despite z inserted above it");
+        assert_eq!(list[3].id, c_id, "c kept its retained node despite z inserted above it");
+        assert!(
+            list[0].id != a_id && list[0].id != b_id && list[0].id != c_id,
+            "z is a genuinely new key, so it must get a freshly allocated node, not one borrowed from a's old slot"
+        );
+    }
+
+    #[test]
+    fn a_list_without_key_rebuilds_every_item_from_the_insertion_point_on() {
+        // The documented contrast to the test above (docs/adr/0045 decision 3: "without key,
+        // items match by index and every item below an insertion rebuilds"). With no key, list
+        // items pair positionally, same as an id-less literal child list -- inserting at the
+        // front silently hands the old position-0 retained node to whatever now sits at position
+        // 0, rather than to the logical item that used to be there.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let itemfn = r#"function(item) return rect { width = item, height = 1 } end"#;
+        let (_lua1, surface_v1) = surface_from(&format!(
+            r#"surface {{ id = "bar", child = list {{ source = {{ 1 }}, itemfn = {itemfn} }} }}"#
+        ));
+        scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
+        let x_id = scene.surfaces.get("bar").unwrap().children[0].children[0].id;
+
+        let (_lua2, surface_v2) = surface_from(&format!(
+            r#"surface {{ id = "bar", child = list {{ source = {{ 2, 1 }}, itemfn = {itemfn} }} }}"#
+        ));
+        scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
+        let list = &scene.surfaces.get("bar").unwrap().children[0].children;
+
+        assert_eq!(list.len(), 2);
+        assert_eq!(
+            list[0].id, x_id,
+            "position 0 reuses the old retained node regardless of which logical item now occupies it"
+        );
+        assert_ne!(
+            list[1].id, x_id,
+            "the item that used to be first is now at position 1, a position with no retained counterpart, so it gets a fresh node instead of keeping x's"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_list_key_is_rejected_naming_key_not_id() {
+        // build-steps.md Phase 19 item 12 / ADR-0045 decision 3: a duplicate key is caught during
+        // list expansion, before either key reaches `pair_children_by_id_then_position`, so the
+        // message names `key` -- the property the config author actually wrote -- rather than
+        // reusing `duplicate_sibling_ids_are_rejected_as_a_layout_error`'s "id" message.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"surface { id = "bar", child = list {
+                source = { { id = "dup" }, { id = "dup" } },
+                key = function(item) return item.id end,
+                itemfn = function(item) return rect { width = 1, height = 1 } end,
+            } }"#,
+        );
+        let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "key" && detail.contains("dup")),
+            "duplicate list keys must be rejected naming `key`, not `id`: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_list_with_no_source_is_a_layout_error_naming_source() {
+        // Error case from build-steps.md Phase 19 item 12: `source` missing entirely.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"surface { id = "bar", child = list { itemfn = function(item) return rect {} end } }"#,
+        );
+        let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
+        assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "source"), "{err:?}");
+    }
+
+    #[test]
+    fn a_list_source_that_is_not_a_table_is_a_layout_error_naming_source() {
+        // Error case: `source` present but not resolving to a table/array.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"surface { id = "bar", child = list { source = 5, itemfn = function(item) return rect {} end } }"#,
+        );
+        let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
+        assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "source"), "{err:?}");
+    }
+
+    #[test]
+    fn a_list_with_no_itemfn_is_a_layout_error_naming_itemfn() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(r#"surface { id = "bar", child = list { source = { 1 } } }"#);
+        let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
+        assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "itemfn"), "{err:?}");
+    }
+
+    #[test]
+    fn a_list_itemfn_that_is_not_a_function_is_a_layout_error_naming_itemfn() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) =
+            surface_from(r#"surface { id = "bar", child = list { source = { 1 }, itemfn = "nope" } }"#);
+        let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
+        assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "itemfn"), "{err:?}");
+    }
+
+    #[test]
+    fn a_list_itemfn_raising_a_lua_error_is_a_layout_error_naming_itemfn() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"surface { id = "bar", child = list { source = { 1 }, itemfn = function(item) error("boom") end } }"#,
+        );
+        let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "itemfn" && detail.contains("boom")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_list_itemfn_returning_a_non_node_table_is_a_layout_error_naming_itemfn() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"surface { id = "bar", child = list { source = { 1 }, itemfn = function(item) return 5 end } }"#,
+        );
+        let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
+        assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "itemfn"), "{err:?}");
+    }
+
+    #[test]
+    fn a_list_key_that_is_not_a_function_is_a_layout_error_naming_key() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"surface { id = "bar", child = list { source = { 1 }, key = "nope", itemfn = function(item) return rect {} end } }"#,
+        );
+        let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
+        assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "key"), "{err:?}");
+    }
+
+    #[test]
+    fn a_list_key_returning_a_non_string_is_a_layout_error_naming_key() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"surface { id = "bar", child = list {
+                source = { 1 },
+                key = function(item) return 5 end,
+                itemfn = function(item) return rect {} end,
+            } }"#,
+        );
+        let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
+        assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "key"), "{err:?}");
+    }
+
+    #[test]
+    fn a_list_with_an_empty_source_has_no_children_and_does_not_error() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"surface { id = "bar", child = list { source = {}, itemfn = function(item) return rect {} end } }"#,
+        );
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
+        let list = &scene.surface("bar").unwrap().children[0];
+        assert_eq!(list.children.len(), 0);
+    }
+
+    #[test]
+    fn a_list_sizes_and_positions_like_a_column() {
+        // Design decision 5: a `list` lays out exactly like a `column` -- vertical stack, own
+        // width the widest child, own height the summed children plus spacing gaps.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"surface { id = "bar", child = list {
+                spacing = 3,
+                source = { 1, 2 },
+                itemfn = function(item) return rect { width = 6, height = 10 } end,
+            } }"#,
+        );
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
+        let list = &scene.surface("bar").unwrap().children[0];
+        assert_eq!(list.rect.width, 6.0, "own width is the widest child, same formula as column");
+        assert_eq!(list.rect.height, 23.0, "10 + 10 + 3 spacing, same formula as column");
+        assert_eq!(list.children[0].rect.y, 0.0);
+        assert_eq!(list.children[1].rect.y, 13.0, "second item stacks below the first plus spacing");
     }
 }
