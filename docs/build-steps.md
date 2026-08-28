@@ -1100,6 +1100,28 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    without changing the parent. It bites exactly the case a popup or a notification card is: sized
    to its contents, with padding as the whole point. Item 6 is what makes it visible, since a
    background painted at the reported size will visibly stop short of its own text.
+
+   **Done in `c3bcb1d`**, in `resolve_and_reconcile` rather than in `intrinsic_content_size`, and
+   deliberately so: `intrinsic_content_size` answers "how much room do the contents need", which is
+   what the row/column sums and the stacking union are about, while a node's own padding belongs to
+   the node. Adding it through `own_width_known.unwrap_or(...)` is also what confines it to an axis
+   the config did not state, since on a stated axis padding has already done its work insetting the
+   child budget and adding it again would count it twice.
+
+   **A leftover this exposed, on leaves rather than containers.** That `unwrap_or` runs for every
+   kind, so a `text` or `icon` with its own `padding` grows too. Measured: `text { content = "Ob",
+   font_size = 14 }` resolves to 19.544x16.8, and the same node with `padding = 10` on every edge
+   resolves to 39.544x36.8, exactly the padding. But `TextPainter::draw_line` draws at the rect's
+   origin, and a leaf has no children for `position_children` to inset, so the glyphs stay in the
+   top-left corner and the padding becomes dead space on the right and bottom.
+
+   Both halves want doing together, and neither alone is the fix. Dropping the leaf from the size
+   calculation makes `padding` on a `text` silently do nothing, which is not better than doing the
+   wrong thing visibly. The honest version is `paint_text` offsetting the draw by the node's own
+   padding while the size keeps including it, which is the same shape as the container case:
+   `position_children` insets children by padding, so paint should inset a leaf's content by it
+   too. Sequence it with item 17's wrap follow-up, since both change what `paint_text` hands
+   `draw_line`.
 15. **One spelling for the geometry properties.** `border_width = 1` is accepted and `padding = 10`
    is not, though both reach `parse_edge_insets`: only `border_width` has the scalar shorthand in
    front of it (item 6's second commit added it there and nowhere else). A config author who learns
