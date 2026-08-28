@@ -186,10 +186,17 @@ Before rendering any pixels on screen, the `renderer` must initialize an OpenGL 
 1.  **Registry and layer-shell binding**: use `smithay-client-toolkit`'s `shell::wlr_layer` module for `zwlr_layer_shell_v1`/`zwlr_layer_surface_v1` instead of hand-dispatching the protocol against raw `wayland-client` (ADR-0008). Reserve raw `wayland-protocols` for the one thing SCTK doesn't wrap: `wp-text-input-v3` for `textfield`.
 2.  **EGL Context Allocation**: Initialize EGL with `khronos_egl`, following SCTK's own EGL setup as a reference: [SCTK EGL Module](https://github.com/Smithay/client-toolkit/tree/main/src/egl). Find the optimal EGL config supporting 8-bit ARGB color formats (`EGL_SURFACE_TYPE` with `EGL_WINDOW_BIT`, `EGL_RENDERABLE_TYPE` with `EGL_OPENGL_ES3_BIT`).
 3.  **Surface Context Binding**: Match the Wayland physical native window (`wl_egl_window`) to the created EGL surface and make the GLES3 rendering context current on the thread. Refer to `noctalia`'s OpenGL ES Renderer initialization logic: [Noctalia Renderer Setup](https://github.com/noctalia-dev/noctalia/tree/main/src/renderer).
-4.  **Static Layer Constraints**: Register the three static surfaces returned by your layout (ADR-0007):
+4.  **Layer Constraints**: Bring up three surfaces to prove the layer-shell path end to end:
     *   `main_bar`: anchored on top, marked exclusive.
     *   `overlay_canvas`: anchored to all four edges, non-exclusive, transparent. On boot, immediately commit an empty input region (`wl_compositor::create_region` with no added coordinates) to allow background applications to receive pointer clicks.
-    *   `wallpaper_layer`: `Background` layer, non-exclusive, one per monitor.
+    *   `wallpaper_layer`: `Background` layer, non-exclusive, one per monitor (ADR-0007).
+
+    Superseded by ADR-0038: these three are a bring-up scaffold, not the surface model. They are
+    hardcoded in Rust as a `SurfaceRole` enum and created before any Lua runs, which means
+    `shell.lua`'s own `surface` declarations are discarded. Phase 20 deletes the enum and drives
+    surface creation from the evaluated topology, at which point these three become ordinary ids in
+    the default config. Do not add a fourth role here; adding the third one is what exposed the
+    problem.
 
 ---
 
@@ -459,7 +466,9 @@ persistent structure the loader's output is reconciled into.
    visible children, projected logical-to-physical with floor/ceiling snapping, pushed via
    `wl_surface::set_input_region`. Reuse `text/snap.rs`'s existing `snap_to_physical`/
    `snap_border_to_physical` (Phase 4); the second has no caller yet and was built for exactly
-   this.
+   this. Per ADR-0038 this is a per-surface operation, not an `overlay_canvas` special case: it is
+   a no-op for a tightly-sized bar and applies to any surface larger than its visible content. The
+   live push waits for Phase 20 (ADR-0023 item 5).
 
 Deliberately deferred: `list`'s virtual-repeater fast-reconciliation beyond basic indexed diffing,
 if index-based matching turns out insufficient for reordering without full rebuild. Flag rather
@@ -576,7 +585,437 @@ socket, Lua, or any D-Bus controller. Can be built any time, including in parall
 
 ---
 
-## 5. Continuation Testing & Validation Protocols
+## 5. Renderer Playbook: Phases 18 Onward
+
+Phases 9 through 17 built the Supervisor out to ten capabilities pushing real system state into
+live Lua signals. None of that state can become a pixel. The Renderer draws one hardcoded proof
+string (`wayland/mod.rs`'s `draw_main_bar_proof_text`, labelled a Phase 4 integration proof in its
+own comment), and the resolved `Scene` the layout engine maintains is never referenced by the
+Wayland module at all. ADR-0023 item 9 recorded this deliberately: Phase 12 was the layout module,
+not the paint pipeline.
+
+Two structural findings from the 2026-08-28 renderer review set the order of what follows.
+
+The Renderer is two OS threads that cannot reach each other's state (ADR-0039). The Lua VM and the
+retained scene are on the socket thread; the EGL context, the surfaces, and the FemtoVG canvas are
+on the Wayland thread. Painting, dynamic surfaces, and input dispatch are all blocked on the same
+seam, so it is removed first and alone.
+
+The surface set is hardcoded in Rust and disconnected from `shell.lua` (ADR-0038). Three roles are
+created before any Lua is evaluated, so a config's own `surface` declarations are discarded. This
+is what stands between Oblisk and the Quickshell-shaped goal of a config that builds any shell
+component rather than a bar with an overlay.
+
+A third finding arrived with the 2026-08-28 scope call for Quickshell-equivalent freedom: floating
+windows, popups, session lock, and per-screen variants. ADR-0040 turns the surface set into four
+Wayland roles (`panel`, `window`, `popup`, `lock`), ADR-0041 replaces `Variants` with a Lua loop over
+a new `oblisk.screens` signal, ADR-0042 moves the session lock into the Renderer, and ADR-0043 sets a
+memory budget with the two decisions that make it reachable.
+
+A fourth finding came out of the 2026-08-28 review of the Lua boundary, and it is the oldest of the
+four. No path exists from a capability's state to the screen. A `StateSnapshot` push writes its
+`LiveSignalHandle` and stops there, `layout/node.rs` rejects a `Signal` handle in every property it
+parses, and re-evaluation runs only on a config edit. Change the volume and nothing moves. ADR-0023
+item 2 deferred this and named Phase 13 as the place to pick it up; Phase 13 shipped without it and
+no later phase claimed it. ADR-0044 settles it, and it has to land before the frame gating below,
+which currently names no mechanism for deciding that the scene changed.
+
+The phases below close all four. Each reuses what already exists rather than re-deriving it, and
+each names what it leaves for the next, following the same scope-ceiling discipline as ADR-0021 and
+ADR-0023. Phases 18 through 21 are strictly ordered, since each unblocks the next; 22 through 24 are
+independent of each other once 21 lands, except that Phase 24 is worth building early. Phase 25 is
+independent of all of them and blocks nothing, but every § 3.2 write command stays unreachable from
+Lua until it lands.
+
+Phases 26 and 27 come from a fifth review, of Quickshell's own QML-to-C++ layer on 2026-08-28. They
+close the two gaps that changed a design rather than adding a feature: a config is a directory of
+Lua files and not one file (ADR-0047), the config VM drops the stdlib calls that would stall the
+Wayland thread ADR-0039 put it on (ADR-0048), and a startup failure needs an error path that does not
+run through the config that just failed (ADR-0046). The same review produced ADR-0045, which lands
+inside Phase 19 because it changes reconciliation. Both phases are independent of everything above.
+
+### Phase 18: Renderer Thread Consolidation
+
+Implement ADR-0039. Move `Loader`, the live-signal map, the rescue state, and `layout::Scene` into
+`wayland::run`; demote `socket::spawn_client` to framed I/O that forwards inbound
+`SupervisorFrame`s over a channel and writes outbound envelopes it receives over another. `mlua::Lua`
+is `!Send`, so this is a construction move, not a hand-off.
+
+Collapse what the move makes redundant: three of `main.rs`'s four channels become direct calls,
+the duplicate `ShapingHandle` and its second `FontSystem::new()` startup cost go away (ADR-0023
+item 8), and `PLACEHOLDER_OUTPUT_SIZE` is replaced by each surface's real configured size
+(ADR-0023 item 6).
+
+A pure refactor with no behavior change: same three hardcoded surfaces, same proof string, same PBA
+handshake, fewer threads. That is the acceptance criterion. Resist folding any of Phase 19 into it;
+a refactor that also adds a paint pass cannot be verified as behavior-preserving.
+
+Deliberately deferred: everything the move unblocks. Painting, surface creation, input, and the
+`overlay_input_regions` push all wait for their own phases, even though each becomes a local call
+the moment this lands.
+
+### Phase 19: Signal Reactivity and the Paint Pass
+
+The first phase that puts Lua-driven content on screen, and the first where that content changes on
+its own. Items 1 through 4 implement ADR-0044 and ADR-0045 and are verifiable with no EGL at all:
+push a snapshot, assert the resolved `ResolvedNode` tree changed. Items 5 onward turn a resolved
+tree into pixels. Build them in that order, since item 8's gating condition is item 2's output.
+
+1. **Resolve `Signal` properties instead of rejecting them** (ADR-0044 decision 1). Delete
+   `layout/node.rs`'s `reject_signal` and its twelve call sites. Where a parser finds a `Signal`
+   userdata, call `get()` and parse the result under the rules it already applies to a literal. Take
+   `#[allow(dead_code)]` off `lua/marshal.rs` and run a resolved value through
+   `check_number`/`check_integer`/`check_string`: this is the Lua-authored value crossing into Rust
+   that those functions were written for, and until now nothing called them.
+2. **The dirty flag** (ADR-0044 decision 2). `LiveSignalHandle::set` marks the scene dirty. Hold the
+   last evaluation's `LoadOutput` and re-run `Scene::apply` against it when the flag is set, without
+   running `shell.lua`. Mark it `ponytail:`, naming the ceiling: one flag for the whole scene, so a
+   high-frequency capability re-resolves surfaces that read nothing from it.
+3. **Recursion depth cap.** `resolve_and_reconcile` recurses through `children_of` with no counter,
+   so `local r = rect {}; r.children = { r }` overflows the stack and aborts the process past the
+   guard page, where `oblisk.rescue` cannot catch it. § 1.1 caps strings at 64KB and integers at
+   2^53 and says nothing about table shape. Cap depth at a constant, return a `LayoutError`, and let
+   the existing rescue path report it. Item 2 makes this reachable far more often, since a cyclic
+   tree now re-resolves on every push rather than once per config edit.
+4. **Reconcile by `id`, not by position alone** (ADR-0045). `Scene`'s § 4 matching pairs a parent's
+   children by index, so inserting a node above a sibling shifts every node below it onto the wrong
+   retained counterpart. Add an optional `id` base property on every node kind, pair identified
+   children first within one parent, then fall back to today's positional rule for the rest. Reject
+   duplicate ids among siblings as a `LayoutError`. This matters here rather than later because
+   item 2 turns reconciliation from a per-edit event into a per-push one.
+5. **Per-node drawing.** `rect` (background, `radius`, per-edge `border_color`/`border_width`) and
+   `text` (reuse `TextPainter`, already a FemtoVG `Canvas<OpenGl>` with `resize` per frame, and
+   `text/shaping.rs`'s existing off-thread shaping). `row`/`column`/`button` are containers with no
+   paint of their own beyond their `rect` properties. Draw in tree order so the stacking model
+   ADR-0023 item 4 already implements resolves overlaps the way layout resolved them.
+6. **Snapping.** Reuse `text/snap.rs`'s `snap_to_physical` and `snap_border_to_physical`. The second
+   has had no caller since Phase 4 and this is what it was written for: a border snapped to whole
+   physical pixels instead of straddling two (`oblisk-layout-engine-geometry.md` § 5).
+7. **One canvas, many surfaces.** All surfaces share one EGL context, so one `TextPainter` serves
+   all of them: make the surface's EGL surface current, `resize` the canvas to that surface, draw,
+   swap. Verify FemtoVG tolerates the surface switch under a shared context before assuming it; if
+   it does not, one canvas per surface is the fallback, not a redesign.
+8. **Frame-callback scheduling.** Request `wl_surface::frame()` and redraw only when both a frame
+   callback has arrived and item 2's re-resolve produced a different result for that surface, rather
+   than on the current 15ms poll timeout in `wayland::run`'s loop. ashell's `src/application.rs` does
+   exactly this with a `frame_pending` flag and reports an idle cost of zero, which is the target:
+   the loop blocks when nothing is happening. Write the gate so a second reason to wake can be added
+   next to the first rather than replacing it: an animation repaints whether or not a signal changed,
+   and that is the one thing here that would be a redesign rather than an addition if the condition
+   is hardcoded to "the scene changed".
+9. **Declared fonts, not discovered ones** (ADR-0043). Do not call `load_system_fonts()`. Load the
+   families the config names plus its declared fallback chain, through `fontdb`'s
+   `load_font_file`/`load_fonts_dir`. This is the single largest lever on the memory budget, and it
+   also removes most of the roughly one second `FontSystem::new()` currently costs, since that time
+   is mostly cold-cache I/O over fonts the shell never draws with.
+10. **Atlas eviction** (ADR-0043). femtovg allocates 512x512 RGBA8 atlas pages, one mebibyte each,
+   grows the list without bound, and frees them only on an explicit `clear()`. Clear at a
+   page-count threshold on an idle frame and let it rebuild. Mark it `ponytail:`, naming the
+   ceiling: a whole-cache drop rather than an LRU, because femtovg exposes no per-glyph eviction.
+
+Deliberately deferred, and this one is a decision rather than an omission: **no damage tracking.**
+Redraw the whole surface. `oblisk-layout-engine-geometry.md` § 5 projects damage rectangles, but
+ashell ships a working bar presenting the full viewport every frame with no `wl_surface::damage`
+call anywhere, and reports no cost from it. Partial damage is a real optimization with a real
+bookkeeping burden; build it when a profile says the full redraw is the problem, not before.
+
+Also deferred: `icon`, which needs a spec conflict settled first. `oblisk-idl-api-specs.md` § 5.2
+item 5 gives `icon` a `name` property holding a theme name (`"audio-volume-high"`), implying the
+Renderer resolves it. `oblisk-supervisor-services-dbus.md` § 9.2 puts an off-thread XDG desktop and
+icon-theme resolver in the Supervisor, with an LRU cache, exposed to Lua as
+`system:find_icon(app_id, name, fallback)` returning an absolute path. Building both means two icon
+resolvers.
+
+Settle it toward the Supervisor's, which is already specified, already required to be off-thread,
+and already has the cache; the tray and notification controllers also already spool decoded icons
+to `/dev/shm` by path (`dbus/shm_icons.rs`), so a path-taking `icon` node has two producers waiting
+and a name-taking one has none. Drawing an image from a path is the easy half either way. Note that
+neither resolver exists yet, so nothing has to be unbuilt. ashell's dependency on the
+`freedesktop-icons` crate is the reference for whichever side ends up owning it.
+
+Also deferred: Lua-authored state (ADR-0044 decision 5). Live signals are read-only to Lua, so a
+config cannot hold reactive state of its own and "is this dropdown open" has nowhere to live.
+`state(name, initial)` returns a writable `Signal` that marks dirty through item 2's flag, and the
+name is what makes it survive an in-place reload. Phase 22 is the first thing that cannot work
+without it.
+
+Testing: `oblisk-tdd-test-harness.md` § 3.1's headless EGL harness is written for exactly this,
+using `EGL_PLATFORM_SURFACELESS_MESA` to render off-screen and assert pixel values (a `rect` with
+background `#FF0000` writes red). It has never been built. Note two constraints before starting:
+`renderer` is a binary-only crate with no `src/lib.rs`, so this lives in an inline `#[cfg(test)]`
+module rather than the `renderer/tests/test_headless_renderer.rs` path the harness doc names (the
+same conclusion ADR-0021 reached for its own tests), and a surfaceless context still needs a working
+driver, so the test needs gating rather than being assumed to run in every environment.
+
+### Phase 20: Lua-Declared Surfaces
+
+Implement ADR-0038. Delete `SurfaceRole` and the three `create_*` calls; drive surface creation,
+reconfiguration, and destruction from the evaluated topology instead.
+
+1. **Build the surface set from the evaluation, at generation startup.** `Scene` keys top-level
+   surfaces by `id` in a `HashMap<String, RetainedNode>` (ADR-0023) and
+   `layout::node::SurfaceTopology` already parses `id`/`layer`/`anchor`/`monitor`. Create one layer
+   surface per declared `(surface, output)` pair after the first evaluation, replacing the three
+   `create_*` calls that run before it today.
+
+   Do not add in-place surface creation or destruction. Adding or removing a surface, or changing
+   its layer/anchor/monitor/namespace, is a topology change and stays the generation swap ADR-0001
+   routes it to; the candidate builds its own set the same way. Within a live generation only two
+   things move: `visible` maps and unmaps a surface, and the fields layer-shell permits changing on
+   a live surface (`margin`, exclusive zone, `keyboard_interactivity`, size) apply in place.
+
+   That rule is about `panel`, which is all this phase builds. `popup` and `window` cannot follow it,
+   because `xdg_popup` needs its grab before mapping and its positioner is consumed at `get_popup`
+   time; for those two roles `visible` creates and destroys the Wayland object (ADR-0049). Phase 22
+   owns that, and the distinction is noted here so this item is not later read as forbidding it.
+2. **One Wayland surface per targeted output.** Generalize the `"{id}@{output}"` surface-id
+   convention `supervisor/src/reload.rs` already carries through the PBA handshake for wallpaper.
+   `OutputHandler` is already implemented, so monitor hotplug adds and removes surface instances for
+   any surface targeting `"All"`.
+3. **Three new `surface` properties**: `namespace` (the layer-shell namespace compositor rules match
+   on, hardcoded per role today), `keyboard_interactivity` (`"None"`/`"OnDemand"`/`"Exclusive"`,
+   without which a launcher cannot take typing), and `margin` (anchor offsets, which padding cannot
+   express because padding is inside the surface). All three are in `oblisk-idl-api-specs.md` § 6.1
+   as of ADR-0038.
+4. **Move the default surfaces into Lua.** `main_bar`, `overlay_canvas`, and `wallpaper_layer` stop
+   being Rust constants and become declarations in the shipped default config. `dev-config/oblisk/shell.lua`
+   currently declares `surface { id = "bar", layer = "Overlay" }` and is ignored; the acceptance
+   test is that editing that `layer` changes what the compositor stacks. Rename the constructor
+   `surface` to `panel` here (ADR-0040): "surface" becomes the umbrella term for all four roles, and
+   this phase is the last point where that rename is a one-line change.
+5. **Push input regions.** `layout::overlay_input_regions` has been correct and tested since Phase
+   12 with no caller (ADR-0023 item 5). Wire it per surface, not just for one overlay: it is a no-op
+   for a tightly-sized bar and load-bearing for any surface larger than its visible content.
+6. **`oblisk.screens`** (ADR-0041). Expose `OutputState`'s outputs to Lua as a reactive signal, so a
+   config can loop over screens to declare per-monitor panels; this is what replaces Quickshell's
+   `Variants`, since Lua already has `for`. It is the first Lua signal sourced in the Renderer rather
+   than pushed by the Supervisor, and it stays out of `shared::CAPABILITIES`. An output change
+   re-enters the existing reload path (re-evaluate, diff topology, report to the Supervisor), adding
+   a trigger rather than a second reload mechanism.
+
+Deliberately deferred: xdg-shell toplevels and xdg-popup, both with reasoning recorded in ADR-0038.
+ashell ships without popups and hand-rolls dropdown menus as ordinary layer surfaces with computed
+anchors, which is the evidence that the layer-shell path is sufficient rather than merely tolerable.
+
+### Phase 21: Input Routing
+
+The last seam between a drawn tree and an interactive one. `button`'s `on_click` has been stored as
+an opaque Lua value since ADR-0021 item 2 and has never been called.
+
+1. **Pointer events to nodes.** Bind SCTK's pointer handling on the seat already bound for
+   `wp-text-input-v3`, hit-test the resolved tree in reverse paint order, and invoke the matched
+   `button`'s `on_click`. After Phase 18 the Lua closure is a direct call on the same thread, not a
+   channel round trip.
+2. **Per-surface keyboard focus.** Honor Phase 20's `keyboard_interactivity` and route key events to
+   the focused surface.
+3. **Real `textfield` focus attribution.** `wayland/mod.rs`'s `PLACEHOLDER_SECURE_SUBMIT_CAPABILITY`
+   and `PLACEHOLDER_SECURE_SUBMIT_ACTION` constants exist because no per-`textfield` focus tracking
+   does. Once a focused node is known, a completed `secure_submit` reads that node's own
+   `{ capability, action }` table (§ 5.2 item 8) instead of reporting `"unknown"`.
+
+Click-outside-to-dismiss for a `panel` stays unsolved: layer surfaces have no compositor-agnostic
+grab, and Quickshell's `HyprlandFocusGrab` works through a Hyprland-specific extension. Popups do
+not have this problem, because `xdg_popup.grab` is protocol-native (ADR-0040); that is a reason to
+reach for a `popup` rather than a second `panel` when something needs to dismiss itself.
+
+### Phase 22: The `window` and `popup` Roles
+
+Implement ADR-0040's remaining two roles now that panels paint and take input. Both are
+`smithay_client_toolkit::shell::xdg` work.
+
+1. **`window`** (`xdg_toplevel`) via SCTK's `XdgShell::create_window`, `Window`, and
+   `WindowHandler`. `WindowConfigure` carries the size, the decoration mode, and the state bitflags
+   (`is_maximized`, `is_fullscreen`, `is_activated`, the `tiled_*` set) that layer-shell has no
+   analogue for. The initial-commit discipline is identical to layer-shell's, so PBA's null-buffer
+   staging needs no new branch. Ack through the wrapping `xdg_surface`, not the role object.
+2. **`popup`** (`xdg_popup`) via `Popup`, `PopupHandler`, and `XdgPositioner`. Create with
+   `Popup::from_surface(None, ...)` and then root it: `LayerSurface::get_popup` for a panel parent,
+   `xdg_surface.get_popup` for a window parent, always before the popup's initial commit. Feed the
+   positioner from the rect Phase 21's `on_click` returns.
+3. **The grab**, which SCTK does not wrap. Call `popup.xdg_popup().grab(seat, serial)` through the
+   raw-object escape hatch, the same pattern ADR-0009 established for `wp-text-input-v3`. Own the
+   bookkeeping SCTK will not: grab only in response to a real input event, only before mapping, and
+   destroy nested popups in reverse creation order. Treat `popup_done` arriving immediately as a
+   denied grab, which the spec explicitly permits, not as an error.
+4. **Decorations**: bind `zxdg_decoration_manager_v1` if present, request server-side, accept what
+   the compositor grants. Do not build a client-side titlebar frame.
+5. **`visible` creates and destroys, for these two roles only** (ADR-0049). A `popup` or `window`
+   node's Wayland object exists only while shown, unlike a `panel`'s, which lives as long as the
+   generation. Nothing new drives it: `on_click` writes named state, the write marks the scene
+   dirty, and the re-resolve that reads `visible` as true is still running inside input dispatch, so
+   the serial `grab` needs and the anchor rect are both in hand at creation time. Destroy nested
+   popups in reverse creation order when a parent's `visible` goes false.
+
+   This is also where the memory budget gets its cheapest win. Twenty declared popups that are never
+   opened cost twenty retained nodes and zero surfaces, buffers, or EGL surfaces, which is what
+   Quickshell buys with a `LazyLoader` primitive and Oblisk gets from the protocol constraint.
+
+Deliberately deferred: `Popup::reposition` and the `Reactive` configure kind. Item 5 covers a
+dropdown that opens under different buttons by creating a fresh popup per open; only an anchor that
+moves while a popup is already open needs `reposition`, and nothing needs that yet.
+
+### Phase 23: The `lock` Role and Session Lock
+
+Implement ADR-0042. The Renderer takes `ext_session_lock_v1` through SCTK's `SessionLockState` /
+`SessionLock` / `SessionLockHandler`, creates one `ext_session_lock_surface_v1` per output, and
+paints the config's `lock` node tree into them. Move SCTK's `session_lock` usage out of the
+Supervisor, which keeps idle-notify and the decision to lock.
+
+1. **Lock and surface lifecycle.** One surface per output, a new one for each output as it is
+   advertised, and destroy on output removal. A second surface on one output is a `duplicate_output`
+   error, and destroying a surface on a still-active output makes the compositor fall back to a
+   solid color. Reuse ADR-0041's output tracking rather than adding a second source.
+2. **`finished` is two events.** In response to `lock` it means the lock was denied, usually because
+   another lock client holds it. Later, it means the compositor tore the lock down itself. Surface
+   both through `oblisk.rescue`; never swallow either.
+3. **Authentication composes what exists.** `textfield` with `secure_submit` fills
+   `shared::SecureBuffer` (ADR-0005, ADR-0027), the buffer crosses the control socket, the
+   Supervisor's re-exec'd PAM worker runs the conversation (ADR-0028), and on success the Renderer
+   calls `unlock_and_destroy`. No new secure path.
+4. **Never unlock except on successful authentication.** SCTK's `Drop` deliberately does not unlock,
+   and nothing here may add a convenience path that does.
+5. **Block generation swaps while locked.** Only one client may hold a lock, so a candidate cannot
+   acquire one while the authoritative generation holds it. The Supervisor queues a topology-changing
+   reload until unlock. In-place reloads still apply.
+
+### Phase 24: Memory Measurement Harness
+
+Implement ADR-0043 decision 1, which the fonts and atlas work in Phase 19 is otherwise unverifiable
+against. Read `/proc/[pid]/smaps_rollup` for the Supervisor and each live Renderer, sum PSS, record
+per-Renderer USS, and sample the two-Renderer PBA handoff window as its own number. Report GPU memory
+from DRM fdinfo's `drm-*-memory` fields rather than assuming `smaps` captures it.
+
+No dependency on the paint pass; buildable at any point, and more useful before Phase 19 than after,
+since it gives the font decision a before-and-after number.
+
+### Phase 25: The Lua Write Path and the `oblisk` Namespace
+
+Everything above is the read direction. Lua still cannot write. `Signal` userdata exposes `get` and
+`map` and nothing else, so § 3.2's roughly thirty write commands and § 7.1's "intercepts all method
+invocations on exported singletons" have no implementation and, until now, no phase. Phase 9
+deferred the dispatch routing table and nothing claimed it back.
+
+Both ends already exist. `shared::CommandEnvelope` is the wire type, the Supervisor routes per
+module through ADR-0037's `dispatch(controller, envelope)`, and `lua/process.rs` builds a real
+envelope from a real Lua call. `process.run` is the working template, not a special case.
+
+1. **A generic capability method.** Give the `Signal` userdata (or a sibling handle registered under
+   the same name) a method that builds a `CommandEnvelope` from `{capability, action, arguments}`
+   and queues it on the outbound sender, exactly as `ProcessRegistry::send` does. One implementation
+   covers all thirty commands; § 3.2's table is validation detail, not thirty code paths.
+2. **Track the revision.** `apply_state_snapshot` reads `snapshot.capability` and `snapshot.payload`
+   and drops `snapshot.revision`. § 7.3's guard rule compares `expected_revision` against the
+   Supervisor's ledger, so a write needs the revision the read arrived with, and the Renderer
+   currently keeps no such number. Store it alongside the `LiveSignalHandle` and stamp it. This is
+   why `process.rs` hardcodes `expected_revision: 0`, which is correct only because `process` holds
+   no state to be stale about.
+3. **The `oblisk` namespace.** Globals are bare today (`audio`, `network`, `rescue`), and § 2
+   specifies `oblisk.audio` throughout. `socket.rs` admits the divergence in a comment and calls it
+   ADR-0022's ad-hoc precedent. Register one `oblisk` table and hang the roster off it. Every doc
+   example in § 2 is wrong until this lands, which makes it the cheapest correctness win in the
+   playbook.
+4. **`oblisk.version`**, a `{ major, minor, patch }` table, registered on the same table item 3
+   builds. Marginal cost here is zero and it is hostile to retrofit: a config written before any
+   version exists has nothing to guard on, forever. Take Quickshell's idea and not its shape.
+   `Quickshell.hasVersion(major, minor, features)` carries a feature-name list, which is the answer
+   to a problem Oblisk does not have yet; a table a config can compare is the same guard without a
+   registry of feature names to maintain.
+
+Deliberately deferred: per-command argument validation from § 3.2's table. The envelope carries
+`arguments` as JSON and each capability's `dispatch` already parses what it needs, so validating
+twice means maintaining the schema twice. Reject at the module that owns the command.
+
+### Phase 26: The Config Environment
+
+Implement ADR-0047 and ADR-0048. Both change what a config *is* rather than what it can draw, and
+both are small enough that splitting them buys nothing.
+
+1. **`package.path` points at the config directory** (ADR-0047 decision 1), replacing the default
+   rather than prepending to it, so `require "widgets.clock"` resolves inside the config and never
+   picks up a same-named system module. C modules need no work: mlua's safe mode already replaces the
+   C searchers and makes `package.loadlib` raise.
+2. **Clear `package.loaded` before every re-evaluation** (ADR-0047 decision 2). ADR-0044 decision 4
+   keeps the VM alive across an in-place reload and `require` caches by module name, so without this
+   an edit to a required module re-runs `shell.lua` against the stale cached copy and changes
+   nothing. It looks exactly like a reload that silently did not happen, which is why it is worth its
+   own item.
+3. **Watch the tree, hash the contents** (ADR-0047 decision 3). `supervisor/src/watcher.rs`'s single
+   non-recursive `add()` becomes a recursive walk over the config directory. Keep a `path -> hash`
+   map and drop any event whose `.lua` file hashes the same as last time. The existing debounce
+   stays: it collapses one save's event burst, while the hash rejects saves that changed no bytes.
+4. **Cut the stdlib** (ADR-0048). `Loader::new` calls `Lua::new_with` with an explicit `StdLib` set
+   instead of `Lua::new`'s `ALL_SAFE`, dropping `IO` and `OS`, then re-registers `os.time`,
+   `os.date`, `os.clock`, and `os.getenv`. After ADR-0039 every blocking stdlib call stalls Wayland
+   dispatch, and ADR-0021's 5ms cap cannot catch it: the cap is an instruction-count hook, and a
+   thread parked in a syscall executes no instructions.
+
+Acceptance: a config split across `shell.lua` and `widgets/clock.lua` reloads when either file
+changes, and `os.execute` is `nil`.
+
+### Phase 27: Out-of-Band Rescue
+
+Implement ADR-0046. `oblisk.rescue` is a Lua signal the config reads and renders, which works only
+while the config works. A startup evaluation failure leaves no tree to render through, and ADR-0024
+item 4 records the result: the shell stays blank. The failure that most needs an error message is the
+one that cannot produce one.
+
+1. **Split the two failures.** A reload failure keeps a working scene under ADR-0024's rollback
+   guarantee, so the running config renders its own banner through `oblisk.rescue`, unchanged. A
+   startup failure with no prior scene is what gets the process.
+2. **Re-exec, following ADR-0028's PAM worker.** The Supervisor re-runs its own binary with a flag
+   and the error text. No second binary to install and no code path the failed config can influence.
+3. **One `Overlay` layer surface per output**, drawing the error text, the file and line `mlua::Error`
+   already carries, and the path it tried to load. Hardcoded Rust, no Lua VM, no capability
+   connections.
+4. **It is not a generation.** No generation id, no dependency snapshots, no PBA handshake, no
+   authority over any output. The Supervisor reaps it the moment a real generation reaches
+   presentation evidence.
+
+No `inhibitReloadPopup` equivalent is needed. Quickshell has one because its popup also spawns on
+reload failures, which is the case item 1 hands back to `oblisk.rescue`.
+
+### The missing animation model
+
+The largest remaining gap, and it was found by pulling on a smaller one. `CONTEXT.md`'s Lease exists
+to hold a removed node's GPU resource alive for "a wallpaper crossfade, an in-flight transition", and
+it has had no caller since Phase 12 (ADR-0023 item 7). The reason is not that the API is missing. A
+grep for transition, animation, or easing across `docs/` and `renderer/src/` returns nothing but
+Hyprland's compositor-side `layerrule`. The feature the lease was built to serve was never specified.
+
+Underneath that, Lua has no clock. Capability pushes are the only thing that changes a value over
+time, they arrive at the Supervisor's pace, and ADR-0048 keeps `os.time` as a read rather than adding
+a callback. A config cannot animate anything today, whatever API the lease grows.
+
+Quickshell has `EasingCurve` and `ElapsedTimer` in `core/` and inherits QML's `Behavior`,
+`NumberAnimation`, and `Transition` on top. Matching that is a real body of work and it is not
+scheduled here, because a shell without animation is functional and nothing is blocked.
+
+One constraint does need respecting now, in Phase 19 item 8. Frame gating is written as "repaint when
+the scene changed", which is one reason to wake. An animation is a second reason, orthogonal to the
+first: a running animation must repaint whether or not a signal changed. Build the gate so a second
+reason can be added rather than replacing the condition, and this stays an additive change instead of
+a redesign.
+
+The Lua-facing lease follows from that, not before it. Quickshell's `Retainable` exposes a refcounted
+`lock()`/`unlock()` and a `dropped()` signal so the config can say "not yet" when its exit transition
+is still running, and a `RetainableLock` wrapper because Quickshell found raw locking "overly
+complicated and error prone". That is the right shape to copy on the day exit transitions exist.
+
+### Judged and dropped
+
+**Lazy surface creation.** Resolved by ADR-0049 rather than deferred. Creating `popup` and `window`
+objects on show is forced by the protocol, and it delivers what Quickshell's `LazyLoader` delivers
+without a `LazyLoader`. Asynchronous incubation during frame gaps, the other half of that type, has
+no analogue here: Oblisk's per-open creation is one Wayland object, not an incubated QML tree.
+
+**Config-triggered reload.** `Quickshell.reload(hard)` is callable from QML; Oblisk's reload is
+Supervisor-only through `inotify`. It has no caller. ADR-0047's recursive watch covers edits, and
+ADR-0048 removed file reading from Lua, which was the one remaining "something external changed"
+trigger a config could have noticed and nothing else would. Build it if a caller appears.
+
+---
+
+## 6. Continuation Testing & Validation Protocols
 
 ```bash
 #!/usr/bin/env bash

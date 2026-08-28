@@ -1,5 +1,18 @@
 # Layout engine ships a stacking model, not a full constraint solver
 
+> Item 2 (`Signal`-valued properties rejected, not resolved) is settled by ADR-0044. This ADR's
+> upgrade path handed the item to Phase 13's Watcher; Phase 13 shipped without it and no later phase
+> claimed it, leaving the Renderer unable to turn any state change into a pixel. Property parsers now
+> resolve a `Signal` at layout time, and a live push marks the scene dirty rather than triggering an
+> evaluation.
+>
+> § 4's positional child matching is amended by ADR-0045. Matching by position alone loses node
+> identity whenever a config inserts a node above an existing sibling, so nodes may now carry an
+> `id` scoped to their parent, and identified children pair before the rest fall back to this ADR's
+> positional rule. Item 1's deferred `list` gains a `key` requirement from the same ADR.
+>
+> Everything else here stands.
+
 Phase 12's title ("Retained Scene & the One-Pass Layout Engine") and its build-steps.md text scope
 `renderer/src/layout/mod.rs` against `oblisk-layout-engine-geometry.md` § 3-5 and `CONTEXT.md`'s
 retained-scene entries: the constraint/size/position passes, the retained-scene transaction, the

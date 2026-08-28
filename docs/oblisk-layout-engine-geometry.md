@@ -3,7 +3,7 @@
 
 This specification details the mathematical, algorithmic, and programmatic contracts governing the Oblisk Layout Engine. The layout engine is implemented entirely in compiled Rust within the ephemeral Renderer's scene-graph module. 
 
-To prevent LLMs and developers from hardcoding visual products (such as bars or menus) in Rust, the engine rejects high-level widgets. It operates strictly as a one-pass geometric constraint solver that resolves primitive layout nodes into scaled physical damage rectangles inside our two static layer-shell window surfaces.
+To prevent LLMs and developers from hardcoding visual products (such as bars or menus) in Rust, the engine rejects high-level widgets. It operates strictly as a one-pass geometric constraint solver that resolves primitive layout nodes into scaled physical rectangles, independently within each layer-shell surface `shell.lua` declares.
 
 ---
 
@@ -42,10 +42,13 @@ The Rust retained-scene graph accepts only the following primitive nodes. Any co
 
 All calculations use single-precision floating-point coordinates (`f32`) representing logical pixels. They are converted to integer physical pixels (`i32`) only during final viewport projection.
 
-### 2.1 Static Window Surface Isolation
-To maintain maximum stability and avoid complex multi-window lifecycles, Oblisk mounts exactly **two window surfaces** on startup: the persistent `main_bar` and the transparent fullscreen `overlay_canvas`.
+### 2.1 Window Surface Isolation
+Oblisk mounts one layer surface per `(surface, output)` pair `shell.lua` declares, created and
+destroyed as the evaluated topology changes (ADR-0038). The default config declares a `main_bar`,
+a transparent fullscreen `overlay_canvas`, and a per-monitor `wallpaper_layer`, but those are
+config, not engine constants.
 *   Every `surface` returned in your layout is solved as an independent scene-graph tree.
-*   Constraints, coordinate math, and bounding dimensions are isolated. Layout changes or updates inside your overlay elements never trigger redraw passes on your status bar.
+*   Constraints, coordinate math, and bounding dimensions are isolated. Layout changes inside one surface never trigger a redraw pass on another.
 
 ---
 
@@ -99,14 +102,14 @@ For dynamic lists (like notification feeds), the layout engine executes a fast l
 
 ---
 
-## 5. Overlay Input Region Bounding Box Calculations
+## 5. Input Region Bounding Box Calculations
 
-In our dual-surface model, the transparent `overlay_canvas` surface must not block mouse pointer events on applications underneath, except where active UI elements are currently drawn.
+A surface larger than its visible content must not block pointer events on the applications underneath, except where its UI elements are currently drawn. This applies per surface: it is load-bearing for a transparent fullscreen surface and a no-op for a bar sized tightly around its own content.
 
 ### 5.1 Bounding Box Union Merging
-*   **Default State**: When no cards are visible, the active input region of the `overlay_canvas` is updated to an empty rectangle via:
-    `wl_surface::set_input_region(canvas_surface, empty_region)`
-*   **Visible Node Scan**: During the rendering pass, the Renderer scans all children of the `canvas_rect` and checks for nodes with `visible == true` and their coordinates solved in logical pixels.
+*   **Default State**: When none of a surface's children are visible, its input region is set to an empty rectangle via:
+    `wl_surface::set_input_region(surface, empty_region)`
+*   **Visible Node Scan**: During the rendering pass, the Renderer scans that surface's children and checks for nodes with `visible == true` and their coordinates solved in logical pixels.
 *   **Physical Projection**: It multiplies logical coordinates and sizes by the fractional scale $S_f$ and snaps them to physical boundaries:
     $$X_{1} = \lfloor X_{logical} 	imes S_f 
 floor$$
@@ -119,5 +122,5 @@ ceil$$
 *   **Region Allocation & Update**: Rust allocates a standard Wayland region handle (`wl_region`), iterates over all visible cards, and executes:
     `wl_region::add(region, X1, Y1, X2 - X1, Y2 - Y1)`
     Finally, the merged region list is pushed back over the Wayland protocol:
-    `wl_surface::set_input_region(canvas_surface, region)`
-    This guarantees that clicks outside of active cards pass through seamlessly with absolutely no dynamic window creation delays.
+    `wl_surface::set_input_region(surface, region)`
+    Clicks outside the visible children pass through to whatever is underneath.

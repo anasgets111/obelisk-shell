@@ -9,6 +9,8 @@ This document defines the strict binary and type boundaries between the Rust pla
 
 All data passing across the Rust-Lua boundary (driven by `mlua` hosting PUC Lua 5.4) is mapped according to the following strict, non-coercive rules. Any mismatch fails immediately at construction/execution time rather than degrading silently or raising unhandled panic errors.
 
+**What the config VM contains.** "Lua 5.4" no longer describes it on its own. `coroutine`, `table`, `string`, `utf8`, `math`, and `package` are present in full. `debug` and `ffi` are absent, and `package.loadlib` raises, because mlua's safe mode says so. `io` is absent and `os` is cut to `time`, `date`, `clock`, and `getenv`: every other call in either library blocks the thread that dispatches Wayland events, and `process.run` is the non-blocking way to run a command (ADR-0048). `package.path` resolves inside the config directory only (ADR-0047).
+
 ### 1.1 Fundamental Type Mapping Table
 
 | Rust Type | Lua Type | Boundary Mapping Rules & Constraints |
@@ -33,6 +35,15 @@ Signals are exposed to Lua as read-only or read-write userdata primitives.
 *   **Computed Signal Rules**:
     *   `computed(dependencies, fn)`: Exposes a multi-dependency computed signal. The `dependencies` argument must be an array of `Signal` or `Computed` handles.
     *   The evaluation function `fn` must be entirely side-effect-free. CPU runtime is capped at 5ms per evaluation.
+
+**Handles are live; `:get()` results are not.** Wherever a node property below accepts `T / Signal`, the two spellings mean different things and both are valid Lua:
+
+```lua
+text { content = oblisk.mpris.title }         -- live: re-reads whenever the value changes
+text { content = oblisk.mpris.title:get() }   -- frozen: the value at evaluation time, forever
+```
+
+A handle left in a property resolves at layout time on every pass, so the node follows the signal. A `:get()` result is a plain string the engine cannot distinguish from a literal, and nothing updates it until the next config edit. Signals are read-only to Lua: a config cannot construct one or write to one, and the only writable state is what the Supervisor pushes (ADR-0044).
 
 ---
 
@@ -130,13 +141,11 @@ The active Renderer process populates the global `oblisk` state tree with the fo
         *   `position_updated_at`: `integer` (Monotonic clock timestamp in microseconds matching the exact instant the position was recorded)
         *   `length`: `integer` (Total track duration in microseconds)
 
-### 2.9 Workspaces & Output State (`oblisk.workspaces`)
-*   `workspaces.outputs`: `table` (Array of connected display output structures)
+### 2.9 Workspace State (`oblisk.workspaces`)
+Workspace state only. Output geometry lives in `oblisk.screens` (§ 2.15), which reads it from `wl_output` rather than from a compositor adaptor; this section refers to screens by `name` instead of restating their dimensions (ADR-0041).
+*   `workspaces.outputs`: `table` (Array of per-output workspace structures)
     *   Output structure:
-        *   `name`: `string` (Connector name, e.g., `"eDP-1"`)
-        *   `width`: `integer` (Physical pixel width)
-        *   `height`: `integer` (Physical pixel height)
-        *   `scale`: `number` (Fractional scaling factor, e.g., `1.25`)
+        *   `name`: `string` (Connector name, e.g., `"eDP-1"`, matching an `oblisk.screens` entry)
         *   `active_workspace`: `integer` (ID of the workspace currently visible)
         *   `focused_workspace`: `integer` (ID of the workspace that currently has keyboard focus)
 *   `workspaces.active_client`: `table` (Focused top-level Wayland client window parameters, or `nil` if none focused):
@@ -148,6 +157,8 @@ The active Renderer process populates the global `oblisk` state tree with the fo
 ### 2.10 Rescue Mode & Recovery State (`oblisk.rescue`)
 *   `rescue.is_rescue`: `boolean` (True if the user configuration is broken and Rescue Mode is active)
 *   `rescue.error_log`: `string` (The compiled Lua syntax error or backtrace message)
+
+This signal covers **reload** failures only, where the scene from before the edit is still on screen and the still-running config can render its own error banner. It cannot cover a **startup** failure, because there is no tree to render it through: a config that fails its first evaluation has no surfaces, and `is_rescue` has nobody to read it. That case is handled out of band by a separate Supervisor-spawned process (ADR-0046), not by this signal, and no config code runs for it.
 
 ### 2.11 Persistent User State and Storage Paths (`oblisk.system`)
 *   `system.state`: `table` (A reactive, read-only dictionary of persistent states loaded from `$XDG_STATE_HOME/oblisk/state.json`)
@@ -186,6 +197,16 @@ The active Renderer process populates the global `oblisk` state tree with the fo
                 *   `toggle_type`: `string` (`"checkmark"`, `"radio"`, or `nil` if not a toggle entry)
                 *   `toggle_state`: `integer` (DBusMenu's own `-1`/`0`/`1`, or `nil` if not a toggle entry)
                 *   `children`: `table` (Array of nested Menu Item objects, recursive, empty if none)
+
+### 2.15 Screens (`oblisk.screens`) (docs/adr/0041)
+The connected outputs, read from `wl_output` in the Renderer rather than pushed by the Supervisor. This is the one signal in § 2 that is not a Supervisor-owned capability and does not appear in `shared::CAPABILITIES`; it needs no compositor adaptor and is available from a generation's first evaluation. Iterating it is how a config declares one panel per monitor (ADR-0041), and it updates on monitor hotplug.
+*   `screens`: `table` (Array of connected output structures)
+    *   Screen structure:
+        *   `name`: `string` (Connector name, e.g. `"eDP-1"`. The value a `panel`'s `monitor` property takes, and the key `oblisk.workspaces` entries refer to)
+        *   `width`: `integer` (Physical pixel width)
+        *   `height`: `integer` (Physical pixel height)
+        *   `scale`: `number` (Fractional scaling factor, e.g. `1.25`)
+        *   `refresh`: `number` (Refresh rate in Hz, or `nil` if the compositor does not report one)
 
 ---
 
@@ -247,15 +268,23 @@ The `process.run` function yields an opaque `ProcessHandle` object to Lua:
 
 ---
 
-## 4. The Lazy Window Surface & Input Grab Handshake
+## 4. The Window Surface Lifecycle & Input Grab Handshake
 
-To maintain a zero-overhead footprint and support completely dynamic rendering without resource thrashing, Oblisk maps exactly **two static layer surfaces** on startup. All popups, OSDs, and modals are visual nodes drawn inside the permanent **Overlay Surface** (`overlay_canvas`).
+`shell.lua` decides what surfaces exist. Every `surface` node it returns (§ 6.1) maps to one
+`zwlr_layer_surface_v1` per output it targets, with its own layer, anchors, namespace, exclusive
+zone, and keyboard interactivity. Surfaces are created, unmapped, and destroyed at runtime as the
+evaluated topology changes; the Renderer owns no surface the config did not ask for (ADR-0038).
+
+A config may still put every popup, OSD, and modal inside one fullscreen transparent surface, and
+the default config does. That is a configuration idiom, not an engine rule. A launcher needing
+`keyboard_interactivity = "Exclusive"` while a volume OSD stays click-through needs two surfaces,
+because both fields are per surface in the layer-shell protocol.
 
 ```text
 Renderer (Lua VM)                          Renderer (Rust Engine)                Wayland Compositor
        │                                            │                                     │
        │                                            │─── eglCreateWindowSurface() ───────▶│
-       │                                            │─── zwlr_layer_surface::set_size() ─▶│ (Mapped at startup)
+       │                                            │─── zwlr_layer_surface::set_size() ─▶│ (One per declared surface)
        │                                            │                                     │
        │─── Toggle Modal (visible=true) ───────────▶│                                     │
        │                                            │─── Set Bounding Box Input Region ──▶│ (Updates input region)
@@ -264,11 +293,11 @@ Renderer (Lua VM)                          Renderer (Rust Engine)               
        │                                            │─── Clear Input Region (Empty) ─────▶│ (Input passes through)
 ```
 
-1.  **Static Surface Setup**: At boot, the Renderer allocates the two top-level window structures returned by `shell.lua`. It registers them with the compositor.
-2.  **Input Region Manipulation**:
-    *   By default, the **Overlay Surface** has an empty input region. All pointer clicks bypass the canvas entirely and trigger background application windows.
-    *   When the Lua configuration toggles visibility of an overlay card (such as a volume OSD or a dropdown notification overlay), the Renderer intercepts the layout change, calculates the absolute coordinate bounding box of that visual child, and calls `wl_surface::set_input_region` on the Overlay surface to include only the active bounds.
-    *   Clicks inside the bounds are routed to Lua callbacks (`on_click`), while clicks outside the bounds pass through seamlessly.
+1.  **Surface Setup**: The Renderer evaluates `shell.lua`, reads the surface topology from the returned nodes, and registers one layer surface per `(surface, output)` pair with the compositor. Evaluation happens before binding, matching the Candidate's own ordering in `oblisk-supervisor-services-dbus.md` § 15.2.
+2.  **Input Region Manipulation**: This applies to any surface whose visible content is smaller than the surface itself. It is load-bearing for a fullscreen transparent surface and a no-op for a tightly-sized bar.
+    *   A surface with no visible content has an empty input region. All pointer clicks bypass it entirely and reach background application windows.
+    *   When the Lua configuration toggles a child's visibility (a volume OSD, a dropdown notification card), the Renderer recomputes the union of its visible children's absolute bounding boxes and calls `wl_surface::set_input_region` on that surface with only those bounds.
+    *   Clicks inside the bounds are routed to Lua callbacks (`on_click`), while clicks outside the bounds pass through.
 
 ---
 
@@ -278,7 +307,9 @@ The Rust scene-graph engine parses layout trees built from sugar constructors. T
 
 ### 5.1 The Abstract Node Base Class Table
 
-Every node schema contains the following base layout properties:
+Every node schema contains the following base layout properties.
+
+Any property in this table or in § 5.2 accepts a `Signal` handle in place of a literal, whether or not its row spells the union out. The engine resolves the handle at layout time and then applies that property's normal rules to the result, so a `Signal` returning `"Fill"` is a valid `width` and one returning a table is the same error a literal table would be (ADR-0044). The rows that name `Signal` explicitly are the ones a config reaches for most, not the only ones allowed.
 
 | Property Name | Type | Valid Range / Options | Layout Engine Interpretation |
 | :--- | :--- | :--- | :--- |
@@ -289,6 +320,7 @@ Every node schema contains the following base layout properties:
 | `align_h` | `string` | `"Start"`, `"Center"`, `"End"`, `"Stretch"` | Horizontal alignment distribution. |
 | `align_v` | `string` | `"Start"`, `"Center"`, `"End"`, `"Stretch"` | Vertical alignment distribution. |
 | `visible` | `boolean` / `Signal` | `true`, `false`, or binary signal | Determines if the node enters constraint and paint passes. |
+| `id` | `string` | Unique among siblings | Optional reconciliation hint. Matches this node to its previous self across a re-resolve, so leases and named state follow the right node when siblings are inserted or removed. Scoped to the parent, so a reusable module may carry the same ids in every instantiation. Not addressable from Lua and has no effect on layout or paint (ADR-0045). |
 
 ### 5.2 Specific Geometric Node Schemas
 
@@ -330,6 +362,7 @@ Receives input focus and pointer events.
 A fast-reconciling virtual repeater element.
 *   `source`: `Signal` (Must wrap a flat array table)
 *   `itemfn`: `function` (A Lua builder function that is executed for every index, returning child nodes)
+*   `key`: `function` (Maps a `source` element to a stable string, called on the element rather than on the node `itemfn` builds. Items reconcile by key, so inserting one element rebuilds one item instead of every item below it. Duplicate keys are an error. Without `key`, items match by index and an insertion rebuilds everything after it, which is fine for a short static list and wrong for anything driven by a capability. ADR-0045)
 
 #### 8. `textfield` (The Engine Security Exception)
 An IME-aware native input field mapped directly to Rust-owned `wp-text-input-v3`.
@@ -339,21 +372,69 @@ An IME-aware native input field mapped directly to Rust-owned `wp-text-input-v3`
 *   `on_change`: `function` (Lua callback executed on each committed edit batch from `wp-text-input-v3`, not per keystroke; IME composition is not character-by-character. Key events are swallowed inside Rust's memory blocks during sensitive lock states)
 *   `on_submit`: `function` (Fires on `zwp_text_input_v3`'s protocol-native `submit` action, e.g. Enter -- IME-correct, not a raw keystroke check. Takes the committed text as its one argument, *except* when both `mask_character` and `secure_submit` are set: fires with no argument, since the Renderer's IPC layer attaches the native input buffer directly to the named capability/action envelope instead. docs/adr/0005, docs/adr/0027)
 
-## 6. Top-Level Window Surface Nodes
+## 6. Top-Level Surface Nodes
 
-These nodes are returned at the root of `shell.lua` and define physical Wayland window mappings.
+These nodes are returned at the root of `shell.lua` and define physical Wayland surface mappings. In Wayland a `wl_surface` is inert until a protocol assigns it a **role**; Oblisk exposes four, one constructor each (ADR-0040). The set of surfaces is whatever `shell.lua` returns, evaluated fresh on each reload; there is no fixed or engine-owned set (ADR-0038).
 
-### 6.1 `surface`
-A layer-shell surface container (`zwlr_layer_surface_v1`).
-*   `id`: `string` (Unique window identifier)
+| Constructor | Role | Protocol | Typical use |
+| :--- | :--- | :--- | :--- |
+| `panel` | Layer surface | `zwlr_layer_surface_v1` | Bar, dock, wallpaper, OSD, launcher |
+| `window` | Toplevel | `xdg_toplevel` | Settings window, standalone dialog |
+| `popup` | Popup | `xdg_popup` | Dropdown, context menu, tooltip |
+| `lock` | Lock surface | `ext_session_lock_surface_v1` | Lock screen |
+
+All four share the base node properties (§ 5.1) and take a `child` node tree. Adding or removing any of them is a topology change (`CONTEXT.md`); see ADR-0038 for what changes in place instead.
+
+### 6.1 `panel`
+A layer-shell surface container (`zwlr_layer_surface_v1`). Formerly named `surface`; renamed in ADR-0040 when "surface" became the umbrella term for all four roles.
+*   `id`: `string` (Unique window identifier. A surface targeting several outputs produces one Wayland surface per output, addressed as `"{id}@{output}"`)
 *   `layer`: `string` (`"Background"`, `"Bottom"`, `"Top"`, `"Overlay"`)
 *   `anchor`: `table` (`{ top, bottom, left, right }` edge booleans)
 *   `exclusive`: `boolean` (Reserves physical screen area for bar if true)
 *   `height`: `integer` / `string` (Explicit height or `"Fill"`)
 *   `width`: `integer` / `string` (Explicit width or `"Fill"`)
+*   `margin`: `table` (`{ top, right, bottom, left }` offsets from the anchored edges. Distinct from a node's `padding`, which is inside the surface: `margin` moves the surface itself, so a floating panel inset from a screen edge needs it)
 *   `monitor`: `string` (A specific output EDID, or `"All"` to spawn on all monitors)
-*   `visible`: `boolean` / `Signal` (Hides/unmaps surface completely if false)
+*   `namespace`: `string` (The layer-shell namespace the compositor sees. Compositor rules match on it, for instance Hyprland's `layerrule` for blur and animations. Defaults to `"oblisk-{id}"`)
+*   `keyboard_interactivity`: `string` (`"None"` (default), `"OnDemand"`, or `"Exclusive"`, mapping to layer-shell's own field. A launcher or any surface accepting typed input needs `"OnDemand"` or `"Exclusive"`; leaving it `"None"` means the surface never receives key events)
+*   `visible`: `boolean` / `Signal` (Unmaps the surface when false, without destroying it. Toggling this is how a config shows and hides a panel; it does not churn Wayland objects)
 *   `child`: `node` (The root visual primitive node inside this window)
+
+### 6.2 `window`
+A standard toplevel window (`xdg_toplevel`), the kind the compositor tiles, stacks, and lists in a task switcher. For a settings window or a standalone dialog, where a `panel` would be wrong.
+*   `id`: `string` (Unique identifier)
+*   `title`: `string` / `Signal` (Window title the compositor displays)
+*   `app_id`: `string` (Application identifier the compositor matches rules against, e.g. `"oblisk.settings"`)
+*   `min_size`: `table` (`{ width, height }`. Advisory: the spec states a client "should not rely on the compositor to obey" it)
+*   `max_size`: `table` (`{ width, height }`. Advisory, same as `min_size`)
+*   `on_close`: `function` (Fires when the compositor asks the window to close. This is a request, not a command: the callback may decline by doing nothing, and the window stays open until the config sets `visible = false`)
+*   `visible`: `boolean` / `Signal`
+*   `child`: `node`
+
+Decorations are not requested per window. Oblisk asks the compositor for server-side decorations once and accepts whatever mode it grants; it draws no titlebar of its own (ADR-0040).
+
+### 6.3 `popup`
+A real popup (`xdg_popup`), positioned by the compositor relative to its parent and dismissed by the compositor on click-outside. Parents to either a `panel` or a `window`, so a bar can own a genuine dropdown rather than a hand-positioned second panel.
+*   `id`: `string` (Unique identifier)
+*   `parent`: `string` (The `id` of the `panel` or `window` this popup anchors to)
+*   `anchor_rect`: `table` (`{ x, y, width, height }` in the parent surface's logical coordinates. Required and must be non-zero. Normally passed straight from the rect `button`'s `on_click` hands back, so a dropdown lands on the button that opened it)
+*   `width` / `height`: `integer` (Required and must be non-zero; a popup has no `"Fill"`)
+*   `anchor`: `string` (Which edge or corner of `anchor_rect` the popup hangs from: `"Top"`, `"Bottom"`, `"Left"`, `"Right"`, `"TopLeft"`, and so on, or `"Center"`)
+*   `gravity`: `string` (Which direction the popup extends from that point, same value set as `anchor`)
+*   `constraint_adjustment`: `table` (Array of `"SlideX"`, `"SlideY"`, `"FlipX"`, `"FlipY"`, `"ResizeX"`, `"ResizeY"` naming how the compositor may move the popup to keep it on screen. Defaults to `{ "FlipY", "SlideX" }`, which is dropdown behavior; the protocol's own default is no adjustment at all. Applied in the fixed precedence flip, then slide, then resize)
+*   `offset`: `table` (`{ x, y }` pixel nudge applied after anchor and gravity)
+*   `grab`: `boolean` (Default `true`. Takes an explicit grab, giving the popup keyboard focus and letting the compositor dismiss it on click-outside. A compositor may deny the grab, in which case the popup is dismissed immediately and `on_dismiss` fires; treat that as a normal outcome, not an error)
+*   `on_dismiss`: `function` (Fires when the compositor dismisses the popup)
+*   `child`: `node`
+
+A popup may only be opened in response to real user input, so `grab = true` outside an input callback is rejected. Nested popups close in reverse order of opening.
+
+### 6.4 `lock`
+A session-lock surface (`ext_session_lock_surface_v1`). One per output, created when the session locks and destroyed on unlock. While the session is locked the compositor shows only these, so a `panel` cannot be part of a lock screen (ADR-0042).
+*   `id`: `string` (Unique identifier)
+*   `child`: `node` (The lock screen's node tree, authored like any other)
+
+There is no `visible`, `monitor`, `anchor`, or size: a lock surface covers its output, exists on every output, and its lifetime is the lock's, not the config's. Authentication runs through a `textfield` with `secure_submit` (§ 5.2 item 8), so the password reaches the Supervisor's PAM worker without entering the Lua VM (ADR-0005, ADR-0028, ADR-0042). Locking is triggered by the Supervisor, not by returning this node; declaring it says what the lock screen looks like, not when it appears.
 
 ---
 

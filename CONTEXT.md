@@ -21,7 +21,7 @@ Proof that a targeted output produced its first frame or presentation feedback a
 _Avoid_: readiness, activation ACK
 
 **Topology change**:
-A config edit that adds, removes, or changes the layer, anchor, or monitor target of a top-level `surface` node. Triggers a generation swap.
+A config edit that adds or removes a top-level `surface` node, or changes its layer, anchor, monitor target, or namespace. Triggers a generation swap. Namespace and monitor are fixed when the compositor creates a layer surface and cannot be changed on a live one, so they belong here by protocol. Layer and anchor are listed here by choice, not necessity: the protocol can change both in place, and narrowing the swap set to only what genuinely requires recreation is an open question, not a settled one.
 _Avoid_: structural change, breaking change
 
 **Value change**:
@@ -33,8 +33,8 @@ The full candidate-spawn, presentation-evidence, promote-and-reap flow. Reserved
 _Avoid_: hot-reload (ambiguous: covers both swap and in-place reload)
 
 **In-place reload**:
-Resetting the Lua VM and re-running the config inside the current generation, without spawning a candidate or rebinding Wayland/EGL. Used for value changes.
-_Avoid_: hot-reload, live patch
+Re-running the config on the current generation's existing Lua VM, without spawning a candidate or rebinding Wayland/EGL. Used for value changes. The VM is not reset: the retained scene holds `mlua` values that keep it alive, so dropping it would leak the whole VM per reload and leave the scene reading a state no config runs in (ADR-0044). One VM per generation, dropped only when the generation ends.
+_Avoid_: hot-reload, live patch, VM reset (a generation swap's job, and a swap gets a new process)
 
 **Dependency snapshot**:
 The Supervisor-owned system-state payload (`shared::StateSnapshot`: capability, revision, and JSON payload) pushed to a generation so its loader hydrates signals without live-querying NetworkManager, BlueZ, or PipeWire itself. The same snapshot type hydrates a candidate's first evaluation and an in-place reload's re-evaluation. One payload per capability, routed to that capability's own live Lua signal by name (ADR-0029).
@@ -52,10 +52,30 @@ _Avoid_: file monitor, reload trigger
 The rule that a reload never replaces a working generation's state with a failed one. A failed generation swap leaves the authoritative generation untouched (already built: `reload::run_pba` aborts the candidate on any pre-evidence failure). A failed in-place reload keeps the pre-reload retained scene applied and surfaces the failure through `oblisk.rescue` instead of applying a broken tree.
 _Avoid_: revert, recovery
 
+**Rescue process**:
+A Supervisor-spawned process that draws an evaluation error on one `Overlay` layer surface per output. Holds no Lua VM, no config, and no capability connections, so it works precisely when the config does not. Not a generation: no generation id, no dependency snapshots, no PBA handshake, no authority. Reaped as soon as a real generation reaches presentation evidence. Distinct from the `oblisk.rescue` signal, which covers the opposite case, a reload failure where a working config is still on screen to render its own error (ADR-0046).
+_Avoid_: rescue mode (the `oblisk.rescue` signal's state), fallback config (a rejected alternative), rescue generation
+
 ## Surfaces
 
+**Surface**:
+A top-level thing `shell.lua` declares, mapped to one Wayland surface per output it targets. The umbrella term covering all four roles, not any one of them. The engine owns no surface the config did not declare. A generation builds its whole surface set from its own evaluation at startup and does not add or remove surfaces afterwards; changing the set is a topology change. `main_bar`, `overlay_canvas`, and `wallpaper_layer` are ids the default config happens to use, not engine-defined roles (ADR-0038).
+_Avoid_: window (one of the four roles, not the umbrella), panel (likewise), layer (protocol term for a panel's stacking level)
+
+**Surface role**:
+Which Wayland protocol gives a surface its behavior, and the Lua constructor that declares it: `panel` (layer surface), `window` (toplevel), `popup` (popup), `lock` (lock surface). A surface has exactly one role, fixed when it is declared, and the role decides which properties are meaningful. Mirrors Wayland's own use of "role" for what turns an inert `wl_surface` into something the compositor shows (ADR-0040).
+_Avoid_: surface type, window kind, surface class
+
+**Lock client**:
+The process holding `ext_session_lock_v1`, which is the Renderer. Only one may exist at a time, so no generation swap can happen while locked, and the process holding the lock is necessarily the one painting the lock screen: lock surfaces cannot cross a process boundary. If it dies, the compositor is required to keep the session locked (ADR-0042).
+_Avoid_: lock authority (the superseded ADR-0010 term for a Supervisor-held handle), locker, lock screen (the Lua-authored UI, not the client)
+
+**Surface instance**:
+One `(surface, output)` pair, addressed as `"{id}@{output}"`. A surface targeting every monitor has one instance per monitor, each with its own configured size. This is what the compositor actually maps, and what a presentation-evidence report names. Monitor hotplug adds and removes instances within a live generation: the declared surfaces are unchanged, so it is not a topology change and triggers no swap.
+_Avoid_: surface copy, per-monitor surface
+
 **Wallpaper surface**:
-The third static surface (`Background` layer, non-exclusive, one per monitor), distinct from `main_bar` and `overlay_canvas`. Owns wallpaper texture rendering.
+A `panel` on the `Background` layer, non-exclusive, one instance per monitor. Distinct from the UI surfaces because `Overlay` sits above every application window by protocol definition, so wallpaper drawn there would cover the desktop rather than sit behind it (ADR-0007). Owns wallpaper texture rendering.
 _Avoid_: background layer (protocol term, not the Oblisk surface)
 
 ## Scene
@@ -71,6 +91,30 @@ _Avoid_: reload apply, tree diff
 **Lease**:
 A grace period that keeps a removed node's GPU resource alive past its removal from the retained scene, until whatever still needs it (a wallpaper crossfade, an in-flight transition) finishes consuming it. Child-first cleanup runs once the lease expires.
 _Avoid_: keepalive, grace period
+
+**Paint pass**:
+The walk over one surface instance's resolved geometry that emits its draw calls and swaps its buffer. Runs per surface instance, never across them, and reads the retained scene without changing it. Distinct from the layout passes, which decide geometry; the paint pass only consumes what they resolved.
+_Avoid_: render pass (ambiguous: also a GPU term), draw loop, frame
+
+**Node identity**:
+What makes a freshly evaluated node the same node as the one already in the retained scene, so its lease and its named state follow it. An optional `id`, unique among its siblings and scoped to its parent rather than to the tree, decides it; unidentified siblings still fall back to matching by position among themselves. A `list`'s items use their `key` instead (ADR-0045).
+_Avoid_: node id (the property, not the concept), key (a `list`'s spelling of this, not the general term), handle
+
+**Named state**:
+Config-authored reactive state, created by `state(name, initial)` and writable from Lua, unlike every other signal. The name is what survives: a generation keeps one `name -> Signal` map that outlives any single evaluation, so re-running the config on an in-place reload finds the same signal holding the same value and an open dropdown stays open. Dies on a generation swap, since the map lives in the process being reaped (ADR-0044).
+_Avoid_: persistent state (implies it survives a swap or a restart, which it does not), local state, property
+
+**Signal resolution**:
+Reading a `Signal` handle's current value at layout time, where a config put the handle itself into a node property rather than the result of `:get()`. The two spellings differ in lifetime, not in type: a handle stays live and re-reads on every resolve, a `:get()` result is a value frozen at evaluation time. Only a handle makes a property reactive (ADR-0044).
+_Avoid_: binding, unwrapping, dereferencing
+
+**Dirty scene**:
+The flag a live signal's write sets, meaning the retained scene must re-resolve before the next paint. Re-resolving re-runs layout against the last evaluation's node tree and reads current signal values through it; it does not re-run `shell.lua`. One flag covers the whole scene, so any write re-resolves every surface (ADR-0044).
+_Avoid_: damage (a paint-region mechanism, not this), invalidation (implies a dependency graph, which there isn't), stale scene
+
+**Frame gating**:
+The rule that a surface instance repaints only when the compositor has returned its frame callback and the retained scene has actually changed since the last paint. Keeps an idle shell at zero redraws rather than repainting on a timer.
+_Avoid_: vsync, throttling, damage (a different mechanism: which region changed, not whether to paint)
 
 ## Ownership
 

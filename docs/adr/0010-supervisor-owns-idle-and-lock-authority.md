@@ -1,5 +1,12 @@
 # Supervisor owns idle-notify and lock authority, with its own Wayland connection
 
+> The session-lock half is superseded by ADR-0042; the idle-notify half stands. Two premises below
+> did not survive contact with the protocol. `ext-session-lock-v1` requires the compositor to keep
+> the session locked when the lock client dies, so a Renderer crash cannot fail open. And the
+> Lua-styled lock UI cannot render "through the Renderer as before": a locked session hides every
+> non-lock surface, so an `overlay_canvas` widget is invisible while locked, and lock surfaces
+> cannot be shared across processes. The Renderer now holds the lock and paints it.
+
 `supervisor/Cargo.toml` had no Wayland dependency, but `oblisk-supervisor-services-dbus.md` §7 states the Supervisor binds `ext_idle_notifier_v1` directly, a Wayland protocol, not a D-Bus interface. That contradiction forced a real decision: does idle-notify move to the Renderer (which already owns a Wayland connection, ADR-0008/0009), or does the Supervisor get a second one.
 
 The deciding case is session-lock, not idle-notify. `ext_session_lock_v1` and the `ext_session_lock_surface_v1` objects it requires are Wayland protocol objects bound to whichever process's connection created them; they cannot cross a process boundary. The reference fixture's lock screen today is an ordinary Lua-authored `overlay_canvas` widget, painted by the ephemeral Renderer. If the Renderer crashes while `system.state.locked == true`, that surface dies with it: `rescue.is_rescue` only covers Lua syntax errors at load time, not a runtime crash of an already-locked Renderer. Locking is a security boundary, not a visual one, so the process that holds "is the screen locked" has to be the one durable enough that a Renderer crash can never drop coverage, even for one frame.

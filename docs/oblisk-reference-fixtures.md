@@ -1,13 +1,17 @@
 # Oblisk Reference Fixtures
-## Syntactically Perfect, Production-Grade Declarative Lua Configurations
+## Worked Declarative Lua Configurations
 
-This document contains a complete, production-grade, syntactically flawless Lua configuration. It represents our simplified, zero-dependency, dual-surface architecture. This file combines all widgets (workspaces, media, hardware state, OSDs, and notifications) into a single, cohesive, easy-to-compile configuration.
+A complete `shell.lua` plus the widget modules it pulls in: workspaces, media, hardware state, OSDs, and notifications.
+
+Read these as one worked example, not as the shape a config has to take. The engine's surface set is whatever `shell.lua` returns (ADR-0038), and this example happens to declare two `panel`s: a bar, and one fullscreen overlay hosting every card. That idiom keeps the example short and it is a reasonable default, but it is not the only shape and no longer the only one available.
+
+A config has four roles to reach for (§ 6, ADR-0040): `panel` for anything anchored to a screen edge or layer, `window` for a real toplevel the compositor tiles, `popup` for a dropdown the compositor positions and dismisses on click-outside, and `lock` for the lock screen. The overlay idiom below predates three of them. A dropdown drawn as a card inside `overlay_canvas`, as the widget files here do it, is the thing `popup` replaces: a real `xdg_popup` gets compositor-side repositioning and a keyboard grab that a card in a shared overlay cannot have. Treat those widgets as showing layout and signal wiring, not as the recommended way to open a menu.
 
 ---
 
 ## 1. Complete Unified Shell Configuration (`shell.lua`)
 
-This file is evaluated by the Renderer on boot. It instantiates exactly two surfaces: the persistent status bar at the top, and the fullscreen transparent overlay surface that hosts your OSDs and notifications.
+This file is evaluated by the Renderer on boot, and its return value decides which surfaces get created. It declares two panels: the persistent status bar at the top, and the fullscreen transparent overlay that hosts the OSDs and notifications.
 
 ```lua
 -- =============================================================================
@@ -86,7 +90,7 @@ return {
     -- =========================================================================
     -- SURFACE 1: Persistent Top Status Bar
     -- =========================================================================
-    surface {
+    panel {
         id = "top_status_bar",
         layer = "Top",
         anchor = { top = true, left = true, right = true },
@@ -301,7 +305,7 @@ return {
     -- =========================================================================
     -- SURFACE 2: Fullscreen Transparent Overlay Surface (Canvas Layer)
     -- =========================================================================
-    surface {
+    panel {
         id = "overlay_canvas",
         layer = "Overlay",
         anchor = { top = true, bottom = true, left = true, right = true },
