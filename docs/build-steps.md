@@ -642,9 +642,17 @@ Implement ADR-0039. Move `Loader`, the live-signal map, the rescue state, and `l
 is `!Send`, so this is a construction move, not a hand-off.
 
 Collapse what the move makes redundant: three of `main.rs`'s four channels become direct calls,
-the duplicate `ShapingHandle` and its second `FontSystem::new()` startup cost go away (ADR-0023
-item 8), and `PLACEHOLDER_OUTPUT_SIZE` is replaced by each surface's real configured size
-(ADR-0023 item 6).
+and the duplicate `ShapingHandle` and its second `FontSystem::new()` startup cost go away
+(ADR-0023 item 8).
+
+`PLACEHOLDER_OUTPUT_SIZE` does not go with them, and ADR-0039 decision 4 is wrong about why it
+could. Being on one thread makes the configured sizes reachable, not attributable. `Scene` keys
+surfaces by the `id` a config writes, and `wayland::mod` hardcodes `TrackedSurface::surface_id`
+from `SurfaceRole::label()`. Today those id spaces do not intersect: the only config in the repo
+declares `"bar"` and the three Rust-created surfaces are `"main_bar"`, `"overlay_canvas"`, and
+`"wallpaper_layer@{output}"`. Nothing to look up, and a fallback for the misses would be a
+mapping policy invented here for ADR-0038 to delete. It moves to Phase 20 item 4, which deletes
+`SurfaceRole` and is what makes the two id spaces one.
 
 A pure refactor with no behavior change: same three hardcoded surfaces, same proof string, same PBA
 handshake, fewer threads. That is the acceptance criterion. Resist folding any of Phase 19 into it;
@@ -783,6 +791,12 @@ reconfiguration, and destruction from the evaluated topology instead.
    test is that editing that `layer` changes what the compositor stacks. Rename the constructor
    `surface` to `panel` here (ADR-0040): "surface" becomes the umbrella term for all four roles, and
    this phase is the last point where that rename is a one-line change.
+
+   Delete `PLACEHOLDER_OUTPUT_SIZE` here too, and resolve each surface against its own
+   `TrackedSurface::configured_size` (ADR-0023 item 6, ADR-0039 decision 4). This is where it
+   belongs rather than in Phase 18: deleting `SurfaceRole` is what collapses the Lua `id` space and
+   the Wayland `surface_id` space into one, and until they are one there is no surface a size
+   lookup could hit.
 5. **Push input regions.** `layout::overlay_input_regions` has been correct and tested since Phase
    12 with no caller (ADR-0023 item 5). Wire it per surface, not just for one overlay: it is a no-op
    for a tightly-sized bar and load-bearing for any surface larger than its visible content.

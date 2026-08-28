@@ -1,5 +1,13 @@
 # The Lua VM, the retained scene, and the paint pass share the Wayland dispatch thread
 
+> Decision 4 is deferred to Phase 20, and its stated reason was wrong. "Layout resolves against
+> each surface's real configured size, which is now in scope" treats the thread boundary as the
+> only blocker. Consolidation makes the sizes reachable but not attributable: `Scene` keys surfaces
+> by the `id` a config writes, `wayland::mod` derives `TrackedSurface::surface_id` from
+> `SurfaceRole::label()`, and those two id spaces do not intersect. Deleting `SurfaceRole` is what
+> makes them one, so the per-surface size lands with ADR-0038 in Phase 20 item 4. Decisions 1, 2, 3
+> and 5 are unaffected; 1 through 3 shipped with the refactor.
+
 The 2026-08-28 renderer review found the Renderer split into two OS threads that cannot reach each
 other's state, with the scene on one side and the pixels on the other.
 

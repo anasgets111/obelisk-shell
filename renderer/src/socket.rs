@@ -87,9 +87,17 @@ use crate::lua::{self, Loader};
 use crate::text::shaping::ShapingHandle;
 
 /// Every surface still resolves against one hardcoded size instead of its own configured one
-/// (docs/adr/0023 item 6, docs/adr/0039 decision 4). The real per-surface sizes are now on this
-/// same thread, in `crate::wayland::App`'s `TrackedSurface::configured_size`; threading each one
-/// into its own `Scene::apply` is Phase 18's second half, not the thread move itself.
+/// (docs/adr/0023 item 6, docs/adr/0039 decision 4).
+///
+/// ponytail: the sizes are reachable now, but not yet attributable. ADR-0039 decision 4 assumed
+/// "on the same thread" was the whole blocker; it is not. `Scene` keys surfaces by the `id` a
+/// config writes (`dev-config/oblisk/shell.lua` says `"bar"`), while `crate::wayland` hardcodes
+/// `TrackedSurface::surface_id` from `SurfaceRole::label()` (`"main_bar"`, `"overlay_canvas"`,
+/// `"wallpaper_layer@{output}"`). Those two id spaces have no overlap at all, so there is no
+/// surface whose configured size a lookup could find, and any fallback for the misses would be a
+/// mapping policy invented here and deleted by ADR-0038. Phase 20 item 4 moves the default
+/// surfaces into Lua and deletes `SurfaceRole`, which is what makes the ids one space; the
+/// per-surface size threads in there, against real correspondence rather than a guess.
 const PLACEHOLDER_OUTPUT_SIZE: layout::LogicalSize = layout::LogicalSize { width: 1920.0, height: 40.0 };
 
 /// This Renderer's own generation id (`OBLISK_GENERATION_ID`, defaulting to `0`). Read once in
