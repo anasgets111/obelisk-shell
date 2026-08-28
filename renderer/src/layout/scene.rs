@@ -63,8 +63,29 @@ const MAX_TREE_DEPTH: u32 = 64;
 pub struct NodeId(u64);
 
 /// The public, ID-less output of one node's resolution: geometry plus a full passthrough of its
-/// raw properties for a future paint stage. Reused by `Scene::surface` and by
-/// `overlay_input_regions`.
+/// properties for a future paint stage. Reused by `Scene::surface` and by `overlay_input_regions`.
+///
+/// `properties` holds **resolved** values, never a `Signal` handle: `node::resolve_properties` ran
+/// over this node's raw map exactly once, at the top of the pass that produced this node
+/// (build-steps.md Phase 19 item 5). So this tree is a snapshot of one pass, which is what makes
+/// it safe for a later paint stage to read a colour or a radius straight off it without resolving
+/// anything itself -- and what guarantees the value it paints is the same one layout measured.
+/// The structural keys are the deliberate exception: `node::is_structural_property` copies them
+/// through raw on the kinds whose parsers read them, and those parsers reject a `Signal` outright,
+/// so no handle reaches here by that route either.
+///
+/// ponytail: absent and nil are one state in this map. `node::resolve_properties` omits a key whose
+/// signal resolved to `Value::Nil` (ADR-0044 decision 1's amendment), so a `background` bound to a
+/// capability signal that currently reads `nil` is indistinguishable here from a `background` the
+/// config never set. For every property a parser in `layout::node` reads that is exactly right --
+/// each has a documented default and the two spellings of "no value here" must agree, which is the
+/// argument that rule rests on. For the paint-only properties this comment tells a paint stage to
+/// trust, it is a real difference collapsed: that stage will apply its own built-in default to a
+/// property the config did bind, at precisely the moments a capability has not answered yet (every
+/// `CAPABILITIES` global reads `nil` until the first `StateSnapshot` drains, so this is the state
+/// at boot, not an edge case). Distinguishing them means a third state in the map, `Value::Nil`
+/// retained as "bound but unresolved", and every parser here re-learning to treat it as absent --
+/// not worth it before a paint stage exists to have the opinion.
 #[derive(Debug, Clone)]
 pub struct ResolvedNode {
     pub kind: String,
@@ -75,7 +96,8 @@ pub struct ResolvedNode {
 }
 
 /// One retained node: `ResolvedNode`'s geometry plus the `NodeId` identity that lets the next
-/// `Scene::apply` decide whether to reuse it or retire it.
+/// `Scene::apply` decide whether to reuse it or retire it. `properties` is resolved, for the same
+/// reason and with the same exception as [`ResolvedNode`]'s -- it is where that one comes from.
 ///
 /// `Clone` exists solely for `Scene::apply`'s rollback snapshot (see its doc comment) -- nothing
 /// else in this module needs to duplicate a retained subtree.
@@ -159,9 +181,14 @@ impl Scene {
     /// tree whether or not anything fails, and item 2's dirty flag turns that into once per
     /// capability push rather than once per config edit. The clone is structural (a
     /// `RetainedNode`'s `mlua::Value` properties are refcount bumps, not deep copies), so it is
-    /// O(nodes), not O(Lua heap). Item 5 is the real fix: resolving every property once up front
-    /// means the fallible work finishes before any of `next_id`/`retiring`/`surfaces` is touched,
-    /// and a walk that cannot fail partway needs no snapshot at all.
+    /// O(nodes), not O(Lua heap). This comment used to name build-steps.md Phase 19 item 5 as the
+    /// fix, on the theory that resolving every property up front would finish all the fallible
+    /// work before any state was touched. Item 5 landed and that turned out to be wrong: a parent
+    /// must know a child's `margin` before it can hand that child a budget, so resolution is
+    /// interleaved with the walk rather than preceding it, and a Signal getter can still fail at
+    /// arbitrary depth with `next_id` and `retiring` already mutated. Removing the snapshot needs
+    /// the whole fresh tree resolved into a separate tree first, which is a second traversal and a
+    /// second allocation to save a clone that is already O(nodes).
     pub fn apply(
         &mut self,
         fresh_surfaces: &[VirtualNode],
@@ -195,7 +222,15 @@ impl Scene {
     ) -> Result<(), LayoutError> {
         let key = node::parse_surface_id(&fresh.properties)?;
         let existing = self.surfaces.remove(&key);
-        let reconciled = resolve_and_reconcile(self, existing, fresh, available, shaping, None, None, lua, 0)?;
+        // The root's one resolve for this pass, gated by the same admissibility check its children
+        // get in the loop below, for the same reason: resolution runs Lua, so a node the walk will
+        // refuse must not run any first. Every node below this one is resolved by its own parent,
+        // in the child loop that needs its `margin` before it can recurse (build-steps.md Phase 19
+        // item 5).
+        ensure_node_admissible(&fresh.kind, 0)?;
+        let properties = node::resolve_properties(&fresh.properties, &fresh.kind, lua)?;
+        let reconciled =
+            resolve_and_reconcile(self, existing, &fresh.kind, properties, available, shaping, None, None, lua, 0)?;
         self.surfaces.insert(key, reconciled);
         Ok(())
     }
@@ -289,6 +324,46 @@ fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
     }
 }
 
+/// Everything a node has to pass before *anything* reads its properties: a supported kind, and a
+/// level within [`MAX_TREE_DEPTH`]. Called at each site about to run `node::resolve_properties`
+/// over a node's raw map -- `Scene::apply_one_surface` for a surface root, `resolve_and_reconcile`'s
+/// child loop for every node below one -- and again at the top of `resolve_and_reconcile`, which is
+/// what keeps [`children_of`]'s `unreachable!` arm unreachable for any caller.
+///
+/// The ordering is the whole reason this is a function rather than two lines inline. Resolution
+/// calls back into Lua (ADR-0044 decision 1), so running it before these checks executes a rejected
+/// node's `Signal` getters on its behalf: measured, a self-generating `children` signal's body ran
+/// 64 times against a 64-level cap, because the parent at the last admitted level resolved the
+/// child's whole property map -- running its `children` closure -- before recursing into the check
+/// that refused that child. The kind case is worse than one wasted level: every property getter of
+/// a `kind = "list"` node ran, arbitrary Lua side effects for a node that never entered the
+/// accepted tree.
+///
+/// `depth` is the level the node being checked would occupy, so a parent at `depth` checks its
+/// children at `depth + 1` -- the same number the recursive call is handed, and the same
+/// `TreeTooDeep` this used to raise one frame later.
+fn ensure_node_admissible(kind: &str, depth: u32) -> Result<(), LayoutError> {
+    ensure_supported_kind(kind)?;
+    // build-steps.md Phase 19 item 3: a cyclic or infinitely-generating tree returns a LayoutError
+    // at MAX_TREE_DEPTH's own stack depth, not somewhere further down (see MAX_TREE_DEPTH's doc
+    // comment for the measured stack cost this leaves margin against).
+    //
+    // `>=`, not `>`: `depth` counts levels already entered, root at 0, so this admits levels
+    // 0..MAX_TREE_DEPTH-1 -- exactly MAX_TREE_DEPTH of them, which is what the constant and the
+    // error message both say. `>` admitted MAX_TREE_DEPTH + 1 levels while claiming
+    // MAX_TREE_DEPTH, and disagreed with the signal cap's `>= MAX_SIGNAL_NESTING_DEPTH` about
+    // what "maximum depth" means. The reported `depth` is 1-based (the level being refused) so
+    // "maximum depth of 64 levels ... got at least 65" reads as the truth.
+    if depth >= MAX_TREE_DEPTH {
+        return Err(LayoutError::TreeTooDeep {
+            kind: kind.to_string(),
+            depth: depth + 1,
+            max: MAX_TREE_DEPTH,
+        });
+    }
+    Ok(())
+}
+
 /// Dispatches to the right raw property (`child` for `surface`, `children` for the container
 /// kinds, none for leaves) -- only called after [`ensure_supported_kind`] already validated
 /// `node.kind`, so the fallback arm is unreachable, not a silent default.
@@ -302,12 +377,12 @@ fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
 /// -- ADR-0009 named this a `TextInputService`, but this slice inlined the fields onto `App`
 /// directly rather than extracting that type; see that file's own `bind_text_input` doc comment
 /// for the upgrade path).
-fn children_of(node: &VirtualNode, lua: &Lua) -> Result<Vec<VirtualNode>, LayoutError> {
-    match node.kind.as_str() {
-        "surface" => Ok(node::parse_single_child(&node.properties, "child", lua)?
+fn children_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Vec<VirtualNode>, LayoutError> {
+    match kind {
+        "surface" => Ok(node::parse_single_child(properties, "child")?
             .into_iter()
             .collect()),
-        "rect" | "row" | "column" | "button" => node::parse_children(&node.properties, lua),
+        "rect" | "row" | "column" | "button" => node::parse_children(properties),
         "text" | "icon" | "textfield" => Ok(Vec::new()),
         other => unreachable!("ensure_supported_kind already rejected `{other}`"),
     }
@@ -337,22 +412,21 @@ fn stretch_forced_size(
     own_width_known: Option<f32>,
     own_height_known: Option<f32>,
     margined_budget: LogicalSize,
-    lua: &Lua,
 ) -> Result<(Option<f32>, Option<f32>), LayoutError> {
     match parent_kind {
         "row" => {
-            let cross = node::parse_align(child_properties, "align_v", lua)?;
+            let cross = node::parse_align(child_properties, "align_v")?;
             let forced_h = (cross == Align::Stretch && own_height_known.is_some()).then_some(margined_budget.height);
             Ok((None, forced_h))
         }
         "column" => {
-            let cross = node::parse_align(child_properties, "align_h", lua)?;
+            let cross = node::parse_align(child_properties, "align_h")?;
             let forced_w = (cross == Align::Stretch && own_width_known.is_some()).then_some(margined_budget.width);
             Ok((forced_w, None))
         }
         "rect" | "button" | "surface" => {
-            let align_h = node::parse_align(child_properties, "align_h", lua)?;
-            let align_v = node::parse_align(child_properties, "align_v", lua)?;
+            let align_h = node::parse_align(child_properties, "align_h")?;
+            let align_v = node::parse_align(child_properties, "align_v")?;
             let forced_w = (align_h == Align::Stretch && own_width_known.is_some()).then_some(margined_budget.width);
             let forced_h = (align_v == Align::Stretch && own_height_known.is_some()).then_some(margined_budget.height);
             Ok((forced_w, forced_h))
@@ -480,14 +554,28 @@ fn pair_children_by_id_then_position(
 /// case, and always the case when the parent's own axis is itself `Content`-sized, since its
 /// final size isn't known until after its children resolve) falls back to the usual
 /// `width`/`height`-mode resolution.
-// Nine parameters, but each is load-bearing for this single recursive pass (§ 3's "single...
+///
+/// `properties` arrives already resolved -- `node::resolve_properties` has run over this node's
+/// raw map exactly once for this pass, replacing every `Signal` with its current value
+/// (build-steps.md Phase 19 item 5). The caller does that rather than this function, because a
+/// parent has to read a child's `margin` to compute the budget it recurses with, so the one read
+/// has to happen in the parent's loop; `Scene::apply_one_surface` does it for a surface root,
+/// which has no parent. Everything from here down -- this node's own parsing,
+/// `intrinsic_content_size`, `position_children`, and the `RetainedNode` this returns -- reads that
+/// one map, so a `Signal` behind a property is read exactly once per node per pass and the sizing
+/// and positioning passes cannot disagree about *it*. They can still disagree about a property
+/// whose resolved value is a plain table with an `__index` metamethod, which every `table.get`
+/// re-runs: see `node::parse_edge_insets`'s `ponytail:`, since `margin` is the property both passes
+/// read and the one that shape breaks.
+// Ten parameters, but each is load-bearing for this single recursive pass (§ 3's "single...
 // pass", see the module doc comment); splitting them into a struct would just be a bag carrying
-// the same nine fields through the same one caller.
+// the same ten fields through the same one caller.
 #[allow(clippy::too_many_arguments)]
 fn resolve_and_reconcile(
     scene: &mut Scene,
     retained: Option<RetainedNode>,
-    fresh: &VirtualNode,
+    kind: &str,
+    properties: HashMap<String, Value>,
     available: LogicalSize,
     shaping: &ShapingHandle,
     forced_width: Option<f32>,
@@ -495,34 +583,19 @@ fn resolve_and_reconcile(
     lua: &Lua,
     depth: u32,
 ) -> Result<RetainedNode, LayoutError> {
-    ensure_supported_kind(&fresh.kind)?;
-    // build-steps.md Phase 19 item 3: checked before touching any of this node's own children so
-    // a cyclic/infinitely-generating tree returns a LayoutError at MAX_TREE_DEPTH's own stack
-    // depth, not somewhere further down (see MAX_TREE_DEPTH's doc comment for the measured stack
-    // cost this leaves margin against).
-    //
-    // `>=`, not `>`: `depth` counts levels already entered, root at 0, so this admits levels
-    // 0..MAX_TREE_DEPTH-1 -- exactly MAX_TREE_DEPTH of them, which is what the constant and the
-    // error message both say. `>` admitted MAX_TREE_DEPTH + 1 levels while claiming
-    // MAX_TREE_DEPTH, and disagreed with the signal cap's `>= MAX_SIGNAL_NESTING_DEPTH` about
-    // what "maximum depth" means. The reported `depth` is 1-based (the level being refused) so
-    // "maximum depth of 64 levels ... got at least 65" reads as the truth.
-    if depth >= MAX_TREE_DEPTH {
-        return Err(LayoutError::TreeTooDeep {
-            kind: fresh.kind.clone(),
-            depth: depth + 1,
-            max: MAX_TREE_DEPTH,
-        });
-    }
+    // Already run by whoever resolved `properties` (that is the ordering `ensure_node_admissible`
+    // exists to enforce), and repeated here so this function holds its own preconditions rather
+    // than trusting a call site -- notably `children_of`'s `unreachable!` arm below.
+    ensure_node_admissible(kind, depth)?;
 
     let id = retained.as_ref().map(|r| r.id);
     let old_children = retained.map(|r| r.children).unwrap_or_default();
     let id = id.unwrap_or_else(|| scene.alloc_id());
 
-    let padding = node::parse_edge_insets(&fresh.properties, "padding", lua)?;
-    let visible = node::parse_visible(&fresh.properties, lua)?;
-    let width_mode = node::parse_size_mode(&fresh.properties, "width", lua)?;
-    let height_mode = node::parse_size_mode(&fresh.properties, "height", lua)?;
+    let padding = node::parse_edge_insets(&properties, "padding")?;
+    let visible = node::parse_visible(&properties)?;
+    let width_mode = node::parse_size_mode(&properties, "width")?;
+    let height_mode = node::parse_size_mode(&properties, "height")?;
 
     let own_width_known = forced_width.or_else(|| resolve_non_content(width_mode, available.width));
     let own_height_known = forced_height.or_else(|| resolve_non_content(height_mode, available.height));
@@ -545,11 +618,18 @@ fn resolve_and_reconcile(
         height: own_height_known.map_or(0.0, |h| (h - padding.top - padding.bottom).max(0.0)),
     };
 
-    let fresh_children = children_of(fresh, lua)?;
+    let fresh_children = children_of(kind, &properties)?;
     let matched_candidates = pair_children_by_id_then_position(scene, &fresh_children, old_children)?;
 
     let mut new_children = Vec::with_capacity(fresh_children.len());
     for (fresh_child, candidate) in fresh_children.iter().zip(matched_candidates) {
+        // Before this child's own getters run, not after: resolving its property map calls back
+        // into Lua, and a child the walk is about to refuse must not get to execute anything on the
+        // way to being refused. `depth + 1` is the level this child would occupy, so the error is
+        // the same variant, kind and level the recursive call raised when this check lived one
+        // frame further down -- see `ensure_node_admissible`.
+        ensure_node_admissible(&fresh_child.kind, depth + 1)?;
+
         let reusable = match candidate {
             Some(c) if c.kind == fresh_child.kind => Some(c),
             Some(stale) => {
@@ -559,27 +639,28 @@ fn resolve_and_reconcile(
             None => None,
         };
 
+        // This child's one resolve for this pass (build-steps.md Phase 19 item 5). It happens here
+        // rather than inside the recursive call because the budget that call receives depends on
+        // this child's own `margin`, and a second read of an impure signal would hand it a budget
+        // computed from a value nothing downstream would ever see again.
+        let child_properties = node::resolve_properties(&fresh_child.properties, &fresh_child.kind, lua)?;
+
         // § 3.1: a child's own margin comes out of the same available-space budget its parent's
         // padding already inset -- subtracted here, per child, since each child can carry a
         // different margin.
-        let child_margin = node::parse_edge_insets(&fresh_child.properties, "margin", lua)?;
+        let child_margin = node::parse_edge_insets(&child_properties, "margin")?;
         let margined_budget = LogicalSize {
             width: (child_budget.width - child_margin.left - child_margin.right).max(0.0),
             height: (child_budget.height - child_margin.top - child_margin.bottom).max(0.0),
         };
-        let (child_forced_width, child_forced_height) = stretch_forced_size(
-            &fresh.kind,
-            &fresh_child.properties,
-            own_width_known,
-            own_height_known,
-            margined_budget,
-            lua,
-        )?;
+        let (child_forced_width, child_forced_height) =
+            stretch_forced_size(kind, &child_properties, own_width_known, own_height_known, margined_budget)?;
 
         new_children.push(resolve_and_reconcile(
             scene,
             reusable,
-            fresh_child,
+            &fresh_child.kind,
+            child_properties,
             margined_budget,
             shaping,
             child_forced_width,
@@ -589,7 +670,7 @@ fn resolve_and_reconcile(
         )?);
     }
 
-    let intrinsic = intrinsic_content_size(fresh, &new_children, text_wrap_width, shaping, lua)?;
+    let intrinsic = intrinsic_content_size(kind, &properties, &new_children, text_wrap_width, shaping)?;
     let own_width = own_width_known.unwrap_or(intrinsic.width);
     let own_height = own_height_known.unwrap_or(intrinsic.height);
     let size = LogicalSize {
@@ -597,11 +678,11 @@ fn resolve_and_reconcile(
         height: own_height,
     };
 
-    position_children(fresh, &mut new_children, size, padding, own_width_known, own_height_known, lua)?;
+    position_children(kind, &properties, &mut new_children, size, padding, own_width_known, own_height_known)?;
 
     Ok(RetainedNode {
         id,
-        kind: fresh.kind.clone(),
+        kind: kind.to_string(),
         rect: LogicalRect {
             x: 0.0,
             y: 0.0,
@@ -609,7 +690,7 @@ fn resolve_and_reconcile(
             height: size.height,
         },
         visible,
-        properties: fresh.properties.clone(),
+        properties,
         children: new_children,
     })
 }
@@ -618,16 +699,16 @@ fn resolve_and_reconcile(
 /// `resolve_and_reconcile`'s doc comment on the collapse-vs-reserve-space choice) -- filtered out
 /// before the row/column sum and the stacking union.
 fn intrinsic_content_size(
-    node: &VirtualNode,
+    kind: &str,
+    properties: &HashMap<String, Value>,
     children: &[RetainedNode],
     text_wrap_width: f32,
     shaping: &ShapingHandle,
-    lua: &Lua,
 ) -> Result<LogicalSize, LayoutError> {
-    match node.kind.as_str() {
+    match kind {
         "text" => {
-            let content = node::parse_content(&node.properties, lua)?;
-            let font_size = node::parse_font_size(&node.properties, lua)?;
+            let content = node::parse_content(properties)?;
+            let font_size = node::parse_font_size(properties)?;
             // A wrap width of 0 means nothing is known yet (a Content-sized text inside a
             // Content-sized ancestor with no room resolved so far) -- treat that as unconstrained
             // rather than forcing every word onto its own line.
@@ -638,10 +719,8 @@ fn intrinsic_content_size(
             // is now up to once per poll turn (ADR-0044 decision 2's dirty flag), so a bar with 20
             // text nodes on a 15ms poll driven by a high-frequency capability is roughly 1300
             // blocking round trips per second on the Wayland dispatch thread, which is also the
-            // thread that answers `configure` and runs the VM (docs/adr/0039). Two fixes, both
-            // already planned: a shape cache keyed on (text, font_size, max_width), and
-            // build-steps.md Phase 19 item 5's resolve-once-per-pass, which stops a single apply
-            // shaping the same node more than once. Neither is built here.
+            // thread that answers `configure` and runs the VM (docs/adr/0039). The remaining fix
+            // is a shape cache keyed on (text, font_size, max_width); not built here.
             let shaped = shaping.shape(ShapeRequest {
                 text: content,
                 font_size,
@@ -654,7 +733,7 @@ fn intrinsic_content_size(
             })
         }
         "icon" => {
-            let size = node::parse_icon_size(&node.properties, lua)?;
+            let size = node::parse_icon_size(properties)?;
             Ok(LogicalSize {
                 width: size,
                 height: size,
@@ -662,7 +741,7 @@ fn intrinsic_content_size(
         }
         "rect" if children.is_empty() => Ok(LogicalSize::default()),
         "row" => {
-            let spacing = node::parse_spacing(&node.properties, lua)?;
+            let spacing = node::parse_spacing(properties)?;
             let visible: Vec<&RetainedNode> = children.iter().filter(|c| c.visible).collect();
             // § 3.1: a child's margin travels with it -- its footprint on the row's main axis is
             // its own width plus its margin, matching `position_children`'s identical footprint
@@ -670,32 +749,32 @@ fn intrinsic_content_size(
             // leave a gap once positioned).
             let width = visible
                 .iter()
-                .map(|c| Ok(c.rect.width + node::parse_edge_insets(&c.properties, "margin", lua)?.horizontal()))
+                .map(|c| Ok(c.rect.width + node::parse_edge_insets(&c.properties, "margin")?.horizontal()))
                 .collect::<Result<Vec<f32>, LayoutError>>()?
                 .into_iter()
                 .sum::<f32>()
                 + spacing * visible.len().saturating_sub(1) as f32;
             let height = visible
                 .iter()
-                .map(|c| Ok(c.rect.height + node::parse_edge_insets(&c.properties, "margin", lua)?.vertical()))
+                .map(|c| Ok(c.rect.height + node::parse_edge_insets(&c.properties, "margin")?.vertical()))
                 .collect::<Result<Vec<f32>, LayoutError>>()?
                 .into_iter()
                 .fold(0.0_f32, f32::max);
             Ok(LogicalSize { width, height })
         }
         "column" => {
-            let spacing = node::parse_spacing(&node.properties, lua)?;
+            let spacing = node::parse_spacing(properties)?;
             let visible: Vec<&RetainedNode> = children.iter().filter(|c| c.visible).collect();
             let height = visible
                 .iter()
-                .map(|c| Ok(c.rect.height + node::parse_edge_insets(&c.properties, "margin", lua)?.vertical()))
+                .map(|c| Ok(c.rect.height + node::parse_edge_insets(&c.properties, "margin")?.vertical()))
                 .collect::<Result<Vec<f32>, LayoutError>>()?
                 .into_iter()
                 .sum::<f32>()
                 + spacing * visible.len().saturating_sub(1) as f32;
             let width = visible
                 .iter()
-                .map(|c| Ok(c.rect.width + node::parse_edge_insets(&c.properties, "margin", lua)?.horizontal()))
+                .map(|c| Ok(c.rect.width + node::parse_edge_insets(&c.properties, "margin")?.horizontal()))
                 .collect::<Result<Vec<f32>, LayoutError>>()?
                 .into_iter()
                 .fold(0.0_f32, f32::max);
@@ -709,13 +788,13 @@ fn intrinsic_content_size(
             let visible: Vec<&RetainedNode> = children.iter().filter(|c| c.visible).collect();
             let width = visible
                 .iter()
-                .map(|c| Ok(c.rect.width + node::parse_edge_insets(&c.properties, "margin", lua)?.horizontal()))
+                .map(|c| Ok(c.rect.width + node::parse_edge_insets(&c.properties, "margin")?.horizontal()))
                 .collect::<Result<Vec<f32>, LayoutError>>()?
                 .into_iter()
                 .fold(0.0_f32, f32::max);
             let height = visible
                 .iter()
-                .map(|c| Ok(c.rect.height + node::parse_edge_insets(&c.properties, "margin", lua)?.vertical()))
+                .map(|c| Ok(c.rect.height + node::parse_edge_insets(&c.properties, "margin")?.vertical()))
                 .collect::<Result<Vec<f32>, LayoutError>>()?
                 .into_iter()
                 .fold(0.0_f32, f32::max);
@@ -742,13 +821,13 @@ fn cross_axis_offset(align: Align, container: f32, child: f32) -> f32 {
 /// won't be repositioned for that new size -- the same Content-sized-parent limitation as
 /// docs/adr/0023 item 10, not the general bug that forcing above fixes).
 fn position_children(
-    node: &VirtualNode,
+    kind: &str,
+    properties: &HashMap<String, Value>,
     children: &mut [RetainedNode],
     size: LogicalSize,
     padding: EdgeInsets,
     own_width_known: Option<f32>,
     own_height_known: Option<f32>,
-    lua: &Lua,
 ) -> Result<(), LayoutError> {
     let content_x = padding.left;
     let content_y = padding.top;
@@ -757,13 +836,13 @@ fn position_children(
 
     let margins: Vec<EdgeInsets> = children
         .iter()
-        .map(|c| node::parse_edge_insets(&c.properties, "margin", lua))
+        .map(|c| node::parse_edge_insets(&c.properties, "margin"))
         .collect::<Result<_, _>>()?;
 
-    match node.kind.as_str() {
+    match kind {
         "row" => {
-            let spacing = node::parse_spacing(&node.properties, lua)?;
-            let main_align = node::parse_align(&node.properties, "align_h", lua)?;
+            let spacing = node::parse_spacing(properties)?;
+            let main_align = node::parse_align(properties, "align_h")?;
             let visible_indices: Vec<usize> = children
                 .iter()
                 .enumerate()
@@ -784,7 +863,7 @@ fn position_children(
                 Align::End => spare,
             };
             for &i in &visible_indices {
-                let cross_align = node::parse_align(&children[i].properties, "align_v", lua)?;
+                let cross_align = node::parse_align(&children[i].properties, "align_v")?;
                 let slot_h = (content_height - margins[i].top - margins[i].bottom).max(0.0);
                 let child_h = children[i].rect.height;
                 let y = cross_axis_offset(cross_align, slot_h, child_h);
@@ -797,8 +876,8 @@ fn position_children(
             }
         }
         "column" => {
-            let spacing = node::parse_spacing(&node.properties, lua)?;
-            let main_align = node::parse_align(&node.properties, "align_v", lua)?;
+            let spacing = node::parse_spacing(properties)?;
+            let main_align = node::parse_align(properties, "align_v")?;
             let visible_indices: Vec<usize> = children
                 .iter()
                 .enumerate()
@@ -817,7 +896,7 @@ fn position_children(
                 Align::End => spare,
             };
             for &i in &visible_indices {
-                let cross_align = node::parse_align(&children[i].properties, "align_h", lua)?;
+                let cross_align = node::parse_align(&children[i].properties, "align_h")?;
                 let slot_w = (content_width - margins[i].left - margins[i].right).max(0.0);
                 let child_w = children[i].rect.width;
                 let x = cross_axis_offset(cross_align, slot_w, child_w);
@@ -837,8 +916,8 @@ fn position_children(
                 if !child.visible {
                     continue;
                 }
-                let align_h = node::parse_align(&child.properties, "align_h", lua)?;
-                let align_v = node::parse_align(&child.properties, "align_v", lua)?;
+                let align_h = node::parse_align(&child.properties, "align_h")?;
+                let align_v = node::parse_align(&child.properties, "align_v")?;
                 let slot_w = (content_width - margins[i].left - margins[i].right).max(0.0);
                 let slot_h = (content_height - margins[i].top - margins[i].bottom).max(0.0);
                 let x = cross_axis_offset(align_h, slot_w, child.rect.width);
@@ -1216,9 +1295,11 @@ mod tests {
         let next_id_before = scene.next_id;
         let retiring_before = scene.retiring_ids();
 
-        // A getter that errors on read: `resolve_property` propagates that as `LayoutError`
-        // partway through resolving the row's second child's `width`, after the first child (and
-        // the row/surface's own properties) already resolved successfully this pass.
+        // A getter that errors on read: `resolve_properties` propagates that as a `LayoutError`
+        // while building the row's second child's resolved map, after the first child's map (and
+        // the row's, and the surface's) was built successfully this pass. The failure is therefore
+        // partway through the walk, with `next_id` and `retiring` already mutated -- which is the
+        // state this test exists to prove `apply` rolls back.
         let lua2 = mlua::Lua::new();
         register_node_constructors(&lua2).unwrap();
         crate::lua::signal::register(&lua2).unwrap();
@@ -1395,10 +1476,12 @@ mod tests {
 
     #[test]
     fn a_computed_children_signal_generating_fresh_depth_is_rejected_with_a_layout_error() {
-        // build-steps.md Phase 19 item 3, defect 2: `resolve_property`'s "resolved to another
-        // Signal" guard never fires here because every result is a fresh Table, not a Signal --
-        // the recursion is pure Rust through resolve_and_reconcile, so the same tree-depth cap
-        // that catches defect 1 must catch this too (verified, not assumed, per the task brief).
+        // build-steps.md Phase 19 item 3, defect 2: `resolve_properties`' "a Signal resolved to
+        // another Signal" guard never fires here, because each read of `children` answers with a
+        // fresh Table rather than a Signal. The recursion is pure Rust through
+        // resolve_and_reconcile -- one `resolve_properties` per node level, each running the
+        // generator once more -- so the same tree-depth cap that catches defect 1 must catch this
+        // too (verified, not assumed, per the task brief).
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let lua = mlua::Lua::new();
@@ -1904,6 +1987,166 @@ mod tests {
         }
         assert!(!before.contains(&after[0]), "the never-seen `fresh` id must allocate rather than inherit n0's node");
         assert!(scene.retiring_ids().contains(&before[0]), "n0 left the config, so it is retired");
+    }
+
+    /// The three tests below share one shape: a `margin` that is a `computed` signal counting its
+    /// own reads into a Lua global, so what a single `Scene::apply` does with that property is
+    /// observable from the config's side (build-steps.md Phase 19 item 5).
+    fn surface_with_a_read_counting_margin(lua: &mlua::Lua) -> VirtualNode {
+        register_node_constructors(lua).unwrap();
+        crate::lua::signal::register(lua).unwrap();
+        let table: mlua::Table = lua
+            .load(
+                r#"
+                reads = 0
+                local m = computed({}, function() reads = reads + 1; return { left = reads } end)
+                return surface { id = "bar", child = row { children = {
+                    rect { width = 10, height = 10, margin = m },
+                } } }
+                "#,
+            )
+            .eval()
+            .unwrap();
+        deserialize_lua_table(&table).unwrap()
+    }
+
+    #[test]
+    fn an_impure_margin_closure_positions_a_child_inside_the_size_its_parent_was_measured_at() {
+        // build-steps.md Phase 19 item 5's headline defect. `margin` used to be resolved four
+        // separate times in one apply (the parent loop, both `intrinsic_content_size` folds, and
+        // `position_children`), each an independent `Signal::get_value`, so a closure that is not
+        // a pure function of unchanged state answered differently within one pass: the row was
+        // measured 12 wide from the second read and positioned its child at x 4 from the fourth,
+        // a 10-wide child spanning 4..14 inside a 12-wide parent. That breaks the invariant
+        // `intrinsic_content_size`'s own comment states -- the sizing and positioning passes "must
+        // agree, or a child would be sized to fit but then overlap or leave a gap once
+        // positioned".
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        let surface = surface_with_a_read_counting_margin(&lua);
+
+        scene.apply(&[surface], full(), &shaping, &lua).unwrap();
+
+        let root = scene.surface("bar").unwrap();
+        let row = &root.children[0];
+        let child = &row.children[0];
+        assert_eq!(
+            child.rect.x + child.rect.width,
+            row.rect.width,
+            "the margin the row was measured with must be the margin its child was positioned with: the child spans {}..{} inside a {}-wide row",
+            child.rect.x,
+            child.rect.x + child.rect.width,
+            row.rect.width
+        );
+    }
+
+    #[test]
+    fn a_signal_valued_property_resolves_exactly_once_per_apply() {
+        // The mechanism behind the test above, asserted directly: one pass, one answer per
+        // property. `margin` is the property measured at four reads, so it is the one counted
+        // here. This is not the memoization docs/adr/0044 decision 3 rejects -- nothing is cached
+        // past the end of this apply, and the next one resolves again.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        let surface = surface_with_a_read_counting_margin(&lua);
+
+        scene.apply(&[surface], full(), &shaping, &lua).unwrap();
+
+        assert_eq!(
+            lua.globals().get::<i64>("reads").unwrap(),
+            1,
+            "one Scene::apply must read a property's Signal exactly once"
+        );
+    }
+
+    #[test]
+    fn a_second_apply_resolves_the_property_again_rather_than_reusing_the_first_passes_answer() {
+        // The other side of the same rule: resolve-once is scoped to one pass, so a push-driven
+        // re-resolve (docs/adr/0044 decision 2) reads the signal again. A cache across applies
+        // would be the memoization decision 3 refuses.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        let surface = surface_with_a_read_counting_margin(&lua);
+
+        scene.apply(std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        scene.apply(&[surface], full(), &shaping, &lua).unwrap();
+
+        assert_eq!(lua.globals().get::<i64>("reads").unwrap(), 2, "each apply resolves afresh");
+    }
+
+    #[test]
+    fn the_resolved_tree_holds_a_signals_current_value_not_the_handle() {
+        // build-steps.md Phase 19 item 5: `ResolvedNode::properties` is a snapshot of one pass,
+        // which is what makes it safe for a later paint stage to read a colour or a radius off it
+        // without resolving anything itself. A property no parser reads yet (`background`) is the
+        // honest test of that, since only the resolve step can have replaced it.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua).unwrap();
+        let white = lua.create_string("#FFFFFF").unwrap();
+        let signal = crate::lua::signal::Signal::new_live(Value::String(white), crate::lua::signal::DirtyFlag::new()).0;
+        lua.globals().set("bg", signal).unwrap();
+        let table: mlua::Table = lua
+            .load(r#"return surface { id = "bar", child = rect { background = bg, width = 4, height = 4 } }"#)
+            .eval()
+            .unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+
+        scene.apply(&[surface], full(), &shaping, &lua).unwrap();
+
+        let child = &scene.surface("bar").unwrap().children[0];
+        let background = child.properties.get("background").expect("background must survive into the resolved tree");
+        assert_eq!(
+            background.as_string().map(|s| s.to_string_lossy()),
+            Some("#FFFFFF".to_string()),
+            "the resolved tree must hold the value, not the Signal handle: {background:?}"
+        );
+    }
+
+    #[test]
+    fn a_child_whose_kind_is_rejected_never_runs_its_property_getters() {
+        // Resolution calls back into Lua (docs/adr/0044 decision 1), so *when* it happens relative
+        // to the checks is observable from the config's side. Resolving a child's map in the parent
+        // loop and only then recursing into `ensure_supported_kind` meant every property getter of
+        // a node the walk was about to refuse ran first: arbitrary Lua side effects on behalf of a
+        // node that never enters the accepted tree. `ensure_node_admissible` runs in the parent
+        // loop ahead of the resolve, so nothing of a refused child is evaluated. The depth cap is
+        // the same ordering and the same fix -- one level's worth of generator body, rather than a
+        // whole property map.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua).unwrap();
+        let table: mlua::Table = lua
+            .load(
+                r#"
+                ran = false
+                local w = computed({}, function() ran = true; return 10 end)
+                return surface { id = "bar", child = row { children = {
+                    { kind = "list", width = w },
+                } } }
+                "#,
+            )
+            .eval()
+            .unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+
+        let err = scene.apply(&[surface], full(), &shaping, &lua).unwrap_err();
+
+        assert!(
+            matches!(&err, LayoutError::UnsupportedNodeKind(kind) if kind == "list"),
+            "the error must be unchanged by moving the check earlier: {err:?}"
+        );
+        assert!(
+            !lua.globals().get::<bool>("ran").unwrap(),
+            "a rejected child's property getters must not run"
+        );
     }
 
     #[test]

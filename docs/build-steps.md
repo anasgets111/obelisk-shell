@@ -789,11 +789,35 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    when `get_value` returns while `parse_edge_insets` reads four keys afterwards through
    metamethod-aware `Table::get`. A `__index` of `while true do end` hangs unkillably.
 
-   Resolve every property of a node once, at the top of its reconcile, and have the sizing and
-   positioning passes read those values rather than the raw `mlua::Value`s. This is not the
+   Resolve every property of a node once and have the sizing and positioning passes read those
+   values rather than the raw `mlua::Value`s. Not literally at the top of the node's own reconcile:
+   a parent reads its child's `margin` to compute the budget it recurses with, so the resolve has to
+   happen in the parent's loop iteration for that child, with the surface root resolved by
+   `Scene::apply` itself. Same once-per-node guarantee, one frame further up. This is not the
    memoization ADR-0044 decision 3 rejects: that is about caching *across* pushes, and this caches
    nothing beyond the pass it happens in. One pass, one answer per property, which is what makes the
    resolved tree a snapshot rather than four disagreeing reads.
+
+   Two things this item does not deliver, against how the paragraphs above read. The `__index` hole
+   stays open, and it is worse than "a signal read twice": a plain Lua table with an `__index`
+   reproduces the whole original bug with **no signal involved at all**. `parse_edge_insets` is still
+   called four times per child per pass on the same resolved table, 16 metamethod invocations, and a
+   measured `margin` metatable produced a row measured 18 wide with its child positioned spanning
+   16..26, which is the exact assertion this item's own headline test makes. Those reads also run
+   with no instruction hook installed, because `CpuBudget` drops its hook when `Signal::get_value`
+   returns: an `__index` spinning 200 million iterations made one `Scene::apply` take 26.10 seconds
+   and return `Ok(())`, where the same loop inside a `computed` was refused in 5.12ms. Closing it
+   means parsing geometry once into the retained node too, and bounding a whole layout pass rather
+   than each getter call. And this does not remove `Scene::apply`'s rollback snapshot: resolution
+   stays interleaved with the walk, so a failure at depth still leaves partial mutation to undo.
+
+   Accept one cost knowingly. Resolving the whole property map means every signal-bound property
+   resolves every pass, including the paint-only ones no parser reads yet (`background`, `color`,
+   `radius`), each buying its own 5ms budget. That is the price of the resolved tree being a
+   complete snapshot, which is what lets item 6 read a colour off it without resolving anything
+   itself. It also means a getter that raises fails the apply even for a property nothing currently
+   reads, which is correct: § 1.2 says any property may hold a `Signal`, so "nothing reads it" is a
+   fact about today's parser set, not about the config.
 6. **Per-node drawing.** `rect` (background, `radius`, per-edge `border_color`/`border_width`) and
    `text` (reuse `TextPainter`, already a FemtoVG `Canvas<OpenGl>` with `resize` per frame, and
    `text/shaping.rs`'s existing off-thread shaping). `row`/`column`/`button` are containers with no
