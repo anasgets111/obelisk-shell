@@ -2882,6 +2882,28 @@ mod tests {
     }
 
     #[test]
+    fn a_popup_root_needs_no_forcing_because_section_6_3_requires_both_of_its_sizes() {
+        // The counterpart question to `an_unsized_window_root_...`, asked rather than assumed
+        // (build-steps.md Phase 22 item 2). A `window` needed the `Content`-default override
+        // because § 6.2 gives it no size at all; § 6.3 requires a popup to state both, and gives it
+        // no `"Fill"`, so `parse_size_mode` reads real numbers here and a `Fill` child fills them
+        // through the ordinary path. A popup that omits a size never reaches this pass at all --
+        // `node::popup_spec` fails the evaluation first.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(
+            r#"{ kind = "popup", id = "menu", parent = "bar", width = 200, height = 120,
+                 anchor_rect = { x = 0, y = 0, width = 86, height = 24 },
+                 child = rect { width = "Fill", height = "Fill" } }"#,
+        );
+        apply_at(&mut scene, &[surface], LogicalSize { width: 200.0, height: 120.0 }, &shaping, &lua).unwrap();
+
+        let root = scene.surface("menu@TEST").unwrap();
+        assert_eq!((root.rect.width, root.rect.height), (200.0, 120.0));
+        assert_eq!((root.children[0].rect.width, root.children[0].rect.height), (200.0, 120.0));
+    }
+
+    #[test]
     fn an_unsupported_top_level_kind_is_still_rejected() {
         // The other half of adding two kinds: the list is still a list, not a catch-all.
         let mut scene = Scene::new();

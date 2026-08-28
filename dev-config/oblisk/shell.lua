@@ -121,8 +121,7 @@ local clicks = state("clicks", 0)
 -- The anchor rect the `popup` below hangs from. ADR-0049's amendment settles where it comes from:
 -- not off the input-dispatch stack (the re-resolve runs after `dispatch_pending` has returned) but
 -- through the config, because `on_click` receives the button's own rect (ADR-0050 decision 3) and
--- writes it to a named `state` signal the `popup` reads back. Both halves are wired here so the
--- commit that actually creates the `xdg_popup` has nothing left to connect.
+-- writes it to a named `state` signal the `popup` reads back.
 --
 -- The initial is the button's declared size, so the popup is well-formed before anything has ever
 -- been clicked: `anchor_rect` must be non-zero or the whole evaluation fails (§ 6.3).
@@ -135,6 +134,18 @@ local popup_anchor = state("popup_anchor", { x = 0, y = 0, width = 86, height = 
 -- click builds an `xdg_toplevel` and the next destroys it, with no engine-side toggle anywhere.
 local settings_open = state("settings_open", false)
 
+-- Whether the `popup` below is open. Set true by the click, and back to false by the popup's own
+-- `on_dismiss`, which is the shape a dropdown wants: the compositor is what closes it, on a click
+-- anywhere outside it, and that is the whole reason ADR-0040 reached for a real popup instead of a
+-- second panel.
+--
+-- Deliberately not toggled here the way `settings_open` above is, and the reason is measured rather
+-- than assumed. Under an `xdg_popup` grab, niri still delivers a click on *this* button to us,
+-- because the bar is the popup's own parent surface and so inside the grab's tree -- so a toggle
+-- would close it, on this compositor. What a toggle would also do is fight `on_dismiss` on every
+-- click that lands anywhere else, since that path already writes `false`. One writer per edge.
+local menu_open = state("menu_open", false)
+
 local click_button = button {
     width = 86,
     height = 24,
@@ -145,6 +156,7 @@ local click_button = button {
         clicks:set(n)
         popup_anchor:set(rect)
         settings_open:set(not settings_open:get())
+        menu_open:set(true)
         print(string.format("[shell.lua] click %d, button rect %.0f,%.0f %.0fx%.0f, settings %s", n, rect.x, rect.y, rect.width, rect.height,
             settings_open:get() and "open" or "closed"))
     end,
@@ -168,7 +180,9 @@ end), "#f38ba8ff")
 -- when a config is big enough to get wrong. Both get a real `zwlr_layer_surface_v1` now, one per
 -- monitor each, addressed as `"bar@{output}"` and `"notification_area@{output}"`. The `window`
 -- after them is a real `xdg_toplevel`, addressed as `"settings"` with no `@output` because the
--- compositor places it; the `popup` last is a declaration only -- see its own comment.
+-- compositor places it; the `popup` last is a real `xdg_popup`, addressed as `"click_menu"` and for
+-- the same reason plus one of its own -- it belongs to the click that opened it, not to the output
+-- set (ADR-0051 decision 1).
 return {
     panel {
         id = "bar",
@@ -245,11 +259,13 @@ return {
         -- The `id` of the surface this anchors to, not a node -- the protocol roots a popup under a
         -- parent *surface* at creation (§ 6.3).
         parent = "bar",
-        -- Read now rather than bound as a signal: a top-level spec is parsed from the *unresolved*
-        -- properties, so `:get()` is what turns the signal into the table § 6.3 wants. The ceiling
-        -- that follows -- this is what the last evaluation saw, not what the last click wrote -- is
-        -- named in `renderer/src/socket.rs`'s `surface_specs`.
-        anchor_rect = popup_anchor:get(),
+        -- Bound as a signal, which is the spelling § 6.3 and docs/adr/0050 decision 3 prescribe:
+        -- `on_click` receives the button's own rect and writes it here, and the popup opens over
+        -- whichever button was actually clicked. It used to read `:get()` because the evaluation
+        -- pass rejected a raw signal outright, which froze the rect at whatever the file last saw;
+        -- that pass now skips a signal-bound property and leaves it to the resolved tree
+        -- (docs/adr/0049's second amendment, `renderer/src/layout/node.rs`'s `is_deferred_signal`).
+        anchor_rect = popup_anchor,
         -- Required and non-zero on both axes: a popup has no "Fill" (§ 6.3), because there is
         -- nothing for it to fill.
         width = 200,
@@ -260,7 +276,20 @@ return {
         -- to exercise the parser, and the protocol's own default is no adjustment at all.
         constraint_adjustment = { "FlipY", "SlideX" },
         offset = { x = 0, y = 4 },
-        visible = false,
+        -- Not a literal, for the `window` above's reason and one more: `visible` going true is what
+        -- creates the `xdg_popup`, and it may only do so from inside a click, because that is the
+        -- only turn a grab serial is armed for (docs/adr/0049's amendment).
+        visible = menu_open,
+        -- Fired when the compositor dismisses this popup, which for a grabbing popup is what a
+        -- click anywhere outside it means (§ 6.3). Writing the flag back is the config's half of
+        -- docs/adr/0051 decision 2: the engine has already destroyed the object and latched the
+        -- declaration shut, and this `false` is what unlatches it so the next click can reopen it.
+        -- A config that omits this is not a config error -- the latch is what keeps that from being
+        -- a livelock -- it just cannot reopen until something else writes `visible = false`.
+        on_dismiss = function()
+            menu_open:set(false)
+            print("[shell.lua] popup dismissed")
+        end,
         child = column {
             padding = { top = 8, right = 10, bottom = 8, left = 10 },
             background = "#181825ee",

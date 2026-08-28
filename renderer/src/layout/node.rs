@@ -489,6 +489,32 @@ fn reject_signal_in_structural_field(property: &str, value: &Value) -> Result<()
     Ok(())
 }
 
+/// Whether `property` currently holds a live [`Signal`], which is the one thing an **unresolved**
+/// property map can say that a resolved one cannot: "this pass is not in a position to check it"
+/// (docs/adr/0049's second amendment).
+///
+/// Only ever true on the evaluation-time pass, and that is what makes it safe to act on.
+/// [`resolve_properties`] reads every `Signal` it is handed and stores the *result* in its place,
+/// refusing a result that is itself a `Signal`, so no map that has been through it can hold one --
+/// except under a key [`is_structural_property`] copies through raw, and those keys are exactly the
+/// ones [`reject_signal_in_structural_field`] refuses outright instead of deferring.
+///
+/// A parser that consults this is saying one thing, and it is the amendment's own split. On the
+/// pass that reads raw properties (`crate::socket`'s `surface_specs`, which runs before any getter
+/// has been called and must not call one), a signal-bound property is skipped and left at the
+/// parser's documented placeholder; the authoritative value is re-read from the resolved tree by
+/// `crate::wayland::App::apply_resolved_state` before anything is built from it. A *literal* is
+/// still fully validated on that pass, so a config typo fails fast into docs/adr/0046's `rescue`
+/// log rather than surfacing as an `xdg_positioner` protocol error at first open.
+///
+/// Without this the amendment's "a property holding a `Signal` is skipped there" was a claim with
+/// no implementation: every parser below rejected a raw `Value::UserData` with a type error, so
+/// `anchor_rect = popup_anchor` -- the exact spelling docs/adr/0050 decision 3 tells a config to
+/// write -- failed the whole evaluation.
+fn is_deferred_signal(properties: &HashMap<String, Value>, property: &str) -> bool {
+    matches!(properties.get(property), Some(Value::UserData(ud)) if ud.is::<Signal>())
+}
+
 /// `"NN%"` (`^\d+(\.\d+)?%$`) as `SizeMode::Percent`. Not a confirmed spec syntax -- § 5.1's base
 /// property table only documents integer/`"Fill"` for width/height even though § 3.1 names
 /// `Percent(f32)` as a size class without giving it a literal Lua form. See docs/adr/0023.
@@ -518,6 +544,15 @@ pub fn parse_size_mode(
     properties: &HashMap<String, Value>,
     property: &str,
 ) -> Result<SizeMode, LayoutError> {
+    // Deferred on the evaluation-time pass ([`is_deferred_signal`]): § 6.1's `width`/`height` are a
+    // layer-shell `set_size`, which docs/adr/0038 decision 2 lists among the requests that are valid
+    // on a live surface, so `crate::wayland::App::apply_spec_change` re-derives both from the
+    // resolved tree on every pass. Same placeholder an absent property gets. The guard cannot fire
+    // below a surface root, where this parser is also used: `resolve_properties` has already
+    // replaced every `Signal` in an inner node's map.
+    if is_deferred_signal(properties, property) {
+        return Ok(SizeMode::Content);
+    }
     let Some(value) = properties.get(property) else {
         return Ok(SizeMode::Content);
     };
@@ -600,6 +635,13 @@ pub fn parse_edge_insets(
     properties: &HashMap<String, Value>,
     property: &str,
 ) -> Result<EdgeInsets, LayoutError> {
+    // Deferred on the evaluation-time pass, for [`parse_size_mode`]'s reason: on a `panel` root
+    // `margin` is the layer-shell anchor offset, which `set_margin` changes on a live surface
+    // (docs/adr/0038 decision 2). Zero insets are the placeholder an absent `margin` already takes,
+    // and the same "cannot fire below a root" note applies.
+    if is_deferred_signal(properties, property) {
+        return Ok(EdgeInsets::default());
+    }
     let Some(value) = properties.get(property) else {
         return Ok(EdgeInsets::default());
     };
@@ -1080,6 +1122,12 @@ pub enum KeyboardInteractivity {
 /// valid on a live surface, so a `Signal` here resolves like any other property
 /// (docs/adr/0044 decision 1) and an edit to it is a value change, not a swap.
 pub fn parse_keyboard_interactivity(properties: &HashMap<String, Value>) -> Result<KeyboardInteractivity, LayoutError> {
+    // Deferred on the evaluation-time pass ([`is_deferred_signal`]), same split as [`parse_title`]'s:
+    // this doc comment's own argument is what makes it a deferral rather than a rejection, since a
+    // field valid on a live surface is one only the resolved pass is in a position to read.
+    if is_deferred_signal(properties, "keyboard_interactivity") {
+        return Ok(KeyboardInteractivity::None);
+    }
     let Some(value) = properties.get("keyboard_interactivity") else {
         return Ok(KeyboardInteractivity::None);
     };
@@ -1107,6 +1155,12 @@ pub fn parse_keyboard_interactivity(properties: &HashMap<String, Value>) -> Resu
 /// surface. The *zone* itself is not computed here -- `crate::wayland` derives it at configure
 /// time from the size the compositor actually chose, which is the only point a real number exists.
 pub fn parse_exclusive(properties: &HashMap<String, Value>) -> Result<bool, LayoutError> {
+    // Deferred on the evaluation-time pass for [`parse_keyboard_interactivity`]'s reason:
+    // `set_exclusive_zone` is valid on a live surface, so `exclusive = hide_bar` is a config § 5.1
+    // permits and only this pass cannot read. `false` is the placeholder an absent `exclusive` takes.
+    if is_deferred_signal(properties, "exclusive") {
+        return Ok(false);
+    }
     let Some(value) = properties.get("exclusive") else {
         return Ok(false);
     };
@@ -1199,6 +1253,14 @@ pub fn panel_spec(properties: &HashMap<String, Value>) -> Result<PanelSpec, Layo
 /// (docs/adr/0044 decision 1, and § 6.2 spells the `string`/`Signal` union out) and the next pass
 /// simply sends the new title.
 pub fn parse_title(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
+    // Deferred rather than rejected on the evaluation-time pass ([`is_deferred_signal`]): § 6.2
+    // spells `title` as `string`/`Signal`, and `parse_string_property`'s `Signal` refusal is meant
+    // for the topology fields it also backs. Same placeholder an absent `title` gets, and for the
+    // same reason -- a toplevel that never sends `set_title` has no title -- since `show_window`
+    // builds the real one from the resolved spec.
+    if is_deferred_signal(properties, "title") {
+        return Ok(String::new());
+    }
     parse_string_property(properties, "title", Some(""))
 }
 
@@ -1216,6 +1278,12 @@ pub fn parse_title(properties: &HashMap<String, Value>) -> Result<String, Layout
 /// reconcile identity, not a protocol field (docs/adr/0045 decision 1).
 pub fn parse_app_id(properties: &HashMap<String, Value>, id: &str) -> Result<String, LayoutError> {
     let default = format!("oblisk-{id}");
+    // Deferred on the evaluation-time pass for [`parse_title`]'s reason: `set_app_id` is a request
+    // on a live toplevel, so § 5.1's blanket "any property accepts a `Signal`" applies and only
+    // this pass is unable to read it.
+    if is_deferred_signal(properties, "app_id") {
+        return Ok(default);
+    }
     parse_string_property(properties, "app_id", Some(&default))
 }
 
@@ -1236,6 +1304,11 @@ pub struct SizeHint {
 /// Both axes are required when the table is present. A `min_size` naming only a width is a config
 /// typo, not a request to leave the height unconstrained -- that spelling is an explicit `0`.
 fn parse_size_hint(properties: &HashMap<String, Value>, property: &str) -> Result<Option<SizeHint>, LayoutError> {
+    // Deferred on the evaluation-time pass, and `None` is the honest placeholder: the request is
+    // simply not sent from a spec built there, and `show_window` sends the resolved one.
+    if is_deferred_signal(properties, property) {
+        return Ok(None);
+    }
     let Some(value) = properties.get(property) else {
         return Ok(None);
     };
@@ -1359,6 +1432,9 @@ pub enum PopupAnchor {
 /// invented here -- unlike [`parse_constraint_adjustment`], where § 6.3 departs from the protocol
 /// default on purpose.
 pub fn parse_popup_anchor(properties: &HashMap<String, Value>, property: &str) -> Result<PopupAnchor, LayoutError> {
+    if is_deferred_signal(properties, property) {
+        return Ok(PopupAnchor::Center);
+    }
     let Some(value) = properties.get(property) else {
         return Ok(PopupAnchor::Center);
     };
@@ -1426,6 +1502,9 @@ impl Default for ConstraintAdjustment {
 }
 
 pub fn parse_constraint_adjustment(properties: &HashMap<String, Value>) -> Result<ConstraintAdjustment, LayoutError> {
+    if is_deferred_signal(properties, "constraint_adjustment") {
+        return Ok(ConstraintAdjustment::default());
+    }
     let Some(value) = properties.get("constraint_adjustment") else {
         return Ok(ConstraintAdjustment::default());
     };
@@ -1476,6 +1555,9 @@ pub struct PopupOffset {
 }
 
 pub fn parse_popup_offset(properties: &HashMap<String, Value>) -> Result<PopupOffset, LayoutError> {
+    if is_deferred_signal(properties, "offset") {
+        return Ok(PopupOffset::default());
+    }
     let Some(value) = properties.get("offset") else {
         return Ok(PopupOffset::default());
     };
@@ -1502,7 +1584,30 @@ pub fn parse_popup_offset(properties: &HashMap<String, Value>) -> Result<PopupOf
 /// and a non-zero anchor rectangle set by set_anchor_rect"), which raises `invalid_positioner`
 /// later, at `get_popup`. Either way one config typo would take the Wayland connection down for
 /// the whole shell, so both are a [`LayoutError`] here.
+/// What [`parse_anchor_rect`] and [`parse_popup_extent`] answer for a property whose value is a
+/// live `Signal`, which only the evaluation-time pass ever sees ([`is_deferred_signal`]).
+///
+/// One logical pixel rather than zero, because every [`PopupSpec`] that exists has to satisfy the
+/// type's own invariant whichever pass built it: `xdg_positioner`'s own description calls a zero
+/// size or a zero anchor rectangle incomplete, and `get_popup` answers that with
+/// `invalid_positioner`. A placeholder that would itself be a protocol error is not a placeholder.
+///
+/// It never reaches a compositor. docs/adr/0049's second amendment puts the authoritative spec in
+/// `crate::wayland::App::apply_resolved_state`, which re-derives it from the resolved tree and does
+/// so *before* `apply_visibility` can create anything from it, so the positioner is always fed the
+/// resolved value.
+///
+/// The one place it is observable is `layout::instance::expand_instances`, which seeds a popup
+/// instance's `available` from the declared `width`/`height`. A popup that signal-binds a size
+/// measures its child against 1x1 until its first configure replaces `available` with the size the
+/// compositor granted -- and it is not on screen before then, since no `xdg_popup` exists until
+/// `visible` resolves true (docs/adr/0049 decision 1).
+const DEFERRED_POPUP_EXTENT: f32 = 1.0;
+
 pub fn parse_anchor_rect(properties: &HashMap<String, Value>) -> Result<LogicalRect, LayoutError> {
+    if is_deferred_signal(properties, "anchor_rect") {
+        return Ok(LogicalRect { x: 0.0, y: 0.0, width: DEFERRED_POPUP_EXTENT, height: DEFERRED_POPUP_EXTENT });
+    }
     let value = properties.get("anchor_rect").ok_or_else(|| {
         invalid(
             "anchor_rect",
@@ -1548,6 +1653,9 @@ pub fn parse_anchor_rect(properties: &HashMap<String, Value>) -> Result<LogicalR
 /// other budget in this engine. It quantizes once, at the `set_size` call site that also knows the
 /// output scale -- the same split [`PanelSpec`]'s `width` already documents for layer-shell.
 fn parse_popup_extent(properties: &HashMap<String, Value>, property: &str) -> Result<f32, LayoutError> {
+    if is_deferred_signal(properties, property) {
+        return Ok(DEFERRED_POPUP_EXTENT);
+    }
     let value = properties.get(property).ok_or_else(|| {
         invalid(property, "required for `popup`, got nothing -- a popup has no \"Fill\", and set_size raises invalid_input on a zero size")
     })?;
@@ -1568,6 +1676,9 @@ fn parse_popup_extent(properties: &HashMap<String, Value>, property: &str) -> Re
 /// event, which only exists for the length of one poll turn (docs/adr/0049's amendment), and a
 /// compositor may deny it anyway, which docs/adr/0040 decision 2 records as a normal outcome.
 pub fn parse_grab(properties: &HashMap<String, Value>) -> Result<bool, LayoutError> {
+    if is_deferred_signal(properties, "grab") {
+        return Ok(true);
+    }
     let Some(value) = properties.get("grab") else {
         return Ok(true);
     };
@@ -1617,6 +1728,11 @@ pub struct PopupSpec {
 }
 
 pub fn popup_spec(properties: &HashMap<String, Value>) -> Result<PopupSpec, LayoutError> {
+    // The one field here that is *not* deferred when it holds a `Signal` (see
+    // [`is_deferred_signal`], which every other field below consults). `parent` decides which
+    // surface `get_popup` roots this popup under and docs/adr/0051 decision 1 pins that to one
+    // parent instance chosen at creation, which is the structural-decision test
+    // [`reject_signal_in_structural_field`] exists for -- `parse_string_property` applies it.
     let parent = parse_string_property(properties, "parent", None)?;
     if parent.is_empty() {
         return Err(invalid("parent", "must name the `id` of the `panel` or `window` this popup anchors to"));
@@ -2595,6 +2711,49 @@ mod tests {
         assert_eq!(spec.margin, EdgeInsets { top: 4.0, right: 0.0, bottom: 0.0, left: 8.0 });
         assert_eq!(spec.width, SizeMode::Fill);
         assert_eq!(spec.height, SizeMode::Pixels(48.0));
+    }
+
+    #[test]
+    fn a_signal_in_a_panels_five_in_place_fields_is_deferred_on_the_evaluation_pass() {
+        // The `panel` twin of the `window` and `popup` deferrals. docs/adr/0038 decision 2 lists all
+        // five as requests layer-shell accepts on a live surface, so § 5.1's blanket "any property
+        // accepts a `Signal`" applies and only this pass is unable to read one. Before this,
+        // `panel { exclusive = hide_bar }` failed the whole evaluation and dropped the shell to
+        // docs/adr/0046's rescue.
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua
+            .load(
+                r#"return { kind = "panel", id = "bar", layer = "Top",
+                            keyboard_interactivity = state("k", "Exclusive"), exclusive = state("e", true),
+                            margin = state("m", { top = 4 }), width = state("w", 100), height = state("h", 48) }"#,
+            )
+            .eval()
+            .unwrap();
+        let spec = panel_spec(&props_from_table(&table)).unwrap();
+        assert_eq!(spec.keyboard_interactivity, KeyboardInteractivity::None, "§ 6.1's default, not the signal's current value");
+        assert!(!spec.exclusive);
+        assert_eq!(spec.margin, EdgeInsets::default());
+        assert_eq!((spec.width, spec.height), (SizeMode::Content, SizeMode::Content));
+    }
+
+    #[test]
+    fn a_signal_in_a_panels_topology_fields_is_still_rejected_on_the_evaluation_pass() {
+        // The line `is_structural_property` draws, and the deferrals above must not move it:
+        // `get_layer_surface` fixes `layer`, `anchor`, `monitor` and `namespace` at creation, so a
+        // handle that could drift after the topology diff has nothing left to re-check it.
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        for property in ["layer", "anchor", "monitor", "namespace"] {
+            let table: mlua::Table = lua
+                .load(format!(r#"return {{ kind = "panel", id = "bar", layer = "Top", {property} = state("s", "Top") }}"#))
+                .eval()
+                .unwrap();
+            assert!(
+                matches!(panel_spec(&props_from_table(&table)).unwrap_err(), LayoutError::UnsupportedSignalProperty(p) if p == property),
+                "{property} is structural"
+            );
+        }
     }
 
     #[test]
@@ -4054,5 +4213,101 @@ mod tests {
             popup_spec(&resolved).unwrap().anchor_rect,
             LogicalRect { x: 4.0, y: 8.0, width: 16.0, height: 24.0 }
         );
+    }
+
+    // --- the evaluation-time pass, where a `Signal` has not been read yet
+    // (docs/adr/0049's second amendment) ---
+
+    /// The same fixture as [`popup_props`] but with every property under test bound to a live
+    /// signal instead of a literal, and *not* run through [`resolve_properties`] -- which is
+    /// exactly the map `crate::socket`'s `surface_specs` parses.
+    fn unresolved_popup_props(lua: &mlua::Lua, extra: &str) -> HashMap<String, Value> {
+        crate::lua::signal::register(lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua
+            .load(format!(
+                r#"return {{ kind = "popup", id = "menu", parent = "bar",
+                             anchor_rect = state("a", {{ x = 4, y = 8, width = 16, height = 24 }}),
+                             width = 200, height = 300 {extra} }}"#
+            ))
+            .eval()
+            .unwrap();
+        props_from_table(&table)
+    }
+
+    #[test]
+    fn a_signal_bound_popup_property_is_deferred_rather_than_rejected_before_it_resolves() {
+        // The half of the amendment that had no implementation. `surface_specs` parses the
+        // *unresolved* properties, so it sees the raw `Signal` the config wrote, and every parser
+        // below answered that with a type error -- which failed the whole evaluation for the exact
+        // spelling docs/adr/0050 decision 3 tells a config to use (`anchor_rect = menu_anchor`).
+        //
+        // The placeholders are non-zero because a `PopupSpec` has to satisfy `xdg_positioner`'s own
+        // completeness rule whichever pass built it, and they never reach a compositor:
+        // `apply_resolved_state` re-derives the spec from the resolved tree before
+        // `apply_visibility` can create anything from it.
+        let lua = lua();
+        let spec = popup_spec(&unresolved_popup_props(
+            &lua,
+            r#", width = state("w", 200), height = state("h", 300), anchor = state("an", "Top"),
+                gravity = state("g", "Bottom"), constraint_adjustment = state("c", {}),
+                offset = state("o", { x = 3, y = 3 }), grab = state("gr", false)"#,
+        ))
+        .unwrap();
+        assert_eq!(spec.anchor_rect, LogicalRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 });
+        assert_eq!((spec.width, spec.height), (1.0, 1.0));
+        assert_eq!((spec.anchor, spec.gravity), (PopupAnchor::Center, PopupAnchor::Center));
+        assert_eq!(spec.constraint_adjustment, ConstraintAdjustment::default());
+        assert_eq!(spec.offset, PopupOffset::default());
+        assert!(spec.grab, "a deferred `grab` takes § 6.3's default, not the signal's current value");
+    }
+
+    #[test]
+    fn a_literal_typo_beside_a_deferred_signal_still_fails_on_the_evaluation_pass() {
+        // Deferral is per property, not per node: the amendment's whole point is that each pass
+        // checks what it is in a position to know, and a literal is something this pass knows. A
+        // typo in one still lands in docs/adr/0046's `rescue` log rather than waiting for a click
+        // that never comes.
+        let lua = lua();
+        assert!(matches!(
+            popup_spec(&unresolved_popup_props(&lua, r#", anchor = "Middle""#)).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "anchor"
+        ));
+    }
+
+    #[test]
+    fn a_signal_in_a_popup_parent_is_still_rejected_on_the_evaluation_pass() {
+        // Deliberately not deferred. `parent` decides which surface `get_popup` roots this popup
+        // under, and docs/adr/0051 decision 1 pins that to one parent instance chosen at creation
+        // -- a structural decision of exactly the kind `reject_signal_in_structural_field`'s
+        // reasoning covers, even though `parent` is not in `is_structural_property` (it has no
+        // reason to survive `resolve_properties` raw, because only this pass ever needs to refuse
+        // it).
+        let lua = lua();
+        assert!(matches!(
+            popup_spec(&unresolved_popup_props(&lua, r#", parent = state("p", "bar")"#)).unwrap_err(),
+            LayoutError::UnsupportedSignalProperty(p) if p == "parent"
+        ));
+    }
+
+    #[test]
+    fn a_signal_in_a_window_title_app_id_or_size_hint_is_deferred_on_the_evaluation_pass_too() {
+        // The `window` twin of the same defect, latent only because the dev config writes all four
+        // as literals. Every one of these is a request on a live toplevel, so the resolved pass
+        // sends whatever the signal currently says and this pass sends nothing at all.
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua
+            .load(
+                r#"return { kind = "window", id = "w", title = state("t", "Now Playing"),
+                            app_id = state("a", "oblisk.later"),
+                            min_size = state("mn", { width = 320, height = 240 }),
+                            max_size = state("mx", { width = 1280, height = 800 }) }"#,
+            )
+            .eval()
+            .unwrap();
+        let spec = window_spec(&props_from_table(&table)).unwrap();
+        assert_eq!(spec.title, "", "the placeholder is what a toplevel that never sends set_title has");
+        assert_eq!(spec.app_id, "oblisk-w", "the same default an absent `app_id` takes");
+        assert_eq!((spec.min_size, spec.max_size), (None, None), "absent means the request is simply not sent");
     }
 }

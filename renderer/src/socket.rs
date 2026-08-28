@@ -959,13 +959,23 @@ fn rescue_table(loader: &Loader, is_rescue: bool, error_log: &str) -> mlua::Resu
 ///
 /// **This is an evaluation-time, literal-only fast-fail, not the authoritative spec** for the two
 /// roles whose properties are meant to move (docs/adr/0049's second amendment). It parses the
-/// *unresolved* properties, so a `Signal` in a `window`'s `title` or a `popup`'s `anchor_rect` is
-/// whatever the last evaluation saw rather than what the last push or click wrote. That is the
-/// honest half of the check: a literal is validated here and a typo fails fast, and a signal-bound
-/// property is checked when it resolves. `crate::wayland::App::apply_resolved_state` builds the
-/// authoritative [`WindowSpec`](layout::node::WindowSpec) from the *resolved* tree instead, where
+/// *unresolved* properties, so a `Signal` in a `window`'s `title` or a `popup`'s `anchor_rect` has
+/// not been read at all when this runs. Such a property is **skipped** rather than rejected --
+/// `layout::node::is_deferred_signal` is that skip, and every § 6.2/§ 6.3 parser consults it -- and
+/// the spec it yields carries that parser's documented placeholder in its place. A *literal* is
+/// validated here in full, so a typo fails fast. `crate::wayland::App::apply_resolved_state` builds
+/// the authoritative [`WindowSpec`](layout::node::WindowSpec) and
+/// [`PopupSpec`](layout::node::PopupSpec) from the *resolved* tree instead, where
 /// `layout::node::resolve_properties` has already run exactly once for that pass (ADR-0044
-/// decision 1).
+/// decision 1), and it does so before anything is built from either.
+///
+/// The skip is what makes the amendment's own worked example compile: § 6.3 says `anchor_rect` is
+/// "normally passed straight from the rect `button`'s `on_click` hands back", and docs/adr/0050
+/// decision 3 spells that as `anchor_rect = menu_anchor` over a `state` signal. Before the skip
+/// existed every parser answered a raw `Value::UserData` with a type error, so the one spelling the
+/// docs prescribe failed the whole evaluation and a config had to write `menu_anchor:get()` --
+/// freezing the rect at whatever the file last saw, which for a dropdown means opening over the
+/// button clicked before the last reload.
 ///
 /// Resolving here instead is not the upgrade path and never was: `resolve_properties` runs Lua
 /// getters, and this function also runs on every monitor hotplug via

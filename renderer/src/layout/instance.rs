@@ -82,9 +82,19 @@ pub struct OutputGeometry {
 /// granted -- exactly a panel's lifecycle. Zero when nothing is connected, which is honest: with no
 /// output there is no screen to measure against and nothing is being painted.
 ///
-/// A **`popup`** expands to nothing yet. Its Wayland object is created per open (docs/adr/0049
-/// decision 1) and build-steps.md Phase 22 items 2 and 3 own that; until then a declared `popup` is
-/// parsed and validated by `crate::socket`'s `surface_specs` and reaches no further.
+/// A **`popup`** expands to exactly one instance, for the same reason a `window` does and one more
+/// of its own (docs/adr/0051 decision 1). A popup is opened by one click, on one monitor, and it
+/// belongs there; expanding it per parent instance would give `click_menu@eDP-1` and
+/// `click_menu@DP-1` driven by *one* `visible` signal, so a single click would open a dropdown on
+/// every monitor. Its instance id is therefore the bare declared `id`, like a `window`'s, and the
+/// parent it roots under is chosen at creation from the click that armed it, not here.
+///
+/// Its `available` is seeded from the popup's own § 6.3 `width`/`height`, not from an output's, and
+/// that is the one place this differs from the other two roles. § 6.3 requires both and gives a
+/// popup no `"Fill"`, because a popup has nothing to fill: its size is `xdg_positioner::set_size`'s
+/// argument, so the declared size *is* the budget its child is measured against. The first
+/// `xdg_popup` configure replaces it through
+/// `crate::socket::RendererClient::set_instance_size`, exactly as it does for the other two.
 pub fn expand_instances(specs: &[SurfaceSpec], outputs: &[OutputGeometry]) -> Vec<SurfaceInstance> {
     let mut instances = Vec::new();
     for spec in specs {
@@ -108,10 +118,39 @@ pub fn expand_instances(specs: &[SurfaceSpec], outputs: &[OutputGeometry]) -> Ve
                 output: String::new(),
                 available: outputs.first().map_or(LogicalSize::default(), |output| output.size),
             }),
-            SurfaceSpec::Popup(_) => {}
+            SurfaceSpec::Popup(popup) => instances.push(SurfaceInstance {
+                instance_id: popup.id.clone(),
+                declared_id: popup.id.clone(),
+                output: String::new(),
+                available: LogicalSize { width: popup.width, height: popup.height },
+            }),
         }
     }
     instances
+}
+
+/// Whether `instance_id` names an instance of the surface declared as `declared_id` -- the inverse
+/// of the `"{id}@{output}"` rule [`expand_instances`] applies, and the only place that rule is read
+/// back rather than written.
+///
+/// One caller: `crate::wayland::App`'s popup parent lookup (docs/adr/0051 decision 1), which is
+/// handed a declared `parent` by § 6.3 and a set of *instances* by this module, and has to pair
+/// them across both spellings -- `"bar@eDP-1"` for a panel and the bare `"settings"` for a window.
+///
+/// A prefix test rather than a split on `'@'`, because a declared id may itself contain one: § 6.1
+/// puts no character restriction on `id`, so `"a@b"` on output `"DP-1"` has to match `"a@b"` and
+/// `"a@b@DP-1"`, which a split on the *first* `'@'` gets wrong.
+///
+/// ponytail: the id space is ambiguous at the edges and this cannot fix that, only avoid making it
+/// worse. `"a@b@DP-1"` is what `panel { id = "a@b" }` produces on output `"DP-1"` *and* what
+/// `panel { id = "a" }` would produce on an output named `"b@DP-1"`, so both answers are "yes" and
+/// only one can be right. It bites nothing today -- a `wl_output` name is a connector like
+/// `"eDP-1"` and holds no `'@'` -- and the fix is to stop encoding a pair in a string, by carrying
+/// `SurfaceInstance`'s own `declared_id` on `crate::wayland::TrackedSurface` instead of re-deriving
+/// it here. That is a wider change than this one caller justifies.
+pub fn is_instance_of(instance_id: &str, declared_id: &str) -> bool {
+    instance_id == declared_id
+        || instance_id.strip_prefix(declared_id).is_some_and(|rest| rest.starts_with('@'))
 }
 
 /// What one output change does to a live generation's surface instances (docs/adr/0038 decision 3:
@@ -260,15 +299,10 @@ mod tests {
         assert_eq!(instances[0].available, LogicalSize { width: 1920.0, height: 1080.0 });
     }
 
-    #[test]
-    fn a_declared_popup_produces_no_instance_because_its_object_is_created_per_open() {
-        // docs/adr/0049 decision 1: a popup's `xdg_popup` exists only while shown and is rebuilt on
-        // every open, so there is nothing here for a standing instance to be. Declared and
-        // validated (`crate::socket`'s `surface_specs`), and no further until build-steps.md
-        // Phase 22 items 2 and 3.
-        let popup = SurfaceSpec::Popup(crate::layout::node::PopupSpec {
-            id: "menu".to_string(),
-            parent: "bar".to_string(),
+    fn popup(id: &str, parent: &str) -> SurfaceSpec {
+        SurfaceSpec::Popup(crate::layout::node::PopupSpec {
+            id: id.to_string(),
+            parent: parent.to_string(),
             anchor_rect: crate::text::snap::LogicalRect { x: 0.0, y: 0.0, width: 86.0, height: 24.0 },
             width: 200.0,
             height: 120.0,
@@ -277,9 +311,61 @@ mod tests {
             constraint_adjustment: crate::layout::node::ConstraintAdjustment::default(),
             offset: crate::layout::node::PopupOffset::default(),
             grab: true,
-        });
+        })
+    }
 
-        assert!(expand_instances(&[popup], &[output("eDP-1", 1920.0, 1080.0)]).is_empty());
+    #[test]
+    fn a_popup_gets_one_instance_on_its_bare_id_however_many_monitors_are_connected() {
+        // docs/adr/0051 decision 1. The tempting alternative -- one instance per parent instance,
+        // `menu@eDP-1` and `menu@DP-1` -- is wrong for the reason that makes it tempting: one
+        // `visible` signal drives both, so a single click would open a dropdown on every monitor.
+        let instances = expand_instances(&[popup("menu", "bar")], &[output("eDP-1", 1920.0, 1080.0), output("DP-1", 3840.0, 2160.0)]);
+
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].instance_id, "menu");
+        assert_eq!(instances[0].declared_id, "menu");
+        assert!(instances[0].output.is_empty(), "the parent instance is chosen at creation, not here");
+    }
+
+    #[test]
+    fn a_popups_available_is_its_own_declared_size_not_an_outputs() {
+        // The one seeding difference between the three roles, and § 6.3 is why: a popup has no
+        // `"Fill"` and both axes are required, because the declared size *is*
+        // `xdg_positioner::set_size`'s argument and so the budget its child is measured against.
+        let instances = expand_instances(&[popup("menu", "bar")], &[output("eDP-1", 1920.0, 1080.0)]);
+
+        assert_eq!(instances[0].available, LogicalSize { width: 200.0, height: 120.0 });
+    }
+
+    #[test]
+    fn a_popup_still_expands_with_no_outputs_connected_at_all() {
+        // For a `window`'s reason plus one of its own: a popup's size does not come from an output
+        // in the first place, so there is nothing an empty output list could take away.
+        let instances = expand_instances(&[popup("menu", "bar")], &[]);
+
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].available, LogicalSize { width: 200.0, height: 120.0 });
+    }
+
+    #[test]
+    fn is_instance_of_matches_both_spellings_and_nothing_else() {
+        assert!(is_instance_of("bar@eDP-1", "bar"), "a panel instance carries its output");
+        assert!(is_instance_of("settings", "settings"), "a window or popup instance is the bare id");
+        assert!(!is_instance_of("bar", "barn"));
+        assert!(!is_instance_of("barn@eDP-1", "bar"), "a prefix that is not followed by `@` is a different surface");
+        assert!(!is_instance_of("sidebar@eDP-1", "bar"));
+    }
+
+    #[test]
+    fn is_instance_of_survives_a_declared_id_that_itself_contains_an_at_sign() {
+        // § 6.1 puts no character restriction on `id`, so splitting on the first `'@'` would fail
+        // to pair `"a@b@DP-1"` with the surface declared `"a@b"` that actually produced it.
+        assert!(is_instance_of("a@b@DP-1", "a@b"));
+        assert!(is_instance_of("a@b", "a@b"));
+        // And the ambiguity the ponytail names, asserted rather than left to be discovered: this is
+        // also what `id = "a"` on an output named `"b@DP-1"` would produce, and no rule reading one
+        // string can tell the two apart.
+        assert!(is_instance_of("a@b@DP-1", "a"));
     }
 
     #[test]
