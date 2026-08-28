@@ -17,6 +17,8 @@ use std::ffi::c_void;
 use femtovg::renderer::OpenGl;
 use femtovg::{Canvas, Color, FontId, Paint};
 
+use crate::layout::node::Rgba;
+
 use super::snap::{snap_to_physical, LogicalRect};
 
 /// A FemtoVG canvas bound to the calling thread's current EGL/GL context, with one
@@ -50,12 +52,25 @@ impl TextPainter {
         self.canvas.set_size(width, height, 1.0);
     }
 
+    /// The same canvas `draw_line` fills text onto, exposed so `layout::paint`'s tree walk can
+    /// draw a node's background/border on it too (build-steps.md Phase 19 item 6, docs/adr/0023)
+    /// -- one canvas per surface, shared by every paint operation on it, not one per property
+    /// kind.
+    pub fn canvas_mut(&mut self) -> &mut Canvas<OpenGl> {
+        &mut self.canvas
+    }
+
     /// Draws `text` with its snapped top-left corner at `rect`'s origin (build-steps.md
-    /// Phase 4, point 3) and flushes the draw call to the GPU. Does not swap buffers --
-    /// the caller owns the EGL surface and its swap timing.
-    pub fn draw_line(&mut self, text: &str, rect: LogicalRect, font_size: f32, scale: f32) {
+    /// Phase 4, point 3) in `color`. Does not flush or swap buffers -- `layout::paint`'s tree
+    /// walk draws a whole surface's worth of nodes onto this same canvas and flushes once at
+    /// the end (build-steps.md Phase 19 item 6), not once per line the way this used to; the one
+    /// remaining direct caller outside that walk, `wayland::mod`'s `draw_main_bar_proof_text`,
+    /// now flushes for itself right after calling this.
+    pub fn draw_line(&mut self, text: &str, rect: LogicalRect, font_size: f32, scale: f32, color: Rgba) {
         let physical = snap_to_physical(rect, scale);
-        let mut paint = Paint::color(Color::white());
+        // `Rgba`'s four `f32` fields exist precisely so `Color::rgbaf` takes them with no
+        // conversion (see that struct's own doc comment in `layout::node`).
+        let mut paint = Paint::color(Color::rgbaf(color.r, color.g, color.b, color.a));
         paint.set_font(&[self.font]);
         paint.set_font_size(font_size);
         // FemtoVG's fill_text baseline follows the HTML5 Canvas API it's modeled on
@@ -66,6 +81,5 @@ impl TextPainter {
         let ascender = self.canvas.measure_font(&paint).map(|m| m.ascender()).unwrap_or(font_size);
         let baseline_y = physical.y0 as f32 + ascender;
         let _ = self.canvas.fill_text(physical.x0 as f32, baseline_y, text, &paint);
-        self.canvas.flush();
     }
 }

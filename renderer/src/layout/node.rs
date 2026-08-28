@@ -76,16 +76,10 @@ pub enum Align {
 }
 
 /// A parsed colour, four channels in `0.0..=1.0`. `f32`, not `u8`: femtovg's `Color` (the drawing
-/// pass's paint target, not touched by this slice) stores its channels as `f32` already --
+/// pass's paint target, read by `layout::paint`) stores its channels as `f32` already --
 /// `Color::rgbaf` takes them as-is, while `Color::rgba` takes `u8` and immediately divides by
 /// 255.0 to reach that same `f32` form internally. Storing `f32` here means the drawing pass
 /// copies four fields straight into `Color`, with no `u8` round-trip to undo.
-///
-/// ponytail: no production caller yet -- build-steps.md Phase 19 item 6 splits "parse the paint
-/// properties" (this slice) from "draw them" (the femtovg pass, a later slice), same two-slice
-/// shape `renderer/src/lua/mod.rs`'s now-removed `#[allow(dead_code)]` comment records for
-/// `layout::node` itself. Exercised by this module's own tests only.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rgba {
     pub r: f32,
@@ -512,13 +506,9 @@ pub fn parse_edge_insets(
     })
 }
 
-/// `rect.background` (§ 5.2 item 1). Absent is `None`, not transparent black -- the drawing pass
-/// (a later slice) has to be able to skip the fill entirely rather than paint an invisible one, and
+/// `rect.background` (§ 5.2 item 1). Absent is `None`, not transparent black -- `layout::paint`'s
+/// `fill_rect` has to be able to skip the fill entirely rather than paint an invisible one, and
 /// `#RRGGBBAA` with `AA = 00` already covers "explicitly transparent" as a distinct config choice.
-///
-/// ponytail: no production caller yet, same reason as [`Rgba`]'s own `ponytail:`. Exercised by
-/// this module's own tests only.
-#[allow(dead_code)]
 pub fn parse_background(properties: &HashMap<String, Value>) -> Result<Option<Rgba>, LayoutError> {
     let Some(value) = properties.get("background") else {
         return Ok(None);
@@ -558,10 +548,6 @@ fn check_geometry_range(property: &str, n: f32) -> Result<(), LayoutError> {
 /// `rect.radius` (§ 5.2 item 1). Absent defaults to 0, an unrounded rectangle -- same shape as
 /// [`parse_spacing`]/[`parse_font_size`] for an unranged numeric property with no documented
 /// default of its own beyond "no effect when omitted".
-///
-/// ponytail: no production caller yet, same reason as [`Rgba`]'s own `ponytail:`. Exercised by
-/// this module's own tests only.
-#[allow(dead_code)]
 pub fn parse_radius(properties: &HashMap<String, Value>) -> Result<f32, LayoutError> {
     let Some(value) = properties.get("radius") else {
         return Ok(0.0);
@@ -578,10 +564,6 @@ pub fn parse_radius(properties: &HashMap<String, Value>) -> Result<f32, LayoutEr
 /// with a colour but width 0 still paints nothing, so the drawing pass can read either field first
 /// and get the same answer. § 5.2 gives the table form no per-edge default colour to fall back to,
 /// so an absent edge takes `None` rather than an invented default.
-///
-/// ponytail: no production caller yet, same reason as [`Rgba`]'s own `ponytail:`. Exercised by
-/// this module's own tests only.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct BorderColor {
     pub top: Option<Rgba>,
@@ -590,7 +572,6 @@ pub struct BorderColor {
     pub left: Option<Rgba>,
 }
 
-#[allow(dead_code)]
 pub fn parse_border_color(properties: &HashMap<String, Value>) -> Result<BorderColor, LayoutError> {
     let Some(value) = properties.get("border_color") else {
         return Ok(BorderColor::default());
@@ -656,10 +637,6 @@ pub fn parse_border_color(properties: &HashMap<String, Value>) -> Result<BorderC
 /// `rect.border_width` (§ 5.2 item 1), reusing [`EdgeInsets`] rather than a new per-edge type since
 /// the shape (four `f32`, default 0) is already exactly that. A bare number broadcasts to all four
 /// edges; a table delegates to [`parse_edge_insets`], which already defaults an absent edge to 0.
-///
-/// ponytail: no production caller yet, same reason as [`Rgba`]'s own `ponytail:`. Exercised by
-/// this module's own tests only.
-#[allow(dead_code)]
 pub fn parse_border_width(properties: &HashMap<String, Value>) -> Result<EdgeInsets, LayoutError> {
     let Some(value) = properties.get("border_width") else {
         return Ok(EdgeInsets::default());
@@ -758,14 +735,9 @@ pub fn parse_content(properties: &HashMap<String, Value>) -> Result<String, Layo
     }
 }
 
-/// `text.foreground` (§ 5.2 item 4). Absent defaults to white: `TextPainter::draw_line`
-/// (`renderer/src/text/atlas.rs`) currently hardcodes `Paint::color(Color::white())`, and this
-/// slice only adds the parser, not the drawing pass that will read it -- so white is the default
-/// that keeps today's rendered output exactly as it is until that later slice wires this in.
-///
-/// ponytail: no production caller yet, same reason as [`Rgba`]'s own `ponytail:`. Exercised by
-/// this module's own tests only.
-#[allow(dead_code)]
+/// `text.foreground` (§ 5.2 item 4). Absent defaults to white -- `layout::paint`'s `paint_text`
+/// falls back to the same white whenever this parser errors on a present-but-malformed value, so
+/// the rendered result agrees whether the key was omitted or rejected.
 pub fn parse_foreground(properties: &HashMap<String, Value>) -> Result<Rgba, LayoutError> {
     let Some(value) = properties.get("foreground") else {
         return Ok(Rgba {

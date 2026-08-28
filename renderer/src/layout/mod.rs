@@ -17,6 +17,7 @@
 //! call; the lease/retiring mechanism has no real GPU resource to guard yet.
 
 pub mod node;
+pub mod paint;
 pub mod scene;
 
 // ponytail: this is the module's real, tested public surface, but `socket.rs`'s `RendererClient`

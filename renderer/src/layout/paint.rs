@@ -1,0 +1,614 @@
+//! Draws a resolved layout tree onto a shared femtovg canvas (build-steps.md Phase 19 item 6).
+//!
+//! `layout::node`'s paint-property parsers (`parse_background`, `parse_radius`,
+//! `parse_border_color`, `parse_border_width`, `parse_foreground`) landed with no caller in the
+//! commit before this one -- this module is that caller. It walks a `layout::scene::ResolvedNode`
+//! tree (`Scene::surface`'s output, docs/adr/0023) and turns each node's already-resolved
+//! properties into femtovg draw calls on `text::atlas::TextPainter`'s canvas, the same canvas
+//! `draw_line` already draws glyphs on -- one canvas, one flush per surface per frame, not one
+//! flush per node.
+//!
+//! Draws in tree order, parent then children in order: that is what makes the stacking model
+//! docs/adr/0023 item 4 already implements resolve overlaps the same way layout resolved them --
+//! a later sibling or a child paints over what an earlier one already put down. An invisible node
+//! (`visible == false`) and its whole subtree draw nothing, the same collapse
+//! `layout::scene::resolve_and_reconcile`'s own doc comment already picked for row/column space
+//! reservation.
+//!
+//! `ResolvedNode.rect` is parent-relative (`layout::scene::position_children` sets a child's
+//! `rect.x`/`rect.y` to its parent's padding plus its offset *within* the parent's content box),
+//! so [`paint_node`] accumulates an absolute origin as it descends rather than trusting `rect.x`/
+//! `rect.y` as already-absolute. Get this wrong and every subtree nests at the surface's top-left
+//! corner instead of its real position.
+
+use std::collections::HashMap;
+
+use femtovg::renderer::OpenGl;
+use femtovg::{Canvas, Color, Paint, Path};
+use mlua::Value;
+
+use crate::layout::node::{self, BorderColor, EdgeInsets, LayoutError, Rgba};
+use crate::layout::scene::ResolvedNode;
+use crate::text::atlas::TextPainter;
+use crate::text::snap::LogicalRect;
+
+/// Draws `root` and its whole subtree onto `painter`'s canvas, then flushes once. `scale` is the
+/// physical/logical pixel ratio `text::snap::snap_to_physical` and `TextPainter::draw_line` take
+/// everywhere else in this crate -- every existing call site in `wayland::mod` hardcodes `1.0`
+/// today, and this function makes no different assumption.
+///
+/// ponytail: no production caller yet. `socket.rs`'s `RendererClient` keys a `Scene` by the `id`
+/// a config writes (`"bar"`); `wayland::mod` keys a `wl_surface` by `SurfaceRole::label()`
+/// (`"main_bar"`, `"overlay_canvas"`, `"wallpaper_layer@{output}"`). Those two id spaces don't
+/// overlap, so there is no surface whose retained tree a lookup could find -- see `socket.rs`'s
+/// `PLACEHOLDER_OUTPUT_SIZE` doc comment for the fuller account. Any mapping between the two id
+/// spaces invented here would be policy build-steps.md Phase 20 item 4 deletes outright, once it
+/// removes `SurfaceRole` and makes the ids one space; that is this function's first real caller.
+/// Exercised by this module's own headless-EGL tests only.
+#[allow(dead_code)]
+pub fn paint_tree(painter: &mut TextPainter, root: &ResolvedNode, scale: f32) {
+    paint_node(painter, root, 0.0, 0.0, scale);
+    painter.canvas_mut().flush();
+}
+
+/// One node, then its children (tree order, see this module's doc comment). `origin_x`/`origin_y`
+/// is the absolute position of this node's parent's content box -- added to `node.rect.x`/`.y`
+/// (parent-relative) to get this node's absolute rect, which is in turn what the next recursion
+/// level's origin becomes.
+fn paint_node(painter: &mut TextPainter, node: &ResolvedNode, origin_x: f32, origin_y: f32, scale: f32) {
+    if !node.visible {
+        return;
+    }
+
+    let x = origin_x + node.rect.x;
+    let y = origin_y + node.rect.y;
+    let rect = LogicalRect { x, y, width: node.rect.width, height: node.rect.height };
+
+    match node.kind.as_str() {
+        // `oblisk-idl-api-specs.md` § 5.2: row/column/button have no paint properties of their
+        // own beyond the base `rect` ones they share the property table with, and a surface's
+        // own root paints exactly like a rect -- one code path serves all five.
+        "rect" | "row" | "column" | "button" | "surface" => paint_box(painter.canvas_mut(), &node.kind, &node.properties, rect),
+        "text" => paint_text(painter, &node.properties, rect, scale),
+        // Deferred (build-steps.md Phase 19, "Also deferred: icon"): § 5.2 item 5's theme-name
+        // `icon.name` and `oblisk-supervisor-services-dbus.md` § 9.2's path-taking
+        // `system:find_icon` are two competing resolvers, neither built yet, and picking one here
+        // would be settling that conflict as a side effect of a paint commit rather than the
+        // phase actually settling it. Draws nothing.
+        "icon" => {}
+        // `textfield` reaches here, and drawing nothing is the spec-correct answer rather than an
+        // omission: § 5.1's base properties carry no paint at all, and § 5.2 item 8 gives
+        // `textfield` only `placeholder`/`mask_character`/`secure_submit`/`on_change`/`on_submit`,
+        // so there is no background, border or foreground on it for this pass to read. What it
+        // does need drawn (its placeholder, its masked or unmasked value, a caret) is input state
+        // this module cannot see, and belongs with Phase 21's input routing.
+        //
+        // `layout::scene::ensure_supported_kind`'s list is what bounds this arm: every kind it
+        // admits is named above or here, so a new kind added there without a decision here draws
+        // nothing silently. Named rather than left to a bare catch-all for exactly that reason.
+        _ => {}
+    }
+
+    for child in &node.children {
+        paint_node(painter, child, x, y, scale);
+    }
+}
+
+/// One paint-property parse gone wrong: logged and treated as absent/default rather than
+/// aborting the whole tree walk over one node's malformed `background`/`radius`/`border_*` --
+/// `layout::scene::Scene::apply` never calls these parsers (build-steps.md Phase 19 item 5's own
+/// doc comment: paint-only properties are resolved but never parsed there), so this is genuinely
+/// the first validation a bad literal like `background = 5` ever meets, and a config error in one
+/// node's paint properties shouldn't blank the surface around it.
+///
+/// ponytail: one line per bad property per node per call, and once `paint_tree` has a real caller
+/// that is per frame, not per config edit. A single `background = 5` becomes an unbounded log
+/// stream on the Wayland dispatch thread, and each line re-formats the rejected value's whole
+/// `Debug` form, which build-steps.md Phase 19 item 13 measures at 20 MB for a hostile string. That
+/// item judged the cost acceptable while it was paid once per apply; this pass is what changes the
+/// cadence, and item 13 now records that. The real fix is not rate-limiting here: it is parsing
+/// paint properties once at apply time, where a failure reaches `rescue` and rolls back the way a
+/// bad `align_v` already does, instead of being logged past on every frame. That is the same
+/// "parse geometry once into the retained node" item 5 defers, and it wants both halves at once.
+fn log_paint_error(kind: &str, property: &str, err: &LayoutError) {
+    eprintln!("[oblisk-renderer] paint: {kind}.{property}: {err}");
+}
+
+/// `rect`/`row`/`column`/`button`/`surface`'s shared paint: background fill, then borders
+/// (`oblisk-idl-api-specs.md` § 5.2 item 1).
+fn paint_box(canvas: &mut Canvas<OpenGl>, kind: &str, properties: &HashMap<String, Value>, rect: LogicalRect) {
+    let radius = match node::parse_radius(properties) {
+        Ok(r) => r,
+        Err(e) => {
+            log_paint_error(kind, "radius", &e);
+            0.0
+        }
+    };
+
+    match node::parse_background(properties) {
+        // `None` skips the fill entirely; `Some` with alpha 0 still paints a transparent rect --
+        // `parse_background`'s own doc comment calls this distinction deliberate, so both arms
+        // below matter even though a transparent fill is invisible either way.
+        Ok(Some(color)) => fill_rect(canvas, rect, radius, color),
+        Ok(None) => {}
+        Err(e) => log_paint_error(kind, "background", &e),
+    }
+
+    let colors = match node::parse_border_color(properties) {
+        Ok(c) => c,
+        Err(e) => {
+            log_paint_error(kind, "border_color", &e);
+            BorderColor::default()
+        }
+    };
+    let widths = match node::parse_border_width(properties) {
+        Ok(w) => w,
+        Err(e) => {
+            log_paint_error(kind, "border_width", &e);
+            EdgeInsets::default()
+        }
+    };
+    paint_border(canvas, rect, radius, colors, widths);
+}
+
+fn fill_rect(canvas: &mut Canvas<OpenGl>, rect: LogicalRect, radius: f32, color: Rgba) {
+    let mut path = Path::new();
+    if radius > 0.0 {
+        path.rounded_rect(rect.x, rect.y, rect.width, rect.height, radius);
+    } else {
+        path.rect(rect.x, rect.y, rect.width, rect.height);
+    }
+    canvas.fill_path(&path, &Paint::color(Color::rgbaf(color.r, color.g, color.b, color.a)));
+}
+
+/// femtovg has no per-edge border primitive, so this covers exactly two cases (the simplification
+/// this slice is deliberately handed, not a gap found later). Uniform borders -- all four edges
+/// the same width and colour -- with `radius` above 0 get one `stroke_path` over the rounded
+/// rect, inset by half the stroke width: femtovg strokes centred on the path, so drawing directly
+/// on `rect`'s own edge would have the stroke straddle it, half inside and half outside the box.
+/// Everything else -- any edge differing from another, or radius 0 -- fills each edge that
+/// declares both a non-zero width and a colour as its own rectangle.
+///
+/// ponytail: the per-edge-rectangle fallback ignores `radius` entirely, so a config that combines
+/// a radius with per-edge widths or colours gets square corners where the rounded background
+/// underneath shows through. femtovg exposes no public per-corner arc primitive this could build
+/// on without duplicating its internal `rounded_rect_varying` construction; the upgrade path is
+/// exactly that -- four independent corner arcs plus four edge segments, mitred at each join --
+/// once a real config needs a rounded per-edge border rather than this approximation.
+fn paint_border(canvas: &mut Canvas<OpenGl>, rect: LogicalRect, radius: f32, colors: BorderColor, widths: EdgeInsets) {
+    let uniform_width = widths.top == widths.right && widths.right == widths.bottom && widths.bottom == widths.left;
+    let uniform_color = matches!(
+        (colors.top, colors.right, colors.bottom, colors.left),
+        (Some(t), Some(r), Some(b), Some(l)) if t == r && r == b && b == l
+    );
+
+    if uniform_width && uniform_color && widths.top > 0.0 && radius > 0.0 {
+        let color = colors.top.expect("uniform_color's match arm above guarantees Some on every edge");
+        let width = widths.top;
+        let inset = width / 2.0;
+        let mut path = Path::new();
+        path.rounded_rect(
+            rect.x + inset,
+            rect.y + inset,
+            (rect.width - width).max(0.0),
+            (rect.height - width).max(0.0),
+            radius,
+        );
+        let mut paint = Paint::color(Color::rgbaf(color.r, color.g, color.b, color.a));
+        paint.set_line_width(width);
+        canvas.stroke_path(&path, &paint);
+        return;
+    }
+
+    // Corners overlap here rather than mitre -- each edge is its own filled rect spanning the
+    // node's full width or height, so two adjacent non-zero edges both cover the corner they
+    // share.
+    paint_border_edge(canvas, colors.top, widths.top, LogicalRect { x: rect.x, y: rect.y, width: rect.width, height: widths.top });
+    paint_border_edge(
+        canvas,
+        colors.bottom,
+        widths.bottom,
+        LogicalRect { x: rect.x, y: rect.y + rect.height - widths.bottom, width: rect.width, height: widths.bottom },
+    );
+    paint_border_edge(canvas, colors.left, widths.left, LogicalRect { x: rect.x, y: rect.y, width: widths.left, height: rect.height });
+    paint_border_edge(
+        canvas,
+        colors.right,
+        widths.right,
+        LogicalRect { x: rect.x + rect.width - widths.right, y: rect.y, width: widths.right, height: rect.height },
+    );
+}
+
+/// One border edge: paints only where both a colour and a non-zero width say so
+/// (`node::parse_border_color`'s doc comment -- `border_width` alone is documented § 5.2
+/// behaviour, not a bug this should work around).
+fn paint_border_edge(canvas: &mut Canvas<OpenGl>, color: Option<Rgba>, width: f32, edge_rect: LogicalRect) {
+    let Some(color) = color else { return };
+    if width <= 0.0 {
+        return;
+    }
+    let mut path = Path::new();
+    path.rect(edge_rect.x, edge_rect.y, edge_rect.width, edge_rect.height);
+    canvas.fill_path(&path, &Paint::color(Color::rgbaf(color.r, color.g, color.b, color.a)));
+}
+
+/// `text` (`oblisk-idl-api-specs.md` § 5.2 item 4): `content` through `TextPainter`, at `rect`,
+/// coloured by `foreground`. A parse error on `font_size`/`foreground` falls back to the same
+/// defaults those parsers already return for an absent key, so a malformed value degrades to
+/// "as if omitted" rather than blanking the node's text entirely.
+fn paint_text(painter: &mut TextPainter, properties: &HashMap<String, Value>, rect: LogicalRect, scale: f32) {
+    let content = match node::parse_content(properties) {
+        Ok(c) => c,
+        Err(e) => {
+            log_paint_error("text", "content", &e);
+            String::new()
+        }
+    };
+    let font_size = match node::parse_font_size(properties) {
+        Ok(s) => s,
+        Err(e) => {
+            log_paint_error("text", "font_size", &e);
+            12.0
+        }
+    };
+    let color = match node::parse_foreground(properties) {
+        Ok(c) => c,
+        Err(e) => {
+            log_paint_error("text", "foreground", &e);
+            Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+        }
+    };
+    painter.draw_line(&content, rect, font_size, scale, color);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::ffi::c_void;
+
+    use khronos_egl as egl;
+    use mlua::Lua;
+
+    use crate::lua::nodes::{deserialize_lua_table, register_node_constructors};
+    use crate::lua::signal;
+    use crate::layout::scene::{LogicalSize, Scene};
+    use crate::text::shaping::ShapingHandle;
+
+    // `EGL_PLATFORM_SURFACELESS_MESA` -- not in khronos-egl 6.0.0's constant list (confirmed by
+    // reading its source; the crate ships no `PLATFORM_*` constants at all), so this is the raw
+    // value from Mesa's own `EGL/eglmesaext.h`. Requesting it via `get_platform_display` is what
+    // gives a GLES context with no on-screen display or compositor at all, which is what makes
+    // this harness runnable in CI as well as on a developer's desktop with a real GPU.
+    const PLATFORM_SURFACELESS_MESA: egl::Enum = 0x31DD;
+
+    /// `None` on any failure, with an `eprintln!` naming which step -- "EGL init failed, skip" is
+    /// the gate a driverless CI box takes; this machine has a working Mesa/Iris (and llvmpipe
+    /// under `LIBGL_ALWAYS_SOFTWARE=1`) and is expected to actually run every test below, not
+    /// skip them.
+    ///
+    /// Returns just the `Instance` -- `Display`/`Surface`/`Context` (confirmed by reading
+    /// khronos-egl's source: bare handle newtypes, no `Drop` impl) need no further Rust-side
+    /// ownership once `make_current` below has bound them to this thread; only `instance` is
+    /// read again, for `get_proc_address` in [`text_painter`]. Binds a pbuffer surface (confirmed
+    /// working on this machine's Mesa 26.2 -- no FBO plumbing needed, unlike a real window
+    /// surface) current before returning.
+    fn init_headless_egl(width: i32, height: i32) -> Option<egl::Instance<egl::Static>> {
+        let instance = egl::Instance::new(egl::Static);
+
+        // SAFETY: `PLATFORM_SURFACELESS_MESA` needs no native display handle -- `DEFAULT_DISPLAY`
+        // (null) is the documented argument for it, the same convention EGL's other platformless
+        // extensions use.
+        let display = match unsafe { instance.get_platform_display(PLATFORM_SURFACELESS_MESA, egl::DEFAULT_DISPLAY, &[egl::ATTRIB_NONE]) } {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("EGL init failed, skip: eglGetPlatformDisplay(SURFACELESS_MESA): {e}");
+                return None;
+            }
+        };
+
+        if let Err(e) = instance.initialize(display) {
+            eprintln!("EGL init failed, skip: eglInitialize: {e}");
+            return None;
+        }
+
+        if let Err(e) = instance.bind_api(egl::OPENGL_ES_API) {
+            eprintln!("EGL init failed, skip: eglBindAPI(OPENGL_ES_API): {e}");
+            return None;
+        }
+
+        // Own config chooser, not `wayland::egl::satisfies_requirements`: that function requires
+        // `WINDOW_BIT`, the wrong surface type for a pbuffer -- this asks for `PBUFFER_BIT`
+        // instead, otherwise the same GLES3/8-bit-per-channel shape.
+        let attribs = [
+            egl::SURFACE_TYPE,
+            egl::PBUFFER_BIT,
+            egl::RENDERABLE_TYPE,
+            egl::OPENGL_ES3_BIT,
+            egl::RED_SIZE,
+            8,
+            egl::GREEN_SIZE,
+            8,
+            egl::BLUE_SIZE,
+            8,
+            egl::ALPHA_SIZE,
+            8,
+            egl::NONE,
+        ];
+        let config = match instance.choose_first_config(display, &attribs) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                eprintln!("EGL init failed, skip: no EGL config satisfies PBUFFER+GLES3+8-bit-RGBA");
+                return None;
+            }
+            Err(e) => {
+                eprintln!("EGL init failed, skip: eglChooseConfig: {e}");
+                return None;
+            }
+        };
+
+        let pbuffer_attribs = [egl::WIDTH, width, egl::HEIGHT, height, egl::NONE];
+        let surface = match instance.create_pbuffer_surface(display, config, &pbuffer_attribs) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("EGL init failed, skip: eglCreatePbufferSurface: {e}");
+                return None;
+            }
+        };
+
+        let context_attribs = [egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE];
+        let context = match instance.create_context(display, config, None, &context_attribs) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("EGL init failed, skip: eglCreateContext: {e}");
+                return None;
+            }
+        };
+
+        if let Err(e) = instance.make_current(display, Some(surface), Some(surface), Some(context)) {
+            eprintln!("EGL init failed, skip: eglMakeCurrent: {e}");
+            return None;
+        }
+
+        Some(instance)
+    }
+
+    /// Builds a `TextPainter` against `instance`'s already-current context -- same
+    /// `default_font_bytes` source `wayland::mod`'s own `draw_main_bar_proof_text` uses, so this
+    /// harness draws with the exact font cosmic-text shaped against.
+    fn text_painter(instance: &egl::Instance<egl::Static>, shaping: &ShapingHandle, width: u32, height: u32) -> Option<TextPainter> {
+        let font_bytes = shaping.default_font_bytes();
+        TextPainter::new(
+            |s| instance.get_proc_address(s).map_or(std::ptr::null(), |f| f as *const c_void),
+            width,
+            height,
+            &font_bytes,
+        )
+        .map_err(|e| eprintln!("EGL init failed, skip: FemtoVG init: {e}"))
+        .ok()
+    }
+
+    /// Evaluates `lua_src` as one surface's tree (same `surface_from` shape `layout::scene`'s own
+    /// tests use, private to that module's test list so rebuilt here), applies it, and returns the
+    /// resolved root at `size`. Panics on any layout error -- every fixture below is a config this
+    /// harness controls, so a rejection is this test's own bug, not something to assert on.
+    fn resolved_surface(lua: &Lua, lua_src: &str, size: LogicalSize) -> ResolvedNode {
+        register_node_constructors(lua).unwrap();
+        signal::register(lua).unwrap();
+        let table: mlua::Table = lua.load(lua_src).eval().unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+        let shaping = ShapingHandle::spawn();
+        let mut scene = Scene::new();
+        scene.apply(&[surface], size, &shaping, lua).unwrap();
+        scene.surface("bar").unwrap()
+    }
+
+    /// `#RRGGBBAA` at logical `(x, y)` from `canvas.screenshot()` -- femtovg's own `Canvas::
+    /// screenshot` already does the GL readback and the bottom-up-to-top-down row flip
+    /// (`femtovg::renderer::opengl`'s `screenshot` impl), so this harness needs no raw
+    /// `glReadPixels`/`glow` context of its own. `scale` here is always `1.0` (matching every
+    /// existing call site in this crate), so logical and physical pixel coordinates coincide.
+    fn pixel_at(canvas: &mut Canvas<OpenGl>, x: usize, y: usize) -> (u8, u8, u8, u8) {
+        let image = canvas.screenshot().expect("screenshot reads back the pbuffer's own framebuffer");
+        let px = image[(x, y)];
+        (px.r, px.g, px.b, px.a)
+    }
+
+    #[test]
+    fn a_background_fills_the_surface_with_the_exact_colour() {
+        // Catches: `parse_background`/`fill_rect` never wired up at all, or a wrong-cased/wrong-
+        // channel colour reaching `Color::rgbaf`. `glReadPixels` returning an exact `#FF0000FF`
+        // after a red clear is confirmed working on this machine (Iris and llvmpipe both), so
+        // exact equality is the right assertion here, not a tolerance.
+        let Some(instance) = init_headless_egl(64, 64) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 64, 64) else { return };
+
+        // `surface`/the child both need an explicit size: an unsized `surface` is Content-sized
+        // (docs/adr/0023 item 4's stacking model), which collapses to its *children's* bounding
+        // box, not `available` -- and an unsized childless `rect` is `LogicalSize::default()`,
+        // zero -- so leaving either implicit would size this whole fixture to 0x0.
+        let root = resolved_surface(
+            &lua,
+            r##"return surface { id = "bar", width = 64, height = 64, child = rect { width = "Fill", height = "Fill", background = "#FF0000FF" } }"##,
+            LogicalSize { width: 64.0, height: 64.0 },
+        );
+        paint_tree(&mut painter, &root, 1.0);
+
+        assert_eq!(pixel_at(painter.canvas_mut(), 32, 32), (255, 0, 0, 255));
+    }
+
+    #[test]
+    fn a_later_child_paints_over_its_parent_at_the_overlap_and_the_parent_shows_outside_it() {
+        // Catches: tree order not respected (docs/adr/0023 item 4) -- if children painted before
+        // their parent, or the whole tree painted in the wrong order, the parent's opaque fill
+        // would cover the child's smaller opaque fill instead of the reverse.
+        let Some(instance) = init_headless_egl(64, 64) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 64, 64) else { return };
+
+        let root = resolved_surface(
+            &lua,
+            r##"return surface { id = "bar", width = 64, height = 64, child = rect { width = "Fill", height = "Fill", background = "#0000FFFF", children = {
+                rect { background = "#00FF00FF", width = 20, height = 20 },
+            } } }"##,
+            LogicalSize { width: 64.0, height: 64.0 },
+        );
+        paint_tree(&mut painter, &root, 1.0);
+
+        // Inside the child's box (top-left corner of the stacking model, no alignment set):
+        // green, the child's own colour, painted over the parent.
+        assert_eq!(pixel_at(painter.canvas_mut(), 5, 5), (0, 255, 0, 255));
+        // Outside the child's box, still inside the parent: the parent's blue, untouched.
+        assert_eq!(pixel_at(painter.canvas_mut(), 40, 40), (0, 0, 255, 255));
+    }
+
+    #[test]
+    fn a_childs_padded_offset_position_is_honoured_across_two_levels_of_nesting() {
+        // Catches exactly the parent-relative-coordinate bug this module's own doc comment warns
+        // about, and needs two nesting levels to actually catch it: `blue`'s own absolute position
+        // (5, 5) comes entirely from *its* parent's (the surface's) padding, so a `paint_node` that
+        // forgot to accumulate an origin at all would still place `blue` correctly at the first
+        // level (both a correct walk and a "treat every rect.x/y as absolute" bug start recursing
+        // from origin (0, 0)) -- the bug only shows up one level further down.
+        //
+        // `green`'s parent-relative rect is `(15, 15, 10, 10)` (`blue`'s own padding). Correctly
+        // accumulated, its absolute position is `blue`'s origin (5, 5) plus that offset: (20, 20).
+        // A buggy walk that painted `green` at its raw (parent-relative) `rect.x`/`rect.y` as if
+        // already absolute would place it at (15, 15) instead -- (27, 27) sits inside the correct
+        // box (20..30) but outside that wrong one (15..25), so it reads green only if two levels
+        // of origin both accumulated correctly.
+        let Some(instance) = init_headless_egl(64, 64) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 64, 64) else { return };
+
+        let root = resolved_surface(
+            &lua,
+            r##"return surface { id = "bar", width = 64, height = 64, padding = { top = 5, left = 5 }, child = rect {
+                width = 50, height = 50, background = "#0000FFFF", padding = { top = 15, left = 15 },
+                children = { rect { background = "#00FF00FF", width = 10, height = 10 } },
+            } }"##,
+            LogicalSize { width: 64.0, height: 64.0 },
+        );
+        paint_tree(&mut painter, &root, 1.0);
+
+        // Inside `blue`'s box, well clear of `green`'s box under either the correct or the buggy
+        // placement -- a sanity check that `blue` itself landed at its own correct offset.
+        assert_eq!(pixel_at(painter.canvas_mut(), 10, 10), (0, 0, 255, 255));
+        // The discriminator: green only here if both levels of origin accumulated.
+        assert_eq!(pixel_at(painter.canvas_mut(), 27, 27), (0, 255, 0, 255));
+    }
+
+    #[test]
+    fn a_per_edge_border_paints_only_the_edge_that_declared_both_a_colour_and_a_width() {
+        // Catches: `border_width` alone (no colour) painting anyway (a documented § 5.2 non-
+        // error, not a bug to "fix"), or the per-edge fallback path not reading `border_color`/
+        // `border_width` per edge at all.
+        let Some(instance) = init_headless_egl(64, 64) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 64, 64) else { return };
+
+        let root = resolved_surface(
+            &lua,
+            r##"return surface { id = "bar", width = 64, height = 64, child = rect {
+                width = 40, height = 40, background = "#000000FF",
+                border_width = { top = 4, bottom = 4 },
+                border_color = { top = "#FFFFFFFF" },
+            } }"##,
+            LogicalSize { width: 64.0, height: 64.0 },
+        );
+        paint_tree(&mut painter, &root, 1.0);
+
+        // Top edge: width 4 and colour both declared -- painted white.
+        assert_eq!(pixel_at(painter.canvas_mut(), 20, 1), (255, 255, 255, 255));
+        // Bottom edge: width 4 declared, no colour -- § 5.2's documented "paints nothing", so this
+        // stays the rect's own black background rather than a border colour it never got.
+        assert_eq!(pixel_at(painter.canvas_mut(), 20, 38), (0, 0, 0, 255));
+    }
+
+    #[test]
+    fn text_foreground_colour_puts_non_background_pixels_inside_its_rect() {
+        // Catches: `paint_text` not calling `draw_line` at all, or `parse_foreground` not
+        // reaching it -- if either were true every pixel in the text's box would stay the
+        // surface's own background colour.
+        let Some(instance) = init_headless_egl(120, 40) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 120, 40) else { return };
+
+        // `rect` and `surface` both need an explicit size here, same reason as the first test:
+        // an unsized `rect` with a `text` child takes the stacking model's bounding-union size
+        // (docs/adr/0023 item 4), which would leave everything outside that (possibly small) box
+        // unpainted, and the scan below would be reading undefined pbuffer content rather than the
+        // rect's own deterministic black background.
+        let root = resolved_surface(
+            &lua,
+            r##"return surface { id = "bar", width = 120, height = 40, child = rect { width = "Fill", height = "Fill", background = "#000000FF", children = {
+                text { content = "Oblisk", font_size = 24, foreground = "#00FF00FF" },
+            } } }"##,
+            LogicalSize { width: 120.0, height: 40.0 },
+        );
+        paint_tree(&mut painter, &root, 1.0);
+
+        // Green specifically, not merely "not the background". Asserting non-background alone
+        // cannot see this commit's own change: `draw_line` hardcoded `Color::white()` until now,
+        // and white is not black either, so a `draw_line` that ignored its new `color` parameter
+        // entirely passed that weaker assertion. Measured, by reverting exactly that one line: all
+        // five tests here stayed green. The glyph is antialiased against black, so interior pixels
+        // run from `#000000` to `#00FF00` and the discriminator is the channel *ratio*, not an
+        // exact value: any lit pixel must be green-dominant, and white would fail on `r`.
+        let mut lit_pixels = 0usize;
+        for y in 0..30usize {
+            for x in 0..100usize {
+                let (r, g, b, _) = pixel_at(painter.canvas_mut(), x, y);
+                if (r, g, b) == (0, 0, 0) {
+                    continue;
+                }
+                lit_pixels += 1;
+                assert!(
+                    g > r && g > b,
+                    "a glyph pixel at ({x}, {y}) is {:?}, which is not the green `foreground` asked for -- white here means `foreground` never reached `draw_line`",
+                    (r, g, b)
+                );
+            }
+        }
+        assert!(lit_pixels > 0, "text with a foreground colour must paint at least one non-background pixel inside its rect");
+    }
+
+    /// The uniform-border-with-radius branch of [`paint_border`] had no test at all: the per-edge
+    /// case above takes the fallback path, so the whole `stroke_path` arm, including the half-width
+    /// inset its doc comment reasons carefully about, went unexercised. That inset is the part
+    /// worth pinning: femtovg strokes centred on the path, so an uninset stroke straddles the
+    /// node's own edge with half of it painted outside the box.
+    #[test]
+    fn a_uniform_border_with_a_radius_strokes_inside_the_nodes_own_box() {
+        let Some(instance) = init_headless_egl(64, 64) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 64, 64) else { return };
+
+        // The surface paints red, the bordered rect black with a white border, so a stroke that
+        // leaked outside the rect's box would show up as white on the surface's red.
+        let root = resolved_surface(
+            &lua,
+            r##"return surface { id = "bar", width = 64, height = 64, background = "#FF0000FF", padding = { top = 10, left = 10 }, child = rect {
+                width = 40, height = 40, background = "#000000FF",
+                radius = 8, border_width = 4, border_color = "#FFFFFFFF",
+            } }"##,
+            LogicalSize { width: 64.0, height: 64.0 },
+        );
+        paint_tree(&mut painter, &root, 1.0);
+
+        // Mid-edge of the left border, 2px in: inside the 4px stroke, so white.
+        assert_eq!(pixel_at(painter.canvas_mut(), 12, 30), (255, 255, 255, 255));
+        // Just inside the stroke's inner edge: the rect's own black fill, not border colour.
+        assert_eq!(pixel_at(painter.canvas_mut(), 16, 30), (0, 0, 0, 255));
+        // One pixel outside the rect's own box: the surface's red. A stroke drawn on the box edge
+        // rather than inset by half its width would have painted half of itself out here.
+        assert_eq!(pixel_at(painter.canvas_mut(), 9, 30), (255, 0, 0, 255));
+    }
+}

@@ -1101,7 +1101,15 @@ fn draw_main_bar_proof_text(
             LogicalRect { x: 8.0, y: 0.0, width: shaped.width, height: shaped.height },
             FONT_SIZE,
             1.0,
+            // White: the exact color `draw_line` used to hardcode internally, unchanged now that
+            // it takes one -- this proof-of-wiring call has no `layout::node` property to read a
+            // real `foreground` from.
+            crate::layout::node::Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
         );
+        // `draw_line` no longer flushes for itself (build-steps.md Phase 19 item 6): a real tree
+        // walk flushes once for a whole surface's worth of nodes, and this lone proof-of-wiring
+        // call is its own whole walk, so it flushes right here instead.
+        painter.canvas_mut().flush();
         eprintln!(
             "[oblisk-renderer] main_bar: shaped \"{PROOF_TEXT}\" to {}x{} (logical), drew+flushed via FemtoVG",
             shaped.width, shaped.height

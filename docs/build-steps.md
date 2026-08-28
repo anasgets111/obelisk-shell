@@ -863,9 +863,18 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    functions over an already-resolved property map. Then the drawing pass and the harness, which is
    the only part that needs a GL context. The parsers land with no production caller and therefore
    with an `#[allow(dead_code)]` apiece, seven of them, more than the rest of the crate accumulated
-   across Phases 12 through 19 combined. That is the price of the split and it is paid back by the
-   third commit, which deletes every one of those attributes. If the third commit slips, the debt is
-   real and visible rather than hidden, which is why it is written down here.
+   across Phases 12 through 19 combined. That is the price of the split, and the third commit pays
+   most of it back, not all: it deletes six of the seven attributes by giving every parser a real
+   caller in the new `layout::paint` module, but adds one of its own, on `paint::paint_tree` itself.
+   `RendererClient` (`renderer/src/socket.rs`) keys a `Scene` by the `id` a config writes (`"bar"`);
+   `wayland::mod` keys a `wl_surface` by `SurfaceRole::label()` (`"main_bar"`, `"overlay_canvas"`,
+   `"wallpaper_layer@{output}"`). Those two id spaces don't overlap, so there is no surface whose
+   retained tree a lookup could find to hand `paint_tree` -- `socket.rs`'s `PLACEHOLDER_OUTPUT_SIZE`
+   `ponytail:` comment spells out the same gap. Any mapping invented here would be policy Phase 20
+   item 4 deletes outright, once it removes `SurfaceRole` and unifies the two id spaces -- that is
+   what gives `paint_tree` its first production caller and lets this last attribute go. Net debt
+   goes from seven attributes to one, real and visible rather than hidden, which is why it is
+   written down here.
 
    The harness has to come with the drawing pass and not after it. `EGL_MESA_platform_surfaceless`
    plus a pbuffer surface is confirmed working on Mesa 26.2: a GLES 3.2 context, and `glReadPixels`
@@ -923,6 +932,20 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    mechanical sweep folded into a paint commit. Not urgent: the hostile config is the user's own, so
    this is diagnostics quality rather than a security boundary. It is written down because a fourth
    copy of a bad pattern is how it becomes the convention.
+
+   Item 6's own third commit then changed the cadence this is paid at, which is what turns it from
+   untidy into a real problem. `Scene::apply` never parses the paint properties, so `layout::paint`
+   is the first thing that ever validates a `background` or a `radius`, and it does that while
+   drawing. A malformed value is logged and treated as absent rather than failing the apply, since
+   there is no rollback available mid-frame with a GL context bound. So once `paint_tree` has a
+   production caller, one `background = 5` in one node formats and prints on every frame, on the
+   Wayland dispatch thread, at whatever rate item 9's frame callbacks fire.
+
+   Rate-limiting the log is the wrong fix and would hide the real one. Paint properties should be
+   parsed once at apply time, where a failure already has somewhere to go: a `LayoutError` that
+   rolls back and reaches `rescue`, exactly as a bad `align_v` does today. That is the same "parse
+   geometry once into the retained node" that item 5 defers, and both halves want doing together,
+   which is why this is recorded here rather than bolted onto a paint commit.
 14. **A container's content size must include its own padding.** Measured live: a content-sized
    `column` holding one 15.6-tall `text` reports 15.6 whether its padding is 8 or 50 on every edge.
    `scene.rs` parses `padding` to inset the box it lays children out in, but no arm of
