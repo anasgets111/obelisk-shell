@@ -1554,6 +1554,41 @@ Deliberately deferred: `Popup::reposition` and the `Reactive` configure kind. It
 dropdown that opens under different buttons by creating a fresh popup per open; only an anchor that
 moves while a popup is already open needs `reposition`, and nothing needs that yet.
 
+> **Built** (docs/adr/0049, docs/adr/0051). Items 1 and 4 with the window half of item 5 in
+> `2c80cfc`, items 2 and 3 with the popup half in `4019815`. `reposition` and the `Reactive`
+> configure kind stayed unbuilt as written above.
+>
+> **Two things ADR-0049 left open had to be settled before item 2 would compile**, and ADR-0051
+> records both. A `panel` parent is not one surface, since `monitor = "All"` expands it per output
+> and `get_popup` takes exactly one parent, so a popup anchors to the instance the arming click
+> landed on: a dropdown belongs to the click, not to the output set. And a compositor dismissal
+> latches, because `popup_done` leaves the resolved tree still saying `visible = true` and a config
+> with no `on_dismiss` would otherwise reopen a popup for the same click-outside to close, forever.
+>
+> **An unsized `window` root painted nothing.** § 6.2 gives a `window` no `width` or `height`, so
+> the root fell to `parse_size_mode`'s `Content` default, and a `Content`-sized parent hands its
+> children a zero budget: `child = column { width = "Fill" }` resolved to 0x0 and the window painted
+> a fully transparent buffer. `Scene::apply_one_instance` now forces an unsized `window` root to
+> `available` per axis, overriding the default only.
+>
+> **PBA's null-buffer staging needed no new branch, as item 1 predicted, but the readiness gate
+> did.** `null_buffered` is only set from inside a configure, and a `window` declared
+> `visible = false` has no `xdg_toplevel`, so no configure was ever coming and a Candidate whose
+> every surface was such a window died on `ready_timeout`. The gate now asks whether each surface
+> has staged *or does not exist*.
+>
+> **The grab cannot validate on wlroots, and that is not fixable here.**
+> `wlr_seat_validate_pointer_grab_serial` demands a still-held button and the press serial, while
+> docs/adr/0050 decision 2 defines a click as a press and a release, so `on_click` runs at button
+> count 0. niri accepts the grab because smithay does not run that check. Item 3's "treat
+> `popup_done` arriving immediately as a denied grab" is therefore load-bearing on sway and
+> Hyprland rather than the corner case it reads as here. ADR-0051's second amendment records
+> `on_press` as the upgrade path.
+>
+> **No live coverage: opening the dropdown.** The unit tests cover the latch state machine and the
+> positioner derivation, and a real session has booted the popup's declaration, but nothing has yet
+> clicked the button twice on screen to watch it close and reopen.
+
 ### Phase 23: The `lock` Role and Session Lock
 
 Implement ADR-0042. The Renderer takes `ext_session_lock_v1` through SCTK's `SessionLockState` /
