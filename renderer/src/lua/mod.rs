@@ -195,11 +195,24 @@ fn collect_surfaces(value: Value) -> Result<Vec<VirtualNode>, LoaderError> {
     Ok(surfaces)
 }
 
+/// § 6's roles, at the root where § 6 puts them. Three of the four are a config's to declare
+/// (docs/adr/0040 decision 1), and gating on `panel` alone -- correct while `panel` was the only
+/// role that existed -- rejected a `window` or `popup` here, before the scene or any spec parser
+/// ever saw it (build-steps.md Phase 22).
+///
+/// `lock` gets its own arm rather than falling into the catch-all, because "got `lock`" would read
+/// as a role that is not built yet. It is built as far as anything else here: what is wrong is the
+/// *place*. A lock surface's lifetime is the lock's, not the config's (§ 6.4, docs/adr/0042), so
+/// the Supervisor is what makes one appear and a config's job is to say what it looks like.
 fn require_surface(node: &VirtualNode) -> Result<(), LoaderError> {
-    if node.kind == "panel" {
-        Ok(())
-    } else {
-        Err(LoaderError::InvalidTopLevelReturn(format!("top-level node must be `panel`, got `{}`", node.kind)))
+    match node.kind.as_str() {
+        "panel" | "window" | "popup" => Ok(()),
+        "lock" => Err(LoaderError::InvalidTopLevelReturn(
+            "a `lock` is not returned at the root: a lock surface exists only while the session is locked, so the Supervisor is what makes one appear \
+             (§ 6.4, docs/adr/0042)"
+                .to_string(),
+        )),
+        other => Err(LoaderError::InvalidTopLevelReturn(format!("top-level node must be `panel`, `window` or `popup`, got `{other}`"))),
     }
 }
 
@@ -227,6 +240,39 @@ mod tests {
         let output = loader.evaluate(r#"return panel { id = "bar", layer = "Top" }"#).unwrap();
         assert_eq!(output.surfaces.len(), 1);
         assert_eq!(output.surfaces[0].kind, "panel");
+    }
+
+    #[test]
+    fn evaluate_accepts_a_window_and_a_popup_at_the_top_level_beside_a_panel() {
+        // § 6 returns all four roles at the root and docs/adr/0040 decision 1 makes three of them
+        // a config's to declare, so gating on `panel` alone rejected two thirds of § 6 before the
+        // scene ever saw them (build-steps.md Phase 22).
+        let loader = Loader::new(signal::DirtyFlag::new()).unwrap();
+        let output = loader
+            .evaluate(
+                r#"return {
+                    panel { id = "bar", layer = "Top" },
+                    window { id = "settings", title = "Settings" },
+                    popup { id = "menu", parent = "bar", width = 200, height = 120, anchor_rect = { x = 0, y = 0, width = 86, height = 24 } },
+                }"#,
+            )
+            .unwrap();
+        let kinds: Vec<&str> = output.surfaces.iter().map(|s| s.kind.as_str()).collect();
+        assert_eq!(kinds, ["panel", "window", "popup"]);
+    }
+
+    #[test]
+    fn evaluate_rejects_a_top_level_lock_with_a_message_naming_why_a_lock_is_not_declared_there() {
+        // The fourth role, and the one that stays out: a lock surface's lifetime is the lock's,
+        // not the config's (docs/adr/0042, § 6.4). "got `lock`" would read as a missing feature,
+        // so the message has to say that returning one is not how a lock screen appears.
+        let loader = Loader::new(signal::DirtyFlag::new()).unwrap();
+        let err = loader.evaluate(r#"return { kind = "lock", id = "screen" }"#).unwrap_err();
+        let LoaderError::InvalidTopLevelReturn(message) = err else {
+            panic!("a top-level `lock` must be a top-level-return error");
+        };
+        assert!(message.contains("lock"), "{message}");
+        assert!(message.contains("Supervisor"), "the message must say what does make a lock appear: {message}");
     }
 
     #[test]

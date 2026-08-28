@@ -367,9 +367,13 @@ impl Scene {
     }
 }
 
+/// `window` and `popup` join `panel` here per docs/adr/0040 decision 1 (build-steps.md Phase 22).
+/// All three are surface containers: a role for a `wl_surface`, a `child` tree inside it, and no
+/// layout model of their own beyond the stacking one docs/adr/0023 item 4 already gives `panel`.
+/// `lock`, the fourth role, is not here -- its ownership is still open (docs/adr/0042).
 fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
     match kind {
-        "panel" | "rect" | "row" | "column" | "text" | "icon" | "button" | "list" | "textfield" => Ok(()),
+        "panel" | "window" | "popup" | "rect" | "row" | "column" | "text" | "icon" | "button" | "list" | "textfield" => Ok(()),
         other => Err(LayoutError::UnsupportedNodeKind(other.to_string())),
     }
 }
@@ -414,9 +418,13 @@ fn ensure_node_admissible(kind: &str, depth: u32) -> Result<(), LayoutError> {
     Ok(())
 }
 
-/// Dispatches to the right raw property (`child` for `panel`, `children` for the container
-/// kinds, none for leaves) -- only called after [`ensure_supported_kind`] already validated
-/// `node.kind`, so the fallback arm is unreachable, not a silent default.
+/// Dispatches to the right raw property (`child` for the three surface roles, `children` for the
+/// container kinds, none for leaves) -- only called after [`ensure_supported_kind`] already
+/// validated `node.kind`, so the fallback arm is unreachable, not a silent default.
+///
+/// `window` and `popup` share `panel`'s arm because § 6.2 and § 6.3 give each of them exactly one
+/// `child`, the same as § 6.1 does: a surface holds one root visual node, and the difference
+/// between the three roles is which protocol assigns the surface its role, not what hangs under it.
 ///
 /// `textfield` (`oblisk-idl-api-specs.md` § 5.2 item 8) is a leaf like `text`/`icon`: it never
 /// takes `children`. Its own properties (`mask_character`, `secure_submit`, `on_change`,
@@ -429,7 +437,7 @@ fn ensure_node_admissible(kind: &str, depth: u32) -> Result<(), LayoutError> {
 /// for the upgrade path).
 fn children_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Vec<VirtualNode>, LayoutError> {
     match kind {
-        "panel" => Ok(node::parse_single_child(properties, "child")?
+        "panel" | "window" | "popup" => Ok(node::parse_single_child(properties, "child")?
             .into_iter()
             .collect()),
         "rect" | "row" | "column" | "button" => node::parse_children(properties),
@@ -478,7 +486,11 @@ fn stretch_forced_size(
             let forced_w = (cross == Align::Stretch && own_width_known.is_some()).then_some(margined_budget.width);
             Ok((forced_w, None))
         }
-        "rect" | "button" | "panel" => {
+        // The stacking kinds, all three surface roles included: a child aligned `Stretch` on an
+        // axis takes the whole margined slot in it (docs/adr/0023 item 4). A `window`'s or a
+        // `popup`'s root is a surface container like a `panel`'s, so a full-bleed background inside
+        // one has to work the same way.
+        "rect" | "button" | "panel" | "window" | "popup" => {
             let align_h = node::parse_align(child_properties, "align_h")?;
             let align_v = node::parse_align(child_properties, "align_v")?;
             let forced_w = (align_h == Align::Stretch && own_width_known.is_some()).then_some(margined_budget.width);
@@ -860,10 +872,13 @@ fn intrinsic_content_size(
                 .fold(0.0_f32, f32::max);
             Ok(LogicalSize { width, height })
         }
-        // Stacking model (rect-with-children, button, panel): § 3.2 gives no formula for a
-        // container that isn't row/column -- docs/adr/0023 item 4 documents this as this phase's
-        // own interpretation. Content size is the bounding union over independently-positioned
-        // children, each inflated by its own margin.
+        // Stacking model (rect-with-children, button, and the three surface roles): § 3.2 gives no
+        // formula for a container that isn't row/column -- docs/adr/0023 item 4 documents this as
+        // this phase's own interpretation. Content size is the bounding union over
+        // independently-positioned children, each inflated by its own margin. `window` and `popup`
+        // reach it through the same catch-all `panel` does, which is right for both: neither role
+        // has a layout model of its own, and both are normally sized explicitly anyway (a `popup`
+        // must be, § 6.3).
         _ => {
             let visible: Vec<&RetainedNode> = children.iter().filter(|c| c.visible).collect();
             let width = visible
@@ -993,7 +1008,8 @@ fn position_children(
         }
         // Stacking model: each child independently aligned within the full content box on both
         // axes, no spare-space distribution across siblings -- they can overlap. See docs/adr/0023
-        // item 4.
+        // item 4. Reached by `rect`/`button` and by all three surface roles, matching
+        // `intrinsic_content_size`'s catch-all and `stretch_forced_size`'s named arm.
         _ => {
             for (i, child) in children.iter_mut().enumerate() {
                 if !child.visible {
@@ -2766,5 +2782,57 @@ mod tests {
         assert_eq!(list.rect.height, 23.0, "10 + 10 + 3 spacing, same formula as column");
         assert_eq!(list.children[0].rect.y, 0.0);
         assert_eq!(list.children[1].rect.y, 13.0, "second item stacks below the first plus spacing");
+    }
+
+    #[test]
+    fn window_and_popup_are_supported_kinds_carrying_a_single_child() {
+        // docs/adr/0040 decision 1's other two roles. Both are top-level nodes, siblings of
+        // `panel` in what `shell.lua` returns, and both take `child` rather than `children`
+        // (§ 6.2, § 6.3). Written as raw tables because `lua::nodes::NODE_KINDS` has no
+        // constructor for either yet -- that is the protocol commit's edit, not this one's.
+        for kind in ["window", "popup"] {
+            let mut scene = Scene::new();
+            let shaping = ShapingHandle::spawn();
+            let (lua, surface) = surface_from(&format!(
+                r#"{{ kind = "{kind}", id = "s", child = rect {{ width = 40, height = 20 }} }}"#
+            ));
+            apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap();
+            let root = scene.surface("s@TEST").unwrap();
+            assert_eq!(root.kind, kind);
+            assert_eq!(root.children.len(), 1, "`{kind}` must carry its `child`");
+            assert_eq!(root.children[0].rect.width, 40.0);
+            assert_eq!(root.children[0].rect.height, 20.0);
+        }
+    }
+
+    #[test]
+    fn a_window_or_popup_root_stacks_and_stretches_its_child_exactly_as_a_panel_does() {
+        // Neither role has a layout model of its own: both are surface containers, so they take
+        // the stacking model docs/adr/0023 item 4 already gives `panel`, including the
+        // `Stretch` forcing in `stretch_forced_size`.
+        for kind in ["window", "popup"] {
+            let mut scene = Scene::new();
+            let shaping = ShapingHandle::spawn();
+            let (lua, surface) = surface_from(&format!(
+                r#"{{ kind = "{kind}", id = "s", width = 100, height = 50,
+                       child = rect {{ align_h = "Stretch", align_v = "Stretch" }} }}"#
+            ));
+            apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap();
+            let child = &scene.surface("s@TEST").unwrap().children[0];
+            assert_eq!(child.rect.width, 100.0, "`{kind}` must stretch its child like `panel`");
+            assert_eq!(child.rect.height, 50.0);
+        }
+    }
+
+    #[test]
+    fn an_unsupported_top_level_kind_is_still_rejected() {
+        // The other half of adding two kinds: the list is still a list, not a catch-all.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(r#"{ kind = "dialog", id = "s", child = rect {} }"#);
+        assert!(matches!(
+            apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap_err(),
+            LayoutError::UnsupportedNodeKind(k) if k == "dialog"
+        ));
     }
 }

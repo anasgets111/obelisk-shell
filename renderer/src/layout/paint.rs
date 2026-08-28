@@ -103,9 +103,16 @@ fn paint_node(painter: &mut TextPainter, node: &ResolvedNode, origin_x: f32, ori
 
     match node.kind.as_str() {
         // `oblisk-idl-api-specs.md` § 5.2: row/column/button have no paint properties of their
-        // own beyond the base `rect` ones they share the property table with, and a panel's
-        // own root paints exactly like a rect -- one code path serves all five.
-        "rect" | "row" | "column" | "button" | "panel" => paint_box(painter.canvas_mut(), &node.kind, &node.properties, rect, scale),
+        // own beyond the base `rect` ones they share the property table with, and a surface root
+        // paints exactly like a rect -- one code path serves all seven.
+        //
+        // All three surface roles, not just `panel` (build-steps.md Phase 22): § 6.2 and § 6.3
+        // give a `window` and a `popup` the same base properties § 6.1 gives a `panel`, so a
+        // background or a border on either root is the same fill this already draws. A dropdown's
+        // own rounded, bordered background is the normal case for a `popup`, not an edge one.
+        "rect" | "row" | "column" | "button" | "panel" | "window" | "popup" => {
+            paint_box(painter.canvas_mut(), &node.kind, &node.properties, rect, scale)
+        }
         "text" => paint_text(painter, &node.properties, rect, scale),
         // Deferred (build-steps.md Phase 19, "Also deferred: icon"): § 5.2 item 5's theme-name
         // `icon.name` and `oblisk-supervisor-services-dbus.md` § 9.2's path-taking
@@ -155,8 +162,8 @@ fn log_paint_error(kind: &str, property: &str, err: &LayoutError) {
     eprintln!("[oblisk-renderer] paint: {kind}.{property}: {err}");
 }
 
-/// `rect`/`row`/`column`/`button`/`panel`'s shared paint: background fill, then borders
-/// (`oblisk-idl-api-specs.md` § 5.2 item 1).
+/// The shared paint of `rect`/`row`/`column`/`button` and all three surface roles: background
+/// fill, then borders (`oblisk-idl-api-specs.md` § 5.2 item 1).
 fn paint_box(canvas: &mut Canvas<OpenGl>, kind: &str, properties: &HashMap<String, Value>, rect: LogicalRect, scale: f32) {
     let radius = match node::parse_radius(properties) {
         Ok(r) => r,
@@ -651,6 +658,32 @@ mod tests {
         paint_tree(&mut painter, &root, 1.0);
 
         assert_eq!(pixel_at(painter.canvas_mut(), 32, 32), (255, 0, 0, 255));
+    }
+
+    #[test]
+    fn a_window_or_popup_root_paints_its_own_box_exactly_as_a_panel_root_does() {
+        // build-steps.md Phase 22: `layout::scene::ensure_supported_kind` admits two more surface
+        // roles, and this module's match is bounded by that list. Until both are named here a
+        // `window` or `popup` root fell through to the `_ => {}` arm and drew nothing at all --
+        // not its background, not its border -- while its children painted normally, so the bug
+        // would have looked like a missing background rather than a missing kind.
+        //
+        // The root's own `background` is what is under test, not a child's: that is the property
+        // the `_` arm swallowed.
+        let Some(instance) = init_headless_egl(64, 64) else { return };
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 64, 64) else { return };
+
+        for (kind, colour, expected) in [("window", "#FF0000FF", (255, 0, 0, 255)), ("popup", "#0000FFFF", (0, 0, 255, 255))] {
+            let lua = Lua::new();
+            let root = resolved_surface(
+                &lua,
+                &format!(r#"return {kind} {{ id = "bar", width = 64, height = 64, background = "{colour}" }}"#),
+                LogicalSize { width: 64.0, height: 64.0 },
+            );
+            paint_tree(&mut painter, &root, 1.0);
+            assert_eq!(pixel_at(painter.canvas_mut(), 32, 32), expected, "a `{kind}` root must paint its own box like a `panel` root");
+        }
     }
 
     #[test]

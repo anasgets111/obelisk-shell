@@ -16,9 +16,16 @@ use std::collections::HashMap;
 
 use mlua::{Lua, Table, Value};
 
-/// § 5.2's eight geometric nodes plus § 6.1's top-level `panel` (ADR-0040: `panel` is the
-/// layer-shell surface role; "surface" is the umbrella term covering all four roles).
-const NODE_KINDS: [&str; 9] = ["rect", "row", "column", "text", "icon", "button", "list", "textfield", "panel"];
+/// § 5.2's eight geometric nodes plus the three top-level surface roles a config declares:
+/// § 6.1's `panel`, § 6.2's `window`, § 6.3's `popup` (ADR-0040: these are surface *roles*;
+/// "surface" is the umbrella term covering all four).
+///
+/// § 6.4's `lock` is the fourth role and deliberately absent. A lock surface's lifetime is the
+/// lock's, not the config's (docs/adr/0042), so it is not something `shell.lua` returns and giving
+/// it a constructor here would say it is -- see `crate::lua::require_surface`, which rejects one at
+/// the root with that reason.
+const NODE_KINDS: [&str; 11] =
+    ["rect", "row", "column", "text", "icon", "button", "list", "textfield", "panel", "window", "popup"];
 
 /// A Lua node table, tagged with its constructor's `kind` and carrying every other prop
 /// untouched. Not the final in-memory scene node -- see the module doc comment.
@@ -38,10 +45,10 @@ pub enum DeserializeError {
     KindNotAString,
 }
 
-/// Registers `rect`/`row`/`column`/`text`/`icon`/`button`/`list`/`textfield`/`panel` as
-/// Lua-callable sugar: each takes the props table Lua passed and tags it with `kind`, matching
-/// `docs/oblisk-tdd-test-harness.md` § 4.1's own worked example ("Echo table structure back to
-/// Rust").
+/// Registers every [`NODE_KINDS`] entry as Lua-callable sugar: each takes the props table Lua
+/// passed and tags it with `kind`, matching `docs/oblisk-tdd-test-harness.md` § 4.1's own worked
+/// example ("Echo table structure back to Rust"). One loop over the array rather than a list
+/// spelled out again here, so adding a role is one edit.
 pub fn register_node_constructors(lua: &Lua) -> mlua::Result<()> {
     for kind in NODE_KINDS {
         lua.globals().set(
@@ -139,11 +146,23 @@ mod tests {
     }
 
     #[test]
-    fn every_section_5_2_and_6_1_node_kind_constructs_and_tags_correctly() {
+    fn every_section_5_2_and_6_1_to_6_3_node_kind_constructs_and_tags_correctly() {
         let lua = lua_with_constructors();
         for kind in NODE_KINDS {
             let table: Table = lua.load(format!("return {kind} {{}}")).eval().unwrap();
             assert_eq!(table.get::<String>("kind").unwrap(), kind);
         }
+    }
+
+    #[test]
+    fn window_and_popup_are_constructors_a_config_can_call() {
+        // The two roles docs/adr/0040 decision 1 gives a config beside `panel`. Named explicitly
+        // rather than left to the loop above, because the loop passes whatever the array happens
+        // to hold and this is the pair build-steps.md Phase 22 exists to add.
+        let lua = lua_with_constructors();
+        assert!(NODE_KINDS.contains(&"window") && NODE_KINDS.contains(&"popup"));
+        let table: Table = lua.load(r#"return popup { id = "menu", parent = "bar" }"#).eval().unwrap();
+        assert_eq!(table.get::<String>("kind").unwrap(), "popup");
+        assert_eq!(table.get::<String>("parent").unwrap(), "bar");
     }
 }

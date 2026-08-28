@@ -118,6 +118,16 @@ local notification_feed = cell(label(notifications, notification_summary))
 -- where the button is actually drawn.
 local clicks = state("clicks", 0)
 
+-- The anchor rect the `popup` below hangs from. ADR-0049's amendment settles where it comes from:
+-- not off the input-dispatch stack (the re-resolve runs after `dispatch_pending` has returned) but
+-- through the config, because `on_click` receives the button's own rect (ADR-0050 decision 3) and
+-- writes it to a named `state` signal the `popup` reads back. Both halves are wired here so the
+-- commit that actually creates the `xdg_popup` has nothing left to connect.
+--
+-- The initial is the button's declared size, so the popup is well-formed before anything has ever
+-- been clicked: `anchor_rect` must be non-zero or the whole evaluation fails (§ 6.3).
+local popup_anchor = state("popup_anchor", { x = 0, y = 0, width = 86, height = 24 })
+
 local click_button = button {
     width = 86,
     height = 24,
@@ -126,6 +136,7 @@ local click_button = button {
     on_click = function(rect)
         local n = clicks:get() + 1
         clicks:set(n)
+        popup_anchor:set(rect)
         print(string.format("[shell.lua] click %d, button rect %.0f,%.0f %.0fx%.0f", n, rect.x, rect.y, rect.width, rect.height))
     end,
     children = { cell(clicks:map(function(n)
@@ -146,7 +157,8 @@ end), "#f38ba8ff")
 -- named every surface by its kind (the literal string "panel") until a second one made that
 -- visible, and a candidate that fails to build a scene still gets promoted, which only shows up
 -- when a config is big enough to get wrong. Both get a real `zwlr_layer_surface_v1` now, one per
--- monitor each, addressed as `"bar@{output}"` and `"notification_area@{output}"`.
+-- monitor each, addressed as `"bar@{output}"` and `"notification_area@{output}"`. The `window` and
+-- `popup` after them are declarations only -- see their own comment.
 return {
     panel {
         id = "bar",
@@ -189,6 +201,58 @@ return {
             border_width = 1,
             border_color = "#313244ff",
             children = { notification_feed },
+        },
+    },
+    -- Two more of § 6's roles, declared but never mapped: nothing creates an `xdg_toplevel` or an
+    -- `xdg_popup` yet, so neither gets a surface instance and neither reaches the scene at all.
+    -- What they exercise is the half that does exist -- `window_spec`/`popup_spec` run over both on
+    -- every evaluation, so a typo in either lands in `rescue.error_log` (§ 2.10) instead of
+    -- surfacing as a protocol error the first time something tries to open one. `visible = false`
+    -- on both says the same thing the config's way, and is what stays true once they do map.
+    window {
+        id = "settings",
+        title = "Oblisk settings",
+        app_id = "oblisk.settings",
+        -- Advisory in the spec's own words, and never clamped against the resolved tree (§ 6.2).
+        min_size = { width = 320, height = 240 },
+        max_size = { width = 1280, height = 800 },
+        visible = false,
+        child = column {
+            padding = { top = 12, right = 12, bottom = 12, left = 12 },
+            background = BG,
+            children = { cell("settings", FG) },
+        },
+    },
+    popup {
+        id = "click_menu",
+        -- The `id` of the surface this anchors to, not a node -- the protocol roots a popup under a
+        -- parent *surface* at creation (§ 6.3).
+        parent = "bar",
+        -- Read now rather than bound as a signal: a top-level spec is parsed from the *unresolved*
+        -- properties, so `:get()` is what turns the signal into the table § 6.3 wants. The ceiling
+        -- that follows -- this is what the last evaluation saw, not what the last click wrote -- is
+        -- named in `renderer/src/socket.rs`'s `panel_specs`.
+        anchor_rect = popup_anchor:get(),
+        -- Required and non-zero on both axes: a popup has no "Fill" (§ 6.3), because there is
+        -- nothing for it to fill.
+        width = 200,
+        height = 120,
+        anchor = "BottomLeft",
+        gravity = "BottomRight",
+        -- Dropdown behaviour, which is also the default -- spelled out because this fixture exists
+        -- to exercise the parser, and the protocol's own default is no adjustment at all.
+        constraint_adjustment = { "FlipY", "SlideX" },
+        offset = { x = 0, y = 4 },
+        visible = false,
+        child = column {
+            padding = { top = 8, right = 10, bottom = 8, left = 10 },
+            background = "#181825ee",
+            radius = 8,
+            border_width = 1,
+            border_color = "#313244ff",
+            children = { cell(clicks:map(function(n)
+                return string.format("opened after %d clicks", n)
+            end), ACCENT) },
         },
     },
 }

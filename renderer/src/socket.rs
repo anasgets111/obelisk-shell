@@ -926,19 +926,61 @@ fn rescue_table(loader: &Loader, is_rescue: bool, error_log: &str) -> mlua::Resu
     Ok(table)
 }
 
-/// Every declared `panel`'s full layer-surface spec, in declaration order (§ 6.1,
-/// build-steps.md Phase 20 item 3). Was `surfaces_topology`, returning only the swap fingerprint;
-/// it returns the whole spec now because `crate::wayland` needs the rest of it to *create* the
-/// surfaces, while `handle_reevaluate` still diffs `PanelSpec::topology` alone.
+/// Parses **every** declared surface by its own role, and returns the `panel` specs (§ 6.1-6.3,
+/// build-steps.md Phase 20 item 3 and Phase 22). Was `surfaces_topology`, returning only the swap
+/// fingerprint; it returns the whole spec now because `crate::wayland` needs the rest of it to
+/// *create* the surfaces, while `handle_reevaluate` still diffs `PanelSpec::topology` alone.
 ///
 /// A surface whose fields don't type-check fails with [`lua::LoaderError::InvalidTopology`] -- a
 /// distinct message from an actual top-level-return shape error, since conflating the two (as an
 /// earlier version of this function did) produced a misleading `rescue.error_log`.
+///
+/// **Parsing a `window` and a `popup` here is the point, even though only panels come back.** § 6.3's
+/// properties become `xdg_positioner` requests that raise protocol errors -- a zero `anchor_rect`
+/// leaves the positioner incomplete and `get_popup` answers `invalid_positioner`, a `max_size` under
+/// a `min_size` answers `invalid_size` -- and a protocol error kills the connection and the whole
+/// shell with it. Phase 20 settled that a config typo is a `layout::node::LayoutError` at
+/// evaluation, never a protocol error at runtime, so the parse has to happen at the one point every
+/// declaration passes through. Failing here puts the message in `rescue`'s `error_log` for a human
+/// (§ 2.10, docs/adr/0046) instead of leaving a popup that silently refuses to open on some later
+/// click.
+///
+/// ponytail: the validated `WindowSpec`/`PopupSpec` are **dropped**, and nothing is lost by that
+/// because nothing is stored either -- `RendererClient::state.applied_output` retains the whole
+/// evaluation, so the next commit re-derives both from it exactly as `applied_panel_specs` already
+/// re-derives the panel specs. Storing them now would be a cache with no reader. Two things the
+/// commit that does create the Wayland objects needs and this one deliberately does not build:
+/// the returned roster has to become role-aware (`expand_instances` maps one layer surface per
+/// declared `(panel, output)` pair, which is right for a `panel` and wrong for both other roles --
+/// the compositor places a toplevel, and a popup is created per open, docs/adr/0049 decision 1),
+/// and `applied_topology` has to carry the non-panel declarations, since adding or removing one is
+/// a topology change (docs/adr/0049 decision 3) that today's panel-only fingerprint cannot see.
+///
+/// ponytail: these parse the *unresolved* properties, so a `Signal` in a `popup`'s `anchor_rect` --
+/// § 6.3's own idiom, the rect `on_click` hands back -- is refused here rather than read. A config
+/// spells it `anchor_rect = popup_anchor:get()` today, which is a literal table by the time it
+/// arrives (`dev-config/oblisk/shell.lua` does exactly this). The ceiling is that the value is then
+/// whatever the last *evaluation* saw, not what the last click wrote. Resolving first is not the
+/// upgrade path: `layout::node::resolve_properties` runs Lua getters, and this function also runs on
+/// every monitor hotplug via `applied_panel_specs`, where a second read of every signal would both
+/// double ADR-0021's per-getter budget and break the one-read-per-pass rule that function's doc
+/// comment exists to state. The real fix is the positioner being built from the *resolved*
+/// properties inside `Scene::apply`, where a popup is created per open anyway; that is the same
+/// commit as the role-aware roster above.
 fn panel_specs(output: &lua::LoadOutput) -> Result<Vec<PanelSpec>, lua::LoaderError> {
+    let invalid = |err: layout::node::LayoutError| lua::LoaderError::InvalidTopology(err.to_string());
     let mut specs = Vec::with_capacity(output.surfaces.len());
     for surface in &output.surfaces {
-        let spec = layout::node::panel_spec(&surface.properties).map_err(|err| lua::LoaderError::InvalidTopology(err.to_string()))?;
-        specs.push(spec);
+        match surface.kind.as_str() {
+            "panel" => specs.push(layout::node::panel_spec(&surface.properties).map_err(invalid)?),
+            // Parsed for its errors, then dropped -- see the second `ponytail:` above.
+            "window" => drop(layout::node::window_spec(&surface.properties).map_err(invalid)?),
+            "popup" => drop(layout::node::popup_spec(&surface.properties).map_err(invalid)?),
+            // Unreachable: `lua::require_surface` admits exactly the three roles above and rejects
+            // everything else, `lock` with its own message. Named rather than left to a silent
+            // `_ => {}`, because that arm would let a fourth role reach a generation unvalidated.
+            other => return Err(lua::LoaderError::InvalidTopology(format!("`{other}` is not a surface role"))),
+        }
     }
     Ok(specs)
 }
@@ -1160,6 +1202,77 @@ mod tests {
         assert!(client.scene.surface("bar@TEST").is_some());
         assert_eq!(client.state.applied_topology.as_ref().map(Vec::len), Some(1));
         assert_eq!(rescue_state(&client.loader), (false, String::new()));
+    }
+
+    /// A `window` and a `popup` both declared alongside the panels, spelled the way
+    /// `dev-config/oblisk/shell.lua` spells them.
+    fn three_roles_config() -> &'static str {
+        r#"return {
+            panel { id = "bar", layer = "Top" },
+            window { id = "settings", title = "Settings", min_size = { width = 320, height = 240 } },
+            popup { id = "menu", parent = "bar", width = 200, height = 120,
+                    anchor_rect = { x = 12, y = 32, width = 86, height = 24 } },
+        }"#
+    }
+
+    #[test]
+    fn a_declared_window_and_popup_survive_the_startup_evaluation_without_becoming_panel_instances() {
+        // The evaluation must parse all three roles (build-steps.md Phase 22) and hand back only
+        // the `panel` specs: `expand_instances` maps a layer surface per declared `(panel, output)`
+        // pair, and a `window` or `popup` that leaked into that list would be bound as one.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), three_roles_config());
+        let (mut client, _outbound_rx) = test_client(&path);
+
+        let specs = client.run_startup_evaluation().expect("all three roles must evaluate");
+
+        assert_eq!(specs.len(), 1, "only the `panel` becomes a layer-surface spec");
+        assert_eq!(specs[0].topology.id, "bar");
+        assert_eq!(rescue_state(&client.loader), (false, String::new()));
+    }
+
+    #[test]
+    fn a_popup_with_a_zero_anchor_rect_fails_the_evaluation_and_names_the_property_in_rescue() {
+        // The reason non-panel roles are parsed at evaluation at all (build-steps.md Phase 22).
+        // § 6.3's `anchor_rect` feeds `xdg_positioner::set_anchor_rect`, and a zero size leaves the
+        // positioner incomplete, which raises `invalid_positioner` at `get_popup` and takes the
+        // whole Wayland connection with it. Phase 20 settled that a config typo is a `LayoutError`
+        // at evaluation, never a protocol error at runtime, so this must land in `rescue`'s
+        // `error_log` (§ 2.10, docs/adr/0046) with the property named.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(
+            dir.path(),
+            r#"return {
+                panel { id = "bar", layer = "Top" },
+                popup { id = "menu", parent = "bar", width = 200, height = 120,
+                        anchor_rect = { x = 0, y = 0, width = 0, height = 0 } },
+            }"#,
+        );
+        let (mut client, _outbound_rx) = test_client(&path);
+
+        assert!(client.run_startup_evaluation().is_none(), "a malformed popup must fail the whole evaluation");
+
+        let (is_rescue, error_log) = rescue_state(&client.loader);
+        assert!(is_rescue);
+        assert!(error_log.contains("anchor_rect"), "the human reading rescue's error_log needs the property named: {error_log}");
+    }
+
+    #[test]
+    fn a_window_whose_max_size_is_below_its_min_size_fails_the_evaluation() {
+        // The `window` half of the same rule: `set_max_size` raises `invalid_size` on a maximum
+        // under the minimum, so `check_max_size_above_min` has to run somewhere a config author
+        // can see it, and evaluation is that place.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(
+            dir.path(),
+            r#"return window { id = "settings", min_size = { width = 800, height = 600 }, max_size = { width = 320, height = 240 } }"#,
+        );
+        let (mut client, _outbound_rx) = test_client(&path);
+
+        assert!(client.run_startup_evaluation().is_none());
+        let (is_rescue, error_log) = rescue_state(&client.loader);
+        assert!(is_rescue);
+        assert!(error_log.contains("max_size"), "{error_log}");
     }
 
     #[test]
