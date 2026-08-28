@@ -319,7 +319,7 @@ impl Scene {
 
 fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
     match kind {
-        "surface" | "rect" | "row" | "column" | "text" | "icon" | "button" | "list" | "textfield" => Ok(()),
+        "panel" | "rect" | "row" | "column" | "text" | "icon" | "button" | "list" | "textfield" => Ok(()),
         other => Err(LayoutError::UnsupportedNodeKind(other.to_string())),
     }
 }
@@ -364,7 +364,7 @@ fn ensure_node_admissible(kind: &str, depth: u32) -> Result<(), LayoutError> {
     Ok(())
 }
 
-/// Dispatches to the right raw property (`child` for `surface`, `children` for the container
+/// Dispatches to the right raw property (`child` for `panel`, `children` for the container
 /// kinds, none for leaves) -- only called after [`ensure_supported_kind`] already validated
 /// `node.kind`, so the fallback arm is unreachable, not a silent default.
 ///
@@ -379,7 +379,7 @@ fn ensure_node_admissible(kind: &str, depth: u32) -> Result<(), LayoutError> {
 /// for the upgrade path).
 fn children_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Vec<VirtualNode>, LayoutError> {
     match kind {
-        "surface" => Ok(node::parse_single_child(properties, "child")?
+        "panel" => Ok(node::parse_single_child(properties, "child")?
             .into_iter()
             .collect()),
         "rect" | "row" | "column" | "button" => node::parse_children(properties),
@@ -428,7 +428,7 @@ fn stretch_forced_size(
             let forced_w = (cross == Align::Stretch && own_width_known.is_some()).then_some(margined_budget.width);
             Ok((forced_w, None))
         }
-        "rect" | "button" | "surface" => {
+        "rect" | "button" | "panel" => {
             let align_h = node::parse_align(child_properties, "align_h")?;
             let align_v = node::parse_align(child_properties, "align_v")?;
             let forced_w = (align_h == Align::Stretch && own_width_known.is_some()).then_some(margined_budget.width);
@@ -810,7 +810,7 @@ fn intrinsic_content_size(
                 .fold(0.0_f32, f32::max);
             Ok(LogicalSize { width, height })
         }
-        // Stacking model (rect-with-children, button, surface): § 3.2 gives no formula for a
+        // Stacking model (rect-with-children, button, panel): § 3.2 gives no formula for a
         // container that isn't row/column -- docs/adr/0023 item 4 documents this as this phase's
         // own interpretation. Content size is the bounding union over independently-positioned
         // children, each inflated by its own margin.
@@ -1023,7 +1023,7 @@ mod tests {
         let signal = crate::lua::signal::Signal::new_live(Value::Integer(40), crate::lua::signal::DirtyFlag::new()).0;
         lua.globals().set("w", signal).unwrap();
         let table: mlua::Table = lua
-            .load(r#"return surface { id = "bar", child = rect { width = w, height = 20 } }"#)
+            .load(r#"return panel { id = "bar", child = rect { width = w, height = 20 } }"#)
             .eval()
             .unwrap();
         let surface = deserialize_lua_table(&table).unwrap();
@@ -1039,7 +1039,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) =
-            surface_from(r#"surface { id = "bar", child = rect { width = 40, height = 20 } }"#);
+            surface_from(r#"panel { id = "bar", child = rect { width = 40, height = 20 } }"#);
         scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let root = scene.surface("bar").unwrap();
         let child = &root.children[0];
@@ -1051,7 +1051,7 @@ mod tests {
     fn a_childless_rect_with_no_explicit_size_resolves_to_zero() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        let (_lua, surface) = surface_from(r#"surface { id = "bar", child = rect {} }"#);
+        let (_lua, surface) = surface_from(r#"panel { id = "bar", child = rect {} }"#);
         scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let child = &scene.surface("bar").unwrap().children[0];
         assert_eq!(child.rect.width, 0.0);
@@ -1063,7 +1063,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", width = 1000, height = 500, child = rect { width = "Fill", height = "Fill" } }"#,
+            r#"panel { id = "bar", width = 1000, height = 500, child = rect { width = "Fill", height = "Fill" } }"#,
         );
         scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let child = &scene.surface("bar").unwrap().children[0];
@@ -1076,7 +1076,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", width = 1000, height = 500, child = rect { width = "50%" } }"#,
+            r#"panel { id = "bar", width = 1000, height = 500, child = rect { width = "50%" } }"#,
         );
         scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let child = &scene.surface("bar").unwrap().children[0];
@@ -1089,7 +1089,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = row { spacing = 5, children = { rect { width = 10, height = 8 }, rect { width = 10, height = 4 } } } }"#,
+            r#"panel { id = "bar", child = row { spacing = 5, children = { rect { width = 10, height = 8 }, rect { width = 10, height = 4 } } } }"#,
         );
         scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let row = &scene.surface("bar").unwrap().children[0];
@@ -1102,7 +1102,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = column { spacing = 3, children = { rect { width = 6, height = 10 }, rect { width = 9, height = 10 } } } }"#,
+            r#"panel { id = "bar", child = column { spacing = 3, children = { rect { width = 6, height = 10 }, rect { width = 9, height = 10 } } } }"#,
         );
         scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let column = &scene.surface("bar").unwrap().children[0];
@@ -1118,7 +1118,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = row { children = { rect { width = 10, height = 10, margin = { left = 4, right = 4 } } } } }"#,
+            r#"panel { id = "bar", child = row { children = { rect { width = 10, height = 10, margin = { left = 4, right = 4 } } } } }"#,
         );
         scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let row = &scene.surface("bar").unwrap().children[0];
@@ -1131,7 +1131,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = row { children = {
+            r#"panel { id = "bar", child = row { children = {
                 rect { width = 10, height = 10, margin = { right = 5 } },
                 rect { width = 10, height = 10 },
             } } }"#,
@@ -1152,7 +1152,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", width = 100, height = 50, child = row { height = "Fill", children = {
+            r#"panel { id = "bar", width = 100, height = 50, child = row { height = "Fill", children = {
                 rect { width = 20, align_v = "Stretch", children = {
                     rect { width = 6, height = 6, align_h = "Center", align_v = "Center" },
                 } },
@@ -1175,7 +1175,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = row { children = { rect { width = 10, height = 10 }, rect { width = 10, height = 10 } } } }"#,
+            r#"panel { id = "bar", child = row { children = { rect { width = 10, height = 10 }, rect { width = 10, height = 10 } } } }"#,
         );
         scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let row = &scene.surface("bar").unwrap().children[0];
@@ -1188,7 +1188,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", width = 100, height = 20, child = row { width = "Fill", align_h = "End", children = { rect { width = 10, height = 10 } } } }"#,
+            r#"panel { id = "bar", width = 100, height = 20, child = row { width = "Fill", align_h = "End", children = { rect { width = 10, height = 10 } } } }"#,
         );
         scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let row = &scene.surface("bar").unwrap().children[0];
@@ -1200,7 +1200,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", width = 100, height = 50, child = row { height = "Fill", children = { rect { width = 10, height = 5, align_v = "Stretch" } } } }"#,
+            r#"panel { id = "bar", width = 100, height = 50, child = row { height = "Fill", children = { rect { width = 10, height = 5, align_v = "Stretch" } } } }"#,
         );
         scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let row = &scene.surface("bar").unwrap().children[0];
@@ -1212,7 +1212,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", width = 100, height = 100, child = rect { width = "Fill", height = "Fill", children = {
+            r#"panel { id = "bar", width = 100, height = 100, child = rect { width = "Fill", height = "Fill", children = {
                 rect { width = 20, height = 20, align_h = "Start", align_v = "Start" },
                 rect { width = 20, height = 20, align_h = "End", align_v = "End" },
             } } }"#,
@@ -1229,7 +1229,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = row { children = {
+            r#"panel { id = "bar", child = row { children = {
                 rect { width = 10, height = 10, visible = false },
                 rect { width = 10, height = 10 },
             } } }"#,
@@ -1256,7 +1256,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = column {
+            r#"panel { id = "bar", child = column {
                 padding = { top = 8, right = 10, bottom = 8, left = 10 },
                 children = { rect { width = 20, height = 20 } },
             } }"#,
@@ -1278,7 +1278,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", padding = { top = 6, right = 6, bottom = 6, left = 6 },
+            r#"panel { id = "bar", padding = { top = 6, right = 6, bottom = 6, left = 6 },
                 child = rect { width = 20, height = 20 } }"#,
         );
         scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
@@ -1294,7 +1294,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = column {
+            r#"panel { id = "bar", child = column {
                 width = 100,
                 padding = { top = 8, right = 10, bottom = 8, left = 10 },
                 children = { rect { width = 20, height = 20 } },
@@ -1311,7 +1311,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) =
-            surface_from(r#"surface { id = "bar", child = text { content = "Oblisk" } }"#);
+            surface_from(r#"panel { id = "bar", child = text { content = "Oblisk" } }"#);
         scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let text = &scene.surface("bar").unwrap().children[0];
         assert!(text.rect.width > 0.0);
@@ -1330,7 +1330,7 @@ mod tests {
         // constructor but rejected by `ensure_supported_kind` (build-steps.md Phase 19 item 12).
         // It is a real kind now, so a raw table naming a kind no constructor registers at all is
         // what "unsupported" actually means going forward.
-        let (_lua, surface) = surface_from(r#"surface { id = "bar", child = { kind = "banana" } }"#);
+        let (_lua, surface) = surface_from(r#"panel { id = "bar", child = { kind = "banana" } }"#);
         let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
         assert!(matches!(err, LayoutError::UnsupportedNodeKind(k) if k == "banana"));
     }
@@ -1340,7 +1340,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) =
-            surface_from(r#"surface { id = "bar", child = row { children = { { kind = "banana" } } } }"#);
+            surface_from(r#"panel { id = "bar", child = row { children = { { kind = "banana" } } } }"#);
         let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
         assert!(matches!(err, LayoutError::UnsupportedNodeKind(k) if k == "banana"));
     }
@@ -1353,7 +1353,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = row { children = { textfield { mask_character = "*", secure_submit = { capability = "polkit", action = "authenticate" } } } } }"#,
+            r#"panel { id = "bar", child = row { children = { textfield { mask_character = "*", secure_submit = { capability = "polkit", action = "authenticate" } } } } }"#,
         );
         scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
 
@@ -1377,7 +1377,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
-            r#"surface { id = "bar", child = row { children = {
+            r#"panel { id = "bar", child = row { children = {
                 rect { width = 10, height = 10 },
                 rect { width = 20, height = 20 },
             } } }"#,
@@ -1404,7 +1404,7 @@ mod tests {
             .load(
                 r#"
                 local bad_width = computed({}, function() error("boom") end)
-                return surface { id = "bar", child = row { children = {
+                return panel { id = "bar", child = row { children = {
                     rect { width = 10, height = 10 },
                     rect { width = bad_width, height = 20 },
                 } } }
@@ -1431,7 +1431,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) =
-            surface_from(r#"surface { id = "bar", child = rect { width = 10, height = 10 } }"#);
+            surface_from(r#"panel { id = "bar", child = rect { width = 10, height = 10 } }"#);
         scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
         let first_id = {
             let key = "bar";
@@ -1439,7 +1439,7 @@ mod tests {
         };
 
         let (_lua2, surface_v2) =
-            surface_from(r#"surface { id = "bar", child = rect { width = 99, height = 99 } }"#);
+            surface_from(r#"panel { id = "bar", child = rect { width = 99, height = 99 } }"#);
         scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
         let second_id = scene.surfaces.get("bar").unwrap().children[0].id;
 
@@ -1459,12 +1459,12 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) =
-            surface_from(r#"surface { id = "bar", child = rect { width = 10, height = 10 } }"#);
+            surface_from(r#"panel { id = "bar", child = rect { width = 10, height = 10 } }"#);
         scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
         assert!(scene.retiring_ids().is_empty());
 
         let (_lua2, surface_v2) =
-            surface_from(r#"surface { id = "bar", child = text { content = "hi" } }"#);
+            surface_from(r#"panel { id = "bar", child = text { content = "hi" } }"#);
         scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
 
         assert_eq!(scene.surface("bar").unwrap().children[0].kind, "text");
@@ -1480,12 +1480,12 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
-            r#"surface { id = "bar", child = row { children = { rect { width = 1, height = 1 }, rect { width = 2, height = 2 } } } }"#,
+            r#"panel { id = "bar", child = row { children = { rect { width = 1, height = 1 }, rect { width = 2, height = 2 } } } }"#,
         );
         scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
 
         let (_lua2, surface_v2) = surface_from(
-            r#"surface { id = "bar", child = row { children = { rect { width = 1, height = 1 } } } }"#,
+            r#"panel { id = "bar", child = row { children = { rect { width = 1, height = 1 } } } }"#,
         );
         scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
 
@@ -1498,7 +1498,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
-            r#"surface { id = "bar", child = row { children = { rect { width = 1, height = 1, children = { rect { width = 1, height = 1 } } } } } }"#,
+            r#"panel { id = "bar", child = row { children = { rect { width = 1, height = 1, children = { rect { width = 1, height = 1 } } } } } }"#,
         );
         scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
         let outer_id = scene.surfaces.get("bar").unwrap().children[0].children[0].id;
@@ -1506,7 +1506,7 @@ mod tests {
 
         // Remove the whole subtree by shrinking the row to zero children.
         let (_lua2, surface_v2) =
-            surface_from(r#"surface { id = "bar", child = row { children = {} } }"#);
+            surface_from(r#"panel { id = "bar", child = row { children = {} } }"#);
         scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
 
         let order = scene.retiring_ids();
@@ -1523,10 +1523,10 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) =
-            surface_from(r#"surface { id = "bar", child = rect { width = 1, height = 1 } }"#);
+            surface_from(r#"panel { id = "bar", child = rect { width = 1, height = 1 } }"#);
         scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
         let (_lua2, surface_v2) =
-            surface_from(r#"surface { id = "bar", child = text { content = "x" } }"#);
+            surface_from(r#"panel { id = "bar", child = text { content = "x" } }"#);
         scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
 
         let id = scene.retiring_ids()[0];
@@ -1557,7 +1557,7 @@ mod tests {
                 r#"
                 local r = rect {}
                 r.children = { r }
-                return surface { id = "bar", child = r }
+                return panel { id = "bar", child = r }
                 "#,
             )
             .eval()
@@ -1591,7 +1591,7 @@ mod tests {
                 deep = computed({}, function()
                     return { rect { width = 1, height = 1, children = deep } }
                 end)
-                return surface { id = "bar", child = rect { children = deep } }
+                return panel { id = "bar", child = rect { children = deep } }
                 "#,
             )
             .eval()
@@ -1612,7 +1612,7 @@ mod tests {
         assert!(capped, "a computed children signal generating fresh depth must be capped, not abort: {err:?}");
     }
 
-    /// A `surface` wrapping `rows` nested `row`s around one `rect`, so the deepest level is
+    /// A `panel` wrapping `rows` nested `row`s around one `rect`, so the deepest level is
     /// `rows + 2`. Built with a Lua loop rather than nested table literals: at these depths the
     /// literal form runs into Lua's own `LUAI_MAXCCALLS` parser nesting limit, which would be
     /// testing the parser rather than this cap.
@@ -1622,7 +1622,7 @@ mod tests {
                 r#"
                 local n = rect {{ width = 1, height = 1 }}
                 for _ = 1, {rows} do n = row {{ children = {{ n }} }} end
-                return surface {{ id = "bar", child = n }}
+                return panel {{ id = "bar", child = n }}
                 "#
             ))
             .eval()
@@ -1640,7 +1640,7 @@ mod tests {
         let lua = mlua::Lua::new();
         register_node_constructors(&lua).unwrap();
 
-        // surface + (deepest - 2) rows + rect == exactly MAX_TREE_DEPTH levels.
+        // panel + (deepest - 2) rows + rect == exactly MAX_TREE_DEPTH levels.
         let mut scene = Scene::new();
         scene.apply(&[surface_nested(&lua, deepest - 2)], full(), &shaping, &lua).unwrap();
 
@@ -1659,7 +1659,7 @@ mod tests {
         // rows/columns runs 10-15 levels deep (MAX_TREE_DEPTH's doc comment), so 20 levels of
         // plain nesting -- well above any real shell.lua -- must still apply cleanly.
         const NESTING: usize = 20;
-        let mut lua_src = String::from(r#"surface { id = "bar", child = "#);
+        let mut lua_src = String::from(r#"panel { id = "bar", child = "#);
         for _ in 0..NESTING {
             lua_src.push_str(r#"row { children = { "#);
         }
@@ -1694,7 +1694,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
-            r#"surface { id = "bar", child = row { children = {
+            r#"panel { id = "bar", child = row { children = {
                 rect { id = "keep", width = 10, height = 10 },
             } } }"#,
         );
@@ -1702,7 +1702,7 @@ mod tests {
         let keep_id_before = scene.surfaces.get("bar").unwrap().children[0].children[0].id;
 
         let (_lua2, surface_v2) = surface_from(
-            r#"surface { id = "bar", child = row { children = {
+            r#"panel { id = "bar", child = row { children = {
                 rect { width = 5, height = 5 },
                 rect { id = "keep", width = 10, height = 10 },
             } } }"#,
@@ -1725,7 +1725,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
-            r#"surface { id = "bar", child = row { children = {
+            r#"panel { id = "bar", child = row { children = {
                 rect { width = 10, height = 10 },
             } } }"#,
         );
@@ -1733,7 +1733,7 @@ mod tests {
         let original_id = scene.surfaces.get("bar").unwrap().children[0].children[0].id;
 
         let (_lua2, surface_v2) = surface_from(
-            r#"surface { id = "bar", child = row { children = {
+            r#"panel { id = "bar", child = row { children = {
                 rect { width = 5, height = 5 },
                 rect { width = 10, height = 10 },
             } } }"#,
@@ -1760,7 +1760,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
-            r#"surface { id = "bar", child = row { children = {
+            r#"panel { id = "bar", child = row { children = {
                 rect { width = 1, height = 1 },
                 rect { id = "anchor", width = 2, height = 2 },
                 rect { width = 3, height = 3 },
@@ -1774,7 +1774,7 @@ mod tests {
         };
 
         let (_lua2, surface_v2) = surface_from(
-            r#"surface { id = "bar", child = row { children = {
+            r#"panel { id = "bar", child = row { children = {
                 rect { width = 1, height = 1 },
                 rect { id = "anchor", width = 2, height = 2 },
                 rect { width = 9, height = 9 },
@@ -1801,7 +1801,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = row { children = {
+            r#"panel { id = "bar", child = row { children = {
                 rect { id = "dup", width = 1, height = 1 },
                 rect { id = "dup", width = 2, height = 2 },
             } } }"#,
@@ -1820,7 +1820,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = row { children = {
+            r#"panel { id = "bar", child = row { children = {
                 column { children = { rect { id = "inner", width = 1, height = 1 } } },
                 column { children = { rect { id = "inner", width = 2, height = 2 } } },
             } } }"#,
@@ -1849,7 +1849,7 @@ mod tests {
         .0;
         lua.globals().set("sig", signal).unwrap();
         let table: mlua::Table = lua
-            .load(r#"return surface { id = "bar", child = rect { id = sig, width = 1, height = 1 } }"#)
+            .load(r#"return panel { id = "bar", child = rect { id = sig, width = 1, height = 1 } }"#)
             .eval()
             .unwrap();
         let surface = deserialize_lua_table(&table).unwrap();
@@ -1869,7 +1869,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
-            r#"surface { id = "bar", child = row { children = {
+            r#"panel { id = "bar", child = row { children = {
                 rect { id = "gone", width = 1, height = 1, children = { rect { width = 1, height = 1 } } },
             } } }"#,
         );
@@ -1880,7 +1880,7 @@ mod tests {
             (outer.id, outer.children[0].id)
         };
 
-        let (_lua2, surface_v2) = surface_from(r#"surface { id = "bar", child = row { children = {} } }"#);
+        let (_lua2, surface_v2) = surface_from(r#"panel { id = "bar", child = row { children = {} } }"#);
         scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
 
         let order = scene.retiring_ids();
@@ -1903,7 +1903,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
-            r#"surface { id = "bar", child = row { children = {
+            r#"panel { id = "bar", child = row { children = {
                 rect { id = "a", width = 1, height = 1 },
                 rect { id = "b", width = 2, height = 2 },
                 rect { id = "c", width = 3, height = 3 },
@@ -1916,7 +1916,7 @@ mod tests {
         };
 
         let (_lua2, surface_v2) = surface_from(
-            r#"surface { id = "bar", child = row { children = {
+            r#"panel { id = "bar", child = row { children = {
                 rect { id = "b", width = 2, height = 2 },
                 rect { id = "c", width = 3, height = 3 },
                 rect { id = "d", width = 4, height = 4 },
@@ -1948,7 +1948,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
-            r#"surface { id = "bar", child = row { children = {
+            r#"panel { id = "bar", child = row { children = {
                 rect { id = "x", width = 1, height = 1 },
                 rect { width = 2, height = 2 },
             } } }"#,
@@ -1960,7 +1960,7 @@ mod tests {
         };
 
         let (_lua2, surface_v2) = surface_from(
-            r#"surface { id = "bar", child = row { children = {
+            r#"panel { id = "bar", child = row { children = {
                 rect { width = 1, height = 1 },
                 rect { width = 2, height = 2 },
             } } }"#,
@@ -1988,12 +1988,12 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) =
-            surface_from(r#"surface { id = "bar", child = row { children = { rect { id = "x", width = 1, height = 1 } } } }"#);
+            surface_from(r#"panel { id = "bar", child = row { children = { rect { id = "x", width = 1, height = 1 } } } }"#);
         scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
         let x_id = scene.surfaces.get("bar").unwrap().children[0].children[0].id;
 
         let (_lua2, surface_v2) =
-            surface_from(r#"surface { id = "bar", child = row { children = { rect { width = 1, height = 1 } } } }"#);
+            surface_from(r#"panel { id = "bar", child = row { children = { rect { width = 1, height = 1 } } } }"#);
         scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
         let row = &scene.surfaces.get("bar").unwrap().children[0].children;
 
@@ -2014,7 +2014,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
-            r#"surface { id = "bar", child = row { children = {
+            r#"panel { id = "bar", child = row { children = {
                 rect { id = "gone", width = 1, height = 1, children = { rect { width = 1, height = 1 } } },
             } } }"#,
         );
@@ -2025,7 +2025,7 @@ mod tests {
         };
 
         let (_lua2, surface_v2) = surface_from(
-            r#"surface { id = "bar", child = row { children = {
+            r#"panel { id = "bar", child = row { children = {
                 rect { id = "other", width = 1, height = 1 },
             } } }"#,
         );
@@ -2062,7 +2062,7 @@ mod tests {
             v1_children.push_str(&format!("rect {{ id = \"n{i}\", width = 1, height = 1 }},\n"));
         }
         let (_lua1, surface_v1) =
-            surface_from(&format!("surface {{ id = \"bar\", child = row {{ children = {{ {v1_children} }} }} }}"));
+            surface_from(&format!("panel {{ id = \"bar\", child = row {{ children = {{ {v1_children} }} }} }}"));
         scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
         let before: Vec<NodeId> = scene.surfaces.get("bar").unwrap().children[0].children.iter().map(|c| c.id).collect();
 
@@ -2074,7 +2074,7 @@ mod tests {
             v2_children.push_str(&format!("rect {{ id = \"n{i}\", width = 1, height = 1 }},\n"));
         }
         let (_lua2, surface_v2) =
-            surface_from(&format!("surface {{ id = \"bar\", child = row {{ children = {{ {v2_children} }} }} }}"));
+            surface_from(&format!("panel {{ id = \"bar\", child = row {{ children = {{ {v2_children} }} }} }}"));
         scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
         let after: Vec<NodeId> = scene.surfaces.get("bar").unwrap().children[0].children.iter().map(|c| c.id).collect();
 
@@ -2097,7 +2097,7 @@ mod tests {
                 r#"
                 reads = 0
                 local m = computed({}, function() reads = reads + 1; return { left = reads } end)
-                return surface { id = "bar", child = row { children = {
+                return panel { id = "bar", child = row { children = {
                     rect { width = 10, height = 10, margin = m },
                 } } }
                 "#,
@@ -2189,7 +2189,7 @@ mod tests {
         let signal = crate::lua::signal::Signal::new_live(Value::String(white), crate::lua::signal::DirtyFlag::new()).0;
         lua.globals().set("bg", signal).unwrap();
         let table: mlua::Table = lua
-            .load(r#"return surface { id = "bar", child = rect { background = bg, width = 4, height = 4 } }"#)
+            .load(r#"return panel { id = "bar", child = rect { background = bg, width = 4, height = 4 } }"#)
             .eval()
             .unwrap();
         let surface = deserialize_lua_table(&table).unwrap();
@@ -2225,7 +2225,7 @@ mod tests {
                 r#"
                 ran = false
                 local w = computed({}, function() ran = true; return 10 end)
-                return surface { id = "bar", child = row { children = {
+                return panel { id = "bar", child = row { children = {
                     { kind = "banana", width = w },
                 } } }
                 "#,
@@ -2273,7 +2273,7 @@ mod tests {
             children: Vec::new(),
         };
         let root = ResolvedNode {
-            kind: "surface".to_string(),
+            kind: "panel".to_string(),
             rect: LogicalRect {
                 x: 0.0,
                 y: 0.0,
@@ -2306,7 +2306,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = list {
+            r#"panel { id = "bar", child = list {
                 source = { 10, 20, 30 },
                 itemfn = function(item) return rect { width = item, height = 5 } end,
             } }"#,
@@ -2330,7 +2330,7 @@ mod tests {
         let itemfn = r#"function(item) return rect { width = item.n, height = 1 } end"#;
         let key = r#"function(item) return item.id end"#;
         let (_lua1, surface_v1) = surface_from(&format!(
-            r#"surface {{ id = "bar", child = list {{
+            r#"panel {{ id = "bar", child = list {{
                 source = {{ {{ id = "a", n = 1 }}, {{ id = "b", n = 2 }}, {{ id = "c", n = 3 }} }},
                 key = {key},
                 itemfn = {itemfn},
@@ -2343,7 +2343,7 @@ mod tests {
         };
 
         let (_lua2, surface_v2) = surface_from(&format!(
-            r#"surface {{ id = "bar", child = list {{
+            r#"panel {{ id = "bar", child = list {{
                 source = {{ {{ id = "z", n = 9 }}, {{ id = "a", n = 1 }}, {{ id = "b", n = 2 }}, {{ id = "c", n = 3 }} }},
                 key = {key},
                 itemfn = {itemfn},
@@ -2373,13 +2373,13 @@ mod tests {
         let shaping = ShapingHandle::spawn();
         let itemfn = r#"function(item) return rect { width = item, height = 1 } end"#;
         let (_lua1, surface_v1) = surface_from(&format!(
-            r#"surface {{ id = "bar", child = list {{ source = {{ 1 }}, itemfn = {itemfn} }} }}"#
+            r#"panel {{ id = "bar", child = list {{ source = {{ 1 }}, itemfn = {itemfn} }} }}"#
         ));
         scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
         let x_id = scene.surfaces.get("bar").unwrap().children[0].children[0].id;
 
         let (_lua2, surface_v2) = surface_from(&format!(
-            r#"surface {{ id = "bar", child = list {{ source = {{ 2, 1 }}, itemfn = {itemfn} }} }}"#
+            r#"panel {{ id = "bar", child = list {{ source = {{ 2, 1 }}, itemfn = {itemfn} }} }}"#
         ));
         scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
         let list = &scene.surfaces.get("bar").unwrap().children[0].children;
@@ -2404,7 +2404,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = list {
+            r#"panel { id = "bar", child = list {
                 source = { { id = "dup" }, { id = "dup" } },
                 key = function(item) return item.id end,
                 itemfn = function(item) return rect { width = 1, height = 1 } end,
@@ -2423,7 +2423,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = list { itemfn = function(item) return rect {} end } }"#,
+            r#"panel { id = "bar", child = list { itemfn = function(item) return rect {} end } }"#,
         );
         let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
         assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "source"), "{err:?}");
@@ -2435,7 +2435,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = list { source = 5, itemfn = function(item) return rect {} end } }"#,
+            r#"panel { id = "bar", child = list { source = 5, itemfn = function(item) return rect {} end } }"#,
         );
         let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
         assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "source"), "{err:?}");
@@ -2445,7 +2445,7 @@ mod tests {
     fn a_list_with_no_itemfn_is_a_layout_error_naming_itemfn() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        let (_lua, surface) = surface_from(r#"surface { id = "bar", child = list { source = { 1 } } }"#);
+        let (_lua, surface) = surface_from(r#"panel { id = "bar", child = list { source = { 1 } } }"#);
         let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
         assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "itemfn"), "{err:?}");
     }
@@ -2455,7 +2455,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) =
-            surface_from(r#"surface { id = "bar", child = list { source = { 1 }, itemfn = "nope" } }"#);
+            surface_from(r#"panel { id = "bar", child = list { source = { 1 }, itemfn = "nope" } }"#);
         let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
         assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "itemfn"), "{err:?}");
     }
@@ -2465,7 +2465,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = list { source = { 1 }, itemfn = function(item) error("boom") end } }"#,
+            r#"panel { id = "bar", child = list { source = { 1 }, itemfn = function(item) error("boom") end } }"#,
         );
         let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
         assert!(
@@ -2479,7 +2479,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = list { source = { 1 }, itemfn = function(item) return 5 end } }"#,
+            r#"panel { id = "bar", child = list { source = { 1 }, itemfn = function(item) return 5 end } }"#,
         );
         let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
         assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "itemfn"), "{err:?}");
@@ -2490,7 +2490,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = list { source = { 1 }, key = "nope", itemfn = function(item) return rect {} end } }"#,
+            r#"panel { id = "bar", child = list { source = { 1 }, key = "nope", itemfn = function(item) return rect {} end } }"#,
         );
         let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
         assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "key"), "{err:?}");
@@ -2501,7 +2501,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = list {
+            r#"panel { id = "bar", child = list {
                 source = { 1 },
                 key = function(item) return 5 end,
                 itemfn = function(item) return rect {} end,
@@ -2516,7 +2516,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = list { source = {}, itemfn = function(item) return rect {} end } }"#,
+            r#"panel { id = "bar", child = list { source = {}, itemfn = function(item) return rect {} end } }"#,
         );
         scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
         let list = &scene.surface("bar").unwrap().children[0];
@@ -2530,7 +2530,7 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
-            r#"surface { id = "bar", child = list {
+            r#"panel { id = "bar", child = list {
                 spacing = 3,
                 source = { 1, 2 },
                 itemfn = function(item) return rect { width = 6, height = 10 } end,

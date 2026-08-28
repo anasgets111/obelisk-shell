@@ -1,5 +1,5 @@
 //! Lua VM bootstrap and the loader (build-steps.md Phase 10; `CONTEXT.md`, Loader): evaluates
-//! `shell.lua` into the top-level `surface` node(s) and their topology, reused for both a
+//! `shell.lua` into the top-level `panel` node(s) and their topology, reused for both a
 //! candidate's first evaluation and the authoritative generation's re-evaluation on an in-place
 //! reload.
 //!
@@ -31,9 +31,9 @@ pub enum LoaderError {
     /// `shell.lua` failed to parse or raised a runtime error while evaluating.
     #[error("shell.lua failed to evaluate: {0}")]
     Eval(#[from] mlua::Error),
-    /// The script evaluated cleanly, but its top-level return wasn't a `surface` node or a
-    /// non-empty array of `surface` nodes (§ 6.1).
-    #[error("shell.lua's top-level return must be a `surface` node or an array of them: {0}")]
+    /// The script evaluated cleanly, but its top-level return wasn't a `panel` node or a
+    /// non-empty array of `panel` nodes (§ 6.1).
+    #[error("shell.lua's top-level return must be a `panel` node or an array of them: {0}")]
     InvalidTopLevelReturn(String),
     /// [`Loader::evaluate_file`] couldn't read `shell.lua` off disk (missing file, permissions).
     #[error("failed to read shell.lua: {0}")]
@@ -53,7 +53,7 @@ impl From<nodes::DeserializeError> for LoaderError {
     }
 }
 
-/// What one `Loader::evaluate` call produces: the top-level `surface` node(s), each still
+/// What one `Loader::evaluate` call produces: the top-level `panel` node(s), each still
 /// carrying its own topology fields (`id`/`layer`/`anchor`/`monitor`/`exclusive`, § 6.1) directly
 /// in its `properties` bag -- readable without walking into `child` (see `nodes.rs`'s doc
 /// comment). This is the cheap-to-diff output Phase 13's Watcher will compare across reloads.
@@ -192,10 +192,10 @@ fn collect_surfaces(value: Value) -> Result<Vec<VirtualNode>, LoaderError> {
 }
 
 fn require_surface(node: &VirtualNode) -> Result<(), LoaderError> {
-    if node.kind == "surface" {
+    if node.kind == "panel" {
         Ok(())
     } else {
-        Err(LoaderError::InvalidTopLevelReturn(format!("top-level node must be `surface`, got `{}`", node.kind)))
+        Err(LoaderError::InvalidTopLevelReturn(format!("top-level node must be `panel`, got `{}`", node.kind)))
     }
 }
 
@@ -220,9 +220,9 @@ mod tests {
     #[test]
     fn evaluate_accepts_a_single_top_level_surface() {
         let loader = Loader::new().unwrap();
-        let output = loader.evaluate(r#"return surface { id = "bar", layer = "Top" }"#).unwrap();
+        let output = loader.evaluate(r#"return panel { id = "bar", layer = "Top" }"#).unwrap();
         assert_eq!(output.surfaces.len(), 1);
-        assert_eq!(output.surfaces[0].kind, "surface");
+        assert_eq!(output.surfaces[0].kind, "panel");
     }
 
     #[test]
@@ -231,11 +231,11 @@ mod tests {
         let (signal, handle) = signal::Signal::new_live(Value::Integer(7), signal::DirtyFlag::new());
         loader.set_global("audio", signal).unwrap();
 
-        let output = loader.evaluate(r#"return surface { id = "bar", layer = "Top", reading = audio:get() }"#).unwrap();
+        let output = loader.evaluate(r#"return panel { id = "bar", layer = "Top", reading = audio:get() }"#).unwrap();
         assert_eq!(output.surfaces[0].properties.get("reading").unwrap().as_integer().unwrap(), 7);
 
         handle.set(Value::Integer(9));
-        let output = loader.evaluate(r#"return surface { id = "bar", layer = "Top", reading = audio:get() }"#).unwrap();
+        let output = loader.evaluate(r#"return panel { id = "bar", layer = "Top", reading = audio:get() }"#).unwrap();
         assert_eq!(output.surfaces[0].properties.get("reading").unwrap().as_integer().unwrap(), 9);
     }
 
@@ -246,7 +246,7 @@ mod tests {
         let value = loader.to_lua_value(&json).unwrap();
         loader.set_global("state", value).unwrap();
 
-        let output = loader.evaluate(r#"return surface { id = "bar", layer = "Top", volume = state.volume, muted = state.muted }"#).unwrap();
+        let output = loader.evaluate(r#"return panel { id = "bar", layer = "Top", volume = state.volume, muted = state.muted }"#).unwrap();
         assert_eq!(output.surfaces[0].properties.get("volume").unwrap().as_f64().unwrap(), 0.5);
         assert_eq!(output.surfaces[0].properties.get("muted").unwrap(), &Value::Boolean(false));
     }
@@ -271,7 +271,7 @@ mod tests {
                 r#"
                 local key_count = 0
                 for _ in pairs(item) do key_count = key_count + 1 end
-                return surface {
+                return panel {
                     id = "bar", layer = "Top",
                     key_count = key_count,
                     path_is_nil = item.icon_path == nil,
@@ -369,7 +369,7 @@ mod tests {
 
         let output = loader
             .evaluate(
-                r#"return surface {
+                r#"return panel {
                     id = "bar", layer = "Top",
                     volume = state.volume, muted = state.muted, label = state.label, second_tag = state.tags[2],
                 }"#,
@@ -391,12 +391,12 @@ mod tests {
     fn evaluate_file_reads_and_evaluates_a_real_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shell.lua");
-        std::fs::write(&path, r#"return surface { id = "bar", layer = "Top" }"#).unwrap();
+        std::fs::write(&path, r#"return panel { id = "bar", layer = "Top" }"#).unwrap();
 
         let loader = Loader::new().unwrap();
         let output = loader.evaluate_file(&path).unwrap();
         assert_eq!(output.surfaces.len(), 1);
-        assert_eq!(output.surfaces[0].kind, "surface");
+        assert_eq!(output.surfaces[0].kind, "panel");
     }
 
     /// A config author reads this string and nothing else when their edit is rejected, so it has
@@ -407,7 +407,7 @@ mod tests {
     fn an_evaluation_error_names_the_config_file_not_this_source_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shell.lua");
-        std::fs::write(&path, "return surface { id = \"bar\" }\nthis is not lua\n").unwrap();
+        std::fs::write(&path, "return panel { id = \"bar\" }\nthis is not lua\n").unwrap();
 
         let loader = Loader::new().unwrap();
         let message = loader.evaluate_file(&path).unwrap_err().to_string();
@@ -435,8 +435,8 @@ mod tests {
             .evaluate(
                 r#"
                 return {
-                    surface { id = "bar" },
-                    surface { id = "overlay" },
+                    panel { id = "bar" },
+                    panel { id = "overlay" },
                 }
                 "#,
             )

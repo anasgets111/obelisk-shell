@@ -12,7 +12,7 @@
 //! Scope ceilings recorded in docs/adr/0023, minus the ones later phases lifted: `list` is an
 //! unsupported node kind (`textfield` became one in Phase 15, and a `Signal` in a geometry
 //! property now resolves rather than being rejected -- docs/adr/0044 decision 1); `rect`/`button`/
-//! `surface` containers use a stacking positioning model with no formula in § 3.2; overlay
+//! `panel` containers use a stacking positioning model with no formula in § 3.2; overlay
 //! input-region computation is pure but not yet wired to a live `wl_surface::set_input_region`
 //! call; the lease/retiring mechanism has no real GPU resource to guard yet.
 

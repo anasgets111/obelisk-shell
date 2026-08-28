@@ -112,13 +112,13 @@ local rescue_cell = cell(label(rescue, function(r)
 end), "#f38ba8ff")
 
 -- Two surfaces, because one surface cannot catch a whole class of bug: the applied-scene log
--- named every surface by its kind (the literal string "surface") until a second one made that
+-- named every surface by its kind (the literal string "panel") until a second one made that
 -- visible, and a candidate that fails to build a scene still gets promoted, which only shows up
 -- when a config is big enough to get wrong. `notification_area` has no `wl_surface` behind it
 -- yet, so it resolves and reconciles without appearing on screen -- Phase 20 item 4 is what
 -- deletes `SurfaceRole` and makes the config's ids the same id space the compositor sees.
 return {
-    surface {
+    panel {
         id = "bar",
         layer = "Top",
         anchor = { top = true, left = true, right = true },
@@ -134,7 +134,7 @@ return {
             children = { clock, net, bt, kbd, media, sound, tray_cell, notifs, rescue_cell },
         },
     },
-    surface {
+    panel {
         id = "notification_area",
         layer = "Overlay",
         anchor = { top = true, right = true },

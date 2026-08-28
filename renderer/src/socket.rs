@@ -701,8 +701,8 @@ fn evaluate_and_topology(loader: &Loader, shell_lua_path: &Path) -> Result<(lua:
 /// visibility only, matching Phase 12's original `apply_to_scene` logging.
 fn log_applied_surfaces(scene: &Scene, output: &lua::LoadOutput) {
     for surface in &output.surfaces {
-        // The `id`, not `surface.kind`. Every surface's kind is the literal string "surface", so
-        // naming the kind here printed `surface "surface"` on every line and told a reader with
+        // The `id`, not `surface.kind`. Every surface's kind is the literal string "panel"
+        // (docs/adr/0040), so naming the kind here printed `surface "panel"` on every line and told a reader with
         // more than one surface nothing about which one they were looking at (found live against
         // dev-config). Splitting the two failure cases apart is the same fix: the old single arm
         // said "has no resolvable `id`" for a surface whose id parsed fine but was missing from
@@ -762,7 +762,7 @@ mod tests {
     /// observe what a prior `set_rescue_state` call actually stored.
     fn rescue_state(loader: &Loader) -> (bool, String) {
         let output = loader
-            .evaluate(r#"return surface { id = "_rescue_probe", layer = "Top", is_rescue = rescue:get().is_rescue, error_log = rescue:get().error_log }"#)
+            .evaluate(r#"return panel { id = "_rescue_probe", layer = "Top", is_rescue = rescue:get().is_rescue, error_log = rescue:get().error_log }"#)
             .unwrap();
         let props = &output.surfaces[0].properties;
         let is_rescue = props.get("is_rescue").unwrap().as_boolean().unwrap();
@@ -801,7 +801,7 @@ mod tests {
         let snapshot = StateSnapshot { capability: "audio".to_string(), revision: 1, payload: serde_json::json!({ "app_name": "Zen" }) };
         client.apply_state_snapshot(snapshot).unwrap();
 
-        let output = client.loader.evaluate(r#"return surface { id = "bar", layer = "Top", app_name = audio:get().app_name }"#).unwrap();
+        let output = client.loader.evaluate(r#"return panel { id = "bar", layer = "Top", app_name = audio:get().app_name }"#).unwrap();
         let app_name = output.surfaces[0].properties.get("app_name").unwrap().as_string().unwrap().to_string_lossy();
         assert_eq!(app_name, "Zen");
     }
@@ -818,7 +818,7 @@ mod tests {
         let snapshot = StateSnapshot { capability: "workspace".to_string(), revision: 1, payload: serde_json::json!({ "active": 2 }) };
         client.apply_state_snapshot(snapshot).unwrap();
 
-        let output = client.loader.evaluate(r#"return surface { id = "bar", layer = "Top", active = workspace:get().active }"#).unwrap();
+        let output = client.loader.evaluate(r#"return panel { id = "bar", layer = "Top", active = workspace:get().active }"#).unwrap();
         assert_eq!(output.surfaces[0].properties.get("active").unwrap().as_integer(), Some(2));
     }
 
@@ -832,7 +832,7 @@ mod tests {
         let (client, _outbound_rx) = test_client(&missing);
 
         for capability in shared::CAPABILITIES {
-            let probe = format!(r#"return surface {{ id = "bar", layer = "Top", is_nil = {capability}:get() == nil }}"#);
+            let probe = format!(r#"return panel {{ id = "bar", layer = "Top", is_nil = {capability}:get() == nil }}"#);
             let output = client.loader.evaluate(&probe).unwrap_or_else(|err| panic!("rostered capability {capability:?} has no live global: {err}"));
             assert_eq!(output.surfaces[0].properties.get("is_nil").unwrap().as_boolean(), Some(true), "{capability} should read nil before its first snapshot");
         }
@@ -850,7 +850,7 @@ mod tests {
             .apply_state_snapshot(StateSnapshot { capability: "network".to_string(), revision: 2, payload: serde_json::json!({ "scanning": false }) })
             .unwrap();
 
-        let output = client.loader.evaluate(r#"return surface { id = "bar", layer = "Top", scanning = network:get().scanning }"#).unwrap();
+        let output = client.loader.evaluate(r#"return panel { id = "bar", layer = "Top", scanning = network:get().scanning }"#).unwrap();
         assert_eq!(
             output.surfaces[0].properties.get("scanning").unwrap().as_boolean(),
             Some(false),
@@ -861,7 +861,7 @@ mod tests {
     #[test]
     fn run_startup_evaluation_applies_a_valid_file_and_clears_rescue() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top" }"#);
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, _outbound_rx) = test_client(&path);
 
         client.run_startup_evaluation();
@@ -898,7 +898,7 @@ mod tests {
         client.run_startup_evaluation();
         assert!(client.state.applied_topology.is_none(), "startup must have failed (no file yet)");
 
-        write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top" }"#);
+        write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         client.handle_reevaluate(ReevaluateRequest { sequence: 1 });
 
         assert_eq!(
@@ -912,7 +912,7 @@ mod tests {
     #[test]
     fn handle_reevaluate_reports_unchanged_and_stores_pending_when_topology_matches() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top" }"#);
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
         client.state.applied_topology = Some(surfaces_topology(&client.loader.evaluate_file(&path).unwrap()).unwrap());
 
@@ -925,7 +925,7 @@ mod tests {
     #[test]
     fn handle_reevaluate_reports_topology_changed_and_does_not_store_pending() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top" }"#);
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
         // Seed a *different* applied topology (a different id) so the fresh evaluation reads as changed.
         client.state.applied_topology =
@@ -962,9 +962,9 @@ mod tests {
     fn handle_reevaluate_reports_a_topology_field_error_distinctly_from_a_top_level_return_error() {
         // Regression test for a minor correctness finding: a topology-field type error (e.g.
         // `anchor.top` not a boolean) used to be folded into `InvalidTopLevelReturn`'s fixed
-        // "must be a `surface` node or an array of them" message, which is wrong for this case.
+        // "must be a `panel` node or an array of them" message, which is wrong for this case.
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top", anchor = { top = "yes" } }"#);
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", anchor = { top = "yes" } }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
 
         client.handle_reevaluate(ReevaluateRequest { sequence: 1 });
@@ -981,7 +981,7 @@ mod tests {
     #[test]
     fn handle_apply_pending_reconciles_the_pending_evaluation_into_the_scene() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top" }"#);
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, _outbound_rx) = test_client(&path);
         let (output, topology) = evaluate_and_topology(&client.loader, &path).unwrap();
         client.state.pending = Some((3, output, topology));
@@ -996,7 +996,7 @@ mod tests {
     #[test]
     fn handle_apply_pending_ignores_a_mismatched_sequence() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top" }"#);
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, _outbound_rx) = test_client(&path);
         let (output, topology) = evaluate_and_topology(&client.loader, &path).unwrap();
         client.state.pending = Some((3, output, topology));
@@ -1029,7 +1029,7 @@ mod tests {
     #[test]
     fn re_resolve_if_dirty_applies_a_pushed_value_without_reading_shell_lua_again() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top", visible = workspace }"#);
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", visible = workspace }"#);
         let (mut client, _outbound_rx) = test_client(&path);
         client
             .apply_state_snapshot(StateSnapshot { capability: "workspace".to_string(), revision: 1, payload: serde_json::json!(true) })
@@ -1058,7 +1058,7 @@ mod tests {
     #[test]
     fn re_resolve_if_dirty_clears_the_flag_and_a_second_call_does_no_work() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top", visible = workspace }"#);
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", visible = workspace }"#);
         let (mut client, _outbound_rx) = test_client(&path);
         client
             .apply_state_snapshot(StateSnapshot { capability: "workspace".to_string(), revision: 1, payload: serde_json::json!(true) })
@@ -1076,7 +1076,7 @@ mod tests {
         // with an evaluation that resolves `visible` to `true`. If a second `re_resolve_if_dirty`
         // call did any work at all, this would be visible; a true no-op leaves the scene exactly
         // as the first resolve left it.
-        let poisoned_path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top", visible = true }"#);
+        let poisoned_path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", visible = true }"#);
         let (poisoned_output, _) = evaluate_and_topology(&client.loader, &poisoned_path).unwrap();
         client.state.applied_output = Some(poisoned_output);
 
@@ -1110,7 +1110,7 @@ mod tests {
     #[test]
     fn a_push_that_makes_a_property_invalid_keeps_the_prior_scene_and_does_not_enter_rescue() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top", visible = workspace }"#);
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", visible = workspace }"#);
         let (mut client, _outbound_rx) = test_client(&path);
         client
             .apply_state_snapshot(StateSnapshot { capability: "workspace".to_string(), revision: 1, payload: serde_json::json!(true) })
@@ -1151,7 +1151,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),
-            r#"return surface { id = "bar", layer = "Top", visible = audio, child = rect { width = network, height = 10, children = tray } }"#,
+            r#"return panel { id = "bar", layer = "Top", visible = audio, child = rect { width = network, height = 10, children = tray } }"#,
         );
         let (mut client, _outbound_rx) = test_client(&path);
 
@@ -1170,7 +1170,7 @@ mod tests {
         // though `title` still reads `nil` here, same as the sibling test above for `visible` and
         // `children`. Before item 6, `content` had no default and this rejected the whole tree.
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top", child = text { content = audio } }"#);
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", child = text { content = audio } }"#);
         let (mut client, _outbound_rx) = test_client(&path);
 
         client.run_startup_evaluation();
@@ -1215,7 +1215,7 @@ mod tests {
         let path = write_shell_lua(
             dir.path(),
             r#"
-            return surface { id = "bar", layer = "Top", child = row { children = computed({audio}, function(n)
+            return panel { id = "bar", layer = "Top", child = row { children = computed({audio}, function(n)
                 if n == 3 then
                     return { rect { width = 1, height = 1 }, rect { width = 1, height = 1 }, rect { width = 1, height = 1 } }
                 end
@@ -1250,7 +1250,7 @@ mod tests {
         // clear. The first poll turn then redid a whole `Scene::apply` -- retained-tree clone,
         // full walk, a blocking shaping round trip per text node -- for nothing.
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top", child = text { content = "hi" } }"#);
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", child = text { content = "hi" } }"#);
         let (mut client, _outbound_rx) = test_client(&path);
 
         client.run_startup_evaluation();
@@ -1266,7 +1266,7 @@ mod tests {
         // no-op `set_rescue_state(false, "")` on the success path left the flag set, so the next
         // poll turn re-applied `applied_output` to a scene the verdict says must not be mutated.
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top" }"#);
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
         client.state.applied_topology =
             Some(vec![SurfaceTopology { id: "other".to_string(), layer: "Top".to_string(), anchor: Default::default(), monitor: "All".to_string() }]);
@@ -1280,7 +1280,7 @@ mod tests {
     #[test]
     fn handle_frame_answers_a_reevaluate_frame_with_a_report() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top" }"#);
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
         // A different applied topology so the fresh evaluation reads as changed -- proves the
         // dispatch/queue path, not `handle_reevaluate`'s own classification logic (already
@@ -1298,7 +1298,7 @@ mod tests {
         // The one frame `handle_frame` can't service itself: drawing needs `wayland::App`'s EGL
         // and surface state, so the nonce goes back to the caller for `App::activate_draw`.
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top" }"#);
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, _outbound_rx) = test_client(&path);
 
         assert_eq!(client.handle_frame(SupervisorFrame::ActivateDraw(ActivateDraw { nonce: 42 })), Some(42));
@@ -1307,7 +1307,7 @@ mod tests {
     #[test]
     fn handle_frame_logs_and_continues_on_deselect_input_and_promote_generation() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top" }"#);
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
 
         assert_eq!(client.handle_frame(SupervisorFrame::DeselectInput(DeselectInput { surface_id: "main_bar".to_string() })), None);
@@ -1325,7 +1325,7 @@ mod tests {
     #[test]
     fn handle_frame_routes_process_output_and_exit_frames_to_the_registered_lua_callbacks() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top" }"#);
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, _outbound_rx) = test_client(&path);
         // Register real out_cb/exit_cb through the real process.run global, exactly as
         // `renderer/src/lua/process.rs`'s own tests do -- the id (0, the first call on a fresh
@@ -1335,7 +1335,7 @@ mod tests {
             .evaluate(
                 r#"
                 process.run("cmd", {}, function(line, stream) probe_line = line; probe_stream = stream end, function(code) probe_code = code end)
-                return surface { id = "bar", layer = "Top" }
+                return panel { id = "bar", layer = "Top" }
                 "#,
             )
             .unwrap();
@@ -1346,7 +1346,7 @@ mod tests {
 
         let output = client
             .loader
-            .evaluate(r#"return surface { id = "bar", layer = "Top", line = probe_line, stream = probe_stream, code = probe_code }"#)
+            .evaluate(r#"return panel { id = "bar", layer = "Top", line = probe_line, stream = probe_stream, code = probe_code }"#)
             .unwrap();
         let props = &output.surfaces[0].properties;
         assert_eq!(props.get("line").unwrap().as_string().unwrap().to_string_lossy(), "hello");

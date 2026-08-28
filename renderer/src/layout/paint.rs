@@ -105,9 +105,9 @@ fn paint_node(painter: &mut TextPainter, node: &ResolvedNode, origin_x: f32, ori
 
     match node.kind.as_str() {
         // `oblisk-idl-api-specs.md` § 5.2: row/column/button have no paint properties of their
-        // own beyond the base `rect` ones they share the property table with, and a surface's
+        // own beyond the base `rect` ones they share the property table with, and a panel's
         // own root paints exactly like a rect -- one code path serves all five.
-        "rect" | "row" | "column" | "button" | "surface" => paint_box(painter.canvas_mut(), &node.kind, &node.properties, rect, scale),
+        "rect" | "row" | "column" | "button" | "panel" => paint_box(painter.canvas_mut(), &node.kind, &node.properties, rect, scale),
         "text" => paint_text(painter, &node.properties, rect, scale),
         // Deferred (build-steps.md Phase 19, "Also deferred: icon"): § 5.2 item 5's theme-name
         // `icon.name` and `oblisk-supervisor-services-dbus.md` § 9.2's path-taking
@@ -157,7 +157,7 @@ fn log_paint_error(kind: &str, property: &str, err: &LayoutError) {
     eprintln!("[oblisk-renderer] paint: {kind}.{property}: {err}");
 }
 
-/// `rect`/`row`/`column`/`button`/`surface`'s shared paint: background fill, then borders
+/// `rect`/`row`/`column`/`button`/`panel`'s shared paint: background fill, then borders
 /// (`oblisk-idl-api-specs.md` § 5.2 item 1).
 fn paint_box(canvas: &mut Canvas<OpenGl>, kind: &str, properties: &HashMap<String, Value>, rect: LogicalRect, scale: f32) {
     let radius = match node::parse_radius(properties) {
@@ -513,13 +513,13 @@ mod tests {
         let shaping = ShapingHandle::spawn();
         let Some(mut painter) = text_painter(&instance, &shaping, 64, 64) else { return };
 
-        // `surface`/the child both need an explicit size: an unsized `surface` is Content-sized
+        // `panel`/the child both need an explicit size: an unsized `panel` is Content-sized
         // (docs/adr/0023 item 4's stacking model), which collapses to its *children's* bounding
         // box, not `available` -- and an unsized childless `rect` is `LogicalSize::default()`,
         // zero -- so leaving either implicit would size this whole fixture to 0x0.
         let root = resolved_surface(
             &lua,
-            r##"return surface { id = "bar", width = 64, height = 64, child = rect { width = "Fill", height = "Fill", background = "#FF0000FF" } }"##,
+            r##"return panel { id = "bar", width = 64, height = 64, child = rect { width = "Fill", height = "Fill", background = "#FF0000FF" } }"##,
             LogicalSize { width: 64.0, height: 64.0 },
         );
         paint_tree(&mut painter, &root, 1.0);
@@ -539,7 +539,7 @@ mod tests {
 
         let root = resolved_surface(
             &lua,
-            r##"return surface { id = "bar", width = 64, height = 64, child = rect { width = "Fill", height = "Fill", background = "#0000FFFF", children = {
+            r##"return panel { id = "bar", width = 64, height = 64, child = rect { width = "Fill", height = "Fill", background = "#0000FFFF", children = {
                 rect { background = "#00FF00FF", width = 20, height = 20 },
             } } }"##,
             LogicalSize { width: 64.0, height: 64.0 },
@@ -575,7 +575,7 @@ mod tests {
 
         let root = resolved_surface(
             &lua,
-            r##"return surface { id = "bar", width = 64, height = 64, padding = { top = 5, left = 5 }, child = rect {
+            r##"return panel { id = "bar", width = 64, height = 64, padding = { top = 5, left = 5 }, child = rect {
                 width = 50, height = 50, background = "#0000FFFF", padding = { top = 15, left = 15 },
                 children = { rect { background = "#00FF00FF", width = 10, height = 10 } },
             } }"##,
@@ -602,7 +602,7 @@ mod tests {
 
         let root = resolved_surface(
             &lua,
-            r##"return surface { id = "bar", width = 64, height = 64, child = rect {
+            r##"return panel { id = "bar", width = 64, height = 64, child = rect {
                 width = 40, height = 40, background = "#000000FF",
                 border_width = { top = 4, bottom = 4 },
                 border_color = { top = "#FFFFFFFF" },
@@ -628,14 +628,14 @@ mod tests {
         let shaping = ShapingHandle::spawn();
         let Some(mut painter) = text_painter(&instance, &shaping, 120, 40) else { return };
 
-        // `rect` and `surface` both need an explicit size here, same reason as the first test:
+        // `rect` and `panel` both need an explicit size here, same reason as the first test:
         // an unsized `rect` with a `text` child takes the stacking model's bounding-union size
         // (docs/adr/0023 item 4), which would leave everything outside that (possibly small) box
         // unpainted, and the scan below would be reading undefined pbuffer content rather than the
         // rect's own deterministic black background.
         let root = resolved_surface(
             &lua,
-            r##"return surface { id = "bar", width = 120, height = 40, child = rect { width = "Fill", height = "Fill", background = "#000000FF", children = {
+            r##"return panel { id = "bar", width = 120, height = 40, child = rect { width = "Fill", height = "Fill", background = "#000000FF", children = {
                 text { content = "Oblisk", font_size = 24, foreground = "#00FF00FF" },
             } } }"##,
             LogicalSize { width: 120.0, height: 40.0 },
@@ -683,7 +683,7 @@ mod tests {
         // leaked outside the rect's box would show up as white on the surface's red.
         let root = resolved_surface(
             &lua,
-            r##"return surface { id = "bar", width = 64, height = 64, background = "#FF0000FF", padding = { top = 10, left = 10 }, child = rect {
+            r##"return panel { id = "bar", width = 64, height = 64, background = "#FF0000FF", padding = { top = 10, left = 10 }, child = rect {
                 width = 40, height = 40, background = "#000000FF",
                 radius = 8, border_width = 4, border_color = "#FFFFFFFF",
             } }"##,
@@ -776,7 +776,7 @@ mod tests {
         // the surface's own blue background the scan below asserts on.
         let root = resolved_surface(
             &lua,
-            r##"return surface { id = "bar", width = 200, height = 50, background = "#0000FFFF", child = rect {
+            r##"return panel { id = "bar", width = 200, height = 50, background = "#0000FFFF", child = rect {
                 width = 40, height = 50, background = "#000000FF", children = {
                     text { content = "Oblisk Shell Renderer Overflow", font_size = 24, foreground = "#FFFFFFFF" },
                 } } }"##,
@@ -818,7 +818,7 @@ mod tests {
 
         let root = resolved_surface(
             &lua,
-            r##"return surface { id = "bar", width = 64, height = 64, background = "#FF0000FF", padding = { top = 10.3 }, child = rect {
+            r##"return panel { id = "bar", width = 64, height = 64, background = "#FF0000FF", padding = { top = 10.3 }, child = rect {
                 width = 30, height = 20, background = "#000000FF",
                 border_width = { top = 1 }, border_color = { top = "#FFFFFFFF" },
             } }"##,
@@ -863,7 +863,7 @@ mod tests {
 
         let root = resolved_surface(
             &lua,
-            r##"return surface { id = "bar", width = 64, height = 64, background = "#FF0000FF", padding = { top = 31.3 }, child = rect {
+            r##"return panel { id = "bar", width = 64, height = 64, background = "#FF0000FF", padding = { top = 31.3 }, child = rect {
                 width = 30, height = 20, background = "#000000FF",
                 border_width = { top = 4 }, border_color = { top = "#FFFFFFFF" },
             } }"##,
@@ -902,7 +902,7 @@ mod tests {
 
         let root = resolved_surface(
             &lua,
-            r##"return surface { id = "bar", width = 64, height = 64, background = "#FF0000FF", padding = { top = 10, left = 10.3 }, child = rect {
+            r##"return panel { id = "bar", width = 64, height = 64, background = "#FF0000FF", padding = { top = 10, left = 10.3 }, child = rect {
                 width = 40, height = 40, background = "#000000FF",
                 radius = 8, border_width = 4, border_color = "#FFFFFFFF",
             } }"##,
@@ -941,7 +941,7 @@ mod tests {
         // outside the parent's (10, 10)..(40, 40) box.
         let root = resolved_surface(
             &lua,
-            r##"return surface { id = "bar", width = 80, height = 80, background = "#FF00FFFF", padding = { top = 10, left = 10 }, child = rect {
+            r##"return panel { id = "bar", width = 80, height = 80, background = "#FF00FFFF", padding = { top = 10, left = 10 }, child = rect {
                 width = 30, height = 30, background = "#000000FF", children = {
                     rect { background = "#00FF00FF", width = 60, height = 60 },
                 } } }"##,

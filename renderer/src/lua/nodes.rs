@@ -16,8 +16,9 @@ use std::collections::HashMap;
 
 use mlua::{Lua, Table, Value};
 
-/// § 5.2's eight geometric nodes plus § 6.1's top-level `surface`.
-const NODE_KINDS: [&str; 9] = ["rect", "row", "column", "text", "icon", "button", "list", "textfield", "surface"];
+/// § 5.2's eight geometric nodes plus § 6.1's top-level `panel` (ADR-0040: `panel` is the
+/// layer-shell surface role; "surface" is the umbrella term covering all four roles).
+const NODE_KINDS: [&str; 9] = ["rect", "row", "column", "text", "icon", "button", "list", "textfield", "panel"];
 
 /// A Lua node table, tagged with its constructor's `kind` and carrying every other prop
 /// untouched. Not the final in-memory scene node -- see the module doc comment.
@@ -37,7 +38,7 @@ pub enum DeserializeError {
     KindNotAString,
 }
 
-/// Registers `rect`/`row`/`column`/`text`/`icon`/`button`/`list`/`textfield`/`surface` as
+/// Registers `rect`/`row`/`column`/`text`/`icon`/`button`/`list`/`textfield`/`panel` as
 /// Lua-callable sugar: each takes the props table Lua passed and tags it with `kind`, matching
 /// `docs/oblisk-tdd-test-harness.md` § 4.1's own worked example ("Echo table structure back to
 /// Rust").
@@ -128,7 +129,7 @@ mod tests {
     fn deserialize_lua_table_leaves_a_nested_child_table_unconverted() {
         let lua = lua_with_constructors();
         let table: Table = lua
-            .load(r##"return surface { id = "bar", layer = "Top", child = rect { background = "#000000" } }"##)
+            .load(r##"return panel { id = "bar", layer = "Top", child = rect { background = "#000000" } }"##)
             .eval()
             .unwrap();
 

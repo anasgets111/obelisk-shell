@@ -296,7 +296,7 @@ fn parse_hex_color(property: &str, s: &str) -> Result<Rgba, LayoutError> {
 /// hands to the paint stage, which is told it may read a colour or a radius off the map directly.
 /// Below a surface these three are ordinary properties and resolve like any other.
 fn is_structural_property(kind: &str, property: &str) -> bool {
-    property == "id" || (kind == "surface" && matches!(property, "layer" | "anchor" | "monitor"))
+    property == "id" || (kind == "panel" && matches!(property, "layer" | "anchor" | "monitor"))
 }
 
 /// One node's raw property map with every `Signal` replaced by its current value (build-steps.md
@@ -1012,7 +1012,7 @@ pub fn surface_topology(properties: &HashMap<String, Value>) -> Result<SurfaceTo
     })
 }
 
-/// A single-node property (`surface.child`), converted from its raw table via
+/// A single-node property (`panel.child`), converted from its raw table via
 /// `lua::nodes::deserialize_lua_table` -- not re-implemented here.
 pub fn parse_single_child(
     properties: &HashMap<String, Value>,
@@ -1528,7 +1528,7 @@ mod tests {
         assert!(parse_visible(&props_with_nil_signal(&lua, "rect", "visible")).unwrap());
         assert_eq!(parse_spacing(&props_with_nil_signal(&lua, "row", "spacing")).unwrap(), 0.0);
         assert_eq!(parse_font_size(&props_with_nil_signal(&lua, "text", "font_size")).unwrap(), 12.0);
-        assert!(parse_single_child(&props_with_nil_signal(&lua, "surface", "child"), "child").unwrap().is_none());
+        assert!(parse_single_child(&props_with_nil_signal(&lua, "panel", "child"), "child").unwrap().is_none());
         assert!(parse_children(&props_with_nil_signal(&lua, "row", "children")).unwrap().is_empty());
         // `content` and `size` joined this list under docs/adr/0044's amendment banner: they used
         // to be the two properties this rule could not cover, because each was required and had no
@@ -1630,7 +1630,7 @@ mod tests {
     fn parse_single_child_converts_the_child_table() {
         let lua = lua();
         let table: mlua::Table = lua
-            .load(r#"return { kind = "surface", child = { kind = "rect" } }"#)
+            .load(r#"return { kind = "panel", child = { kind = "rect" } }"#)
             .eval()
             .unwrap();
         let props = props_from_table(&table);
@@ -1653,7 +1653,7 @@ mod tests {
     #[test]
     fn layer_reads_the_string() {
         let lua = lua();
-        let table: mlua::Table = lua.load(r#"return { kind = "surface", layer = "Top" }"#).eval().unwrap();
+        let table: mlua::Table = lua.load(r#"return { kind = "panel", layer = "Top" }"#).eval().unwrap();
         let props = props_from_table(&table);
         assert_eq!(parse_layer(&props).unwrap(), "Top");
     }
@@ -1667,7 +1667,7 @@ mod tests {
     #[test]
     fn anchor_reads_named_edges_defaulting_absent_ones_to_false() {
         let lua = lua();
-        let table: mlua::Table = lua.load(r#"return { kind = "surface", anchor = { top = true, left = true } }"#).eval().unwrap();
+        let table: mlua::Table = lua.load(r#"return { kind = "panel", anchor = { top = true, left = true } }"#).eval().unwrap();
         let props = props_from_table(&table);
         assert_eq!(parse_anchor(&props).unwrap(), Anchor { top: true, right: false, bottom: false, left: true });
     }
@@ -1681,7 +1681,7 @@ mod tests {
     #[test]
     fn monitor_reads_the_string() {
         let lua = lua();
-        let table: mlua::Table = lua.load(r#"return { kind = "surface", monitor = "eDP-1" }"#).eval().unwrap();
+        let table: mlua::Table = lua.load(r#"return { kind = "panel", monitor = "eDP-1" }"#).eval().unwrap();
         let props = props_from_table(&table);
         assert_eq!(parse_monitor(&props).unwrap(), "eDP-1");
     }
@@ -1690,7 +1690,7 @@ mod tests {
     fn surface_topology_combines_id_layer_anchor_and_monitor() {
         let lua = lua();
         let table: mlua::Table = lua
-            .load(r#"return { kind = "surface", id = "bar", layer = "Top", anchor = { top = true }, monitor = "eDP-1" }"#)
+            .load(r#"return { kind = "panel", id = "bar", layer = "Top", anchor = { top = true }, monitor = "eDP-1" }"#)
             .eval()
             .unwrap();
         let props = props_from_table(&table);
@@ -1792,14 +1792,14 @@ mod tests {
         crate::lua::signal::register(&lua).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::Boolean(true), crate::lua::signal::DirtyFlag::new()).0;
         let table = lua.create_table().unwrap();
-        table.set("kind", "surface").unwrap();
+        table.set("kind", "panel").unwrap();
         table.set("layer", signal).unwrap();
         let node = deserialize_lua_table(&table).unwrap();
         assert!(matches!(parse_layer(&node.properties).unwrap_err(), LayoutError::UnsupportedSignalProperty(p) if p == "layer"));
     }
 
     #[test]
-    fn a_signal_in_layer_on_a_non_surface_node_resolves_instead_of_surviving_as_a_handle() {
+    fn a_signal_in_layer_on_a_non_panel_node_resolves_instead_of_surviving_as_a_handle() {
         // The skip list is kind-aware because `layer`/`anchor`/`monitor` are only ever parsed by
         // `surface_topology`, which `layout::scene`'s `Scene::apply_one_surface` calls on top-level
         // surfaces alone. Skipped unconditionally, a `rect { layer = someSignal }` copied the raw
@@ -1826,20 +1826,20 @@ mod tests {
     }
 
     #[test]
-    fn a_signal_in_layer_on_a_surface_still_survives_raw_for_parse_layer_to_reject() {
-        // The other half of kind-awareness: on a `surface`, `parse_layer` does run and does the
+    fn a_signal_in_layer_on_a_panel_still_survives_raw_for_parse_layer_to_reject() {
+        // The other half of kind-awareness: on a `panel`, `parse_layer` does run and does the
         // rejecting, so the skip is still what makes that rejection reachable.
         let lua = lua();
         crate::lua::signal::register(&lua).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::Boolean(true), crate::lua::signal::DirtyFlag::new()).0;
         let table = lua.create_table().unwrap();
-        table.set("kind", "surface").unwrap();
+        table.set("kind", "panel").unwrap();
         table.set("layer", signal).unwrap();
         let node = deserialize_lua_table(&table).unwrap();
 
-        let resolved = resolve_properties(&node.properties, "surface", &lua).unwrap();
+        let resolved = resolve_properties(&node.properties, "panel", &lua).unwrap();
 
-        assert!(matches!(resolved.get("layer"), Some(Value::UserData(_))), "layer must survive the resolve step unresolved on a surface");
+        assert!(matches!(resolved.get("layer"), Some(Value::UserData(_))), "layer must survive the resolve step unresolved on a panel");
         assert!(matches!(parse_layer(&resolved).unwrap_err(), LayoutError::UnsupportedSignalProperty(p) if p == "layer"));
     }
 
