@@ -16,7 +16,7 @@
 //! doesn't literally pin this calling convention down, and passing already-unwrapped values means
 //! every `computed` body doesn't have to redundantly call `:get()` on each of its own dependencies.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -114,9 +114,15 @@ impl Signal {
     /// arrives already `serde_json`-serialized from a Rust struct (e.g. `AppStream`), which can't
     /// produce a NaN/Inf/oversized string the way hand-authored Lua can. `try_new_direct` guards
     /// Lua-authored values crossing into Rust; this is a value Rust itself produced.
-    pub fn new_live(initial: Value) -> (Self, LiveSignalHandle) {
+    ///
+    /// `dirty` is the scene-dirty flag (ADR-0044 decision 2) the paired [`LiveSignalHandle`]
+    /// marks on every `set`. Every live signal in one generation shares the same `DirtyFlag`
+    /// (`renderer/src/socket.rs`'s `RendererClient` holds the clone that reads and clears it),
+    /// because decision 2's "one flag for the whole scene" means there is exactly one to share,
+    /// not one per capability.
+    pub fn new_live(initial: Value, dirty: DirtyFlag) -> (Self, LiveSignalHandle) {
         let cell = Rc::new(RefCell::new(initial));
-        (Signal(SignalKind::Live(Rc::clone(&cell))), LiveSignalHandle(cell))
+        (Signal(SignalKind::Live(Rc::clone(&cell))), LiveSignalHandle(cell, dirty))
     }
 
     /// Reads this signal's current value (ADR-0044 decision 1, `CONTEXT.md`'s Signal resolution
@@ -170,11 +176,54 @@ impl Signal {
 /// (Lua-side) always reads whatever was last set here -- no memoization, matching every other
 /// `Signal` kind in this file.
 #[derive(Clone)]
-pub struct LiveSignalHandle(Rc<RefCell<Value>>);
+pub struct LiveSignalHandle(Rc<RefCell<Value>>, DirtyFlag);
 
 impl LiveSignalHandle {
+    /// Writes `value` and marks the shared scene dirty (ADR-0044 decision 2, `CONTEXT.md`'s
+    /// Dirty scene entry): every push, not just this capability's own next read, has to make the
+    /// next poll turn re-resolve the whole scene, since decision 3 rejects a per-signal
+    /// dependency graph that could narrow that down.
     pub fn set(&self, value: Value) {
         *self.0.borrow_mut() = value;
+        self.1.mark();
+    }
+}
+
+/// The one scene-dirty flag ADR-0044 decision 2 specifies: a single `bool`, shared by every
+/// [`LiveSignalHandle`] in a generation and by the `RendererClient` that reads and clears it, not
+/// a per-signal or per-surface set. `Rc<Cell<bool>>`, not `Arc<AtomicBool>`: this lives entirely
+/// on the Wayland dispatch thread (docs/adr/0039), the same single-threaded-state reasoning
+/// `SignalKind::Live`'s `Rc<RefCell<Value>>` documents above.
+///
+/// `ponytail:` one flag for the whole scene means any push re-resolves every surface, including
+/// one that reads nothing from the capability that changed. The upgrade path is a per-surface
+/// flag keyed on which signals a surface actually reads, which needs read-tracking that doesn't
+/// exist yet (ADR-0044 decision 2's own ceiling).
+#[derive(Clone)]
+pub struct DirtyFlag(Rc<Cell<bool>>);
+
+impl DirtyFlag {
+    pub fn new() -> Self {
+        Self(Rc::new(Cell::new(false)))
+    }
+
+    fn mark(&self) {
+        self.0.set(true);
+    }
+
+    /// Reads and clears the flag in one step -- the "drain first, then re-resolve once" rule
+    /// (ADR-0044 decision 2): `wayland::run`'s poll loop drains every pending inbound frame
+    /// before calling this once, so a burst of `StateSnapshot` pushes marks the flag repeatedly
+    /// but this only ever reports it once, coalescing the burst into a single re-resolve instead
+    /// of one per push.
+    pub fn take(&self) -> bool {
+        self.0.replace(false)
+    }
+}
+
+impl Default for DirtyFlag {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -434,7 +483,7 @@ mod tests {
     fn a_live_signal_reflects_a_value_pushed_after_construction_not_a_frozen_snapshot() {
         let lua = Lua::new();
         register(&lua).unwrap();
-        let (signal, handle) = Signal::new_live(Value::Integer(1));
+        let (signal, handle) = Signal::new_live(Value::Integer(1), DirtyFlag::new());
         lua.globals().set("live", signal).unwrap();
 
         let first: i64 = lua.load("return live:get()").eval().unwrap();

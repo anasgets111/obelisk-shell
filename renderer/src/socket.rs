@@ -23,11 +23,14 @@
 //! its poll loop.
 //!
 //! Real `shell.lua` reload flow (build-steps.md Phase 13; `CONTEXT.md`, Watcher/Rollback/
-//! In-place reload/Generation swap; docs/adr/0024): a `shared::StateSnapshot` push only
-//! hydrates that snapshot's own `capability`-named live signal now (docs/adr/0029; created
-//! lazily on first sight of a new capability name, see `apply_state_snapshot`) -- it no longer
-//! triggers any Lua evaluation, unlike Phase 11's proof-of-wiring hack. Evaluation is driven by
-//! the Supervisor's own
+//! In-place reload/Generation swap; docs/adr/0024): a `shared::StateSnapshot` push hydrates that
+//! snapshot's own `capability`-named live signal (docs/adr/0029; created lazily on first sight of
+//! a new capability name, see `apply_state_snapshot`) and marks the scene dirty
+//! (docs/adr/0044 decision 2, `CONTEXT.md`'s Dirty scene entry) -- it never triggers a Lua
+//! evaluation itself, unlike Phase 11's proof-of-wiring hack. `RendererClient::re_resolve_if_dirty`
+//! is what a dirty flag leads to: a re-run of `Scene::apply` against the last applied
+//! `lua::LoadOutput`, not a re-read of `shell.lua`. Evaluation itself is still driven only by the
+//! Supervisor's own
 //! `shared::SupervisorFrame::Reevaluate`, sent after its `inotify` watch on
 //! `~/.config/oblisk/` detects a debounced edit to `shell.lua`:
 //!
@@ -50,6 +53,11 @@
 //! 4. An evaluation failure sets the ad-hoc `rescue` global's `is_rescue`/`error_log` fields
 //!    (mirrors the ad-hoc `audio` global, ADR-0022's precedent -- not the full `oblisk.*`
 //!    signal tree) and leaves the prior applied scene untouched (`CONTEXT.md`'s Rollback).
+//! 5. A dirty-scene re-resolve failure is a distinct case from 4, not a variant of it:
+//!    [`RendererClient::re_resolve_if_dirty`] leaves the prior scene untouched the same way (via
+//!    [`Scene::apply`]'s own rollback), but never sets `rescue` -- `rescue` means `shell.lua`
+//!    itself failed to evaluate, and a rejected pushed value is a property parser rejecting one
+//!    capability's transient number or string, not that.
 //!
 //! Deliberately deferred: real generation-ID assignment tied to process spawning (a later phase,
 //! once Phase 7/8's spawn primitives are wired to this transport) -- for now the generation ID
@@ -82,7 +90,7 @@ use tokio::sync::mpsc;
 use crate::layout::node::SurfaceTopology;
 use crate::layout::{self, Scene};
 use crate::lua::process::ProcessRegistry;
-use crate::lua::signal::LiveSignalHandle;
+use crate::lua::signal::{DirtyFlag, LiveSignalHandle};
 use crate::lua::{self, Loader};
 use crate::text::shaping::ShapingHandle;
 
@@ -137,8 +145,26 @@ pub fn spawn_client(generation_id: u32, inbound_tx: std::sync::mpsc::Sender<Supe
 /// same thing as an empty topology. `pending` holds the evaluated-but-not-yet-applied output
 /// (and its already-computed topology, so `handle_apply_pending` doesn't need to recompute it)
 /// between a `Reevaluate` that reported `Unchanged` and its matching `ApplyPendingReload`.
+///
+/// `applied_output` is the last evaluation actually applied to the `Scene` -- ADR-0044 decision
+/// 2's re-resolve target. Set alongside `applied_topology`, on the same two successful-apply
+/// paths (`RendererClient::run_startup_evaluation`, `RendererClient::handle_apply_pending`) and
+/// never on a failed one. Kept alive past the evaluation that produced it, rather than dropped
+/// once applied, so every later push can resolve against it without re-running `shell.lua`.
+///
+/// What makes that safe is a *drop-order* obligation, not a lifetime the values enforce for
+/// themselves, and ADR-0044 decision 4 states the mechanism backwards (its own amendment says so).
+/// mlua 0.12's `ValueRef` holds a `WeakLua`, not a strong reference
+/// (`mlua-0.12.0/src/types/value_ref.rs`), so these retained `mlua::Value`s do *not* keep the VM
+/// alive: nothing stops the `Lua` being dropped first. The hazard is the opposite one -- reading a
+/// value out of a dead state panics, because `ValueRef::to_pointer` locks the state and
+/// `LoadOutput`'s derived `Debug` reaches it (a `{other:?}` in a `LayoutError` message is enough).
+/// `ValueRef::Drop` is the only operation that survives a dead state, since it uses `try_lock` and
+/// no-ops. So the `Lua` must outlive every retained value because the code reads them, and Rust
+/// drops struct fields in declaration order: see [`RendererClient`]'s field ordering.
 struct ReloadState {
     applied_topology: Option<Vec<SurfaceTopology>>,
+    applied_output: Option<lua::LoadOutput>,
     pending: Option<(u64, lua::LoadOutput, Vec<SurfaceTopology>)>,
 }
 
@@ -149,8 +175,18 @@ struct ReloadState {
 /// `!Send`, and deliberately so: `crate::wayland::App` owns one of these directly (docs/adr/0039),
 /// so a Lua closure, a scene reconcile, and the EGL context are all reachable from one another
 /// without a channel hop.
+///
+/// **The field order below is load-bearing: `loader` must stay last.** Rust drops fields in
+/// declaration order, and almost every other field here holds `mlua::Value`s belonging to that
+/// `Loader`'s VM -- `scene`'s `RetainedNode::properties`, `state`'s retained `LoadOutput`s,
+/// `capability_signals`/`rescue_handle`'s `Rc<RefCell<Value>>`, `process_registry`'s Lua
+/// callbacks. Those values do not keep the VM alive (mlua 0.12's `ValueRef` holds a `WeakLua`; see
+/// [`ReloadState`]'s doc comment), so declaring `loader` first meant the `Lua` was dropped *before*
+/// them. It happens not to crash today only because `ValueRef::Drop` `try_lock`s and no-ops on a
+/// dead state and nothing reads a value during teardown -- but any read does lock, and
+/// `ValueRef::to_pointer` panics, which a `Debug` format of a `LoadOutput` reaches. Do not reorder
+/// `loader` back up.
 pub struct RendererClient {
-    loader: Loader,
     shell_lua_path: PathBuf,
     scene: Scene,
     /// A clone of the one `ShapingHandle` `crate::wayland::App` also holds -- one worker thread
@@ -166,12 +202,25 @@ pub struct RendererClient {
     /// needs to mutate.
     capability_signals: RefCell<HashMap<String, LiveSignalHandle>>,
     rescue_handle: LiveSignalHandle,
+    /// What `rescue_handle` currently holds, mirrored here as a plain tuple so
+    /// [`Self::set_rescue_state`] can tell a real change from a no-op rewrite -- see its doc
+    /// comment. Seeded to match `register_rescue_signal`'s initial `{ is_rescue = false,
+    /// error_log = "" }` table.
+    rescue_state: (bool, String),
     process_registry: ProcessRegistry,
+    /// The scene-dirty flag (ADR-0044 decision 2, `CONTEXT.md`'s Dirty scene entry). Cloned into
+    /// every `LiveSignalHandle` this client hands out (the roster seed, the lazy
+    /// `capability_signal` path, and `rescue_handle`), so a `set` on any of them marks this same
+    /// flag. `re_resolve_if_dirty` is the only reader: it checks and clears it in one step.
+    dirty: DirtyFlag,
     state: ReloadState,
     /// Where a `ReevaluateReport` goes: the socket thread's [`pump`] drains this and writes each
     /// frame to the wire. `UnboundedSender::send` is synchronous and non-blocking, so this is
     /// callable straight from the Wayland dispatch thread.
     outbound_tx: mpsc::UnboundedSender<RendererFrame>,
+    /// Last, and that is load-bearing -- see this struct's own doc comment. Every field above
+    /// holds `mlua::Value`s from this VM, and reading one from a dead `Lua` panics.
+    loader: Loader,
 }
 
 impl RendererClient {
@@ -190,10 +239,14 @@ impl RendererClient {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let shell_lua_path = shared::shell_lua_path().map_err(|err| format!("failed to resolve shell.lua's path: {err}"))?;
         let loader = Loader::new().map_err(|err| format!("failed to start the Lua loader: {err}"))?;
-        let rescue_handle = register_rescue_signal(&loader).map_err(|err| format!("failed to register the rescue signal: {err}"))?;
+        // One flag for this whole generation (ADR-0044 decision 2), created before anything that
+        // hands out a `LiveSignalHandle` so the rescue signal shares it too.
+        let dirty = DirtyFlag::new();
+        let rescue_handle =
+            register_rescue_signal(&loader, dirty.clone()).map_err(|err| format!("failed to register the rescue signal: {err}"))?;
         let process_registry = ProcessRegistry::new(generation_id, outbound_tx.clone());
         loader.register_process(process_registry.clone()).map_err(|err| format!("failed to register the process global: {err}"))?;
-        let client = Self::new(loader, shell_lua_path, shaping, outbound_tx, rescue_handle, process_registry)
+        let client = Self::new(loader, shell_lua_path, shaping, outbound_tx, rescue_handle, process_registry, dirty)
             .map_err(|err| format!("failed to seed the capability roster's signals: {err}"))?;
         Ok(client)
     }
@@ -213,29 +266,57 @@ impl RendererClient {
         outbound_tx: mpsc::UnboundedSender<RendererFrame>,
         rescue_handle: LiveSignalHandle,
         process_registry: ProcessRegistry,
+        dirty: DirtyFlag,
     ) -> mlua::Result<Self> {
         let mut seeded = HashMap::new();
         for capability in shared::CAPABILITIES {
-            let (signal, handle) = lua::signal::Signal::new_live(mlua::Value::Nil);
+            let (signal, handle) = lua::signal::Signal::new_live(mlua::Value::Nil, dirty.clone());
             loader.set_global(capability, signal)?;
             seeded.insert((*capability).to_string(), handle);
         }
         Ok(Self {
-            loader,
             shell_lua_path,
             scene: Scene::new(),
             shaping,
             capability_signals: RefCell::new(seeded),
             rescue_handle,
+            // Matches the table `register_rescue_signal` already put in the signal.
+            rescue_state: (false, String::new()),
             process_registry,
-            state: ReloadState { applied_topology: None, pending: None },
+            dirty,
+            state: ReloadState { applied_topology: None, applied_output: None, pending: None },
             outbound_tx,
+            loader,
         })
     }
 
-    fn set_rescue_state(&self, is_rescue: bool, error_log: &str) {
+    /// Writes the `rescue` global's `{ is_rescue, error_log }` table -- but only when the value
+    /// actually differs from what is already in there.
+    ///
+    /// The early return is a correctness fix, not an optimization. `rescue_handle` is a
+    /// `LiveSignalHandle` like any capability's, so writing through it marks the shared
+    /// `DirtyFlag` (ADR-0044 decision 2), and both of this method's callers write on their
+    /// *success* paths: `run_startup_evaluation` clears rescue right after a successful
+    /// `Scene::apply`, and `handle_reevaluate` clears it before every verdict. Rewriting an
+    /// unchanged value therefore marked the scene dirty when nothing had changed, so a clean
+    /// startup made the first poll turn redo a whole `Scene::apply` for nothing, and -- worse -- a
+    /// `TopologyChanged` verdict left the flag set, so the next turn mutated the scene of a
+    /// generation that must not have its scene mutated at all (that case is a generation swap,
+    /// Phase 14; see this module's doc comment point 2).
+    ///
+    /// This is not the memoization ADR-0044 decision 3 rejects. Decision 3 is about not caching a
+    /// signal's *resolved* value across reads; this is about a write that stores nothing new not
+    /// claiming the scene changed. A genuine rescue transition still marks dirty and still
+    /// re-resolves, because `rescue` is a live signal a config may read like any other.
+    fn set_rescue_state(&mut self, is_rescue: bool, error_log: &str) {
+        if self.rescue_state.0 == is_rescue && self.rescue_state.1 == error_log {
+            return;
+        }
         match rescue_table(&self.loader, is_rescue, error_log) {
-            Ok(table) => self.rescue_handle.set(mlua::Value::Table(table)),
+            Ok(table) => {
+                self.rescue_handle.set(mlua::Value::Table(table));
+                self.rescue_state = (is_rescue, error_log.to_string());
+            }
             Err(err) => eprintln!("control-socket client: failed to build rescue state: {err}"),
         }
     }
@@ -261,7 +342,7 @@ impl RendererClient {
         if let Some(handle) = self.capability_signals.borrow().get(capability) {
             return Ok(handle.clone());
         }
-        let (signal, handle) = lua::signal::Signal::new_live(mlua::Value::Nil);
+        let (signal, handle) = lua::signal::Signal::new_live(mlua::Value::Nil, self.dirty.clone());
         self.loader.set_global(capability, signal)?;
         self.capability_signals.borrow_mut().insert(capability.to_string(), handle.clone());
         Ok(handle)
@@ -283,8 +364,15 @@ impl RendererClient {
             Ok((output, topology)) => match self.scene.apply(&output.surfaces, PLACEHOLDER_OUTPUT_SIZE, &self.shaping, self.loader.lua()) {
                 Ok(()) => {
                     log_applied_surfaces(&self.scene, &output);
+                    // Nothing holds a lease, so nothing can be holding a subtree this apply
+                    // retired -- see `Scene::release_all_retired`, including when that stops
+                    // being true.
+                    self.scene.release_all_retired();
                     self.set_rescue_state(false, "");
                     self.state.applied_topology = Some(topology);
+                    // ADR-0044 decision 2: hold the evaluation that was actually applied, so a
+                    // later push can re-resolve against it without re-running shell.lua.
+                    self.state.applied_output = Some(output);
                 }
                 Err(err) => {
                     eprintln!("control-socket client: startup shell.lua evaluated but failed to apply to the scene: {err}");
@@ -388,10 +476,72 @@ impl RendererClient {
         match self.scene.apply(&output.surfaces, PLACEHOLDER_OUTPUT_SIZE, &self.shaping, self.loader.lua()) {
             Ok(()) => {
                 log_applied_surfaces(&self.scene, &output);
+                self.scene.release_all_retired();
                 self.state.applied_topology = Some(topology);
+                // ADR-0044 decision 2: same rule as `run_startup_evaluation` -- only a successful
+                // apply becomes the re-resolve target.
+                self.state.applied_output = Some(output);
             }
             Err(err) => eprintln!("control-socket client: ApplyPendingReload's stored evaluation failed to apply: {err}"),
         }
+    }
+
+    /// Re-runs `Scene::apply` against `state.applied_output` when a live signal's `set` has
+    /// marked the scene dirty since the last resolve (ADR-0044 decision 2, `CONTEXT.md`'s Dirty
+    /// scene entry). Does not touch `shell.lua`: the retained `VirtualNode` tree in
+    /// `applied_output` still holds the `Signal` handles Lua put there, so re-applying it reads
+    /// their current values through decision 1's resolve-at-layout-time rule. What keeps those
+    /// stale `mlua::Value`s readable is this client's own field ordering, not anything the values
+    /// enforce themselves -- see [`ReloadState`]'s doc comment.
+    ///
+    /// `crate::wayland::run`'s poll loop calls this once per turn, *after* draining every pending
+    /// inbound frame and *before* servicing that turn's `ActivateDraw`, not once per frame:
+    /// `DirtyFlag::take` collapses however many pushes arrived in that drain into a single `true`,
+    /// so a burst of `StateSnapshot`s costs one re-resolve, not one per push.
+    ///
+    /// The resolved tree stops here, in memory. This damages no surface and requests no frame, so
+    /// a push that changes geometry does not yet reach the screen on its own -- that is correct
+    /// for this slice, not an oversight: the paint pass that consumes the retained scene is
+    /// build-steps.md Phase 19 items 6 through 11, and `RendererClient::scene` is deliberately
+    /// still private with no accessor until there is a consumer to hand it to.
+    pub fn re_resolve_if_dirty(&mut self) {
+        // `applied_output` is checked *before* the flag is taken, and that order is the whole
+        // point. With nothing to re-resolve against (startup failed, or no reload has ever
+        // landed) there is nothing this call can do, so consuming the flag would silently discard
+        // the push that set it. Taking it first meant a config that failed its first apply
+        // swallowed every subsequent push and stayed blank until an inotify edit forced a
+        // re-evaluation. Left set, the flag is picked up by whatever applies next.
+        let Some(output) = self.state.applied_output.as_ref() else {
+            return;
+        };
+        // Read and clear in one step, on the path that actually acts on it.
+        if !self.dirty.take() {
+            return;
+        }
+        let applied = self.scene.apply(&output.surfaces, PLACEHOLDER_OUTPUT_SIZE, &self.shaping, self.loader.lua());
+        if let Err(err) = applied {
+            // `Scene::apply` rolls back to its exact pre-call state on error (see its own doc
+            // comment), so the prior good scene is still applied and still on screen. This is
+            // deliberately not routed to `set_rescue_state`: rescue means shell.lua failed to
+            // evaluate, and this is a capability push that some property's parser rejected (e.g.
+            // a numeric field pushed where `content` wants a string). Entering rescue here would
+            // flap the whole shell to an error screen over one capability's transient bad value,
+            // which is a worse outcome than just keeping the last good frame.
+            //
+            // ponytail: logging is the only signal this gets. A config with a genuinely broken
+            // signal-valued property (a `content` bound to a capability field that is sometimes
+            // not a string) now logs this line on every push forever, with nothing user-visible
+            // telling anyone something is wrong. The upgrade path is a distinct rescue-adjacent
+            // channel for "a pushed value was rejected", separate from "the config didn't
+            // evaluate" -- not built here since nothing has needed it yet.
+            eprintln!("control-socket client: dirty-scene re-resolve failed, keeping the prior scene: {err}");
+            return;
+        }
+        // The one path where an undrained lease bag actually leaks at cadence: a re-resolve that
+        // shortens a `children` list retires the tail on every poll turn that carries a push.
+        // Same "nothing holds a lease" argument as the other two apply sites -- see
+        // `Scene::release_all_retired`.
+        self.scene.release_all_retired();
     }
 }
 
@@ -507,9 +657,9 @@ fn frame_label(frame: &RendererFrame) -> &'static str {
 /// Builds the `{ is_rescue, error_log }` table and registers it as the ad-hoc `rescue` global
 /// (mirrors the ad-hoc `audio` global, ADR-0022's precedent -- see docs/adr/0024 item 3, not
 /// the full `oblisk.*` signal tree). Returns the handle so later evaluations can update it.
-fn register_rescue_signal(loader: &Loader) -> mlua::Result<LiveSignalHandle> {
+fn register_rescue_signal(loader: &Loader, dirty: DirtyFlag) -> mlua::Result<LiveSignalHandle> {
     let table = rescue_table(loader, false, "")?;
-    let (signal, handle) = lua::signal::Signal::new_live(mlua::Value::Table(table));
+    let (signal, handle) = lua::signal::Signal::new_live(mlua::Value::Table(table), dirty);
     loader.set_global("rescue", signal)?;
     Ok(handle)
 }
@@ -620,11 +770,12 @@ mod tests {
     fn test_client(shell_lua_path: &std::path::Path) -> (RendererClient, mpsc::UnboundedReceiver<RendererFrame>) {
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
         let loader = Loader::new().unwrap();
-        let rescue_handle = register_rescue_signal(&loader).unwrap();
+        let dirty = DirtyFlag::new();
+        let rescue_handle = register_rescue_signal(&loader, dirty.clone()).unwrap();
         let process_registry = ProcessRegistry::new(0, outbound_tx.clone());
         loader.register_process(process_registry.clone()).unwrap();
-        let client =
-            RendererClient::new(loader, shell_lua_path.to_path_buf(), ShapingHandle::spawn(), outbound_tx, rescue_handle, process_registry).unwrap();
+        let client = RendererClient::new(loader, shell_lua_path.to_path_buf(), ShapingHandle::spawn(), outbound_tx, rescue_handle, process_registry, dirty)
+            .unwrap();
         (client, outbound_rx)
     }
 
@@ -846,6 +997,255 @@ mod tests {
 
         assert!(client.scene.surface("bar").is_none(), "a stale ApplyPendingReload must not apply");
         assert!(client.state.pending.is_some(), "the still-current pending evaluation must survive a mismatched Apply");
+    }
+
+    // ADR-0044 decision 2, build-steps.md Phase 19 item 2: a `StateSnapshot` push marks the
+    // scene dirty, and a dirty scene re-resolves against the last applied evaluation without
+    // running shell.lua again. `workspace` is used as the pushed capability throughout (matching
+    // `apply_state_snapshot_lazily_registers_an_unrostered_capabilitys_live_signal` above) because
+    // it isn't in `shared::CAPABILITIES`, so pushing it before `run_startup_evaluation` is what
+    // makes a `shell.lua` that references it bare (not `:get()`) evaluate at all.
+
+    #[test]
+    fn apply_state_snapshot_marks_the_scene_dirty() {
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (client, _outbound_rx) = test_client(&missing);
+        assert!(!client.dirty.take(), "a fresh client must not start dirty");
+
+        let snapshot = StateSnapshot { capability: "audio".to_string(), revision: 1, payload: serde_json::json!({ "app_name": "Zen" }) };
+        client.apply_state_snapshot(snapshot).unwrap();
+
+        assert!(client.dirty.take(), "LiveSignalHandle::set must mark the shared scene-dirty flag");
+    }
+
+    #[test]
+    fn re_resolve_if_dirty_applies_a_pushed_value_without_reading_shell_lua_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top", visible = workspace }"#);
+        let (mut client, _outbound_rx) = test_client(&path);
+        client
+            .apply_state_snapshot(StateSnapshot { capability: "workspace".to_string(), revision: 1, payload: serde_json::json!(true) })
+            .unwrap();
+        client.run_startup_evaluation();
+        assert!(client.scene.surface("bar").unwrap().visible, "startup must have applied the pushed initial value");
+
+        // Break the file so a real re-evaluation would fail -- proves the second half: the
+        // re-resolve below reads the pushed value straight off the retained tree's live signal,
+        // never touching this file again.
+        std::fs::write(&path, "this is not lua").unwrap();
+
+        client
+            .apply_state_snapshot(StateSnapshot { capability: "workspace".to_string(), revision: 2, payload: serde_json::json!(false) })
+            .unwrap();
+        client.re_resolve_if_dirty();
+
+        assert!(!client.scene.surface("bar").unwrap().visible, "the re-resolve must reflect the pushed value");
+        assert_eq!(
+            rescue_state(&client.loader),
+            (false, String::new()),
+            "no evaluation error occurred -- shell.lua was never re-read, so the broken file on disk is never seen"
+        );
+    }
+
+    #[test]
+    fn re_resolve_if_dirty_clears_the_flag_and_a_second_call_does_no_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top", visible = workspace }"#);
+        let (mut client, _outbound_rx) = test_client(&path);
+        client
+            .apply_state_snapshot(StateSnapshot { capability: "workspace".to_string(), revision: 1, payload: serde_json::json!(true) })
+            .unwrap();
+        client.run_startup_evaluation();
+        client
+            .apply_state_snapshot(StateSnapshot { capability: "workspace".to_string(), revision: 2, payload: serde_json::json!(false) })
+            .unwrap();
+
+        client.re_resolve_if_dirty();
+        assert!(!client.scene.surface("bar").unwrap().visible, "the first re-resolve must apply the pushed value");
+        assert!(!client.dirty.take(), "re_resolve_if_dirty must clear the flag it consumed");
+
+        // Replace `applied_output` directly (bypassing the push path, which would re-mark dirty)
+        // with an evaluation that resolves `visible` to `true`. If a second `re_resolve_if_dirty`
+        // call did any work at all, this would be visible; a true no-op leaves the scene exactly
+        // as the first resolve left it.
+        let poisoned_path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top", visible = true }"#);
+        let (poisoned_output, _) = evaluate_and_topology(&client.loader, &poisoned_path).unwrap();
+        client.state.applied_output = Some(poisoned_output);
+
+        client.re_resolve_if_dirty();
+        assert!(
+            !client.scene.surface("bar").unwrap().visible,
+            "with nothing pushed since, a second re-resolve must do no work at all, even though a different applied_output is now in place"
+        );
+    }
+
+    #[test]
+    fn a_burst_of_pushes_before_one_check_marks_the_flag_only_once() {
+        // ADR-0044 decision 2's "drain first, then re-resolve once": `wayland::run`'s poll loop
+        // only calls `re_resolve_if_dirty` after draining every pending inbound frame, so several
+        // pushes landing in one drain must coalesce into a single dirty read, not one per push.
+        // `DirtyFlag` is a bool, not a counter, so this is provable directly: however many pushes
+        // land before the flag is read, reading it reports "dirty" exactly once.
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (client, _outbound_rx) = test_client(&missing);
+
+        for revision in 1..=5 {
+            client
+                .apply_state_snapshot(StateSnapshot { capability: "audio".to_string(), revision, payload: serde_json::json!({ "n": revision }) })
+                .unwrap();
+        }
+
+        assert!(client.dirty.take(), "a burst of five pushes must have marked the flag");
+        assert!(!client.dirty.take(), "the flag records only whether a push happened since the last check, not how many, so the burst coalesces into one turn's work");
+    }
+
+    #[test]
+    fn a_push_that_makes_a_property_invalid_keeps_the_prior_scene_and_does_not_enter_rescue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top", visible = workspace }"#);
+        let (mut client, _outbound_rx) = test_client(&path);
+        client
+            .apply_state_snapshot(StateSnapshot { capability: "workspace".to_string(), revision: 1, payload: serde_json::json!(true) })
+            .unwrap();
+        client.run_startup_evaluation();
+        assert!(client.scene.surface("bar").unwrap().visible);
+        assert_eq!(rescue_state(&client.loader), (false, String::new()));
+
+        // `visible` requires a boolean (`parse_visible`); a table makes the re-resolve fail.
+        client
+            .apply_state_snapshot(StateSnapshot {
+                capability: "workspace".to_string(),
+                revision: 2,
+                payload: serde_json::json!({ "not": "a boolean" }),
+            })
+            .unwrap();
+
+        client.re_resolve_if_dirty();
+
+        assert!(
+            client.scene.surface("bar").unwrap().visible,
+            "Scene::apply rolls back to its pre-call state on error, so the prior good scene must survive"
+        );
+        assert_eq!(
+            rescue_state(&client.loader),
+            (false, String::new()),
+            "a rejected pushed value is not a shell.lua evaluation failure and must not enter rescue"
+        );
+    }
+
+    #[test]
+    fn a_config_binding_a_bare_rostered_signal_applies_at_startup_with_no_push_at_all() {
+        // ADR-0044 decision 1's nil rule, from the Renderer's end: `run_startup_evaluation` runs
+        // before `wayland::run`'s poll loop has drained one inbound frame, so every rostered
+        // capability's signal still reads `nil` here. A config that binds one bare -- the exact
+        // shape decision 1 exists to enable -- must still apply, taking each parser's absent
+        // property default, rather than failing layout and leaving the shell blank.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(
+            dir.path(),
+            r#"return surface { id = "bar", layer = "Top", visible = audio, child = rect { width = network, height = 10, children = tray } }"#,
+        );
+        let (mut client, _outbound_rx) = test_client(&path);
+
+        client.run_startup_evaluation();
+
+        let bar = client.scene.surface("bar").expect("a bare rostered signal must not stop the config applying");
+        assert!(bar.visible, "`visible = audio` with audio still nil must take parse_visible's default");
+        assert!(bar.children[0].children.is_empty(), "`children = tray` with tray still nil must take parse_children's default");
+        assert_eq!(rescue_state(&client.loader), (false, String::new()), "a startup that applies must not be in rescue");
+    }
+
+    #[test]
+    fn a_push_arriving_before_the_first_successful_apply_is_not_consumed_and_lost() {
+        // `applied_output` is checked *before* the flag is taken: with nothing to re-resolve
+        // against there is nothing this call can do with the flag, so consuming it would silently
+        // discard the push. Taking it first meant a startup that failed to apply swallowed every
+        // later push, and the shell stayed blank until an inotify edit forced a re-evaluation.
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (mut client, _outbound_rx) = test_client(&missing);
+        client.run_startup_evaluation();
+        assert!(client.state.applied_output.is_none(), "startup must have failed (no file)");
+
+        client
+            .apply_state_snapshot(StateSnapshot { capability: "audio".to_string(), revision: 1, payload: serde_json::json!({ "app_name": "Zen" }) })
+            .unwrap();
+        client.re_resolve_if_dirty();
+
+        assert!(client.dirty.take(), "the push must still be pending for whatever applies next, not consumed by the early return");
+    }
+
+    #[test]
+    fn repeated_re_resolves_that_retire_nodes_do_not_grow_the_lease_bag() {
+        // `Scene::apply` now runs up to once per poll turn rather than once per config edit, and
+        // `retire_child_first` pushes every removed subtree onto `Scene::retiring`, which nothing
+        // in production drains (`Scene::release` has no caller, docs/adr/0023 item 7). A children
+        // signal that alternates its length therefore leaked a `RetainedNode` -- and the
+        // `mlua::Value` properties it holds -- at push cadence, in a process meant to run for a
+        // whole session.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(
+            dir.path(),
+            r#"
+            return surface { id = "bar", layer = "Top", child = row { children = computed({audio}, function(n)
+                if n == 3 then
+                    return { rect { width = 1, height = 1 }, rect { width = 1, height = 1 }, rect { width = 1, height = 1 } }
+                end
+                return { rect { width = 1, height = 1 } }
+            end) } }
+            "#,
+        );
+        let (mut client, _outbound_rx) = test_client(&path);
+        client.run_startup_evaluation();
+        assert!(client.scene.surface("bar").is_some(), "startup must have applied");
+
+        for revision in 1..=20 {
+            let count = if revision % 2 == 0 { 1 } else { 3 };
+            client
+                .apply_state_snapshot(StateSnapshot { capability: "audio".to_string(), revision, payload: serde_json::json!(count) })
+                .unwrap();
+            client.re_resolve_if_dirty();
+        }
+
+        assert_eq!(client.scene.surface("bar").unwrap().children[0].children.len(), 1, "the last push shrank the row back to one child");
+        assert!(
+            client.scene.retiring_ids().is_empty(),
+            "a successful apply must drain the lease bag, since nothing holds a lease today; got {} entries after 20 re-resolves",
+            client.scene.retiring_ids().len()
+        );
+    }
+
+    #[test]
+    fn a_clean_startup_leaves_the_scene_flag_clear() {
+        // `set_rescue_state` writes through `rescue_handle`, which shares the one `DirtyFlag`, so
+        // a successful startup used to mark the scene dirty by clearing rescue that was already
+        // clear. The first poll turn then redid a whole `Scene::apply` -- retained-tree clone,
+        // full walk, a blocking shaping round trip per text node -- for nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top", child = text { content = "hi" } }"#);
+        let (mut client, _outbound_rx) = test_client(&path);
+
+        client.run_startup_evaluation();
+
+        assert!(client.scene.surface("bar").is_some(), "startup must have applied");
+        assert!(!client.dirty.take(), "an apply that succeeded resolved every signal at its current value, so nothing is stale");
+    }
+
+    #[test]
+    fn a_topology_changed_reevaluate_leaves_the_scene_flag_clear() {
+        // Worse than the wasted work above: a `TopologyChanged` verdict must leave this
+        // generation's scene alone entirely (that case is a generation swap, Phase 14), but the
+        // no-op `set_rescue_state(false, "")` on the success path left the flag set, so the next
+        // poll turn re-applied `applied_output` to a scene the verdict says must not be mutated.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), r#"return surface { id = "bar", layer = "Top" }"#);
+        let (mut client, mut outbound_rx) = test_client(&path);
+        client.state.applied_topology =
+            Some(vec![SurfaceTopology { id: "other".to_string(), layer: "Top".to_string(), anchor: Default::default(), monitor: "All".to_string() }]);
+
+        client.handle_reevaluate(ReevaluateRequest { sequence: 1 });
+
+        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence: 1 }));
+        assert!(!client.dirty.take(), "a topology-changed generation must not have its scene marked dirty by the verdict itself");
     }
 
     #[test]

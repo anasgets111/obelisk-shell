@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn set_global_registers_a_value_a_later_evaluate_can_see() {
         let loader = Loader::new().unwrap();
-        let (signal, handle) = signal::Signal::new_live(Value::Integer(7));
+        let (signal, handle) = signal::Signal::new_live(Value::Integer(7), signal::DirtyFlag::new());
         loader.set_global("audio", signal).unwrap();
 
         let output = loader.evaluate(r#"return surface { id = "bar", layer = "Top", reading = audio:get() }"#).unwrap();

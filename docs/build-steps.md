@@ -690,6 +690,21 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    last evaluation's `LoadOutput` and re-run `Scene::apply` against it when the flag is set, without
    running `shell.lua`. Mark it `ponytail:`, naming the ceiling: one flag for the whole scene, so a
    high-frequency capability re-resolves surfaces that read nothing from it.
+
+   Four things this item's own review found, all of which belong in it. A signal resolving to `nil`
+   must mean the property is absent, or a config binding a bare capability signal cannot boot at
+   all: startup evaluation runs before the first `StateSnapshot` is drained, so every rostered
+   signal reads `nil` and layout rejects the tree (see ADR-0044's amendment). The flag must not be
+   consumed when there is nothing to re-resolve against, or a push arriving before the first
+   successful apply is cleared and lost, which after a failed startup means a permanently blank
+   shell that no later push can recover. `Scene::retiring` now grows at push cadence rather than per
+   config edit, and `Scene::release` still has no production caller (ADR-0023 item 7), so a
+   successful apply has to drain it. And the `rescue` signal shares the flag, so a clean startup and
+   a `TopologyChanged` verdict both leave the scene marked dirty, the second of which re-applies a
+   generation whose scene is supposed to stay untouched.
+
+   Order the poll loop drain, then re-resolve, then draw. `ActivateDraw` arriving in the same drain
+   as a snapshot would otherwise paint the pre-push layout, and nothing would draw the corrected one.
 3. **Recursion depth cap.** `resolve_and_reconcile` recurses through `children_of` with no counter,
    so `local r = rect {}; r.children = { r }` overflows the stack and aborts the process past the
    guard page, where `oblisk.rescue` cannot catch it. § 1.1 caps strings at 64KB and integers at
@@ -768,6 +783,15 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    `text/shaping.rs`'s existing off-thread shaping). `row`/`column`/`button` are containers with no
    paint of their own beyond their `rect` properties. Draw in tree order so the stacking model
    ADR-0023 item 4 already implements resolves overlaps the way layout resolved them.
+
+   Give `content` and `icon`'s `size` defaults here, so absence stops being an error for them. Item
+   2 made a signal resolving to `nil` mean absent, which is what lets a config bind a capability
+   before its first push, but `text { content = oblisk.mpris.title }` still fails at boot because
+   `content` is required. A `text` bound to a not-yet-pushed signal is a normal boot state, and once
+   `nil` maps to absent the parser cannot tell it apart from an omitted key, so the fix is a default
+   rather than a new distinction. It belongs here rather than in item 2 because painting an empty
+   `text` is what makes an empty default meaningful. The cost, accepted: a misspelled `content` key
+   renders an empty node instead of being rejected.
 7. **Snapping.** Reuse `text/snap.rs`'s `snap_to_physical` and `snap_border_to_physical`. The second
    has had no caller since Phase 4 and this is what it was written for: a border snapped to whole
    physical pixels instead of straddling two (`oblisk-layout-engine-geometry.md` § 5).

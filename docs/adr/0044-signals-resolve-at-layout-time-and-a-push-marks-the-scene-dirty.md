@@ -27,6 +27,33 @@
 > whole evaluation rather than each leaf call (see ADR-0021's amendment): the config gets an error
 > instead of a wedged shell, measured firing after roughly 3,200 calls. The original reason to
 > refuse a cache is also unchanged, since a cache needs an invalidation rule and no push has one.
+>
+> Decision 1 needs one more rule, found when decision 2 landed: **a signal resolving to `nil` means
+> the property is absent**, so the parser's own default applies rather than the parser erroring on a
+> `nil`. Every rostered signal reads `nil` until its first `StateSnapshot`, and
+> `run_startup_evaluation` runs before the first frame is drained, so without this rule a config
+> binding a bare capability signal cannot boot at all. The rule is also the consistent one, because
+> a Lua table cannot store a `nil` value, so `content = nil` never reaches the property map and only
+> a signal can produce an explicit `nil` there. Treating both as absent makes the two spellings
+> agree.
+>
+> That rule alone does not deliver this ADR's headline example. `text { content = oblisk.mpris.title }`
+> still fails at boot, because `content` has no default and "absent" is an error for it, as it is for
+> `icon`'s `size`. Making absence a default for those two is a separate change with real semantics,
+> and it is the right one: a `text` bound to a signal that has not been pushed yet is a normal boot
+> state, not an authoring error, and once `nil` maps to absent the parser can no longer tell the two
+> apart. The cost is that a misspelled `content` key renders an empty node instead of being rejected,
+> which is the better failure for a shell that has to boot. Scheduled in `build-steps.md` Phase 19
+> item 6, where `text` gets a real painter.
+>
+> Decision 4's *mechanism* is wrong, though its conclusion survives. It says the VM must outlive the
+> retained scene "because `mlua::Value` keeps a dropped `Lua` alive by refcount, leaking a whole VM
+> per reload". mlua 0.12's `ValueRef` holds a `WeakLua`, not a strong reference
+> (`src/types/value_ref.rs`), so a retained value does not keep the VM alive and there is no leak of
+> that kind. The real reason to keep the VM alive is the opposite hazard: reading a retained value
+> from a dead state panics, since `ValueRef::to_pointer` locks the state and `LoadOutput`'s derived
+> `Debug` reaches it. That makes struct field order load-bearing, because Rust drops fields in
+> declaration order and the `Loader` must be declared after anything holding values from it.
 
 Nothing connects a capability's state to the screen. Three facts, each defensible alone, combine
 into a shell that cannot react to anything:

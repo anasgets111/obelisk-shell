@@ -45,6 +45,10 @@ text { content = oblisk.mpris.title:get() }   -- frozen: the value at evaluation
 
 A handle left in a property resolves at layout time on every pass, so the node follows the signal. A `:get()` result is a plain string the engine cannot distinguish from a literal, and nothing updates it until the next config edit. Signals are read-only to Lua: a config cannot construct one or write to one, and the only writable state is what the Supervisor pushes (ADR-0044).
 
+**A signal resolving to `nil` means the property is absent**, so the property's documented default applies instead of the resolution failing. Every capability signal reads `nil` until its first `StateSnapshot` arrives, which is a state a config sees on every boot, so `content = oblisk.mpris.title` renders the `content` default until the first push rather than rejecting the tree. This also keeps the two spellings consistent: a Lua table cannot store a `nil` value, so `content = nil` is already indistinguishable from omitting `content`.
+
+The four `surface` topology fields (`id`, `layer`, `anchor`, `monitor`) are the exception to all of the above and reject a `Signal` outright. They are read once per evaluation to decide whether a reload is an in-place update or a generation swap (ADR-0001), and a value that changes after that decision would move a surface between layers or monitors inside a live generation.
+
 ---
 
 ## 2. Core Engine Signals (Read-Only State Schema)

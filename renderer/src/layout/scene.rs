@@ -214,6 +214,27 @@ impl Scene {
         }
     }
 
+    /// Releases every retired subtree at once, in the child-first order [`Self::retire_child_first`]
+    /// established. `crate::socket`'s `RendererClient` calls this after each successful
+    /// `Scene::apply`, which is what stops the lease bag growing forever now that an apply runs at
+    /// capability-push cadence (ADR-0044 decision 2) rather than once per config edit: every
+    /// re-resolve that shortens a `children` list retires the tail, and each retired
+    /// `RetainedNode` holds a `HashMap<String, mlua::Value>`, so an undrained bag leaks Lua heap
+    /// as well as Rust memory in a process meant to live for a whole session.
+    ///
+    /// Unconditional, and only correct because it is: nothing in this codebase holds a lease
+    /// today, so nothing can be mid-teardown when this runs (docs/adr/0023 item 7, the same fact
+    /// [`Self::release`]'s own ponytail records).
+    ///
+    /// ponytail: this is the wrong shape the moment a real lease holder exists. Once a paint stage
+    /// owns per-node GPU resources, release has to be driven by that holder dropping its lease --
+    /// per node, when it is actually done with it -- and dropping a node here while it still owns
+    /// a texture would free a resource out from under it. This call is what has to change then:
+    /// it becomes the holder's own `release` calls, and `apply` stops being the trigger at all.
+    pub fn release_all_retired(&mut self) {
+        self.retiring.clear();
+    }
+
     /// Ids currently held in the lease bag, in child-first insertion order. A diagnostic/future
     /// consumer accessor, not needed by `apply`/`release` themselves.
     ///
@@ -501,6 +522,16 @@ fn intrinsic_content_size(
             // Content-sized ancestor with no room resolved so far) -- treat that as unconstrained
             // rather than forcing every word onto its own line.
             let max_width = (text_wrap_width > 0.0).then_some(text_wrap_width);
+            // ponytail: this reshapes every text node on every `Scene::apply`, and there is no
+            // cache -- `ShapingHandle::shape` blocks on a cross-thread round trip to the shaping
+            // worker for each call (see `crate::text::shaping`). That was once per config edit; it
+            // is now up to once per poll turn (ADR-0044 decision 2's dirty flag), so a bar with 20
+            // text nodes on a 15ms poll driven by a high-frequency capability is roughly 1300
+            // blocking round trips per second on the Wayland dispatch thread, which is also the
+            // thread that answers `configure` and runs the VM (docs/adr/0039). Two fixes, both
+            // already planned: a shape cache keyed on (text, font_size, max_width), and
+            // build-steps.md Phase 19 item 5's resolve-once-per-pass, which stops a single apply
+            // shaping the same node more than once. Neither is built here.
             let shaped = shaping.shape(ShapeRequest {
                 text: content,
                 font_size,
@@ -767,7 +798,7 @@ mod tests {
         let lua = mlua::Lua::new();
         register_node_constructors(&lua).unwrap();
         crate::lua::signal::register(&lua).unwrap();
-        let signal = crate::lua::signal::Signal::new_live(Value::Integer(40)).0;
+        let signal = crate::lua::signal::Signal::new_live(Value::Integer(40), crate::lua::signal::DirtyFlag::new()).0;
         lua.globals().set("w", signal).unwrap();
         let table: mlua::Table = lua
             .load(r#"return surface { id = "bar", child = rect { width = w, height = 20 } }"#)

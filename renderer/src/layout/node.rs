@@ -11,10 +11,11 @@
 //! result is itself a `Signal` (a fresh `Value::UserData`), that's an error rather than a second
 //! read. That guard only stops a signal resolving directly to another signal; it is not a
 //! recursion bound, and it does nothing for a computed signal whose getter returns a fresh table
-//! on every call (e.g. a `children` signal that builds new node tables each read), which still
-//! recurses as deep as the getter wants to go, through `resolve_and_reconcile` and
-//! `deserialize_lua_table`, until the process aborts on a stack overflow rather than returning a
-//! `LayoutError`. A bounded depth cap is build-steps.md Phase 19 item 3's job, not this one's.
+//! on every call (e.g. a `children` signal that builds new node tables each read), which recurses
+//! as deep as the getter wants to go through `resolve_and_reconcile` and `deserialize_lua_table`.
+//! That one is bounded elsewhere: `layout::scene::MAX_TREE_DEPTH` caps the recursion and raises
+//! [`LayoutError::TreeTooDeep`] (build-steps.md Phase 19 item 3), so it is a rejected config
+//! rather than the stack overflow it used to be.
 //!
 //! [`SurfaceTopology`]'s four fields (`parse_surface_id`/`parse_layer`/`parse_anchor`/
 //! `parse_monitor`) are the one carve-out and keep rejecting a `Signal` outright -- see
@@ -148,7 +149,8 @@ fn checked_string(property: &str, s: &mlua::LuaString) -> Result<String, LayoutE
 /// build-steps.md Phase 19 item 3's job, not this function's.
 ///
 /// `None` means the property was absent; callers keep their own default-handling for that case,
-/// same as every caller did before this function existed.
+/// same as every caller did before this function existed. A signal resolving to `Value::Nil`
+/// returns `None` too -- see below for why that is the same case, not a bad value.
 fn resolve_property(
     properties: &HashMap<String, Value>,
     property: &str,
@@ -171,6 +173,23 @@ fn resolve_property(
             property,
             "a Signal resolved to another Signal -- resolution happens exactly once, not to a fixed point",
         ));
+    }
+    // A signal resolving to `nil` means the property is absent (ADR-0044 decision 1's amendment),
+    // so the caller's own default applies rather than the caller erroring on a `Nil`.
+    //
+    // Two reasons, and the second is why this is the consistent rule rather than a convenience.
+    // First: `crate::socket`'s `RendererClient::run_startup_evaluation` runs before
+    // `crate::wayland::run`'s poll loop has drained a single inbound frame, so every
+    // `shared::CAPABILITIES` signal still reads `nil` at the first `Scene::apply`. Without this,
+    // a config binding a bare capability signal (`visible = audio`) -- the exact shape decision 1
+    // exists to enable -- fails layout at boot and the shell comes up blank.
+    //
+    // Second: a Lua table cannot store a `nil` value, so `visible = nil` in a config drops the key
+    // entirely and never reaches `properties` at all. `Some(Value::Nil)` is therefore reachable
+    // only through a *signal*, and treating it as anything other than absent would make the two
+    // spellings of "no value here" disagree for no reason a config author could see.
+    if matches!(resolved, Value::Nil) {
+        return Ok(None);
     }
     Ok(Some(resolved))
 }
@@ -632,7 +651,7 @@ mod tests {
         // topology field, so it now resolves a `Signal` instead of erroring on one.
         let lua = lua();
         crate::lua::signal::register(&lua).unwrap();
-        let signal = crate::lua::signal::Signal::new_live(Value::Boolean(false)).0;
+        let signal = crate::lua::signal::Signal::new_live(Value::Boolean(false), crate::lua::signal::DirtyFlag::new()).0;
         let table = lua.create_table().unwrap();
         table.set("kind", "rect").unwrap();
         table.set("visible", signal).unwrap();
@@ -658,7 +677,7 @@ mod tests {
         let lua = lua();
         crate::lua::signal::register(&lua).unwrap();
         let hello = lua.create_string("hello").unwrap();
-        let signal = crate::lua::signal::Signal::new_live(Value::String(hello)).0;
+        let signal = crate::lua::signal::Signal::new_live(Value::String(hello), crate::lua::signal::DirtyFlag::new()).0;
         let table = lua.create_table().unwrap();
         table.set("kind", "text").unwrap();
         table.set("content", signal).unwrap();
@@ -675,7 +694,7 @@ mod tests {
         let literal_props = props_from_table(&literal_table);
         let literal_err = parse_content(&literal_props, &lua).unwrap_err();
 
-        let signal = crate::lua::signal::Signal::new_live(Value::Table(lua.create_table().unwrap())).0;
+        let signal = crate::lua::signal::Signal::new_live(Value::Table(lua.create_table().unwrap()), crate::lua::signal::DirtyFlag::new()).0;
         let table = lua.create_table().unwrap();
         table.set("kind", "text").unwrap();
         table.set("content", signal).unwrap();
@@ -697,9 +716,9 @@ mod tests {
         // userdata is an error, not a second read to a fixed point.
         let lua = lua();
         crate::lua::signal::register(&lua).unwrap();
-        let inner = crate::lua::signal::Signal::new_live(Value::Integer(5)).0;
+        let inner = crate::lua::signal::Signal::new_live(Value::Integer(5), crate::lua::signal::DirtyFlag::new()).0;
         let inner_userdata = lua.create_userdata(inner).unwrap();
-        let outer = crate::lua::signal::Signal::new_live(Value::UserData(inner_userdata)).0;
+        let outer = crate::lua::signal::Signal::new_live(Value::UserData(inner_userdata), crate::lua::signal::DirtyFlag::new()).0;
         let table = lua.create_table().unwrap();
         table.set("kind", "text").unwrap();
         table.set("font_size", outer).unwrap();
@@ -708,6 +727,60 @@ mod tests {
             parse_font_size(&node.properties, &lua).unwrap_err(),
             LayoutError::InvalidProperty { property, .. } if property == "font_size"
         ));
+    }
+
+    /// A property bag whose `property` slot holds a live signal currently reading `nil` -- exactly
+    /// the state every rostered capability's global is in before its first `StateSnapshot`
+    /// (`renderer/src/socket.rs`'s `RendererClient::new` seeds all of `shared::CAPABILITIES` at
+    /// `Value::Nil`), which is what a config binding a bare capability signal resolves at startup.
+    fn props_with_nil_signal(lua: &mlua::Lua, kind: &str, property: &str) -> HashMap<String, Value> {
+        crate::lua::signal::register(lua).unwrap();
+        let signal = crate::lua::signal::Signal::new_live(Value::Nil, crate::lua::signal::DirtyFlag::new()).0;
+        let table = lua.create_table().unwrap();
+        table.set("kind", kind).unwrap();
+        table.set(property, signal).unwrap();
+        props_from_table(&table)
+    }
+
+    #[test]
+    fn a_signal_resolving_to_nil_takes_each_parsers_absent_property_default() {
+        // ADR-0044 decision 1's nil rule: a signal resolving to `nil` means the property is
+        // absent, so every parser's own default applies instead of it erroring on the `Nil`.
+        // Without it a config binding any bare capability signal fails its very first
+        // `Scene::apply`, because `run_startup_evaluation` runs before the poll loop has drained
+        // a single `StateSnapshot`.
+        let lua = lua();
+        assert_eq!(parse_size_mode(&props_with_nil_signal(&lua, "rect", "width"), "width", &lua).unwrap(), SizeMode::Content);
+        assert_eq!(
+            parse_edge_insets(&props_with_nil_signal(&lua, "rect", "padding"), "padding", &lua).unwrap(),
+            EdgeInsets::default()
+        );
+        assert_eq!(parse_align(&props_with_nil_signal(&lua, "rect", "align_h"), "align_h", &lua).unwrap(), Align::Start);
+        assert!(parse_visible(&props_with_nil_signal(&lua, "rect", "visible"), &lua).unwrap());
+        assert_eq!(parse_spacing(&props_with_nil_signal(&lua, "row", "spacing"), &lua).unwrap(), 0.0);
+        assert_eq!(parse_font_size(&props_with_nil_signal(&lua, "text", "font_size"), &lua).unwrap(), 12.0);
+        assert!(parse_single_child(&props_with_nil_signal(&lua, "surface", "child"), "child", &lua).unwrap().is_none());
+        assert!(parse_children(&props_with_nil_signal(&lua, "row", "children"), &lua).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_signal_resolving_to_nil_reports_a_required_property_as_missing_not_as_a_bad_value() {
+        // The other half of the same rule: `content`/`size` have no default, so "absent" is still
+        // an error for them -- but it must be the *missing property* error a literal omission
+        // raises, not "expected a string, got Nil". Both spellings of absence agree, which is the
+        // consistency argument the rule rests on (a Lua table cannot store a `nil`, so
+        // `content = nil` never reaches the property map at all).
+        let lua = lua();
+        let content_err = parse_content(&props_with_nil_signal(&lua, "text", "content"), &lua).unwrap_err();
+        assert!(
+            matches!(&content_err, LayoutError::InvalidProperty { property, detail } if property == "content" && detail == "text node requires `content`"),
+            "got: {content_err}"
+        );
+        let size_err = parse_icon_size(&props_with_nil_signal(&lua, "icon", "size"), &lua).unwrap_err();
+        assert!(
+            matches!(&size_err, LayoutError::InvalidProperty { property, detail } if property == "size" && detail == "icon node requires `size`"),
+            "got: {size_err}"
+        );
     }
 
     #[test]
@@ -756,7 +829,7 @@ mod tests {
     fn a_signal_resolving_to_a_number_satisfies_font_size_through_marshals_check_number() {
         let lua = lua();
         crate::lua::signal::register(&lua).unwrap();
-        let signal = crate::lua::signal::Signal::new_live(Value::Number(18.0)).0;
+        let signal = crate::lua::signal::Signal::new_live(Value::Number(18.0), crate::lua::signal::DirtyFlag::new()).0;
         let table = lua.create_table().unwrap();
         table.set("kind", "text").unwrap();
         table.set("font_size", signal).unwrap();
@@ -880,7 +953,7 @@ mod tests {
     fn a_signal_userdata_in_layer_is_rejected() {
         let lua = lua();
         crate::lua::signal::register(&lua).unwrap();
-        let signal = crate::lua::signal::Signal::new_live(Value::Boolean(true)).0;
+        let signal = crate::lua::signal::Signal::new_live(Value::Boolean(true), crate::lua::signal::DirtyFlag::new()).0;
         let table = lua.create_table().unwrap();
         table.set("kind", "surface").unwrap();
         table.set("layer", signal).unwrap();

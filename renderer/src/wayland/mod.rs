@@ -252,10 +252,38 @@ pub fn run(
         // diff, but the blast radius is wider now that the VM and scene live on this same
         // surviving thread (docs/adr/0039). Not fixed here: adding an exit path on disconnect is
         // a policy change outside this refactor's scope.
+        // One turn is three ordered stages: drain everything, re-resolve once, then draw. An
+        // `ActivateDraw` nonce is therefore collected here rather than serviced in place. Drawing
+        // in the loop body painted whatever layout the scene happened to hold at that instant, so
+        // a `StateSnapshot` and an `ActivateDraw` arriving in the same drain -- snapshot first,
+        // which is exactly the PBA hydrate-then-activate order (§ 15.2) -- hydrated the signal,
+        // painted the *pre-push* layout, and only then re-resolved. Nothing requests another draw
+        // after a re-resolve (that gating is build-steps.md Phase 19 items 6 through 11), so that
+        // stale frame was the one the Supervisor accepted as presentation evidence.
+        //
+        // A `Vec`, not a single nonce: two `ActivateDraw`s in one drain would be unusual, but each
+        // one owes the Supervisor its own `PresentationEvidence` per surface, so none may be
+        // dropped by coalescing.
+        let mut draw_nonces: Vec<u64> = Vec::new();
         while let Ok(frame) = inbound_rx.try_recv() {
             if let Some(nonce) = app.client.handle_frame(frame) {
-                app.activate_draw(nonce);
+                draw_nonces.push(nonce);
             }
+            if app.exit {
+                break;
+            }
+        }
+        if app.exit {
+            break;
+        }
+        // Once per turn, after the drain above has emptied `inbound_rx` -- not inside that
+        // `while` loop's body (ADR-0044 decision 2). A burst of `StateSnapshot` pushes marks the
+        // dirty flag repeatedly while draining, but `DirtyFlag::take` only reports it once, so
+        // this coalesces the whole burst into a single `Scene::apply` per poll turn instead of one
+        // per pushed frame -- and, per the comment above, it lands before this turn's draw.
+        app.client.re_resolve_if_dirty();
+        for nonce in draw_nonces {
+            app.activate_draw(nonce);
             if app.exit {
                 break;
             }
