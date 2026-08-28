@@ -277,15 +277,44 @@ pub enum PamOutcome {
     PamError(String),
 }
 
+/// The workspace's tracked dev config, baked in at compile time so it resolves the same from any
+/// working directory. `CARGO_MANIFEST_DIR` is this crate's own directory, so the workspace root
+/// is one level up.
+#[cfg(debug_assertions)]
+const DEV_CONFIG_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../dev-config/oblisk");
+
 /// `~/.config/oblisk/`, resolved via `$XDG_CONFIG_HOME` falling back to `$HOME/.config` (XDG
 /// Base Directory order), hand-rolled rather than a new `dirs`-style dependency -- same
 /// one-function reasoning `control_socket_path` already used for `$XDG_RUNTIME_DIR`. Both
 /// `supervisor` (watches this directory) and `renderer` (reads `shell.lua` from it) resolve it
 /// identically.
+///
+/// A debug build looks in the workspace's `dev-config/oblisk/` first, so `cargo run -p supervisor`
+/// boots against the tracked dev config with no environment set up. Before this, a bare
+/// `cargo run` read `~/.config/oblisk/shell.lua`, which does not exist on a developer's machine,
+/// and the run came up with no config at all: the surfaces still appeared, because they are
+/// created from `SurfaceRole` rather than from the config, so the only symptom was one
+/// `failed to read shell.lua` line in a wall of startup logging.
+///
+/// `$XDG_CONFIG_HOME` still wins in both builds, which is what makes the dev branch safe to add
+/// rather than a second source of truth: it is how a debug build tests against a real config
+/// directory, and it keeps the existing `XDG_CONFIG_HOME=dev-config` invocation working
+/// unchanged. Release builds never see the dev branch at all -- `debug_assertions` is off, so
+/// `DEV_CONFIG_DIR` is not even compiled in, and no build-machine path reaches a shipped binary.
 pub fn config_dir() -> io::Result<PathBuf> {
     if let Some(xdg_config_home) = std::env::var_os("XDG_CONFIG_HOME") {
         return Ok(PathBuf::from(xdg_config_home).join("oblisk"));
     }
+
+    // Checked rather than assumed: a debug binary run away from the tree it was built in (moved,
+    // copied to another machine, `cargo install --debug`) has a `DEV_CONFIG_DIR` pointing at
+    // nothing. Falling through to the XDG path there is what keeps such a binary usable instead
+    // of failing on a path only the build machine ever had.
+    #[cfg(debug_assertions)]
+    if std::fs::metadata(DEV_CONFIG_DIR).is_ok() {
+        return Ok(PathBuf::from(DEV_CONFIG_DIR));
+    }
+
     let home = std::env::var_os("HOME")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "neither XDG_CONFIG_HOME nor HOME is set"))?;
     Ok(PathBuf::from(home).join(".config").join("oblisk"))
@@ -578,5 +607,42 @@ mod tests {
         let path = shell_lua_path().unwrap();
         assert_eq!(path, config_dir().unwrap().join("shell.lua"));
         assert!(path.ends_with("oblisk/shell.lua"));
+    }
+
+    /// The dev branch is only worth anything if the baked-in path is real, and a `concat!` of
+    /// `CARGO_MANIFEST_DIR` is exactly the kind of thing that compiles fine while pointing at
+    /// nothing. This is what catches the crate being moved or the workspace being restructured
+    /// without this constant following: it reads the file `config_dir` exists to find, rather
+    /// than asserting on the string.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_baked_in_dev_config_path_holds_a_real_shell_lua() {
+        let shell_lua = PathBuf::from(DEV_CONFIG_DIR).join("shell.lua");
+        assert!(
+            std::fs::read_to_string(&shell_lua).is_ok(),
+            "DEV_CONFIG_DIR points at {DEV_CONFIG_DIR:?}, which has no readable shell.lua -- \
+             a debug build resolves its config through this constant"
+        );
+    }
+
+    /// `$XDG_CONFIG_HOME` must keep winning in a debug build, which is the whole reason the dev
+    /// branch is safe: it is how a debug build is pointed at a real config directory, and it is
+    /// what keeps the existing `XDG_CONFIG_HOME=dev-config` invocation resolving to the same
+    /// place it always did. Without this the dev branch would be a second source of truth that
+    /// silently overrides the documented one.
+    ///
+    /// Sets a process-global for the duration, so it is deliberately the only test here that
+    /// touches the environment. The one other `config_dir` caller above asserts on a suffix both
+    /// branches share, so it stays correct whichever way it interleaves with this.
+    #[test]
+    fn xdg_config_home_still_wins_over_the_dev_config_directory() {
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", "/tmp/oblisk-config-dir-test") };
+        let resolved = config_dir().unwrap();
+        match previous {
+            Some(value) => unsafe { std::env::set_var("XDG_CONFIG_HOME", value) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        assert_eq!(resolved, PathBuf::from("/tmp/oblisk-config-dir-test/oblisk"));
     }
 }
