@@ -4,9 +4,12 @@
 //! `resolve_and_reconcile` is the single recursive walk doing all three of § 3's passes
 //! (constraint down, size up, position down) per node in one recursion, matching the spec's
 //! literal "single... pass" language, while simultaneously matching fresh nodes to retained ones
-//! by position (§ 4) and retiring removed subtrees child-first (`CONTEXT.md`, Lease).
+//! (`pair_children_by_id_then_position`, § 4 as amended by docs/adr/0045: children carrying an
+//! `id` pair by that `id` alone, scoped to their parent, and the id-less ones pair by position
+//! among themselves -- ADR-0023's original rule on a smaller set) and retiring removed subtrees
+//! child-first (`CONTEXT.md`, Lease).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use mlua::{Lua, Value};
 
@@ -103,8 +106,13 @@ impl RetainedNode {
 }
 
 /// The persistent node tree for one generation (`CONTEXT.md`, Retained scene), keyed per surface
-/// by that surface's own `id` property (§ 6.1) -- surfaces are identified, not ordered, unlike
-/// everything below a surface's root, which reconciles positionally (§ 4).
+/// by that surface's own `id` property (§ 6.1) -- a surface's `id` is both its topology identity
+/// (`node::SurfaceTopology`) and its reconcile identity (`node::parse_surface_id`'s doc comment,
+/// docs/adr/0045 decision 5), the same property serving both purposes at the root. Everything
+/// below a surface's root reconciles through `pair_children_by_id_then_position`: an optional,
+/// per-parent-scoped `id` pairs only against the same `id`, and the children carrying none fall
+/// back to ADR-0023's original positional rule among themselves (§ 4 as amended by
+/// docs/adr/0045).
 #[derive(Default)]
 pub struct Scene {
     surfaces: HashMap<String, RetainedNode>,
@@ -353,6 +361,112 @@ fn stretch_forced_size(
     }
 }
 
+/// Pairs `fresh_children` against `old_children` (`docs/oblisk-layout-engine-geometry.md` § 4,
+/// docs/adr/0045 decisions 1-2) by partitioning both sides into identified and unidentified
+/// subsequences, because an `id` means "this is the same node, and *only* the same node", in both
+/// directions:
+///
+/// - a fresh child **with** an `id` matches only a retained child carrying the same `id`. If none
+///   exists it is new, and it must not fall through to the positional pool -- otherwise a node
+///   declared brand new would inherit the NodeId, and therefore the entire retained subtree, of an
+///   unrelated node that happened to be left over, which is exactly what a paint stage keying GPU
+///   resources on NodeId cannot survive;
+/// - a fresh child **without** an `id` matches only a retained child **without** one, positionally
+///   among themselves. That is ADR-0023's original positional rule applied to a smaller set, and it
+///   is what keeps adding or removing an `id` an honest change of identity rather than a silent
+///   preservation of it;
+/// - every retained child claimed by neither rule is retired child-first (`CONTEXT.md`, Lease),
+///   whether it shrank out of an id-less list or its `id` disappeared from the fresh tree
+///   (decision 2's last sentence). An identified child gets no special teardown, just the existing
+///   lease path. Retirement depends on whether the child was claimed, never on whether the fresh
+///   list happened to run short.
+///
+/// Returns one `Option<RetainedNode>` per `fresh_children` entry, in the same order, for the
+/// caller's own kind-match check: a same-id pair whose kind changed is still not reusable, same
+/// as a positionally-matched pair whose kind changed always was.
+///
+/// Linear in this parent's child count: each side's ids are parsed exactly once, and the id match
+/// goes through a `HashMap<&str, usize>` built once per parent rather than a scan per fresh child.
+/// That matters because nothing bounds sibling count -- a config can emit
+/// `for i = 1, 10000 do c[i] = rect { id = "n" .. i } end` -- and this runs on the Wayland dispatch
+/// thread at capability-push cadence (ADR-0044 decision 2's dirty flag), not once per config edit.
+/// Every temporary below is sized to this parent's own children and dropped on return, so peak
+/// allocation stays proportional to the widest single parent rather than to the whole tree.
+fn pair_children_by_id_then_position(
+    scene: &mut Scene,
+    fresh_children: &[VirtualNode],
+    old_children: Vec<RetainedNode>,
+) -> Result<Vec<Option<RetainedNode>>, LayoutError> {
+    let fresh_ids: Vec<Option<String>> = fresh_children
+        .iter()
+        .map(|c| node::parse_node_id(&c.properties))
+        .collect::<Result<_, _>>()?;
+
+    // Decision 1: a duplicate id among siblings is a LayoutError, not silent last-one-wins.
+    // Checked before touching `old_children` at all, so a bad config never partially retires
+    // anything before this fails.
+    let mut seen: HashSet<&str> = HashSet::with_capacity(fresh_ids.len());
+    for id in fresh_ids.iter().flatten() {
+        if !seen.insert(id.as_str()) {
+            return Err(LayoutError::InvalidProperty {
+                property: "id".to_string(),
+                detail: format!("duplicate id `{id}` among siblings"),
+            });
+        }
+    }
+
+    // Each retained child's id, parsed once per parent rather than once per comparison. A retained
+    // child's id can't hold a Signal or duplicate a sibling's -- both were rejected in the pass
+    // that first made this node retained -- so `.ok().flatten()` collapsing "no id" and "already
+    // validated" together is safe here.
+    let old_ids: Vec<Option<String>> = old_children
+        .iter()
+        .map(|c| node::parse_node_id(&c.properties).ok().flatten())
+        .collect();
+    let mut old_slots: Vec<Option<RetainedNode>> = old_children.into_iter().map(Some).collect();
+
+    let mut retained_by_id: HashMap<&str, usize> = HashMap::with_capacity(old_ids.len());
+    for (index, id) in old_ids.iter().enumerate() {
+        if let Some(id) = id {
+            retained_by_id.insert(id.as_str(), index);
+        }
+    }
+
+    // Step 1: the identified subsequence. A miss stays `None` and is *not* refilled below, which
+    // is the whole point -- an id that matched nothing is a new node, not an unclaimed slot.
+    let mut matched: Vec<Option<RetainedNode>> = Vec::with_capacity(fresh_children.len());
+    for fresh_id in &fresh_ids {
+        let claimed = fresh_id
+            .as_deref()
+            .and_then(|id| retained_by_id.get(id).copied())
+            .and_then(|index| old_slots[index].take());
+        matched.push(claimed);
+    }
+
+    // Step 2: the unidentified subsequence on both sides, zipped in order -- ADR-0023's positional
+    // rule, restricted to the children that never claimed an identity. Identified retained
+    // children are excluded by construction, so a leftover identified node can never be handed to
+    // an anonymous fresh child.
+    let mut unidentified_old = old_ids.iter().enumerate().filter(|(_, id)| id.is_none()).map(|(index, _)| index);
+    for (slot, fresh_id) in matched.iter_mut().zip(&fresh_ids) {
+        if fresh_id.is_none()
+            && let Some(index) = unidentified_old.next()
+        {
+            *slot = old_slots[index].take();
+        }
+    }
+
+    // Whatever neither rule claimed: id-less shrinkage, or a retained child whose id vanished from
+    // the fresh tree. Both retire through the same child-first path, in the order they sat in.
+    for slot in &mut old_slots {
+        if let Some(leftover) = slot.take() {
+            scene.retire_child_first(leftover);
+        }
+    }
+
+    Ok(matched)
+}
+
 /// The single recursive walk: constraint pass on entry, size pass from the recursive children's
 /// results, position pass once this node's own size is known. Reconciles as it goes: `retained`
 /// is `Some` only when the caller already matched `fresh`'s kind at this position (§ 4).
@@ -432,10 +546,10 @@ fn resolve_and_reconcile(
     };
 
     let fresh_children = children_of(fresh, lua)?;
-    let mut old_iter = old_children.into_iter();
+    let matched_candidates = pair_children_by_id_then_position(scene, &fresh_children, old_children)?;
+
     let mut new_children = Vec::with_capacity(fresh_children.len());
-    for fresh_child in &fresh_children {
-        let candidate = old_iter.next();
+    for (fresh_child, candidate) in fresh_children.iter().zip(matched_candidates) {
         let reusable = match candidate {
             Some(c) if c.kind == fresh_child.kind => Some(c),
             Some(stale) => {
@@ -473,10 +587,6 @@ fn resolve_and_reconcile(
             lua,
             depth + 1,
         )?);
-    }
-    // Fresh list shorter than the retained one: everything left over was removed this cycle.
-    for leftover in old_iter {
-        scene.retire_child_first(leftover);
     }
 
     let intrinsic = intrinsic_content_size(fresh, &new_children, text_wrap_width, shaping, lua)?;
@@ -1392,6 +1502,408 @@ mod tests {
         }
         assert_eq!(node.kind, "rect");
         assert_eq!(node.rect.width, 4.0, "the innermost rect's own geometry must have resolved");
+    }
+
+    #[test]
+    fn an_identified_child_keeps_its_node_id_across_applies_when_a_sibling_is_inserted_above_it() {
+        // docs/adr/0045 decision 2: an id-bearing sibling pairs by id, not by position, so
+        // inserting a fresh node above it must not shift it onto a different retained
+        // counterpart. Under the pre-ADR-0045 purely-positional rule (ADR-0023 § 4) this fails:
+        // index 0's retained node gets handed to whatever fresh child now sits at index 0 (the
+        // newly inserted one), not to "keep".
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua1, surface_v1) = surface_from(
+            r#"surface { id = "bar", child = row { children = {
+                rect { id = "keep", width = 10, height = 10 },
+            } } }"#,
+        );
+        scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
+        let keep_id_before = scene.surfaces.get("bar").unwrap().children[0].children[0].id;
+
+        let (_lua2, surface_v2) = surface_from(
+            r#"surface { id = "bar", child = row { children = {
+                rect { width = 5, height = 5 },
+                rect { id = "keep", width = 10, height = 10 },
+            } } }"#,
+        );
+        scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
+        let row = &scene.surfaces.get("bar").unwrap().children[0];
+
+        assert_eq!(
+            row.children[1].id, keep_id_before,
+            "the id-matched sibling must keep its NodeId despite the insertion above it"
+        );
+    }
+
+    #[test]
+    fn an_unidentified_child_list_keeps_node_ids_across_applies_by_position_only() {
+        // docs/adr/0045 decision 2's "degrades to today's behavior when a config uses no ids at
+        // all": with no id anywhere, pairing falls back exactly to index order, so an id-less
+        // list is unaffected by this slice -- inserting above a sibling still shifts it onto a
+        // different retained counterpart, unlike the identified case above.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua1, surface_v1) = surface_from(
+            r#"surface { id = "bar", child = row { children = {
+                rect { width = 10, height = 10 },
+            } } }"#,
+        );
+        scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
+        let original_id = scene.surfaces.get("bar").unwrap().children[0].children[0].id;
+
+        let (_lua2, surface_v2) = surface_from(
+            r#"surface { id = "bar", child = row { children = {
+                rect { width = 5, height = 5 },
+                rect { width = 10, height = 10 },
+            } } }"#,
+        );
+        scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
+        let row = &scene.surfaces.get("bar").unwrap().children[0];
+
+        assert_eq!(row.children[0].id, original_id, "position 0 still reuses the retained identity, since matching stays positional");
+        assert_ne!(
+            row.children[1].id, original_id,
+            "position 1 is a fresh allocation, not a reused identity -- matching today's rule with no ids present"
+        );
+    }
+
+    #[test]
+    fn a_mixed_child_list_keeps_identified_node_ids_across_applies_and_the_rest_only_by_position() {
+        // v1: [B (no id), anchor (id), C (no id)]. v2 inserts a new unidentified node between
+        // anchor and C: [B, anchor, NEW, C]. Once "anchor" claims its retained counterpart by
+        // id, the *remaining* fresh/retained subsequences are [B, NEW, C] against [B's old node,
+        // C's old node] -- a plain positional zip (decision 2's fallback), so B (unmoved ahead of
+        // the insertion) keeps its slot, but the insertion still bumps C onto a fresh id. This is
+        // the same "no special treatment for unidentified nodes" the dedicated positional test
+        // shows in isolation; here it holds even with an identified sibling in the same parent.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua1, surface_v1) = surface_from(
+            r#"surface { id = "bar", child = row { children = {
+                rect { width = 1, height = 1 },
+                rect { id = "anchor", width = 2, height = 2 },
+                rect { width = 3, height = 3 },
+            } } }"#,
+        );
+        scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
+        let (b_id_before, anchor_id_before, c_id_before) = {
+            let root = scene.surfaces.get("bar").unwrap();
+            let row = &root.children[0].children;
+            (row[0].id, row[1].id, row[2].id)
+        };
+
+        let (_lua2, surface_v2) = surface_from(
+            r#"surface { id = "bar", child = row { children = {
+                rect { width = 1, height = 1 },
+                rect { id = "anchor", width = 2, height = 2 },
+                rect { width = 9, height = 9 },
+                rect { width = 3, height = 3 },
+            } } }"#,
+        );
+        scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
+        let root = scene.surfaces.get("bar").unwrap();
+        let row2 = &root.children[0].children;
+
+        assert_eq!(row2.len(), 4);
+        assert_eq!(row2[0].id, b_id_before, "B sits ahead of the insertion, so it keeps its slot either way");
+        assert_eq!(row2[1].id, anchor_id_before, "the identified sibling keeps its id regardless of position");
+        assert_ne!(
+            row2[3].id, c_id_before,
+            "C is unidentified, so the inserted node claims its retained slot positionally -- same rule an id-less list already had"
+        );
+    }
+
+    #[test]
+    fn duplicate_sibling_ids_are_rejected_as_a_layout_error() {
+        // docs/adr/0045 decision 1: a duplicate id among siblings is a LayoutError routed to
+        // rescue, not silent last-one-wins.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"surface { id = "bar", child = row { children = {
+                rect { id = "dup", width = 1, height = 1 },
+                rect { id = "dup", width = 2, height = 2 },
+            } } }"#,
+        );
+        let err = scene.apply(&[surface], full(), &shaping, &_lua).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "id" && detail.contains("dup")),
+            "duplicate sibling ids must be rejected, naming the offending id: {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_same_id_under_two_different_parents_does_not_collide() {
+        // docs/adr/0045 decision 1: id is scoped to its parent, not the tree, so two nodes under
+        // different parents may share one -- what makes a reusable component composable.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"surface { id = "bar", child = row { children = {
+                column { children = { rect { id = "inner", width = 1, height = 1 } } },
+                column { children = { rect { id = "inner", width = 2, height = 2 } } },
+            } } }"#,
+        );
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
+        let row = &scene.surface("bar").unwrap().children[0];
+        assert_eq!(row.children.len(), 2, "two columns, each with its own 'inner' child, must not collide across parents");
+        assert_eq!(row.children[0].children[0].rect.width, 1.0);
+        assert_eq!(row.children[1].children[0].rect.width, 2.0);
+    }
+
+    #[test]
+    fn a_signal_valued_id_is_rejected() {
+        // docs/adr/0045 decision 1: id follows SurfaceTopology's four fields (ADR-0044's
+        // amendment banner) in rejecting a Signal outright rather than resolving it -- a
+        // reconcile identity that changes from pass to pass is meaningless.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua).unwrap();
+        let signal = crate::lua::signal::Signal::new_live(
+            Value::String(lua.create_string("x").unwrap()),
+            crate::lua::signal::DirtyFlag::new(),
+        )
+        .0;
+        lua.globals().set("sig", signal).unwrap();
+        let table: mlua::Table = lua
+            .load(r#"return surface { id = "bar", child = rect { id = sig, width = 1, height = 1 } }"#)
+            .eval()
+            .unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+
+        let err = scene.apply(&[surface], full(), &shaping, &lua).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::UnsupportedSignalProperty(p) if p == "id"),
+            "a Signal-valued id must be rejected outright, not resolved: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_retained_identified_child_whose_id_vanishes_is_retired_child_first_when_the_fresh_list_empties() {
+        // docs/adr/0045 decision 2's last sentence: a retained child whose id disappears is
+        // retired through the existing child-first path (`CONTEXT.md`, Lease), same as any other
+        // removed subtree -- an identified child gets no special teardown.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua1, surface_v1) = surface_from(
+            r#"surface { id = "bar", child = row { children = {
+                rect { id = "gone", width = 1, height = 1, children = { rect { width = 1, height = 1 } } },
+            } } }"#,
+        );
+        scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
+        let (outer_id, inner_id) = {
+            let root = scene.surfaces.get("bar").unwrap();
+            let outer = &root.children[0].children[0];
+            (outer.id, outer.children[0].id)
+        };
+
+        let (_lua2, surface_v2) = surface_from(r#"surface { id = "bar", child = row { children = {} } }"#);
+        scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
+
+        let order = scene.retiring_ids();
+        let inner_pos = order.iter().position(|id| *id == inner_id).unwrap();
+        let outer_pos = order.iter().position(|id| *id == outer_id).unwrap();
+        assert!(
+            inner_pos < outer_pos,
+            "the id-matched subtree's retirement is still child-first, same as the positional path"
+        );
+    }
+
+    #[test]
+    fn a_fresh_id_that_matches_nothing_gets_a_new_node_id_and_the_vanished_id_is_retired() {
+        // docs/adr/0045 decision 2, both directions of "an id means the same node and only the
+        // same node": retained [a, b, c] against fresh [b, c, d]. `d` is a brand new declaration,
+        // so it must not fall through to the positional pool and inherit `a`'s NodeId (and with
+        // it `a`'s whole retained subtree, which a paint stage keying GPU resources on NodeId
+        // would then paint `d` into). `a` left the config, so it must be retired, not silently
+        // handed to `d`.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua1, surface_v1) = surface_from(
+            r#"surface { id = "bar", child = row { children = {
+                rect { id = "a", width = 1, height = 1 },
+                rect { id = "b", width = 2, height = 2 },
+                rect { id = "c", width = 3, height = 3 },
+            } } }"#,
+        );
+        scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
+        let (a_id, b_id, c_id) = {
+            let row = &scene.surfaces.get("bar").unwrap().children[0].children;
+            (row[0].id, row[1].id, row[2].id)
+        };
+
+        let (_lua2, surface_v2) = surface_from(
+            r#"surface { id = "bar", child = row { children = {
+                rect { id = "b", width = 2, height = 2 },
+                rect { id = "c", width = 3, height = 3 },
+                rect { id = "d", width = 4, height = 4 },
+            } } }"#,
+        );
+        scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
+        let row = &scene.surfaces.get("bar").unwrap().children[0].children;
+
+        assert_eq!(row[0].id, b_id, "b keeps its identity across the apply");
+        assert_eq!(row[1].id, c_id, "c keeps its identity across the apply");
+        assert!(
+            row[2].id != a_id && row[2].id != b_id && row[2].id != c_id,
+            "d declared a new id, so it must get a fresh NodeId rather than adopt a retained one"
+        );
+        assert!(
+            scene.retiring_ids().contains(&a_id),
+            "a's id vanished from the config, so a must be retired rather than reused: {:?}",
+            scene.retiring_ids()
+        );
+    }
+
+    #[test]
+    fn an_anonymous_fresh_child_never_inherits_an_identified_retained_node() {
+        // The other direction of the same rule: an unidentified fresh child pairs positionally
+        // only against unidentified retained children. Retained [x (id), anon] against fresh
+        // [anon, anon] must hand the retained *anonymous* node to fresh slot 0 and retire `x`;
+        // drawing `x` out of a shared positional pool would let an id-less node inherit the
+        // identity of one that was explicitly named.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua1, surface_v1) = surface_from(
+            r#"surface { id = "bar", child = row { children = {
+                rect { id = "x", width = 1, height = 1 },
+                rect { width = 2, height = 2 },
+            } } }"#,
+        );
+        scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
+        let (x_id, anon_id) = {
+            let row = &scene.surfaces.get("bar").unwrap().children[0].children;
+            (row[0].id, row[1].id)
+        };
+
+        let (_lua2, surface_v2) = surface_from(
+            r#"surface { id = "bar", child = row { children = {
+                rect { width = 1, height = 1 },
+                rect { width = 2, height = 2 },
+            } } }"#,
+        );
+        scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
+        let row = &scene.surfaces.get("bar").unwrap().children[0].children;
+
+        assert_eq!(
+            row[0].id, anon_id,
+            "the unidentified subsequence pairs among itself, so the retained anonymous node lands in slot 0"
+        );
+        assert!(row[1].id != x_id && row[1].id != anon_id, "slot 1 has no unidentified counterpart left, so it is new");
+        assert!(
+            scene.retiring_ids().contains(&x_id),
+            "x's id is gone from the fresh tree, so x is retired rather than adopted by an anonymous child: {:?}",
+            scene.retiring_ids()
+        );
+    }
+
+    #[test]
+    fn removing_an_id_retires_the_old_node_and_allocates_a_new_one() {
+        // Adding or removing an `id` is a change of identity, not a cosmetic edit: a node that
+        // stops declaring one is a different node from docs/adr/0045's point of view, so its
+        // retained counterpart is retired and the anonymous replacement allocates fresh.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua1, surface_v1) =
+            surface_from(r#"surface { id = "bar", child = row { children = { rect { id = "x", width = 1, height = 1 } } } }"#);
+        scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
+        let x_id = scene.surfaces.get("bar").unwrap().children[0].children[0].id;
+
+        let (_lua2, surface_v2) =
+            surface_from(r#"surface { id = "bar", child = row { children = { rect { width = 1, height = 1 } } } }"#);
+        scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
+        let row = &scene.surfaces.get("bar").unwrap().children[0].children;
+
+        assert_ne!(row[0].id, x_id, "dropping the id allocates a new node rather than silently preserving identity");
+        assert!(
+            scene.retiring_ids().contains(&x_id),
+            "the identified node that vanished must be retired: {:?}",
+            scene.retiring_ids()
+        );
+    }
+
+    #[test]
+    fn a_vanished_id_is_retired_child_first_even_when_fresh_slots_are_still_unmatched() {
+        // The non-empty companion to the test above: the fresh list is the *same length* as the
+        // retained one, so there is an unclaimed slot the old fallthrough would have filled from
+        // the leftover pool. Retiring must depend on whether the id was claimed, not on whether
+        // the fresh list ran short.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua1, surface_v1) = surface_from(
+            r#"surface { id = "bar", child = row { children = {
+                rect { id = "gone", width = 1, height = 1, children = { rect { width = 1, height = 1 } } },
+            } } }"#,
+        );
+        scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
+        let (outer_id, inner_id) = {
+            let outer = &scene.surfaces.get("bar").unwrap().children[0].children[0];
+            (outer.id, outer.children[0].id)
+        };
+
+        let (_lua2, surface_v2) = surface_from(
+            r#"surface { id = "bar", child = row { children = {
+                rect { id = "other", width = 1, height = 1 },
+            } } }"#,
+        );
+        scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
+        let row = &scene.surfaces.get("bar").unwrap().children[0].children;
+
+        assert!(row[0].id != outer_id, "`other` is a new id, so it must not adopt `gone`'s retained node");
+        let order = scene.retiring_ids();
+        let inner_pos = order.iter().position(|id| *id == inner_id).expect("the vanished subtree's child must be retired");
+        let outer_pos = order.iter().position(|id| *id == outer_id).expect("the vanished node must be retired");
+        assert!(inner_pos < outer_pos, "retirement stays child-first even with a same-length fresh list");
+    }
+
+    #[test]
+    fn many_identified_siblings_reconcile_in_reversed_order_without_a_quadratic_scan() {
+        // A config is free to emit thousands of identified siblings
+        // (`for i = 1, 10000 do c[i] = rect { id = "n" .. i } end`), and this pairing runs on the
+        // Wayland dispatch thread at capability-push cadence (ADR-0044 decision 2's dirty flag),
+        // so it must be linear. N is 2000 because that is where the gap is unmistakable without
+        // making the suite slow: reversed order is the worst case for the old nested `position`
+        // scan plus `Vec::remove`, and this test measured 0.80s against it versus 0.06s against
+        // the map lookup, both in a debug test build. A regression to quadratic therefore shows up
+        // as a test that visibly drags, without a flaky wall-clock assertion in the test itself.
+        //
+        // Correctness is what is asserted: every re-emitted id keeps its NodeId despite the
+        // reversal, the one id that was dropped is retired, and the one id that is new allocates
+        // fresh rather than inheriting the dropped node.
+        const N: usize = 2000;
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+
+        let mut v1_children = String::new();
+        for i in 0..N {
+            v1_children.push_str(&format!("rect {{ id = \"n{i}\", width = 1, height = 1 }},\n"));
+        }
+        let (_lua1, surface_v1) =
+            surface_from(&format!("surface {{ id = \"bar\", child = row {{ children = {{ {v1_children} }} }} }}"));
+        scene.apply(&[surface_v1], full(), &shaping, &_lua1).unwrap();
+        let before: Vec<NodeId> = scene.surfaces.get("bar").unwrap().children[0].children.iter().map(|c| c.id).collect();
+
+        // Reversed, with "n0" replaced by a never-seen "fresh" so the run also covers the
+        // no-counterpart path at scale.
+        let mut v2_children = String::new();
+        v2_children.push_str("rect { id = \"fresh\", width = 1, height = 1 },\n");
+        for i in (1..N).rev() {
+            v2_children.push_str(&format!("rect {{ id = \"n{i}\", width = 1, height = 1 }},\n"));
+        }
+        let (_lua2, surface_v2) =
+            surface_from(&format!("surface {{ id = \"bar\", child = row {{ children = {{ {v2_children} }} }} }}"));
+        scene.apply(&[surface_v2], full(), &shaping, &_lua2).unwrap();
+        let after: Vec<NodeId> = scene.surfaces.get("bar").unwrap().children[0].children.iter().map(|c| c.id).collect();
+
+        assert_eq!(after.len(), N);
+        for (slot, i) in (1..N).rev().enumerate() {
+            assert_eq!(after[slot + 1], before[i], "n{i} must keep its NodeId across the reversal");
+        }
+        assert!(!before.contains(&after[0]), "the never-seen `fresh` id must allocate rather than inherit n0's node");
+        assert!(scene.retiring_ids().contains(&before[0]), "n0 left the config, so it is retired");
     }
 
     #[test]

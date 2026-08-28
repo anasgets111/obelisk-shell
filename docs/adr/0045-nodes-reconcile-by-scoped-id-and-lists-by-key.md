@@ -1,5 +1,24 @@
 # Nodes reconcile by scoped `id`, and `list` items by `key`
 
+> "Match the remaining fresh children to the remaining retained children" is ambiguous, and the
+> first implementation read it the wrong way, so this states the rule exactly. **An `id` means "this
+> is the same node, and only the same node", in both directions.** A fresh child carrying an `id`
+> matches only a retained child with that same `id`; if none exists it is new and must not draw from
+> the positional pool. A fresh child carrying no `id` matches only a retained child carrying no
+> `id`. Everything unclaimed is retired child-first.
+>
+> Read the other way, "remaining" lets an identified-but-unmatched fresh child adopt whatever
+> retained node is next in line, and lets an anonymous fresh child inherit a retained node that
+> declared an explicit `id`. Both were measured: retained `[a, b, c]` against fresh `[b, c, d]`
+> produced `[3, 4, 2]` with nothing retired, so `d` inherited `a`'s node and subtree while `a` was
+> never released. That makes declaring an `id` a weaker guarantee than declaring none, which
+> inverts the point of the feature.
+>
+> `list` and its `key` are still unbuilt, and not because they were skipped. `list` is registered as
+> a Lua constructor in `NODE_KINDS` but rejected by `layout::scene::ensure_supported_kind`, so a
+> config using it never reaches reconciliation at all. `key` has nothing to attach to until `list`
+> exists as a real node kind, which is its own slice.
+
 ADR-0023 § 4 matches a freshly evaluated node to its retained counterpart by position among its
 parent's children. That is correct only while the child order never changes. Insert one node above
 an existing sibling and every node below it shifts by one, so each reconciles against the wrong

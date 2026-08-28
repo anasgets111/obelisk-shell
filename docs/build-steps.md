@@ -753,6 +753,22 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    children first within one parent, then fall back to today's positional rule for the rest. Reject
    duplicate ids among siblings as a `LayoutError`. This matters here rather than later because
    item 2 turns reconciliation from a per-edit event into a per-push one.
+
+   "Fall back for the rest" means the rest of the *unidentified* children, on both sides. An `id`
+   has to mean "this is the same node, and only the same node" in both directions, or declaring one
+   is weaker than declaring none: an identified fresh child whose id is new must not adopt a
+   positional leftover, and an anonymous fresh child must not inherit a retained node that declared
+   an id. See ADR-0045's amendment banner, which exists because the first implementation read the
+   ADR's looser wording the other way and measured `[a,b,c]` against `[b,c,d]` retiring nothing.
+
+   Pair through a per-parent map rather than a nested scan. Sibling count is config-controlled and
+   this now runs on the Wayland dispatch thread at push cadence: a nested scan measured 32ms for
+   1000 reversed siblings and 380ms for 4000. Reject a non-UTF-8 `id` rather than converting it
+   lossily, since an id is an equality key and `U+FFFD` collapses distinct ids together.
+
+   ADR-0045's `list` and `key` half is not part of this item. `list` is registered as a Lua
+   constructor in `NODE_KINDS` but rejected by `ensure_supported_kind`, so it never reaches
+   reconciliation; `key` has nothing to attach to until `list` is a real node kind. That is item 12.
 5. **Resolve each property once per pass.** Item 1's review measured one `Scene::apply` over
    `surface > row > rect` and found `margin` resolved four times (the parent loop, both
    `intrinsic_content_size` folds, and `position_children`), `align_v` and `spacing` twice each,
@@ -816,6 +832,18 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    grows the list without bound, and frees them only on an explicit `clear()`. Clear at a
    page-count threshold on an idle frame and let it rebuild. Mark it `ponytail:`, naming the
    ceiling: a whole-cache drop rather than an LRU, because femtovg exposes no per-glyph eviction.
+12. **The `list` node, and `key`** (ADR-0045, `oblisk-idl-api-specs.md` § 5.2). `list` is registered
+   as a Lua constructor in `lua/nodes.rs`'s `NODE_KINDS` but rejected by
+   `layout::scene::ensure_supported_kind`, so a config that uses it gets `UnsupportedNodeKind` and
+   never reaches reconciliation. Build the node kind: children generated from a `source` collection,
+   with `key` mapping a source element to a string used the way item 4 uses `id`, and a duplicate
+   `key` rejected as a `LayoutError` the same way a duplicate sibling `id` is.
+
+   Last in the phase because it needs both halves of what precedes it. Item 4's identified pairing
+   is the mechanism `key` reuses, and a `list` whose items reorder is only observably correct once
+   items 6 through 11 can draw them. Until this lands, a config that wants a dynamic child list
+   writes a computed `children` signal, which reconciles positionally and therefore loses identity
+   on every insertion.
 
 Deliberately deferred, and this one is a decision rather than an omission: **no damage tracking.**
 Redraw the whole surface. `oblisk-layout-engine-geometry.md` § 5 projects damage rectangles, but

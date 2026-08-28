@@ -18,8 +18,9 @@
 //! rather than the stack overflow it used to be.
 //!
 //! [`SurfaceTopology`]'s four fields (`parse_surface_id`/`parse_layer`/`parse_anchor`/
-//! `parse_monitor`) are the one carve-out and keep rejecting a `Signal` outright -- see
-//! [`reject_signal_in_topology_field`]'s doc comment for why.
+//! `parse_monitor`) and every node's optional `id` (`parse_node_id`, docs/adr/0045 decision 1)
+//! are the carve-outs and keep rejecting a `Signal` outright -- see
+//! [`reject_signal_in_structural_field`]'s doc comment for why.
 
 use std::collections::HashMap;
 
@@ -194,20 +195,30 @@ fn resolve_property(
     Ok(Some(resolved))
 }
 
-/// The one carve-out from decision 1's "parsers resolve a `Signal`" rule: [`SurfaceTopology`]'s
-/// four fields (`parse_surface_id`/`parse_layer`/`parse_anchor`/`parse_monitor`) keep rejecting
-/// one outright, the same way every parser used to (this function used to be named
-/// `reject_signal` and back every one of them).
+/// The carve-outs from decision 1's "parsers resolve a `Signal`" rule: [`SurfaceTopology`]'s four
+/// fields (`parse_surface_id`/`parse_layer`/`parse_anchor`/`parse_monitor`) and every node's
+/// optional `id` ([`parse_node_id`], docs/adr/0045 decision 1) keep rejecting one outright, the
+/// same way every parser used to (this function used to be named `reject_signal` and back every
+/// one of them, then narrowed to the topology fields alone -- ADR-0044's amendment banner --
+/// before widening again here to cover `id`).
 ///
-/// `surface_topology` runs on every `Scene::apply` so `renderer/src/socket.rs`'s
+/// The unifying reason, which is why these five and nothing else: each is read exactly once per
+/// evaluation and a *structural* decision is then made from it and acted on -- where a surface is
+/// placed, or which retained node a fresh one is. A `Signal` is free to change between passes, so
+/// admitting one here would leave a decision already taken resting on a value that no longer
+/// holds, with nothing left to re-check it. Every other property is read for the geometry or
+/// appearance of the pass it was read in, so a later change simply produces different output on
+/// the next pass, which is the point of a signal.
+///
+/// Concretely: `surface_topology` runs on every `Scene::apply` so `renderer/src/socket.rs`'s
 /// `handle_reevaluate` can diff it against `applied_topology` and choose swap-versus-in-place
-/// (ADR-0001). A `Signal` in one of these four fields would resolve once for that comparison and
-/// then be free to change inside the live generation afterwards: a surface could move layer or
-/// monitor with no swap, and the swap-versus-in-place decision would already have been made
-/// against a value that no longer holds by the time anything acted on it. ADR-0044 decision 1
-/// doesn't carve this out explicitly -- it's a gap in the ADR, not a case the ADR considered and
-/// rejected.
-fn reject_signal_in_topology_field(property: &str, value: &Value) -> Result<(), LayoutError> {
+/// (ADR-0001) -- a surface could otherwise move layer or monitor with no swap. And `id` is
+/// `pair_children_by_id_then_position`'s reconcile identity, matched once per `Scene::apply` to
+/// pair a fresh child against its retained counterpart -- a value that could change between the
+/// match and whatever reads it afterward would make "the same node as last time" itself
+/// ambiguous. ADR-0044 decision 1 doesn't carve either out explicitly -- it's a gap in the ADR,
+/// not a case the ADR considered and rejected.
+fn reject_signal_in_structural_field(property: &str, value: &Value) -> Result<(), LayoutError> {
     if matches!(value, Value::UserData(_)) {
         return Err(LayoutError::UnsupportedSignalProperty(property.to_string()));
     }
@@ -383,15 +394,59 @@ fn parse_string_property(properties: &HashMap<String, Value>, property: &str, de
             None => return Err(invalid(property, format!("surface node requires `{property}`"))),
         },
     };
-    reject_signal_in_topology_field(property, value)?;
+    reject_signal_in_structural_field(property, value)?;
     match value {
         Value::String(s) => Ok(s.to_string_lossy()),
         other => Err(invalid(property, format!("expected a string, got {other:?}"))),
     }
 }
 
+/// A top-level surface's `id`: required, unique among the surfaces in one config, and keys
+/// `Scene::apply`'s `HashMap` (`docs/oblisk-layout-engine-geometry.md` § 4). Also, since
+/// docs/adr/0045, this same property is the surface's *reconcile* identity -- the root of a
+/// tree is the one node whose retained counterpart is found by key lookup rather than by
+/// [`parse_node_id`]'s per-parent pairing, because a surface has no parent to be scoped within.
+/// One property name, one meaning ("which node is this, across two applies"), read by two
+/// different call sites for what happens to be two different purposes at the root versus
+/// everywhere below it -- decision 5 is explicit that this is not a second mechanism to build,
+/// just the existing one restated at the level below.
 pub fn parse_surface_id(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     parse_string_property(properties, "id", None)
+}
+
+/// The optional `id` base property on every node kind, one level below a surface's root
+/// (`docs/oblisk-layout-engine-geometry.md` § 4, docs/adr/0045 decisions 1-2). `None` means "no
+/// id" and is not an error -- `pair_children_by_id_then_position` pairs a child that carries none
+/// positionally against the other id-less children, exactly ADR-0023's original rule applied to
+/// that subsequence. Adding or dropping an `id` is therefore a change of identity, not a cosmetic
+/// edit: the retained counterpart is retired and a new node allocated. Rejects a `Signal` via
+/// [`reject_signal_in_structural_field`] for the same reason [`parse_surface_id`] already does:
+/// this is a reconcile identity, decided once at match time, not a value that should be able to
+/// drift between the fresh tree and whatever the match produces.
+///
+/// Non-UTF-8 bytes are refused rather than converted, unlike [`checked_string`]'s lossy handling
+/// of display-oriented properties like `content`. An id is an *equality key*: with
+/// `to_string_lossy`, `"\xFF"` and `"\xFE"` both become `U+FFFD` and two genuinely distinct ids
+/// compare equal, so `pair_children_by_id_then_position`'s duplicate check would reject a valid
+/// config and a fresh child could claim the wrong retained counterpart. A garbled glyph in a
+/// label is cosmetic; a garbled identity silently rebinds a node's retained subtree.
+///
+/// Scoping ("unique among siblings, not across the tree") and duplicate rejection are
+/// `pair_children_by_id_then_position`'s job, not this parser's -- a duplicate can only be
+/// detected by comparing this node's id against its siblings', which this function has no
+/// visibility into.
+pub fn parse_node_id(properties: &HashMap<String, Value>) -> Result<Option<String>, LayoutError> {
+    let Some(value) = properties.get("id") else {
+        return Ok(None);
+    };
+    reject_signal_in_structural_field("id", value)?;
+    match value {
+        Value::String(s) => s
+            .to_str()
+            .map(|s| Some(s.to_string()))
+            .map_err(|_| invalid("id", "must be valid UTF-8 -- an id is compared for equality, so it cannot be converted lossily")),
+        other => Err(invalid("id", format!("expected a string, got {other:?}"))),
+    }
 }
 
 /// § 6.1's `layer` (`"Background"`/`"Bottom"`/`"Top"`/`"Overlay"`). Required, same shape as
@@ -416,7 +471,7 @@ pub fn parse_anchor(properties: &HashMap<String, Value>) -> Result<Anchor, Layou
     let Some(value) = properties.get("anchor") else {
         return Ok(Anchor::default());
     };
-    reject_signal_in_topology_field("anchor", value)?;
+    reject_signal_in_structural_field("anchor", value)?;
     let Value::Table(table) = value else {
         return Err(invalid("anchor", format!("expected a table, got {value:?}")));
     };
@@ -947,6 +1002,66 @@ mod tests {
                 monitor: "eDP-1".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn node_id_absent_is_none() {
+        let props = HashMap::new();
+        assert_eq!(parse_node_id(&props).unwrap(), None);
+    }
+
+    #[test]
+    fn node_id_reads_the_string() {
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "rect", id = "handle" }"#).eval().unwrap();
+        let props = props_from_table(&table);
+        assert_eq!(parse_node_id(&props).unwrap(), Some("handle".to_string()));
+    }
+
+    #[test]
+    fn a_signal_userdata_in_node_id_is_rejected() {
+        // docs/adr/0045 decision 1: id is a reconcile identity, decided once at match time, so it
+        // rejects a Signal the same way SurfaceTopology's four fields already do.
+        let lua = lua();
+        crate::lua::signal::register(&lua).unwrap();
+        let signal = crate::lua::signal::Signal::new_live(Value::Boolean(true), crate::lua::signal::DirtyFlag::new()).0;
+        let table = lua.create_table().unwrap();
+        table.set("kind", "rect").unwrap();
+        table.set("id", signal).unwrap();
+        let node = deserialize_lua_table(&table).unwrap();
+        assert!(matches!(parse_node_id(&node.properties).unwrap_err(), LayoutError::UnsupportedSignalProperty(p) if p == "id"));
+    }
+
+    #[test]
+    fn a_non_utf8_node_id_is_rejected_rather_than_lossily_converted() {
+        // An id is an equality key (docs/adr/0045 decision 1), so a lossy conversion would map
+        // every distinct invalid byte onto U+FFFD and make two genuinely different ids compare
+        // equal: the duplicate check would reject a valid config, and a fresh child could claim
+        // the wrong retained counterpart.
+        let lua = lua();
+        let table = lua.create_table().unwrap();
+        table.set("kind", "rect").unwrap();
+        table.set("id", lua.create_string(b"\xff").unwrap()).unwrap();
+        let props = props_from_table(&table);
+        let err = parse_node_id(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "id"),
+            "a non-UTF-8 id must be a LayoutError naming the property: {err:?}"
+        );
+    }
+
+    #[test]
+    fn two_distinct_non_utf8_ids_do_not_collapse_onto_one_replacement_character() {
+        // The specific collision the lossy conversion produced: "\xFF" and "\xFE" both became
+        // U+FFFD. Both are now refused outright, so neither can stand in for the other.
+        let lua = lua();
+        for byte in [b"\xff".as_slice(), b"\xfe".as_slice()] {
+            let table = lua.create_table().unwrap();
+            table.set("kind", "rect").unwrap();
+            table.set("id", lua.create_string(byte).unwrap()).unwrap();
+            let props = props_from_table(&table);
+            assert!(matches!(parse_node_id(&props), Err(LayoutError::InvalidProperty { ref property, .. }) if property == "id"));
+        }
     }
 
     #[test]
