@@ -1,5 +1,6 @@
 //! The `Signal` reactive primitive (`oblisk-idl-api-specs.md` § 1.2): `signal:get()`,
-//! `signal:map(fn)`, and the global `computed(dependencies, fn)`.
+//! `signal:map(fn)`, `signal:set(value)`, and the globals `computed(dependencies, fn)` and
+//! `state(name, initial)` (ADR-0044 decision 5).
 //!
 //! Lua never constructs a bare `Signal` itself -- § 1.2 exposes it as Rust-owned userdata handed
 //! *to* Lua, never built *by* Lua from a raw value. `Signal::try_new_direct` is the Rust-side
@@ -17,6 +18,7 @@
 //! every `computed` body doesn't have to redundantly call `:get()` on each of its own dependencies.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -75,6 +77,54 @@ enum SignalKind {
     /// the same single-threaded-state convention `supervisor/src/audio/mixer.rs`'s
     /// `Rc<RefCell<MixerState>>` already uses.
     Live(Rc<RefCell<Value>>),
+    /// Lua-authored state (ADR-0044 decision 5): the one signal kind `Signal::set` accepts, built
+    /// by the `state(name, initial)` global and written from a config's own `on_click`.
+    ///
+    /// A fourth variant rather than a reuse of `Live`, even though the storage is identical.
+    /// ADR-0044 makes capability signals read-only to Lua, and a `set` that accepted `Live` would
+    /// let a config overwrite the network SSID the Supervisor just pushed, with every reader
+    /// downstream believing it. Keeping the writable kind distinct makes that rule a fact the type
+    /// system holds rather than a comment `set` has to remember, and makes it testable.
+    ///
+    /// Carries its own `DirtyFlag` clone rather than reaching for one at write time, for the same
+    /// reason [`LiveSignalHandle`] does: `set` is a `UserData` method with no `RendererClient` in
+    /// reach, and every signal in a generation shares the one flag decision 2 specifies anyway.
+    State { cell: Rc<RefCell<Value>>, dirty: DirtyFlag },
+}
+
+impl SignalKind {
+    /// What a refused [`Signal::set`] calls this kind when it explains itself to a config author.
+    fn describe(&self) -> &'static str {
+        match self {
+            SignalKind::Direct(_) => "a direct",
+            SignalKind::Computed { .. } => "a computed",
+            SignalKind::Live(_) => "a capability",
+            SignalKind::State { .. } => "a state",
+        }
+    }
+}
+
+/// The marshalling boundary (`marshal.rs`, § 1.1) applied to one Lua-authored value: the
+/// types § 1.1 constrains (`Number`/`Integer`/`String`) are checked, and every other shape passes
+/// through untouched since the spec places no extra constraint on it.
+///
+/// Shared by [`Signal::try_new_direct`], [`Signal::new_state`] and `set`, which all guard the same
+/// thing: a value hand-authored in Lua crossing into Rust. `Signal::new_live` deliberately does
+/// not, because its value came out of a Rust struct (see that constructor's doc comment).
+fn check_lua_authored(value: &Value) -> Result<(), marshal::MarshalError> {
+    match value {
+        Value::Number(n) => {
+            marshal::check_number(*n)?;
+        }
+        Value::Integer(i) => {
+            marshal::check_integer(*i)?;
+        }
+        Value::String(s) => {
+            marshal::check_string(&s.to_string_lossy())?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// A read-only reactive value. Wraps either a plain value (`Direct`, Rust-pushed) or a Lua
@@ -94,19 +144,19 @@ impl Signal {
     /// tests only.
     #[allow(dead_code)]
     pub fn try_new_direct(value: Value) -> Result<Self, marshal::MarshalError> {
-        match &value {
-            Value::Number(n) => {
-                marshal::check_number(*n)?;
-            }
-            Value::Integer(i) => {
-                marshal::check_integer(*i)?;
-            }
-            Value::String(s) => {
-                marshal::check_string(&s.to_string_lossy())?;
-            }
-            _ => {}
-        }
+        check_lua_authored(&value)?;
         Ok(Signal(SignalKind::Direct(value)))
+    }
+
+    /// The signal behind `state(name, initial)` (ADR-0044 decision 5): writable from Lua through
+    /// `signal:set(value)`, which marks `dirty` so the next poll turn re-resolves.
+    ///
+    /// Marshal-checked, unlike [`Self::new_live`] and exactly like [`Self::try_new_direct`]:
+    /// `initial` is written in `shell.lua`, so it is a hand-authored value crossing into Rust,
+    /// which is the boundary `marshal.rs` exists for.
+    pub fn new_state(initial: Value, dirty: DirtyFlag) -> Result<Self, marshal::MarshalError> {
+        check_lua_authored(&initial)?;
+        Ok(Signal(SignalKind::State { cell: Rc::new(RefCell::new(initial)), dirty }))
     }
 
     /// A signal Rust can push new values into after construction via the paired
@@ -138,6 +188,7 @@ impl Signal {
         match &self.0 {
             SignalKind::Direct(value) => Ok(value.clone()),
             SignalKind::Live(cell) => Ok(cell.borrow().clone()),
+            SignalKind::State { cell, .. } => Ok(cell.borrow().clone()),
             SignalKind::Computed { deps, func } => {
                 // The budget is entered *before* dependency resolution, not around `func.call`
                 // alone, and that ordering is the whole point (see [`CpuBudget`]): it makes the
@@ -237,8 +288,40 @@ impl UserData for Signal {
         methods.add_method("map", |_, this, f: Function| {
             Ok(Signal(SignalKind::Computed { deps: vec![this.clone()], func: f }))
         });
+        // ADR-0044 decision 5's write path, and the only one Lua has. Every other kind is refused
+        // by name rather than by a type error, because the config author who typed
+        // `network:set(...)` needs to be told *why* a capability signal will not take a value,
+        // not just that the call did not work.
+        methods.add_method("set", |_, this, value: Value| {
+            let SignalKind::State { cell, dirty } = &this.0 else {
+                return Err(mlua::Error::runtime(format!(
+                    "signal:set() is only valid on a state(name, initial) signal, and this is {} signal: every other signal kind is read-only to Lua (docs/adr/0044 decision 5)",
+                    this.0.describe()
+                )));
+            };
+            // Checked before the write, so a refused value leaves the stored one alone and marks
+            // nothing -- the same Lua-authored boundary `Signal::new_state` puts on `initial`.
+            check_lua_authored(&value).map_err(|err| {
+                mlua::Error::runtime(format!("signal:set() refused its value at the marshalling boundary: {err}"))
+            })?;
+            *cell.borrow_mut() = value;
+            dirty.mark();
+            Ok(())
+        });
     }
 }
+
+/// The `name -> Signal` map ADR-0044 decision 5 hangs `state` off: the *name* is the identity, so
+/// re-running the config on an in-place reload finds the signal it built last time still holding
+/// whatever the user's last click left in it, and an open dropdown stays open across a config edit.
+///
+/// It lives in `Lua::set_app_data`, the same per-`Lua` storage [`CpuBudget::enter`] keeps its
+/// deadline stack in, and that placement is why the map needs no explicit lifetime management:
+/// decision 4 keeps the VM alive across an in-place reload, so anything hung off the `Lua`
+/// outlives an evaluation by construction, and a generation swap is a new process with a new VM,
+/// which is decision 5's "named state dies on a generation swap" falling out for free.
+#[derive(Default)]
+struct StateRegistry(HashMap<String, Signal>);
 
 /// An RAII claim on the 5ms evaluation budget, held for one `Computed` [`Signal::get_value`] --
 /// dependency resolution *and* the closure call, not the closure call alone. Entering pushes a
@@ -372,9 +455,15 @@ fn governing_deadline_expired(lua: &Lua) -> bool {
         .is_some_and(|deadline| Instant::now() > deadline)
 }
 
-/// Registers the `computed(dependencies, fn)` global (§ 1.2). `dependencies` must be an array of
-/// `Signal` userdata handles.
-pub fn register(lua: &Lua) -> mlua::Result<()> {
+/// Registers the `computed(dependencies, fn)` global (§ 1.2) and the `state(name, initial)` global
+/// (ADR-0044 decision 5). `dependencies` must be an array of `Signal` userdata handles.
+///
+/// `dirty` is decision 2's one scene-dirty flag, taken explicitly rather than fished out of
+/// `app_data` at call time: a hidden coupling that fails inside a config author's own `state()`
+/// call, because nobody stashed the flag, is worse than threading one argument through the call
+/// sites. It must be the same flag `Signal::new_live` hands out and `RendererClient` drains, or a
+/// `:set()` would mark a flag nothing reads.
+pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
     lua.globals().set(
         "computed",
         lua.create_function(|_, (deps, func): (Table, Function)| {
@@ -386,6 +475,29 @@ pub fn register(lua: &Lua) -> mlua::Result<()> {
             }
             Ok(Signal(SignalKind::Computed { deps: collected, func }))
         })?,
+    )?;
+    lua.globals().set(
+        "state",
+        lua.create_function(move |lua, (name, initial): (String, Value)| {
+            if lua.app_data_ref::<StateRegistry>().is_none() {
+                lua.set_app_data(StateRegistry::default());
+            }
+            let existing =
+                lua.app_data_ref::<StateRegistry>().expect("just ensured the state registry exists").0.get(&name).cloned();
+            if let Some(signal) = existing {
+                // Decision 5: a name already in the map wins and `initial` is ignored, which is
+                // what makes an in-place reload keep the value instead of resetting it.
+                return Ok(signal);
+            }
+            let signal = Signal::new_state(initial, dirty.clone()).map_err(|err| {
+                mlua::Error::runtime(format!("state(\"{name}\", ...) refused its initial value at the marshalling boundary: {err}"))
+            })?;
+            lua.app_data_mut::<StateRegistry>()
+                .expect("just ensured the state registry exists")
+                .0
+                .insert(name, signal.clone());
+            Ok(signal)
+        })?,
     )
 }
 
@@ -395,10 +507,150 @@ mod tests {
 
     fn lua_with_signal(name: &str, value: Value) -> Lua {
         let lua = Lua::new();
-        register(&lua).unwrap();
+        register(&lua, DirtyFlag::new()).unwrap();
         let signal = Signal::try_new_direct(value).unwrap();
         lua.globals().set(name, signal).unwrap();
         lua
+    }
+
+    /// A VM whose `state` global marks the returned flag, so a test can assert on the same flag
+    /// `RendererClient` would be draining.
+    fn lua_with_state() -> (Lua, DirtyFlag) {
+        let lua = Lua::new();
+        let dirty = DirtyFlag::new();
+        register(&lua, dirty.clone()).unwrap();
+        (lua, dirty)
+    }
+
+    #[test]
+    fn state_returns_a_signal_reading_back_the_initial_value_it_was_given() {
+        let (lua, _dirty) = lua_with_state();
+        let result: i64 = lua.load(r#"return state("count", 7):get()"#).eval().unwrap();
+        assert_eq!(result, 7);
+    }
+
+    #[test]
+    fn set_replaces_what_a_later_get_returns() {
+        let (lua, _dirty) = lua_with_state();
+        let result: i64 = lua
+            .load(
+                r#"
+                local s = state("count", 7)
+                s:set(41)
+                return s:get()
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(result, 41, "a state signal must read back what Lua last wrote, not its initial value");
+    }
+
+    #[test]
+    fn set_marks_the_scene_dirty_flag_and_a_plain_get_does_not() {
+        // ADR-0044 decision 5: `:set()` marks dirty through decision 2's flag. Reading must not,
+        // or every layout-time resolve would re-dirty the scene it was resolving.
+        let (lua, dirty) = lua_with_state();
+        lua.load(r#"s = state("count", 0)"#).exec().unwrap();
+        assert!(!dirty.take(), "constructing a state signal changes nothing that is painted");
+
+        let _: i64 = lua.load("return s:get()").eval().unwrap();
+        assert!(!dirty.take(), "reading a state signal must not mark the scene dirty");
+
+        lua.load("s:set(1)").exec().unwrap();
+        assert!(dirty.take(), "writing a state signal must mark the shared scene-dirty flag");
+    }
+
+    #[test]
+    fn the_same_state_name_returns_the_same_signal_and_ignores_the_second_initial() {
+        // ADR-0044 decision 5's whole point: an in-place reload re-runs the config, and `state`
+        // has to hand back the signal holding the value the user's last click left in it rather
+        // than resetting it to what the config literal says.
+        let (lua, _dirty) = lua_with_state();
+        let result: i64 = lua
+            .load(
+                r#"
+                state("open", 0):set(5)
+                return state("open", 99):get()
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(result, 5, "a re-declared name must keep its current value and ignore the new initial");
+    }
+
+    #[test]
+    fn two_state_names_are_two_independent_signals() {
+        let (lua, _dirty) = lua_with_state();
+        let (a, b): (i64, i64) = lua
+            .load(
+                r#"
+                state("a", 1):set(10)
+                return state("a", 0):get(), state("b", 2):get()
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!((a, b), (10, 2), "the map is keyed by name, so a write to one name must not reach another");
+    }
+
+    #[test]
+    fn set_on_a_live_capability_signal_is_refused_because_capability_values_are_read_only_to_lua() {
+        // The security-relevant one. If `:set()` accepted a `Live` signal, a config could
+        // overwrite the network SSID the Supervisor just pushed, and every reader downstream would
+        // believe it. ADR-0044 makes capability signals read-only to Lua; the separate `State`
+        // variant is what makes that a type-level fact rather than a comment.
+        let (lua, dirty) = lua_with_state();
+        let (signal, _handle) = Signal::new_live(Value::Integer(1), dirty.clone());
+        lua.globals().set("network", signal).unwrap();
+
+        let err = lua.load(r#"network:set(2)"#).exec().unwrap_err();
+        assert!(err.to_string().contains("read-only"), "the refusal must name the read-only rule: {err}");
+        assert!(!dirty.take(), "a refused write must not mark the scene dirty either");
+
+        let unchanged: i64 = lua.load("return network:get()").eval().unwrap();
+        assert_eq!(unchanged, 1, "the pushed value must survive the attempt");
+    }
+
+    #[test]
+    fn set_on_a_computed_signal_is_refused() {
+        let (lua, _dirty) = lua_with_state();
+        let err = lua
+            .load(
+                r#"
+                local s = state("count", 1)
+                s:map(function(v) return v end):set(9)
+                "#,
+            )
+            .exec()
+            .unwrap_err();
+        assert!(err.to_string().contains("read-only"), "the refusal must name the read-only rule: {err}");
+    }
+
+    #[test]
+    fn state_refuses_an_initial_value_that_fails_the_marshalling_boundary() {
+        // `state`'s initial is Lua-authored, which is exactly the boundary `marshal.rs` guards.
+        let (lua, _dirty) = lua_with_state();
+        let err = lua.load(r#"return state("bad", 0/0)"#).eval::<Value>().unwrap_err();
+        assert!(err.to_string().contains("finite"), "a NaN initial must be refused by name: {err}");
+    }
+
+    #[test]
+    fn set_refuses_a_value_that_fails_the_marshalling_boundary() {
+        let (lua, dirty) = lua_with_state();
+        let err = lua
+            .load(
+                r#"
+                s = state("count", 0)
+                s:set(0/0)
+                "#,
+            )
+            .exec()
+            .unwrap_err();
+        assert!(err.to_string().contains("finite"), "a NaN write must be refused by name: {err}");
+        assert!(!dirty.take(), "a refused write must not mark the scene dirty");
+
+        let unchanged: i64 = lua.load("return s:get()").eval().unwrap();
+        assert_eq!(unchanged, 0, "a refused write must leave the stored value alone");
     }
 
     #[test]
@@ -418,7 +670,7 @@ mod tests {
     #[test]
     fn computed_combines_multiple_dependencies_current_values() {
         let lua = Lua::new();
-        register(&lua).unwrap();
+        register(&lua, DirtyFlag::new()).unwrap();
         lua.globals().set("a", Signal::try_new_direct(Value::Integer(3)).unwrap()).unwrap();
         lua.globals().set("b", Signal::try_new_direct(Value::Integer(4)).unwrap()).unwrap();
 
@@ -434,7 +686,7 @@ mod tests {
         // No memoization: rebuilding the dependency signal under the same global name and
         // re-reading the computed's :get() must observe the new value, not a cached first read.
         let lua = Lua::new();
-        register(&lua).unwrap();
+        register(&lua, DirtyFlag::new()).unwrap();
         lua.globals().set("a", Signal::try_new_direct(Value::Integer(1)).unwrap()).unwrap();
         lua.load("doubled = computed({a}, function(x) return x * 2 end)").exec().unwrap();
 
@@ -450,7 +702,7 @@ mod tests {
     #[test]
     fn computed_aborts_a_runaway_closure_instead_of_hanging_or_returning_a_wrong_value() {
         let lua = Lua::new();
-        register(&lua).unwrap();
+        register(&lua, DirtyFlag::new()).unwrap();
         lua.globals().set("a", Signal::try_new_direct(Value::Integer(1)).unwrap()).unwrap();
 
         let start = Instant::now();
@@ -469,7 +721,7 @@ mod tests {
         // `dependencies`) re-enters `call_with_cpu_cap` before the outer call returns. The inner
         // call must hand enforcement back to the outer one on return, not erase it.
         let lua = Lua::new();
-        register(&lua).unwrap();
+        register(&lua, DirtyFlag::new()).unwrap();
         lua.globals().set("a", Signal::try_new_direct(Value::Integer(1)).unwrap()).unwrap();
         lua.globals().set("other", Signal::try_new_direct(Value::Integer(2)).unwrap()).unwrap();
 
@@ -486,7 +738,7 @@ mod tests {
     #[test]
     fn a_live_signal_reflects_a_value_pushed_after_construction_not_a_frozen_snapshot() {
         let lua = Lua::new();
-        register(&lua).unwrap();
+        register(&lua, DirtyFlag::new()).unwrap();
         let (signal, handle) = Signal::new_live(Value::Integer(1), DirtyFlag::new());
         lua.globals().set("live", signal).unwrap();
 
@@ -506,7 +758,7 @@ mod tests {
         // overflow before this cap existed -- observed with this exact test run alone, recorded
         // in the task report).
         let lua = Lua::new();
-        register(&lua).unwrap();
+        register(&lua, DirtyFlag::new()).unwrap();
         let start = Instant::now();
         let result: mlua::Result<i64> = lua
             .load(
@@ -526,7 +778,7 @@ mod tests {
     #[test]
     fn a_mutually_recursive_computed_pair_is_rejected_with_a_nesting_depth_error_not_an_abort() {
         let lua = Lua::new();
-        register(&lua).unwrap();
+        register(&lua, DirtyFlag::new()).unwrap();
         let start = Instant::now();
         let result: mlua::Result<i64> = lua
             .load(
@@ -674,7 +926,7 @@ mod tests {
     #[test]
     fn a_cap_abort_does_not_leave_the_hook_installed_for_later_unrelated_evaluation() {
         let lua = Lua::new();
-        register(&lua).unwrap();
+        register(&lua, DirtyFlag::new()).unwrap();
         lua.globals().set("a", Signal::try_new_direct(Value::Integer(1)).unwrap()).unwrap();
         let _: mlua::Result<i64> =
             lua.load("return computed({a}, function(x) while true do end end):get()").eval();

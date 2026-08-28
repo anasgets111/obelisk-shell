@@ -107,14 +107,16 @@ local notification_feed = cell(label(notifications, notification_summary))
 -- Phase 21 item 1's live proof: a `button` whose `on_click` changes what a `text` paints, which is
 -- the whole point of routing pointer events at all.
 --
--- The counter is a plain Lua upvalue read back through a zero-dependency `computed`, not a signal
--- the handler writes, because there is no writable signal to write: ADR-0044 decision 5's
--- `state(name, initial)` is not built yet. What makes the new count appear is the Renderer marking
--- the scene dirty once `on_click` returns (`RendererClient::mark_scene_dirty`), so the next poll
--- turn re-resolves this `computed` and repaints. `rect` is the button's own rect in this surface's
--- logical coordinates (ADR-0050 decision 3) -- Phase 22's `popup` is what really wants it; this
--- prints it so a live session can check it against where the button is actually drawn.
-local clicks = 0
+-- The counter is a `state` signal (ADR-0044 decision 5), so the handler's `:set()` is what marks
+-- the scene dirty and drives the repaint -- nothing outside the config guesses that a click
+-- changed something. The name is also what survives an in-place reload: edit a colour below while
+-- this is running and the count keeps going instead of resetting to 0, because `state("clicks", 0)`
+-- finds the signal it built last time and ignores the new initial.
+--
+-- `rect` is the button's own rect in this surface's logical coordinates (ADR-0050 decision 3) --
+-- Phase 22's `popup` is what really wants it; this prints it so a live session can check it against
+-- where the button is actually drawn.
+local clicks = state("clicks", 0)
 
 local click_button = button {
     width = 86,
@@ -122,11 +124,12 @@ local click_button = button {
     background = "#313244ff",
     radius = 4,
     on_click = function(rect)
-        clicks = clicks + 1
-        print(string.format("[shell.lua] click %d, button rect %.0f,%.0f %.0fx%.0f", clicks, rect.x, rect.y, rect.width, rect.height))
+        local n = clicks:get() + 1
+        clicks:set(n)
+        print(string.format("[shell.lua] click %d, button rect %.0f,%.0f %.0fx%.0f", n, rect.x, rect.y, rect.width, rect.height))
     end,
-    children = { cell(computed({}, function()
-        return string.format("clicks %d", clicks)
+    children = { cell(clicks:map(function(n)
+        return string.format("clicks %d", n)
     end), ACCENT) },
 }
 

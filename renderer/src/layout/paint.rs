@@ -480,7 +480,7 @@ mod tests {
     /// harness controls, so a rejection is this test's own bug, not something to assert on.
     fn resolved_surface(lua: &Lua, lua_src: &str, size: LogicalSize) -> ResolvedNode {
         register_node_constructors(lua).unwrap();
-        signal::register(lua).unwrap();
+        signal::register(lua, signal::DirtyFlag::new()).unwrap();
         let table: mlua::Table = lua.load(lua_src).eval().unwrap();
         let surface = deserialize_lua_table(&table).unwrap();
         let shaping = ShapingHandle::spawn();

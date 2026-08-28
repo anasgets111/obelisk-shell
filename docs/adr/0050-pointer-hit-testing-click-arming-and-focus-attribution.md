@@ -1,5 +1,10 @@
 # Pointer hit-testing walks a path, a click is press-and-release on one node, and focus attributes the secret
 
+> **Amended when built (Phase 21 item 1, commit `c317aa2`).** Two statements below were written
+> against code that had already moved. Both are corrected in the amendment section at the end; the
+> decisions themselves stand. Read decision 1's ponytail and the consequences section's first
+> paragraph together with that section.
+
 `on_click` has been an inert `mlua::Value` in a node's property map since ADR-0021 item 2. Phase 21
 calls it. Three things have to be decided before it can be called at all, and none of them are
 recoverable cheaply once a config depends on the answer.
@@ -97,3 +102,43 @@ compositor focuses; `wl_keyboard`'s `enter`/`leave` is how the engine finds out.
 Click-outside-to-dismiss for a `panel` stays unsolved and this changes nothing about it. Layer
 surfaces have no compositor-agnostic grab. A `popup` does not have the problem, which is the reason
 to reach for one.
+
+## Amendment: two things above were already false when written
+
+### `ResolvedNode::rect` is parent-relative
+
+The consequences section says pointer coordinates "arrive surface-local and logical, which is the
+space `ResolvedNode::rect` is already in, so hit-testing needs no conversion." Half right.
+`layout::paint::paint_node` carries a running `origin_x + node.rect.x` down the tree, so a node's
+rect is relative to its parent and only the root's is surface-local.
+
+The point-to-node comparison genuinely needs no conversion, as long as the walk accumulates the same
+running origin paint does. What does not exist for free is the *absolute* rect: decision 3 hands
+`on_click` the button's rect, and Phase 22's positioner wants it in surface coordinates, and that
+number is only recoverable as the sum along the path that reached the node. `layout::hit` exports
+`absolute_rect` for exactly that, which is a second reason the return type is the whole chain rather
+than a node and a depth.
+
+### Paint does clip, so hitting and painting agree exactly
+
+Decision 1's ponytail says "painting without clipping and hitting without clipping at least disagree
+in the safe direction." That describes code deleted before this ADR was written: Phase 19 item 17
+added an `intersect_scissor` chain to `paint_node`.
+
+The real outcome is better than the ponytail settles for. Containment-gated descent makes a node's
+hittable region exactly its intersection with every ancestor's rect, and the scissor chain makes its
+painted region exactly the same intersection. The two walks agree exactly, without either one
+carrying a clip rect, because they are computing the same intersection by different means. The
+overflow case the ponytail worried about is not a gap to close.
+
+What survives of that ponytail is smaller and still true: neither walk carries an explicit clip
+rect, so anything that gives one of them a scroll offset or a transform has to give the other the
+same one in the same commit.
+
+### Decision 4's premise was missing a piece
+
+Decision 4 and ADR-0049 both assume `on_click` writes named state and the write marks the scene
+dirty. `state(name, initial)` (ADR-0044 decision 5) was not built, so nothing a handler could do
+marked anything. Phase 21 item 1 shipped an unconditional dirty mark after every handler as a
+stopgap and named it as one; the following commit built `state` and deleted it. Phase 22 depends on
+the same mechanism, which is why it was worth fixing rather than documenting.

@@ -257,10 +257,11 @@ impl RendererClient {
         generation_id: u32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let shell_lua_path = shared::shell_lua_path().map_err(|err| format!("failed to resolve shell.lua's path: {err}"))?;
-        let loader = Loader::new().map_err(|err| format!("failed to start the Lua loader: {err}"))?;
         // One flag for this whole generation (ADR-0044 decision 2), created before anything that
-        // hands out a `LiveSignalHandle` so the rescue signal shares it too.
+        // hands out a `LiveSignalHandle` so the rescue signal shares it too, and before the loader
+        // so the `state(name, initial)` global it registers marks this same flag (decision 5).
         let dirty = DirtyFlag::new();
+        let loader = Loader::new(dirty.clone()).map_err(|err| format!("failed to start the Lua loader: {err}"))?;
         let rescue_handle =
             register_rescue_signal(&loader, dirty.clone()).map_err(|err| format!("failed to register the rescue signal: {err}"))?;
         let process_registry = ProcessRegistry::new(generation_id, outbound_tx.clone());
@@ -588,20 +589,6 @@ impl RendererClient {
     /// [`crate::wayland::App::fire_on_click`].
     pub fn lua(&self) -> &mlua::Lua {
         self.loader.lua()
-    }
-
-    /// Marks the scene dirty from outside a live-signal write, so the next poll turn re-resolves
-    /// (ADR-0044 decision 2). The one caller is a `button`'s `on_click` having just run.
-    ///
-    /// ponytail: unconditional, because Rust cannot see what the handler touched. ADR-0044
-    /// decision 5's `state(name, initial)` -- the writable, Lua-facing signal whose own `:set()`
-    /// would mark this flag -- is not built yet, so today a handler's only way to change what is
-    /// painted is to mutate a Lua upvalue a `computed` reads, which marks nothing. The ceiling is
-    /// one wasted `Scene::apply` per click on a handler that wrote nothing; a click is a discrete
-    /// human action, so that is a resolve per click, not per frame. Drop this call once `state`
-    /// exists and every path a handler can change the scene through marks the flag itself.
-    pub fn mark_scene_dirty(&self) {
-        self.dirty.mark();
     }
 
     /// Handles one inbound `SupervisorFrame`, decoded off the wire by [`pump`] and handed over by
@@ -1049,8 +1036,8 @@ mod tests {
     /// `lua/process.rs`'s own tests for that.
     fn test_client(shell_lua_path: &std::path::Path) -> (RendererClient, mpsc::UnboundedReceiver<RendererFrame>) {
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
-        let loader = Loader::new().unwrap();
         let dirty = DirtyFlag::new();
+        let loader = Loader::new(dirty.clone()).unwrap();
         let rescue_handle = register_rescue_signal(&loader, dirty.clone()).unwrap();
         let process_registry = ProcessRegistry::new(0, outbound_tx.clone());
         loader.register_process(process_registry.clone()).unwrap();

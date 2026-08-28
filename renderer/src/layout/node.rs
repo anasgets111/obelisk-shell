@@ -1320,6 +1320,76 @@ pub fn parse_list_children(properties: &HashMap<String, Value>) -> Result<Vec<Vi
     Ok(children)
 }
 
+/// `textfield.secure_submit` (§ 5.2 item 8): the `{ capability, action }` pair a masked field's
+/// committed buffer is addressed to once `zwp_text_input_v3` fires `submit`, instead of the value
+/// ever reaching Lua (docs/adr/0005, docs/adr/0027). This pair becomes the routing key on a
+/// `RendererFrame::SecureSubmit` envelope (docs/adr/0050 decision 4), which is why both fields are
+/// required rather than falling back to some default capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecureSubmitTarget {
+    pub capability: String,
+    pub action: String,
+}
+
+/// `Ok(None)` when the property is absent -- `secure_submit` is optional even on a masked field
+/// (§ 5.2 item 8's own note: without it, a masked value is just unreadable from Lua).
+///
+/// `secure_submit` is not in [`is_structural_property`]'s carve-out, so a signal-bound value
+/// arrives here already resolved by [`resolve_properties`] and this function never has to reject a
+/// raw `Value::UserData` the way [`parse_node_id`] does -- nothing reconciles a node by its
+/// `secure_submit`, so there is no structural decision here for a live-changing signal to
+/// undermine.
+///
+/// `capability`/`action` are refused non-UTF-8 rather than converted lossily, the same call
+/// [`parse_node_id`] makes for the same reason (see its non-UTF-8 doc comment): this pair
+/// addresses a secret to a Supervisor capability, so a lossy conversion could collapse two
+/// distinct byte strings onto the same name and route a password to a capability nobody
+/// registered.
+pub fn parse_secure_submit(
+    properties: &HashMap<String, Value>,
+) -> Result<Option<SecureSubmitTarget>, LayoutError> {
+    let Some(value) = properties.get("secure_submit") else {
+        return Ok(None);
+    };
+    let Value::Table(table) = value else {
+        return Err(invalid(
+            "secure_submit",
+            format!("expected a table, got {}", preview_for_error(value)),
+        ));
+    };
+    let field = |key: &str| -> Result<String, LayoutError> {
+        let v: Value = table
+            .get(key)
+            .map_err(|e| invalid("secure_submit", e.to_string()))?;
+        let s = match v {
+            Value::Nil => return Err(invalid("secure_submit", format!("`{key}` is required"))),
+            Value::String(s) => s,
+            other => {
+                return Err(invalid(
+                    "secure_submit",
+                    format!("`{key}` must be a string, got {}", preview_for_error(&other)),
+                ));
+            }
+        };
+        let s = s.to_str().map(|s| s.to_string()).map_err(|_| {
+            invalid(
+                "secure_submit",
+                format!(
+                    "`{key}` must be valid UTF-8 -- it addresses a Supervisor capability, so it cannot be converted lossily"
+                ),
+            )
+        })?;
+        if s.is_empty() {
+            return Err(invalid("secure_submit", format!("`{key}` must not be empty")));
+        }
+        Ok(s)
+    };
+    Ok(Some(SecureSubmitTarget {
+        capability: field("capability")?,
+        action: field("action")?,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1576,7 +1646,7 @@ mod tests {
         // Replaces the old "rejected" test (docs/adr/0044 decision 1): `visible` is not a
         // topology field, so it now resolves a `Signal` instead of erroring on one.
         let lua = lua();
-        crate::lua::signal::register(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::Boolean(false), crate::lua::signal::DirtyFlag::new()).0;
         let table = lua.create_table().unwrap();
         table.set("kind", "rect").unwrap();
@@ -1602,7 +1672,7 @@ mod tests {
     fn a_signal_resolving_to_a_string_satisfies_content() {
         // ADR-0044 decision 1, step 1: a Signal wrapping "hello" parses as "hello".
         let lua = lua();
-        crate::lua::signal::register(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let hello = lua.create_string("hello").unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::String(hello), crate::lua::signal::DirtyFlag::new()).0;
         let table = lua.create_table().unwrap();
@@ -1615,7 +1685,7 @@ mod tests {
     #[test]
     fn a_signal_resolving_to_a_table_reports_the_same_error_a_literal_table_would() {
         let lua = lua();
-        crate::lua::signal::register(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
 
         let literal_table: mlua::Table = lua.load(r#"return { kind = "text", content = {} }"#).eval().unwrap();
         let literal_props = props_from_table(&literal_table);
@@ -1642,7 +1712,7 @@ mod tests {
         // ADR-0044 decision 1's "resolve exactly once": a Signal whose value is itself a Signal
         // userdata is an error, not a second read to a fixed point.
         let lua = lua();
-        crate::lua::signal::register(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let inner = crate::lua::signal::Signal::new_live(Value::Integer(5), crate::lua::signal::DirtyFlag::new()).0;
         let inner_userdata = lua.create_userdata(inner).unwrap();
         let outer = crate::lua::signal::Signal::new_live(Value::UserData(inner_userdata), crate::lua::signal::DirtyFlag::new()).0;
@@ -1664,7 +1734,7 @@ mod tests {
     /// nil rule now lives: the key is omitted from the resolved map rather than each parser
     /// checking for a `Value::Nil` of its own (build-steps.md Phase 19 item 5).
     fn props_with_nil_signal(lua: &mlua::Lua, kind: &str, property: &str) -> HashMap<String, Value> {
-        crate::lua::signal::register(lua).unwrap();
+        crate::lua::signal::register(lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::Nil, crate::lua::signal::DirtyFlag::new()).0;
         let table = lua.create_table().unwrap();
         table.set("kind", kind).unwrap();
@@ -1751,7 +1821,7 @@ mod tests {
     #[test]
     fn a_signal_resolving_to_a_number_satisfies_font_size_through_marshals_check_number() {
         let lua = lua();
-        crate::lua::signal::register(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::Number(18.0), crate::lua::signal::DirtyFlag::new()).0;
         let table = lua.create_table().unwrap();
         table.set("kind", "text").unwrap();
@@ -1910,7 +1980,7 @@ mod tests {
         // surface, so it is a topology field by protocol (`CONTEXT.md`, Topology change) and a
         // handle that could drift after the diff has nothing left to re-check it.
         let lua = lua();
-        crate::lua::signal::register(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::String(lua.create_string("x").unwrap()), crate::lua::signal::DirtyFlag::new()).0;
         lua.globals().set("ns", signal).unwrap();
         let table: mlua::Table = lua.load(r#"return { kind = "panel", id = "bar", layer = "Top", namespace = ns }"#).eval().unwrap();
@@ -1954,7 +2024,7 @@ mod tests {
         // valid on a live surface, so this is an in-place field and a `Signal` in it is legal
         // (docs/adr/0044 decision 1). A launcher flipping focus mode from Lua is the point.
         let lua = lua();
-        crate::lua::signal::register(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::String(lua.create_string("Exclusive").unwrap()), crate::lua::signal::DirtyFlag::new()).0;
         lua.globals().set("mode", signal).unwrap();
         let table: mlua::Table = lua.load(r#"return { kind = "panel", id = "bar", layer = "Top", keyboard_interactivity = mode }"#).eval().unwrap();
@@ -2057,7 +2127,7 @@ mod tests {
         // docs/adr/0045 decision 1: id is a reconcile identity, decided once at match time, so it
         // rejects a Signal the same way SurfaceTopology's five fields already do.
         let lua = lua();
-        crate::lua::signal::register(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::Boolean(true), crate::lua::signal::DirtyFlag::new()).0;
         let table = lua.create_table().unwrap();
         table.set("kind", "rect").unwrap();
@@ -2073,7 +2143,7 @@ mod tests {
         // because a resolved signal is indistinguishable from a literal by then. The rejection
         // itself stays exactly where it was, in the five parsers that read the raw value.
         let lua = lua();
-        crate::lua::signal::register(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::Boolean(true), crate::lua::signal::DirtyFlag::new()).0;
         let table = lua.create_table().unwrap();
         table.set("kind", "rect").unwrap();
@@ -2121,7 +2191,7 @@ mod tests {
     #[test]
     fn a_signal_userdata_in_layer_is_rejected() {
         let lua = lua();
-        crate::lua::signal::register(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::Boolean(true), crate::lua::signal::DirtyFlag::new()).0;
         let table = lua.create_table().unwrap();
         table.set("kind", "panel").unwrap();
@@ -2139,7 +2209,7 @@ mod tests {
         // "never a Signal" invariant `layout::scene::ResolvedNode::properties` hands the paint
         // stage. On a `rect` these are ordinary properties, so they resolve like any other.
         let lua = lua();
-        crate::lua::signal::register(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         for property in ["layer", "anchor", "monitor"] {
             let signal = crate::lua::signal::Signal::new_live(Value::Boolean(true), crate::lua::signal::DirtyFlag::new()).0;
             let table = lua.create_table().unwrap();
@@ -2162,7 +2232,7 @@ mod tests {
         // The other half of kind-awareness: on a `panel`, `parse_layer` does run and does the
         // rejecting, so the skip is still what makes that rejection reachable.
         let lua = lua();
-        crate::lua::signal::register(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::Boolean(true), crate::lua::signal::DirtyFlag::new()).0;
         let table = lua.create_table().unwrap();
         table.set("kind", "panel").unwrap();
@@ -2512,7 +2582,7 @@ mod tests {
         // survives into `parse_edge_insets`'s `edge` closure, which used to misreport it as "must
         // be a number, got AnyUserData(Ref(0x...))" instead of the actionable Signal error.
         let lua = lua();
-        crate::lua::signal::register(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal =
             crate::lua::signal::Signal::new_live(Value::Integer(4), crate::lua::signal::DirtyFlag::new()).0;
         let table = lua.create_table().unwrap();
@@ -2603,7 +2673,7 @@ mod tests {
     #[test]
     fn a_signal_nested_in_a_border_color_edge_table_is_rejected_naming_the_edge() {
         let lua = lua();
-        crate::lua::signal::register(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let hex = lua.create_string("#ff0000").unwrap();
         let signal =
             crate::lua::signal::Signal::new_live(Value::String(hex), crate::lua::signal::DirtyFlag::new()).0;
@@ -2682,7 +2752,7 @@ mod tests {
         // the point: re-resolving the *same* map would order the same way every time and prove
         // nothing.
         let lua = lua();
-        crate::lua::signal::register(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let table: mlua::Table = lua
             .load(
                 r#"
@@ -2791,5 +2861,123 @@ mod tests {
             panic!("expected InvalidProperty, got {err}");
         };
         assert_eq!(detail, "expected a number, got Boolean(true)");
+    }
+
+    #[test]
+    fn secure_submit_absent_is_none() {
+        let props = HashMap::new();
+        assert_eq!(parse_secure_submit(&props).unwrap(), None);
+    }
+
+    #[test]
+    fn secure_submit_well_formed_table_parses_capability_and_action() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "textfield", secure_submit = { capability = "network", action = "connect" } }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        assert_eq!(
+            parse_secure_submit(&props).unwrap(),
+            Some(SecureSubmitTarget {
+                capability: "network".to_string(),
+                action: "connect".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn secure_submit_missing_capability_is_invalid_property_naming_the_field() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "textfield", secure_submit = { action = "connect" } }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_secure_submit(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "secure_submit" && detail.contains("capability")),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn secure_submit_missing_action_is_invalid_property_naming_the_field() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "textfield", secure_submit = { capability = "network" } }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_secure_submit(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "secure_submit" && detail.contains("action")),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn secure_submit_empty_capability_is_invalid_property() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "textfield", secure_submit = { capability = "", action = "connect" } }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_secure_submit(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "secure_submit" && detail.contains("capability")),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn secure_submit_empty_action_is_invalid_property() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "textfield", secure_submit = { capability = "network", action = "" } }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_secure_submit(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "secure_submit" && detail.contains("action")),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn secure_submit_non_table_value_is_invalid_property() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "textfield", secure_submit = "network.connect" }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        assert!(matches!(
+            parse_secure_submit(&props).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "secure_submit"
+        ));
+    }
+
+    #[test]
+    fn secure_submit_non_utf8_capability_is_rejected_rather_than_lossily_converted() {
+        // capability/action are the routing key on a RendererFrame::SecureSubmit envelope
+        // (docs/adr/0005, docs/adr/0027) -- same call parse_node_id makes for the same reason
+        // (see its non-UTF-8 tests above): a lossy conversion could address a secret to a
+        // capability nobody registered.
+        let lua = lua();
+        let table = lua.create_table().unwrap();
+        table.set("kind", "textfield").unwrap();
+        let inner = lua.create_table().unwrap();
+        inner.set("capability", lua.create_string(b"\xff").unwrap()).unwrap();
+        inner.set("action", "connect").unwrap();
+        table.set("secure_submit", inner).unwrap();
+        let props = props_from_table(&table);
+        let err = parse_secure_submit(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "secure_submit"),
+            "a non-UTF-8 secure_submit field must be a LayoutError naming the property: {err:?}"
+        );
     }
 }

@@ -63,10 +63,14 @@ pub struct LoadOutput {
 }
 
 impl Loader {
-    pub fn new() -> mlua::Result<Self> {
+    /// `dirty` is the generation's one scene-dirty flag (ADR-0044 decision 2), threaded through to
+    /// the `state(name, initial)` global so a config's own `:set()` marks the same flag every
+    /// capability push does. `renderer/src/socket.rs`'s `RendererClient::start` creates it before
+    /// the loader for exactly this reason; see `signal::register`.
+    pub fn new(dirty: signal::DirtyFlag) -> mlua::Result<Self> {
         let lua = Lua::new();
         nodes::register_node_constructors(&lua)?;
-        signal::register(&lua)?;
+        signal::register(&lua, dirty)?;
         Ok(Loader { lua })
     }
 
@@ -205,21 +209,21 @@ mod tests {
 
     #[test]
     fn evaluate_rejects_a_lua_syntax_error_as_an_eval_error() {
-        let loader = Loader::new().unwrap();
+        let loader = Loader::new(signal::DirtyFlag::new()).unwrap();
         let err = loader.evaluate("this is not lua").unwrap_err();
         assert!(matches!(err, LoaderError::Eval(_)));
     }
 
     #[test]
     fn evaluate_rejects_a_top_level_return_that_is_not_a_surface() {
-        let loader = Loader::new().unwrap();
+        let loader = Loader::new(signal::DirtyFlag::new()).unwrap();
         let err = loader.evaluate(r#"return rect { background = "red" }"#).unwrap_err();
         assert!(matches!(err, LoaderError::InvalidTopLevelReturn(_)));
     }
 
     #[test]
     fn evaluate_accepts_a_single_top_level_surface() {
-        let loader = Loader::new().unwrap();
+        let loader = Loader::new(signal::DirtyFlag::new()).unwrap();
         let output = loader.evaluate(r#"return panel { id = "bar", layer = "Top" }"#).unwrap();
         assert_eq!(output.surfaces.len(), 1);
         assert_eq!(output.surfaces[0].kind, "panel");
@@ -227,7 +231,7 @@ mod tests {
 
     #[test]
     fn set_global_registers_a_value_a_later_evaluate_can_see() {
-        let loader = Loader::new().unwrap();
+        let loader = Loader::new(signal::DirtyFlag::new()).unwrap();
         let (signal, handle) = signal::Signal::new_live(Value::Integer(7), signal::DirtyFlag::new());
         loader.set_global("audio", signal).unwrap();
 
@@ -241,7 +245,7 @@ mod tests {
 
     #[test]
     fn to_lua_value_converts_a_json_object_a_script_can_read_fields_from() {
-        let loader = Loader::new().unwrap();
+        let loader = Loader::new(signal::DirtyFlag::new()).unwrap();
         let json = serde_json::json!({ "volume": 0.5, "muted": false });
         let value = loader.to_lua_value(&json).unwrap();
         loader.set_global("state", value).unwrap();
@@ -258,7 +262,7 @@ mod tests {
     /// landed in it at all.
     #[test]
     fn to_lua_value_maps_a_json_null_field_to_a_nil_that_is_absent_from_the_table() {
-        let loader = Loader::new().unwrap();
+        let loader = Loader::new(signal::DirtyFlag::new()).unwrap();
         let json = serde_json::json!({
             "icon_name": "org.telegram.desktop-mute-symbolic",
             "icon_path": null,
@@ -291,7 +295,7 @@ mod tests {
     /// this one distinguishes it from real `nil`.
     #[test]
     fn to_lua_value_a_null_field_is_falsy_not_a_truthy_lightuserdata_sentinel() {
-        let loader = Loader::new().unwrap();
+        let loader = Loader::new(signal::DirtyFlag::new()).unwrap();
         let json = serde_json::json!({ "icon_path": null });
         let value = loader.to_lua_value(&json).unwrap();
         loader.set_global("payload", value).unwrap();
@@ -310,7 +314,7 @@ mod tests {
     /// table level down, which is where the real bug actually lived.
     #[test]
     fn to_lua_value_a_null_nested_inside_an_array_element_is_also_nil() {
-        let loader = Loader::new().unwrap();
+        let loader = Loader::new(signal::DirtyFlag::new()).unwrap();
         let json = serde_json::json!({
             "items": [
                 {
@@ -339,7 +343,7 @@ mod tests {
     /// shape a config would meet first if one ever did.
     #[test]
     fn to_lua_value_a_null_array_element_leaves_a_hole_ipairs_stops_at() {
-        let loader = Loader::new().unwrap();
+        let loader = Loader::new(signal::DirtyFlag::new()).unwrap();
         let json = serde_json::json!({ "xs": [1, null, 3] });
         let value = loader.to_lua_value(&json).unwrap();
         loader.set_global("state", value).unwrap();
@@ -357,7 +361,7 @@ mod tests {
     /// numbers, strings, booleans, and array elements round-trip.
     #[test]
     fn to_lua_value_leaves_non_null_fields_unchanged() {
-        let loader = Loader::new().unwrap();
+        let loader = Loader::new(signal::DirtyFlag::new()).unwrap();
         let json = serde_json::json!({
             "volume": 0.5,
             "muted": false,
@@ -393,7 +397,7 @@ mod tests {
         let path = dir.path().join("shell.lua");
         std::fs::write(&path, r#"return panel { id = "bar", layer = "Top" }"#).unwrap();
 
-        let loader = Loader::new().unwrap();
+        let loader = Loader::new(signal::DirtyFlag::new()).unwrap();
         let output = loader.evaluate_file(&path).unwrap();
         assert_eq!(output.surfaces.len(), 1);
         assert_eq!(output.surfaces[0].kind, "panel");
@@ -409,7 +413,7 @@ mod tests {
         let path = dir.path().join("shell.lua");
         std::fs::write(&path, "return panel { id = \"bar\" }\nthis is not lua\n").unwrap();
 
-        let loader = Loader::new().unwrap();
+        let loader = Loader::new(signal::DirtyFlag::new()).unwrap();
         let message = loader.evaluate_file(&path).unwrap_err().to_string();
 
         assert!(message.contains(&path.display().to_string()), "expected the config path in: {message}");
@@ -423,14 +427,14 @@ mod tests {
 
     #[test]
     fn evaluate_file_on_a_missing_path_is_an_io_error() {
-        let loader = Loader::new().unwrap();
+        let loader = Loader::new(signal::DirtyFlag::new()).unwrap();
         let err = loader.evaluate_file(std::path::Path::new("/no/such/shell.lua")).unwrap_err();
         assert!(matches!(err, LoaderError::Io(_)));
     }
 
     #[test]
     fn evaluate_accepts_an_array_of_top_level_surfaces() {
-        let loader = Loader::new().unwrap();
+        let loader = Loader::new(signal::DirtyFlag::new()).unwrap();
         let output = loader
             .evaluate(
                 r#"

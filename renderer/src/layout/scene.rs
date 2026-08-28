@@ -1106,7 +1106,7 @@ mod tests {
         let shaping = ShapingHandle::spawn();
         let lua = mlua::Lua::new();
         register_node_constructors(&lua).unwrap();
-        crate::lua::signal::register(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::Integer(40), crate::lua::signal::DirtyFlag::new()).0;
         lua.globals().set("w", signal).unwrap();
         let table: mlua::Table = lua
@@ -1119,6 +1119,34 @@ mod tests {
 
         let child = &scene.surface("bar@TEST").unwrap().children[0];
         assert_eq!(child.rect.width, 40.0, "a Signal-valued width must resolve at layout time");
+    }
+
+    #[test]
+    fn a_state_signal_in_a_property_resolves_at_layout_time_and_a_set_between_applies_moves_it() {
+        // ADR-0044 decision 5's end of the seam: a `state` signal is a `Signal` like any other, so
+        // `resolve_properties` reads it with no new arm, and what a handler's `:set()` wrote is
+        // what the next apply lays out.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua
+            .load(r#"return panel { id = "bar", child = rect { width = state("w", 40), height = 20 } }"#)
+            .eval()
+            .unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        assert_eq!(scene.surface("bar@TEST").unwrap().children[0].rect.width, 40.0);
+
+        lua.load(r#"state("w", 0):set(90)"#).exec().unwrap();
+        apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap();
+        assert_eq!(
+            scene.surface("bar@TEST").unwrap().children[0].rect.width,
+            90.0,
+            "a re-resolve after :set() must lay out the written value, not the initial one"
+        );
     }
 
     #[test]
@@ -1547,7 +1575,7 @@ mod tests {
         // state this test exists to prove `apply` rolls back.
         let lua2 = mlua::Lua::new();
         register_node_constructors(&lua2).unwrap();
-        crate::lua::signal::register(&lua2).unwrap();
+        crate::lua::signal::register(&lua2, crate::lua::signal::DirtyFlag::new()).unwrap();
         let table: mlua::Table = lua2
             .load(
                 r#"
@@ -1731,7 +1759,7 @@ mod tests {
         let shaping = ShapingHandle::spawn();
         let lua = mlua::Lua::new();
         register_node_constructors(&lua).unwrap();
-        crate::lua::signal::register(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let table: mlua::Table = lua
             .load(
                 r#"
@@ -1989,7 +2017,7 @@ mod tests {
         let shaping = ShapingHandle::spawn();
         let lua = mlua::Lua::new();
         register_node_constructors(&lua).unwrap();
-        crate::lua::signal::register(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(
             Value::String(lua.create_string("x").unwrap()),
             crate::lua::signal::DirtyFlag::new(),
@@ -2239,7 +2267,7 @@ mod tests {
     /// observable from the config's side (build-steps.md Phase 19 item 5).
     fn surface_with_a_read_counting_margin(lua: &mlua::Lua) -> VirtualNode {
         register_node_constructors(lua).unwrap();
-        crate::lua::signal::register(lua).unwrap();
+        crate::lua::signal::register(lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let table: mlua::Table = lua
             .load(
                 r#"
@@ -2332,7 +2360,7 @@ mod tests {
         let shaping = ShapingHandle::spawn();
         let lua = mlua::Lua::new();
         register_node_constructors(&lua).unwrap();
-        crate::lua::signal::register(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let white = lua.create_string("#FFFFFF").unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::String(white), crate::lua::signal::DirtyFlag::new()).0;
         lua.globals().set("bg", signal).unwrap();
@@ -2367,7 +2395,7 @@ mod tests {
         let shaping = ShapingHandle::spawn();
         let lua = mlua::Lua::new();
         register_node_constructors(&lua).unwrap();
-        crate::lua::signal::register(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let table: mlua::Table = lua
             .load(
                 r#"

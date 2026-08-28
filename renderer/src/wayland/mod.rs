@@ -1854,10 +1854,12 @@ impl App {
                 return;
             }
         };
+        // Nothing marks the scene dirty here. A handler that changes what is painted does it by
+        // writing a `state(name, initial)` signal, and `signal:set()` marks the flag itself
+        // (ADR-0044 decision 5); a handler that writes nothing correctly causes no re-resolve.
         if let Err(e) = on_click.call::<()>(argument) {
             eprintln!("[oblisk-renderer] {instance_id}: on_click raised, ignoring it: {e}");
         }
-        self.client.mark_scene_dirty();
     }
 }
 
