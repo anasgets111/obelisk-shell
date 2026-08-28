@@ -30,7 +30,7 @@ use mlua::Value;
 use crate::layout::node::{self, BorderColor, EdgeInsets, LayoutError, Rgba};
 use crate::layout::scene::ResolvedNode;
 use crate::text::atlas::TextPainter;
-use crate::text::snap::{snap_to_physical, LogicalRect};
+use crate::text::snap::{snap_border_band, snap_to_physical, LogicalRect};
 
 /// Draws `root` and its whole subtree onto `painter`'s canvas, then flushes once. `scale` is the
 /// physical/logical pixel ratio `text::snap::snap_to_physical` and `TextPainter::draw_line` take
@@ -107,7 +107,7 @@ fn paint_node(painter: &mut TextPainter, node: &ResolvedNode, origin_x: f32, ori
         // `oblisk-idl-api-specs.md` § 5.2: row/column/button have no paint properties of their
         // own beyond the base `rect` ones they share the property table with, and a surface's
         // own root paints exactly like a rect -- one code path serves all five.
-        "rect" | "row" | "column" | "button" | "surface" => paint_box(painter.canvas_mut(), &node.kind, &node.properties, rect),
+        "rect" | "row" | "column" | "button" | "surface" => paint_box(painter.canvas_mut(), &node.kind, &node.properties, rect, scale),
         "text" => paint_text(painter, &node.properties, rect, scale),
         // Deferred (build-steps.md Phase 19, "Also deferred: icon"): § 5.2 item 5's theme-name
         // `icon.name` and `oblisk-supervisor-services-dbus.md` § 9.2's path-taking
@@ -159,7 +159,7 @@ fn log_paint_error(kind: &str, property: &str, err: &LayoutError) {
 
 /// `rect`/`row`/`column`/`button`/`surface`'s shared paint: background fill, then borders
 /// (`oblisk-idl-api-specs.md` § 5.2 item 1).
-fn paint_box(canvas: &mut Canvas<OpenGl>, kind: &str, properties: &HashMap<String, Value>, rect: LogicalRect) {
+fn paint_box(canvas: &mut Canvas<OpenGl>, kind: &str, properties: &HashMap<String, Value>, rect: LogicalRect, scale: f32) {
     let radius = match node::parse_radius(properties) {
         Ok(r) => r,
         Err(e) => {
@@ -191,7 +191,7 @@ fn paint_box(canvas: &mut Canvas<OpenGl>, kind: &str, properties: &HashMap<Strin
             EdgeInsets::default()
         }
     };
-    paint_border(canvas, rect, radius, colors, widths);
+    paint_border(canvas, rect, radius, colors, widths, scale);
 }
 
 fn fill_rect(canvas: &mut Canvas<OpenGl>, rect: LogicalRect, radius: f32, color: Rgba) {
@@ -218,7 +218,7 @@ fn fill_rect(canvas: &mut Canvas<OpenGl>, rect: LogicalRect, radius: f32, color:
 /// on without duplicating its internal `rounded_rect_varying` construction; the upgrade path is
 /// exactly that -- four independent corner arcs plus four edge segments, mitred at each join --
 /// once a real config needs a rounded per-edge border rather than this approximation.
-fn paint_border(canvas: &mut Canvas<OpenGl>, rect: LogicalRect, radius: f32, colors: BorderColor, widths: EdgeInsets) {
+fn paint_border(canvas: &mut Canvas<OpenGl>, rect: LogicalRect, radius: f32, colors: BorderColor, widths: EdgeInsets, scale: f32) {
     let uniform_width = widths.top == widths.right && widths.right == widths.bottom && widths.bottom == widths.left;
     let uniform_color = matches!(
         (colors.top, colors.right, colors.bottom, colors.left),
@@ -227,16 +227,19 @@ fn paint_border(canvas: &mut Canvas<OpenGl>, rect: LogicalRect, radius: f32, col
 
     if uniform_width && uniform_color && widths.top > 0.0 && radius > 0.0 {
         let color = colors.top.expect("uniform_color's match arm above guarantees Some on every edge");
-        let width = widths.top;
+        // Rounding a box's own two edges to nearest is exactly what `snap_border_band`
+        // does, so it also snaps the node's span on each axis, not only a hairline's
+        // thickness. The stroke's thickness is snapped the same way (band-of-one
+        // starting at `rect.x`, only the thickness half of the result kept) so that
+        // with integer box edges and an integer thickness, the centerline lands on an
+        // integer for an even width and a half-integer for an odd one -- the parity
+        // femtovg actually rasterizes (this module's `snap_border_band` doc comment).
+        let (box_x, box_width) = snap_border_band(rect.x, rect.width, scale);
+        let (box_y, box_height) = snap_border_band(rect.y, rect.height, scale);
+        let (_, width) = snap_border_band(rect.x, widths.top, scale);
         let inset = width / 2.0;
         let mut path = Path::new();
-        path.rounded_rect(
-            rect.x + inset,
-            rect.y + inset,
-            (rect.width - width).max(0.0),
-            (rect.height - width).max(0.0),
-            radius,
-        );
+        path.rounded_rect(box_x + inset, box_y + inset, (box_width - width).max(0.0), (box_height - width).max(0.0), radius);
         let mut paint = Paint::color(Color::rgbaf(color.r, color.g, color.b, color.a));
         paint.set_line_width(width);
         canvas.stroke_path(&path, &paint);
@@ -246,30 +249,58 @@ fn paint_border(canvas: &mut Canvas<OpenGl>, rect: LogicalRect, radius: f32, col
     // Corners overlap here rather than mitre -- each edge is its own filled rect spanning the
     // node's full width or height, so two adjacent non-zero edges both cover the corner they
     // share.
-    paint_border_edge(canvas, colors.top, widths.top, LogicalRect { x: rect.x, y: rect.y, width: rect.width, height: widths.top });
+    paint_border_edge(canvas, colors.top, widths.top, LogicalRect { x: rect.x, y: rect.y, width: rect.width, height: widths.top }, EdgeAxis::Horizontal, scale);
     paint_border_edge(
         canvas,
         colors.bottom,
         widths.bottom,
         LogicalRect { x: rect.x, y: rect.y + rect.height - widths.bottom, width: rect.width, height: widths.bottom },
+        EdgeAxis::Horizontal,
+        scale,
     );
-    paint_border_edge(canvas, colors.left, widths.left, LogicalRect { x: rect.x, y: rect.y, width: widths.left, height: rect.height });
+    paint_border_edge(canvas, colors.left, widths.left, LogicalRect { x: rect.x, y: rect.y, width: widths.left, height: rect.height }, EdgeAxis::Vertical, scale);
     paint_border_edge(
         canvas,
         colors.right,
         widths.right,
         LogicalRect { x: rect.x + rect.width - widths.right, y: rect.y, width: widths.right, height: rect.height },
+        EdgeAxis::Vertical,
+        scale,
     );
+}
+
+/// Which dimension of an edge rect is the thin one -- the top/bottom edges span the
+/// node's full width and are thin in y, left/right span the full height and are thin
+/// in x. `paint_border_edge` needs this to know which axis to hand `snap_border_band`;
+/// inferring it from the rect's own width/height would be ambiguous whenever a node's
+/// height happens to equal its border width.
+enum EdgeAxis {
+    Horizontal,
+    Vertical,
 }
 
 /// One border edge: paints only where both a colour and a non-zero width say so
 /// (`node::parse_border_color`'s doc comment -- `border_width` alone is documented § 5.2
-/// behaviour, not a bug this should work around).
-fn paint_border_edge(canvas: &mut Canvas<OpenGl>, color: Option<Rgba>, width: f32, edge_rect: LogicalRect) {
+/// behaviour, not a bug this should work around). Snaps the edge's thin axis with
+/// `snap_border_band` before building the path, so a filled-edge border gets the same
+/// whole-physical-pixel treatment as the uniform-radius stroke above (build-steps.md
+/// Phase 19 item 7) -- the long axis is left alone, since only the thin axis can
+/// straddle a pixel boundary and blur.
+fn paint_border_edge(canvas: &mut Canvas<OpenGl>, color: Option<Rgba>, width: f32, edge_rect: LogicalRect, axis: EdgeAxis, scale: f32) {
     let Some(color) = color else { return };
     if width <= 0.0 {
         return;
     }
+    let edge_rect = match axis {
+        EdgeAxis::Horizontal => {
+            let (y, height) = snap_border_band(edge_rect.y, edge_rect.height, scale);
+            LogicalRect { y, height, ..edge_rect }
+        }
+        EdgeAxis::Vertical => {
+            let (x, width) = snap_border_band(edge_rect.x, edge_rect.width, scale);
+            LogicalRect { x, width, ..edge_rect }
+        }
+    };
     let mut path = Path::new();
     path.rect(edge_rect.x, edge_rect.y, edge_rect.width, edge_rect.height);
     canvas.fill_path(&path, &Paint::color(Color::rgbaf(color.r, color.g, color.b, color.a)));
@@ -766,6 +797,126 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Regression test for docs/build-steps.md Phase 19 item 7: a 1px border at a fractional
+    /// position must land on exactly one physical pixel row, not blur across two.
+    /// `padding.top = 10.3` puts the bordered rect's absolute y at a fractional offset --
+    /// unsnapped, femtovg's own antialiasing fills part of row 10 and part of row 11 at
+    /// partial coverage instead of one row at full coverage.
+    ///
+    /// Proved this catches the bug it exists for: with `snap_border_band` removed from
+    /// `paint_border_edge`'s horizontal branch (using the raw, unsnapped `edge_rect` instead),
+    /// row 10 came back `(201, 178, 178, 255)`, a red/white blend rather than white, and the
+    /// row-10 assertion failed. Restored before finishing.
+    #[test]
+    fn a_1px_border_at_a_fractional_position_is_exactly_one_pixel_row() {
+        let Some(instance) = init_headless_egl(64, 64) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 64, 64) else { return };
+
+        let root = resolved_surface(
+            &lua,
+            r##"return surface { id = "bar", width = 64, height = 64, background = "#FF0000FF", padding = { top = 10.3 }, child = rect {
+                width = 30, height = 20, background = "#000000FF",
+                border_width = { top = 1 }, border_color = { top = "#FFFFFFFF" },
+            } }"##,
+            LogicalSize { width: 64.0, height: 64.0 },
+        );
+        paint_tree(&mut painter, &root, 1.0);
+
+        // Row 9, entirely above the rect (which starts at unsnapped y = 10.3): the surface's
+        // own red, untouched by any border bleed.
+        assert_eq!(pixel_at(painter.canvas_mut(), 15, 9), (255, 0, 0, 255));
+        // Row 10: the snapped border band, fully lit white -- the discriminator this test
+        // exists for.
+        assert_eq!(pixel_at(painter.canvas_mut(), 15, 10), (255, 255, 255, 255));
+        // Row 11, past the 1px band: the rect's own black fill, not a blend.
+        assert_eq!(pixel_at(painter.canvas_mut(), 15, 11), (0, 0, 0, 255));
+    }
+
+    /// The same snap as the 1px test above, at a width wide enough that "one row either way"
+    /// is not the whole story: a 4px band must stay exactly four rows, neither growing to five
+    /// nor losing one, which is what pins `snap_border_band` rounding both edges independently
+    /// rather than rounding the near edge and adding an unrounded thickness. `padding.top =
+    /// 31.3` is deliberately close to the dev config's own fractional geometry --
+    /// `notification_area` resolves to a height of 31.6 -- so this is the real shape of the
+    /// bug, not a contrived one.
+    ///
+    /// Note this is the filled-edge branch, not the stroke: `border_width = { top = 4 }` leaves
+    /// the other three edges at zero, so `paint_border`'s `uniform_width` test fails and it
+    /// takes the per-edge path. Stroke parity, the thing the deleted `snap_border_to_physical`
+    /// actually got wrong, is covered by
+    /// `a_uniform_stroked_border_at_a_fractional_position_covers_whole_pixel_columns` below.
+    ///
+    /// Proved this catches the bug: with the same unsnapped `edge_rect` change as the 1px test
+    /// above, row 31 came back `(201, 178, 178, 255)` instead of full white -- the loop below
+    /// fails on the first row it checks, so this only pins that one value, not all four rows'
+    /// worth of blend. Restored before finishing.
+    #[test]
+    fn a_4px_border_at_a_fractional_position_stays_exactly_four_rows() {
+        let Some(instance) = init_headless_egl(64, 64) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 64, 64) else { return };
+
+        let root = resolved_surface(
+            &lua,
+            r##"return surface { id = "bar", width = 64, height = 64, background = "#FF0000FF", padding = { top = 31.3 }, child = rect {
+                width = 30, height = 20, background = "#000000FF",
+                border_width = { top = 4 }, border_color = { top = "#FFFFFFFF" },
+            } }"##,
+            LogicalSize { width: 64.0, height: 64.0 },
+        );
+        paint_tree(&mut painter, &root, 1.0);
+
+        // Row 30, above the band: the surface's own red.
+        assert_eq!(pixel_at(painter.canvas_mut(), 15, 30), (255, 0, 0, 255));
+        // Rows 31 through 34: the snapped 4px border band, every row fully white.
+        for y in 31..35usize {
+            assert_eq!(pixel_at(painter.canvas_mut(), 15, y), (255, 255, 255, 255), "row {y} is not fully white");
+        }
+        // Row 35, past the band: the rect's own black fill, not a blend.
+        assert_eq!(pixel_at(painter.canvas_mut(), 15, 35), (0, 0, 0, 255));
+    }
+
+    /// The uniform-width-with-radius branch of `paint_border` strokes rather than fills, and a
+    /// stroke is where physical-pixel parity actually bites: femtovg centres a stroke on its
+    /// path, so a 4-wide stroke centred on a half-integer spreads across five rows at partial
+    /// coverage while the same stroke centred on an integer covers exactly four. Snapping the
+    /// box span and the thickness as bands is what puts the centreline on the right side of that
+    /// split without the caller reasoning about parity at all.
+    ///
+    /// `padding.left = 10.3` is what makes this a real test: with an integer padding the stroke
+    /// already lands on whole pixels and passes without any snapping, which is why the existing
+    /// `a_uniform_border_with_a_radius_strokes_inside_the_nodes_own_box` test above cannot see
+    /// this. Measured with the `snap_border_band` calls in that branch removed: column 10 came
+    /// back `(201, 178, 178, 255)`, a red/white blend, instead of full white.
+    #[test]
+    fn a_uniform_stroked_border_at_a_fractional_position_covers_whole_pixel_columns() {
+        let Some(instance) = init_headless_egl(64, 64) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 64, 64) else { return };
+
+        let root = resolved_surface(
+            &lua,
+            r##"return surface { id = "bar", width = 64, height = 64, background = "#FF0000FF", padding = { top = 10, left = 10.3 }, child = rect {
+                width = 40, height = 40, background = "#000000FF",
+                radius = 8, border_width = 4, border_color = "#FFFFFFFF",
+            } }"##,
+            LogicalSize { width: 64.0, height: 64.0 },
+        );
+        paint_tree(&mut painter, &root, 1.0);
+
+        // Row 30 is mid-edge, clear of the radius-8 corners on both ends, so the left border
+        // there is a straight vertical band four columns wide.
+        assert_eq!(pixel_at(painter.canvas_mut(), 9, 30), (255, 0, 0, 255), "column 9 should be the surface's red, outside the border");
+        for x in 10..14usize {
+            assert_eq!(pixel_at(painter.canvas_mut(), x, 30), (255, 255, 255, 255), "column {x} is not fully white");
+        }
+        assert_eq!(pixel_at(painter.canvas_mut(), 14, 30), (0, 0, 0, 255), "column 14 should be the rect's own black fill, past the border");
     }
 
     /// A `row`/`column`/`rect` container clips its children just as much as a `text` node clips

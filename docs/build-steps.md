@@ -885,6 +885,53 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
 7. **Snapping.** Reuse `text/snap.rs`'s `snap_to_physical` and `snap_border_to_physical`. The second
    has had no caller since Phase 4 and this is what it was written for: a border snapped to whole
    physical pixels instead of straddling two (`oblisk-layout-engine-geometry.md` § 5).
+
+   **Amendment, on landing. `snap_border_to_physical` was deleted rather than wired up, because
+   its contract is wrong.** It rounds a coordinate to the nearest physical pixel *center*, a
+   half-integer, which is correct only when the stroke is an odd number of physical pixels wide.
+   Measured directly against femtovg 0.26.0 on this machine's Mesa/Iris, stroking a horizontal
+   line and reading back a pixel column:
+
+   | stroke width | centerline | rows lit |
+   |---|---|---|
+   | 1 | 10.5 | row 10 at 255. Crisp. |
+   | 1 | 10.0 | rows 9 and 10 at 128. Blurred across two. |
+   | 4 | 10.5 | rows 8 to 12 at 127, 255, 255, 255, 127. Blurred across five. |
+   | 4 | 10.0 | rows 8 to 11 all 255. Crisp, exactly four. |
+
+   An even-width stroke wants an integer centerline, an odd-width stroke a half-integer, so a
+   function that always returns a half-integer makes a 4px border worse than leaving it alone. It
+   had no caller, so nothing had to be unbuilt.
+
+   `snap_border_band(start, thickness, scale) -> (f32, f32)` replaces it: round the band's two
+   edges to the nearest physical pixel independently, and let the centerline and width fall out.
+   Parity then takes care of itself at every width. A positive thickness whose edges round
+   together is forced to one physical pixel, so a hairline the config asked for cannot vanish
+   between two pixels. It returns logical units, since `layout::paint` builds every path in
+   logical coordinates and `TextPainter::resize` hardcodes a device pixel ratio of 1.0, so a
+   caller handed physical units would convert every one back.
+
+   Both branches of `paint_border` use it. The per-edge fill branch snaps each edge's thin axis
+   (an `EdgeAxis` argument says which, since inferring it from the rect's own width and height is
+   ambiguous whenever a node's height equals its border width). The uniform-width-with-radius
+   stroke branch snaps the node's box span on each axis and the stroke thickness, then keeps the
+   existing half-width inset, computed from the snapped thickness.
+
+   Two things deliberately left alone. `fill_rect` does not snap: backgrounds are a separate
+   question with their own trap, since two adjacent snapped rects either overlap or leave a seam
+   depending on the rounding rule, and this item names borders. And item 17's scissor clip keeps
+   using `snap_to_physical`, which rounds outward, not `snap_border_band`, which rounds to
+   nearest. The two sit next to each other and must not be unified: a clip has to grow outward so
+   it never shaves a pixel a box legitimately filled, a border has to round to nearest so it
+   never comes out a pixel wider than asked for. `text/snap.rs`'s module doc comment now says
+   this, since picking the wrong one is the mistake the pairing invites.
+
+   Three pixel tests cover it, all proved by removing the snap and rerunning. A 1px border at
+   `padding.top = 10.3` reads `(201, 178, 178, 255)` on its row unsnapped instead of full white.
+   A 4px filled edge at 31.3 (close to the dev config's real `notification_area` height of 31.6)
+   loses a fully-lit row the same way. The stroke branch needs its own fixture at a fractional
+   position, since the pre-existing radius test sits at an integer padding where the stroke
+   already lands on whole pixels and passes with no snapping at all.
 8. **One canvas, many surfaces.** All surfaces share one EGL context, so one `TextPainter` serves
    all of them: make the surface's EGL surface current, `resize` the canvas to that surface, draw,
    swap. Verify FemtoVG tolerates the surface switch under a shared context before assuming it; if

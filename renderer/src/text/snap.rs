@@ -8,7 +8,14 @@
 //! coordinates to physical pixel boundaries: floor the top-left corner, ceil the
 //! bottom-right, so the physical box always fully contains the logical one. This
 //! module is that same technique as a small reusable function, for text line boxes
-//! and rect borders instead of input regions.
+//! and paint clips instead of input regions.
+//!
+//! Borders round differently, and the two must not be conflated. [`snap_to_physical`]
+//! grows a box outward so it never shaves a pixel the thing inside it legitimately
+//! covered, which is right for a containment box and wrong for a border: growing a
+//! 1px border outward makes it 2px. [`snap_border_band`] rounds each edge to the
+//! nearest pixel instead, so a border keeps the width the config asked for. Picking
+//! the wrong one of the two is the mistake this module is shaped to make obvious.
 
 /// A rectangle in logical (fractional, DPI-independent) pixel coordinates.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,30 +50,35 @@ pub fn snap_to_physical(rect: LogicalRect, scale: f32) -> PhysicalRect {
     }
 }
 
-/// Snaps a border/hairline's centerline coordinate so a 1-physical-pixel-wide stroke
-/// centered on it lands exactly on one row/column of physical pixels, instead of
-/// straddling two and blurring -- the second, distinct half of build-steps.md Phase 4
-/// point 3 ("snap borders strictly to single physical pixels"), which `snap_to_physical`
-/// deliberately does not cover: that function grows a *containment* box outward to the
-/// nearest whole pixels (correct for damage rects, wrong for a hairline, which would
-/// end up 2 physical pixels wide if you just floored one edge and ceiled the other).
+/// Snaps a border band's two edges to whole physical pixels, and returns the snapped
+/// `(start, thickness)`, still in logical units (docs/build-steps.md Phase 19 item 7).
 ///
-/// Physical pixel `n` covers `[n, n+1)` and is centered at `n + 0.5`; a stroke needs
-/// its centerline there; a coordinate sitting on the integer boundary itself is
-/// exactly between two pixel centers and rasterizes as a blurred 2px-wide line.
-/// This rounds to the nearest such center. Returns physical pixel units (unlike
-/// `snap_to_physical`'s integer `PhysicalRect`, this is fractional by construction --
-/// pixel centers sit at half-integers, not whole ones), so pair it with a stroke width
-/// of `1.0 / scale` in logical units to draw an exactly-one-physical-pixel-wide line.
+/// `start` is the band's smaller coordinate along its thin axis (a horizontal border's
+/// `y`, say) and `thickness` its extent along that axis. Both edges -- `start * scale`
+/// and `(start + thickness) * scale` -- round to the nearest integer independently, then
+/// divide back by `scale`. Rounding the edges, not a centerline, is what makes stroke
+/// parity fall out for free: an even-width band's centerline lands on an integer, an
+/// odd-width band's on a half-integer, matching how femtovg actually rasterizes a stroke
+/// (measured directly against femtovg 0.26.0 on this machine's Mesa/Iris: a 1px stroke
+/// centered on a half-integer is one fully-lit row, a 4px stroke centered on the same
+/// half-integer blurs across five rows at partial alpha, while centered on an integer it
+/// is exactly four fully-lit rows). The deleted `snap_border_to_physical` picked a
+/// half-integer centerline unconditionally and was correct only for odd widths.
 ///
-/// No caller yet -- nothing in this milestone draws a border/rect stroke (that's the
-/// future scene-graph `Rect` node, see docs/oblisk-layout-engine-geometry.md § 1.1).
-/// The function and its tests are the spec deliverable for now (build-steps.md Phase
-/// 4 point 3's second half); wiring it up is that later phase's job, not this one's.
-#[allow(dead_code)]
-pub fn snap_border_to_physical(position: f32, scale: f32) -> f32 {
-    let physical = position * scale;
-    (physical - 0.5).round() + 0.5
+/// Returns logical units, not physical. `layout::paint` builds every path in logical
+/// coordinates, and `TextPainter::resize` hardcodes a device pixel ratio of 1.0, so the
+/// canvas applies no scale transform of its own -- a caller that got physical units back
+/// would have to convert every one before building a path. Logical and physical
+/// therefore coincide today; `scale` is threaded through for when that stops being true.
+///
+/// If `thickness` is positive but both edges round to the same integer, the band is
+/// forced to one physical pixel instead of vanishing -- a border the config asked for
+/// must not disappear because it landed between two pixels.
+pub fn snap_border_band(start: f32, thickness: f32, scale: f32) -> (f32, f32) {
+    let near_edge = (start * scale).round();
+    let far_edge = ((start + thickness) * scale).round();
+    let far_edge = if thickness > 0.0 && far_edge == near_edge { near_edge + 1.0 } else { far_edge };
+    (near_edge / scale, (far_edge - near_edge) / scale)
 }
 
 #[cfg(test)]
@@ -113,49 +125,50 @@ mod tests {
     }
 
     #[test]
-    fn border_snaps_to_nearest_pixel_center_below() {
-        // 5.2 is closer to pixel 5's center (5.5) than pixel 4's (4.5).
-        assert_eq!(snap_border_to_physical(5.2, 1.0), 5.5);
+    fn border_band_already_aligned_is_unchanged() {
+        // Catches a rounding function that nudges an edge already on an integer --
+        // both 4.0 and 5.0 round to themselves, so start and thickness must come
+        // back exactly as given.
+        assert_eq!(snap_border_band(4.0, 1.0, 1.0), (4.0, 1.0));
     }
 
     #[test]
-    fn border_snaps_to_nearest_pixel_center_above() {
-        // 6.1 is closer to pixel 6's center (6.5) than pixel 5's (5.5) -- this only
-        // passes if rounding is genuinely direction-sensitive, not a fixed offset.
-        assert_eq!(snap_border_to_physical(6.1, 1.0), 6.5);
+    fn border_band_rounds_each_edge_to_nearest() {
+        // Edges 10.3 and 13.7 round independently to 10 and 14 -- catches a
+        // function that snaps only one edge, or that derives the far edge from the
+        // rounded near edge plus the unrounded thickness instead of rounding both.
+        assert_eq!(snap_border_band(10.3, 3.4, 1.0), (10.0, 4.0));
     }
 
     #[test]
-    fn border_on_exact_pixel_boundary_resolves_deterministically() {
-        // Sitting exactly on the boundary between two pixel centers (4.5 and 5.5) is
-        // a tie; `round`'s away-from-zero convention breaks it towards 5.5.
-        assert_eq!(snap_border_to_physical(5.0, 1.0), 5.5);
+    fn border_band_thinner_than_a_pixel_is_forced_to_one_physical_pixel() {
+        // 10.1 and 10.3 both round to 10, which would zero the band out -- catches
+        // a hairline border silently disappearing instead of being forced visible.
+        assert_eq!(snap_border_band(10.1, 0.2, 1.0), (10.0, 1.0));
     }
 
     #[test]
-    fn border_snapping_differs_from_containment_snapping() {
-        // The whole point of a separate function: for the same input, snap_to_physical
-        // grows a box outward (here, to 5..6), while snap_border_to_physical picks the
-        // single nearest pixel center (5.5) -- neither result is the other's edge.
+    fn border_band_snaps_correctly_at_fractional_scale() {
+        // At 2x scale, edges 5.1*2=10.2 and 6.1*2=12.2 round to 10 and 12, dividing
+        // back to logical 5.0 and thickness 1.0 -- catches `scale` applied only on
+        // the way in, or forgotten on the way back out.
+        assert_eq!(snap_border_band(5.1, 1.0, 2.0), (5.0, 1.0));
+    }
+
+    #[test]
+    fn border_band_snapping_differs_from_containment_snapping() {
+        // The two functions sit side by side now, so this pins the case where picking
+        // the wrong one shows up. Take the same 1-wide band at 5.6. Containment floors
+        // the near edge to 5 and ceils the far edge to 7, turning a 1px border into a
+        // 2px one; band snapping rounds each edge to nearest and gets 6..7, still one
+        // pixel wide. That width difference is the whole reason both functions exist.
         let scale = 1.0;
-        let r = LogicalRect { x: 5.2, y: 0.0, width: 0.0, height: 0.0 };
-        let containment = snap_to_physical(r, scale);
-        let border = snap_border_to_physical(5.2, scale);
-        assert_eq!(containment.x0, 5);
-        assert_eq!(border, 5.5);
-        assert_ne!(containment.x0 as f32, border);
-    }
+        let band = LogicalRect { x: 5.6, y: 0.0, width: 1.0, height: 0.0 };
+        let containment = snap_to_physical(band, scale);
+        assert_eq!((containment.x0, containment.x1), (5, 7));
+        assert_eq!(containment.x1 - containment.x0, 2);
 
-    #[test]
-    fn border_snaps_correctly_at_fractional_scale() {
-        // Logical 2.0 at 2x scale is physical 4.0, exactly on a boundary -- nearest
-        // center is 4.5 (tie broken the same away-from-zero direction as the 1x case).
-        assert_eq!(snap_border_to_physical(2.0, 2.0), 4.5);
-    }
-
-    #[test]
-    fn border_snaps_negative_coordinates_consistently() {
-        // -3.4 is closer to pixel -4's center (-3.5) than pixel -3's (-2.5).
-        assert_eq!(snap_border_to_physical(-3.4, 1.0), -3.5);
+        let (start, thickness) = snap_border_band(band.x, band.width, scale);
+        assert_eq!((start, thickness), (6.0, 1.0));
     }
 }
