@@ -9,6 +9,24 @@
 > longer holds. Every other property resolves as this decision describes. `build-steps.md` Phase 19
 > item 1's "delete `reject_signal` and its twelve call sites" is amended to the same effect: the
 > helper survives, renamed, for those fields alone.
+>
+> Decision 3's "no memoization" is kept, but Phase 19 item 3's review found the cost sits somewhere
+> this ADR did not look, and it is not the missing cache. `SignalKind::Computed` holds
+> `deps: Vec<Signal>` by value and `Signal` derives `Clone`, so cloning a computed deep-copies its
+> whole dependency subtree. `s:map(f)` copies `s`. A config therefore cannot express a shared
+> dependency graph at all: `computed({s, s}, f)` does not reference `s` twice, it embeds two copies
+> of it. Twenty levels of that is a 2^20 node tree, built in memory before anything is evaluated,
+> and evaluating it is 1,048,575 closure calls.
+>
+> That matters for what the upgrade path actually is. Memoization keyed on signal identity would not
+> help, because after the copy there is no shared identity left to key on. Making `Signal` a shared
+> reference (`Rc`) is the change that turns a diamond back into a diamond, and only then is a cache
+> even meaningful. Recorded here so a future reader does not reach for the cache first.
+>
+> The decision stands. ADR-0021's 5ms cap is what keeps this survivable, once that cap governs a
+> whole evaluation rather than each leaf call (see ADR-0021's amendment): the config gets an error
+> instead of a wedged shell, measured firing after roughly 3,200 calls. The original reason to
+> refuse a cache is also unchanged, since a cache needs an invalidation rule and no push has one.
 
 Nothing connects a capability's state to the screen. Three facts, each defensible alone, combine
 into a shell that cannot react to anything:

@@ -21,6 +21,41 @@ pub struct LogicalSize {
     pub height: f32,
 }
 
+/// The recursion bound for `resolve_and_reconcile` (build-steps.md Phase 19 item 3): at most this
+/// many node levels are admitted, and the level past it is refused, the same "at most N levels"
+/// boundary `lua::signal`'s `MAX_SIGNAL_NESTING_DEPTH` uses. Applies to both a literal cyclic tree
+/// (`r.children = { r }`) and a computed `children` signal that manufactures fresh depth on every
+/// read (`docs/adr/0021`'s amendment, build-steps.md Phase 19 item 3 defect 2): both recurse
+/// through this same function, so one counter catches both.
+///
+/// It exists to turn an abort into a `LayoutError`, not to express a design limit. Sizing it means
+/// sizing it *together with* `MAX_SIGNAL_NESTING_DEPTH`, because the two recursions compound: a
+/// node level resolves its `children` property, and that resolution can nest signals. Measured on
+/// a 2 MiB debug-build test thread (the tightest stack this runs on; in production `wayland::run`
+/// owns the Lua VM on the process main thread, 8 MiB by default), stack cost is additive and
+/// linear in each:
+///
+/// - 5,216 B per `resolve_and_reconcile` level;
+/// - 14,864 B per nested `Signal::get_value` level of the expensive kind (a `computed` body
+///   calling `:get()`, so a full Rust-to-Lua-to-Rust round trip); a plain dependency chain
+///   (`s:map(f):map(g)`) is 1,840 B per level, so the body-nesting figure is the worst case.
+///
+/// The signal nest is popped before descending to the next node level, so it is paid once rather
+/// than per level: the compounded worst case is `MAX_TREE_DEPTH * 5216 +
+/// MAX_SIGNAL_NESTING_DEPTH * 14864`. Verified against the model at (60, 24): predicted 669,696 B,
+/// measured 669,808 B.
+///
+/// That is why this is 64 and not the 128 it started at. 128 with a 32-deep signal nest peaks at
+/// 1,143,296 B, roughly 1.8x margin on a 2 MiB stack -- and 1.8x flatters itself, since the
+/// measurement spans only the recursive frames and not the mlua/Lua frames below the deepest one
+/// or the error-formatting frames the refusal itself runs at full depth. 64 peaks at 809,472 B,
+/// roughly 2.6x, while still leaving 4x headroom above the 10 to 15 levels a real `shell.lua`
+/// produces. `MAX_SIGNAL_NESTING_DEPTH` keeps its 32 because it is the cap that now also bounds
+/// dependency chains, the shape a real config is likeliest to grow; the tree cap was the cheaper
+/// lever, at 2.85x fewer bytes per level.
+const MAX_TREE_DEPTH: u32 = 64;
+
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(u64);
 
@@ -152,7 +187,7 @@ impl Scene {
     ) -> Result<(), LayoutError> {
         let key = node::parse_surface_id(&fresh.properties)?;
         let existing = self.surfaces.remove(&key);
-        let reconciled = resolve_and_reconcile(self, existing, fresh, available, shaping, None, None, lua)?;
+        let reconciled = resolve_and_reconcile(self, existing, fresh, available, shaping, None, None, lua, 0)?;
         self.surfaces.insert(key, reconciled);
         Ok(())
     }
@@ -310,9 +345,9 @@ fn stretch_forced_size(
 /// case, and always the case when the parent's own axis is itself `Content`-sized, since its
 /// final size isn't known until after its children resolve) falls back to the usual
 /// `width`/`height`-mode resolution.
-// Eight parameters, but each is load-bearing for this single recursive pass (§ 3's "single...
+// Nine parameters, but each is load-bearing for this single recursive pass (§ 3's "single...
 // pass", see the module doc comment); splitting them into a struct would just be a bag carrying
-// the same eight fields through the same one caller.
+// the same nine fields through the same one caller.
 #[allow(clippy::too_many_arguments)]
 fn resolve_and_reconcile(
     scene: &mut Scene,
@@ -323,8 +358,27 @@ fn resolve_and_reconcile(
     forced_width: Option<f32>,
     forced_height: Option<f32>,
     lua: &Lua,
+    depth: u32,
 ) -> Result<RetainedNode, LayoutError> {
     ensure_supported_kind(&fresh.kind)?;
+    // build-steps.md Phase 19 item 3: checked before touching any of this node's own children so
+    // a cyclic/infinitely-generating tree returns a LayoutError at MAX_TREE_DEPTH's own stack
+    // depth, not somewhere further down (see MAX_TREE_DEPTH's doc comment for the measured stack
+    // cost this leaves margin against).
+    //
+    // `>=`, not `>`: `depth` counts levels already entered, root at 0, so this admits levels
+    // 0..MAX_TREE_DEPTH-1 -- exactly MAX_TREE_DEPTH of them, which is what the constant and the
+    // error message both say. `>` admitted MAX_TREE_DEPTH + 1 levels while claiming
+    // MAX_TREE_DEPTH, and disagreed with the signal cap's `>= MAX_SIGNAL_NESTING_DEPTH` about
+    // what "maximum depth" means. The reported `depth` is 1-based (the level being refused) so
+    // "maximum depth of 64 levels ... got at least 65" reads as the truth.
+    if depth >= MAX_TREE_DEPTH {
+        return Err(LayoutError::TreeTooDeep {
+            kind: fresh.kind.clone(),
+            depth: depth + 1,
+            max: MAX_TREE_DEPTH,
+        });
+    }
 
     let id = retained.as_ref().map(|r| r.id);
     let old_children = retained.map(|r| r.children).unwrap_or_default();
@@ -396,6 +450,7 @@ fn resolve_and_reconcile(
             child_forced_width,
             child_forced_height,
             lua,
+            depth + 1,
         )?);
     }
     // Fresh list shorter than the retained one: everything left over was removed this cycle.
@@ -1166,6 +1221,146 @@ mod tests {
             !scene.release(NodeId(9999)),
             "releasing an id that never existed must return false"
         );
+    }
+
+    #[test]
+    fn a_self_referential_literal_tree_is_rejected_with_a_layout_error() {
+        // build-steps.md Phase 19 item 3, defect 1: `local r = rect {}; r.children = { r }`
+        // recurses through resolve_and_reconcile with no bound. Before the depth cap this aborted
+        // the process with a stack overflow rather than returning an Err; see this test's sibling
+        // run alone (`-- --test-threads=1`) for the observed abort, recorded in the task report.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        let table: mlua::Table = lua
+            .load(
+                r#"
+                local r = rect {}
+                r.children = { r }
+                return surface { id = "bar", child = r }
+                "#,
+            )
+            .eval()
+            .unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+
+        let err = scene.apply(&[surface], full(), &shaping, &lua).unwrap_err();
+        assert!(
+            matches!(err, LayoutError::TreeTooDeep { .. }),
+            "a cyclic literal tree must return a LayoutError, not abort the process: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_computed_children_signal_generating_fresh_depth_is_rejected_with_a_layout_error() {
+        // build-steps.md Phase 19 item 3, defect 2: `resolve_property`'s "resolved to another
+        // Signal" guard never fires here because every result is a fresh Table, not a Signal --
+        // the recursion is pure Rust through resolve_and_reconcile, so the same tree-depth cap
+        // that catches defect 1 must catch this too (verified, not assumed, per the task brief).
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua).unwrap();
+        let table: mlua::Table = lua
+            .load(
+                r#"
+                local deep
+                deep = computed({}, function()
+                    return { rect { width = 1, height = 1, children = deep } }
+                end)
+                return surface { id = "bar", child = rect { children = deep } }
+                "#,
+            )
+            .eval()
+            .unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+
+        // Either cap is a pass, because the property under test is "bounded, not aborted". Two
+        // caps race here and which one wins is a scheduling detail: every tree level resolves its
+        // own `children` signal in a fresh `Signal::get_value`, so each level gets a fresh 5ms
+        // budget, and on a loaded machine (the whole suite in parallel) one level can be
+        // descheduled past 5ms and refuse before the tree ever reaches MAX_TREE_DEPTH. Observed
+        // roughly once in ten full-suite runs as `InvalidProperty { property: "children", detail:
+        // "Signal getter failed: runtime error: computed/map exceeded its 5ms CPU budget" }`.
+        // Asserting only `TreeTooDeep` would make this test a load meter.
+        let err = scene.apply(&[surface], full(), &shaping, &lua).unwrap_err();
+        let capped = matches!(err, LayoutError::TreeTooDeep { .. })
+            || matches!(&err, LayoutError::InvalidProperty { detail, .. } if detail.contains("5ms CPU budget"));
+        assert!(capped, "a computed children signal generating fresh depth must be capped, not abort: {err:?}");
+    }
+
+    /// A `surface` wrapping `rows` nested `row`s around one `rect`, so the deepest level is
+    /// `rows + 2`. Built with a Lua loop rather than nested table literals: at these depths the
+    /// literal form runs into Lua's own `LUAI_MAXCCALLS` parser nesting limit, which would be
+    /// testing the parser rather than this cap.
+    fn surface_nested(lua: &mlua::Lua, rows: usize) -> VirtualNode {
+        let table: mlua::Table = lua
+            .load(format!(
+                r#"
+                local n = rect {{ width = 1, height = 1 }}
+                for _ = 1, {rows} do n = row {{ children = {{ n }} }} end
+                return surface {{ id = "bar", child = n }}
+                "#
+            ))
+            .eval()
+            .unwrap();
+        deserialize_lua_table(&table).unwrap()
+    }
+
+    #[test]
+    fn a_tree_at_the_depth_cap_is_accepted_and_one_level_past_it_is_rejected() {
+        // Both caps mean the same thing: at most N levels are admitted, the N+1th is refused. The
+        // `>` this used to be admitted MAX_TREE_DEPTH + 1 levels while its message claimed
+        // MAX_TREE_DEPTH, and refused on the level after that.
+        let deepest = MAX_TREE_DEPTH as usize;
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+
+        // surface + (deepest - 2) rows + rect == exactly MAX_TREE_DEPTH levels.
+        let mut scene = Scene::new();
+        scene.apply(&[surface_nested(&lua, deepest - 2)], full(), &shaping, &lua).unwrap();
+
+        let mut scene = Scene::new();
+        let err = scene.apply(&[surface_nested(&lua, deepest - 1)], full(), &shaping, &lua).unwrap_err();
+        assert!(
+            matches!(err, LayoutError::TreeTooDeep { depth, max, .. }
+                if depth == MAX_TREE_DEPTH + 1 && max == MAX_TREE_DEPTH),
+            "one level past the cap must be refused, reporting the limit actually enforced: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_legitimately_deep_but_reasonable_tree_still_applies() {
+        // The cap must not be tightenable into rejecting a real config: a bar with nested
+        // rows/columns runs 10-15 levels deep (MAX_TREE_DEPTH's doc comment), so 20 levels of
+        // plain nesting -- well above any real shell.lua -- must still apply cleanly.
+        const NESTING: usize = 20;
+        let mut lua_src = String::from(r#"surface { id = "bar", child = "#);
+        for _ in 0..NESTING {
+            lua_src.push_str(r#"row { children = { "#);
+        }
+        lua_src.push_str(r#"rect { width = 4, height = 4 }"#);
+        for _ in 0..NESTING {
+            lua_src.push_str(" } }");
+        }
+        lua_src.push('}');
+
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(&lua_src);
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
+
+        // NESTING `row` levels plus one final descent into the innermost `rect`.
+        let mut node = scene.surface("bar").unwrap();
+        for _ in 0..=NESTING {
+            assert_eq!(node.children.len(), 1);
+            node = node.children.into_iter().next().unwrap();
+        }
+        assert_eq!(node.kind, "rect");
+        assert_eq!(node.rect.width, 4.0, "the innermost rect's own geometry must have resolved");
     }
 
     #[test]

@@ -714,6 +714,24 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    the whole nest, which is what it was meant to bound. Decide that with the depth cap, since a
    depth counter alone leaves the cap still unable to bound a wide-but-shallow evaluation. See
    ADR-0021's amendment banner.
+
+   The slice's own review then found the depth cap missed the commoner shape entirely, so four more
+   things belong here. `Signal::get_value` resolved a computed's dependencies *before* pushing a
+   deadline, so a dependency chain nested Rust frames with the stack pinned at depth 1: a 200 link
+   `map` chain reached depth 200 with a maximum stack of 1, and 5000 links aborted with neither cap
+   firing. The deadline has to cover dependency resolution, which is also what makes one deadline
+   govern a whole evaluation. The hook's error is an ordinary Lua error that `pcall` catches (a
+   measured body ran 37.6 ms and returned a partial value), so the budget needs a second gate at the
+   Rust boundary after the call returns, which a config cannot catch. `Lua::set_hook` installs per
+   Lua thread, so a computed body working inside a coroutine was never hooked at all: use
+   `Lua::set_global_hook`. And the two caps must agree on whether the limit is inclusive, with each
+   message stating the limit actually enforced.
+
+   Size the constants against the compounded worst case, not each recursion alone. Measured on a
+   2 MiB debug test thread: 5,216 bytes per tree level, 14,864 per body-nesting signal level, 1,840
+   per dependency-chain level, additive rather than multiplicative because a signal nest pops before
+   the tree descends. The original 128 and 32 peak at 1.14 MB, a 1.8x margin rather than the 3x and
+   4x their comments claimed.
 4. **Reconcile by `id`, not by position alone** (ADR-0045). `Scene`'s § 4 matching pairs a parent's
    children by index, so inserting a node above a sibling shifts every node below it onto the wrong
    retained counterpart. Add an optional `id` base property on every node kind, pair identified

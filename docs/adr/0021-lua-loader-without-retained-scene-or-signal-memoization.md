@@ -14,6 +14,25 @@
 > when `get_value` returns, so a resolved table's `__index` metamethod executes with no hook at all:
 > a `__index` of `while true do end` hangs unkillably. Both are `build-steps.md` Phase 19 items 3
 > and 5.
+>
+> Phase 19 item 3's own review then found the paragraph above understated the problem, and measured
+> all of it. `Signal::get_value` resolves a `Computed`'s dependencies *before* calling
+> `call_with_cpu_cap`, and each dependency's push has already been popped by the time it returns, so
+> a dependency chain nests Rust frames while the deadline stack stays at depth 1. A 200 link `map`
+> chain reached `get_value` depth 200 with a maximum stack depth of 1; a 5000 link chain aborted the
+> process with neither the depth cap nor the time cap firing. The fix is to push the deadline around
+> dependency resolution as well, which is what makes the stack depth mean nesting depth and what
+> makes one deadline govern a whole dependency graph.
+>
+> Two holes make the cap advisory rather than enforced, which matters because ADR-0039 leans on
+> "it is enforced, not merely measured" as one of three reasons a slow evaluation cannot wedge the
+> Wayland thread. The hook raises an ordinary Lua error, so a `pcall` inside a computed body catches
+> it and carries on: a measured body ran 37.6 ms, over seven times the cap, and returned a
+> partially computed number rather than an error. And `Lua::set_hook` installs per Lua thread, so a
+> body that works inside a coroutine is never hooked at all, measured at 5.75 seconds uninterrupted.
+> `Lua::set_global_hook` covers the second. The first needs a second gate at the Rust boundary,
+> after the call returns, that a config cannot catch. Until both land, treat ADR-0039's third
+> bounding argument as weaker than it reads.
 
 Phase 10's title ("Lua VM Bootstrap & the Loader") and its build-steps.md text scope a real
 `mlua` VM instantiation and the loader: Lua evaluation of `shell.lua` into a node tree and

@@ -73,6 +73,18 @@ pub enum LayoutError {
         "`{0}` is a Signal handle, not a plain value -- read it via :get() before returning it from shell.lua"
     )]
     UnsupportedSignalProperty(String),
+    /// build-steps.md Phase 19 item 3: `resolve_and_reconcile`'s recursion, bounded at
+    /// `layout::scene::MAX_TREE_DEPTH`. Covers both a literal cyclic tree (`r.children = { r }`)
+    /// and a computed `children` signal that generates fresh depth on every read -- both recurse
+    /// through the same Rust call, so one cap catches both (see that constant's doc comment).
+    ///
+    /// `max` is the number of levels actually admitted and `depth` is the 1-based level that was
+    /// refused, so `depth` is always `max + 1` -- the message states the limit the code enforces,
+    /// not one adjacent to it.
+    #[error(
+        "node tree exceeds the maximum depth of {max} levels (at `{kind}`, level {depth}) -- a node holding itself in `children`?"
+    )]
+    TreeTooDeep { kind: String, depth: u32, max: u32 },
 }
 
 fn invalid(property: &str, detail: impl Into<String>) -> LayoutError {

@@ -7,6 +7,14 @@
 > `SurfaceRole::label()`, and those two id spaces do not intersect. Deleting `SurfaceRole` is what
 > makes them one, so the per-surface size lands with ADR-0038 in Phase 20 item 4. Decisions 1, 2, 3
 > and 5 are unaffected; 1 through 3 shipped with the refactor.
+>
+> The Consequences section's third bounding argument is weaker than it reads. "ADR-0021's 5ms CPU
+> cap already aborts a runaway `computed` closure through `Lua::set_hook`, and it is enforced, not
+> merely measured" was not true when written. The hook raises an ordinary Lua error that a `pcall`
+> in the closure catches, and `set_hook` installs per Lua thread so a closure working inside a
+> coroutine is never hooked at all. Both were measured in Phase 19 item 3's review and both are
+> being closed. The other two bounds, shaping being off-thread and full evaluation happening only on
+> config edit, are unaffected, and the decision does not turn on this one.
 
 The 2026-08-28 renderer review found the Renderer split into two OS threads that cannot reach each
 other's state, with the scene on one side and the pixels on the other.
