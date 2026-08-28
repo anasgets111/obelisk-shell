@@ -9,6 +9,7 @@ use smithay_client_toolkit::dispatch2::Dispatch2;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::presentation_time::{PresentTime, PresentationTimeHandler, PresentationTimeState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
+use smithay_client_toolkit::seat::keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers};
 use smithay_client_toolkit::seat::pointer::{BTN_LEFT, PointerEvent, PointerEventKind, PointerHandler};
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::wlr_layer::{
@@ -20,7 +21,7 @@ use smithay_client_toolkit::{delegate_registry, registry_handlers};
 use khronos_egl::Surface as EglSurface;
 use mlua::{Function, Lua, Table, Value};
 use wayland_client::globals::{registry_queue_init, GlobalList};
-use wayland_client::protocol::{wl_output, wl_pointer, wl_seat, wl_surface};
+use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface};
 use wayland_client::{Connection, Proxy, QueueHandle, WEnum};
 use wayland_egl::WlEglSurface;
 use wayland_protocols::wp::presentation_time::client::wp_presentation_feedback;
@@ -37,15 +38,6 @@ use crate::socket::RendererClient;
 use crate::text::atlas::TextPainter;
 use crate::text::shaping::ShapingHandle;
 use crate::text::snap::LogicalRect;
-
-/// ponytail: no real per-`textfield` focus/attribution exists yet (see `App::bind_text_input`'s
-/// own `ponytail` comment) -- every `secure_submit` completed this way is attributed to this
-/// fixed placeholder until real focus wiring can read the specific `textfield` node's own
-/// `secure_submit = { capability, action }` table (`oblisk-idl-api-specs.md` § 5.2 item 8), which
-/// is now a lookup in the retained `Scene` this thread owns rather than a cross-thread hop
-/// (docs/adr/0039; build-steps.md Phase 21 item 3).
-const PLACEHOLDER_SECURE_SUBMIT_CAPABILITY: &str = "unknown";
-const PLACEHOLDER_SECURE_SUBMIT_ACTION: &str = "unknown";
 
 /// A live window surface bound to the shared EGL context, once its first configure
 /// has arrived. Holds the native window alongside the EGL surface: per wayland-egl's
@@ -202,8 +194,27 @@ pub struct App {
     /// file is single-seat, and a second seat's pointer would need a second `armed` beside it
     /// rather than sharing this one.
     pointer: Option<wl_pointer::WlPointer>,
+    /// The seat's keyboard, once it advertised one (build-steps.md Phase 21 item 2). Kept alive for
+    /// the same reason `pointer` is, and single-seat for the same reason.
+    ///
+    /// This shell reads no keys off it. It is bound for its `enter`/`leave` alone, which is the only
+    /// way a client learns which of its surfaces `keyboard_interactivity` (Phase 20) actually won
+    /// focus for.
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    /// The instance id of the surface holding keyboard focus, if any of this process's surfaces
+    /// does (docs/adr/0050's consequences).
+    ///
+    /// ponytail: nothing consumes this beyond the log line in [`KeyboardHandler::leave`] and the
+    /// focus clearing that happens alongside it, because § 5.2 has no `on_key` for it to route to
+    /// and docs/adr/0050 explicitly declines to invent one. Upgrade path: an IDL key-handler
+    /// property, at which point this is the surface whose tree the keysym gets dispatched into.
+    keyboard_focus: Option<String>,
     /// The press waiting for its release, if any (docs/adr/0050 decision 2, [`ArmedClick`]).
     armed: Option<ArmedClick>,
+    /// Where the next completed `secure_submit` is addressed, set by the press that focused a
+    /// `textfield` (docs/adr/0050 decision 4, [`focused_target`]). `None` means no frame at all --
+    /// see [`submit_frame_for`].
+    focused_secure_submit: Option<node::SecureSubmitTarget>,
     text_input_pending: TextInputPending,
     /// Accumulates committed `wp-text-input-v3` edits until a protocol-native `ACTION_SUBMIT`
     /// completes them (build-steps.md Phase 15 item 2; ADR-0005/ADR-0009/ADR-0027) -- never
@@ -266,7 +277,10 @@ pub fn run(
         active_nonce: None,
         text_input: None,
         pointer: None,
+        keyboard: None,
+        keyboard_focus: None,
         armed: None,
+        focused_secure_submit: None,
         text_input_pending: TextInputPending::default(),
         secure_buffer: shared::SecureBuffer::new(),
     };
@@ -621,6 +635,61 @@ fn clickable_button<'a>(path: &[&'a layout::ResolvedNode]) -> Option<(LogicalRec
         };
         Some((layout::hit::absolute_rect(&path[..=depth])?, on_click))
     })
+}
+
+/// Both answers one press wants out of decision 1's single traversal: the `button` that would fire,
+/// and the destination the innermost `textfield` addresses the next secret to.
+///
+/// One struct rather than two lookups because they come from one [`layout::hit::hit_path`] call.
+/// Walking twice would be two answers to one event, and a re-resolve landing between the walks
+/// could make them disagree about a tree that no longer exists.
+struct PointerHit {
+    button: Option<(LogicalRect, Function)>,
+    /// `Err` is a malformed `secure_submit` on the innermost `textfield` -- see [`focused_target`].
+    focus: Result<Option<node::SecureSubmitTarget>, node::LayoutError>,
+}
+
+/// The `secure_submit` destination the innermost `textfield` in a hit path names (docs/adr/0050
+/// decision 4, § 5.2 item 8).
+///
+/// `Ok(None)` deliberately collapses two cases nothing downstream can tell apart: the path holds no
+/// `textfield` at all, and the innermost one declared no `secure_submit`. Both mean the next
+/// completed submit has nowhere to go, and § 5.2 item 8 makes the property optional precisely so a
+/// masked field can exist without one.
+///
+/// ponytail: focus is therefore stored as its destination rather than as a node identity, so a
+/// focused field with no destination is indistinguishable from no focus at all. Nothing reads focus
+/// for any other purpose yet -- there is no caret, no selection, and no `on_key` (docs/adr/0050's
+/// consequences). Upgrade path: carry the field's `NodeId` alongside the target once something has
+/// to paint or address the *field* rather than its submit.
+fn focused_target(path: &[&layout::ResolvedNode]) -> Result<Option<node::SecureSubmitTarget>, node::LayoutError> {
+    let Some(field) = path.iter().rev().find(|node| node.kind == "textfield") else {
+        return Ok(None);
+    };
+    node::parse_secure_submit(&field.properties)
+}
+
+/// The frame a completed `wp-text-input-v3` submit produces, or `None` when no focused `textfield`
+/// named a destination for it (docs/adr/0050 decision 4).
+///
+/// `None` is the whole point of this function. Before it, the submit was addressed to
+/// `"unknown"/"unknown"`, which no Supervisor capability routes -- a password put on the wire for
+/// nobody, when ADR-0005's entire premise is that this buffer travels to exactly one named
+/// destination. Sending nothing is the only safe answer to "whose password is this?".
+///
+/// The buffer is zeroized on both branches, and on the branch that sends nothing it is the only
+/// thing that happens: a dropped submit must not leave the accumulated secret sitting in `App`
+/// waiting for the next field to pick it up.
+fn submit_frame_for(
+    generation_id: u32,
+    target: Option<&node::SecureSubmitTarget>,
+    buffer: &mut shared::SecureBuffer,
+) -> Option<RendererFrame> {
+    let Some(target) = target else {
+        buffer.zeroize();
+        return None;
+    };
+    Some(secure_submit_frame(generation_id, &target.capability, &target.action, buffer))
 }
 
 /// Whether a release on `instance_id`, over the button at `released_on`, completes `armed`
@@ -1719,15 +1788,15 @@ impl App {
     /// Binds `zwp_text_input_manager_v3`, creates one `zwp_text_input_v3` for this seat, and
     /// `enable()`s it unconditionally (build-steps.md Phase 15 item 2; ADR-0009, ADR-0027).
     ///
-    /// ponytail: no real per-`textfield` keyboard-focus system exists yet -- this codebase has
-    /// none anywhere, matching `create_wallpaper_layers`'s own disclosed-simplification style.
-    /// A real implementation would call `enable()`/`disable()` in response to the compositor's
-    /// own `enter`/`leave` events on the specific surface a Lua-authored `textfield` occupies
-    /// (`overlay_canvas`, since that's where interactive scene content will eventually live),
-    /// and would thread that `textfield` node's own `secure_submit = { capability, action }`
-    /// table through to `finish_secure_submit` instead of the fixed placeholder there. Upgrade
-    /// path: build that focus system (a click/hit-test pass over the retained `Scene`, plus
-    /// wiring `enter`/`leave` here) once a later phase needs it -- out of scope for this slice.
+    /// ponytail: `enable()` is unconditional and permanent, so this seat's text input stays on for
+    /// the process's whole life rather than following focus. Attribution no longer depends on that
+    /// -- a press now names the `textfield` a submit belongs to (docs/adr/0050 decision 4,
+    /// [`focused_target`]), and a submit with no focused field sends nothing. What is still crude
+    /// is the protocol side: a real implementation would `disable()` when no `textfield` holds
+    /// focus, so a compositor's IME popup does not follow a pointer over a bar that is not asking
+    /// for text. Upgrade path: drive `enable`/`disable` from the same press that sets
+    /// `focused_secure_submit`, once a `textfield` paints and there is something to test it
+    /// against.
     ///
     /// A compositor with no seat, or no `zwp_text_input_manager_v3` global, leaves `text_input`
     /// `None` -- logged, not fatal, same tolerance `PresentationTimeState::bind` already applies
@@ -1789,30 +1858,50 @@ impl App {
                     self.finish_secure_submit();
                 }
             }
+            // The text-input session ended, so whatever is half-typed belongs to a field the user
+            // has walked away from (docs/adr/0050 decision 4: focus clears the moment anything says
+            // the user is elsewhere). Both halves matter and the zeroize is the load-bearing one:
+            // no `submit` is ever coming for these bytes, and leaving them in `secure_buffer` means
+            // the *next* field's first submit would carry the previous field's characters and
+            // address them to the next field's capability. That is one password leaking into
+            // another's destination, which is exactly the routing ADR-0005 exists to make
+            // impossible. Scrubbing here costs nothing in the common case, where the buffer is
+            // already empty.
+            zwp_text_input_v3::Event::Leave { .. } => {
+                self.focused_secure_submit = None;
+                self.secure_buffer.zeroize();
+            }
             // `preedit_string`/`delete_surrounding_text`: acknowledged but not durably applied
-            // to `secure_buffer` -- see `apply_edit`'s doc comment. `enter`/`leave`/`language`
-            // don't affect the accumulated secret.
+            // to `secure_buffer` -- see `apply_edit`'s doc comment. `enter` is the compositor
+            // offering this seat's input to a surface, which says nothing about *which* node owns
+            // it; that is the press's job (decision 4). `language` does not affect the secret.
             _ => {}
         }
     }
 
     /// A completed `secure_submit`: builds the outgoing frame out of the accumulated buffer and
-    /// queues it for the socket thread. [`secure_submit_frame`] both performs the one sanctioned
-    /// read and leaves `self.secure_buffer` scrubbed and empty, ready for the next entry.
+    /// queues it for the socket thread. [`submit_frame_for`] both performs the one sanctioned read
+    /// and leaves `self.secure_buffer` scrubbed and empty on either branch, ready for the next
+    /// entry.
+    ///
+    /// No focused destination means no frame (docs/adr/0050 decision 4), logged rather than
+    /// silent: a user who typed a password and pressed enter deserves an explanation somewhere for
+    /// why nothing happened, and the explanation is almost always a `textfield` missing its
+    /// `secure_submit` table.
     fn finish_secure_submit(&mut self) {
-        let frame = secure_submit_frame(
-            self.generation_id,
-            PLACEHOLDER_SECURE_SUBMIT_CAPABILITY,
-            PLACEHOLDER_SECURE_SUBMIT_ACTION,
-            &mut self.secure_buffer,
-        );
+        let Some(frame) = submit_frame_for(self.generation_id, self.focused_secure_submit.as_ref(), &mut self.secure_buffer) else {
+            eprintln!(
+                "[oblisk-renderer] secure_submit dropped: no focused textfield named a capability/action to address it to; the buffer was zeroized and nothing was sent"
+            );
+            return;
+        };
         if let Err(e) = self.outbound_tx.send(frame) {
             eprintln!("[oblisk-renderer] failed to queue SecureSubmit for the socket thread: {e}");
         }
     }
 
-    /// The handled `button` under a pointer event on surface `index`, as its absolute rect and a
-    /// clone of its `on_click` (docs/adr/0050 decision 1). `None` if the point misses every one.
+    /// One hit-test of surface `index` at `position`, answering both of [`PointerHit`]'s questions
+    /// (docs/adr/0050 decisions 1 and 4).
     ///
     /// `position` is surface-local and *logical*, which is the space `layout::hit` walks
     /// `ResolvedNode::rect` in, so there is no conversion here at all. That holds only while
@@ -1820,14 +1909,22 @@ impl App {
     /// docs/adr/0050's consequences name this as the third caller the HiDPI change from Phase 20
     /// has to move together with `paint_surface` and `apply_input_region`.
     ///
-    /// Owned on the way out, both halves. `Scene::surface` clones into a `ResolvedNode` (the same
+    /// A surface with no resolved tree answers the same as a point that missed everything: no
+    /// button, and no focused destination. There is nothing under the pointer either way.
+    ///
+    /// Owned on the way out, every part. `Scene::surface` clones into a `ResolvedNode` (the same
     /// property `paint_surface` relies on), so the borrow of `self.client` ends on that line, and
-    /// the `Function` is cloned out of the local tree before it is dropped.
-    fn button_under(&self, index: usize, position: (f64, f64)) -> Option<(LogicalRect, Function)> {
-        let tree = self.client.scene().surface(&self.surfaces[index].surface_id)?;
+    /// both the `Function` and the target are cloned out of the local tree before it is dropped.
+    fn hit_under(&self, index: usize, position: (f64, f64)) -> PointerHit {
+        let Some(tree) = self.client.scene().surface(&self.surfaces[index].surface_id) else {
+            return PointerHit { button: None, focus: Ok(None) };
+        };
         let point = layout::hit::LogicalPoint { x: position.0 as f32, y: position.1 as f32 };
         let path = layout::hit::hit_path(&tree, point);
-        clickable_button(&path).map(|(rect, on_click)| (rect, on_click.clone()))
+        PointerHit {
+            button: clickable_button(&path).map(|(rect, on_click)| (rect, on_click.clone())),
+            focus: focused_target(&path),
+        }
     }
 
     /// Calls one `button`'s `on_click` with its rect (docs/adr/0050 decision 3) and marks the
@@ -1937,41 +2034,66 @@ impl SeatHandler for App {
 
     fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
 
-    /// Pointer only. `bind_text_input` needs the bare `wl_seat` rather than a capability, and no
-    /// keyboard or touch object is created from one either -- keyboard focus is build-steps.md
-    /// Phase 21 item 2, and § 5.2 has no touch-specific property for a third to serve.
+    /// Pointer and keyboard. `bind_text_input` needs the bare `wl_seat` rather than a capability,
+    /// and no touch object is created at all -- § 5.2 has no touch-specific property for one to
+    /// serve.
     ///
-    /// Idempotent by the `is_some` guard, not by trusting the compositor: `wl_seat::capabilities`
+    /// Idempotent by the `is_none` guards, not by trusting the compositor: `wl_seat::capabilities`
     /// is a full re-statement of the current set on every change, so a seat that gains a keyboard
     /// re-announces its pointer, and SCTK turns each announcement into this call. Creating a
     /// second `wl_pointer` there would leave two objects delivering the same events into one
-    /// `armed` slot.
+    /// `armed` slot, and a second `wl_keyboard` two `enter`/`leave` streams into one
+    /// `keyboard_focus`.
     fn new_capability(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, capability: Capability) {
-        if !matches!(capability, Capability::Pointer) || self.pointer.is_some() {
-            return;
-        }
-        match self.seat_state.get_pointer(qh, &seat) {
-            Ok(pointer) => self.pointer = Some(pointer),
-            // Not fatal: a shell with no pointer still paints, still reloads, and still takes
-            // `wp-text-input-v3` input. Only `on_click` stops working, which is what this says.
-            Err(e) => eprintln!("[oblisk-renderer] wl_seat::get_pointer failed; no button's on_click will ever fire: {e}"),
+        match capability {
+            Capability::Pointer if self.pointer.is_none() => match self.seat_state.get_pointer(qh, &seat) {
+                Ok(pointer) => self.pointer = Some(pointer),
+                // Not fatal: a shell with no pointer still paints, still reloads, and still takes
+                // `wp-text-input-v3` input. Only `on_click` stops working, which is what this says.
+                Err(e) => eprintln!("[oblisk-renderer] wl_seat::get_pointer failed; no button's on_click will ever fire: {e}"),
+            },
+            // `None` rmlvo: take the compositor's own keymap. This shell never interprets a keysym
+            // (there is no `on_key` in § 5.2), so imposing a layout of its own would be policy
+            // serving nothing.
+            Capability::Keyboard if self.keyboard.is_none() => match self.seat_state.get_keyboard(qh, &seat, None) {
+                Ok(keyboard) => self.keyboard = Some(keyboard),
+                // Also not fatal, and narrower than it looks: losing this loses the `enter`/`leave`
+                // that clear a focused `textfield`, so a stale focus can outlive the user moving on.
+                Err(e) => eprintln!("[oblisk-renderer] wl_seat::get_keyboard failed; keyboard focus will never be tracked: {e}"),
+            },
+            _ => {}
         }
     }
 
     fn remove_capability(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat, capability: Capability) {
-        if !matches!(capability, Capability::Pointer) {
-            return;
-        }
-        // A pointer that is gone will never send the `release` this press was waiting for, which
-        // is the same reason `leave` clears it (docs/adr/0050 decision 2).
-        self.armed = None;
-        if let Some(pointer) = self.pointer.take() {
-            // `wl_pointer::release` is `since="3"`; below that the destructor does not exist and
-            // dropping the proxy is the whole cleanup. Same guard SCTK's own `ThemedPointer::drop`
-            // applies (src/seat/pointer/mod.rs:572).
-            if pointer.version() >= 3 {
-                pointer.release();
+        match capability {
+            Capability::Pointer => {
+                // A pointer that is gone will never send the `release` this press was waiting for,
+                // which is the same reason `leave` clears it (docs/adr/0050 decision 2).
+                self.armed = None;
+                if let Some(pointer) = self.pointer.take() {
+                    // `wl_pointer::release` is `since="3"`; below that the destructor does not exist
+                    // and dropping the proxy is the whole cleanup. Same guard SCTK's own
+                    // `ThemedPointer::drop` applies (src/seat/pointer/mod.rs:572).
+                    if pointer.version() >= 3 {
+                        pointer.release();
+                    }
+                }
             }
+            Capability::Keyboard => {
+                // No keyboard means nothing will ever report the user leaving, so the focus this
+                // was holding is stale from here on (docs/adr/0050 decision 4).
+                self.keyboard_focus = None;
+                self.focused_secure_submit = None;
+                if let Some(keyboard) = self.keyboard.take() {
+                    // `wl_keyboard::release` is `since="3"` too (wayland.xml); same reasoning as
+                    // the pointer's guard directly above.
+                    if keyboard.version() >= 3 {
+                        keyboard.release();
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1999,11 +2121,26 @@ impl PointerHandler for App {
                 // IDL, and inventing one here would be policy no config could override.
                 PointerEventKind::Press { button: BTN_LEFT, .. } => {
                     let instance_id = self.surfaces[index].surface_id.clone();
-                    self.armed = self.button_under(index, event.position).map(|(rect, _)| ArmedClick { instance_id, rect });
+                    let hit = self.hit_under(index, event.position);
+                    // The press decides focus, not the release: decision 4 says a press whose path
+                    // holds a `textfield` focuses it, and a press that lands anywhere else clears
+                    // it. A malformed `secure_submit` is the config's bug, not this shell's, so it
+                    // is logged against the surface and treated as no destination -- refusing to
+                    // guess a capability is the same call `focused_target` documents.
+                    self.focused_secure_submit = match hit.focus {
+                        Ok(target) => target,
+                        Err(e) => {
+                            eprintln!("[oblisk-renderer] {instance_id}: textfield has a malformed secure_submit, so it takes focus with no destination: {e}");
+                            None
+                        }
+                    };
+                    self.armed = hit.button.map(|(rect, _)| ArmedClick { instance_id, rect });
                 }
                 PointerEventKind::Release { button: BTN_LEFT, .. } => {
                     let instance_id = self.surfaces[index].surface_id.clone();
-                    let hit = self.button_under(index, event.position);
+                    // Focus is untouched here. The press already decided it, and a release that
+                    // drags off a `textfield` must not un-focus the field the user is typing into.
+                    let hit = self.hit_under(index, event.position).button;
                     let fires = release_completes_click(self.armed.as_ref(), &instance_id, hit.as_ref().map(|(rect, _)| *rect));
                     // Unconditionally, and before the call: a release ends this press whether or
                     // not it fired, and a handler that re-enters here must not find it still set.
@@ -2022,6 +2159,83 @@ impl PointerHandler for App {
                 _ => {}
             }
         }
+    }
+}
+
+/// Which surface the compositor gave keyboard focus to (build-steps.md Phase 21 item 2).
+///
+/// `keyboard_interactivity` (Phase 20 item 1) is the client's half of this: it tells the compositor
+/// whether a surface may be focused at all. `wl_keyboard`'s `enter`/`leave` is the only way the
+/// client learns what the compositor decided, which is the whole reason this trait is implemented.
+///
+/// No `delegate_keyboard!` accompanies it, for the same reason `PointerHandler` has no
+/// `delegate_pointer!`: `KeyboardData<D, U>` carries a blanket `Dispatch2<WlKeyboard, D>` impl
+/// (src/seat/keyboard/mod.rs:494) that the file-wide `delegate_dispatch2!(App)` at the bottom
+/// already turns into the `Dispatch<WlKeyboard, KeyboardData<App, ()>>` half of `get_keyboard`'s
+/// bound. Adding the macro would collide with it.
+impl KeyboardHandler for App {
+    fn enter(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        surface: &wl_surface::WlSurface,
+        _serial: u32,
+        _raw: &[u32],
+        _keysyms: &[Keysym],
+    ) {
+        // `raw`/`keysyms` are the keys already held down when focus arrived. Nothing reads a key
+        // here, so they are dropped along with every other key event below.
+        self.keyboard_focus = self.surface_id_for(surface).map(str::to_string);
+        match &self.keyboard_focus {
+            Some(id) => eprintln!("[oblisk-renderer] keyboard focus entered {id}"),
+            // A `wl_keyboard` is per seat, not per surface, so an `enter` can name a surface this
+            // process destroyed since the compositor sent it (a `visible` flip, an output change).
+            None => eprintln!("[oblisk-renderer] keyboard focus entered an untracked surface; not tracking it"),
+        }
+    }
+
+    fn leave(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _surface: &wl_surface::WlSurface,
+        _serial: u32,
+    ) {
+        // Unconditional, ignoring which surface is named: the protocol orders `leave` on the old
+        // surface before `enter` on the new one, so there is no interleaving where clearing here
+        // would drop a focus that had already moved on.
+        let left = self.keyboard_focus.take().unwrap_or_else(|| "an untracked surface".to_string());
+        // docs/adr/0050 decision 4's third clearing source. The user is demonstrably somewhere
+        // else, so the `textfield` stops owning the next secret and the armed press will never see
+        // its release -- the same answer `PointerEventKind::Leave` gives for the same reason.
+        self.focused_secure_submit = None;
+        self.armed = None;
+        eprintln!("[oblisk-renderer] keyboard focus left {left}");
+    }
+
+    // The four callbacks below are deliberately empty, and the gap is real rather than deferred
+    // plumbing: § 5.2 declares no key-handler property on any node, so a keysym arriving here has
+    // nowhere in a config to go, and docs/adr/0050's consequences section says this ADR does not
+    // invent one. They exist because `KeyboardHandler` has no default bodies for them.
+
+    fn press_key(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _keyboard: &wl_keyboard::WlKeyboard, _serial: u32, _event: KeyEvent) {}
+
+    fn repeat_key(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _keyboard: &wl_keyboard::WlKeyboard, _serial: u32, _event: KeyEvent) {}
+
+    fn release_key(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _keyboard: &wl_keyboard::WlKeyboard, _serial: u32, _event: KeyEvent) {}
+
+    fn update_modifiers(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        _modifiers: Modifiers,
+        _raw_modifiers: RawModifiers,
+        _layout: u32,
+    ) {
     }
 }
 
@@ -2654,6 +2868,94 @@ mod tests {
         assert!(!release_completes_click(Some(&armed), "notification_area@eDP-1", Some(rect)));
         // A release with nothing armed (a press that hit no button, or a `leave` in between).
         assert!(!release_completes_click(None, "bar@eDP-1", Some(rect)));
+    }
+
+    /// A `textfield` node carrying whatever the config wrote under `secure_submit`; `None` writes
+    /// nothing, which is § 5.2 item 8's "optional even on a masked field".
+    fn textfield(lua: &Lua, secure_submit: Option<Value>) -> layout::ResolvedNode {
+        let mut node = hit_node(lua, "textfield", (0.0, 0.0, 40.0, 24.0), false);
+        if let Some(value) = secure_submit {
+            node.properties.insert("secure_submit".to_string(), value);
+        }
+        node
+    }
+
+    fn secure_submit_table(lua: &Lua, capability: &str, action: &str) -> Value {
+        let table = lua.create_table().unwrap();
+        table.set("capability", capability).unwrap();
+        table.set("action", action).unwrap();
+        Value::Table(table)
+    }
+
+    #[test]
+    fn a_press_landing_on_no_textfield_leaves_no_destination_focused() {
+        let lua = Lua::new();
+        let button = hit_node(&lua, "button", (0.0, 0.0, 40.0, 24.0), true);
+        let root = hit_node(&lua, "panel", (0.0, 0.0, 100.0, 32.0), false);
+        assert_eq!(focused_target(&[&root, &button]).unwrap(), None);
+    }
+
+    #[test]
+    fn the_innermost_textfield_on_the_path_is_the_one_that_owns_the_next_secret() {
+        // Same deep-end scan `clickable_button` makes, and for the same reason (docs/adr/0050
+        // decision 1): one traversal, two questions.
+        let lua = Lua::new();
+        let outer = textfield(&lua, Some(secure_submit_table(&lua, "outer", "ignored")));
+        let inner = textfield(&lua, Some(secure_submit_table(&lua, "polkit", "authenticate")));
+        let root = hit_node(&lua, "panel", (0.0, 0.0, 100.0, 32.0), false);
+
+        assert_eq!(
+            focused_target(&[&root, &outer, &inner]).unwrap(),
+            Some(node::SecureSubmitTarget { capability: "polkit".to_string(), action: "authenticate".to_string() })
+        );
+    }
+
+    #[test]
+    fn a_textfield_with_no_secure_submit_focuses_with_no_destination() {
+        let lua = Lua::new();
+        let field = textfield(&lua, None);
+        let root = hit_node(&lua, "panel", (0.0, 0.0, 100.0, 32.0), false);
+        assert_eq!(focused_target(&[&root, &field]).unwrap(), None);
+    }
+
+    #[test]
+    fn a_malformed_secure_submit_is_an_error_rather_than_a_guessed_destination() {
+        let lua = Lua::new();
+        let field = textfield(&lua, Some(Value::String(lua.create_string("polkit").unwrap())));
+        let root = hit_node(&lua, "panel", (0.0, 0.0, 100.0, 32.0), false);
+        assert!(focused_target(&[&root, &field]).is_err(), "a non-table secure_submit names no capability");
+    }
+
+    #[test]
+    fn a_submit_with_a_focused_target_is_addressed_to_that_capability_and_action() {
+        let mut buffer = shared::SecureBuffer::new();
+        buffer.push_str("hunter2");
+        let target = node::SecureSubmitTarget { capability: "polkit".to_string(), action: "authenticate".to_string() };
+
+        let frame = submit_frame_for(4, Some(&target), &mut buffer);
+
+        assert_eq!(
+            frame,
+            Some(RendererFrame::SecureSubmit(SecureSubmit {
+                generation_id: 4,
+                capability: "polkit".to_string(),
+                action: "authenticate".to_string(),
+                secret: b"hunter2".to_vec(),
+            }))
+        );
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn a_submit_with_no_focused_target_sends_nothing_and_still_zeroizes_the_buffer() {
+        // docs/adr/0050 decision 4: the old placeholder addressed this to `"unknown"/"unknown"`,
+        // which no Supervisor capability routes -- a password on the wire for no one. The scrub is
+        // the half that is not optional.
+        let mut buffer = shared::SecureBuffer::new();
+        buffer.push_str("hunter2");
+
+        assert_eq!(submit_frame_for(4, None, &mut buffer), None);
+        assert!(buffer.is_empty(), "a dropped submit must still leave the accumulated secret scrubbed");
     }
 
     #[test]
