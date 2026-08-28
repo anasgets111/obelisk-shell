@@ -989,7 +989,7 @@ pub enum LayerKind {
 /// **Validating since build-steps.md Phase 20.** This used to return the raw `String`, on the
 /// stated grounds that Phase 13 only needed it for topology-diff equality (`CONTEXT.md`, Topology
 /// change) and nothing bound a real `zwlr_layer_surface_v1` with it -- see docs/adr/0024. Phase 20
-/// is what makes that false: `crate::wayland::App::create_panels` now creates one layer surface per
+/// is what makes that false: `crate::wayland::App::create_panel` now creates one layer surface per
 /// instance straight from this value (docs/adr/0038 decision 1), so an unrecognized string is a
 /// config error the author must see rather than a silent fall to some default layer. A typo'd
 /// `layer = "Toop"` that quietly stacked a bar on `Background` would be a far worse failure than a
@@ -1150,9 +1150,9 @@ pub fn surface_topology(properties: &HashMap<String, Value>) -> Result<SurfaceTo
 }
 
 /// Everything one `zwlr_layer_surface_v1` needs, read off a `panel` node's properties in one pass
-/// (§ 6.1, build-steps.md Phase 20 item 3). `crate::socket`'s `panel_specs` builds one per declared
-/// surface; `layout::instance::expand_instances` turns them into per-output instances, and
-/// `crate::wayland::App::create_panels` is what actually binds them.
+/// (§ 6.1, build-steps.md Phase 20 item 3). `crate::socket`'s `surface_specs` builds one per
+/// declared `panel`; `layout::instance::expand_instances` turns them into per-output instances, and
+/// `crate::wayland::App::create_panel` is what actually binds them.
 ///
 /// The split between `topology` and the rest is the swap-versus-in-place split itself, so it is
 /// worth reading as one: `renderer/src/socket.rs`'s `handle_reevaluate` diffs *only* `topology`,
@@ -1633,6 +1633,71 @@ pub fn popup_spec(properties: &HashMap<String, Value>) -> Result<PopupSpec, Layo
         offset: parse_popup_offset(properties)?,
         grab: parse_grab(properties)?,
     })
+}
+
+/// One declared top-level surface, parsed by whichever § 6 role its `kind` names (docs/adr/0040
+/// decision 1). `crate::socket`'s `surface_specs` builds one per node the evaluation returned, and
+/// this is the roster every later stage reads: `layout::instance::expand_instances` turns it into
+/// surface instances and `crate::wayland::App::create_surfaces` binds them.
+///
+/// One enum rather than three parallel lists, because the *order* of the declarations is part of
+/// the swap fingerprint (see [`SurfaceFingerprint`]) and three lists would lose the interleaving.
+/// It is also what keeps a surface's role one `match` away at every consumer instead of a lookup in
+/// whichever list happens to hold it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SurfaceSpec {
+    Panel(PanelSpec),
+    Window(WindowSpec),
+    Popup(PopupSpec),
+}
+
+impl SurfaceSpec {
+    /// The `id` this surface was declared with, whatever its role -- what
+    /// `layout::scene::Scene`'s apply matches a `SurfaceInstance` back to its `VirtualNode` by.
+    pub fn declared_id(&self) -> &str {
+        match self {
+            SurfaceSpec::Panel(spec) => &spec.topology.id,
+            SurfaceSpec::Window(spec) => &spec.id,
+            SurfaceSpec::Popup(spec) => &spec.id,
+        }
+    }
+
+    /// This declaration's share of the swap fingerprint.
+    pub fn fingerprint(&self) -> SurfaceFingerprint {
+        match self {
+            SurfaceSpec::Panel(spec) => SurfaceFingerprint::Panel(spec.topology.clone()),
+            SurfaceSpec::Window(spec) => SurfaceFingerprint::Window(spec.id.clone()),
+            SurfaceSpec::Popup(spec) => SurfaceFingerprint::Popup(spec.id.clone()),
+        }
+    }
+}
+
+/// One declared surface's share of the topology `crate::socket`'s `handle_reevaluate` diffs to
+/// choose a generation swap over an in-place reload (docs/adr/0001, `CONTEXT.md`'s Topology
+/// change). Order-sensitive equality on `Vec<SurfaceFingerprint>` is that diff.
+///
+/// The three roles contribute different amounts, and the protocol decides how much rather than a
+/// preference. A `panel` carries all five of [`SurfaceTopology`]'s fields, because
+/// `get_layer_surface` fixes every one of them at creation. A `window` and a `popup` carry their
+/// `id` alone: everything else they hold is either a request on a live object (`set_title`,
+/// `set_app_id`, the two size hints -- see [`WindowSpec`]'s own "no `WindowTopology`" note) or
+/// rebuilt per open (the whole `xdg_positioner`, docs/adr/0049 decision 1), so none of it can
+/// strand a live object the way a changed `namespace` would.
+///
+/// What the two `id` arms *do* catch is the case docs/adr/0049 decision 3 names: adding or removing
+/// a declaration is a topology change for every role, including the two whose Wayland object comes
+/// and goes inside one generation. The panel-only fingerprint this replaced could not see a
+/// `window` appear at all, so an edit that added one reported `Unchanged` and reloaded in place
+/// into a generation that had built no surface for it.
+///
+/// The role itself is part of the fingerprint by construction: rewriting `panel { id = "x" }` as
+/// `window { id = "x" }` changes the variant, which is a different Wayland object entirely and so a
+/// swap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SurfaceFingerprint {
+    Panel(SurfaceTopology),
+    Window(String),
+    Popup(String),
 }
 
 /// A single-node property (`panel.child`), converted from its raw table via
@@ -2361,7 +2426,7 @@ mod tests {
     #[test]
     fn an_unrecognized_layer_is_a_config_error_not_a_silent_default() {
         // build-steps.md Phase 20 item 3: this used to return the raw string, so a typo reached
-        // the topology diff intact and nothing ever validated it. Now `create_panels` binds a real
+        // the topology diff intact and nothing ever validated it. Now `create_panel` binds a real
         // `zwlr_layer_surface_v1` with it, and a typo that quietly stacked a bar on the wrong
         // layer would be a worse failure than a rejected config -- nothing on screen would say why.
         let lua = lua();

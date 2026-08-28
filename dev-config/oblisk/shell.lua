@@ -128,6 +128,13 @@ local clicks = state("clicks", 0)
 -- been clicked: `anchor_rect` must be non-zero or the whole evaluation fails (§ 6.3).
 local popup_anchor = state("popup_anchor", { x = 0, y = 0, width = 86, height = 24 })
 
+-- Whether the `window` below is open. ADR-0049 decision 2: for a `window` (and, next commit, a
+-- `popup`) `visible` creates and destroys the Wayland object rather than mapping and unmapping it,
+-- and nothing outside this file drives that. The handler's `:set()` marks the scene dirty
+-- (ADR-0044 decision 5), the poll loop re-resolves, and the reconcile reads the new value -- so one
+-- click builds an `xdg_toplevel` and the next destroys it, with no engine-side toggle anywhere.
+local settings_open = state("settings_open", false)
+
 local click_button = button {
     width = 86,
     height = 24,
@@ -137,7 +144,9 @@ local click_button = button {
         local n = clicks:get() + 1
         clicks:set(n)
         popup_anchor:set(rect)
-        print(string.format("[shell.lua] click %d, button rect %.0f,%.0f %.0fx%.0f", n, rect.x, rect.y, rect.width, rect.height))
+        settings_open:set(not settings_open:get())
+        print(string.format("[shell.lua] click %d, button rect %.0f,%.0f %.0fx%.0f, settings %s", n, rect.x, rect.y, rect.width, rect.height,
+            settings_open:get() and "open" or "closed"))
     end,
     children = { cell(clicks:map(function(n)
         return string.format("clicks %d", n)
@@ -157,8 +166,9 @@ end), "#f38ba8ff")
 -- named every surface by its kind (the literal string "panel") until a second one made that
 -- visible, and a candidate that fails to build a scene still gets promoted, which only shows up
 -- when a config is big enough to get wrong. Both get a real `zwlr_layer_surface_v1` now, one per
--- monitor each, addressed as `"bar@{output}"` and `"notification_area@{output}"`. The `window` and
--- `popup` after them are declarations only -- see their own comment.
+-- monitor each, addressed as `"bar@{output}"` and `"notification_area@{output}"`. The `window`
+-- after them is a real `xdg_toplevel`, addressed as `"settings"` with no `@output` because the
+-- compositor places it; the `popup` last is a declaration only -- see its own comment.
 return {
     panel {
         id = "bar",
@@ -203,24 +213,31 @@ return {
             children = { notification_feed },
         },
     },
-    -- Two more of § 6's roles, declared but never mapped: nothing creates an `xdg_toplevel` or an
-    -- `xdg_popup` yet, so neither gets a surface instance and neither reaches the scene at all.
-    -- What they exercise is the half that does exist -- `window_spec`/`popup_spec` run over both on
-    -- every evaluation, so a typo in either lands in `rescue.error_log` (§ 2.10) instead of
-    -- surfacing as a protocol error the first time something tries to open one. `visible = false`
-    -- on both says the same thing the config's way, and is what stays true once they do map.
+    -- A real `xdg_toplevel`, opened and closed by the button above. It is the compositor that
+    -- places and sizes this, not the config: § 6.2 gives a `window` no `monitor`, no `anchor` and
+    -- no size, so `niri msg windows` is where you check that the title and app_id below arrived.
     window {
         id = "settings",
         title = "Oblisk settings",
         app_id = "oblisk.settings",
         -- Advisory in the spec's own words, and never clamped against the resolved tree (§ 6.2).
+        -- They do bound the size this client picks when a compositor leaves an axis to it.
         min_size = { width = 320, height = 240 },
         max_size = { width = 1280, height = 800 },
-        visible = false,
+        -- Not a literal: the whole point of Phase 22 item 5. False until the first click.
+        visible = settings_open,
         child = column {
+            -- Fills whatever the compositor configured, so the window is opaque and takes clicks
+            -- across its whole area -- a `Content`-sized child under a tiling compositor would
+            -- leave most of the surface transparent and, since the input region is the visible
+            -- content (ADR-0038 decision 5), click-through.
+            width = "Fill",
+            height = "Fill",
             padding = { top = 12, right = 12, bottom = 12, left = 12 },
             background = BG,
-            children = { cell("settings", FG) },
+            children = { cell(clicks:map(function(n)
+                return string.format("settings, opened after %d clicks", n)
+            end), FG) },
         },
     },
     popup {
@@ -231,7 +248,7 @@ return {
         -- Read now rather than bound as a signal: a top-level spec is parsed from the *unresolved*
         -- properties, so `:get()` is what turns the signal into the table § 6.3 wants. The ceiling
         -- that follows -- this is what the last evaluation saw, not what the last click wrote -- is
-        -- named in `renderer/src/socket.rs`'s `panel_specs`.
+        -- named in `renderer/src/socket.rs`'s `surface_specs`.
         anchor_rect = popup_anchor:get(),
         -- Required and non-zero on both axes: a popup has no "Fill" (§ 6.3), because there is
         -- nothing for it to fill.

@@ -275,8 +275,32 @@ impl Scene {
         // item 5).
         ensure_node_admissible(&fresh.kind, 0)?;
         let properties = node::resolve_properties(&fresh.properties, &fresh.kind, lua)?;
+        // **An unsized `window` root is its surface** (build-steps.md Phase 22 item 1). A `panel`
+        // root sizes itself from § 6.1's `width`/`height`, which are also its
+        // `zwlr_layer_surface_v1::set_size` request; § 6.2 gives a `window` neither, because a
+        // toplevel's size is the compositor's and arrives as an `xdg_toplevel` configure that
+        // `set_instance_size` has already turned into this `available`.
+        //
+        // Without this the root fell to `parse_size_mode`'s `Content` default, and a
+        // `Content`-sized parent hands its children a budget of zero (see `child_budget` in
+        // `resolve_and_reconcile`), so `child = column { width = "Fill" }` -- the obvious way to
+        // write a window -- resolved to nothing and the toplevel mapped a fully transparent buffer.
+        // Measured against niri, which configured the window at its 1920x1168 tile and had a 0x0
+        // tree painted into it.
+        //
+        // Only the `Content` default is overridden, per axis. A `window` that does write a `width`
+        // is writing a property § 6.2 does not define, and the answer to that is to honour it like
+        // any other node's rather than to silently discard it.
+        let forced = if fresh.kind == "window" {
+            (
+                matches!(node::parse_size_mode(&properties, "width")?, SizeMode::Content).then_some(available.width),
+                matches!(node::parse_size_mode(&properties, "height")?, SizeMode::Content).then_some(available.height),
+            )
+        } else {
+            (None, None)
+        };
         let reconciled =
-            resolve_and_reconcile(self, existing, &fresh.kind, properties, available, shaping, None, None, lua, 0)?;
+            resolve_and_reconcile(self, existing, &fresh.kind, properties, available, shaping, forced.0, forced.1, lua, 0)?;
         self.surfaces.insert(key, reconciled);
         Ok(())
     }
@@ -1090,8 +1114,9 @@ mod tests {
     /// The single-output shorthand every fixture below uses: one instance per declared surface,
     /// against one output named `"TEST"`, so a fixture declaring `id = "bar"` reads back as
     /// `scene.surface("bar@TEST")`. Deliberately not `layout::instance::expand_instances` -- that
-    /// function takes `PanelSpec`s, which require a `layer`, and these fixtures test layout rather
-    /// than topology; `expand_instances` has its own direct tests in `layout::instance`.
+    /// function takes `SurfaceSpec`s, whose `panel` arm requires a `layer`, and these fixtures
+    /// test layout rather than topology; `expand_instances` has its own direct tests in
+    /// `layout::instance`.
     fn apply_at(
         scene: &mut Scene,
         surfaces: &[VirtualNode],
@@ -2822,6 +2847,38 @@ mod tests {
             assert_eq!(child.rect.width, 100.0, "`{kind}` must stretch its child like `panel`");
             assert_eq!(child.rect.height, 50.0);
         }
+    }
+
+    #[test]
+    fn an_unsized_window_root_is_the_surface_so_a_fill_child_actually_fills_it() {
+        // § 6.2 gives a `window` no `width`/`height`, because a toplevel's size is the compositor's
+        // and reaches `available` as an `xdg_toplevel` configure. Left to `parse_size_mode`'s
+        // `Content` default the root would hand its children a zero budget, and the obvious way to
+        // write a window -- a `Fill` child -- resolved to nothing, so the toplevel mapped a fully
+        // transparent buffer. Measured against niri (build-steps.md Phase 22 item 1).
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) =
+            surface_from(r#"{ kind = "window", id = "settings", child = rect { width = "Fill", height = "Fill" } }"#);
+        apply_at(&mut scene, &[surface], LogicalSize { width: 1920.0, height: 1168.0 }, &shaping, &lua).unwrap();
+
+        let root = scene.surface("settings@TEST").unwrap();
+        assert_eq!((root.rect.width, root.rect.height), (1920.0, 1168.0));
+        assert_eq!((root.children[0].rect.width, root.children[0].rect.height), (1920.0, 1168.0));
+    }
+
+    #[test]
+    fn a_window_root_that_does_write_a_size_still_gets_the_size_it_wrote() {
+        // Per axis, and only the `Content` default is overridden: a `window` writing a `width` is
+        // writing a property § 6.2 does not define, and honouring it is better than silently
+        // discarding it.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(r#"{ kind = "window", id = "settings", width = 400, child = rect { width = "Fill", height = "Fill" } }"#);
+        apply_at(&mut scene, &[surface], LogicalSize { width: 1920.0, height: 1168.0 }, &shaping, &lua).unwrap();
+
+        let root = scene.surface("settings@TEST").unwrap();
+        assert_eq!((root.rect.width, root.rect.height), (400.0, 1168.0), "the written width stands; the unwritten height fills");
     }
 
     #[test]

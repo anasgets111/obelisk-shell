@@ -37,8 +37,9 @@
 //! 1. On `Reevaluate`, [`RendererClient::handle_reevaluate`] reads and evaluates the real
 //!    `shell.lua` file ([`crate::lua::Loader::evaluate_file`]) *without* applying it to the
 //!    retained [`Scene`] yet, diffs the evaluation's topology
-//!    (`crate::layout::node::SurfaceTopology`) against whatever's currently applied, and reports
-//!    back a `shared::ReevaluateReport::Unchanged`, `TopologyChanged`, or `Failed` verdict -- the
+//!    (`crate::layout::node::SurfaceFingerprint`, one entry per declared surface of any role)
+//!    against whatever's currently applied, and reports back a
+//!    `shared::ReevaluateReport::Unchanged`, `TopologyChanged`, or `Failed` verdict -- the
 //!    Supervisor (CONTEXT.md's Watcher) owns what happens next, not this module.
 //! 2. `Unchanged` evaluations are kept as `pending`, applied to the `Scene` only once the
 //!    Supervisor sends back `ApplyPendingReload` for that same sequence -- never eagerly,
@@ -48,11 +49,18 @@
 //!    `None` only when no evaluation has produced one (first boot, or a startup evaluation that
 //!    failed). Since docs/adr/0038 that is the evaluation's topology, recorded in
 //!    [`RendererClient::run_startup_evaluation`], not the applied scene's: `crate::wayland::run`
-//!    creates one layer surface per declared `(panel, output)` pair straight from those specs, so
-//!    the surfaces exist whether or not the tree inside them resolved. Before that the surfaces
-//!    were a fixed Rust-owned set with no relation to the topology at all, and tying this field to
-//!    a successful apply was the only proxy available. Now the thing the diff is really asking is
-//!    "do the surfaces that exist still match what the config declares", and that is this field.
+//!    creates the surfaces straight from those specs, so they exist whether or not the tree inside
+//!    them resolved. Before that the surfaces were a fixed Rust-owned set with no relation to the
+//!    topology at all, and tying this field to a successful apply was the only proxy available. Now
+//!    the thing the diff is really asking is "do the surfaces that exist still match what the config
+//!    declares", and that is this field.
+//!
+//!    It covers **every** declared role since build-steps.md Phase 22, not only the panels
+//!    (docs/adr/0049 decision 3, ADR-0001). A `window`'s and a `popup`'s Wayland object comes and
+//!    goes inside one generation, but the *declaration* is still fixed for that generation's life,
+//!    so adding or removing one is a topology change like any other -- and a panel-only fingerprint
+//!    could not see it, so such an edit reported `Unchanged` and reloaded in place into a generation
+//!    that had built no surface for it.
 //!
 //!    `handle_reevaluate` treats `None` as "safe to apply", not as an empty topology to diff
 //!    against: after a startup failure there's nothing to protect, so the next successful
@@ -97,7 +105,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use crate::layout::instance::SurfaceInstance;
-use crate::layout::node::{PanelSpec, SurfaceTopology};
+use crate::layout::node::{SurfaceFingerprint, SurfaceSpec};
 use crate::layout::{self, Scene};
 use crate::lua::process::ProcessRegistry;
 use crate::lua::signal::{DirtyFlag, LiveSignalHandle};
@@ -164,9 +172,9 @@ pub fn spawn_client(generation_id: u32, inbound_tx: std::sync::mpsc::Sender<Supe
 /// no-ops. So the `Lua` must outlive every retained value because the code reads them, and Rust
 /// drops struct fields in declaration order: see [`RendererClient`]'s field ordering.
 struct ReloadState {
-    applied_topology: Option<Vec<SurfaceTopology>>,
+    applied_topology: Option<Vec<SurfaceFingerprint>>,
     applied_output: Option<lua::LoadOutput>,
-    pending: Option<(u64, lua::LoadOutput, Vec<SurfaceTopology>)>,
+    pending: Option<(u64, lua::LoadOutput, Vec<SurfaceFingerprint>)>,
 }
 
 /// One generation's whole Lua side: the VM, the retained scene, the live signals, and the
@@ -390,26 +398,27 @@ impl RendererClient {
     ///
     /// A failed *apply* no longer clears it, which is the one behavior this split moved rather
     /// than preserved. That is the correct side of the line since docs/adr/0038: the caller has
-    /// already bound one layer surface per declared `(panel, output)` pair by then, so those
-    /// surfaces exist and a later edit that changes the topology genuinely needs a new generation
-    /// to build a different set. The old rule would have applied that edit in place, into surfaces
-    /// the config no longer describes. See the module doc comment point 3.
+    /// already bound the declared surfaces by then, so they exist and a later edit that changes the
+    /// topology genuinely needs a new generation to build a different set. The old rule would have
+    /// applied that edit in place, into surfaces the config no longer describes. See the module doc
+    /// comment point 3.
     ///
     /// Runs before any layer surface is bound (`oblisk-supervisor-services-dbus.md` § 15.2's
     /// order: evaluate, bind, null-buffer, signal ready), which on one thread is just the order
     /// of the statements in `crate::wayland::run`.
     ///
     /// Split from the scene apply since build-steps.md Phase 20, and the split is forced by that
-    /// same § 15.2 ordering rather than chosen: the caller needs the returned [`PanelSpec`]s to
-    /// expand into surface instances (`layout::instance::expand_instances`) *before* there is
-    /// anything to resolve a tree against, so evaluation has to hand its result back rather than
-    /// consume it. [`Self::apply_instances`] is the other half.
+    /// same § 15.2 ordering rather than chosen: the caller needs the returned
+    /// [`SurfaceSpec`](layout::node::SurfaceSpec)s to expand into surface instances
+    /// (`layout::instance::expand_instances`) *before* there is anything to resolve a tree against,
+    /// so evaluation has to hand its result back rather than consume it. [`Self::apply_instances`]
+    /// is the other half.
     ///
     /// Returns `None` when the evaluation itself failed, with rescue set exactly as before.
-    pub fn run_startup_evaluation(&mut self) -> Option<Vec<PanelSpec>> {
+    pub fn run_startup_evaluation(&mut self) -> Option<Vec<SurfaceSpec>> {
         match evaluate_and_specs(&self.loader, &self.shell_lua_path) {
             Ok((output, specs)) => {
-                self.state.applied_topology = Some(specs.iter().map(|spec| spec.topology.clone()).collect());
+                self.state.applied_topology = Some(specs.iter().map(SurfaceSpec::fingerprint).collect());
                 // ADR-0044 decision 2: hold the evaluation that was actually applied, so a
                 // later push can re-resolve against it without re-running shell.lua.
                 self.state.applied_output = Some(output);
@@ -438,8 +447,8 @@ impl RendererClient {
         &self.instances
     }
 
-    /// The `panel` specs of the evaluation currently applied, re-parsed from the retained
-    /// `applied_output` rather than re-read from `shell.lua`.
+    /// The whole declared surface roster of the evaluation currently applied, re-parsed from the
+    /// retained `applied_output` rather than re-read from `shell.lua`.
     ///
     /// This is what a monitor hotplug expands against (docs/adr/0038 decision 3): the declared set
     /// is unchanged by an output appearing, so the specs already in hand are exactly the right
@@ -448,17 +457,17 @@ impl RendererClient {
     ///
     /// Empty when nothing has ever applied (a startup evaluation that failed), which is the
     /// honest answer: there are no declared surfaces to expand, so a hotplug adds none.
-    pub fn applied_panel_specs(&self) -> Vec<PanelSpec> {
+    pub fn applied_surface_specs(&self) -> Vec<SurfaceSpec> {
         let Some(output) = self.state.applied_output.as_ref() else {
             return Vec::new();
         };
-        match panel_specs(output) {
+        match surface_specs(output) {
             Ok(specs) => specs,
             Err(err) => {
                 // Unreachable in practice -- `applied_output` is only ever stored after
-                // `panel_specs` already succeeded on it -- but a panic here would take down a
+                // `surface_specs` already succeeded on it -- but a panic here would take down a
                 // shell that is painting fine, over an output event.
-                eprintln!("control-socket client: the applied evaluation's panel specs no longer parse: {err}");
+                eprintln!("control-socket client: the applied evaluation's surface specs no longer parse: {err}");
                 Vec::new()
             }
         }
@@ -644,16 +653,18 @@ impl RendererClient {
     /// nothing to protect, so the fresh evaluation is safe to stage as `pending` -- see the module
     /// doc comment point 3.
     ///
-    /// The diff reads `PanelSpec::topology` and nothing else, which is the swap-versus-in-place
-    /// split itself (docs/adr/0038 decision 2, `CONTEXT.md`'s Topology change/Value change): an
-    /// edit to `margin`, `keyboard_interactivity`, `exclusive`, or a size is a request layer-shell
-    /// accepts on a live surface, so it must report `Unchanged` and reload in place rather than
-    /// respawning the process. Comparing whole specs would make every one of those a generation
-    /// swap.
+    /// The diff reads each spec's [`SurfaceFingerprint`](layout::node::SurfaceFingerprint) and
+    /// nothing else, which is the swap-versus-in-place split itself (docs/adr/0038 decision 2,
+    /// docs/adr/0049 decision 3, `CONTEXT.md`'s Topology change/Value change): an edit to a
+    /// `margin`, a `keyboard_interactivity`, an `exclusive`, a size, or a `window`'s `title` is a
+    /// request the protocol accepts on a live object, so it must report `Unchanged` and reload in
+    /// place rather than respawning the process. Comparing whole specs would make every one of
+    /// those a generation swap. What the fingerprint does catch, for every role, is a declaration
+    /// appearing or disappearing.
     fn handle_reevaluate(&mut self, request: ReevaluateRequest) {
         let report = match evaluate_and_specs(&self.loader, &self.shell_lua_path) {
             Ok((output, specs)) => {
-                let topology: Vec<SurfaceTopology> = specs.iter().map(|spec| spec.topology.clone()).collect();
+                let topology: Vec<SurfaceFingerprint> = specs.iter().map(SurfaceSpec::fingerprint).collect();
                 self.set_rescue_state(false, "");
                 let topology_changed = self.state.applied_topology.as_ref().is_some_and(|applied| applied != &topology);
                 if topology_changed {
@@ -926,61 +937,58 @@ fn rescue_table(loader: &Loader, is_rescue: bool, error_log: &str) -> mlua::Resu
     Ok(table)
 }
 
-/// Parses **every** declared surface by its own role, and returns the `panel` specs (§ 6.1-6.3,
+/// Parses **every** declared surface by its own role and returns the whole roster (§ 6.1-6.3,
 /// build-steps.md Phase 20 item 3 and Phase 22). Was `surfaces_topology`, returning only the swap
-/// fingerprint; it returns the whole spec now because `crate::wayland` needs the rest of it to
-/// *create* the surfaces, while `handle_reevaluate` still diffs `PanelSpec::topology` alone.
+/// fingerprint, then `panel_specs`, which parsed all three roles and returned only the panels;
+/// build-steps.md Phase 22 is what made every role's spec something a caller actually needs, so all
+/// three come back now.
 ///
 /// A surface whose fields don't type-check fails with [`lua::LoaderError::InvalidTopology`] -- a
 /// distinct message from an actual top-level-return shape error, since conflating the two (as an
 /// earlier version of this function did) produced a misleading `rescue.error_log`.
 ///
-/// **Parsing a `window` and a `popup` here is the point, even though only panels come back.** § 6.3's
-/// properties become `xdg_positioner` requests that raise protocol errors -- a zero `anchor_rect`
-/// leaves the positioner incomplete and `get_popup` answers `invalid_positioner`, a `max_size` under
-/// a `min_size` answers `invalid_size` -- and a protocol error kills the connection and the whole
+/// **Parsing every role here is the point, even for properties nothing on this path sends.** § 6.2's
+/// and § 6.3's properties become requests that raise protocol errors -- a zero `anchor_rect` leaves
+/// the positioner incomplete and `get_popup` answers `invalid_positioner`, a `max_size` under a
+/// `min_size` answers `invalid_size` -- and a protocol error kills the connection and the whole
 /// shell with it. Phase 20 settled that a config typo is a `layout::node::LayoutError` at
 /// evaluation, never a protocol error at runtime, so the parse has to happen at the one point every
 /// declaration passes through. Failing here puts the message in `rescue`'s `error_log` for a human
 /// (§ 2.10, docs/adr/0046) instead of leaving a popup that silently refuses to open on some later
 /// click.
 ///
-/// ponytail: the validated `WindowSpec`/`PopupSpec` are **dropped**, and nothing is lost by that
-/// because nothing is stored either -- `RendererClient::state.applied_output` retains the whole
-/// evaluation, so the next commit re-derives both from it exactly as `applied_panel_specs` already
-/// re-derives the panel specs. Storing them now would be a cache with no reader. Two things the
-/// commit that does create the Wayland objects needs and this one deliberately does not build:
-/// the returned roster has to become role-aware (`expand_instances` maps one layer surface per
-/// declared `(panel, output)` pair, which is right for a `panel` and wrong for both other roles --
-/// the compositor places a toplevel, and a popup is created per open, docs/adr/0049 decision 1),
-/// and `applied_topology` has to carry the non-panel declarations, since adding or removing one is
-/// a topology change (docs/adr/0049 decision 3) that today's panel-only fingerprint cannot see.
+/// **This is an evaluation-time, literal-only fast-fail, not the authoritative spec** for the two
+/// roles whose properties are meant to move (docs/adr/0049's second amendment). It parses the
+/// *unresolved* properties, so a `Signal` in a `window`'s `title` or a `popup`'s `anchor_rect` is
+/// whatever the last evaluation saw rather than what the last push or click wrote. That is the
+/// honest half of the check: a literal is validated here and a typo fails fast, and a signal-bound
+/// property is checked when it resolves. `crate::wayland::App::apply_resolved_state` builds the
+/// authoritative [`WindowSpec`](layout::node::WindowSpec) from the *resolved* tree instead, where
+/// `layout::node::resolve_properties` has already run exactly once for that pass (ADR-0044
+/// decision 1).
 ///
-/// ponytail: these parse the *unresolved* properties, so a `Signal` in a `popup`'s `anchor_rect` --
-/// § 6.3's own idiom, the rect `on_click` hands back -- is refused here rather than read. A config
-/// spells it `anchor_rect = popup_anchor:get()` today, which is a literal table by the time it
-/// arrives (`dev-config/oblisk/shell.lua` does exactly this). The ceiling is that the value is then
-/// whatever the last *evaluation* saw, not what the last click wrote. Resolving first is not the
-/// upgrade path: `layout::node::resolve_properties` runs Lua getters, and this function also runs on
-/// every monitor hotplug via `applied_panel_specs`, where a second read of every signal would both
-/// double ADR-0021's per-getter budget and break the one-read-per-pass rule that function's doc
-/// comment exists to state. The real fix is the positioner being built from the *resolved*
-/// properties inside `Scene::apply`, where a popup is created per open anyway; that is the same
-/// commit as the role-aware roster above.
-fn panel_specs(output: &lua::LoadOutput) -> Result<Vec<PanelSpec>, lua::LoaderError> {
+/// Resolving here instead is not the upgrade path and never was: `resolve_properties` runs Lua
+/// getters, and this function also runs on every monitor hotplug via
+/// [`RendererClient::applied_surface_specs`], where a second read of every signal would both double
+/// ADR-0021's per-getter budget and break the one-read-per-pass rule.
+///
+/// What *is* authoritative here is the roster and the fingerprint: which surfaces were declared, in
+/// what order, with what role. That is exactly what a topology diff and an instance expansion need,
+/// and none of it is a `Signal`'s to move -- `layout::node`'s structural-field rejection refuses one
+/// in an `id`.
+fn surface_specs(output: &lua::LoadOutput) -> Result<Vec<SurfaceSpec>, lua::LoaderError> {
     let invalid = |err: layout::node::LayoutError| lua::LoaderError::InvalidTopology(err.to_string());
     let mut specs = Vec::with_capacity(output.surfaces.len());
     for surface in &output.surfaces {
-        match surface.kind.as_str() {
-            "panel" => specs.push(layout::node::panel_spec(&surface.properties).map_err(invalid)?),
-            // Parsed for its errors, then dropped -- see the second `ponytail:` above.
-            "window" => drop(layout::node::window_spec(&surface.properties).map_err(invalid)?),
-            "popup" => drop(layout::node::popup_spec(&surface.properties).map_err(invalid)?),
+        specs.push(match surface.kind.as_str() {
+            "panel" => SurfaceSpec::Panel(layout::node::panel_spec(&surface.properties).map_err(invalid)?),
+            "window" => SurfaceSpec::Window(layout::node::window_spec(&surface.properties).map_err(invalid)?),
+            "popup" => SurfaceSpec::Popup(layout::node::popup_spec(&surface.properties).map_err(invalid)?),
             // Unreachable: `lua::require_surface` admits exactly the three roles above and rejects
             // everything else, `lock` with its own message. Named rather than left to a silent
             // `_ => {}`, because that arm would let a fourth role reach a generation unvalidated.
             other => return Err(lua::LoaderError::InvalidTopology(format!("`{other}` is not a surface role"))),
-        }
+        });
     }
     Ok(specs)
 }
@@ -992,9 +1000,9 @@ fn panel_specs(output: &lua::LoadOutput) -> Result<Vec<PanelSpec>, lua::LoaderEr
 // with no configure handling and no way to set `app.exit` until it returns -- `while true do end`
 // in `shell.lua` wedges the whole process. Upgrade path: extend ADR-0021's hook to cover
 // `Loader::evaluate_file` itself, not just the closures it registers.
-fn evaluate_and_specs(loader: &Loader, shell_lua_path: &Path) -> Result<(lua::LoadOutput, Vec<PanelSpec>), lua::LoaderError> {
+fn evaluate_and_specs(loader: &Loader, shell_lua_path: &Path) -> Result<(lua::LoadOutput, Vec<SurfaceSpec>), lua::LoaderError> {
     let output = loader.evaluate_file(shell_lua_path)?;
-    let specs = panel_specs(&output)?;
+    let specs = surface_specs(&output)?;
     Ok((output, specs))
 }
 
@@ -1216,19 +1224,56 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_window_and_popup_survive_the_startup_evaluation_without_becoming_panel_instances() {
-        // The evaluation must parse all three roles (build-steps.md Phase 22) and hand back only
-        // the `panel` specs: `expand_instances` maps a layer surface per declared `(panel, output)`
-        // pair, and a `window` or `popup` that leaked into that list would be bound as one.
+    fn every_declared_role_comes_back_from_the_startup_evaluation_tagged_with_its_own_spec() {
+        // The whole roster, not just the panels (build-steps.md Phase 22). `expand_instances` and
+        // `create_surfaces` both branch on the variant, so a role that arrived untagged -- or was
+        // dropped, as it was before this commit -- could only ever be bound as a layer surface.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), three_roles_config());
         let (mut client, _outbound_rx) = test_client(&path);
 
         let specs = client.run_startup_evaluation().expect("all three roles must evaluate");
 
-        assert_eq!(specs.len(), 1, "only the `panel` becomes a layer-surface spec");
-        assert_eq!(specs[0].topology.id, "bar");
+        assert!(matches!(specs.as_slice(), [SurfaceSpec::Panel(_), SurfaceSpec::Window(_), SurfaceSpec::Popup(_)]));
+        assert_eq!(specs.iter().map(SurfaceSpec::declared_id).collect::<Vec<_>>(), ["bar", "settings", "menu"]);
         assert_eq!(rescue_state(&client.loader), (false, String::new()));
+    }
+
+    #[test]
+    fn the_swap_fingerprint_carries_every_role_so_adding_a_window_is_a_topology_change() {
+        // docs/adr/0049 decision 3 and ADR-0001: a `window`'s Wayland object comes and goes inside
+        // one generation, but its *declaration* is fixed for that generation's life. The panel-only
+        // fingerprint this replaced could not see one appear, so adding a `window` reported
+        // `Unchanged` and reloaded in place into a generation that had built no surface for it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
+        let (mut client, mut outbound_rx) = test_client(&path);
+        client.state.applied_topology =
+            Some(surface_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap().iter().map(SurfaceSpec::fingerprint).collect());
+
+        write_shell_lua(dir.path(), three_roles_config());
+        client.handle_reevaluate(ReevaluateRequest { sequence: 9 });
+
+        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence: 9 }));
+        assert!(client.state.pending.is_none());
+    }
+
+    #[test]
+    fn a_windows_title_is_an_in_place_field_rather_than_a_topology_one() {
+        // The other side of that line, and the protocol is what decides it: `xdg-shell.xml` says a
+        // `set_title`/`set_app_id` request may be sent after the toplevel is mapped, so a changed
+        // title must not respawn the process to deliver it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), r#"return window { id = "settings", title = "Settings" }"#);
+        let (mut client, mut outbound_rx) = test_client(&path);
+        client.state.applied_topology =
+            Some(surface_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap().iter().map(SurfaceSpec::fingerprint).collect());
+
+        write_shell_lua(dir.path(), r#"return window { id = "settings", title = "Oblisk settings", app_id = "oblisk.settings" }"#);
+        client.handle_reevaluate(ReevaluateRequest { sequence: 10 });
+
+        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 10 }));
+        assert!(client.state.pending.is_some());
     }
 
     #[test]
@@ -1319,7 +1364,7 @@ mod tests {
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
         client.state.applied_topology =
-            Some(panel_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap().into_iter().map(|spec| spec.topology).collect());
+            Some(surface_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap().iter().map(SurfaceSpec::fingerprint).collect());
 
         client.handle_reevaluate(ReevaluateRequest { sequence: 5 });
 
@@ -1334,7 +1379,7 @@ mod tests {
         let (mut client, mut outbound_rx) = test_client(&path);
         // Seed a *different* applied topology (a different id) so the fresh evaluation reads as changed.
         client.state.applied_topology =
-            Some(vec![SurfaceTopology { id: "other".to_string(), layer: LayerKind::Top, anchor: Default::default(), monitor: "All".to_string(), namespace: "oblisk-other".to_string() }]);
+            Some(vec![SurfaceFingerprint::Panel(layout::node::SurfaceTopology { id: "other".to_string(), layer: LayerKind::Top, anchor: Default::default(), monitor: "All".to_string(), namespace: "oblisk-other".to_string() })]);
 
         client.handle_reevaluate(ReevaluateRequest { sequence: 1 });
 
@@ -1356,7 +1401,7 @@ mod tests {
         );
         let (mut client, mut outbound_rx) = test_client(&path);
         client.state.applied_topology =
-            Some(panel_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap().into_iter().map(|spec| spec.topology).collect());
+            Some(surface_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap().iter().map(SurfaceSpec::fingerprint).collect());
 
         // Every in-place field changed at once; every topology field left alone.
         write_shell_lua(
@@ -1382,7 +1427,7 @@ mod tests {
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
         client.state.applied_topology =
-            Some(panel_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap().into_iter().map(|spec| spec.topology).collect());
+            Some(surface_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap().iter().map(SurfaceSpec::fingerprint).collect());
 
         write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", namespace = "my-bar" }"#);
         client.handle_reevaluate(ReevaluateRequest { sequence: 8 });
@@ -1507,7 +1552,7 @@ mod tests {
         let (mut client, _outbound_rx) = test_client(&path);
         let (output, specs) = evaluate_and_specs(&client.loader, &path).unwrap();
         client.set_instances(instances_for(&["bar"]));
-        client.state.pending = Some((3, output, specs.into_iter().map(|spec| spec.topology).collect()));
+        client.state.pending = Some((3, output, specs.iter().map(SurfaceSpec::fingerprint).collect()));
 
         client.handle_apply_pending(ApplyPendingReload { sequence: 3 });
 
@@ -1528,7 +1573,7 @@ mod tests {
         let (mut client, _outbound_rx) = test_client(&path);
         let (output, specs) = evaluate_and_specs(&client.loader, &path).unwrap();
         client.set_instances(instances_for(&["bar"]));
-        client.state.pending = Some((3, output, specs.into_iter().map(|spec| spec.topology).collect()));
+        client.state.pending = Some((3, output, specs.iter().map(SurfaceSpec::fingerprint).collect()));
 
         client.handle_apply_pending(ApplyPendingReload { sequence: 99 });
 
@@ -1820,8 +1865,8 @@ mod tests {
         assert!(client.set_screens(screens_json(&["eDP-1", "DP-1"])));
         let specs = client.run_startup_evaluation().expect("the config must evaluate");
 
-        assert_eq!(specs.iter().map(|spec| spec.topology.id.as_str()).collect::<Vec<_>>(), ["bar@eDP-1", "bar@DP-1"]);
-        assert_eq!(specs[1].topology.monitor, "DP-1");
+        assert_eq!(specs.iter().map(SurfaceSpec::declared_id).collect::<Vec<_>>(), ["bar@eDP-1", "bar@DP-1"]);
+        assert!(matches!(&specs[1], SurfaceSpec::Panel(panel) if panel.topology.monitor == "DP-1"));
     }
 
     #[test]
@@ -1891,7 +1936,7 @@ mod tests {
     }
 
     #[test]
-    fn applied_panel_specs_returns_the_applied_declarations_without_reading_shell_lua_again() {
+    fn applied_surface_specs_returns_the_applied_declarations_without_reading_shell_lua_again() {
         // What a monitor hotplug re-expands against (docs/adr/0038 decision 3). Re-reading the
         // file here would cost an evaluation and race the `Reevaluate` the Supervisor is about to
         // send anyway, so the file is deleted mid-test to prove it is never touched.
@@ -1901,18 +1946,17 @@ mod tests {
         run_startup(&mut client);
         std::fs::remove_file(&path).unwrap();
 
-        let specs = client.applied_panel_specs();
+        let specs = client.applied_surface_specs();
         assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].topology.id, "bar");
-        assert_eq!(specs[0].topology.monitor, "All");
+        assert!(matches!(&specs[0], SurfaceSpec::Panel(panel) if panel.topology.id == "bar" && panel.topology.monitor == "All"));
     }
 
     #[test]
-    fn applied_panel_specs_is_empty_when_no_evaluation_has_ever_applied() {
+    fn applied_surface_specs_is_empty_when_no_evaluation_has_ever_applied() {
         // A startup evaluation that failed declares nothing, so a hotplug adds no instance --
         // the honest answer rather than a panic on an output event.
         let (client, _outbound_rx) = test_client(std::path::Path::new("/no/such/shell.lua"));
-        assert!(client.applied_panel_specs().is_empty());
+        assert!(client.applied_surface_specs().is_empty());
     }
 
     #[test]
@@ -1935,7 +1979,7 @@ mod tests {
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
         client.state.applied_topology =
-            Some(vec![SurfaceTopology { id: "other".to_string(), layer: LayerKind::Top, anchor: Default::default(), monitor: "All".to_string(), namespace: "oblisk-other".to_string() }]);
+            Some(vec![SurfaceFingerprint::Panel(layout::node::SurfaceTopology { id: "other".to_string(), layer: LayerKind::Top, anchor: Default::default(), monitor: "All".to_string(), namespace: "oblisk-other".to_string() })]);
 
         client.handle_reevaluate(ReevaluateRequest { sequence: 1 });
 
@@ -1952,7 +1996,7 @@ mod tests {
         // dispatch/queue path, not `handle_reevaluate`'s own classification logic (already
         // covered by the tests above).
         client.state.applied_topology =
-            Some(vec![SurfaceTopology { id: "other".to_string(), layer: LayerKind::Top, anchor: Default::default(), monitor: "All".to_string(), namespace: "oblisk-other".to_string() }]);
+            Some(vec![SurfaceFingerprint::Panel(layout::node::SurfaceTopology { id: "other".to_string(), layer: LayerKind::Top, anchor: Default::default(), monitor: "All".to_string(), namespace: "oblisk-other".to_string() })]);
 
         assert_eq!(client.handle_frame(SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: 1 })), None);
 

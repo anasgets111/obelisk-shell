@@ -16,6 +16,8 @@ use smithay_client_toolkit::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
     LayerSurfaceConfigure,
 };
+use smithay_client_toolkit::shell::xdg::XdgShell;
+use smithay_client_toolkit::shell::xdg::window::{DecorationMode, Window, WindowConfigure, WindowDecorations, WindowHandler};
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::{delegate_registry, registry_handlers};
 use khronos_egl::Surface as EglSurface;
@@ -33,7 +35,7 @@ use shared::{PresentationEvidence, ReadySignal, RendererFrame, SecureSubmit, Sup
 
 use crate::layout;
 use crate::layout::instance::{OutputGeometry, SurfaceInstance, expand_instances, reconcile_instances};
-use crate::layout::node::{self, LayerKind, PanelSpec, SizeMode};
+use crate::layout::node::{self, LayerKind, PanelSpec, SizeHint, SizeMode, SurfaceSpec, WindowSpec};
 use crate::socket::RendererClient;
 use crate::text::atlas::TextPainter;
 use crate::text::shaping::ShapingHandle;
@@ -94,32 +96,82 @@ impl MapState {
     }
 }
 
+/// The protocol object one tracked surface's `wl_surface` has been given a role by, together with
+/// the spec that object's state was last set from (§ 6, docs/adr/0040 decision 1). One enum rather
+/// than two parallel `Vec<TrackedSurface>`s, because everything *around* the role object -- the EGL
+/// binding, the paint pass, the input routing, the PBA staging -- is identical across roles and
+/// indexes into one `App::surfaces`; splitting the vec would fork all of it.
+///
+/// **The variants differ in exactly one thing, and it is the whole of docs/adr/0049 decision 1: how
+/// long the Wayland object lives.** A `panel`'s is created at generation startup and kept for the
+/// generation's whole life, with `visible` mapping and unmapping it. A `window`'s exists only while
+/// shown, which is why its object is an `Option` and a panel's is not.
+enum TrackedRole {
+    Panel {
+        layer: LayerSurface,
+        /// The `panel` spec this surface's layer-shell state was last set from -- the diff baseline
+        /// [`spec_update`] compares a freshly resolved root against, so a re-resolve pushes only
+        /// the fields that actually moved (docs/adr/0038 decision 2, build-steps.md Phase 20
+        /// item 1).
+        ///
+        /// Also the standing answer to "what is this surface's anchor and is it exclusive", which
+        /// [`App::apply_exclusive_zone`] needs once a `configure` says how large the surface is.
+        spec: PanelSpec,
+        /// This surface's output's logical size, the basis a `SizeMode::Percent` resolves against.
+        ///
+        /// Kept per surface rather than read back from `SurfaceInstance::available`, which is the
+        /// same number only until the first `configure`: `set_instance_size` then replaces
+        /// `available` with the size the compositor granted, so resolving a percent against it on a
+        /// later re-resolve would take a percentage of a percentage and shrink the surface on every
+        /// push.
+        ///
+        /// Panel-only because `layer_extent_for` is: § 6.2 gives a `window` no `width`/`height` at
+        /// all, so a toplevel has no size request to resolve a percent for.
+        output_size: layout::LogicalSize,
+    },
+    Window {
+        /// `None` whenever `visible` is false, which for this role means the `xdg_toplevel`, its
+        /// `xdg_surface` and its `wl_surface` do not exist at all (docs/adr/0049 decision 1). This
+        /// is the memory win that ADR gives: a declared-but-never-shown window costs one retained
+        /// node and zero Wayland objects, buffers, or EGL surfaces.
+        window: Option<Window>,
+        /// The `window` spec this toplevel's state was last set from, kept for the same reason a
+        /// panel's is: [`window_update`]'s diff baseline. Maintained even while `window` is `None`,
+        /// so the toplevel [`App::show_window`] creates is built from the spec the last re-resolve
+        /// produced rather than the one the evaluation happened to parse.
+        spec: WindowSpec,
+    },
+}
+
+impl TrackedRole {
+    /// This surface's `wl_surface`, or `None` for a `window` that is not currently shown -- the one
+    /// question every role-agnostic path in this file asks (finding a surface by the one a
+    /// `Dispatch` callback names, staging a null buffer, requesting presentation feedback).
+    fn wl_surface(&self) -> Option<&wl_surface::WlSurface> {
+        match self {
+            TrackedRole::Panel { layer, .. } => Some(layer.wl_surface()),
+            TrackedRole::Window { window, .. } => window.as_ref().map(WaylandSurface::wl_surface),
+        }
+    }
+}
+
 struct TrackedSurface {
-    layer: LayerSurface,
+    role: TrackedRole,
     bound: Option<BoundSurface>,
     /// § 15's "surface_id", and since docs/adr/0038 the *instance* id
-    /// (`layout::instance::SurfaceInstance::instance_id`): `"{id}@{output}"`, built from the
-    /// config's own `id`. This is the one id space Lua, the retained `Scene`, this `wl_surface`,
-    /// and the PBA handshake all share -- before this it was a fixed Rust-owned role's label, which
-    /// overlapped none of them, which is why `layout::paint::paint_tree` had no caller.
+    /// (`layout::instance::SurfaceInstance::instance_id`): `"{id}@{output}"` for a panel and the
+    /// bare declared `id` for a window, which has no output to qualify it with. This is the one id
+    /// space Lua, the retained `Scene`, this `wl_surface`, and the PBA handshake all share --
+    /// before this it was a fixed Rust-owned role's label, which overlapped none of them, which is
+    /// why `layout::paint::paint_tree` had no caller.
     surface_id: String,
-    /// The `panel` spec this surface's layer-shell state was last set from -- the diff baseline
-    /// [`spec_update`] compares a freshly resolved root against, so a re-resolve pushes only the
-    /// fields that actually moved (docs/adr/0038 decision 2, build-steps.md Phase 20 item 1).
-    ///
-    /// Also the standing answer to "what is this surface's anchor and is it exclusive", which
-    /// [`App::apply_exclusive_zone`] needs once a `configure` says how large the surface is.
-    applied_spec: PanelSpec,
-    /// This surface's output's logical size, the basis a `SizeMode::Percent` resolves against.
-    ///
-    /// Kept per surface rather than read back from `SurfaceInstance::available`, which is the same
-    /// number only until the first `configure`: `set_instance_size` then replaces `available` with
-    /// the size the compositor granted, so resolving a percent against it on a later re-resolve
-    /// would take a percentage of a percentage and shrink the surface on every push.
-    output_size: layout::LogicalSize,
     map_state: MapState,
     /// Set once this surface's null buffer has been committed (PBA candidate mode only, § 15.2
     /// points 2-3). Irrelevant, always `false`, outside candidate mode.
+    ///
+    /// Never set for a `window` that is not shown, and that is why [`candidate_has_staged`] exists
+    /// rather than the gate being a plain `all(null_buffered)`: staging happens on a configure, and
+    /// a window with no `xdg_toplevel` will never get one.
     null_buffered: bool,
     /// The most recent `configure` event's size, remembered so [`App::activate_draw`] has a real
     /// size to bind its EGL window surface to -- in candidate mode, the first configure doesn't
@@ -134,6 +186,11 @@ pub struct App {
     compositor_state: CompositorState,
     seat_state: SeatState,
     layer_shell: LayerShell,
+    /// `xdg_wm_base`, plus the `zxdg_decoration_manager_v1` `XdgShell::bind` picks up alongside it
+    /// (build-steps.md Phase 22 items 1 and 4). `None` on a compositor advertising no xdg-shell,
+    /// which is legal if odd -- a `panel`-only config still works there, and a declared `window`
+    /// says so once instead of taking the process down.
+    xdg_shell: Option<XdgShell>,
     egl: egl::EglState,
     gl: Option<glow::Context>,
     /// The one `ShapingHandle` for the whole process; `client` holds a clone of it, so
@@ -236,6 +293,14 @@ pub fn run(
 
     let compositor_state = CompositorState::bind(&globals, &qh)?;
     let layer_shell = LayerShell::bind(&globals, &qh)?;
+    // Optional, unlike layer-shell's: a compositor with no `xdg_wm_base` is legal, and a config
+    // declaring only panels works fine there. Logged and carried, the same tolerance
+    // `PresentationTimeState::bind` and `bind_text_input` already apply to a protocol that may not
+    // be advertised -- `create_surfaces` is what says which `window` went unbuilt, since only it
+    // knows there was one.
+    let xdg_shell = XdgShell::bind(&globals, &qh)
+        .inspect_err(|err| log_bind_failure("<xdg-shell>", "xdg_wm_base::bind", err))
+        .ok();
     let output_state = OutputState::new(&globals, &qh);
     let seat_state = SeatState::new(&globals, &qh);
     let registry_state = RegistryState::new(&globals);
@@ -260,6 +325,7 @@ pub fn run(
         compositor_state,
         seat_state,
         layer_shell,
+        xdg_shell,
         egl: egl_state,
         gl: None,
         shaping,
@@ -315,13 +381,18 @@ pub fn run(
     let specs = app.client.run_startup_evaluation().unwrap_or_default();
     let instances = expand_instances(&specs, &outputs);
     for spec in &specs {
-        if spec.topology.monitor != "All" && !outputs.iter().any(|output| output.name == spec.topology.monitor) {
+        let SurfaceSpec::Panel(panel) = spec else {
+            // Only a `panel` names a monitor (§ 6.2, § 6.3): the compositor places a toplevel and a
+            // popup positions against its parent, so neither can miss one.
+            continue;
+        };
+        if panel.topology.monitor != "All" && !outputs.iter().any(|output| output.name == panel.topology.monitor) {
             // `expand_instances` is pure and returns nothing for a miss; the log belongs here,
             // where the real output list is, so a config naming an unplugged monitor says so once
             // at startup rather than silently producing no surface.
             eprintln!(
                 "[oblisk-renderer] surface {:?} targets monitor {:?}, which is not connected; no surface created for it",
-                spec.topology.id, spec.topology.monitor
+                panel.topology.id, panel.topology.monitor
             );
         }
     }
@@ -341,7 +412,16 @@ pub fn run(
         eprintln!("[oblisk-renderer] no scene was applied at startup; surfaces still bind, and paint nothing until a reload or a push produces one");
     }
 
-    app.create_panels(&qh, &specs, &instances);
+    app.create_surfaces(&qh, &specs, &instances);
+    if app.is_pba_candidate {
+        // The configure-driven check in `bind_and_clear` covers every surface that gets a
+        // configure, and a generation whose every declared surface is a `window` with `visible =
+        // false` gets none at all -- no `xdg_toplevel` exists to be configured (docs/adr/0049
+        // decision 1). Without this call such a Candidate would never announce itself and would die
+        // on `ready_timeout`. A no-op in every other case, since no panel has been configured yet
+        // at this point and the gate refuses.
+        app.maybe_send_ready_signal();
+    }
     // From here on an output event owns the whole job: there is an evaluation to expand and
     // surfaces to reconcile against it (see `App::startup_complete`).
     app.startup_complete = true;
@@ -736,14 +816,132 @@ fn rect_table(lua: &Lua, rect: LogicalRect) -> mlua::Result<Table> {
 ///
 /// A panel declared `visible = false` is what forces the filter: docs/adr/0038 decision 2 still
 /// *creates* it, so it exists as a `TrackedSurface` and stages like every other surface, but it
-/// never presents a frame, so it must not be in the expected set. An empty result is legal, not a
-/// degenerate case -- `drive_handshake`'s collection loop exits immediately on an empty expected
-/// set, so a generation whose every panel starts hidden completes its handshake.
+/// never presents a frame, so it must not be in the expected set. A window declared `visible =
+/// false` reaches the same answer by a shorter route, since docs/adr/0049 decision 1 does not
+/// create its `xdg_toplevel` at all.
+///
+/// An empty result is legal, not a degenerate case -- `drive_handshake`'s collection loop exits
+/// immediately on an empty expected set, so a generation whose every surface starts hidden
+/// completes its handshake.
 fn presenting_surface_ids<'a>(surfaces: impl Iterator<Item = (&'a str, MapState)>) -> Vec<String> {
     surfaces
         .filter(|(_, state)| state.presents())
         .map(|(id, _)| id.to_string())
         .collect()
+}
+
+/// Whether every tracked surface has staged everything a PBA Candidate owes it, which is
+/// [`App::maybe_send_ready_signal`]'s gate (§ 15.2 points 2-3). Takes `(null_buffered, exists)` per
+/// surface, where `exists` is whether the surface currently has a Wayland object at all.
+///
+/// The second half is what build-steps.md Phase 22 item 1's "PBA's null-buffer staging needs no new
+/// branch" missed, and it is a gate rather than a staging difference. The *staging* really does
+/// generalize: xdg-shell's initial-commit discipline is layer-shell's, so a shown `window` attaches
+/// a null buffer on its first configure through the identical code path. What does not generalize is
+/// the assumption underneath the old `all(null_buffered)` gate -- that every tracked surface gets a
+/// configure. A `panel` always does, because it is created and initially committed at startup even
+/// when `visible` is false. A `window` declared `visible = false` has no `xdg_toplevel` at all
+/// (docs/adr/0049 decision 1), so no configure is coming, `null_buffered` would stay false forever,
+/// and the Candidate would never send its `ReadySignal` -- a `ready_timeout` hang on every config
+/// that declares a hidden window, which is the shape the dev config already has.
+///
+/// A surface with no object has nothing to stage and nothing to present, so it is complete by
+/// construction. It is filtered out of the announced set by [`presenting_surface_ids`] on the same
+/// `MapState::Unmapped` that makes it objectless here, which is what keeps the two in step.
+fn candidate_has_staged(surfaces: impl Iterator<Item = (bool, bool)>) -> bool {
+    surfaces.into_iter().all(|(null_buffered, exists)| null_buffered || !exists)
+}
+
+/// What a `window` takes on a configure axis the compositor left to it, when the config declared no
+/// `min_size` to take instead.
+///
+/// ponytail: a constant, because § 6.2 gives a `window` no `width`/`height` for a config to state
+/// one with, and its tree cannot answer either -- a toplevel's root is forced to the surface the
+/// compositor granted (`layout::scene`'s `Scene::apply_one_instance`), so "the size the content
+/// wants" is not a number this engine ever computes. The ceiling is that a config with no
+/// `min_size` opens at this size on a compositor that leaves the first configure at zero, whatever
+/// it actually draws. Two upgrade paths, either of which retires the constant: § 6.2 gaining an
+/// advisory initial size, or a real two-pass content measure that can size a `Content` root against
+/// a known budget (`resolve_and_reconcile`'s own `ponytail:` names that second pass).
+const UNCONFIGURED_WINDOW_SIZE: (f32, f32) = (640.0, 480.0);
+
+/// The size a toplevel's buffer takes for one `xdg_toplevel` configure (build-steps.md Phase 22
+/// item 1).
+///
+/// A `Some` axis is the compositor's and is taken as given: `xdg_toplevel::configure`'s own wording
+/// makes a maximized or fullscreen size binding, and a tiling compositor sizes every window this
+/// way, so on niri this is the only branch that ever runs.
+///
+/// A `None` axis is "the client picks" ("If this value is None, you may set the size of the window
+/// as you wish"), which is the ordinary first configure on a floating compositor. What it picks is
+/// the config's own `min_size` for that axis, falling back to [`UNCONFIGURED_WINDOW_SIZE`], then
+/// clamped by `max_size`. The hints are what a config can actually say about a window's size, and on
+/// this branch the client holds the pen: § 6.2's "advisory" caveat is about what the *compositor*
+/// may do with them, not a licence to ignore our own numbers when nobody else has chosen.
+///
+/// A zero `max_size` axis is not a maximum of zero: `set_max_size`'s own "0 means no expected
+/// maximum size in the given dimension", the same reading [`node::window_spec`]'s parser applies
+/// when it refuses a maximum below a minimum.
+///
+/// At least 1 on both axes, because a `wl_egl_window` of 0 is invalid and a window has to attach a
+/// buffer to map at all.
+fn toplevel_size_for(new_size: (Option<std::num::NonZeroU32>, Option<std::num::NonZeroU32>), spec: &WindowSpec) -> (u32, u32) {
+    let axis = |configured: Option<std::num::NonZeroU32>, fallback: f32, min: f32, max: f32| -> u32 {
+        if let Some(configured) = configured {
+            return configured.get();
+        }
+        let mut picked = if min > 0.0 { min } else { fallback };
+        if max > 0.0 {
+            picked = picked.min(max);
+        }
+        (picked.max(1.0)) as u32
+    };
+    let min = spec.min_size.unwrap_or(SizeHint { width: 0.0, height: 0.0 });
+    let max = spec.max_size.unwrap_or(SizeHint { width: 0.0, height: 0.0 });
+    (
+        axis(new_size.0, UNCONFIGURED_WINDOW_SIZE.0, min.width, max.width),
+        axis(new_size.1, UNCONFIGURED_WINDOW_SIZE.1, min.height, max.height),
+    )
+}
+
+/// The `xdg_toplevel` requests one *live* toplevel needs after a re-resolve changed its `window`
+/// properties (§ 6.2, docs/adr/0049's second amendment). `None` per field means "unchanged, send
+/// nothing", exactly as [`SpecUpdate`] does for a panel and for the same reason: all four are
+/// double-buffered, so re-sending an unchanged value is noise rather than an error.
+///
+/// **Every one of § 6.2's protocol-facing fields is here, which is the difference from a panel.**
+/// `SpecUpdate` deliberately omits [`node::SurfaceTopology`]'s five, because `get_layer_surface`
+/// fixes them at creation. A toplevel has no such set: `xdg-shell.xml` says of `set_app_id` that it
+/// "can be sent after the xdg_toplevel has been mapped to update the property", `set_title` is the
+/// same shape, and both size hints are ordinary double-buffered requests. So a changed `title` is an
+/// in-place update, never a recreate, and the only field left out is `id`, which is the reconcile
+/// identity rather than a protocol field.
+///
+/// `Option<Option<SizeHint>>` reads oddly and is the honest type: the outer layer is "did it move",
+/// the inner one is § 6.2's own absent-versus-present distinction, and "moved to absent" is a real
+/// transition that has to reach `set_min_size(None)` -- which the protocol spells as a zero, meaning
+/// unset.
+#[derive(Debug, Default, PartialEq)]
+struct WindowUpdate {
+    title: Option<String>,
+    app_id: Option<String>,
+    min_size: Option<Option<SizeHint>>,
+    max_size: Option<Option<SizeHint>>,
+}
+
+fn window_update(applied: &WindowSpec, fresh: &WindowSpec) -> WindowUpdate {
+    WindowUpdate {
+        title: (fresh.title != applied.title).then(|| fresh.title.clone()),
+        app_id: (fresh.app_id != applied.app_id).then(|| fresh.app_id.clone()),
+        min_size: (fresh.min_size != applied.min_size).then_some(fresh.min_size),
+        max_size: (fresh.max_size != applied.max_size).then_some(fresh.max_size),
+    }
+}
+
+/// A [`SizeHint`] as the two `xdg_toplevel` requests take it. `None` stays `None`, which
+/// `Window::set_min_size`/`set_max_size` send as the protocol's zero, meaning unset.
+fn size_hint_pair(hint: Option<SizeHint>) -> Option<(u32, u32)> {
+    hint.map(|hint| (hint.width.max(0.0) as u32, hint.height.max(0.0) as u32))
 }
 
 /// The layer-shell requests one *live* surface needs after a re-resolve changed its `panel`
@@ -961,10 +1159,17 @@ impl App {
         layer
     }
 
-    /// One `zwlr_layer_surface_v1` per surface instance, built from the evaluation that declared
-    /// it (docs/adr/0038 decision 1, build-steps.md Phase 20 items 1 and 2). This replaced
-    /// `create_main_bar`/`create_overlay_canvas`/`create_wallpaper_layers`, which ran *before* any
-    /// Lua had been evaluated and discarded every field the config wrote.
+    /// One tracked surface per surface instance, built from the evaluation that declared it
+    /// (docs/adr/0038 decision 1, docs/adr/0049 decision 1, build-steps.md Phase 20 items 1 and 2
+    /// and Phase 22 item 1). This replaced `create_main_bar`/`create_overlay_canvas`/
+    /// `create_wallpaper_layers`, which ran *before* any Lua had been evaluated and discarded every
+    /// field the config wrote.
+    ///
+    /// The two roles diverge in what "create" means, and only there. A `panel` gets its
+    /// `zwlr_layer_surface_v1` here whatever its `visible` says, because that object lives as long
+    /// as the generation. A `window` gets a `TrackedSurface` here and its `xdg_toplevel` only if
+    /// `visible` already resolves true, through the same [`App::show_window`] a later flip uses --
+    /// one creation path, not a startup special case.
     ///
     /// `instances` and `specs` come from the same evaluation, so an instance whose declared id has
     /// no spec cannot happen; it is skipped with a log rather than panicking, on the same
@@ -972,8 +1177,8 @@ impl App {
     ///
     /// Called with the whole instance set at startup and with only the *added* instances on a
     /// monitor hotplug (see [`App::handle_output_change`]) -- the same function either way, since
-    /// "build a layer surface for this instance" is the same job in both.
-    fn create_panels(&mut self, qh: &QueueHandle<App>, specs: &[PanelSpec], instances: &[SurfaceInstance]) {
+    /// "build the surface this instance names" is the same job in both.
+    fn create_surfaces(&mut self, qh: &QueueHandle<App>, specs: &[SurfaceSpec], instances: &[SurfaceInstance]) {
         // Re-read per call rather than snapshotted once at startup: this now also runs from an
         // output event, where the whole point is that the output list has just changed.
         let outputs: HashMap<String, wl_output::WlOutput> = self
@@ -987,68 +1192,107 @@ impl App {
             .collect();
 
         for instance in instances {
-            let Some(spec) = specs.iter().find(|spec| spec.topology.id == instance.declared_id) else {
+            let Some(spec) = specs.iter().find(|spec| spec.declared_id() == instance.declared_id) else {
                 eprintln!("[oblisk-renderer] instance {:?} has no matching declaration; skipping", instance.instance_id);
                 continue;
             };
-            let Some(output) = outputs.get(&instance.output) else {
-                eprintln!("[oblisk-renderer] instance {:?} names an output that has since gone; skipping", instance.instance_id);
-                continue;
-            };
-            let size = (
-                layer_extent_for(spec.width, instance.available.width),
-                layer_extent_for(spec.height, instance.available.height),
-            );
-            if let Some(axis) = ambiguous_zero_axis(size, spec.topology.anchor) {
-                eprintln!(
-                    "[oblisk-renderer] surface {:?} leaves its {axis} to the compositor without anchoring both {axis} edges, \
-                     which layer-shell rejects as a protocol error; no surface created. Give it an explicit {axis}, or anchor both edges.",
-                    instance.instance_id
-                );
-                continue;
-            }
-            let layer = self.spawn_layer(
-                qh,
-                LayerSpec {
-                    layer_type: layer_for(spec.topology.layer),
-                    namespace: &spec.topology.namespace,
-                    output,
-                    anchor: anchor_for(spec.topology.anchor),
-                    size,
-                    margin: spec.margin,
-                    keyboard_interactivity: keyboard_interactivity_for(spec.keyboard_interactivity),
-                },
-            );
-            layer.commit();
-
-            // § 6.1's `visible` at its starting value. A panel declared `visible = false` is still
-            // created (docs/adr/0038 decision 2: `visible` maps and unmaps, it does not create and
-            // destroy). It still performs the initial commit directly above, which
-            // `get_layer_surface` requires before any configure arrives and which does not map
-            // anything on its own; what makes it invisible is that no buffer is ever attached, and
-            // `MapState::Unmapped` is what keeps `paint_surface` from attaching one. No *unmap*
-            // commit is needed or wanted here, since on an already-bufferless surface that is the
-            // protocol's re-map procedure rather than an unmap -- see [`App::remap`], which
-            // measured both sides of this distinction against a real compositor.
-            //
-            // A surface whose instance has no resolved tree (the startup apply failed) is treated
-            // as visible, matching every other "keep the shell up" fallback in this file.
+            // § 5.1's `visible` at its starting value, read the same way for both roles. A surface
+            // whose instance has no resolved tree (the startup apply failed) is treated as visible,
+            // matching every other "keep the shell up" fallback in this file.
             let visible = self
                 .client
                 .scene()
                 .surface(&instance.instance_id)
                 .is_none_or(|tree| tree.visible);
 
-            self.surfaces.push(TrackedSurface {
-                layer,
-                bound: None,
-                surface_id: instance.instance_id.clone(),
-                applied_spec: spec.clone(),
-                output_size: instance.available,
-                map_state: if visible { MapState::AwaitingConfigure } else { MapState::Unmapped },
-                null_buffered: false,
-                configured_size: (0, 0),
-            });
+            match spec {
+                SurfaceSpec::Panel(panel) => self.create_panel(qh, panel, instance, &outputs, visible),
+                SurfaceSpec::Window(window) => self.create_window(qh, window, instance, visible),
+                // Nothing to build: a popup's `xdg_popup` is created per open (docs/adr/0049
+                // decision 1) and `expand_instances` yields no instance for one, so this arm is
+                // unreachable rather than a skip. Named anyway, so a future instance for one does
+                // not silently fall into a catch-all.
+                SurfaceSpec::Popup(_) => {}
+            }
+        }
+    }
+
+    /// [`App::create_surfaces`]'s `panel` arm: one `zwlr_layer_surface_v1` on this instance's own
+    /// output, initially committed and tracked.
+    fn create_panel(
+        &mut self,
+        qh: &QueueHandle<App>,
+        spec: &PanelSpec,
+        instance: &SurfaceInstance,
+        outputs: &HashMap<String, wl_output::WlOutput>,
+        visible: bool,
+    ) {
+        let Some(output) = outputs.get(&instance.output) else {
+            eprintln!("[oblisk-renderer] instance {:?} names an output that has since gone; skipping", instance.instance_id);
+            return;
+        };
+        let size = (
+            layer_extent_for(spec.width, instance.available.width),
+            layer_extent_for(spec.height, instance.available.height),
+        );
+        if let Some(axis) = ambiguous_zero_axis(size, spec.topology.anchor) {
+            eprintln!(
+                "[oblisk-renderer] surface {:?} leaves its {axis} to the compositor without anchoring both {axis} edges, \
+                 which layer-shell rejects as a protocol error; no surface created. Give it an explicit {axis}, or anchor both edges.",
+                instance.instance_id
+            );
+            return;
+        }
+        let layer = self.spawn_layer(
+            qh,
+            LayerSpec {
+                layer_type: layer_for(spec.topology.layer),
+                namespace: &spec.topology.namespace,
+                output,
+                anchor: anchor_for(spec.topology.anchor),
+                size,
+                margin: spec.margin,
+                keyboard_interactivity: keyboard_interactivity_for(spec.keyboard_interactivity),
+            },
+        );
+        layer.commit();
+
+        // § 6.1's `visible`. A panel declared `visible = false` is still created (docs/adr/0038
+        // decision 2: `visible` maps and unmaps, it does not create and destroy). It still performs
+        // the initial commit directly above, which `get_layer_surface` requires before any configure
+        // arrives and which does not map anything on its own; what makes it invisible is that no
+        // buffer is ever attached, and `MapState::Unmapped` is what keeps `paint_surface` from
+        // attaching one. No *unmap* commit is needed or wanted here, since on an already-bufferless
+        // surface that is the protocol's re-map procedure rather than an unmap -- see
+        // [`App::remap`], which measured both sides of this distinction against a real compositor.
+        self.surfaces.push(TrackedSurface {
+            role: TrackedRole::Panel { layer, spec: spec.clone(), output_size: instance.available },
+            bound: None,
+            surface_id: instance.instance_id.clone(),
+            map_state: if visible { MapState::AwaitingConfigure } else { MapState::Unmapped },
+            null_buffered: false,
+            configured_size: (0, 0),
+        });
+    }
+
+    /// [`App::create_surfaces`]'s `window` arm: the tracking entry always, the `xdg_toplevel` only
+    /// if this window is already shown (docs/adr/0049 decision 1).
+    ///
+    /// The entry exists either way because it is what makes the window reachable at all: the poll
+    /// loop's [`App::apply_resolved_surface_state`] walks `self.surfaces`, and a window with no
+    /// entry would never have its `visible` looked at, so it could never open.
+    fn create_window(&mut self, qh: &QueueHandle<App>, spec: &WindowSpec, instance: &SurfaceInstance, visible: bool) {
+        self.surfaces.push(TrackedSurface {
+            role: TrackedRole::Window { window: None, spec: spec.clone() },
+            bound: None,
+            surface_id: instance.instance_id.clone(),
+            map_state: MapState::Unmapped,
+            null_buffered: false,
+            configured_size: (0, 0),
+        });
+        if visible {
+            let index = self.surfaces.len() - 1;
+            self.show_window(qh, index);
         }
     }
 
@@ -1089,61 +1333,80 @@ impl App {
         }
         eprintln!("[oblisk-renderer] outputs changed: {:?}", screens.iter().map(|s| s.name.as_str()).collect::<Vec<_>>());
 
-        let specs = self.client.applied_panel_specs();
+        let specs = self.client.applied_surface_specs();
         let fresh = expand_instances(&specs, &geometries_from(&screens));
         let reconcile = reconcile_instances(self.client.instances(), &fresh);
 
         for instance_id in &reconcile.removed {
             self.destroy_surface_by_id(instance_id);
         }
-        // A surviving surface's `output_size` is the basis a `SizeMode::Percent` resolves against,
+        // A surviving *panel*'s `output_size` is the basis a `SizeMode::Percent` resolves against,
         // so a mode change that resized the monitor under it has to move it -- `fresh` carries the
         // output's *current* logical size, while the instance set deliberately keeps the size the
-        // compositor configured each surface to (see `reconcile_instances`).
+        // compositor configured each surface to (see `reconcile_instances`). A `window` has no such
+        // field: § 6.2 gives it no size request, and the seed `expand_instances` hands its instance
+        // is superseded by the first configure.
         for instance in &fresh {
-            if let Some(tracked) = self.surfaces.iter_mut().find(|s| s.surface_id == instance.instance_id) {
-                tracked.output_size = instance.available;
+            if let Some(TrackedRole::Panel { output_size, .. }) =
+                self.surfaces.iter_mut().find(|s| s.surface_id == instance.instance_id).map(|s| &mut s.role)
+            {
+                *output_size = instance.available;
             }
         }
-        // Before `create_panels`, which reads the scene by instance id to decide a new surface's
+        // Before `create_surfaces`, which reads the scene by instance id to decide a new surface's
         // starting `visible`.
         self.client.set_instances(reconcile.instances);
-        self.create_panels(qh, &specs, &reconcile.added);
+        self.create_surfaces(qh, &specs, &reconcile.added);
         self.client.request_reload();
     }
 
-    /// Destroys one surface instance: its `zwlr_layer_surface_v1`, its `wl_surface`, its
-    /// `wl_egl_window`, and its EGL surface (docs/adr/0038 decision 3's removal half). A no-op for
-    /// an id this process has no surface for, which is the normal case for the second of the two
-    /// events an unplugged monitor produces -- `zwlr_layer_surface_v1::closed` and
-    /// `OutputHandler::output_destroyed` both arrive, in either order, and whichever comes first
-    /// does the work.
+    /// Frees one surface's rendering side -- its EGL surface and its `wl_egl_window` -- and leaves
+    /// it unbound, with its role object untouched. Steps 1 and 2 of the teardown order
+    /// [`App::destroy_surface_by_id`] documents; whoever calls this owns step 3.
     ///
-    /// Teardown runs outermost-first, and the two explicit `drop`s below are what make that so
-    /// rather than leaving it to `TrackedSurface`'s field order (which declares `layer` before
-    /// `bound`, so a plain drop would destroy the `wl_surface` out from under the
-    /// `wl_egl_window` still pointing at it):
+    /// Two callers, and they differ in what they do with the role object rather than in how they
+    /// free this half: `destroy_surface_by_id` drops it, and [`App::hide_window`] drops only the
+    /// `xdg_toplevel` and keeps the tracking entry (docs/adr/0049 decision 1).
+    fn release_bound(&mut self, index: usize) {
+        let Some(bound) = self.surfaces[index].bound.take() else {
+            return;
+        };
+        // `eglDestroySurface`, by hand, because `khronos_egl::Surface` is a plain copyable handle
+        // with no `Drop` -- without this every unplugged monitor and every closed window leaks one
+        // EGL surface. It has to come before the `wl_egl_window` is destroyed, since
+        // [`BoundSurface`]'s own contract is that the `WlEglSurface` outlives the EGL surface built
+        // from it.
+        if let Err(err) = self.egl.instance.destroy_surface(self.egl.display, bound.egl_surface) {
+            log_bind_failure(&self.surfaces[index].surface_id, "eglDestroySurface", err);
+        }
+        // `BoundSurface`'s drop, which is `wl_egl_window_destroy`.
+        drop(bound);
+        self.surfaces[index].configured_size = (0, 0);
+    }
+
+    /// Destroys one surface instance: its role object, its `wl_surface`, its `wl_egl_window`, and
+    /// its EGL surface (docs/adr/0038 decision 3's removal half). A no-op for an id this process has
+    /// no surface for, which is the normal case for the second of the two events an unplugged
+    /// monitor produces -- `zwlr_layer_surface_v1::closed` and `OutputHandler::output_destroyed`
+    /// both arrive, in either order, and whichever comes first does the work.
     ///
-    /// 1. `eglDestroySurface`, by hand, because `khronos_egl::Surface` is a plain copyable handle
-    ///    with no `Drop` -- without this every unplugged monitor leaks one EGL surface. It has to
-    ///    be first, since [`BoundSurface`]'s own contract is that the `WlEglSurface` outlives the
-    ///    EGL surface built from it.
-    /// 2. `BoundSurface`'s drop, which is `wl_egl_window_destroy`.
-    /// 3. `LayerSurface`'s drop, which destroys the `zwlr_layer_surface_v1` and then the
-    ///    `wl_surface` (in that order, which is the layer-shell protocol's own requirement and
-    ///    `smithay_client_toolkit`'s job, not this function's).
+    /// Teardown runs outermost-first, and the explicit steps below are what make that so rather
+    /// than leaving it to field order (`TrackedSurface` declares `role` before `bound`, so a plain
+    /// drop would destroy the `wl_surface` out from under the `wl_egl_window` still pointing at it):
+    ///
+    /// 1. `eglDestroySurface`, by hand ([`App::release_bound`]).
+    /// 2. `BoundSurface`'s drop, which is `wl_egl_window_destroy` (also `release_bound`).
+    /// 3. The role object's drop, which destroys the role (`zwlr_layer_surface_v1`, or an
+    ///    `xdg_toplevel` preceded by its decoration object) and then the `wl_surface`, in that
+    ///    order -- both protocols require it and `smithay_client_toolkit` implements it, so it is
+    ///    not this function's job.
     fn destroy_surface_by_id(&mut self, instance_id: &str) {
         let Some(index) = self.surfaces.iter().position(|s| s.surface_id == instance_id) else {
             return;
         };
-        let TrackedSurface { layer, bound, surface_id, .. } = self.surfaces.remove(index);
-        if let Some(bound) = bound.as_ref()
-            && let Err(err) = self.egl.instance.destroy_surface(self.egl.display, bound.egl_surface)
-        {
-            log_bind_failure(&surface_id, "eglDestroySurface", err);
-        }
-        drop(bound);
-        drop(layer);
+        self.release_bound(index);
+        let TrackedSurface { role, surface_id, .. } = self.surfaces.remove(index);
+        drop(role);
         eprintln!("[oblisk-renderer] {surface_id} destroyed: its output is gone");
     }
 
@@ -1156,11 +1419,13 @@ impl App {
     /// the raw `wl_surface` rather than binding EGL at all -- the Candidate stays invisible,
     /// occupying zero on-screen coordinates, until [`App::activate_draw`] does the real EGL bind
     /// later.
-    fn bind_and_clear(&mut self, layer: &LayerSurface, width: u32, height: u32) {
-        let Some(index) = self.surfaces.iter().position(|s| &s.layer == layer) else {
-            return;
-        };
-
+    ///
+    /// Role-agnostic since build-steps.md Phase 22 item 1, and that is the ADR-0040 decision 4
+    /// claim made literal: xdg-shell's initial-commit discipline is `zwlr_layer_surface_v1`'s, so
+    /// an `xdg_toplevel` configure lands here through the same path with nothing branching on which
+    /// protocol asked. The two callers differ only in where the size comes from -- layer-shell
+    /// hands one over, and a toplevel's may be the client's to pick (see [`toplevel_size_for`]).
+    fn bind_and_clear(&mut self, index: usize, width: u32, height: u32) {
         self.surfaces[index].configured_size = (width, height);
         // Only here does a real size for this instance exist (build-steps.md Phase 20 item 4,
         // closing docs/adr/0023 item 6): the startup resolve used the whole output's size, and
@@ -1193,18 +1458,21 @@ impl App {
         self.apply_resolved_state(index);
 
         if self.is_pba_candidate {
-            if self.surfaces[index].map_state.presents() {
+            // Cloned rather than borrowed: a `wl_surface` proxy is a refcounted handle, and holding
+            // a borrow of `self.surfaces` across the `null_buffered` write below would not compile.
+            let surface = self.surfaces[index].role.wl_surface().cloned();
+            if let Some(surface) = surface.filter(|_| self.surfaces[index].map_state.presents()) {
                 if !self.surfaces[index].null_buffered {
                     // verified against wayland_client::protocol::wl_surface::WlSurface's generated
                     // API: `attach(&self, buffer: Option<&wl_buffer::WlBuffer>, x: i32, y: i32)`,
                     // `commit(&self)`.
-                    self.surfaces[index].layer.wl_surface().attach(None, 0, 0);
+                    surface.attach(None, 0, 0);
                     self.surfaces[index].null_buffered = true;
                 }
                 // Committed on every candidate-mode configure rather than only the first: a
                 // Candidate has no `swap_buffers` to ride on until `ActivateDraw`, so this is the
                 // only commit that can carry the state staged directly above.
-                self.surfaces[index].layer.wl_surface().commit();
+                surface.commit();
             } else {
                 // `visible = false`: no buffer was ever attached, so this surface is *already* in
                 // the invisible state § 15.2 point 3 asks a Candidate to reach, and committing it
@@ -1258,14 +1526,17 @@ impl App {
     /// separate ways once `visible` landed: it would split one surface update across several
     /// commits, and on an unmapped surface a commit with no buffer attached is the protocol's own
     /// re-map procedure (see [`App::unmap`]).
+    ///
+    /// A no-op on a `window`, and the protocol is why rather than an omission: an exclusive zone is
+    /// `zwlr_layer_surface_v1`'s own request, and a toplevel reserves no screen area -- reserving
+    /// space is what makes a surface a shell component instead of a window (§ 6.1, § 6.2).
     fn apply_exclusive_zone(&mut self, index: usize) {
         let tracked = &self.surfaces[index];
-        let zone = if tracked.applied_spec.exclusive {
-            exclusive_zone_for(tracked.applied_spec.topology.anchor, tracked.configured_size)
-        } else {
-            0
+        let TrackedRole::Panel { layer, spec, .. } = &tracked.role else {
+            return;
         };
-        tracked.layer.set_exclusive_zone(zone);
+        let zone = if spec.exclusive { exclusive_zone_for(spec.topology.anchor, tracked.configured_size) } else { 0 };
+        layer.set_exclusive_zone(zone);
     }
 
     /// [`App::apply_resolved_state`] for every tracked surface, which is what the poll loop calls
@@ -1278,16 +1549,32 @@ impl App {
         }
     }
 
-    /// Pushes one surface's freshly resolved root back to the compositor: the layer-shell fields
-    /// layer-shell permits changing on a live surface, the input region, and whether the surface
-    /// is mapped at all (docs/adr/0038 decision 2, § 6.1's `visible` and `margin` rows,
-    /// build-steps.md Phase 20 items 1 and 5).
+    /// Pushes one surface's freshly resolved root back to the compositor: the protocol fields its
+    /// role permits changing on a live object, the input region, and whether the surface is shown
+    /// at all (docs/adr/0038 decision 2, docs/adr/0049 decisions 1-2, § 6.1's `visible` and
+    /// `margin` rows, § 6.2's `title` row, build-steps.md Phase 20 items 1 and 5 and Phase 22
+    /// items 1 and 5).
     ///
-    /// All three are double-buffered `wl_surface` state and are therefore *staged* here, not
+    /// **This is where a `window`'s authoritative [`WindowSpec`] is derived, and the "resolved" is
+    /// the whole point** (docs/adr/0049's second amendment). `crate::socket`'s `surface_specs`
+    /// parses the *unresolved* properties, which is right for a `panel`'s topology fields -- they
+    /// reject a `Signal` on purpose, because `get_layer_surface` fixes them at creation. A
+    /// `window`'s `title` is the opposite case: § 6.2 spells it as `string`/`Signal` precisely so it
+    /// can move, and parsing it at evaluation time would freeze it at whatever the file last saw.
+    /// `tree.properties` here is a `resolve_properties` result, so every `Signal` in it has already
+    /// been read exactly once for this pass (ADR-0044 decision 1) -- one read, at the one point the
+    /// surface is being reconciled, which is the same read `visible` and the input region below use.
+    ///
+    /// All three pushes are double-buffered `wl_surface` state and are therefore *staged* here, not
     /// committed: the caller's commit -- `paint_surface`'s `swap_buffers` on a mapped surface, the
     /// candidate branch's own commit on a staging Candidate -- carries the whole update at once.
-    /// The two exceptions are the map and unmap transitions, which are commits by definition and
-    /// perform their own.
+    /// The exceptions are the map, unmap, create and destroy transitions, which are commits (or
+    /// object lifetimes) by definition and perform their own.
+    ///
+    /// The spec push runs **before** `apply_visibility`, and for a `window` that ordering is
+    /// load-bearing rather than incidental: a `visible` flip from false to true creates the
+    /// `xdg_toplevel` out of the stored spec, so the spec has to be this pass's before the object
+    /// is built from it.
     fn apply_resolved_state(&mut self, index: usize) {
         let surface_id = self.surfaces[index].surface_id.clone();
         // Owned, so the immutable borrow of `self.client` ends before the `&mut self` calls below.
@@ -1300,11 +1587,19 @@ impl App {
             return;
         };
 
-        match node::panel_spec(&tree.properties) {
-            Ok(fresh) => self.apply_spec_change(index, fresh),
-            Err(err) => eprintln!(
-                "[oblisk-renderer] {surface_id}: re-resolved panel properties are invalid, keeping the last applied ones: {err}"
-            ),
+        match &self.surfaces[index].role {
+            TrackedRole::Panel { .. } => match node::panel_spec(&tree.properties) {
+                Ok(fresh) => self.apply_spec_change(index, fresh),
+                Err(err) => eprintln!(
+                    "[oblisk-renderer] {surface_id}: re-resolved panel properties are invalid, keeping the last applied ones: {err}"
+                ),
+            },
+            TrackedRole::Window { .. } => match node::window_spec(&tree.properties) {
+                Ok(fresh) => self.apply_window_change(index, fresh),
+                Err(err) => eprintln!(
+                    "[oblisk-renderer] {surface_id}: re-resolved window properties are invalid, keeping the last applied ones: {err}"
+                ),
+            },
         }
         self.apply_input_region(index, &tree);
         self.apply_visibility(index, tree.visible);
@@ -1314,11 +1609,13 @@ impl App {
     /// last set from and sends only what moved (see [`spec_update`] for which fields, and for why
     /// the topology ones are not among them).
     fn apply_spec_change(&mut self, index: usize, mut fresh: PanelSpec) {
-        let tracked = &self.surfaces[index];
-        let update = spec_update(&tracked.applied_spec, &fresh, tracked.output_size);
+        let TrackedRole::Panel { layer, spec: applied, output_size } = &self.surfaces[index].role else {
+            return;
+        };
+        let update = spec_update(applied, &fresh, *output_size);
 
         if let Some(margin) = update.margin {
-            self.surfaces[index].layer.set_margin(
+            layer.set_margin(
                 margin.top as i32,
                 margin.right as i32,
                 margin.bottom as i32,
@@ -1326,12 +1623,10 @@ impl App {
             );
         }
         if let Some(mode) = update.keyboard_interactivity {
-            self.surfaces[index]
-                .layer
-                .set_keyboard_interactivity(keyboard_interactivity_for(mode));
+            layer.set_keyboard_interactivity(keyboard_interactivity_for(mode));
         }
         if let Some(size) = update.size {
-            // The same guard `create_panels` runs, and it has to run again here rather than only
+            // The same guard `create_panel` runs, and it has to run again here rather than only
             // at creation: `width`/`height` are ordinary resolvable properties, so a `Signal` can
             // turn a fixed height into `"Fill"` at runtime, and a `set_size` of 0 on a singly
             // anchored axis is a protocol error that kills the connection and the whole shell with
@@ -1344,17 +1639,56 @@ impl App {
                 );
                 // The refused size must not enter the baseline, or the next re-resolve would see
                 // no change and never retry the size the config eventually settles on.
-                fresh.width = self.surfaces[index].applied_spec.width;
-                fresh.height = self.surfaces[index].applied_spec.height;
+                fresh.width = applied.width;
+                fresh.height = applied.height;
             } else {
-                self.surfaces[index].layer.set_size(size.0, size.1);
+                layer.set_size(size.0, size.1);
             }
         }
 
-        // Before `apply_exclusive_zone`, which reads `exclusive` and the anchor off it.
-        self.surfaces[index].applied_spec = fresh;
+        // Before `apply_exclusive_zone`, which reads `exclusive` and the anchor off it. The borrow
+        // of `self.surfaces[index].role` taken at the top ends here, which is why every request
+        // above had to be sent first.
+        if let TrackedRole::Panel { spec, .. } = &mut self.surfaces[index].role {
+            *spec = fresh;
+        }
         if update.exclusive.is_some() || update.size.is_some() {
             self.apply_exclusive_zone(index);
+        }
+    }
+
+    /// Diffs one toplevel's freshly resolved `window` spec against the one its `xdg_toplevel` state
+    /// was last set from and sends only what moved (§ 6.2, build-steps.md Phase 22 item 1; see
+    /// [`window_update`] for which fields and why all of them qualify).
+    ///
+    /// Sends nothing while the window is not shown, and stores the spec anyway. That is not a
+    /// dropped update: `visible = false` means there is no `xdg_toplevel` to send a request to
+    /// (docs/adr/0049 decision 1), and [`App::show_window`] builds the next one out of exactly this
+    /// stored spec. So a `title` that changed three times while the window was closed opens with
+    /// the third one.
+    fn apply_window_change(&mut self, index: usize, fresh: WindowSpec) {
+        let TrackedRole::Window { window, spec: applied } = &mut self.surfaces[index].role else {
+            return;
+        };
+        let update = window_update(applied, &fresh);
+        *applied = fresh;
+        let Some(window) = window.as_ref() else {
+            return;
+        };
+        if let Some(title) = update.title {
+            window.set_title(title);
+        }
+        if let Some(app_id) = update.app_id {
+            window.set_app_id(app_id);
+        }
+        // Minimum before maximum, so the pair the compositor validates at the next commit is never
+        // momentarily inverted -- `set_max_size` raises `invalid_size` for a maximum under the
+        // minimum, and `node::window_spec` has already refused that pairing in the fresh spec.
+        if let Some(min_size) = update.min_size {
+            window.set_min_size(size_hint_pair(min_size));
+        }
+        if let Some(max_size) = update.max_size {
+            window.set_max_size(size_hint_pair(max_size));
         }
     }
 
@@ -1378,7 +1712,14 @@ impl App {
     /// Not diffed against the last region pushed, unlike the spec fields: this only runs when the
     /// scene actually re-resolved, and the full GPU repaint that follows on the same turn costs
     /// orders of magnitude more than one `wl_region` round of requests.
+    ///
+    /// Skipped for a `window` that is not shown, which is the only role-aware line in it: there is
+    /// no `wl_surface` to set a region on, and [`App::show_window`]'s first re-resolve after the
+    /// window opens sets one.
     fn apply_input_region(&mut self, index: usize, tree: &layout::ResolvedNode) {
+        let Some(surface) = self.surfaces[index].role.wl_surface().cloned() else {
+            return;
+        };
         let region = match Region::new(&self.compositor_state) {
             Ok(region) => region,
             Err(e) => {
@@ -1393,13 +1734,21 @@ impl App {
         for rect in layout::overlay_input_regions(tree, 1.0) {
             region.add(rect.x0, rect.y0, rect.x1 - rect.x0, rect.y1 - rect.y0);
         }
-        self.surfaces[index].layer.set_input_region(Some(region.wl_region()));
+        surface.set_input_region(Some(region.wl_region()));
         // `region` drops here, destroying the `wl_region` -- `wl_surface::set_input_region` copies
         // its contents, so the object has no reason to outlive the request. Same shape the deleted
         // `create_overlay_canvas` used.
     }
 
-    /// Applies § 6.1's `visible` to a live surface (docs/adr/0038 decision 2).
+    /// Applies § 5.1's `visible` to a live surface, by whichever mechanism the role's lifetime rule
+    /// calls for (docs/adr/0038 decision 2, docs/adr/0049 decisions 1-2).
+    ///
+    /// **The same Lua-facing property, two different mechanics underneath, and this is the one
+    /// function where that divergence lives.** A `panel`'s Wayland object outlives every flip, so
+    /// `visible` is a map or an unmap commit. A `window`'s exists only while shown, so `visible` is
+    /// a create or a destroy. Nothing new drives either: a `state` write marks the scene dirty
+    /// (ADR-0044 decision 5), the poll loop re-resolves, and `apply_resolved_state` calls this with
+    /// whatever the fresh tree says.
     ///
     /// **Frozen for a PBA Candidate**, and that is the one line in this file where a mistake hangs
     /// the shell rather than failing a test. `maybe_send_ready_signal` announces the surfaces this
@@ -1416,11 +1765,105 @@ impl App {
         if self.is_pba_candidate {
             return;
         }
-        match (self.surfaces[index].map_state, visible) {
-            (MapState::Unmapped, true) => self.remap(index),
-            (MapState::AwaitingConfigure | MapState::Mapped, false) => self.unmap(index),
+        let is_window = matches!(self.surfaces[index].role, TrackedRole::Window { .. });
+        match (is_window, self.surfaces[index].map_state, visible) {
+            (false, MapState::Unmapped, true) => self.remap(index),
+            (false, MapState::AwaitingConfigure | MapState::Mapped, false) => self.unmap(index),
+            (true, MapState::Unmapped, true) => {
+                // Cloned because `show_window` takes `&mut self`; a `QueueHandle` is a cheap
+                // refcounted handle, which is why `App` keeps one for exactly this kind of call
+                // from outside a `Dispatch` callback.
+                let qh = self.queue_handle.clone();
+                self.show_window(&qh, index);
+            }
+            (true, MapState::AwaitingConfigure | MapState::Mapped, false) => self.hide_window(index),
             _ => {}
         }
+    }
+
+    /// Creates this window's `xdg_toplevel` and performs the initial commit `xdg_surface` requires
+    /// (§ 6.2, docs/adr/0040 decisions 4 and 5, docs/adr/0049 decision 1, build-steps.md Phase 22
+    /// items 1 and 4).
+    ///
+    /// The whole sequence is the layer-shell one with a different constructor, which is exactly what
+    /// ADR-0040 decision 4 predicted: create the surface, send the role's state, commit with **no
+    /// buffer attached**, and wait for the configure before anything may be drawn. `MapState::
+    /// AwaitingConfigure` is that wait, shared verbatim with the panel path.
+    ///
+    /// SCTK does the two things it would be easy to get wrong here. It acks each `xdg_surface.
+    /// configure` itself, through the wrapping `xdg_surface` rather than the role object
+    /// (`shell/xdg/window/inner.rs`'s `Dispatch2<XdgSurface, _>`), so nothing in this file acks;
+    /// and `XdgShell::bind` already picked up `zxdg_decoration_manager_v1` alongside `xdg_wm_base`,
+    /// so `WindowDecorations::RequestServer` plus [`Window::request_decoration_mode`] is the whole
+    /// of build-steps.md Phase 22 item 4 and there is no second global to bind.
+    ///
+    /// No `set_window_geometry`: `xdg_surface`'s own default is the bounding box of the surface and
+    /// its subsurfaces, this shell draws its content edge to edge with no client-side shadow to
+    /// exclude, and there are no subsurfaces. Sending the default back would be ceremony.
+    ///
+    /// A compositor with no xdg-shell leaves the window unbuilt, logged once per attempt: not
+    /// fatal, on the same "keep the shell up" principle every other failure in this file follows --
+    /// the panels still paint.
+    fn show_window(&mut self, qh: &QueueHandle<App>, index: usize) {
+        let Some(xdg_shell) = self.xdg_shell.as_ref() else {
+            eprintln!(
+                "[oblisk-renderer] {}: this compositor advertises no xdg_wm_base, so no window can be created for it",
+                self.surfaces[index].surface_id
+            );
+            return;
+        };
+        let TrackedRole::Window { spec, .. } = &self.surfaces[index].role else {
+            return;
+        };
+        let spec = spec.clone();
+
+        let surface = self.compositor_state.create_surface(qh);
+        let window = xdg_shell.create_window(surface, WindowDecorations::RequestServer, qh);
+        // Asked for explicitly as well as through `WindowDecorations::RequestServer`, because the
+        // two reach different objects: the constructor argument decides whether a
+        // `zxdg_toplevel_decoration_v1` is created at all, and this is the `set_mode` on it. Whatever
+        // the compositor answers with is accepted -- `WindowHandler::configure` logs a client-side
+        // grant and carries on undecorated rather than faking a frame (ADR-0040 decision 4, § 6.2).
+        window.request_decoration_mode(Some(DecorationMode::Server));
+        window.set_title(spec.title.clone());
+        window.set_app_id(spec.app_id.clone());
+        // Advisory, and sent as such: nothing in `layout` clamps the resolved tree against them
+        // (§ 6.2, `WindowSpec`'s own note). They do bound the size *this* client picks on a
+        // `None` configure axis, which is the one place the choice is ours -- see
+        // [`toplevel_size_for`].
+        window.set_min_size(size_hint_pair(spec.min_size));
+        window.set_max_size(size_hint_pair(spec.max_size));
+        // The initial commit `xdg_surface` requires: "the client must perform an initial commit
+        // without any buffer attached", after which the compositor replies with the configure that
+        // makes attaching one legal.
+        window.commit();
+
+        if let TrackedRole::Window { window: slot, .. } = &mut self.surfaces[index].role {
+            *slot = Some(window);
+        }
+        self.surfaces[index].map_state = MapState::AwaitingConfigure;
+        eprintln!("[oblisk-renderer] {} creating: visible = true", self.surfaces[index].surface_id);
+    }
+
+    /// Destroys this window's `xdg_toplevel` and everything hanging off it, leaving the tracking
+    /// entry behind so a later `visible = true` can build a fresh one (docs/adr/0049 decision 1).
+    ///
+    /// Teardown order is [`App::destroy_surface_by_id`]'s, reused rather than restated: EGL surface
+    /// by hand, then the `wl_egl_window`, then the role object. Dropping the [`Window`] handle is
+    /// that last step -- `smithay_client_toolkit`'s `WindowInner::drop` destroys the decoration
+    /// object, then the `xdg_toplevel`, then the `xdg_surface`, then the `wl_surface`, which is the
+    /// order xdg-shell requires and not this function's to re-derive.
+    ///
+    /// `configured_size` is cleared with the binding (inside `release_bound`), because the next
+    /// toplevel gets its own configure and must not paint into a stale one.
+    fn hide_window(&mut self, index: usize) {
+        self.release_bound(index);
+        if let TrackedRole::Window { window, .. } = &mut self.surfaces[index].role {
+            drop(window.take());
+        }
+        self.surfaces[index].map_state = MapState::Unmapped;
+        self.surfaces[index].null_buffered = false;
+        eprintln!("[oblisk-renderer] {} destroyed: visible = false", self.surfaces[index].surface_id);
     }
 
     /// `zwlr_layer_surface_v1`'s own unmap procedure, taken literally: "Attaching a null buffer to
@@ -1434,9 +1877,11 @@ impl App {
     /// without any buffer attached" -- a stray bookkeeping commit on an unmapped surface would
     /// silently re-map it.
     fn unmap(&mut self, index: usize) {
-        let tracked = &self.surfaces[index];
-        tracked.layer.wl_surface().attach(None, 0, 0);
-        tracked.layer.wl_surface().commit();
+        let TrackedRole::Panel { layer, .. } = &self.surfaces[index].role else {
+            return;
+        };
+        layer.wl_surface().attach(None, 0, 0);
+        layer.wl_surface().commit();
         self.surfaces[index].map_state = MapState::Unmapped;
         eprintln!("[oblisk-renderer] {} unmapped: visible = false", self.surfaces[index].surface_id);
     }
@@ -1451,8 +1896,8 @@ impl App {
     /// under one. The exclusive zone is not re-sent here because it is not a spec field -- the
     /// configure re-derives it from the size the compositor grants.
     ///
-    /// `set_size` needs no [`ambiguous_zero_axis`] guard: `applied_spec`'s size is only ever one
-    /// that already passed it, in `create_panels` or in [`App::apply_spec_change`], which both
+    /// `set_size` needs no [`ambiguous_zero_axis`] guard: the applied spec's size is only ever one
+    /// that already passed it, in [`App::create_panel`] or in [`App::apply_spec_change`], which both
     /// refuse rather than store a size the protocol would reject.
     ///
     /// **Two starting states share this one request sequence and end in different `MapState`s**,
@@ -1477,21 +1922,22 @@ impl App {
     /// ends in a `swap_buffers`, so the two questions are the same question.
     fn remap(&mut self, index: usize) {
         let was_mapped = self.surfaces[index].bound.is_some();
-        let tracked = &self.surfaces[index];
-        let spec = &tracked.applied_spec;
-        tracked.layer.set_anchor(anchor_for(spec.topology.anchor));
-        tracked.layer.set_size(
-            layer_extent_for(spec.width, tracked.output_size.width),
-            layer_extent_for(spec.height, tracked.output_size.height),
+        let TrackedRole::Panel { layer, spec, output_size } = &self.surfaces[index].role else {
+            return;
+        };
+        layer.set_anchor(anchor_for(spec.topology.anchor));
+        layer.set_size(
+            layer_extent_for(spec.width, output_size.width),
+            layer_extent_for(spec.height, output_size.height),
         );
-        tracked.layer.set_keyboard_interactivity(keyboard_interactivity_for(spec.keyboard_interactivity));
-        tracked.layer.set_margin(
+        layer.set_keyboard_interactivity(keyboard_interactivity_for(spec.keyboard_interactivity));
+        layer.set_margin(
             spec.margin.top as i32,
             spec.margin.right as i32,
             spec.margin.bottom as i32,
             spec.margin.left as i32,
         );
-        tracked.layer.wl_surface().commit();
+        layer.wl_surface().commit();
         self.surfaces[index].map_state =
             if was_mapped { MapState::AwaitingConfigure } else { MapState::Mapped };
         eprintln!("[oblisk-renderer] {} mapping: visible = true", self.surfaces[index].surface_id);
@@ -1509,8 +1955,14 @@ impl App {
         let (width, height) = self.surfaces[index].configured_size;
         let width = width.max(1) as i32;
         let height = height.max(1) as i32;
+        let Some(surface_object_id) = self.surfaces[index].role.wl_surface().map(Proxy::id) else {
+            // A `window` whose `visible` went false between the call that asked for a bind and this
+            // one. Not fatal and not an error: there is nothing left to bind, and the caller's
+            // `map_state` guard has already stopped it painting.
+            return false;
+        };
 
-        let native_window = match WlEglSurface::new(self.surfaces[index].layer.wl_surface().id(), width, height) {
+        let native_window = match WlEglSurface::new(surface_object_id, width, height) {
             Ok(w) => w,
             Err(e) => {
                 log_bind_failure(&surface_id, "WlEglSurface::new", e);
@@ -1707,7 +2159,10 @@ impl App {
     /// present a frame, because a panel declared `visible = false` never will -- see
     /// [`presenting_surface_ids`] for what each direction of a mismatch costs.
     fn maybe_send_ready_signal(&mut self) {
-        if self.ready_signal_sent || !self.surfaces.iter().all(|s| s.null_buffered) {
+        let staged = candidate_has_staged(
+            self.surfaces.iter().map(|s| (s.null_buffered, s.role.wl_surface().is_some())),
+        );
+        if self.ready_signal_sent || !staged {
             return;
         }
         self.ready_signal_sent = true;
@@ -1766,7 +2221,9 @@ impl App {
         // `wayland-client-0.31.15`'s own client examples' placement convention; verify with
         // `WAYLAND_DEBUG=1` during a manual smoke test that `feedback` appears on the wire
         // before the corresponding `commit`.
-        if let Err(e) = self.presentation_time.feedback(self.surfaces[index].layer.wl_surface(), &self.queue_handle) {
+        if let Some(surface) = self.surfaces[index].role.wl_surface().cloned()
+            && let Err(e) = self.presentation_time.feedback(&surface, &self.queue_handle)
+        {
             // Not fatal to the whole candidate -- the Supervisor's evidence_timeout is what
             // catches a surface that never presents (docs/adr/0025 item 6); don't invent a
             // second failure-reporting path here.
@@ -2113,7 +2570,7 @@ impl PointerHandler for App {
             // A surface this process does not own: a `wl_pointer` is per seat, not per surface,
             // and nothing stops the compositor from having delivered an event for a surface that
             // has since been destroyed by a `visible` flip or an output change.
-            let Some(index) = self.surfaces.iter().position(|s| s.layer.wl_surface() == &event.surface) else {
+            let Some(index) = self.index_of_surface(&event.surface) else {
                 continue;
             };
             match event.kind {
@@ -2287,11 +2744,21 @@ impl PresentationTimeHandler for App {
 }
 
 impl App {
-    /// Resolves a raw `wl_surface` (as handed back by a `wp_presentation_feedback` callback)
-    /// to its `surface_id` -- shared by `presented`/`discarded`, which both used to inline this
-    /// same lookup independently (Standards review).
+    /// Resolves a raw `wl_surface` (as handed back by a `wp_presentation_feedback` callback, a
+    /// pointer event, or a keyboard focus event) to the tracked surface that owns it.
+    ///
+    /// `None` is routine rather than exceptional on every one of those paths: a `wl_pointer`,
+    /// a `wl_keyboard` and a feedback object are all per seat or per commit, not per surface, so
+    /// any of them can name a surface this process has since destroyed -- through an output change,
+    /// or a `visible` flip that took a `window`'s toplevel away (docs/adr/0049 decision 1).
+    fn index_of_surface(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
+        self.surfaces.iter().position(|s| s.role.wl_surface() == Some(surface))
+    }
+
+    /// [`App::index_of_surface`]'s answer as the surface id -- shared by `presented`/`discarded`,
+    /// which both used to inline the same lookup independently (Standards review).
     fn surface_id_for(&self, surface: &wl_surface::WlSurface) -> Option<&str> {
-        self.surfaces.iter().find(|s| s.layer.wl_surface() == surface).map(|s| s.surface_id.as_str())
+        self.index_of_surface(surface).map(|index| self.surfaces[index].surface_id.as_str())
     }
 }
 
@@ -2389,7 +2856,7 @@ impl LayerShellHandler for App {
     /// later, and `run`'s `dispatch_pending` fails out of the loop on its own. Upgrade path: exit
     /// on a `closed` that no output change explains, which needs the two events correlated.
     fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
-        let Some(surface_id) = self.surfaces.iter().find(|s| &s.layer == layer).map(|s| s.surface_id.clone()) else {
+        let Some(surface_id) = self.surface_id_for(layer.wl_surface()).map(str::to_string) else {
             return;
         };
         self.destroy_surface_by_id(&surface_id);
@@ -2403,8 +2870,105 @@ impl LayerShellHandler for App {
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
+        let Some(index) = self.index_of_surface(layer.wl_surface()) else {
+            return;
+        };
         let (width, height) = configure.new_size;
-        self.bind_and_clear(layer, width, height);
+        self.bind_and_clear(index, width, height);
+    }
+}
+
+/// `xdg_toplevel` for the `window` role (build-steps.md Phase 22 items 1 and 4, § 6.2).
+///
+/// No `delegate_xdg_shell!`/`delegate_xdg_window!` accompanies it, and neither exists in this SCTK
+/// to add: `smithay-client-toolkit-0.21.1` ships exactly two `delegate_*` macros
+/// (`delegate_dispatch2!` and `delegate_registry!`, checked against `src/`). Every user-data type
+/// this role needs -- `WindowData` for the `xdg_surface`, the `xdg_toplevel` and the
+/// `zxdg_toplevel_decoration_v1`, and `GlobalData` for `xdg_wm_base`, `xdg_wm_dialog_v1` and
+/// `zxdg_decoration_manager_v1` -- carries its own blanket `Dispatch2` impl, which the file-wide
+/// `delegate_dispatch2!(App)` at the bottom turns into the `Dispatch` half of `XdgShell::bind`'s and
+/// `create_window`'s bounds. The same thing Phase 21 found for `PointerData` and `KeyboardData`;
+/// this trait is the only half left to supply.
+impl WindowHandler for App {
+    /// `xdg_toplevel::close`, which is **a request and not a command**: "The client may choose to
+    /// ignore this request", and § 6.2 makes that the config's call rather than the engine's -- the
+    /// callback may decline by doing nothing, and the window stays open until the config sets
+    /// `visible = false`.
+    ///
+    /// So this deliberately destroys nothing. Closing on behalf of a config that did not ask would
+    /// take the decision away from the one place docs/adr/0049 decision 2 puts it, and would leave
+    /// the scene's `visible` saying `true` about a window that no longer exists -- which the next
+    /// re-resolve would answer by creating a second one.
+    ///
+    /// The Lua call has `fire_on_click`'s shape for `fire_on_click`'s reasons: the `Function` is
+    /// cloned out of the resolved tree so no borrow of `self.client` is live while Lua runs inside
+    /// it, and a raise is logged and swallowed rather than taking down a shell that is otherwise
+    /// painting.
+    fn request_close(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, window: &Window) {
+        let Some(index) = self.index_of_surface(window.wl_surface()) else {
+            return;
+        };
+        let surface_id = self.surfaces[index].surface_id.clone();
+        let on_close = self
+            .client
+            .scene()
+            .surface(&surface_id)
+            .and_then(|tree| match tree.properties.get("on_close") {
+                // § 6.2 leaves the key opaque to `layout::node` exactly as § 5.2 leaves `on_click`,
+                // so this is the only place its type is ever checked. Anything that is not a
+                // function simply is not a close handler.
+                Some(Value::Function(on_close)) => Some(on_close.clone()),
+                _ => None,
+            });
+        let Some(on_close) = on_close else {
+            eprintln!("[oblisk-renderer] {surface_id}: the compositor asked it to close and no `on_close` declined or accepted; staying open");
+            return;
+        };
+        if let Err(e) = on_close.call::<()>(()) {
+            eprintln!("[oblisk-renderer] {surface_id}: on_close raised, ignoring it: {e}");
+        }
+    }
+
+    /// One `xdg_surface.configure`, already acked by SCTK before this runs (see
+    /// [`App::show_window`]). Everything after the size decision is `bind_and_clear`, shared
+    /// verbatim with layer-shell.
+    ///
+    /// `WindowConfigure` carries three things layer-shell has no analogue for, and this handles
+    /// exactly one of them:
+    ///
+    /// - `new_size`, whose axes are `Option` because a toplevel may be told to pick for itself.
+    ///   [`toplevel_size_for`] is that decision.
+    /// - `decoration_mode`, logged on the first configure of a mapping when the compositor granted
+    ///   client-side decorations. Logged and nothing more: ADR-0040 decision 4 and § 6.2 both refuse
+    ///   a client-side titlebar frame, so an undecorated window is the accepted outcome rather than
+    ///   a failure. Only the first, because a configure repeats on every resize and the mode
+    ///   practically never moves after the initial one.
+    /// - `state` (`is_maximized`, `is_fullscreen`, `is_activated`, the tiled set) and
+    ///   `capabilities`, deliberately unread. § 5.2 and § 6.2 give a config nothing to bind them to,
+    ///   and their one consequence that matters -- a fullscreen or maximized configure is binding --
+    ///   already reaches this shell as a `Some` axis of `new_size`, which is taken as given.
+    fn configure(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        window: &Window,
+        configure: WindowConfigure,
+        _serial: u32,
+    ) {
+        let Some(index) = self.index_of_surface(window.wl_surface()) else {
+            return;
+        };
+        let surface_id = self.surfaces[index].surface_id.clone();
+        if configure.decoration_mode == DecorationMode::Client && self.surfaces[index].map_state == MapState::AwaitingConfigure {
+            eprintln!(
+                "[oblisk-renderer] {surface_id}: the compositor granted client-side decorations; carrying on undecorated, since this shell draws no titlebar of its own"
+            );
+        }
+        let TrackedRole::Window { spec, .. } = &self.surfaces[index].role else {
+            return;
+        };
+        let (width, height) = toplevel_size_for(configure.new_size, spec);
+        self.bind_and_clear(index, width, height);
     }
 }
 
@@ -2636,6 +3200,131 @@ mod tests {
             ["bar@eDP-1", "dock@DP-1"],
             "a panel declared `visible = false` is created and staged, but never presents a frame, so it must not be expected to"
         );
+    }
+
+    #[test]
+    fn a_candidate_stages_when_every_surface_that_has_a_wayland_object_has_null_buffered() {
+        // The `all(null_buffered)` gate this replaced was correct while every tracked surface was a
+        // panel, because a panel always gets a configure -- it is created and initially committed
+        // at startup even when `visible` is false.
+        assert!(candidate_has_staged([(true, true), (true, true)].into_iter()));
+        assert!(!candidate_has_staged([(true, true), (false, true)].into_iter()));
+    }
+
+    #[test]
+    fn a_window_declared_invisible_has_nothing_to_stage_and_must_not_hold_the_ready_signal() {
+        // docs/adr/0049 decision 1 creates no `xdg_toplevel` for it, so no configure is coming and
+        // `null_buffered` would stay false forever. Under the old gate that is a `ready_timeout`
+        // hang on every config declaring a hidden window, which `dev-config/oblisk/shell.lua`
+        // already does.
+        assert!(candidate_has_staged([("bar", true, true), ("settings", false, false)].into_iter().map(|(_, n, e)| (n, e))));
+        assert!(candidate_has_staged([(false, false)].into_iter()), "a surface with no object at all is complete by construction");
+    }
+
+    fn settings_window() -> WindowSpec {
+        WindowSpec {
+            id: "settings".to_string(),
+            title: "Oblisk settings".to_string(),
+            app_id: "oblisk.settings".to_string(),
+            min_size: None,
+            max_size: None,
+        }
+    }
+
+    fn nz(n: u32) -> Option<std::num::NonZeroU32> {
+        std::num::NonZeroU32::new(n)
+    }
+
+    #[test]
+    fn a_configured_toplevel_axis_is_the_compositors_and_is_taken_as_given() {
+        // A tiling compositor sizes every window, and `xdg_toplevel::configure`'s own wording makes
+        // a maximized or fullscreen size binding rather than advisory. On niri this is the only
+        // branch that ever runs.
+        let mut spec = settings_window();
+        spec.min_size = Some(SizeHint { width: 320.0, height: 240.0 });
+        spec.max_size = Some(SizeHint { width: 1280.0, height: 800.0 });
+        assert_eq!(toplevel_size_for((nz(1920), nz(1168)), &spec), (1920, 1168), "the hints never override a configure");
+    }
+
+    #[test]
+    fn an_unconfigured_toplevel_axis_takes_the_min_size_the_config_declared() {
+        // "If this value is None, you may set the size of the window as you wish", which is the
+        // ordinary first configure on a floating compositor. `min_size` is the only thing § 6.2
+        // lets a config say about a window's size, so it is what the client says back.
+        let mut spec = settings_window();
+        spec.min_size = Some(SizeHint { width: 320.0, height: 240.0 });
+        assert_eq!(toplevel_size_for((None, None), &spec), (320, 240));
+        // One axis each way, which is the shape a compositor constraining only width produces.
+        assert_eq!(toplevel_size_for((nz(800), None), &spec), (800, 240));
+    }
+
+    #[test]
+    fn an_unconfigured_axis_with_no_min_size_falls_back_to_the_named_constant() {
+        // Its `ponytail:` states the ceiling: § 6.2 gives a config nothing else to say here, and a
+        // toplevel's root is forced to the surface, so no content size exists to prefer instead.
+        assert_eq!(toplevel_size_for((None, None), &settings_window()), (640, 480));
+    }
+
+    #[test]
+    fn the_size_this_client_picks_stays_under_the_max_size_the_config_declared() {
+        let mut spec = settings_window();
+        spec.min_size = Some(SizeHint { width: 900.0, height: 900.0 });
+        spec.max_size = Some(SizeHint { width: 400.0, height: 0.0 });
+        // A zero `max_size` axis is not a maximum of zero: `set_max_size`'s own "0 means no
+        // expected maximum size in the given dimension", the same reading `node::window_spec`
+        // applies when it refuses a maximum below a minimum.
+        assert_eq!(toplevel_size_for((None, None), &spec), (400, 900));
+    }
+
+    #[test]
+    fn a_re_resolve_that_changed_no_window_property_sends_no_requests_at_all() {
+        let applied = settings_window();
+        assert_eq!(window_update(&applied, &applied.clone()), WindowUpdate::default());
+    }
+
+    #[test]
+    fn every_window_field_is_pushed_on_its_own_and_only_when_it_moved() {
+        // All four, unlike a panel's diff: `xdg-shell.xml` says a `set_app_id` "can be sent after
+        // the xdg_toplevel has been mapped to update the property", `set_title` is the same shape,
+        // and both size hints are ordinary double-buffered requests. Nothing here is fixed at
+        // creation the way a layer surface's namespace is, so a changed `title` is an in-place
+        // update rather than a recreate.
+        let applied = settings_window();
+
+        let mut renamed = applied.clone();
+        renamed.title = "Settings".to_string();
+        assert_eq!(
+            window_update(&applied, &renamed),
+            WindowUpdate { title: Some("Settings".to_string()), ..WindowUpdate::default() }
+        );
+
+        let mut rematched = applied.clone();
+        rematched.app_id = "oblisk.prefs".to_string();
+        assert_eq!(
+            window_update(&applied, &rematched),
+            WindowUpdate { app_id: Some("oblisk.prefs".to_string()), ..WindowUpdate::default() }
+        );
+
+        let mut bounded = applied.clone();
+        bounded.min_size = Some(SizeHint { width: 320.0, height: 240.0 });
+        assert_eq!(
+            window_update(&applied, &bounded),
+            WindowUpdate { min_size: Some(Some(SizeHint { width: 320.0, height: 240.0 })), ..WindowUpdate::default() }
+        );
+    }
+
+    #[test]
+    fn a_size_hint_that_moved_to_absent_is_still_a_change_that_has_to_reach_the_wire() {
+        // The reason the field is `Option<Option<_>>`: the outer layer is "did it move", the inner
+        // one is § 6.2's absent-versus-present, and dropping a `max_size` from a config has to send
+        // the protocol's zero (meaning unset) rather than leaving the old maximum standing.
+        let mut applied = settings_window();
+        applied.max_size = Some(SizeHint { width: 1280.0, height: 800.0 });
+        let fresh = settings_window();
+
+        assert_eq!(window_update(&applied, &fresh), WindowUpdate { max_size: Some(None), ..WindowUpdate::default() });
+        assert_eq!(size_hint_pair(None), None, "which `Window::set_max_size` sends as the protocol's zero");
+        assert_eq!(size_hint_pair(Some(SizeHint { width: 320.0, height: 240.0 })), Some((320, 240)));
     }
 
     #[test]
