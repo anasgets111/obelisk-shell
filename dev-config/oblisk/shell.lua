@@ -141,10 +141,6 @@ return {
         width = 380,
         child = column {
             spacing = 6,
-            -- A container's own padding does not contribute to its content size today, so this
-            -- column reports the height of its children alone and the padding pushes them past
-            -- its own edge. Left as written rather than worked around: the config is right and
-            -- the engine is not.
             padding = { top = 8, right = 10, bottom = 8, left = 10 },
             background = "#181825ee",
             radius = 8,

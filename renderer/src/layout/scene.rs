@@ -670,9 +670,19 @@ fn resolve_and_reconcile(
         )?);
     }
 
+    // Padding is added here rather than inside `intrinsic_content_size`, and only on an axis whose
+    // size the config did not state. `intrinsic_content_size` answers "how much room do the
+    // contents need", which is the number the row/column sums and the stacking union are about; a
+    // node's own padding is a property of the node, not of what it contains. On a stated axis
+    // padding has already done its work by insetting `child_budget` above, so adding it here too
+    // would count it twice. On a `Content` axis nothing has accounted for it yet, and
+    // `position_children` below offsets every child by exactly this much inside `size`: without
+    // this the children are placed past the edge of the box meant to contain them (measured live
+    // against dev-config, where a padded column reported its child's bare height at both 8px and
+    // 50px of padding -- build-steps.md Phase 19 item 14).
     let intrinsic = intrinsic_content_size(kind, &properties, &new_children, text_wrap_width, shaping)?;
-    let own_width = own_width_known.unwrap_or(intrinsic.width);
-    let own_height = own_height_known.unwrap_or(intrinsic.height);
+    let own_width = own_width_known.unwrap_or(intrinsic.width + padding.horizontal());
+    let own_height = own_height_known.unwrap_or(intrinsic.height + padding.vertical());
     let size = LogicalSize {
         width: own_width,
         height: own_height,
@@ -1211,6 +1221,66 @@ mod tests {
             row.children[1].rect.x, 0.0,
             "the visible child packs at the start as if the hidden one weren't there"
         );
+    }
+
+    /// Found live against `dev-config`: a content-sized `column` with 8px of padding reported the
+    /// bare height of its one child, and reported the same height with 50px of padding. Padding
+    /// insets the box children are laid out in (`position_children` offsets them by exactly this
+    /// much), so a content-sized container that does not also grow by it positions its children
+    /// past its own edge.
+    #[test]
+    fn a_content_sized_container_grows_by_its_own_padding() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"surface { id = "bar", child = column {
+                padding = { top = 8, right = 10, bottom = 8, left = 10 },
+                children = { rect { width = 20, height = 20 } },
+            } }"#,
+        );
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
+        let column = &scene.surface("bar").unwrap().children[0];
+        assert_eq!(column.rect.width, 40.0, "20 wide child plus 10 of padding on each side");
+        assert_eq!(column.rect.height, 36.0, "20 tall child plus 8 of padding top and bottom");
+        // The child sits at the padding offset, which is the half that already worked, and is
+        // what makes the sizes above the ones that keep it inside the box.
+        assert_eq!(column.children[0].rect.x, 10.0);
+        assert_eq!(column.children[0].rect.y, 8.0);
+    }
+
+    /// The surface root resolves through the same `unwrap_or`, and a popup sized to its contents
+    /// is the case this actually bites (build-steps.md Phase 19 item 14).
+    #[test]
+    fn padding_grows_a_content_sized_surface_too() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"surface { id = "bar", padding = { top = 6, right = 6, bottom = 6, left = 6 },
+                child = rect { width = 20, height = 20 } }"#,
+        );
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
+        let root = scene.surface("bar").unwrap();
+        assert_eq!(root.rect.width, 32.0);
+        assert_eq!(root.rect.height, 32.0);
+    }
+
+    /// Padding must not double-count on an axis whose size the config stated: there it correctly
+    /// shrinks the child budget and leaves the parent alone.
+    #[test]
+    fn padding_does_not_grow_an_explicitly_sized_container() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"surface { id = "bar", child = column {
+                width = 100,
+                padding = { top = 8, right = 10, bottom = 8, left = 10 },
+                children = { rect { width = 20, height = 20 } },
+            } }"#,
+        );
+        scene.apply(&[surface], full(), &shaping, &_lua).unwrap();
+        let column = &scene.surface("bar").unwrap().children[0];
+        assert_eq!(column.rect.width, 100.0, "stated width wins, padding already inset the child");
+        assert_eq!(column.rect.height, 36.0, "the Content axis still grows by its padding");
     }
 
     #[test]
