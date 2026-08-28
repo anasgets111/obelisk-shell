@@ -1012,6 +1012,42 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    grows the list without bound, and frees them only on an explicit `clear()`. Clear at a
    page-count threshold on an idle frame and let it rebuild. Mark it `ponytail:`, naming the
    ceiling: a whole-cache drop rather than an LRU, because femtovg exposes no per-glyph eviction.
+
+   **Amendment: not built, because none of its three premises hold.** Checked against femtovg
+   0.26.0's own source rather than its docs.
+
+   *There is no public clear.* `GlyphAtlas::clear` is `pub(crate)` (`src/text.rs:928`) and
+   `Canvas`'s `glyph_atlas` field is private (`src/lib.rs:312`). The only `clear` a public path
+   reaches is on `ephemeral_glyph_atlas`, the per-flush color-glyph atlas, in `flush()`.
+   `Canvas::reset()` resets draw state (transform, scissor, paint), not the atlas. ADR-0043
+   decision 3 says pages are freed "when something explicitly calls `clear()`"; nothing outside
+   the crate can. ADR-0043 still reads as though the call is available, and wants an amendment
+   banner pointing here.
+
+   *There is no page count either*, except behind the `debug_inspector` cargo feature, which is
+   what gates `debug_inspector_get_font_textures` (`src/lib.rs:2275`). It is an empty feature that
+   pulls in no dependency, so enabling it is cheap, but shipping a release build that turns on a
+   debug-gated inspector to read one number is the wrong shape for a threshold check.
+
+   *There is no idle frame.* Item 9's frame-callback scheduling is what would define one, and it
+   is unbuilt and blocked behind Phase 20 item 4.
+
+   The one reachable mechanism is dropping the whole `Canvas` and rebuilding `TextPainter`:
+   `Drop for Canvas` calls `images.clear`, which frees the atlas textures with everything else.
+   That is a heavier operation than the ADR costed. It re-uploads every font and drops every
+   non-glyph image too, so "a full rebuild on an idle frame is invisible" is a claim about a
+   targeted atlas clear, not about this.
+
+   Not built, because the problem is currently unreachable. `paint_tree` has no production caller
+   (Phase 20 item 4), so the only glyphs production rasterizes are the six characters of
+   `draw_main_bar_proof_text`'s "Oblisk" at one size, which is one atlas page forever. Building a
+   whole-canvas teardown, a debug-feature-gated page count and an invented idea of idleness, to
+   guard growth that cannot happen yet, is three speculative mechanisms for zero present benefit.
+
+   Revisit when `paint_tree` has a production caller and a config draws varied text, and take one
+   of: enable `debug_inspector` and rebuild the painter at a threshold; or upstream a public
+   `Canvas::clear_glyph_atlas` to femtovg, which is a small patch against code that already has
+   the method. Prefer the second. The first is a workaround for a missing four-line accessor.
 12. **The `list` node, and `key`** (ADR-0045, `oblisk-idl-api-specs.md` § 5.2). `list` is registered
    as a Lua constructor in `lua/nodes.rs`'s `NODE_KINDS` but rejected by
    `layout::scene::ensure_supported_kind`, so a config that uses it gets `UnsupportedNodeKind` and
