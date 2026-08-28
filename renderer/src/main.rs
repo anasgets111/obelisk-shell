@@ -4,27 +4,28 @@ mod socket;
 mod text;
 mod wayland;
 
-/// Bridges the socket thread (`Loader`/`Scene`/`mlua::Lua`, `!Send`, current-thread tokio
-/// runtime) and the Wayland/EGL thread (`wayland::run`'s blocking dispatch loop) with four
-/// plain `std::sync::mpsc` channels, matching this file's established "one dedicated OS thread
-/// per blocking concern" pattern (build-steps.md Phase 14, § 15.2-15.3; Phase 15 item 2):
-/// - `ready_tx`/`ready_rx`: the Wayland thread announces its one-time `ReadySignal` surface_id
-///   list once every tracked surface has staged its null buffer.
-/// - `presented_tx`/`presented_rx`: the Wayland thread announces each surface_id's
-///   `wp_presentation_feedback` `presented` event as it happens, tagged with the `ActivateDraw`
-///   nonce it was drawn for.
-/// - `activate_tx`/`activate_rx`: the socket thread forwards a received `ActivateDraw` nonce to
-///   the Wayland thread.
-/// - `secure_submit_tx`/`secure_submit_rx`: the Wayland thread announces one completed
-///   `textfield` `secure_submit` (ADR-0005/ADR-0027), carrying the accumulated
-///   `shared::SecureBuffer` intact so the socket thread can perform the one sanctioned read and
-///   the explicit post-send `.zeroize()` as close as possible to the actual socket write.
+/// Two OS threads, two channels (docs/adr/0039, build-steps.md Phase 18). `wayland::run` owns the
+/// main thread: the Wayland dispatch loop, EGL, the Lua VM, the retained `Scene`, and the live
+/// signals all live there, because `mlua::Lua` is `!Send` and the scene has to be reachable from
+/// the thread that holds the GL context. `socket::spawn_client` owns one dedicated I/O thread
+/// with its own current-thread tokio runtime, matching this file's established "one dedicated OS
+/// thread per blocking concern" pattern (build-steps.md Phase 14, § 15.2-15.3), and does nothing
+/// but framed I/O between that thread and the Supervisor's control socket:
+/// - inbound: every decoded `SupervisorFrame` is forwarded over a `std::sync::mpsc` channel and
+///   drained by `wayland::run`'s poll loop on a bounded 15ms latency.
+/// - outbound: every `RendererFrame` the Wayland thread produces (`ReadySignal`,
+///   `PresentationEvidence`, `ReevaluateReport`, process `Command`s, `SecureSubmit`) is queued on
+///   a `tokio::sync::mpsc` channel and written to the wire by the socket thread.
+///   `UnboundedSender::send` is synchronous and non-blocking, so the Wayland thread can call it
+///   directly without bridging.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Vec<String>>();
-    let (presented_tx, presented_rx) = std::sync::mpsc::channel::<shared::PresentationEvidence>();
-    let (activate_tx, activate_rx) = std::sync::mpsc::channel::<u64>();
-    let (secure_submit_tx, secure_submit_rx) = std::sync::mpsc::channel::<wayland::SecureSubmitPayload>();
+    let (inbound_tx, inbound_rx) = std::sync::mpsc::channel::<shared::SupervisorFrame>();
+    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::unbounded_channel::<shared::RendererFrame>();
 
-    socket::spawn_client(ready_rx, presented_rx, activate_tx, secure_submit_rx);
-    wayland::run(ready_tx, presented_tx, activate_rx, secure_submit_tx)
+    // Read once and handed to both threads: the socket thread stamps it into the connection
+    // handshake, the Wayland thread stamps it into every outbound `CommandEnvelope`/`SecureSubmit`.
+    let generation_id = socket::generation_id_from_env();
+
+    socket::spawn_client(generation_id, inbound_tx, outbound_rx);
+    wayland::run(generation_id, inbound_rx, outbound_tx)
 }

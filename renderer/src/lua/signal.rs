@@ -42,7 +42,7 @@ enum SignalKind {
     Computed { deps: Vec<Signal>, func: Function },
     /// A value Rust can overwrite after construction (`Signal::new_live`/`LiveSignalHandle`,
     /// Phase 11). `Rc<RefCell<_>>`, not `Arc<Mutex<_>>`: the `Loader` this lives on stays
-    /// confined to one dedicated OS thread (`renderer/src/socket.rs`'s socket-client thread),
+    /// confined to one dedicated OS thread (the Wayland dispatch thread, docs/adr/0039),
     /// the same single-threaded-state convention `supervisor/src/audio/mixer.rs`'s
     /// `Rc<RefCell<MixerState>>` already uses.
     Live(Rc<RefCell<Value>>),

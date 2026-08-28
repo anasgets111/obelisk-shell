@@ -2,6 +2,7 @@ use std::io;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use zeroize::ZeroizeOnDrop;
 
 pub mod framing;
 mod secure_buffer;
@@ -207,11 +208,17 @@ pub struct ProcessExited {
 /// item 2; ADR-0005/ADR-0009/ADR-0027). `secret` is the accumulated `wp-text-input-v3` input,
 /// read once from a `shared::SecureBuffer` via its one sanctioned read (`expose_secret`) --
 /// never routed through [`CommandParams::arguments`], whose `Vec<serde_json::Value>` would leave
-/// an intermediate plaintext copy `.zeroize()` can never reach (ADR-0027, ADR-0014). The
-/// Renderer's socket thread calls `.zeroize()` on the source `SecureBuffer` immediately after
-/// writing this frame -- see `renderer/src/socket.rs`'s `dispatch_loop`, not this type, which is
-/// just the wire shape.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// an intermediate plaintext copy `.zeroize()` can never reach (ADR-0027, ADR-0014). The Renderer
+/// `.zeroize()`s the source `SecureBuffer` the instant it has been read into this frame (see
+/// `renderer/src/wayland/mod.rs`'s `secure_submit_frame`) and this frame's own plaintext copy the
+/// instant its wire write completes (`renderer/src/socket.rs`'s `pump`). `Zeroize`/`ZeroizeOnDrop`
+/// *are* this type's job too, as a backstop: a bare `SecureSubmit` now crosses an unbounded
+/// channel on its own (docs/adr/0039 collapsed the old `SecureSubmitPayload` wrapper whose
+/// `SecureBuffer` field used to carry this protection), so every path that drops the frame instead
+/// of writing it -- the outbound send failing because the socket thread is gone, or a frame still
+/// buffered when `outbound_rx` itself is dropped -- must scrub `secret` on drop, not just on the
+/// happy-path write.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct SecureSubmit {
     pub generation_id: u32,
     pub capability: String,
@@ -504,6 +511,20 @@ mod tests {
 
         let parsed: RendererFrame = serde_json::from_value(wire).unwrap();
         assert_eq!(parsed, frame);
+    }
+
+    /// Regression test for a CONFIRMED correctness finding: a bare `SecureSubmit` now crosses an
+    /// unbounded channel on its own (docs/adr/0039 collapsed the old `SecureSubmitPayload`
+    /// wrapper), so this type must scrub its own `secret` on zeroize/drop rather than relying on
+    /// a wrapper that no longer exists.
+    #[test]
+    fn zeroizing_a_secure_submit_clears_its_secret() {
+        let mut submit =
+            SecureSubmit { generation_id: 4, capability: "polkit".to_string(), action: "authenticate".to_string(), secret: b"hunter2".to_vec() };
+
+        submit.zeroize();
+
+        assert_eq!(submit.secret, Vec::<u8>::new());
     }
 
     #[test]

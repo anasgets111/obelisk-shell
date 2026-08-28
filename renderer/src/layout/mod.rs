@@ -16,12 +16,13 @@
 pub mod node;
 pub mod scene;
 
-// ponytail: this is the module's real, tested public surface, but `socket.rs`'s Phase 12 wiring
+// ponytail: this is the module's real, tested public surface, but `socket.rs`'s `RendererClient`
 // (the only caller outside `layout` today) only needs `Scene`/`LogicalSize`, below, to call
 // `apply`/`surface`. `LayoutError`'s variants get a real external caller once something matches
 // on them instead of just logging the `Display` output; `NodeId`/`ResolvedNode` are already
 // exercised via `Scene::surface`'s return type but never named directly outside this module;
-// `overlay_input_regions` waits on the Wayland-thread bridging named in docs/adr/0023 item 5.
+// `overlay_input_regions` is now reachable from the `wl_region` call site (docs/adr/0039 put the
+// scene and the surfaces on one thread) and waits only on its own slice, build-steps.md Phase 20.
 #[allow(unused_imports)]
 pub use node::{Align, EdgeInsets, LayoutError, SizeMode};
 pub use scene::{LogicalSize, Scene};

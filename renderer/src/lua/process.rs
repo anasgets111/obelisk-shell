@@ -1,16 +1,16 @@
 //! `process` global table and `ProcessHandle` userdata (`oblisk-idl-api-specs.md` § 3.2/3.3,
 //! `docs/oblisk-supervisor-services-dbus.md` § 12, build-steps.md Phase 15 item 1, docs/adr/0026).
 //!
-//! `process.run(cmd, args, out_cb, exit_cb)` executes on the same thread `renderer/src/socket.rs`'s
-//! `dispatch_loop` runs on, but synchronously, with no `&mut write_half` in scope -- so it can't
-//! write the outbound `"process"`/`"run"` `CommandEnvelope` directly. [`ProcessRegistry`] instead
-//! queues it onto an `mpsc::UnboundedSender<CommandEnvelope>` that `dispatch_loop` drains in its
-//! own `tokio::select!`, the same "queue it, let the owning loop actually write it" shape as every
-//! other outbound frame in this codebase.
+//! `process.run(cmd, args, out_cb, exit_cb)` executes on the Wayland dispatch thread, inside a Lua
+//! evaluation, with no socket in scope -- so it can't write the outbound `"process"`/`"run"`
+//! `CommandEnvelope` directly. [`ProcessRegistry`] instead queues it onto the same
+//! `mpsc::UnboundedSender<RendererFrame>` every other outbound frame goes to, which the socket
+//! thread's `renderer/src/socket.rs`-side `pump` drains and writes (docs/adr/0039) -- the same
+//! "queue it, let the owning loop actually write it" shape as every other outbound frame here.
 //!
-//! `Rc<RefCell<_>>`, not `Arc<Mutex<_>>` -- [`ProcessRegistry`] is confined to the one socket
-//! thread, matching `lua::signal::Signal::Live` and `supervisor/src/audio/mixer.rs`'s
-//! `Rc<RefCell<MixerState>>`.
+//! `Rc<RefCell<_>>`, not `Arc<Mutex<_>>` -- [`ProcessRegistry`] is confined to the one Wayland
+//! dispatch thread, alongside the Lua VM whose closures drive it, matching
+//! `lua::signal::Signal::Live` and `supervisor/src/audio/mixer.rs`'s `Rc<RefCell<MixerState>>`.
 //!
 //! Callback calling convention (not pinned down by the spec docs, decided here -- see
 //! docs/adr/0026): `out_cb(line, stream)` with `stream` the Lua string `"stdout"`/`"stderr"` (the
@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use mlua::{Function, Lua, UserData, UserDataMethods};
-use shared::{CommandEnvelope, CommandParams, ProcessStream};
+use shared::{CommandEnvelope, CommandParams, ProcessStream, RendererFrame};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// One `process.run` call's registered Lua callbacks, kept until its matching
@@ -43,7 +43,7 @@ struct Inner {
     generation_id: u32,
     next_id: u64,
     pending: HashMap<u64, PendingProcess>,
-    outbound_tx: UnboundedSender<CommandEnvelope>,
+    outbound_tx: UnboundedSender<RendererFrame>,
 }
 
 fn process_command(generation_id: u32, action: &str, arguments: Vec<serde_json::Value>, id: u64) -> CommandEnvelope {
@@ -57,8 +57,9 @@ fn process_command(generation_id: u32, action: &str, arguments: Vec<serde_json::
 
 impl ProcessRegistry {
     /// `generation_id` is this Renderer's own generation id (`OBLISK_GENERATION_ID`), stamped
-    /// into every outbound `CommandEnvelope`. `outbound_tx` is drained by `dispatch_loop`.
-    pub fn new(generation_id: u32, outbound_tx: UnboundedSender<CommandEnvelope>) -> Self {
+    /// into every outbound `CommandEnvelope`. `outbound_tx` is the Renderer's one outbound frame
+    /// channel, drained by the socket thread's `pump`.
+    pub fn new(generation_id: u32, outbound_tx: UnboundedSender<RendererFrame>) -> Self {
         ProcessRegistry(Rc::new(RefCell::new(Inner { generation_id, next_id: 0, pending: HashMap::new(), outbound_tx })))
     }
 
@@ -72,7 +73,7 @@ impl ProcessRegistry {
     fn send(&self, envelope: CommandEnvelope) {
         let id = envelope.id;
         let action = envelope.params.action.clone();
-        if self.0.borrow().outbound_tx.send(envelope).is_err() {
+        if self.0.borrow().outbound_tx.send(RendererFrame::Command(envelope)).is_err() {
             eprintln!("process.{action}(id={id}): failed to queue request, the control-socket writer is gone");
         }
     }
@@ -90,7 +91,7 @@ impl ProcessRegistry {
         self.send(process_command(generation_id, "kill", Vec::new(), id));
     }
 
-    /// `SupervisorFrame::ProcessOutput` dispatch (`renderer/src/socket.rs`'s `dispatch_loop`):
+    /// `SupervisorFrame::ProcessOutput` dispatch (`renderer/src/socket.rs`'s `handle_frame`):
     /// invokes `id`'s registered `out_cb`. A stale/unknown `id` (a frame arriving for a since-
     /// forgotten generation, or a wire desync) is silently ignored -- this codebase's established
     /// tolerance for a frame that doesn't match any live state, matching `SocketCandidateLink`'s
@@ -157,7 +158,16 @@ mod tests {
 
     use super::*;
 
-    fn lua_with_process(generation_id: u32) -> (Lua, ProcessRegistry, mpsc::UnboundedReceiver<CommandEnvelope>) {
+    /// Unwraps the one frame shape this module ever queues, so each test below asserts on the
+    /// `CommandEnvelope` itself rather than re-matching the wrapper every time.
+    fn queued_command(rx: &mut mpsc::UnboundedReceiver<RendererFrame>) -> Option<CommandEnvelope> {
+        match rx.try_recv().ok()? {
+            RendererFrame::Command(envelope) => Some(envelope),
+            other => panic!("process commands must be queued as RendererFrame::Command, got {other:?}"),
+        }
+    }
+
+    fn lua_with_process(generation_id: u32) -> (Lua, ProcessRegistry, mpsc::UnboundedReceiver<RendererFrame>) {
         let lua = Lua::new();
         let (tx, rx) = mpsc::unbounded_channel();
         let registry = ProcessRegistry::new(generation_id, tx);
@@ -171,7 +181,7 @@ mod tests {
 
         lua.load(r#"handle = process.run("echo", {"hi"}, function() end, function() end)"#).exec().unwrap();
 
-        let envelope = rx.try_recv().expect("a run command must have been queued");
+        let envelope = queued_command(&mut rx).expect("a run command must have been queued");
         assert_eq!(envelope.params.generation_id, 4);
         assert_eq!(envelope.params.capability, "process");
         assert_eq!(envelope.params.action, "run");
@@ -189,8 +199,8 @@ mod tests {
         lua.load(r#"process.run("a", {}, function() end, function() end)"#).exec().unwrap();
         lua.load(r#"process.run("b", {}, function() end, function() end)"#).exec().unwrap();
 
-        assert_eq!(rx.try_recv().unwrap().id, 0);
-        assert_eq!(rx.try_recv().unwrap().id, 1);
+        assert_eq!(queued_command(&mut rx).unwrap().id, 0);
+        assert_eq!(queued_command(&mut rx).unwrap().id, 1);
     }
 
     #[test]
@@ -199,8 +209,8 @@ mod tests {
 
         lua.load(r#"handle = process.run("sleep", {"5"}, function() end, function() end); handle:kill()"#).exec().unwrap();
 
-        let run_envelope = rx.try_recv().unwrap();
-        let kill_envelope = rx.try_recv().expect("a kill command must have been queued");
+        let run_envelope = queued_command(&mut rx).unwrap();
+        let kill_envelope = queued_command(&mut rx).expect("a kill command must have been queued");
         assert_eq!(kill_envelope.params.capability, "process");
         assert_eq!(kill_envelope.params.action, "kill");
         assert_eq!(kill_envelope.params.arguments, Vec::<serde_json::Value>::new());

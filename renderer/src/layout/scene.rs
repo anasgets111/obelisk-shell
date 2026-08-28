@@ -606,9 +606,10 @@ fn position_children(
 /// physical pixels. Pure -- see docs/adr/0023 item 5 for why the real `wl_region`/
 /// `wl_surface::set_input_region` push isn't wired here.
 ///
-/// ponytail: no production caller yet -- those Wayland objects live on `wayland::mod`'s main
-/// thread, this function's caller (`Scene`) lives on `socket.rs`'s dedicated socket-client
-/// thread. Exercised by this module's own tests only.
+/// ponytail: no production caller yet. The thread boundary that used to make one impossible is
+/// gone (docs/adr/0039 put the `Scene` and the `wl_surface`s on the same thread), so this is now
+/// one direct call away; making it is build-steps.md Phase 20's job, not the thread move's.
+/// Exercised by this module's own tests only.
 #[allow(dead_code)]
 pub fn overlay_input_regions(overlay_root: &ResolvedNode, scale: f32) -> Vec<PhysicalRect> {
     overlay_root

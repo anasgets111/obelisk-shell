@@ -40,6 +40,12 @@ enum Request {
 }
 
 /// A handle to a dedicated shaping worker thread and its warm font cache.
+///
+/// `Clone` clones the request `Sender` alone, so every clone still addresses the one worker
+/// thread and the one `FontSystem` behind it -- that is what lets `wayland::App` and the
+/// `RendererClient` it owns share a single warm font cache instead of each paying
+/// `FontSystem::new()`'s ~1s startup (docs/adr/0023 item 8, closed by docs/adr/0039 decision 3).
+#[derive(Clone)]
 pub struct ShapingHandle {
     requests: mpsc::Sender<Request>,
 }

@@ -25,7 +25,9 @@ use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_manager_v3::{self, ZwpTextInputManagerV3},
     zwp_text_input_v3::{self, ZwpTextInputV3},
 };
+use shared::{PresentationEvidence, ReadySignal, RendererFrame, SecureSubmit, SupervisorFrame, Zeroize};
 
+use crate::socket::RendererClient;
 use crate::text::atlas::TextPainter;
 use crate::text::shaping::{ShapeRequest, ShapingHandle};
 use crate::text::snap::LogicalRect;
@@ -48,23 +50,12 @@ impl SurfaceRole {
     }
 }
 
-/// Cross-thread payload for one completed `secure_submit` (build-steps.md Phase 15 item 2;
-/// ADR-0005/ADR-0027): the accumulated `shared::SecureBuffer` travels to the socket thread
-/// intact, not as a pre-copied `Vec<u8>` -- the socket thread performs the one sanctioned read
-/// (`expose_secret`) and the explicit `.zeroize()` as close as possible to the actual socket
-/// write (`renderer/src/socket.rs`'s `dispatch_loop`), since this thread has no socket to write
-/// to and `generation_id` isn't known here either (see `socket.rs`'s `generation_id_from_env`).
-pub struct SecureSubmitPayload {
-    pub capability: String,
-    pub action: String,
-    pub buffer: shared::SecureBuffer,
-}
-
 /// ponytail: no real per-`textfield` focus/attribution exists yet (see `App::bind_text_input`'s
 /// own `ponytail` comment) -- every `secure_submit` completed this way is attributed to this
 /// fixed placeholder until real focus wiring can read the specific `textfield` node's own
-/// `secure_submit = { capability, action }` table (`oblisk-idl-api-specs.md` § 5.2 item 8) and
-/// thread it across the same Wayland-thread/socket-thread boundary this channel already crosses.
+/// `secure_submit = { capability, action }` table (`oblisk-idl-api-specs.md` § 5.2 item 8), which
+/// is now a lookup in the retained `Scene` this thread owns rather than a cross-thread hop
+/// (docs/adr/0039; build-steps.md Phase 21 item 3).
 const PLACEHOLDER_SECURE_SUBMIT_CAPABILITY: &str = "unknown";
 const PLACEHOLDER_SECURE_SUBMIT_ACTION: &str = "unknown";
 
@@ -111,8 +102,16 @@ pub struct App {
     layer_shell: LayerShell,
     egl: egl::EglState,
     gl: Option<glow::Context>,
+    /// The one `ShapingHandle` for the whole process; `client` holds a clone of it, so
+    /// content-sizing and painting share one worker thread and one `FontSystem`
+    /// (docs/adr/0023 item 8, closed by docs/adr/0039 decision 3).
     shaping: ShapingHandle,
     text_painter: Option<TextPainter>,
+    /// The Lua VM, the `Loader`, the retained `Scene`, the live signals, and the reload
+    /// bookkeeping, all owned by this dispatch state rather than by a separate thread
+    /// (docs/adr/0039). `mlua::Lua` is `!Send`, so `App` is `!Send` too -- fine, since
+    /// `wayland-client` puts no `Send` bound on the dispatch state.
+    client: RendererClient,
     surfaces: Vec<TrackedSurface>,
     exit: bool,
     /// `OBLISK_PBA_CANDIDATE` is set (build-steps.md Phase 14, § 15.2) -- read once in [`run`]
@@ -121,8 +120,13 @@ pub struct App {
     /// Set once [`App::maybe_send_ready_signal`] has sent `ReadySignal` -- a one-time signal,
     /// never resent even if a later spurious configure re-triggers the check.
     ready_signal_sent: bool,
-    ready_tx: std::sync::mpsc::Sender<Vec<String>>,
-    presented_tx: std::sync::mpsc::Sender<shared::PresentationEvidence>,
+    /// Every frame this thread sends the Supervisor goes here; the socket thread's `pump` drains
+    /// it and writes each one to the wire (docs/adr/0039). `UnboundedSender::send` is
+    /// synchronous and non-blocking, so it's safe to call from inside a `Dispatch` callback.
+    outbound_tx: tokio::sync::mpsc::UnboundedSender<RendererFrame>,
+    /// This Renderer's own generation id, stamped into every `SecureSubmit` it writes
+    /// (build-steps.md Phase 15 item 2) -- read once in `main` from `OBLISK_GENERATION_ID`.
+    generation_id: u32,
     presentation_time: PresentationTimeState,
     /// Cloned once in [`run`] so [`App::activate_draw`] (called from the poll loop, not a
     /// `Dispatch` callback) can still request `wp_presentation_feedback` -- `QueueHandle` is a
@@ -143,14 +147,15 @@ pub struct App {
     /// completes them (build-steps.md Phase 15 item 2; ADR-0005/ADR-0009/ADR-0027) -- never
     /// surfaced to Lua.
     secure_buffer: shared::SecureBuffer,
-    secure_submit_tx: std::sync::mpsc::Sender<SecureSubmitPayload>,
 }
 
+/// The Renderer's main thread: Wayland dispatch, EGL, and (since docs/adr/0039) the Lua VM, the
+/// retained `Scene`, and the live signals. `inbound_rx` carries `SupervisorFrame`s decoded by the
+/// socket thread; `outbound_tx` carries every frame this thread sends back.
 pub fn run(
-    ready_tx: std::sync::mpsc::Sender<Vec<String>>,
-    presented_tx: std::sync::mpsc::Sender<shared::PresentationEvidence>,
-    activate_rx: std::sync::mpsc::Receiver<u64>,
-    secure_submit_tx: std::sync::mpsc::Sender<SecureSubmitPayload>,
+    generation_id: u32,
+    inbound_rx: std::sync::mpsc::Receiver<SupervisorFrame>,
+    outbound_tx: tokio::sync::mpsc::UnboundedSender<RendererFrame>,
 ) -> Result<(), Box<dyn Error>> {
     let conn = Connection::connect_to_env()?;
     let (globals, mut event_queue) = registry_queue_init::<App>(&conn)?;
@@ -170,6 +175,12 @@ pub fn run(
 
     let is_pba_candidate = std::env::var("OBLISK_PBA_CANDIDATE").is_ok();
 
+    // One `ShapingHandle` for the process: `App` keeps this one, `RendererClient` gets a clone
+    // (docs/adr/0039 decision 3). `Loader::new()` runs inside `start`, on this thread, because
+    // `mlua::Lua` is `!Send` -- the move this whole phase is about.
+    let shaping = ShapingHandle::spawn();
+    let client = RendererClient::start(shaping.clone(), outbound_tx.clone(), generation_id)?;
+
     let mut app = App {
         registry_state,
         output_state,
@@ -178,21 +189,21 @@ pub fn run(
         layer_shell,
         egl: egl_state,
         gl: None,
-        shaping: ShapingHandle::spawn(),
+        shaping,
         text_painter: None,
+        client,
         surfaces: Vec::new(),
         exit: false,
         is_pba_candidate,
         ready_signal_sent: false,
-        ready_tx,
-        presented_tx,
+        outbound_tx,
+        generation_id,
         presentation_time,
         queue_handle: qh.clone(),
         active_nonce: None,
         text_input: None,
         text_input_pending: TextInputPending::default(),
         secure_buffer: shared::SecureBuffer::new(),
-        secure_submit_tx,
     };
 
     // Outputs (and the seat) arrive as a burst of registry + wl_seat/wl_output events after
@@ -200,6 +211,19 @@ pub fn run(
     // create one wallpaper_layer surface per monitor) and the seat `bind_text_input` needs.
     event_queue.roundtrip(&mut app)?;
     event_queue.roundtrip(&mut app)?;
+
+    // `oblisk-supervisor-services-dbus.md` § 15.2's Candidate order, which on one thread is just
+    // the order of these statements: evaluate shell.lua, bind the layer-shell surfaces, commit
+    // null buffers (in `bind_and_clear`'s candidate branch), signal ready
+    // (`maybe_send_ready_signal`).
+    //
+    // ponytail: this runs inside the PBA ready window -- no layer surface exists until it
+    // returns, so `maybe_send_ready_signal` cannot fire until after this call, and the
+    // Supervisor's `ready_timeout` is 2s (`supervisor/src/main.rs`'s `PBA_TIMINGS`). The first
+    // `text` node's shaping blocks on `ShapingHandle::shape` until the worker's `FontSystem::new()`
+    // finishes, eating into that same 2s budget. The § 15.2 ordering (evaluate before bind) is
+    // required, not incidental, so this stays sequential -- not a fix, just the accepted cost.
+    app.client.run_startup_evaluation();
 
     app.create_main_bar(&qh);
     app.create_overlay_canvas(&qh);
@@ -209,7 +233,7 @@ pub fn run(
     // Replaces `event_queue.blocking_dispatch(&mut app)?` (used through Phase 13): a real
     // Wayland event might not arrive for a long time after `ActivateDraw` is sent, since nothing
     // else happens on these mostly-static surfaces once staged -- this loop also checks
-    // `activate_rx` on a bounded latency instead of blocking indefinitely on the Wayland
+    // `inbound_rx` on a bounded latency instead of blocking indefinitely on the Wayland
     // connection's fd alone. The existing immediate-draw behavior on first configure (non-
     // candidate mode) is unaffected -- it still happens synchronously inside the `configure`
     // handler, which `dispatch_pending` still calls.
@@ -218,17 +242,32 @@ pub fn run(
         if app.exit {
             break;
         }
-        if let Ok(nonce) = activate_rx.try_recv() {
-            app.activate_draw(nonce);
+        // Drain, not one-per-pass: every `SupervisorFrame` reaches this thread through this
+        // channel now (docs/adr/0039), so a burst of `StateSnapshot` pushes must not be spread
+        // one per 15ms poll tick the way a lone `ActivateDraw` nonce could afford to be.
+        //
+        // ponytail: `try_recv`'s `Err` collapses `Disconnected` and `Empty` alike, so a dead
+        // socket thread (pump exited, see `crate::socket`) reads the same as an idle one -- this
+        // process spins its 15ms poll forever with a live but unreachable shell. Predates this
+        // diff, but the blast radius is wider now that the VM and scene live on this same
+        // surviving thread (docs/adr/0039). Not fixed here: adding an exit path on disconnect is
+        // a policy change outside this refactor's scope.
+        while let Ok(frame) = inbound_rx.try_recv() {
+            if let Some(nonce) = app.client.handle_frame(frame) {
+                app.activate_draw(nonce);
+            }
             if app.exit {
                 break;
             }
+        }
+        if app.exit {
+            break;
         }
         event_queue.flush()?;
         if let Some(guard) = event_queue.prepare_read() {
             let fd = guard.connection_fd();
             let mut fds = [nix::poll::PollFd::new(fd, nix::poll::PollFlags::POLLIN)];
-            // 15ms: bounded latency for activate_rx, irrelevant next to PBA's second-scale
+            // 15ms: bounded latency for inbound_rx, irrelevant next to PBA's second-scale
             // ready/evidence timeouts (supervisor/src/main.rs's `PBA_TIMINGS`).
             if matches!(nix::poll::poll(&mut fds, nix::poll::PollTimeout::from(15u16)), Ok(n) if n > 0) {
                 guard.read()?;
@@ -617,18 +656,18 @@ impl App {
     }
 
     /// § 15.2 points 2-3: once every tracked surface has committed its null buffer, computes
-    /// the full surface_id list (in `self.surfaces`' order) and sends it once via `ready_tx`.
-    /// A no-op if it's already been sent, or if some surface hasn't staged yet -- called on
-    /// every candidate-mode configure, since any of them might be the one that completes the
-    /// set.
+    /// the full surface_id list (in `self.surfaces`' order) and queues it once as a
+    /// `ReadySignal`. A no-op if it's already been sent, or if some surface hasn't staged yet --
+    /// called on every candidate-mode configure, since any of them might be the one that
+    /// completes the set.
     fn maybe_send_ready_signal(&mut self) {
         if self.ready_signal_sent || !self.surfaces.iter().all(|s| s.null_buffered) {
             return;
         }
         self.ready_signal_sent = true;
         let surfaces = self.surfaces.iter().map(|s| s.surface_id.clone()).collect();
-        if let Err(e) = self.ready_tx.send(surfaces) {
-            eprintln!("[oblisk-renderer] failed to send ReadySignal to the socket thread: {e}");
+        if let Err(e) = self.outbound_tx.send(RendererFrame::ReadySignal(ReadySignal { surfaces })) {
+            eprintln!("[oblisk-renderer] failed to queue ReadySignal for the socket thread: {e}");
         }
     }
 
@@ -828,21 +867,44 @@ impl App {
         }
     }
 
-    /// A completed `secure_submit`: hands the accumulated buffer to the socket thread over
-    /// `secure_submit_tx` and starts a fresh, empty buffer for the next entry. The buffer itself
-    /// is `.zeroize()`'d by the socket thread immediately after the wire write completes
-    /// (ADR-0005/ADR-0027), not here -- see `SecureSubmitPayload`'s doc comment.
+    /// A completed `secure_submit`: builds the outgoing frame out of the accumulated buffer and
+    /// queues it for the socket thread. [`secure_submit_frame`] both performs the one sanctioned
+    /// read and leaves `self.secure_buffer` scrubbed and empty, ready for the next entry.
     fn finish_secure_submit(&mut self) {
-        let buffer = std::mem::take(&mut self.secure_buffer);
-        let payload = SecureSubmitPayload {
-            capability: PLACEHOLDER_SECURE_SUBMIT_CAPABILITY.to_string(),
-            action: PLACEHOLDER_SECURE_SUBMIT_ACTION.to_string(),
-            buffer,
-        };
-        if let Err(e) = self.secure_submit_tx.send(payload) {
-            eprintln!("[oblisk-renderer] failed to send SecureSubmit to the socket thread: {e}");
+        let frame = secure_submit_frame(
+            self.generation_id,
+            PLACEHOLDER_SECURE_SUBMIT_CAPABILITY,
+            PLACEHOLDER_SECURE_SUBMIT_ACTION,
+            &mut self.secure_buffer,
+        );
+        if let Err(e) = self.outbound_tx.send(frame) {
+            eprintln!("[oblisk-renderer] failed to queue SecureSubmit for the socket thread: {e}");
         }
     }
+}
+
+/// Builds one `RendererFrame::SecureSubmit` out of `buffer` (build-steps.md Phase 15 item 2;
+/// ADR-0005/ADR-0027).
+///
+/// The one sanctioned read (`expose_secret`) and the explicit `.zeroize()` of the source buffer
+/// sit on adjacent lines here, so the accumulated secret stops existing the instant it has been
+/// copied into the outgoing envelope -- not left to `Drop`, and not left live while the frame
+/// travels to the socket thread. The frame's own plaintext copy is the socket thread's to scrub,
+/// immediately after its wire write (`crate::socket`'s `pump`); that is as close to the write as
+/// this side of the channel can get, and it is where the pre-ADR-0039 code did it too.
+///
+/// A free function, not a `&mut self` method, for the same reason `wallpaper_surface_id` and
+/// `apply_edit` are: it makes the whole read/zeroize contract directly unit-testable, which
+/// nothing involving a live `wl_surface` is.
+fn secure_submit_frame(generation_id: u32, capability: &str, action: &str, buffer: &mut shared::SecureBuffer) -> RendererFrame {
+    let frame = RendererFrame::SecureSubmit(SecureSubmit {
+        generation_id,
+        capability: capability.to_string(),
+        action: action.to_string(),
+        secret: buffer.expose_secret().to_vec(),
+    });
+    buffer.zeroize();
+    frame
 }
 
 /// Zero-sized user-data marker for `zwp_text_input_v3`, following
@@ -911,7 +973,7 @@ impl PresentationTimeHandler for App {
     }
 
     /// § 15.3 point 4: the compositor confirmed `surface`'s committed frame physically hit the
-    /// screen. Forwards a `shared::PresentationEvidence` to the socket thread.
+    /// screen. Queues a `shared::PresentationEvidence` frame for the socket thread to write.
     fn presented(
         &mut self,
         _conn: &Connection,
@@ -932,14 +994,14 @@ impl PresentationTimeHandler for App {
             eprintln!("[oblisk-renderer] presented event for an untracked surface; dropping");
             return;
         };
-        if let Err(e) = self.presented_tx.send(shared::PresentationEvidence { nonce, surface_id }) {
-            eprintln!("[oblisk-renderer] failed to send PresentationEvidence to the socket thread: {e}");
+        if let Err(e) = self.outbound_tx.send(RendererFrame::PresentationEvidence(PresentationEvidence { nonce, surface_id })) {
+            eprintln!("[oblisk-renderer] failed to queue PresentationEvidence for the socket thread: {e}");
         }
     }
 
     /// The content update was never displayed. Logged only -- not a distinct fast-fail signal;
     /// the Supervisor's `evidence_timeout` is what catches this surface never presenting
-    /// (docs/adr/0025 item 6). Deliberately does **not** send anything into `presented_tx`.
+    /// (docs/adr/0025 item 6). Deliberately does **not** queue any `PresentationEvidence`.
     fn discarded(
         &mut self,
         _conn: &Connection,
@@ -1163,6 +1225,28 @@ mod tests {
         apply_edit(&mut buffer, TextInputEdit { commit: Some("hunter".to_string()), submit: false });
         apply_edit(&mut buffer, TextInputEdit { commit: Some("2".to_string()), submit: false });
         assert_eq!(buffer.expose_secret(), b"hunter2");
+    }
+
+    #[test]
+    fn secure_submit_frame_carries_the_accumulated_secret_and_zeroizes_the_buffer_it_read() {
+        // build-steps.md Phase 15 item 2 / ADR-0005/ADR-0027: the frame carries the exact secret
+        // this thread accumulated, tagged with this process's own generation_id, and the source
+        // buffer is scrubbed in the same breath as the read rather than left live.
+        let mut buffer = shared::SecureBuffer::new();
+        buffer.push_str("hunter2");
+
+        let frame = secure_submit_frame(4, "polkit", "authenticate", &mut buffer);
+
+        assert_eq!(
+            frame,
+            RendererFrame::SecureSubmit(SecureSubmit {
+                generation_id: 4,
+                capability: "polkit".to_string(),
+                action: "authenticate".to_string(),
+                secret: b"hunter2".to_vec(),
+            })
+        );
+        assert!(buffer.is_empty(), "the source SecureBuffer must be zeroized as soon as it has been read");
     }
 
     #[test]
