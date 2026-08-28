@@ -1240,6 +1240,10 @@ config cannot hold reactive state of its own and "is this dropdown open" has now
 name is what makes it survive an in-place reload. Phase 22 is the first thing that cannot work
 without it.
 
+> **Built in Phase 21, one phase earlier than this predicted.** Phase 21 is the first thing that
+> cannot work without it: without a writable signal, nothing a `button`'s `on_click` does marks the
+> scene dirty, so no handler is observable. See Phase 21's own note.
+
 Testing: `oblisk-tdd-test-harness.md` § 3.1's headless EGL harness is written for exactly this,
 using `EGL_PLATFORM_SURFACELESS_MESA` to render off-screen and assert pixel values (a `rect` with
 background `#FF0000` writes red). It has never been built. Note two constraints before starting:
@@ -1447,6 +1451,67 @@ an opaque Lua value since ADR-0021 item 2 and has never been called.
    and `PLACEHOLDER_SECURE_SUBMIT_ACTION` constants exist because no per-`textfield` focus tracking
    does. Once a focused node is known, a completed `secure_submit` reads that node's own
    `{ capability, action }` table (§ 5.2 item 8) instead of reporting `"unknown"`.
+
+   > **Built** (docs/adr/0050). Items 1, 2 and 3 across three commits, plus `state(name, initial)`,
+   > which this phase turned out to need a phase earlier than the note below Phase 19 predicted.
+   >
+   > **Hit-testing returns the path, not the topmost node.** The only tree anyone writes is a
+   > `button` whose child is a `text`, so "deepest node under the pointer wins" finds the `text`,
+   > which has no handler, and no button ever fires. `layout::hit::hit_path` returns the whole
+   > chain and each caller scans it from the deep end: `on_click` for the innermost `button`, focus
+   > attribution for the innermost `textfield`. One traversal, two questions, which is why item 3's
+   > `hit_under` returns both answers from one call.
+   >
+   > **`ResolvedNode::rect` is parent-relative**, which ADR-0050 got wrong before it was amended.
+   > The point-to-node comparison needs no conversion, but the button's *absolute* rect -- what
+   > `on_click` is handed, and what Phase 22's positioner wants -- only exists as the sum along the
+   > path. `absolute_rect` is that sum, and it is a second reason the return type is the chain.
+   >
+   > **Containment gates descent, and that turns out to match paint exactly.** A node whose rect
+   > misses the point is not entered and neither are its children, so a node's hittable region is
+   > its intersection with every ancestor's rect. Phase 19 item 17's `intersect_scissor` chain
+   > makes its painted region the same intersection. The two walks agree without either carrying a
+   > clip rect, because they compute the same thing by different means.
+   >
+   > **A click is a press and a release on the same node.** Firing on press is shorter and removes
+   > drag-off-to-cancel, which every toolkit a user has touched has. Identity is the
+   > `(instance_id, rect)` pair, because `ResolvedNode` carries none that survives `to_resolved`;
+   > a re-resolve that moves the button between press and release cancels the click, which is the
+   > answer a real identity would give anyway.
+   >
+   > **`on_click` receives the button's rect.** ADR-0040 and ADR-0049 both say the anchor rect
+   > comes from "the rect `on_click` returns", which read literally is impossible: the engine does
+   > not know which `popup` a click was meant to open. The rect travels out to Lua as
+   > `{ x, y, width, height }` and the config hands it to the popup. ADR-0050 decision 3 settles it.
+   >
+   > **`state(name, initial)` had to come first.** Live signals are read-only to Lua, so nothing an
+   > `on_click` could do marked the scene dirty and no handler was observable at all. Item 1 shipped
+   > an unconditional dirty mark after every handler and labelled it a stopgap; the next commit
+   > built ADR-0044 decision 5 and deleted it. `SignalKind::State` is a fourth variant rather than a
+   > reuse of `Live` because a `set` accepting `Live` would let a config overwrite the SSID the
+   > Supervisor just pushed.
+   >
+   > **A submit with no focused destination now sends nothing.** The deleted placeholders addressed
+   > a password to `"unknown"/"unknown"`, which no capability routes. `zwp_text_input_v3::Leave`
+   > zeroizes too, which is the sharper half: no submit is ever coming for bytes left in
+   > `secure_buffer` when a session ends, so leaving them means the next field's first submit
+   > carries the previous field's characters to the next field's capability.
+   >
+   > **Item 2 binds `wl_keyboard` for `enter`/`leave` alone.** There is no `on_key` in § 5.2 and
+   > ADR-0050 declines to invent one, so the four key callbacks are empty and say so. What focus
+   > buys is the clearing rule: losing it clears the focused field and any armed click.
+   >
+   > Verified live on niri: three injected clicks incrementing a `state` counter with the rect
+   > logged at `997,4 86x24`, matching where the button is drawn; drag-off-to-cancel in both
+   > directions; an in-place reload triggered by a colour edit leaving the counter's value intact,
+   > which is decision 5's reload rule; keyboard enter/leave with the right instance id against a
+   > panel temporarily set to `OnDemand`; a malformed `secure_submit` taking focus with no
+   > destination without killing the shell. Clicks go through a uinput absolute-axis device, since
+   > xdotool cannot reach a native layer surface and libinput's acceleration defeats a relative one.
+   >
+   > **No live coverage: the end-to-end submit, either branch, and the `Leave` zeroize.** A
+   > `textfield` paints nothing and a real `wp-text-input-v3` submit needs an IME, so the unit tests
+   > are the whole evidence there.
 
 Click-outside-to-dismiss for a `panel` stays unsolved: layer surfaces have no compositor-agnostic
 grab, and Quickshell's `HyprlandFocusGrab` works through a Hyprland-specific extension. Popups do
