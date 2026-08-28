@@ -577,6 +577,24 @@ impl RendererClient {
                 self.state.applied_topology = Some(topology);
                 // ADR-0044 decision 2's re-resolve target.
                 self.state.applied_output = Some(output);
+                // An in-place reload changed the retained scene, and until this line nothing told
+                // the screen. `crate::wayland::run`'s poll loop only repaints -- and, since
+                // build-steps.md Phase 20 items 1 and 5, only pushes each surface's `visible`,
+                // in-place layer-shell fields and input region -- when `re_resolve_if_dirty`
+                // reports a change, so an edit that reached here and stopped sat in memory until
+                // some unrelated capability push happened to mark the flag. On a live session that
+                // hid the bug (a push lands every few seconds) and on a static config it would not
+                // have.
+                //
+                // The cost is one redundant `Scene::apply` on the next poll turn, paid once per
+                // file save, which is a human-scale event. That is the right trade against
+                // inventing a second "something changed" signal beside the one flag ADR-0044
+                // decision 2 established -- the same argument `set_instance_size` already makes.
+                // Safe here specifically because an `ApplyPendingReload` only ever follows an
+                // `Unchanged` verdict: this generation's scene *is* the one that should be
+                // mutated, which is the case this module's doc comment point 2 contrasts with a
+                // `TopologyChanged` verdict.
+                self.dirty.mark();
             }
             Err(err) => eprintln!("control-socket client: ApplyPendingReload's stored evaluation failed to apply: {err}"),
         }
@@ -1242,6 +1260,11 @@ mod tests {
         assert!(client.scene.surface("bar@TEST").is_some());
         assert!(client.state.pending.is_none());
         assert_eq!(client.state.applied_topology.as_ref().map(Vec::len), Some(1));
+        // The half that reaches the screen: `crate::wayland::run`'s poll loop repaints and pushes
+        // each surface's `visible`/in-place fields/input region only when `re_resolve_if_dirty`
+        // reports a change, so an in-place reload that applied but left the flag clear would never
+        // show up on a static config.
+        assert!(client.dirty.take(), "an applied in-place reload must mark the scene dirty");
     }
 
     #[test]

@@ -26,10 +26,11 @@ pub mod scene;
 // `apply`/`surface`. `LayoutError`'s variants get a real external caller once something matches
 // on them instead of just logging the `Display` output; `NodeId`/`ResolvedNode` are already
 // exercised via `Scene::surface`'s return type but never named directly outside this module;
-// `overlay_input_regions` is now reachable from the `wl_region` call site (docs/adr/0039 put the
-// scene and the surfaces on one thread) and waits only on its own slice, build-steps.md Phase 20.
+// `ResolvedNode` and `overlay_input_regions` are named directly by `crate::wayland` since
+// build-steps.md Phase 20 item 5 wired the input-region push per surface; `NodeId` is still only
+// exercised through `Scene`'s own API.
 #[allow(unused_imports)]
 pub use node::{Align, EdgeInsets, LayoutError, SizeMode};
-pub use scene::{LogicalSize, Scene};
+pub use scene::{LogicalSize, ResolvedNode, Scene, overlay_input_regions};
 #[allow(unused_imports)]
-pub use scene::{NodeId, ResolvedNode, overlay_input_regions};
+pub use scene::NodeId;

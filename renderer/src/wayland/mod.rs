@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::c_void;
 
-use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
+use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
 use smithay_client_toolkit::dispatch2::Dispatch2;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::presentation_time::{PresentTime, PresentationTimeHandler, PresentationTimeState};
@@ -63,6 +63,37 @@ fn log_bind_failure(surface_id: &str, stage: &str, err: impl std::fmt::Display) 
     eprintln!("[oblisk-renderer] {surface_id}: {stage} failed: {err}");
 }
 
+/// § 6.1's `visible`, as the compositor currently sees it (docs/adr/0038 decision 2: within a live
+/// generation `visible` maps and unmaps a surface without destroying it, so toggling a launcher
+/// costs a commit rather than a process spawn).
+///
+/// Three states rather than two, and the middle one is the protocol's, not a convenience.
+/// `zwlr_layer_surface_v1`'s own description spells the re-map procedure out: "The client can
+/// re-map the surface by performing a commit without any buffer attached, waiting for a configure
+/// event and handling it as usual." Attaching a buffer before that configure arrives would break
+/// that rule, and the same wait applies to a surface's very first map, so both share this state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MapState {
+    /// The resolved root's `visible` is `false`. Either no buffer was ever attached (a panel
+    /// declared invisible at startup) or a null buffer unmapped it. Nothing may be painted here,
+    /// and -- see [`App::unmap`] -- nothing may be *committed* here either, since a commit with no
+    /// buffer attached is exactly how the protocol says a client re-maps.
+    Unmapped,
+    /// The map (or re-map) commit is out and the compositor has not configured the surface yet.
+    AwaitingConfigure,
+    /// Configured: [`App::paint_surface`] may attach a buffer, and its `swap_buffers` is the
+    /// commit every other staged request rides on.
+    Mapped,
+}
+
+impl MapState {
+    /// Whether this surface will put a frame on screen, which is the one predicate PBA's expected
+    /// set and PBA's drawn set must agree on -- see [`presenting_surface_ids`].
+    fn presents(self) -> bool {
+        self != MapState::Unmapped
+    }
+}
+
 struct TrackedSurface {
     layer: LayerSurface,
     bound: Option<BoundSurface>,
@@ -72,12 +103,21 @@ struct TrackedSurface {
     /// and the PBA handshake all share -- before this it was a fixed Rust-owned role's label, which
     /// overlapped none of them, which is why `layout::paint::paint_tree` had no caller.
     surface_id: String,
-    /// The declared `anchor`, kept so [`App::apply_exclusive_zone`] can decide which axis this
-    /// surface reserves along once a `configure` says how large it actually is.
-    anchor: node::Anchor,
-    /// § 6.1's `exclusive`. The zone itself is derived at configure time, not stored: see
-    /// [`exclusive_zone_for`].
-    exclusive: bool,
+    /// The `panel` spec this surface's layer-shell state was last set from -- the diff baseline
+    /// [`spec_update`] compares a freshly resolved root against, so a re-resolve pushes only the
+    /// fields that actually moved (docs/adr/0038 decision 2, build-steps.md Phase 20 item 1).
+    ///
+    /// Also the standing answer to "what is this surface's anchor and is it exclusive", which
+    /// [`App::apply_exclusive_zone`] needs once a `configure` says how large the surface is.
+    applied_spec: PanelSpec,
+    /// This surface's output's logical size, the basis a `SizeMode::Percent` resolves against.
+    ///
+    /// Kept per surface rather than read back from `SurfaceInstance::available`, which is the same
+    /// number only until the first `configure`: `set_instance_size` then replaces `available` with
+    /// the size the compositor granted, so resolving a percent against it on a later re-resolve
+    /// would take a percentage of a percentage and shrink the surface on every push.
+    output_size: layout::LogicalSize,
+    map_state: MapState,
     /// Set once this surface's null buffer has been committed (PBA candidate mode only, § 15.2
     /// points 2-3). Irrelevant, always `false`, outside candidate mode.
     null_buffered: bool,
@@ -309,8 +349,16 @@ pub fn run(
         // nothing is happening instead of waking on the 15ms poll below. This is the other half --
         // the one that makes a capability push actually reach the screen at all, rather than
         // stopping at a resolved tree in memory. Item 9 still has to be built on top of it.
+        // Two statements, in this order, because they are the two halves of one commit. The first
+        // *stages* everything the re-resolve changed about each surface itself -- the layer-shell
+        // fields layer-shell permits changing in place, the input region, and whether the surface
+        // is mapped at all (docs/adr/0038 decision 2, build-steps.md Phase 20 items 1 and 5). All
+        // of that is double-buffered `wl_surface` state, so none of it takes effect until a
+        // commit, and the second statement's `swap_buffers` is that commit. Committing per field
+        // instead would show the compositor a half-updated surface between requests.
         if app.client.re_resolve_if_dirty() {
-            app.repaint_bound_surfaces();
+            app.apply_resolved_surface_state();
+            app.repaint_mapped_surfaces();
         }
         for nonce in draw_nonces {
             app.activate_draw(nonce);
@@ -493,6 +541,76 @@ fn exclusive_zone_for(anchor: node::Anchor, configured_size: (u32, u32)) -> i32 
     }
 }
 
+/// The surface ids a PBA Candidate both announces in its `ReadySignal` and then draws on
+/// `ActivateDraw` -- one function, called from [`App::maybe_send_ready_signal`], and the same
+/// [`MapState::presents`] predicate [`App::activate_draw`] skips on.
+///
+/// The two sets have to be *identical*, and both directions of a mismatch are fatal in
+/// `supervisor/src/reload.rs`'s `drive_handshake`. Announcing a surface that never draws leaves
+/// `while collected.len() < expected.len()` waiting for evidence that cannot arrive, until
+/// `evidence_timeout` fires. Drawing one that was not announced trips
+/// `!expected.contains(&surface_id)` and aborts the Candidate as `PbaFailure::UnexpectedEvidence`.
+///
+/// A panel declared `visible = false` is what forces the filter: docs/adr/0038 decision 2 still
+/// *creates* it, so it exists as a `TrackedSurface` and stages like every other surface, but it
+/// never presents a frame, so it must not be in the expected set. An empty result is legal, not a
+/// degenerate case -- `drive_handshake`'s collection loop exits immediately on an empty expected
+/// set, so a generation whose every panel starts hidden completes its handshake.
+fn presenting_surface_ids<'a>(surfaces: impl Iterator<Item = (&'a str, MapState)>) -> Vec<String> {
+    surfaces
+        .filter(|(_, state)| state.presents())
+        .map(|(id, _)| id.to_string())
+        .collect()
+}
+
+/// The layer-shell requests one *live* surface needs after a re-resolve changed its `panel`
+/// properties -- `margin`, `keyboard_interactivity`, size, and the `exclusive` flag the zone is
+/// derived from (docs/adr/0038 decision 2, § 6.1, build-steps.md Phase 20 item 1). `None` per
+/// field means "unchanged, send nothing": these are all double-buffered, so re-sending an
+/// unchanged value is not wrong, just noise on the wire that the diff exists to avoid.
+///
+/// [`SurfaceTopology`](node::SurfaceTopology)'s five fields -- `id`, `layer`, `anchor`, `monitor`,
+/// `namespace` -- are deliberately absent, and that is a statement rather than an omission. The
+/// protocol cannot change a surface's namespace or output at all (`get_layer_surface` consumes
+/// both), and an edit to any of the five is a topology change `crate::socket`'s `handle_reevaluate`
+/// routes to a generation swap, where the Candidate builds its own surfaces from its own
+/// evaluation. So they cannot legitimately differ between `applied` and `fresh` here: every one of
+/// them is `is_structural_property`, copied through raw and refused a `Signal`
+/// (`layout::node::reject_signal_in_structural_field`), precisely so a live surface can never be
+/// asked to move.
+///
+/// `output` is the surface's *output's* logical size, not its configured size -- see
+/// [`TrackedSurface::output_size`] for why the two must not be confused.
+#[derive(Debug, Default, PartialEq)]
+struct SpecUpdate {
+    margin: Option<node::EdgeInsets>,
+    keyboard_interactivity: Option<node::KeyboardInteractivity>,
+    size: Option<(u32, u32)>,
+    /// § 6.1's `exclusive` boolean. The zone itself is not here because it is not a spec field:
+    /// it is derived from the size the compositor configured (see [`exclusive_zone_for`]), so
+    /// this only reports that the derivation's *input* flipped.
+    exclusive: Option<bool>,
+}
+
+fn spec_update(applied: &PanelSpec, fresh: &PanelSpec, output: layout::LogicalSize) -> SpecUpdate {
+    // Compared as the pixel pair that actually goes on the wire, not as the two `SizeMode`s: a
+    // percent and an equivalent pixel count are the same request, and `Fill` and `Content` are
+    // both the protocol's `0`.
+    let extent = |spec: &PanelSpec| {
+        (
+            layer_extent_for(spec.width, output.width),
+            layer_extent_for(spec.height, output.height),
+        )
+    };
+    SpecUpdate {
+        margin: (fresh.margin != applied.margin).then_some(fresh.margin),
+        keyboard_interactivity: (fresh.keyboard_interactivity != applied.keyboard_interactivity)
+            .then_some(fresh.keyboard_interactivity),
+        size: (extent(fresh) != extent(applied)).then(|| extent(fresh)),
+        exclusive: (fresh.exclusive != applied.exclusive).then_some(fresh.exclusive),
+    }
+}
+
 /// Parameters for [`App::spawn_layer`]; bundled so the helper stays under clippy's
 /// argument-count limit while still taking each surface's divergent bits.
 struct LayerSpec<'a> {
@@ -634,12 +752,31 @@ impl App {
             );
             layer.commit();
 
+            // § 6.1's `visible` at its starting value. A panel declared `visible = false` is still
+            // created (docs/adr/0038 decision 2: `visible` maps and unmaps, it does not create and
+            // destroy). It still performs the initial commit directly above, which
+            // `get_layer_surface` requires before any configure arrives and which does not map
+            // anything on its own; what makes it invisible is that no buffer is ever attached, and
+            // `MapState::Unmapped` is what keeps `paint_surface` from attaching one. No *unmap*
+            // commit is needed or wanted here, since on an already-bufferless surface that is the
+            // protocol's re-map procedure rather than an unmap -- see [`App::remap`], which
+            // measured both sides of this distinction against a real compositor.
+            //
+            // A surface whose instance has no resolved tree (the startup apply failed) is treated
+            // as visible, matching every other "keep the shell up" fallback in this file.
+            let visible = self
+                .client
+                .scene()
+                .surface(&instance.instance_id)
+                .is_none_or(|tree| tree.visible);
+
             self.surfaces.push(TrackedSurface {
                 layer,
                 bound: None,
                 surface_id: instance.instance_id.clone(),
-                anchor: spec.topology.anchor,
-                exclusive: spec.exclusive,
+                applied_spec: spec.clone(),
+                output_size: instance.available,
+                map_state: if visible { MapState::AwaitingConfigure } else { MapState::Unmapped },
                 null_buffered: false,
                 configured_size: (0, 0),
             });
@@ -676,18 +813,52 @@ impl App {
             &self.surfaces[index].surface_id,
             layout::LogicalSize { width: width as f32, height: height as f32 },
         );
+        // The configure the protocol requires before any buffer may be attached, whether this is
+        // the surface's first one or the one completing a re-map (`zwlr_layer_surface_v1`'s
+        // description: "waiting for a configure event and handling it as usual"). Everything below
+        // this line is allowed to draw; nothing above it was.
+        if self.surfaces[index].map_state == MapState::AwaitingConfigure {
+            self.surfaces[index].map_state = MapState::Mapped;
+        }
         self.apply_exclusive_zone(index);
+        // The other half of the poll loop's `re_resolve_if_dirty` hook, reached from the other
+        // direction. It matters most on the *first* configure: no input region has ever been set
+        // at that point, and a fullscreen transparent panel whose configured size happens to equal
+        // its output's marks the scene clean, so no later re-resolve would arrive to set one and
+        // the surface would swallow every click meant for the window behind it.
+        self.apply_resolved_state(index);
 
         if self.is_pba_candidate {
-            if !self.surfaces[index].null_buffered {
-                // verified against wayland_client::protocol::wl_surface::WlSurface's generated
-                // API: `attach(&self, buffer: Option<&wl_buffer::WlBuffer>, x: i32, y: i32)`,
-                // `commit(&self)`.
-                self.surfaces[index].layer.wl_surface().attach(None, 0, 0);
+            if self.surfaces[index].map_state.presents() {
+                if !self.surfaces[index].null_buffered {
+                    // verified against wayland_client::protocol::wl_surface::WlSurface's generated
+                    // API: `attach(&self, buffer: Option<&wl_buffer::WlBuffer>, x: i32, y: i32)`,
+                    // `commit(&self)`.
+                    self.surfaces[index].layer.wl_surface().attach(None, 0, 0);
+                    self.surfaces[index].null_buffered = true;
+                }
+                // Committed on every candidate-mode configure rather than only the first: a
+                // Candidate has no `swap_buffers` to ride on until `ActivateDraw`, so this is the
+                // only commit that can carry the state staged directly above.
                 self.surfaces[index].layer.wl_surface().commit();
+            } else {
+                // `visible = false`: no buffer was ever attached, so this surface is *already* in
+                // the invisible state § 15.2 point 3 asks a Candidate to reach, and committing it
+                // is exactly the protocol's re-map procedure. Marked staged without touching the
+                // wire, so `maybe_send_ready_signal`'s "every surface has staged" gate still
+                // completes -- the surface is then filtered out of the announced set itself, by
+                // `presenting_surface_ids`.
                 self.surfaces[index].null_buffered = true;
             }
             self.maybe_send_ready_signal();
+            return;
+        }
+
+        // `!= Mapped` rather than "is unmapped": `apply_resolved_state` directly above may have
+        // just issued a *re-map* commit, and the protocol's own wait applies to that too -- the
+        // configure answering it has not arrived yet, so no buffer may be attached in this pass.
+        // The unmapped case additionally takes deliberately no commit here: see [`App::unmap`].
+        if self.surfaces[index].map_state != MapState::Mapped {
             return;
         }
 
@@ -707,18 +878,259 @@ impl App {
         self.paint_surface(index);
     }
 
-    /// `set_exclusive_zone` for a surface the config marked `exclusive`, computed from the size
-    /// the compositor just configured (see [`exclusive_zone_for`]) and committed so the
-    /// compositor acts on it. A non-exclusive surface is left alone entirely: the protocol's
-    /// default zone is already 0, so setting it would be a no-op request per configure.
+    /// `set_exclusive_zone`, computed from the size the compositor configured (see
+    /// [`exclusive_zone_for`]) for a surface the config marked `exclusive`, and an explicit `0`
+    /// for one it did not.
+    ///
+    /// The explicit `0` is what changed with build-steps.md Phase 20 item 1. This used to leave a
+    /// non-exclusive surface alone entirely, on the correct-at-the-time reasoning that the
+    /// protocol's default zone is already 0 -- true only while `exclusive` could never change.
+    /// It is a `Signal`-bindable property (docs/adr/0038 decision 2 lists the exclusive zone among
+    /// the fields layer-shell accepts on a live surface), so a dock turning `exclusive = false`
+    /// has to *take back* the zone it previously reserved, and the default is no help once a real
+    /// value has been sent.
+    ///
+    /// Stages only; the caller's commit carries it. Committing here would have been wrong in two
+    /// separate ways once `visible` landed: it would split one surface update across several
+    /// commits, and on an unmapped surface a commit with no buffer attached is the protocol's own
+    /// re-map procedure (see [`App::unmap`]).
     fn apply_exclusive_zone(&mut self, index: usize) {
         let tracked = &self.surfaces[index];
-        if !tracked.exclusive {
+        let zone = if tracked.applied_spec.exclusive {
+            exclusive_zone_for(tracked.applied_spec.topology.anchor, tracked.configured_size)
+        } else {
+            0
+        };
+        tracked.layer.set_exclusive_zone(zone);
+    }
+
+    /// [`App::apply_resolved_state`] for every tracked surface, which is what the poll loop calls
+    /// after a re-resolve actually changed the retained scene. Every surface, not the changed
+    /// ones, for exactly the reason [`App::repaint_bound_surfaces`] gives: ADR-0044 decision 2's
+    /// dirty flag is one flag for the whole scene.
+    fn apply_resolved_surface_state(&mut self) {
+        for index in 0..self.surfaces.len() {
+            self.apply_resolved_state(index);
+        }
+    }
+
+    /// Pushes one surface's freshly resolved root back to the compositor: the layer-shell fields
+    /// layer-shell permits changing on a live surface, the input region, and whether the surface
+    /// is mapped at all (docs/adr/0038 decision 2, § 6.1's `visible` and `margin` rows,
+    /// build-steps.md Phase 20 items 1 and 5).
+    ///
+    /// All three are double-buffered `wl_surface` state and are therefore *staged* here, not
+    /// committed: the caller's commit -- `paint_surface`'s `swap_buffers` on a mapped surface, the
+    /// candidate branch's own commit on a staging Candidate -- carries the whole update at once.
+    /// The two exceptions are the map and unmap transitions, which are commits by definition and
+    /// perform their own.
+    fn apply_resolved_state(&mut self, index: usize) {
+        let surface_id = self.surfaces[index].surface_id.clone();
+        // Owned, so the immutable borrow of `self.client` ends before the `&mut self` calls below.
+        let Some(tree) = self.client.scene().surface(&surface_id) else {
+            // No resolved tree for this instance: a startup whose apply failed, or a re-resolve
+            // that rolled back (`Scene::apply` restores its pre-call state on error). Every field
+            // stays at what was last applied, which is the same "keep the last good frame"
+            // principle `re_resolve_if_dirty` already follows -- pushing protocol defaults here
+            // would resize and un-anchor a working surface over a transient bad capability value.
+            return;
+        };
+
+        match node::panel_spec(&tree.properties) {
+            Ok(fresh) => self.apply_spec_change(index, fresh),
+            Err(err) => eprintln!(
+                "[oblisk-renderer] {surface_id}: re-resolved panel properties are invalid, keeping the last applied ones: {err}"
+            ),
+        }
+        self.apply_input_region(index, &tree);
+        self.apply_visibility(index, tree.visible);
+    }
+
+    /// Diffs one surface's freshly resolved `panel` spec against the one its layer-shell state was
+    /// last set from and sends only what moved (see [`spec_update`] for which fields, and for why
+    /// the topology ones are not among them).
+    fn apply_spec_change(&mut self, index: usize, mut fresh: PanelSpec) {
+        let tracked = &self.surfaces[index];
+        let update = spec_update(&tracked.applied_spec, &fresh, tracked.output_size);
+
+        if let Some(margin) = update.margin {
+            self.surfaces[index].layer.set_margin(
+                margin.top as i32,
+                margin.right as i32,
+                margin.bottom as i32,
+                margin.left as i32,
+            );
+        }
+        if let Some(mode) = update.keyboard_interactivity {
+            self.surfaces[index]
+                .layer
+                .set_keyboard_interactivity(keyboard_interactivity_for(mode));
+        }
+        if let Some(size) = update.size {
+            // The same guard `create_panels` runs, and it has to run again here rather than only
+            // at creation: `width`/`height` are ordinary resolvable properties, so a `Signal` can
+            // turn a fixed height into `"Fill"` at runtime, and a `set_size` of 0 on a singly
+            // anchored axis is a protocol error that kills the connection and the whole shell with
+            // it (see [`ambiguous_zero_axis`]).
+            if let Some(axis) = ambiguous_zero_axis(size, fresh.topology.anchor) {
+                eprintln!(
+                    "[oblisk-renderer] surface {:?} resolved to a {axis} of 0 without anchoring both {axis} edges, \
+                     which layer-shell rejects as a protocol error; keeping its previous size. Give it an explicit {axis}, or anchor both edges.",
+                    self.surfaces[index].surface_id
+                );
+                // The refused size must not enter the baseline, or the next re-resolve would see
+                // no change and never retry the size the config eventually settles on.
+                fresh.width = self.surfaces[index].applied_spec.width;
+                fresh.height = self.surfaces[index].applied_spec.height;
+            } else {
+                self.surfaces[index].layer.set_size(size.0, size.1);
+            }
+        }
+
+        // Before `apply_exclusive_zone`, which reads `exclusive` and the anchor off it.
+        self.surfaces[index].applied_spec = fresh;
+        if update.exclusive.is_some() || update.size.is_some() {
+            self.apply_exclusive_zone(index);
+        }
+    }
+
+    /// `wl_surface::set_input_region` from this surface's own resolved tree (§ 5.1,
+    /// docs/adr/0038 decision 5, build-steps.md Phase 20 item 5), closing docs/adr/0023 item 5.
+    ///
+    /// Per surface, not for one overlay. Three cases fall out of the same code rather than needing
+    /// three branches, which is the generalization the ADR asks for: a root with no visible
+    /// children yields an empty region and every click passes through to whatever is behind it
+    /// (the boot-time empty region the deleted `create_overlay_canvas` set, now the ordinary
+    /// answer for any surface with nothing drawn in it); a root whose child fills it yields a
+    /// region covering the surface, which is what the protocol default already is, so a tightly
+    /// sized bar is a no-op and deliberately gets no special case; and anything in between -- a
+    /// fullscreen transparent panel holding one small OSD -- gets exactly its visible content.
+    ///
+    /// The scale is `1.0`, matching `paint_surface`'s for the same reason its `ponytail:` gives:
+    /// nothing calls `set_buffer_scale`, so surface-local coordinates and the framebuffer are both
+    /// at scale 1, and passing a real scale here alone would put the input region on a physical
+    /// grid the drawn content is not on.
+    ///
+    /// Not diffed against the last region pushed, unlike the spec fields: this only runs when the
+    /// scene actually re-resolved, and the full GPU repaint that follows on the same turn costs
+    /// orders of magnitude more than one `wl_region` round of requests.
+    fn apply_input_region(&mut self, index: usize, tree: &layout::ResolvedNode) {
+        let region = match Region::new(&self.compositor_state) {
+            Ok(region) => region,
+            Err(e) => {
+                // Not fatal, unlike `create_overlay_canvas`'s version of this: the only failure
+                // `Region::new` reports is a missing `wl_compositor`, which cannot happen here
+                // because `CompositorState::bind` in `run` already succeeded against it. Killing
+                // a working shell over an unreachable branch is the worse trade.
+                log_bind_failure(&self.surfaces[index].surface_id.clone(), "wl_compositor::create_region", e);
+                return;
+            }
+        };
+        for rect in layout::overlay_input_regions(tree, 1.0) {
+            region.add(rect.x0, rect.y0, rect.x1 - rect.x0, rect.y1 - rect.y0);
+        }
+        self.surfaces[index].layer.set_input_region(Some(region.wl_region()));
+        // `region` drops here, destroying the `wl_region` -- `wl_surface::set_input_region` copies
+        // its contents, so the object has no reason to outlive the request. Same shape the deleted
+        // `create_overlay_canvas` used.
+    }
+
+    /// Applies § 6.1's `visible` to a live surface (docs/adr/0038 decision 2).
+    ///
+    /// **Frozen for a PBA Candidate**, and that is the one line in this file where a mistake hangs
+    /// the shell rather than failing a test. `maybe_send_ready_signal` announces the surfaces this
+    /// process will present and `activate_draw` draws exactly that set; if `visible` could move
+    /// between those two points -- and it can, since § 15.2 point 2 hydrates a Candidate with
+    /// cached capability state precisely in that window -- the announced set and the drawn set
+    /// would disagree, which is either an `evidence_timeout` hang or a `PbaFailure::
+    /// UnexpectedEvidence` abort (see [`presenting_surface_ids`]). Freezing makes them agree by
+    /// construction rather than by two functions being kept in step by hand. The deferred change
+    /// applies on the first re-resolve after promotion clears `is_pba_candidate`, which is the
+    /// next capability push; a Candidate's whole life is the handshake, so there is nothing else
+    /// that window could be for.
+    fn apply_visibility(&mut self, index: usize, visible: bool) {
+        if self.is_pba_candidate {
             return;
         }
-        let zone = exclusive_zone_for(tracked.anchor, tracked.configured_size);
-        tracked.layer.set_exclusive_zone(zone);
-        tracked.layer.commit();
+        match (self.surfaces[index].map_state, visible) {
+            (MapState::Unmapped, true) => self.remap(index),
+            (MapState::AwaitingConfigure | MapState::Mapped, false) => self.unmap(index),
+            _ => {}
+        }
+    }
+
+    /// `zwlr_layer_surface_v1`'s own unmap procedure, taken literally: "Attaching a null buffer to
+    /// a layer surface unmaps it." One commit, no destroyed protocol objects, which is the whole
+    /// point of docs/adr/0038 decision 2 -- toggling a launcher costs this instead of a process
+    /// spawn.
+    ///
+    /// This is the commit the staged state above it rides on, and it is the *only* commit an
+    /// unmapped surface ever gets. Nothing else in this file may commit one, because the same
+    /// description spells out that "the client can re-map the surface by performing a commit
+    /// without any buffer attached" -- a stray bookkeeping commit on an unmapped surface would
+    /// silently re-map it.
+    fn unmap(&mut self, index: usize) {
+        let tracked = &self.surfaces[index];
+        tracked.layer.wl_surface().attach(None, 0, 0);
+        tracked.layer.wl_surface().commit();
+        self.surfaces[index].map_state = MapState::Unmapped;
+        eprintln!("[oblisk-renderer] {} unmapped: visible = false", self.surfaces[index].surface_id);
+    }
+
+    /// The re-map half: "The client can re-map the surface by performing a commit without any
+    /// buffer attached, waiting for a configure event and handling it as usual."
+    ///
+    /// Every layer-shell field is re-sent, not just the ones a diff would find, because the same
+    /// description says an unmapped surface "returns to the state it had right after
+    /// layer_shell.get_layer_surface". `anchor` is included for that reason alone: it is a
+    /// topology field that can never *change* on a live surface, but it can be reset out from
+    /// under one. The exclusive zone is not re-sent here because it is not a spec field -- the
+    /// configure re-derives it from the size the compositor grants.
+    ///
+    /// `set_size` needs no [`ambiguous_zero_axis`] guard: `applied_spec`'s size is only ever one
+    /// that already passed it, in `create_panels` or in [`App::apply_spec_change`], which both
+    /// refuse rather than store a size the protocol would reject.
+    ///
+    /// **Two starting states share this one request sequence and end in different `MapState`s**,
+    /// and the difference is the compositor's, not a choice made here. Measured against niri with
+    /// `WAYLAND_DEBUG=1`:
+    ///
+    /// - A panel declared `visible = false` at startup was *never mapped*. It performed the
+    ///   initial commit `get_layer_surface` requires, was configured, and was acked; it simply
+    ///   never attached a buffer. Its layer-surface state was never reset, so the commit below
+    ///   changes nothing the compositor has an opinion about and **no configure comes back**. The
+    ///   surface is already in the "acked a configure, may attach a buffer" state the protocol
+    ///   describes, so it goes straight to [`MapState::Mapped`] and the next
+    ///   [`App::repaint_mapped_surfaces`] binds and draws it.
+    /// - A surface that really was mapped and then null-buffered *has* been reset, so this commit
+    ///   is a fresh initial commit and a configure does come back. Attaching a buffer before
+    ///   acking it is exactly what `get_layer_surface`'s description forbids, so that case waits
+    ///   in [`MapState::AwaitingConfigure`] and lets `bind_and_clear` handle the configure with no
+    ///   re-map special case at all.
+    ///
+    /// `bound.is_some()` is the honest test for which of the two this is: an EGL surface exists
+    /// only for a surface that has been through the bind-and-paint path, and every trip through it
+    /// ends in a `swap_buffers`, so the two questions are the same question.
+    fn remap(&mut self, index: usize) {
+        let was_mapped = self.surfaces[index].bound.is_some();
+        let tracked = &self.surfaces[index];
+        let spec = &tracked.applied_spec;
+        tracked.layer.set_anchor(anchor_for(spec.topology.anchor));
+        tracked.layer.set_size(
+            layer_extent_for(spec.width, tracked.output_size.width),
+            layer_extent_for(spec.height, tracked.output_size.height),
+        );
+        tracked.layer.set_keyboard_interactivity(keyboard_interactivity_for(spec.keyboard_interactivity));
+        tracked.layer.set_margin(
+            spec.margin.top as i32,
+            spec.margin.right as i32,
+            spec.margin.bottom as i32,
+            spec.margin.left as i32,
+        );
+        tracked.layer.wl_surface().commit();
+        self.surfaces[index].map_state =
+            if was_mapped { MapState::AwaitingConfigure } else { MapState::Mapped };
+        eprintln!("[oblisk-renderer] {} mapping: visible = true", self.surfaces[index].surface_id);
     }
 
     /// Creates this surface's `wl_egl_window` and EGL window surface against the shared context if
@@ -815,6 +1227,14 @@ impl App {
     /// physical size, and this argument -- since passing a scale here alone would snap geometry to
     /// a physical grid the framebuffer does not have.
     fn paint_surface(&mut self, index: usize) {
+        // An unmapped surface has no buffer, and one still waiting for the configure that follows
+        // its (re-)map commit may not attach one yet (docs/adr/0038 decision 2; see [`MapState`]).
+        // `swap_buffers` at the bottom of this function is that attach *and* the commit carrying
+        // it, so this guard is what keeps `visible = false` from quietly re-mapping the surface it
+        // just hid.
+        if self.surfaces[index].map_state != MapState::Mapped {
+            return;
+        }
         let Some(egl_surface) = self.surfaces[index].bound.as_ref().map(|b| b.egl_surface) else {
             return;
         };
@@ -880,14 +1300,31 @@ impl App {
         }
     }
 
-    /// Repaints every surface that has been bound, after a re-resolve actually changed the scene.
-    /// Every surface, not the changed ones: ADR-0044 decision 2's dirty flag is one flag for the
-    /// whole scene, so which surfaces changed is not information this process has (that flag's own
+    /// Repaints every mapped surface, after a re-resolve actually changed the scene. Every
+    /// surface, not the changed ones: ADR-0044 decision 2's dirty flag is one flag for the whole
+    /// scene, so which surfaces changed is not information this process has (that flag's own
     /// `ponytail:` records the same ceiling).
-    fn repaint_bound_surfaces(&mut self) {
+    ///
+    /// This is also the commit that carries everything [`App::apply_resolved_surface_state`]
+    /// staged for each surface on the same poll turn -- `paint_surface` ends in `swap_buffers`,
+    /// which is a `wl_surface` commit.
+    fn repaint_mapped_surfaces(&mut self) {
         for index in 0..self.surfaces.len() {
-            if self.surfaces[index].bound.is_none() {
+            if self.surfaces[index].map_state != MapState::Mapped {
                 continue;
+            }
+            if self.surfaces[index].bound.is_none() {
+                // A panel that started `visible = false` and has just been mapped by a `visible`
+                // flip has no EGL surface yet: it was created and configured, but the configure
+                // path returned before `ensure_bound` because there was nothing to draw into it.
+                // This is the one place that bind can happen, since no further configure is coming
+                // (see [`App::remap`]).
+                //
+                // Never for a Candidate, whatever the scene does: § 15.2 point 3 keeps it
+                // invisible until `ActivateDraw`, and `activate_draw_one` is its only bind.
+                if self.is_pba_candidate || !self.ensure_bound(index) {
+                    continue;
+                }
             }
             self.paint_surface(index);
             if self.exit {
@@ -896,29 +1333,42 @@ impl App {
         }
     }
 
-    /// § 15.2 points 2-3: once every tracked surface has committed its null buffer, computes
-    /// the full surface_id list (in `self.surfaces`' order) and queues it once as a
-    /// `ReadySignal`. A no-op if it's already been sent, or if some surface hasn't staged yet --
-    /// called on every candidate-mode configure, since any of them might be the one that
-    /// completes the set.
+    /// § 15.2 points 2-3: once every tracked surface has staged, computes the surface_id list the
+    /// Supervisor will expect presentation evidence from and queues it once as a `ReadySignal`. A
+    /// no-op if it's already been sent, or if some surface hasn't staged yet -- called on every
+    /// candidate-mode configure, since any of them might be the one that completes the set.
+    ///
+    /// Two different sets, deliberately. The *gate* is every surface, because a Candidate is not
+    /// ready until each one has been dealt with. The *payload* is only the surfaces that will
+    /// present a frame, because a panel declared `visible = false` never will -- see
+    /// [`presenting_surface_ids`] for what each direction of a mismatch costs.
     fn maybe_send_ready_signal(&mut self) {
         if self.ready_signal_sent || !self.surfaces.iter().all(|s| s.null_buffered) {
             return;
         }
         self.ready_signal_sent = true;
-        let surfaces = self.surfaces.iter().map(|s| s.surface_id.clone()).collect();
+        let surfaces = presenting_surface_ids(self.surfaces.iter().map(|s| (s.surface_id.as_str(), s.map_state)));
         if let Err(e) = self.outbound_tx.send(RendererFrame::ReadySignal(ReadySignal { surfaces })) {
             eprintln!("[oblisk-renderer] failed to queue ReadySignal for the socket thread: {e}");
         }
     }
 
-    /// § 15.3: draws every tracked surface's first real frame in response to `ActivateDraw`,
-    /// requesting `wp_presentation_feedback` for each. `nonce` is remembered as `active_nonce`
+    /// § 15.3: draws the first real frame in response to `ActivateDraw`, requesting
+    /// `wp_presentation_feedback` for each surface drawn. `nonce` is remembered as `active_nonce`
     /// so the later `presented` callback (this file's `PresentationTimeHandler` impl) knows
     /// which handshake attempt to tag its evidence with.
+    ///
+    /// The surfaces that present, not every tracked surface: exactly the set
+    /// `maybe_send_ready_signal` announced, filtered by the same [`MapState::presents`] predicate
+    /// over a `map_state` that [`App::apply_visibility`] holds still for a Candidate's whole life.
+    /// That is what makes the announced set and the drawn set identical rather than merely similar
+    /// -- see [`presenting_surface_ids`] for why "similar" is a hang.
     fn activate_draw(&mut self, nonce: u64) {
         self.active_nonce = Some(nonce);
         for index in 0..self.surfaces.len() {
+            if !self.surfaces[index].map_state.presents() {
+                continue;
+            }
             self.activate_draw_one(index, nonce);
             if self.exit {
                 return;
@@ -1381,6 +1831,122 @@ mod tests {
         assert_eq!(exclusive_zone_for(node::Anchor::default(), (400, 300)), 0);
         let corner = node::Anchor { top: true, right: false, bottom: false, left: true };
         assert_eq!(exclusive_zone_for(corner, (400, 300)), 0);
+    }
+
+    fn panel(id: &str) -> PanelSpec {
+        PanelSpec {
+            topology: node::SurfaceTopology {
+                id: id.to_string(),
+                layer: LayerKind::Top,
+                anchor: node::Anchor { top: true, right: true, bottom: false, left: true },
+                monitor: "All".to_string(),
+                namespace: format!("oblisk-{id}"),
+            },
+            keyboard_interactivity: node::KeyboardInteractivity::None,
+            exclusive: true,
+            margin: node::EdgeInsets::default(),
+            width: SizeMode::Fill,
+            height: SizeMode::Pixels(32.0),
+        }
+    }
+
+    fn output_1080p() -> layout::LogicalSize {
+        layout::LogicalSize { width: 1920.0, height: 1080.0 }
+    }
+
+    #[test]
+    fn the_ready_signal_announces_every_surface_that_will_present_and_no_others() {
+        // The one place a mistake hangs the shell instead of failing a test: `activate_draw` draws
+        // exactly this set, `run_pba` expects evidence from exactly this set, and both directions
+        // of a mismatch abort or time out the Candidate.
+        let surfaces = [
+            ("bar@eDP-1", MapState::Mapped),
+            ("launcher@eDP-1", MapState::Unmapped),
+            ("dock@DP-1", MapState::AwaitingConfigure),
+        ];
+        assert_eq!(
+            presenting_surface_ids(surfaces.into_iter()),
+            ["bar@eDP-1", "dock@DP-1"],
+            "a panel declared `visible = false` is created and staged, but never presents a frame, so it must not be expected to"
+        );
+    }
+
+    #[test]
+    fn a_generation_whose_every_panel_starts_hidden_announces_nothing_at_all() {
+        // Legal, not degenerate: `drive_handshake`'s `while collected.len() < expected.len()` loop
+        // exits immediately on an empty expected set, so this Candidate completes its handshake.
+        let surfaces = [("launcher@eDP-1", MapState::Unmapped)];
+        assert!(presenting_surface_ids(surfaces.into_iter()).is_empty());
+    }
+
+    #[test]
+    fn a_re_resolve_that_changed_nothing_sends_no_requests_at_all() {
+        let applied = panel("bar");
+        assert_eq!(spec_update(&applied, &applied.clone(), output_1080p()), SpecUpdate::default());
+    }
+
+    #[test]
+    fn each_in_place_field_is_pushed_on_its_own_and_only_when_it_moved() {
+        let applied = panel("bar");
+
+        let mut moved_margin = applied.clone();
+        moved_margin.margin = node::EdgeInsets { top: 12.0, right: 12.0, bottom: 0.0, left: 0.0 };
+        assert_eq!(
+            spec_update(&applied, &moved_margin, output_1080p()),
+            SpecUpdate { margin: Some(moved_margin.margin), ..SpecUpdate::default() }
+        );
+
+        let mut takes_typing = applied.clone();
+        takes_typing.keyboard_interactivity = node::KeyboardInteractivity::Exclusive;
+        assert_eq!(
+            spec_update(&applied, &takes_typing, output_1080p()),
+            SpecUpdate {
+                keyboard_interactivity: Some(node::KeyboardInteractivity::Exclusive),
+                ..SpecUpdate::default()
+            }
+        );
+
+        let mut stops_reserving = applied.clone();
+        stops_reserving.exclusive = false;
+        assert_eq!(
+            spec_update(&applied, &stops_reserving, output_1080p()),
+            SpecUpdate { exclusive: Some(false), ..SpecUpdate::default() }
+        );
+    }
+
+    #[test]
+    fn a_size_change_is_diffed_as_the_pixels_that_go_on_the_wire_not_as_the_size_mode() {
+        let applied = panel("bar");
+
+        let mut taller = applied.clone();
+        taller.height = SizeMode::Pixels(48.0);
+        assert_eq!(
+            spec_update(&applied, &taller, output_1080p()),
+            SpecUpdate { size: Some((0, 48)), ..SpecUpdate::default() },
+            "`Fill` stays the protocol's 0 on the width axis; only the height moved"
+        );
+
+        // A percent resolves against the *output*, so half of a 1080p height is the same request
+        // as an explicit 540, and neither is a change against the other.
+        let mut half_by_percent = applied.clone();
+        half_by_percent.height = SizeMode::Percent(0.5);
+        let mut half_by_pixels = applied.clone();
+        half_by_pixels.height = SizeMode::Pixels(540.0);
+        assert_eq!(spec_update(&half_by_percent, &half_by_pixels, output_1080p()), SpecUpdate::default());
+    }
+
+    #[test]
+    fn a_size_change_a_signal_could_make_is_refused_by_the_same_guard_creation_uses() {
+        // `height` is an ordinary resolvable property, so a `Signal` can turn a fixed 32 into
+        // `"Fill"` at runtime -- and `set_size(_, 0)` on a surface anchored to one vertical edge
+        // is a protocol error that kills the connection and the whole shell with it. The guard has
+        // to run on the update path, not only at creation.
+        let applied = panel("bar");
+        let mut filled = applied.clone();
+        filled.height = SizeMode::Fill;
+
+        let size = spec_update(&applied, &filled, output_1080p()).size.expect("the height moved from 32 to 0");
+        assert_eq!(ambiguous_zero_axis(size, filled.topology.anchor), Some("height"));
     }
 
     #[test]

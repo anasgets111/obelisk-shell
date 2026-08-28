@@ -1256,6 +1256,35 @@ reconfiguration, and destruction from the evaluated topology instead.
    because `xdg_popup` needs its grab before mapping and its positioner is consumed at `get_popup`
    time; for those two roles `visible` creates and destroys the Wayland object (ADR-0049). Phase 22
    owns that, and the distinction is noted here so this item is not later read as forbidding it.
+
+   > Built, and three things the plan did not anticipate, all three found against a live niri
+   > session with `WAYLAND_DEBUG=1` rather than reasoned out.
+   >
+   > **A commit with no buffer attached is how a client *re-maps*.** The XML says so directly, and
+   > the consequence runs backwards through the whole file: an unmapped surface must never be
+   > committed for any other reason. `apply_exclusive_zone` used to commit for itself, which would
+   > have silently re-mapped every surface the config had just hidden. It now stages only, and the
+   > commit that carries it is whichever one the caller was going to make anyway -- `swap_buffers`
+   > on a mapped surface, the null-buffer commit on a staging Candidate, or nothing at all on an
+   > unmapped one. That is also why "stage the whole update, commit once" is a correctness rule
+   > here and not a tidiness preference.
+   >
+   > **Mapping a panel that was declared `visible = false` gets no configure back.** The protocol's
+   > re-map procedure ("commit without any buffer attached, waiting for a configure event") applies
+   > to a surface whose state was *reset* by an unmap. A panel that started invisible was never
+   > mapped: it made its initial commit, was configured, and was acked, and simply never attached a
+   > buffer. The compositor has nothing new to say, so waiting for a second configure waits
+   > forever. The two cases share one request sequence and end in different states, told apart by
+   > whether the surface has ever been bound. Measured both ways; the reset case does get its
+   > configure.
+   >
+   > **An in-place reload never reached the screen on its own.** `handle_apply_pending` applied the
+   > new scene and stopped there, and `wayland::run`'s poll loop only repaints when
+   > `re_resolve_if_dirty` reports a change, so an edit sat in memory until some unrelated
+   > capability push happened to mark the flag. A live session hides this (a push lands every few
+   > seconds); a static config would not have. Predates this item and only surfaced because
+   > `visible` made a reload's effect binary rather than a few pixels. Fixed by marking the same
+   > ADR-0044 decision 2 flag, at the cost of one redundant `Scene::apply` per file save.
 2. **One Wayland surface per targeted output.** Generalize the `"{id}@{output}"` surface-id
    convention `supervisor/src/reload.rs` already carries through the PBA handshake for wallpaper.
    `OutputHandler` is already implemented, so monitor hotplug adds and removes surface instances for
@@ -1314,6 +1343,12 @@ reconfiguration, and destruction from the evaluated topology instead.
 5. **Push input regions.** `layout::overlay_input_regions` has been correct and tested since Phase
    12 with no caller (ADR-0023 item 5). Wire it per surface, not just for one overlay: it is a no-op
    for a tightly-sized bar and load-bearing for any surface larger than its visible content.
+
+   > Built, and the prediction held on a live session: the bar's region came out `(0, 0, 1920, 32)`,
+   > which is what the protocol default already is, while the notification area's came out
+   > `(0, 0, 41, 32)` inside a 380x60 surface -- the rest of that surface passes clicks through. No
+   > special case distinguishes them, which is the point. `overlay_input_regions` keeps its name
+   > and loses its `#[allow(dead_code)]`; the workspace total drops from 13 to 12.
 6. **`oblisk.screens`** (ADR-0041). Expose `OutputState`'s outputs to Lua as a reactive signal, so a
    config can loop over screens to declare per-monitor panels; this is what replaces Quickshell's
    `Variants`, since Lua already has `for`. It is the first Lua signal sourced in the Renderer rather

@@ -1019,17 +1019,27 @@ fn position_children(
     Ok(())
 }
 
-/// § 5.1's overlay input-region scan: `overlay_root`'s direct, visible children, projected to
-/// physical pixels. Pure -- see docs/adr/0023 item 5 for why the real `wl_region`/
-/// `wl_surface::set_input_region` push isn't wired here.
+/// § 5.1's input-region scan: `surface_root`'s direct, visible children, projected to physical
+/// pixels. Pure, and the `wl_region`/`wl_surface::set_input_region` push it feeds lives in
+/// `crate::wayland::App::apply_input_region`, which is the only place a Wayland object exists to
+/// push it to.
 ///
-/// ponytail: no production caller yet. The thread boundary that used to make one impossible is
-/// gone (docs/adr/0039 put the `Scene` and the `wl_surface`s on the same thread), so this is now
-/// one direct call away; making it is build-steps.md Phase 20's job, not the thread move's.
-/// Exercised by this module's own tests only.
-#[allow(dead_code)]
-pub fn overlay_input_regions(overlay_root: &ResolvedNode, scale: f32) -> Vec<PhysicalRect> {
-    overlay_root
+/// Per surface since docs/adr/0038 decision 5, which is why the name is the one thing here that
+/// still says "overlay": § 5.1's bounding-box union was written for a single fullscreen
+/// `overlay_canvas` and was not deleted with it, it was generalized. It applies to any surface
+/// whose visible content is smaller than the surface itself -- load-bearing for a fullscreen
+/// transparent panel, an empty region (so clicks pass straight through) for one with nothing
+/// visible in it, and a no-op for a tightly-sized bar whose child fills it.
+///
+/// ponytail: direct children only, not a recursive union over the whole visible subtree. A panel
+/// whose child is a full-surface transparent container holding one small button therefore claims
+/// the container's whole box for input, not the button's. That is § 5.1's own wording ("the union
+/// of its visible children's absolute bounding boxes") and it is exactly right for the shape the
+/// spec has in mind, where each direct child *is* one floating panel. Upgrade path: recurse into a
+/// child whose own `background` is absent or fully transparent, once a config writes that shape
+/// and the extra walk earns itself.
+pub fn overlay_input_regions(surface_root: &ResolvedNode, scale: f32) -> Vec<PhysicalRect> {
+    surface_root
         .children
         .iter()
         .filter(|child| child.visible)
@@ -2434,6 +2444,54 @@ mod tests {
                 y1: 10
             }
         );
+    }
+
+    #[test]
+    fn a_surface_with_nothing_visible_in_it_claims_no_input_at_all() {
+        // The click-through case, and since docs/adr/0038 decision 5 it is the ordinary answer for
+        // any surface rather than a boot-time special case for one overlay: an empty region means
+        // every pointer event reaches the application window behind the surface. A root whose only
+        // child is hidden and a root with no children at all must agree about that.
+        let hidden_child = ResolvedNode {
+            kind: "rect".to_string(),
+            rect: LogicalRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 },
+            visible: false,
+            properties: HashMap::new(),
+            children: Vec::new(),
+        };
+        let mut root = ResolvedNode {
+            kind: "panel".to_string(),
+            rect: LogicalRect { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0 },
+            visible: true,
+            properties: HashMap::new(),
+            children: vec![hidden_child],
+        };
+        assert!(overlay_input_regions(&root, 1.0).is_empty());
+
+        root.children.clear();
+        assert!(overlay_input_regions(&root, 1.0).is_empty());
+    }
+
+    #[test]
+    fn a_child_that_fills_its_surface_claims_the_whole_surface() {
+        // The "no-op for a tightly-sized bar" build-steps.md Phase 20 item 5 predicts: the region
+        // this produces is what the protocol default already is, which is why the wiring needs no
+        // special case to skip it.
+        let root = ResolvedNode {
+            kind: "panel".to_string(),
+            rect: LogicalRect { x: 0.0, y: 0.0, width: 1920.0, height: 32.0 },
+            visible: true,
+            properties: HashMap::new(),
+            children: vec![ResolvedNode {
+                kind: "row".to_string(),
+                rect: LogicalRect { x: 0.0, y: 0.0, width: 1920.0, height: 32.0 },
+                visible: true,
+                properties: HashMap::new(),
+                children: Vec::new(),
+            }],
+        };
+
+        assert_eq!(overlay_input_regions(&root, 1.0), [PhysicalRect { x0: 0, y0: 0, x1: 1920, y1: 32 }]);
     }
 
     #[test]
