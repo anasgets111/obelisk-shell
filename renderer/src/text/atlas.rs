@@ -83,9 +83,10 @@ impl TextPainter {
     /// Draws `text` with its snapped top-left corner at `rect`'s origin (build-steps.md
     /// Phase 4, point 3) in `color`. Does not flush or swap buffers -- `layout::paint`'s tree
     /// walk draws a whole surface's worth of nodes onto this same canvas and flushes once at
-    /// the end (build-steps.md Phase 19 item 6), not once per line the way this used to; the one
-    /// remaining direct caller outside that walk, `wayland::mod`'s `draw_main_bar_proof_text`,
-    /// now flushes for itself right after calling this.
+    /// the end (build-steps.md Phase 19 item 6), not once per line the way this used to. That
+    /// walk is now the only caller: `wayland::mod`'s `draw_main_bar_proof_text`, which used to
+    /// flush for itself right after calling this, was deleted in Phase 20 item 4 along with the
+    /// rest of the fixed-role scaffolding.
     pub fn draw_line(&mut self, text: &str, rect: LogicalRect, font_size: f32, scale: f32, color: Rgba) {
         let physical = snap_to_physical(rect, scale);
         // `Rgba`'s four `f32` fields exist precisely so `Color::rgbaf` takes them with no

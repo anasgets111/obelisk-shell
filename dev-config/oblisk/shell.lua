@@ -155,6 +155,10 @@ return {
         -- Reserves 32px of screen area along the anchored (top) edge. The zone is derived from
         -- the height the compositor actually configures, so it stays right if this changes.
         exclusive = true,
+        -- Not what a real bar wants, and deliberate: this file is a fixture that exercises the
+        -- engine, so it opts into Phase 21 item 2's focus path rather than leaving it dark. The
+        -- cost is that clicking the bar takes keyboard focus off the window behind it.
+        keyboard_interactivity = "OnDemand",
         width = "Fill",
         height = 32,
         child = row {
