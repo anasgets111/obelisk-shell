@@ -136,8 +136,31 @@ impl Loader {
     /// Converts a JSON value into the equivalent Lua value, on this `Loader`'s own `Lua` state (a
     /// `Value` is tied to the state that created it). Turns a pushed `StateSnapshot`'s
     /// `serde_json::Value` payload into something a `LiveSignalHandle::set` call can store.
+    ///
+    /// docs/build-steps.md Phase 19 item 16: mlua's serde bridge defaults
+    /// `serialize_none_to_null`/`serialize_unit_to_null` to true, which maps `Value::Null` to a
+    /// lightuserdata sentinel rather than Lua `nil` -- and lightuserdata is truthy, so
+    /// `if payload.field then` took the branch that assumes a real value. Both options are turned
+    /// off here so `null` becomes `nil` instead. That also erases the key from the table entirely
+    /// rather than leaving it present with a nil-ish value, which is the part a reader coming from
+    /// JSON will not expect: it is the same semantics every `x or default` idiom in Lua already
+    /// assumes, and it is why `to_lua_value_maps_a_json_null_field_to_a_nil_that_is_absent_from_the_table`
+    /// counts keys instead of just comparing `== nil` (indexing a genuinely absent key returns
+    /// `nil` too).
+    ///
+    /// The cost, since it is not free and a config author will meet it: a `null` sitting in a JSON
+    /// *array* now leaves a hole, and `ipairs` stops at a hole. Measured on `[1, null, 3]`:
+    /// `ipairs` yields one element, while `#` returns 3 and `xs[3]` still reads back 3. The old
+    /// sentinel filled the hole, so `ipairs` walked all three. This matters because iterating a
+    /// capability's list with `ipairs` is exactly what `dev-config/oblisk/shell.lua` already does
+    /// for `network.available_networks`. It is still the right trade: a null *field* is the shape
+    /// every payload actually has (`icon_path`, `toggle_state`, `icon_name` in a tray menu), a
+    /// null array *element* is not one any capability produces today, and the alternative leaves
+    /// every optional field truthy. `to_lua_value_a_null_array_element_leaves_a_hole_ipairs_stops_at`
+    /// pins the behavior so it is a known quantity rather than a surprise.
     pub fn to_lua_value(&self, json: &serde_json::Value) -> mlua::Result<Value> {
-        self.lua.to_value(json)
+        let options = mlua::serde::ser::Options::new().serialize_none_to_null(false).serialize_unit_to_null(false);
+        self.lua.to_value_with(json, options)
     }
 }
 
@@ -226,6 +249,142 @@ mod tests {
         let output = loader.evaluate(r#"return surface { id = "bar", layer = "Top", volume = state.volume, muted = state.muted }"#).unwrap();
         assert_eq!(output.surfaces[0].properties.get("volume").unwrap().as_f64().unwrap(), 0.5);
         assert_eq!(output.surfaces[0].properties.get("muted").unwrap(), &Value::Boolean(false));
+    }
+
+    /// docs/build-steps.md Phase 19 item 16: a JSON `null` must reach Lua as `nil`, which erases
+    /// the key from the table rather than leaving a typed-but-absent value in it. Checking only
+    /// `item.icon_path == nil` would not catch this -- indexing a table for a missing key also
+    /// returns `nil` in Lua -- so this counts the table's own keys to prove `icon_path` never
+    /// landed in it at all.
+    #[test]
+    fn to_lua_value_maps_a_json_null_field_to_a_nil_that_is_absent_from_the_table() {
+        let loader = Loader::new().unwrap();
+        let json = serde_json::json!({
+            "icon_name": "org.telegram.desktop-mute-symbolic",
+            "icon_path": null,
+        });
+        let value = loader.to_lua_value(&json).unwrap();
+        loader.set_global("item", value).unwrap();
+
+        let output = loader
+            .evaluate(
+                r#"
+                local key_count = 0
+                for _ in pairs(item) do key_count = key_count + 1 end
+                return surface {
+                    id = "bar", layer = "Top",
+                    key_count = key_count,
+                    path_is_nil = item.icon_path == nil,
+                }
+                "#,
+            )
+            .unwrap();
+        assert_eq!(output.surfaces[0].properties.get("key_count").unwrap().as_integer().unwrap(), 1);
+        assert_eq!(output.surfaces[0].properties.get("path_is_nil").unwrap(), &Value::Boolean(true));
+    }
+
+    /// This is the actual bug from docs/build-steps.md Phase 19 item 16, not a stand-in for it:
+    /// mlua's default `serialize_none_to_null` maps JSON `null` to a lightuserdata sentinel, and
+    /// lightuserdata is truthy in Lua, so a live Telegram tray item's `icon_path = null` made
+    /// `if item.icon_path then` take the branch that assumes a real path. Checking the Lua *type*
+    /// of the converted value would still pass for that sentinel; only a truthiness check like
+    /// this one distinguishes it from real `nil`.
+    #[test]
+    fn to_lua_value_a_null_field_is_falsy_not_a_truthy_lightuserdata_sentinel() {
+        let loader = Loader::new().unwrap();
+        let json = serde_json::json!({ "icon_path": null });
+        let value = loader.to_lua_value(&json).unwrap();
+        loader.set_global("payload", value).unwrap();
+
+        let result: String = loader
+            .lua()
+            .load(r#"if payload.icon_path then return "truthy" else return "falsy" end"#)
+            .eval()
+            .unwrap();
+        assert_eq!(result, "falsy");
+    }
+
+    /// The live tray payload's nulls sit inside `items[1]`, not at the top level (a Telegram item
+    /// arrived as `icon_name = "org.telegram.desktop-mute-symbolic", icon_path = null`). This
+    /// catches a fix that only handles a top-level null and still leaves the truthy sentinel one
+    /// table level down, which is where the real bug actually lived.
+    #[test]
+    fn to_lua_value_a_null_nested_inside_an_array_element_is_also_nil() {
+        let loader = Loader::new().unwrap();
+        let json = serde_json::json!({
+            "items": [
+                {
+                    "icon_name": "org.telegram.desktop-mute-symbolic",
+                    "icon_path": null,
+                }
+            ]
+        });
+        let value = loader.to_lua_value(&json).unwrap();
+        loader.set_global("tray", value).unwrap();
+
+        let result: String = loader
+            .lua()
+            .load(r#"if tray.items[1].icon_path then return "truthy" else return "falsy" end"#)
+            .eval()
+            .unwrap();
+        assert_eq!(result, "falsy");
+    }
+
+    /// The trade this fix accepts, pinned so it stays a known quantity. Mapping `null` to `nil`
+    /// leaves a hole when the null is an array *element* rather than a field value, and `ipairs`
+    /// stops at a hole, while `#` and direct indexing still see past it. The old lightuserdata
+    /// sentinel filled the hole, so `ipairs` walked the whole array. No capability payload
+    /// produces a null array element today (their nulls are all optional *fields*), but
+    /// `dev-config/oblisk/shell.lua` does iterate capability lists with `ipairs`, so this is the
+    /// shape a config would meet first if one ever did.
+    #[test]
+    fn to_lua_value_a_null_array_element_leaves_a_hole_ipairs_stops_at() {
+        let loader = Loader::new().unwrap();
+        let json = serde_json::json!({ "xs": [1, null, 3] });
+        let value = loader.to_lua_value(&json).unwrap();
+        loader.set_global("state", value).unwrap();
+
+        let ipairs_count: i64 = loader.lua().load("local n = 0 for _ in ipairs(state.xs) do n = n + 1 end return n").eval().unwrap();
+        assert_eq!(ipairs_count, 1, "ipairs must stop at the hole the nil leaves");
+        // Reachable past the hole by index, which is what makes this a hole rather than a
+        // truncation: a config that indexes directly still sees the third element.
+        let third: i64 = loader.lua().load("return state.xs[3]").eval().unwrap();
+        assert_eq!(third, 3);
+    }
+
+    /// Negative control: turning off `serialize_none_to_null`/`serialize_unit_to_null` should only
+    /// change how `Value::Null` maps. This guards against the same edit disturbing how ordinary
+    /// numbers, strings, booleans, and array elements round-trip.
+    #[test]
+    fn to_lua_value_leaves_non_null_fields_unchanged() {
+        let loader = Loader::new().unwrap();
+        let json = serde_json::json!({
+            "volume": 0.5,
+            "muted": false,
+            "label": "media",
+            "tags": ["a", "b"],
+        });
+        let value = loader.to_lua_value(&json).unwrap();
+        loader.set_global("state", value).unwrap();
+
+        let output = loader
+            .evaluate(
+                r#"return surface {
+                    id = "bar", layer = "Top",
+                    volume = state.volume, muted = state.muted, label = state.label, second_tag = state.tags[2],
+                }"#,
+            )
+            .unwrap();
+        assert_eq!(output.surfaces[0].properties.get("volume").unwrap().as_f64().unwrap(), 0.5);
+        assert_eq!(output.surfaces[0].properties.get("muted").unwrap(), &Value::Boolean(false));
+        assert_eq!(
+            output.surfaces[0].properties.get("label").unwrap().as_string().unwrap().to_string_lossy(),
+            "media"
+        );
+        assert_eq!(
+            output.surfaces[0].properties.get("second_tag").unwrap().as_string().unwrap().to_string_lossy(),
+            "b"
+        );
     }
 
     #[test]
