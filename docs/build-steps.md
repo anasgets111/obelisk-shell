@@ -936,6 +936,19 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    all of them: make the surface's EGL surface current, `resize` the canvas to that surface, draw,
    swap. Verify FemtoVG tolerates the surface switch under a shared context before assuming it; if
    it does not, one canvas per surface is the fallback, not a redesign.
+
+   > Built inside Phase 20 item 4, and it could not have landed anywhere else: deleting
+   > `SurfaceRole` deletes `draw_main_bar_proof_text`'s only condition, so `paint_tree` had to
+   > become the draw path in the same commit that removed the enum.
+   >
+   > The shared-context question is verified rather than assumed, as this item asks.
+   > `one_canvas_draws_correctly_across_two_surfaces_sharing_one_context` builds two pbuffers on one
+   > EGL context and drives one `TextPainter` across both, asserting three separate things: the
+   > second surface draws at all (the canvas survived `eglMakeCurrent`), it draws at its own size
+   > (the `resize` took effect), and the first surface's framebuffer is untouched by the second's
+   > draw. It runs for real on this machine's Mesa rather than skipping. The reason it holds is that
+   > under EGL a context owns its GL objects while a surface is only the framebuffer, so the
+   > per-surface work is `Canvas::set_size` and nothing else. The fallback was not needed.
 9. **Frame-callback scheduling.** Request `wl_surface::frame()` and redraw only when both a frame
    callback has arrived and item 2's re-resolve produced a different result for that surface, rather
    than on the current 15ms poll timeout in `wayland::run`'s loop. ashell's `src/application.rs` does
