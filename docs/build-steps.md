@@ -832,6 +832,23 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    rather than a new distinction. It belongs here rather than in item 2 because painting an empty
    `text` is what makes an empty default meaningful. The cost, accepted: a misspelled `content` key
    renders an empty node instead of being rejected.
+
+   Built in three commits rather than one, recorded here because the middle one leaves visible
+   debt. First the two defaults above, which need no renderer at all. Then the paint property
+   parsers (`background`, `radius`, `border_color`, `border_width`, `foreground`), which are pure
+   functions over an already-resolved property map. Then the drawing pass and the harness, which is
+   the only part that needs a GL context. The parsers land with no production caller and therefore
+   with an `#[allow(dead_code)]` apiece, seven of them, more than the rest of the crate accumulated
+   across Phases 12 through 19 combined. That is the price of the split and it is paid back by the
+   third commit, which deletes every one of those attributes. If the third commit slips, the debt is
+   real and visible rather than hidden, which is why it is written down here.
+
+   The harness has to come with the drawing pass and not after it. `EGL_MESA_platform_surfaceless`
+   plus a pbuffer surface is confirmed working on Mesa 26.2: a GLES 3.2 context, and `glReadPixels`
+   returning an exact `#FF0000FF` after a red clear, both on Iris and, with
+   `LIBGL_ALWAYS_SOFTWARE=1`, on llvmpipe. So the gate is "EGL init failed, skip" rather than "this
+   only runs on a developer's desktop", and there is no reason to write the drawing pass first and
+   assert its pixels later.
 7. **Snapping.** Reuse `text/snap.rs`'s `snap_to_physical` and `snap_border_to_physical`. The second
    has had no caller since Phase 4 and this is what it was written for: a border snapped to whole
    physical pixels instead of straddling two (`oblisk-layout-engine-geometry.md` § 5).
@@ -868,6 +885,20 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    items 6 through 11 can draw them. Until this lands, a config that wants a dynamic child list
    writes a computed `children` signal, which reconciles positionally and therefore loses identity
    on every insertion.
+13. **Cap what an error message interpolates.** Every type-mismatch arm in `layout/node.rs` builds
+   its detail with `format!("expected a number, got {value:?}")`. mlua's `Debug` for `LuaString`
+   formats the whole byte string escaped, and `marshal::check_string`'s 64KB cap never runs on this
+   path because it lives in `checked_string`, which a rejected value never reaches. So
+   `rect { radius = string.rep("x", 20 * 1024 * 1024) }` allocates and formats 20 MB on the Wayland
+   dispatch thread, then hands it to `rescue`'s `error_log` (§ 2.10) for a human to scroll past.
+
+   Found by item 6's review, which counted four instances and declined to fix them, because the
+   shape predates the slice that copied it: `parse_spacing`, `parse_font_size` and `parse_icon_size`
+   all shipped with it. It is roughly fifteen call sites and one helper that truncates a value's
+   `Debug` form to something a log line can hold, and it wants its own tests rather than a
+   mechanical sweep folded into a paint commit. Not urgent: the hostile config is the user's own, so
+   this is diagnostics quality rather than a security boundary. It is written down because a fourth
+   copy of a bad pattern is how it becomes the convention.
 
 Deliberately deferred, and this one is a decision rather than an omission: **no damage tracking.**
 Redraw the whole surface. `oblisk-layout-engine-geometry.md` § 5 projects damage rectangles, but

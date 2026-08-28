@@ -75,6 +75,25 @@ pub enum Align {
     Stretch,
 }
 
+/// A parsed colour, four channels in `0.0..=1.0`. `f32`, not `u8`: femtovg's `Color` (the drawing
+/// pass's paint target, not touched by this slice) stores its channels as `f32` already --
+/// `Color::rgbaf` takes them as-is, while `Color::rgba` takes `u8` and immediately divides by
+/// 255.0 to reach that same `f32` form internally. Storing `f32` here means the drawing pass
+/// copies four fields straight into `Color`, with no `u8` round-trip to undo.
+///
+/// ponytail: no production caller yet -- build-steps.md Phase 19 item 6 splits "parse the paint
+/// properties" (this slice) from "draw them" (the femtovg pass, a later slice), same two-slice
+/// shape `renderer/src/lua/mod.rs`'s now-removed `#[allow(dead_code)]` comment records for
+/// `layout::node` itself. Exercised by this module's own tests only.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rgba {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LayoutError {
     #[error("unsupported node kind `{0}`")]
@@ -147,6 +166,49 @@ fn checked_string(property: &str, s: &mlua::LuaString) -> Result<String, LayoutE
     let s = s.to_string_lossy();
     marshal::check_string(&s).map_err(|e| invalid(property, e.to_string()))?;
     Ok(s)
+}
+
+/// Strict `#RRGGBB` / `#RRGGBBAA` hex colour parsing (§ 5.2's `rect.background`, `border_color`,
+/// `text.foreground`). No 3-digit shorthand, no named colours, no bare digits without `#` --
+/// § 5.2 documents none of them, and accepting one here would commit the project to a convenience
+/// syntax the IDL never specified.
+fn parse_hex_color(property: &str, s: &str) -> Result<Rgba, LayoutError> {
+    let Some(digits) = s.strip_prefix('#') else {
+        return Err(invalid(
+            property,
+            format!("hex colour must start with `#`, got `{s}`"),
+        ));
+    };
+    // Digit check before length check, and in that order deliberately: every byte of a multi-byte
+    // UTF-8 sequence is >= 0x80 and so fails `is_ascii_hexdigit`, so non-ASCII input (`"#日本語"`)
+    // is caught here with the accurate diagnosis. By the time the length check below runs, the
+    // string is known to be pure ASCII, where `.len()` is the character count -- reporting a byte
+    // count for `"#日本語"` (9 bytes, 3 characters) would name the wrong number entirely.
+    if !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(invalid(
+            property,
+            format!("hex colour must contain only hex digits, got `{s}`"),
+        ));
+    }
+    if digits.len() != 6 && digits.len() != 8 {
+        return Err(invalid(
+            property,
+            format!(
+                "hex colour must have 6 or 8 hex digits after `#`, got {} in `{s}`",
+                digits.len()
+            ),
+        ));
+    }
+    let channel = |range: std::ops::Range<usize>| -> f32 {
+        u8::from_str_radix(&digits[range], 16).expect("digits validated as hex above") as f32 / 255.0
+    };
+    let a = if digits.len() == 8 { channel(6..8) } else { 1.0 };
+    Ok(Rgba {
+        r: channel(0..2),
+        g: channel(2..4),
+        b: channel(4..6),
+        a,
+    })
 }
 
 /// Whether `property` is one [`resolve_properties`] copies through untouched on a node of this
@@ -428,6 +490,15 @@ pub fn parse_edge_insets(
             .map_err(|e| invalid(property, e.to_string()))?;
         match v {
             Value::Nil => Ok(0.0),
+            // A Signal only resolves at the top level of the property map (`resolve_properties`
+            // never looks inside a table value), so one surviving into a per-edge slot is refused
+            // outright rather than falling into the `other` arm below, which would misreport it as
+            // "must be a number, got AnyUserData(Ref(0x...))" -- an opaque pointer and a wrong claim
+            // about the type. `UnsupportedSignalProperty` already carries the right advice (read
+            // it via `:get()` first); `{property}.{key}` names both the property and which edge.
+            Value::UserData(_) => Err(LayoutError::UnsupportedSignalProperty(format!(
+                "{property}.{key}"
+            ))),
             other => value_as_f32(property, &other)?.ok_or_else(|| {
                 invalid(property, format!("`{key}` must be a number, got {other:?}"))
             }),
@@ -439,6 +510,184 @@ pub fn parse_edge_insets(
         bottom: edge("bottom")?,
         left: edge("left")?,
     })
+}
+
+/// `rect.background` (§ 5.2 item 1). Absent is `None`, not transparent black -- the drawing pass
+/// (a later slice) has to be able to skip the fill entirely rather than paint an invisible one, and
+/// `#RRGGBBAA` with `AA = 00` already covers "explicitly transparent" as a distinct config choice.
+///
+/// ponytail: no production caller yet, same reason as [`Rgba`]'s own `ponytail:`. Exercised by
+/// this module's own tests only.
+#[allow(dead_code)]
+pub fn parse_background(properties: &HashMap<String, Value>) -> Result<Option<Rgba>, LayoutError> {
+    let Some(value) = properties.get("background") else {
+        return Ok(None);
+    };
+    let Value::String(s) = value else {
+        return Err(invalid(
+            "background",
+            format!("expected a string, got {value:?}"),
+        ));
+    };
+    let s = checked_string("background", s)?;
+    Ok(Some(parse_hex_color("background", &s)?))
+}
+
+/// Shared `[0, 8192]` bound for `radius` and `border_width` -- the same range [`parse_size_mode`]
+/// already enforces for `width`/`height` (§ 5.1's base property table), applied here because these
+/// are geometry on the same node kind with no bound of their own otherwise. Traced in femtovg
+/// 0.26: `radius = -4` silently draws square corners (`path.rs:458` treats anything under 0.1 as
+/// unrounded) and `border_width = -4` clamps to 0.0 and multiplies paint alpha by zero, so both
+/// negative ends fail silently rather than raising. The upper end is the one that matters most:
+/// above roughly 8.4e6, `curve_divisions` (`path/cache.rs:911`) computes `acos(1.0) == 0.0`,
+/// divides by it, and `inf as u32` saturates to `u32::MAX` as a stroke-loop bound in
+/// `round_join`/`round_cap_start` -- billions of iterations and tens of gigabytes of vertices on
+/// the Wayland dispatch thread. `[0, 8192]` alone doesn't make that reachability obvious, which is
+/// worth spelling out here so a future reader doesn't widen the bound without knowing why it was
+/// chosen.
+fn check_geometry_range(property: &str, n: f32) -> Result<(), LayoutError> {
+    if !(0.0..=8192.0).contains(&n) {
+        return Err(invalid(
+            property,
+            format!("must be within [0, 8192], got {n}"),
+        ));
+    }
+    Ok(())
+}
+
+/// `rect.radius` (§ 5.2 item 1). Absent defaults to 0, an unrounded rectangle -- same shape as
+/// [`parse_spacing`]/[`parse_font_size`] for an unranged numeric property with no documented
+/// default of its own beyond "no effect when omitted".
+///
+/// ponytail: no production caller yet, same reason as [`Rgba`]'s own `ponytail:`. Exercised by
+/// this module's own tests only.
+#[allow(dead_code)]
+pub fn parse_radius(properties: &HashMap<String, Value>) -> Result<f32, LayoutError> {
+    let Some(value) = properties.get("radius") else {
+        return Ok(0.0);
+    };
+    let n = value_as_f32("radius", value)?
+        .ok_or_else(|| invalid("radius", format!("expected a number, got {value:?}")))?;
+    check_geometry_range("radius", n)?;
+    Ok(n)
+}
+
+/// `rect.border_color` (§ 5.2 item 1), one colour per edge. `None` on an edge means "not painted",
+/// the same absence [`parse_background`] returns for a missing fill and the same zero
+/// [`parse_border_width`] defaults an edge to -- an edge with width 0 needs no colour, and an edge
+/// with a colour but width 0 still paints nothing, so the drawing pass can read either field first
+/// and get the same answer. § 5.2 gives the table form no per-edge default colour to fall back to,
+/// so an absent edge takes `None` rather than an invented default.
+///
+/// ponytail: no production caller yet, same reason as [`Rgba`]'s own `ponytail:`. Exercised by
+/// this module's own tests only.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct BorderColor {
+    pub top: Option<Rgba>,
+    pub right: Option<Rgba>,
+    pub bottom: Option<Rgba>,
+    pub left: Option<Rgba>,
+}
+
+#[allow(dead_code)]
+pub fn parse_border_color(properties: &HashMap<String, Value>) -> Result<BorderColor, LayoutError> {
+    let Some(value) = properties.get("border_color") else {
+        return Ok(BorderColor::default());
+    };
+    if let Value::String(s) = value {
+        let s = checked_string("border_color", s)?;
+        let color = Some(parse_hex_color("border_color", &s)?);
+        return Ok(BorderColor {
+            top: color,
+            right: color,
+            bottom: color,
+            left: color,
+        });
+    }
+    let Value::Table(table) = value else {
+        return Err(invalid(
+            "border_color",
+            format!("expected a string or a table, got {value:?}"),
+        ));
+    };
+    // ponytail: `table.get` is metamethod-aware, the same hole [`parse_edge_insets`]'s `ponytail:`
+    // documents for margin/padding -- see that comment for the cost and the upgrade path.
+    let edge = |key: &str| -> Result<Option<Rgba>, LayoutError> {
+        let v: Value = table
+            .get(key)
+            .map_err(|e| invalid("border_color", e.to_string()))?;
+        // Every error this closure raises names the edge, `key`, not just the property --
+        // see the `Value::UserData` arm below and `name_edge` for why the String arm needs help
+        // to do that too, since `checked_string`/`parse_hex_color` only know the property.
+        let name_edge = |e: LayoutError| match e {
+            LayoutError::InvalidProperty { property, detail } => LayoutError::InvalidProperty {
+                property,
+                detail: format!("`{key}`: {detail}"),
+            },
+            other => other,
+        };
+        match v {
+            Value::Nil => Ok(None),
+            // Same hole as `parse_edge_insets`'s `edge` closure, same fix: a Signal only resolves
+            // at the top level of the property map, so one nested here is refused outright rather
+            // than falling into the `other` arm and being misreported as a bad hex string.
+            Value::UserData(_) => Err(LayoutError::UnsupportedSignalProperty(format!(
+                "border_color.{key}"
+            ))),
+            Value::String(s) => {
+                let s = checked_string("border_color", &s).map_err(name_edge)?;
+                Ok(Some(parse_hex_color("border_color", &s).map_err(name_edge)?))
+            }
+            other => Err(invalid(
+                "border_color",
+                format!("`{key}` must be a hex colour string, got {other:?}"),
+            )),
+        }
+    };
+    Ok(BorderColor {
+        top: edge("top")?,
+        right: edge("right")?,
+        bottom: edge("bottom")?,
+        left: edge("left")?,
+    })
+}
+
+/// `rect.border_width` (§ 5.2 item 1), reusing [`EdgeInsets`] rather than a new per-edge type since
+/// the shape (four `f32`, default 0) is already exactly that. A bare number broadcasts to all four
+/// edges; a table delegates to [`parse_edge_insets`], which already defaults an absent edge to 0.
+///
+/// ponytail: no production caller yet, same reason as [`Rgba`]'s own `ponytail:`. Exercised by
+/// this module's own tests only.
+#[allow(dead_code)]
+pub fn parse_border_width(properties: &HashMap<String, Value>) -> Result<EdgeInsets, LayoutError> {
+    let Some(value) = properties.get("border_width") else {
+        return Ok(EdgeInsets::default());
+    };
+    if let Some(n) = value_as_f32("border_width", value)? {
+        check_geometry_range("border_width", n)?;
+        return Ok(EdgeInsets {
+            top: n,
+            right: n,
+            bottom: n,
+            left: n,
+        });
+    }
+    if matches!(value, Value::Table(_)) {
+        // The range check runs here, on each edge of the result, rather than inside
+        // `parse_edge_insets` itself: that function is shared with `margin`/`padding`, which have
+        // no such bound (a real gap, but a different property set with its own callers -- not
+        // widened here).
+        let insets = parse_edge_insets(properties, "border_width")?;
+        for n in [insets.top, insets.right, insets.bottom, insets.left] {
+            check_geometry_range("border_width", n)?;
+        }
+        return Ok(insets);
+    }
+    Err(invalid(
+        "border_width",
+        format!("expected a number or a table, got {value:?}"),
+    ))
 }
 
 pub fn parse_align(
@@ -507,6 +756,33 @@ pub fn parse_content(properties: &HashMap<String, Value>) -> Result<String, Layo
             format!("expected a string, got {other:?}"),
         )),
     }
+}
+
+/// `text.foreground` (§ 5.2 item 4). Absent defaults to white: `TextPainter::draw_line`
+/// (`renderer/src/text/atlas.rs`) currently hardcodes `Paint::color(Color::white())`, and this
+/// slice only adds the parser, not the drawing pass that will read it -- so white is the default
+/// that keeps today's rendered output exactly as it is until that later slice wires this in.
+///
+/// ponytail: no production caller yet, same reason as [`Rgba`]'s own `ponytail:`. Exercised by
+/// this module's own tests only.
+#[allow(dead_code)]
+pub fn parse_foreground(properties: &HashMap<String, Value>) -> Result<Rgba, LayoutError> {
+    let Some(value) = properties.get("foreground") else {
+        return Ok(Rgba {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 1.0,
+        });
+    };
+    let Value::String(s) = value else {
+        return Err(invalid(
+            "foreground",
+            format!("expected a string, got {value:?}"),
+        ));
+    };
+    let s = checked_string("foreground", s)?;
+    parse_hex_color("foreground", &s)
 }
 
 pub fn parse_font_size(properties: &HashMap<String, Value>) -> Result<f32, LayoutError> {
@@ -1285,6 +1561,503 @@ mod tests {
 
         assert!(matches!(resolved.get("layer"), Some(Value::UserData(_))), "layer must survive the resolve step unresolved on a surface");
         assert!(matches!(parse_layer(&resolved).unwrap_err(), LayoutError::UnsupportedSignalProperty(p) if p == "layer"));
+    }
+
+    #[test]
+    fn background_absent_is_none() {
+        let props = HashMap::new();
+        assert_eq!(parse_background(&props).unwrap(), None);
+    }
+
+    #[test]
+    fn background_six_digit_hex_is_opaque() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r##"return { kind = "rect", background = "#336699" }"##)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        assert_eq!(
+            parse_background(&props).unwrap(),
+            Some(Rgba {
+                r: 0x33 as f32 / 255.0,
+                g: 0x66 as f32 / 255.0,
+                b: 0x99 as f32 / 255.0,
+                a: 1.0,
+            })
+        );
+    }
+
+    #[test]
+    fn background_eight_digit_hex_carries_its_own_alpha() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r##"return { kind = "rect", background = "#33669980" }"##)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        assert_eq!(
+            parse_background(&props).unwrap(),
+            Some(Rgba {
+                r: 0x33 as f32 / 255.0,
+                g: 0x66 as f32 / 255.0,
+                b: 0x99 as f32 / 255.0,
+                a: 0x80 as f32 / 255.0,
+            })
+        );
+    }
+
+    #[test]
+    fn background_without_a_leading_hash_is_rejected_naming_the_property() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", background = "336699" }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_background(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "background" && detail.contains("must start with `#`")),
+            "must name the missing `#`, not just some invalid-property error: {err}"
+        );
+    }
+
+    #[test]
+    fn background_with_the_wrong_digit_count_is_rejected() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r##"return { kind = "rect", background = "#369" }"##)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_background(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "background" && detail.contains("6 or 8") && detail.contains("got 3")),
+            "must be the digit-count rule specifically, naming 3 digits: {err}"
+        );
+    }
+
+    #[test]
+    fn background_with_non_hex_characters_is_rejected() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r##"return { kind = "rect", background = "#zzzzzz" }"##)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_background(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "background" && detail.contains("only hex digits")),
+            "must be the hex-digit rule specifically, not the digit-count rule: {err}"
+        );
+    }
+
+    #[test]
+    fn a_non_ascii_colour_string_gets_the_hex_digit_diagnosis_not_a_byte_count() {
+        // CONFIRMED finding: "#日本語" is 3 characters but 9 UTF-8 bytes, so a length check run
+        // before the hex-digit check reports "got 9" -- an accurate byte count and a misleading
+        // character count. Every byte of a multi-byte sequence fails `is_ascii_hexdigit`, so the
+        // hex-digit check catches it first once the checks are reordered, and no digit count is
+        // named at all.
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r##"return { kind = "rect", background = "#日本語" }"##)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_background(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "background" && detail.contains("only hex digits") && !detail.contains("got 9")),
+            "non-ASCII input must get the hex-digit diagnosis, not a byte-length count: {err}"
+        );
+    }
+
+    #[test]
+    fn background_wrong_type_is_rejected() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", background = {} }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_background(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "background" && detail.contains("expected a string")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn uppercase_hex_parses_the_same_as_lowercase() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r##"return { kind = "rect", background = "#FF0000" }"##)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        assert_eq!(
+            parse_background(&props).unwrap(),
+            Some(Rgba { r: 1.0, g: 0.0, b: 0.0, a: 1.0 })
+        );
+    }
+
+    #[test]
+    fn a_seven_digit_hex_is_rejected_naming_the_digit_count() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r##"return { kind = "rect", background = "#1234567" }"##)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_background(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "background" && detail.contains("6 or 8") && detail.contains("got 7")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_bare_hash_is_rejected_for_wrong_digit_count() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r##"return { kind = "rect", background = "#" }"##)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_background(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "background" && detail.contains("6 or 8") && detail.contains("got 0")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn radius_absent_defaults_to_zero() {
+        let props = HashMap::new();
+        assert_eq!(parse_radius(&props).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn radius_reads_the_number() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", radius = 6 }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        assert_eq!(parse_radius(&props).unwrap(), 6.0);
+    }
+
+    #[test]
+    fn radius_wrong_type_is_rejected() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", radius = true }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_radius(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "radius" && detail.contains("expected a number")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_negative_radius_is_rejected() {
+        // Traced consequence (femtovg 0.26 `path.rs:458`): a negative radius silently draws square
+        // corners instead of erroring, since anything under 0.1 is treated as unrounded.
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", radius = -4 }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_radius(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "radius" && detail.contains("[0, 8192]")),
+            "must be the range rule, naming the bound: {err}"
+        );
+    }
+
+    #[test]
+    fn radius_above_8192_is_rejected() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", radius = 8193 }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_radius(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "radius" && detail.contains("[0, 8192]")),
+            "must be the range rule, naming the bound: {err}"
+        );
+    }
+
+    #[test]
+    fn border_width_absent_defaults_to_all_zero() {
+        let props = HashMap::new();
+        assert_eq!(parse_border_width(&props).unwrap(), EdgeInsets::default());
+    }
+
+    #[test]
+    fn border_width_scalar_broadcasts_to_all_four_edges() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", border_width = 3 }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        assert_eq!(
+            parse_border_width(&props).unwrap(),
+            EdgeInsets { top: 3.0, right: 3.0, bottom: 3.0, left: 3.0 }
+        );
+    }
+
+    #[test]
+    fn border_width_table_sets_edges_independently() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", border_width = { top = 2, left = 5 } }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        assert_eq!(
+            parse_border_width(&props).unwrap(),
+            EdgeInsets { top: 2.0, right: 0.0, bottom: 0.0, left: 5.0 }
+        );
+    }
+
+    #[test]
+    fn border_width_wrong_type_is_rejected() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", border_width = true }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_border_width(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "border_width" && detail.contains("expected a number or a table")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_negative_border_width_is_rejected() {
+        // Traced consequence (femtovg 0.26): a negative border_width clamps to 0.0 and multiplies
+        // paint alpha by zero, so the border renders fully transparent with nothing logged.
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", border_width = -4 }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_border_width(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "border_width" && detail.contains("[0, 8192]")),
+            "must be the range rule, naming the bound: {err}"
+        );
+    }
+
+    #[test]
+    fn border_width_above_8192_is_rejected() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", border_width = 8193 }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_border_width(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "border_width" && detail.contains("[0, 8192]")),
+            "must be the range rule, naming the bound: {err}"
+        );
+    }
+
+    #[test]
+    fn border_width_table_form_out_of_range_edge_is_rejected() {
+        // The table form delegates to `parse_edge_insets` and range-checks the result afterwards --
+        // this is what proves that check actually runs on every edge, not just the scalar form.
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", border_width = { top = 8193 } }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_border_width(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "border_width" && detail.contains("[0, 8192]")),
+            "must be the range rule, naming the bound: {err}"
+        );
+    }
+
+    #[test]
+    fn a_signal_nested_in_a_margin_edge_table_is_rejected_naming_the_edge() {
+        // CONFIRMED finding: `resolve_properties` only unwraps a Signal at the top level of the
+        // property map, so one nested inside a table value (`margin = { top = someSignal }`)
+        // survives into `parse_edge_insets`'s `edge` closure, which used to misreport it as "must
+        // be a number, got AnyUserData(Ref(0x...))" instead of the actionable Signal error.
+        let lua = lua();
+        crate::lua::signal::register(&lua).unwrap();
+        let signal =
+            crate::lua::signal::Signal::new_live(Value::Integer(4), crate::lua::signal::DirtyFlag::new()).0;
+        let table = lua.create_table().unwrap();
+        table.set("kind", "rect").unwrap();
+        let margin = lua.create_table().unwrap();
+        margin.set("top", signal).unwrap();
+        table.set("margin", margin).unwrap();
+        let props = props_from_table(&table);
+        assert!(matches!(
+            parse_edge_insets(&props, "margin").unwrap_err(),
+            LayoutError::UnsupportedSignalProperty(p) if p == "margin.top"
+        ));
+    }
+
+    #[test]
+    fn border_color_absent_is_all_none() {
+        let props = HashMap::new();
+        assert_eq!(parse_border_color(&props).unwrap(), BorderColor::default());
+    }
+
+    #[test]
+    fn border_color_scalar_string_broadcasts_to_all_four_edges() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r##"return { kind = "rect", border_color = "#ff0000" }"##)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let red = Some(Rgba { r: 1.0, g: 0.0, b: 0.0, a: 1.0 });
+        assert_eq!(
+            parse_border_color(&props).unwrap(),
+            BorderColor { top: red, right: red, bottom: red, left: red }
+        );
+    }
+
+    #[test]
+    fn border_color_table_sets_edges_independently_leaving_absent_edges_none() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r##"return { kind = "rect", border_color = { top = "#ff0000", left = "#00ff00" } }"##)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        assert_eq!(
+            parse_border_color(&props).unwrap(),
+            BorderColor {
+                top: Some(Rgba { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }),
+                right: None,
+                bottom: None,
+                left: Some(Rgba { r: 0.0, g: 1.0, b: 0.0, a: 1.0 }),
+            }
+        );
+    }
+
+    #[test]
+    fn border_color_malformed_hex_in_a_table_is_rejected_naming_the_edge() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", border_color = { top = "not-a-color" } }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_border_color(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "border_color" && detail.contains("top") && detail.contains("must start with `#`")),
+            "must name the failing edge, not just `border_color`: {err}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_hex_on_a_non_top_edge_names_that_edge() {
+        // Fix 4's specific case: before the fix, only the closure's catch-all `other` arm
+        // interpolated `{key}` -- the `Value::String` arm (the one `checked_string`'s 64KB cap and
+        // `parse_hex_color`'s own errors go through) named neither the edge nor the content.
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", border_color = { right = "not-a-color" } }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_border_color(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "border_color" && detail.contains("right")),
+            "must name `right`, the edge that actually failed: {err}"
+        );
+    }
+
+    #[test]
+    fn a_signal_nested_in_a_border_color_edge_table_is_rejected_naming_the_edge() {
+        let lua = lua();
+        crate::lua::signal::register(&lua).unwrap();
+        let hex = lua.create_string("#ff0000").unwrap();
+        let signal =
+            crate::lua::signal::Signal::new_live(Value::String(hex), crate::lua::signal::DirtyFlag::new()).0;
+        let table = lua.create_table().unwrap();
+        table.set("kind", "rect").unwrap();
+        let border_color = lua.create_table().unwrap();
+        border_color.set("top", signal).unwrap();
+        table.set("border_color", border_color).unwrap();
+        let props = props_from_table(&table);
+        assert!(matches!(
+            parse_border_color(&props).unwrap_err(),
+            LayoutError::UnsupportedSignalProperty(p) if p == "border_color.top"
+        ));
+    }
+
+    #[test]
+    fn border_color_wrong_type_is_rejected() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "rect", border_color = true }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_border_color(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "border_color" && detail.contains("expected a string or a table")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn foreground_absent_defaults_to_white() {
+        let props = HashMap::new();
+        assert_eq!(
+            parse_foreground(&props).unwrap(),
+            Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+        );
+    }
+
+    #[test]
+    fn foreground_reads_a_hex_colour() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r##"return { kind = "text", foreground = "#00ff0080" }"##)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        assert_eq!(
+            parse_foreground(&props).unwrap(),
+            Rgba { r: 0.0, g: 1.0, b: 0.0, a: 0x80 as f32 / 255.0 }
+        );
+    }
+
+    #[test]
+    fn foreground_wrong_type_is_rejected() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "text", foreground = 5 }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_foreground(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "foreground" && detail.contains("expected a string")),
+            "{err}"
+        );
     }
 
     #[test]

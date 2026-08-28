@@ -330,10 +330,10 @@ Any property in this table or in § 5.2 accepts a `Signal` handle in place of a 
 
 #### 1. `rect`
 A flexible rectangular element representing either a containment box or a solid drawing shape, depending on whether it has children.
-*   `background`: `string` (Hex-color code `#RRGGBB` or `#RRGGBBAA`)
-*   `radius`: `integer` (Corner rounding radius)
-*   `border_color`: `string` / `table` (Hex-color code or a dictionary table `{ top, right, bottom, left }`)
-*   `border_width`: `integer` / `table` (Border thickness in logical pixels or `{ top, right, bottom, left }`)
+*   `background`: `string` (Hex-color code `#RRGGBB` or `#RRGGBBAA`. Strict: the `#` is required, and only 6 or 8 hex digits are accepted, with no 3-digit shorthand and no named colors. Omitted means no fill at all, which is distinct from `#00000000`: the first draws nothing, the second draws a fully transparent rectangle)
+*   `radius`: `integer` (Corner rounding radius. Defaults to `0`, an unrounded rectangle)
+*   `border_color`: `string` / `table` (Hex-color code or a dictionary table `{ top, right, bottom, left }`. A bare string applies to all four edges. There is no default color: an edge paints only where both a color and a non-zero width say so, so `border_width` on its own paints nothing, as does a table whose entry for that edge is omitted. This is not an error, because setting a width in a shared style table and the color conditionally is a normal pattern)
+*   `border_width`: `integer` / `table` (Border thickness in logical pixels or `{ top, right, bottom, left }`. A bare number applies to all four edges. Defaults to `0` on every edge, so a `border_color` alone paints nothing)
 *   `children`: `table` (Optional dense array of child node structures. If specified, the layout engine instantiates this node as a layout parent container; if omitted, it resolves as a static childless leaf shape, e.g. a progress bar or background spacer.)
 
 #### 2. `row`
@@ -350,7 +350,7 @@ Arranges children vertically.
 Draws shaped unicode glyph text via `cosmic-text`.
 *   `content`: `string` / `Signal` (The string text to display. Defaults to `""`, so a `text` bound to a capability signal renders empty until that signal's first push rather than rejecting the tree at boot, ADR-0044)
 *   `font_size`: `integer` (Defaults to `12`)
-*   `foreground`: `string` (Hex-color code)
+*   `foreground`: `string` (Hex-color code, same strict `#RRGGBB` / `#RRGGBBAA` form as `rect.background`. Defaults to opaque white)
 
 #### 5. `icon`
 Draws a system SVG/PNG icon.
