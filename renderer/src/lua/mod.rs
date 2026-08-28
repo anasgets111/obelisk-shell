@@ -70,16 +70,34 @@ impl Loader {
         Ok(Loader { lua })
     }
 
+    /// Evaluates `source` directly, under a generic `shell.lua` chunk name. Test-only since
+    /// `evaluate_file` started naming the chunk after the real path: production always has a path
+    /// to name, and a test fixture never does.
+    #[cfg(test)]
     pub fn evaluate(&self, source: &str) -> Result<LoadOutput, LoaderError> {
-        let value: Value = self.lua.load(source).eval()?;
-        Ok(LoadOutput { surfaces: collect_surfaces(value)? })
+        self.evaluate_named(source, "shell.lua")
     }
 
     /// Reads `path` and evaluates it exactly like [`Self::evaluate`] -- the real `shell.lua`
     /// entry point (build-steps.md Phase 13). See the module doc comment.
     pub fn evaluate_file(&self, path: &std::path::Path) -> Result<LoadOutput, LoaderError> {
         let source = std::fs::read_to_string(path)?;
-        self.evaluate(&source)
+        self.evaluate_named(&source, &path.display().to_string())
+    }
+
+    /// `name` is the chunk name Lua prefixes onto every error raised out of `source`, so it is
+    /// what a config author reads when their edit is rejected. Without it mlua names the chunk
+    /// after *this* Rust call site: a live session reported a typo in `shell.lua` as
+    /// "renderer/src/lua/mod.rs:74:127", which points a reader at the engine's source instead of
+    /// their own file for a line number (127) that was theirs all along.
+    ///
+    /// The leading `@` is Lua's own marker for "this name is a file path" (`lua_Debug.source`),
+    /// and it is load-bearing rather than cosmetic: without it Lua treats the name as inline
+    /// source text and renders it as `[string "/mnt/Work/0Coding/1Rust/oblisk-shell/dev-conf..."]`,
+    /// truncating the path at 60-odd characters right where the filename would be.
+    fn evaluate_named(&self, source: &str, name: &str) -> Result<LoadOutput, LoaderError> {
+        let value: Value = self.lua.load(source).set_name(format!("@{name}")).eval()?;
+        Ok(LoadOutput { surfaces: collect_surfaces(value)? })
     }
 
     /// Creates a fresh, empty Lua table on this `Loader`'s own VM -- lets a caller build an
@@ -220,6 +238,28 @@ mod tests {
         let output = loader.evaluate_file(&path).unwrap();
         assert_eq!(output.surfaces.len(), 1);
         assert_eq!(output.surfaces[0].kind, "surface");
+    }
+
+    /// A config author reads this string and nothing else when their edit is rejected, so it has
+    /// to name their file and their line. Before the chunk name was set, a live session reported a
+    /// syntax error on line 127 of `shell.lua` as "renderer/src/lua/mod.rs:74:127", which sends
+    /// the reader into the engine's source for a line number that was theirs.
+    #[test]
+    fn an_evaluation_error_names_the_config_file_not_this_source_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shell.lua");
+        std::fs::write(&path, "return surface { id = \"bar\" }\nthis is not lua\n").unwrap();
+
+        let loader = Loader::new().unwrap();
+        let message = loader.evaluate_file(&path).unwrap_err().to_string();
+
+        assert!(message.contains(&path.display().to_string()), "expected the config path in: {message}");
+        assert!(!message.contains("lua/mod.rs"), "expected no engine source path in: {message}");
+        // Not `[string "/long/path/to/shell..."]` -- Lua truncates a non-`@` chunk name, and a
+        // truncated absolute path loses the filename, which is the part worth printing.
+        assert!(!message.contains("[string"), "expected a file-named chunk in: {message}");
+        // The line the author has to go and fix, not just the file.
+        assert!(message.contains(":2:"), "expected the offending line number in: {message}");
     }
 
     #[test]

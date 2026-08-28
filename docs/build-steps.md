@@ -513,6 +513,30 @@ against a fake. This phase gives them their first real implementation and their 
    per promoted output, and signaling `N+1` to claim focus.
 5. **`main.rs` wiring**. `mod reload;` already exists in `supervisor/src/main.rs` with no caller
    (Phase 8). Phase 13's watcher becomes that caller here.
+6. **A Candidate that cannot build a scene must not signal ready.** Found live against
+   `dev-config`, not by a test. `run_startup_evaluation` sets rescue state and returns on an apply
+   failure, and `wayland::run` then binds, presents and signals ready regardless, so the Supervisor
+   promoted a Candidate whose config had been rejected and SIGTERM'd a working Generation 0. The log
+   reads in order: `startup shell.lua evaluated but failed to apply to the scene`,
+   `main_bar activated ... presentation feedback requested`, `superseded generation 0 exited
+   cleanly`, `PromoteGeneration(main_bar) received`.
+
+   The evidence gate cannot catch this on its own, and that is the part worth understanding before
+   fixing it. Evidence is `wp_presentation_feedback` on a surface whose pixels come from
+   `draw_main_bar_proof_text`, which reads nothing from the scene, so presentation proves the GPU
+   works rather than that the config does. Phase 19 item 6 makes the pixels come from the scene,
+   which narrows the hole without closing it: an empty scene is a legitimate config, and a Candidate
+   that presents nothing is indistinguishable from one that was asked to present nothing.
+
+   The Renderer is what has to refuse. `OBLISK_PBA_CANDIDATE` is already read in `wayland::run`
+   three statements away, and `run_startup_evaluation` currently returns `()`. A Candidate whose
+   startup evaluation or apply fails should exit non-zero without signalling ready, and let
+   `run_pba`'s ready deadline or the child's exit drive the rollback that already exists.
+
+   Generation 0 keeps today's behavior, and ADR-0024 item 4's reasoning is why: a blank shell that a
+   config edit can recover beats no shell, and on first boot there is no prior Generation to roll
+   back to. That ADR's doc comment reasons only about first boot and never asks whether this process
+   is a Candidate. Amend it with a banner when this lands.
 
 ### Phase 15: `process.run`, Stream Piping & Secure Input
 
@@ -899,6 +923,38 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    mechanical sweep folded into a paint commit. Not urgent: the hostile config is the user's own, so
    this is diagnostics quality rather than a security boundary. It is written down because a fourth
    copy of a bad pattern is how it becomes the convention.
+14. **A container's content size must include its own padding.** Measured live: a content-sized
+   `column` holding one 15.6-tall `text` reports 15.6 whether its padding is 8 or 50 on every edge.
+   `scene.rs` parses `padding` to inset the box it lays children out in, but no arm of
+   `intrinsic_content_size` adds it back, so a content-sized container is exactly `padding` short in
+   both axes and its children are positioned past the edge of the box meant to contain them. Every
+   child's `margin` is already folded into all four arms, which is what makes the omission read as
+   an oversight rather than a rule.
+
+   Harmless for a `Fill` or fixed-size container, where padding correctly shrinks the child budget
+   without changing the parent. It bites exactly the case a popup or a notification card is: sized
+   to its contents, with padding as the whole point. Item 6 is what makes it visible, since a
+   background painted at the reported size will visibly stop short of its own text.
+15. **One spelling for the geometry properties.** `border_width = 1` is accepted and `padding = 10`
+   is not, though both reach `parse_edge_insets`: only `border_width` has the scalar shorthand in
+   front of it (item 6's second commit added it there and nowhere else). A config author who learns
+   the shorthand on one property finds it missing on the two that use it most. Give `margin` and
+   `padding` the same scalar form, which also means moving the range check `parse_border_width`
+   applies per edge to a decision that covers all three rather than one.
+
+   While there: `height = "Content"` is rejected by a message that lists a number, `"Fill"` and
+   `"NN%"` and never says content sizing is spelled by omitting the property. That is the one size
+   mode with no spelling, so it is the one a config author will guess at.
+16. **A JSON `null` in a snapshot must reach Lua as `nil`.** `Loader::to_lua_value` goes through
+   mlua's serde bridge, which maps `Value::Null` to a lightuserdata sentinel rather than `nil`. Live
+   against a real tray, Telegram's item arrived with `icon_path = userdata: (nil)`, which is truthy:
+   `if item.icon_path then` takes the branch that assumes a path and then concatenates a userdata.
+   Every optional field of every capability payload has this shape, so the first config to read one
+   gets it wrong, and gets it wrong silently.
+
+   `serialize_none_to_null(false)` and its unit-variant sibling are the switch. Mapping to `nil`
+   also erases the key from the table, which is the semantics a config wants and the one every
+   `x or default` idiom in Lua already assumes.
 
 Deliberately deferred, and this one is a decision rather than an omission: **no damage tracking.**
 Redraw the whole surface. `oblisk-layout-engine-geometry.md` § 5 projects damage rectangles, but

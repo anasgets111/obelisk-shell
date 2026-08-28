@@ -701,18 +701,26 @@ fn evaluate_and_topology(loader: &Loader, shell_lua_path: &Path) -> Result<(lua:
 /// visibility only, matching Phase 12's original `apply_to_scene` logging.
 fn log_applied_surfaces(scene: &Scene, output: &lua::LoadOutput) {
     for surface in &output.surfaces {
-        let resolved = layout::node::parse_surface_id(&surface.properties).ok().and_then(|id| scene.surface(&id));
-        match resolved {
+        // The `id`, not `surface.kind`. Every surface's kind is the literal string "surface", so
+        // naming the kind here printed `surface "surface"` on every line and told a reader with
+        // more than one surface nothing about which one they were looking at (found live against
+        // dev-config). Splitting the two failure cases apart is the same fix: the old single arm
+        // said "has no resolvable `id`" for a surface whose id parsed fine but was missing from
+        // the scene, which is a different fault with a different cause.
+        let Ok(id) = layout::node::parse_surface_id(&surface.properties) else {
+            eprintln!("layout resolved but a surface has no resolvable `id`");
+            continue;
+        };
+        match scene.surface(&id) {
             Some(r) => eprintln!(
-                "layout resolved: surface {:?} kind={} rect={:?} visible={} children={} properties={}",
-                surface.kind,
+                "layout resolved: surface {id:?} kind={} rect={:?} visible={} children={} properties={}",
                 r.kind,
                 r.rect,
                 r.visible,
                 r.children.len(),
                 r.properties.len()
             ),
-            None => eprintln!("layout resolved but surface {:?} has no resolvable `id`", surface.kind),
+            None => eprintln!("layout resolved but surface {id:?} is absent from the applied scene"),
         }
     }
 }
