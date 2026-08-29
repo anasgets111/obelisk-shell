@@ -9,7 +9,7 @@ use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::presentation_time::{PresentTime, PresentationTimeHandler, PresentationTimeState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::seat::keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers};
-use smithay_client_toolkit::seat::pointer::{BTN_LEFT, PointerEvent, PointerEventKind, PointerHandler};
+use smithay_client_toolkit::seat::pointer::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, PointerEvent, PointerEventKind, PointerHandler};
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::session_lock::{
     SessionLock, SessionLockHandler, SessionLockState, SessionLockSurface, SessionLockSurfaceConfigure,
@@ -882,6 +882,18 @@ fn exclusive_zone_for(anchor: node::Anchor, configured_size: (u32, u32)) -> i32 
 struct ArmedClick {
     instance_id: String,
     rect: LogicalRect,
+    /// The evdev code the press carried, so the release has to be the *same* button and not merely
+    /// a button (docs/adr/0050's second amendment).
+    ///
+    /// ponytail: one armed click, so chording drops both. `armed` is a single `Option`, and a
+    /// second press overwrites the first, so pressing right then left on the same node and
+    /// releasing either fires nothing: the release that arrives finds a different button armed, and
+    /// the one after it finds nothing armed at all. It fails in the safe direction (a wrong handler
+    /// never runs, a click is only lost) and it needs two buttons held at once, which nobody does
+    /// to a shell. The upgrade is `armed` becoming keyed by button, an `ArrayVec` of three or a
+    /// small map, with the same instance-id-and-rect comparison per entry; do it if a config ever
+    /// wants a chord, or if a real mouse turns out to emit overlapping pairs on its own.
+    button: u32,
 }
 
 /// The serial `xdg_popup.grab` needs, plus the surface the event carrying it was delivered to
@@ -1638,6 +1650,47 @@ fn secure_key_action<'a>(event: &'a KeyEvent, repeat: bool) -> SecureKeyAction<'
     }
 }
 
+/// The name `on_click`'s second argument carries for one evdev button code, or `None` for a button
+/// this engine does not hand to Lua at all.
+///
+/// A string rather than the raw `273` or a normalized `1`/`2`/`3`, because every categorical value
+/// that crosses this boundary already is one: `fit` (`image::Fit::from_str`), `layer` and `anchor`
+/// (`layout::node::parse_layer`/`parse_anchor`), `align_h` (`parse_align`). docs/adr/0050's second
+/// amendment argues the rest of it and is the place to change if this is ever revisited.
+///
+/// `None` means the press never arms and the release never fires, which is what an unhandled button
+/// already did. The set that fires has to equal the set a config can name: handed `"other"` for
+/// `BTN_TASK`, a config cannot tell it from `BTN_EXTRA`, cannot write a correct handler for either,
+/// and would instead run whatever was written for the left button.
+///
+/// ponytail: back and forward do nothing, on a mouse that has them. Three of the eight `BTN_*`
+/// codes `smithay_client_toolkit::seat::pointer` names are handled here and the other five are
+/// dropped, which costs a five-button mouse its two thumb buttons. Adding them is not a rename:
+/// real mice emit `BTN_SIDE` (0x113) and `BTN_EXTRA` (0x114) for back and forward, while
+/// `BTN_BACK` (0x116) and `BTN_FORWARD` (0x115) carry the literal names and are rarer, so a correct
+/// mapping is four codes onto two names and there is no caller to check it against yet. Map both
+/// pairs with the first config that asks; this function is the only place that changes.
+fn pointer_button_name(code: u32) -> Option<&'static str> {
+    match code {
+        BTN_LEFT => Some("left"),
+        BTN_RIGHT => Some("right"),
+        BTN_MIDDLE => Some("middle"),
+        _ => None,
+    }
+}
+
+/// Whether a release of `button` ends the press `armed` is holding, whether or not it completes it.
+///
+/// The pair of [`release_completes_click`] and the narrower of the two. Completing needs the same
+/// surface, the same rect and the same button; ending needs only the same button, because dragging
+/// off the node and releasing ends the press exactly as clicking does. What must not end it is a
+/// release of a *different* button: that event is the release of some other press, and clearing the
+/// slot for it throws away a press that is still live. Pressing left, pressing right, then
+/// releasing left used to do that, and lost the right click as well as the left one.
+fn release_ends_press(armed: Option<&ArmedClick>, button: u32) -> bool {
+    armed.is_some_and(|armed| armed.button == button)
+}
+
 /// Whether a release on `instance_id`, over the button at `released_on`, completes `armed`
 /// (docs/adr/0050 decision 2).
 ///
@@ -1645,9 +1698,9 @@ fn secure_key_action<'a>(event: &'a KeyEvent, repeat: bool) -> SecureKeyAction<'
 /// the armed rect but on something that is no longer a handled button (the config re-resolved and
 /// put a plain `rect` there) is not the click the press started. `released_on` is therefore
 /// [`clickable_button`]'s answer for the release, not the raw pointer position.
-fn release_completes_click(armed: Option<&ArmedClick>, instance_id: &str, released_on: Option<LogicalRect>) -> bool {
+fn release_completes_click(armed: Option<&ArmedClick>, instance_id: &str, released_on: Option<LogicalRect>, button: u32) -> bool {
     match (armed, released_on) {
-        (Some(armed), Some(rect)) => armed.instance_id == instance_id && armed.rect == rect,
+        (Some(armed), Some(rect)) => armed.instance_id == instance_id && armed.rect == rect && armed.button == button,
         _ => false,
     }
 }
@@ -1661,6 +1714,17 @@ fn release_completes_click(armed: Option<&ArmedClick>, instance_id: &str, releas
 /// which `popup` a click was meant to open, and it already has the button's rect. "Hands back"
 /// is the round trip through the config: `on_click = function(rect) menu_anchor:set(rect) end`,
 /// with the `popup` declaring `anchor_rect = menu_anchor` (build-steps.md Phase 22 item 2).
+/// `Err` names the step as well as carrying the error, because the two failures are not the same
+/// bug: a rect table this engine could not build is the engine's, and a handler that raised is the
+/// config's. [`App::fire_on_click`] prints the pair, and merging them would tell a config author to
+/// look at their own Lua for a fault that is not there.
+fn call_on_click(lua: &Lua, on_click: &Function, rect: LogicalRect, button: &str) -> Result<(), (&'static str, mlua::Error)> {
+    let argument = rect_table(lua, rect).map_err(|e| ("could not build on_click's rect argument", e))?;
+    on_click.call::<()>((argument, button)).map_err(|e| ("on_click raised, ignoring it", e))
+}
+
+/// `on_click`'s first argument: the button's rect as `{ x, y, width, height }` in its surface's
+/// logical coordinates (docs/adr/0050 decision 3).
 fn rect_table(lua: &Lua, rect: LogicalRect) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     table.set("x", rect.x)?;
@@ -3929,21 +3993,12 @@ impl App {
     /// calls `dispatch_pending` (which is where this runs) at the top of the same turn whose
     /// `re_resolve_if_dirty`/`repaint_mapped_surfaces` pair then picks the mark up, so a click is
     /// on screen one turn later without this function knowing anything about painting.
-    fn fire_on_click(&mut self, instance_id: &str, rect: LogicalRect, on_click: &Function) {
-        // The table is built and the `&Lua` borrow released before the call, so no borrow of
-        // `self.client` is live while Lua runs inside it.
-        let argument = match rect_table(self.client.lua(), rect) {
-            Ok(table) => table,
-            Err(e) => {
-                eprintln!("[oblisk-renderer] {instance_id}: could not build on_click's rect argument: {e}");
-                return;
-            }
-        };
+    fn fire_on_click(&mut self, instance_id: &str, rect: LogicalRect, button: &str, on_click: &Function) {
         // Nothing marks the scene dirty here. A handler that changes what is painted does it by
         // writing a `state(name, initial)` signal, and `signal:set()` marks the flag itself
         // (ADR-0044 decision 5); a handler that writes nothing correctly causes no re-resolve.
-        if let Err(e) = on_click.call::<()>(argument) {
-            eprintln!("[oblisk-renderer] {instance_id}: on_click raised, ignoring it: {e}");
+        if let Err((what, e)) = call_on_click(self.client.lua(), on_click, rect, button) {
+            eprintln!("[oblisk-renderer] {instance_id}: {what}: {e}");
         }
     }
 }
@@ -4062,9 +4117,13 @@ impl PointerHandler for App {
                 continue;
             };
             match event.kind {
-                // `BTN_LEFT` alone (docs/adr/0050 decision 2). A right-click has no meaning in the
-                // IDL, and inventing one here would be policy no config could override.
-                PointerEventKind::Press { button: BTN_LEFT, serial, .. } => {
+                // Left, right and middle (docs/adr/0050's second amendment). Any other code is not
+                // a button a config can name, so it arms nothing and fires nothing, which is what
+                // decision 2's original `BTN_LEFT`-only match did for every code but one.
+                PointerEventKind::Press { button, serial, .. } => {
+                    if pointer_button_name(button).is_none() {
+                        continue;
+                    }
                     let instance_id = self.surfaces[index].surface_id.clone();
                     // docs/adr/0049's amendment: armed here, read by this turn's re-resolve if one
                     // creates a popup, cleared by `run`'s poll loop at the end of the turn either
@@ -4094,9 +4153,12 @@ impl PointerHandler for App {
                     // clears: a press moving from one `textfield` to another is the direct A-to-B
                     // transition [`retarget_secure_submit`] exists for.
                     self.focus_secure_submit(focus);
-                    self.armed = hit.button.map(|(rect, _)| ArmedClick { instance_id, rect });
+                    self.armed = hit.button.map(|(rect, _)| ArmedClick { instance_id, rect, button });
                 }
-                PointerEventKind::Release { button: BTN_LEFT, serial, .. } => {
+                PointerEventKind::Release { button, serial, .. } => {
+                    let Some(name) = pointer_button_name(button) else {
+                        continue;
+                    };
                     let instance_id = self.surfaces[index].surface_id.clone();
                     // Overwrites the press's, and that is the point: a click fires on the release
                     // (docs/adr/0050 decision 2), so a popup opened by `on_click` is opened by
@@ -4106,21 +4168,23 @@ impl PointerHandler for App {
                     // Focus is untouched here. The press already decided it, and a release that
                     // drags off a `textfield` must not un-focus the field the user is typing into.
                     let hit = self.hit_under(index, event.position).button;
-                    let fires = release_completes_click(self.armed.as_ref(), &instance_id, hit.as_ref().map(|(rect, _)| *rect));
-                    // Unconditionally, and before the call: a release ends this press whether or
-                    // not it fired, and a handler that re-enters here must not find it still set.
-                    self.armed = None;
+                    let fires = release_completes_click(self.armed.as_ref(), &instance_id, hit.as_ref().map(|(rect, _)| *rect), button);
+                    // Before the call, so a handler that re-enters here cannot find its own press
+                    // still armed. See [`release_ends_press`] for why this is not unconditional.
+                    if release_ends_press(self.armed.as_ref(), button) {
+                        self.armed = None;
+                    }
                     if let Some((rect, on_click)) = hit.filter(|_| fires) {
-                        self.fire_on_click(&instance_id, rect, &on_click);
+                        self.fire_on_click(&instance_id, rect, name, &on_click);
                     }
                 }
                 // The pointer left the surface, so the release (if it ever comes) lands somewhere
                 // else. This is the drag-off-and-cancel decision 2 is built around.
                 PointerEventKind::Leave { .. } => self.armed = None,
-                // `Enter`/`Motion`/`Axis`: nothing in § 5.2 reads hover or scroll yet, and a
-                // motion that leaves the armed rect deliberately does *not* disarm -- dragging
-                // back onto the button and releasing still clicks it, which is what every toolkit
-                // does.
+                // `Enter`/`Motion`/`Axis`: nothing in § 5.2 reads hover or scroll yet
+                // (build-steps.md section 6 ranks both), and a motion that leaves the armed rect
+                // deliberately does *not* disarm -- dragging back onto the button and releasing
+                // still clicks it, which is what every toolkit does.
                 _ => {}
             }
         }
@@ -5322,17 +5386,59 @@ mod tests {
     fn a_release_fires_only_over_the_same_surface_and_the_same_rect_the_press_armed() {
         let rect = LogicalRect { x: 10.0, y: 4.0, width: 40.0, height: 24.0 };
         let moved = LogicalRect { x: 11.0, y: 4.0, width: 40.0, height: 24.0 };
-        let armed = ArmedClick { instance_id: "bar@eDP-1".to_string(), rect };
+        let armed = ArmedClick { instance_id: "bar@eDP-1".to_string(), rect, button: BTN_LEFT };
 
-        assert!(release_completes_click(Some(&armed), "bar@eDP-1", Some(rect)));
+        assert!(release_completes_click(Some(&armed), "bar@eDP-1", Some(rect), BTN_LEFT));
         // Dragged off the button, then released: the release hits no button at all.
-        assert!(!release_completes_click(Some(&armed), "bar@eDP-1", None));
+        assert!(!release_completes_click(Some(&armed), "bar@eDP-1", None, BTN_LEFT));
         // Dragged onto a different button on the same surface.
-        assert!(!release_completes_click(Some(&armed), "bar@eDP-1", Some(moved)));
+        assert!(!release_completes_click(Some(&armed), "bar@eDP-1", Some(moved), BTN_LEFT));
         // Same button geometry, different surface -- two panels can resolve identical rects.
-        assert!(!release_completes_click(Some(&armed), "notification_area@eDP-1", Some(rect)));
+        assert!(!release_completes_click(Some(&armed), "notification_area@eDP-1", Some(rect), BTN_LEFT));
         // A release with nothing armed (a press that hit no button, or a `leave` in between).
-        assert!(!release_completes_click(None, "bar@eDP-1", Some(rect)));
+        assert!(!release_completes_click(None, "bar@eDP-1", Some(rect), BTN_LEFT));
+    }
+
+    #[test]
+    fn only_the_three_buttons_a_config_can_name_are_handled_at_all() {
+        assert_eq!(pointer_button_name(BTN_LEFT), Some("left"));
+        assert_eq!(pointer_button_name(BTN_RIGHT), Some("right"));
+        assert_eq!(pointer_button_name(BTN_MIDDLE), Some("middle"));
+        // A side button, a browser-back button, and a code off the end of the mouse range. Each
+        // answers `None`, which is what stops the press arming: a config cannot tell these apart,
+        // so firing `on_click` for one would run a handler written for a button the user did not
+        // press.
+        assert_eq!(pointer_button_name(0x113), None);
+        assert_eq!(pointer_button_name(0x116), None);
+        assert_eq!(pointer_button_name(0), None);
+    }
+
+    #[test]
+    fn a_release_ends_only_its_own_buttons_press() {
+        // The bug this exists to stop: press left, press right, release left, release right, all
+        // on one node. If the left release clears the slot, the right press is thrown away with
+        // it and the right click never fires despite being a complete pair.
+        let rect = LogicalRect { x: 10.0, y: 4.0, width: 40.0, height: 24.0 };
+        let armed = ArmedClick { instance_id: "bar@eDP-1".to_string(), rect, button: BTN_RIGHT };
+
+        assert!(release_ends_press(Some(&armed), BTN_RIGHT));
+        assert!(!release_ends_press(Some(&armed), BTN_LEFT));
+        // Ending it does not depend on it having fired: dragging off the node and releasing the
+        // same button is over too, and the slot has to go.
+        assert!(!release_ends_press(None, BTN_RIGHT));
+    }
+
+    #[test]
+    fn a_release_fires_only_for_the_button_the_press_armed() {
+        // Press right, release left, on the same node: two different clicks interleaved, and
+        // neither completed. A mouse can hold more than one button down at a time, so this is a
+        // real sequence rather than a hypothetical one.
+        let rect = LogicalRect { x: 10.0, y: 4.0, width: 40.0, height: 24.0 };
+        let armed = ArmedClick { instance_id: "bar@eDP-1".to_string(), rect, button: BTN_RIGHT };
+
+        assert!(release_completes_click(Some(&armed), "bar@eDP-1", Some(rect), BTN_RIGHT));
+        assert!(!release_completes_click(Some(&armed), "bar@eDP-1", Some(rect), BTN_LEFT));
+        assert!(!release_completes_click(Some(&armed), "bar@eDP-1", Some(rect), BTN_MIDDLE));
     }
 
     /// One `secure_submit` destination, as the parsers hand it back.
@@ -5677,6 +5783,37 @@ mod tests {
         assert_eq!(table.get::<f32>("y").unwrap(), 4.0);
         assert_eq!(table.get::<f32>("width").unwrap(), 40.0);
         assert_eq!(table.get::<f32>("height").unwrap(), 24.0);
+    }
+
+    #[test]
+    fn on_click_takes_the_button_name_as_a_second_argument_beside_the_rect() {
+        // Second argument, not a fifth field on the rect table. Every handler written against the
+        // one-argument form keeps working untouched, because Lua drops arguments a function does
+        // not declare, and the table the config forwards to a `popup`'s `anchor_rect` stays four
+        // fields wide instead of carrying a `button` into the positioner.
+        let lua = Lua::new();
+        let seen: Function = lua
+            .load(r#"seen = {} return function(rect, button) seen.x, seen.w, seen.button = rect.x, rect.width, button end"#)
+            .eval()
+            .unwrap();
+        call_on_click(&lua, &seen, LogicalRect { x: 12.0, y: 4.0, width: 40.0, height: 24.0 }, "right").unwrap();
+
+        let recorded: Table = lua.globals().get("seen").unwrap();
+        assert_eq!(recorded.get::<f32>("x").unwrap(), 12.0);
+        assert_eq!(recorded.get::<f32>("w").unwrap(), 40.0);
+        assert_eq!(recorded.get::<String>("button").unwrap(), "right");
+    }
+
+    #[test]
+    fn a_one_argument_on_click_still_runs_unchanged() {
+        // docs/adr/0050 decision 3's exact worked example, which every config in the tree uses.
+        let lua = Lua::new();
+        let anchor: Function = lua.load(r#"anchor = nil return function(rect) anchor = rect end"#).eval().unwrap();
+        call_on_click(&lua, &anchor, LogicalRect { x: 40.0, y: 0.0, width: 86.0, height: 24.0 }, "left").unwrap();
+
+        let recorded: Table = lua.globals().get("anchor").unwrap();
+        assert_eq!(recorded.get::<f32>("x").unwrap(), 40.0);
+        assert_eq!(recorded.get::<f32>("height").unwrap(), 24.0);
     }
 
     // --- `popup` (§ 6.3, docs/adr/0049, docs/adr/0051) ---

@@ -146,7 +146,8 @@ local workspaces_module = pill({
     button {
         height = 18,
         align_v = "Center",
-        on_click = function()
+        -- Right cycles backwards, the same reading of the second argument the brightness pill makes.
+        on_click = function(_, button)
             local w = oblisk.workspaces:get()
             local out = w and (w.outputs or {})[1]
             if out == nil then
@@ -162,7 +163,8 @@ local workspaces_module = pill({
                     at = i
                 end
             end
-            oblisk.workspaces:invoke("focus", entries[at % #entries + 1].id)
+            local step = button == "right" and -1 or 1
+            oblisk.workspaces:invoke("focus", entries[(at - 1 + step) % #entries + 1].id)
         end,
         children = { cell(label(oblisk.workspaces, function(w)
             local out = (w.outputs or {})[1]
@@ -368,6 +370,10 @@ local volume_module = pill({
 -- demo nobody clicks twice, and `brightness:set(0)` on this machine's `intel_backlight` does
 -- exactly that.
 --
+-- Left steps up, right steps down, which is `on_click`'s second argument doing the only job it has
+-- (docs/adr/0050's second amendment). A wheel would be the obvious control and there is no
+-- `on_scroll`; this is what the pointer can express today.
+--
 -- Reads "--" forever on a machine with no backlight, deliberately: § 2.3 specifies no absence
 -- sentinel, so the capability pushes nothing at all rather than fabricating a `0` that a config
 -- could not tell from a screen turned all the way down (docs/adr/0053).
@@ -378,14 +384,16 @@ local brightness_module = pill({
         width = 58,
         height = 18,
         align_v = "Center",
-        on_click = function()
+        on_click = function(_, button)
             local b = oblisk.brightness:get()
             if b == nil then
                 return
             end
-            local stepped = b.percent + BRIGHTNESS_STEP
+            local stepped = b.percent + (button == "right" and -BRIGHTNESS_STEP or BRIGHTNESS_STEP)
             if stepped > 100 then
                 stepped = BRIGHTNESS_STEP
+            elseif stepped < BRIGHTNESS_STEP then
+                stepped = 100
             end
             oblisk.brightness:invoke("set", stepped)
         end,
@@ -541,7 +549,12 @@ local lock_button = button {
     height = 24,
     background = SURFACE,
     radius = 6,
-    on_click = function()
+    -- The one handler in this tree where the widened button set is not cosmetic: a right-click
+    -- landing here would take over the session (docs/adr/0050's second amendment names this).
+    on_click = function(_, button)
+        if button ~= "left" then
+            return
+        end
         oblisk.lock:invoke("lock")
     end,
     children = { cell("lock", MAUVE) },

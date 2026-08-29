@@ -5,6 +5,13 @@
 > decisions themselves stand. Read decision 1's ponytail and the consequences section's first
 > paragraph together with that section.
 
+> **Amended again: decision 2's `BTN_LEFT`-only rule is gone.** `on_click` now fires for left, right
+> and middle, and takes the button's name as a second argument. See the last amendment section.
+> Decisions 1 and 3 are untouched. Decision 4's *rule* is untouched and its *trigger* is not: "the
+> press decides focus" now runs on three buttons rather than one, which the amendment's "Two
+> knock-on effects" section records. The press-arms/release-fires rule that is the rest of decision 2
+> also stands.
+
 `on_click` has been an inert `mlua::Value` in a node's property map since ADR-0021 item 2. Phase 21
 calls it. Three things have to be decided before it can be called at all, and none of them are
 recoverable cheaply once a config depends on the answer.
@@ -142,3 +149,85 @@ dirty. `state(name, initial)` (ADR-0044 decision 5) was not built, so nothing a 
 marked anything. Phase 21 item 1 shipped an unconditional dirty mark after every handler as a
 stopgap and named it as one; the following commit built `state` and deleted it. Phase 22 depends on
 the same mechanism, which is why it was worth fixing rather than documenting.
+
+## Amendment: `BTN_LEFT` alone was too narrow, and the fix is one argument
+
+Decision 2's last paragraph says `BTN_LEFT` only, because "a right-click has no meaning in the IDL,
+and inventing one here would be policy the config cannot override." The premise was right and the
+conclusion was backwards. Handing the config the button is what stops the engine having a policy.
+Refusing to hand it over is the policy.
+
+`build-steps.md` section 6 measured the cost against a Quickshell config that already ships. Six of
+its nineteen bar modules put a different action on the right button: the tray opens an item's menu,
+the power menu cancels its countdown, the update checker opens its panel, the idle inhibitor opens
+its settings, the wallpaper button randomizes every monitor, and the screen recorder opens options.
+None of them is expressible here, and none of them is exotic.
+
+### `on_click` takes a second argument, and it is a string
+
+```lua
+on_click = function(rect, button)
+    if button == "right" then menu_open:set(true) else oblisk.tray:invoke("activate", id) end
+end
+```
+
+A second argument rather than a fifth field on the rect table. Lua drops arguments a function does
+not declare, so every handler written against decision 3's one-argument form keeps working with no
+edit, and the table a config forwards to a `popup`'s `anchor_rect` stays four fields wide instead of
+carrying a `button` into the positioner.
+
+A string, not the raw evdev `273` and not a normalized `1`/`2`/`3`. Every categorical value that
+crosses this boundary is already a lowercase string matched against named literals: `fit`, `layer`,
+`anchor`, `align_h`. `if button == "right"` needs no lookup table in the author's head; `if button ==
+273` needs the evdev header, and `if button == 3` needs to know which of the two disagreeing
+small-integer conventions is in play (the DOM's own `MouseEvent.button` and `MouseEvent.buttons`
+number the same three buttons differently). Qt's `MouseArea`, which is the prior art a Quickshell
+author already has muscle memory for, normalizes to a name for the same reason. The direction is also
+the cheap one to be wrong about: adding the raw code later is one more argument, while shipping codes
+now and normalizing later rewrites every `if` in every config.
+
+### Three buttons, and an unhandled code still does nothing
+
+`left`, `right`, `middle`. A press carrying any other code arms nothing and a release carrying one
+fires nothing, which is exactly what decision 2's original match did for the seven other codes
+`smithay_client_toolkit::seat::pointer` names.
+
+Not `"other"` for the rest, which is the tempting alternative. The set that fires has to equal the
+set a config can name. A config handed `"other"` for `BTN_TASK` cannot tell it from `BTN_EXTRA`, so
+it cannot write a correct handler for either, and the practical effect is that a side button runs
+whatever handler was written for the left one. That is decision 2's "policy the config cannot
+override" with a different button in it.
+
+Back and forward are the two a mouse plausibly has next, and they are left out because a correct
+mapping is not obvious and there is no caller to check it against. Real mice emit `BTN_SIDE` (0x113)
+and `BTN_EXTRA` (0x114) for back and forward, while `BTN_BACK` (0x116) and `BTN_FORWARD` (0x115)
+carry the literal names and are rarer, so the mapping is four codes onto two names. Add them with the
+first config that asks, and `pointer_button_name` is the only place that changes.
+
+### The press has to remember which button armed it
+
+`ArmedClick` carries the evdev code alongside the surface id and the rect, and a release completes
+the click only if all three match. A mouse holds more than one button at a time, so pressing right,
+then pressing left, then releasing left is a real sequence, and without the third comparison it
+completes the right-button press with a left-button release.
+
+### Two knock-on effects, both wanted
+
+A right or middle press now decides focus the way a left press does, because decision 4's rule is
+"the press decides focus" and these are presses. Right-clicking away from a `textfield` clears it,
+where before that event did nothing. Every toolkit answers the same way, and the alternative is a
+focus rule that depends on which button you used.
+
+A right or middle press also arms the `xdg_popup.grab` serial and counts toward
+`pointer_input_count` (docs/adr/0049's amendment, docs/adr/0051's first). Both exist to answer "did
+real user input cause this", and a right-click is real user input. Without it, a `popup` opened from
+a right-click handler would be refused for having no serial, which is the whole feature.
+
+### What this changes for a config that ignores the argument
+
+A handler that takes no `button` argument now runs on a right or middle click as well as a left one,
+where before those events did nothing. That is a real behavior change and there is no way to have the
+feature without it, short of a second property per button, which does not scale past three and
+matches no toolkit. A config that wants the old behavior asks for it: `if button ~= "left" then
+return end`. `dev-config/oblisk/shell.lua`'s `lock_button` does exactly that, because locking the
+session on a stray right-click is the one handler in the tree where the difference is not cosmetic.

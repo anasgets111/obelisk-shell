@@ -383,9 +383,13 @@ An `image` has no intrinsic size and takes the box § 5.1's `width`/`height` giv
 #### 6. `button`
 Receives input focus and pointer events.
 *   `children`: `table` (Content elements nested inside the button boundary)
-*   `on_click`: `function` (Lua callback executed on mouse click or pointer tap. Called with the button's absolute rect, per ADR-0050 decision 3)
+*   `on_click`: `function(rect, button)` (Lua callback executed on mouse click or pointer tap. Fires for the left, right and middle buttons, on the release, and only when the release lands on the same node and the same button the press armed)
+    *   `rect`: `table` (The button's absolute rect, `{ x, y, width, height }`, in its surface's logical coordinates, per ADR-0050 decision 3)
+    *   `button`: `string` (`"left"`, `"right"` or `"middle"`. Any other evdev code arms nothing and fires nothing, so this is never another value. Added by ADR-0050's second amendment, which also records why back and forward are left out and why this is a name rather than a code)
 
-> **This row is the whole pointer model, and it reads one `wl_pointer` event of four.** `renderer/src/wayland/mod.rs`'s frame handler matches `Press`, `Release` and `Leave`, and drops `Enter`, `Motion` and `Axis`. Three things follow. `on_click` carries no button index, so left, middle and right are indistinguishable. There is no `on_hover`, so nothing can express a tooltip or an expand-on-hover affordance. There is no `on_scroll`, so a wheel drives neither a value nor a viewport. The first is one more field on the argument this row already passes. The other two each need a design decision before a spec row. `build-steps.md` section 6 ranks all three.
+> A handler declaring one parameter still works untouched, because Lua drops arguments a function does not declare. It does now run on a right or middle click as well as a left one, where before those events did nothing. `if button ~= "left" then return end` restores the old behavior for a handler that wants it.
+
+> **This row is most of the pointer model, and it reads two `wl_pointer` events of four.** `renderer/src/wayland/mod.rs`'s frame handler matches `Press`, `Release` and `Leave`, and drops `Enter`, `Motion` and `Axis`. Two things follow. There is no `on_hover`, so nothing can express a tooltip or an expand-on-hover affordance. There is no `on_scroll`, so a wheel drives neither a value nor a viewport. Each needs a design decision before a spec row. `build-steps.md` section 6 ranks both.
 
 #### 7. `list`
 A fast-reconciling virtual repeater element.

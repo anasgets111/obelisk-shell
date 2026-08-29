@@ -2289,6 +2289,19 @@ The data layer is fine. That was the surprise. Input and paint are where this fa
 
 ### The pointer reads one of four events
 
+> **Item 1 is built.** `on_click` now fires for left, right and middle and takes the button's name
+> as a second argument, which amends ADR-0050 decision 2. The six right-click modules below are
+> unblocked; the hover and scroll rows are not. The paragraph and table are left as they were
+> measured, because they are what the ranking was built from.
+>
+> Verified by unit test, not on a live session, which is a weaker claim than Phase 29's and is worth
+> stating rather than leaving to inference. Six tests cover the three seams: the evdev-to-name map
+> including the codes it refuses, the press/release button match, the release that must not clear
+> another button's press, and the callback receiving `(rect, button)` with a one-parameter handler
+> still running unchanged. What no test reaches is `pointer_frame` itself, which needs a compositor
+> to deliver a real `BTN_RIGHT`. Until someone right-clicks the dev config's brightness pill and
+> watches the number go down, that half is written and unconfirmed.
+
 `renderer/src/wayland/mod.rs`'s frame handler matches `Press`, `Release` and `Leave`. Its `_ => {}`
 arm drops `Enter`, `Motion` and `Axis`, with a comment saying why: "nothing in § 5.2 reads hover or
 scroll yet". `clickable_button` looks up one property, `on_click`, and `fire_on_click` calls it with
@@ -2439,7 +2452,11 @@ A gap ledger reads worse than the situation is.
 By modules unblocked per unit of work, which is not the same as by size.
 
 1. **A button index on `on_click`.** Six modules, one field, no new concepts. Nothing else should go
-   first.
+   first. **Built**, as a second argument carrying a name (`"left"`, `"right"`, `"middle"`) rather
+   than a field or a code. ADR-0050's second amendment records the three calls that took: a second
+   argument keeps every one-parameter handler working, a string matches what `fit`, `layer` and
+   `align_h` already do at this boundary, and an unhandled evdev code still does nothing rather than
+   arriving as `"other"` and running a handler written for the left button.
 2. **A JSON decoder reachable from Lua.** Turns `process.run` from fire-and-forget into a data
    source. Every subprocess row above depends on it.
 3. **Gradient and shadow on `rect`.** Already in the dependency. Parsers and § 5.2 rows only.
