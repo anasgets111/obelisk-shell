@@ -356,9 +356,12 @@ cargo check --workspace --release
 echo "Step 2: Executing shared IPC serialization tests..."
 cargo test -p shared --all-features
 
-# 3. Dry-run the config compiler to ensure Lua AST evaluates properly
-echo "Step 3: Validating user layout configuration schema..."
-cargo run -p renderer -- --validate ~/.config/oblisk/shell.lua
+# 3. There is no config dry run, and there never was. See section 6, "Found while writing this":
+#    the Renderer parses no command-line arguments, so `--validate` is ignored in full and this
+#    line starts a live shell over the running session instead of checking a config.
+#    Left in place, corrected, because the flag it names is still worth building.
+#
+#    cargo run -p renderer -- --validate ~/.config/oblisk/shell.lua   # DOES NOT VALIDATE
 
 echo "Success: Scaffolding has compiled with 100% type-safety!"
 ```
@@ -2249,7 +2252,227 @@ trigger a config could have noticed and nothing else would. Build it if a caller
 
 ---
 
-## 6. Continuation Testing & Validation Protocols
+## 6. The gap ledger: measured against a shell that already ships
+
+Every phase above was written from `docs/oblisk-idl-api-specs.md`. A spec cannot list what it forgot,
+so it cannot answer "is this enough to be somebody's daily shell". This section works the other way
+round. It takes a Quickshell config that is already somebody's daily shell (`anasgets111/dotfiles`,
+at `quickshell/.config/quickshell`) as a reference workload, and diffs it against what this workspace
+compiles today.
+
+A ledger, not a phase. Nothing here is scheduled, several entries need an ADR before a line of code,
+and two are decisions about what Oblisk is for. Entries cite code, not docs, because the docs are
+what missed this.
+
+### What the reference workload is
+
+Nineteen bar modules across three zones, eight Wayland surfaces, about forty data sources. It drives
+PipeWire, UPower, BlueZ, MPRIS, NetworkManager, SystemTray, Polkit and PAM through native bindings.
+It speaks niri's event stream on one socket and its request channel on another. It polls backlight
+and keyboard-backlight sysfs at 100ms, shells out to more than twenty binaries, fetches weather over
+HTTPS, and renders a live 256-bar audio spectrum through a GLSL fragment shader in the middle of the
+bar.
+
+### The verdict, by layer
+
+| Layer | State | Detail |
+| :--- | :--- | :--- |
+| Capabilities (read) | near complete | every native Quickshell service has an Oblisk counterpart |
+| Capabilities (write) | near complete | ahead in one place: that config reads the power profile, Oblisk sets it |
+| Surface roles | complete | `panel` on four layers, `window`, `popup`, `lock`, all live-tested |
+| Pointer input | one event of four | `on_click` and nothing else |
+| Paint vocabulary | four operations | fill, radius, per-edge border, blit |
+| Animation | absent | Lua has no clock faster than 1 Hz |
+| Text and layout | sufficient | shaping, clipping, alignment and keyed reconciliation are built |
+
+The data layer is fine. That was the surprise. Input and paint are where this falls over.
+
+### The pointer reads one of four events
+
+`renderer/src/wayland/mod.rs`'s frame handler matches `Press`, `Release` and `Leave`. Its `_ => {}`
+arm drops `Enter`, `Motion` and `Axis`, with a comment saying why: "nothing in § 5.2 reads hover or
+scroll yet". `clickable_button` looks up one property, `on_click`, and `fire_on_click` calls it with
+a rect and no button index. That is the whole pointer model.
+
+Eleven of nineteen bar modules lose their interaction to it, most losing more than one thing. The
+last row is not a bar module; it is the only thing in the reference shell that needs a drag.
+
+| Module | What it needs | What it gets |
+| :--- | :--- | :--- |
+| Volume | hover-expand, drag slider, wheel, middle-click mute, right-click panel | one click |
+| SysTray | left activate, right menu, scroll forwarded to the item | one click |
+| ScreenRecorder | left region record, middle focused-output record, right options | one click |
+| PowerMenu | click arms a countdown, right-click cancels it | no cancel |
+| ArchChecker | left polls, right opens the panel | one of the two |
+| IdleInhibitor | left toggles, right opens settings | one of the two |
+| WallpaperButton | left opens the picker, right randomizes every monitor | one of the two |
+| BatteryIndicator | hover tooltip: power source, platform profile, CPU governor | no tooltip |
+| DateTimeDisplay | hover tooltip: mini calendar and weather detail | no tooltip |
+| MediaIndicator | hover opens the media panel | no hover |
+| WorkspaceStrip | hover highlights the slot under the pointer | no hover |
+| DisplaySettings | drag monitors on a canvas, snapping to neighbouring edges | no drag |
+
+Three things are missing. They cost very different amounts, so keep them apart.
+
+1. **A button index on `on_click`.** The cheapest item in this ledger. `wl_pointer::button` already
+   carries the code, and `fire_on_click` already builds a table argument for the rect, which can
+   carry a second field. One § 5.2 row, nothing else. Right-click alone repairs six modules.
+2. **`on_hover`.** `Enter`, `Motion` and `Leave` already arrive at the drop site, and `hit_under`
+   already resolves a position to a node path. Reading the event is not the work. The work is
+   deciding what a hover *is* in a retained tree that re-resolves on every signal push. Two shapes
+   fit: a callback firing with a boolean, or a `hovered` signal the config binds to `visible`. The
+   signal makes a tooltip declarative instead of a state machine. It also makes the engine a source
+   of signals rather than only a consumer, which is why it needs an ADR.
+3. **`on_scroll`.** `Axis` arrives at the same drop site. The open question is what a scrollable
+   container means, not what the callback looks like. Clipping already exists: `paint_tree` pushes an
+   `intersect_scissor` per node, so a subtree is already cut to its parent's box. The missing half is
+   a scroll offset applied during layout. Small change to `layout::scene`, large one to the spec,
+   since § 5.2 has no container that owns a viewport. Until it lands, no panel holding a list is
+   usable: network access points, bluetooth devices, notification history, launcher results, SMS
+   threads.
+
+### Paint has four operations
+
+`layout::paint` fills a rounded rect, strokes up to four border edges, blits an image or icon, and
+draws a text run. Every one of `rect`, `row`, `column`, `button`, `panel`, `window`, `popup` and
+`lock` resolves to `paint_box`. The reference shell's look is built almost entirely out of what is
+not in that list.
+
+**Gradients and drop shadows are nearly free. Take them first.** femtovg 0.26, already the only
+drawing dependency, ships `Paint::linear_gradient`, `Paint::radial_gradient`, `Paint::box_gradient`
+and their `_stops` variants, plus a Canvas-2D shadow model on `Canvas` itself (`set_shadow_color`,
+`set_shadow_blur`, `set_shadow_offset`). The work is § 5.2 rows, parsers in `layout::node`, and calls
+in `fill_rect`. A `background` accepting a table of stops, and a `shadow` alongside `border_width`,
+land the notification cards' `RectangularShadow` and every gradient pill in one slice. femtovg caps
+the blur kernel at +/-24 physical pixels, so a `shadowBlur` above 16 renders tighter than the Canvas
+2D spec says. Do not promise a large shadow.
+
+**Backdrop blur is a decision, not a feature.** The reference shell's most distinctive trait is
+`BackgroundEffect.blurRegion`, one continuous blur shared by the bar and whichever dropdown is open,
+so it does not seam at the bar's edge. Wayland gives a client no way to read what is behind its own
+surface, so nobody implements this by sampling the compositor. Two ways, and both need an ADR before
+either gets built.
+
+- *Compositor-side.* Hyprland's `layerrule = blur, <namespace>` blurs the surface for us. Zero
+  renderer code, one documented namespace. niri has no equivalent, so it does nothing on the
+  compositor this project targets.
+- *Client-side, against the wallpaper we already own.* The config knows the wallpaper path, the
+  Renderer already decodes and caches it (Phase 29), and femtovg has `Canvas::filter_image` with
+  `ImageFilter::GaussianBlur`. Blur that image once, blit the offset crop under the panel, and the
+  result matches the reference shell exactly, because that shell is not sampling a live backdrop
+  either. It fails visibly over any window that is not the wallpaper.
+
+Only the second works on niri, and it is a lie that looks right. That belongs in an ADR, not a commit
+message.
+
+**No shaders and no immediate-mode canvas, and that is the right call for now.** The reference config
+uses raw GLSL twice: six wallpaper transitions, and the 256-bar Cava spectrum. It uses `Canvas` twice
+more: the concave notch at the bar's corners (`RoundCorner.qml`, a cubic-bezier arc approximation)
+and the monitor-arrangement grid. Exposing either to Lua puts the GPU in reach of config code, which
+is a far larger decision than any node property.
+
+The notch is the one real loss, because it carries the look and nothing else reaches it. femtovg's
+`Path` already has `arc`, `arc_to` and `bezier_to`, and `Canvas` already has `fill_path` and
+`stroke_path`, all of which `layout::paint` uses today for nothing more exotic than a rounded
+rectangle. A `shape` node taking a path costs far less than a shader and closes the notch, the arcs
+and the circular progress rings together.
+
+### Animation: see "The missing animation model" above
+
+Written up in section 5. Repeated here only for what the reference workload adds. That section
+concluded from a grep that nobody ever specified an animation model. This config shows what one is
+worth in practice: four named durations reused everywhere (`animationFast` 100ms, `animationDuration`
+147ms, `animationSlow` 250ms, `animationVerySlow` 400ms), two shared `Behavior` components
+(`ColorTransition`, `NumberTransition`), and effects that carry meaning rather than decoration. The
+lock card shakes horizontally on a failed authentication. The notification card slides off to the
+right when dismissed, so the gesture and the result match. The OSD queue suppresses lower-priority
+entries instead of stacking them.
+
+One correction to that section. It says a shell without animation is functional and nothing is
+blocked. True of the engine, false of this workload: PowerMenu, WorkspaceStrip, SpecialWorkspaces and
+Volume all use expansion as their primary affordance, and each is blocked twice over. It needs the
+hover to trigger the expansion before it needs the easing to run it.
+
+### Data no capability carries
+
+The capability roster covers every native service this shell uses. It does not cover what the config
+reaches for outside them.
+
+| Missing | Used for | Nearest path today | Verdict |
+| :--- | :--- | :--- | :--- |
+| A JSON decoder in the Lua environment | `nvtop -s`, `lsblk --json`, `busctl --json=short`, weather, currency | none; `process.run`'s `out_cb` hands Lua a string Lua cannot read | highest value in this table, and it unblocks every subprocess row below it |
+| An HTTP client | weather (open-meteo), IP geolocation, currency conversion | `process.run` `curl`, then the decoder above | fine as a subprocess; a capability would be scope creep |
+| Desktop entry lookup | app-id to icon and display name, and the whole launcher | ADR-0054 decision 5 dropped `system:find_icon`, and this is the caller it said had none | that ADR was right about the mechanism, wrong that nothing would want the data; amendment, not reversal |
+| Per-workspace window lists | `WorkspaceStrip` draws each workspace's app icon | § 2.9 carries one global `active_client` and per-workspace `{ id, idx, name }` | ADR-0056 chose that payload, so this is not an oversight; niri's `Window.workspace_id` is right there, making it an additive field |
+| Special workspaces | the `SpecialWorkspaces` pill | nothing in § 2.9 models them | niri-specific; ADR-0056's one-compositor decision makes it cheap to build and awkward to name |
+| Source (microphone) mute | `PrivacyIndicator`'s click target | § 3.2 has `set_default_source` and no `set_source_muted` | a spec hole, not a design choice; the mixer already writes node props |
+| KDE Connect | SMS, ring, mount, remote commands | none; Lua cannot speak D-Bus, and this needs a live signal stream, not one-shot calls | out of scope by a wide margin, and the only entry arguing for a general D-Bus escape hatch |
+| Monitor configuration | the display-settings arrangement editor | § 2.15 `screens` reads; nothing writes | writing output config is compositor-specific, and ADR-0056's reasoning applies unchanged |
+
+Take the first row. A pure-Lua JSON decoder is about a hundred lines and ships in the config, not the
+engine. That stays the YAGNI-correct answer right up until three configs have each written their own.
+
+### What the reference workload proves is already right
+
+A gap ledger reads worse than the situation is.
+
+- **The capability boundary held.** Sixteen capabilities, and the only native Quickshell services
+  with no Oblisk counterpart are KDE Connect and desktop entries. The write path is ahead in one
+  place: that config reads the power profile through `powerprofilesctl get` and cannot set it, while
+  `power:set_profile` is built.
+- **Brightness is better here, on both halves.** The reference config polls
+  `/sys/class/backlight/*/brightness` every 100ms to read, and forks `brightnessctl` to write. Oblisk
+  reads through a udev `backlight` subsystem watch, so the change wakes it instead of it asking ten
+  times a second, and writes through `org.freedesktop.login1.Session.SetBrightness`, so no fork and
+  no setuid helper on the write path either.
+- **The surface roles are complete.** All eight of the reference shell's surfaces map onto built
+  Oblisk roles, including the two that are usually hard: a real `ext-session-lock-v1` lock, and a
+  registered Polkit agent with PAM behind a `secure_submit`.
+- **Nerd Font glyphs sidestep the `currentColor` bug.** The themed-icon defect recorded above under
+  Phase 29 does not touch this workload. The reference shell draws its chrome with Nerd Font
+  private-use glyphs as `text`, which takes a `foreground` and works today. Only the tray and app
+  icons come from a real icon theme, and those are full-colour SVGs that already render correctly.
+  The bug is real and still worth fixing. It is not on the path to this shell.
+
+### The ranking
+
+By modules unblocked per unit of work, which is not the same as by size.
+
+1. **A button index on `on_click`.** Six modules, one field, no new concepts. Nothing else should go
+   first.
+2. **A JSON decoder reachable from Lua.** Turns `process.run` from fire-and-forget into a data
+   source. Every subprocess row above depends on it.
+3. **Gradient and shadow on `rect`.** Already in the dependency. Parsers and § 5.2 rows only.
+4. **`on_hover`.** Two tooltips, a hover-to-open panel, a hover highlight, and every expand-on-hover
+   affordance. Needs an ADR on whether the engine may emit a signal rather than only consume one.
+5. **`on_scroll` plus a scroll offset.** Clipping is built, so this is layout and spec work, not
+   paint work. Blocks every list-bearing panel until it lands.
+6. **The animation model.** Largest item, scoped in section 5, and gated behind items 4 and 5 in
+   practice. An expanding pill needs the hover before it needs the easing.
+7. **Backdrop blur.** One ADR, two bad options, and only the client-side one works on niri.
+8. **A `shape` node taking a path.** Closes the notch, the arcs and circular progress together, and
+   costs far less than exposing shaders.
+9. **Shaders.** The Cava spectrum and the wallpaper transitions. Lowest value, and the only item that
+   puts the GPU in reach of config code.
+
+### Found while writing this: `--validate` does not exist
+
+Both validation protocols in this document, section 3 item 3 and section 7 item 3, have said `cargo
+run -p renderer -- --validate <path>` since they were written, and both call it a dry run of the
+config compiler. The Renderer parses no command-line arguments. `renderer/src/main.rs` never reads
+`env::args`, there is no argument parser in its dependency tree, and the flag is ignored in full.
+That command validates nothing. It starts a live Renderer, which connects to the compositor, opens
+the DRM render node, and stays up until something kills it.
+
+Worse than a no-op. The command is documented as the safe way to check a config, and it launches a
+second shell over the running session. Found by running it. It sat there for twelve minutes holding
+`/dev/dri/renderD128` and printing nothing. Both call sites are corrected in place rather than
+deleted, because the flag they name is worth building. A config that fails to load should say so at a
+shell prompt, not by taking over the screen.
+
+---
+
+## 7. Continuation Testing & Validation Protocols
 
 ```bash
 #!/usr/bin/env bash
@@ -2261,6 +2484,10 @@ cargo check --workspace --release
 # 2. Full test suite, including the new transport/loader/layout/watcher seams
 cargo test --workspace
 
-# 3. Dry-run a reference config against the real loader
-cargo run -p renderer -- --validate ~/.config/oblisk/shell.lua
+# 3. There is no dry run. `--validate` was never built (section 6, "Found while writing this").
+#    The Renderer reads no arguments, so the line below starts a live shell over the running
+#    session instead of checking anything. Left here, corrected, rather than deleted, because
+#    the flag it names is still worth building.
+#
+#    cargo run -p renderer -- --validate ~/.config/oblisk/shell.lua   # DOES NOT VALIDATE
 ```

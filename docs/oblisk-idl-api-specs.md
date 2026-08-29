@@ -166,6 +166,8 @@ Workspace state only. Output geometry lives in `oblisk.screens` (§ 2.15), which
     *   `is_floating`: `boolean` (True if marked floating/pinned by compositor)
     *   `is_fullscreen`: `boolean` (True if window occupies entire display boundary. **Not reported**, per ADR-0056 decision 5)
 
+> **Two things a real workspace strip wants and this section does not carry.** There is no per-workspace window list, so a config can name and focus a workspace but cannot draw the icon of what runs on it. `active_client` is one window across every output, not one per workspace, and niri-ipc's `Window.workspace_id` makes closing that an additive field rather than a redesign. Special workspaces are not modelled at all. ADR-0056's one-compositor decision makes both cheap to build and awkward to name, since neither term survives a second compositor unchanged. See `build-steps.md` section 6, "Data no capability carries".
+
 ### 2.10 Rescue Mode & Recovery State (`oblisk.rescue`)
 *   `rescue.is_rescue`: `boolean` (True if the user configuration is broken and Rescue Mode is active)
 *   `rescue.error_log`: `string` (The compiled Lua syntax error or backtrace message)
@@ -234,12 +236,13 @@ All write actions are serialized as JSON-RPC 2.0 payloads over the private Unix 
 | Module Method | IPC Command JSON Payload Details |
 | :--- | :--- |
 | `system:write_state(key, val)` | `capability: "system", action: "write_state", arguments: [key, val]`<br>**Validation**: `key` must be alphanumeric. `val` must be string, number, or boolean. |
-| `system:find_icon(app_id, name, fallback_name)` | *Synchronous internal Rust lookup* returning `string` path.<br>**Validation**: `app_id` and `name` are strings. Falls back to desktop entry values. **Not built, and not planned as written (ADR-0054 decision 5).** The theme-name half of this lookup lives in the Renderer and is reached through `icon.name` (§ 5.2 item 5), which leaves this function nothing to be asked for; the `app_id` to `.desktop` to `Icon=` half has no caller. "Synchronous" is the row that settled where the resolver lives: the control socket carries one-way commands and one-way state snapshots, with no request/response shape to return a path over. |
+| `system:find_icon(app_id, name, fallback_name)` | *Synchronous internal Rust lookup* returning `string` path.<br>**Validation**: `app_id` and `name` are strings. Falls back to desktop entry values. **Not built, and not planned as written (ADR-0054 decision 5).** The theme-name half of this lookup lives in the Renderer and is reached through `icon.name` (§ 5.2 item 5), which leaves this function nothing to be asked for; the `app_id` to `.desktop` to `Icon=` half has no caller. "Synchronous" is the row that settled where the resolver lives: the control socket carries one-way commands and one-way state snapshots, with no request/response shape to return a path over. **A caller has since appeared** (`build-steps.md` section 6, "Data no capability carries"). An application launcher needs `app_id` to display name and icon for every entry, which is desktop-entry enumeration rather than a per-`app_id` lookup, so it does not want this row's signature. ADR-0054 was right that this function has no asker, and wrong that the underlying data has no want. |
 | `audio:set_volume(vol)` | `capability: "audio", action: "set_volume", arguments: [vol]`<br>**Validation**: `vol` must be a float in range `[0.0, 1.0]`. |
 | `audio:set_muted(bool)` | `capability: "audio", action: "set_muted", arguments: [bool]`<br>**Validation**: `bool` is boolean. |
 | `audio:toggle_mute()` | `capability: "audio", action: "toggle_mute", arguments: []` |
 | `audio:set_default_sink(id)` | `capability: "audio", action: "set_default_sink", arguments: [id]`<br>**Validation**: `id` must be an active Sink Node ID. |
 | `audio:set_default_source(id)` | `capability: "audio", action: "set_default_source", arguments: [id]`<br>**Validation**: `id` must be an active Source Node ID. |
+| `audio:set_source_muted(bool)` | **Not specified, and that is a hole rather than a decision.** It would be `capability: "audio", action: "set_source_muted", arguments: [bool]`, mirroring `set_muted`. A microphone-mute toggle is the click target of every privacy indicator that exists, and this table gives the default sink a mute with no counterpart for the default source. The mixer already writes node props, so this is a dispatch arm and a row, not a mechanism. See `build-steps.md` section 6. |
 | `audio:set_app_volume(id, vol)` | `capability: "audio", action: "set_app_volume", arguments: [id, vol]`<br>**Validation**: `id` is application node ID, `vol` float `[0.0, 1.0]`. |
 | `audio:set_app_muted(id, bool)` | `capability: "audio", action: "set_app_muted", arguments: [id, bool]`<br>**Validation**: `id` is application node ID, `bool` is boolean. |
 | `audio:play_sound(sound)` | `capability: "audio", action: "play_sound", arguments: [sound]`<br>**Validation**: `sound` must be string path or system theme icon name. |
@@ -278,6 +281,8 @@ All write actions are serialized as JSON-RPC 2.0 payloads over the private Unix 
 ### 3.3 The Non-Blocking Process Control Handle (`ProcessHandle`)
 The `process.run` function yields an opaque `ProcessHandle` object to Lua:
 *   `process_handle:kill()`: Terminate the child process and its entire Unix process group cleanly in Rust (sending `SIGTERM`, then escalating to `SIGKILL` if it persists). Prevents orphaned processes.
+
+> **`out_cb` hands Lua a string, and Lua cannot read it.** The config environment has no JSON decoder, which puts every subprocess reporting structured output out of reach: `nvtop -s`, `lsblk --json`, `busctl --json=short`, and any HTTP fetch through `curl`. That is what leaves `process.run` as fire-and-forget instead of a data source. A pure-Lua decoder is about a hundred lines and belongs in the config, not the engine, which stays the right answer until a third config has written its own. `build-steps.md` section 6 ranks this second overall, behind only a button index on `on_click`.
 
 ---
 
@@ -345,6 +350,8 @@ A flexible rectangular element representing either a containment box or a solid 
 *   `border_width`: `integer` / `table` (Border thickness in logical pixels or `{ top, right, bottom, left }`. A bare number applies to all four edges. Defaults to `0` on every edge, so a `border_color` alone paints nothing)
 *   `children`: `table` (Optional dense array of child node structures. If specified, the layout engine instantiates this node as a layout parent container; if omitted, it resolves as a static childless leaf shape, e.g. a progress bar or background spacer.)
 
+> **A `rect` has no gradient and no shadow.** `background` takes one flat colour. Both are cheap to add: femtovg 0.26, this workspace's only drawing dependency, already ships `Paint::linear_gradient` / `radial_gradient` / `box_gradient` and a Canvas-2D shadow model on `Canvas`, so the work is parsers and rows here, not rendering. Backdrop blur is a separate and much harder question. See `build-steps.md` section 6, "Paint has four operations", for both.
+
 #### 2. `row`
 Arranges children horizontally.
 *   `spacing`: `integer` (Pixels of space between siblings)
@@ -376,13 +383,17 @@ An `image` has no intrinsic size and takes the box § 5.1's `width`/`height` giv
 #### 6. `button`
 Receives input focus and pointer events.
 *   `children`: `table` (Content elements nested inside the button boundary)
-*   `on_click`: `function` (Lua callback executed on mouse click or pointer tap)
+*   `on_click`: `function` (Lua callback executed on mouse click or pointer tap. Called with the button's absolute rect, per ADR-0050 decision 3)
+
+> **This row is the whole pointer model, and it reads one `wl_pointer` event of four.** `renderer/src/wayland/mod.rs`'s frame handler matches `Press`, `Release` and `Leave`, and drops `Enter`, `Motion` and `Axis`. Three things follow. `on_click` carries no button index, so left, middle and right are indistinguishable. There is no `on_hover`, so nothing can express a tooltip or an expand-on-hover affordance. There is no `on_scroll`, so a wheel drives neither a value nor a viewport. The first is one more field on the argument this row already passes. The other two each need a design decision before a spec row. `build-steps.md` section 6 ranks all three.
 
 #### 7. `list`
 A fast-reconciling virtual repeater element.
 *   `source`: `Signal` (Must wrap a flat array table)
 *   `itemfn`: `function` (A Lua builder function that is executed for every index, returning child nodes)
 *   `key`: `function` (Maps a `source` element to a stable string, called on the element rather than on the node `itemfn` builds. Items reconcile by key, so inserting one element rebuilds one item instead of every item below it. Duplicate keys are an error. Without `key`, items match by index and an insertion rebuilds everything after it, which is fine for a short static list and wrong for anything driven by a capability. ADR-0045)
+
+> **A `list` stacks vertically and has no viewport.** It lays out exactly like a `column` (`renderer/src/layout/scene.rs`, design decision 5), so a horizontal repeater such as a tray row or a workspace strip is a hand-built `row` today, and a list longer than its surface overflows it. Clipping is already built: `layout::paint::paint_tree` pushes an `intersect_scissor` per node, cutting a subtree to its parent's box. What is missing is a scroll offset applied during layout, and the input to drive it. `build-steps.md` section 6 ranks both behind the pointer's button index and ahead of the animation model.
 
 #### 8. `textfield` (The Engine Security Exception)
 An IME-aware native input field mapped directly to Rust-owned `wp-text-input-v3`.
