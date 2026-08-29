@@ -46,6 +46,10 @@ use crate::text::snap::{snap_border_band, snap_to_physical, LogicalRect};
 /// Deleting that role enum (docs/adr/0038 decision 1) is what made them one space, and that is
 /// what took this function's `#[allow(dead_code)]` off.
 pub fn paint_tree(painter: &mut TextPainter, images: &mut ImageCache, root: &ResolvedNode, scale: f32) {
+    // Before the walk, never during it: the previous frame's flush has happened, this one has
+    // recorded nothing yet, so this is the only point where deleting a texture cannot pull it out
+    // from under a queued draw call (see `ImageCache::release_evicted`).
+    images.release_evicted(painter.canvas_mut());
     paint_node(painter, images, root, 0.0, 0.0, scale);
     painter.canvas_mut().flush();
 }

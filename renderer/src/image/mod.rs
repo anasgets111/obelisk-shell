@@ -18,11 +18,17 @@
 //! decode regardless of the box it lands in, so its key pins the size at 0 and every box shares
 //! the single upload.
 //!
-//! Failures are cached too, as `None`. A missing file, an unreadable one, an `.svgz` (see
-//! [`rasterize_svg`]) would otherwise be retried on every frame, and `layout::paint` logs from
-//! inside the frame loop -- one bad path would be an unbounded log stream on the Wayland dispatch
-//! thread, which is the failure mode `paint::log_paint_error`'s own ponytail comment already
-//! describes for paint properties.
+//! The key also carries the file's modification time and length, so a producer that overwrites a
+//! path in place gets a new texture rather than the one it wrote last time. The tray does exactly
+//! that, deliberately (docs/adr/0031), and this is the consumer-side half that ADR deferred until
+//! an icon-loading path existed to need it.
+//!
+//! Failures are cached too, as `None`. An unreadable file or an `.svgz` (see [`rasterize_svg`])
+//! would otherwise be retried on every frame, and `layout::paint` logs from inside the frame loop
+//! -- one bad path would be an unbounded log stream on the Wayland dispatch thread, which is the
+//! failure mode `paint::log_paint_error`'s own ponytail comment already describes for paint
+//! properties. A *missing* file is the one failure that retries, because its key changes the moment
+//! it appears.
 
 pub mod icons;
 
@@ -48,10 +54,50 @@ const CACHE_CAPACITY: usize = 128;
 
 /// One cache slot. `raster_px` is the longest edge the SVG was rasterized for, or `0` for a file
 /// decoded at its own native size (see this module's doc comment).
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CacheKey {
     path: PathBuf,
     raster_px: u32,
+    version: FileVersion,
+}
+
+/// What tells one revision of a file from the next, at a path that keeps its name.
+///
+/// This is docs/adr/0031's deferred item coming due. That ADR had the tray spool every icon update
+/// to the same `/dev/shm/oblisk-$UID/tray/{name}.png` with "no revision suffix, no cleanup logic",
+/// and deferred the consumer-side fix as Speculative Generality on the explicit grounds that "the
+/// renderer has no scene graph or icon-loading path at all as of this ADR", with the upgrade path
+/// named as "Renderer-side texture cache-busting, only once the renderer's actual icon-loading
+/// mechanism exists and is shown to need it". It exists now, and a path-only key means an app that
+/// changes its tray icon (a badge, a mute toggle, a connection state) keeps the pixels it had at
+/// first paint for the life of the Renderer process.
+///
+/// Modification time and length together rather than either alone: tmpfs carries nanosecond
+/// timestamps so mtime alone is enough in practice, and length is free and covers a filesystem that
+/// rounds. Not a content hash, which would mean reading the file to decide whether to read the file.
+///
+/// A file that cannot be stat'd takes the default, which is what makes a *missing* file retry
+/// rather than stay negatively cached forever: once it appears, its key changes and the lookup is
+/// new.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+struct FileVersion {
+    mtime_secs: i64,
+    mtime_nanos: i64,
+    len: u64,
+}
+
+impl FileVersion {
+    fn read(path: &Path) -> Self {
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return FileVersion::default();
+        };
+        let modified = metadata.modified().ok().and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
+        FileVersion {
+            mtime_secs: modified.map(|d| d.as_secs() as i64).unwrap_or(-1),
+            mtime_nanos: modified.map(|d| i64::from(d.subsec_nanos())).unwrap_or(-1),
+            len: metadata.len(),
+        }
+    }
 }
 
 /// How an image fills the box layout gave it (docs/adr/0055 decision 3).
@@ -88,6 +134,9 @@ impl Fit {
 pub struct ImageCache {
     entries: HashMap<CacheKey, Option<ImageId>>,
     order: VecDeque<CacheKey>,
+    /// Textures evicted since the last [`ImageCache::release_evicted`], not yet freed. See that
+    /// method for why the deletion cannot happen where the eviction does.
+    evicted: Vec<ImageId>,
 }
 
 impl Default for ImageCache {
@@ -101,6 +150,22 @@ impl ImageCache {
         ImageCache {
             entries: HashMap::new(),
             order: VecDeque::new(),
+            evicted: Vec::new(),
+        }
+    }
+
+    /// Frees the textures evicted during the previous frame. `layout::paint::paint_tree` calls this
+    /// before it walks anything.
+    ///
+    /// The deletion cannot happen where the eviction does. femtovg batches a frame's draw calls and
+    /// resolves an `ImageId` to a texture at `flush`, not at `fill_path`, so deleting mid-walk
+    /// unbinds a texture an already-recorded command still names. femtovg answers a missing id by
+    /// returning default paint parameters rather than by failing, so the symptom would be one
+    /// silently blank image per eviction, in a frame that drew more than [`CACHE_CAPACITY`] distinct
+    /// images. Deferring to the next frame's start puts the deletion after that flush.
+    pub fn release_evicted(&mut self, canvas: &mut Canvas<OpenGl>) {
+        for id in self.evicted.drain(..) {
+            canvas.delete_image(id);
         }
     }
 
@@ -111,10 +176,27 @@ impl ImageCache {
     /// `None` for anything that did not decode, logged once rather than once per frame (see this
     /// module's doc comment). The canvas must be current on the calling thread, which since
     /// docs/adr/0039 is the only thread that paints.
+    ///
+    /// Stats the file on every call, including a hit, because the key carries the file's revision
+    /// (see [`FileVersion`]). That is one `stat` per image node per frame, which on a bar with ten
+    /// icons at 60Hz is six hundred a second against tmpfs, and is the cheapest correct answer:
+    /// the alternative to asking whether the bytes changed is re-reading them to find out.
+    ///
+    /// ponytail: a miss reads the file, and for an SVG rasterizes it, inside the frame. That thread
+    /// is also the Wayland dispatch thread and the one the config VM runs on (docs/adr/0039), so a
+    /// cold `list` of thirty tray icons on a cold page cache is thirty `open`/`read` pairs plus
+    /// thirty resvg renders before the first `swap_buffers`. Steady state after that is one hash
+    /// lookup per node per frame, which is why this is a startup and reload cost rather than a
+    /// per-frame one. The upgrade path is the shape `text::shaping` already has: hand the path and
+    /// the size to a worker, return `None` for this frame, and mark the scene dirty when the upload
+    /// is ready (docs/adr/0044 decision 2). That is also
+    /// `oblisk-supervisor-services-dbus.md` § 9.2's "off-thread", met on this side of the process
+    /// boundary. Not built now because nothing has measured a dropped frame from it.
     pub fn image(&mut self, canvas: &mut Canvas<OpenGl>, path: &Path, box_px: u32) -> Option<ImageId> {
         let key = CacheKey {
             path: path.to_path_buf(),
             raster_px: if is_vector(path) { box_px.max(1) } else { 0 },
+            version: FileVersion::read(path),
         };
         if let Some(cached) = self.entries.get(&key) {
             return *cached;
@@ -126,21 +208,22 @@ impl ImageCache {
                 None
             }
         };
-        self.insert(canvas, key, loaded);
+        self.insert(key, loaded);
         loaded
     }
 
     /// Evicts before inserting, so the map never exceeds [`CACHE_CAPACITY`] rather than exceeding
-    /// it by one and trimming afterwards. Deletes the evicted texture from the canvas: dropping
-    /// the `ImageId` alone leaks the GPU allocation, since femtovg keys its own image store by
-    /// that id and frees nothing until told to.
-    fn insert(&mut self, canvas: &mut Canvas<OpenGl>, key: CacheKey, value: Option<ImageId>) {
+    /// it by one and trimming afterwards. The evicted texture is queued for
+    /// [`ImageCache::release_evicted`] rather than deleted here, and it has to be queued rather than
+    /// dropped: femtovg keys its own image store by `ImageId` and frees nothing until told to, so
+    /// losing the id leaks the GPU allocation for the life of the process.
+    fn insert(&mut self, key: CacheKey, value: Option<ImageId>) {
         while self.order.len() >= CACHE_CAPACITY {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };
             if let Some(Some(id)) = self.entries.remove(&oldest) {
-                canvas.delete_image(id);
+                self.evicted.push(id);
             }
         }
         self.order.push_back(key.clone());
@@ -299,6 +382,66 @@ mod tests {
         let distinct: std::collections::HashSet<[u8; 3]> =
             pixels.as_chunks::<4>().0.iter().map(|px| [px[0], px[1], px[2]]).collect();
         assert!(distinct.len() > 16, "expected a gradient, got {} colours", distinct.len());
+    }
+
+    #[test]
+    fn the_cache_stays_at_its_capacity_and_keeps_the_keys_it_kept() {
+        // Negative entries only, because `ImageId` has no public constructor: this pins the bound
+        // and the ordering, and `release_evicted`'s own doc comment covers the half a unit test
+        // cannot reach without a GL context.
+        let mut cache = ImageCache::new();
+        for n in 0..(CACHE_CAPACITY * 2) {
+            cache.insert(key(&format!("/tmp/{n}.png"), 0, FileVersion::default()), None);
+        }
+        assert_eq!(cache.entries.len(), CACHE_CAPACITY);
+        assert_eq!(cache.order.len(), CACHE_CAPACITY);
+        // Oldest out: the first half is gone and the last entry inserted is still there.
+        let newest = key(&format!("/tmp/{}.png", CACHE_CAPACITY * 2 - 1), 0, FileVersion::default());
+        let oldest = key("/tmp/0.png", 0, FileVersion::default());
+        assert!(cache.entries.contains_key(&newest));
+        assert!(!cache.entries.contains_key(&oldest));
+    }
+
+    fn key(path: &str, px: u32, version: FileVersion) -> CacheKey {
+        CacheKey {
+            path: PathBuf::from(path),
+            raster_px: if is_vector(Path::new(path)) { px } else { 0 },
+            version,
+        }
+    }
+
+    #[test]
+    fn a_vector_and_a_raster_of_the_same_name_do_not_share_a_slot() {
+        // The key is the path and, for SVG only, the size. Two boxes asking for one PNG share one
+        // upload; two boxes asking for one SVG at different sizes must not, or the smaller
+        // rasterization is served to the larger box forever.
+        let v = FileVersion::default();
+        assert_eq!(key("/tmp/a.png", 12, v), key("/tmp/a.png", 24, v));
+        assert_ne!(key("/tmp/a.svg", 12, v), key("/tmp/a.svg", 24, v));
+    }
+
+    #[test]
+    fn one_path_rewritten_in_place_is_a_different_slot() {
+        // docs/adr/0031's deferred item. The tray spools every icon update over the same
+        // `/dev/shm/oblisk-$UID/tray/{name}.png`, so without the version in the key an app that
+        // changes its icon keeps the pixels it had at first paint for the life of the process.
+        let first = FileVersion { mtime_secs: 1_700_000_000, mtime_nanos: 0, len: 512 };
+        let same_time_new_size = FileVersion { len: 640, ..first };
+        let same_size_new_time = FileVersion { mtime_nanos: 1, ..first };
+        assert_ne!(key("/dev/shm/x.png", 16, first), key("/dev/shm/x.png", 16, same_time_new_size));
+        assert_ne!(key("/dev/shm/x.png", 16, first), key("/dev/shm/x.png", 16, same_size_new_time));
+        assert_eq!(key("/dev/shm/x.png", 16, first), key("/dev/shm/x.png", 16, first));
+    }
+
+    #[test]
+    fn a_missing_file_and_a_real_one_read_different_versions() {
+        // The default is what a failed stat produces, and it is what makes a missing file retry
+        // instead of staying negatively cached: once it exists, its key changes.
+        assert_eq!(FileVersion::read(Path::new("/nonexistent/oblisk-x.png")), FileVersion::default());
+        let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/wallpaper.svg");
+        let version = FileVersion::read(&shipped);
+        assert_ne!(version, FileVersion::default());
+        assert!(version.len > 0);
     }
 
     #[test]

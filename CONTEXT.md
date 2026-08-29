@@ -101,7 +101,7 @@ The walk over one surface instance's resolved geometry that emits its draw calls
 _Avoid_: render pass (ambiguous: also a GPU term), draw loop, frame
 
 **Image cache**:
-The Renderer's map from a resolved file path and an integer pixel size to one uploaded GPU texture. Keyed on both because an SVG rasterized for a 12px box is a different texture from the same file rasterized for a 24px box. Belongs to one generation and is cold again after every swap.
+The Renderer's map from a resolved file path, an integer pixel size, and the file's own revision to one uploaded GPU texture. The size is in the key because an SVG rasterized for a 12px box is a different texture from the same file rasterized for a 24px box; the revision is, because the tray overwrites one spool path in place on every icon update (ADR-0031) and a path-only key would serve an app's first icon forever. Belongs to one generation and is cold again after every swap.
 _Avoid_: texture atlas (femtovg's private glyph store, ADR-0012), asset cache
 
 **Icon resolver**:

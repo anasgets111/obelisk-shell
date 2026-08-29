@@ -1990,12 +1990,37 @@ wallpaper.
 > the gradient survived, which is the half that would otherwise break silently: a tree that parses
 > to nothing renders a transparent pixmap rather than an error.
 >
-> **The tray was not proved live.** No `StatusNotifierItem` was registered on the session while
-> this was built, and the tray host does not manufacture one. The config's `itemfn` draws
-> `icon { name = item.icon_name or item.icon_path }`, which is the whole of ADR-0054 decision 2,
-> and it is the one item here resting on a code reading rather than a screenshot. The vertical
-> `list` is a second, older problem for it: `intrinsic_content_size` has no horizontal repeater, so
-> a second tray item stacks below the first and is clipped by a 34px bar.
+> **The review found two silent bugs, and ADR-0031 had already named one of them.** A path-keyed
+> cache serves an app's first tray icon forever, because `dbus/shm_icons.rs::write_png` overwrites
+> the same spool path in place on every `NewIcon`. ADR-0031 chose that deliberately and deferred the
+> consumer-side fix with the trigger spelled out: "Renderer-side texture cache-busting, only once
+> the renderer's actual icon-loading mechanism exists and is shown to need it". This is that
+> mechanism and it needed it on the first commit that could have exercised it. The key now carries
+> the file's modification time and length, at the cost of one `stat` per image node per frame.
+>
+> The second: eviction deleted a texture that an already-recorded draw call in the same frame still
+> named, because femtovg resolves an `ImageId` at `flush` rather than at `fill_path`. It answers a
+> missing id with default paint parameters instead of an error, so the symptom is a silently blank
+> image in any frame drawing more than 128 distinct ones. Eviction now queues and `paint_tree`
+> frees the queue before it walks. Both bugs share a shape worth naming: neither crashes, neither
+> logs, and both look exactly like a correct frame.
+>
+> **The tray draws.** Telegram registered a `StatusNotifierItem` reporting
+> `icon_name: "org.telegram.desktop-symbolic"` and a null `icon_path`, and the bar drew the paper
+> plane out of the active theme at 16px. That is ADR-0054 decision 2's `icon_name` branch end to
+> end. The `icon_path` branch is still only a code reading: nothing on this session produced a
+> pixmap-only item, so `dbus/shm_icons.rs`'s spooled PNG has never been painted.
+>
+> One older problem is now visible behind it. `intrinsic_content_size` has no horizontal `list`, so
+> a second tray item would stack below the first and be clipped by a 34px bar. One item hides that
+> completely.
+>
+> A second, unrelated one showed up in the same log and is worth writing down before it is
+> rediscovered: the tray's first `StateSnapshot` was refused with "no connection registered for
+> generation 0", because the Supervisor pushed it before the Renderer had registered. `tray` pushes
+> only on change, unlike `battery` or `brightness` which poll and self-heal, so a capability that
+> loses that race stays `nil` until the app happens to change its icon. It hydrated here on a later
+> push. Not this phase's to fix, and not a thing to discover twice.
 
 
 ### The missing animation model

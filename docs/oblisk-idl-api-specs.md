@@ -226,7 +226,7 @@ All write actions are serialized as JSON-RPC 2.0 payloads over the private Unix 
 | Module Method | IPC Command JSON Payload Details |
 | :--- | :--- |
 | `system:write_state(key, val)` | `capability: "system", action: "write_state", arguments: [key, val]`<br>**Validation**: `key` must be alphanumeric. `val` must be string, number, or boolean. |
-| `system:find_icon(app_id, name, fallback_name)` | *Synchronous internal Rust lookup* returning `string` path.<br>**Validation**: `app_id` and `name` are strings. Falls back to desktop entry values. |
+| `system:find_icon(app_id, name, fallback_name)` | *Synchronous internal Rust lookup* returning `string` path.<br>**Validation**: `app_id` and `name` are strings. Falls back to desktop entry values. **Not built, and not planned as written (ADR-0054 decision 5).** The theme-name half of this lookup lives in the Renderer and is reached through `icon.name` (§ 5.2 item 5), which leaves this function nothing to be asked for; the `app_id` to `.desktop` to `Icon=` half has no caller. "Synchronous" is the row that settled where the resolver lives: the control socket carries one-way commands and one-way state snapshots, with no request/response shape to return a path over. |
 | `audio:set_volume(vol)` | `capability: "audio", action: "set_volume", arguments: [vol]`<br>**Validation**: `vol` must be a float in range `[0.0, 1.0]`. |
 | `audio:set_muted(bool)` | `capability: "audio", action: "set_muted", arguments: [bool]`<br>**Validation**: `bool` is boolean. |
 | `audio:toggle_mute()` | `capability: "audio", action: "toggle_mute", arguments: []` |
@@ -257,7 +257,7 @@ All write actions are serialized as JSON-RPC 2.0 payloads over the private Unix 
 | `mpris:seek_relative(id, off)`| `capability: "mpris", action: "seek_relative", arguments: [id, off]`<br>**Validation**: Shifts current playback by relative microseconds `off`. |
 | `idle:register_threshold(sec, on_idle, on_resume)` | `capability: "idle", action: "register", arguments: [sec]`<br>**Validation**: `sec` is integer. Creates dynamic listener callback reference inside Renderer. |
 | `oblisk.lock:lock()` | `capability: "lock", action: "lock", arguments: []`<br>**Validation**: None. Asks the Supervisor to lock the session; it commands the Renderer, which holds `ext_session_lock_v1` (ADR-0042). Refused if the config declares no § 6.4 `lock` surface, reported through `rescue` (ADR-0052). **There is deliberately no `unlock` action**: a lock screen's own tree is Lua and its callbacks run while it is the only thing on the glass, so one would be a click-through past PAM. The only unlock is the Supervisor's, on a successful `secure_submit(lock, authenticate)`. Spelled `oblisk.lock:invoke("lock")` for now: Phase 25 item 1's envelope-building method is built, but the `capability:action(...)` sugar this table uses throughout is not. |
-| `wallpaper:set(mon, path, fit, anim, dur)` | `capability: "wallpaper", action: "set", arguments: [mon, path, fit, anim, dur]`<br>**Validation**: Sets background config parameters. |
+| `wallpaper:set(mon, path, fit, anim, dur)` | **Superseded by ADR-0055. There is no `wallpaper` capability and none is planned.** A wallpaper is an `image` node on a config-declared `Background` panel: `mon` is `panel.monitor`, `path` is `image.source`, `fit` is `image.fit`, and a runtime change is a write to the `state()` signal bound to `source`, with no IPC in the path. `anim` and `dur` are the two arguments with nowhere to go, because the engine has no animation model at all (`build-steps.md`, "The missing animation model"). |
 | `workspaces:focus(id)` | `capability: "workspaces", action: "focus", arguments: [id]`<br>**Validation**: `id` must be an integer. Focuses target workspace. |
 | `rescue:reload_config()` | `capability: "rescue", action: "reload_config", arguments: []`<br>**Validation**: Runs compiler pass on `shell.lua` and reloads Renderer if valid. |
 | `sysinfo:configure(cfg)` | `capability: "sysinfo", action: "configure", arguments: [cfg]`<br>**Validation**: `cfg` is dictionary containing integers `cpu_interval`, `ram_interval`, `temp_interval` in seconds. An interval of `0` suspends the matching monitor thread. |
@@ -355,8 +355,15 @@ Draws shaped unicode glyph text via `cosmic-text`.
 
 #### 5. `icon`
 Draws a system SVG/PNG icon.
-*   `name`: `string` / `Signal` (The theme name, e.g., `"audio-volume-high"`)
+*   `name`: `string` / `Signal` (The theme name, e.g., `"audio-volume-high"`. An absolute path is used as that path instead, the same rule a `.desktop` file's `Icon=` key follows, which is what lets § 2.14's tray pass whichever of `icon_name` and `icon_path` it populated without branching. Resolved in the Renderer, ADR-0054)
 *   `size`: `integer` (Bounding box diameter. Defaults to `12`, matching `text`'s `font_size`, for the same boot reason as `content`)
+
+#### 5a. `image`
+Draws a file. Not one of § 5.2's original eight: added by ADR-0054 decision 3, because album art has an aspect ratio and a wallpaper is not an icon by any reading.
+*   `source`: `string` / `Signal` (An absolute path. Never a theme name; that is `icon`'s job)
+*   `fit`: `string` (`"cover"` scales to fill and crops, `"contain"` fits inside, `"stretch"` ignores the aspect ratio. Defaults to `"cover"`)
+
+An `image` has no intrinsic size and takes the box § 5.1's `width`/`height` give it, unlike `icon`: the only way to know a file's own dimensions is to decode it, and the layout pass has no canvas to decode against.
 
 #### 6. `button`
 Receives input focus and pointer events.

@@ -137,3 +137,16 @@ ADR-0030).
   icon-loading mechanism exists and is shown to need it.
 - `docs/oblisk-idl-api-specs.md` gains a real `oblisk.tray` §2.x read schema
   and §3.2 write-table entries matching this ADR's design.
+
+## Amendment: the deferred cache-busting was built, in the Renderer, by ADR-0054
+
+This ADR's upgrade path read "Renderer-side texture cache-busting, only once the renderer's actual
+icon-loading mechanism exists and is shown to need it". Phase 29 built that mechanism and it needed
+it immediately: a path-keyed texture cache served an app's first tray icon forever, because
+`write_png` overwrites the same spool path in place on every `NewIcon`.
+
+The fix is entirely on the Renderer's side and this ADR's decision is unchanged. The spool still
+overwrites in place, still has no revision suffix and still has no cleanup logic. The consumer keys
+its cache on the file's modification time and length as well as its path (ADR-0054's first
+amendment). Deferring was the right call: the fix that landed is four fields and a `stat`, and it
+could not have been designed correctly before there was a cache to design it against.

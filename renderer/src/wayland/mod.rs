@@ -38,8 +38,8 @@ use crate::layout::instance::{OutputGeometry, SurfaceInstance, expand_instances,
 use crate::layout::node::{
     self, ConstraintAdjustment, LayerKind, PanelSpec, PopupAnchor, PopupSpec, SizeHint, SizeMode, SurfaceSpec, WindowSpec,
 };
-use crate::socket::{FrameOutcome, RendererClient};
 use crate::image::ImageCache;
+use crate::socket::{FrameOutcome, RendererClient};
 use crate::text::atlas::TextPainter;
 use crate::text::shaping::ShapingHandle;
 use crate::text::snap::LogicalRect;

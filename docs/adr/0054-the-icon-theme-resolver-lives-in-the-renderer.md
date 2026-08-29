@@ -107,3 +107,46 @@ notification history with distinct album art is what would push against the cap.
 upgrade, and the reason it is not the starting point is that FIFO is ten lines and needs no
 dependency. Byte-accounted eviction is what ADR-0043's memory budget will eventually want, and
 neither is worth building before an image cache exists to measure.
+
+## Amendment: the cache key carries the file's revision, and ADR-0031 predicted why
+
+Decision 4 said the key is the resolved path together with the pixel size. That is wrong for a
+raster file, and the review that found it traced the exact path: `dbus/shm_icons.rs::write_png`
+overwrites `/dev/shm/oblisk-$UID/tray/{name}.png` in place on every `NewIcon`, same filename, new
+bytes. With a path-only key an app that changes its tray icon (a badge appearing, a mute toggling, a
+connection state) keeps the pixels it had at first paint for the life of the Renderer process. No
+error, no log line, just an icon that stops telling the truth.
+
+ADR-0031 chose that spooling behaviour deliberately and deferred the consumer-side fix as
+Speculative Generality, on the explicit grounds that "the renderer has no scene graph or
+icon-loading path at all as of this ADR", with the upgrade path named as "Renderer-side texture
+cache-busting, only once the renderer's actual icon-loading mechanism exists and is shown to need
+it". This is that mechanism, and this is it being shown to need it. The deferral was correct and it
+came due on the first commit that could have exercised it.
+
+The key gains the file's modification time and length. Both rather than either: tmpfs carries
+nanosecond timestamps so mtime alone suffices in practice, and length is free and covers a
+filesystem that rounds. Not a content hash, which would mean reading the file to decide whether to
+read the file.
+
+The cost is one `stat` per image node per frame, on a hit as well as a miss, because there is no
+other way to ask whether the bytes changed. On a bar with ten icons at 60Hz that is six hundred
+stats a second against tmpfs, and it is still cheaper than the thing it replaces.
+
+It also fixes something that was not the reason for it. A missing file took the negative cache and
+would have stayed there forever; its version now changes the moment it appears, so the lookup is
+new and the file is picked up. A wallpaper written after the config referring to it is the case
+that needs this.
+
+## Amendment: eviction cannot free a texture during the frame that evicted it
+
+femtovg batches a frame's draw calls and resolves an `ImageId` to a texture at `flush`, not at
+`fill_path`. Deleting on eviction therefore unbinds a texture an already-recorded command still
+names, and femtovg answers a missing id with default paint parameters rather than an error, so the
+symptom is one silently blank image per eviction in any frame that drew more than `CACHE_CAPACITY`
+distinct images. Never a crash, never a log line.
+
+Eviction now queues the id and `paint_tree` frees the queue before it walks anything, which is the
+one point in the cycle where the previous flush has happened and the current frame has recorded
+nothing. That also took the canvas out of `ImageCache::insert`, which is what made the capacity
+bound testable without a GL context.
