@@ -79,8 +79,8 @@ One `(surface, output)` pair, addressed as `"{id}@{output}"`. A surface targetin
 _Avoid_: surface copy, per-monitor surface
 
 **Wallpaper surface**:
-A `panel` on the `Background` layer, non-exclusive, one instance per monitor. Distinct from the UI surfaces because `Overlay` sits above every application window by protocol definition, so wallpaper drawn there would cover the desktop rather than sit behind it (ADR-0007). Owns wallpaper texture rendering.
-_Avoid_: background layer (protocol term, not the Oblisk surface)
+A `panel` on the `Background` layer, non-exclusive, one instance per monitor. Distinct from the UI surfaces because `Overlay` sits above every application window by protocol definition, so wallpaper drawn there would cover the desktop rather than sit behind it (ADR-0007). It holds an `image` node like any other surface holds its children; there is no wallpaper-specific engine code and no `wallpaper` capability (ADR-0055).
+_Avoid_: background layer (protocol term, not the Oblisk surface), wallpaper capability (there is none)
 
 ## Scene
 
@@ -99,6 +99,14 @@ _Avoid_: keepalive, grace period
 **Paint pass**:
 The walk over one surface instance's resolved geometry that emits its draw calls and swaps its buffer. Runs per surface instance, never across them, and reads the retained scene without changing it. Distinct from the layout passes, which decide geometry; the paint pass only consumes what they resolved.
 _Avoid_: render pass (ambiguous: also a GPU term), draw loop, frame
+
+**Image cache**:
+The Renderer's map from a resolved file path and an integer pixel size to one uploaded GPU texture. Keyed on both because an SVG rasterized for a 12px box is a different texture from the same file rasterized for a 24px box. Belongs to one generation and is cold again after every swap.
+_Avoid_: texture atlas (femtovg's private glyph store, ADR-0012), asset cache
+
+**Icon resolver**:
+The Renderer-side lookup turning a theme name into an absolute file path, through the installed XDG icon themes. A name that is already an absolute path is used as itself, the same rule a `.desktop` file's `Icon=` key follows. Lives in the Renderer rather than the Supervisor because the control socket has no request/response shape to resolve one over (ADR-0054).
+_Avoid_: find_icon (the unbuilt Lua-facing half), icon theme engine
 
 **Node identity**:
 What makes a freshly evaluated node the same node as the one already in the retained scene, so its lease and its named state follow it. An optional `id`, unique among its siblings and scoped to its parent rather than to the tree, decides it; unidentified siblings still fall back to matching by position among themselves. A `list`'s items use their `key` instead (ADR-0045).

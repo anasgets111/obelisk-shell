@@ -8,3 +8,10 @@
 `oblisk-supervisor-services-dbus.md` §14 fixes exactly two static surfaces: `main_bar` (layer `Top`) and `overlay_canvas` (layer `Overlay`). Wallpaper rendering (§8) has no surface to live on. Considered painting it inside `overlay_canvas` since that surface already spans the whole screen. Rejected: `Overlay` is the topmost layer in wlr-layer-shell stacking, above every application window, by protocol definition, not by z-order the shell controls. Wallpaper content drawn there would cover the desktop instead of sitting behind it, and no input-region trick changes that: the problem is paint order, not click routing.
 
 Decision: add a third static surface, `wallpaper_layer` (`Background` layer, non-exclusive, one per monitor), owned separately from the two UI surfaces. See the **Wallpaper surface** term in `CONTEXT.md` and ADR-0002 for its reload and transition behavior.
+
+## Amendment: ADR-0055 removes the surface's last Rust-owned trace
+
+ADR-0038 moved the declaration into `shell.lua`; ADR-0055 settles what goes in it. There is no
+`wallpaper` capability and no wallpaper-specific Rust code of any kind: a `Background` panel holding
+an `image` node is the whole feature. The layer choice this ADR argued for is what survives, and it
+survives verbatim.

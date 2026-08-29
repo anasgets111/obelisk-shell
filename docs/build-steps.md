@@ -1234,6 +1234,12 @@ and a name-taking one has none. Drawing an image from a path is the easy half ei
 neither resolver exists yet, so nothing has to be unbuilt. ashell's dependency on the
 `freedesktop-icons` crate is the reference for whichever side ends up owning it.
 
+> **Settled in Phase 29, the other way.** docs/adr/0054 puts the resolver in the Renderer, not the
+> Supervisor. The recommendation above missed that § 3.2's own row calls `system:find_icon` a
+> synchronous lookup returning a path, and the control socket carries one-way commands and one-way
+> snapshots with no request/response shape to make that true over. `freedesktop-icons` was the right
+> reference, on the wrong side of the process boundary.
+
 Also deferred: Lua-authored state (ADR-0044 decision 5). Live signals are read-only to Lua, so a
 config cannot hold reactive state of its own and "is this dropdown open" has nowhere to live.
 `state(name, initial)` returns a writable `Signal` that marks dirty through item 2's flag, and the
@@ -1920,6 +1926,42 @@ the IDL-only entries fell between the two documents.
 > `oblisk.brightness:invoke("set", 40)` moved `intel_backlight` to 7680, which is 40% of this
 > panel's 19200 exactly. That is also the first § 3.2 command with an argument in it, so it is what
 > proves Phase 25's arguments array and revision stamp reach the Supervisor intact.
+
+### Phase 29: Icons, Images and the Wallpaper
+
+Implement docs/adr/0054 and docs/adr/0055. Nothing in this codebase draws a pixel from a file. The
+`icon` node parses its `size`, reserves that much layout space and paints nothing (`layout/paint.rs`
+is literally `"icon" => {}`), there is no `image` node kind, and three capabilities already emit file
+paths that no node can consume: tray (`icon_path` spooled to `/dev/shm` by `dbus/shm_icons.rs`),
+notifications (the whole `Notify` icon precedence, same spool), and mpris (`album_art_path`). Like
+Phase 28's five capabilities, no phase in this document ever owned this. Phase 19 deferred `icon` on
+a spec conflict and named no phase to settle it; § 5.2 has no `image` at all; wallpaper had two ADRs
+and a § 3.2 row and no phase.
+
+1. **The image cache and the `image` node.** `image { source, fit }` plus § 5.1's base
+   `width`/`height`. `source` is an absolute path. Decode through femtovg's existing `image`
+   dependency for PNG and JPEG, through `resvg` for SVG (ADR-0054 decision 4), upload once and cache
+   by (resolved path, integer pixel size). `image` has no intrinsic size: it takes the box it is
+   given and measures `0x0` without one, unlike `icon`, because knowing a file's dimensions means
+   decoding it during a layout pass that has no canvas to decode against.
+2. **`fit`.** `cover` (default), `contain`, `stretch`. Clip to the node's rect; `cover` overflows the
+   paint rect and crops (ADR-0055 decision 3).
+3. **The icon resolver and the `icon` paint arm.** `freedesktop-icons`, called synchronously with the
+   cache in front of it. `icon.name` that starts with `/` is a path, everything else is a theme name
+   (ADR-0054 decision 2). This is what makes the tray draw icons instead of truncated app names.
+4. **Wallpaper.** No capability, no controller, no dispatch arm. A `Background` panel with an `image`
+   in it, its `source` bound to a `state()` signal, all four of which already exist (ADR-0055). The
+   work here is proving it in `dev-config/oblisk/shell.lua`, not writing engine code.
+5. **`system:find_icon`.** Not built. § 9.2's `app_id` to `.desktop` to `Icon=` half has no caller
+   once `icon.name` resolves theme names itself, and `freedesktop-icons` does not do it (ADR-0054
+   decision 5).
+
+Testing: the headless EGL harness Phase 19 describes and nothing has yet built would assert this
+directly, since "an `image` whose source is a 1x1 red PNG paints red" is the same shape as its own
+worked example. Short of that, the resolver and the fit math are ordinary unit tests, and the
+end-to-end check is the live session: the tray draws icons, and a `Background` panel shows a
+wallpaper.
+
 
 ### The missing animation model
 
