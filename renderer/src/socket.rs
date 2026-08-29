@@ -108,23 +108,11 @@ use tokio::sync::mpsc;
 use crate::layout::instance::SurfaceInstance;
 use crate::layout::node::{SurfaceFingerprint, SurfaceSpec};
 use crate::layout::{self, Scene};
-use crate::lua::capability::{Capability, CommandSender};
+use crate::lua::capability::{Capability, CapabilityHandle, CommandSender};
 use crate::lua::process::ProcessRegistry;
 use crate::lua::signal::{DirtyFlag, LiveSignalHandle};
 use crate::lua::{self, Loader};
 use crate::text::shaping::ShapingHandle;
-
-/// The one `shared::CAPABILITIES` roster name that is **not** registered as a bare Lua global
-/// (docs/adr/0052 decision 1, build-steps.md Phase 25 item 3 brought forward for exactly one
-/// name). § 6.4's `lock` node constructor already owns the global `lock`, and `RendererClient::new`'s
-/// roster seed runs after `lua::nodes::register_node_constructors`, so seeding this one the usual
-/// way overwrote the constructor and broke every `lock { ... }` declaration in the file that
-/// declares the lock screen -- silently, since the overwrite is just a `set`.
-///
-/// It is registered as `oblisk.lock` instead, which is what § 2 calls it anyway. The other ten
-/// keep their bare names until Phase 25 item 3 moves them together: one table with one member is
-/// a smaller change than renaming ten globals mid-phase, and it is the direction of travel.
-const NAMESPACED_CAPABILITY: &str = "lock";
 
 /// This Renderer's own generation id (`OBLISK_GENERATION_ID`, defaulting to `0`). Read once in
 /// `main`, then handed to both threads -- the socket thread stamps it into the handshake, the
@@ -267,17 +255,21 @@ pub struct RendererClient {
     /// and one `FontSystem` for the whole process (docs/adr/0023 item 8, closed by docs/adr/0039
     /// decision 3), instead of the second `FontSystem::new()`'s ~1s startup this used to pay.
     shaping: ShapingHandle,
-    /// One live Lua signal per capability seen so far, keyed by `StateSnapshot.capability`
+    /// One handle per capability seen so far, keyed by `StateSnapshot.capability`
     /// (docs/adr/0029) -- every `shared::CAPABILITIES` roster name is seeded at construction
-    /// (ADR-0037; see `new`'s doc comment); an unrostered capability's global is registered
-    /// lazily, on the first `StateSnapshot` that names it, by `apply_state_snapshot`. `RefCell`,
+    /// (ADR-0037; see `new`'s doc comment); an unrostered capability is added lazily, on the
+    /// first `StateSnapshot` that names it, by `apply_state_snapshot`. `RefCell`,
     /// not `&mut self`: `apply_state_snapshot` is called through a `&self` receiver (see its own
     /// doc comment for why), and this is the one piece of `RendererClient` state that read path
     /// needs to mutate.
-    capability_signals: RefCell<HashMap<String, LiveSignalHandle>>,
+    capabilities: RefCell<HashMap<String, CapabilityHandle>>,
+    /// Cloned into every [`Capability`] this client builds, including the lazy path's. Kept
+    /// rather than consumed by the constructor because that lazy path builds a `Capability` long
+    /// after `new` has returned.
+    commands: CommandSender,
     rescue_handle: LiveSignalHandle,
-    /// The ad-hoc `screens` global's handle (docs/adr/0041 decision 2) -- Renderer-sourced, so it
-    /// is deliberately not in `capability_signals` above and deliberately not in
+    /// `oblisk.screens`'s handle (docs/adr/0041 decision 2) -- Renderer-sourced, so it
+    /// is deliberately not in `capabilities` above and deliberately not in
     /// `shared::CAPABILITIES` either. See [`register_screens_signal`].
     screens_handle: LiveSignalHandle,
     /// What `screens_handle` currently holds, mirrored as JSON so [`Self::set_screens`] can tell a
@@ -303,6 +295,11 @@ pub struct RendererClient {
     /// frame to the wire. `UnboundedSender::send` is synchronous and non-blocking, so this is
     /// callable straight from the Wayland dispatch thread.
     outbound_tx: mpsc::UnboundedSender<RendererFrame>,
+    /// The `oblisk` table itself (build-steps.md Phase 25 item 3), held so
+    /// [`Self::capability_handle`]'s lazy path can add a member to it after construction. Below
+    /// every other retained value and above `loader` for the drop-order reason this struct's own
+    /// doc comment gives: it is an `mlua` value like the signals above it.
+    oblisk: mlua::Table,
     /// Last, and that is load-bearing -- see this struct's own doc comment. Every field above
     /// holds `mlua::Value`s from this VM, and reading one from a dead `Lua` panics.
     loader: Loader,
@@ -328,8 +325,6 @@ impl RendererClient {
         // so the `state(name, initial)` global it registers marks this same flag (decision 5).
         let dirty = DirtyFlag::new();
         let loader = Loader::new(dirty.clone()).map_err(|err| format!("failed to start the Lua loader: {err}"))?;
-        let rescue_handle =
-            register_rescue_signal(&loader, dirty.clone()).map_err(|err| format!("failed to register the rescue signal: {err}"))?;
         let process_registry = ProcessRegistry::new(generation_id, outbound_tx.clone());
         loader.register_process(process_registry.clone()).map_err(|err| format!("failed to register the process global: {err}"))?;
         // The one write path § 3.2's commands all take (build-steps.md Phase 25 item 1), stamped
@@ -337,65 +332,68 @@ impl RendererClient {
         // guard rule drops a packet whose generation is stale, so a second source for it would be a
         // second way to be silently ignored.
         let commands = CommandSender::new(generation_id, outbound_tx);
-        let client = Self::new(loader, shell_lua_path, shaping, commands, rescue_handle, process_registry, dirty)
-            .map_err(|err| format!("failed to seed the capability roster's and `screens` signals: {err}"))?;
+        let client = Self::new(loader, shell_lua_path, shaping, commands, process_registry, dirty)
+            .map_err(|err| format!("failed to build the `oblisk` namespace: {err}"))?;
         Ok(client)
     }
 
-    /// Every `shared::CAPABILITIES` roster name is pre-seeded here (not left to
-    /// `apply_state_snapshot`'s lazy path) so a `shell.lua` that reads any rostered capability's
-    /// global before its first real push still gets a live signal (reading `nil` inside it)
-    /// instead of an undefined-global Lua error and rescue -- ADR-0037's uniform
-    /// nil-until-hydrated contract. The previous hand-listed four-name seed (audio/network/
-    /// bluetooth/tray) froze at ADR-0031 while six more capabilities landed, exactly the drift a
-    /// hand-list guarantees; the roster is the single source both processes share.
-    /// `capability_signal`'s lazy path stays as the fallback for unrostered names.
+    /// Builds the whole `oblisk` namespace (build-steps.md Phase 25 item 3): every
+    /// `shared::CAPABILITIES` roster name, the two Renderer-sourced signals `rescue` and
+    /// `screens`, and `version`. Before this every capability but `lock` was a bare global, which
+    /// made every § 2 example in the IDL wrong about the name it used.
     ///
-    /// One roster name is seeded under a different Lua name rather than skipped: see
-    /// [`NAMESPACED_CAPABILITY`] and [`register_oblisk_namespace`].
+    /// **Every roster name is pre-seeded here**, not left to [`Self::capability_handle`]'s lazy
+    /// path, so a `shell.lua` that reads any rostered capability before its first real push gets
+    /// a live signal (reading `nil` inside it) instead of an index-into-nil Lua error and rescue.
+    /// That is ADR-0037's uniform nil-until-hydrated contract. The previous hand-listed four-name
+    /// seed (audio/network/bluetooth/tray) froze at ADR-0031 while six more capabilities landed,
+    /// exactly the drift a hand-list guarantees; the roster is the single source both processes
+    /// share. The lazy path stays as the fallback for unrostered names.
+    ///
+    /// **One table, so a typo is a Lua error rather than silence.** A bare global that does not
+    /// exist reads `nil` and a config gets "attempt to index a nil value" at the use site with no
+    /// hint that the *name* was the problem. Inside a table the same typo is still `nil`, so this
+    /// buys nothing on its own -- what it buys is the collision the bare form could not avoid.
+    /// § 6.4's `lock` node constructor owns the global `lock`, and seeding a bare `lock` signal
+    /// silently overwrote it and broke every `lock { ... }` declaration in the file that declares
+    /// the lock screen (docs/adr/0052 decision 1 found that the hard way). The engine's DSL and
+    /// § 2's state now live in separate namespaces and cannot collide again, whatever § 2 grows.
     fn new(
         loader: Loader,
         shell_lua_path: PathBuf,
         shaping: ShapingHandle,
         commands: CommandSender,
-        rescue_handle: LiveSignalHandle,
         process_registry: ProcessRegistry,
         dirty: DirtyFlag,
     ) -> mlua::Result<Self> {
         // Taken off `commands` rather than passed alongside it, so this constructor stays inside
-        // clippy's argument limit (the same pressure that put `screens` here, below) and so there
-        // is visibly one channel rather than two clones of one that could drift apart.
+        // clippy's argument limit and so there is visibly one channel rather than two clones of
+        // one that could drift apart.
         let outbound_tx = commands.frames();
+        let oblisk = loader.create_table()?;
         let mut seeded = HashMap::new();
         for capability in shared::CAPABILITIES {
-            if *capability == NAMESPACED_CAPABILITY {
-                continue;
-            }
-            let (signal, handle) = lua::signal::Signal::new_live(mlua::Value::Nil, dirty.clone());
-            loader.set_global(capability, signal)?;
+            let (member, handle) = Capability::new(capability, dirty.clone(), commands.clone());
+            oblisk.set(*capability, member)?;
             seeded.insert((*capability).to_string(), handle);
         }
-        // Registered as `oblisk.lock`, not as a bare global like the ten above -- see
-        // [`register_oblisk_namespace`]. It goes into the same `seeded` map regardless, because
-        // that map is what `apply_state_snapshot` routes a `StateSnapshot` through and the wire
-        // still names this capability `"lock"`.
-        seeded.insert(NAMESPACED_CAPABILITY.to_string(), register_oblisk_namespace(&loader, dirty.clone(), commands)?);
-        // Registered here rather than in `start` alongside `rescue` only to keep this
-        // constructor's argument list under clippy's limit; it belongs with the roster seed
-        // either way, since both exist so a `shell.lua` reading the global before its first real
-        // value gets a live signal rather than an undefined-global error. Seeded to an empty list
-        // (not `nil`) so a config that loops over `screens` iterates zero times rather than
-        // erroring, and set through `new_live`'s initial value rather than a `set` so seeding it
-        // does not mark the scene dirty before anything has ever been applied.
+        let rescue_handle = register_rescue_signal(&loader, &oblisk, dirty.clone())?;
+        // Seeded to an empty list (not `nil`) so a config that loops over `oblisk.screens`
+        // iterates zero times rather than erroring, and set through `new_live`'s initial value
+        // rather than a `set` so seeding it does not mark the scene dirty before anything has
+        // ever been applied.
         let screens_payload = serde_json::Value::Array(Vec::new());
-        let screens_handle = register_screens_signal(&loader, dirty.clone(), &screens_payload)?;
+        let screens_handle = register_screens_signal(&loader, &oblisk, dirty.clone(), &screens_payload)?;
+        oblisk.set("version", version_table(&loader)?)?;
+        loader.set_global("oblisk", oblisk.clone())?;
         Ok(Self {
             shell_lua_path,
             scene: Scene::new(),
             instances: Vec::new(),
             holds_session_lock: false,
             shaping,
-            capability_signals: RefCell::new(seeded),
+            capabilities: RefCell::new(seeded),
+            commands,
             rescue_handle,
             screens_handle,
             screens_payload,
@@ -405,6 +403,7 @@ impl RendererClient {
             dirty,
             state: ReloadState { applied_topology: None, applied_output: None, pending: None },
             outbound_tx,
+            oblisk,
             loader,
         })
     }
@@ -455,22 +454,41 @@ impl RendererClient {
     /// to `&mut self`.
     fn apply_state_snapshot(&self, snapshot: StateSnapshot) -> mlua::Result<()> {
         let value = self.loader.to_lua_value(&snapshot.payload)?;
-        let handle = self.capability_signal(&snapshot.capability)?;
-        handle.set(value);
+        // Value and revision together (build-steps.md Phase 25 item 2): the revision is what a
+        // later `oblisk.<name>:invoke(...)` stamps onto its envelope for § 7.3's staleness guard,
+        // and this push is the only thing that moves it.
+        self.capability_handle(&snapshot.capability)?.hydrate(value, snapshot.revision);
         Ok(())
     }
 
-    /// Looks up `capability`'s live signal, registering a fresh one (initial value `nil`) as a
-    /// new Lua global named `capability` the first time this capability is ever seen
-    /// (docs/adr/0029). Every later `StateSnapshot` for the same capability reuses the same
-    /// handle instead of re-registering the global on every push.
-    fn capability_signal(&self, capability: &str) -> mlua::Result<LiveSignalHandle> {
-        if let Some(handle) = self.capability_signals.borrow().get(capability) {
+    /// Looks up `capability`'s handle, adding a fresh `oblisk.<capability>` member (value `nil`,
+    /// revision `0`) the first time this capability is ever seen (docs/adr/0029). Every later
+    /// `StateSnapshot` for the same capability reuses the same handle instead of rebuilding the
+    /// member on every push.
+    ///
+    /// Unreachable in a debug build, where `supervisor::snapshot::push_snapshot`'s
+    /// `debug_assert` rejects an off-roster capability before it is ever sent. This is what
+    /// happens in release instead of a panic: the capability appears under `oblisk` and works.
+    ///
+    /// **It refuses to overwrite a name the table already holds**, which is the one thing this
+    /// path must not do. `oblisk` also carries `rescue`, `screens` and `version`, none of which
+    /// are capabilities, and `Table::set` over an existing key says nothing. An off-roster push
+    /// named `rescue` would replace the signal that reports config failures with an empty one,
+    /// and the symptom would be a shell that stops reporting its own breakage. That is ADR-0052
+    /// decision 1's bug exactly, one level down: a silent `set` over a name something else owns.
+    /// Refusing logs through `handle_frame`'s existing error path instead.
+    fn capability_handle(&self, capability: &str) -> mlua::Result<CapabilityHandle> {
+        if let Some(handle) = self.capabilities.borrow().get(capability) {
             return Ok(handle.clone());
         }
-        let (signal, handle) = lua::signal::Signal::new_live(mlua::Value::Nil, self.dirty.clone());
-        self.loader.set_global(capability, signal)?;
-        self.capability_signals.borrow_mut().insert(capability.to_string(), handle.clone());
+        if self.oblisk.contains_key(capability)? {
+            return Err(mlua::Error::runtime(format!(
+                "a StateSnapshot named the unrostered capability {capability:?}, and `oblisk.{capability}` is already something else; refusing to replace it"
+            )));
+        }
+        let (member, handle) = Capability::new(capability, self.dirty.clone(), self.commands.clone());
+        self.oblisk.set(capability, member)?;
+        self.capabilities.borrow_mut().insert(capability.to_string(), handle.clone());
         Ok(handle)
     }
 
@@ -1017,57 +1035,74 @@ fn frame_label(frame: &RendererFrame) -> &'static str {
     }
 }
 
-/// Builds the `{ is_rescue, error_log }` table and registers it as the ad-hoc `rescue` global
-/// (mirrors the ad-hoc `audio` global, ADR-0022's precedent -- see docs/adr/0024 item 3, not
-/// the full `oblisk.*` signal tree). Returns the handle so later evaluations can update it.
-fn register_rescue_signal(loader: &Loader, dirty: DirtyFlag) -> mlua::Result<LiveSignalHandle> {
+/// Builds the `{ is_rescue, error_log }` table and hangs it off the `oblisk` table as
+/// `oblisk.rescue` (§ 2.10). Returns the handle so later evaluations can update it.
+///
+/// A bare `lua::signal::Signal` and not a [`Capability`], for the same reason
+/// [`register_screens_signal`] is: this is Renderer-sourced, has no `dispatch` on the Supervisor
+/// side and no roster entry, so an `invoke` on it could only ever be a command the Supervisor
+/// drops. Reading is identical either way, since `Capability` delegates `get`/`map` to a wrapped
+/// `Signal`, so a config author sees one shape and only the writable things are writable.
+fn register_rescue_signal(loader: &Loader, oblisk: &mlua::Table, dirty: DirtyFlag) -> mlua::Result<LiveSignalHandle> {
     let table = rescue_table(loader, false, "")?;
     let (signal, handle) = lua::signal::Signal::new_live(mlua::Value::Table(table), dirty);
-    loader.set_global("rescue", signal)?;
+    oblisk.set("rescue", signal)?;
     Ok(handle)
 }
 
-/// Registers the reactive `screens` signal (docs/adr/0041 decision 2), seeded with `initial`.
+/// Registers the reactive `oblisk.screens` signal (docs/adr/0041 decision 2), seeded with
+/// `initial`. ADR-0041 wrote the name with its namespace from the start; until Phase 25 item 3
+/// there was no `oblisk` table to put it in and it was a bare global instead.
 ///
-/// **A bare global, not `oblisk.screens`.** ADR-0041 writes the name with its namespace, but no
-/// `oblisk` table exists in this VM yet and every signal that does exist is a bare global
-/// (`audio`, `network`, `rescue`) -- see [`register_rescue_signal`], which records the same
-/// divergence. One signal is not a reason to introduce a namespace table; `screens` moves under
-/// the full `oblisk.*` signal tree when that tree is built, along with all of them.
-///
-/// Deliberately outside `shared::CAPABILITIES` and outside `capability_signals`, which is the
+/// Deliberately outside `shared::CAPABILITIES` and outside `capabilities`, which is the
 /// first exception to the shape ADR-0037 established and is stated as such in ADR-0041 decision 2:
 /// this is sourced in the Renderer from `smithay_client_toolkit`'s `OutputState`, not pushed by
 /// the Supervisor as a `StateSnapshot`, so the roster (which is the Supervisor's own dispatch and
-/// push list) has nothing to say about it.
-fn register_screens_signal(loader: &Loader, dirty: DirtyFlag, initial: &serde_json::Value) -> mlua::Result<LiveSignalHandle> {
+/// push list) has nothing to say about it. It sits in the same table anyway, because the table is
+/// what a config reads and § 2.15 names this `oblisk.screens` like everything else in § 2.
+fn register_screens_signal(
+    loader: &Loader,
+    oblisk: &mlua::Table,
+    dirty: DirtyFlag,
+    initial: &serde_json::Value,
+) -> mlua::Result<LiveSignalHandle> {
     let (signal, handle) = lua::signal::Signal::new_live(loader.to_lua_value(initial)?, dirty);
-    loader.set_global("screens", signal)?;
+    oblisk.set("screens", signal)?;
     Ok(handle)
 }
 
-/// Registers the `oblisk` table with its one member, `oblisk.lock` (docs/adr/0052 decision 1).
-/// Returns that capability's `LiveSignalHandle` so `apply_state_snapshot` can hydrate it exactly
-/// like a bare roster global's -- the Lua-side *name* moved, the Rust-side push path did not.
+/// This Renderer binary's version as `{ major, minor, patch }` integers, from Cargo's own
+/// `CARGO_PKG_VERSION_*` (build-steps.md Phase 25 item 4).
 ///
-/// The member is a [`Capability`], not a bare `lua::signal::Signal`, and that is the shape
-/// decision here: ADR-0052 decision 4 has a lock screen read `{ active, authenticating, attempts,
-/// error }` off `oblisk.lock` while ADR-0052 decision 1 has the same config *command* the lock
-/// through it, so both halves live on one handle rather than a signal and a writer a config
-/// author would have to keep straight. See `lua::capability`'s own doc comment.
+/// A plain table, not a signal: it cannot change while the process runs. It is registered on the
+/// day the namespace is built rather than on the day a config needs it, because it is hostile to
+/// retrofit -- a config written before any version exists has nothing to guard on, forever, and
+/// the marginal cost here is one table.
 ///
-/// Deliberately outside [`register_screens_signal`]'s exception rather than beside it: `screens`
-/// is Renderer-sourced and outside the roster (docs/adr/0041 decision 2), whereas `lock` is a real
-/// Supervisor-pushed roster capability that is merely spelled differently, which is why it is
-/// still seeded into `capability_signals` and `screens` is not.
-fn register_oblisk_namespace(loader: &Loader, dirty: DirtyFlag, commands: CommandSender) -> mlua::Result<LiveSignalHandle> {
-    // `nil` until the Supervisor's first push, the same initial every rostered capability gets
-    // (ADR-0037's uniform nil-until-hydrated contract).
-    let (signal, handle) = lua::signal::Signal::new_live(mlua::Value::Nil, dirty);
+/// The shape is deliberately not Quickshell's `Quickshell.hasVersion(major, minor, features)`.
+/// That call carries a feature-name list, which answers a question Oblisk does not have yet and
+/// costs a registry of feature names to maintain; three integers a config can compare are the
+/// same guard without it.
+///
+/// The Renderer's version and not the Supervisor's, and they are the same number today because
+/// the workspace versions both together. The day they diverge this is still the right one: it is
+/// the process that hosts the VM and defines the API a config is written against.
+fn version_table(loader: &Loader) -> mlua::Result<mlua::Table> {
     let table = loader.create_table()?;
-    table.set(NAMESPACED_CAPABILITY, Capability::new(NAMESPACED_CAPABILITY, signal, commands))?;
-    loader.set_global("oblisk", table)?;
-    Ok(handle)
+    let [major, minor, patch] = version_parts();
+    table.set("major", major)?;
+    table.set("minor", minor)?;
+    table.set("patch", patch)?;
+    Ok(table)
+}
+
+/// `expect` rather than a `0` fallback: Cargo derives these three from the `version` field it has
+/// already parsed as semver, so a non-numeric one means the build is broken, and a version table
+/// that quietly reads `0.0.0` is worse than not booting -- a config would guard on it and take
+/// the wrong branch forever.
+fn version_parts() -> [u32; 3] {
+    [env!("CARGO_PKG_VERSION_MAJOR"), env!("CARGO_PKG_VERSION_MINOR"), env!("CARGO_PKG_VERSION_PATCH")]
+        .map(|part| part.parse().expect("Cargo's CARGO_PKG_VERSION_* are the numeric components of an already-parsed semver"))
 }
 
 fn rescue_table(loader: &Loader, is_rescue: bool, error_log: &str) -> mlua::Result<mlua::Table> {
@@ -1317,7 +1352,7 @@ mod tests {
     /// observe what a prior `set_rescue_state` call actually stored.
     fn rescue_state(loader: &Loader) -> (bool, String) {
         let output = loader
-            .evaluate(r#"return panel { id = "_rescue_probe", layer = "Top", is_rescue = rescue:get().is_rescue, error_log = rescue:get().error_log }"#)
+            .evaluate(r#"return panel { id = "_rescue_probe", layer = "Top", is_rescue = oblisk.rescue:get().is_rescue, error_log = oblisk.rescue:get().error_log }"#)
             .unwrap();
         let props = &output.surfaces[0].properties;
         let is_rescue = props.get("is_rescue").unwrap().as_boolean().unwrap();
@@ -1334,12 +1369,11 @@ mod tests {
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
         let dirty = DirtyFlag::new();
         let loader = Loader::new(dirty.clone()).unwrap();
-        let rescue_handle = register_rescue_signal(&loader, dirty.clone()).unwrap();
         let process_registry = ProcessRegistry::new(0, outbound_tx.clone());
         loader.register_process(process_registry.clone()).unwrap();
         let commands = CommandSender::new(0, outbound_tx);
-        let client = RendererClient::new(loader, shell_lua_path.to_path_buf(), ShapingHandle::spawn(), commands, rescue_handle, process_registry, dirty)
-            .unwrap();
+        let client =
+            RendererClient::new(loader, shell_lua_path.to_path_buf(), ShapingHandle::spawn(), commands, process_registry, dirty).unwrap();
         (client, outbound_rx)
     }
 
@@ -1389,7 +1423,7 @@ mod tests {
         let snapshot = StateSnapshot { capability: "audio".to_string(), revision: 1, payload: serde_json::json!({ "app_name": "Zen" }) };
         client.apply_state_snapshot(snapshot).unwrap();
 
-        let output = client.loader.evaluate(r#"return panel { id = "bar", layer = "Top", app_name = audio:get().app_name }"#).unwrap();
+        let output = client.loader.evaluate(r#"return panel { id = "bar", layer = "Top", app_name = oblisk.audio:get().app_name }"#).unwrap();
         let app_name = output.surfaces[0].properties.get("app_name").unwrap().as_string().unwrap().to_string_lossy();
         assert_eq!(app_name, "Zen");
     }
@@ -1406,27 +1440,120 @@ mod tests {
         let snapshot = StateSnapshot { capability: "workspace".to_string(), revision: 1, payload: serde_json::json!({ "active": 2 }) };
         client.apply_state_snapshot(snapshot).unwrap();
 
-        let output = client.loader.evaluate(r#"return panel { id = "bar", layer = "Top", active = workspace:get().active }"#).unwrap();
+        let output = client.loader.evaluate(r#"return panel { id = "bar", layer = "Top", active = oblisk.workspace:get().active }"#).unwrap();
         assert_eq!(output.surfaces[0].properties.get("active").unwrap().as_integer(), Some(2));
     }
 
     #[test]
-    fn every_rostered_capabilitys_global_exists_and_reads_nil_before_its_first_snapshot() {
+    fn every_rostered_capability_is_on_the_oblisk_table_and_reads_nil_before_its_first_snapshot() {
         // ADR-0037's uniform contract: a shell.lua reading any rostered capability at boot --
         // before the Supervisor's first push, or forever for a dormant one like sysinfo -- gets
-        // a live signal reading nil, never an undefined-global error into rescue. This is the
-        // regression the frozen four-name hand-list allowed six times in a row.
+        // a live signal reading nil, never an index-into-nil error into rescue. This is the
+        // regression the frozen four-name hand-list allowed six times in a row, now also
+        // asserting Phase 25 item 3's name: every one of them is `oblisk.<roster name>`.
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let (client, _outbound_rx) = test_client(&missing);
 
         for capability in shared::CAPABILITIES {
-            // One roster name is spelled `oblisk.lock` rather than bare, and the contract is the
-            // same one: reachable before the first push, reading nil. See NAMESPACED_CAPABILITY.
-            let name = if *capability == NAMESPACED_CAPABILITY { format!("oblisk.{capability}") } else { (*capability).to_string() };
-            let probe = format!(r#"return panel {{ id = "bar", layer = "Top", is_nil = {name}:get() == nil }}"#);
-            let output = client.loader.evaluate(&probe).unwrap_or_else(|err| panic!("rostered capability {name:?} has no live signal: {err}"));
-            assert_eq!(output.surfaces[0].properties.get("is_nil").unwrap().as_boolean(), Some(true), "{name} should read nil before its first snapshot");
+            let probe = format!(r#"return panel {{ id = "bar", layer = "Top", is_nil = oblisk.{capability}:get() == nil }}"#);
+            let output = client.loader.evaluate(&probe).unwrap_or_else(|err| panic!("rostered capability {capability:?} is not on `oblisk`: {err}"));
+            assert_eq!(
+                output.surfaces[0].properties.get("is_nil").unwrap().as_boolean(),
+                Some(true),
+                "oblisk.{capability} should read nil before its first snapshot"
+            );
         }
+    }
+
+    #[test]
+    fn no_rostered_capability_is_left_as_a_bare_global() {
+        // The other half of Phase 25 item 3, and the half a passing namespace test would not
+        // catch: `set_global` never removes anything, so a leftover bare seed would keep working
+        // and every config written against it would keep working too, until the day the name
+        // collided with a node constructor the way `lock` did (docs/adr/0052 decision 1).
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (client, _outbound_rx) = test_client(&missing);
+
+        for capability in shared::CAPABILITIES {
+            // `lock` is excluded because § 6.4's node constructor legitimately owns that global,
+            // which is the whole reason the namespace exists.
+            if *capability == "lock" {
+                continue;
+            }
+            let probe = format!(r#"return panel {{ id = "bar", layer = "Top", is_nil = {capability} == nil }}"#);
+            let output = client.loader.evaluate(&probe).unwrap();
+            assert_eq!(
+                output.surfaces[0].properties.get("is_nil").unwrap().as_boolean(),
+                Some(true),
+                "{capability} is still a bare global; § 2 names it oblisk.{capability}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrostered_push_refuses_to_replace_a_name_the_oblisk_table_already_holds() {
+        // `rescue` is the signal that reports config failures, so replacing it with an empty
+        // capability would make the shell stop reporting its own breakage. `Table::set` over an
+        // existing key is silent, which is how ADR-0052 decision 1's `lock` bug happened.
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (client, _outbound_rx) = test_client(&missing);
+
+        let snapshot = StateSnapshot { capability: "rescue".to_string(), revision: 1, payload: serde_json::json!({}) };
+        let err = client.apply_state_snapshot(snapshot).unwrap_err().to_string();
+        assert!(err.contains("already something else"), "the refusal must say why: {err}");
+
+        // And the real `rescue` still reads its own table, not an empty capability.
+        let output = client
+            .loader
+            .evaluate(r#"return panel { id = "bar", layer = "Top", intact = oblisk.rescue:get().is_rescue == false }"#)
+            .unwrap();
+        assert_eq!(output.surfaces[0].properties.get("intact").unwrap().as_boolean(), Some(true));
+    }
+
+    #[test]
+    fn rescue_and_screens_moved_onto_the_same_table_as_the_roster() {
+        // § 2.10 and § 2.15 name both of these `oblisk.*` like every capability, and ADR-0041
+        // decision 2 said `screens` would move "along with all of them" once a table existed.
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (client, _outbound_rx) = test_client(&missing);
+
+        let probe = r#"return panel { id = "bar", layer = "Top",
+            rescued = oblisk.rescue:get().is_rescue,
+            screen_count = #oblisk.screens:get(),
+            bare_rescue_gone = rescue == nil,
+            bare_screens_gone = screens == nil }"#;
+        let output = client.loader.evaluate(probe).unwrap();
+        let props = &output.surfaces[0].properties;
+        assert_eq!(props.get("rescued").unwrap().as_boolean(), Some(false));
+        assert_eq!(props.get("screen_count").unwrap().as_integer(), Some(0));
+        assert_eq!(props.get("bare_rescue_gone").unwrap().as_boolean(), Some(true));
+        assert_eq!(props.get("bare_screens_gone").unwrap().as_boolean(), Some(true));
+    }
+
+    #[test]
+    fn oblisk_version_is_three_integers_a_config_can_compare() {
+        // Phase 25 item 4. The value matters less than the shape: a config guards with
+        // `if oblisk.version.major > 0 or oblisk.version.minor >= 2 then`, so all three fields
+        // have to be present and numeric on the day the first config is written.
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (client, _outbound_rx) = test_client(&missing);
+
+        let probe = r#"return panel { id = "bar", layer = "Top",
+            major = oblisk.version.major, minor = oblisk.version.minor, patch = oblisk.version.patch }"#;
+        let output = client.loader.evaluate(probe).unwrap();
+        let props = &output.surfaces[0].properties;
+        let [major, minor, patch] = version_parts();
+        assert_eq!(props.get("major").unwrap().as_integer(), Some(i64::from(major)));
+        assert_eq!(props.get("minor").unwrap().as_integer(), Some(i64::from(minor)));
+        assert_eq!(props.get("patch").unwrap().as_integer(), Some(i64::from(patch)));
+    }
+
+    #[test]
+    fn version_parts_are_the_crates_own_version() {
+        // Guards the `expect` in `version_parts`: a `version` Cargo could not split into three
+        // numbers would panic every Renderer at startup, and this fails the build instead.
+        let [major, minor, patch] = version_parts();
+        assert_eq!(format!("{major}.{minor}.{patch}"), env!("CARGO_PKG_VERSION"));
     }
 
     /// The regression build-steps.md Phase 25 item 3 could silently reintroduce, and the reason
@@ -1506,7 +1633,7 @@ mod tests {
             .apply_state_snapshot(StateSnapshot { capability: "network".to_string(), revision: 2, payload: serde_json::json!({ "scanning": false }) })
             .unwrap();
 
-        let output = client.loader.evaluate(r#"return panel { id = "bar", layer = "Top", scanning = network:get().scanning }"#).unwrap();
+        let output = client.loader.evaluate(r#"return panel { id = "bar", layer = "Top", scanning = oblisk.network:get().scanning }"#).unwrap();
         assert_eq!(
             output.surfaces[0].properties.get("scanning").unwrap().as_boolean(),
             Some(false),
@@ -2073,7 +2200,7 @@ mod tests {
     #[test]
     fn re_resolve_if_dirty_applies_a_pushed_value_without_reading_shell_lua_again() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", visible = workspace }"#);
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", visible = oblisk.workspace }"#);
         let (mut client, _outbound_rx) = test_client(&path);
         client
             .apply_state_snapshot(StateSnapshot { capability: "workspace".to_string(), revision: 1, payload: serde_json::json!(true) })
@@ -2102,7 +2229,7 @@ mod tests {
     #[test]
     fn re_resolve_if_dirty_clears_the_flag_and_a_second_call_does_no_work() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", visible = workspace }"#);
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", visible = oblisk.workspace }"#);
         let (mut client, _outbound_rx) = test_client(&path);
         client
             .apply_state_snapshot(StateSnapshot { capability: "workspace".to_string(), revision: 1, payload: serde_json::json!(true) })
@@ -2154,7 +2281,7 @@ mod tests {
     #[test]
     fn a_push_that_makes_a_property_invalid_keeps_the_prior_scene_and_does_not_enter_rescue() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", visible = workspace }"#);
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", visible = oblisk.workspace }"#);
         let (mut client, _outbound_rx) = test_client(&path);
         client
             .apply_state_snapshot(StateSnapshot { capability: "workspace".to_string(), revision: 1, payload: serde_json::json!(true) })
@@ -2195,7 +2322,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),
-            r#"return panel { id = "bar", layer = "Top", visible = audio, child = rect { width = network, height = 10, children = tray } }"#,
+            r#"return panel { id = "bar", layer = "Top", visible = oblisk.audio, child = rect { width = oblisk.network, height = 10, children = oblisk.tray } }"#,
         );
         let (mut client, _outbound_rx) = test_client(&path);
 
@@ -2214,7 +2341,7 @@ mod tests {
         // though `title` still reads `nil` here, same as the sibling test above for `visible` and
         // `children`. Before item 6, `content` had no default and this rejected the whole tree.
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", child = text { content = audio } }"#);
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", child = text { content = oblisk.audio } }"#);
         let (mut client, _outbound_rx) = test_client(&path);
 
         run_startup(&mut client);
@@ -2259,7 +2386,7 @@ mod tests {
         let path = write_shell_lua(
             dir.path(),
             r#"
-            return panel { id = "bar", layer = "Top", child = row { children = computed({audio}, function(n)
+            return panel { id = "bar", layer = "Top", child = row { children = computed({oblisk.audio}, function(n)
                 if n == 3 then
                     return { rect { width = 1, height = 1 }, rect { width = 1, height = 1 }, rect { width = 1, height = 1 } }
                 end
@@ -2324,7 +2451,7 @@ mod tests {
             dir.path(),
             r#"
             local panels = {}
-            for _, screen in ipairs(screens:get()) do
+            for _, screen in ipairs(oblisk.screens:get()) do
                 panels[#panels + 1] = panel { id = "bar@" .. screen.name, layer = "Top", monitor = screen.name }
             end
             return panels
@@ -2346,7 +2473,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),
-            r#"return panel { id = "bar", layer = "Top", child = text { content = "screens: " .. #screens:get() } }"#,
+            r#"return panel { id = "bar", layer = "Top", child = text { content = "screens: " .. #oblisk.screens:get() } }"#,
         );
         let (mut client, _outbound_rx) = test_client(&path);
 
@@ -2375,7 +2502,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),
-            r#"return panel { id = "bar", layer = "Top", child = text { content = computed({screens}, function(list) return "n=" .. #list end) } }"#,
+            r#"return panel { id = "bar", layer = "Top", child = text { content = computed({oblisk.screens}, function(list) return "n=" .. #list end) } }"#,
         );
         let (mut client, _outbound_rx) = test_client(&path);
         client.set_screens(screens_json(&["eDP-1"]));

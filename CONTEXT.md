@@ -137,12 +137,16 @@ A named IPC-addressable module owning one slice of state and its write actions (
 _Avoid_: module, service, backend
 
 **Revision**:
-A capability's state-version counter. A stale revision fails the write.
+A capability's state-version counter, carried on every snapshot it pushes and stamped onto every write issued against what that snapshot said.
 _Avoid_: version, sequence number
 
 **Capability roster**:
-The `shared`-crate constant naming every snapshot-hydrated capability. Each rostered name is reachable from a generation's first evaluation and reads `nil` until its first dependency snapshot arrives (ADR-0037). All but one are bare Lua globals; `lock` is reached as `oblisk.lock`, because a surface role already owns the bare name (ADR-0052).
+The `shared`-crate constant naming every snapshot-hydrated capability. Each rostered name is reachable from a generation's first evaluation and reads `nil` until its first dependency snapshot arrives (ADR-0037). One name serves as the Lua name, the roster key and the `capability` field of every command written through it.
 _Avoid_: pre-seed list, known capabilities
+
+**Oblisk namespace**:
+The single Lua table every capability, `rescue`, `screens` and `version` hang off. It is what keeps engine vocabulary (the node constructors a config calls) and system state (the things a config reads and commands) from sharing a name.
+_Avoid_: globals, the state tree
 
 **Secure submit**:
 A `textfield` property naming the capability/action that receives a masked field's native input buffer directly, bypassing Lua. Without it, a masked field's value is unreadable from Lua entirely.

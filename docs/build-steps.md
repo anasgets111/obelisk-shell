@@ -1743,6 +1743,49 @@ Deliberately deferred: per-command argument validation from § 3.2's table. The 
 `arguments` as JSON and each capability's `dispatch` already parses what it needs, so validating
 twice means maintaining the schema twice. Reject at the module that owns the command.
 
+> **Built.** Item 1 had already landed under ADR-0052 decision 1; items 2, 3 and 4 close the phase.
+>
+> Item 3 is the one with reach. Every roster name now hangs off one `oblisk` table, along with
+> `rescue` (§ 2.10) and `screens` (§ 2.15), and no capability is left as a bare global. A test
+> asserts both halves, because `set_global` never removes anything: a leftover bare seed would keep
+> working, and every config written against it would keep working, until the day that name collided
+> with a node constructor the way `lock` did.
+>
+> **What the rename nearly broke, and what caught it.** A capability is a `Capability` userdata now,
+> not a bare `Signal`, and the engine decided "is this a signal?" by userdata type in three separate
+> places. `computed({oblisk.audio}, f)` and `width = oblisk.sysinfo` would have stopped resolving,
+> and a property the resolver skips is treated as a *literal*, so every live binding in every config
+> would have frozen at frame one with nothing logged. That is the same failure mode the `%d` raise
+> produced in Phase 28, reached by a different route. The three sites now go through one
+> `signal::from_userdata`, with `is_signal` beside it for the callers that only need the question
+> answered, and a test asserts the two agree on every type rather than trusting them to stay in step.
+>
+> Item 2 stores each capability's `StateSnapshot.revision` next to its value and stamps it onto
+> every envelope. `CapabilityHandle::hydrate` writes both or neither, which is the point: a `set`
+> that missed its revision bump would stamp the previous read onto a write reacting to the current
+> one, which is exactly the race § 7.3 exists to drop. `0` is not a revision any push can produce
+> (`bump_revision` starts at 1), so it means "never hydrated" and nothing else.
+>
+> **Nothing reads that number yet, and item 2 never asked anything to.** The Supervisor's
+> `RendererFrame::Command` arm matches on `capability` and dispatches; it checks neither
+> `expected_revision` nor `generation_id`. So § 7.3's guard rule ("if the `generation_id` is less
+> than the current active generation, or if the `expected_revision` is stale, the Supervisor
+> instantly drops the packet") is half-built: the Renderer now sends honest numbers and the
+> Supervisor ignores both of them. That is the right half to build first, since a guard cannot be
+> written against a field that is always `0`, but a write from a superseded generation is accepted
+> today and § 7.3 says it must not be. It needs a phase.
+>
+> Item 4 is `oblisk.version`, three integers from Cargo's own `CARGO_PKG_VERSION_*`. It parses with
+> an `expect` rather than falling back to zero: a version table that quietly reads `0.0.0` is worse
+> than not booting, since a config would guard on it and take the wrong branch forever.
+>
+> **Still divergent from § 2, and now visibly so.** § 1.2 writes `content = oblisk.mpris.title`,
+> one signal per field. This engine has one signal per capability holding a table, so `oblisk.mpris`
+> is live and `oblisk.mpris.title` reads `nil` on a userdata with no such field, which a property
+> treats as absent and renders as the documented default. The name is right now and the shape is
+> not, which is a smaller gap than before this phase and a more confusing one: the example looks
+> like it should work. Settle it by picking one, in the phase that next touches the read path.
+
 ### Phase 26: The Config Environment
 
 Implement ADR-0047 and ADR-0048. Both change what a config *is* rather than what it can draw, and

@@ -129,7 +129,7 @@ end
 -- The one module that reads two capabilities at once, and the reason `computed` exists: a media
 -- widget wants the player from `mpris` and the output volume from `audio`, and neither signal can
 -- see the other.
-local media = pill({ cell(computed({ mpris, audio }, function(m, a)
+local media = pill({ cell(computed({ oblisk.mpris, oblisk.audio }, function(m, a)
     local player = m and (m.players or {})[1]
     if not player then
         return "no media"
@@ -150,7 +150,7 @@ end), ACCENT) })
 -- string, so this deliberately reads `summary` and leaves span rendering to a real notification
 -- surface: flattening spans into one line here would throw away the bold/italic/href structure the
 -- Supervisor went to the trouble of parsing.
-local notifications_module = pill({ cell(label(notifications, function(n)
+local notifications_module = pill({ cell(label(oblisk.notifications, function(n)
     if n.dnd then
         return "dnd"
     end
@@ -167,17 +167,17 @@ end), FG) })
 -- seconds pushed once per wall-clock second, so `os.date` formats it the same way it would format
 -- `os.time()`. The difference is that this one moves: `os.date(os.time())` freezes at whatever
 -- instant the config was evaluated, because nothing re-evaluates it.
-local clock = cell(label(system, function(s)
+local clock = cell(label(oblisk.system, function(s)
     return os.date("%H:%M:%S", s.time)
 end), FG, 15)
 
-local date = cell(label(system, function(s)
+local date = cell(label(oblisk.system, function(s)
     return os.date("%a %d %b", s.time)
 end), DIM, 11)
 
 -- Right zone ----------------------------------------------------------------------------------
 
-local updates_module = pill({ cell(label(updates, function(u)
+local updates_module = pill({ cell(label(oblisk.updates, function(u)
     if u.check_error and u.check_error ~= "" then
         return "updates?"
     end
@@ -195,16 +195,16 @@ end), YELLOW) })
 local privacy_module = row {
     height = "Fill",
     align_v = "Center",
-    visible = shown_when(privacy, function(p)
+    visible = shown_when(oblisk.privacy, function(p)
         return #(p.camera_users or {}) > 0
     end),
-    children = { pill({ cell(label(privacy, function(p)
+    children = { pill({ cell(label(oblisk.privacy, function(p)
         local users = p.camera_users or {}
         return "cam: " .. ((users[1] or {}).app_name or "?")
     end), RED) }, "#45253aff") },
 }
 
-local keyboard_module = pill({ cell(label(keyboard, function(k)
+local keyboard_module = pill({ cell(label(oblisk.keyboard, function(k)
     local name = k.active_layout or "?"
     if k.caps_lock then
         name = name .. " CAPS"
@@ -212,7 +212,7 @@ local keyboard_module = pill({ cell(label(keyboard, function(k)
     return name
 end), DIM) })
 
-local network_module = pill({ cell(label(network, function(n)
+local network_module = pill({ cell(label(oblisk.network, function(n)
     for _, ap in ipairs(n.available_networks or {}) do
         if ap.active then
             return string.format("%s %d%%", truncate(ap.ssid, 14), ap.strength or 0)
@@ -221,7 +221,7 @@ local network_module = pill({ cell(label(network, function(n)
     return n.scanning and "scanning" or "offline"
 end), ACCENT) })
 
-local bluetooth_module = pill({ cell(label(bluetooth, function(b)
+local bluetooth_module = pill({ cell(label(oblisk.bluetooth, function(b)
     if not b.enabled then
         return "bt off"
     end
@@ -242,13 +242,13 @@ end), ACCENT) })
 -- `channelVolumes`, which is the number `wpctl` and `pactl` show and the one a user recognises as
 -- "the volume"; the raw linear value would read 3% where this reads 30%.
 local volume_module = pill({
-    cell(label(audio, function(a)
+    cell(label(oblisk.audio, function(a)
         if a.muted then
             return "muted"
         end
         return string.format("vol %d%%", math.floor(a.volume * 100 + 0.5))
     end), FG),
-    meter(audio, function(a)
+    meter(oblisk.audio, function(a)
         return a.muted and 0 or a.volume * 100
     end, MAUVE),
 })
@@ -274,15 +274,15 @@ local function battery_color(b)
 end
 
 local battery_module = pill({
-    cell(label(battery, function(b)
+    cell(label(oblisk.battery, function(b)
         if not b.present then
             return "ac"
         end
         return string.format("%d%%%s", b.percent, b.charging and " +" or "")
-    end), battery:map(battery_color)),
-    meter(battery, function(b)
+    end), oblisk.battery:map(battery_color)),
+    meter(oblisk.battery, function(b)
         return b.present and b.percent or 0
-    end, battery:map(battery_color), 32),
+    end, oblisk.battery:map(battery_color), 32),
 })
 
 -- The one `list` in this file, and the only node kind whose children do not exist as a literal Lua
@@ -292,7 +292,7 @@ local battery_module = pill({
 -- `key` is what makes reconciliation stable across pushes: without it a tray item appearing at the
 -- front would renumber every sibling and reconcile each one against the wrong previous node.
 local tray_module = pill({ list {
-    source = tray:map(function(t)
+    source = oblisk.tray:map(function(t)
         return (t and t.items) or {}
     end),
     itemfn = function(item)
@@ -309,7 +309,7 @@ local tray_module = pill({ list {
 -- from Phase 25. The field names below are the real ones (`cpu_percent`, not `cpu_pct`); the
 -- previous version of this file read `cpu_pct` and would have silently shown 0% forever the day
 -- Phase 25 landed, which nobody would have caught because dormant and wrong look identical here.
-local sysinfo_module = pill({ cell(label(sysinfo, function(s)
+local sysinfo_module = pill({ cell(label(oblisk.sysinfo, function(s)
     return string.format("cpu %d%% ram %d%%", s.cpu_percent or 0, s.ram_percent or 0)
 end), DIM, 11) })
 
@@ -377,7 +377,7 @@ local lock_button = button {
 local rescue_cell = row {
     height = "Fill",
     align_v = "Center",
-    visible = shown_when(rescue, function(r)
+    visible = shown_when(oblisk.rescue, function(r)
         return r.error_log ~= nil and r.error_log ~= ""
     end),
     children = { pill({ cell("config error", RED) }, "#45253aff") },
@@ -422,7 +422,7 @@ end), RED)
 
 -- The lock screen gets the clock too, because every lock screen has one and because it is the
 -- cheapest possible proof that `system` keeps pushing while the session is locked.
-local lock_clock = cell(label(system, function(s)
+local lock_clock = cell(label(oblisk.system, function(s)
     return os.date("%H:%M", s.time)
 end), FG, 48)
 
@@ -516,14 +516,14 @@ return {
             border_width = 1,
             border_color = SURFACE,
             children = {
-                cell(label(notifications, function(n)
+                cell(label(oblisk.notifications, function(n)
                     local newest = (n.feed or {})[1]
                     if not newest then
                         return "no notifications"
                     end
                     return truncate(newest.app_name or "?", 30)
                 end), DIM, 11),
-                cell(label(notifications, function(n)
+                cell(label(oblisk.notifications, function(n)
                     local newest = (n.feed or {})[1]
                     if not newest then
                         return "nothing to show"
@@ -555,13 +555,13 @@ return {
             background = BG,
             children = {
                 cell("oblisk settings", FG, 16),
-                cell(label(system, function(s)
+                cell(label(oblisk.system, function(s)
                     return "up since " .. os.date("%H:%M:%S", s.time)
                 end), DIM, 11),
-                cell(label(audio, function(a)
+                cell(label(oblisk.audio, function(a)
                     return string.format("%d playback stream(s)", count(a.apps))
                 end), DIM, 11),
-                cell(label(screens, function(s)
+                cell(label(oblisk.screens, function(s)
                     return string.format("%d output(s)", #s)
                 end), DIM, 11),
                 sysinfo_module,
@@ -602,19 +602,19 @@ return {
             border_width = 1,
             border_color = SURFACE,
             children = {
-                cell(label(battery, function(b)
+                cell(label(oblisk.battery, function(b)
                     if not b.present then
                         return "on ac power"
                     end
                     return string.format("battery %d%% %s", b.percent, b.charging and "charging" or "discharging")
                 end), FG, 12),
-                cell(label(network, function(n)
+                cell(label(oblisk.network, function(n)
                     return string.format("%d network(s) in range", count(n.available_networks))
                 end), DIM, 12),
-                cell(label(bluetooth, function(b)
+                cell(label(oblisk.bluetooth, function(b)
                     return string.format("%d bluetooth device(s)", count(b.connected_devices))
                 end), DIM, 12),
-                cell(label(keyboard, function(k)
+                cell(label(oblisk.keyboard, function(k)
                     -- `or 1` would not help here: `layout_count` is 0 until the compositor's first
                     -- layout resync, and 0 is truthy in Lua, so the fallback never fires and the
                     -- line reads "layout 1 of 0". An absent count is absent, not one.
@@ -655,7 +655,7 @@ return {
                     border_color = SURFACE,
                     children = { cell("locked", FG), password_field, lock_status },
                 },
-                cell(label(battery, function(b)
+                cell(label(oblisk.battery, function(b)
                     if not b.present then
                         return ""
                     end

@@ -41,7 +41,7 @@ use mlua::{Lua, Value};
 
 use crate::lua::marshal;
 use crate::lua::nodes::{VirtualNode, deserialize_lua_table};
-use crate::lua::signal::Signal;
+use crate::lua::signal::{self, is_signal};
 use crate::text::snap::LogicalRect;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -434,7 +434,7 @@ pub fn resolve_properties(
             resolved.insert(property.clone(), value.clone());
             continue;
         };
-        let Ok(signal) = ud.borrow::<Signal>() else {
+        let Some(signal) = signal::from_userdata(ud) else {
             resolved.insert(property.clone(), value.clone());
             continue;
         };
@@ -516,7 +516,7 @@ fn reject_signal_in_structural_field(property: &str, value: &Value) -> Result<()
 /// `anchor_rect = popup_anchor` -- the exact spelling docs/adr/0050 decision 3 tells a config to
 /// write -- failed the whole evaluation.
 fn is_deferred_signal(properties: &HashMap<String, Value>, property: &str) -> bool {
-    matches!(properties.get(property), Some(Value::UserData(ud)) if ud.is::<Signal>())
+    matches!(properties.get(property), Some(Value::UserData(ud)) if is_signal(ud))
 }
 
 /// `"NN%"` (`^\d+(\.\d+)?%$`) as `SizeMode::Percent`. Not a confirmed spec syntax -- § 5.1's base

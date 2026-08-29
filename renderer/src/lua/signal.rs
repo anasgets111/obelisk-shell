@@ -467,6 +467,30 @@ fn governing_deadline_expired(lua: &Lua) -> bool {
 /// Registers the `computed(dependencies, fn)` global (§ 1.2) and the `state(name, initial)` global
 /// (ADR-0044 decision 5). `dependencies` must be an array of `Signal` userdata handles.
 ///
+/// The one answer to "does this Lua userdata resolve like a signal?", and the `Signal` to
+/// resolve it through.
+///
+/// Two userdata types answer yes. [`Signal`] is the obvious one. `capability::Capability` is the
+/// other, and it is why this function exists at all: build-steps.md Phase 25 item 3 put every
+/// § 2 capability behind a `Capability` so the same object could be read and commanded, which
+/// means `computed({oblisk.audio}, f)` and `content = oblisk.mpris` now hand the engine a
+/// `Capability` where they used to hand it a bare `Signal`. Without one shared answer here, the
+/// namespace move would have turned every live capability binding in every config into a value
+/// the resolver skipped, and a skipped property is a *literal*, so every bar would have frozen
+/// at its first frame with nothing logged.
+pub fn from_userdata(ud: &mlua::AnyUserData) -> Option<Signal> {
+    if let Ok(signal) = ud.borrow::<Signal>() {
+        return Some(signal.clone());
+    }
+    Some(ud.borrow::<crate::lua::capability::Capability>().ok()?.signal())
+}
+
+/// [`from_userdata`] without the clone, for callers that only need the question answered. The
+/// two must agree on which types are signals, which `from_userdata_and_is_signal_agree` asserts.
+pub fn is_signal(ud: &mlua::AnyUserData) -> bool {
+    ud.is::<Signal>() || ud.is::<crate::lua::capability::Capability>()
+}
+
 /// `dirty` is decision 2's one scene-dirty flag, taken explicitly rather than fished out of
 /// `app_data` at call time: a hidden coupling that fails inside a config author's own `state()`
 /// call, because nobody stashed the flag, is worse than threading one argument through the call
@@ -479,7 +503,11 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
             let mut collected = Vec::new();
             for dep in deps.sequence_values::<mlua::AnyUserData>() {
                 let dep = dep?;
-                let signal = dep.borrow::<Signal>()?.clone();
+                // Named rather than left to `borrow`'s own type error, which reports the mlua
+                // type name of whatever was passed and never says what was expected.
+                let signal = from_userdata(&dep).ok_or_else(|| {
+                    mlua::Error::runtime("computed() dependencies must be Signals or `oblisk` capabilities, § 1.2")
+                })?;
                 collected.push(signal);
             }
             Ok(Signal(SignalKind::Computed { deps: collected, func }))
@@ -953,5 +981,61 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(result, 2_000_001_000_000);
+    }
+
+    /// A `Capability` is a userdata the resolver has to see through, or every `oblisk.<name>`
+    /// bound live into a property silently becomes a literal (see [`from_userdata`]).
+    #[test]
+    fn from_userdata_sees_through_a_capability_to_its_read_signal() {
+        use crate::lua::capability::{Capability, CommandSender};
+
+        let lua = Lua::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (capability, handle) = Capability::new("probe", DirtyFlag::new(), CommandSender::new(0, tx));
+        handle.hydrate(Value::Integer(42), 1);
+        lua.globals().set("probe", capability).unwrap();
+
+        let ud: mlua::AnyUserData = lua.load("return probe").eval().unwrap();
+        let signal = from_userdata(&ud).expect("a capability must resolve like the signal it wraps");
+        assert_eq!(signal.get_value(&lua).unwrap().as_i64(), Some(42));
+    }
+
+    #[test]
+    fn from_userdata_and_is_signal_agree() {
+        // The two answer the same question and list the same types; this is what stops one of
+        // them growing a third type the other does not know about.
+        use crate::lua::capability::{Capability, CommandSender};
+
+        let lua = Lua::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (capability, _handle) = Capability::new("probe", DirtyFlag::new(), CommandSender::new(0, tx));
+        lua.globals().set("probe", capability).unwrap();
+        lua.globals().set("plain", Signal::try_new_direct(Value::Integer(1)).unwrap()).unwrap();
+        // A userdata that is neither, to prove both say no rather than both saying yes.
+        lua.globals().set("handle", lua.create_any_userdata(7u32).unwrap()).unwrap();
+
+        for name in ["probe", "plain", "handle"] {
+            let ud: mlua::AnyUserData = lua.load(format!("return {name}")).eval().unwrap();
+            assert_eq!(from_userdata(&ud).is_some(), is_signal(&ud), "{name}");
+        }
+    }
+
+    #[test]
+    fn computed_accepts_a_capability_as_a_dependency_and_names_what_it_rejects() {
+        use crate::lua::capability::{Capability, CommandSender};
+
+        let lua = Lua::new();
+        register(&lua, DirtyFlag::new()).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (capability, handle) = Capability::new("probe", DirtyFlag::new(), CommandSender::new(0, tx));
+        handle.hydrate(Value::Integer(3), 1);
+        lua.globals().set("probe", capability).unwrap();
+
+        let doubled: i64 = lua.load("return computed({probe}, function(n) return n * 2 end):get()").eval().unwrap();
+        assert_eq!(doubled, 6);
+
+        lua.globals().set("handle", lua.create_any_userdata(7u32).unwrap()).unwrap();
+        let err = lua.load("return computed({handle}, function(n) return n end)").exec().unwrap_err().to_string();
+        assert!(err.contains("must be Signals or `oblisk` capabilities"), "the error must say what was expected: {err}");
     }
 }

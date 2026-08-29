@@ -1,13 +1,17 @@
-//! The `oblisk` namespace's capability objects: one capability's read signal and § 3.2's write
-//! path on the same handle (build-steps.md Phase 25 item 1, docs/adr/0052 decision 1).
+//! The `oblisk` namespace's capability objects: one capability's read signal, its revision, and
+//! § 3.2's write path on the same handle (build-steps.md Phase 25 items 1 and 2, docs/adr/0052
+//! decision 1).
 //!
 //! Phase 25 exists because Lua could not write at all: `Signal` exposes `get`/`map`/`set` and
 //! § 3.2's roughly thirty write commands had no implementation outside `process.run`'s hand-built
-//! envelope. Item 1 of that phase comes forward here, because ADR-0052 decision 1 makes
-//! `oblisk.lock` an ordinary capability and a capability with no caller is dead code. It comes
-//! forward *whole*: [`CommandSender::send`] builds an envelope from `{capability, action,
-//! arguments}` and knows nothing about locking, so the other twenty-nine commands land on it too
-//! rather than each growing a bespoke binding Phase 25 would then have to delete.
+//! envelope. Item 1 landed here early, under ADR-0052 decision 1, because `oblisk.lock` is an
+//! ordinary capability and a capability with no caller is dead code. It landed *whole*:
+//! [`CommandSender::send`] builds an envelope from `{capability, action, arguments}` and knows
+//! nothing about locking, so the other twenty-nine commands land on it too rather than each
+//! growing a bespoke binding the phase would then have to delete. Item 2 is the revision the
+//! envelope carries, and it lives here for the same reason: [`Capability`] and
+//! [`CapabilityHandle`] are the two ends of one capability, so the number a write is stamped
+//! with and the push that moves it are one object apart rather than two maps apart.
 //!
 //! `renderer/src/lua/process.rs` is the working template, not a special case, and this is the
 //! same shape with the capability name lifted out of it: a Lua call on the Wayland dispatch
@@ -35,11 +39,11 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use mlua::{Function, LuaSerdeExt, MultiValue, UserData, UserDataMethods};
+use mlua::{Function, LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value};
 use shared::{CommandEnvelope, CommandParams, RendererFrame};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::lua::signal::Signal;
+use crate::lua::signal::{DirtyFlag, LiveSignalHandle, Signal};
 
 /// Builds § 7.2's generation-guarded envelope for any `{capability, action, arguments}` and
 /// queues it for the socket thread. One per generation, cloned into every [`Capability`] the
@@ -74,15 +78,17 @@ impl CommandSender {
 
     /// § 7.2's envelope, queued rather than written: see the module doc comment.
     ///
-    /// `expected_revision` is `0`, matching `process.rs`'s hardcoded value, and it is correct for
-    /// the same reason ADR-0052 decision 1 gives for `lock`: a command that is not a
-    /// read-modify-write has no state for § 7.3's staleness guard to be measured against. It is
-    /// **not** correct for a capability whose command reacts to a snapshot it just read --
-    /// `audio:set_app_volume` against a stream list, say -- and making it real for those is Phase
-    /// 25 item 2, which stores each capability's `StateSnapshot.revision` (dropped today by
-    /// `socket::RendererClient::apply_state_snapshot`) alongside its `LiveSignalHandle` and stamps
-    /// that here instead.
-    fn send(&self, capability: &str, action: &str, arguments: Vec<serde_json::Value>) {
+    /// `expected_revision` is the revision of the last `StateSnapshot` this capability hydrated
+    /// from, which is the whole of § 7.3's staleness half: a config reads `oblisk.audio:get()`,
+    /// picks a stream out of the result and writes back against it, and this number names which
+    /// read it was reacting to. [`CapabilityHandle`] is what keeps it current.
+    ///
+    /// `0` is not a revision any push can produce -- `supervisor::snapshot::bump_revision` starts
+    /// at `1` -- so it means exactly "this capability has never been hydrated in this Renderer".
+    /// That is the honest value for a write issued before the first snapshot arrives, and it is
+    /// also permanently correct for a capability that holds no state to be stale about, which is
+    /// why `lock` (ADR-0052 decision 1) and `process.rs` both send it forever.
+    fn send(&self, capability: &str, action: &str, arguments: Vec<serde_json::Value>, expected_revision: u32) {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
         let envelope = CommandEnvelope {
@@ -93,7 +99,7 @@ impl CommandSender {
                 capability: capability.to_string(),
                 action: action.to_string(),
                 arguments,
-                expected_revision: 0,
+                expected_revision,
             },
             id,
         };
@@ -106,24 +112,68 @@ impl CommandSender {
 /// One member of the `oblisk` table: the capability's live state signal plus its write path.
 /// `name` is the `shared::CAPABILITIES` roster name, which is both the Lua field it is registered
 /// under and the `capability` field of every envelope it sends -- one string, so a config that
-/// reads `oblisk.lock` cannot write to something else.
+/// reads `oblisk.audio` cannot write to something else.
 pub struct Capability {
     name: String,
     signal: Signal,
+    /// Shared with the [`CapabilityHandle`] built beside this member, so an `invoke` stamps the
+    /// revision of the snapshot the config could last have read rather than a number captured at
+    /// registration time. See [`CommandSender::send`].
+    revision: Rc<Cell<u32>>,
     commands: CommandSender,
 }
 
 impl Capability {
-    pub fn new(name: &str, signal: Signal, commands: CommandSender) -> Self {
-        Capability { name: name.to_string(), signal, commands }
+    /// Builds one `oblisk.<name>` member and the handle `socket::RendererClient` hydrates it
+    /// through. The two come back together rather than being constructible apart, because the
+    /// value and the revision have to move as one: a `set` that missed its matching revision
+    /// bump would stamp the previous read onto a write reacting to the current one, which is
+    /// precisely the race § 7.3 exists to drop.
+    pub fn new(name: &str, dirty: DirtyFlag, commands: CommandSender) -> (Self, CapabilityHandle) {
+        // `nil` until the Supervisor's first push (ADR-0037's uniform nil-until-hydrated
+        // contract), paired with revision `0`, which no push can produce.
+        let (signal, signal_handle) = Signal::new_live(Value::Nil, dirty);
+        let revision = Rc::new(Cell::new(0));
+        let capability = Capability { name: name.to_string(), signal, revision: Rc::clone(&revision), commands };
+        (capability, CapabilityHandle { signal: signal_handle, revision })
+    }
+
+    /// The wrapped read signal, for `signal::from_userdata`. This is what lets a config write
+    /// § 1.2's live spelling (`content = oblisk.mpris`, `computed({oblisk.audio}, f)`) against a
+    /// capability rather than only `:get()`/`:map()`: the engine resolves the inner signal and
+    /// never sees the `Capability` wrapper.
+    pub fn signal(&self) -> Signal {
+        self.signal.clone()
+    }
+}
+
+/// The Rust-side half of one `oblisk.<name>` member: what a `StateSnapshot` writes into.
+///
+/// One handle rather than a `LiveSignalHandle` beside a revision cell, because
+/// `socket::RendererClient` holds one of these per capability and every caller wants both fields
+/// or neither. See [`Self::hydrate`].
+#[derive(Clone)]
+pub struct CapabilityHandle {
+    signal: LiveSignalHandle,
+    revision: Rc<Cell<u32>>,
+}
+
+impl CapabilityHandle {
+    /// Writes one `StateSnapshot` into the Lua-visible signal and records the revision it
+    /// arrived with. Revision first: the value write is what marks the scene dirty (ADR-0044
+    /// decision 2), so it is the one that must happen last.
+    pub fn hydrate(&self, value: Value, revision: u32) {
+        self.revision.set(revision);
+        self.signal.set(value);
     }
 }
 
 impl UserData for Capability {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        // `get`/`map` delegate rather than reimplement, so `oblisk.lock` reads exactly like the
-        // ten bare capability globals beside it (ADR-0037's uniform nil-until-hydrated contract
-        // included: the wrapped signal holds `nil` until the Supervisor's first push).
+        // `get`/`map` delegate rather than reimplement, so a capability reads exactly like the
+        // two bare `Signal` globals beside it in the `oblisk` table (`rescue` and `screens`),
+        // ADR-0037's uniform nil-until-hydrated contract included: the wrapped signal holds
+        // `nil` until the Supervisor's first push.
         methods.add_method("get", |lua, this, ()| this.signal.get_value(lua));
         methods.add_method("map", |_, this, f: Function| Ok(this.signal.mapped(f)));
         // No `set`: ADR-0044 decision 5 keeps capability state read-only to Lua, and the wrapped
@@ -145,7 +195,7 @@ impl UserData for Capability {
                 })?;
                 arguments.push(json);
             }
-            this.commands.send(&this.name, &action, arguments);
+            this.commands.send(&this.name, &action, arguments, this.revision.get());
             Ok(())
         });
     }
@@ -157,17 +207,16 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::lua::signal::{DirtyFlag, LiveSignalHandle};
 
     /// A VM with `oblisk.probe` on it: the roster name is irrelevant to everything in this
     /// module (that is the point of a generic write path), so the tests use a name no capability
     /// owns rather than implying `lock` is special here.
-    fn lua_with_capability(generation_id: u32) -> (Lua, LiveSignalHandle, mpsc::UnboundedReceiver<RendererFrame>) {
+    fn lua_with_capability(generation_id: u32) -> (Lua, CapabilityHandle, mpsc::UnboundedReceiver<RendererFrame>) {
         let lua = Lua::new();
         let (tx, rx) = mpsc::unbounded_channel();
-        let (signal, handle) = Signal::new_live(Value::Nil, DirtyFlag::new());
+        let (capability, handle) = Capability::new("probe", DirtyFlag::new(), CommandSender::new(generation_id, tx));
         let table = lua.create_table().unwrap();
-        table.set("probe", Capability::new("probe", signal, CommandSender::new(generation_id, tx))).unwrap();
+        table.set("probe", capability).unwrap();
         lua.globals().set("oblisk", table).unwrap();
         (lua, handle, rx)
     }
@@ -192,9 +241,25 @@ mod tests {
         assert_eq!(envelope.params.capability, "probe");
         assert_eq!(envelope.params.action, "set_volume");
         assert_eq!(envelope.params.arguments, vec![serde_json::json!(0.75)]);
-        // Phase 25 item 2 is what makes this a real revision; until then a write is not a
-        // read-modify-write and there is nothing for § 7.3's guard to compare (docs/adr/0052).
+        // No snapshot has been hydrated, and `bump_revision` starts at 1, so `0` says exactly
+        // that rather than naming a read this write could have been reacting to.
         assert_eq!(envelope.params.expected_revision, 0);
+    }
+
+    #[test]
+    fn invoke_stamps_the_revision_of_the_snapshot_the_config_could_last_have_read() {
+        // § 7.3's staleness half. A config that reads a capability, picks something out of the
+        // result and writes back has to name the read, or the Supervisor cannot tell a command
+        // reacting to current state from one reacting to state two pushes old.
+        let (lua, handle, mut rx) = lua_with_capability(0);
+
+        handle.hydrate(Value::Nil, 7);
+        lua.load(r#"oblisk.probe:invoke("set_volume", 0.5)"#).exec().unwrap();
+        assert_eq!(queued_command(&mut rx).unwrap().params.expected_revision, 7);
+
+        handle.hydrate(Value::Nil, 8);
+        lua.load(r#"oblisk.probe:invoke("set_volume", 0.6)"#).exec().unwrap();
+        assert_eq!(queued_command(&mut rx).unwrap().params.expected_revision, 8);
     }
 
     #[test]
@@ -237,7 +302,7 @@ mod tests {
 
         let pushed = lua.create_table().unwrap();
         pushed.set("attempts", 2).unwrap();
-        handle.set(Value::Table(pushed));
+        handle.hydrate(Value::Table(pushed), 1);
 
         let attempts: i64 = lua.load("return oblisk.probe:get().attempts").eval().unwrap();
         assert_eq!(attempts, 2);
@@ -255,7 +320,7 @@ mod tests {
 
         let pushed = lua.create_table().unwrap();
         pushed.set("error", "authentication failed").unwrap();
-        handle.set(Value::Table(pushed));
+        handle.hydrate(Value::Table(pushed), 2);
 
         let second: String = lua.load("return mapped:get()").eval().unwrap();
         assert_eq!(second, "authentication failed");
