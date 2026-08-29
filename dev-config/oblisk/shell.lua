@@ -11,18 +11,25 @@
 -- `namespace` on a surface is a topology change and drives a full PBA generation swap (§ 15.2);
 -- anything else reloads in place on the same Lua VM.
 
--- Catppuccin Mocha, because a bar needs a palette and an invented one would just be a worse
--- version of a palette someone already balanced.
-local BG      = "#1e1e2eff"
-local SURFACE = "#313244ff"
-local FG      = "#cdd6f4ff"
-local DIM     = "#6c7086ff"
-local ACCENT  = "#89b4faff"
-local GREEN   = "#a6e3a1ff"
-local YELLOW  = "#f9e2afff"
-local PEACH   = "#fab387ff"
-local RED     = "#f38ba8ff"
-local MAUVE   = "#cba6f7ff"
+-- The palette, and the reason it is a second file rather than ten more locals here: ADR-0047
+-- points `package.path` at this directory and nothing else, and clears `package.loaded` before
+-- every re-evaluation, so editing `theme.lua` recolours the bar in place. Before Phase 26 a
+-- `require` searched `/usr/local/share/lua/5.4/` and then the process's working directory, and an
+-- edit to a required file reached a cached copy and changed nothing.
+--
+-- Unpacked into locals rather than read as `theme.BG` throughout, so that every module below stays
+-- exactly as it was and this split stays a demonstration of `require` rather than a rewrite.
+local theme = require("theme")
+local BG      = theme.BG
+local SURFACE = theme.SURFACE
+local FG      = theme.FG
+local DIM     = theme.DIM
+local ACCENT  = theme.ACCENT
+local GREEN   = theme.GREEN
+local YELLOW  = theme.YELLOW
+local PEACH   = theme.PEACH
+local RED     = theme.RED
+local MAUVE   = theme.MAUVE
 
 -- Every capability signal reads `nil` until the Supervisor's first snapshot for it arrives, and a
 -- payload can be malformed in ways this file should not crash the whole evaluation over. This fixes

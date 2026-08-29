@@ -324,7 +324,12 @@ impl RendererClient {
         // hands out a `LiveSignalHandle` so the rescue signal shares it too, and before the loader
         // so the `state(name, initial)` global it registers marks this same flag (decision 5).
         let dirty = DirtyFlag::new();
-        let loader = Loader::new(dirty.clone()).map_err(|err| format!("failed to start the Lua loader: {err}"))?;
+        // The directory holding the `shell.lua` about to be evaluated, which is where `require`
+        // will look and nowhere else (ADR-0047 decision 1). Taken from the resolved path rather
+        // than by asking `shared::config_dir()` a second time, so the file and its module search
+        // path can never disagree.
+        let config_dir = shell_lua_path.parent().ok_or("shell.lua's path has no parent directory")?.to_path_buf();
+        let loader = Loader::new(dirty.clone(), &config_dir).map_err(|err| format!("failed to start the Lua loader: {err}"))?;
         let process_registry = ProcessRegistry::new(generation_id, outbound_tx.clone());
         loader.register_process(process_registry.clone()).map_err(|err| format!("failed to register the process global: {err}"))?;
         // The one write path § 3.2's commands all take (build-steps.md Phase 25 item 1), stamped
@@ -1380,7 +1385,7 @@ mod tests {
     fn test_client(shell_lua_path: &std::path::Path) -> (RendererClient, mpsc::UnboundedReceiver<RendererFrame>) {
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
         let dirty = DirtyFlag::new();
-        let loader = Loader::new(dirty.clone()).unwrap();
+        let loader = Loader::new(dirty.clone(), shell_lua_path.parent().unwrap()).unwrap();
         let process_registry = ProcessRegistry::new(0, outbound_tx.clone());
         loader.register_process(process_registry.clone()).unwrap();
         let commands = CommandSender::new(0, outbound_tx);

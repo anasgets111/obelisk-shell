@@ -1822,6 +1822,62 @@ both are small enough that splitting them buys nothing.
 Acceptance: a config split across `shell.lua` and `widgets/clock.lua` reloads when either file
 changes, and `os.execute` is `nil`.
 
+> **Built, all four items.** `dev-config/oblisk/shell.lua` now reads its palette from a sibling
+> `theme.lua` through `require`, which is this phase's acceptance shape against the config the repo
+> ships rather than a fixture.
+>
+> **§ 1 of the IDL described this phase in the present tense before it was true.** It has said "`io`
+> is absent and `os` is cut to `time`, `date`, `clock`, and `getenv`" and "`package.path` resolves
+> inside the config directory only" for as long as those ADRs have existed. Measured in the real VM
+> before this phase landed: `io.open("/etc/hostname")` returned a working handle, `io.popen`,
+> `os.execute` and `os.remove` were all present, and `package.path` was Lua's compiled-in default
+> ending in `./?.lua`. The paragraph is accurate now. It is recorded here because a spec that states
+> an intention as a fact is the failure mode this file's other banners exist to catch, and this one
+> went unnoticed through four phases.
+>
+> **`require` had a worse failure than "does not work".** The default `package.path` ends in
+> `./?.lua`, which resolves against the process's working directory, and nothing in the Supervisor
+> sets one. A split config therefore worked when the stack was started from inside the config
+> directory and failed from anywhere else, which is the shape that passes every test run by hand and
+> breaks under a systemd unit.
+>
+> **Three defects in item 3's recursive walk, all found in review and fixed here.** Each was created
+> by the walk itself, so none existed before this phase.
+>
+> The walk propagated `read_dir` errors, and `spawn_watcher`'s one caller passes them straight out
+> through `?`, so a single unreadable subdirectory anywhere under the config directory would have
+> stopped the Supervisor from starting. Before the walk existed, one non-recursive watch ignored that
+> directory entirely. Startup now logs and skips it, agreeing with the `ISDIR` arm that already took
+> the tolerant view for a directory appearing later.
+>
+> The walk used `read_dir`'s own `file_type`, which reads the directory entry and so calls a
+> symlinked directory a symlink rather than a directory. `widgets -> ~/dotfiles/oblisk/widgets` is
+> what a dotfiles repository produces, and `require` resolves through it because Lua opens the file
+> and the kernel follows the link. The config would have loaded and never reloaded, which looks like
+> the watcher working. Now `metadata` follows the link, with a visited set of canonical paths cutting
+> the cycle that following links opens up.
+>
+> A rename is not a delete, and only the delete was handled. Moving a directory out of the tree sends
+> one `MOVED_FROM` for the directory and no `DELETE` for anything inside it, so its watches stayed
+> live on an inode that had left the config, and its files' hashes stayed keyed on paths that no
+> longer existed. Recreating that path with the same bytes then matched a hash recorded against the
+> old directory and the reload was suppressed for a file the watch had never seen. `rm -rf` does not
+> hit this because it sends a `DELETE` per file; `git stash` and `git checkout` do.
+>
+> **A limit `package.path` cannot express, recorded rather than fixed.** It is a plain Lua string
+> with no escape syntax, so a config directory containing `;` reads as two search entries and one
+> containing `?` has every `?` replaced by the module name. Both are silent. Rejecting such a
+> directory at startup is the only real fix and is not worth building for a path that is
+> `$XDG_CONFIG_HOME/oblisk`.
+>
+> **No live coverage: the reload itself.** Unit tests cover all four items and all three defects
+> above, including a re-evaluation seeing an edited required module rather than the cached one, a
+> `.lua` write in a subdirectory firing the watcher, an identical rewrite firing nothing, `require`
+> resolving the shipped `theme.lua`, and a config that deletes `package` failing its next reload
+> loudly instead of silently skipping the cache clear. Nothing has yet edited `theme.lua` against a
+> running session and watched the bar recolour, which is the one check that exercises the watcher and
+> the loader together.
+
 ### Phase 27: Out-of-Band Rescue
 
 Implement ADR-0046. `oblisk.rescue` is a Lua signal the config reads and renders, which works only
