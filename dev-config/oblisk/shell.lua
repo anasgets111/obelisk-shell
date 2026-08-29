@@ -25,11 +25,17 @@
 -- `require` resolves inside this directory only and the module cache is cleared before every
 -- re-evaluation (ADR-0047), so editing any file below reloads the bar in place.
 
-return {
-    require("modules.global.wallpaper"),
-    require("modules.bar"),
-    require("modules.notification.popup"),
-    require("modules.bar.panels.settings"),
-    require("modules.bar.panels.menu").surface,
-    require("modules.global.lock"),
-}
+-- Bound to locals first, and that is load-bearing rather than style. Lua 5.4's `require` returns
+-- *two* values, the module and the loader data (the file path), where 5.3 returned one. A call in
+-- the last position of a table constructor expands to all of its values, so the obvious
+-- `return { require(...), require(...) }` puts a seventh element in this list that is the string
+-- "/path/to/lock.lua", and the engine then reports `error converting Lua string to table` with no
+-- clue which of the six is wrong. `local x = require(...)` takes the first value and nothing else.
+local wallpaper = require("modules.global.wallpaper")
+local bar = require("modules.bar")
+local notifications = require("modules.notification.popup")
+local settings = require("modules.bar.panels.settings")
+local menu = require("modules.bar.panels.menu")
+local lock_screen = require("modules.global.lock")
+
+return { wallpaper, bar, notifications, settings, menu.surface, lock_screen }

@@ -1887,14 +1887,37 @@ changes, and `os.execute` is `nil`.
 > directory at startup is the only real fix and is not worth building for a path that is
 > `$XDG_CONFIG_HOME/oblisk`.
 >
-> **No live coverage: the reload itself.** Unit tests cover all four items and all three defects
-> above, including a re-evaluation seeing an edited required module rather than the cached one, a
-> `.lua` write in a subdirectory firing the watcher, an identical rewrite firing nothing, `require`
-> resolving the shipped `config/theme.lua` and `components/pill.lua` (the second of which requires a
-> module of its own, so it also pins transitive resolution), and a config that deletes `package`
-> failing its next reload loudly instead of silently skipping the cache clear. Nothing has yet edited
-> `config/theme.lua` against a running session and watched the bar recolour, which is the one check
-> that exercises the watcher and the loader together.
+> **Run live, and it found a defect no test could have.** `XDG_CONFIG_HOME=dev-config
+> target/debug/supervisor` against a real niri session resolves all six surfaces and brings up the
+> three visible panels with EGL contexts (`wallpaper` 1920x1200, `bar` 1920x34, `notification_area`
+> 380x96), with `settings` and `click_menu` correctly not visible and `lock_screen` declared but
+> never mapped.
+>
+> The first run did not. It reported `shell.lua failed to evaluate: error converting Lua string to
+> table` and painted nothing. The cause is a Lua 5.4 change: `require` returns *two* values, the
+> module and the loader data (its file path), where 5.3 returned one, and a call in the last position
+> of a table constructor expands to all of its values. So `return { require(a), require(b) }`, the
+> obvious entry point for a split config, is a *three* element list whose last element is a string.
+> Nothing else would have caught it. `luac -p` sees valid syntax, the tree-signature oracle skipped
+> the stray element as a non-table (fixed: it is a hard error there now), and no unit test had ever
+> built a surface list through `require`. Running it was the only way.
+>
+> Two fixes came out of that. `shell.lua` binds each `require` to a local first, with a comment
+> saying why, because the bug is invisible when reading the file. And `collect_surfaces` no longer
+> lets mlua convert the elements: it type-checks each one and reports `surface 2 is a string, not a
+> node` as an `InvalidTopLevelReturn` rather than an `Eval`, since the config evaluated fine and
+> returned the wrong thing, with the `require` cause named because a config author cannot see it by
+> reading their own file.
+>
+> Unit tests cover all four items and all three watcher defects, including a re-evaluation seeing an
+> edited required module rather than the cached one, a `.lua` write in a subdirectory firing the
+> watcher, an identical rewrite firing nothing, `require` resolving the shipped `config/theme.lua`
+> and `components/pill.lua` (the second of which requires a module of its own, so it also pins
+> transitive resolution), and a config that deletes `package` failing its next reload loudly.
+>
+> **Still not covered: the reload itself.** Nothing has yet edited `config/theme.lua` against a
+> running session and watched the bar recolour without a restart, which is the one check that
+> exercises the watcher and the loader together.
 >
 > One limit worth recording, met while trying to test deeper: a bare `Loader` cannot `require` an
 > indicator, because an indicator reads `oblisk.audio` at require time and the `oblisk` table is

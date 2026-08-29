@@ -277,6 +277,16 @@ fn loaded_module_names(lua: &Lua) -> mlua::Result<std::collections::HashSet<Stri
         .collect()
 }
 
+/// Appended to the "surface N is a X" error, because in practice there is one cause and a config
+/// author cannot see it by reading their own file. Lua 5.4's `require` returns two values, the
+/// module and the loader data (its file path), where 5.3 returned one. A call in the last position
+/// of a table constructor expands to all of its values, so the natural entry point for a split
+/// config, `return { require(a), require(b) }`, is a three-element list whose last element is a
+/// string. Found by running `dev-config/oblisk/shell.lua` after it was split across 32 files.
+const REQUIRE_RETURNS_TWO_VALUES: &str = ". If that element came from a `require` in the last \
+position of this table, note that Lua 5.4's `require` returns the module *and* its file path, and a \
+call in last position expands to both: bind it to a local first";
+
 fn collect_surfaces(value: Value) -> Result<Vec<VirtualNode>, LoaderError> {
     let table = match value {
         Value::Table(t) => t,
@@ -291,9 +301,22 @@ fn collect_surfaces(value: Value) -> Result<Vec<VirtualNode>, LoaderError> {
         return Ok(vec![node]);
     }
 
+    // Read each element as a `Value` and type-check it here rather than letting
+    // `sequence_values::<Table>()` convert. mlua's own failure is
+    // `error converting Lua string to table`, which names neither which element nor what it held,
+    // and arrives as `LoaderError::Eval` so the config author is told their file failed to
+    // *evaluate* when it evaluated fine and returned the wrong thing.
     let mut surfaces = Vec::new();
-    for entry in table.sequence_values::<Table>() {
+    for (index, entry) in table.sequence_values::<Value>().enumerate() {
         let entry = entry.map_err(LoaderError::from)?;
+        let Value::Table(entry) = entry else {
+            return Err(LoaderError::InvalidTopLevelReturn(format!(
+                "surface {} is a {}, not a node{}",
+                index + 1,
+                entry.type_name(),
+                REQUIRE_RETURNS_TWO_VALUES
+            )));
+        };
         let node = nodes::deserialize_lua_table(&entry)?;
         require_surface(&node)?;
         surfaces.push(node);
@@ -477,6 +500,30 @@ mod tests {
         assert_eq!(output.surfaces[0].properties.get("has_state").unwrap(), &Value::Boolean(true));
         assert_eq!(output.surfaces[0].properties.get("has_json").unwrap(), &Value::Boolean(true));
         assert!(output.surfaces[0].properties.contains_key("child"), "a node built in a required module has to survive into the tree");
+    }
+
+    /// Found by running the shipped config: the surface list held a seventh element that was a file
+    /// path string, and the engine reported `shell.lua failed to evaluate: error converting Lua
+    /// string to table`. That names neither which element nor what it was, and it blames evaluation
+    /// for a problem in the returned value.
+    ///
+    /// The cause is worth the engine knowing about, because it is not a typo a config author would
+    /// spot. Lua 5.4's `require` returns *two* values, the module and the loader data (its file
+    /// path), where 5.3 returned one. A call in the last position of a table constructor expands to
+    /// all of its values, so `return { require(a), require(b) }` is a three-element list whose last
+    /// element is a string. That is the natural way to write a split config's entry point.
+    #[test]
+    fn a_non_node_in_the_surface_list_names_which_element_and_what_it_was() {
+        let loader = test_loader();
+        let err = loader
+            .evaluate(r#"return { panel { id = "bar", layer = "Top" }, "/home/me/.config/oblisk/modules/global/lock.lua" }"#)
+            .unwrap_err();
+
+        assert!(matches!(err, LoaderError::InvalidTopLevelReturn(_)), "a bad element is a bad return, not an evaluation failure: {err:?}");
+        let message = err.to_string();
+        assert!(message.contains("surface 2"), "the message has to say which element: {message}");
+        assert!(message.contains("string"), "the message has to say what it got: {message}");
+        assert!(message.contains("require"), "the message has to name the cause a config author cannot see: {message}");
     }
 
     /// Whether `expr` evaluates to `nil` in a config's own environment.
