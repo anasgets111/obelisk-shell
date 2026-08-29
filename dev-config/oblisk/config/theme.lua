@@ -5,6 +5,11 @@
 -- them, which is the first thing a config of any size wants to move out. Editing this file
 -- recolours the bar in place: ADR-0047 points `require` at this directory and drops the module
 -- cache before each re-evaluation, so a required file is re-read rather than served stale.
+--
+-- Neither half of that worked before Phase 26, and the failure was quiet both times. `package.path`
+-- was Lua's compiled-in default, so a `require` searched `/usr/local/share/lua/5.4/` and then the
+-- process's working directory, which nothing sets. An edit to a file that did resolve then reached
+-- a cached copy and changed nothing on screen.
 return {
     BG      = "#1e1e2eff",
     SURFACE = "#313244ff",

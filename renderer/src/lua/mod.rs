@@ -421,16 +421,25 @@ mod tests {
     }
 
     /// Phase 26's acceptance shape, against the config this repo actually ships rather than a
-    /// fixture: `dev-config/oblisk/shell.lua` reads its palette out of a sibling `theme.lua`
-    /// through `require`. Same precedent as `crate::image`'s resvg test, which renders the real
+    /// fixture: `dev-config/oblisk/shell.lua` is split across directories and reaches them through
+    /// `require`. Same precedent as `crate::image`'s resvg test, which renders the real
     /// `dev-config/oblisk/wallpaper.svg`.
+    ///
+    /// Dotted names rather than a bare one, because that is the shape a real config uses and it is
+    /// the half of `package.path`'s template that a flat fixture never exercises: `config.theme`
+    /// only resolves if `?` is substituted into a path with a directory component in it.
     #[test]
-    fn require_resolves_the_module_the_shipped_dev_config_actually_splits_out() {
+    fn require_resolves_the_nested_modules_the_shipped_dev_config_actually_splits_out() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk");
         let loader = Loader::new(signal::DirtyFlag::new(), &dir).unwrap();
 
-        let accent: String = loader.lua().load(r#"return require("theme").ACCENT"#).eval().unwrap();
+        let accent: String = loader.lua().load(r#"return require("config.theme").ACCENT"#).eval().unwrap();
         assert!(accent.starts_with('#') && accent.len() == 9, "the palette entry has to be a #rrggbbaa string, got `{accent}`");
+
+        // A component two directories deep, which also proves a module can `require` a module of
+        // its own: `components.pill` reads `config.theme` before it returns.
+        let is_builder: bool = loader.lua().load(r#"return type(require("components.pill")) == "function""#).eval().unwrap();
+        assert!(is_builder, "a component has to come back as the builder it returns");
     }
 
     /// `forget_config_modules` runs before every evaluation and reads `package.loaded`, so a config
@@ -445,6 +454,29 @@ mod tests {
 
         let second = loader.evaluate(r#"return panel { id = "bar", layer = "Top" }"#);
         assert!(matches!(second, Err(LoaderError::Eval(_))), "the next reload has to report, not quietly skip the cache clear: {second:?}");
+    }
+
+    /// The contract every split config rests on: a required module runs in the same VM as
+    /// `shell.lua`, so it sees the node constructors and the engine's globals without being handed
+    /// them. Pinned because the alternative (each module taking a table of dependencies from
+    /// `shell.lua`) is a different config style entirely, and nothing in the engine would complain
+    /// if this quietly stopped being true.
+    #[test]
+    fn a_required_module_sees_the_same_globals_shell_lua_does() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("widget.lua"),
+            r#"return { node = row { spacing = 4, children = { text { content = "hi" } } }, has_state = state ~= nil, has_json = json ~= nil }"#,
+        )
+        .unwrap();
+        let loader = Loader::new(signal::DirtyFlag::new(), dir.path()).unwrap();
+
+        let output = loader
+            .evaluate(r#"local w = require("widget") return panel { id = "bar", layer = "Top", has_state = w.has_state, has_json = w.has_json, child = w.node }"#)
+            .unwrap();
+        assert_eq!(output.surfaces[0].properties.get("has_state").unwrap(), &Value::Boolean(true));
+        assert_eq!(output.surfaces[0].properties.get("has_json").unwrap(), &Value::Boolean(true));
+        assert!(output.surfaces[0].properties.contains_key("child"), "a node built in a required module has to survive into the tree");
     }
 
     /// Whether `expr` evaluates to `nil` in a config's own environment.

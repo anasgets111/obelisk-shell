@@ -226,7 +226,7 @@ To maintain filesystem safety and protect user hardware, Oblisk separates static
 
 | Path | XDG Baseline | Write State | Technical Content |
 | :--- | :--- | :--- | :--- |
-| `~/.config/oblisk/` | `$XDG_CONFIG_HOME` | **Read-Only** to engine | Static config files (`shell.lua`, `theme.lua`). |
+| `~/.config/oblisk/` | `$XDG_CONFIG_HOME` | **Read-Only** to engine | The config directory tree: `shell.lua` and every `.lua` file it `require`s (ADR-0047). |
 | `~/.local/state/oblisk/` | `$XDG_STATE_HOME` | **Read-Write** | Flat interactive state file (`state.json`). |
 | `/dev/shm/oblisk-$UID/` | RAM Memory-Disk | **Read-Write** (RAM) | Decoded notification images and icons. |
 

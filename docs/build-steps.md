@@ -1822,9 +1822,26 @@ both are small enough that splitting them buys nothing.
 Acceptance: a config split across `shell.lua` and `widgets/clock.lua` reloads when either file
 changes, and `os.execute` is `nil`.
 
-> **Built, all four items.** `dev-config/oblisk/shell.lua` now reads its palette from a sibling
-> `theme.lua` through `require`, which is this phase's acceptance shape against the config the repo
-> ships rather than a fixture.
+> **Built, all four items.** `dev-config/oblisk` is a directory of 32 files rather than one, which is
+> this phase's acceptance shape against the config the repo ships rather than a fixture. `shell.lua`
+> is 35 lines: its header comment and a list of six surfaces, each one a `require`.
+>
+> The layout mirrors the Quickshell config this shell is written to replace, because that config is
+> the workload the gap ledger measures against and its 160 files have already answered how to
+> organise this: `config/` for design tokens, `components/` for dumb reusable widgets, `lib/` for
+> functions with no node in them, and `modules/` grouped by the surface they appear on
+> (`modules/bar/indicators/`, `modules/bar/panels/`, `modules/global/`). The one deliberate break is
+> that there is no `services/`. Quickshell needs 25 singleton `*Service.qml` files because each owns
+> a D-Bus connection, a poll loop or a socket; here every one of those is a capability the Supervisor
+> owns and pushes as a signal, so a module reads `oblisk.audio` rather than constructing an
+> `AudioService`. The data layer is not missing from the tree, it is not the config's job.
+>
+> The split was checked against a structural signature of the node tree the config builds, dumped
+> under stubbed engine globals before the first move: a pure refactor changes it by zero bytes across
+> all 80 lines, and it did. Worth naming what that oracle does not catch, since it was nearly caught
+> out once: it compares structure, not semantics, so rewriting `util.label(signal, read)` as a bare
+> `signal:map(read)` passes it while dropping the `pcall` that keeps one malformed payload from
+> failing the whole re-resolve.
 >
 > **§ 1 of the IDL described this phase in the present tense before it was true.** It has said "`io`
 > is absent and `os` is cut to `time`, `date`, `clock`, and `getenv`" and "`package.path` resolves
@@ -1873,10 +1890,16 @@ changes, and `os.execute` is `nil`.
 > **No live coverage: the reload itself.** Unit tests cover all four items and all three defects
 > above, including a re-evaluation seeing an edited required module rather than the cached one, a
 > `.lua` write in a subdirectory firing the watcher, an identical rewrite firing nothing, `require`
-> resolving the shipped `theme.lua`, and a config that deletes `package` failing its next reload
-> loudly instead of silently skipping the cache clear. Nothing has yet edited `theme.lua` against a
-> running session and watched the bar recolour, which is the one check that exercises the watcher and
-> the loader together.
+> resolving the shipped `config/theme.lua` and `components/pill.lua` (the second of which requires a
+> module of its own, so it also pins transitive resolution), and a config that deletes `package`
+> failing its next reload loudly instead of silently skipping the cache clear. Nothing has yet edited
+> `config/theme.lua` against a running session and watched the bar recolour, which is the one check
+> that exercises the watcher and the loader together.
+>
+> One limit worth recording, met while trying to test deeper: a bare `Loader` cannot `require` an
+> indicator, because an indicator reads `oblisk.audio` at require time and the `oblisk` table is
+> built by `RendererClient`, not by `Loader`. Tests reach as deep as `components/`, which is every
+> module that does not touch a capability.
 
 ### Phase 27: Out-of-Band Rescue
 
