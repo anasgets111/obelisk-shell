@@ -165,6 +165,76 @@ local click_button = button {
     end), ACCENT) },
 }
 
+-- Arms the lock screen below. A bar button is a strange place for one, and it is the only place
+-- available: ADR-0052 decision 1 makes locking an ordinary capability command, and an input
+-- callback is the only thing that can issue one today. `oblisk.idle` cannot -- a
+-- `SupervisorFrame::IdleEvent` reaches the Renderer and stops there, because no Lua-side
+-- `register_threshold` callback registry exists to dispatch it to, so the idle threshold a real
+-- config would lock on has nowhere to land yet.
+--
+-- `invoke` is the one generic write path (build-steps.md Phase 25 item 1): it builds § 7.2's
+-- envelope from the capability, the action and the arguments, and knows nothing about locking. The
+-- day `sysinfo:configure` and `audio:set_volume` land, they land on this same call rather than on
+-- twenty-nine more bindings.
+--
+-- Nothing here refuses to lock without a lock screen; that is the engine's job and it does it
+-- (ADR-0052 decision 3), reporting the refusal through `rescue` because a refused lock leaves the
+-- ordinary scene on the glass and `rescue` is what a bar can render.
+local lock_button = button {
+    width = 44,
+    height = 24,
+    background = "#313244ff",
+    radius = 4,
+    on_click = function()
+        oblisk.lock:invoke("lock")
+        print("[shell.lua] lock requested")
+    end,
+    children = { cell("lock", ACCENT) },
+}
+
+-- The password field. § 6.4 routes authentication through a `textfield` with `secure_submit`, and
+-- that pair is what keeps the password out of this VM entirely: with both `mask_character` and
+-- `secure_submit` set, the keystrokes go straight into a native buffer on the Renderer's Wayland
+-- thread and leave as a `("lock", "authenticate")` envelope, never as a Lua value at all
+-- (§ 5.2 item 8, ADR-0005/ADR-0027). So there is deliberately no `on_change`/`on_submit` handler
+-- here: one would be the exact hole the design exists to close.
+--
+-- One byte is the cap on `mask_character`, so an ASCII `*` rather than a bullet.
+--
+-- It is the *only* `secure_submit` field on this lock surface, and that is load-bearing rather than
+-- incidental: the engine focuses a surface's sole `secure_submit` field the moment the compositor
+-- gives that surface keyboard focus, so this one is typable with no click. Adding a second such
+-- field here would put the lock screen back to needing a mouse before a password could be typed,
+-- because with two destinations the engine refuses to guess which one a keystroke belongs to.
+--
+-- Measured, so it is not mistaken for breakage on a live lock: a `textfield` paints nothing today
+-- (`renderer/src/layout/paint.rs` skips the kind), so this reserves its 28px and swallows the
+-- keystrokes while showing no masked characters at all -- `lock_status` below is what shows that
+-- typing is landing.
+local password_field = textfield {
+    width = "Fill",
+    height = 28,
+    placeholder = "password",
+    mask_character = "*",
+    secure_submit = { capability = "lock", action = "authenticate" },
+}
+
+-- The failure state, off `oblisk.lock` rather than off `rescue`, and the split is ADR-0052
+-- decision 4: with the lock surfaces mapped the compositor shows only these, so the bar's
+-- `rescue_cell` below is unreachable and the capability's own state is the only channel left.
+-- `attempts` is printed because a config cannot rebuild it -- capability state is sampled at layout
+-- time (ADR-0044), so two identical failures in a row are one unchanged `error` string and a
+-- counter written here would miss the second.
+-- `type your password, then Enter` rather than `enter your password`, because with a `textfield`
+-- painting nothing the only feedback a user gets that the keyboard is reaching the field at all is
+-- knowing which key ends the entry. Backspace corrects; the engine keeps the buffer, not this VM.
+local lock_status = cell(label(oblisk.lock, function(l)
+    if l.error == nil or l.error == "" then
+        return l.active and "type your password, then Enter" or "locking..."
+    end
+    return string.format("%s (%d)", l.error, l.attempts or 0)
+end), "#f38ba8ff")
+
 -- Only rendered when the config itself has failed, so `rescue` is the one signal whose absence is
 -- the healthy case (§ 2.10).
 local rescue_cell = cell(label(rescue, function(r)
@@ -204,7 +274,7 @@ return {
             padding = { left = 12, right = 12, top = 4, bottom = 4 },
             spacing = 8,
             align_v = "Center",
-            children = { clock, net, bt, kbd, media, sound, tray_cell, notifs, click_button, rescue_cell },
+            children = { clock, net, bt, kbd, media, sound, tray_cell, notifs, click_button, lock_button, rescue_cell },
         },
     },
     panel {
@@ -299,6 +369,33 @@ return {
             children = { cell(clicks:map(function(n)
                 return string.format("opened after %d clicks", n)
             end), ACCENT) },
+        },
+    },
+    -- Declared, not open. § 6.4 gives a `lock` an `id` and a `child` and nothing else -- no
+    -- `visible`, no `monitor`, no size -- because the compositor decides when these surfaces exist
+    -- and the protocol requires one on every output while they do. Returning this costs one
+    -- retained node and zero Wayland objects until `oblisk.lock:invoke("lock")` above is clicked,
+    -- the same declaration/lifetime split ADR-0049 already made for `window` and `popup`.
+    lock {
+        id = "lock_screen",
+        child = column {
+            -- Opaque and full-bleed: this is what covers the session, so a `Content`-sized child
+            -- would leave the desktop showing through everything it did not paint.
+            width = "Fill",
+            height = "Fill",
+            background = "#11111bff",
+            align_h = "Center",
+            align_v = "Center",
+            children = { column {
+                width = 360,
+                padding = { top = 20, right = 20, bottom = 20, left = 20 },
+                spacing = 10,
+                background = BG,
+                radius = 10,
+                border_width = 1,
+                border_color = "#313244ff",
+                children = { cell("locked", FG), password_field, lock_status },
+            } },
         },
     },
 }

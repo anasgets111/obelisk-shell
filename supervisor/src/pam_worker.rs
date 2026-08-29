@@ -12,7 +12,10 @@
 //!   Supervisor process. It resolves the polkit challenge's uid to a username, re-execs this
 //!   same binary as a worker (via [`crate::process::spawn_group_leader_stdio_piped`]), exchanges
 //!   the password/outcome over the worker's piped stdin/stdout, and reports the result back to
-//!   polkitd via `AuthenticationAgentResponse2`.
+//!   polkitd via `AuthenticationAgentResponse2`. [`authenticate_current_user`] is its sibling for
+//!   the session lock, which has no polkit challenge and no polkitd: the same worker exchange,
+//!   the uid taken from this process's own owner, the outcome returned rather than reported
+//!   (docs/adr/0052).
 //!
 //! ADR-0028: no reuse of `RendererFrame`/`SupervisorFrame` for the worker protocol -- that's the
 //! wrong domain (Supervisor<->Renderer), this is a completely different process boundary
@@ -23,6 +26,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use nonstick::{ConversationAdapter, Transaction};
+use tokio::sync::mpsc::UnboundedSender;
 
 /// The PAM service this worker authenticates against. This system has no
 /// `/etc/pam.d/polkit-1` -- `"login"` is the disclosed fallback (ADR-0028), matching both
@@ -39,7 +43,10 @@ const PAM_SERVICE: &str = "login";
 /// returns from `read_json_frame`, and since `drive_pam_and_respond` is `.await`ed directly
 /// inside `main.rs`'s top-level `select!` (not `tokio::spawn`ed), that single hang stalls the
 /// entire Supervisor: no more polkit challenges, no more Renderer frames, no more process
-/// reaping, until the process is killed from outside (Correctness review finding).
+/// reaping, until the process is killed from outside (Correctness review finding). The lock
+/// screen's [`authenticate_current_user`] no longer runs on that loop (`main.rs` spawns it, see
+/// its own doc comment), but it wants the same ceiling for a different reason: an unbounded
+/// exchange there is a task and a plaintext copy of a password that never go away.
 const PAM_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Oblisk's flow only ever has one pre-supplied password known before the conversation starts
@@ -206,28 +213,10 @@ pub async fn drive_pam_and_respond(
         return;
     };
 
-    // ponytail: `User::from_uid` is a blocking libc call (`getpwuid_r`), not routed through
-    // `spawn_blocking`, inline in this async fn -- same "the main loop blocks for real work,
-    // bounded and rare" precedent docs/adr/0025 already established for PBA swaps. A uid lookup
-    // is normally local-passwd-file-fast; on this system there's no NSS/LDAP backend to make it
-    // otherwise, and adding a `spawn_blocking` hop for a call this cheap and this rare (one
-    // polkit challenge at a time, ADR-0028) would be speculative generality, not a fix.
-    let username = match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
-        Ok(Some(user)) => user.name,
-        Ok(None) => {
-            deny(&mut secret, &challenge.cookie, format!("uid {uid} has no passwd entry"));
-            return;
-        }
-        Err(err) => {
-            deny(&mut secret, &challenge.cookie, format!("failed to resolve uid {uid}: {err}"));
-            return;
-        }
-    };
-
-    let outcome = match spawn_worker_and_exchange(&username, &secret).await {
+    let outcome = match authenticate_uid(uid, &secret).await {
         Ok(outcome) => outcome,
-        Err(err) => {
-            deny(&mut secret, &challenge.cookie, format!("pam worker failed: {err}"));
+        Err(reason) => {
+            deny(&mut secret, &challenge.cookie, reason);
             return;
         }
     };
@@ -249,6 +238,154 @@ pub async fn drive_pam_and_respond(
             // polkitd's own challenge timeout apply is the correct behavior on failure, not a
             // missing case.
             eprintln!("polkit authentication for cookie {:?} did not succeed: {other:?}", challenge.cookie);
+        }
+    }
+}
+
+/// The half [`drive_pam_and_respond`] and [`authenticate_current_user`] share: resolve `uid` to a
+/// username and run the whole worker round trip against it. `Err` carries the reason the
+/// conversation never happened (no passwd entry, a uid-resolution failure, a worker failure), for
+/// each caller to report the way its own protocol demands -- polkitd gets silence and a log line,
+/// `oblisk.lock` gets a string on the lock screen.
+///
+/// Borrows `secret` and never zeroizes it: both callers own that buffer and each already scrubs
+/// it on every one of its own return paths (ADR-0005), so scrubbing here as well would make the
+/// ownership harder to audit, not the plaintext shorter-lived.
+///
+/// ponytail: `User::from_uid` is a blocking libc call (`getpwuid_r`), not routed through
+/// `spawn_blocking`, inline in this async fn -- same "the main loop blocks for real work,
+/// bounded and rare" precedent docs/adr/0025 already established for PBA swaps, and on the lock
+/// path it blocks a spawned task's runtime worker thread rather than the `select!` loop itself.
+/// A uid lookup is normally local-passwd-file-fast; on this system there's no NSS/LDAP backend to
+/// make it otherwise, and adding a `spawn_blocking` hop for a call this cheap and this rare (one
+/// polkit challenge or one lock screen submission at a time, ADR-0028 and
+/// `LockController::try_begin_authentication`) would be speculative generality, not a fix. The
+/// upgrade path if a networked NSS backend ever does appear: wrap this one call in
+/// `tokio::task::spawn_blocking`, which needs nothing else here to change.
+async fn authenticate_uid(uid: u32, secret: &[u8]) -> Result<shared::PamOutcome, String> {
+    let username = match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
+        Ok(Some(user)) => user.name,
+        Ok(None) => return Err(format!("uid {uid} has no passwd entry")),
+        Err(err) => return Err(format!("failed to resolve uid {uid}: {err}")),
+    };
+    spawn_worker_and_exchange(&username, secret).await.map_err(|err| format!("pam worker failed: {err}"))
+}
+
+/// [`drive_pam_and_respond`]'s sibling for the session lock (docs/adr/0042, docs/adr/0052): the
+/// same worker exchange with no polkit challenge to read a uid out of and no polkitd to report
+/// to. The user being authenticated is this process's own owner, because the Supervisor runs as
+/// the session user and the lock screen is that session's.
+///
+/// Returns the outcome instead of acting on it. `main.rs`'s `secure_submit(lock, authenticate)`
+/// arm is the only caller, and it `tokio::spawn`s this rather than `.await`ing it inline the way
+/// the polkit arm does its own sibling: an Enter key at a lock screen is neither bounded nor rare,
+/// so the outcome comes back to the `select!` loop over a channel (see that arm for the argument).
+/// The `pam_outcomes` arm it lands in is the only place allowed to turn a `Success` into an unlock
+/// order, which is what keeps ADR-0042's "never call `unlock_and_destroy` except on a successful
+/// authentication" a property of one call site.
+///
+/// `secret` is zeroized on every return path, the same standard [`drive_pam_and_respond`] holds
+/// -- and, unlike that function, also on a path that isn't a *return* at all: this async fn is
+/// `tokio::spawn`ed by [`run_lock_authentication`] rather than `.await`ed inline in `main.rs`'s
+/// `select!`, so it can be dropped mid-`.await` by a runtime shutdown, or have a panic unwind
+/// through it (e.g. one of the `.expect()` calls in `write_secret_then_read_outcome` firing if
+/// `spawn_group_leader_stdio_piped` ever stopped piping stdin/stdout). Neither is a `return`, so
+/// the explicit `shared::Zeroize::zeroize` call below -- reached only on the ordinary path --
+/// would not run, and the plain `Vec<u8>` this function used to hold as `secret` directly would
+/// drop with the plaintext still intact (Correctness review finding; ADR-0005 requires an
+/// explicit `.zeroize()` before *every* drop, not just the happy one). `zeroize::Zeroizing` closes
+/// that the same way `shared::SecureBuffer` does for `secure_submit`'s Renderer-side writer: a
+/// `Drop` impl as the backstop under an explicit call, not as the only mechanism. It is the
+/// `zeroize` crate's own newtype for exactly this, re-exported through `shared` beside `Zeroize`,
+/// so nothing here hand-rolls a second `Drop` impl over a plaintext buffer. `SecureBuffer` itself
+/// is the wrong shape rather than the wrong idea: its only way to load bytes is `push_str(&str)`,
+/// and this secret arrives as a raw `Vec<u8>` off the wire.
+///
+/// **The wrapper is a parameter rather than something applied in here**, and that is a real leak
+/// rather than a style point (Correctness review pass five). A `tokio::spawn`ed future's arguments
+/// are captured the moment it is built, but its body does not run until the first poll. Wrapping
+/// inside the body leaves a bare `Vec<u8>` owned by a task a runtime shutdown can drop before ever
+/// polling it, which drops the plaintext unscrubbed on exactly the never-returns path this wrapper
+/// exists for. Wrapping at the call site puts it inside a scrubbing owner for the task's whole
+/// life, including a task that never runs at all.
+///
+/// A failure to even reach PAM becomes `StartFailed`: it is pre-conversation, exactly like the
+/// `pam_start` failure that variant was named for, and the lock screen has one `error` string to
+/// show either way.
+pub async fn authenticate_current_user(mut secret: shared::Zeroizing<Vec<u8>>) -> shared::PamOutcome {
+    let outcome = match authenticate_uid(nix::unistd::Uid::current().as_raw(), &secret).await {
+        Ok(outcome) => outcome,
+        Err(reason) => shared::PamOutcome::StartFailed(reason),
+    };
+    shared::Zeroize::zeroize(&mut *secret);
+    outcome
+}
+
+/// Wraps [`authenticate_current_user`] so `outcome_tx` is guaranteed to receive *something* no
+/// matter how the `tokio::spawn`ed task built from this future ends: the ordinary path where
+/// `authenticate_current_user` returns normally, a panic unwinding out of it, or this future
+/// being dropped mid-`.await` by a runtime shutdown before it ever polls to completion.
+///
+/// Without this wrapper, `LockController::try_begin_authentication` sets `authenticating`
+/// (docs/adr/0052) on one side of the spawn, and only a `LockEvent::Authenticated` landing in
+/// `main.rs`'s `pam_outcomes` arm ever clears it. A task that never reaches its own `.send()`
+/// call (Correctness review finding) leaves that flag a one-way latch: `may_authenticate` stays
+/// false forever and every later Enter on the lock screen is dropped (`try_begin_authentication`'s
+/// own refusal log line), stranding the session behind the lock with no way back in short of a VT
+/// switch.
+///
+/// [`ReportOnDrop`] is the mechanism. `UnboundedSender::send` is synchronous, so calling it from
+/// `Drop::drop` still runs during an unwind -- unlike a second `.await`ed cleanup step, which a
+/// panicking task would never reach. This is the choice between the two the review raised: read a
+/// `JoinHandle`'s `Result` back in `main.rs`'s `select!`, or let the task's own scope report its
+/// own failure. A `JoinHandle` would need that already-large `select!` to grow a second arm and
+/// hand-translate a `JoinError` into this same channel; a `Drop` guard keeps the failure path
+/// local to the one task that can fail, and changes nothing about the channel's shape or about
+/// `main.rs` beyond the one line that used to build this future inline.
+/// `acquisition` is the tag `LockController::try_begin_authentication` handed out when this
+/// conversation was admitted, carried back untouched with the outcome. This side never interprets
+/// it: it exists because an answer outlives the lock it answers for (`pam_unix`'s ~1 second,
+/// [`PAM_EXCHANGE_TIMEOUT`]'s 30), and only `lock::accepts_outcome` can say whether the lock it was
+/// typed against is still the one on the glass. Carrying it here rather than re-reading the
+/// controller's current acquisition in the `pam_outcomes` arm is the whole point -- by then the
+/// number has moved.
+pub async fn run_lock_authentication(
+    secret: shared::Zeroizing<Vec<u8>>,
+    acquisition: u64,
+    outcome_tx: UnboundedSender<(u64, shared::PamOutcome)>,
+) {
+    let mut guard = ReportOnDrop { acquisition, outcome_tx: Some(outcome_tx) };
+    let outcome = authenticate_current_user(secret).await;
+    if let Some(tx) = guard.outcome_tx.take() {
+        // A closed channel means `main.rs`'s loop is gone, i.e. the Supervisor is shutting down
+        // -- the same posture `LockController::send` takes.
+        if tx.send((acquisition, outcome)).is_err() {
+            eprintln!("lock: the pam outcome channel is closed; dropping an authentication result");
+        }
+    }
+}
+
+/// [`run_lock_authentication`]'s `Drop` backstop: reports a fallback outcome the one time it is
+/// dropped still holding its sender, i.e. on every exit from that function except the ordinary
+/// one, which already `.take()`s the sender before sending the real outcome. See that function's
+/// own doc comment for why this exists instead of an awaited `JoinHandle`.
+struct ReportOnDrop {
+    /// Carried so the fallback is bound to the same lock the real answer would have been. A
+    /// fallback tagged with anything else would be applied to whatever lock happens to be up when
+    /// it lands, which is the case `lock::accepts_outcome` exists to refuse.
+    acquisition: u64,
+    outcome_tx: Option<UnboundedSender<(u64, shared::PamOutcome)>>,
+}
+
+impl Drop for ReportOnDrop {
+    fn drop(&mut self) {
+        if let Some(tx) = self.outcome_tx.take() {
+            // `main.rs`'s pam_outcomes arm only needs *a* PamOutcome to run LockEvent::Authenticated
+            // and clear `authenticating` -- the exact variant doesn't matter here the way it does
+            // on the ordinary path, since there is no real PAM answer to report. PamError also
+            // means the lock screen's `error` string says something happened rather than nothing.
+            let outcome = shared::PamOutcome::PamError("pam authentication task ended without reporting an outcome".to_string());
+            let _ = tx.send((self.acquisition, outcome));
         }
     }
 }
@@ -280,9 +417,10 @@ async fn spawn_worker_and_exchange(username: &str, secret: &[u8]) -> std::io::Re
 ///
 /// `timeout` bounds the write+read exchange, not the reap that follows it (`reap_process_group`
 /// has its own bounded grace period). Without this bound, a worker that never writes anything
-/// and never exits would hang `read_json_frame` forever -- and since this whole call chain is
-/// `.await`ed inline in `main.rs`'s top-level `select!`, not `tokio::spawn`ed, that single hang
-/// would stall the entire Supervisor's event loop (Correctness review finding). Takes `timeout`
+/// and never exits would hang `read_json_frame` forever -- and on the polkit path, where this
+/// whole call chain is `.await`ed inline in `main.rs`'s top-level `select!` rather than
+/// `tokio::spawn`ed, that single hang would stall the entire Supervisor's event loop (Correctness
+/// review finding). Takes `timeout`
 /// as a parameter, matching `reap_process_group`'s own `grace` parameter, so tests can use a
 /// short one instead of [`PAM_EXCHANGE_TIMEOUT`]'s real-world 30 seconds.
 async fn exchange_over(mut child: tokio::process::Child, secret: &[u8], timeout: Duration) -> std::io::Result<shared::PamOutcome> {
@@ -462,5 +600,54 @@ mod tests {
         // partially-filled Vec has already been dropped inside read_password, the same
         // Rust-level limit shared/src/secure_buffer.rs's own tests document (proving a *live*
         // buffer was zeroized needs inspecting it before it drops, not after).
+    }
+
+    // The next three tests pin the half of the two Correctness review findings that is this
+    // module's own code: `authenticating` must be releasable even when the spawned task that
+    // would otherwise release it panics or is dropped before reporting. The scrub-on-every-exit
+    // half is `zeroize::Zeroizing`'s job now, and testing that crate's `Drop` impl here would be
+    // testing someone else's library.
+
+    #[test]
+    fn report_on_drop_sends_a_fallback_outcome_when_dropped_before_reporting() {
+        // Simulates a panic unwinding out of authenticate_current_user, or run_lock_authentication's
+        // future being dropped by a runtime shutdown mid-.await: either way, the guard is dropped
+        // without its own `.take()`-then-send ever running.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(ReportOnDrop { acquisition: 7, outcome_tx: Some(tx) });
+
+        let (acquisition, outcome) = rx.try_recv().expect("a fallback outcome must be sent when the guard is dropped before reporting");
+        assert!(matches!(outcome, shared::PamOutcome::PamError(_)), "the fallback must be a PamOutcome so main.rs's pam_outcomes arm can still clear `authenticating`");
+        assert_eq!(acquisition, 7, "and it must be tagged with the lock it was started for, or lock::accepts_outcome cannot place it");
+    }
+
+    #[test]
+    fn report_on_drop_does_not_double_send_once_the_real_outcome_already_went_out() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut guard = ReportOnDrop { acquisition: 7, outcome_tx: Some(tx) };
+        guard.outcome_tx.take().expect("freshly built guard holds a sender").send((7, shared::PamOutcome::Success)).expect("send failed");
+        drop(guard);
+
+        assert_eq!(rx.try_recv(), Ok((7, shared::PamOutcome::Success)));
+        assert!(rx.try_recv().is_err(), "the drop guard must not also send its fallback once the real outcome already went out");
+    }
+
+    #[tokio::test]
+    async fn a_panicking_task_still_reports_a_fallback_outcome_via_the_drop_guard() {
+        // The scenario run_lock_authentication's doc comment describes as real: an FFI panic (or
+        // any other panic) unwinding out of authenticate_current_user before it reaches its own
+        // send. tokio::spawn catches the unwind (surfacing it as an Err from the JoinHandle, which
+        // this test doesn't need), but the task's own locals -- including the ReportOnDrop guard
+        // -- still drop normally during that unwind, which is the property this test pins.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = tokio::spawn(async move {
+            let _guard = ReportOnDrop { acquisition: 7, outcome_tx: Some(tx) };
+            panic!("simulated panic before the task's own explicit send");
+        });
+        let join_result = handle.await;
+        assert!(join_result.is_err(), "the task did panic -- that part of the simulation, not the fix, is what's asserted here");
+
+        let (_acquisition, outcome) = rx.try_recv().expect("the drop guard must still report a fallback outcome even though the task panicked first");
+        assert!(matches!(outcome, shared::PamOutcome::PamError(_)));
     }
 }

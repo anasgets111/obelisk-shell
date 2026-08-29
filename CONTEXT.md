@@ -119,8 +119,12 @@ _Avoid_: vsync, throttling, damage (a different mechanism: which region changed,
 ## Ownership
 
 **Lock authority**:
-The Supervisor-held `ext_session_lock_v1` handle and its minimal `wl_shm` fallback surface. Outlives the Renderer; distinct from the Lua-authored lock screen widget, which is presentation only and can die with the Renderer.
-_Avoid_: lock screen (ambiguous: covers both the authority and the Lua widget)
+The decision to lock and the supervision of whoever holds the lock, both the Supervisor's. Not the protocol handle: the Renderer holds `ext_session_lock_v1` and paints the lock screen, because the process that holds the lock is the only one that can create a surface for it (ADR-0042). Only a successful PAM authentication ends a lock, and only the Supervisor can order that.
+_Avoid_: lock screen (ambiguous: covers both the authority and the surfaces), lock client (the Renderer, which is a different owner)
+
+**Lock surface**:
+One `ext_session_lock_surface_v1` per output, existing only between the compositor granting the lock and the unlock. A `lock` declaration is returned at the root of `shell.lua` like any other role and costs one retained node per output and no Wayland object until the session locks (ADR-0052).
+_Avoid_: lock screen widget (the pre-ADR-0042 term for a layer-shell surface, which cannot be part of a lock screen at all)
 
 ## Capabilities
 
@@ -133,7 +137,7 @@ A capability's state-version counter. A stale revision fails the write.
 _Avoid_: version, sequence number
 
 **Capability roster**:
-The `shared`-crate constant naming every snapshot-hydrated capability. Each rostered name's Lua global exists from a generation's first evaluation and reads `nil` until its first dependency snapshot arrives (ADR-0037).
+The `shared`-crate constant naming every snapshot-hydrated capability. Each rostered name is reachable from a generation's first evaluation and reads `nil` until its first dependency snapshot arrives (ADR-0037). All but one are bare Lua globals; `lock` is reached as `oblisk.lock`, because a surface role already owns the bare name (ADR-0052).
 _Avoid_: pre-seed list, known capabilities
 
 **Secure submit**:
@@ -165,7 +169,7 @@ The one input device Oblisk reads `oblisk.keyboard`'s per-key state from (backli
 _Avoid_: main keyboard, active keyboard
 
 **Compositor link**:
-The trait behind `keyboard.active_layout`/`keyboard:switch_layout`, one implementor per compositor (Hyprland, Niri). The Supervisor picks an implementor at startup by probing `$HYPRLAND_INSTANCE_SIGNATURE`/`$NIRI_SOCKET`. Scoped deliberately to what keyboard layout needs today, not widened to guess the still-undesigned workspace adaptor's (§10) eventual method surface — whether that trait extends this one or defines its own is an open question, not settled here.
+The trait behind `keyboard.active_layout`/`keyboard:switch_layout`, one implementor per compositor (Hyprland, Niri). The Supervisor picks an implementor at startup by probing `$HYPRLAND_INSTANCE_SIGNATURE`/`$NIRI_SOCKET`. Scoped deliberately to what keyboard layout needs today, not widened to guess the still-undesigned workspace adaptor's (§10) eventual method surface. Whether that trait extends this one or defines its own is an open question, not settled here.
 _Avoid_: workspace adaptor (a different, still-unbuilt trait), compositor adapter
 
 **Track identity**:

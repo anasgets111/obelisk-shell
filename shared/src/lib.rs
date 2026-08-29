@@ -7,7 +7,7 @@ use zeroize::ZeroizeOnDrop;
 pub mod framing;
 mod secure_buffer;
 pub use secure_buffer::SecureBuffer;
-pub use zeroize::Zeroize;
+pub use zeroize::{Zeroize, Zeroizing};
 
 /// Where the control socket lives, derived from `$XDG_RUNTIME_DIR`. Both
 /// `supervisor` (the listener) and `renderer` (the client) resolve this the same way, so it
@@ -29,8 +29,16 @@ pub fn control_socket_path() -> io::Result<PathBuf> {
 /// fails on its first push in development instead of as an undefined-global error in a user's
 /// `shell.lua` at boot. `idle` is deliberately absent: it's event-shaped, not snapshot state
 /// (ADR-0032).
-pub const CAPABILITIES: &[&str] =
-    &["audio", "network", "bluetooth", "tray", "notifications", "mpris", "sysinfo", "keyboard", "privacy", "updates"];
+///
+/// `lock` is on the roster and is the one name the Renderer does *not* seed as a bare global:
+/// § 6.4's `lock` node constructor already owns that name, and the seeding loop runs after
+/// `NODE_KINDS` registration, so a bare `lock` signal would silently overwrite the constructor and
+/// break every `lock { ... }` declaration. It is seeded as `oblisk.lock` instead, which is the name
+/// § 2 specifies for it anyway (docs/adr/0052). Phase 25 item 3 moves the other ten there too and
+/// deletes the special case.
+pub const CAPABILITIES: &[&str] = &[
+    "audio", "network", "bluetooth", "tray", "notifications", "mpris", "sysinfo", "keyboard", "privacy", "updates", "lock",
+];
 
 /// Guarded JSON-RPC 2.0 envelope wrapping a Lua write action.
 /// See docs/oblisk-idl-api-specs.md §7.2.
@@ -226,6 +234,47 @@ pub struct SecureSubmit {
     pub secret: Vec<u8>,
 }
 
+/// Supervisor -> Renderer: take or release the `ext_session_lock_v1` session lock (ADR-0042,
+/// ADR-0052 decision 1). One command for both directions rather than a `Lock`/`Unlock` pair,
+/// because the Renderer's job is the same either way: make the lock state match this flag and
+/// report what happened.
+///
+/// `locked = false` is the *only* thing that may call `unlock_and_destroy`, and the Supervisor
+/// sends it only after its PAM worker returned [`PamOutcome::Success`] -- ADR-0042's "never call
+/// `unlock_and_destroy` except on a successful authentication" is a property of that one call site,
+/// not a rule the Renderer is trusted to keep.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetSessionLock {
+    pub locked: bool,
+}
+
+/// What became of the lock, reported by the Renderer that holds it (ADR-0052 decision 4). Four
+/// distinct real events, not a `bool` plus a message: the Supervisor gates generation swaps on
+/// this (ADR-0042), and "never acquired" and "acquired then torn down by the compositor" need
+/// different handling even though both end with the session unlocked.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LockOutcome {
+    /// `ext_session_lock_v1::locked` arrived. Lock surfaces are up and swaps are blocked.
+    Locked,
+    /// The lock was never acquired, for the reason carried here: the config declared no `lock`
+    /// node (ADR-0052 decision 3), the compositor denied the request with an immediate `finished`,
+    /// or `ext_session_lock_manager_v1` is not advertised at all.
+    Refused(String),
+    /// `finished` after a `Locked`: the compositor tore the lock down through its own secure
+    /// mechanism. Not a denial, and not something the Supervisor asked for.
+    Finished,
+    /// `unlock_and_destroy` was called, in response to a `SetSessionLock { locked: false }`.
+    Unlocked,
+}
+
+/// Renderer -> Supervisor: one [`LockOutcome`] per lock state change. The connection already
+/// carries the sending generation's id, so this does not repeat it (same shape as
+/// [`ReevaluateReport`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockReport {
+    pub outcome: LockOutcome,
+}
+
 /// Every frame the Supervisor can push to a Renderer connection, adjacently tagged so a single
 /// read loop can dispatch on `kind` without the connection needing a separate channel per
 /// message shape. `content = "data"` (not internally-tagged) because [`ReevaluateReport`] is
@@ -242,6 +291,7 @@ pub enum SupervisorFrame {
     ProcessOutput(ProcessOutputLine),
     ProcessExited(ProcessExited),
     IdleEvent(IdleEvent),
+    SetSessionLock(SetSessionLock),
 }
 
 /// Every frame a Renderer connection can send to the Supervisor, same tagging scheme as
@@ -257,6 +307,7 @@ pub enum RendererFrame {
     ReadySignal(ReadySignal),
     PresentationEvidence(PresentationEvidence),
     SecureSubmit(SecureSubmit),
+    LockReport(LockReport),
     /// Asks the Supervisor to *start* a reload cycle for this generation: bump the sequence it
     /// owns and send the [`ReevaluateRequest`] carrying it (docs/adr/0041 decision 4).
     ///

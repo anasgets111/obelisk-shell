@@ -16,16 +16,20 @@ use std::collections::HashMap;
 
 use mlua::{Lua, Table, Value};
 
-/// § 5.2's eight geometric nodes plus the three top-level surface roles a config declares:
-/// § 6.1's `panel`, § 6.2's `window`, § 6.3's `popup` (ADR-0040: these are surface *roles*;
-/// "surface" is the umbrella term covering all four).
+/// § 5.2's eight geometric nodes plus all four top-level surface roles a config declares: § 6.1's
+/// `panel`, § 6.2's `window`, § 6.3's `popup` and § 6.4's `lock` (ADR-0040: these are surface
+/// *roles*; "surface" is the umbrella term covering all four).
 ///
-/// § 6.4's `lock` is the fourth role and deliberately absent. A lock surface's lifetime is the
-/// lock's, not the config's (docs/adr/0042), so it is not something `shell.lua` returns and giving
-/// it a constructor here would say it is -- see `crate::lua::require_surface`, which rejects one at
-/// the root with that reason.
-const NODE_KINDS: [&str; 11] =
-    ["rect", "row", "column", "text", "icon", "button", "list", "textfield", "panel", "window", "popup"];
+/// `lock` was held out of this array through Phase 22 on the argument that a lock surface's
+/// lifetime is the lock's rather than the config's, so a constructor here would be claiming
+/// `shell.lua` decides when one exists. docs/adr/0052 decision 2 retires that argument: a
+/// constructor decides where a declaration is *written*, and docs/adr/0049 already separated that
+/// from when the Wayland object exists. `window` and `popup` are both in this array and neither
+/// owns an `xdg_toplevel` or an `xdg_popup` until `visible` says so; `lock` is the same shape with
+/// the compositor's `locked` event as its trigger instead of a signal. Without a constructor here
+/// § 6.4's "declaring it says what the lock screen looks like" has nowhere to be written at all.
+const NODE_KINDS: [&str; 12] =
+    ["rect", "row", "column", "text", "icon", "button", "list", "textfield", "panel", "window", "popup", "lock"];
 
 /// A Lua node table, tagged with its constructor's `kind` and carrying every other prop
 /// untouched. Not the final in-memory scene node -- see the module doc comment.
@@ -164,5 +168,18 @@ mod tests {
         let table: Table = lua.load(r#"return popup { id = "menu", parent = "bar" }"#).eval().unwrap();
         assert_eq!(table.get::<String>("kind").unwrap(), "popup");
         assert_eq!(table.get::<String>("parent").unwrap(), "bar");
+    }
+
+    #[test]
+    fn lock_is_a_constructor_a_config_can_call_because_declaring_one_is_not_locking() {
+        // The reversal docs/adr/0052 decision 2 records. Phase 22 left `lock` out of the array on
+        // purpose, so this is pinned by name rather than by the loop above: the loop would go on
+        // passing if a later edit dropped the entry, and the whole point of § 6.4 is that a config
+        // gets to author the lock screen's tree.
+        let lua = lua_with_constructors();
+        assert!(NODE_KINDS.contains(&"lock"));
+        let table: Table = lua.load(r#"return lock { id = "screen-lock" }"#).eval().unwrap();
+        assert_eq!(table.get::<String>("kind").unwrap(), "lock");
+        assert_eq!(table.get::<String>("id").unwrap(), "screen-lock");
     }
 }

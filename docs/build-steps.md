@@ -1613,6 +1613,46 @@ Supervisor, which keeps idle-notify and the decision to lock.
    acquire one while the authoritative generation holds it. The Supervisor queues a topology-changing
    reload until unlock. In-place reloads still apply.
 
+> **Built** (docs/adr/0052, and an amendment to docs/adr/0027). All five items, plus two decisions
+> the phase could not avoid making and one it had to reverse.
+>
+> Item 3's "composes what exists" was the false premise. What existed did not work: `SecureBuffer`
+> was written only from `zwp_text_input_v3::commit_string`, which a compositor sends only when an
+> input method is bound, and `KeyboardHandler::press_key` was an empty stub. A password could not be
+> typed, so a lock could not be left, and `ext-session-lock-v1` keeps a session locked on purpose
+> when its client dies. A `secure_submit` field now reads `wl_keyboard` directly and the text-input
+> binding is deleted, since `secure_submit` turned out to be its only consumer. docs/adr/0027 carries
+> the amendment.
+>
+> Reversed from Phase 22: `lua::require_surface` rejected a `lock` at the root, which left § 6.4's
+> "declaring it says what the lock screen looks like" with nowhere to write the declaration. It
+> conflated where a declaration lives with when its Wayland object exists, two things docs/adr/0049
+> had already separated for `window` and `popup`.
+>
+> Pulled forward from Phase 25: item 1's generic `CommandEnvelope` method, because a capability with
+> no caller is dead code, and item 3 for exactly one name, because the roster seeds bare globals
+> after `NODE_KINDS` and a bare `lock` signal would have overwritten § 6.4's constructor. The other
+> ten stay bare until Phase 25 moves them together.
+>
+> Five review passes, each of which found at least one way to strand the session or bypass
+> authentication, all fixed: a lock granted with no field to type into; a `TopologyChanged` in the
+> window before `locked` reaping the lock holder; a stale `LockReport` from a reaped generation; two
+> `lock` declarations sending two `get_lock_surface` for one output; an in-place reload deleting the
+> password field mid-lock; a PAM outcome not bound to the lock it authenticated against, which
+> released a *different* lock nobody had authenticated to; and a login password surviving a focus
+> change to be submitted to another capability's action.
+>
+> **No live coverage: taking the lock.** Every gate here is a unit test plus a boot with the lock
+> declared and never triggered. Nobody has typed a password into it. The first real trigger needs a
+> VT escape hatch ready, because the failure mode is losing the session.
+>
+> Known and deliberate: one retained scene tree leaks per unplugged monitor (inert, the veto reads
+> live instances); two PAM workers can overlap across a teardown and reacquisition, bounded by
+> `PAM_EXCHANGE_TIMEOUT` and unable to apply more than one answer; a `lock()` in the one-hop window
+> while a `Finished` is in flight is dropped rather than acquiring; and a `textfield` on a surface
+> that never takes keyboard focus is now untypable rather than silently capturing another surface's
+> keys.
+
 ### Phase 24: Memory Measurement Harness
 
 Implement ADR-0043 decision 1, which the fonts and atlas work in Phase 19 is otherwise unverifiable

@@ -5,13 +5,15 @@ use std::error::Error;
 use std::ffi::c_void;
 
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
-use smithay_client_toolkit::dispatch2::Dispatch2;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::presentation_time::{PresentTime, PresentationTimeHandler, PresentationTimeState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::seat::keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers};
 use smithay_client_toolkit::seat::pointer::{BTN_LEFT, PointerEvent, PointerEventKind, PointerHandler};
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
+use smithay_client_toolkit::session_lock::{
+    SessionLock, SessionLockHandler, SessionLockState, SessionLockSurface, SessionLockSurfaceConfigure,
+};
 use smithay_client_toolkit::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
     LayerSurfaceConfigure,
@@ -23,24 +25,20 @@ use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::{delegate_registry, registry_handlers};
 use khronos_egl::Surface as EglSurface;
 use mlua::{Function, Lua, Table, Value};
-use wayland_client::globals::{registry_queue_init, GlobalList};
+use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface};
 use wayland_client::{Connection, Proxy, QueueHandle, WEnum};
 use wayland_egl::WlEglSurface;
 use wayland_protocols::wp::presentation_time::client::wp_presentation_feedback;
 use wayland_protocols::xdg::shell::client::{xdg_positioner, xdg_surface};
-use wayland_protocols::wp::text_input::zv3::client::{
-    zwp_text_input_manager_v3::{self, ZwpTextInputManagerV3},
-    zwp_text_input_v3::{self, ZwpTextInputV3},
-};
-use shared::{PresentationEvidence, ReadySignal, RendererFrame, SecureSubmit, SupervisorFrame, Zeroize};
+use shared::{LockOutcome, LockReport, PresentationEvidence, ReadySignal, RendererFrame, SecureSubmit, SupervisorFrame, Zeroize};
 
 use crate::layout;
 use crate::layout::instance::{OutputGeometry, SurfaceInstance, expand_instances, is_instance_of, reconcile_instances};
 use crate::layout::node::{
     self, ConstraintAdjustment, LayerKind, PanelSpec, PopupAnchor, PopupSpec, SizeHint, SizeMode, SurfaceSpec, WindowSpec,
 };
-use crate::socket::RendererClient;
+use crate::socket::{FrameOutcome, RendererClient};
 use crate::text::atlas::TextPainter;
 use crate::text::shaping::ShapingHandle;
 use crate::text::snap::LogicalRect;
@@ -196,6 +194,29 @@ enum TrackedRole {
         /// again.
         refusal_logged: Option<PopupRefusal>,
     },
+    Lock {
+        /// The output this lock surface covers, held from the moment the instance was expanded
+        /// rather than looked up again when the lock is taken. `get_lock_surface` takes a
+        /// `wl_output` and § 6.4 gives a `lock` no `monitor` to name one with, so the instance's
+        /// own output is the only possible answer -- and it is docs/adr/0041's output tracking
+        /// rather than a second source of it, since [`App::create_surfaces`] is handed this proxy
+        /// by the same map that places a `panel`.
+        output: wl_output::WlOutput,
+        /// `None` until this process holds the lock (docs/adr/0052 decision 2). The `Option` is a
+        /// `window`'s with the trigger moved: a `window`'s object appears when the config says
+        /// `visible`, and a lock surface's appears when the *compositor* has granted the lock, so
+        /// a declared lock screen costs one retained node and zero Wayland objects for as long as
+        /// the session is unlocked, which is nearly always.
+        ///
+        /// **Dropping this handle is the teardown, and nothing else is.**
+        /// `SessionLockSurfaceInner::Drop` sends `ext_session_lock_surface_v1.destroy`, which the
+        /// protocol *recommends* once the surface's `wl_output` global is gone and which makes the
+        /// compositor "fall back to rendering a solid color" on an output that is still there. So
+        /// the only two things that may clear this are an output removal
+        /// ([`App::destroy_surface_by_id`], which drops the whole entry) and the end of the lock
+        /// ([`App::teardown_lock_surfaces`]).
+        surface: Option<SessionLockSurface>,
+    },
 }
 
 impl TrackedRole {
@@ -207,6 +228,7 @@ impl TrackedRole {
             TrackedRole::Panel { layer, .. } => Some(layer.wl_surface()),
             TrackedRole::Window { window, .. } => window.as_ref().map(WaylandSurface::wl_surface),
             TrackedRole::Popup { popup, .. } => popup.as_ref().map(WaylandSurface::wl_surface),
+            TrackedRole::Lock { surface, .. } => surface.as_ref().map(SessionLockSurface::wl_surface),
         }
     }
 
@@ -221,6 +243,14 @@ impl TrackedRole {
             TrackedRole::Panel { layer, .. } => Some(PopupParent::Layer(layer.clone())),
             TrackedRole::Window { window, .. } => window.as_ref().map(|w| PopupParent::Xdg(w.xdg_surface().clone())),
             TrackedRole::Popup { popup, .. } => popup.as_ref().map(|p| PopupParent::Xdg(p.xdg_surface().clone())),
+            // Never, and not for want of a mapped surface. `ext_session_lock_surface_v1` is neither
+            // an `xdg_surface` nor a `zwlr_layer_surface_v1`, and those two are the whole of what
+            // `xdg_surface.get_popup` and layer-shell's `get_popup` accept, so there is no request
+            // that would root a popup here. That also happens to be the answer the protocol wants:
+            // while the session is locked the compositor shows lock surfaces and nothing else
+            // (docs/adr/0042), so a dropdown over a lock screen belongs in the lock screen's own
+            // tree rather than in a second surface.
+            TrackedRole::Lock { .. } => None,
         }
     }
 }
@@ -292,6 +322,27 @@ pub struct App {
     /// which is legal if odd -- a `panel`-only config still works there, and a declared `window`
     /// says so once instead of taking the process down.
     xdg_shell: Option<XdgShell>,
+    /// `ext_session_lock_manager_v1`, or the knowledge that the compositor advertises none
+    /// (docs/adr/0042, build-steps.md Phase 23). Unlike `xdg_shell` this is not an `Option`: SCTK
+    /// wraps the global in a `GlobalProxy`, so the absent case is carried inside and surfaces as a
+    /// `GlobalError::MissingGlobal` from `lock` -- which is where it belongs, since docs/adr/0052
+    /// decision 4 wants "this compositor cannot lock" reported as a *refusal of a lock command*
+    /// rather than as a bind failure at startup that nobody asked for.
+    ///
+    /// Not in `registry_handlers![OutputState, SeatState]` either, and correctly so:
+    /// `SessionLockState` is not a `RegistryHandler`. It binds once from the `GlobalList` in
+    /// [`run`] and has no interest in later registry churn.
+    session_lock_state: SessionLockState,
+    /// The live `ext_session_lock_v1`, from the moment `lock` is sent until the lock ends by any of
+    /// its three routes: an unlock the Supervisor ordered, a denial, or a teardown the compositor
+    /// performed itself.
+    ///
+    /// `Some` with `is_locked()` still false is the in-flight window between the request and the
+    /// compositor's answer, and that window is the whole reason `finished` is two different events
+    /// (docs/adr/0042, build-steps.md Phase 23 item 2) -- see [`finished_outcome`], which reads
+    /// exactly that flag. One field rather than a phase enum beside it, because SCTK already keeps
+    /// the flag and a second copy here could only ever disagree with it.
+    session_lock: Option<SessionLock>,
     egl: egl::EglState,
     gl: Option<glow::Context>,
     /// The one `ShapingHandle` for the whole process; `client` holds a clone of it, so
@@ -339,18 +390,14 @@ pub struct App {
     /// drives one handshake at a time (docs/adr/0025 item 5), so one field, not a per-surface
     /// map, is enough.
     active_nonce: Option<u64>,
-    /// Kept alive for the object's whole lifetime (never read again after
-    /// [`App::bind_text_input`] enables it) -- dropping the proxy would destroy the protocol
-    /// object, same reasoning `BoundSurface`'s `#[allow(dead_code)]` fields already document.
-    #[allow(dead_code)]
-    text_input: Option<ZwpTextInputV3>,
     /// The seat's pointer, once it advertised one (build-steps.md Phase 21 item 1). Kept alive
-    /// for the same reason `text_input` is -- dropping the proxy destroys the protocol object,
-    /// and with it every `enter`/`press`/`release` this shell is interactive because of.
+    /// because dropping the proxy destroys the protocol object, and with it every
+    /// `enter`/`press`/`release` this shell is interactive because of -- the same reasoning
+    /// `BoundSurface`'s `#[allow(dead_code)]` fields already document.
     ///
-    /// One, not one per seat: `bind_text_input` already takes `seats().next()`, so this whole
-    /// file is single-seat, and a second seat's pointer would need a second `armed` beside it
-    /// rather than sharing this one.
+    /// One, not one per seat: [`SeatHandler::new_capability`] takes whichever seat announced the
+    /// capability into one slot, so this whole file is single-seat, and a second seat's pointer
+    /// would need a second `armed` beside it rather than sharing this one.
     pointer: Option<wl_pointer::WlPointer>,
     /// The seat's keyboard, once it advertised one (build-steps.md Phase 21 item 2). Kept alive for
     /// the same reason `pointer` is, and single-seat for the same reason.
@@ -362,8 +409,10 @@ pub struct App {
     /// The instance id of the surface holding keyboard focus, if any of this process's surfaces
     /// does (docs/adr/0050's consequences).
     ///
-    /// ponytail: nothing consumes this beyond the log line in [`KeyboardHandler::leave`] and the
-    /// focus clearing that happens alongside it, because § 5.2 has no `on_key` for it to route to
+    /// [`focus_is_still_armed`] reads it on every keystroke: a `secure_submit` field is armed only
+    /// while the surface that declared it is the one this names.
+    ///
+    /// ponytail: nothing *else* consumes it, because § 5.2 has no `on_key` for a keysym to route to
     /// and docs/adr/0050 explicitly declines to invent one. Upgrade path: an IDL key-handler
     /// property, at which point this is the surface whose tree the keysym gets dispatched into.
     keyboard_focus: Option<String>,
@@ -386,14 +435,19 @@ pub struct App {
     /// of them still increments this after [`App::latch_popup`] stamped it, and the end-of-turn
     /// `apply_popup_visibility` sees a moved counter.
     pointer_input_count: u64,
-    /// Where the next completed `secure_submit` is addressed, set by the press that focused a
-    /// `textfield` (docs/adr/0050 decision 4, [`focused_target`]). `None` means no frame at all --
-    /// see [`submit_frame_for`].
-    focused_secure_submit: Option<node::SecureSubmitTarget>,
-    text_input_pending: TextInputPending,
-    /// Accumulates committed `wp-text-input-v3` edits until a protocol-native `ACTION_SUBMIT`
-    /// completes them (build-steps.md Phase 15 item 2; ADR-0005/ADR-0009/ADR-0027) -- never
-    /// surfaced to Lua.
+    /// The focused `secure_submit` field and the surface it lives on, set by the press that focused
+    /// a `textfield` (docs/adr/0050 decision 4, [`focused_target`]) or by keyboard focus landing on
+    /// a surface with a sole one ([`sole_secure_submit`]). `None` means no frame at all -- see
+    /// [`submit_frame_for`]. Written only through [`App::focus_secure_submit`].
+    focused_secure_submit: Option<FocusedField>,
+    /// Accumulates the focused field's keystrokes until Enter completes them (build-steps.md
+    /// Phase 15 item 2, Phase 23 item 3; ADR-0005/ADR-0009/ADR-0027) -- never surfaced to Lua.
+    ///
+    /// **Its lifetime belongs to `focused_secure_submit`, not to any transport event.** Every
+    /// write to the field above goes through [`App::focus_secure_submit`], which zeroizes this
+    /// on any change of destination, because bytes typed for one field must never be readdressed
+    /// to the next one's capability -- see [`retarget_secure_submit`] for the leak that rule
+    /// closes.
     secure_buffer: shared::SecureBuffer,
 }
 
@@ -413,7 +467,7 @@ pub fn run(
     let layer_shell = LayerShell::bind(&globals, &qh)?;
     // Optional, unlike layer-shell's: a compositor with no `xdg_wm_base` is legal, and a config
     // declaring only panels works fine there. Logged and carried, the same tolerance
-    // `PresentationTimeState::bind` and `bind_text_input` already apply to a protocol that may not
+    // `PresentationTimeState::bind` already applies to a protocol that may not
     // be advertised -- `create_surfaces` is what says which `window` went unbuilt, since only it
     // knows there was one.
     let xdg_shell = XdgShell::bind(&globals, &qh)
@@ -421,6 +475,11 @@ pub fn run(
         .ok();
     let output_state = OutputState::new(&globals, &qh);
     let seat_state = SeatState::new(&globals, &qh);
+    // Deliberately not `?` and deliberately not logged: `SessionLockState::new` cannot fail. It
+    // stores a `GlobalProxy`, so a compositor advertising no `ext_session_lock_manager_v1` is
+    // indistinguishable from one that does until something actually asks for a lock, which is the
+    // only point at which anyone cares (docs/adr/0052 decision 4).
+    let session_lock_state = SessionLockState::new(&globals, &qh);
     let registry_state = RegistryState::new(&globals);
     // Stable protocol, no `staging`/`unstable` Cargo feature needed -- `PresentationTimeState::
     // bind` tolerates a compositor that doesn't advertise it (later `feedback()` calls fail with
@@ -444,6 +503,8 @@ pub fn run(
         seat_state,
         layer_shell,
         xdg_shell,
+        session_lock_state,
+        session_lock: None,
         egl: egl_state,
         gl: None,
         shaping,
@@ -459,7 +520,6 @@ pub fn run(
         presentation_time,
         queue_handle: qh.clone(),
         active_nonce: None,
-        text_input: None,
         pointer: None,
         keyboard: None,
         keyboard_focus: None,
@@ -467,14 +527,13 @@ pub fn run(
         input_serial: None,
         pointer_input_count: 0,
         focused_secure_submit: None,
-        text_input_pending: TextInputPending::default(),
         secure_buffer: shared::SecureBuffer::new(),
     };
 
     // Outputs (and the seat) arrive as a burst of registry + wl_seat/wl_output events after
     // binding; two roundtrips is enough to have both the full initial output list (which
     // `expand_instances` below turns a `monitor = "All"` declaration into one surface per monitor
-    // from) and the seat `bind_text_input` needs.
+    // from) and the seat `SeatHandler::new_capability` gets this process's keyboard from.
     event_queue.roundtrip(&mut app)?;
     event_queue.roundtrip(&mut app)?;
 
@@ -545,7 +604,6 @@ pub fn run(
     // From here on an output event owns the whole job: there is an evaluation to expand and
     // surfaces to reconcile against it (see `App::startup_complete`).
     app.startup_complete = true;
-    app.bind_text_input(&globals, &qh);
 
     // Replaces `event_queue.blocking_dispatch(&mut app)?` (used through Phase 13): a real
     // Wayland event might not arrive for a long time after `ActivateDraw` is sent, since nothing
@@ -583,8 +641,54 @@ pub fn run(
         // dropped by coalescing.
         let mut draw_nonces: Vec<u64> = Vec::new();
         while let Ok(frame) = inbound_rx.try_recv() {
-            if let Some(nonce) = app.client.handle_frame(frame) {
-                draw_nonces.push(nonce);
+            match app.client.handle_frame(frame) {
+                FrameOutcome::Handled => {}
+                FrameOutcome::ActivateDraw(nonce) => draw_nonces.push(nonce),
+                // Serviced here in the drain rather than collected the way a draw nonce is, and the
+                // difference is what each one needs from the rest of this turn. A draw has to land
+                // *after* the re-resolve below or it paints the pre-push layout, which is the whole
+                // argument the comment above makes. A lock reads nothing a re-resolve produces:
+                // whether this config declares a `lock` surface at all is a fact about the tracked
+                // surface set (docs/adr/0052 decision 3), and no capability push can change it.
+                // Deferring it would buy nothing and cost a poll turn on the one command whose
+                // entire point is that the screen goes secure now.
+                FrameOutcome::SetSessionLock(locked) => {
+                    // A round trip before an *unlock*, and only before an unlock. SCTK sets the
+                    // `locked` flag its `SessionLock::unlock` is gated on when
+                    // `ext_session_lock_v1::locked` is **dispatched**, not when the compositor sends
+                    // it, and this drain runs in a different turn from `dispatch_pending` above --
+                    // the poll at the bottom of the previous turn may well have timed out with
+                    // `locked` already on the wire. `unlock()` would then be a silent no-op and the
+                    // `Drop` immediately after it would send the plain `destroy` that the protocol
+                    // XML calls out by name: "it is a protocol error to make this request if the
+                    // locked event was sent". That is `invalid_destroy`, which kills the connection
+                    // with the session still locked -- the exact unrecoverable state docs/adr/0052
+                    // exists to keep the user out of. `roundtrip` closes it by definition: the
+                    // compositor's `wl_callback` cannot arrive before everything it sent earlier.
+                    //
+                    // The acquire path needs none of this and deliberately does not pay for it. Its
+                    // inputs are the tracked surface set and `session_lock.is_some()`, both of which
+                    // this thread owns outright, and an undispatched `locked` can only make
+                    // `session_lock` already `Some`, which [`lock_command`] answers `Nothing`.
+                    // Blocking the one command whose whole point is that the screen goes secure now
+                    // on a compositor round trip would be a real cost for no fact gained.
+                    //
+                    // **Deliberately not `?`.** Propagating here would return from `run` between
+                    // the correct password and `unlock_and_destroy`, killing the client with the
+                    // session still locked -- and the compositor does not unlock when a lock client
+                    // dies, so the user's only way back in would be a VT switch. That is the exact
+                    // outcome this whole path exists to prevent, reached by the error handling
+                    // rather than by the protocol. Every `DispatchError` this can raise means the
+                    // connection is already broken, so the unlock attempt below may well send
+                    // nothing; attempting it costs one failed flush and is strictly better than
+                    // exiting without trying. What is *not* acceptable is skipping the attempt.
+                    if !locked && let Err(err) = event_queue.roundtrip(&mut app) {
+                        eprintln!(
+                            "[oblisk-renderer] the round trip before an unlock failed ({err}); attempting the unlock anyway rather than exiting with the session locked"
+                        );
+                    }
+                    app.set_session_lock(&qh, locked);
+                }
             }
             if app.exit {
                 break;
@@ -627,6 +731,12 @@ pub fn run(
         // `if` would leak a click's serial across every turn until the *next* re-resolve, which is
         // exactly the window that rule exists to close.
         app.input_serial = None;
+        // Once a turn, so a focused `secure_submit` field whose surface this process tore down --
+        // a lock screen the compositor `finished`, a `window` whose `visible` went false -- does not
+        // sit there holding a half-typed password until some later keystroke happens to notice. The
+        // load-bearing check is the one in `App::apply_secure_key`; this one is the residency
+        // ceiling, and it is deliberately the narrower of the two.
+        app.drop_secure_focus_if_its_surface_is_gone();
         for nonce in draw_nonces {
             app.activate_draw(nonce);
             if app.exit {
@@ -651,64 +761,6 @@ pub fn run(
     }
 
     Ok(())
-}
-
-/// One `zwp_text_input_v3`'s double-buffered pending edit -- the protocol's own rule that
-/// `preedit_string`/`commit_string`/`delete_surrounding_text`/`action` events only take effect on
-/// the next `done` (`done`'s own description: "This event replaces the current state with the
-/// pending state"). Kept separate from the real `Dispatch2` impl below so it's unit-testable
-/// without a live Wayland connection -- this file has no headless Wayland test harness, which is
-/// why the config-facing enums live in `layout` and only pure functions (the `layer_for` through
-/// `exclusive_zone_for` block below, and docs/adr/0050's click-decision functions beside them)
-/// live here.
-#[derive(Default)]
-struct TextInputPending {
-    commit: Option<String>,
-    submit: bool,
-}
-
-impl TextInputPending {
-    fn on_commit_string(&mut self, text: Option<String>) {
-        self.commit = text;
-    }
-
-    fn on_action_submit(&mut self) {
-        self.submit = true;
-    }
-
-    /// `done`: takes the completed edit and resets pending state for the next cycle.
-    fn take_done(&mut self) -> TextInputEdit {
-        TextInputEdit { commit: self.commit.take(), submit: std::mem::take(&mut self.submit) }
-    }
-}
-
-/// One completed `done` cycle's edit (ADR-0027's `TextInputEdit` shape, borrowed from
-/// Noctalia's `TextInputEdit`) -- this slice only threads `commit`/`submit` through to
-/// `shared::SecureBuffer`; see [`apply_edit`]'s doc comment for `preedit`/delete-surrounding-text.
-struct TextInputEdit {
-    commit: Option<String>,
-    submit: bool,
-}
-
-/// Applies one completed edit to `buffer` (ADR-0027, ADR-0009's diff-based edit model): only
-/// `commit_string`'s final text is pushed. `preedit_string`'s transient composition text is
-/// deliberately never pushed here -- real IME composition revises or clears a preedit before it
-/// commits, and an append-only `SecureBuffer` has no way to "undo" a stale revision; pushing
-/// every intermediate preedit would corrupt the secret with duplicated composition fragments.
-///
-/// ponytail: `delete_surrounding_text` (backspace) isn't applied either -- `shared::SecureBuffer`
-/// (ADR-0014) is append-only by design, with zero production callers (and so no truncate method)
-/// until this slice. Upgrade path: give `SecureBuffer` a zeroize-on-shrink truncate method
-/// (tested the same allocator-hook way `push_str`'s growth path already is in
-/// `shared/tests/secure_buffer_growth_zeroizes.rs`) and apply `before_length`/`after_length` here
-/// once it exists.
-///
-/// Returns whether this edit's `action` was `ACTION_SUBMIT`.
-fn apply_edit(buffer: &mut shared::SecureBuffer, edit: TextInputEdit) -> bool {
-    if let Some(commit) = edit.commit {
-        buffer.push_str(&commit);
-    }
-    edit.submit
 }
 
 /// `layout`'s `LayerKind` to the protocol's own stacking level. Pure, and one of the
@@ -912,13 +964,25 @@ fn popup_visibility_action(visible: bool, exists: bool, dismissed_at: Option<u64
 /// the "keep the shell up" fallback the rest of this file follows: the bar comes up, painting
 /// nothing, and the next successful re-resolve fills it in.
 ///
-/// For the two roles docs/adr/0049 decision 1 gives create-and-destroy semantics it is the opposite
-/// answer. An absent tree there would create an `xdg_toplevel` for every declared `window` and an
-/// `xdg_popup` for every declared `popup`, so one failed apply opens the dev config's empty
-/// `settings` window, which claims a tile and takes focus. An absent tree is not a declaration of
-/// `visible = true`.
+/// The other three roles all answer `false`, and each for its own reason rather than by sharing a
+/// fallback arm. For the two docs/adr/0049 decision 1 gives create-and-destroy semantics, an absent
+/// tree would create an `xdg_toplevel` for every declared `window` and an `xdg_popup` for every
+/// declared `popup`, so one failed apply opens the dev config's empty `settings` window, which
+/// claims a tile and takes focus. An absent tree is not a declaration of `visible = true`.
+///
+/// A `lock` is the fourth answer and it is a different kind of `false`: § 6.4 gives a `lock` no
+/// `visible` property at all, because the compositor owns when those surfaces exist
+/// (docs/adr/0042), and [`App::create_surfaces`] accordingly hands this value to `create_panel`,
+/// `create_window` and `create_popup` and *not* to `create_lock`. So the value is unread for this
+/// role today, and `false` is still the only answer worth writing down: it is the one that stays
+/// correct if a future caller does read it, since a `lock` that has not been granted is not up.
+/// Spelling all four arms out is what stopped `Lock` being silently absorbed into a `matches!`
+/// fallback the moment the role was added.
 fn starting_visible(resolved: Option<bool>, roster: &SurfaceSpec) -> bool {
-    resolved.unwrap_or(matches!(roster, SurfaceSpec::Panel(_)))
+    resolved.unwrap_or(match roster {
+        SurfaceSpec::Panel(_) => true,
+        SurfaceSpec::Window(_) | SurfaceSpec::Popup(_) | SurfaceSpec::Lock(_) => false,
+    })
 }
 
 /// One surface's [`SurfaceSpec`] re-derived from its resolved properties, and the § 6 role word for
@@ -942,7 +1006,156 @@ fn resolved_surface_spec(
         SurfaceSpec::Panel(_) => ("panel", node::panel_spec(properties).map(SurfaceSpec::Panel)),
         SurfaceSpec::Window(_) => ("window", node::window_spec(properties).map(SurfaceSpec::Window)),
         SurfaceSpec::Popup(_) => ("popup", node::popup_spec(properties).map(SurfaceSpec::Popup)),
+        SurfaceSpec::Lock(_) => ("lock", node::lock_spec(properties).map(SurfaceSpec::Lock)),
     }
+}
+
+/// docs/adr/0052 decision 3's refusal, as the sentence the user reads. A config that declares no
+/// `lock` node cannot be locked, and the reasoning is worth stating where it is enforced: acquiring
+/// the lock anyway paints nothing, the protocol guarantees the compositor will not unlock on client
+/// death (docs/adr/0042), and the only way out is a VT switch and killing the shell. Locking a user
+/// out of their own session over a config omission is not fail-secure, it is a denial of service
+/// spelled the same way. Fail-secure is about a lock that was taken; this is one that never was, and
+/// nothing was protected by it a moment earlier.
+const NO_LOCK_DECLARED: &str =
+    "this config declares no `lock` surface (§ 6.4), so locking the session would leave a black screen with no password field and no way back \
+     in short of a VT switch; the lock was refused (docs/adr/0052 decision 3)";
+
+/// The `(capability, action)` pair that reaches PAM, and the only one that can ever end a session
+/// lock. `supervisor/src/main.rs` routes `SecureSubmit { capability: "lock", action:
+/// "authenticate" }` to the PAM worker and answers a `PamOutcome::Success` with the one
+/// `SetSessionLock { locked: false }` this process will ever see; every other pair lands in some
+/// other capability's dispatch and can no more unlock the session than a `print` could.
+const UNLOCK_TARGET: (&str, &str) = ("lock", "authenticate");
+
+/// The second half of docs/adr/0052 decision 3's refusal, and the one the guard was missing.
+///
+/// `node::lock_spec` requires an `id` and nothing else -- `child` is optional -- so `lock { id =
+/// "x" }` is a legal declaration that resolves to a surface with no password field, an empty input
+/// region and a transparent buffer. Counting tracked `lock` instances therefore said "a lock screen
+/// exists" for exactly the black screen the decision refuses the lock to avoid, reached *through*
+/// the guard rather than around it. The condition that actually matters is not whether a `lock`
+/// node was written but whether the tree under it holds a [`UNLOCK_TARGET`] field, because that is
+/// the only thing in a config that can produce the `SecureSubmit` the Supervisor answers with an
+/// unlock.
+///
+/// A separate sentence from [`NO_LOCK_DECLARED`] because they are separate edits: one config is
+/// missing a `lock` node, the other is missing a `textfield` inside the one it has.
+const LOCK_CANNOT_AUTHENTICATE: &str =
+    "this config's `lock` surface (§ 6.4) does not hold exactly one `textfield` with `secure_submit = { capability = \"lock\", action = \"authenticate\" }` \
+     and nothing else, so the compositor handing it keyboard focus would arm no field, nothing on it could ever authenticate, and the only way back in \
+     would be a VT switch; the lock was refused (docs/adr/0052 decision 3)";
+
+/// A `SetSessionLock { locked: false }` that reached a lock object the compositor never answered
+/// with `locked`. See [`App::release_session_lock`]: nothing was released, because there was
+/// nothing up to release.
+const LOCK_NEVER_GRANTED: &str =
+    "the session lock was given up before the compositor ever granted it (no `ext_session_lock_v1::locked` arrived), so nothing was unlocked";
+
+/// The other half of `finished`: the compositor answered the `lock` request with an immediate
+/// refusal instead of `locked`. Almost always another lock client already holds the session lock,
+/// which the protocol names first among its reasons, but it is compositor policy and not something
+/// this side of the wire can narrow down further -- so the message says what is known and does not
+/// guess.
+const LOCK_DENIED: &str =
+    "the compositor denied the session lock; another lock client most likely holds it already (`ext_session_lock_v1::finished` arrived in place \
+     of `locked`)";
+
+/// What `oblisk.rescue` says when the compositor tore down a lock that really was up. Not a
+/// failure of anything this process did, and the message says so: docs/adr/0052 decision 4 routes
+/// it here rather than to `oblisk.lock`'s `error` because there is no lock screen left on the glass
+/// to read a message on -- the ordinary scene is what came back.
+const LOCK_TORN_DOWN: &str =
+    "the compositor ended the session lock through its own mechanism; the session is unlocked and the lock screen is gone \
+     (`ext_session_lock_v1::finished` after `locked`)";
+
+/// What one `SetSessionLock` asks this process to do, decided before any Wayland object is touched
+/// (docs/adr/0042, docs/adr/0052 decisions 3 and 4).
+///
+/// Pure and separate because the two interesting answers are refusals, and a refusal that only
+/// exists inside a `&mut self` method that also talks to the compositor is a refusal nothing can
+/// test. See [`lock_command`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockCommand {
+    /// Call `SessionLockState::lock` and create the surfaces.
+    Acquire,
+    /// Call `SessionLock::unlock`, then tear the surfaces down. **The only value that unlocks.**
+    Release,
+    /// Touch no protocol object at all; report this as `LockOutcome::Refused` and set `rescue`.
+    Refuse(&'static str),
+    /// The command asks for the state the lock is already in.
+    Nothing,
+}
+
+/// One `SetSessionLock`, resolved against what this process is already holding.
+///
+/// `locked = true` has four answers and only one of them is "take the lock". Two of the other three
+/// are refusals, and docs/adr/0052 decision 3 is both: the lock must be refused *here*, before
+/// `SessionLockState::lock` is called, because a lock that was granted and then found unusable is
+/// exactly the black screen the decision exists to prevent, and the protocol guarantees the
+/// compositor will not unlock when the client dies.
+///
+/// The two refusals ask two different questions, and both have to be asked. `declares_lock` is a
+/// question about the tracked surface set, which is the only place "is there a `lock` instance"
+/// lives. `can_authenticate` is a question about that instance's *resolved tree*, and it is the one
+/// the first check cannot stand in for: `lock { id = "x" }` declares an instance and resolves to
+/// nothing typable (see [`LOCK_CANNOT_AUTHENTICATE`]). Refusing on the first and granting on the
+/// second would be decision 3 enforced against the config that forgot the node and waived for the
+/// config that forgot its contents, which land the user in the same place.
+///
+/// The compositor-cannot-lock case is deliberately **not** an input. `SessionLockState` keeps its
+/// `ext_session_lock_manager_v1` in a `GlobalProxy` and `lock` answers `GlobalError::MissingGlobal`
+/// when there is none, so asking a second time here would mean reading the registry directly and
+/// keeping two answers to one question in step. The caller maps that `Err` to a `Refuse` with the
+/// error's own words.
+///
+/// `locked = false` against nothing held is `Nothing` rather than `Release`, and that is not
+/// defensive tidying: `unlock_and_destroy` on a lock that never got `locked` is the protocol's own
+/// `invalid_unlock` error, and this is the guard that makes the unlock path unable to send one.
+fn lock_command(locked: bool, declares_lock: bool, can_authenticate: bool, lock_held: bool) -> LockCommand {
+    match (locked, lock_held) {
+        (false, true) => LockCommand::Release,
+        (false, false) | (true, true) => LockCommand::Nothing,
+        (true, false) if !declares_lock => LockCommand::Refuse(NO_LOCK_DECLARED),
+        (true, false) if !can_authenticate => LockCommand::Refuse(LOCK_CANNOT_AUTHENTICATE),
+        (true, false) => LockCommand::Acquire,
+    }
+}
+
+/// What one ordered release actually did, given whether `ext_session_lock_v1::locked` had been
+/// dispatched on the lock object being given up (docs/adr/0052 decision 4).
+///
+/// `Unlocked` is a state transition and the Supervisor's `lock::apply` moves its `active` flag on
+/// it, so reporting one for a lock that was never granted tells the Supervisor the session went
+/// from locked to unlocked when it was never locked at all. SCTK's `SessionLock::unlock` is a no-op
+/// below `is_locked()`, so on that branch literally nothing was sent and there is nothing to
+/// announce as having cleared -- [`LOCK_NEVER_GRANTED`] says so instead.
+fn release_outcome(was_locked: bool) -> LockOutcome {
+    if was_locked { LockOutcome::Unlocked } else { LockOutcome::Refused(LOCK_NEVER_GRANTED.to_string()) }
+}
+
+/// Which of `ext_session_lock_v1::finished`'s **two** events this one is (docs/adr/0042,
+/// build-steps.md Phase 23 item 2), decided by the one fact that separates them: whether `locked`
+/// was ever sent on this lock object.
+///
+/// The protocol puts both on one event and describes each separately. "The finished event should be
+/// sent immediately on creation of this object if the compositor decides that the locked event will
+/// not be sent" is a *denial*, typically because another lock client already holds the lock, and
+/// nothing was ever protected by it. "If the locked event is sent on creation of this object the
+/// finished event may still be sent at some later time" is a lock that was really up and that the
+/// compositor then ended through its own secure mechanism, leaving the session unlocked without
+/// anyone here asking for it.
+///
+/// They must not collapse into one report. The Supervisor routes them differently (`lock::apply`),
+/// and a denial is a failure the user has to see while a teardown is a state change the user
+/// already lived through. Build-steps.md Phase 23 item 2 says neither may be swallowed, and this is
+/// where the two are told apart.
+///
+/// `was_locked` is SCTK's own flag: its `Dispatch2` for `ext_session_lock_v1` sets it on `Locked`
+/// and never clears it, including not on `Finished`, so it answers exactly this question and no
+/// bookkeeping of ours can drift from it.
+fn finished_outcome(was_locked: bool) -> LockOutcome {
+    if was_locked { LockOutcome::Finished } else { LockOutcome::Refused(LOCK_DENIED.to_string()) }
 }
 
 /// Which tracked surface a popup roots under (docs/adr/0051 decision 1), as an index into the same
@@ -1150,11 +1363,271 @@ fn submit_frame_for(
     target: Option<&node::SecureSubmitTarget>,
     buffer: &mut shared::SecureBuffer,
 ) -> Option<RendererFrame> {
-    let Some(target) = target else {
+    // An empty buffer is not a password, and sending one is not free. The Supervisor routes it
+    // straight into PAM, which spends one of the user's counted attempts and one `pam_unix` failure
+    // delay answering a keystroke that said nothing -- on the lock screen, where attempts are the
+    // scarce resource. Enter on an empty field does nothing, the way it does in every other password
+    // prompt. Checked before the destination, because it is true whatever the destination was.
+    let Some(target) = target.filter(|_| !buffer.is_empty()) else {
         buffer.zeroize();
         return None;
     };
     Some(secure_submit_frame(generation_id, &target.capability, &target.action, buffer))
+}
+
+/// A focused `secure_submit` field, together with the surface whose tree declared it.
+///
+/// **The surface id is the half the fourth review's defects 2 and 3 were both missing.** Focus used
+/// to be nothing but a destination, so nothing could tell "the field on the surface that currently
+/// has the keyboard" from "the field on a surface this process destroyed ten seconds ago". Two holes
+/// fell out of that, and they are the same hole: [`KeyboardHandler::enter`]'s early returns moved
+/// `keyboard_focus` on and left the old field armed, and every destruction path
+/// ([`App::teardown_lock_surfaces`], [`App::destroy_surface_by_id`], [`App::hide_window`]) tore down
+/// the `wl_surface` that owned the field while the target and the half-typed secret stayed live.
+/// The traced consequence of the second is the login password: type one on the lock screen, let the
+/// compositor send `finished`, and the plaintext sits in `App::secure_buffer` still addressed to
+/// `("lock", "authenticate")` with later bar keystrokes appending to it. `wl_keyboard.leave` is what
+/// used to be relied on to notice, and the protocol does not require a compositor to send one for a
+/// surface the client itself destroyed.
+///
+/// So the field is bound to its surface and [`focus_is_still_armed`] is the one question every
+/// keystroke asks, rather than a clearing call bolted onto each of the five or six sites that can
+/// take a surface away -- which is exactly the shape that left the hole to begin with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FocusedField {
+    /// The `"{id}@{output}"` instance id of the surface the field was declared on.
+    surface_id: String,
+    target: node::SecureSubmitTarget,
+}
+
+/// The one place `App::focused_secure_submit` is ever written, and the reason it is one place.
+///
+/// **A `shared::SecureBuffer`'s lifetime belongs to the field the bytes were typed into, not to the
+/// transport that carried them.** While `zwp_text_input_v3` was the only writer that looked like a
+/// property of its `leave` event, and the scrub lived there. It never was: three other sites cleared
+/// or *reassigned* the focus target and left the plaintext behind -- `KeyboardHandler::leave`,
+/// `SeatHandler::remove_capability`'s keyboard arm, and the press in `PointerHandler::pointer_frame`
+/// that retargets outright. The traced consequence is a credential leak with no lock involved: type
+/// a login password into the lock screen's field and press nothing, let the compositor tear the lock
+/// surfaces down, take keyboard focus on a bar whose sole `secure_submit` is `("network",
+/// "connect")`, type a Wi-Fi PSK, press Enter, and [`submit_frame_for`] addresses
+/// `<login password><psk>` to the network capability. That is precisely the routing docs/adr/0005
+/// exists to make impossible.
+///
+/// So the rule is enforced on the *transition* rather than at each site that performs one: any
+/// change of destination, including one field to another directly, scrubs. A fifth caller added
+/// later inherits it by construction instead of having to remember it.
+///
+/// Re-arming the *same* destination deliberately does not scrub. A press decides focus
+/// unconditionally (docs/adr/0050 decision 4), so clicking twice in the field being typed into
+/// arrives here with the target unchanged, and wiping there would delete half an entry.
+///
+/// A free function taking both halves rather than a `&mut self` method, so the property is testable
+/// without a live Wayland connection -- the same reason [`secure_submit_frame`] is one.
+fn retarget_secure_submit(focused: &mut Option<FocusedField>, buffer: &mut shared::SecureBuffer, next: Option<FocusedField>) {
+    if *focused != next {
+        buffer.zeroize();
+    }
+    *focused = next;
+}
+
+/// Whether this `secure_submit` destination is the one that can end a session lock.
+///
+/// Named rather than compared inline because two callers want it for opposite reasons:
+/// [`lock_command`] refuses a lock screen that has no such field, and nothing else in the file may
+/// quietly grow a second opinion about which pair unlocks. See [`UNLOCK_TARGET`].
+fn unlocks_the_session(target: &node::SecureSubmitTarget) -> bool {
+    (target.capability.as_str(), target.action.as_str()) == UNLOCK_TARGET
+}
+
+/// Every `secure_submit` destination a resolved tree declares, in document order.
+///
+/// Whole-tree, unlike [`focused_target`], and the difference is what each answer is for: a press
+/// names one node, so it walks a hit path and takes the innermost. These two callers have no node
+/// to start from -- one is asking what a surface as a whole offers before a single event has
+/// arrived on it.
+///
+/// A malformed `secure_submit` contributes nothing rather than an error. The config bug is already
+/// reported where it can name the surface it is on (the press path logs it), and neither caller
+/// here has a use for a second copy: a field whose destination cannot be parsed is a field nothing
+/// can address a secret to, which is exactly what "not a candidate" means.
+fn secure_submit_targets(tree: &layout::ResolvedNode) -> Vec<node::SecureSubmitTarget> {
+    let mut found = Vec::new();
+    let mut stack = vec![tree];
+    while let Some(node) = stack.pop() {
+        if node.kind == "textfield"
+            && let Ok(Some(target)) = node::parse_secure_submit(&node.properties)
+        {
+            found.push(target);
+        }
+        stack.extend(node.children.iter().rev());
+    }
+    found
+}
+
+/// The destination a surface takes on *keyboard* focus, when its tree declares exactly one
+/// (build-steps.md Phase 23 item 3).
+///
+/// **Why keyboard focus focuses a field at all.** Until this, `focused_secure_submit` was set only
+/// by a pointer press, which made a lock screen require a mouse click before a keystroke could
+/// reach `shared::SecureBuffer` -- on the one surface whose entire purpose is to accept a password
+/// with the rest of the session hidden behind it. A lock surface has to be typable the moment the
+/// compositor hands it keyboard focus, and the compositor saying "this surface has the keyboard" is
+/// the only signal available before the user has touched anything.
+///
+/// **Exactly one, deliberately.** With two `secure_submit` fields on one surface there is no
+/// non-arbitrary answer to "whose password is this?", and guessing is the thing
+/// [`submit_frame_for`] already refuses to do (docs/adr/0050 decision 4). Zero is the same answer
+/// for the same reason. Both cases leave focus alone for a press to decide, which is what a
+/// multi-field surface has always needed anyway; the rule buys the single-field case, which is
+/// every lock screen and every password prompt.
+fn sole_secure_submit(tree: &layout::ResolvedNode) -> Option<node::SecureSubmitTarget> {
+    let mut targets = secure_submit_targets(tree);
+    (targets.len() == 1).then(|| targets.remove(0))
+}
+
+/// What `focused_secure_submit` becomes when keyboard focus arrives on `surface_id`, given that
+/// surface's resolved tree and whatever is focused now.
+///
+/// **A total function, which is defect 2.** [`KeyboardHandler::enter`] used to spell its two
+/// "nothing to arm" cases -- an untracked surface, and a tracked one declaring no sole
+/// `secure_submit` -- as early returns that moved `keyboard_focus` on and left
+/// `focused_secure_submit` exactly as it was. `apply_secure_key` gates on the focus alone, so
+/// keystrokes arriving on a surface with no password field went on accumulating into the *previous*
+/// surface's field and could still be submitted to that field's capability. Every case answers here,
+/// and `enter` pushes the answer through [`App::focus_secure_submit`] whatever it is, so "nothing to
+/// arm" is the scrub it always should have been.
+///
+/// **What survives an `enter` is a field on the surface that is entering, and only that.** A press
+/// on a surface declaring several `secure_submit` fields picks one that [`sole_secure_submit`]
+/// deliberately refuses to pick, and the compositor's `enter` for that same surface commonly follows
+/// the press that caused it -- so discarding the press's choice would make a multi-field surface
+/// untypable by clicking. Requiring the tree to still declare that destination is what keeps a
+/// reload from leaving the choice pointing at a field the config has since deleted.
+fn focus_on_enter(surface_id: Option<&str>, tree: Option<&layout::ResolvedNode>, current: Option<&FocusedField>) -> Option<FocusedField> {
+    let (id, tree) = (surface_id?, tree?);
+    if let Some(current) = current.filter(|field| field.surface_id == id && secure_submit_targets(tree).contains(&field.target)) {
+        return Some(current.clone());
+    }
+    Some(FocusedField { surface_id: id.to_string(), target: sole_secure_submit(tree)? })
+}
+
+/// Whether a focused field is still armed: its own surface both holds the keyboard and still exists
+/// as a live `wl_surface` in this process.
+///
+/// **Both clauses, and neither is redundant.** The keyboard clause is defect 2: a pointer press arms
+/// focus on whatever surface it landed on, so without it a field on a `keyboard_interactivity =
+/// none` panel stays armed while another surface is the one actually receiving keys. The liveness
+/// clause is defect 3: a `wl_surface` this process destroyed may never produce a `leave` at all, so
+/// the field on a torn-down lock screen would otherwise stay armed with a login password in it.
+///
+/// Asked at the point of use rather than enforced at each site that can break it. There are five or
+/// six such sites today and the next one added would inherit nothing; this way a field is armed only
+/// while both facts are true, by construction.
+fn focus_is_still_armed(field: &FocusedField, keyboard_focus: Option<&str>, its_surface_is_live: bool) -> bool {
+    keyboard_focus == Some(field.surface_id.as_str()) && its_surface_is_live
+}
+
+/// Whether a `lock` surface's resolved tree can actually be authenticated out of -- the predicate
+/// [`lock_command`]'s `can_authenticate` reads, and it is deliberately built out of
+/// [`sole_secure_submit`] rather than out of [`secure_submit_targets`].
+///
+/// **The guard that grants the lock and the rule that arms the keyboard must be one predicate.**
+/// They were two: admission asked whether *any* field in the tree unlocks, focus armed only a
+/// *sole* field. A lock screen with two `secure_submit` fields therefore passed the guard, took the
+/// lock -- which the compositor will not release when the client dies -- and then armed nothing when
+/// the compositor handed the surface keyboard focus. On a keyboard-only machine, or with the second
+/// field buried in a subtree the user cannot see to click, the only way back into the session was a
+/// VT switch. Two predicates that agree in the common case are not a guard; this is one function
+/// with two callers.
+///
+/// Sole-and-unlocking is the right rule of the two, and not merely the stricter one. `any` is not
+/// implementable as a focus rule at all: with two destinations there is no non-arbitrary answer to
+/// "whose password is this?", which is the guess [`submit_frame_for`] already refuses to make
+/// (docs/adr/0050 decision 4). Weakening focus to match `any` would mean picking one field by
+/// document order and sending a lock password to whatever capability that field happened to name.
+/// So the focus rule stays, and admission is what moves to meet it.
+pub(crate) fn tree_can_authenticate(tree: &layout::ResolvedNode) -> bool {
+    sole_secure_submit(tree).as_ref().is_some_and(unlocks_the_session)
+}
+
+/// What one key event does to a focused `secure_submit` field.
+///
+/// Borrowed rather than owned so the decision costs no allocation: the `String` only ever exists
+/// because SCTK already built one on the `KeyEvent`.
+#[derive(Debug, PartialEq, Eq)]
+enum SecureKeyAction<'a> {
+    Append(&'a str),
+    Backspace,
+    /// Escape: throw the whole entry away and stay in the field.
+    Clear,
+    Submit,
+    Ignore,
+}
+
+/// One `wl_keyboard` key, as an edit to a focused `secure_submit` buffer (build-steps.md Phase 23
+/// item 3).
+///
+/// **Why the keyboard and not `zwp_text_input_v3`.** text-input-v3 only ever produces a
+/// `commit_string` when the compositor has an input method bound to the seat, so on an ordinary
+/// session with no IME running -- the normal case, and the case on the machine this was found on --
+/// not one byte reached `shared::SecureBuffer`, no `SecureSubmit` was ever built, and a lock that
+/// had been granted could not be authenticated out of at all. It is also the security-correct
+/// transport independently of that: a password must not be routed through an input method, which is
+/// why swaylock and hyprlock read xkb directly and do not bind text-input either.
+///
+/// **So the `zwp_text_input_v3` binding is gone entirely, and this is what replaced it.** Keeping
+/// it would have left two independent writers on one `shared::SecureBuffer` -- this one and
+/// `handle_text_input_event`'s `done` arm -- with an IME able to land a character through both, and
+/// a live `ContentPurpose::Password` session sitting open beside the keyboard reader for a protocol
+/// docs/adr/0027's amendment says must never see a password in the first place. Nothing else
+/// consumed it: `on_change`/`on_submit` were never wired to anything, so the bridge served only the
+/// one field kind that must not use it. Deleted rather than left dormant, since a dormant enabled
+/// text-input object is still an IME session the compositor may route keystrokes into.
+///
+/// docs/adr/0027 still records the design and it is still the right one for the *other* field kind:
+/// what brings the binding back is an ordinary Lua-readable `textfield` with `on_change`/`on_submit`
+/// (§ 5.2 item 8's unmasked half), which needs IME composition and must not be a raw keysym reader.
+/// That one binds without `ContentPurpose::Password`, writes a Lua-visible buffer rather than this
+/// one, and shares nothing with this path but the node kind.
+///
+/// **This adds no IDL surface, and § 5.2 still declares no key handler.** Nothing here reaches Lua:
+/// the bytes go into a native buffer and out to the Supervisor, which is the whole definition of a
+/// `secure_submit` field (docs/adr/0005), and a key that does not land in one is [`Ignore`d]. The
+/// old comment on the empty `press_key` was right that docs/adr/0050 does not invent an `on_key`
+/// property; it stays right, because this is not one.
+///
+/// [`Ignore`d]: SecureKeyAction::Ignore
+///
+/// **Control characters are filtered by their text, not by an allow-list of keysyms.** `utf8` is
+/// `Some` for Escape, Tab and Return alike -- xkbcommon hands back the C0 control character -- so an
+/// unfiltered append would bury an ESC byte inside a secret and leave PAM rejecting it for no
+/// visible reason.
+///
+/// `repeat` exists for one case: a held Enter must not submit twice. A submit zeroizes the buffer as
+/// it reads it (see [`secure_submit_frame`]), so the repeat would send an *empty* password to PAM
+/// and spend one of the user's attempts on it. Characters and Backspace repeat normally, which is
+/// what every text field does.
+fn secure_key_action<'a>(event: &'a KeyEvent, repeat: bool) -> SecureKeyAction<'a> {
+    match event.keysym {
+        Keysym::Return | Keysym::KP_Enter => {
+            if repeat {
+                SecureKeyAction::Ignore
+            } else {
+                SecureKeyAction::Submit
+            }
+        }
+        Keysym::BackSpace => SecureKeyAction::Backspace,
+        // Escape used to fall through to the control-character filter below and be ignored, which
+        // left one Backspace per character as the only way to abandon a mistyped password -- on the
+        // one surface where getting it wrong costs a counted PAM attempt. Every other password
+        // prompt clears on Escape; so does this one.
+        Keysym::Escape => SecureKeyAction::Clear,
+        _ => match event.utf8.as_deref() {
+            Some(text) if !text.is_empty() && !text.chars().any(char::is_control) => SecureKeyAction::Append(text),
+            _ => SecureKeyAction::Ignore,
+        },
+    }
 }
 
 /// Whether a release on `instance_id`, over the button at `released_on`, completes `armed`
@@ -1626,7 +2099,269 @@ impl App {
                 SurfaceSpec::Panel(panel) => self.create_panel(qh, panel, instance, &outputs, visible),
                 SurfaceSpec::Window(window) => self.create_window(qh, window, instance, visible),
                 SurfaceSpec::Popup(popup) => self.create_popup(qh, popup, instance, visible),
+                SurfaceSpec::Lock(_) => self.create_lock(instance, &outputs),
             }
+        }
+        // The "and any new outputs as they are advertised" half of `ext-session-lock-v1`'s own
+        // expectation (docs/adr/0042, build-steps.md Phase 23 item 1). A no-op unless a lock is
+        // being held right now, which at startup it never is; on a monitor hotplug it is what gives
+        // the freshly advertised output its lock surface instead of leaving the compositor to paint
+        // a solid colour there.
+        self.ensure_lock_surfaces(qh);
+    }
+
+    /// [`App::create_surfaces`]'s `lock` arm: the tracking entry always, the
+    /// `ext_session_lock_surface_v1` never from here (docs/adr/0052 decision 2).
+    ///
+    /// The entry exists for [`App::create_window`]'s reason and for one that is stronger. It is what
+    /// makes the retained scene resolve this instance's tree at all, which is what lets an in-place
+    /// reload restyle a live lock screen; and it is the **only** record that this config declares a
+    /// lock screen, which is the fact docs/adr/0052 decision 3 refuses a lock on the absence of.
+    /// [`App::set_session_lock`] asks that question by looking for these entries, so there is no
+    /// second roster to keep in step with this one.
+    ///
+    /// No `visible` is consulted and there is none to consult: `layout::node::lock_spec` refuses the
+    /// property outright, because the compositor owns this surface's lifetime end to end. The
+    /// resolved tree's default `true` is not a statement the config made.
+    ///
+    /// The `wl_output` is kept rather than the output's name, for the reason [`TrackedRole::Lock`]
+    /// gives: `get_lock_surface` takes the proxy, and this is the one place it is already in hand.
+    fn create_lock(&mut self, instance: &SurfaceInstance, outputs: &HashMap<String, wl_output::WlOutput>) {
+        let Some(output) = outputs.get(&instance.output) else {
+            eprintln!("[oblisk-renderer] instance {:?} names an output that has since gone; skipping", instance.instance_id);
+            return;
+        };
+        self.surfaces.push(TrackedSurface {
+            role: TrackedRole::Lock { output: output.clone(), surface: None },
+            bound: None,
+            surface_id: instance.instance_id.clone(),
+            map_state: MapState::Unmapped,
+            null_buffered: false,
+            configured_size: (0, 0),
+        });
+    }
+
+    /// One `ext_session_lock_surface_v1` for every declared `lock` instance that does not have one
+    /// yet, or nothing at all if this process holds no lock (build-steps.md Phase 23 item 1).
+    ///
+    /// **Idempotent per output, and that is a protocol requirement rather than tidiness.** A second
+    /// lock surface on one output is a `duplicate_output` error, which kills the connection with the
+    /// session still locked. `layout::instance::expand_instances` produces one `lock` instance per
+    /// output *per declared lock spec* (docs/adr/0052 decision 2), so "this instance already has a
+    /// surface" and "this output already has one" are the same test only while a config declares at
+    /// most one `lock` -- which is exactly what `crate::socket`'s `surface_specs` now refuses to let
+    /// through, for this invariant. The `surface: None` in the pattern below is the per-instance
+    /// half; that refusal is the other half, and neither is sufficient alone.
+    ///
+    /// Three callers, one job, because "make the set of lock surfaces match the set of outputs" is
+    /// the same job whenever either set moves. Right after `lock` succeeds, because the protocol
+    /// asks clients to "immediately create lock surfaces for all outputs currently present" -- the
+    /// compositor may wait for them before it sends `locked`, precisely to avoid showing a blank
+    /// frame first, and a client that waits for `locked` to create them guarantees that blank frame
+    /// for however long the compositor's time limit is. Again on `locked` itself, for an output
+    /// advertised inside that window. And from [`App::create_surfaces`], which is the hotplug path.
+    ///
+    /// **No commit here, and this is the one role where that is not an oversight.** Every other
+    /// create path in this file ends in the initial commit its shell protocol requires;
+    /// `ext_session_lock_surface_v1` inverts the rule -- "Committing the surface before acking the
+    /// first configure is a protocol error" -- and the compositor sends that first configure
+    /// immediately on `get_lock_surface`. So `MapState::AwaitingConfigure` here means what it means
+    /// everywhere else, the ordinary [`App::bind_and_clear`] path does the whole map, and SCTK has
+    /// already acked by the time it runs.
+    fn ensure_lock_surfaces(&mut self, qh: &QueueHandle<App>) {
+        // Cloned out of `self` so the `&mut self` calls in the loop are free to run; `SessionLock`
+        // is an `Arc` handle, so this is a refcount bump and not a second lock.
+        let Some(lock) = self.session_lock.clone() else {
+            return;
+        };
+        for index in 0..self.surfaces.len() {
+            let TrackedRole::Lock { output, surface: None } = &self.surfaces[index].role else {
+                continue;
+            };
+            let output = output.clone();
+            let wl_surface = self.compositor_state.create_surface(qh);
+            let lock_surface = lock.create_lock_surface(wl_surface, &output, qh);
+            if let TrackedRole::Lock { surface, .. } = &mut self.surfaces[index].role {
+                *surface = Some(lock_surface);
+            }
+            self.surfaces[index].map_state = MapState::AwaitingConfigure;
+            eprintln!("[oblisk-renderer] {}: lock surface created, awaiting its configure", self.surfaces[index].surface_id);
+        }
+    }
+
+    /// Destroys every live `ext_session_lock_surface_v1` and frees the EGL side behind it, leaving
+    /// the tracking entries where they are.
+    ///
+    /// The order is [`App::destroy_surface_by_id`]'s minus its last step: `eglDestroySurface` and
+    /// `wl_egl_window_destroy` first ([`App::release_bound`]), then the `SessionLockSurface` handle,
+    /// whose `Drop` sends `destroy` and then destroys the `wl_surface` underneath it. A
+    /// `wl_egl_window` still pointing at a destroyed `wl_surface` is the failure that order exists
+    /// to prevent, and it does not care which protocol destroyed the surface.
+    ///
+    /// The entries survive because the declarations did. A `lock` instance is one retained node for
+    /// as long as the config declares it, and the next lock builds its surfaces again through
+    /// [`App::ensure_lock_surfaces`] -- the same shape a `window` has when `visible` goes false.
+    ///
+    /// **When this runs relative to the unlock is load-bearing.** On the ordered-unlock path it runs
+    /// *after* `unlock_and_destroy`, because destroying a lock surface whose output is still active
+    /// while the session is still locked makes the compositor "fall back to rendering a solid
+    /// color" -- a visible flash between the password being accepted and the desktop coming back.
+    /// On the `finished` path there is no such window: the compositor has already ended the lock.
+    fn teardown_lock_surfaces(&mut self) {
+        for index in 0..self.surfaces.len() {
+            if !matches!(self.surfaces[index].role, TrackedRole::Lock { surface: Some(_), .. }) {
+                continue;
+            }
+            self.release_bound(index);
+            if let TrackedRole::Lock { surface, .. } = &mut self.surfaces[index].role {
+                *surface = None;
+            }
+            self.surfaces[index].map_state = MapState::Unmapped;
+            eprintln!("[oblisk-renderer] {}: lock surface destroyed", self.surfaces[index].surface_id);
+        }
+    }
+
+    /// One `SetSessionLock` from the Supervisor (docs/adr/0042, docs/adr/0052 decision 1). The
+    /// decision is [`lock_command`], which is pure and tested; this is the protocol traffic it does
+    /// not do.
+    ///
+    /// `declares_lock` is counted off the tracked surface set rather than off the roster or the
+    /// scene, because that set is the one place the question has a single answer: `create_lock`
+    /// pushes an entry per `lock` instance and `destroy_surface_by_id` removes it with its output.
+    /// A session with no outputs at all therefore declares no lock instance and is refused, which is
+    /// right -- there is no screen to lock.
+    ///
+    /// `can_authenticate` is the second question and it goes to the *scene*, because that is where
+    /// the answer lives: a tracked instance says a `lock` node was written, and only its resolved
+    /// tree says whether anything under it could ever produce the `SecureSubmit` that unlocks (see
+    /// [`LOCK_CANNOT_AUTHENTICATE`]). The per-tree answer is [`tree_can_authenticate`], which is the
+    /// *same* predicate keyboard focus arms on -- see its doc comment for why two nearly-equal rules
+    /// here strand the machine. `any`, not `all`, across the instances: one lock surface per output
+    /// is the protocol's requirement and they all resolve from the same declaration, so a single
+    /// typable one is the config being correct rather than a partial answer.
+    ///
+    /// A `lock` that fails at the protocol level is a refusal and not a crash, which is the same
+    /// tolerance [`App::show_window`] applies to a missing `xdg_wm_base`: the shell keeps painting,
+    /// and the one thing that did not happen says so through the channel docs/adr/0052 decision 4
+    /// named for it.
+    fn set_session_lock(&mut self, qh: &QueueHandle<App>, locked: bool) {
+        let lock_instances: Vec<String> = self
+            .surfaces
+            .iter()
+            .filter(|tracked| matches!(tracked.role, TrackedRole::Lock { .. }))
+            .map(|tracked| tracked.surface_id.clone())
+            .collect();
+        let can_authenticate = lock_instances.iter().filter_map(|id| self.client.scene().surface(id)).any(|tree| tree_can_authenticate(&tree));
+        match lock_command(locked, !lock_instances.is_empty(), can_authenticate, self.session_lock.is_some()) {
+            LockCommand::Nothing => {}
+            LockCommand::Refuse(reason) => self.refuse_lock(reason),
+            LockCommand::Acquire => match self.session_lock_state.lock(qh) {
+                Ok(lock) => {
+                    self.session_lock = Some(lock);
+                    // Armed here rather than on `locked`. A reload landing between the request and
+                    // the grant would otherwise strip the password field out of the very tree the
+                    // compositor is about to put on screen -- see `crate::socket`'s
+                    // `lock_stays_authenticatable`, which is also why nothing but the fact of the
+                    // lock is handed over: the ids the guard above answered on are the ids that
+                    // existed *now*, and a monitor hotplug retires and replaces them.
+                    self.client.set_session_locked(true);
+                    self.ensure_lock_surfaces(qh);
+                    eprintln!("[oblisk-renderer] session lock requested; waiting for the compositor's `locked` or `finished`");
+                }
+                // The compositor advertises no `ext_session_lock_manager_v1`. Carried as the
+                // error's own words rather than a constant beside the other two, because this is
+                // the one refusal whose cause is outside both this shell and its config, and
+                // `GlobalError` already says which global is missing.
+                Err(err) => {
+                    let reason = format!("this compositor cannot lock the session: {err} (docs/adr/0042)");
+                    self.refuse_lock(&reason);
+                }
+            },
+            LockCommand::Release => self.release_session_lock(),
+        }
+    }
+
+    /// `unlock_and_destroy`, and **the only path in this process that performs one** (docs/adr/0042,
+    /// docs/adr/0052's consequences).
+    ///
+    /// It is reachable from exactly one place: a `SetSessionLock { locked: false }`, which the
+    /// Supervisor sends only from the `pam_outcomes` arm of its `select!` loop, on a
+    /// `PamOutcome::Success`. The PAM conversation itself is spawned off that loop rather than
+    /// awaited inside the `secure_submit(lock, authenticate)` arm that starts it, so the arm that
+    /// *begins* an attempt and the arm that *orders* the unlock are two, but the property is
+    /// unchanged and is the reason this comment exists: `LockController::unlock` still has exactly
+    /// one call site and it is still reached only on a `Success`, which makes "never unlock except
+    /// on a successful authentication" a property of one call site in the Supervisor rather than a
+    /// rule the Renderer has to be trusted with. **No convenience path may be added here** -- not on
+    /// shutdown, not on a `finished`, not on a config reload. SCTK's `Drop` deliberately does not
+    /// unlock, and the reason is the whole security model: a Renderer that dies while locked leaves
+    /// the session locked, and anything in this file that unlocked on its own initiative would be
+    /// the one way to turn a crash into an unlocked desktop.
+    ///
+    /// `SessionLock::unlock` is itself a no-op unless `is_locked()`, so the in-flight case -- a
+    /// `lock` request whose `locked` has not arrived -- sends nothing and the `Drop` below sends the
+    /// plain `destroy` the protocol requires there instead. That is not belt-and-braces on top of
+    /// [`lock_command`]'s guard; it is SCTK's guarantee, and it is what makes the two cases one
+    /// function. **It is also why [`run`] round-trips before calling this** -- `is_locked()` is set
+    /// when `locked` is *dispatched*, not when the compositor sends it, so without that round trip
+    /// a `locked` sitting unread on the wire would make this send a plain `destroy` that the
+    /// compositor answers with `invalid_destroy`.
+    ///
+    /// The report matches what happened rather than what was asked for ([`release_outcome`]): a
+    /// no-op `unlock` released nothing, and the Supervisor's `active` flag moves on these reports.
+    fn release_session_lock(&mut self) {
+        let Some(lock) = self.session_lock.take() else {
+            return;
+        };
+        // Read before the unlock, because `unlock_and_destroy` is a destructor and the flag it is
+        // gated on is the same one being reported here.
+        let was_locked = lock.is_locked();
+        lock.unlock();
+        // Sends `ext_session_lock_v1.destroy` if `unlock` did not already destroy the object, which
+        // is SCTK's sanctioned sequence: its own `SessionLock` doc says a locked object must be
+        // `unlock`ed before it is dropped.
+        drop(lock);
+        // After the unlock, per [`App::teardown_lock_surfaces`]'s last paragraph.
+        self.teardown_lock_surfaces();
+        // Nothing is locked any more, so an in-place reload is free to reshape the lock screen
+        // however it likes again, including out of existence.
+        self.client.set_session_locked(false);
+        let outcome = release_outcome(was_locked);
+        match &outcome {
+            LockOutcome::Unlocked => eprintln!("[oblisk-renderer] the session lock was released"),
+            _ => eprintln!("[oblisk-renderer] {LOCK_NEVER_GRANTED}"),
+        }
+        self.report_lock(outcome);
+    }
+
+    /// A lock that was asked for and did not happen: logged, pushed to `oblisk.rescue`, and reported
+    /// (docs/adr/0052 decision 4).
+    ///
+    /// `rescue` is the right channel and the ADR's reasoning is worth restating where the write
+    /// happens: a refused lock leaves the *ordinary* scene on the glass, so there is no lock screen
+    /// for the message to appear on, and `rescue` is rendered by the config's own surfaces. The
+    /// wrong-password case is the opposite and deliberately does not come here -- it happens with
+    /// the lock surfaces mapped and everything else hidden, so it reaches the config as `oblisk.lock`
+    /// state instead.
+    ///
+    /// Nothing clears this again on purpose. A later successful evaluation clears `rescue` on its
+    /// own success path (`RendererClient::handle_reevaluate`), which is exactly the event that
+    /// matters: the ordinary way out of `NO_LOCK_DECLARED` is editing the config to declare a lock
+    /// screen, and that edit *is* a re-evaluation. Clearing it on a subsequent successful lock
+    /// instead would stamp on an unrelated evaluation failure that had nothing to do with locking.
+    fn refuse_lock(&mut self, reason: &str) {
+        eprintln!("[oblisk-renderer] the session lock was refused: {reason}");
+        self.client.set_rescue_state(true, reason);
+        self.report_lock(LockOutcome::Refused(reason.to_string()));
+    }
+
+    /// Queues one `LockReport` on the outbound channel, the way `ReadySignal` and
+    /// `PresentationEvidence` are queued. Every lock state change goes through here, so the
+    /// Supervisor's `lock::apply` sees each transition exactly once -- its `active` flag moves on
+    /// these reports alone and on nothing it ordered itself.
+    fn report_lock(&mut self, outcome: LockOutcome) {
+        if let Err(e) = self.outbound_tx.send(RendererFrame::LockReport(LockReport { outcome })) {
+            eprintln!("[oblisk-renderer] failed to queue a LockReport for the socket thread: {e}");
         }
     }
 
@@ -2063,6 +2798,22 @@ impl App {
                     "[oblisk-renderer] {surface_id}: re-resolved popup properties are invalid, keeping the last applied ones: {err}"
                 ),
             },
+            // Nothing to push, and § 6.4 is the reason rather than an omission. A lock surface has
+            // no protocol field a config could set: `ext_session_lock_surface_v1` has exactly one
+            // request, `ack_configure`, and the size arrives in the configure rather than being
+            // asked for, so a re-parsed `LockSpec` would carry an `id` this surface already has and
+            // nothing else to send.
+            //
+            // The create path *does* call `node::lock_spec`, through [`resolved_surface_spec`], and
+            // the two are not in disagreement: that call exists to rebuild a `SurfaceSpec` for
+            // `create_surfaces` to dispatch its four-arm `match` on, and its `Err` is what makes a
+            // `lock` whose resolved properties are invalid fall back to the roster rather than being
+            // created from them. Here there is no `match` to feed and no object to create, so the
+            // parse would produce a value with no consumer. What does still run for a lock is
+            // everything past this match: the input region, computed from the same resolved tree as
+            // any other surface's, and `apply_visibility`, which deliberately does nothing for this
+            // role.
+            TrackedRole::Lock { .. } => {}
         }
         self.apply_input_region(index, &tree);
         self.apply_visibility(index, tree.visible);
@@ -2250,6 +3001,15 @@ impl App {
             // second, and a dismissed popup sits in `MapState::Unmapped` with `visible` still true
             // -- a state the other two roles never reach.
             TrackedRole::Popup { .. } => self.apply_popup_visibility(index, visible),
+            // The one role where `visible` is not a property at all. `layout::node::lock_spec`
+            // refuses the key outright, so the `true` this is called with is `parse_visible`'s
+            // default and not something the config said. A lock surface's lifetime is the
+            // compositor's from end to end -- created once `locked` arrives, destroyed at
+            // `unlock_and_destroy` -- and between those two points the protocol requires one on
+            // every output, so acting on a `visible` here could only destroy a surface the
+            // compositor is still showing and make it fall back to a solid colour (docs/adr/0042,
+            // docs/adr/0052 decision 2).
+            TrackedRole::Lock { .. } => {}
         }
     }
 
@@ -2996,97 +3756,104 @@ impl App {
         );
     }
 
-    /// Binds `zwp_text_input_manager_v3`, creates one `zwp_text_input_v3` for this seat, and
-    /// `enable()`s it unconditionally (build-steps.md Phase 15 item 2; ADR-0009, ADR-0027).
-    ///
-    /// ponytail: `enable()` is unconditional and permanent, so this seat's text input stays on for
-    /// the process's whole life rather than following focus. Attribution no longer depends on that
-    /// -- a press now names the `textfield` a submit belongs to (docs/adr/0050 decision 4,
-    /// [`focused_target`]), and a submit with no focused field sends nothing. What is still crude
-    /// is the protocol side: a real implementation would `disable()` when no `textfield` holds
-    /// focus, so a compositor's IME popup does not follow a pointer over a bar that is not asking
-    /// for text. Upgrade path: drive `enable`/`disable` from the same press that sets
-    /// `focused_secure_submit`, once a `textfield` paints and there is something to test it
-    /// against.
-    ///
-    /// A compositor with no seat, or no `zwp_text_input_manager_v3` global, leaves `text_input`
-    /// `None` -- logged, not fatal, same tolerance `PresentationTimeState::bind` already applies
-    /// to an optional protocol.
-    ///
-    /// ponytail: ADR-0009 names the Wayland-thread protocol owner a `TextInputService`; this
-    /// slice inlines its state (`text_input`, `text_input_pending`, `secure_buffer`) directly
-    /// onto `App` instead of extracting that type, since `App` is still this thread's only
-    /// `Dispatch` target. Upgrade path: pull these fields and their `Dispatch2` impls into a real
-    /// `TextInputService` type once a second consumer (or the focus system above) needs to own
-    /// it independently of `App`.
-    fn bind_text_input(&mut self, globals: &GlobalList, qh: &QueueHandle<App>) {
-        let Some(seat) = self.seat_state.seats().next() else {
-            eprintln!("[oblisk-renderer] no wl_seat advertised; secure_submit textfields will never receive input");
-            return;
-        };
-
-        // Bound up to v2, not v1: the `action` event this module's whole submit detection
-        // depends on (`handle_text_input_event`'s `Action::Submit` match) is `since="2"` in the
-        // protocol XML. `GlobalList::bind` negotiates `min(advertised, version_end)`, so binding
-        // `1..=1` silently caps every object this manager creates at v1 -- a compositor would
-        // never send `action` at all, and no `textfield` would ever submit.
-        let manager = match globals.bind::<ZwpTextInputManagerV3, App, TextInputManagerData>(qh, 1..=2, TextInputManagerData) {
-            Ok(manager) => manager,
-            Err(e) => {
-                log_bind_failure("<text-input>", "zwp_text_input_manager_v3::bind", e);
-                return;
-            }
-        };
-
-        let text_input = manager.get_text_input(&seat, qh, TextInputData);
-        // ADR-0005's amendment (ADR-0009): tell the compositor/IME this field is sensitive,
-        // independent of and in addition to the Lua-boundary protection -- skips logging,
-        // autocorrect, and clipboard-history capture on a well-behaved IME. Set unconditionally
-        // rather than gated on a specific node's `mask_character`: this slice's only consumer of
-        // `zwp_text_input_v3` at all is the secure_submit path (no generic `on_change` frontend
-        // exists yet), so every text-input session bound here already is one.
-        text_input.set_content_type(zwp_text_input_v3::ContentHint::SensitiveData, zwp_text_input_v3::ContentPurpose::Password);
-        text_input.enable();
-        text_input.commit();
-        self.text_input = Some(text_input);
+    /// Every write to `focused_secure_submit` in this file, funnelled so [`retarget_secure_submit`]
+    /// gets to enforce the buffer's lifetime. See that function for the leak this closes; assigning
+    /// the field directly anywhere else reopens it.
+    fn focus_secure_submit(&mut self, next: Option<FocusedField>) {
+        retarget_secure_submit(&mut self.focused_secure_submit, &mut self.secure_buffer, next);
     }
 
-    /// Dispatches one raw `zwp_text_input_v3` event (called from [`TextInputData`]'s
-    /// [`Dispatch2`] impl below): accumulates `commit_string`/`action` into
-    /// [`TextInputPending`], and on `done`, applies the completed edit and finalizes a
-    /// `secure_submit` if it carried `ACTION_SUBMIT`.
-    fn handle_text_input_event(&mut self, event: zwp_text_input_v3::Event) {
-        match event {
-            zwp_text_input_v3::Event::CommitString { text } => self.text_input_pending.on_commit_string(text),
-            zwp_text_input_v3::Event::Action { action, .. } => {
-                if matches!(action, WEnum::Value(zwp_text_input_v3::Action::Submit)) {
-                    self.text_input_pending.on_action_submit();
-                }
+    /// Whether `instance_id` is still a surface this process has a live `wl_surface` for.
+    ///
+    /// `TrackedRole::wl_surface` is the whole test, and it is the right one because it answers
+    /// `None` for both shapes a gone surface takes here: the entry removed outright
+    /// ([`App::destroy_surface_by_id`]) and the entry kept with its role object dropped
+    /// ([`App::hide_window`], [`App::teardown_lock_surfaces`], [`App::drop_popup_object`]).
+    fn surface_is_live(&self, instance_id: &str) -> bool {
+        self.surfaces.iter().any(|tracked| tracked.surface_id == instance_id && tracked.role.wl_surface().is_some())
+    }
+
+    /// Drops the focused field, and the half-typed secret with it, the moment [`focus_is_still_armed`]
+    /// stops holding -- through [`App::focus_secure_submit`], so the scrub is the same one every
+    /// other transition gets.
+    ///
+    /// Called before every keystroke, which is what makes the rule load-bearing rather than
+    /// advisory: nothing can reach `secure_buffer` through a focus that has gone stale, whatever
+    /// took the surface away and whether or not a `leave` ever followed.
+    fn prune_secure_focus(&mut self) {
+        let armed = self
+            .focused_secure_submit
+            .as_ref()
+            .is_some_and(|field| focus_is_still_armed(field, self.keyboard_focus.as_deref(), self.surface_is_live(&field.surface_id)));
+        if self.focused_secure_submit.is_some() && !armed {
+            eprintln!("[oblisk-renderer] the focused secure_submit field is no longer the one receiving keys; dropping it and scrubbing its buffer");
+            self.focus_secure_submit(None);
+        }
+    }
+
+    /// The half of [`App::prune_secure_focus`] that does not wait for a keystroke: a field whose
+    /// surface this process destroyed is dropped, and its buffer scrubbed, on the next poll turn.
+    ///
+    /// **Only the liveness clause, deliberately.** `prune_secure_focus`'s other clause is about
+    /// *routing* -- which surface is receiving keys -- and it is only ever wrong at the moment a key
+    /// arrives, which is where it is asked. Applying it once a turn would also disarm the field a
+    /// press on a multi-field surface just chose, in the window before the compositor's matching
+    /// `enter` lands, and `sole_secure_submit` cannot re-choose it (see [`focus_on_enter`]).
+    ///
+    /// What this buys is the residency ceiling defect 3 named: type a password on the lock screen,
+    /// let the compositor send `finished`, and `teardown_lock_surfaces` destroys the `wl_surface`
+    /// without the protocol requiring any `leave` to follow. Without this the plaintext would sit in
+    /// `secure_buffer`, still addressed to `("lock", "authenticate")`, until some later keystroke
+    /// happened to notice -- which on a session where the user walks away is never.
+    fn drop_secure_focus_if_its_surface_is_gone(&mut self) {
+        let gone = self.focused_secure_submit.as_ref().is_some_and(|field| !self.surface_is_live(&field.surface_id));
+        if gone {
+            eprintln!("[oblisk-renderer] the surface holding the focused secure_submit field is gone; dropping it and scrubbing its buffer");
+            self.focus_secure_submit(None);
+        }
+    }
+
+    /// One key event applied to the focused `secure_submit` field, or nothing at all when no field
+    /// is focused (build-steps.md Phase 23 item 3, docs/adr/0005).
+    ///
+    /// The focus check is the gate, and `focused_secure_submit` is exactly the right one to gate on:
+    /// it is `Some` only when some field named a destination for the next secret, so a keystroke
+    /// that reaches the buffer already has somewhere to be sent. A `textfield` with no
+    /// `secure_submit` leaves it `None` (see [`focused_target`]), and a key arriving then is
+    /// dropped rather than accumulated -- there is no destination to address it to, and buffering
+    /// a password for a field that can never submit it is a secret held for no reason.
+    ///
+    /// Nothing here touches Lua. That is the whole of docs/adr/0005: the bytes go from the
+    /// `KeyEvent` into a native `shared::SecureBuffer` and out to the Supervisor, and no Lua value
+    /// is ever built from them.
+    fn apply_secure_key(&mut self, event: &KeyEvent, repeat: bool) {
+        // Before the gate, not after it: the gate reads `focused_secure_submit` alone, and a focus
+        // whose surface is gone or is no longer the one receiving keys is exactly the state this key
+        // must not be appended to (see [`focus_is_still_armed`]).
+        self.prune_secure_focus();
+        if self.focused_secure_submit.is_none() {
+            return;
+        }
+        match secure_key_action(event, repeat) {
+            SecureKeyAction::Append(text) => self.secure_buffer.push_str(text),
+            // `pop_char` zeroizes the bytes it drops rather than only shortening the buffer, which
+            // is what keeps a corrected character from staying readable in this process's heap for
+            // the rest of the entry.
+            SecureKeyAction::Backspace => {
+                self.secure_buffer.pop_char();
             }
-            zwp_text_input_v3::Event::Done { .. } => {
-                let edit = self.text_input_pending.take_done();
-                if apply_edit(&mut self.secure_buffer, edit) {
-                    self.finish_secure_submit();
-                }
+            // Through the seam in both directions rather than reaching for the buffer directly: the
+            // scrub Escape wants *is* the one `retarget_secure_submit` performs on a transition, and
+            // re-arming the identical field immediately afterwards is what leaves the user still in
+            // it, free to retype. A fifth writer of `secure_buffer` with its own idea of what
+            // clearing means is what this file has spent two reviews avoiding.
+            SecureKeyAction::Clear => {
+                let field = self.focused_secure_submit.clone();
+                self.focus_secure_submit(None);
+                self.focus_secure_submit(field);
             }
-            // The text-input session ended, so whatever is half-typed belongs to a field the user
-            // has walked away from (docs/adr/0050 decision 4: focus clears the moment anything says
-            // the user is elsewhere). Both halves matter and the zeroize is the load-bearing one:
-            // no `submit` is ever coming for these bytes, and leaving them in `secure_buffer` means
-            // the *next* field's first submit would carry the previous field's characters and
-            // address them to the next field's capability. That is one password leaking into
-            // another's destination, which is exactly the routing ADR-0005 exists to make
-            // impossible. Scrubbing here costs nothing in the common case, where the buffer is
-            // already empty.
-            zwp_text_input_v3::Event::Leave { .. } => {
-                self.focused_secure_submit = None;
-                self.secure_buffer.zeroize();
-            }
-            // `preedit_string`/`delete_surrounding_text`: acknowledged but not durably applied
-            // to `secure_buffer` -- see `apply_edit`'s doc comment. `enter` is the compositor
-            // offering this seat's input to a surface, which says nothing about *which* node owns
-            // it; that is the press's job (decision 4). `language` does not affect the secret.
-            _ => {}
+            SecureKeyAction::Submit => self.finish_secure_submit(),
+            SecureKeyAction::Ignore => {}
         }
     }
 
@@ -3095,14 +3862,16 @@ impl App {
     /// and leaves `self.secure_buffer` scrubbed and empty on either branch, ready for the next
     /// entry.
     ///
-    /// No focused destination means no frame (docs/adr/0050 decision 4), logged rather than
-    /// silent: a user who typed a password and pressed enter deserves an explanation somewhere for
-    /// why nothing happened, and the explanation is almost always a `textfield` missing its
-    /// `secure_submit` table.
+    /// [`submit_frame_for`] refuses on two counts and both end here: no focused destination
+    /// (docs/adr/0050 decision 4) and an empty buffer. Logged rather than silent, because a user who
+    /// pressed enter deserves an explanation somewhere for why nothing happened, and it is almost
+    /// always a `textfield` missing its `secure_submit` table -- the empty case explains itself on
+    /// the glass, since there is nothing in the field.
     fn finish_secure_submit(&mut self) {
-        let Some(frame) = submit_frame_for(self.generation_id, self.focused_secure_submit.as_ref(), &mut self.secure_buffer) else {
+        let target = self.focused_secure_submit.as_ref().map(|field| &field.target);
+        let Some(frame) = submit_frame_for(self.generation_id, target, &mut self.secure_buffer) else {
             eprintln!(
-                "[oblisk-renderer] secure_submit dropped: no focused textfield named a capability/action to address it to; the buffer was zeroized and nothing was sent"
+                "[oblisk-renderer] secure_submit dropped: nothing had been typed, or no focused textfield named a capability/action to address it to; the buffer was zeroized and nothing was sent"
             );
             return;
         };
@@ -3181,8 +3950,9 @@ impl App {
 /// immediately after its wire write (`crate::socket`'s `pump`); that is as close to the write as
 /// this side of the channel can get, and it is where the pre-ADR-0039 code did it too.
 ///
-/// A free function, not a `&mut self` method, for the same reason `apply_edit` is: it makes the whole read/zeroize contract directly unit-testable, which
-/// nothing involving a live `wl_surface` is.
+/// A free function, not a `&mut self` method, for [`retarget_secure_submit`]'s reason: it makes the
+/// whole read/zeroize contract directly unit-testable, which nothing involving a live `wl_surface`
+/// is.
 fn secure_submit_frame(generation_id: u32, capability: &str, action: &str, buffer: &mut shared::SecureBuffer) -> RendererFrame {
     let frame = RendererFrame::SecureSubmit(SecureSubmit {
         generation_id,
@@ -3194,50 +3964,6 @@ fn secure_submit_frame(generation_id: u32, capability: &str, action: &str, buffe
     frame
 }
 
-/// Zero-sized user-data marker for `zwp_text_input_v3`, following
-/// `smithay_client_toolkit::globals::GlobalData`'s own convention (ADR-0009: a hand-written
-/// `Dispatch` for text-input that slots into the same [`delegate_dispatch2!`] blanket every
-/// other SCTK subsystem in this file already uses). `GlobalData` itself is SCTK's own foreign
-/// type and can't be reused here -- orphan rules block implementing the foreign [`Dispatch2`]
-/// trait for it against a foreign interface type this crate didn't define -- so this crate needs
-/// its own marker types.
-struct TextInputData;
-
-impl Dispatch2<ZwpTextInputV3, App> for TextInputData {
-    fn event(
-        &self,
-        state: &mut App,
-        _proxy: &ZwpTextInputV3,
-        event: zwp_text_input_v3::Event,
-        _conn: &Connection,
-        _qh: &QueueHandle<App>,
-    ) {
-        state.handle_text_input_event(event);
-    }
-}
-
-/// Marker for `zwp_text_input_manager_v3`, which never sends any events (see the XML: only
-/// `destroy`/`get_text_input` requests, no `<event>`) -- generic over `D` since nothing here
-/// touches `App` specifically, matching SCTK's own `GlobalData` impls for similar zero-event
-/// managers.
-struct TextInputManagerData;
-
-impl<D> Dispatch2<ZwpTextInputManagerV3, D> for TextInputManagerData {
-    fn event(
-        &self,
-        _state: &mut D,
-        _proxy: &ZwpTextInputManagerV3,
-        _event: zwp_text_input_manager_v3::Event,
-        _conn: &Connection,
-        _qh: &QueueHandle<D>,
-    ) {
-        // No `<event>` in this interface's XML at all -- the generated `Event` enum is
-        // `#[non_exhaustive]` (future protocol versions might add one), not truly uninhabited,
-        // so this can't be an empty `match event {}`; this can never actually fire at version 1.
-        unreachable!("zwp_text_input_manager_v3 (version 1) has no events to dispatch")
-    }
-}
-
 impl SeatHandler for App {
     fn seat_state(&mut self) -> &mut SeatState {
         &mut self.seat_state
@@ -3245,9 +3971,8 @@ impl SeatHandler for App {
 
     fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
 
-    /// Pointer and keyboard. `bind_text_input` needs the bare `wl_seat` rather than a capability,
-    /// and no touch object is created at all -- § 5.2 has no touch-specific property for one to
-    /// serve.
+    /// Pointer and keyboard, and no touch object at all -- § 5.2 has no touch-specific property for
+    /// one to serve.
     ///
     /// Idempotent by the `is_none` guards, not by trusting the compositor: `wl_seat::capabilities`
     /// is a full re-statement of the current set on every change, so a seat that gains a keyboard
@@ -3293,9 +4018,10 @@ impl SeatHandler for App {
             }
             Capability::Keyboard => {
                 // No keyboard means nothing will ever report the user leaving, so the focus this
-                // was holding is stale from here on (docs/adr/0050 decision 4).
+                // was holding is stale from here on (docs/adr/0050 decision 4), and whatever was
+                // half-typed into it goes with it ([`App::focus_secure_submit`]).
                 self.keyboard_focus = None;
-                self.focused_secure_submit = None;
+                self.focus_secure_submit(None);
                 if let Some(keyboard) = self.keyboard.take() {
                     // `wl_keyboard::release` is `since="3"` too (wayland.xml); same reasoning as
                     // the pointer's guard directly above.
@@ -3345,13 +4071,21 @@ impl PointerHandler for App {
                     // it. A malformed `secure_submit` is the config's bug, not this shell's, so it
                     // is logged against the surface and treated as no destination -- refusing to
                     // guess a capability is the same call `focused_target` documents.
-                    self.focused_secure_submit = match hit.focus {
+                    let focus = match hit.focus {
                         Ok(target) => target,
                         Err(e) => {
                             eprintln!("[oblisk-renderer] {instance_id}: textfield has a malformed secure_submit, so it takes focus with no destination: {e}");
                             None
                         }
-                    };
+                    }
+                    // Bound to the surface the press landed on, per [`FocusedField`]: a field armed
+                    // here stays armed only while that surface is both alive and the one the
+                    // compositor is sending keys to.
+                    .map(|target| FocusedField { surface_id: instance_id.clone(), target });
+                    // Through the seam, because this is the site that *reassigns* rather than
+                    // clears: a press moving from one `textfield` to another is the direct A-to-B
+                    // transition [`retarget_secure_submit`] exists for.
+                    self.focus_secure_submit(focus);
                     self.armed = hit.button.map(|(rect, _)| ArmedClick { instance_id, rect });
                 }
                 PointerEventKind::Release { button: BTN_LEFT, serial, .. } => {
@@ -3409,13 +4143,31 @@ impl KeyboardHandler for App {
     ) {
         // `raw`/`keysyms` are the keys already held down when focus arrived. Nothing reads a key
         // here, so they are dropped along with every other key event below.
+        //
+        // A `wl_keyboard` is per seat, not per surface, so an `enter` can name a surface this
+        // process destroyed since the compositor sent it (a `visible` flip, an output change); that
+        // is the `None` below and it is not an error.
         self.keyboard_focus = self.surface_id_for(surface).map(str::to_string);
-        match &self.keyboard_focus {
-            Some(id) => eprintln!("[oblisk-renderer] keyboard focus entered {id}"),
-            // A `wl_keyboard` is per seat, not per surface, so an `enter` can name a surface this
-            // process destroyed since the compositor sent it (a `visible` flip, an output change).
-            None => eprintln!("[oblisk-renderer] keyboard focus entered an untracked surface; not tracking it"),
+        // `Scene::surface` hands back an owned tree, so the borrow of `self.client` ends on this
+        // line and the write below is free to take `&mut self`.
+        let tree = self.keyboard_focus.as_ref().and_then(|id| self.client.scene().surface(id));
+        // The rule that makes a lock screen typable with no click: keyboard focus on a surface
+        // declaring exactly one `secure_submit` field focuses that field (see [`sole_secure_submit`]
+        // for why exactly one, and why this is needed at all).
+        let next = focus_on_enter(self.keyboard_focus.as_deref(), tree.as_ref(), self.focused_secure_submit.as_ref());
+        match (&self.keyboard_focus, &next) {
+            (None, _) => eprintln!("[oblisk-renderer] keyboard focus entered an untracked surface; not tracking it"),
+            (Some(id), Some(field)) => eprintln!(
+                "[oblisk-renderer] {id}: keyboard focus takes its `secure_submit` field ({}/{})",
+                field.target.capability, field.target.action
+            ),
+            (Some(id), None) => eprintln!("[oblisk-renderer] keyboard focus entered {id}, which declares no sole `secure_submit` field"),
         }
+        // Unconditional, and that is defect 2. Both "nothing to arm" cases used to be early returns
+        // that moved `keyboard_focus` on and left the previous surface's field armed with its
+        // half-typed secret, which `apply_secure_key` would then go on appending to and submitting
+        // to that surface's capability. A focus that arms nothing has to *disarm*.
+        self.focus_secure_submit(next);
     }
 
     fn leave(
@@ -3432,21 +4184,33 @@ impl KeyboardHandler for App {
         let left = self.keyboard_focus.take().unwrap_or_else(|| "an untracked surface".to_string());
         // docs/adr/0050 decision 4's third clearing source. The user is demonstrably somewhere
         // else, so the `textfield` stops owning the next secret and the armed press will never see
-        // its release -- the same answer `PointerEventKind::Leave` gives for the same reason.
-        self.focused_secure_submit = None;
+        // its release -- the same answer `PointerEventKind::Leave` gives for the same reason. The
+        // scrub that used to live on `zwp_text_input_v3`'s `leave` is now this call's, and it is the
+        // load-bearing half: no submit is coming for those bytes.
+        self.focus_secure_submit(None);
         self.armed = None;
         eprintln!("[oblisk-renderer] keyboard focus left {left}");
     }
 
-    // The four callbacks below are deliberately empty, and the gap is real rather than deferred
-    // plumbing: § 5.2 declares no key-handler property on any node, so a keysym arriving here has
-    // nowhere in a config to go, and docs/adr/0050's consequences section says this ADR does not
-    // invent one. They exist because `KeyboardHandler` has no default bodies for them.
+    // A key reaches exactly one place and it is not a config. § 5.2 still declares no key-handler
+    // property on any node, and docs/adr/0050's consequences section still says this ADR does not
+    // invent one, so a keysym arriving here has nowhere in Lua to go and is not offered one. What it
+    // does have is the `secure_submit` field docs/adr/0005 defines as the node whose bytes bypass
+    // the VM entirely: [`App::apply_secure_key`] pushes them into a native `shared::SecureBuffer`
+    // and out to the Supervisor without a Lua value ever existing. That is engine-internal handling
+    // for a field whose whole definition is that the password never enters the Lua VM, so it adds no
+    // IDL surface. See [`secure_key_action`] for why this is the keyboard and not text-input.
+    fn press_key(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _keyboard: &wl_keyboard::WlKeyboard, _serial: u32, event: KeyEvent) {
+        self.apply_secure_key(&event, false);
+    }
 
-    fn press_key(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _keyboard: &wl_keyboard::WlKeyboard, _serial: u32, _event: KeyEvent) {}
+    fn repeat_key(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _keyboard: &wl_keyboard::WlKeyboard, _serial: u32, event: KeyEvent) {
+        self.apply_secure_key(&event, true);
+    }
 
-    fn repeat_key(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _keyboard: &wl_keyboard::WlKeyboard, _serial: u32, _event: KeyEvent) {}
-
+    // Genuinely empty, and the two below with it: a release carries no `utf8` at all (SCTK's own
+    // `KeyEvent` doc says so), and neither a modifier latch nor a layout change edits a buffer.
+    // They exist because `KeyboardHandler` has no default bodies for them.
     fn release_key(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _keyboard: &wl_keyboard::WlKeyboard, _serial: u32, _event: KeyEvent) {}
 
     fn update_modifiers(
@@ -3826,6 +4590,135 @@ impl PopupHandler for App {
     }
 }
 
+/// `ext_session_lock_v1` for the session lock (build-steps.md Phase 23, docs/adr/0042,
+/// docs/adr/0052).
+///
+/// No `delegate_session_lock!` accompanies it and none exists in this SCTK to add, for
+/// [`WindowHandler`]'s reason exactly: `GlobalData`, `SessionLockData` and `SessionLockSurfaceData`
+/// each carry their own blanket `Dispatch2` impl covering `ext_session_lock_manager_v1`,
+/// `ext_session_lock_v1` and `ext_session_lock_surface_v1`, which the file-wide
+/// `delegate_dispatch2!(App)` at the bottom turns into the `Dispatch` half of `SessionLockState::
+/// new`'s, `lock`'s and `create_lock_surface`'s bounds the moment this trait is implemented. This
+/// trait is the only half left to supply, and it has exactly three methods.
+///
+/// `SessionLockState` is also absent from `registry_handlers![OutputState, SeatState]`, and that is
+/// correct rather than forgotten: it is not a `RegistryHandler`. It binds from the `GlobalList` once
+/// in [`run`] and its `GlobalProxy` carries the "not advertised" case for [`App::set_session_lock`]
+/// to report.
+impl SessionLockHandler for App {
+    /// The compositor granted the lock: the session is now locked, every other client's content is
+    /// hidden, and this process is responsible for what is on screen until it unlocks
+    /// (docs/adr/0042).
+    ///
+    /// The surface creation here is normally a no-op, and that is deliberate.
+    /// [`App::set_session_lock`] already created one per output the moment `lock` succeeded, because
+    /// the protocol asks clients to create them immediately and lets the compositor wait for them
+    /// before sending this event, specifically so the user does not see a blank frame first. What
+    /// this call catches is an output advertised inside that window, which
+    /// [`App::ensure_lock_surfaces`] handles idempotently rather than by a second code path.
+    ///
+    /// The lock handle is re-stored rather than compared against the one `lock` returned. It is the
+    /// same `Arc`, SCTK's dispatch flipped `is_locked()` on it before calling in here, and storing
+    /// it costs a refcount bump while removing the only way the two could ever disagree.
+    fn locked(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, session_lock: SessionLock) {
+        self.session_lock = Some(session_lock);
+        self.ensure_lock_surfaces(qh);
+        let surfaces = self.surfaces.iter().filter(|tracked| matches!(tracked.role, TrackedRole::Lock { surface: Some(_), .. })).count();
+        eprintln!("[oblisk-renderer] the session is locked; {surfaces} lock surface(s) up");
+        self.report_lock(LockOutcome::Locked);
+    }
+
+    /// **Two different events**, told apart by [`finished_outcome`] and never swallowed
+    /// (build-steps.md Phase 23 item 2). Arriving before any `locked`, the compositor denied the
+    /// request. Arriving after one, it ended a lock that was really up, through its own secure
+    /// mechanism.
+    ///
+    /// Both set `rescue`, per docs/adr/0052 decision 4, and the test that puts them there is not
+    /// severity but whether there is a lock screen left to read a message on. There is not: a denial
+    /// never put one up, and a teardown took the one that was up away, so in both cases the ordinary
+    /// scene is what the user is looking at and `rescue` is what the ordinary scene renders.
+    ///
+    /// **Which teardown verb to send is decided by `is_locked()`, and the protocol leaves no
+    /// choice.** `ext-session-lock-v1` says of `finished`: "the client should make either the
+    /// destroy request or the unlock_and_destroy request, depending on whether or not the locked
+    /// event was received on this object", and of `ext_session_lock_v1.destroy`: "it is a protocol
+    /// error to make this request if the locked event was sent, the unlock_and_destroy request must
+    /// be used instead". That is unconditional, so a post-`locked` `finished` answered with a plain
+    /// `destroy` is an `invalid_destroy` every time, and losing the connection here is the worst of
+    /// the available outcomes: the compositor has already decided the lock is over, so the session
+    /// ends up unlocked *and* the shell is dead, with the `rescue` message set two lines below
+    /// never reaching a surface.
+    ///
+    /// This is not the convenience path docs/adr/0042 forbids. That rule is about *initiating* an
+    /// unlock, and the compositor initiated this one through its own secure mechanism -- `finished`
+    /// is documented as "the compositor has decided that the session lock should be destroyed".
+    /// `unlock_and_destroy` here is the cleanup verb for a lock that is already over, not a way to
+    /// end one that is still up. The one path that ends a live lock is still
+    /// [`App::release_session_lock`], reached only from a `SetSessionLock { locked: false }`.
+    ///
+    /// Both verbs are `type="destructor"`, and `wayland-backend` refuses a request on an
+    /// already-destroyed object client-side rather than putting it on the wire, so
+    /// `SessionLockInner::Drop`'s unconditional `destroy` after this `unlock` is a no-op rather than
+    /// a second teardown. SCTK's own `SessionLock::unlock` is written against that same guarantee.
+    fn finished(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, session_lock: SessionLock) {
+        let outcome = finished_outcome(session_lock.is_locked());
+        // Ahead of dropping the lock object, unlike the ordered-unlock path: there is no
+        // fall-back-to-solid-colour window to worry about here, because the compositor has already
+        // decided the lock is over, and the surfaces are the thing whose `wl_surface`s the EGL side
+        // still points at.
+        self.teardown_lock_surfaces();
+        if session_lock.is_locked() {
+            // `unlock_and_destroy`, which is the only verb the protocol accepts once `locked` has
+            // been sent. See this method's doc comment: this ends an object, not a session.
+            session_lock.unlock();
+        }
+        // For a denial (no `locked`), `SessionLockInner::Drop`'s plain `destroy` is the correct
+        // verb and this is what sends it.
+        self.session_lock = None;
+        // Whichever of the two events this was, no lock is held now -- disarmed for
+        // [`App::release_session_lock`]'s reason.
+        self.client.set_session_locked(false);
+        let reason = match &outcome {
+            LockOutcome::Finished => LOCK_TORN_DOWN,
+            _ => LOCK_DENIED,
+        };
+        eprintln!("[oblisk-renderer] the session lock ended: {reason}");
+        self.client.set_rescue_state(true, reason);
+        self.report_lock(outcome);
+    }
+
+    /// One `ext_session_lock_surface_v1.configure`, already acked by SCTK's own `Dispatch2` before
+    /// this runs -- so nothing here acks, exactly as nothing in the `window` and `popup` paths acks
+    /// their `xdg_surface`.
+    ///
+    /// Everything after the lookup is [`App::bind_and_clear`], shared verbatim with the other three
+    /// roles. The size is taken as given with no [`toplevel_size_for`]-style negotiation, and there
+    /// is nothing to negotiate: a lock surface covers its output, the compositor knows that output's
+    /// size, and committing a buffer that does not match the acked size is the protocol's own
+    /// `dimensions_mismatch` error.
+    ///
+    /// This is also the event that maps the surface. `ensure_lock_surfaces` left it in
+    /// `MapState::AwaitingConfigure` and performed no initial commit, because
+    /// `ext_session_lock_surface_v1` forbids one before the first ack; `bind_and_clear` flips that
+    /// to `Mapped`, binds EGL, paints the resolved tree, and the `eglSwapBuffers` is the commit that
+    /// carries the first buffer -- which is precisely what the protocol asks for in response to a
+    /// configure.
+    fn configure(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        surface: SessionLockSurface,
+        configure: SessionLockSurfaceConfigure,
+        _serial: u32,
+    ) {
+        let Some(index) = self.index_of_surface(surface.wl_surface()) else {
+            return;
+        };
+        let (width, height) = configure.new_size;
+        self.bind_and_clear(index, width, height);
+    }
+}
+
 impl ProvidesRegistryState for App {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
@@ -3839,6 +4732,80 @@ smithay_client_toolkit::delegate_dispatch2!(App);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lock_is_refused_when_the_config_declares_no_lock_surface() {
+        // docs/adr/0052 decision 3, and the refusal has to happen before `SessionLockState::lock` is
+        // called: a lock that was granted and then painted nothing is a black screen with no
+        // password field, and the protocol guarantees the compositor will not unlock on client
+        // death, so the only way out would be a VT switch.
+        assert_eq!(lock_command(true, false, false, false), LockCommand::Refuse(NO_LOCK_DECLARED));
+        assert_eq!(lock_command(true, true, true, false), LockCommand::Acquire);
+    }
+
+    #[test]
+    fn a_lock_screen_with_no_password_field_is_refused_as_loudly_as_no_lock_screen_at_all() {
+        // `lock_spec` requires only an `id` and makes `child` optional, so `lock { id = "x" }` is a
+        // legal declaration that resolves to an empty tree: a transparent buffer, an empty input
+        // region, and nothing to type into. Granting the lock for it reaches docs/adr/0052 decision
+        // 3's black screen *through* the guard instead of around it, so the tracked-surface test is
+        // not enough on its own -- the tree has to hold a field that can actually reach PAM.
+        assert_eq!(lock_command(true, true, false, false), LockCommand::Refuse(LOCK_CANNOT_AUTHENTICATE));
+        // And the two refusals stay distinct: "you declared no lock screen" and "your lock screen
+        // has no password field" are different edits to make to a config.
+        assert_ne!(NO_LOCK_DECLARED, LOCK_CANNOT_AUTHENTICATE);
+    }
+
+    #[test]
+    fn a_repeated_lock_or_unlock_command_touches_no_protocol_object() {
+        // `locked = true` while already holding one would be a second `ext_session_lock_v1`, which
+        // the compositor answers with an immediate `finished` on the new object -- reported as a
+        // denial of a lock this process already has. `locked = false` while holding none would be
+        // `unlock_and_destroy` on nothing, which is the protocol's `invalid_unlock` error.
+        assert_eq!(lock_command(true, true, true, true), LockCommand::Nothing);
+        assert_eq!(lock_command(false, true, true, false), LockCommand::Nothing);
+        assert_eq!(lock_command(false, false, false, false), LockCommand::Nothing);
+    }
+
+    #[test]
+    fn only_a_locked_false_command_against_a_held_lock_releases() {
+        // The single `Release` in the whole table, and docs/adr/0042 is why it is worth a test of
+        // its own: `unlock_and_destroy` has exactly one reachable caller in this process, and the
+        // Supervisor sends the command that reaches it only on a `PamOutcome::Success`.
+        assert_eq!(lock_command(false, true, true, true), LockCommand::Release);
+        assert_eq!(lock_command(false, false, false, true), LockCommand::Release);
+    }
+
+    #[test]
+    fn releasing_a_lock_the_compositor_never_granted_does_not_report_it_as_unlocked() {
+        // The Supervisor's `lock::apply` moves its `active` flag on these reports alone, so an
+        // `Unlocked` for a lock that was never `locked` tells it a transition happened that did
+        // not: SCTK's `SessionLock::unlock` is a no-op below `is_locked()`, so nothing was
+        // released and the session was never secured in the first place.
+        assert_eq!(release_outcome(true), LockOutcome::Unlocked);
+        assert_eq!(release_outcome(false), LockOutcome::Refused(LOCK_NEVER_GRANTED.to_string()));
+    }
+
+    #[test]
+    fn finished_before_a_locked_is_a_denial_and_finished_after_one_is_a_teardown() {
+        // build-steps.md Phase 23 item 2: one event, two meanings, neither of which may be
+        // swallowed. A denial is a failure the user has to see; a teardown is a state change they
+        // already lived through, and the Supervisor routes the two differently.
+        assert_eq!(finished_outcome(false), LockOutcome::Refused(LOCK_DENIED.to_string()));
+        assert_eq!(finished_outcome(true), LockOutcome::Finished);
+    }
+
+    #[test]
+    fn a_declared_but_unlocked_lock_instance_neither_hangs_nor_joins_the_pba_ready_set() {
+        // The bug the popup slice hit, asked of the fourth role. A `lock` instance owns zero Wayland
+        // objects until `locked` arrives, so it reaches both PBA gates as `(null_buffered: false,
+        // exists: false)` and `MapState::Unmapped` -- complete by construction for the staging gate
+        // (nothing to stage), absent from the announced set (it will present no frame). Getting
+        // either wrong is a `ready_timeout` hang or an `UnexpectedEvidence` abort, and the two
+        // answers have to agree.
+        assert!(candidate_has_staged([(false, false)].into_iter()));
+        assert!(presenting_surface_ids([("screen-lock@eDP-1", MapState::Unmapped)].into_iter()).is_empty());
+    }
 
     #[test]
     fn every_layer_kind_maps_to_its_protocol_level() {
@@ -4260,48 +5227,6 @@ mod tests {
     }
 
     #[test]
-    fn text_input_pending_take_done_returns_and_resets_the_pending_commit() {
-        let mut pending = TextInputPending::default();
-        pending.on_commit_string(Some("h".to_string()));
-
-        let edit = pending.take_done();
-        assert_eq!(edit.commit.as_deref(), Some("h"));
-        assert!(!edit.submit);
-
-        let next = pending.take_done();
-        assert_eq!(next.commit, None, "done must reset pending state for the next cycle");
-        assert!(!next.submit);
-    }
-
-    #[test]
-    fn text_input_pending_take_done_reports_a_pending_submit_action() {
-        let mut pending = TextInputPending::default();
-        pending.on_action_submit();
-
-        let edit = pending.take_done();
-        assert!(edit.submit);
-
-        let next = pending.take_done();
-        assert!(!next.submit, "done must reset the pending submit flag for the next cycle");
-    }
-
-    #[test]
-    fn apply_edit_pushes_commit_text_into_the_secure_buffer_and_reports_submit() {
-        let mut buffer = shared::SecureBuffer::new();
-        let submit = apply_edit(&mut buffer, TextInputEdit { commit: Some("hunter2".to_string()), submit: true });
-        assert_eq!(buffer.expose_secret(), b"hunter2");
-        assert!(submit);
-    }
-
-    #[test]
-    fn apply_edit_accumulates_across_multiple_commit_string_batches() {
-        let mut buffer = shared::SecureBuffer::new();
-        apply_edit(&mut buffer, TextInputEdit { commit: Some("hunter".to_string()), submit: false });
-        apply_edit(&mut buffer, TextInputEdit { commit: Some("2".to_string()), submit: false });
-        assert_eq!(buffer.expose_secret(), b"hunter2");
-    }
-
-    #[test]
     fn secure_submit_frame_carries_the_accumulated_secret_and_zeroizes_the_buffer_it_read() {
         // build-steps.md Phase 15 item 2 / ADR-0005/ADR-0027: the frame carries the exact secret
         // this thread accumulated, tagged with this process's own generation_id, and the source
@@ -4321,17 +5246,6 @@ mod tests {
             })
         );
         assert!(buffer.is_empty(), "the source SecureBuffer must be zeroized as soon as it has been read");
-    }
-
-    #[test]
-    fn apply_edit_with_no_commit_text_leaves_the_buffer_unchanged_and_reports_no_submit() {
-        let mut buffer = shared::SecureBuffer::new();
-        buffer.push_str("existing");
-
-        let submit = apply_edit(&mut buffer, TextInputEdit { commit: None, submit: false });
-
-        assert_eq!(buffer.expose_secret(), b"existing");
-        assert!(!submit);
     }
 
     fn hit_node(lua: &Lua, kind: &str, (x, y, width, height): (f32, f32, f32, f32), on_click: bool) -> layout::ResolvedNode {
@@ -4413,6 +5327,17 @@ mod tests {
         assert!(!release_completes_click(None, "bar@eDP-1", Some(rect)));
     }
 
+    /// One `secure_submit` destination, as the parsers hand it back.
+    fn target(capability: &str, action: &str) -> node::SecureSubmitTarget {
+        node::SecureSubmitTarget { capability: capability.to_string(), action: action.to_string() }
+    }
+
+    /// A focused field as [`App::focus_secure_submit`] stores one: a destination *and* the instance
+    /// id of the surface it was declared on.
+    fn field(surface_id: &str, capability: &str, action: &str) -> FocusedField {
+        FocusedField { surface_id: surface_id.to_string(), target: target(capability, action) }
+    }
+
     /// A `textfield` node carrying whatever the config wrote under `secure_submit`; `None` writes
     /// nothing, which is § 5.2 item 8's "optional even on a masked field".
     fn textfield(lua: &Lua, secure_submit: Option<Value>) -> layout::ResolvedNode {
@@ -4462,6 +5387,60 @@ mod tests {
     }
 
     #[test]
+    fn moving_focus_between_two_secure_submit_fields_zeroizes_what_the_first_accumulated() {
+        // The credential leak this seam exists to close, and the one transition three separate
+        // call sites used to get wrong: the lock screen's `("lock", "authenticate")` field
+        // accumulates a login password, focus moves to the bar's `("network", "connect")` field
+        // without an Enter in between, and the next submit carried `<login password><psk>` to the
+        // network capability. Nothing may survive a change of destination.
+        let mut focused = Some(field("screen@DP-1", "lock", "authenticate"));
+        let mut buffer = shared::SecureBuffer::new();
+        buffer.push_str("hunter2");
+
+        retarget_secure_submit(&mut focused, &mut buffer, Some(field("bar@DP-1", "network", "connect")));
+
+        assert_eq!(focused, Some(field("bar@DP-1", "network", "connect")));
+        assert!(buffer.is_empty(), "a password typed for one destination must not reach the next one's capability");
+    }
+
+    #[test]
+    fn the_same_destination_on_a_different_surface_is_a_different_field() {
+        // The surface half of the identity, and it is load-bearing rather than decorative. Two
+        // surfaces may perfectly well both declare `("lock", "authenticate")` -- the lock screen on
+        // each of two monitors does, since one declaration expands to one instance per output. With
+        // the destination alone as the identity, focus moving between them compared equal and the
+        // scrub was skipped, so the entry begun on one output carried on into the other.
+        let mut focused = Some(field("screen@eDP-1", "lock", "authenticate"));
+        let mut buffer = shared::SecureBuffer::new();
+        buffer.push_str("hunter2");
+
+        retarget_secure_submit(&mut focused, &mut buffer, Some(field("screen@DP-1", "lock", "authenticate")));
+
+        assert!(buffer.is_empty(), "a field is its surface as well as its destination");
+    }
+
+    #[test]
+    fn clearing_focus_zeroizes_the_buffer_and_re_focusing_the_same_field_does_not() {
+        // Two halves of the same rule. Clearing is `leave`/`capability_lost`, where no submit is
+        // ever coming for the bytes, so they must not sit in `App` waiting for the next `enter` to
+        // arm a destination for them. Re-arming the *same* destination is a press landing in the
+        // field the user is already typing into (docs/adr/0050 decision 4 makes the press decide
+        // focus unconditionally), and wiping there would delete half a password mid-entry.
+        let mut focused = Some(field("screen@TEST", "lock", "authenticate"));
+        let mut buffer = shared::SecureBuffer::new();
+        buffer.push_str("hunter2");
+
+        retarget_secure_submit(&mut focused, &mut buffer, None);
+        assert_eq!(focused, None);
+        assert!(buffer.is_empty(), "focus leaving with no submit must scrub what it accumulated");
+
+        focused = Some(field("screen@TEST", "lock", "authenticate"));
+        buffer.push_str("hunter2");
+        retarget_secure_submit(&mut focused, &mut buffer, Some(field("screen@TEST", "lock", "authenticate")));
+        assert_eq!(buffer.expose_secret(), b"hunter2", "re-focusing the same field must not eat the entry in progress");
+    }
+
+    #[test]
     fn a_malformed_secure_submit_is_an_error_rather_than_a_guessed_destination() {
         let lua = Lua::new();
         let field = textfield(&lua, Some(Value::String(lua.create_string("polkit").unwrap())));
@@ -4502,6 +5481,187 @@ mod tests {
     }
 
     #[test]
+    fn an_enter_on_an_empty_field_sends_nothing() {
+        // Not free, which is why it is refused rather than merely useless: the Supervisor routes a
+        // `("lock", "authenticate")` submit straight into PAM, so an Enter that said nothing spends
+        // one of the user's counted attempts and one `pam_unix` failure delay.
+        let mut buffer = shared::SecureBuffer::new();
+        assert_eq!(submit_frame_for(4, Some(&target("lock", "authenticate")), &mut buffer), None);
+    }
+
+    #[test]
+    fn keyboard_focus_arriving_on_nothing_typable_disarms_whatever_was_armed() {
+        // Both of `KeyboardHandler::enter`'s "nothing to arm" cases, which used to be early returns
+        // that moved `keyboard_focus` on and left the *previous* surface's field armed: keystrokes
+        // then went on accumulating into that field's secret and could still be submitted to its
+        // capability. `enter` now pushes this answer through `App::focus_secure_submit` whatever it
+        // is, so `None` disarms and scrubs.
+        let lua = Lua::new();
+        let untypable = tree_with(&lua, vec![textfield(&lua, None)]);
+        let armed = field("screen@TEST", "lock", "authenticate");
+        assert_eq!(focus_on_enter(None, None, Some(&armed)), None, "an `enter` on a surface this process already destroyed");
+        assert_eq!(focus_on_enter(Some("bar@TEST"), Some(&untypable), Some(&armed)), None, "a surface whose tree names no destination");
+
+        let typable = tree_with(&lua, vec![textfield(&lua, Some(secure_submit_table(&lua, "lock", "authenticate")))]);
+        assert_eq!(focus_on_enter(Some("screen@TEST"), Some(&typable), None), Some(armed.clone()));
+
+        // What an `enter` must *not* undo: a press on a surface declaring two fields picked one the
+        // sole-field rule refuses to pick, and the compositor's `enter` for that surface commonly
+        // follows the press that caused it.
+        let two_fields = tree_with(
+            &lua,
+            vec![
+                textfield(&lua, Some(secure_submit_table(&lua, "lock", "authenticate"))),
+                textfield(&lua, Some(secure_submit_table(&lua, "polkit", "authenticate"))),
+            ],
+        );
+        let pressed = field("screen@TEST", "polkit", "authenticate");
+        assert_eq!(focus_on_enter(Some("screen@TEST"), Some(&two_fields), Some(&pressed)), Some(pressed));
+        assert_eq!(
+            focus_on_enter(Some("screen@TEST"), Some(&two_fields), Some(&field("bar@TEST", "network", "connect"))),
+            None,
+            "a field belonging to another surface is not this surface's to keep"
+        );
+    }
+
+    #[test]
+    fn a_field_is_armed_only_while_its_own_surface_holds_the_keyboard_and_still_exists() {
+        // The one question every keystroke asks, in place of a clearing call bolted onto each of the
+        // five or six sites that can take a surface away. The liveness half is the traced leak:
+        // type a login password on the lock screen, the compositor sends `finished`,
+        // `teardown_lock_surfaces` destroys the `wl_surface`, and no `leave` is required to follow
+        // it -- so the plaintext stayed live in `App::secure_buffer`, still addressed to
+        // `("lock", "authenticate")`, with later bar keystrokes appending to it.
+        let armed = field("screen@TEST", "lock", "authenticate");
+        assert!(focus_is_still_armed(&armed, Some("screen@TEST"), true));
+        assert!(!focus_is_still_armed(&armed, Some("screen@TEST"), false), "its `wl_surface` is gone, whether or not a `leave` ever came");
+        assert!(!focus_is_still_armed(&armed, Some("bar@TEST"), true), "another surface is the one receiving keys");
+        assert!(!focus_is_still_armed(&armed, None, true), "the keyboard is on a surface this process does not own");
+    }
+
+    /// A `lock` tree as the scene hands one back: a root with the password field somewhere under it.
+    fn tree_with(lua: &Lua, fields: Vec<layout::ResolvedNode>) -> layout::ResolvedNode {
+        let mut root = hit_node(lua, "column", (0.0, 0.0, 1920.0, 1080.0), false);
+        let mut inner = hit_node(lua, "column", (0.0, 0.0, 360.0, 200.0), false);
+        inner.children = fields;
+        root.children = vec![hit_node(lua, "label", (0.0, 0.0, 100.0, 20.0), false), inner];
+        root
+    }
+
+    #[test]
+    fn keyboard_focus_takes_the_one_secure_submit_field_a_surface_declares() {
+        // The rule that makes a lock screen typable without a click. `focused_secure_submit` used
+        // to be set only by a pointer press, so the one surface whose whole job is to accept a
+        // password needed a mouse click before a keystroke could reach `SecureBuffer` at all.
+        let lua = Lua::new();
+        let tree = tree_with(&lua, vec![textfield(&lua, Some(secure_submit_table(&lua, "lock", "authenticate")))]);
+
+        assert_eq!(
+            sole_secure_submit(&tree),
+            Some(node::SecureSubmitTarget { capability: "lock".to_string(), action: "authenticate".to_string() })
+        );
+    }
+
+    #[test]
+    fn two_secure_submit_fields_on_one_surface_focus_neither() {
+        // Deliberately not "the first one": with two destinations there is no non-arbitrary answer
+        // to "whose password is this?", which is the same question `submit_frame_for` refuses to
+        // guess at (docs/adr/0050 decision 4). A press still picks one, because a press names a node.
+        let lua = Lua::new();
+        let tree = tree_with(
+            &lua,
+            vec![
+                textfield(&lua, Some(secure_submit_table(&lua, "lock", "authenticate"))),
+                textfield(&lua, Some(secure_submit_table(&lua, "polkit", "authenticate"))),
+            ],
+        );
+        assert_eq!(sole_secure_submit(&tree), None);
+
+        // A field with no destination is not a candidate either -- it names nowhere to send to.
+        let bare = tree_with(&lua, vec![textfield(&lua, None)]);
+        assert_eq!(sole_secure_submit(&bare), None);
+    }
+
+    #[test]
+    fn the_lock_admission_guard_and_the_keyboard_focus_rule_are_one_predicate() {
+        // Defect D: `lock_command`'s `can_authenticate` asked whether *any* field unlocks, while
+        // keyboard focus arms only a surface's *sole* field. A lock tree with two `secure_submit`
+        // fields passed the guard, took the lock, and then armed nothing on `enter` -- on a
+        // keyboard-only machine the session could not be left except by a VT switch. The two now
+        // read the same answer out of the same function, so they cannot drift apart.
+        let lua = Lua::new();
+        let typable = tree_with(&lua, vec![textfield(&lua, Some(secure_submit_table(&lua, "lock", "authenticate")))]);
+        assert!(tree_can_authenticate(&typable));
+        assert_eq!(sole_secure_submit(&typable), Some(target("lock", "authenticate")));
+
+        let two_fields = tree_with(
+            &lua,
+            vec![
+                textfield(&lua, Some(secure_submit_table(&lua, "lock", "authenticate"))),
+                textfield(&lua, Some(secure_submit_table(&lua, "polkit", "authenticate"))),
+            ],
+        );
+        assert!(!tree_can_authenticate(&two_fields), "a lock the keyboard cannot arm must not be granted the lock");
+        assert_eq!(sole_secure_submit(&two_fields), None);
+
+        // One field, but pointed somewhere the Supervisor does not route an unlock through.
+        let wrong_destination = tree_with(&lua, vec![textfield(&lua, Some(secure_submit_table(&lua, "polkit", "authenticate")))]);
+        assert!(!tree_can_authenticate(&wrong_destination));
+    }
+
+    #[test]
+    fn only_the_lock_authenticate_pair_can_unlock_the_session() {
+        // supervisor/src/main.rs routes `("lock", "authenticate")` to the PAM worker and nothing
+        // else to it, so a lock screen whose field submits anywhere else can never unlock.
+        assert!(unlocks_the_session(&target("lock", "authenticate")));
+        assert!(!unlocks_the_session(&target("polkit", "authenticate")));
+        assert!(!unlocks_the_session(&target("lock", "cancel")));
+    }
+
+    fn key(keysym: Keysym, utf8: Option<&str>) -> KeyEvent {
+        KeyEvent { time: 0, raw_code: 0, keysym, utf8: utf8.map(str::to_string) }
+    }
+
+    #[test]
+    fn a_focused_secure_field_reads_the_keyboard_directly() {
+        // Phase 23 item 3's actual claim, which `zwp_text_input_v3` alone did not deliver: that
+        // path only produces a `commit_string` when the compositor has an input method bound, so on
+        // a session with no IME -- the normal case -- not one byte ever reached `SecureBuffer` and
+        // the lock could not be authenticated out of.
+        assert_eq!(secure_key_action(&key(Keysym::a, Some("a")), false), SecureKeyAction::Append("a"));
+        assert_eq!(secure_key_action(&key(Keysym::Return, Some("\r")), false), SecureKeyAction::Submit);
+        assert_eq!(secure_key_action(&key(Keysym::KP_Enter, Some("\r")), false), SecureKeyAction::Submit);
+        assert_eq!(secure_key_action(&key(Keysym::BackSpace, Some("\u{8}")), false), SecureKeyAction::Backspace);
+    }
+
+    #[test]
+    fn a_control_key_never_becomes_a_character_of_the_password() {
+        // `utf8` is not empty for Escape, Tab or Return -- xkbcommon hands back the C0 control
+        // character for each -- so an unfiltered append would silently put an ESC byte in the
+        // middle of a secret that PAM then rejects with no visible reason.
+        assert_eq!(secure_key_action(&key(Keysym::Tab, Some("\t")), false), SecureKeyAction::Ignore);
+        assert_eq!(secure_key_action(&key(Keysym::Shift_L, None), false), SecureKeyAction::Ignore);
+    }
+
+    #[test]
+    fn escape_throws_the_entry_away_instead_of_being_ignored() {
+        // Escape used to reach the control-character filter above and be dropped, which left one
+        // Backspace per character as the only way to abandon a mistyped password -- on the surface
+        // where a wrong guess costs a counted PAM attempt and a `pam_unix` failure delay.
+        assert_eq!(secure_key_action(&key(Keysym::Escape, Some("\u{1b}")), false), SecureKeyAction::Clear);
+    }
+
+    #[test]
+    fn holding_enter_down_does_not_resubmit_an_already_scrubbed_buffer() {
+        // A submit zeroizes the buffer as it reads it, so the second submit of a key repeat would
+        // send an *empty* password to PAM and burn one of the user's attempts. Backspace and
+        // ordinary characters repeat normally, which is what every text field does.
+        assert_eq!(secure_key_action(&key(Keysym::Return, Some("\r")), true), SecureKeyAction::Ignore);
+        assert_eq!(secure_key_action(&key(Keysym::BackSpace, Some("\u{8}")), true), SecureKeyAction::Backspace);
+        assert_eq!(secure_key_action(&key(Keysym::a, Some("a")), true), SecureKeyAction::Append("a"));
+    }
+
+    #[test]
     fn on_clicks_argument_is_the_buttons_rect_as_four_named_fields() {
         let lua = Lua::new();
         let table = rect_table(&lua, LogicalRect { x: 10.5, y: 4.0, width: 40.0, height: 24.0 }).unwrap();
@@ -4528,6 +5688,10 @@ mod tests {
         }
     }
 
+    fn lock_spec_fixture() -> node::LockSpec {
+        node::LockSpec { id: "lock_screen".to_string() }
+    }
+
     fn window(id: &str) -> WindowSpec {
         WindowSpec {
             id: id.to_string(),
@@ -4548,11 +5712,17 @@ mod tests {
         assert!(starting_visible(None, &SurfaceSpec::Panel(panel("bar"))));
         assert!(!starting_visible(None, &SurfaceSpec::Window(window("settings"))));
         assert!(!starting_visible(None, &SurfaceSpec::Popup(popup_spec_fixture())));
+        assert!(!starting_visible(None, &SurfaceSpec::Lock(lock_spec_fixture())));
     }
 
     #[test]
     fn a_resolved_tree_answers_visible_for_every_role_and_the_fallback_never_runs() {
-        for roster in [SurfaceSpec::Panel(panel("bar")), SurfaceSpec::Window(window("settings")), SurfaceSpec::Popup(popup_spec_fixture())] {
+        for roster in [
+            SurfaceSpec::Panel(panel("bar")),
+            SurfaceSpec::Window(window("settings")),
+            SurfaceSpec::Popup(popup_spec_fixture()),
+            SurfaceSpec::Lock(lock_spec_fixture()),
+        ] {
             assert!(starting_visible(Some(true), &roster));
             assert!(!starting_visible(Some(false), &roster), "a declared-closed surface stays closed whatever its role");
         }

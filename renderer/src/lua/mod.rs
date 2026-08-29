@@ -11,6 +11,7 @@
 // `#[allow(dead_code)]` came off here per ADR-0044 decision 1: `layout::node`'s property parsers
 // now run every resolved value through `check_number`/`check_integer`/`check_string` (build-steps.md
 // Phase 19 item 1), so this module has a real production caller, not just its own tests.
+pub mod capability;
 pub mod marshal;
 pub mod nodes;
 pub mod process;
@@ -195,24 +196,25 @@ fn collect_surfaces(value: Value) -> Result<Vec<VirtualNode>, LoaderError> {
     Ok(surfaces)
 }
 
-/// § 6's roles, at the root where § 6 puts them. Three of the four are a config's to declare
-/// (docs/adr/0040 decision 1), and gating on `panel` alone -- correct while `panel` was the only
-/// role that existed -- rejected a `window` or `popup` here, before the scene or any spec parser
-/// ever saw it (build-steps.md Phase 22).
+/// § 6's roles, at the root where § 6 puts them -- all four of them (docs/adr/0040 decision 1),
+/// since gating on `panel` alone was correct only while `panel` was the only role that existed and
+/// rejected a `window` or `popup` here, before the scene or any spec parser ever saw it
+/// (build-steps.md Phase 22).
 ///
-/// `lock` gets its own arm rather than falling into the catch-all, because "got `lock`" would read
-/// as a role that is not built yet. It is built as far as anything else here: what is wrong is the
-/// *place*. A lock surface's lifetime is the lock's, not the config's (§ 6.4, docs/adr/0042), so
-/// the Supervisor is what makes one appear and a config's job is to say what it looks like.
+/// `lock` had its own rejecting arm through Phase 22, on the argument that a lock surface's
+/// lifetime is the lock's rather than the config's, so the root of `shell.lua` was the wrong
+/// *place* to write one. docs/adr/0052 decision 2 reverses that, and the reversal is not a change
+/// of mind about lifetimes: the lifetime claim was true and stays true. What the arm got wrong was
+/// treating "where the declaration lives" and "when the Wayland object exists" as one question,
+/// which docs/adr/0049 had already split for the two roles sitting beside it. A `window` is
+/// admitted here and owns no `xdg_toplevel` until `visible` resolves true; a `lock` is admitted
+/// here and owns no `ext_session_lock_surface_v1` until the compositor sends `locked`. Refusing it
+/// left § 6.4's `child` -- the whole authored lock screen -- with no legal place to be written, so
+/// the rejection cost the feature rather than protecting the lifetime.
 fn require_surface(node: &VirtualNode) -> Result<(), LoaderError> {
     match node.kind.as_str() {
-        "panel" | "window" | "popup" => Ok(()),
-        "lock" => Err(LoaderError::InvalidTopLevelReturn(
-            "a `lock` is not returned at the root: a lock surface exists only while the session is locked, so the Supervisor is what makes one appear \
-             (§ 6.4, docs/adr/0042)"
-                .to_string(),
-        )),
-        other => Err(LoaderError::InvalidTopLevelReturn(format!("top-level node must be `panel`, `window` or `popup`, got `{other}`"))),
+        "panel" | "window" | "popup" | "lock" => Ok(()),
+        other => Err(LoaderError::InvalidTopLevelReturn(format!("top-level node must be `panel`, `window`, `popup` or `lock`, got `{other}`"))),
     }
 }
 
@@ -262,17 +264,30 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_rejects_a_top_level_lock_with_a_message_naming_why_a_lock_is_not_declared_there() {
-        // The fourth role, and the one that stays out: a lock surface's lifetime is the lock's,
-        // not the config's (docs/adr/0042, § 6.4). "got `lock`" would read as a missing feature,
-        // so the message has to say that returning one is not how a lock screen appears.
+    fn evaluate_accepts_a_top_level_lock_because_declaring_one_is_not_the_same_as_locking() {
+        // Replaces the Phase 22 test that asserted the opposite, per docs/adr/0052 decision 2.
+        // The lifetime claim that test rested on is still true -- the compositor decides when a
+        // lock surface exists -- but it is a claim about the Wayland object, and this function
+        // only ever decided where the declaration may be written.
         let loader = Loader::new(signal::DirtyFlag::new()).unwrap();
-        let err = loader.evaluate(r#"return { kind = "lock", id = "screen" }"#).unwrap_err();
+        let output = loader.evaluate(r##"return lock { id = "screen", child = rect { background = "#000000FF" } }"##).unwrap();
+        assert_eq!(output.surfaces.len(), 1);
+        assert_eq!(output.surfaces[0].kind, "lock");
+    }
+
+    #[test]
+    fn a_top_level_return_of_an_unknown_kind_names_all_four_roles_it_could_have_been() {
+        // The catch-all is the only place a config author learns the roster, so it has to list
+        // `lock` now that `lock` is admitted -- an omission here reads as "not built yet", which
+        // is exactly the wrong impression the Phase 22 arm used to give.
+        let loader = Loader::new(signal::DirtyFlag::new()).unwrap();
+        let err = loader.evaluate(r#"return { kind = "rect" }"#).unwrap_err();
         let LoaderError::InvalidTopLevelReturn(message) = err else {
-            panic!("a top-level `lock` must be a top-level-return error");
+            panic!("a top-level `rect` must be a top-level-return error");
         };
-        assert!(message.contains("lock"), "{message}");
-        assert!(message.contains("Supervisor"), "the message must say what does make a lock appear: {message}");
+        for role in ["panel", "window", "popup", "lock"] {
+            assert!(message.contains(role), "the message must name `{role}`: {message}");
+        }
     }
 
     #[test]

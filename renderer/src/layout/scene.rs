@@ -189,6 +189,15 @@ impl Scene {
     /// untouched: a `surface` disappearing entirely is a topology change (`CONTEXT.md`), handled
     /// by a generation swap, not this in-place apply.
     ///
+    /// `admit` is a veto on the *finished* apply, run once after every instance has reconciled and
+    /// before this returns `Ok`. It exists because some invariants are not properties of any one
+    /// node and cannot be checked as the walk builds one: `crate::socket`'s lock guard has to ask
+    /// whether the whole resolved lock tree is still authenticatable, which is only answerable once
+    /// the tree exists. An `Err` from it takes the same road an `Err` from the walk takes -- the
+    /// snapshot below is restored and the caller keeps the scene it had -- which is why this is a
+    /// parameter here rather than a check bolted on at the call sites: a caller that noticed the
+    /// problem after `apply` returned `Ok` would have nothing left to roll back with.
+    ///
     /// Rolls back to exactly its pre-call state on `Err` (`CONTEXT.md`, Rollback; `socket.rs`'s
     /// `handle_reevaluate` already assumes this -- it deliberately leaves `applied_topology`
     /// unchanged on a failed apply). Before property resolve could call back into Lua (ADR-0044
@@ -215,12 +224,31 @@ impl Scene {
     /// arbitrary depth with `next_id` and `retiring` already mutated. Removing the snapshot needs
     /// the whole fresh tree resolved into a separate tree first, which is a second traversal and a
     /// second allocation to save a clone that is already O(nodes).
+    /// The unguarded spelling, and it is `cfg(test)` so it cannot become a production call site.
+    ///
+    /// Every fixture in this crate applies a tree with nothing to veto, and threading a `|_| Ok(())`
+    /// through each of them would only make the real callers' guard easier to leave off by
+    /// accident. Gating it on `test` is what keeps [`Scene::apply_admitting`] the *only* way
+    /// production code applies a scene, which is the property `crate::socket`'s lock veto depends
+    /// on: a fourth apply site added later cannot silently skip it.
+    #[cfg(test)]
     pub fn apply(
         &mut self,
         fresh_surfaces: &[VirtualNode],
         instances: &[SurfaceInstance],
         shaping: &ShapingHandle,
         lua: &Lua,
+    ) -> Result<(), LayoutError> {
+        self.apply_admitting(fresh_surfaces, instances, shaping, lua, |_| Ok(()))
+    }
+
+    pub fn apply_admitting(
+        &mut self,
+        fresh_surfaces: &[VirtualNode],
+        instances: &[SurfaceInstance],
+        shaping: &ShapingHandle,
+        lua: &Lua,
+        admit: impl Fn(&Scene) -> Result<(), LayoutError>,
     ) -> Result<(), LayoutError> {
         let next_id_snapshot = self.next_id;
         let retiring_snapshot_len = self.retiring.len();
@@ -233,6 +261,12 @@ impl Scene {
                 self.retiring.truncate(retiring_snapshot_len);
                 return Err(err);
             }
+        }
+        if let Err(err) = admit(self) {
+            self.surfaces = surfaces_snapshot;
+            self.next_id = next_id_snapshot;
+            self.retiring.truncate(retiring_snapshot_len);
+            return Err(err);
         }
         Ok(())
     }
@@ -275,8 +309,8 @@ impl Scene {
         // item 5).
         ensure_node_admissible(&fresh.kind, 0)?;
         let properties = node::resolve_properties(&fresh.properties, &fresh.kind, lua)?;
-        // **An unsized `window` root is its surface** (build-steps.md Phase 22 item 1). A `panel`
-        // root sizes itself from § 6.1's `width`/`height`, which are also its
+        // **An unsized `window` or `lock` root is its surface** (build-steps.md Phase 22 item 1,
+        // Phase 23). A `panel` root sizes itself from § 6.1's `width`/`height`, which are also its
         // `zwlr_layer_surface_v1::set_size` request; § 6.2 gives a `window` neither, because a
         // toplevel's size is the compositor's and arrives as an `xdg_toplevel` configure that
         // `set_instance_size` has already turned into this `available`.
@@ -288,10 +322,18 @@ impl Scene {
         // Measured against niri, which configured the window at its 1920x1168 tile and had a 0x0
         // tree painted into it.
         //
+        // § 6.4's `lock` is the same case and a worse failure. It has no `width` or `height` at all
+        // -- `layout::node::lock_spec` refuses both -- so it can only ever fall to `Content`, and
+        // the surface it fills is the whole output. A zero-sized lock root paints a transparent
+        // buffer over a locked session, which is the black screen with no password field
+        // docs/adr/0052 decision 3 refuses the lock to avoid. Sizing the root from `available` is
+        // also just what § 6.4 states in words: a lock surface covers its output.
+        //
         // Only the `Content` default is overridden, per axis. A `window` that does write a `width`
         // is writing a property § 6.2 does not define, and the answer to that is to honour it like
-        // any other node's rather than to silently discard it.
-        let forced = if fresh.kind == "window" {
+        // any other node's rather than to silently discard it. A `lock` cannot reach that branch,
+        // because the spec parser rejected the config before the scene ever saw it.
+        let forced = if matches!(fresh.kind.as_str(), "window" | "lock") {
             (
                 matches!(node::parse_size_mode(&properties, "width")?, SizeMode::Content).then_some(available.width),
                 matches!(node::parse_size_mode(&properties, "height")?, SizeMode::Content).then_some(available.height),
@@ -391,13 +433,17 @@ impl Scene {
     }
 }
 
-/// `window` and `popup` join `panel` here per docs/adr/0040 decision 1 (build-steps.md Phase 22).
-/// All three are surface containers: a role for a `wl_surface`, a `child` tree inside it, and no
-/// layout model of their own beyond the stacking one docs/adr/0023 item 4 already gives `panel`.
-/// `lock`, the fourth role, is not here -- its ownership is still open (docs/adr/0042).
+/// All four § 6 roles are here per docs/adr/0040 decision 1 (build-steps.md Phase 22 for `window`
+/// and `popup`, Phase 23 for `lock`). Every one of them is a surface container: a role for a
+/// `wl_surface`, a `child` tree inside it, and no layout model of their own beyond the stacking one
+/// docs/adr/0023 item 4 already gives `panel`. `lock` was held out while docs/adr/0042 left its
+/// declaration site open; docs/adr/0052 decision 2 settled that a `lock` is returned at the root
+/// like the rest, and from this function's point of view it was never the interesting question --
+/// this admits a *node kind* into the walk, and a lock screen's tree has to be walked whether or
+/// not the compositor has handed out a surface to paint it into.
 fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
     match kind {
-        "panel" | "window" | "popup" | "rect" | "row" | "column" | "text" | "icon" | "button" | "list" | "textfield" => Ok(()),
+        "panel" | "window" | "popup" | "lock" | "rect" | "row" | "column" | "text" | "icon" | "button" | "list" | "textfield" => Ok(()),
         other => Err(LayoutError::UnsupportedNodeKind(other.to_string())),
     }
 }
@@ -442,26 +488,28 @@ fn ensure_node_admissible(kind: &str, depth: u32) -> Result<(), LayoutError> {
     Ok(())
 }
 
-/// Dispatches to the right raw property (`child` for the three surface roles, `children` for the
+/// Dispatches to the right raw property (`child` for the four surface roles, `children` for the
 /// container kinds, none for leaves) -- only called after [`ensure_supported_kind`] already
 /// validated `node.kind`, so the fallback arm is unreachable, not a silent default.
 ///
-/// `window` and `popup` share `panel`'s arm because § 6.2 and § 6.3 give each of them exactly one
-/// `child`, the same as § 6.1 does: a surface holds one root visual node, and the difference
-/// between the three roles is which protocol assigns the surface its role, not what hangs under it.
+/// `window`, `popup` and `lock` share `panel`'s arm because § 6.2, § 6.3 and § 6.4 give each of
+/// them exactly one `child`, the same as § 6.1 does: a surface holds one root visual node, and the
+/// difference between the four roles is which protocol assigns the surface its role, not what hangs
+/// under it. § 6.4 is the shortest case of all -- `child` is one of the only two properties a
+/// `lock` has, and `layout::node::lock_spec` takes the other.
 ///
 /// `textfield` (`oblisk-idl-api-specs.md` § 5.2 item 8) is a leaf like `text`/`icon`: it never
 /// takes `children`. Its own properties (`mask_character`, `secure_submit`, `on_change`,
-/// `on_submit`) ride along unvalidated in `RetainedNode.properties`, same as `button`'s
-/// `on_click` -- no GPU painting or `wp-text-input-v3` wiring reads them from the scene graph
-/// yet (build-steps.md Phase 15 item 2 scopes this to a valid, parseable node kind; the protocol
-/// state itself lives entirely outside the scene graph, on `App` in `renderer/src/wayland/mod.rs`
-/// -- ADR-0009 named this a `TextInputService`, but this slice inlined the fields onto `App`
-/// directly rather than extracting that type; see that file's own `bind_text_input` doc comment
-/// for the upgrade path).
+/// `on_submit`) ride along unvalidated in `RetainedNode.properties`, same as `button`'s `on_click`.
+/// Nothing paints them yet, and `on_change`/`on_submit` are still wired to nothing at all. What
+/// *does* read `secure_submit` out of the resolved tree is `renderer/src/wayland/mod.rs`'s keyboard
+/// path, off the scene graph rather than through it: the buffer and the focus target live on `App`,
+/// because docs/adr/0005 says a masked field's bytes never become an `mlua::Value`. ADR-0009 named
+/// that a `TextInputService`; this slice inlines the two fields onto `App` instead of extracting
+/// the type.
 fn children_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Vec<VirtualNode>, LayoutError> {
     match kind {
-        "panel" | "window" | "popup" => Ok(node::parse_single_child(properties, "child")?
+        "panel" | "window" | "popup" | "lock" => Ok(node::parse_single_child(properties, "child")?
             .into_iter()
             .collect()),
         "rect" | "row" | "column" | "button" => node::parse_children(properties),
@@ -510,11 +558,13 @@ fn stretch_forced_size(
             let forced_w = (cross == Align::Stretch && own_width_known.is_some()).then_some(margined_budget.width);
             Ok((forced_w, None))
         }
-        // The stacking kinds, all three surface roles included: a child aligned `Stretch` on an
-        // axis takes the whole margined slot in it (docs/adr/0023 item 4). A `window`'s or a
-        // `popup`'s root is a surface container like a `panel`'s, so a full-bleed background inside
-        // one has to work the same way.
-        "rect" | "button" | "panel" | "window" | "popup" => {
+        // The stacking kinds, all four surface roles included: a child aligned `Stretch` on an
+        // axis takes the whole margined slot in it (docs/adr/0023 item 4). A `window`'s, a
+        // `popup`'s or a `lock`'s root is a surface container like a `panel`'s, so a full-bleed
+        // background inside one has to work the same way. A lock screen is the case that needs it
+        // least conditionally: § 6.4 says a lock surface covers its output, so the tree inside one
+        // is full-bleed by definition rather than by an author's choice.
+        "rect" | "button" | "panel" | "window" | "popup" | "lock" => {
             let align_h = node::parse_align(child_properties, "align_h")?;
             let align_v = node::parse_align(child_properties, "align_v")?;
             let forced_w = (align_h == Align::Stretch && own_width_known.is_some()).then_some(margined_budget.width);
@@ -1581,6 +1631,36 @@ mod tests {
 
         assert!(err.to_string().contains("ghost@TEST"), "the message must name the offending instance: {err}");
         assert!(scene.surface("ghost@TEST").is_none());
+    }
+
+    #[test]
+    fn a_veto_from_admit_takes_the_same_rollback_road_a_failed_walk_takes() {
+        // `apply_admitting`'s guard is a veto on the *finished* scene, which is the only shape that
+        // works for an invariant no single node can answer -- `crate::socket`'s lock guard asks
+        // whether the whole resolved lock tree is still authenticatable. Refusing after the walk is
+        // only safe if the refusal unwinds exactly as far as a mid-walk `Err` does, so this pins
+        // that: the second apply is rejected and the first apply's tree is still what `surface`
+        // hands back.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua1, v1) = surface_from(r#"panel { id = "bar", width = 10, height = 10 }"#);
+        apply_at(&mut scene, &[v1], full(), &shaping, &_lua1).unwrap();
+        let next_id_before = scene.next_id;
+
+        let (_lua2, v2) = surface_from(r#"panel { id = "bar", width = 99, height = 99 }"#);
+        let instances = vec![SurfaceInstance {
+            instance_id: "bar@TEST".to_string(),
+            declared_id: "bar".to_string(),
+            output: "TEST".to_string(),
+            available: full(),
+        }];
+        let err = scene
+            .apply_admitting(&[v2], &instances, &shaping, &_lua2, |_| Err(node::invalid("child", "the finished scene is not admissible")))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("not admissible"), "the veto's own message must reach the caller: {err}");
+        assert_eq!(scene.surface("bar@TEST").unwrap().rect.width, 10.0, "a vetoed apply must leave the prior tree on screen");
+        assert_eq!(scene.next_id, next_id_before, "and must not leak the ids the vetoed walk allocated");
     }
 
     #[test]
@@ -2813,8 +2893,9 @@ mod tests {
     fn window_and_popup_are_supported_kinds_carrying_a_single_child() {
         // docs/adr/0040 decision 1's other two roles. Both are top-level nodes, siblings of
         // `panel` in what `shell.lua` returns, and both take `child` rather than `children`
-        // (§ 6.2, § 6.3). Written as raw tables because `lua::nodes::NODE_KINDS` has no
-        // constructor for either yet -- that is the protocol commit's edit, not this one's.
+        // (§ 6.2, § 6.3). Written as raw tables because this module's fixture builds a
+        // `VirtualNode` straight from a table rather than going through `lua::nodes`'s
+        // constructors, which is what keeps the walk under test and not the registration.
         for kind in ["window", "popup"] {
             let mut scene = Scene::new();
             let shaping = ShapingHandle::spawn();
@@ -2901,6 +2982,46 @@ mod tests {
         let root = scene.surface("menu@TEST").unwrap();
         assert_eq!((root.rect.width, root.rect.height), (200.0, 120.0));
         assert_eq!((root.children[0].rect.width, root.children[0].rect.height), (200.0, 120.0));
+    }
+
+    #[test]
+    fn a_lock_is_a_supported_kind_carrying_a_single_child_and_stretching_it_like_a_panel() {
+        // § 6.4's role, admitted into the walk by docs/adr/0052 decision 2. Two properties on the
+        // node, one of them `child`, so the whole of what this stage owes a `lock` is: walk the
+        // child, and stack it the way every other surface container stacks one (docs/adr/0023
+        // item 4). No size on the fixture, because § 6.4 gives a `lock` none to write.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(
+            r#"{ kind = "lock", id = "screen-lock",
+                 child = rect { align_h = "Stretch", align_v = "Stretch" } }"#,
+        );
+        apply_at(&mut scene, &[surface], LogicalSize { width: 1920.0, height: 1080.0 }, &shaping, &lua).unwrap();
+
+        let root = scene.surface("screen-lock@TEST").unwrap();
+        assert_eq!(root.kind, "lock");
+        assert_eq!(root.children.len(), 1, "§ 6.4's `child`, read through the same `parse_single_child` a panel's is");
+        assert_eq!((root.children[0].rect.width, root.children[0].rect.height), (1920.0, 1080.0));
+    }
+
+    #[test]
+    fn an_unsized_lock_root_is_its_output_so_a_fill_child_covers_the_locked_screen() {
+        // The `window` sizing fix, applied to the role that cannot opt out of needing it: § 6.4
+        // gives a `lock` no `width`/`height` at all and `node::lock_spec` refuses both, so the root
+        // can only ever reach `parse_size_mode`'s `Content` default. A `Content` root hands its
+        // children a zero budget, so a `Fill` child would paint nothing into a surface covering the
+        // whole output -- a transparent buffer over a locked session, which is the black screen
+        // docs/adr/0052 decision 3 refuses a lock to avoid.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(
+            r#"{ kind = "lock", id = "screen-lock", child = rect { width = "Fill", height = "Fill" } }"#,
+        );
+        apply_at(&mut scene, &[surface], LogicalSize { width: 2560.0, height: 1440.0 }, &shaping, &lua).unwrap();
+
+        let root = scene.surface("screen-lock@TEST").unwrap();
+        assert_eq!((root.rect.width, root.rect.height), (2560.0, 1440.0));
+        assert_eq!((root.children[0].rect.width, root.children[0].rect.height), (2560.0, 1440.0));
     }
 
     #[test]

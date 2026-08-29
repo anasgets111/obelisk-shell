@@ -106,11 +106,13 @@ fn paint_node(painter: &mut TextPainter, node: &ResolvedNode, origin_x: f32, ori
         // own beyond the base `rect` ones they share the property table with, and a surface root
         // paints exactly like a rect -- one code path serves all seven.
         //
-        // All three surface roles, not just `panel` (build-steps.md Phase 22): § 6.2 and § 6.3
-        // give a `window` and a `popup` the same base properties § 6.1 gives a `panel`, so a
-        // background or a border on either root is the same fill this already draws. A dropdown's
-        // own rounded, bordered background is the normal case for a `popup`, not an edge one.
-        "rect" | "row" | "column" | "button" | "panel" | "window" | "popup" => {
+        // All four surface roles, not just `panel` (build-steps.md Phase 22 and Phase 23): § 6.2,
+        // § 6.3 and § 6.4 give a `window`, a `popup` and a `lock` the same § 5.1 base properties
+        // § 6.1 gives a `panel`, so a background or a border on any of those roots is the same fill
+        // this already draws. A dropdown's own rounded, bordered background is the normal case for
+        // a `popup`, not an edge one, and a `lock` root's `background` is the one property standing
+        // between a locked session and a transparent buffer over the whole output.
+        "rect" | "row" | "column" | "button" | "panel" | "window" | "popup" | "lock" => {
             paint_box(painter.canvas_mut(), &node.kind, &node.properties, rect, scale)
         }
         "text" => paint_text(painter, &node.properties, rect, scale),
@@ -684,6 +686,32 @@ mod tests {
             paint_tree(&mut painter, &root, 1.0);
             assert_eq!(pixel_at(painter.canvas_mut(), 32, 32), expected, "a `{kind}` root must paint its own box like a `panel` root");
         }
+    }
+
+    #[test]
+    fn a_lock_root_paints_its_own_background_over_the_whole_output_it_covers() {
+        // build-steps.md Phase 23, and the sharpest case of the arm above. § 6.4 gives a `lock` no
+        // size, so the root takes its output's (see `layout::scene`'s forced-size note) and its
+        // `background` is the only thing painting anything over that whole area. Falling through to
+        // the `_ => {}` arm here is not a missing background, it is a transparent buffer covering a
+        // locked session -- the black screen docs/adr/0052 decision 3 refuses a lock to avoid,
+        // reached by a different route.
+        //
+        // No `width`/`height` on the fixture, unlike the `window`/`popup` case above: `node::
+        // lock_spec` refuses both, so a config that wrote them never reaches a paint pass at all.
+        let Some(instance) = init_headless_egl(64, 64) else { return };
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 64, 64) else { return };
+
+        let lua = Lua::new();
+        let root = resolved_surface(
+            &lua,
+            r##"return lock { id = "bar", background = "#00FF00FF" }"##,
+            LogicalSize { width: 64.0, height: 64.0 },
+        );
+        paint_tree(&mut painter, &root, 1.0);
+        assert_eq!(pixel_at(painter.canvas_mut(), 32, 32), (0, 255, 0, 255));
+        assert_eq!(pixel_at(painter.canvas_mut(), 1, 1), (0, 255, 0, 255), "the fill reaches the corner of the output the surface covers");
     }
 
     #[test]

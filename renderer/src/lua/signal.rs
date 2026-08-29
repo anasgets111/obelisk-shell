@@ -175,6 +175,17 @@ impl Signal {
         (Signal(SignalKind::Live(Rc::clone(&cell))), LiveSignalHandle(cell, dirty))
     }
 
+    /// The signal `map(f)` builds: a `Computed` with this one as its only dependency, recomputed
+    /// on every read like any other (ADR-0044 decision 3, no memoization).
+    ///
+    /// Lifted out of the Lua-facing `map` method so a Rust caller can build the same thing --
+    /// `lua::capability::Capability` delegates its own `map` here, because `oblisk.lock` has to
+    /// read exactly like the ten bare capability globals beside it and a second, hand-rolled
+    /// `Computed` construction there would be a second place for that to drift.
+    pub(crate) fn mapped(&self, func: Function) -> Signal {
+        Signal(SignalKind::Computed { deps: vec![self.clone()], func })
+    }
+
     /// Reads this signal's current value (ADR-0044 decision 1, `CONTEXT.md`'s Signal resolution
     /// entry). `pub(crate)`, not private: `layout::node`'s property parsers call this directly to
     /// resolve a `Signal` userdata found in a property slot, instead of rejecting it -- the same
@@ -285,9 +296,7 @@ impl Default for DirtyFlag {
 impl UserData for Signal {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("get", |lua, this, ()| this.get_value(lua));
-        methods.add_method("map", |_, this, f: Function| {
-            Ok(Signal(SignalKind::Computed { deps: vec![this.clone()], func: f }))
-        });
+        methods.add_method("map", |_, this, f: Function| Ok(this.mapped(f)));
         // ADR-0044 decision 5's write path, and the only one Lua has. Every other kind is refused
         // by name rather than by a type error, because the config author who typed
         // `network:set(...)` needs to be told *why* a capability signal will not take a value,

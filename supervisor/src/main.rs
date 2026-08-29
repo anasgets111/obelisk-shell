@@ -1,6 +1,7 @@
 mod audio;
 mod dbus;
 mod hardware;
+mod lock;
 mod pam_worker;
 mod privacy;
 mod process;
@@ -25,6 +26,7 @@ use dbus::tray::{self, TrayController, TraySignal};
 use hardware::idle::{self, IdleController};
 use hardware::keyboard::{self, KeyboardController, KeyboardSignal};
 use hardware::sysinfo::{self, SysinfoController, SysinfoSignal};
+use lock::LockController;
 use privacy::{PrivacyController, PrivacySignal};
 use updates::{UpdatesController, UpdatesSignal};
 use process::registry::{LiveProcesses, reap_all_processes, reap_generations_processes, take_exited_process, wait_and_report_exit};
@@ -286,6 +288,23 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     let (updates_signal_tx, mut updates_signals) = tokio::sync::mpsc::unbounded_channel::<UpdatesSignal>();
     let updates = UpdatesController::new(PathBuf::from("/etc/pacman.conf"), PathBuf::from("/var/lib/pacman"), updates_signal_tx);
 
+    // lock capability (docs/adr/0042, docs/adr/0052): the Renderer holds `ext_session_lock_v1`
+    // and paints it; this side owns the decision to take it, the state a lock screen reads, and
+    // the one call site allowed to order an unlock. No D-Bus and no hardware, so no degrade path
+    // -- the whole capability is a state machine plus a channel. The channel exists because the
+    // controller must not cache the authoritative generation id (a swap reassigns it): each
+    // `SetSessionLock` comes back to this loop to be addressed.
+    let (lock_command_tx, mut lock_commands) = tokio::sync::mpsc::unbounded_channel::<shared::SetSessionLock>();
+    let lock = LockController::new(lock_command_tx);
+    // How a spawned lock-screen PAM conversation's answer gets back into this loop, the same
+    // shape every controller signal above already uses. See the `secure_submit(lock,
+    // authenticate)` arm for why that one conversation is spawned rather than `.await`ed inline
+    // like polkit's. `pam_outcome_tx` is kept here for the whole run, so the channel never closes
+    // and this arm never busy-loops on a `None`.
+    // Each outcome carries the acquisition the conversation was admitted against, because a PAM
+    // answer outlives the lock it answers for -- see `lock::accepts_outcome`.
+    let (pam_outcome_tx, mut pam_outcomes) = tokio::sync::mpsc::unbounded_channel::<(u64, shared::PamOutcome)>();
+
     let config_dir = shared::config_dir()?;
     let mut reload_events = watcher::spawn_watcher(&config_dir, RELOAD_DEBOUNCE)?;
     let mut next_sequence: u64 = 0;
@@ -322,6 +341,12 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     // Every `process.run`-spawned child still tracked (docs/adr/0026), plus the channel
     // `stream_process_output`'s background tasks use to report a naturally-exited process back to
     // this loop for reaping and registry cleanup.
+    // Whether a topology-changing reload was refused while the session was locked and still has
+    // to run once it clears (docs/adr/0042: only one client may hold a session lock, so a
+    // candidate cannot acquire the one the authoritative generation holds). A bool, not a queue:
+    // a second topology change while locked is still one reload to run on unlock.
+    let mut swap_owed_on_unlock = false;
+
     let mut processes: LiveProcesses = HashMap::new();
     let (process_done_tx, mut process_done) = tokio::sync::mpsc::unbounded_channel::<(u32, u64)>();
     // No handler at all previously meant Ctrl-C killed the Supervisor on the spot, leaving the
@@ -437,6 +462,42 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 let state = updates.snapshot();
                 push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "updates", &state);
             }
+            Some(command) = lock_commands.recv() => {
+                // The only place a `SetSessionLock` is addressed, because this is the only holder
+                // of the authoritative generation id. The state push rides along: every command
+                // this capability sends is also a state change a lock screen has to see
+                // (docs/adr/0052 decision 4).
+                send_frame_logged(&registry, authoritative.generation_id, &SupervisorFrame::SetSessionLock(command));
+                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "lock", &lock.snapshot());
+            }
+            Some((acquisition, outcome)) = pam_outcomes.recv() => {
+                // The other half of the `secure_submit(lock, authenticate)` arm below: the one
+                // place a `Success` becomes an unlock order, which is what keeps docs/adr/0042's
+                // "never call `unlock_and_destroy` except on a successful authentication" a
+                // property of a single call site even though the conversation itself now runs off
+                // this loop.
+                //
+                // `acquisition` is what makes that property mean anything. An answer takes about
+                // a second to come back and may take `PAM_EXCHANGE_TIMEOUT`'s thirty, and inside
+                // that window the compositor can end the lock the password was typed against
+                // (`finished` after `locked`, which is what `loginctl unlock-session` produces)
+                // and an idle timer can take a new one. `record_authentication` refuses an answer
+                // that no longer matches the lock on the glass; without it, that stale `Success`
+                // released a lock nobody had authenticated against, and a stale failure counted an
+                // attempt and printed an error against a lock screen the user had not touched yet.
+                let succeeded = outcome == shared::PamOutcome::Success;
+                if !lock.record_authentication(acquisition, outcome) {
+                    // No push: a refused answer changed no state, and `push_snapshot` bumps the
+                    // revision unconditionally, so pushing here would tell every lock screen its
+                    // state changed when it did not.
+                    eprintln!("lock: dropping a pam outcome for acquisition {acquisition}, which is no longer the lock on the glass");
+                } else if succeeded {
+                    // The command's own arm pushes the snapshot that goes with it.
+                    lock.unlock();
+                } else {
+                    push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "lock", &lock.snapshot());
+                }
+            }
             Some(()) = reload_events.recv() => {
                 begin_reload(&registry, authoritative.generation_id, &mut next_sequence);
             }
@@ -448,6 +509,43 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 }
             }
             Some(inbound) = inbound_frames.recv() => match inbound.frame {
+                RendererFrame::LockReport(report) if inbound.generation_id != authoritative.generation_id => {
+                    // Same posture the `Unchanged` and handshake-frame arms below take towards a
+                    // stale frame, and for a sharper reason: a superseded-but-not-yet-reaped
+                    // connection is a real source of frames here, and either direction of a
+                    // stale report corrupts the swap gate. A stale `Unlocked`/`Finished` clears
+                    // `active` while the live generation genuinely holds the lock, reopening the
+                    // gate and firing `swap_owed_on_unlock` straight into a swap that reaps the
+                    // holder; a stale `Locked` shuts the gate with no holder at all, and no
+                    // report will ever arrive to reopen it, so the config can never reload again.
+                    eprintln!(
+                        "generation {}'s lock report arrived from a non-authoritative generation (authoritative is {}); dropping: {report:?}",
+                        inbound.generation_id, authoritative.generation_id
+                    );
+                }
+                RendererFrame::LockReport(report) => {
+                    // docs/adr/0052 decision 4: the outcome *is* this capability's state, so it
+                    // goes through the controller and straight back out as a snapshot the lock
+                    // screen reads. Also docs/adr/0042's gate: a swap deferred while the gate was
+                    // shut runs the moment it opens.
+                    //
+                    // The question asked is `defers_swap` after the report, not "was the outcome
+                    // `Finished`/`Unlocked`". `Refused` opens the gate too, now that a request in
+                    // flight shuts it: a topology change deferred in the window before the
+                    // Renderer answered, followed by a refusal (a config that declared no `lock`
+                    // node, docs/adr/0052 decision 3), would otherwise leave a swap owed that
+                    // nothing ever redeems, and the config could never reload again.
+                    lock.record(lock::LockEvent::Reported(report.outcome));
+                    push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "lock", &lock.snapshot());
+                    if !lock.defers_swap() && std::mem::take(&mut swap_owed_on_unlock) {
+                        // A fresh cycle through the same call the watcher and `RequestReload`
+                        // already make, not the deferred evaluation replayed: its `sequence` is
+                        // stale by now (`is_current_reload` would drop the report anyway) and the
+                        // config may have changed again since. Reusing the whole existing reload
+                        // machinery with a second trigger holds no stale candidate.
+                        begin_reload(&registry, authoritative.generation_id, &mut next_sequence);
+                    }
+                }
                 RendererFrame::Command(envelope) => match envelope.params.capability.as_str() {
                     // One arm per capability: each capability's own `dispatch` adapter owns its
                     // action match, argument parse, and write-action spawn (ADR-0037), so a new
@@ -462,6 +560,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                     "mpris" => dbus::mpris::dispatch(&mpris, &envelope),
                     "updates" => updates::dispatch(&updates, &envelope),
                     "notifications" => notifications::dispatch(&notifications, &envelope),
+                    "lock" => lock::dispatch(&lock, &envelope),
                     _ => eprintln!("inbound command from generation {}: {:?}", inbound.generation_id, envelope),
                 },
                 RendererFrame::ReadySignal(_) | RendererFrame::PresentationEvidence(_) => {
@@ -493,6 +592,25 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                             inbound.generation_id
                         );
                     }
+                }
+                RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence }) if lock.defers_swap() => {
+                    // docs/adr/0042 and build-steps.md Phase 23 item 5: candidate N+1 cannot
+                    // acquire the session lock generation N is holding, so PBA's overlapping-
+                    // generation handoff is impossible until the lock clears. Deferred, not
+                    // failed -- the `Finished`/`Unlocked` arm above starts a fresh cycle. Guarded
+                    // arm before the real one below, the same ordering the `SecureSubmit` arms
+                    // further down rely on. In-place reloads (the `Unchanged` arm above) are
+                    // deliberately not gated: a colour or a label still applies live to a lock
+                    // screen, which is the whole point of painting it in the Lua process.
+                    //
+                    // `defers_swap`, not `is_active`: a lock whose order is out but whose report
+                    // has not come back yet is just as unswappable, and that window is neither
+                    // short nor rare (`ext_session_lock_v1` lets the compositor withhold `locked`
+                    // until lock surfaces are presented on every output). A swap there would
+                    // `reap_process_group` the process that owns the lock object, with no report
+                    // left to redeem `swap_owed_on_unlock` -- the session stays locked for good.
+                    eprintln!("generation swap for sequence {sequence} deferred: the session is locked (docs/adr/0042)");
+                    swap_owed_on_unlock = true;
                 }
                 RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence }) => {
                     // Phase 13's watcher becomes `run_pba`'s real caller here (build-steps.md
@@ -615,14 +733,90 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                         }
                     }
                 }
+                RendererFrame::SecureSubmit(mut submit)
+                    if submit.capability == "lock"
+                        && submit.action == "authenticate"
+                        && inbound.generation_id != authoritative.generation_id =>
+                {
+                    // The same stale-frame guard the `LockReport` arm above takes, and the
+                    // asymmetry of leaving it off here would be the bug rather than the tidiness
+                    // (Correctness review pass five). A superseded-but-not-yet-reaped connection is
+                    // a real source of frames, and only the authoritative generation paints the
+                    // lock screen a password can have been typed into. Left ungated, a stale
+                    // submission spends the single in-flight PAM slot `try_begin_authentication`
+                    // hands out and counts an attempt against a lock the user is still looking at.
+                    //
+                    // Deliberately unlike the polkit and network arms, which take any generation's
+                    // submission: those answer a challenge the Supervisor itself is holding, so the
+                    // pending intent is the guard. This one answers a lock, and the lock belongs to
+                    // exactly one generation (docs/adr/0042).
+                    eprintln!(
+                        "generation {}'s secure_submit(lock, authenticate) is stale -- {} is authoritative; dropping",
+                        submit.generation_id, authoritative.generation_id
+                    );
+                    submit.secret.zeroize();
+                }
+                RendererFrame::SecureSubmit(mut submit) if submit.capability == "lock" && submit.action == "authenticate" => {
+                    // docs/adr/0042 and docs/adr/0052: this arm and the `pam_outcomes` arm above
+                    // are the *only* path to an unlock, which is what turns "never call
+                    // `unlock_and_destroy` except on a successful authentication" into a property
+                    // of one call site rather than a rule the Renderer has to be trusted to keep.
+                    // Must come before the catch-all SecureSubmit arm below, same ordering reason
+                    // as the polkit and network arms above. No pending-intent lookup (unlike
+                    // those two): the lock screen's submission carries everything needed, and the
+                    // user being authenticated is this process's own owner.
+                    //
+                    // `try_begin_authentication` is the admission check, and it refuses two
+                    // things (see its own doc comment): a submit with no lock held -- nothing
+                    // stops a config from putting a `("lock", "authenticate")` textfield on the
+                    // bar, and build-steps.md Phase 23 item 3 scopes authentication to the lock
+                    // screen -- and a second submit while one conversation is still in flight.
+                    // The `Some` is the acquisition this conversation is about, carried through
+                    // the worker and back so the `pam_outcomes` arm above can tell an answer about
+                    // *this* lock from an answer about the one before it.
+                    if let Some(acquisition) = lock.try_begin_authentication() {
+                        push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "lock", &lock.snapshot());
+                        // mem::take moves the plaintext bytes out for run_lock_authentication (via
+                        // authenticate_current_user) to own and zeroize on every exit path,
+                        // including a panic or a runtime-shutdown cancellation (see both
+                        // functions' own doc comments) -- it leaves submit.secret as an empty Vec
+                        // (Default), which holds no plaintext, so there is nothing left in
+                        // `submit` to zeroize.
+                        let secret = std::mem::take(&mut submit.secret);
+                        // Spawned, not `.await`ed inline like the polkit arm above -- a deliberate
+                        // departure from docs/adr/0025's "the main loop blocks for real work,
+                        // bounded and rare". A polkit challenge is user-initiated once and
+                        // rate-limited by polkitd; a lock screen's Enter key is neither bounded
+                        // nor rare, and it is reachable by whoever is sitting at the console, so
+                        // the same reasoning gives the opposite answer here. Blocking this loop
+                        // for `pam_unix`'s ~2 second failure delay (or `PAM_EXCHANGE_TIMEOUT`'s 30
+                        // seconds on a wedged worker) stalls every `LockReport`, every reload and
+                        // every process reap behind it.
+                        //
+                        // run_lock_authentication, not authenticate_current_user directly: it
+                        // guarantees outcome_tx still gets a PamOutcome even if this task panics
+                        // or is dropped before its own happy-path send would run (Correctness
+                        // review finding: `authenticating` has no other release path than that
+                        // send reaching the pam_outcomes arm above).
+                        let outcome_tx = pam_outcome_tx.clone();
+                        tokio::spawn(pam_worker::run_lock_authentication(shared::Zeroizing::new(secret), acquisition, outcome_tx));
+                    } else {
+                        eprintln!(
+                            "generation {}'s secure_submit(lock, authenticate) arrived with no lock held, or with an attempt already in flight; dropping",
+                            submit.generation_id
+                        );
+                        submit.secret.zeroize();
+                    }
+                }
                 RendererFrame::SecureSubmit(mut submit) => {
                     // build-steps.md Phase 15 item 2 closes ADR-0015 item 2 (the textfield/IPC
                     // half only) -- this is deliberately still just a channel-forward-and-log
                     // placeholder, the same discipline this codebase already uses for
                     // `challenges.recv()` above. The `("polkit", "authenticate")` and
-                    // `("network", "connect")` cases are now handled by the guarded arms above
-                    // (docs/adr/0028 Phase 15 item 3; docs/adr/0029); this fallback covers every
-                    // other capability/action, none of which exist yet.
+                    // `("network", "connect")` and `("lock", "authenticate")` cases are now
+                    // handled by the guarded arms above (docs/adr/0028 Phase 15 item 3;
+                    // docs/adr/0029; docs/adr/0042); this fallback covers every other
+                    // capability/action, none of which exist yet.
                     //
                     // Never log the secret itself -- only its length -- and log before zeroizing
                     // it, not after (a post-zeroize log would just print the byte count of an

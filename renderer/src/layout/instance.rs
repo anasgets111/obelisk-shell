@@ -9,9 +9,12 @@
 //! anywhere, which is what makes it the testable seam in a file whose neighbours have no headless
 //! harness at all.
 //!
-//! Per-output is a `panel` rule, not a surface rule, and Phase 22 is where that stops being the
-//! same statement. § 6.2 gives a `window` no `monitor` because the compositor places a toplevel, so
-//! one declaration is one instance no matter how many monitors are connected.
+//! Per-output is not one rule but three answers, and Phase 22 and Phase 23 are where that stops
+//! being the same statement. § 6.2 gives a `window` no `monitor` because the compositor places a
+//! toplevel, so one declaration is one instance no matter how many monitors are connected. § 6.4
+//! gives a `lock` no `monitor` for the opposite reason: the protocol requires a surface on every
+//! output, so one declaration is always every monitor. Only a `panel` expands per output because a
+//! property asked it to.
 
 use crate::layout::node::SurfaceSpec;
 use crate::layout::scene::LogicalSize;
@@ -95,6 +98,22 @@ pub struct OutputGeometry {
 /// argument, so the declared size *is* the budget its child is measured against. The first
 /// `xdg_popup` configure replaces it through
 /// `crate::socket::RendererClient::set_instance_size`, exactly as it does for the other two.
+///
+/// A **`lock`** expands per output like a `panel`, on the same `"{id}@{output}"` id, and with no
+/// filter of any kind (docs/adr/0052 decision 2, build-steps.md Phase 23). The absence of the
+/// filter is the whole difference between the two, and it is the protocol's doing rather than a
+/// default: `ext-session-lock-v1` says the client "is expected to create lock surfaces for all
+/// outputs currently present", and a second surface on one output is a `duplicate_output` error, so
+/// there is exactly one legal answer per output. § 6.4 therefore gives a `lock` no `monitor` at
+/// all, and offering a choice with one legal value would be worse than not offering it. The
+/// per-output `available` matters here for the same reason it does for a `panel` and for more: a
+/// lock surface is sized by its own output's configure, and a laptop panel beside a 4K external
+/// cannot share one resolved tree.
+///
+/// Zero outputs produce zero lock instances, and that is not a hole to plug. There is no screen to
+/// lock, nothing is being painted, and the surfaces appear when the outputs do -- ADR-0042's
+/// "any new outputs as they are advertised" is a re-expansion through this same function, not a
+/// separate path.
 pub fn expand_instances(specs: &[SurfaceSpec], outputs: &[OutputGeometry]) -> Vec<SurfaceInstance> {
     let mut instances = Vec::new();
     for spec in specs {
@@ -124,6 +143,16 @@ pub fn expand_instances(specs: &[SurfaceSpec], outputs: &[OutputGeometry]) -> Ve
                 output: String::new(),
                 available: LogicalSize { width: popup.width, height: popup.height },
             }),
+            SurfaceSpec::Lock(lock) => {
+                for output in outputs {
+                    instances.push(SurfaceInstance {
+                        instance_id: format!("{}@{}", lock.id, output.name),
+                        declared_id: lock.id.clone(),
+                        output: output.name.clone(),
+                        available: output.size,
+                    });
+                }
+            }
         }
     }
     instances
@@ -312,6 +341,41 @@ mod tests {
             offset: crate::layout::node::PopupOffset::default(),
             grab: true,
         })
+    }
+
+    fn lock(id: &str) -> SurfaceSpec {
+        SurfaceSpec::Lock(crate::layout::node::LockSpec { id: id.to_string() })
+    }
+
+    #[test]
+    fn a_lock_expands_to_one_instance_per_output_with_no_filter_to_pass_first() {
+        // The protocol leaves one legal answer -- "lock surfaces for all outputs currently
+        // present", with a `duplicate_output` error for a second on one output -- so § 6.4 gives a
+        // `lock` no `monitor` to filter on (docs/adr/0042, docs/adr/0052 decision 2). Same
+        // `"{id}@{output}"` shape a `panel` gets, because every consumer downstream reads one id
+        // form and a lock instance is no more special to them than a bar on a second monitor is.
+        let outputs = [output("eDP-1", 1920.0, 1080.0), output("DP-1", 3840.0, 2160.0)];
+        let instances = expand_instances(&[lock("screen-lock")], &outputs);
+
+        assert_eq!(
+            instances.iter().map(|i| i.instance_id.as_str()).collect::<Vec<_>>(),
+            ["screen-lock@eDP-1", "screen-lock@DP-1"]
+        );
+        assert_eq!(instances[0].declared_id, "screen-lock");
+        assert_eq!(instances[1].output, "DP-1");
+        // Per-output sizing, for the reason a panel needs it and one more: a lock surface is sized
+        // by its own output's configure, so one resolved tree cannot serve both screens.
+        assert_eq!(instances[0].available, LogicalSize { width: 1920.0, height: 1080.0 });
+        assert_eq!(instances[1].available, LogicalSize { width: 3840.0, height: 2160.0 });
+    }
+
+    #[test]
+    fn a_lock_with_no_outputs_connected_expands_to_nothing_rather_than_to_one_unplaced_instance() {
+        // Unlike a `window`, which is one instance whatever `outputs` holds. A lock surface is
+        // always attached to an output, so with none connected there is nothing to attach to and
+        // nothing being painted; the surfaces arrive when the outputs do, through a re-expansion
+        // of this same function rather than a second path.
+        assert!(expand_instances(&[lock("screen-lock")], &[]).is_empty());
     }
 
     #[test]

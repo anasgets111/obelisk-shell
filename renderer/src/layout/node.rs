@@ -312,15 +312,19 @@ fn parse_hex_color(property: &str, s: &str) -> Result<Rgba, LayoutError> {
 /// changing each of them on a live surface, so a `Signal` in one resolves normally
 /// (docs/adr/0044 decision 1) and the next pass simply applies the new value.
 ///
-/// **`window` and `popup` add nothing to the carve-out** (build-steps.md Phase 22), and the same
-/// live-object test is what says so. On a `window`, `set_title` and `set_app_id` are both requests
-/// on a mapped toplevel -- the XML says so of `set_app_id` in as many words -- and `set_min_size`/
-/// `set_max_size` are double-buffered requests, so none of the four is fixed at creation the way a
-/// namespace is. On a `popup`, the whole `xdg_positioner` is consumed by `get_popup` and rebuilt on
-/// every open (docs/adr/0049 decision 1), so `parent`, `anchor_rect`, `anchor`, `gravity` and the
-/// rest are re-read each time and a `Signal` in any of them is the intended way to drive one --
-/// § 6.3's `anchor_rect` is specified as arriving from a click. Both roles' `id` is already covered
-/// by the universal arm below, because it is a reconcile identity rather than a protocol field.
+/// **`window`, `popup` and `lock` add nothing to the carve-out** (build-steps.md Phase 22 and
+/// Phase 23), and the same live-object test is what says so. On a `window`, `set_title` and
+/// `set_app_id` are both requests on a mapped toplevel -- the XML says so of `set_app_id` in as
+/// many words -- and `set_min_size`/`set_max_size` are double-buffered requests, so none of the
+/// four is fixed at creation the way a namespace is. On a `popup`, the whole `xdg_positioner` is
+/// consumed by `get_popup` and rebuilt on every open (docs/adr/0049 decision 1), so `parent`,
+/// `anchor_rect`, `anchor`, `gravity` and the rest are re-read each time and a `Signal` in any of
+/// them is the intended way to drive one -- § 6.3's `anchor_rect` is specified as arriving from a
+/// click. A `lock` settles the question by having nothing to answer it about: § 6.4's whole
+/// property list is `id` and `child`, and `layout::node::lock_spec` refuses the four properties a
+/// config might reach for anyway, so the carve-out would have to name a property that cannot
+/// appear. All three roles' `id` is already covered by the universal arm below, because it is a
+/// reconcile identity rather than a protocol field.
 fn is_structural_property(kind: &str, property: &str) -> bool {
     property == "id" || (kind == "panel" && matches!(property, "layer" | "anchor" | "monitor" | "namespace"))
 }
@@ -1751,6 +1755,73 @@ pub fn popup_spec(properties: &HashMap<String, Value>) -> Result<PopupSpec, Layo
     })
 }
 
+/// § 6.4's `lock`, whose whole property list is `id` and `child` (build-steps.md Phase 23,
+/// docs/adr/0052 decision 2). `child` is not a field here for the same reason it is not one on the
+/// other three roles: `layout::scene::children_of` walks it into the retained tree, and a spec
+/// carries what the Wayland side has to be told, not what the layout engine reads.
+///
+/// So this is one field, and it stays a struct rather than collapsing into a
+/// `SurfaceSpec::Lock(String)`. [`lock_spec`] is where § 6.4's four refusals live, and a bare
+/// `String` variant would leave them with no parser to hang off -- `crate::socket`'s
+/// `surface_specs` would have had to grow a role-specific check inline, which is exactly the shape
+/// the three parsers beside this one exist to avoid.
+///
+/// **No `LockTopology`, and for a stronger reason than [`PopupSpec`] has.** A panel carries one
+/// because `get_layer_surface` fixes five fields at creation. A lock surface has *no* protocol
+/// field at all that a config could set: `ext_session_lock_surface_v1` has exactly one request,
+/// `ack_configure`, and the size arrives in the configure rather than being asked for. There is
+/// nothing for a topology diff to compare beyond the declaration's existence, which is what
+/// [`SurfaceFingerprint::Lock`] holds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LockSpec {
+    pub id: String,
+}
+
+/// § 6.4's parser. Refuses the properties § 6.4 says a `lock` does not have, then reads the one it
+/// does.
+///
+/// **Refusing rather than ignoring is this parser's one real decision.** A config that writes
+/// `visible = false` on a lock screen believes it decides when the lock screen is up, and it does
+/// not: the compositor creates lock surfaces after `locked` and destroys them at
+/// `unlock_and_destroy`, and between those two points the protocol requires one on every output.
+/// Obeying the property would destroy a surface the compositor is still showing, which
+/// docs/adr/0042 records as the thing that makes it "fall back to rendering a solid color".
+/// Ignoring it silently would leave the wrong model in place until the author meets it from the
+/// other side, locked out of a session by a screen that did not do what they wrote. An error at
+/// evaluation lands in `rescue`'s `error_log` (§ 2.10, docs/adr/0046), where a human is reading and
+/// the session is not locked, so it is the cheapest place the correction can happen.
+///
+/// `monitor`, `anchor`, `width` and `height` get the same treatment for a weaker but sufficient
+/// reason: each is inert rather than dangerous -- a lock surface's geometry is entirely the
+/// compositor's configure, and it expands per output because the protocol says so rather than
+/// because a `monitor` asked (docs/adr/0052 decision 2) -- and a property that quietly does nothing
+/// is worse unreported than reported.
+///
+/// The refusals run *before* `id` is read, which is the opposite order to [`popup_spec`]'s and
+/// deliberate. `lock { visible = false }` with no `id` has two problems, and "missing `id`" is the
+/// one the author already knows how to fix; leading with it would hide the one that says their
+/// whole mental model of the role is wrong.
+///
+/// Nothing here consults [`is_deferred_signal`], and there is nothing for it to consult about. A
+/// refusal tests for the *key*, so a `Signal` under it is refused exactly as a literal is; `id` is
+/// in [`is_structural_property`]'s universal arm and rejects a `Signal` outright. § 6.4 leaves a
+/// `lock` no movable property at all, so the two-pass split docs/adr/0049's second amendment set up
+/// for `window` and `popup` has no second pass to do here.
+pub fn lock_spec(properties: &HashMap<String, Value>) -> Result<LockSpec, LayoutError> {
+    for property in ["visible", "monitor", "anchor", "width", "height"] {
+        if properties.contains_key(property) {
+            return Err(invalid(
+                property,
+                format!(
+                    "§ 6.4 gives a `lock` no `{property}`: a lock surface covers every connected output, for exactly as long as the compositor holds \
+                     the session locked, and none of that is the config's to set (docs/adr/0042, docs/adr/0052 decision 2)"
+                ),
+            ));
+        }
+    }
+    Ok(LockSpec { id: parse_surface_id(properties)? })
+}
+
 /// One declared top-level surface, parsed by whichever § 6 role its `kind` names (docs/adr/0040
 /// decision 1). `crate::socket`'s `surface_specs` builds one per node the evaluation returned, and
 /// this is the roster every later stage reads: `layout::instance::expand_instances` turns it into
@@ -1765,6 +1836,7 @@ pub enum SurfaceSpec {
     Panel(PanelSpec),
     Window(WindowSpec),
     Popup(PopupSpec),
+    Lock(LockSpec),
 }
 
 impl SurfaceSpec {
@@ -1775,6 +1847,7 @@ impl SurfaceSpec {
             SurfaceSpec::Panel(spec) => &spec.topology.id,
             SurfaceSpec::Window(spec) => &spec.id,
             SurfaceSpec::Popup(spec) => &spec.id,
+            SurfaceSpec::Lock(spec) => &spec.id,
         }
     }
 
@@ -1784,6 +1857,7 @@ impl SurfaceSpec {
             SurfaceSpec::Panel(spec) => SurfaceFingerprint::Panel(spec.topology.clone()),
             SurfaceSpec::Window(spec) => SurfaceFingerprint::Window(spec.id.clone()),
             SurfaceSpec::Popup(spec) => SurfaceFingerprint::Popup(spec.id.clone()),
+            SurfaceSpec::Lock(spec) => SurfaceFingerprint::Lock(spec.id.clone()),
         }
     }
 }
@@ -1792,19 +1866,27 @@ impl SurfaceSpec {
 /// choose a generation swap over an in-place reload (docs/adr/0001, `CONTEXT.md`'s Topology
 /// change). Order-sensitive equality on `Vec<SurfaceFingerprint>` is that diff.
 ///
-/// The three roles contribute different amounts, and the protocol decides how much rather than a
+/// The four roles contribute different amounts, and the protocol decides how much rather than a
 /// preference. A `panel` carries all five of [`SurfaceTopology`]'s fields, because
-/// `get_layer_surface` fixes every one of them at creation. A `window` and a `popup` carry their
-/// `id` alone: everything else they hold is either a request on a live object (`set_title`,
-/// `set_app_id`, the two size hints -- see [`WindowSpec`]'s own "no `WindowTopology`" note) or
-/// rebuilt per open (the whole `xdg_positioner`, docs/adr/0049 decision 1), so none of it can
-/// strand a live object the way a changed `namespace` would.
+/// `get_layer_surface` fixes every one of them at creation. A `window`, a `popup` and a `lock`
+/// carry their `id` alone: everything else they hold is either a request on a live object
+/// (`set_title`, `set_app_id`, the two size hints -- see [`WindowSpec`]'s own "no `WindowTopology`"
+/// note) or rebuilt per open (the whole `xdg_positioner`, docs/adr/0049 decision 1), so none of it
+/// can strand a live object the way a changed `namespace` would.
 ///
-/// What the two `id` arms *do* catch is the case docs/adr/0049 decision 3 names: adding or removing
-/// a declaration is a topology change for every role, including the two whose Wayland object comes
-/// and goes inside one generation. The panel-only fingerprint this replaced could not see a
-/// `window` appear at all, so an edit that added one reported `Unchanged` and reloaded in place
-/// into a generation that had built no surface for it.
+/// A `lock` reaches the same one-field answer from the other end. It holds nothing else to begin
+/// with: § 6.4 gives it `id` and `child`, and [`LockSpec`] explains why there is no protocol field
+/// under it for a diff to be about. So the only question a topology diff can ask about a lock
+/// declaration is whether it is still there, and `Lock(String)` is exactly that question.
+///
+/// What the three `id` arms *do* catch is the case docs/adr/0049 decision 3 names: adding or
+/// removing a declaration is a topology change for every role, including the three whose Wayland
+/// object comes and goes inside one generation. The panel-only fingerprint this replaced could not
+/// see a `window` appear at all, so an edit that added one reported `Unchanged` and reloaded in
+/// place into a generation that had built no surface for it. Deleting a `lock` mid-session is the
+/// sharpest case of the three: it is a topology change, so it is a swap, so docs/adr/0042's rule
+/// queues it until unlock and a live lock screen cannot lose its tree underneath it (docs/adr/0052,
+/// Consequences).
 ///
 /// The role itself is part of the fingerprint by construction: rewriting `panel { id = "x" }` as
 /// `window { id = "x" }` changes the variant, which is a different Wayland object entirely and so a
@@ -1814,6 +1896,7 @@ pub enum SurfaceFingerprint {
     Panel(SurfaceTopology),
     Window(String),
     Popup(String),
+    Lock(String),
 }
 
 /// A single-node property (`panel.child`), converted from its raw table via
@@ -1960,8 +2043,11 @@ pub fn parse_list_children(properties: &HashMap<String, Value>) -> Result<Vec<Vi
 }
 
 /// `textfield.secure_submit` (§ 5.2 item 8): the `{ capability, action }` pair a masked field's
-/// committed buffer is addressed to once `zwp_text_input_v3` fires `submit`, instead of the value
-/// ever reaching Lua (docs/adr/0005, docs/adr/0027). This pair becomes the routing key on a
+/// committed buffer is addressed to once the focused field submits, instead of the value ever
+/// reaching Lua (docs/adr/0005, docs/adr/0027). The submit is Enter on `wl_keyboard`, read natively
+/// in `renderer/src/wayland/mod.rs` -- ADR-0027's `zwp_text_input_v3` bridge was the original
+/// transport and no longer carries this path at all; see that file's `secure_key_action` for why a
+/// password must not travel through an input method. This pair becomes the routing key on a
 /// `RendererFrame::SecureSubmit` envelope (docs/adr/0050 decision 4), which is why both fields are
 /// required rather than falling back to some default capability.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4309,5 +4395,105 @@ mod tests {
         assert_eq!(spec.title, "", "the placeholder is what a toplevel that never sends set_title has");
         assert_eq!(spec.app_id, "oblisk-w", "the same default an absent `app_id` takes");
         assert_eq!((spec.min_size, spec.max_size), (None, None), "absent means the request is simply not sent");
+    }
+    // --- `lock` (§ 6.4) ---
+
+    #[test]
+    fn lock_spec_reads_the_id_and_that_is_the_whole_of_section_6_4() {
+        // § 6.4's property list is two entries long, and one of them (`child`) is the scene's to
+        // walk. A test that looked thin would be reporting the role accurately.
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "lock", id = "screen-lock", child = { kind = "rect" } }"#)
+            .eval()
+            .unwrap();
+        assert_eq!(lock_spec(&props_from_table(&table)).unwrap(), LockSpec { id: "screen-lock".to_string() });
+    }
+
+    #[test]
+    fn a_lock_without_an_id_is_rejected_the_same_way_every_other_role_is() {
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "lock" }"#).eval().unwrap();
+        assert!(matches!(
+            lock_spec(&props_from_table(&table)).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "id"
+        ));
+    }
+
+    #[test]
+    fn every_property_section_6_4_denies_a_lock_is_refused_by_name_rather_than_ignored() {
+        // The decision `lock_spec`'s doc comment argues. Silently dropping `visible = false` would
+        // leave an author believing they control when the lock screen is up, and honouring it would
+        // destroy a surface the compositor is still showing (docs/adr/0042). Each property is
+        // checked on its own so a later edit cannot quietly drop one from the list.
+        let lua = lua();
+        for property in ["visible", "monitor", "anchor", "width", "height"] {
+            let table: mlua::Table = lua
+                .load(format!(r#"return {{ kind = "lock", id = "screen-lock", {property} = 1 }}"#))
+                .eval()
+                .unwrap();
+            let err = lock_spec(&props_from_table(&table)).unwrap_err();
+            assert!(
+                matches!(&err, LayoutError::InvalidProperty { property: p, .. } if p == property),
+                "`{property}` must be refused by name, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_lock_property_wins_over_a_missing_id_because_it_is_the_error_that_teaches() {
+        // Ordering is deliberate and the opposite of `popup_spec`'s. "Missing `id`" is a mistake an
+        // author already knows how to fix; "a `lock` has no `visible`" is the one that corrects
+        // their model of the role, so it must not be hidden behind the easier message.
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "lock", visible = false }"#).eval().unwrap();
+        assert!(matches!(
+            lock_spec(&props_from_table(&table)).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "visible"
+        ));
+    }
+
+    #[test]
+    fn a_signal_bound_lock_property_is_refused_on_the_evaluation_pass_like_a_literal_one() {
+        // A `lock` has nothing to defer (docs/adr/0049's second amendment has no work to do for
+        // § 6.4), and the refusals must not become a way to smuggle one past: they test for the
+        // key, not the value, so `visible = state(...)` is the same error `visible = false` is.
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "lock", id = "screen-lock", visible = state("v", true) }"#)
+            .eval()
+            .unwrap();
+        assert!(matches!(
+            lock_spec(&props_from_table(&table)).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "visible"
+        ));
+    }
+
+    #[test]
+    fn a_signal_in_a_lock_id_is_rejected_by_the_universal_structural_arm_with_no_new_carve_out() {
+        // The answer to "does `lock` need an `is_structural_property` carve-out": no. `id` is
+        // already covered universally (docs/adr/0045 decision 1), and § 6.4 leaves no second
+        // property for a carve-out to name.
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua.load(r#"return { kind = "lock", id = state("i", "screen-lock") }"#).eval().unwrap();
+        let resolved = resolve_properties(&props_from_table(&table), "lock", &lua).unwrap();
+        assert!(matches!(
+            lock_spec(&resolved).unwrap_err(),
+            LayoutError::UnsupportedSignalProperty(p) if p == "id"
+        ));
+    }
+
+    #[test]
+    fn a_lock_fingerprints_on_its_id_alone_so_only_its_existence_is_a_topology_change() {
+        // There is no in-place-mutable protocol field on `ext_session_lock_surface_v1` for a diff
+        // to be about -- its one request is `ack_configure`. Renaming the declaration is adding one
+        // and removing another, which is the swap docs/adr/0052's Consequences relies on to keep a
+        // live lock screen's tree from being deleted underneath it.
+        let spec = SurfaceSpec::Lock(LockSpec { id: "screen-lock".to_string() });
+        assert_eq!(spec.declared_id(), "screen-lock");
+        assert_eq!(spec.fingerprint(), SurfaceFingerprint::Lock("screen-lock".to_string()));
+        assert_ne!(spec.fingerprint(), SurfaceFingerprint::Window("screen-lock".to_string()));
     }
 }

@@ -17,3 +17,48 @@ Grilled against `build-steps.md` Phase 15 item 2 and ADR-0005/0009/0014/0015, ch
 ## Upgrade path
 
 Not yet built: `TextInputService` itself, the `textfield` scene-node kind (`layout::scene::ensure_supported_kind` still rejects it), the seat binding, the `RendererFrame::SecureSubmit` type and its Supervisor-side receive/dispatch, and the new cross-thread channel pair. This ADR records the shape; implementation is a separate, later pass per this project's established phase-loop workflow.
+
+## Amendment: a `secure_submit` field reads the keyboard, not the text input
+
+This ADR chose `zwp_text_input_v3` for `textfield`, and for `on_submit` it argued the protocol's own
+`ACTION_SUBMIT` is "IME-correct (works with CJK composition, unlike raw keystroke detection)". That
+reasoning is right for an ordinary field and wrong for a masked one, and Phase 23 is where the
+difference stops being theoretical.
+
+text-input-v3 is the client half of a two-sided arrangement. The compositor delivers `commit_string`
+only when it has an input method bound, so with no IME running the events never arrive and the field
+receives nothing at all. Every `secure_submit` field written against this ADR was therefore unusable
+on a bare session, which was invisible for as long as nothing depended on it. A lock screen depends
+on it completely: § 6.4's lock surfaces are the only thing on the glass, and a password that cannot
+be typed is a session that cannot be unlocked, which `ext-session-lock-v1` then keeps locked on
+purpose (ADR-0042).
+
+So a `secure_submit` field takes its bytes from `wl_keyboard` directly, and the `zwp_text_input_v3`
+binding is gone rather than kept beside it. Deleting it is the part worth stating plainly, because
+this ADR designed it: `secure_submit` turned out to be its only consumer. `on_change` and
+`on_submit` were never wired to anything, so what this ADR built was a bridge serving exactly the
+one field kind that must not use it. Keeping it bound would have left a live
+`ContentPurpose::Password` session next to the keyboard reader, two writers on one secret buffer,
+and the IME argument below defeated by the thing it argues against.
+
+The design in this ADR is not withdrawn, only unbuilt. An ordinary, Lua-readable `textfield` is
+still what text-input is right for, and wiring one brings the binding back without
+`ContentPurpose::Password`. The split is not a workaround:
+
+- **An IME must not see a password.** Composition means the candidate text lives in another process
+  and is echoed to a popup. That is a reasonable price for a search box and not one a password field
+  may pay, which is why swaylock and hyprlock read xkb directly and no lock screen supports IME
+  composition.
+- **A masked field has no composition to be correct about.** ADR-0005 already makes its value
+  unreadable from Lua and its `on_submit` argument-free, so preedit, candidate windows and
+  delete-surrounding-text have nothing to act on. The whole feature set this ADR chose text-input for
+  is inapplicable to the one field kind now being carved out of it.
+
+`ACTION_SUBMIT` stays the trigger for an ordinary field's `on_submit`. On a masked field, Enter is,
+and Backspace is what `shared::SecureBuffer::pop_char` exists for.
+
+ponytail: with text-input gone, a `textfield` without `secure_submit` now receives nothing at all,
+where before it received nothing useful. The ceiling is that the two field kinds are designed for
+different input transports and only one is built. The upgrade path is the one this ADR already
+specifies, wired for real: `TextInputService`, `on_change`/`on_submit`, and a binding that omits
+`ContentPurpose::Password` because that field kind is not a password.

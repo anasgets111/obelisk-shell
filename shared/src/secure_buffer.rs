@@ -1,6 +1,7 @@
 //! Native buffer for typed secrets (passwords) that must never live in the Lua VM
-//! heap (ADR-0005). `textfield`'s `secure_submit` path is the eventual writer: keystrokes
-//! land here directly, never as a Lua string.
+//! heap (ADR-0005). `textfield`'s `secure_submit` path is the writer: the Renderer reads the
+//! keyboard itself for a focused `secure_submit` field and pushes the bytes straight in here,
+//! never as a Lua string and never through an input method.
 //!
 //! ADR-0005 explicitly distrusts `Drop` timing alone under a panic or early return: the
 //! caller must call `.zeroize()` itself right after the one sanctioned read
@@ -21,8 +22,9 @@ impl SecureBuffer {
         Self::default()
     }
 
-    /// Appends `s`'s UTF-8 bytes. The eventual `textfield` write site calls this once per
-    /// edit diff (ADR-0009), not once per keystroke.
+    /// Appends `s`'s UTF-8 bytes. Called once per `commit_string` edit diff when an input method
+    /// is driving `zwp_text_input_v3` (ADR-0009), and once per keystroke on the keyboard path that
+    /// a lock screen actually uses -- neither one changes what this has to guarantee.
     ///
     /// Growth is handled manually rather than left to `Vec`: `Vec`'s own reallocation
     /// allocates a new block, copies the old bytes over, and frees the old block without
@@ -42,6 +44,35 @@ impl SecureBuffer {
             old.zeroize();
         }
         self.bytes.extend_from_slice(s.as_bytes());
+    }
+
+    /// Backspace on a `secure_submit` field: drops the last UTF-8 character and zeroizes the
+    /// bytes it dropped, in place, before shortening the length.
+    ///
+    /// A `Vec::truncate` alone would be the same unscrubbed-plaintext bug `push_str`'s growth path
+    /// already guards against, one step smaller: the deleted byte would stay live in the backing
+    /// allocation for as long as the user keeps typing, and the explicit `.zeroize()` that ends a
+    /// submit is far too late to be the answer -- a lock screen holds this buffer across a whole
+    /// password entry, corrections included (docs/adr/0005).
+    ///
+    /// **A whole scalar, not a byte.** The secret leaves here through `expose_secret` and goes
+    /// straight into an IPC envelope with no second UTF-8 decode to catch a split character, so
+    /// removing one byte of a multi-byte scalar would put a byte sequence on the wire that PAM was
+    /// never given. `rposition` on the non-continuation bytes finds the last scalar's start, which
+    /// is the only index a delete may cut at.
+    ///
+    /// Returns whether anything was removed -- `false` on an empty buffer, which is Backspace in an
+    /// empty field and not an error.
+    pub fn pop_char(&mut self) -> bool {
+        let Some(start) = self.bytes.iter().rposition(|byte| (byte & 0xC0) != 0x80) else {
+            return false;
+        };
+        // `<[u8]>::zeroize` clears in place, and `truncate` on a `Vec<u8>` neither reallocates nor
+        // frees, so the scrubbed bytes stay inside this same allocation for the eventual
+        // `.zeroize()`/`Drop` to scrub a second time rather than being handed back to the allocator.
+        self.bytes[start..].zeroize();
+        self.bytes.truncate(start);
+        true
     }
 
     pub fn len(&self) -> usize {
@@ -105,5 +136,45 @@ mod tests {
         // read as plain bytes.
         let backing = unsafe { std::slice::from_raw_parts(ptr, capacity) };
         assert!(backing.iter().all(|&b| b == 0), "backing allocation was not fully zeroed");
+    }
+
+    /// Backspace's half of the trust-boundary property, and the reason [`SecureBuffer::pop_char`]
+    /// exists rather than a bare `Vec::truncate`: `truncate` only moves the length, so the byte
+    /// the user just deleted stays sitting in the backing allocation, past the reach of nothing at
+    /// all -- the later `.zeroize()` and `Drop` do scrub the whole allocation, but a lock screen
+    /// holds a live buffer for as long as the user is typing, and a deleted character must not
+    /// still be readable out of this process's heap in the meantime.
+    #[test]
+    fn pop_char_zeroizes_the_bytes_it_removes() {
+        let mut buf = SecureBuffer::new();
+        buf.push_str("hunter2");
+        let ptr = buf.bytes.as_ptr();
+
+        assert!(buf.pop_char());
+
+        assert_eq!(buf.expose_secret(), b"hunter");
+        // SAFETY: `pop_char` truncates without deallocating, so the allocation this pointer names
+        // is still owned by `buf.bytes` and the byte past the new length is valid to read as a
+        // plain `u8`.
+        assert_eq!(unsafe { *ptr.add(6) }, 0, "the removed byte was left in the backing allocation");
+    }
+
+    /// A multi-byte character is one Backspace, not one byte of one. Splitting a UTF-8 scalar
+    /// would leave the buffer holding a byte sequence that is not valid UTF-8 at all, and the
+    /// secret is serialized straight onto the wire from `expose_secret` without a second decode
+    /// to catch it (docs/adr/0005).
+    #[test]
+    fn pop_char_removes_a_whole_utf8_scalar_and_reports_an_empty_buffer() {
+        let mut buf = SecureBuffer::new();
+        buf.push_str("a\u{e9}");
+        assert_eq!(buf.len(), 3);
+
+        assert!(buf.pop_char());
+        assert_eq!(buf.expose_secret(), b"a");
+
+        assert!(buf.pop_char());
+        assert!(buf.is_empty());
+        // Backspace on an empty field is not an error, it is nothing happening.
+        assert!(!buf.pop_char());
     }
 }

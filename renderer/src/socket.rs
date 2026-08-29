@@ -85,9 +85,10 @@
 //! Real PBA handshake wiring (build-steps.md Phase 14, § 15.2-15.3, closing docs/adr/0019 items
 //! 1/3/6; Phase 15 item 2 adds `SecureSubmit`): `ReadySignal`, `PresentationEvidence` and
 //! `SecureSubmit` are all built by `crate::wayland::App` itself, at the point that actually knows
-//! them, and reach the wire as ordinary outbound frames. `ActivateDraw` is the one inbound frame
-//! [`RendererClient::handle_frame`] can't service on its own -- drawing needs the EGL/surface
-//! state -- so it hands the nonce straight back to the Wayland poll loop.
+//! them, and reach the wire as ordinary outbound frames. `ActivateDraw` and `SetSessionLock` are
+//! the two inbound frames [`RendererClient::handle_frame`] can't service on its own -- drawing
+//! needs the EGL/surface state, and a session lock is a Wayland object (docs/adr/0042) -- so each
+//! hands its argument straight back to the Wayland poll loop as a [`FrameOutcome`].
 //! `DeselectInput`/`PromoteGeneration` are real, received, and currently logged only (no real
 //! input-region/focus machinery exists yet to hand them to -- docs/adr/0025 item 4).
 
@@ -98,7 +99,7 @@ use std::path::{Path, PathBuf};
 use shared::framing::{self, write_json_frame};
 use shared::{
     ApplyPendingReload, ConnectionHandshake, DeselectInput, IdleEvent, ProcessExited, ProcessOutputLine, PromoteGeneration, ReevaluateReport,
-    ReevaluateRequest, RendererFrame, StateSnapshot, SupervisorFrame, Zeroize,
+    ReevaluateRequest, RendererFrame, SetSessionLock, StateSnapshot, SupervisorFrame, Zeroize,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
@@ -107,10 +108,23 @@ use tokio::sync::mpsc;
 use crate::layout::instance::SurfaceInstance;
 use crate::layout::node::{SurfaceFingerprint, SurfaceSpec};
 use crate::layout::{self, Scene};
+use crate::lua::capability::{Capability, CommandSender};
 use crate::lua::process::ProcessRegistry;
 use crate::lua::signal::{DirtyFlag, LiveSignalHandle};
 use crate::lua::{self, Loader};
 use crate::text::shaping::ShapingHandle;
+
+/// The one `shared::CAPABILITIES` roster name that is **not** registered as a bare Lua global
+/// (docs/adr/0052 decision 1, build-steps.md Phase 25 item 3 brought forward for exactly one
+/// name). § 6.4's `lock` node constructor already owns the global `lock`, and `RendererClient::new`'s
+/// roster seed runs after `lua::nodes::register_node_constructors`, so seeding this one the usual
+/// way overwrote the constructor and broke every `lock { ... }` declaration in the file that
+/// declares the lock screen -- silently, since the overwrite is just a `set`.
+///
+/// It is registered as `oblisk.lock` instead, which is what § 2 calls it anyway. The other ten
+/// keep their bare names until Phase 25 item 3 moves them together: one table with one member is
+/// a smaller change than renaming ten globals mid-phase, and it is the direction of travel.
+const NAMESPACED_CAPABILITY: &str = "lock";
 
 /// This Renderer's own generation id (`OBLISK_GENERATION_ID`, defaulting to `0`). Read once in
 /// `main`, then handed to both threads -- the socket thread stamps it into the handshake, the
@@ -177,6 +191,31 @@ struct ReloadState {
     pending: Option<(u64, lua::LoadOutput, Vec<SurfaceFingerprint>)>,
 }
 
+/// What one inbound [`SupervisorFrame`] still owes the Wayland thread after
+/// [`RendererClient::handle_frame`] has done everything it can do on its own.
+///
+/// One enum rather than an `Option<u64>` plus a second out-parameter, and the second frame is what
+/// forced it: `ActivateDraw` and `SetSessionLock` are the two frames whose work lives on
+/// `crate::wayland::App` (EGL and surface state for the first, SCTK's `SessionLockState` and the
+/// lock surfaces for the second, docs/adr/0042). A second `Option` beside the first would let a
+/// caller service both, neither, or the wrong one, and nothing in the type would say that exactly
+/// one of them can be owed per frame. This says it.
+///
+/// `Handled` is not "nothing happened": most frames -- a `StateSnapshot` hydrating a signal, a
+/// `Reevaluate` producing a report -- do their whole job inside `handle_frame` and owe the caller
+/// only the knowledge that they did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameOutcome {
+    /// Fully serviced inside [`RendererClient::handle_frame`].
+    Handled,
+    /// § 15.3's `ActivateDraw`: draw the announced surface set and request presentation feedback
+    /// for each, tagged with this nonce (`crate::wayland::App::activate_draw`).
+    ActivateDraw(u64),
+    /// ADR-0042/docs/adr/0052's `SetSessionLock`: make the session lock match this flag and report
+    /// a `LockReport` for what happened (`crate::wayland::App::set_session_lock`).
+    SetSessionLock(bool),
+}
+
 /// One generation's whole Lua side: the VM, the retained scene, the live signals, and the
 /// reload bookkeeping, grouped so they travel as one receiver instead of the same 6-7 pieces
 /// threaded through every function's parameter list separately (Standards review, docs/adr/0024).
@@ -205,6 +244,25 @@ pub struct RendererClient {
     /// and [`Self::re_resolve_if_dirty`] on every capability push -- and only `crate::wayland`
     /// knows the outputs they were expanded from.
     instances: Vec<SurfaceInstance>,
+    /// Whether this process is holding, or has just asked for, a session lock -- written only by
+    /// `crate::wayland::App::set_session_lock` and its teardown paths, through
+    /// [`Self::set_session_locked`].
+    ///
+    /// It is the arming half of [`lock_stays_authenticatable`], the veto every `Scene::apply` below
+    /// carries. See that function for the hole it closes; the short version is that
+    /// `SurfaceFingerprint::Lock` carries only the `id`, so editing a lock's `child` reads as
+    /// `Unchanged` and reloads *in place*, and an in-place reload that deletes the password field
+    /// while the lock is up leaves the session with no way out but a VT switch.
+    ///
+    /// **A `bool` and not the instance ids, and that is the whole of the fourth review's defect 1.**
+    /// This used to hold the `lock` instance ids that existed at the moment the lock was asked for.
+    /// `crate::wayland::App::handle_output_change` destroys instances and creates new ones on every
+    /// hotplug and never revisited that list, and `Scene` leaves a retired instance's tree behind,
+    /// so after a lid close onto a dock the veto went on validating `screen@eDP-1` -- a fossil
+    /// nothing can paint -- while the live lock screen was `screen@DP-1`. A snapshot taken at
+    /// acquire time cannot survive a hotplug, so there is no snapshot: the veto reads
+    /// [`Self::instances`], which `set_instances` keeps current for exactly this reason.
+    holds_session_lock: bool,
     /// A clone of the one `ShapingHandle` `crate::wayland::App` also holds -- one worker thread
     /// and one `FontSystem` for the whole process (docs/adr/0023 item 8, closed by docs/adr/0039
     /// decision 3), instead of the second `FontSystem::new()`'s ~1s startup this used to pay.
@@ -274,7 +332,12 @@ impl RendererClient {
             register_rescue_signal(&loader, dirty.clone()).map_err(|err| format!("failed to register the rescue signal: {err}"))?;
         let process_registry = ProcessRegistry::new(generation_id, outbound_tx.clone());
         loader.register_process(process_registry.clone()).map_err(|err| format!("failed to register the process global: {err}"))?;
-        let client = Self::new(loader, shell_lua_path, shaping, outbound_tx, rescue_handle, process_registry, dirty)
+        // The one write path § 3.2's commands all take (build-steps.md Phase 25 item 1), stamped
+        // with the same generation id `ProcessRegistry` above stamps, from the same source: § 7.3's
+        // guard rule drops a packet whose generation is stale, so a second source for it would be a
+        // second way to be silently ignored.
+        let commands = CommandSender::new(generation_id, outbound_tx);
+        let client = Self::new(loader, shell_lua_path, shaping, commands, rescue_handle, process_registry, dirty)
             .map_err(|err| format!("failed to seed the capability roster's and `screens` signals: {err}"))?;
         Ok(client)
     }
@@ -287,21 +350,36 @@ impl RendererClient {
     /// bluetooth/tray) froze at ADR-0031 while six more capabilities landed, exactly the drift a
     /// hand-list guarantees; the roster is the single source both processes share.
     /// `capability_signal`'s lazy path stays as the fallback for unrostered names.
+    ///
+    /// One roster name is seeded under a different Lua name rather than skipped: see
+    /// [`NAMESPACED_CAPABILITY`] and [`register_oblisk_namespace`].
     fn new(
         loader: Loader,
         shell_lua_path: PathBuf,
         shaping: ShapingHandle,
-        outbound_tx: mpsc::UnboundedSender<RendererFrame>,
+        commands: CommandSender,
         rescue_handle: LiveSignalHandle,
         process_registry: ProcessRegistry,
         dirty: DirtyFlag,
     ) -> mlua::Result<Self> {
+        // Taken off `commands` rather than passed alongside it, so this constructor stays inside
+        // clippy's argument limit (the same pressure that put `screens` here, below) and so there
+        // is visibly one channel rather than two clones of one that could drift apart.
+        let outbound_tx = commands.frames();
         let mut seeded = HashMap::new();
         for capability in shared::CAPABILITIES {
+            if *capability == NAMESPACED_CAPABILITY {
+                continue;
+            }
             let (signal, handle) = lua::signal::Signal::new_live(mlua::Value::Nil, dirty.clone());
             loader.set_global(capability, signal)?;
             seeded.insert((*capability).to_string(), handle);
         }
+        // Registered as `oblisk.lock`, not as a bare global like the ten above -- see
+        // [`register_oblisk_namespace`]. It goes into the same `seeded` map regardless, because
+        // that map is what `apply_state_snapshot` routes a `StateSnapshot` through and the wire
+        // still names this capability `"lock"`.
+        seeded.insert(NAMESPACED_CAPABILITY.to_string(), register_oblisk_namespace(&loader, dirty.clone(), commands)?);
         // Registered here rather than in `start` alongside `rescue` only to keep this
         // constructor's argument list under clippy's limit; it belongs with the roster seed
         // either way, since both exist so a `shell.lua` reading the global before its first real
@@ -315,6 +393,7 @@ impl RendererClient {
             shell_lua_path,
             scene: Scene::new(),
             instances: Vec::new(),
+            holds_session_lock: false,
             shaping,
             capability_signals: RefCell::new(seeded),
             rescue_handle,
@@ -335,7 +414,7 @@ impl RendererClient {
     ///
     /// The early return is a correctness fix, not an optimization. `rescue_handle` is a
     /// `LiveSignalHandle` like any capability's, so writing through it marks the shared
-    /// `DirtyFlag` (ADR-0044 decision 2), and both of this method's callers write on their
+    /// `DirtyFlag` (ADR-0044 decision 2), and two of this method's callers write on their
     /// *success* paths: `run_startup_evaluation` clears rescue right after a successful
     /// `Scene::apply`, and `handle_reevaluate` clears it before every verdict. Rewriting an
     /// unchanged value therefore marked the scene dirty when nothing had changed, so a clean
@@ -348,7 +427,14 @@ impl RendererClient {
     /// signal's *resolved* value across reads; this is about a write that stores nothing new not
     /// claiming the scene changed. A genuine rescue transition still marks dirty and still
     /// re-resolves, because `rescue` is a live signal a config may read like any other.
-    fn set_rescue_state(&mut self, is_rescue: bool, error_log: &str) {
+    ///
+    /// `pub` for the third caller, which is outside this module: `crate::wayland::App`'s
+    /// `SessionLockHandler`, which docs/adr/0052 decision 4 requires to set `rescue` on a refused
+    /// lock and on both `finished` cases, because in each of them the ordinary scene is what is on
+    /// the glass and `rescue` is the only channel that reaches the user. The ADR is explicit that
+    /// the Renderer sets that signal itself rather than round-tripping it through the Supervisor,
+    /// and this is the one write path to it.
+    pub fn set_rescue_state(&mut self, is_rescue: bool, error_log: &str) {
         if self.rescue_state.0 == is_rescue && self.rescue_state.1 == error_log {
             return;
         }
@@ -438,6 +524,19 @@ impl RendererClient {
     /// `OutputHandler` on every monitor hotplug (docs/adr/0038 decision 3).
     pub fn set_instances(&mut self, instances: Vec<SurfaceInstance>) {
         self.instances = instances;
+    }
+
+    /// Arms or disarms the lock-authentication veto every `Scene::apply` in this module carries
+    /// (docs/adr/0052 decision 3). `crate::wayland::App::set_session_lock` arms it the moment it
+    /// asks the compositor for the lock -- not when `locked` arrives, because a reload landing
+    /// inside that window would strip the field out of the tree the compositor is about to show --
+    /// and every path that gives the lock up disarms it.
+    ///
+    /// Carries no instance ids: which surfaces the veto has to defend is a question only the apply
+    /// that is running can answer, and [`lock_stays_authenticatable`] asks it there. See
+    /// [`Self::holds_session_lock`].
+    pub fn set_session_locked(&mut self, locked: bool) {
+        self.holds_session_lock = locked;
     }
 
     /// The set [`Self::set_instances`] last stored, so `crate::wayland::App` can diff a fresh
@@ -549,7 +648,10 @@ impl RendererClient {
         let Some(output) = self.state.applied_output.as_ref() else {
             return false;
         };
-        let applied = self.scene.apply(&output.surfaces, &self.instances, &self.shaping, self.loader.lua());
+        let (instances, locked) = (&self.instances, self.holds_session_lock);
+        let applied = self.scene.apply_admitting(&output.surfaces, instances, &self.shaping, self.loader.lua(), |scene| {
+            lock_stays_authenticatable(scene, instances, locked)
+        });
         match applied {
             Ok(()) => {
                 log_applied_surfaces(&self.scene, &self.instances);
@@ -603,12 +705,12 @@ impl RendererClient {
     /// Handles one inbound `SupervisorFrame`, decoded off the wire by [`pump`] and handed over by
     /// `crate::wayland::run`'s poll loop.
     ///
-    /// Returns `Some(nonce)` for an `ActivateDraw` and `None` for everything else: drawing needs
-    /// the EGL/surface state that lives on `crate::wayland::App`, so that one nonce goes back to
-    /// the caller to drive `App::activate_draw` (§ 15.3). Every other frame is fully serviced
-    /// here.
+    /// Returns a [`FrameOutcome`]: `Handled` for every frame this can finish on its own, and one
+    /// of the two hand-backs for the two it cannot. Both of those need state that lives on
+    /// `crate::wayland::App` and not here -- the EGL and surface state a draw needs (§ 15.3), and
+    /// SCTK's `SessionLockState` plus the lock surfaces a `SetSessionLock` needs (docs/adr/0042).
     #[must_use]
-    pub fn handle_frame(&mut self, frame: SupervisorFrame) -> Option<u64> {
+    pub fn handle_frame(&mut self, frame: SupervisorFrame) -> FrameOutcome {
         match frame {
             SupervisorFrame::StateSnapshot(snapshot) => {
                 if let Err(err) = self.apply_state_snapshot(snapshot) {
@@ -617,7 +719,7 @@ impl RendererClient {
             }
             SupervisorFrame::Reevaluate(request) => self.handle_reevaluate(request),
             SupervisorFrame::ApplyPendingReload(apply) => self.handle_apply_pending(apply),
-            SupervisorFrame::ActivateDraw(activate) => return Some(activate.nonce),
+            SupervisorFrame::ActivateDraw(activate) => return FrameOutcome::ActivateDraw(activate.nonce),
             SupervisorFrame::DeselectInput(DeselectInput { surface_id }) => {
                 // Real, received, currently-inert: no per-surface input-region/focus
                 // machinery exists yet to hand this to -- docs/adr/0025 item 4.
@@ -632,6 +734,13 @@ impl RendererClient {
             SupervisorFrame::ProcessExited(ProcessExited { id, code }) => {
                 self.process_registry.dispatch_exit(id, code);
             }
+            // Handed straight back, for `ActivateDraw`'s reason and no other: `ext_session_lock_v1`
+            // is a Wayland object, so every part of servicing this -- taking the lock, creating one
+            // `ext_session_lock_surface_v1` per output, tearing them down again -- lives on
+            // `crate::wayland::App` (docs/adr/0042, docs/adr/0052 decision 1). Nothing about it can
+            // be decided here: whether the config even declares a `lock` surface is a question about
+            // the tracked surface set, not about the scene this module owns.
+            SupervisorFrame::SetSessionLock(SetSessionLock { locked }) => return FrameOutcome::SetSessionLock(locked),
             SupervisorFrame::IdleEvent(IdleEvent { generation_id, threshold_sec, state }) => {
                 // Real, received, currently-inert: no Lua-side `register_threshold` callback
                 // registry exists yet to dispatch this to -- ADR-0032's Supervisor-side
@@ -643,7 +752,7 @@ impl RendererClient {
                 );
             }
         }
-        None
+        FrameOutcome::Handled
     }
 
     /// Runs one `Reevaluate` request: evaluates `shell.lua`, classifies the result against
@@ -697,7 +806,10 @@ impl RendererClient {
             return;
         }
         let (_, output, topology) = self.state.pending.take().expect("just confirmed Some above");
-        match self.scene.apply(&output.surfaces, &self.instances, &self.shaping, self.loader.lua()) {
+        let (instances, locked) = (&self.instances, self.holds_session_lock);
+        match self.scene.apply_admitting(&output.surfaces, instances, &self.shaping, self.loader.lua(), |scene| {
+            lock_stays_authenticatable(scene, instances, locked)
+        }) {
             Ok(()) => {
                 log_applied_surfaces(&self.scene, &self.instances);
                 self.scene.release_all_retired();
@@ -763,7 +875,10 @@ impl RendererClient {
         if !self.dirty.take() {
             return false;
         }
-        let applied = self.scene.apply(&output.surfaces, &self.instances, &self.shaping, self.loader.lua());
+        let (instances, locked) = (&self.instances, self.holds_session_lock);
+        let applied = self.scene.apply_admitting(&output.surfaces, instances, &self.shaping, self.loader.lua(), |scene| {
+            lock_stays_authenticatable(scene, instances, locked)
+        });
         if let Err(err) = applied {
             // `Scene::apply` rolls back to its exact pre-call state on error (see its own doc
             // comment), so the prior good scene is still applied and still on screen. This is
@@ -897,6 +1012,7 @@ fn frame_label(frame: &RendererFrame) -> &'static str {
         RendererFrame::ReevaluateReport(_) => "ReevaluateReport",
         RendererFrame::Command(_) => "Command",
         RendererFrame::SecureSubmit(_) => "SecureSubmit",
+        RendererFrame::LockReport(_) => "LockReport",
         RendererFrame::RequestReload => "RequestReload",
     }
 }
@@ -930,6 +1046,30 @@ fn register_screens_signal(loader: &Loader, dirty: DirtyFlag, initial: &serde_js
     Ok(handle)
 }
 
+/// Registers the `oblisk` table with its one member, `oblisk.lock` (docs/adr/0052 decision 1).
+/// Returns that capability's `LiveSignalHandle` so `apply_state_snapshot` can hydrate it exactly
+/// like a bare roster global's -- the Lua-side *name* moved, the Rust-side push path did not.
+///
+/// The member is a [`Capability`], not a bare `lua::signal::Signal`, and that is the shape
+/// decision here: ADR-0052 decision 4 has a lock screen read `{ active, authenticating, attempts,
+/// error }` off `oblisk.lock` while ADR-0052 decision 1 has the same config *command* the lock
+/// through it, so both halves live on one handle rather than a signal and a writer a config
+/// author would have to keep straight. See `lua::capability`'s own doc comment.
+///
+/// Deliberately outside [`register_screens_signal`]'s exception rather than beside it: `screens`
+/// is Renderer-sourced and outside the roster (docs/adr/0041 decision 2), whereas `lock` is a real
+/// Supervisor-pushed roster capability that is merely spelled differently, which is why it is
+/// still seeded into `capability_signals` and `screens` is not.
+fn register_oblisk_namespace(loader: &Loader, dirty: DirtyFlag, commands: CommandSender) -> mlua::Result<LiveSignalHandle> {
+    // `nil` until the Supervisor's first push, the same initial every rostered capability gets
+    // (ADR-0037's uniform nil-until-hydrated contract).
+    let (signal, handle) = lua::signal::Signal::new_live(mlua::Value::Nil, dirty);
+    let table = loader.create_table()?;
+    table.set(NAMESPACED_CAPABILITY, Capability::new(NAMESPACED_CAPABILITY, signal, commands))?;
+    loader.set_global("oblisk", table)?;
+    Ok(handle)
+}
+
 fn rescue_table(loader: &Loader, is_rescue: bool, error_log: &str) -> mlua::Result<mlua::Table> {
     let table = loader.create_table()?;
     table.set("is_rescue", is_rescue)?;
@@ -937,8 +1077,8 @@ fn rescue_table(loader: &Loader, is_rescue: bool, error_log: &str) -> mlua::Resu
     Ok(table)
 }
 
-/// Parses **every** declared surface by its own role and returns the whole roster (§ 6.1-6.3,
-/// build-steps.md Phase 20 item 3 and Phase 22). Was `surfaces_topology`, returning only the swap
+/// Parses **every** declared surface by its own role and returns the whole roster (§ 6.1-6.4,
+/// build-steps.md Phase 20 item 3, Phase 22 and Phase 23). Was `surfaces_topology`, returning only the swap
 /// fingerprint, then `panel_specs`, which parsed all three roles and returned only the panels;
 /// build-steps.md Phase 22 is what made every role's spec something a caller actually needs, so all
 /// three come back now.
@@ -986,6 +1126,15 @@ fn rescue_table(loader: &Loader, is_rescue: bool, error_log: &str) -> mlua::Resu
 /// what order, with what role. That is exactly what a topology diff and an instance expansion need,
 /// and none of it is a `Signal`'s to move -- `layout::node`'s structural-field rejection refuses one
 /// in an `id`.
+///
+/// **§ 6.4's `lock` is authoritative here in full, and it is the only role that is** (docs/adr/0052
+/// decision 2). The two-pass split above exists for properties that are meant to move; a `lock` has
+/// none. Its property list is `id` and `child`, `id` is structural, and `child` is the scene's to
+/// walk, so [`lock_spec`](layout::node::lock_spec) consults `is_deferred_signal` nowhere and there
+/// is no second pass over a lock's properties to be the real one. The four properties it refuses
+/// are refused on the *key*, so a config writing `visible = some_signal` on a lock screen fails
+/// here exactly as `visible = false` does -- deferring that would be deferring a check on a
+/// property that will never legally exist.
 fn surface_specs(output: &lua::LoadOutput) -> Result<Vec<SurfaceSpec>, lua::LoaderError> {
     let invalid = |err: layout::node::LayoutError| lua::LoaderError::InvalidTopology(err.to_string());
     let mut specs = Vec::with_capacity(output.surfaces.len());
@@ -994,11 +1143,38 @@ fn surface_specs(output: &lua::LoadOutput) -> Result<Vec<SurfaceSpec>, lua::Load
             "panel" => SurfaceSpec::Panel(layout::node::panel_spec(&surface.properties).map_err(invalid)?),
             "window" => SurfaceSpec::Window(layout::node::window_spec(&surface.properties).map_err(invalid)?),
             "popup" => SurfaceSpec::Popup(layout::node::popup_spec(&surface.properties).map_err(invalid)?),
-            // Unreachable: `lua::require_surface` admits exactly the three roles above and rejects
-            // everything else, `lock` with its own message. Named rather than left to a silent
-            // `_ => {}`, because that arm would let a fourth role reach a generation unvalidated.
+            "lock" => SurfaceSpec::Lock(layout::node::lock_spec(&surface.properties).map_err(invalid)?),
+            // Unreachable: `lua::require_surface` admits exactly the four § 6 roles above and
+            // rejects everything else. Named rather than left to a silent `_ => {}`, because that
+            // arm would let a fifth role reach a generation unvalidated -- which is not
+            // hypothetical, since `lock` spent Phase 22 as a role this match had no arm for.
             other => return Err(lua::LoaderError::InvalidTopology(format!("`{other}` is not a surface role"))),
         });
+    }
+    // **At most one `lock` in a config, and this is the only place that can say so.** Every other
+    // § 6 role may be declared any number of times, so the check is a property of the surface *set*
+    // rather than of any one spec, and this is the one function every declaration passes through on
+    // both the startup path and the `Reevaluate` path -- rejecting here is what keeps a second
+    // declaration from ever reaching a generation.
+    //
+    // The failure it prevents is unrecoverable rather than cosmetic.
+    // `layout::instance::expand_instances` emits one instance per lock spec per output, so two
+    // declarations make `crate::wayland::App::ensure_lock_surfaces` send two `get_lock_surface` for
+    // the same `wl_output`, and `ext-session-lock-v1` is explicit: "Attempting to create more than
+    // one lock surface for a given output is a duplicate_output protocol error." The compositor
+    // disconnects the client, it does not unlock the session when a lock client dies, and the user
+    // is left with a VT switch as the only way back in.
+    //
+    // There is also nothing coherent to admit. § 6.4 gives a `lock` no `monitor` and exactly one
+    // surface per output, so "two lock screens" names no arrangement a compositor could show --
+    // unlike two `panel`s, which are two strips of glass.
+    let locks = specs.iter().filter(|spec| matches!(spec, SurfaceSpec::Lock(_))).count();
+    if locks > 1 {
+        return Err(lua::LoaderError::InvalidTopology(format!(
+            "this config declares {locks} `lock` surfaces; § 6.4 gives a `lock` no `monitor` and exactly one surface per output, so a config may \
+             declare at most one -- a second would ask the compositor for two lock surfaces on one output, which is `duplicate_output`, which kills \
+             the connection with the session still locked"
+        )));
     }
     Ok(specs)
 }
@@ -1014,6 +1190,66 @@ fn evaluate_and_specs(loader: &Loader, shell_lua_path: &Path) -> Result<(lua::Lo
     let output = loader.evaluate_file(shell_lua_path)?;
     let specs = surface_specs(&output)?;
     Ok((output, specs))
+}
+
+/// The veto `Scene::apply` runs on the finished scene while this process holds a session lock: the
+/// locked session must still be one the user can authenticate out of.
+///
+/// **Why this exists at all.** `layout::node::SurfaceFingerprint::Lock` carries only the `id`, so
+/// editing what is *inside* a `lock` -- its `child`, and therefore its password field -- diffs as
+/// `Unchanged` and takes the in-place reload path, which the generation-swap gate deliberately does
+/// not police. Saving a `shell.lua` that deletes the `textfield` while the lock screen is up would
+/// therefore apply immediately, and the session becomes unauthenticatable the next time focus is
+/// evaluated. The compositor does not unlock when a lock client dies, so the way out is a VT switch.
+///
+/// **It asks the apply what is on the glass, and holds no list of its own.** The arming side is one
+/// `bool` (see [`RendererClient::holds_session_lock`]); the `lock` instances are read out of the
+/// instance set this very apply is resolving, which `RendererClient::set_instances` replaces on
+/// every monitor hotplug. A remembered list could not survive one: a lid closing onto a dock retires
+/// `screen@eDP-1` and creates `screen@DP-1`, and `Scene` keeps the retired instance's tree, so a
+/// snapshot taken when the lock was granted went on vouching for a fossil nothing can paint while
+/// the live lock screen quietly lost its way out.
+///
+/// **`any`, not `all`, and it is the same rule the grant used.** `crate::wayland::App`'s
+/// `set_session_lock` admits a lock when *any* declared instance is typable, because one lock
+/// surface per output is the protocol's requirement and they all resolve from the same declaration.
+/// A veto that demanded all of them would refuse every reload for the rest of a lock the guard had
+/// already granted, which is the nuisance mirror of the strand above. An empty set fails, which is
+/// the case where the reload removed the `lock` declaration outright.
+///
+/// **Restyling a live lock screen must keep working**, and this is why the veto asks the narrowest
+/// possible question rather than freezing the tree. Painting the lock screen out of the config's own
+/// Lua is the entire point of docs/adr/0052 decision 2; changing its colours, its clock, its
+/// placeholder text or its layout is exactly the edit that should land while it is on the glass.
+/// Removing the way out is the one edit that must not.
+///
+/// The predicate is `crate::wayland`'s `tree_can_authenticate`, not a copy of it, for the reason
+/// that function's own doc comment gives: a second opinion about what makes a lock screen usable is
+/// how a lock gets granted against a rule the keyboard does not follow.
+fn lock_stays_authenticatable(scene: &Scene, instances: &[SurfaceInstance], holds_session_lock: bool) -> Result<(), layout::node::LayoutError> {
+    if !holds_session_lock {
+        return Ok(());
+    }
+    let mut locks = Vec::new();
+    for instance in instances {
+        let Some(tree) = scene.surface(&instance.instance_id) else {
+            continue;
+        };
+        if tree.kind == "lock" {
+            if crate::wayland::tree_can_authenticate(&tree) {
+                return Ok(());
+            }
+            locks.push(instance.instance_id.as_str());
+        }
+    }
+    Err(layout::node::invalid(
+        "child",
+        format!(
+            "this evaluation leaves the locked session's `lock` surfaces {locks:?} with no single `textfield` carrying \
+             `secure_submit = {{ capability = \"lock\", action = \"authenticate\" }}`, so the locked session would have no way back in \
+             but a VT switch; the reload was refused and the lock screen that is on screen still stands (§ 6.4, docs/adr/0052 decision 3)"
+        ),
+    ))
 }
 
 /// Logs each surface *instance*'s resolved geometry after a successful `scene.apply` --
@@ -1101,7 +1337,8 @@ mod tests {
         let rescue_handle = register_rescue_signal(&loader, dirty.clone()).unwrap();
         let process_registry = ProcessRegistry::new(0, outbound_tx.clone());
         loader.register_process(process_registry.clone()).unwrap();
-        let client = RendererClient::new(loader, shell_lua_path.to_path_buf(), ShapingHandle::spawn(), outbound_tx, rescue_handle, process_registry, dirty)
+        let commands = CommandSender::new(0, outbound_tx);
+        let client = RendererClient::new(loader, shell_lua_path.to_path_buf(), ShapingHandle::spawn(), commands, rescue_handle, process_registry, dirty)
             .unwrap();
         (client, outbound_rx)
     }
@@ -1183,10 +1420,78 @@ mod tests {
         let (client, _outbound_rx) = test_client(&missing);
 
         for capability in shared::CAPABILITIES {
-            let probe = format!(r#"return panel {{ id = "bar", layer = "Top", is_nil = {capability}:get() == nil }}"#);
-            let output = client.loader.evaluate(&probe).unwrap_or_else(|err| panic!("rostered capability {capability:?} has no live global: {err}"));
-            assert_eq!(output.surfaces[0].properties.get("is_nil").unwrap().as_boolean(), Some(true), "{capability} should read nil before its first snapshot");
+            // One roster name is spelled `oblisk.lock` rather than bare, and the contract is the
+            // same one: reachable before the first push, reading nil. See NAMESPACED_CAPABILITY.
+            let name = if *capability == NAMESPACED_CAPABILITY { format!("oblisk.{capability}") } else { (*capability).to_string() };
+            let probe = format!(r#"return panel {{ id = "bar", layer = "Top", is_nil = {name}:get() == nil }}"#);
+            let output = client.loader.evaluate(&probe).unwrap_or_else(|err| panic!("rostered capability {name:?} has no live signal: {err}"));
+            assert_eq!(output.surfaces[0].properties.get("is_nil").unwrap().as_boolean(), Some(true), "{name} should read nil before its first snapshot");
         }
+    }
+
+    /// The regression build-steps.md Phase 25 item 3 could silently reintroduce, and the reason
+    /// docs/adr/0052 decision 1 brought exactly one name of that item forward. `RendererClient::new`
+    /// seeds the roster *after* `Loader::new` registered § 6.4's node constructors, so seeding
+    /// `lock` as a bare global overwrites the constructor -- and a `set` over an existing global
+    /// says nothing, so the failure surfaces as "attempt to call a userdata value" from the
+    /// config's own `lock { ... }` line, pointing at the config rather than at the seed.
+    ///
+    /// Asserted after a whole generation is built, not after the seed alone, because the ordering
+    /// between the two registrations is exactly what is under test.
+    #[test]
+    fn a_full_generation_keeps_lock_as_the_node_constructor_and_puts_the_capability_on_oblisk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(
+            dir.path(),
+            r##"return {
+                panel { id = "bar", layer = "Top" },
+                lock {
+                    id = "screen",
+                    child = text { content = oblisk.lock:map(function(s) return (s and s.error) or "" end) },
+                },
+            }"##,
+        );
+        let (mut client, _outbound_rx) = test_client(&path);
+        client
+            .apply_state_snapshot(StateSnapshot {
+                capability: "lock".to_string(),
+                revision: 1,
+                payload: serde_json::json!({ "active": false, "authenticating": false, "attempts": 2, "error": "authentication failed" }),
+            })
+            .unwrap();
+
+        assert!(run_startup(&mut client), "a config declaring a lock screen must build a scene");
+
+        // The constructor survived: a `lock { ... }` at the root still produced a § 6.4 surface.
+        let probe = client.loader.evaluate(
+            r##"return panel {
+                id = "_probe", layer = "Top",
+                lock_kind = lock { id = "screen" }.kind,
+                capability_type = type(oblisk.lock),
+                attempts = oblisk.lock:get().attempts,
+            }"##,
+        ).unwrap();
+        let props = &probe.surfaces[0].properties;
+        assert_eq!(props.get("lock_kind").unwrap().as_string().unwrap().to_string_lossy(), "lock", "the global `lock` must still be § 6.4's node constructor");
+        // And the capability is reachable, hydrated, under the name § 2 gives it.
+        assert_eq!(props.get("capability_type").unwrap().as_string().unwrap().to_string_lossy(), "userdata");
+        assert_eq!(props.get("attempts").unwrap().as_integer(), Some(2), "the `lock` StateSnapshot must reach `oblisk.lock`, not a bare global nothing registered");
+    }
+
+    /// The write half of the same object (build-steps.md Phase 25 item 1): a config's own
+    /// `on_click` calling the lock action puts a real § 7.2 envelope on the outbound channel.
+    #[test]
+    fn a_config_calling_the_lock_action_queues_a_command_for_the_supervisor() {
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (client, mut outbound_rx) = test_client(&missing);
+
+        client.loader.lua().load(r#"oblisk.lock:invoke("lock")"#).exec().unwrap();
+
+        let RendererFrame::Command(envelope) = queued_frame(&mut outbound_rx) else {
+            panic!("a capability write must be queued as RendererFrame::Command");
+        };
+        assert_eq!(envelope.params.capability, "lock");
+        assert_eq!(envelope.params.action, "lock", "the action `supervisor/src/lock.rs`'s dispatch answers to");
     }
 
     #[test]
@@ -1265,6 +1570,161 @@ mod tests {
         client.handle_reevaluate(ReevaluateRequest { sequence: 9 });
 
         assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence: 9 }));
+        assert!(client.state.pending.is_none());
+    }
+
+    /// A lock screen whose `child` holds the one `secure_submit` field § 6.4 needs, wrapped in a
+    /// `column` whose colour the second half of the test below edits.
+    fn lock_config(background: &str) -> String {
+        format!(
+            r##"return {{
+                panel {{ id = "bar", layer = "Top" }},
+                lock {{ id = "screen", child = column {{ background = "{background}", children = {{
+                    textfield {{ mask_character = "*", secure_submit = {{ capability = "lock", action = "authenticate" }} }},
+                }} }} }},
+            }}"##
+        )
+    }
+
+    #[test]
+    fn an_in_place_reload_may_restyle_a_live_lock_screen_but_not_remove_its_way_out() {
+        // Defect E. `SurfaceFingerprint::Lock` carries only the `id`, so an edit *inside* the lock
+        // diffs as `Unchanged` and takes the in-place path, which the generation-swap gate
+        // deliberately does not police. Deleting the password field while the lock is up therefore
+        // applied straight into the tree on the glass, and the session had no way back in but a VT
+        // switch -- the compositor does not unlock when a lock client dies.
+        //
+        // Both halves are the point. The restyle has to keep landing, because painting the lock
+        // screen out of the config's own Lua is the whole of docs/adr/0052 decision 2; only the edit
+        // that removes the way out is refused, and `Scene::apply`'s existing rollback is what makes
+        // the refusal leave the live tree exactly as it was.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), &lock_config("#101010FF"));
+        let (mut client, mut outbound_rx) = test_client(&path);
+        assert!(run_startup(&mut client));
+        client.set_session_locked(true);
+
+        // A restyle: same surfaces, same field, different colour.
+        write_shell_lua(dir.path(), &lock_config("#204080FF"));
+        client.handle_reevaluate(ReevaluateRequest { sequence: 20 });
+        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 20 }));
+        client.handle_apply_pending(ApplyPendingReload { sequence: 20 });
+        let restyled = client.scene.surface("screen@TEST").expect("the lock instance is still resolved");
+        assert_eq!(
+            restyled.children[0].properties.get("background").unwrap().as_string().unwrap().to_string_lossy(),
+            "#204080FF",
+            "restyling a live lock screen is the reason it is painted from Lua at all"
+        );
+
+        // The edit that must not land: same lock, no `textfield` under it.
+        write_shell_lua(dir.path(), r##"return {
+            panel { id = "bar", layer = "Top" },
+            lock { id = "screen", child = column { background = "#204080FF", children = {} } },
+        }"##);
+        client.handle_reevaluate(ReevaluateRequest { sequence: 21 });
+        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 21 }));
+        client.handle_apply_pending(ApplyPendingReload { sequence: 21 });
+
+        let still_up = client.scene.surface("screen@TEST").expect("a refused apply leaves the prior scene standing");
+        assert_eq!(
+            still_up.children[0].children.len(),
+            1,
+            "the password field must still be there: a refused apply rolls the whole scene back to what was on screen"
+        );
+        assert_eq!(still_up.children[0].children[0].kind, "textfield");
+    }
+
+    #[test]
+    fn an_unlocked_session_may_still_delete_its_lock_screens_password_field() {
+        // The other side of the veto's arming, and the reason it is a stored instance set rather
+        // than a standing rule: with no lock held there is nothing to be locked out of, so a config
+        // may edit its lock screen down to nothing like any other surface. Freezing the tree
+        // whenever a `lock` is merely *declared* would make the ordinary editing loop for a lock
+        // screen impossible.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), &lock_config("#101010FF"));
+        let (mut client, mut outbound_rx) = test_client(&path);
+        assert!(run_startup(&mut client));
+
+        write_shell_lua(dir.path(), r##"return {
+            panel { id = "bar", layer = "Top" },
+            lock { id = "screen", child = column { background = "#101010FF", children = {} } },
+        }"##);
+        client.handle_reevaluate(ReevaluateRequest { sequence: 22 });
+        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 22 }));
+        client.handle_apply_pending(ApplyPendingReload { sequence: 22 });
+
+        assert!(client.scene.surface("screen@TEST").unwrap().children[0].children.is_empty(), "an unlocked session's lock screen is ordinary");
+    }
+
+    #[test]
+    fn the_lock_veto_follows_the_outputs_rather_than_the_instances_it_was_armed_with() {
+        // CONFIRMED, and it strands the session. The veto used to be armed with the `lock` instance
+        // ids that existed at `LockCommand::Acquire`. `crate::wayland::App::handle_output_change`
+        // retires instances and creates new ones on every hotplug and never revisited that list, and
+        // `Scene` leaves a retired instance's tree standing, so a lid closing onto a dock left the
+        // veto validating `screen@TEST` -- a fossil nothing can paint -- while the live lock screen
+        // was `screen@DP-1`. Deleting the password field then passed the veto, applied in place, and
+        // the way out of the locked session was a VT switch.
+        //
+        // The apply below is the same sequence `handle_output_change` performs: re-expand the
+        // applied specs against the outputs that exist now, store them, resolve.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), &lock_config("#101010FF"));
+        let (mut client, mut outbound_rx) = test_client(&path);
+        assert!(run_startup(&mut client));
+        client.set_session_locked(true);
+
+        let specs = client.applied_surface_specs();
+        let docked = vec![OutputGeometry { name: "DP-1".to_string(), size: layout::LogicalSize { width: 2560.0, height: 1440.0 } }];
+        client.set_instances(expand_instances(&specs, &docked));
+        assert!(client.apply_instances(), "the freshly plugged output resolves its own lock surface");
+
+        write_shell_lua(dir.path(), r##"return {
+            panel { id = "bar", layer = "Top" },
+            lock { id = "screen", child = column { background = "#101010FF", children = {} } },
+        }"##);
+        client.handle_reevaluate(ReevaluateRequest { sequence: 30 });
+        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 30 }));
+        client.handle_apply_pending(ApplyPendingReload { sequence: 30 });
+
+        let live = client.scene.surface("screen@DP-1").expect("the lock instance on the output that is actually plugged in");
+        assert_eq!(live.children[0].children.len(), 1, "the veto must ask what is on the glass now, not what was there when the lock was taken");
+    }
+
+    #[test]
+    fn a_second_lock_declaration_is_refused_at_evaluation_naming_6_4() {
+        // Defect C, and it strands the machine rather than merely misrendering.
+        // `expand_instances` emits one instance per lock spec per output, so two `lock`
+        // declarations make `ensure_lock_surfaces` send two `get_lock_surface` for the same
+        // `wl_output` -- which `ext-session-lock-v1` calls out by name: "Attempting to create more
+        // than one lock surface for a given output is a duplicate_output protocol error". The
+        // compositor kills the connection *after* the lock is taken and does not unlock on client
+        // death, so the only way back in is a VT switch. § 6.4 gives a lock no `monitor` and one
+        // surface per output, so a second declaration has no coherent meaning to admit.
+        //
+        // Both entry points, because both reach a generation: the startup evaluation refuses to
+        // hand any specs back, and a `Reevaluate` reports `Failed` rather than staging it.
+        let dir = tempfile::tempdir().unwrap();
+        let two_locks = r#"return { lock { id = "first" }, lock { id = "second" } }"#;
+        let path = write_shell_lua(dir.path(), two_locks);
+        let (mut client, mut outbound_rx) = test_client(&path);
+
+        assert!(!run_startup(&mut client), "a config with two `lock` surfaces must not produce a generation");
+        let (is_rescue, error_log) = rescue_state(&client.loader);
+        assert!(is_rescue, "the refusal has to be visible somewhere, and rescue is where an evaluation failure goes");
+        assert!(error_log.contains("§ 6.4"), "the message must name the section that says one lock surface per output: {error_log}");
+
+        write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
+        client.state.applied_topology =
+            Some(surface_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap().iter().map(SurfaceSpec::fingerprint).collect());
+        write_shell_lua(dir.path(), two_locks);
+        client.handle_reevaluate(ReevaluateRequest { sequence: 11 });
+
+        assert!(
+            matches!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::Failed { sequence: 11, .. })),
+            "an edit that adds a second lock must fail the reevaluation rather than be staged"
+        );
         assert!(client.state.pending.is_none());
     }
 
@@ -2008,20 +2468,34 @@ mod tests {
         client.state.applied_topology =
             Some(vec![SurfaceFingerprint::Panel(layout::node::SurfaceTopology { id: "other".to_string(), layer: LayerKind::Top, anchor: Default::default(), monitor: "All".to_string(), namespace: "oblisk-other".to_string() })]);
 
-        assert_eq!(client.handle_frame(SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: 1 })), None);
+        assert_eq!(client.handle_frame(SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: 1 })), FrameOutcome::Handled);
 
         assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence: 1 }));
     }
 
     #[test]
     fn handle_frame_hands_an_activate_draw_nonce_back_to_the_wayland_loop() {
-        // The one frame `handle_frame` can't service itself: drawing needs `wayland::App`'s EGL
-        // and surface state, so the nonce goes back to the caller for `App::activate_draw`.
+        // One of the two frames `handle_frame` can't service itself: drawing needs `wayland::App`'s
+        // EGL and surface state, so the nonce goes back to the caller for `App::activate_draw`.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, _outbound_rx) = test_client(&path);
 
-        assert_eq!(client.handle_frame(SupervisorFrame::ActivateDraw(ActivateDraw { nonce: 42 })), Some(42));
+        assert_eq!(client.handle_frame(SupervisorFrame::ActivateDraw(ActivateDraw { nonce: 42 })), FrameOutcome::ActivateDraw(42));
+    }
+
+    #[test]
+    fn handle_frame_hands_a_set_session_lock_back_to_the_wayland_loop_in_both_directions() {
+        // The other one, and both directions matter: `locked = true` has to reach the Wayland
+        // thread to be refused there when no `lock` surface is declared (docs/adr/0052 decision 3),
+        // and `locked = false` is the only path in this process permitted to unlock at all
+        // (docs/adr/0042). Swallowing either here would be silent.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
+        let (mut client, _outbound_rx) = test_client(&path);
+
+        assert_eq!(client.handle_frame(SupervisorFrame::SetSessionLock(SetSessionLock { locked: true })), FrameOutcome::SetSessionLock(true));
+        assert_eq!(client.handle_frame(SupervisorFrame::SetSessionLock(SetSessionLock { locked: false })), FrameOutcome::SetSessionLock(false));
     }
 
     #[test]
@@ -2030,14 +2504,14 @@ mod tests {
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
 
-        assert_eq!(client.handle_frame(SupervisorFrame::DeselectInput(DeselectInput { surface_id: "main_bar".to_string() })), None);
-        assert_eq!(client.handle_frame(SupervisorFrame::PromoteGeneration(PromoteGeneration { surface_id: "main_bar".to_string() })), None);
+        assert_eq!(client.handle_frame(SupervisorFrame::DeselectInput(DeselectInput { surface_id: "main_bar".to_string() })), FrameOutcome::Handled);
+        assert_eq!(client.handle_frame(SupervisorFrame::PromoteGeneration(PromoteGeneration { surface_id: "main_bar".to_string() })), FrameOutcome::Handled);
         // A third, recognized frame to prove dispatch kept working (not stuck/panicked) after the
         // two inert ones above. No prior `applied_topology` is seeded, so this fresh evaluation
         // reports `Unchanged` (see the module doc comment point 3) -- the report's exact verdict
         // isn't this test's point, only that a real response arrives at all after the two inert
         // frames.
-        assert_eq!(client.handle_frame(SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: 9 })), None);
+        assert_eq!(client.handle_frame(SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: 9 })), FrameOutcome::Handled);
 
         assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 9 }));
     }
@@ -2061,8 +2535,8 @@ mod tests {
             .unwrap();
 
         let output_frame = SupervisorFrame::ProcessOutput(ProcessOutputLine { id: 0, stream: shared::ProcessStream::Stdout, line: "hello".to_string() });
-        assert_eq!(client.handle_frame(output_frame), None);
-        assert_eq!(client.handle_frame(SupervisorFrame::ProcessExited(ProcessExited { id: 0, code: Some(3) })), None);
+        assert_eq!(client.handle_frame(output_frame), FrameOutcome::Handled);
+        assert_eq!(client.handle_frame(SupervisorFrame::ProcessExited(ProcessExited { id: 0, code: Some(3) })), FrameOutcome::Handled);
 
         let output = client
             .loader
