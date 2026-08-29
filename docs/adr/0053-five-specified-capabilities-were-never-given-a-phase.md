@@ -136,6 +136,43 @@ This is the same hole decision 3 left open in `audio`, resolved the other way. `
 say "unknown", every unavailable path there collapses into a plausible number, and that is how a
 failed sink bind hid as a 0% volume. `brightness` does not repeat it.
 
+## Amendment: `power` is built, and it is the first capability whose fields are optional one at a time
+
+Decision 1 gave `power` a phase of its own. This records what building it settled.
+
+**Two services wearing one name.** § 2.13 puts `active_profile`/`profiles` and
+`on_battery`/`energy_rate` in one capability, and they come from two unrelated daemons:
+power-profiles-daemon and UPower. Either can be missing while the other works, which no capability
+before this one had to model.
+
+**So every field is optional, individually.** `brightness` never pushes at all when its one source
+is missing, and that was right for a capability with one source. Here it would mean a desktop with
+no profile daemon losing its mains-adapter reading too. The rule that covers both is narrower than
+either: report what this host can answer, omit what it cannot, fabricate nothing. There is no
+`"balanced"` invented for a machine with no profile daemon and no `0` invented for a machine with
+no UPower, because § 2.13 gives no absence sentinel for any of the four fields.
+
+**`on_battery` and `energy_rate` come from UPower, not from the sysfs `battery` already reads.**
+`battery`'s udev watch is already open on `/sys/class/power_supply`, and `AC0/online` plus
+`BAT0/power_now` answer both fields on this machine with no D-Bus at all. UPower wins anyway, on
+one point: `OnBattery` is the system-wide answer across every power supply, and a laptop in a dock
+with two adapters is exactly where a single hand-picked `Mains` device gets it wrong. That is the
+same class of bug `battery::select_system_battery` exists to avoid, and repeating that selection
+logic against a second source of truth is worse than one property read. The cost is a D-Bus
+dependency for a number sysfs also has, and it is named here rather than hidden.
+
+**The power-profiles-daemon half is not live-verified, and says so in its own module doc.** That
+daemon is not installed on the machine this was written on: `busctl --system list` shows UPower and
+no `PowerProfiles` under either name. So its interface is built to the project's documented D-Bus
+API and confirmed against nothing, including the 0.20 rename from `net.hadess.PowerProfiles` to
+`org.freedesktop.UPower.PowerProfiles`, which is why both are tried in that order. This is the same
+posture ADR-0034 takes for `keyboard`'s Hyprland implementor, and the same admission: built to a
+real documented protocol, verified by nobody here.
+
+The UPower half is verified. Both properties were read off this machine's own `upowerd`, both emit
+`PropertiesChanged`, and the live bar drew `ac 0.0W` against a `busctl` reporting `OnBattery=false`
+and `EnergyRate=0`.
+
 ## What this does not decide
 
 Whether `oblisk.system`'s `state` should ever be writable. § 2.11 calls it "read-only" and this

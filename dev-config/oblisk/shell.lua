@@ -266,8 +266,11 @@ local privacy_module = row {
     end), RED) }, "#45253aff") },
 }
 
+-- Truncated, and the number is a budget rather than a taste: a zone with a fixed width is a fixed
+-- number of characters, and every text module in it spends from the same total. See the surfaces
+-- section for what adding `power` cost.
 local keyboard_module = pill({ cell(label(oblisk.keyboard, function(k)
-    local name = k.active_layout or "?"
+    local name = truncate(k.active_layout or "?", 10)
     if k.caps_lock then
         name = name .. " CAPS"
     end
@@ -277,7 +280,7 @@ end), DIM) })
 local network_module = pill({ cell(label(oblisk.network, function(n)
     for _, ap in ipairs(n.available_networks or {}) do
         if ap.active then
-            return string.format("%s %d%%", truncate(ap.ssid, 14), ap.strength or 0)
+            return string.format("%s %d%%", truncate(ap.ssid, 12), ap.strength or 0)
         end
     end
     return n.scanning and "scanning" or "offline"
@@ -406,6 +409,28 @@ local battery_module = pill({
     meter(oblisk.battery, function(b)
         return b.present and b.percent or 0
     end, oblisk.battery:map(battery_color), 32),
+    -- `power` sits beside the battery it describes rather than in a pill of its own: § 2.13's two
+    -- UPower fields read the same hardware § 2.2 reports the charge of, and the right zone has no
+    -- room for a twelfth pill.
+    --
+    -- Each of § 2.13's four fields can be absent on its own, so each is read behind its own check
+    -- rather than through one `nil` guard. This machine has no power-profiles-daemon, so
+    -- `active_profile` is `nil` forever and this draws the rate and the source alone. That is the
+    -- absence being reported correctly, not the module failing, and it is the difference between
+    -- `nil` and a fabricated `"balanced"` that made every field optional.
+    cell(label(oblisk.power, function(p)
+        local parts = {}
+        if p.on_battery ~= nil then
+            parts[#parts + 1] = p.on_battery and "bat" or "ac"
+        end
+        if p.energy_rate ~= nil then
+            parts[#parts + 1] = string.format("%.1fW", p.energy_rate)
+        end
+        if p.active_profile ~= nil then
+            parts[#parts + 1] = p.active_profile
+        end
+        return #parts > 0 and table.concat(parts, " ") or "--"
+    end), DIM, 11),
 })
 
 -- The one `list` in this file, and the only node kind whose children do not exist as a literal Lua
@@ -569,12 +594,20 @@ end), FG, 48)
 -- 1920px output; widening only the right zone would have fixed the overflow and moved the clock off
 -- centre, since a centre zone is only centred while it is symmetric about the middle.
 --
--- The tray is in the left zone and everything else status-shaped is on the right, which reads
--- backwards until you notice it is the one module with no width of its own: it grows with however
--- many `StatusNotifierItem`s happen to be registered. Adding `brightness` to the right zone put it
--- over 768px and ran `lock` off the edge, and moving the tray is the fix that survives the next
--- module, because a zone holding an unbounded-width child has no budget anyone can reason about.
--- The left zone holds two fixed modules in the same 768px and had the room.
+-- The tray is in the left zone and most status-shaped modules are on the right, which reads
+-- backwards until you notice the tray is the one module with no width of its own: it grows with
+-- however many `StatusNotifierItem`s happen to be registered.
+--
+-- Adding `power` to the battery pill put the right zone over its 768px again and clipped `lock`
+-- off the edge, and trimming two text modules did not buy back enough. Two things moved instead.
+-- `notifications` left the bar entirely: the `notification_area` surface below already draws the
+-- same newest notification, so the bar copy was the one place that information appeared twice.
+-- `brightness` moved to the left zone, which has the room and no reason to prefer the right.
+--
+-- Worth naming rather than fixing again by shaving characters: neither side can grow. The sides
+-- are equal because that is what makes the middle a centre, and a 20% centre holding a clock and a
+-- date has slack that a 40% side cannot borrow. Every module added from here costs another module
+-- its place until this engine has a real space-between.
 -- The wallpaper, which is not a capability and never was (docs/adr/0055). Everything
 -- `wallpaper:set(mon, path, fit, anim, dur)` was going to carry already had a home once ADR-0038
 -- moved surface declaration here and Phase 21 built `state`: the monitor is `panel.monitor`, the
@@ -634,7 +667,7 @@ return {
                     align_h = "Start",
                     align_v = "Center",
                     spacing = 6,
-                    children = { workspaces_module, media, notifications_module, tray_module },
+                    children = { workspaces_module, media, tray_module, brightness_module },
                 },
                 row {
                     width = "20%",
@@ -657,7 +690,6 @@ return {
                         keyboard_module,
                         network_module,
                         bluetooth_module,
-                        brightness_module,
                         volume_module,
                         battery_module,
                         menu_button,

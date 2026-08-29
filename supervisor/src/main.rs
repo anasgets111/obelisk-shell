@@ -25,6 +25,7 @@ use dbus::bluetooth::{self, BluetoothController, BluetoothSignal};
 use dbus::network::{self, NetworkController, NetworkSignal};
 use dbus::notifications::{self, NotificationsController, NotificationsSignal};
 use dbus::polkit::{AGENT_OBJECT_PATH, AuthenticationAgent, current_session_subject, register_agent};
+use dbus::power::{self, PowerController, PowerSignal};
 use dbus::tray::{self, TrayController, TraySignal};
 use hardware::battery::{BatteryController, BatterySignal};
 use hardware::brightness::{self, BrightnessController, BrightnessSignal};
@@ -320,6 +321,13 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     let (workspaces_signal_tx, mut workspaces_signals) = tokio::sync::mpsc::unbounded_channel::<WorkspacesSignal>();
     let workspaces = WorkspacesController::new(workspaces_signal_tx);
 
+    // power capability (§ 2.13, docs/adr/0053's own `power` amendment): UPower for `on_battery`
+    // and `energy_rate`, power-profiles-daemon for `active_profile` and `profiles`, both on the
+    // shared system-bus `connection`. Either service can be missing and the other still reports:
+    // every field is optional and an unanswerable one is omitted rather than filled in.
+    let (power_signal_tx, mut power_signals) = tokio::sync::mpsc::unbounded_channel::<PowerSignal>();
+    let power = PowerController::new(connection.clone(), power_signal_tx);
+
     // system capability (docs/adr/0053, § 2.11): the 1 Hz clock a config needs to draw a time that
     // moves, plus the persisted `state.json` dictionary. Both env reads happen here rather than
     // inside the module, matching how `resolve_state_path` was written to take them as arguments.
@@ -520,6 +528,13 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 let state = workspaces.snapshot();
                 push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "workspaces", &state);
             }
+            Some(PowerSignal::Changed) = power_signals.recv() => {
+                // Same no-debounce, full-re-derive shape as the arms above. UPower re-emits
+                // `EnergyRate` on its own cadence (roughly once a minute on this machine) and the
+                // controller filters that down to real changes before it ever reaches here.
+                let state = power.snapshot();
+                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "power", &state);
+            }
             Some(SystemSignal::Changed) = system_signals.recv() => {
                 // Once per wall-clock second, and the only capability here that pushes on a timer
                 // rather than on a real event -- docs/adr/0053 decision 2 owns why that cost is
@@ -636,6 +651,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                     "keyboard" => keyboard::dispatch(&keyboard, &envelope),
                     "brightness" => brightness::dispatch(&brightness, &envelope),
                     "workspaces" => workspaces::dispatch(&workspaces, &envelope),
+                    "power" => power::dispatch(&power, &envelope),
                     "mpris" => dbus::mpris::dispatch(&mpris, &envelope),
                     "updates" => updates::dispatch(&updates, &envelope),
                     "notifications" => notifications::dispatch(&notifications, &envelope),

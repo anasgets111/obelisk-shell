@@ -1861,7 +1861,8 @@ the IDL-only entries fell between the two documents.
    let a bar's need for a workspace strip decide it. Built, see the third note below, and the ADR is
    docs/adr/0056.
 4. **`power`** (§ 2.13). Profiles through `power-profiles-daemon`, `on_battery` and `energy_rate`
-   through UPower, which the keyboard capability already talks to.
+   through UPower, which the keyboard capability already talks to. Built, see the fourth note below,
+   and half of it is unverified for a reason worth reading.
 5. **`audio`'s `sinks`/`sources`** (§ 2.4) and per-app `volume`/`muted`. The per-app half needs the
    same `SPA_PARAM_Props` subscription per stream node that the master already has; the arrays need
    the sink and source globals tracked as well as the streams.
@@ -1975,6 +1976,36 @@ the IDL-only entries fell between the two documents.
 > invariants and this reader cannot violate them from outside, so the panic would kill the reader
 > thread and stop workspace updates for the rest of the run with only a stderr backtrace. Named in
 > the code, not worked around.
+
+> **Built (item 4).** `power` is the first capability whose fields go absent one at a time.
+> § 2.13 names four, and they come from two unrelated daemons: `active_profile`/`profiles` from
+> power-profiles-daemon, `on_battery`/`energy_rate` from UPower. Either can be missing while the
+> other works, so every field is optional and an unanswerable one is omitted rather than filled in.
+> `brightness`'s all-or-nothing rule was right for a capability with one source and is the wrong
+> shape for one with two: a desktop with no profile daemon would have lost its mains reading too.
+>
+> **Power-profiles-daemon is not installed on this machine, and that half is therefore unverified.**
+> `busctl --system list` shows UPower and no `PowerProfiles` under either name. The proxy is built
+> to the project's documented D-Bus API, including the 0.20 rename from `net.hadess.PowerProfiles`
+> to `org.freedesktop.UPower.PowerProfiles` (both are tried, newest first), and confirmed against
+> nothing. Same posture and same admission as `keyboard`'s Hyprland implementor. The degrade path
+> *is* verified, because this machine is the degrade path: the run logged "no power-profiles-daemon
+> reachable" and the bar drew the two UPower fields alone.
+>
+> **The UPower half is verified.** `ac 0.0W` on the live bar, against a `busctl` reporting
+> `OnBattery=false` and `EnergyRate=0` on the composite `DisplayDevice`. `on_battery` comes from
+> UPower rather than from the sysfs `battery` already watches because it is the system-wide answer
+> across every power supply, and a laptop docked with two adapters is where picking one `Mains`
+> device by hand gets it wrong.
+>
+> **The bar ran out of room, and that is now a documented ceiling rather than a fourth trim.**
+> Adding `power` to the battery pill pushed the right zone past its 768px and clipped `lock` off
+> the edge, the same failure `brightness` caused once already. Shaving two text modules did not buy
+> enough back. `notifications` left the bar (the `notification_area` surface already draws the same
+> newest notification, so it was the one duplicated readout) and `brightness` moved to the left
+> zone. Neither side can grow: the sides are equal because that is what makes the middle a centre,
+> and the 20% centre's slack cannot be borrowed by a 40% side. From here every module added costs
+> another module its place, until this engine has a real space-between.
 
 ### Phase 29: Icons, Images and the Wallpaper
 
