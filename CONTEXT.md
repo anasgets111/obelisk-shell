@@ -185,8 +185,8 @@ The one input device Oblisk reads `oblisk.keyboard`'s per-key state from (backli
 _Avoid_: main keyboard, active keyboard
 
 **Compositor link**:
-The trait behind `keyboard.active_layout`/`keyboard:switch_layout`, one implementor per compositor (Hyprland, Niri). The Supervisor picks an implementor at startup by probing `$HYPRLAND_INSTANCE_SIGNATURE`/`$NIRI_SOCKET`. Scoped deliberately to what keyboard layout needs today, not widened to guess the still-undesigned workspace adaptor's (§10) eventual method surface. Whether that trait extends this one or defines its own is an open question, not settled here.
-_Avoid_: workspace adaptor (a different, still-unbuilt trait), compositor adapter
+The trait behind `keyboard.active_layout`/`keyboard:switch_layout`, one implementor per compositor (Hyprland, Niri). The Supervisor picks an implementor at startup by probing `$HYPRLAND_INSTANCE_SIGNATURE`/`$NIRI_SOCKET`. Scoped deliberately to what keyboard layout needs today. There is no workspace adaptor and this trait did not grow one: `oblisk.workspaces` has a single implementor and so has no trait at all, reusing only the compositor probe (ADR-0056). Extracting a shared trait is what a second live-tested compositor is for.
+_Avoid_: workspace adaptor (never built; ADR-0056 decided against it), compositor adapter
 
 **Track identity**:
 A composite key (`mpris:trackid` + `xesam:url` + `xesam:title`) an `oblisk.mpris` player entry uses to detect whether its current track actually changed, since real players are observed to leave any one of `mpris:trackid`/`xesam:url`/`xesam:title` unchanged across a genuine track change (any single one changing counts as a change). Unchanged track identity across a resync means a missing/malformed `album_art_path`/`length` in that resync keeps its last known-good value instead of clearing; changed identity resets both before applying the new read (ADR-0036).

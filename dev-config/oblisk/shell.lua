@@ -126,6 +126,68 @@ end
 
 -- Left zone -----------------------------------------------------------------------------------
 
+-- Workspaces, and the only module here reading a compositor's IPC rather than a device or a D-Bus
+-- service (docs/adr/0056). The strip is one `text` cell, not a `list` of buttons, because `list`
+-- lays out vertically only (the no-horizontal-list ponytail in scene.rs) -- this is that ponytail's
+-- second consumer, the tray being the first.
+--
+-- It reads `outputs[1]` rather than looping, which is the fixture winning over the worked example:
+-- this machine has one output, and a config for a real multi-monitor setup would match
+-- `out.focused_workspace ~= nil` to find the monitor with keyboard focus (docs/adr/0056 decision 4)
+-- or loop and draw a strip per monitor.
+--
+-- `name` before `idx`: niri lets a workspace be named, and a named one is what its user calls it.
+-- `idx` is the position on the output, which is what an unnamed workspace has instead.
+--
+-- The click cycles to the next workspace and is what proves § 3.2's `workspaces:focus(id)`. It
+-- sends `id`, never `idx`: `idx` shifts when workspaces are reordered, so the id is the only
+-- argument that still names the workspace the user just saw.
+local workspaces_module = pill({
+    button {
+        height = 18,
+        align_v = "Center",
+        on_click = function()
+            local w = oblisk.workspaces:get()
+            local out = w and (w.outputs or {})[1]
+            if out == nil then
+                return
+            end
+            local entries = out.workspaces or {}
+            if #entries == 0 then
+                return
+            end
+            local at = 1
+            for i, ws in ipairs(entries) do
+                if ws.id == out.active_workspace then
+                    at = i
+                end
+            end
+            oblisk.workspaces:invoke("focus", entries[at % #entries + 1].id)
+        end,
+        children = { cell(label(oblisk.workspaces, function(w)
+            local out = (w.outputs or {})[1]
+            if out == nil then
+                return "no workspaces"
+            end
+            local marks = {}
+            for _, ws in ipairs(out.workspaces or {}) do
+                local name = ws.name or tostring(ws.idx)
+                marks[#marks + 1] = ws.id == out.active_workspace and ("[" .. name .. "]") or name
+            end
+            return table.concat(marks, " ")
+        end), FG) },
+    },
+    -- § 2.9's `active_client`, minus the `is_fullscreen` niri cannot answer (docs/adr/0056
+    -- decision 5). `class` is the app id: on Wayland there is no WM_CLASS to read.
+    cell(label(oblisk.workspaces, function(w)
+        local client = w.active_client
+        if client == nil then
+            return "no window"
+        end
+        return truncate(client.class ~= "" and client.class or "?", 14) .. (client.is_floating and " (float)" or "")
+    end), DIM, 11),
+})
+
 -- The one module that reads two capabilities at once, and the reason `computed` exists: a media
 -- widget wants the player from `mpris` and the output volume from `audio`, and neither signal can
 -- see the other.
@@ -135,9 +197,9 @@ local media = pill({ cell(computed({ oblisk.mpris, oblisk.audio }, function(m, a
         return "no media"
     end
     local mark = player.play_state == "Playing" and ">" or "||"
-    local title = truncate(player.title or player.identity or "?", 28)
+    local title = truncate(player.title or player.identity or "?", 16)
     if player.artist and player.artist ~= "" then
-        title = title .. " -- " .. truncate(player.artist, 16)
+        title = title .. " -- " .. truncate(player.artist, 10)
     end
     if a and a.muted then
         return mark .. " " .. title .. " (muted)"
@@ -158,7 +220,7 @@ local notifications_module = pill({ cell(label(oblisk.notifications, function(n)
     if not newest then
         return "no notifications"
     end
-    return truncate(newest.summary or newest.app_name or "?", 30)
+    return truncate(newest.summary or newest.app_name or "?", 16)
 end), FG) })
 
 -- Centre zone ---------------------------------------------------------------------------------
@@ -572,7 +634,7 @@ return {
                     align_h = "Start",
                     align_v = "Center",
                     spacing = 6,
-                    children = { media, notifications_module, tray_module },
+                    children = { workspaces_module, media, notifications_module, tray_module },
                 },
                 row {
                     width = "20%",

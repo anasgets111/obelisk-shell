@@ -147,16 +147,24 @@ The active Renderer process populates the global `oblisk` state tree with the fo
 
 ### 2.9 Workspace State (`oblisk.workspaces`)
 Workspace state only. Output geometry lives in `oblisk.screens` (§ 2.15), which reads it from `wl_output` rather than from a compositor adaptor; this section refers to screens by `name` instead of restating their dimensions (ADR-0041).
+
+> **Amended by ADR-0056**, which built this against niri and found three problems with the rows below. `focused_workspace` is present only on the output that actually holds focus, because focus is one workspace across every output and this structure models it as one per output (decision 4). `is_fullscreen` is not reported at all, because niri-ipc has no such field and a fabricated `false` would be wrong for exactly the windows a fullscreen check exists to find (decision 5). And each output structure carries a `workspaces` array, added because the two ids below are opaque and nothing here tells a config which workspaces exist, what they are called or what order they sit in (decision 3).
+
 *   `workspaces.outputs`: `table` (Array of per-output workspace structures)
     *   Output structure:
         *   `name`: `string` (Connector name, e.g., `"eDP-1"`, matching an `oblisk.screens` entry)
         *   `active_workspace`: `integer` (ID of the workspace currently visible)
-        *   `focused_workspace`: `integer` (ID of the workspace that currently has keyboard focus)
+        *   `focused_workspace`: `integer` (ID of the workspace that currently has keyboard focus; absent on every output that does not hold focus, per ADR-0056)
+        *   `workspaces`: `table` (Array of the workspaces on this output, ordered by `idx`; added by ADR-0056)
+            *   Workspace structure:
+                *   `id`: `integer` (Stable, monitor-independent identity; what the two ids above refer to and what `workspaces:focus(id)` takes)
+                *   `idx`: `integer` (1-based position on this output; not stable across a reorder)
+                *   `name`: `string` (The compositor's own name for the workspace, absent when unnamed)
 *   `workspaces.active_client`: `table` (Focused top-level Wayland client window parameters, or `nil` if none focused):
     *   `title`: `string` (Active window title text, e.g. `"src/main.rs - Neovim"`)
-    *   `class`: `string` (Active window application class name, e.g. `"Alacritty"` or `"firefox"`)
+    *   `class`: `string` (Active window application class name, e.g. `"Alacritty"` or `"firefox"`. A Wayland toplevel has an `app_id`, not a `WM_CLASS`, and that is what this carries)
     *   `is_floating`: `boolean` (True if marked floating/pinned by compositor)
-    *   `is_fullscreen`: `boolean` (True if window occupies entire display boundary)
+    *   `is_fullscreen`: `boolean` (True if window occupies entire display boundary. **Not reported**, per ADR-0056 decision 5)
 
 ### 2.10 Rescue Mode & Recovery State (`oblisk.rescue`)
 *   `rescue.is_rescue`: `boolean` (True if the user configuration is broken and Rescue Mode is active)

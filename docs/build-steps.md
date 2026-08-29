@@ -1858,7 +1858,8 @@ the IDL-only entries fell between the two documents.
 3. **`workspaces`** (§ 2.9). Not small and not obviously ours. `niri-ipc` is already a dependency, so
    one compositor is reachable cheaply, but whether this capability speaks one compositor's IPC or an
    abstraction over several is a design question that needs an ADR before an implementation. Do not
-   let a bar's need for a workspace strip decide it.
+   let a bar's need for a workspace strip decide it. Built, see the third note below, and the ADR is
+   docs/adr/0056.
 4. **`power`** (§ 2.13). Profiles through `power-profiles-daemon`, `on_battery` and `energy_rate`
    through UPower, which the keyboard capability already talks to.
 5. **`audio`'s `sinks`/`sources`** (§ 2.4) and per-app `volume`/`muted`. The per-app half needs the
@@ -1926,6 +1927,54 @@ the IDL-only entries fell between the two documents.
 > `oblisk.brightness:invoke("set", 40)` moved `intel_backlight` to 7680, which is 40% of this
 > panel's 19200 exactly. That is also the first § 3.2 command with an argument in it, so it is what
 > proves Phase 25's arguments array and revision stamp reach the Supervisor intact.
+
+> **Built (item 3).** `workspaces` speaks niri and only niri (docs/adr/0056 decision 1). The
+> alternative was extending `keyboard`'s `CompositorLink`, and it loses on a specific point rather
+> than on taste: that trait's Hyprland implementor is unverified by ADR-0034's own admission, and
+> workspaces would have forced a second, much larger unverified Hyprland implementation in the same
+> commit. Hyprland models one active workspace per monitor plus a globally focused monitor; niri
+> models a per-output `is_active` and a single global `is_focused`. Those do not map onto each other
+> by renaming fields, and writing that mapping with no machine to run it on is how the last three
+> silently-wrong answers got shipped. A session that is not niri never pushes, and the signal stays
+> `nil`, which is `brightness`'s no-backlight posture unchanged.
+>
+> **§ 2.9 is wrong in three places, and only building it showed that.** `focused_workspace` sits
+> inside the per-output structure, and focus is one workspace across every output, so it is reported
+> only on the output that holds it and absent elsewhere rather than repeated onto monitors that do
+> not have focus. `active_client.is_fullscreen` has no source at all: niri-ipc 26.4.0's `Window`
+> struct has no such field and its event stream never reports one, so the key is omitted rather than
+> answered `false`, which would be wrong for exactly the windows a fullscreen check exists to find.
+> And § 2.9 as specified cannot be drawn: two opaque workspace ids per output, and nothing saying
+> which workspaces exist, what they are called or what order they sit in. Each output entry carries
+> a `workspaces` array now, which is the same call docs/adr/0053 decision 3 made for `audio`.
+>
+> `class` is niri's `app_id`. A Wayland toplevel has no `WM_CLASS`, so the IDL's own example values
+> are app ids in practice, and this is a rename rather than a match.
+>
+> This is the second niri event-stream connection in the process, `keyboard`'s being the first. Both
+> replay niri's full startup state to a reader that discards most of it. That is the smaller cost:
+> sharing one stream couples `keyboard` and `workspaces` lifetimes, in a codebase where every
+> controller owns its own connection. The third consumer is the point where that stops being true,
+> and the ponytail in `workspaces/controller.rs` says so.
+>
+> Verified live on this session with screenshots, both branches. With the bar's `OnDemand` keyboard
+> interactivity holding focus, niri reports no focused toplevel and the config drew "no window",
+> which is the `active_client = nil` case being correct rather than broken. With a non-focusing bar,
+> it drew `kitty (float)` against a live `niri msg -j focused-window` reporting exactly that. The
+> strip drew `1 2 [3] 4 5 6 7 8 9 10 stash 12`, which is also the proof that a named workspace and
+> an `idx`-only one both render. `workspaces:focus(id)` moved the live session from workspace 3 to 4
+> and it was put back.
+>
+> The workspace strip is one `text` cell, not a `list` of buttons, because `list` still lays out
+> vertically only. That ponytail has a second consumer now and neither of its two upgrade paths got
+> cheaper: a `direction` property invents API § 5.2 does not have, and a true repeater needs
+> docs/adr/0045 amended first.
+>
+> One hazard found in `niri_ipc::state` and not fixed: its reducer panics, rather than degrading, on
+> a `WindowClosed` or `WindowLayoutsChanged` naming a window it has not seen. Those are niri's own
+> invariants and this reader cannot violate them from outside, so the panic would kill the reader
+> thread and stop workspace updates for the rest of the run with only a stderr backtrace. Named in
+> the code, not worked around.
 
 ### Phase 29: Icons, Images and the Wallpaper
 

@@ -13,6 +13,7 @@ mod socket;
 mod system;
 mod updates;
 mod watcher;
+mod workspaces;
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -34,6 +35,7 @@ use lock::LockController;
 use privacy::{PrivacyController, PrivacySignal};
 use system::{SystemController, SystemSignal};
 use updates::{UpdatesController, UpdatesSignal};
+use workspaces::{WorkspacesController, WorkspacesSignal};
 use process::registry::{LiveProcesses, reap_all_processes, reap_generations_processes, take_exited_process, wait_and_report_exit};
 use reload_link::SocketCandidateLink;
 use shared::{
@@ -310,6 +312,14 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     let (brightness_signal_tx, mut brightness_signals) = tokio::sync::mpsc::unbounded_channel::<BrightnessSignal>();
     let brightness = BrightnessController::new(PathBuf::from("/sys/class/backlight"), connection.clone(), brightness_signal_tx);
 
+    // workspaces capability (docs/adr/0056, § 2.9): niri's IPC event stream, reduced through
+    // `niri_ipc::state`'s own two state parts. No sysfs root and no D-Bus connection to inject --
+    // the socket path comes from `$NIRI_SOCKET`, which niri sets for every process in its own
+    // session, so there is nothing here for a test to point somewhere else (the mapping is a pure
+    // function and is tested directly instead). A session that is not niri never pushes at all.
+    let (workspaces_signal_tx, mut workspaces_signals) = tokio::sync::mpsc::unbounded_channel::<WorkspacesSignal>();
+    let workspaces = WorkspacesController::new(workspaces_signal_tx);
+
     // system capability (docs/adr/0053, § 2.11): the 1 Hz clock a config needs to draw a time that
     // moves, plus the persisted `state.json` dictionary. Both env reads happen here rather than
     // inside the module, matching how `resolve_state_path` was written to take them as arguments.
@@ -503,6 +513,13 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 let state = brightness.snapshot();
                 push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "brightness", &state);
             }
+            Some(WorkspacesSignal::Changed) = workspaces_signals.recv() => {
+                // Same no-debounce, full-re-derive shape as the arms above -- the controller
+                // already filters to real changes, since niri's event stream reports plenty this
+                // capability's payload does not carry (urgency, per-window layout geometry).
+                let state = workspaces.snapshot();
+                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "workspaces", &state);
+            }
             Some(SystemSignal::Changed) = system_signals.recv() => {
                 // Once per wall-clock second, and the only capability here that pushes on a timer
                 // rather than on a real event -- docs/adr/0053 decision 2 owns why that cost is
@@ -618,6 +635,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                     "sysinfo" => sysinfo::dispatch(&sysinfo, &envelope),
                     "keyboard" => keyboard::dispatch(&keyboard, &envelope),
                     "brightness" => brightness::dispatch(&brightness, &envelope),
+                    "workspaces" => workspaces::dispatch(&workspaces, &envelope),
                     "mpris" => dbus::mpris::dispatch(&mpris, &envelope),
                     "updates" => updates::dispatch(&updates, &envelope),
                     "notifications" => notifications::dispatch(&notifications, &envelope),
