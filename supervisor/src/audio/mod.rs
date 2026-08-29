@@ -3,8 +3,103 @@
 //! Phase 28 item 5). `mixer` tracks the registry and every list § 2.4 names; `master` holds the
 //! pure parsing/resolution logic `mixer` wires PipeWire events through.
 //!
+//! § 3.2's audio write actions live here too, in [`dispatch`]. Seven of the nine are built; see
+//! that function's own doc comment for the two that are not, and `mixer::write_master` for the
+//! one thing about the write path that is not obvious and cost three silent failures to find.
+//!
 //! BlueZ codec control (`docs/oblisk-supervisor-services-dbus.md` §6) is later work and belongs
 //! to `bluetooth` rather than here.
 
 pub mod master;
 pub mod mixer;
+
+use mixer::{AudioCommand, AudioCommandSender};
+
+/// `oblisk.audio`'s action dispatch (ADR-0037). Unlike every other capability's adapter, this one
+/// has no controller to call: each action becomes an [`AudioCommand`] on the channel into the
+/// PipeWire thread (see [`mixer::AudioCommand`] for why), and nothing here awaits a result. A
+/// failed write surfaces as the absence of a state change, the same as a `brightness:set` logind
+/// refuses.
+///
+/// § 3.2 lists two more audio actions this does not implement. `play_sound(sound)` and
+/// `set_event_sounds_enabled(en)` need a sound player, an event-sound theme and a place to store
+/// the toggle, and none of the three exists anywhere in this codebase; the `notifications`
+/// capability's own do-not-disturb toggle already gates sound playback that nothing plays. They
+/// are named here so their absence is a decision rather than a gap in the match.
+pub fn dispatch(commands: &AudioCommandSender, envelope: &shared::CommandEnvelope) {
+    let params = &envelope.params;
+    let command = match params.action.as_str() {
+        "set_volume" => parse_volume_arg(&params.arguments).map(AudioCommand::SetMasterVolume),
+        "set_muted" => crate::dbus::parse_bool_arg(&params.arguments).map(AudioCommand::SetMasterMuted),
+        "toggle_mute" => Some(AudioCommand::ToggleMasterMute),
+        "set_default_sink" => parse_id_arg(&params.arguments).map(AudioCommand::SetDefaultSink),
+        "set_default_source" => parse_id_arg(&params.arguments).map(AudioCommand::SetDefaultSource),
+        "set_app_volume" => parse_id_and_volume_args(&params.arguments).map(|(id, volume)| AudioCommand::SetAppVolume { id, volume }),
+        "set_app_muted" => parse_id_and_bool_args(&params.arguments).map(|(id, muted)| AudioCommand::SetAppMuted { id, muted }),
+        _ => return crate::log_unknown_action(params),
+    };
+    let Some(command) = command else {
+        return crate::log_malformed_command(params);
+    };
+    if commands.send(command).is_err() {
+        eprintln!("audio: the PipeWire command channel is closed; {} was dropped", params.action);
+    }
+}
+
+/// `[vol]`. Shape check only: § 3.2's `[0.0, 1.0]` range is clamped once, in
+/// `master::cubed_channel_volumes`, matching this codebase's "clamp in the place that needs the
+/// bound" convention.
+fn parse_volume_arg(arguments: &[serde_json::Value]) -> Option<f32> {
+    Some(arguments.first()?.as_f64()? as f32)
+}
+
+/// `[id]`. A PipeWire registry id, so it must fit a `u32`: a larger number is rejected here
+/// rather than truncated into an id naming a different node, the same check
+/// `keyboard::switch_layout` makes for its own `u8`.
+fn parse_id_arg(arguments: &[serde_json::Value]) -> Option<u32> {
+    u32::try_from(arguments.first()?.as_u64()?).ok()
+}
+
+fn parse_id_and_volume_args(arguments: &[serde_json::Value]) -> Option<(u32, f32)> {
+    let id = parse_id_arg(arguments)?;
+    Some((id, arguments.get(1)?.as_f64()? as f32))
+}
+
+fn parse_id_and_bool_args(arguments: &[serde_json::Value]) -> Option<(u32, bool)> {
+    let id = parse_id_arg(arguments)?;
+    Some((id, arguments.get(1)?.as_bool()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_volume_arg_reads_a_float_and_an_integer_alike() {
+        assert_eq!(parse_volume_arg(&[serde_json::json!(0.3)]), Some(0.3));
+        // Lua has one number type, so a config writing `1` rather than `1.0` is the common case,
+        // not the odd one, and `as_f64` is what accepts both.
+        assert_eq!(parse_volume_arg(&[serde_json::json!(1)]), Some(1.0));
+    }
+
+    #[test]
+    fn parse_volume_arg_is_none_for_an_empty_or_wrong_typed_argument() {
+        assert_eq!(parse_volume_arg(&[]), None);
+        assert_eq!(parse_volume_arg(&[serde_json::json!("loud")]), None);
+    }
+
+    #[test]
+    fn parse_id_arg_rejects_a_value_that_would_truncate_into_another_nodes_id() {
+        assert_eq!(parse_id_arg(&[serde_json::json!(59)]), Some(59));
+        assert_eq!(parse_id_arg(&[serde_json::json!(u64::from(u32::MAX) + 1)]), None);
+        assert_eq!(parse_id_arg(&[serde_json::json!(-1)]), None);
+    }
+
+    #[test]
+    fn the_two_argument_parsers_need_both_arguments_and_both_types() {
+        assert_eq!(parse_id_and_volume_args(&[serde_json::json!(7), serde_json::json!(0.5)]), Some((7, 0.5)));
+        assert_eq!(parse_id_and_volume_args(&[serde_json::json!(7)]), None);
+        assert_eq!(parse_id_and_bool_args(&[serde_json::json!(7), serde_json::json!(true)]), Some((7, true)));
+        assert_eq!(parse_id_and_bool_args(&[serde_json::json!(7), serde_json::json!(1)]), None);
+    }
+}

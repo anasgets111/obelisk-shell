@@ -2007,7 +2007,7 @@ the IDL-only entries fell between the two documents.
 > and the 20% centre's slack cannot be borrowed by a 40% side. From here every module added costs
 > another module its place, until this engine has a real space-between.
 
-> **Built (item 5's read half).** § 2.4 is now reported in full. The prediction in the item above
+> **Built (item 5).** § 2.4 is now reported in full. The prediction in the item above
 > was right about both halves and wrong about how much each cost.
 >
 > Per-app `volume`/`muted` is the same `SPA_PARAM_Props` subscription the master sink already had,
@@ -2040,6 +2040,53 @@ the IDL-only entries fell between the two documents.
 > one parser serves both and got renamed to say so. `default.configured.audio.sink` is a different
 > fact and is not read: on this machine it names a Bluetooth device that is not connected while
 > `default.audio.sink` names the analog output actually in use.
+
+> **Built beyond item 5: § 3.2's audio write actions.** Item 5 asks for the read side and this
+> shipped the writes with it, which is an addition, not a reading of the item. The reason is that
+> the read side alone produces a volume readout nobody can change and a device list nobody can
+> switch to, and `main.rs` had no `audio` dispatch arm at all, so every § 3.2 audio row fell into
+> the catch-all and was logged. Seven of the nine actions are built: `set_volume`, `set_muted`,
+> `toggle_mute`, `set_default_sink`, `set_default_source`, `set_app_volume`, `set_app_muted`. All
+> seven were exercised against the live session and put back.
+>
+> `play_sound` and `set_event_sounds_enabled` are not built. They need a sound player, an event
+> sound theme and somewhere to persist the toggle, and none of the three exists anywhere in this
+> codebase. `notifications`'s own do-not-disturb toggle already gates sound playback that nothing
+> plays.
+>
+> **A write crosses into the PipeWire thread through `pipewire::channel`, not a controller.**
+> Every proxy that thread holds is `!Send` and the thread sits inside a blocking `main_loop.run()`,
+> so there is no handle for `main.rs` to call. The channel hands the loop an eventfd to poll beside
+> its own sources, which is what that API exists for.
+>
+> **A hardware sink does not own its own volume, and writing its node's `Props` succeeds and does
+> nothing.** This cost three failed attempts and each one looked like success. `pw-cli set-param 59
+> Props '{ mute: true }'` against this machine's analog sink was accepted and had no effect, while
+> the same write against a stream node worked immediately: the volume lives on the ALSA `Device`'s
+> `Route` param, and the node's `channelVolumes` is a mirror that gets restored over anything
+> written to it. So a sink with a device behind it is written through `Device::set_param(Route,
+> ...)` with the volume in a nested `Props` object, and the node path is the fallback for a virtual
+> sink that really is its own owner.
+>
+> Two more things had to be right before that write landed, and both were silent when wrong. The
+> `Route` object's nested `Props` carries `SPA_PARAM_Route` as its param id, not `SPA_PARAM_Props`;
+> a live `pw-cli enum-params <device> Route` prints it. And the route target
+> (`device.id`/`card.profile.device`) is not in a sink's registry `global` event at all, only in its
+> `info` props. Reading it at `global` time returns nothing, the write silently takes the node path,
+> and the volume does not move. That is the same "the `global` event carries a subset" trap this
+> module's own doc comment already recorded for a stream node's `application.process.id`, met again
+> in a different field.
+>
+> **A `Props` write carries only the field being changed.** Sending the pair loses a write, observed
+> live rather than reasoned about: nothing is updated optimistically, so `set_app_volume(id, 0.42)`
+> followed immediately by `set_app_muted(id, true)` sent the second object with the volume from
+> before the first and put it back to 1.0. A partial `Props` object is applied as a partial update,
+> which `pw-cli set-param <stream> Props '{ mute: true }'` confirms.
+>
+> **`MixerState` got the extraction the review asked for.** Six maps keyed by the same device id
+> collapsed into one entry struct per sink and per source, with the PipeWire proxies kept in their
+> own maps so the entry stays plain data a test can build. The device tracking this write path needs
+> would otherwise have made it nine.
 
 ### Phase 29: Icons, Images and the Wallpaper
 
@@ -2136,6 +2183,28 @@ wallpaper.
 > loses that race stays `nil` until the app happens to change its icon. It hydrated here on a later
 > push. Not this phase's to fix, and not a thing to discover twice.
 
+
+### Found in Phase 28, owned by Phase 29: a themed icon renders nearly invisible
+
+Not this phase's to fix and not a thing to discover twice. The `icon` node resolves and rasterizes
+correctly and then draws in almost the wrong colour.
+
+A freedesktop icon theme paints with `fill:currentColor` and sets the actual colour in a `<style>`
+block through a class (`.ColorScheme-Text { color:#565656; }`). resvg does not apply that rule, so
+`currentColor` falls back to its default, and a 16px `audio-volume-low` from `Tela-circle-dracula`
+rasterizes to pixels around RGB 30 out of 255. On this bar's `#1e1e2e` background that is a shape
+nobody can see. Confirmed by rasterizing the file directly and reading the pixels, not by looking at
+a screenshot: resolution returns the right path, the pixmap has 116 non-transparent pixels, and every
+one of them is nearly black. Breeze's `org.telegram.desktop-symbolic` does the same thing with
+`#232629`, so this is how icon themes are written, not one theme's quirk.
+
+The shape of the fix is a decision rather than a patch, which is why it is written down instead of
+bolted on here. `text` already takes a `foreground`, and an icon drawn from a monochrome theme wants
+the same thing: either give resvg a `color` to resolve `currentColor` against, or tint the rasterized
+pixmap. Both change what `icon` means (a themed glyph the config colours, rather than an image),
+which is an amendment to docs/adr/0054 and not a one-line change. The full-colour icons this affects
+nothing for (an app icon like `firefox.svg`) already draw correctly, which is why Phase 29 saw the
+tray draw and read it as working.
 
 ### The missing animation model
 

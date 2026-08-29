@@ -209,7 +209,12 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     let (video_tx, video_sources) = tokio::sync::mpsc::unbounded_channel();
     // pipewire-rs's event loop is Rc-based and single-threaded (not Send) -- it needs its
     // own OS thread, not a tokio task.
-    std::thread::spawn(move || audio::mixer::run(audio_tx, video_tx));
+    // The write half of § 3.2's audio actions. A `pipewire::channel` rather than a controller
+    // handle, because every proxy the mixer thread holds is `!Send` and that thread is inside a
+    // blocking `main_loop.run()`; the channel hands the loop an eventfd to poll beside its own
+    // sources. See `audio::mixer::AudioCommand`.
+    let (audio_commands, audio_command_rx) = audio::mixer::command_channel();
+    std::thread::spawn(move || audio::mixer::run(audio_tx, video_tx, audio_command_rx));
 
     // Notifications (docs/oblisk-supervisor-services-dbus.md §1; ADR-0033): its own, separate
     // session-bus connection, independent of tray's -- a real desktop might already run mako/dunst
@@ -652,6 +657,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                     "brightness" => brightness::dispatch(&brightness, &envelope),
                     "workspaces" => workspaces::dispatch(&workspaces, &envelope),
                     "power" => power::dispatch(&power, &envelope),
+                    "audio" => audio::dispatch(&audio_commands, &envelope),
                     "mpris" => dbus::mpris::dispatch(&mpris, &envelope),
                     "updates" => updates::dispatch(&updates, &envelope),
                     "notifications" => notifications::dispatch(&notifications, &envelope),

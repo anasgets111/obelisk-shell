@@ -927,9 +927,9 @@ fn intrinsic_content_size(
         //
         // ponytail: no horizontal list. A repeated tray (icons flowing left to right) can't be
         // expressed today, and neither upgrade path is built because both cost more than this
-        // slice needs. It has a second consumer now, `oblisk.workspaces` (docs/adr/0056), whose
-        // workspace strip is the same shape and draws as one `text` cell in `dev-config` for the
-        // same reason the tray draws one item. A `direction` property on `list` would invent API § 5.2 doesn't have --
+        // slice needs. It has a second consumer now, `oblisk.workspaces` (docs/adr/0056),
+        // whose workspace strip is the same shape and draws as one `text` cell in `dev-config`
+        // for the same reason the tray draws one item. A `direction` property on `list` would invent API § 5.2 doesn't have --
         // `list`'s own spec entry lists only `source`/`itemfn`/`key`. Splicing a list's generated
         // children into its *parent's* child list -- a true repeater, which would inherit
         // whichever direction that parent already lays out in -- conflicts with ADR-0045's "a

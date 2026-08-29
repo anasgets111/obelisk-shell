@@ -227,12 +227,11 @@ async fn run_power_task(system_bus: zbus::Connection, state: Arc<Mutex<PowerStat
         return;
     }
 
-    let mut previous = read_state(upower.as_ref(), device.as_ref(), profiles.as_ref()).await;
-    *state.lock().expect("power state mutex poisoned") = previous.clone();
-    if events.send(PowerSignal::Changed).is_err() {
-        return;
-    }
-
+    // Subscribed before the first read, not after. Each `receive_*_changed` is its own D-Bus
+    // round trip, and a charger unplugged during that window would land between a read and a
+    // subscription that does not exist yet: the stale value would then be published and never
+    // corrected, because the event that would have corrected it was never delivered to anyone.
+    // Subscribing first makes the window close in the harmless direction, one redundant push.
     let mut on_battery_changed = match upower.as_ref() {
         Some(proxy) => Some(proxy.receive_on_battery_changed().await),
         None => None,
@@ -245,6 +244,12 @@ async fn run_power_task(system_bus: zbus::Connection, state: Arc<Mutex<PowerStat
         Some(proxy) => Some(proxy.receive_active_profile_changed().await),
         None => None,
     };
+
+    let mut previous = read_state(upower.as_ref(), device.as_ref(), profiles.as_ref()).await;
+    *state.lock().expect("power state mutex poisoned") = previous.clone();
+    if events.send(PowerSignal::Changed).is_err() {
+        return;
+    }
 
     loop {
         tokio::select! {

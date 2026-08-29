@@ -41,9 +41,8 @@
 //! usually equal, but nothing guarantees that) and cube-roots it, rather than reading the scalar
 //! `volume` key or reporting `channelVolumes` unconverted.
 
-use std::collections::HashMap;
-
-use pipewire::spa::pod::Value;
+use pipewire::spa::pod::serialize::PodSerializer;
+use pipewire::spa::pod::{Object, Property, Value, ValueArray};
 use pipewire::spa::sys as spa_sys;
 use serde::Serialize;
 
@@ -178,27 +177,157 @@ pub fn parse_default_device_name(json: &str) -> Option<String> {
 /// rather than restructured. The upgrade path, if either window ever proves too wide in
 /// practice, is to hold the previous resolved master id across an unresolved query instead of
 /// guessing by id.
-pub fn resolve_default_device(default_name: Option<&str>, names: &HashMap<u32, String>) -> Option<u32> {
-    if let Some(default_name) = default_name
-        && let Some((&id, _)) = names.iter().find(|(_, name)| name.as_str() == default_name)
-    {
-        return Some(id);
+pub fn resolve_default_device<'a>(default_name: Option<&str>, names: impl Iterator<Item = (u32, &'a str)>) -> Option<u32> {
+    let mut matched: Option<u32> = None;
+    let mut lowest: Option<u32> = None;
+    for (id, name) in names {
+        if default_name == Some(name) {
+            // Lowest id wins a tie rather than whichever the map happened to yield first. Two
+            // devices can share a `node.name` while hardware reconnects, and `HashMap` iteration
+            // order is not an order: without this, which device § 2.4's array marks `active`
+            // would change between two publishes of an unchanged registry.
+            matched = Some(matched.map_or(id, |current| current.min(id)));
+        }
+        lowest = Some(lowest.map_or(id, |low| low.min(id)));
     }
-    names.keys().copied().min()
+    matched.or(lowest)
 }
 
-/// Combines [`resolve_default_device`] and the tracked per-sink [`MasterVolume`]s into the one
+/// Combines [`resolve_default_device`] and the tracked per-sink [`RawSinkProps`] into the one
 /// value `mixer.rs` publishes -- [`MasterVolume::default`] (see its doc comment) if no sink is
-/// resolved yet, or a resolved sink's own `Props` haven't been parsed into `sink_volumes` yet
+/// resolved yet, or a resolved sink's own `Props` haven't been parsed into `sink_props` yet
 /// (the two maps update from separate PipeWire events and aren't guaranteed to catch up in the
 /// same tick).
-pub fn compute_master(default_name: Option<&str>, sink_names: &HashMap<u32, String>, sink_volumes: &HashMap<u32, MasterVolume>) -> MasterVolume {
-    resolve_default_device(default_name, sink_names).and_then(|id| sink_volumes.get(&id).copied()).unwrap_or_default()
+///
+/// `mixer.rs` keeps the whole [`RawSinkProps`], not the derived [`MasterVolume`], because the
+/// write path needs the channel count: a `channelVolumes` array set with the wrong arity is
+/// silently ignored by PipeWire, and the only honest source for how many channels a device has
+/// is the array it last reported.
+pub fn compute_master<'a>(default_name: Option<&str>, names: impl Iterator<Item = (u32, &'a str)>, props: impl Fn(u32) -> Option<RawSinkProps>) -> MasterVolume {
+    resolve_default_device(default_name, names).and_then(props).map(|raw| master_volume_from_props(&raw)).unwrap_or_default()
+}
+
+/// The inverse of [`master_volume_from_props`]'s cube root, spread across `channels` channels.
+/// PipeWire stores `channelVolumes` cubed, so a linear `0.3` a config asks for is written as
+/// `0.027`; skipping this writes 30% as 67%, which is the same conversion `audio` already got
+/// wrong once in the read direction (docs/adr/0053's own note about `wpctl` disagreeing).
+///
+/// `linear` is clamped to `[0.0, 1.0]` here rather than at the parse, matching
+/// `hardware::scale::raw_from_percent`'s own "clamp once, in the place that needs the bound"
+/// convention: § 3.2 states the range and this is the one function whose output leaves the
+/// process.
+///
+/// Every channel gets the same value. § 2.4 has one volume per device, not one per channel, so
+/// setting a volume through this capability necessarily flattens a device a user had balanced
+/// unevenly. That is the shape of the spec, and it is worth knowing before wondering where a
+/// left/right balance went.
+pub fn cubed_channel_volumes(linear: f32, channels: usize) -> Option<Vec<f32>> {
+    if channels == 0 {
+        // `extract_sink_props` accepts a structurally valid but empty `channelVolumes` array, and
+        // `master_volume_from_props` reads that as `0.0` on purpose. The write direction has no
+        // such honest answer: an empty array is a `Props` object PipeWire accepts and ignores, so
+        // a `set_volume` would report success and change nothing. Refusing lets the caller say so.
+        return None;
+    }
+    let clamped = linear.clamp(0.0, 1.0);
+    Some(vec![clamped * clamped * clamped; channels])
+}
+
+/// Builds the `SPA_PARAM_Props` object `Node::set_param` takes, carrying only the fields the
+/// caller is actually changing. A partial object is applied as a partial update, confirmed live
+/// with `pw-cli set-param <stream> Props '{ mute: true }'`, which muted the stream and left its
+/// volume alone.
+///
+/// Only the changed field, and not the pair, because sending the pair loses a write. Both values
+/// reach this capability through PipeWire's own `param` event and nothing here updates them
+/// optimistically, so two commands in the same tick both read the state from before either of
+/// them: `set_app_volume(id, 0.42)` followed immediately by `set_app_muted(id, true)` sent the
+/// second object with the volume from before the first, and put it back to 1.0. Observed on a
+/// live session, not reasoned about.
+pub fn props_object(channel_volumes: Option<Vec<f32>>, muted: Option<bool>) -> Value {
+    props_object_with_id(spa_sys::SPA_PARAM_Props, channel_volumes, muted)
+}
+
+/// The same object under a caller-chosen param id. A `Props` object nested inside a `Route`
+/// carries `SPA_PARAM_Route` as its id, not `SPA_PARAM_Props`: read straight off a live `pw-cli
+/// enum-params <device> Route`, whose nested object prints as `type Spa:Pod:Object:Param:Props
+/// (262146), id Spa:Enum:ParamId:Route (13)`. Building it with the standalone id instead is a pod
+/// PipeWire accepts and ignores, which is the same silent failure a node-level write already is.
+fn props_object_with_id(id: u32, channel_volumes: Option<Vec<f32>>, muted: Option<bool>) -> Value {
+    let mut properties = Vec::new();
+    if let Some(muted) = muted {
+        properties.push(Property::new(spa_sys::SPA_PROP_mute, Value::Bool(muted)));
+    }
+    if let Some(channel_volumes) = channel_volumes {
+        properties.push(Property::new(spa_sys::SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(channel_volumes))));
+    }
+    Value::Object(Object { type_: spa_sys::SPA_TYPE_OBJECT_Props, id, properties })
+}
+
+/// Serializes [`props_object`]'s output into the raw pod bytes `Pod::from_bytes` reads back.
+/// Separate from `props_object` so the object shape stays unit-testable without going through a
+/// serializer, and so `mixer.rs` holds the bytes alive for exactly as long as the `&Pod` borrowed
+/// from them is in use.
+pub fn serialize_props(object: &Value) -> Option<Vec<u8>> {
+    let (cursor, _) = PodSerializer::serialize(std::io::Cursor::new(Vec::new()), object).ok()?;
+    Some(cursor.into_inner())
+}
+
+/// Builds the `SPA_PARAM_Route` object a hardware sink's volume actually has to be written
+/// through (see `mixer::write_master` for how that was found, and why a node write is silently
+/// ignored). `index` names which of the card's routes to write; `profile_device` is the
+/// `card.profile.device` the sink node reports and the `device` field a `Route` matches on.
+///
+/// `save: true` matches every other mixer's write and is what makes the setting survive the
+/// device being re-plugged. The volume and mute ride in a nested `Props` object, which is the
+/// shape a live `pw-cli enum-params <device> Route` shows on this machine.
+pub fn route_object(index: i32, profile_device: i32, channel_volumes: Option<Vec<f32>>, muted: Option<bool>) -> Value {
+    Value::Object(Object {
+        type_: spa_sys::SPA_TYPE_OBJECT_ParamRoute,
+        id: spa_sys::SPA_PARAM_Route,
+        properties: vec![
+            Property::new(spa_sys::SPA_PARAM_ROUTE_index, Value::Int(index)),
+            Property::new(spa_sys::SPA_PARAM_ROUTE_device, Value::Int(profile_device)),
+            Property::new(spa_sys::SPA_PARAM_ROUTE_props, props_object_with_id(spa_sys::SPA_PARAM_Route, channel_volumes, muted)),
+            Property::new(spa_sys::SPA_PARAM_ROUTE_save, Value::Bool(true)),
+        ],
+    })
+}
+
+/// Pulls `(card.profile.device, route index)` out of one `Route` object a device published. That
+/// pair is the whole reason devices are tracked: a card advertises several routes and only this
+/// param says which index is currently active for a given port, and a write to the wrong index
+/// goes nowhere.
+///
+/// `None` for an object missing either field, which is how the `EnumRoute`-shaped entries and
+/// anything else arriving under a different param are skipped rather than misread.
+pub fn extract_route_target(value: &Value) -> Option<(i32, i32)> {
+    let Value::Object(object) = value else { return None };
+    let mut index = None;
+    let mut profile_device = None;
+    for property in &object.properties {
+        match (property.key, &property.value) {
+            (spa_sys::SPA_PARAM_ROUTE_index, Value::Int(value)) => index = Some(*value),
+            (spa_sys::SPA_PARAM_ROUTE_device, Value::Int(value)) => profile_device = Some(*value),
+            _ => {}
+        }
+    }
+    Some((profile_device?, index?))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+
+    /// Adapts a plain `id -> node.name` fixture map into the iterator both functions take. They
+    /// take an iterator rather than a map because `mixer.rs` keeps one entry struct per device,
+    /// not a map of names, and building a throwaway `HashMap` on every publish to call these
+    /// would be an allocation per PipeWire event.
+    fn names(map: &HashMap<u32, String>) -> impl Iterator<Item = (u32, &str)> {
+        map.iter().map(|(&id, name)| (id, name.as_str()))
+    }
 
     // ---- extract_sink_props ----
 
@@ -349,24 +478,118 @@ mod tests {
     #[test]
     fn resolve_default_device_matches_by_name() {
         let sinks = HashMap::from([(59, "alsa_output.pci-...analog-stereo".to_string()), (70, "bluez_output.headset".to_string())]);
-        assert_eq!(resolve_default_device(Some("bluez_output.headset"), &sinks), Some(70));
+        assert_eq!(resolve_default_device(Some("bluez_output.headset"), names(&sinks)), Some(70));
     }
 
     #[test]
     fn resolve_default_device_falls_back_to_lowest_id_with_no_default_name() {
         let sinks = HashMap::from([(70, "bluez_output.headset".to_string()), (59, "alsa_output.pci-...analog-stereo".to_string())]);
-        assert_eq!(resolve_default_device(None, &sinks), Some(59));
+        assert_eq!(resolve_default_device(None, names(&sinks)), Some(59));
     }
 
     #[test]
     fn resolve_default_device_falls_back_when_the_named_sink_is_not_tracked_yet() {
         let sinks = HashMap::from([(59, "alsa_output.pci-...analog-stereo".to_string())]);
-        assert_eq!(resolve_default_device(Some("bluez_output.not-seen-yet"), &sinks), Some(59));
+        assert_eq!(resolve_default_device(Some("bluez_output.not-seen-yet"), names(&sinks)), Some(59));
     }
 
     #[test]
     fn resolve_default_device_is_none_with_no_sinks_tracked_at_all() {
-        assert_eq!(resolve_default_device(None, &HashMap::new()), None);
+        assert_eq!(resolve_default_device(None, names(&HashMap::new())), None);
+    }
+
+    // ---- cubed_channel_volumes ----
+
+    #[test]
+    fn cubed_channel_volumes_is_the_exact_inverse_of_the_read_direction() {
+        let volumes = cubed_channel_volumes(0.3, 2).expect("two channels is not zero");
+        let read_back = master_volume_from_props(&RawSinkProps { mute: false, channel_volumes: volumes });
+        assert!((read_back.volume - 0.3).abs() < 1e-6, "expected ~0.3, got {}", read_back.volume);
+    }
+
+    #[test]
+    fn cubed_channel_volumes_writes_one_entry_per_channel() {
+        assert_eq!(cubed_channel_volumes(1.0, 6).map(|v| v.len()), Some(6));
+    }
+
+    #[test]
+    fn cubed_channel_volumes_clamps_a_value_outside_the_specified_range() {
+        assert_eq!(cubed_channel_volumes(2.0, 1), Some(vec![1.0]));
+        assert_eq!(cubed_channel_volumes(-0.5, 1), Some(vec![0.0]));
+    }
+
+    #[test]
+    fn cubed_channel_volumes_refuses_a_device_reporting_no_channels() {
+        // An empty `channelVolumes` array is a Props object PipeWire accepts and ignores, so a
+        // write built from one would report success and change nothing. The read direction has an
+        // honest answer for the same input (0.0); this one does not, so it declines.
+        assert_eq!(cubed_channel_volumes(0.5, 0), None);
+    }
+
+    // ---- route_object / extract_route_target ----
+
+    #[test]
+    fn a_route_object_round_trips_back_to_the_target_it_names() {
+        let object = route_object(2, 7, Some(vec![0.027, 0.027]), Some(false));
+        assert_eq!(extract_route_target(&object), Some((7, 2)));
+    }
+
+    #[test]
+    fn a_props_object_carries_only_the_field_the_caller_is_changing() {
+        // Sending both would lose a write: neither value is updated optimistically, so two
+        // commands in the same tick each read the state from before the other. See
+        // `props_object`'s own doc comment for the live observation that found it.
+        let Value::Object(volume_only) = props_object(Some(vec![0.5]), None) else { panic!("props_object must build an object") };
+        assert_eq!(volume_only.properties.len(), 1);
+        assert_eq!(volume_only.properties[0].key, spa_sys::SPA_PROP_channelVolumes);
+
+        let Value::Object(mute_only) = props_object(None, Some(true)) else { panic!("props_object must build an object") };
+        assert_eq!(mute_only.properties.len(), 1);
+        assert_eq!(mute_only.properties[0].key, spa_sys::SPA_PROP_mute);
+    }
+
+    #[test]
+    fn a_route_object_carries_the_volume_in_a_nested_props_object() {
+        // The shape a live `pw-cli enum-params <device> Route` shows: the volume is not on the
+        // Route, it is on a `Props` object hanging off its `props` key.
+        let Value::Object(route) = route_object(2, 7, Some(vec![0.125, 0.125]), Some(true)) else { panic!("route_object must build an object") };
+        let nested = route.properties.iter().find(|property| property.key == spa_sys::SPA_PARAM_ROUTE_props).expect("a Route must carry props");
+        let extracted = extract_sink_props(&nested.value).expect("the nested object must parse as sink props");
+        assert!(extracted.mute);
+        assert_eq!(extracted.channel_volumes, vec![0.125, 0.125]);
+    }
+
+    #[test]
+    fn a_route_object_asks_for_the_setting_to_be_saved() {
+        let Value::Object(route) = route_object(2, 7, Some(vec![0.5]), None) else { panic!("route_object must build an object") };
+        let save = route.properties.iter().find(|property| property.key == spa_sys::SPA_PARAM_ROUTE_save).expect("a Route must carry save");
+        assert_eq!(save.value, Value::Bool(true));
+    }
+
+    #[test]
+    fn extract_route_target_skips_an_object_missing_either_field() {
+        let index_only = Value::Object(Object {
+            type_: spa_sys::SPA_TYPE_OBJECT_ParamRoute,
+            id: spa_sys::SPA_PARAM_Route,
+            properties: vec![Property::new(spa_sys::SPA_PARAM_ROUTE_index, Value::Int(2))],
+        });
+        assert_eq!(extract_route_target(&index_only), None);
+        assert_eq!(extract_route_target(&Value::Bool(true)), None);
+    }
+
+    // ---- serialize_props ----
+
+    #[test]
+    fn a_serialized_props_object_reads_back_as_the_same_values() {
+        // The write path hands these bytes to C through `Pod::from_bytes`. If the serializer and
+        // the deserializer disagree, PipeWire gets a pod that parses as something else and the
+        // symptom is a write that is accepted and ignored, which is exactly the failure this
+        // capability already hit once.
+        let bytes = serialize_props(&props_object(Some(vec![0.027, 0.027]), Some(true))).expect("a Props object must serialize");
+        let (_, value) = pipewire::spa::pod::deserialize::PodDeserializer::deserialize_from::<Value>(&bytes).expect("the bytes must read back as a pod");
+        let extracted = extract_sink_props(&value).expect("the round trip must still parse as sink props");
+        assert!(extracted.mute);
+        assert_eq!(extracted.channel_volumes, vec![0.027, 0.027]);
     }
 
     // ---- compute_master ----
@@ -374,8 +597,12 @@ mod tests {
     #[test]
     fn compute_master_combines_resolution_and_lookup() {
         let sinks = HashMap::from([(59, "alsa_output.pci-...analog-stereo".to_string())]);
-        let volumes = HashMap::from([(59, MasterVolume { volume: 0.3, muted: false })]);
-        assert_eq!(compute_master(Some("alsa_output.pci-...analog-stereo"), &sinks, &volumes), MasterVolume { volume: 0.3, muted: false });
+        // 0.027 cubed-back is 0.3 linear, which is the conversion `compute_master` now runs
+        // itself rather than receiving already applied.
+        let props = HashMap::from([(59, RawSinkProps { mute: false, channel_volumes: vec![0.027, 0.027] })]);
+        let master = compute_master(Some("alsa_output.pci-...analog-stereo"), names(&sinks), |id| props.get(&id).cloned());
+        assert!((master.volume - 0.3).abs() < 1e-6, "expected ~0.3, got {}", master.volume);
+        assert!(!master.muted);
     }
 
     #[test]
@@ -383,11 +610,11 @@ mod tests {
         // resolve_default_device can find a node id before that node's own Props param has arrived
         // (they're independent events) -- compute_master must not panic on that gap.
         let sinks = HashMap::from([(59, "alsa_output.pci-...analog-stereo".to_string())]);
-        assert_eq!(compute_master(Some("alsa_output.pci-...analog-stereo"), &sinks, &HashMap::new()), MasterVolume::default());
+        assert_eq!(compute_master(Some("alsa_output.pci-...analog-stereo"), names(&sinks), |_| None), MasterVolume::default());
     }
 
     #[test]
     fn compute_master_defaults_with_nothing_tracked() {
-        assert_eq!(compute_master(None, &HashMap::new(), &HashMap::new()), MasterVolume::default());
+        assert_eq!(compute_master(None, names(&HashMap::new()), |_| None), MasterVolume::default());
     }
 }
