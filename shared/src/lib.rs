@@ -34,10 +34,10 @@ pub fn control_socket_path() -> io::Result<PathBuf> {
 /// § 6.4's `lock` node constructor already owns that name, and the seeding loop runs after
 /// `NODE_KINDS` registration, so a bare `lock` signal would silently overwrite the constructor and
 /// break every `lock { ... }` declaration. It is seeded as `oblisk.lock` instead, which is the name
-/// § 2 specifies for it anyway (docs/adr/0052). Phase 25 item 3 moves the other ten there too and
+/// § 2 specifies for it anyway (docs/adr/0052). Phase 25 item 3 moves the other twelve there too and
 /// deletes the special case.
 pub const CAPABILITIES: &[&str] = &[
-    "audio", "network", "bluetooth", "tray", "notifications", "mpris", "sysinfo", "keyboard", "privacy", "updates", "lock",
+    "audio", "network", "bluetooth", "tray", "notifications", "mpris", "sysinfo", "keyboard", "privacy", "updates", "lock", "battery", "system",
 ];
 
 /// Guarded JSON-RPC 2.0 envelope wrapping a Lua write action.

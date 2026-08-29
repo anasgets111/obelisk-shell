@@ -1792,6 +1792,59 @@ one that cannot produce one.
 No `inhibitReloadPopup` equivalent is needed. Quickshell has one because its popup also spawns on
 reload failures, which is the case item 1 hands back to `oblisk.rescue`.
 
+### Phase 28: The Capabilities § 2 Specified and No Phase Claimed
+
+Implement docs/adr/0053. Five § 2 capabilities were specified and never built, and no phase in this
+document owned any of them: `battery` (§ 2.2), `brightness` (§ 2.3), `workspaces` (§ 2.9), `system`
+(§ 2.11) and `power` (§ 2.13), plus four fifths of `audio` (§ 2.4). Phase 16 built "the capability
+roster" scoped by `oblisk-supervisor-services-dbus.md`'s section numbers rather than the IDL's, and
+the IDL-only entries fell between the two documents.
+
+1. **`battery`** (§ 2.2), **`system`** (§ 2.11) and **`audio`'s `volume`/`muted`** (§ 2.4). Done, see
+   the note below.
+2. **`brightness`** (§ 2.3). `/sys/class/backlight`, and the same `inotify` watch line 98 of this
+   document already justifies the dependency with. Small, and deliberately not bundled above: it has
+   no consumer pressing for it the way the other three did.
+3. **`workspaces`** (§ 2.9). Not small and not obviously ours. `niri-ipc` is already a dependency, so
+   one compositor is reachable cheaply, but whether this capability speaks one compositor's IPC or an
+   abstraction over several is a design question that needs an ADR before an implementation. Do not
+   let a bar's need for a workspace strip decide it.
+4. **`power`** (§ 2.13). Profiles through `power-profiles-daemon`, `on_battery` and `energy_rate`
+   through UPower, which the keyboard capability already talks to.
+5. **`audio`'s `sinks`/`sources`** (§ 2.4) and per-app `volume`/`muted`. The per-app half needs the
+   same `SPA_PARAM_Props` subscription per stream node that the master already has; the arrays need
+   the sink and source globals tracked as well as the streams.
+
+> **Built (items 1 and part of 5).** `battery` reads `/sys/class/power_supply` behind a real udev
+> monitor on `AsyncFd`, filtered to the one system battery: the mains adapter, the USB-C PD source
+> and any `scope=Device` peripheral battery are all excluded, and `Not charging` is matched exactly
+> rather than by substring, which a `contains` check would invert into charging. That monitor is the
+> first caller `udev` has ever had. It has been a declared dependency since scaffolding, justified by
+> line 98's "§ 1.1's battery netlink monitor", which nothing then wrote. Its `send` feature had to be
+> enabled, and `AsyncFd::readable_mut` used rather than `readable`, because the shared-reference
+> guard needs `Sync` and only `send` is on.
+>
+> `system` pushes `time` once per wall-clock second, aligned to the boundary, and only when the epoch
+> second it would report actually changed (docs/adr/0053 decision 2). `state` loads
+> `$XDG_STATE_HOME/oblisk/state.json` once and degrades to an empty object on missing, unreadable,
+> malformed or non-object JSON. Nothing writes that file yet, which the ADR names rather than hides.
+>
+> `audio` moved to § 2.4's object shape, which forced its app fields to § 2.4's names at the same
+> time (`node_id` to `id`, `app_name` to `name`). Master volume comes from the default sink's
+> `SPA_PARAM_Props` param, resolved through the `default.audio.sink` metadata key, and is the cube
+> root of the max of `channelVolumes`: PipeWire stores those cubed, so the raw value reads 3% where
+> `wpctl` and the user both say 30%. Verified against `wpctl get-volume`, not against the header.
+> Per-app `volume`/`muted` are placeholders and are marked as such.
+>
+> The rewritten `dev-config/oblisk/shell.lua` is what all of this was for, and it found two things
+> the capability work did not. Its previous version read `sysinfo.cpu_pct`/`ram_pct`; the real keys
+> are `cpu_percent`/`ram_percent`, so it would have shown 0% forever the day Phase 25 woke sysinfo's
+> pollers, with a dormant capability and a typo looking identical until then. And a three-zone bar
+> cannot be built the way a flexbox one is: `resolve_non_content` gives a `Fill` child the parent's
+> whole budget rather than the remainder, so two `Fill` spacers both take the full width instead of
+> splitting it. The bar uses three fixed percentage zones each distributing its own spare space by
+> its own `align_h`. There is no space-between in this engine, and nothing said so before now.
+
 ### The missing animation model
 
 The largest remaining gap, and it was found by pulling on a smaller one. `CONTEXT.md`'s Lease exists
@@ -1800,9 +1853,11 @@ it has had no caller since Phase 12 (ADR-0023 item 7). The reason is not that th
 grep for transition, animation, or easing across `docs/` and `renderer/src/` returns nothing but
 Hyprland's compositor-side `layerrule`. The feature the lease was built to serve was never specified.
 
-Underneath that, Lua has no clock. Capability pushes are the only thing that changes a value over
-time, they arrive at the Supervisor's pace, and ADR-0048 keeps `os.time` as a read rather than adding
-a callback. A config cannot animate anything today, whatever API the lease grows.
+Underneath that, Lua had no clock at all when this was written. Phase 28 built `system.time`, so a
+config now has a 1 Hz heartbeat and can draw a time that moves. That is not an animation clock and
+does not change the paragraph's conclusion: 1 Hz is three orders of magnitude short of a frame, and
+ADR-0048 still keeps `os.time` as a read rather than adding a callback. A config cannot animate
+anything today, whatever API the lease grows.
 
 Quickshell has `EasingCurve` and `ElapsedTimer` in `core/` and inherits QML's `Behavior`,
 `NumberAnimation`, and `Transition` on top. Matching that is a real body of work and it is not

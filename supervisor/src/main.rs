@@ -10,6 +10,7 @@ mod reload;
 mod reload_link;
 mod snapshot;
 mod socket;
+mod system;
 mod updates;
 mod watcher;
 
@@ -24,11 +25,13 @@ use dbus::network::{self, NetworkController, NetworkSignal};
 use dbus::notifications::{self, NotificationsController, NotificationsSignal};
 use dbus::polkit::{AGENT_OBJECT_PATH, AuthenticationAgent, current_session_subject, register_agent};
 use dbus::tray::{self, TrayController, TraySignal};
+use hardware::battery::{BatteryController, BatterySignal};
 use hardware::idle::{self, IdleController};
 use hardware::keyboard::{self, KeyboardController, KeyboardSignal};
 use hardware::sysinfo::{self, SysinfoController, SysinfoSignal};
 use lock::LockController;
 use privacy::{PrivacyController, PrivacySignal};
+use system::{SystemController, SystemSignal};
 use updates::{UpdatesController, UpdatesSignal};
 use process::registry::{LiveProcesses, reap_all_processes, reap_generations_processes, take_exited_process, wait_and_report_exit};
 use reload_link::SocketCandidateLink;
@@ -289,6 +292,26 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     let (updates_signal_tx, mut updates_signals) = tokio::sync::mpsc::unbounded_channel::<UpdatesSignal>();
     let updates = UpdatesController::new(PathBuf::from("/etc/pacman.conf"), PathBuf::from("/var/lib/pacman"), updates_signal_tx);
 
+    // battery capability (docs/adr/0053, § 2.2): `/sys/class/power_supply`, filtered to the one
+    // system battery. The root is a parameter rather than a constant for the same reason
+    // `PrivacyController`'s is -- it is what makes the device-selection rule testable against a
+    // fixture directory instead of against whatever hardware the test machine happens to have.
+    let (battery_signal_tx, mut battery_signals) = tokio::sync::mpsc::unbounded_channel::<BatterySignal>();
+    let battery = BatteryController::new(PathBuf::from("/sys/class/power_supply"), battery_signal_tx);
+
+    // system capability (docs/adr/0053, § 2.11): the 1 Hz clock a config needs to draw a time that
+    // moves, plus the persisted `state.json` dictionary. Both env reads happen here rather than
+    // inside the module, matching how `resolve_state_path` was written to take them as arguments.
+    // A missing `$HOME` degrades to `/` instead of failing the boot: it makes `state` empty, which
+    // is already the correct answer for a first run, and a shell that refuses to start because it
+    // could not find a preferences file it does not need would be the worse trade.
+    let (system_signal_tx, mut system_signals) = tokio::sync::mpsc::unbounded_channel::<SystemSignal>();
+    let system = SystemController::new(
+        PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| std::ffi::OsString::from("/"))),
+        std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+        system_signal_tx,
+    );
+
     // lock capability (docs/adr/0042, docs/adr/0052): the Renderer holds `ext_session_lock_v1`
     // and paints it; this side owns the decision to take it, the state a lock screen reads, and
     // the one call site allowed to order an unlock. No D-Bus and no hardware, so no degrade path
@@ -457,6 +480,19 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 // forwarder already wrote `backlight_pct` under its own lock before signaling.
                 let state = keyboard.snapshot();
                 push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "keyboard", &state);
+            }
+            Some(BatterySignal::Changed) = battery_signals.recv() => {
+                // Same no-debounce, full-re-derive shape as sysinfo/keyboard below.
+                let state = battery.snapshot();
+                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "battery", &state);
+            }
+            Some(SystemSignal::Changed) = system_signals.recv() => {
+                // Once per wall-clock second, and the only capability here that pushes on a timer
+                // rather than on a real event -- docs/adr/0053 decision 2 owns why that cost is
+                // taken and what bounds it (the controller emits only when the epoch second it
+                // would report actually changed).
+                let state = system.snapshot();
+                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "system", &state);
             }
             Some(PrivacySignal::Changed) = privacy_signals.recv() => {
                 // Same no-debounce, full-re-derive shape as sysinfo/keyboard above.

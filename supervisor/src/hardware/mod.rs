@@ -8,6 +8,7 @@
 //! D-Bus proxy (`UPower.KbdBacklight`) riding the shared system-bus connection for its
 //! backlight half, the same "mostly non-D-Bus, one proxy riding along" shape `idle` already has.
 
+pub mod battery;
 pub mod idle;
 pub mod keyboard;
 pub mod sysinfo;
