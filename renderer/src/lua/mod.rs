@@ -13,13 +13,14 @@
 // Phase 19 item 1), so this module has a real production caller, not just its own tests.
 pub mod capability;
 pub mod marshal;
+pub mod json;
 pub mod nodes;
 pub mod process;
 pub mod signal;
 
 pub use nodes::VirtualNode;
 
-use mlua::{Lua, LuaSerdeExt, Table, Value};
+use mlua::{Lua, Table, Value};
 
 /// Owns the Lua VM for one generation. `Loader::evaluate` is stateless across calls beyond that
 /// -- each call is a fresh evaluation of its `source` argument, not an incremental re-run.
@@ -71,6 +72,7 @@ impl Loader {
     pub fn new(dirty: signal::DirtyFlag) -> mlua::Result<Self> {
         let lua = Lua::new();
         nodes::register_node_constructors(&lua)?;
+        json::register(&lua)?;
         signal::register(&lua, dirty)?;
         Ok(Loader { lua })
     }
@@ -142,30 +144,12 @@ impl Loader {
     /// `Value` is tied to the state that created it). Turns a pushed `StateSnapshot`'s
     /// `serde_json::Value` payload into something a `LiveSignalHandle::set` call can store.
     ///
-    /// docs/build-steps.md Phase 19 item 16: mlua's serde bridge defaults
-    /// `serialize_none_to_null`/`serialize_unit_to_null` to true, which maps `Value::Null` to a
-    /// lightuserdata sentinel rather than Lua `nil` -- and lightuserdata is truthy, so
-    /// `if payload.field then` took the branch that assumes a real value. Both options are turned
-    /// off here so `null` becomes `nil` instead. That also erases the key from the table entirely
-    /// rather than leaving it present with a nil-ish value, which is the part a reader coming from
-    /// JSON will not expect: it is the same semantics every `x or default` idiom in Lua already
-    /// assumes, and it is why `to_lua_value_maps_a_json_null_field_to_a_nil_that_is_absent_from_the_table`
-    /// counts keys instead of just comparing `== nil` (indexing a genuinely absent key returns
-    /// `nil` too).
-    ///
-    /// The cost, since it is not free and a config author will meet it: a `null` sitting in a JSON
-    /// *array* now leaves a hole, and `ipairs` stops at a hole. Measured on `[1, null, 3]`:
-    /// `ipairs` yields one element, while `#` returns 3 and `xs[3]` still reads back 3. The old
-    /// sentinel filled the hole, so `ipairs` walked all three. This matters because iterating a
-    /// capability's list with `ipairs` is exactly what `dev-config/oblisk/shell.lua` already does
-    /// for `network.available_networks`. It is still the right trade: a null *field* is the shape
-    /// every payload actually has (`icon_path`, `toggle_state`, `icon_name` in a tray menu), a
-    /// null array *element* is not one any capability produces today, and the alternative leaves
-    /// every optional field truthy. `to_lua_value_a_null_array_element_leaves_a_hole_ipairs_stops_at`
-    /// pins the behavior so it is a known quantity rather than a surprise.
+    /// Delegates to [`json::to_lua`], which is also what `json.decode` calls: a config must not
+    /// meet one `null` mapping on `oblisk.tray.items` and a different one on the output of
+    /// `lsblk --json`, with nothing in the language to tell the two apart. See that function for
+    /// what the mapping is and what it costs.
     pub fn to_lua_value(&self, json: &serde_json::Value) -> mlua::Result<Value> {
-        let options = mlua::serde::ser::Options::new().serialize_none_to_null(false).serialize_unit_to_null(false);
-        self.lua.to_value_with(json, options)
+        json::to_lua(&self.lua, json)
     }
 }
 

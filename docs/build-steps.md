@@ -2413,7 +2413,7 @@ reaches for outside them.
 
 | Missing | Used for | Nearest path today | Verdict |
 | :--- | :--- | :--- | :--- |
-| A JSON decoder in the Lua environment | `nvtop -s`, `lsblk --json`, `busctl --json=short`, weather, currency | none; `process.run`'s `out_cb` hands Lua a string Lua cannot read | highest value in this table, and it unblocks every subprocess row below it |
+| A JSON decoder in the Lua environment | `nvtop -s`, `lsblk --json`, `busctl --json=short`, weather, currency | **Built** as `json.decode` (ADR-0057); was none, and `process.run`'s `out_cb` handed Lua a string Lua could not read | highest value in this table, and it unblocked every subprocess row below it |
 | An HTTP client | weather (open-meteo), IP geolocation, currency conversion | `process.run` `curl`, then the decoder above | fine as a subprocess; a capability would be scope creep |
 | Desktop entry lookup | app-id to icon and display name, and the whole launcher | ADR-0054 decision 5 dropped `system:find_icon`, and this is the caller it said had none | that ADR was right about the mechanism, wrong that nothing would want the data; amendment, not reversal |
 | Per-workspace window lists | `WorkspaceStrip` draws each workspace's app icon | § 2.9 carries one global `active_client` and per-workspace `{ id, idx, name }` | ADR-0056 chose that payload, so this is not an oversight; niri's `Window.workspace_id` is right there, making it an additive field |
@@ -2422,8 +2422,15 @@ reaches for outside them.
 | KDE Connect | SMS, ring, mount, remote commands | none; Lua cannot speak D-Bus, and this needs a live signal stream, not one-shot calls | out of scope by a wide margin, and the only entry arguing for a general D-Bus escape hatch |
 | Monitor configuration | the display-settings arrangement editor | § 2.15 `screens` reads; nothing writes | writing output config is compositor-specific, and ADR-0056's reasoning applies unchanged |
 
-Take the first row. A pure-Lua JSON decoder is about a hundred lines and ships in the config, not the
-engine. That stays the YAGNI-correct answer right up until three configs have each written their own.
+Take the first row, whose original entry here argued that a pure-Lua decoder of about a hundred lines
+belonged in the config rather than the engine, and stayed YAGNI-correct until three configs had each
+written their own. That was wrong, and wrong for a reason worth recording: it was written without
+checking what the engine already had. `renderer/src/lua/mod.rs` has converted `serde_json::Value` to
+Lua since Phase 19 item 16, because every capability payload arrives that way, and both `serde_json`
+and mlua's `serde` feature were already compiled into the `renderer`. A decoder written in Lua would
+also have disagreed with that converter about `null`, which is the part no config author could have
+debugged. ADR-0057 records the decision and why jq, a query crate, and the pure-Lua decoder all lose
+to one function on the mapping that was already there.
 
 ### What the reference workload proves is already right
 
@@ -2458,7 +2465,25 @@ By modules unblocked per unit of work, which is not the same as by size.
    `align_h` already do at this boundary, and an unhandled evdev code still does nothing rather than
    arriving as `"other"` and running a handler written for the left button.
 2. **A JSON decoder reachable from Lua.** Turns `process.run` from fire-and-forget into a data
-   source. Every subprocess row above depends on it.
+   source. Every subprocess row above depends on it. **Built**, as `json.decode(text)` returning the
+   value or `nil` plus a message (ADR-0057). It is one function over the JSON-to-Lua converter the
+   engine already had, so the engine grew no new dependency and no second `null` mapping.
+
+   Verified by nine unit tests, one of them decoding a real captured `niri msg -j focused-window`
+   line with its nested `null`s and its non-ASCII title, plus a `luac -p` syntax check on the config
+   below. Not live-verified: no test drives the full path, which is `on_click` to `process.run` to
+   `out_cb` per line to `json.decode` to `state:set` to a repaint, because the middle of it needs the
+   Supervisor to spawn a real child. `dev-config/oblisk/shell.lua`'s `refresh_window_title` is that
+   path written out, reporting the focused window title, which is data no capability carries because
+   ADR-0056 keeps window lists out of `workspaces`. Clicking it is the check.
+
+   That config carries a request counter, and it is not decoration. A review traced the failure: left
+   click, then a reset, then the first click's reply landing late and overwriting the reset, with a
+   rapid double click showing whichever answer finished last rather than the newer one. Confirmed by
+   loading the real `shell.lua` under stubbed engine globals and driving both orderings through the
+   button's own `on_click`, which fails on the first scenario with the counter removed and passes
+   with it. Nothing in `process.run` cancels a request the config has moved on from, so every
+   subprocess-backed module needs that guard, and a demo without one would teach the wrong shape.
 3. **Gradient and shadow on `rect`.** Already in the dependency. Parsers and § 5.2 rows only.
 4. **`on_hover`.** Two tooltips, a hover-to-open panel, a hover highlight, and every expand-on-hover
    affordance. Needs an ADR on whether the engine may emit a signal rather than only consume one.

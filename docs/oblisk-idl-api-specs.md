@@ -9,7 +9,7 @@ This document defines the strict binary and type boundaries between the Rust pla
 
 All data passing across the Rust-Lua boundary (driven by `mlua` hosting PUC Lua 5.4) is mapped according to the following strict, non-coercive rules. Any mismatch fails immediately at construction/execution time rather than degrading silently or raising unhandled panic errors.
 
-**What the config VM contains.** "Lua 5.4" no longer describes it on its own. `coroutine`, `table`, `string`, `utf8`, `math`, and `package` are present in full. `debug` and `ffi` are absent, and `package.loadlib` raises, because mlua's safe mode says so. `io` is absent and `os` is cut to `time`, `date`, `clock`, and `getenv`: every other call in either library blocks the thread that dispatches Wayland events, and `process.run` is the non-blocking way to run a command (ADR-0048). `package.path` resolves inside the config directory only (ADR-0047).
+**What the config VM contains.** "Lua 5.4" no longer describes it on its own. `coroutine`, `table`, `string`, `utf8`, `math`, and `package` are present in full. `debug` and `ffi` are absent, and `package.loadlib` raises, because mlua's safe mode says so. `io` is absent and `os` is cut to `time`, `date`, `clock`, and `getenv`: every other call in either library blocks the thread that dispatches Wayland events, and `process.run` is the non-blocking way to run a command (ADR-0048). A `json` global with a single `decode` function is added on top of the standard set, because a subprocess's output is otherwise a string Lua cannot read (ADR-0057). `package.path` resolves inside the config directory only (ADR-0047).
 
 ### 1.1 Fundamental Type Mapping Table
 
@@ -274,6 +274,7 @@ All write actions are serialized as JSON-RPC 2.0 payloads over the private Unix 
 | `sysinfo:configure(cfg)` | `capability: "sysinfo", action: "configure", arguments: [cfg]`<br>**Validation**: `cfg` is dictionary containing integers `cpu_interval`, `ram_interval`, `temp_interval` in seconds. An interval of `0` suspends the matching monitor thread. |
 | `power:set_profile(p)` | `capability: "power", action: "set_profile", arguments: [p]`<br>**Validation**: `p` is string matching active host profiles. |
 | `process.run(cmd, args, out_cb, exit_cb)`| *Internal non-blocking shell fork* returning `ProcessHandle`. <br>**Validation**: `cmd` is string, `args` array table of strings, callbacks are Lua functions. |
+| `json.decode(text)` | *Pure function, no IPC.* Returns the decoded value, or `nil` plus a message string on malformed input (ADR-0057). <br>**Validation**: `text` is a string; non-UTF-8 bytes are reported as a decode error rather than raised. |
 | `tray:activate(id, x, y)` | `capability: "tray", action: "activate", arguments: [id, x, y]`<br>**Validation**: `id` is string, `x`/`y` are integers. No-ops (does not call the real `Activate`) when the item's `item_is_menu` is `true` (docs/adr/0031). |
 | `tray:activate_menu_item(id, menu_item_id)` | `capability: "tray", action: "activate_menu_item", arguments: [id, menu_item_id]`<br>**Validation**: `id` is string, `menu_item_id` is integer matching a `menu[].id` from `tray.items`. |
 | `tray:menu_will_show(id, submenu_id)` | `capability: "tray", action: "menu_will_show", arguments: [id, submenu_id]`<br>**Validation**: `id` is string, `submenu_id` is integer. Fires DBusMenu's `AboutToShow` and refreshes `tray.items[].menu` before Lua renders it -- required for correctness with apps that populate submenus lazily (docs/adr/0031). |
@@ -282,7 +283,11 @@ All write actions are serialized as JSON-RPC 2.0 payloads over the private Unix 
 The `process.run` function yields an opaque `ProcessHandle` object to Lua:
 *   `process_handle:kill()`: Terminate the child process and its entire Unix process group cleanly in Rust (sending `SIGTERM`, then escalating to `SIGKILL` if it persists). Prevents orphaned processes.
 
-> **`out_cb` hands Lua a string, and Lua cannot read it.** The config environment has no JSON decoder, which puts every subprocess reporting structured output out of reach: `nvtop -s`, `lsblk --json`, `busctl --json=short`, and any HTTP fetch through `curl`. That is what leaves `process.run` as fire-and-forget instead of a data source. A pure-Lua decoder is about a hundred lines and belongs in the config, not the engine, which stays the right answer until a third config has written its own. `build-steps.md` section 6 ranks this second overall, behind only a button index on `on_click`.
+> **Amended: `json.decode` is built, and this banner's proposed fix was wrong (ADR-0057).** The gap was real. `out_cb` handed Lua a string Lua could not read, which put `nvtop -s`, `lsblk --json`, `busctl --json=short`, `niri msg -j` and any `curl` fetch out of reach and left `process.run` fire-and-forget instead of a data source. The fix proposed here was a pure-Lua decoder in the config, on the grounds that the engine should not grow one. That was written without checking: the engine has converted JSON to Lua since Phase 19 item 16, because every capability payload arrives as a `serde_json::Value`, and both `serde_json` and `mlua`'s `serde` feature were already compiled in. A second decoder in Lua would have disagreed with the first about `null`. `json.decode` is one function on that same mapping.
+
+`json.decode(text)` returns the decoded value, or `nil` plus a message string. See ADR-0057 for the return convention, and `json.decode`'s doc comment in `renderer/src/lua/json.rs` for what `null` maps to. There is deliberately no `json.encode`.
+
+`out_cb` fires once per line with the newline stripped, so a pretty-printed document arrives in pieces: accumulate in `out_cb` and decode in `exit_cb`. `dev-config/oblisk/shell.lua`'s `refresh_window_title` is that shape end to end.
 
 ---
 
