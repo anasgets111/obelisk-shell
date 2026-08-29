@@ -39,6 +39,7 @@ use std::collections::{HashMap, HashSet};
 
 use mlua::{Lua, Value};
 
+use crate::image::Fit;
 use crate::lua::marshal;
 use crate::lua::nodes::{VirtualNode, deserialize_lua_table};
 use crate::lua::signal::{self, is_signal};
@@ -888,15 +889,47 @@ pub fn parse_spacing(properties: &HashMap<String, Value>) -> Result<f32, LayoutE
 /// That is the better failure for a shell that has to boot, and `oblisk.rescue` still exists for
 /// the failures that matter.
 pub fn parse_content(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
-    let Some(value) = properties.get("content") else {
+    parse_optional_string(properties, "content")
+}
+
+/// `icon.name` (§ 5.2 item 5): a theme name, or an absolute path, which `image::icons::resolve`
+/// tells apart. Defaults to `""` for the same boot reason `content` does (docs/adr/0044): a `name`
+/// bound to a capability signal is `nil` until that capability's first push, and rejecting the
+/// tree over it would fail every config that binds one.
+pub fn parse_icon_name(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
+    parse_optional_string(properties, "name")
+}
+
+/// `image.source` (docs/adr/0054 decision 3): an absolute path, never a theme name. The split from
+/// [`parse_icon_name`] is the whole difference between the two node kinds, so they do not share a
+/// property spelling either.
+pub fn parse_image_source(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
+    parse_optional_string(properties, "source")
+}
+
+/// `image.fit` (docs/adr/0055 decision 3). Absent is `cover`; a string that is not one of the three
+/// modes is an error rather than a silent fallback, because `fit = "fill"` is a config author
+/// reaching for a mode that does not exist and a silently-covered image would hide that.
+pub fn parse_fit(properties: &HashMap<String, Value>) -> Result<Fit, LayoutError> {
+    let Some(value) = properties.get("fit") else {
+        return Ok(Fit::default());
+    };
+    let Value::String(s) = value else {
+        return Err(invalid("fit", format!("expected a string, got {}", preview_for_error(value))));
+    };
+    let s = checked_string("fit", s)?;
+    Fit::from_str(&s).ok_or_else(|| invalid("fit", format!("expected `cover`, `contain` or `stretch`, got {s:?}")))
+}
+
+/// The shared shape of every § 5.2 string property that defaults to empty when absent. One
+/// function rather than three copies of the same six lines.
+fn parse_optional_string(properties: &HashMap<String, Value>, property: &str) -> Result<String, LayoutError> {
+    let Some(value) = properties.get(property) else {
         return Ok(String::new());
     };
     match value {
-        Value::String(s) => checked_string("content", s),
-        other => Err(invalid(
-            "content",
-            format!("expected a string, got {}", preview_for_error(other)),
-        )),
+        Value::String(s) => checked_string(property, s),
+        other => Err(invalid(property, format!("expected a string, got {}", preview_for_error(other)))),
     }
 }
 
@@ -2499,6 +2532,36 @@ mod tests {
         // until its first `StateSnapshot`.
         assert_eq!(parse_content(&props_with_nil_signal(&lua, "text", "content")).unwrap(), "");
         assert_eq!(parse_icon_size(&props_with_nil_signal(&lua, "icon", "size")).unwrap(), 12.0);
+        // Phase 29's three. `icon.name` matters most here: the tray binds it straight to
+        // `oblisk.tray`, which reads `nil` until the Supervisor's first push.
+        assert_eq!(parse_icon_name(&props_with_nil_signal(&lua, "icon", "name")).unwrap(), "");
+        assert_eq!(parse_image_source(&props_with_nil_signal(&lua, "image", "source")).unwrap(), "");
+        assert_eq!(parse_fit(&props_with_nil_signal(&lua, "image", "fit")).unwrap(), Fit::Cover);
+    }
+
+    #[test]
+    fn fit_rejects_a_mode_that_does_not_exist_rather_than_covering_silently() {
+        // `fit = "fill"` is the plausible wrong guess (CSS spells it `object-fit: fill`, which is
+        // this engine's `stretch`). Defaulting it to `cover` would draw something that looks
+        // nearly right and never say why it is not what was asked for.
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "image", fit = "fill" }"#).eval().unwrap();
+        let err = parse_fit(&props_from_table(&table)).unwrap_err();
+        assert!(format!("{err}").contains("cover"), "the error should name the modes that do exist, got {err}");
+
+        let table: mlua::Table = lua.load(r#"return { kind = "image", fit = 3 }"#).eval().unwrap();
+        assert!(parse_fit(&props_from_table(&table)).is_err());
+    }
+
+    #[test]
+    fn an_image_source_that_is_not_a_string_is_rejected() {
+        // The same shape `content = 5` already has: a path is a string, and a number here is a
+        // config bug rather than something to coerce.
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "image", source = 5 }"#).eval().unwrap();
+        assert!(parse_image_source(&props_from_table(&table)).is_err());
+        let table: mlua::Table = lua.load(r#"return { kind = "image", source = "/tmp/w.png" }"#).eval().unwrap();
+        assert_eq!(parse_image_source(&props_from_table(&table)).unwrap(), "/tmp/w.png");
     }
 
     #[test]

@@ -28,8 +28,8 @@ use mlua::{Lua, Table, Value};
 /// owns an `xdg_toplevel` or an `xdg_popup` until `visible` says so; `lock` is the same shape with
 /// the compositor's `locked` event as its trigger instead of a signal. Without a constructor here
 /// § 6.4's "declaring it says what the lock screen looks like" has nowhere to be written at all.
-const NODE_KINDS: [&str; 12] =
-    ["rect", "row", "column", "text", "icon", "button", "list", "textfield", "panel", "window", "popup", "lock"];
+const NODE_KINDS: [&str; 13] =
+    ["rect", "row", "column", "text", "icon", "image", "button", "list", "textfield", "panel", "window", "popup", "lock"];
 
 /// A Lua node table, tagged with its constructor's `kind` and carrying every other prop
 /// untouched. Not the final in-memory scene node -- see the module doc comment.
@@ -168,6 +168,19 @@ mod tests {
         let table: Table = lua.load(r#"return popup { id = "menu", parent = "bar" }"#).eval().unwrap();
         assert_eq!(table.get::<String>("kind").unwrap(), "popup");
         assert_eq!(table.get::<String>("parent").unwrap(), "bar");
+    }
+
+    #[test]
+    fn image_is_a_constructor_and_is_the_one_kind_section_5_2_does_not_list() {
+        // docs/adr/0054 decision 3 adds this outside § 5.2's eight, so it is pinned by name: the
+        // loop above passes whatever the array holds, and an edit that dropped `image` back out
+        // would take the wallpaper and every album art with it silently.
+        let lua = lua_with_constructors();
+        assert!(NODE_KINDS.contains(&"image"));
+        let table: Table = lua.load(r#"return image { source = "/tmp/wall.png", fit = "cover" }"#).eval().unwrap();
+        assert_eq!(table.get::<String>("kind").unwrap(), "image");
+        assert_eq!(table.get::<String>("source").unwrap(), "/tmp/wall.png");
+        assert_eq!(table.get::<String>("fit").unwrap(), "cover");
     }
 
     #[test]

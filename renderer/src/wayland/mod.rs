@@ -39,6 +39,7 @@ use crate::layout::node::{
     self, ConstraintAdjustment, LayerKind, PanelSpec, PopupAnchor, PopupSpec, SizeHint, SizeMode, SurfaceSpec, WindowSpec,
 };
 use crate::socket::{FrameOutcome, RendererClient};
+use crate::image::ImageCache;
 use crate::text::atlas::TextPainter;
 use crate::text::shaping::ShapingHandle;
 use crate::text::snap::LogicalRect;
@@ -350,6 +351,12 @@ pub struct App {
     /// (docs/adr/0023 item 8, closed by docs/adr/0039 decision 3).
     shaping: ShapingHandle,
     text_painter: Option<TextPainter>,
+    /// One image cache for the whole process, beside the one `TextPainter`, for the same reason:
+    /// it is keyed by file path and pixel size, so a tray icon drawn on the bar and the same icon
+    /// drawn in a popup are one upload, not one per surface (`CONTEXT.md`, **Image cache**). Not
+    /// an `Option` unlike `text_painter`, which needs a live GL context to construct; this needs
+    /// one only when it loads, and every load already goes through a `&mut Canvas`.
+    image_cache: ImageCache,
     /// The Lua VM, the `Loader`, the retained `Scene`, the live signals, and the reload
     /// bookkeeping, all owned by this dispatch state rather than by a separate thread
     /// (docs/adr/0039). `mlua::Lua` is `!Send`, so `App` is `!Send` too -- fine, since
@@ -509,6 +516,7 @@ pub fn run(
         gl: None,
         shaping,
         text_painter: None,
+        image_cache: ImageCache::new(),
         client,
         surfaces: Vec::new(),
         exit: false,
@@ -3620,7 +3628,7 @@ impl App {
         if let Some(painter) = self.text_painter.as_mut() {
             painter.resize(width, height);
             if let Some(tree) = tree.as_ref() {
-                layout::paint::paint_tree(painter, tree, 1.0);
+                layout::paint::paint_tree(painter, &mut self.image_cache, tree, 1.0);
             }
         }
 

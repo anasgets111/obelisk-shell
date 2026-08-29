@@ -7,10 +7,12 @@ edition = "2024"
 cosmic-text = "0.19.0"
 femtovg = "0.26.0"
 fontdb = "0.23.0"
+freedesktop-icons = "0.4.0"
 glow = "0.18.0"
 khronos-egl = { version = "6.0.0", features = ["static"] }
 mlua = { version = "0.12.0", features = ["lua54", "vendored", "serde"] }
 nix = { version = "0.31.3", features = ["poll"] }
+resvg = { version = "0.48.1", default-features = false }
 serde_json = "1.0.151"
 shared = { version = "0.1.0", path = "../shared" }
 smithay-client-toolkit = "0.21.1"

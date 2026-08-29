@@ -27,6 +27,7 @@ use femtovg::renderer::OpenGl;
 use femtovg::{Canvas, Color, Paint, Path};
 use mlua::Value;
 
+use crate::image::{self, Fit, ImageCache};
 use crate::layout::node::{self, BorderColor, EdgeInsets, LayoutError, Rgba};
 use crate::layout::scene::ResolvedNode;
 use crate::text::atlas::TextPainter;
@@ -44,8 +45,8 @@ use crate::text::snap::{snap_border_band, snap_to_physical, LogicalRect};
 /// did not overlap at all, so there was no surface whose retained tree a lookup could find.
 /// Deleting that role enum (docs/adr/0038 decision 1) is what made them one space, and that is
 /// what took this function's `#[allow(dead_code)]` off.
-pub fn paint_tree(painter: &mut TextPainter, root: &ResolvedNode, scale: f32) {
-    paint_node(painter, root, 0.0, 0.0, scale);
+pub fn paint_tree(painter: &mut TextPainter, images: &mut ImageCache, root: &ResolvedNode, scale: f32) {
+    paint_node(painter, images, root, 0.0, 0.0, scale);
     painter.canvas_mut().flush();
 }
 
@@ -53,7 +54,7 @@ pub fn paint_tree(painter: &mut TextPainter, root: &ResolvedNode, scale: f32) {
 /// is the absolute position of this node's parent's content box -- added to `node.rect.x`/`.y`
 /// (parent-relative) to get this node's absolute rect, which is in turn what the next recursion
 /// level's origin becomes.
-fn paint_node(painter: &mut TextPainter, node: &ResolvedNode, origin_x: f32, origin_y: f32, scale: f32) {
+fn paint_node(painter: &mut TextPainter, images: &mut ImageCache, node: &ResolvedNode, origin_x: f32, origin_y: f32, scale: f32) {
     if !node.visible {
         return;
     }
@@ -116,12 +117,8 @@ fn paint_node(painter: &mut TextPainter, node: &ResolvedNode, origin_x: f32, ori
             paint_box(painter.canvas_mut(), &node.kind, &node.properties, rect, scale)
         }
         "text" => paint_text(painter, &node.properties, rect, scale),
-        // Deferred (build-steps.md Phase 19, "Also deferred: icon"): § 5.2 item 5's theme-name
-        // `icon.name` and `oblisk-supervisor-services-dbus.md` § 9.2's path-taking
-        // `system:find_icon` are two competing resolvers, neither built yet, and picking one here
-        // would be settling that conflict as a side effect of a paint commit rather than the
-        // phase actually settling it. Draws nothing.
-        "icon" => {}
+        "icon" => paint_icon(painter.canvas_mut(), images, &node.properties, rect, scale),
+        "image" => paint_image(painter.canvas_mut(), images, &node.properties, rect, scale),
         // `textfield` reaches here, and drawing nothing is the spec-correct answer rather than an
         // omission: § 5.1's base properties carry no paint at all, and § 5.2 item 8 gives
         // `textfield` only `placeholder`/`mask_character`/`secure_submit`/`on_change`/`on_submit`,
@@ -136,7 +133,7 @@ fn paint_node(painter: &mut TextPainter, node: &ResolvedNode, origin_x: f32, ori
     }
 
     for child in &node.children {
-        paint_node(painter, child, x, y, scale);
+        paint_node(painter, images, child, x, y, scale);
     }
 
     // Inside the clip, not after it: a child's own `save`/`restore` pair balances within this
@@ -199,6 +196,90 @@ fn paint_box(canvas: &mut Canvas<OpenGl>, kind: &str, properties: &HashMap<Strin
         }
     };
     paint_border(canvas, rect, radius, colors, widths, scale);
+}
+
+/// `icon` (§ 5.2 item 5): resolve the theme name, then draw the file (build-steps.md Phase 29
+/// item 3). This is the arm that was `"icon" => {}` from Phase 19 until docs/adr/0054 settled
+/// which side of the process boundary the resolver lives on.
+///
+/// `Contain` rather than `Cover`, and the *shorter* edge as the resolved size: `size` is § 5.2's
+/// "bounding box diameter", so an icon in a box that is not square should sit inside it whole
+/// rather than be cropped to fill it. An icon is the one case where showing less of the image is
+/// never the right answer.
+fn paint_icon(canvas: &mut Canvas<OpenGl>, images: &mut ImageCache, properties: &HashMap<String, Value>, rect: LogicalRect, scale: f32) {
+    let name = match node::parse_icon_name(properties) {
+        Ok(name) => name,
+        Err(e) => {
+            log_paint_error("icon", "name", &e);
+            return;
+        }
+    };
+    let px = physical_edge(rect.width.min(rect.height), scale);
+    // `u16` is `freedesktop-icons`'s own size type, and a theme has no directory above 512 anyway.
+    let Some(path) = image::icons::resolve(&name, px.min(512) as u16) else {
+        return;
+    };
+    draw_file(canvas, images, &path, Fit::Contain, rect, px);
+}
+
+/// `image` (docs/adr/0054 decision 3): draw the file at `source`, fitted by `fit`.
+fn paint_image(canvas: &mut Canvas<OpenGl>, images: &mut ImageCache, properties: &HashMap<String, Value>, rect: LogicalRect, scale: f32) {
+    let source = match node::parse_image_source(properties) {
+        Ok(source) => source,
+        Err(e) => {
+            log_paint_error("image", "source", &e);
+            return;
+        }
+    };
+    if source.is_empty() {
+        return;
+    }
+    let fit = match node::parse_fit(properties) {
+        Ok(fit) => fit,
+        Err(e) => {
+            log_paint_error("image", "fit", &e);
+            Fit::default()
+        }
+    };
+    // The *longer* edge, unlike `paint_icon`: `Cover` scales the image up until it covers the box,
+    // so rasterizing an SVG wallpaper against the shorter edge would upload it at exactly the
+    // resolution the fit is about to scale past.
+    let px = physical_edge(rect.width.max(rect.height), scale);
+    draw_file(canvas, images, std::path::Path::new(&source), fit, rect, px);
+}
+
+/// The shared half of [`paint_icon`] and [`paint_image`]: cache lookup, then one `fill_path` over
+/// exactly the rect the image occupies.
+///
+/// The fill path is the *fitted* rect, not the node's box. femtovg clamps to the edge outside a
+/// paint's extent unless `REPEAT_X`/`REPEAT_Y` are set, so filling the whole box with a `Contain`
+/// paint would smear the image's outermost pixel row across the letterbox. `Cover`'s fitted rect is
+/// larger than the box instead, and `paint_node`'s scissor is what crops it.
+fn draw_file(canvas: &mut Canvas<OpenGl>, images: &mut ImageCache, file: &std::path::Path, fit: Fit, rect: LogicalRect, px: u32) {
+    let Some(id) = images.image(canvas, file, px) else {
+        return;
+    };
+    let Ok((width, height)) = canvas.image_size(id) else {
+        return;
+    };
+    let fitted = image::fitted_rect(rect, width as f32, height as f32, fit);
+    let mut path = Path::new();
+    path.rect(fitted.x, fitted.y, fitted.width, fitted.height);
+    canvas.fill_path(
+        &path,
+        &Paint::image(id, fitted.x, fitted.y, fitted.width, fitted.height, 0.0, 1.0),
+    );
+}
+
+/// One logical edge in whole physical pixels, floored at 1. `ImageCache` keys on this, so it has
+/// to be an integer rather than the `f32` everything else in this module carries: two boxes half a
+/// pixel apart are the same texture, and keying on the float would upload one each.
+fn physical_edge(logical: f32, scale: f32) -> u32 {
+    let physical = logical * scale;
+    if !physical.is_finite() || physical <= 1.0 {
+        return 1;
+    }
+    physical.round() as u32
 }
 
 fn fill_rect(canvas: &mut Canvas<OpenGl>, rect: LogicalRect, radius: f32, color: Rgba) {
@@ -610,7 +691,7 @@ mod tests {
             LogicalSize { width: 64.0, height: 64.0 },
         );
         painter.resize(64, 64);
-        paint_tree(&mut painter, &red, 1.0);
+        paint_tree(&mut painter, &mut ImageCache::new(), &red, 1.0);
         assert_eq!(pixel_at(painter.canvas_mut(), 32, 32), (255, 0, 0, 255));
 
         // The same canvas, a different draw surface, a different size.
@@ -621,7 +702,7 @@ mod tests {
             LogicalSize { width: 32.0, height: 32.0 },
         );
         painter.resize(32, 32);
-        paint_tree(&mut painter, &green, 1.0);
+        paint_tree(&mut painter, &mut ImageCache::new(), &green, 1.0);
         assert_eq!(
             pixel_at(painter.canvas_mut(), 16, 16),
             (0, 255, 0, 255),
@@ -657,7 +738,7 @@ mod tests {
             r##"return panel { id = "bar", width = 64, height = 64, child = rect { width = "Fill", height = "Fill", background = "#FF0000FF" } }"##,
             LogicalSize { width: 64.0, height: 64.0 },
         );
-        paint_tree(&mut painter, &root, 1.0);
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
 
         assert_eq!(pixel_at(painter.canvas_mut(), 32, 32), (255, 0, 0, 255));
     }
@@ -683,7 +764,7 @@ mod tests {
                 &format!(r#"return {kind} {{ id = "bar", width = 64, height = 64, background = "{colour}" }}"#),
                 LogicalSize { width: 64.0, height: 64.0 },
             );
-            paint_tree(&mut painter, &root, 1.0);
+            paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
             assert_eq!(pixel_at(painter.canvas_mut(), 32, 32), expected, "a `{kind}` root must paint its own box like a `panel` root");
         }
     }
@@ -709,7 +790,7 @@ mod tests {
             r##"return lock { id = "bar", background = "#00FF00FF" }"##,
             LogicalSize { width: 64.0, height: 64.0 },
         );
-        paint_tree(&mut painter, &root, 1.0);
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
         assert_eq!(pixel_at(painter.canvas_mut(), 32, 32), (0, 255, 0, 255));
         assert_eq!(pixel_at(painter.canvas_mut(), 1, 1), (0, 255, 0, 255), "the fill reaches the corner of the output the surface covers");
     }
@@ -731,7 +812,7 @@ mod tests {
             } } }"##,
             LogicalSize { width: 64.0, height: 64.0 },
         );
-        paint_tree(&mut painter, &root, 1.0);
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
 
         // Inside the child's box (top-left corner of the stacking model, no alignment set):
         // green, the child's own colour, painted over the parent.
@@ -768,7 +849,7 @@ mod tests {
             } }"##,
             LogicalSize { width: 64.0, height: 64.0 },
         );
-        paint_tree(&mut painter, &root, 1.0);
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
 
         // Inside `blue`'s box, well clear of `green`'s box under either the correct or the buggy
         // placement -- a sanity check that `blue` itself landed at its own correct offset.
@@ -796,7 +877,7 @@ mod tests {
             } }"##,
             LogicalSize { width: 64.0, height: 64.0 },
         );
-        paint_tree(&mut painter, &root, 1.0);
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
 
         // Top edge: width 4 and colour both declared -- painted white.
         assert_eq!(pixel_at(painter.canvas_mut(), 20, 1), (255, 255, 255, 255));
@@ -827,7 +908,7 @@ mod tests {
             } } }"##,
             LogicalSize { width: 120.0, height: 40.0 },
         );
-        paint_tree(&mut painter, &root, 1.0);
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
 
         // Green specifically, not merely "not the background". Asserting non-background alone
         // cannot see this commit's own change: `draw_line` hardcoded `Color::white()` until now,
@@ -876,7 +957,7 @@ mod tests {
             } }"##,
             LogicalSize { width: 64.0, height: 64.0 },
         );
-        paint_tree(&mut painter, &root, 1.0);
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
 
         // Mid-edge of the left border, 2px in: inside the 4px stroke, so white.
         assert_eq!(pixel_at(painter.canvas_mut(), 12, 30), (255, 255, 255, 255));
@@ -969,7 +1050,7 @@ mod tests {
                 } } }"##,
             LogicalSize { width: 200.0, height: 50.0 },
         );
-        paint_tree(&mut painter, &root, 1.0);
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
 
         // The text's own content is long enough at this font size to reach well past the box's
         // 40px width unclipped -- a 5px gap (40..45) is left unscanned so this isn't sensitive to
@@ -1011,7 +1092,7 @@ mod tests {
             } }"##,
             LogicalSize { width: 64.0, height: 64.0 },
         );
-        paint_tree(&mut painter, &root, 1.0);
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
 
         // Row 9, entirely above the rect (which starts at unsnapped y = 10.3): the surface's
         // own red, untouched by any border bleed.
@@ -1056,7 +1137,7 @@ mod tests {
             } }"##,
             LogicalSize { width: 64.0, height: 64.0 },
         );
-        paint_tree(&mut painter, &root, 1.0);
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
 
         // Row 30, above the band: the surface's own red.
         assert_eq!(pixel_at(painter.canvas_mut(), 15, 30), (255, 0, 0, 255));
@@ -1095,7 +1176,7 @@ mod tests {
             } }"##,
             LogicalSize { width: 64.0, height: 64.0 },
         );
-        paint_tree(&mut painter, &root, 1.0);
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
 
         // Row 30 is mid-edge, clear of the radius-8 corners on both ends, so the left border
         // there is a straight vertical band four columns wide.
@@ -1134,7 +1215,7 @@ mod tests {
                 } } }"##,
             LogicalSize { width: 80.0, height: 80.0 },
         );
-        paint_tree(&mut painter, &root, 1.0);
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
 
         // Inside both the parent's and the child's box: the child's green, painted over the
         // parent (tree order).

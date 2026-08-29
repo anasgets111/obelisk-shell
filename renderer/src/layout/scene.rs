@@ -443,7 +443,7 @@ impl Scene {
 /// not the compositor has handed out a surface to paint it into.
 fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
     match kind {
-        "panel" | "window" | "popup" | "lock" | "rect" | "row" | "column" | "text" | "icon" | "button" | "list" | "textfield" => Ok(()),
+        "panel" | "window" | "popup" | "lock" | "rect" | "row" | "column" | "text" | "icon" | "image" | "button" | "list" | "textfield" => Ok(()),
         other => Err(LayoutError::UnsupportedNodeKind(other.to_string())),
     }
 }
@@ -517,7 +517,7 @@ fn children_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Vec<Vi
         // as a literal Lua table -- they're generated from `source`, one per element, which is
         // why this is its own parser rather than a `parse_children` variant.
         "list" => node::parse_list_children(properties),
-        "text" | "icon" | "textfield" => Ok(Vec::new()),
+        "text" | "icon" | "image" | "textfield" => Ok(Vec::new()),
         other => unreachable!("ensure_supported_kind already rejected `{other}`"),
     }
 }
@@ -889,6 +889,12 @@ fn intrinsic_content_size(
                 height: size,
             })
         }
+        // `image` has no intrinsic size, unlike `icon`: knowing a file's own dimensions means
+        // decoding it, and this pass has no canvas to decode against and runs on every
+        // `Scene::apply`. So an `image` takes the box § 5.1's `width`/`height` give it and
+        // measures nothing without one, the same as an empty `rect` (build-steps.md Phase 29 item
+        // 1). A wallpaper wants `Fill` and a bar's album art wants a number; neither needs this.
+        "image" => Ok(LogicalSize::default()),
         "rect" if children.is_empty() => Ok(LogicalSize::default()),
         "row" => {
             let spacing = node::parse_spacing(properties)?;
@@ -1549,6 +1555,47 @@ mod tests {
             surface_from(r#"panel { id = "bar", child = row { children = { { kind = "banana" } } } }"#);
         let err = apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap_err();
         assert!(matches!(err, LayoutError::UnsupportedNodeKind(k) if k == "banana"));
+    }
+
+    #[test]
+    fn image_is_a_supported_leaf_with_no_intrinsic_size_and_icon_still_has_one() {
+        // docs/adr/0054 decision 3 and build-steps.md Phase 29 item 1. The pair is asserted
+        // together because the asymmetry is the decision: `icon` measures to its `size` because a
+        // config states it, and `image` measures nothing because the only way to know a file's
+        // dimensions is to decode it, and this pass has no canvas.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"panel { id = "bar", child = row { children = { image { source = "/tmp/w.png", fit = "contain" }, icon { name = "audio-volume-high", size = 24 } } } }"#,
+        );
+        apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
+
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        let image = &row.children[0];
+        assert_eq!(image.kind, "image");
+        assert!(image.children.is_empty(), "image is a leaf, never a container");
+        assert_eq!((image.rect.width, image.rect.height), (0.0, 0.0));
+
+        let icon = &row.children[1];
+        assert_eq!((icon.rect.width, icon.rect.height), (24.0, 24.0));
+    }
+
+    #[test]
+    fn an_image_given_a_box_takes_that_box() {
+        // The other half of the rule above: no intrinsic size is not no size. This is how a
+        // wallpaper (`Fill` on both axes, docs/adr/0055) and a bar's album art (two numbers) each
+        // get their geometry, and both go through § 5.1's base properties rather than anything
+        // `image` owns. The root `panel` is `Fill` too: a `Content`-sized parent hands a `Fill`
+        // child a zero budget, so the wallpaper config has to say so on both nodes.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"panel { id = "bar", width = "Fill", height = "Fill", child = image { source = "/tmp/w.png", width = "Fill", height = "Fill" } }"#,
+        );
+        apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
+
+        let image = &scene.surface("bar@TEST").unwrap().children[0];
+        assert!(image.rect.width > 0.0 && image.rect.height > 0.0, "a Fill image should take the panel, got {:?}", image.rect);
     }
 
     #[test]
