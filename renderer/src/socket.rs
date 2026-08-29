@@ -385,6 +385,18 @@ impl RendererClient {
         let screens_payload = serde_json::Value::Array(Vec::new());
         let screens_handle = register_screens_signal(&loader, &oblisk, dirty.clone(), &screens_payload)?;
         oblisk.set("version", version_table(&loader)?)?;
+        // The directory the config was loaded from, so a config can name a file it ships beside
+        // itself (build-steps.md Phase 29 item 4). ADR-0047 made the config a directory rather
+        // than a file, which makes it a place to put a wallpaper, an icon or a sound, and until
+        // now nothing in Lua could say where that place is. A string beside `version` rather than
+        // a capability: it is static process information, not something that pushes.
+        //
+        // The parent of `shell.lua` rather than a second call to `shared::config_dir()`, so this
+        // cannot disagree with the file actually loaded.
+        oblisk.set(
+            "config_dir",
+            shell_lua_path.parent().map(|dir| dir.to_string_lossy().into_owned()).unwrap_or_default(),
+        )?;
         loader.set_global("oblisk", oblisk.clone())?;
         Ok(Self {
             shell_lua_path,
@@ -1546,6 +1558,18 @@ mod tests {
         assert_eq!(props.get("major").unwrap().as_integer(), Some(i64::from(major)));
         assert_eq!(props.get("minor").unwrap().as_integer(), Some(i64::from(minor)));
         assert_eq!(props.get("patch").unwrap().as_integer(), Some(i64::from(patch)));
+    }
+
+    #[test]
+    fn oblisk_config_dir_is_the_directory_shell_lua_was_loaded_from() {
+        // build-steps.md Phase 29 item 4: this is how a config names a wallpaper it ships beside
+        // itself. Derived from the loaded path rather than re-resolved, so a Renderer started with
+        // an explicit `shell.lua` cannot report a directory it is not reading from.
+        let (client, _outbound_rx) = test_client(std::path::Path::new("/opt/oblisk-config/shell.lua"));
+        let probe = r#"return panel { id = "bar", layer = "Top", dir = oblisk.config_dir }"#;
+        let output = client.loader.evaluate(probe).unwrap();
+        let dir = output.surfaces[0].properties.get("dir").unwrap().as_string().unwrap();
+        assert_eq!(dir.to_string_lossy(), "/opt/oblisk-config");
     }
 
     #[test]

@@ -282,6 +282,26 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_wallpaper_rasterizes_to_opaque_pixels_at_the_size_asked_for() {
+        // The one test that exercises resvg end to end, against the file `dev-config` actually
+        // ships (docs/adr/0055). Everything above this line is arithmetic; this is the half that
+        // would break silently if `resvg`'s feature set were trimmed further, because a tree that
+        // parses to nothing renders a fully transparent pixmap rather than an error.
+        let svg = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/wallpaper.svg");
+        let (pixels, width, height) = rasterize_svg(&svg, 128).expect("the shipped wallpaper should parse");
+        // 1920x1080 viewBox, longest edge 128, so the aspect ratio survives the scale.
+        assert_eq!((width, height), (128, 72));
+        assert_eq!(pixels.len(), (width * height * 4) as usize);
+        let opaque = pixels.as_chunks::<4>().0.iter().filter(|px| px[3] > 0).count();
+        assert_eq!(opaque, (width * height) as usize, "the wallpaper covers its whole viewBox");
+        // Not a single flat colour: the gradient and the obelisk both have to survive, which is
+        // what tells a real render apart from a pixmap that only got its background rect.
+        let distinct: std::collections::HashSet<[u8; 3]> =
+            pixels.as_chunks::<4>().0.iter().map(|px| [px[0], px[1], px[2]]).collect();
+        assert!(distinct.len() > 16, "expected a gradient, got {} colours", distinct.len());
+    }
+
+    #[test]
     fn fit_parses_the_three_spelled_modes_and_nothing_else() {
         assert_eq!(Fit::from_str("cover"), Some(Fit::Cover));
         assert_eq!(Fit::from_str("contain"), Some(Fit::Contain));

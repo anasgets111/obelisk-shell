@@ -241,7 +241,28 @@ end), ACCENT) })
 -- Volume, real as of docs/adr/0053 decision 3. `audio.volume` is the cube root of PipeWire's
 -- `channelVolumes`, which is the number `wpctl` and `pactl` show and the one a user recognises as
 -- "the volume"; the raw linear value would read 3% where this reads 30%.
+-- § 5.2 item 5's own worked example (`"audio-volume-high"`), which makes this the natural place to
+-- prove `icon` resolves a theme name and re-resolves it when the signal pushes. `:map` rather than
+-- `label`: a nil `audio` should resolve to no icon at all, and `label`'s "--" placeholder would go
+-- to the theme lookup as if it were a name.
+local volume_icon = oblisk.audio:map(function(a)
+    if a == nil then
+        return ""
+    end
+    if a.muted then
+        return "audio-volume-muted"
+    end
+    local percent = (a.volume or 0) * 100
+    if percent < 34 then
+        return "audio-volume-low"
+    elseif percent < 67 then
+        return "audio-volume-medium"
+    end
+    return "audio-volume-high"
+end)
+
 local volume_module = pill({
+    icon { name = volume_icon, size = 14 },
     cell(label(oblisk.audio, function(a)
         if a.muted then
             return "muted"
@@ -331,11 +352,19 @@ local battery_module = pill({
 --
 -- `key` is what makes reconciliation stable across pushes: without it a tray item appearing at the
 -- front would renumber every sibling and reconcile each one against the wrong previous node.
+-- § 2.5 populates exactly one of `icon_name` and `icon_path` per item and never both, which is
+-- why one `icon` node handles both: docs/adr/0054 decision 2 makes an absolute `name` its own path,
+-- so the `or` below is the whole branch. Falling back to the app's name keeps an item visible when
+-- a theme has nothing under the name it reported, rather than leaving a 16px hole.
 local tray_module = pill({ list {
     source = oblisk.tray:map(function(t)
         return (t and t.items) or {}
     end),
     itemfn = function(item)
+        local art = item.icon_name or item.icon_path
+        if art then
+            return icon { name = art, size = 16 }
+        end
         return cell(truncate(item.name or item.id or "?", 10), DIM, 11)
     end,
     key = function(item)
@@ -484,7 +513,40 @@ end), FG, 48)
 -- over 768px and ran `lock` off the edge, and moving the tray is the fix that survives the next
 -- module, because a zone holding an unbounded-width child has no budget anyone can reason about.
 -- The left zone holds two fixed modules in the same 768px and had the room.
+-- The wallpaper, which is not a capability and never was (docs/adr/0055). Everything
+-- `wallpaper:set(mon, path, fit, anim, dur)` was going to carry already had a home once ADR-0038
+-- moved surface declaration here and Phase 21 built `state`: the monitor is `panel.monitor`, the
+-- path is `image.source`, the fit is `image.fit`, and the two animation arguments need an animation
+-- model this engine does not have. Changing it at runtime is `wallpaper:set(path)` on the signal
+-- below, with no IPC anywhere in the path.
+--
+-- `oblisk.config_dir` is what lets this name a file it ships beside itself. It stays a `state`
+-- signal rather than a constant so the runtime path is the one being exercised, not a literal that
+-- happens to work at boot.
+local wallpaper = state("wallpaper", oblisk.config_dir .. "/wallpaper.svg")
+
 return {
+    -- All four edges anchored, so the compositor sizes both axes and this covers the output. Not
+    -- exclusive: a wallpaper that reserved screen area would push every other surface off the
+    -- screen it is behind.
+    panel {
+        id = "wallpaper",
+        layer = "Background",
+        anchor = { top = true, bottom = true, left = true, right = true },
+        exclusive = false,
+        width = "Fill",
+        height = "Fill",
+        -- Painted under the image, so a source that does not decode leaves the desktop dark rather
+        -- than transparent, and the failure is visible instead of looking like a surface that never
+        -- mapped.
+        background = "#11111bff",
+        child = image {
+            source = wallpaper,
+            fit = "cover",
+            width = "Fill",
+            height = "Fill",
+        },
+    },
     panel {
         id = "bar",
         layer = "Top",

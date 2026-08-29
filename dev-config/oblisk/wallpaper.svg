@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The default wallpaper, and the reason it is SVG rather than a PNG: it is the only asset in
+     this repository that a reviewer can read as text, and rasterizing it at the output's own width
+     is what exercises resvg (build-steps.md Phase 29 item 1). A 16:9 viewBox with `fit = "cover"`
+     over it, so a 16:10 or ultrawide output crops rather than letterboxes. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" width="1920" height="1080">
+  <defs>
+    <linearGradient id="ground" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#181825"/>
+      <stop offset="1" stop-color="#11111b"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.62" r="0.55">
+      <stop offset="0" stop-color="#585b70" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#585b70" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1920" height="1080" fill="url(#ground)"/>
+  <circle cx="960" cy="670" r="600" fill="url(#glow)"/>
+  <!-- An obelisk, which is the only joke this file gets to make. -->
+  <path d="M 920 940 L 936 340 L 960 292 L 984 340 L 1000 940 Z" fill="#1e1e2e" stroke="#45475a" stroke-width="3"/>
+  <path d="M 960 292 L 984 340 L 960 356 Z" fill="#313244"/>
+  <rect x="880" y="940" width="160" height="18" rx="4" fill="#313244"/>
+</svg>

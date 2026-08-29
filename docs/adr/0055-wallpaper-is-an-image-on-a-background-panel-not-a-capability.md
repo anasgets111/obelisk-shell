@@ -79,3 +79,18 @@ file picker, no directory scan and no `process.run` recipe blessed here.
 which is the single largest thing ADR-0054's cache will ever hold and roughly the whole of some of
 ADR-0043's budget. It is one entry, it is bounded by the number of distinct wallpapers a session
 uses, and it wants measuring under Phase 24's harness rather than guessing here.
+
+## Amendment: `oblisk.config_dir` was the one thing missing
+
+Decision 1's example needs a path, and a config shipping its own wallpaper needs to name a file
+beside itself. ADR-0047 made the config a directory precisely so it could hold more than one file,
+and nothing in Lua could say where that directory is, so the only way to write the example above was
+to bake an absolute path into a config in the repository.
+
+`oblisk.config_dir` is a string on the `oblisk` table, beside `oblisk.version` and for the same
+reason: it is static process information, not something that pushes, so it is not a capability. It
+is the parent of the `shell.lua` that was actually loaded rather than a second call to
+`shared::config_dir()`, which is what stops it disagreeing with the file being read.
+
+This generalises past wallpaper. Any config shipping an icon, a sound or a second Lua module needs
+it, and every one of those was equally blocked.

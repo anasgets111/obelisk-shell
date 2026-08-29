@@ -1962,6 +1962,41 @@ worked example. Short of that, the resolver and the fit math are ordinary unit t
 end-to-end check is the live session: the tray draws icons, and a `Background` panel shows a
 wallpaper.
 
+> **Built.** Verified on the live session, twice, with screenshots rather than by reading the log.
+> A `Background` panel showed `dev-config/oblisk/wallpaper.svg` rasterized to the full 1920x1200
+> output, `cover` cropping the 16:9 source into a 16:10 screen, and the volume pill drew
+> `audio-volume-low` from `Tela-circle-dracula` beside its text, re-resolved from the signal on
+> every push.
+>
+> **`freedesktop_icons::default_theme_gtk()` is unusable, and it fails silently.** It spawns
+> `gsettings get org.gnome.desktop.interface icon-theme` per call, which is a process spawn on the
+> thread that paints. Worse, it maps the setting through the theme's `index.theme` and returns the
+> `Name=` field, while `with_theme` is keyed by *directory* name: on this machine it answers
+> `"Tela circle dracula"` for a directory called `Tela-circle-dracula`, so every lookup returns
+> `None` and every icon is simply missing with nothing logged anywhere. The theme is read out of
+> `settings.ini` directly instead. This was found by running it, not by reading it, and it is the
+> second time in three phases that a plausible-looking API produced a silently wrong answer rather
+> than an error (the first was `audio`'s cubed `channelVolumes`).
+>
+> **`oblisk.config_dir` was added, and item 4 could not be proved without it.** ADR-0047 made the
+> config a directory rather than a file, which makes it a place to ship a wallpaper, an icon or a
+> sound, and nothing in Lua could name that place. It is a string beside `oblisk.version`, derived
+> from the parent of the `shell.lua` actually loaded so it cannot disagree with it. Without it the
+> shipped wallpaper needed an absolute path baked into a config in the repository.
+>
+> **The wallpaper ships as SVG, deliberately.** It is the one asset here a reviewer can read as
+> text, and rasterizing it at the output's own width is what exercises `resvg` at a size no icon
+> reaches. `rasterize_svg` needs no canvas, so the unit test renders that exact file and asserts
+> the gradient survived, which is the half that would otherwise break silently: a tree that parses
+> to nothing renders a transparent pixmap rather than an error.
+>
+> **The tray was not proved live.** No `StatusNotifierItem` was registered on the session while
+> this was built, and the tray host does not manufacture one. The config's `itemfn` draws
+> `icon { name = item.icon_name or item.icon_path }`, which is the whole of ADR-0054 decision 2,
+> and it is the one item here resting on a code reading rather than a screenshot. The vertical
+> `list` is a second, older problem for it: `intrinsic_content_size` has no horizontal repeater, so
+> a second tray item stacks below the first and is clipped by a 34px bar.
+
 
 ### The missing animation model
 
