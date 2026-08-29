@@ -1847,7 +1847,8 @@ the IDL-only entries fell between the two documents.
    the note below.
 2. **`brightness`** (§ 2.3). `/sys/class/backlight`, and the same `inotify` watch line 98 of this
    document already justifies the dependency with. Small, and deliberately not bundled above: it has
-   no consumer pressing for it the way the other three did.
+   no consumer pressing for it the way the other three did. Built, see the second note below, and
+   line 98's `inotify` prediction is wrong.
 3. **`workspaces`** (§ 2.9). Not small and not obviously ours. `niri-ipc` is already a dependency, so
    one compositor is reachable cheaply, but whether this capability speaks one compositor's IPC or an
    abstraction over several is a design question that needs an ADR before an implementation. Do not
@@ -1887,6 +1888,38 @@ the IDL-only entries fell between the two documents.
 > whole budget rather than the remainder, so two `Fill` spacers both take the full width instead of
 > splitting it. The bar uses three fixed percentage zones each distributing its own spare space by
 > its own `align_h`. There is no space-between in this engine, and nothing said so before now.
+
+> **Built (item 2).** `brightness` reads `/sys/class/backlight`, picking one device by the `type`
+> attribute the kernel's own `Documentation/ABI/stable/sysfs-class-backlight` exposes for exactly
+> this (`firmware`, then `platform`, then `raw`, tie-broken by name), skipping any device whose
+> `max_brightness` is not positive. It reports the `brightness` attribute rather than
+> `actual_brightness`: the two differ while a driver fade is in flight or when the hardware rounds a
+> request, and a config that calls `set(50)` and reads back needs to see `50`.
+>
+> **Line 98 of this document is wrong about the mechanism.** It justified the `inotify` dependency
+> with "§ 1.2's backlight watch", and inotify does not fire on a sysfs attribute write. `keyboard`
+> had already found this for the LED-state files; the same was confirmed here with `udevadm monitor
+> --udev --subsystem-match=backlight`, which shows a `change` uevent on every brightness change.
+> The watch is the `AsyncFd` udev monitor `battery` already uses, with the same 30s poll fallback.
+>
+> **The write goes through logind, because the Supervisor cannot write the file.**
+> `/sys/class/backlight/*/brightness` is root-owned `0644` and the Supervisor runs as the user, so
+> a direct write needs a udev rule shipped with the shell. `login1.Session.SetBrightness(subsystem,
+> name, brightness)` on the `session/auto` path needs nothing installed and was confirmed to
+> succeed as this user. logind refuses it from a session that is not the seat's active one, which
+> is logind correctly protecting a display that session does not own, so that failure is logged and
+> not worked around.
+>
+> **No backlight device means no push, ever.** § 2.3 specifies `percent: integer [0, 100]` and no
+> absence sentinel, unlike `battery.present` and `sysinfo.temp_gpu`'s `-1`. A fabricated `0` would
+> read as "the screen is off" rather than "there is no backlight", so the signal stays `nil` and
+> ADR-0037's nil-until-hydrated contract carries it. This is the gap the previous note flagged in
+> `audio`, which has no way to say "unknown" and hid a bind failure behind a plausible number.
+>
+> Verified end to end against the live session, not against the header: a config calling
+> `oblisk.brightness:invoke("set", 40)` moved `intel_backlight` to 7680, which is 40% of this
+> panel's 19200 exactly. That is also the first § 3.2 command with an argument in it, so it is what
+> proves Phase 25's arguments array and revision stamp reach the Supervisor intact.
 
 ### The missing animation model
 

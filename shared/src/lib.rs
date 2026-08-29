@@ -35,6 +35,7 @@ pub fn control_socket_path() -> io::Result<PathBuf> {
 /// boot. `idle` is deliberately absent: it's event-shaped, not snapshot state (ADR-0032).
 pub const CAPABILITIES: &[&str] = &[
     "audio", "network", "bluetooth", "tray", "notifications", "mpris", "sysinfo", "keyboard", "privacy", "updates", "lock", "battery", "system",
+    "brightness",
 ];
 
 /// Guarded JSON-RPC 2.0 envelope wrapping a Lua write action.

@@ -93,6 +93,49 @@ zero, which then overwrites the correct value the first one had just produced. P
 boot and zero afterwards, which no unit test over a captured mixer pod would have caught, because the
 captured pod is the object that parses correctly.
 
+## Amendment: `brightness` is built, and three of its four decisions were not in the original
+
+Decision 1 deferred `brightness` on the grounds that it had "no consumer pressing for it". It has
+one now. The original decision stands (it is a phase item of its own, not bundled with the three
+above) and this records what building it settled.
+
+**The read watch is udev, not inotify.** `build-steps.md` line 98 justified the `inotify` dependency
+partly with "§ 1.2's backlight watch". Inotify does not fire on a sysfs attribute write. `keyboard`
+had already found this for the LED-state files and said so in its own module doc; the same was
+confirmed here with `udevadm monitor --udev --subsystem-match=backlight`, which shows a `change`
+uevent on the `backlight` subsystem for every brightness change. So this uses the `AsyncFd` udev
+monitor `battery` built, with the same 30s poll fallback. `inotify` keeps its other justification,
+the config-directory watch, and loses this one.
+
+**Device selection ranks by `type`.** `firmware`, then `platform`, then `raw`, tie-broken by sorted
+directory name, and any device whose `max_brightness` is not positive is skipped. This is the
+preference the kernel exposes the `type` attribute for
+(`Documentation/ABI/stable/sysfs-class-backlight`). The alternative, first-in-readdir-order, is what
+`brightnessctl` does and is fine on a machine with one device, which is most machines since the
+kernel started registering only the backlight it believes works. It is wrong on a machine with both
+`acpi_video0` and a native device, and the fix costs one comparator.
+
+**The write is `login1.Session.SetBrightness`, not a sysfs write.** `/sys/class/backlight/*/
+brightness` is root-owned `0644`, and the Supervisor runs as the user and is deliberately not
+privileged. Writing it directly means shipping a udev rule that grants a group write access to a
+device node, which is an install-time dependency and a permission grant to every process the user
+runs. `SetBrightness(subsystem, name, brightness)` on the `session/auto` path needs neither and was
+confirmed to succeed as this user. The cost is that logind refuses it from a session that is not the
+seat's active session: a `set` issued from a background VT logs and does nothing. That is logind
+protecting a display the caller does not own, and it is the correct behaviour to inherit rather than
+work around.
+
+**No backlight device means the capability never pushes at all.** § 2.3 specifies `percent: integer
+[0, 100]` and gives no absence sentinel, unlike `battery.present` or `sysinfo.temp_gpu`'s `-1`. A
+fabricated `0` reads to a config as "the screen is off", not "there is no backlight hardware", so
+the signal stays `nil` forever and ADR-0037's nil-until-hydrated contract carries it. Inventing a
+sentinel the spec does not have was the other option and was rejected: a config author reading § 2.3
+would have no way to know about it.
+
+This is the same hole decision 3 left open in `audio`, resolved the other way. `audio` has no way to
+say "unknown", every unavailable path there collapses into a plausible number, and that is how a
+failed sink bind hid as a 0% volume. `brightness` does not repeat it.
+
 ## What this does not decide
 
 Whether `oblisk.system`'s `state` should ever be writable. § 2.11 calls it "read-only" and this

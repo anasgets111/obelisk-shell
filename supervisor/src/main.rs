@@ -26,6 +26,7 @@ use dbus::notifications::{self, NotificationsController, NotificationsSignal};
 use dbus::polkit::{AGENT_OBJECT_PATH, AuthenticationAgent, current_session_subject, register_agent};
 use dbus::tray::{self, TrayController, TraySignal};
 use hardware::battery::{BatteryController, BatterySignal};
+use hardware::brightness::{self, BrightnessController, BrightnessSignal};
 use hardware::idle::{self, IdleController};
 use hardware::keyboard::{self, KeyboardController, KeyboardSignal};
 use hardware::sysinfo::{self, SysinfoController, SysinfoSignal};
@@ -299,6 +300,16 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     let (battery_signal_tx, mut battery_signals) = tokio::sync::mpsc::unbounded_channel::<BatterySignal>();
     let battery = BatteryController::new(PathBuf::from("/sys/class/power_supply"), battery_signal_tx);
 
+    // brightness capability (docs/adr/0053, § 2.3): `/sys/class/backlight`, ranked by `type`
+    // (firmware over platform over raw), read via a udev `backlight` subsystem watch, written
+    // through `org.freedesktop.login1.Session.SetBrightness` on the shared system-bus
+    // `connection` NetworkManager/BlueZ/polkit/idle-inhibit/keyboard already share (no new
+    // connection). No device found degrades in place to never pushing at all -- see
+    // `hardware::brightness`'s own module doc comment for why that's the correct answer for a
+    // spec with no absence sentinel, not a bug.
+    let (brightness_signal_tx, mut brightness_signals) = tokio::sync::mpsc::unbounded_channel::<BrightnessSignal>();
+    let brightness = BrightnessController::new(PathBuf::from("/sys/class/backlight"), connection.clone(), brightness_signal_tx);
+
     // system capability (docs/adr/0053, § 2.11): the 1 Hz clock a config needs to draw a time that
     // moves, plus the persisted `state.json` dictionary. Both env reads happen here rather than
     // inside the module, matching how `resolve_state_path` was written to take them as arguments.
@@ -486,6 +497,12 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 let state = battery.snapshot();
                 push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "battery", &state);
             }
+            Some(BrightnessSignal::Changed) = brightness_signals.recv() => {
+                // Same no-debounce, full-re-derive shape as sysinfo/keyboard/battery above --
+                // this arm only fires at all when a backlight device was found (docs/adr/0053).
+                let state = brightness.snapshot();
+                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "brightness", &state);
+            }
             Some(SystemSignal::Changed) = system_signals.recv() => {
                 // Once per wall-clock second, and the only capability here that pushes on a timer
                 // rather than on a real event -- docs/adr/0053 decision 2 owns why that cost is
@@ -600,6 +617,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                     "idle" => idle::dispatch(&idle, &envelope),
                     "sysinfo" => sysinfo::dispatch(&sysinfo, &envelope),
                     "keyboard" => keyboard::dispatch(&keyboard, &envelope),
+                    "brightness" => brightness::dispatch(&brightness, &envelope),
                     "mpris" => dbus::mpris::dispatch(&mpris, &envelope),
                     "updates" => updates::dispatch(&updates, &envelope),
                     "notifications" => notifications::dispatch(&notifications, &envelope),

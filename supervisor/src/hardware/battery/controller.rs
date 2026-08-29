@@ -10,6 +10,8 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc::UnboundedSender;
 use udev::MonitorSocket;
 
+use super::super::read_attr;
+
 /// `oblisk.battery`'s full payload (§ 2.2). Field names are the `StateSnapshot` JSON keys
 /// verbatim -- the Renderer routes them straight into the Lua `oblisk.battery` signal table by
 /// name, unchanged, so they may not be renamed. `Default` (`false`, `0`, `false`) already is
@@ -30,14 +32,6 @@ pub struct BatteryState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatterySignal {
     Changed,
-}
-
-/// Reads and trims one sysfs attribute file under `entry_dir`. `None` covers both "file
-/// missing" (e.g. no `scope` file, § 2.2's own system-scope default) and any other read error --
-/// this codebase's sysfs readers don't distinguish "absent" from "unreadable" anywhere else
-/// either (e.g. `keyboard::locks::read_led_on`'s own missing-file case).
-fn read_attr(entry_dir: &Path, name: &str) -> Option<String> {
-    std::fs::read_to_string(entry_dir.join(name)).ok().map(|text| text.trim().to_string())
 }
 
 /// § 2.2's whole device-selection correctness problem, as one pure predicate: `entry_dir`

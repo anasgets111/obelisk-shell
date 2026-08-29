@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::StreamExt;
 
-use super::backlight::{KbdBacklightProxy, percent_from_raw, raw_from_percent};
+use super::super::scale::{percent_from_raw, raw_from_percent};
+use super::backlight::KbdBacklightProxy;
 use super::layout::{CompositorKind, CompositorLink, HyprlandLink, NiriLink, detect_compositor};
 use super::locks::{read_led_on, resolve_lock_leds};
 

@@ -253,6 +253,46 @@ local volume_module = pill({
     end, MAUVE),
 })
 
+-- Brightness, and the first § 3.2 command with an argument in it. `oblisk.lock:invoke("lock")`
+-- below proves the envelope; this proves the rest of the write path: the arguments array, the
+-- round trip back through udev, and the revision the envelope is stamped with (Phase 25 item 2).
+-- The click reads `percent` off the last snapshot, steps it, and the number that comes back is
+-- whatever logind actually wrote, not what this config asked for.
+--
+-- It wraps to 10 rather than to 0. A demo that can black the panel out with one stray click is a
+-- demo nobody clicks twice, and `brightness:set(0)` on this machine's `intel_backlight` does
+-- exactly that.
+--
+-- Reads "--" forever on a machine with no backlight, deliberately: § 2.3 specifies no absence
+-- sentinel, so the capability pushes nothing at all rather than fabricating a `0` that a config
+-- could not tell from a screen turned all the way down (docs/adr/0053).
+local BRIGHTNESS_STEP = 10
+
+local brightness_module = pill({
+    button {
+        width = 58,
+        height = 18,
+        align_v = "Center",
+        on_click = function()
+            local b = oblisk.brightness:get()
+            if b == nil then
+                return
+            end
+            local stepped = b.percent + BRIGHTNESS_STEP
+            if stepped > 100 then
+                stepped = BRIGHTNESS_STEP
+            end
+            oblisk.brightness:invoke("set", stepped)
+        end,
+        children = { cell(label(oblisk.brightness, function(b)
+            return string.format("sun %d%%", b.percent)
+        end), FG) },
+    },
+    meter(oblisk.brightness, function(b)
+        return b.percent
+    end, YELLOW),
+})
+
 -- Battery, real as of docs/adr/0053. Colour carries the state, which is what a bar is for, and it
 -- is a signal rather than a constant because a property resolves from a signal like any other
 -- (ADR-0044). Charging is green whatever the level, because a charging battery at 8% is not the
@@ -437,6 +477,13 @@ end), FG, 48)
 -- modules this bar carries put the right zone over its 576px and ran the battery off the edge of a
 -- 1920px output; widening only the right zone would have fixed the overflow and moved the clock off
 -- centre, since a centre zone is only centred while it is symmetric about the middle.
+--
+-- The tray is in the left zone and everything else status-shaped is on the right, which reads
+-- backwards until you notice it is the one module with no width of its own: it grows with however
+-- many `StatusNotifierItem`s happen to be registered. Adding `brightness` to the right zone put it
+-- over 768px and ran `lock` off the edge, and moving the tray is the fix that survives the next
+-- module, because a zone holding an unbounded-width child has no budget anyone can reason about.
+-- The left zone holds two fixed modules in the same 768px and had the room.
 return {
     panel {
         id = "bar",
@@ -463,7 +510,7 @@ return {
                     align_h = "Start",
                     align_v = "Center",
                     spacing = 6,
-                    children = { media, notifications_module },
+                    children = { media, notifications_module, tray_module },
                 },
                 row {
                     width = "20%",
@@ -483,10 +530,10 @@ return {
                         rescue_cell,
                         privacy_module,
                         updates_module,
-                        tray_module,
                         keyboard_module,
                         network_module,
                         bluetooth_module,
+                        brightness_module,
                         volume_module,
                         battery_module,
                         menu_button,
