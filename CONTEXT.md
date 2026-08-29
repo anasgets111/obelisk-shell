@@ -32,6 +32,10 @@ _Avoid_: minor change, hot patch
 The full candidate-spawn, presentation-evidence, promote-and-reap flow. Reserved for topology changes.
 _Avoid_: hot-reload (ambiguous: covers both swap and in-place reload)
 
+**Handoff window**:
+The part of a generation swap where two renderer processes are alive at once: from the candidate's spawn until the superseded generation is reaped. Bounded by PBA's own timeouts, so it lasts seconds and only exists during a swap. Named because it is the one state the memory budget is measured against separately (ADR-0043 decision 1 item 3), never folded into a steady-state number.
+_Avoid_: overlap, transition period
+
 **In-place reload**:
 Re-running the config on the current generation's existing Lua VM, without spawning a candidate or rebinding Wayland/EGL. Used for value changes. The VM is not reset: the retained scene holds `mlua` values that keep it alive, so dropping it would leak the whole VM per reload and leave the scene reading a state no config runs in (ADR-0044). One VM per generation, dropped only when the generation ends.
 _Avoid_: hot-reload, live patch, VM reset (a generation swap's job, and a swap gets a new process)

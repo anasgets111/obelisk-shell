@@ -1663,6 +1663,49 @@ from DRM fdinfo's `drm-*-memory` fields rather than assuming `smaps` captures it
 No dependency on the paint pass; buildable at any point, and more useful before Phase 19 than after,
 since it gives the font decision a before-and-after number.
 
+> **Built.** `supervisor/src/memory.rs` reads `smaps_rollup` and `fdinfo`, `main.rs` samples from
+> two call sites, and docs/adr/0043 carries the first reading. Three numbers, one log line.
+>
+> Two of this phase's own instructions were wrong about the machine they describe. `drm-*-memory` is
+> not a field i915 exposes; the current `drm-usage-stats` naming is `drm-resident-<region>`, with
+> `drm-memory-<region>` surviving only as an older amdgpu-era spelling the parser keeps as a
+> fallback. And a DRM client holds many fds that each repeat the same byte counts under one
+> `drm-client-id`, so the obvious per-fd sum triple-counts: reading niri, three fds each reported an
+> identical 279968 KiB. The parser dedupes on `(drm-pdev, drm-client-id)` and reports the surviving
+> client count so nobody has to trust that it did.
+>
+> Sampling is split rather than uniform (docs/adr/0043's sampling amendment). Steady state is behind
+> `OBLISK_MEMORY_SAMPLE_SECS` because anyone can read the same file from outside a running shell.
+> The handoff sample is unconditional because nobody outside the process can catch a window that
+> exists only during a swap, and it is taken at one instant, after `run_pba` returns `Ok` and before
+> the superseded generation is reaped, which is the widest point but not a tracked peak.
+>
+> **The reading, and the one it took a second experiment to get right.** 149.7 MiB total PSS on one
+> monitor against a 50 MB budget, and 82.3 MiB of it is `libLLVM`, dragged in by Mesa's gallium
+> megadriver on a machine whose Renderer reports `drm-driver: i915` and never asks for llvmpipe.
+> Every mapped font together is 0.1 MiB.
+>
+> That font number nearly went into ADR-0043 as evidence against its own decision 2. It is the
+> opposite: Phase 19 item 10 already landed, so the shipped path resolves a declared chain through
+> `fc-match` and loads two files, and measuring it was measuring the fix. Pointing the harness at
+> `system_fallback`, the last-resort path that still calls `load_system_fonts()`, gives the
+> before-and-after this phase exists to produce: **2207.9 MiB of Renderer PSS against 137.0 MiB**,
+> across this machine's 2648 faces. Decision 2 argued from a one-second startup cost. It is a 16x
+> multiplier on the whole shell, and it also exceeds the 1.1 GB of fonts on disk, which means
+> `fontdb` reads those files rather than mapping them as the ADR assumed.
+>
+> The handoff came in at 196.9 MiB, 1.32x steady state rather than 2x, with per-Renderer USS falling
+> from 130.4 MiB to 42.6 MiB as the second process mapped the same clean Mesa pages. That is
+> decision 1's whole argument for PSS over RSS, measured: an RSS sum would have said 274 MiB.
+>
+> Left for Phase 19 to weigh, not fixed here: `system_fallback` is shipped code that costs 2.2 GB on
+> any machine without fontconfig, and its own comment calls that "slow".
+>
+> Not measured: femtovg's atlas growth (decision 3), a leak over days that a sample taken seconds
+> after boot cannot see, and anything on a second monitor or a non-i915 driver. The Supervisor
+> cannot divide by monitor count either, since `screens` is Renderer-sourced (ADR-0041), so the
+> per-monitor budget is arithmetic the reader does.
+
 ### Phase 25: The Lua Write Path and the `oblisk` Namespace
 
 Everything above is the read direction. Lua still cannot write. `Signal` userdata exposes `get` and

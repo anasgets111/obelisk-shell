@@ -2,6 +2,7 @@ mod audio;
 mod dbus;
 mod hardware;
 mod lock;
+mod memory;
 mod pam_worker;
 mod privacy;
 mod process;
@@ -354,6 +355,9 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     // confirmed live. `SIGTERM` gets the same treatment: a process manager stopping this unit
     // sends `SIGTERM`, not `SIGINT`.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    let mut memory_sampler = memory::sampler_from_env();
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -363,6 +367,9 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
             _ = sigterm.recv() => {
                 eprintln!("SIGTERM received, shutting down");
                 break;
+            }
+            Some(_) = memory::tick_sampler(&mut memory_sampler) => {
+                memory::log_sample("steady state", &[(authoritative.generation_id, &authoritative.child)]);
             }
             Some(challenge) = challenges.recv() => {
                 eprintln!("polkit authentication challenge received: {challenge:?}");
@@ -631,6 +638,13 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
 
                     match reload::run_pba(&renderer_path_str, &[], &candidate_envs, &mut link, &snapshots, sequence, PBA_TIMINGS).await {
                         Ok(outcome) => {
+                            // docs/adr/0043 decision 1 item 3, taken here and nowhere else: this
+                            // is the widest point of the handoff window. The Candidate has
+                            // presented evidence (`run_pba` returned `Ok`) and the superseded
+                            // generation still owns every buffer it drew, so both are fully
+                            // resident. One statement later the reap below starts tearing one of
+                            // them down.
+                            memory::log_sample("pba handoff", &[(authoritative.generation_id, &authoritative.child), (candidate_generation_id, &outcome.candidate)]);
                             for surface_id in &outcome.promoted_surfaces {
                                 send_frame_logged(&registry, authoritative.generation_id, &SupervisorFrame::DeselectInput(DeselectInput { surface_id: surface_id.clone() }));
                                 send_frame_logged(&registry, candidate_generation_id, &SupervisorFrame::PromoteGeneration(PromoteGeneration { surface_id: surface_id.clone() }));
