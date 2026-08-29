@@ -129,23 +129,29 @@ pub fn master_volume_from_props(props: &RawSinkProps) -> MasterVolume {
     MasterVolume { volume: peak_linear.cbrt(), muted: props.mute }
 }
 
-/// Parses a PipeWire metadata `default.audio.sink` property value -- raw JSON text of the shape
-/// `{"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"}` -- into the sink's `node.name`.
+/// Parses a PipeWire metadata `default.audio.sink` or `default.audio.source` property value --
+/// raw JSON text of the shape `{"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"}` -- into the
+/// device's `node.name`. One function for both keys because both carry the identical shape,
+/// confirmed on the same live `pw-metadata` dump: `default.audio.source` reads
+/// `{"name":"alsa_input.pci-0000_00_1f.3.analog-stereo"}`.
 /// Confirmed this is the real wire shape with `pw-metadata`'s dump output on this machine
 /// (`update: id:0 key:'default.audio.sink' value:'{"name":"alsa_output...stereo"}'
 /// type:'Spa:String:JSON'`), not assumed from the `Spa:String:JSON` type name alone. `None` for
 /// anything that isn't that shape (missing property, malformed JSON, or a `name` that isn't a
 /// string) -- callers treat that the same as "no default known yet".
-pub fn parse_default_sink_name(json: &str) -> Option<String> {
+pub fn parse_default_device_name(json: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
     value.get("name")?.as_str().map(str::to_string)
 }
 
-/// Which tracked sink node id counts as "the master" right now, given the default-sink name
-/// PipeWire's metadata reports (if any) and the `node_id -> node.name` map of `Audio/Sink` nodes
-/// `mixer.rs` has seen `global` events for. The metadata key names a sink by `node.name`, not by
-/// registry id (see the module doc comment), so this matches by name rather than assuming id 0
+/// Which tracked device node id is the default right now, given the name PipeWire's metadata
+/// reports (if any) and the `node_id -> node.name` map of `Audio/Sink` (or `Audio/Source`) nodes
+/// `mixer.rs` has seen `global` events for. The metadata key names a device by `node.name`, not
+/// by registry id (see the module doc comment), so this matches by name rather than assuming id 0
 /// or the like means anything.
+///
+/// Public and device-kind-agnostic since § 2.4's `sinks`/`sources` arrays landed: both need the
+/// same "which of these is the active one" answer, and the rule is identical for each.
 ///
 /// ponytail: `default_name` can name a sink `sink_names` has no entry for, for two different
 /// reasons, and this function can't tell which one it's looking at:
@@ -172,22 +178,22 @@ pub fn parse_default_sink_name(json: &str) -> Option<String> {
 /// rather than restructured. The upgrade path, if either window ever proves too wide in
 /// practice, is to hold the previous resolved master id across an unresolved query instead of
 /// guessing by id.
-fn resolve_master_sink(default_name: Option<&str>, sink_names: &HashMap<u32, String>) -> Option<u32> {
+pub fn resolve_default_device(default_name: Option<&str>, names: &HashMap<u32, String>) -> Option<u32> {
     if let Some(default_name) = default_name
-        && let Some((&id, _)) = sink_names.iter().find(|(_, name)| name.as_str() == default_name)
+        && let Some((&id, _)) = names.iter().find(|(_, name)| name.as_str() == default_name)
     {
         return Some(id);
     }
-    sink_names.keys().copied().min()
+    names.keys().copied().min()
 }
 
-/// Combines [`resolve_master_sink`] and the tracked per-sink [`MasterVolume`]s into the one
+/// Combines [`resolve_default_device`] and the tracked per-sink [`MasterVolume`]s into the one
 /// value `mixer.rs` publishes -- [`MasterVolume::default`] (see its doc comment) if no sink is
 /// resolved yet, or a resolved sink's own `Props` haven't been parsed into `sink_volumes` yet
 /// (the two maps update from separate PipeWire events and aren't guaranteed to catch up in the
 /// same tick).
 pub fn compute_master(default_name: Option<&str>, sink_names: &HashMap<u32, String>, sink_volumes: &HashMap<u32, MasterVolume>) -> MasterVolume {
-    resolve_master_sink(default_name, sink_names).and_then(|id| sink_volumes.get(&id).copied()).unwrap_or_default()
+    resolve_default_device(default_name, sink_names).and_then(|id| sink_volumes.get(&id).copied()).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -320,47 +326,47 @@ mod tests {
         assert_eq!(master_volume_from_props(&props).volume, 0.0);
     }
 
-    // ---- parse_default_sink_name ----
+    // ---- parse_default_device_name ----
 
     #[test]
-    fn parse_default_sink_name_reads_the_real_pw_metadata_shape() {
+    fn parse_default_device_name_reads_the_real_pw_metadata_shape() {
         let json = r#"{"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"}"#;
-        assert_eq!(parse_default_sink_name(json), Some("alsa_output.pci-0000_00_1f.3.analog-stereo".to_string()));
+        assert_eq!(parse_default_device_name(json), Some("alsa_output.pci-0000_00_1f.3.analog-stereo".to_string()));
     }
 
     #[test]
-    fn parse_default_sink_name_rejects_malformed_json() {
-        assert_eq!(parse_default_sink_name("not json"), None);
+    fn parse_default_device_name_rejects_malformed_json() {
+        assert_eq!(parse_default_device_name("not json"), None);
     }
 
     #[test]
-    fn parse_default_sink_name_rejects_a_missing_name_key() {
-        assert_eq!(parse_default_sink_name("{}"), None);
+    fn parse_default_device_name_rejects_a_missing_name_key() {
+        assert_eq!(parse_default_device_name("{}"), None);
     }
 
-    // ---- resolve_master_sink ----
+    // ---- resolve_default_device ----
 
     #[test]
-    fn resolve_master_sink_matches_by_name() {
+    fn resolve_default_device_matches_by_name() {
         let sinks = HashMap::from([(59, "alsa_output.pci-...analog-stereo".to_string()), (70, "bluez_output.headset".to_string())]);
-        assert_eq!(resolve_master_sink(Some("bluez_output.headset"), &sinks), Some(70));
+        assert_eq!(resolve_default_device(Some("bluez_output.headset"), &sinks), Some(70));
     }
 
     #[test]
-    fn resolve_master_sink_falls_back_to_lowest_id_with_no_default_name() {
+    fn resolve_default_device_falls_back_to_lowest_id_with_no_default_name() {
         let sinks = HashMap::from([(70, "bluez_output.headset".to_string()), (59, "alsa_output.pci-...analog-stereo".to_string())]);
-        assert_eq!(resolve_master_sink(None, &sinks), Some(59));
+        assert_eq!(resolve_default_device(None, &sinks), Some(59));
     }
 
     #[test]
-    fn resolve_master_sink_falls_back_when_the_named_sink_is_not_tracked_yet() {
+    fn resolve_default_device_falls_back_when_the_named_sink_is_not_tracked_yet() {
         let sinks = HashMap::from([(59, "alsa_output.pci-...analog-stereo".to_string())]);
-        assert_eq!(resolve_master_sink(Some("bluez_output.not-seen-yet"), &sinks), Some(59));
+        assert_eq!(resolve_default_device(Some("bluez_output.not-seen-yet"), &sinks), Some(59));
     }
 
     #[test]
-    fn resolve_master_sink_is_none_with_no_sinks_tracked_at_all() {
-        assert_eq!(resolve_master_sink(None, &HashMap::new()), None);
+    fn resolve_default_device_is_none_with_no_sinks_tracked_at_all() {
+        assert_eq!(resolve_default_device(None, &HashMap::new()), None);
     }
 
     // ---- compute_master ----
@@ -374,7 +380,7 @@ mod tests {
 
     #[test]
     fn compute_master_defaults_when_the_resolved_sink_has_no_props_yet() {
-        // resolve_master_sink can find a node id before that node's own Props param has arrived
+        // resolve_default_device can find a node id before that node's own Props param has arrived
         // (they're independent events) -- compute_master must not panic on that gap.
         let sinks = HashMap::from([(59, "alsa_output.pci-...analog-stereo".to_string())]);
         assert_eq!(compute_master(Some("alsa_output.pci-...analog-stereo"), &sinks, &HashMap::new()), MasterVolume::default());

@@ -1865,7 +1865,7 @@ the IDL-only entries fell between the two documents.
    and half of it is unverified for a reason worth reading.
 5. **`audio`'s `sinks`/`sources`** (§ 2.4) and per-app `volume`/`muted`. The per-app half needs the
    same `SPA_PARAM_Props` subscription per stream node that the master already has; the arrays need
-   the sink and source globals tracked as well as the streams.
+   the sink and source globals tracked as well as the streams. Built, see the fifth note below.
 
 > **Built (items 1 and part of 5).** `battery` reads `/sys/class/power_supply` behind a real udev
 > monitor on `AsyncFd`, filtered to the one system battery: the mains adapter, the USB-C PD source
@@ -2006,6 +2006,40 @@ the IDL-only entries fell between the two documents.
 > zone. Neither side can grow: the sides are equal because that is what makes the middle a centre,
 > and the 20% centre's slack cannot be borrowed by a 40% side. From here every module added costs
 > another module its place, until this engine has a real space-between.
+
+> **Built (item 5's read half).** § 2.4 is now reported in full. The prediction in the item above
+> was right about both halves and wrong about how much each cost.
+>
+> Per-app `volume`/`muted` is the same `SPA_PARAM_Props` subscription the master sink already had,
+> pointed at a stream node, and that turned out to be a `.param` callback added to the listener
+> those nodes already carried rather than a second listener. `pw-cli enum-params <id> Props` against
+> a live playback stream confirmed a stream publishes `channelVolumes` and `mute` exactly as a sink
+> does, cubed the same way, so `master::extract_sink_props` and `master_volume_from_props` were
+> reused unchanged. Verified live: a stream set to 0.42 with `wpctl` read back as `0.42` in the bar
+> while its two neighbours read `1.00`.
+>
+> `sinks` needed only a display name beside the `node.name` already tracked, because § 2.4's `name`
+> is the "user-friendly description" and the metadata keys route by the other spelling. Both exist
+> on every device this machine advertises: `node.description` is "Built-in Audio Analog Stereo",
+> `node.name` is "alsa_output.pci-0000_00_1f.3.analog-stereo", and only one of them is meant for a
+> person.
+>
+> `sources` cost less than the item predicted. § 2.4's source object is `id`, `name` and `active`,
+> and all three are answerable from the `global` event's own props plus the `default.audio.source`
+> metadata key, so a source is never bound at all: no proxy, no listener, no `Props` subscription.
+> A sink is bound only because § 2.4 asks it for the master volume, which a source has no equivalent
+> of.
+>
+> **No monitor filter, and that is a decision rather than an omission.** PulseAudio synthesizes a
+> `.monitor` source per sink and every mixer UI filters them back out, so a filter was the expected
+> shape here. A native PipeWire registry does not: `pw-dump` on this machine lists one `Audio/Source`
+> beside one `Audio/Sink` with no monitor node between them. A filter written against a node kind
+> this registry never emits would be dropping real devices on the guess that some are fake.
+>
+> `default.audio.source` carries the identical `{"name": ...}` shape as `default.audio.sink`, so the
+> one parser serves both and got renamed to say so. `default.configured.audio.sink` is a different
+> fact and is not read: on this machine it names a Bluetooth device that is not connected while
+> `default.audio.sink` names the analog output actually in use.
 
 ### Phase 29: Icons, Images and the Wallpaper
 

@@ -107,16 +107,17 @@ const STREAM_OUTPUT_AUDIO: &str = "Stream/Output/Audio";
 /// so this is supplementary to that capability's own kernel-level detection, never primary.
 const VIDEO_SOURCE: &str = "Video/Source";
 
-/// ponytail: per-app `volume`/`muted` (§ 2.4) placeholder. A real value needs the same
-/// `SPA_PARAM_Props`/`channelVolumes` machinery [`master`] uses for the master sink, run per
-/// stream node instead of per sink -- landing that in the same slice as master volume was judged
-/// too large (arbitrarily many stream nodes, each needing its own `subscribe_params` + `param`
-/// listener, added and removed live). Every [`AppStream`] reports PipeWire's own "untouched"
-/// values here rather than a wrong measured number. Upgrade path: mirror `bind_sink`'s
-/// `subscribe_params`/`param` listener per audio stream node, keyed the same way `nodes` already
-/// tracks stream node proxies in [`on_global`].
-const APP_VOLUME_PLACEHOLDER: f32 = 1.0;
-const APP_MUTED_PLACEHOLDER: bool = false;
+/// `media.class` value an input capture device node carries (§ 2.4's `sources`). Unlike
+/// [`AUDIO_SINK`], a source is never bound: § 2.4's source object is `id`/`name`/`active`, all
+/// three answerable from the `global` event's own props plus the default-source metadata key, so
+/// there is nothing a proxy or a `param` listener would add.
+///
+/// No monitor filter, deliberately. PulseAudio synthesizes a `.monitor` source per sink and
+/// every mixer UI filters those back out; a native PipeWire registry does not, and `pw-dump` on
+/// this machine lists exactly one `Audio/Source` (the analog input) beside one `Audio/Sink`,
+/// with no monitor node between them. A filter written against a node kind this registry never
+/// emits would be dropping real devices on the guess that some of them are fake.
+const AUDIO_SOURCE: &str = "Audio/Source";
 
 /// One playback stream node PipeWire has advertised, filtered to
 /// `media.class == "Stream/Output/Audio"` and resolved to its owning process.
@@ -141,9 +142,14 @@ pub struct AppStream {
     pub name: Option<String>,
     /// `/proc/{pid}/comm` for `pid`, if the process still existed when this stream was seen.
     pub process_name: Option<String>,
-    /// § 2.4's per-app volume, range `[0.0, 1.0]`. Placeholder -- see [`APP_VOLUME_PLACEHOLDER`].
+    /// § 2.4's per-app volume, range `[0.0, 1.0]`. Read from this stream node's own
+    /// `SPA_PARAM_Props`, through the same cube-root conversion the master sink uses (see
+    /// [`master`]): a stream stores `channelVolumes` cubed exactly as a sink does, confirmed with
+    /// `pw-cli enum-params <id> Props` against a live playback stream. `1.0` until that param
+    /// arrives, which is PipeWire's own untouched value and what a stream that has never been
+    /// adjusted really reports.
     pub volume: f32,
-    /// § 2.4's per-app mute. Placeholder -- see [`APP_MUTED_PLACEHOLDER`].
+    /// § 2.4's per-app mute, from the same `Props` param as `volume`.
     pub muted: bool,
 }
 
@@ -229,8 +235,15 @@ fn build_app_stream(node_id: u32, props: &impl PropsLookup) -> Option<AppStream>
         pid: parsed.pid,
         name: parsed.app_name,
         process_name,
-        volume: APP_VOLUME_PLACEHOLDER,
-        muted: APP_MUTED_PLACEHOLDER,
+        // What PipeWire itself reports for a stream nobody has touched, and what a live
+        // `pw-cli enum-params <id> Props` shows for every stream on this machine. Replaced by
+        // the real reading as soon as this node's own `Props` param arrives, which the same
+        // "first event carries the full current state" contract `MasterVolume::default`'s
+        // ponytail records puts one main-loop iteration away. Not `MasterVolume::default()`'s
+        // `0.0`: that is the right unknown for a master volume nothing has resolved yet, and it
+        // is the wrong one here, where silence is a state a stream can really be in.
+        volume: 1.0,
+        muted: false,
     })
 }
 
@@ -293,8 +306,6 @@ impl AudioApps {
 /// shape to change regardless, so the field renames landed in the same move rather than leaving
 /// a payload that matched neither the old code nor § 2.4.
 ///
-/// `sinks`/`sources` (§ 2.4) are out of scope for this slice (docs/adr/0053 decision 3) and are
-/// not fields here.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AudioState {
     /// Master output volume, range `[0.0, 1.0]` -- see [`master`]'s module doc comment for how
@@ -302,7 +313,61 @@ pub struct AudioState {
     pub volume: f32,
     /// Master output mute.
     pub muted: bool,
+    pub sinks: Vec<AudioDevice>,
+    pub sources: Vec<AudioDevice>,
     pub apps: Vec<AppStream>,
+}
+
+/// One § 2.4 `sinks`/`sources` entry. Both arrays are the same three fields, so they are the same
+/// type: an output and an input differ in which `media.class` produced them and in nothing a
+/// config reads.
+///
+/// `name` is § 2.4's "user-friendly description", which is `node.description` (`"Built-in Audio
+/// Analog Stereo"`), not the `node.name` the metadata keys route by
+/// (`"alsa_output.pci-0000_00_1f.3.analog-stereo"`). Both exist on every device this machine
+/// advertises and only one of them is meant for a person.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AudioDevice {
+    /// PipeWire registry id, which is what `audio:set_default_sink(id)` takes.
+    pub id: u32,
+    pub name: String,
+    /// Whether this is the device the `default.audio.sink`/`default.audio.source` metadata key
+    /// currently routes to.
+    pub active: bool,
+}
+
+/// Builds one of § 2.4's device arrays. Ordered by registry id so two publishes of the same
+/// registry produce the same list, for the reason `AudioApps::snapshot` already sorts.
+///
+/// A device with no `node.description` falls back to whatever [`device_display_name`] found,
+/// which is why `descriptions` is consulted rather than required: a tracked device with no
+/// readable name at all is still a device a config can switch to, and dropping it from the list
+/// would make it unreachable rather than merely unlabelled.
+fn device_list(names: &HashMap<u32, String>, descriptions: &HashMap<u32, String>, default_name: Option<&str>) -> Vec<AudioDevice> {
+    let active = master::resolve_default_device(default_name, names);
+    let mut devices: Vec<AudioDevice> = names
+        .iter()
+        .map(|(&id, node_name)| AudioDevice {
+            id,
+            name: descriptions.get(&id).cloned().unwrap_or_else(|| node_name.clone()),
+            active: active == Some(id),
+        })
+        .collect();
+    devices.sort_by_key(|device| device.id);
+    devices
+}
+
+/// § 2.4's "user-friendly description" for a device node, in PipeWire's own order of
+/// friendliness: `node.description` ("Built-in Audio Analog Stereo"), then `node.nick` ("ALC256
+/// Analog"), then `node.name` as the last resort. All three were read off this machine's live
+/// `pw-dump` rather than assumed; the first two are absent on stream nodes and present on every
+/// sink and source.
+fn device_display_name(props: &impl PropsLookup) -> Option<String> {
+    props
+        .get_prop(*keys::NODE_DESCRIPTION)
+        .or_else(|| props.get_prop(*keys::NODE_NICK))
+        .or_else(|| props.get_prop(*keys::NODE_NAME))
+        .map(str::to_string)
 }
 
 /// One `Video/Source` node PipeWire has advertised, resolved just enough for `oblisk.privacy`'s
@@ -397,14 +462,30 @@ struct MixerState {
     /// `Audio/Sink` node id -> `node.name`, from each sink's `global` event props (see
     /// [`bind_sink`] for why `info` isn't needed here the way it is for stream nodes).
     sink_names: HashMap<u32, String>,
+    /// `Audio/Sink` node id -> the name § 2.4's `sinks` array shows a person
+    /// ([`device_display_name`]). Separate from `sink_names` rather than replacing it: the
+    /// metadata keys route by `node.name`, so both spellings are needed and neither derives from
+    /// the other.
+    sink_descriptions: HashMap<u32, String>,
+    /// `Audio/Source` node id -> `node.name`, and -> display name. No proxy and no listener
+    /// beside them: § 2.4's source object needs nothing a `global` event does not already carry
+    /// (see [`AUDIO_SOURCE`]).
+    source_names: HashMap<u32, String>,
+    source_descriptions: HashMap<u32, String>,
+    /// `Stream/Output/Audio` node id -> that stream's own volume/mute, from its `Props` param.
+    /// The same [`MasterVolume`] type the master sink uses, because it is the same two values
+    /// parsed out of the same pod shape by the same function.
+    app_volumes: HashMap<u32, MasterVolume>,
     /// `Audio/Sink` node id -> the [`MasterVolume`] last parsed from that node's `Props` param.
     sink_volumes: HashMap<u32, MasterVolume>,
     /// Bound sink node proxies and their `param` listeners, kept alive for the same reason
     /// `nodes` keeps stream/video-source proxies alive.
     sink_nodes: HashMap<u32, (pw::node::Node, pw::node::NodeListener)>,
-    /// The `node.name` the `default` metadata object's `default.audio.sink` key currently names,
-    /// or `None` before that property has ever arrived this run.
+    /// The `node.name` the `default` metadata object's `default.audio.sink` and
+    /// `default.audio.source` keys currently name, or `None` before that property has ever
+    /// arrived this run.
     default_sink_name: Option<String>,
+    default_source_name: Option<String>,
     /// The bound `default` `Metadata` proxy/listener, and the registry id it was bound from (so
     /// `global_remove` can tell whether a removed id was this object -- `Metadata` itself exposes
     /// no id accessor). `None` until `on_global` finds the `metadata.name == "default"` global,
@@ -418,7 +499,27 @@ impl MixerState {
     /// a reason to stop tracking streams.
     fn publish_audio(&self) {
         let master = master::compute_master(self.default_sink_name.as_deref(), &self.sink_names, &self.sink_volumes);
-        let state = AudioState { volume: master.volume, muted: master.muted, apps: self.apps.snapshot() };
+        // Applied here rather than inside `AudioApps` because a stream's identity and a stream's
+        // volume arrive on two different PipeWire events (`info` and `param`) with no ordering
+        // between them, and folding the volume into the entry at `info` time would overwrite a
+        // reading that had already landed. `AudioApps` stays the list of streams; this is the
+        // one place the two halves meet.
+        let apps = self
+            .apps
+            .snapshot()
+            .into_iter()
+            .map(|app| match self.app_volumes.get(&app.id) {
+                Some(measured) => AppStream { volume: measured.volume, muted: measured.muted, ..app },
+                None => app,
+            })
+            .collect();
+        let state = AudioState {
+            volume: master.volume,
+            muted: master.muted,
+            sinks: device_list(&self.sink_names, &self.sink_descriptions, self.default_sink_name.as_deref()),
+            sources: device_list(&self.source_names, &self.source_descriptions, self.default_source_name.as_deref()),
+            apps,
+        };
         let _ = self.updates.send(state);
     }
 
@@ -469,9 +570,14 @@ fn run_inner(updates: UnboundedSender<AudioState>, video_updates: UnboundedSende
         updates,
         video_updates,
         sink_names: HashMap::new(),
+        sink_descriptions: HashMap::new(),
+        source_names: HashMap::new(),
+        source_descriptions: HashMap::new(),
+        app_volumes: HashMap::new(),
         sink_volumes: HashMap::new(),
         sink_nodes: HashMap::new(),
         default_sink_name: None,
+        default_source_name: None,
         metadata: None,
         metadata_id: None,
     }));
@@ -496,11 +602,16 @@ fn run_inner(updates: UnboundedSender<AudioState>, video_updates: UnboundedSende
             state.nodes.remove(&id);
             state.sink_nodes.remove(&id);
             state.sink_names.remove(&id);
+            state.sink_descriptions.remove(&id);
             state.sink_volumes.remove(&id);
+            state.source_names.remove(&id);
+            state.source_descriptions.remove(&id);
+            state.app_volumes.remove(&id);
             if state.metadata_id == Some(id) {
                 state.metadata = None;
                 state.metadata_id = None;
                 state.default_sink_name = None;
+                state.default_source_name = None;
             }
             // Audio publishes unconditionally on every removal, exactly matching this
             // capability's pre-existing, already-shipped behavior (Spec review: an earlier
@@ -557,6 +668,20 @@ const METADATA_NAME: &str = "metadata.name";
 /// module doc comment.
 const DEFAULT_AUDIO_SINK_KEY: &str = "default.audio.sink";
 
+/// The metadata key naming § 2.4's default input device. Same JSON shape as
+/// [`DEFAULT_AUDIO_SINK_KEY`], confirmed on the same live `pw-metadata` dump
+/// (`key:'default.audio.source' value:'{"name":"alsa_input...stereo"}'`).
+const DEFAULT_AUDIO_SOURCE_KEY: &str = "default.audio.source";
+
+/// Which of the two default-device names a metadata `property` event is about. An enum rather
+/// than a bool so the arm that reads the key and the arm that writes the field name the same
+/// thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefaultDevice {
+    Sink,
+    Source,
+}
+
 /// Handles one `Node` `global` event: classifies it by `media.class` (audio stream, video
 /// source, `Audio/Sink`, or neither -- see [`classify`]). `Audio/Sink` is handled separately by
 /// [`bind_sink`], not folded into [`classify`]'s [`NodeKind`], because a sink needs a `param`
@@ -572,6 +697,10 @@ fn on_node_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Regi
         bind_sink(state, registry, obj);
         return;
     }
+    if obj.props.and_then(|props| props.get_prop(*keys::MEDIA_CLASS)) == Some(AUDIO_SOURCE) {
+        track_source(state, obj);
+        return;
+    }
     let Some(kind) = obj.props.and_then(classify) else {
         return;
     };
@@ -582,6 +711,7 @@ fn on_node_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Regi
     };
     let node_id = obj.id;
     let state_for_info = Rc::clone(state);
+    let state_for_param = Rc::clone(state);
     let listener = node
         .add_listener_local()
         .info(move |info| {
@@ -598,7 +728,39 @@ fn on_node_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Regi
                 }
             }
         })
+        // § 2.4's per-app `volume`/`muted`, which docs/adr/0053 decision 3 shipped as
+        // placeholders because this listener did not exist. It is the same pod, the same parse
+        // and the same cube root `bind_sink` already runs for the master sink, on a node that
+        // happens to be a stream: verified with `pw-cli enum-params <id> Props` against a live
+        // playback stream, which carries `channelVolumes` and `mute` exactly as a sink does.
+        //
+        // A video source has no `Props` param worth reading, and never gets subscribed below, so
+        // this callback simply never fires for one.
+        .param(move |_seq, param_type, _index, _next, param| {
+            if param_type != pw::spa::param::ParamType::Props {
+                return;
+            }
+            let Some(pod) = param else { return };
+            let Ok((_, value)) = PodDeserializer::deserialize_from::<Value>(pod.as_bytes()) else {
+                return;
+            };
+            // Same `channelVolumes`-must-be-present filter the master sink needs, and needed
+            // here for the same reason: a node can advertise more than one object under
+            // `ParamType::Props`, and reading a non-mixer one as a mixer object reports a volume
+            // of zero. See `master::extract_sink_props`'s own doc comment for the live probe
+            // that found it.
+            let Some(raw) = master::extract_sink_props(&value) else {
+                return;
+            };
+            let mut state_mut = state_for_param.borrow_mut();
+            state_mut.app_volumes.insert(node_id, master::master_volume_from_props(&raw));
+            state_mut.publish_audio();
+        })
         .register();
+
+    if kind == NodeKind::Audio {
+        node.subscribe_params(&[pw::spa::param::ParamType::Props]);
+    }
 
     state.borrow_mut().nodes.insert(node_id, (node, listener));
 }
@@ -623,7 +785,7 @@ fn bind_sink(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryR
 
     // Bound before touching `sink_names`, not after: a sink whose bind fails never gets a
     // `Props` subscription and so `sink_volumes` never gets an entry for it either. Inserting
-    // its name unconditionally used to leave `resolve_master_sink` free to resolve to a node
+    // its name unconditionally used to leave `master::resolve_default_device` free to resolve to a node
     // `sink_volumes` can never fill in -- `compute_master` would then fall back to
     // `MasterVolume::default()` (0.0) forever, on a codebase where `audio` (unlike `battery`'s
     // `present` flag) has no way to say "unknown" instead of a number that looks like a real
@@ -644,6 +806,9 @@ fn bind_sink(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryR
 
     if let Some(name) = name {
         state.borrow_mut().sink_names.insert(node_id, name);
+    }
+    if let Some(description) = obj.props.and_then(device_display_name) {
+        state.borrow_mut().sink_descriptions.insert(node_id, description);
     }
 
     let state_for_param = Rc::clone(state);
@@ -675,6 +840,25 @@ fn bind_sink(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryR
     state.borrow_mut().sink_nodes.insert(node_id, (node, listener));
 }
 
+/// Records an `Audio/Source` node's two names. No `registry.bind`, no proxy, no listener: § 2.4's
+/// source object is `id`, `name` and `active`, and the `global` event already carries the first
+/// two while the third comes from the `default.audio.source` metadata key. Binding one would buy
+/// a `Props` param nothing in § 2.4 reads.
+///
+/// The asymmetry with [`bind_sink`] is worth stating plainly rather than looking like an
+/// oversight: a sink is bound because § 2.4 asks for the master `volume`/`muted`, which only its
+/// `Props` param has. A source has no such field in the spec.
+fn track_source(state: &Rc<RefCell<MixerState>>, obj: &GlobalObject<&DictRef>) {
+    let Some(props) = obj.props else { return };
+    let Some(node_name) = props.get_prop(*keys::NODE_NAME) else { return };
+    let mut state_mut = state.borrow_mut();
+    state_mut.source_names.insert(obj.id, node_name.to_string());
+    if let Some(description) = device_display_name(props) {
+        state_mut.source_descriptions.insert(obj.id, description);
+    }
+    state_mut.publish_audio();
+}
+
 /// Binds the one `Metadata` global whose `metadata.name` is `"default"` -- the object that
 /// publishes `default.audio.sink` (§ 2.4's routing), among several other `default.*` keys this
 /// capability doesn't need. A machine advertises multiple `Metadata` objects (`settings`,
@@ -694,14 +878,25 @@ fn bind_default_metadata(state: &Rc<RefCell<MixerState>>, registry: &pw::registr
     let listener = metadata
         .add_listener_local()
         .property(move |_subject, key, _type_, value| {
-            if key != Some(DEFAULT_AUDIO_SINK_KEY) {
-                return 0;
-            }
+            // Two keys off the same object, and the `default` metadata carries several this
+            // capability does not read (`default.configured.audio.sink`, `default.video.source`,
+            // all confirmed on a live `pw-metadata` dump). `default.configured.*` in particular
+            // is not the same fact: on this machine it names a Bluetooth device that is not
+            // connected, while `default.audio.sink` names the analog output actually in use.
+            let field = match key {
+                Some(DEFAULT_AUDIO_SINK_KEY) => DefaultDevice::Sink,
+                Some(DEFAULT_AUDIO_SOURCE_KEY) => DefaultDevice::Source,
+                _ => return 0,
+            };
             let mut state_mut = state_for_property.borrow_mut();
             // `value: None` means the property was cleared (see `Metadata::property`'s own doc
-            // comment) -- treated the same as "no default known", which `resolve_master_sink`
-            // already falls back from.
-            state_mut.default_sink_name = value.and_then(master::parse_default_sink_name);
+            // comment) -- treated the same as "no default known", which
+            // `master::resolve_default_device` already falls back from.
+            let name = value.and_then(master::parse_default_device_name);
+            match field {
+                DefaultDevice::Sink => state_mut.default_sink_name = name,
+                DefaultDevice::Source => state_mut.default_source_name = name,
+            }
             state_mut.publish_audio();
             0
         })
@@ -895,10 +1090,11 @@ mod tests {
         assert_eq!(app.pid, pid as i32);
         assert_eq!(app.name, Some("Test App".to_string()));
         assert_eq!(app.process_name, expected_process_name);
-        // Placeholders (see APP_VOLUME_PLACEHOLDER/APP_MUTED_PLACEHOLDER's doc comment) --
-        // build_app_stream doesn't have real per-app volume/mute data to report yet.
-        assert_eq!(app.volume, APP_VOLUME_PLACEHOLDER);
-        assert_eq!(app.muted, APP_MUTED_PLACEHOLDER);
+        // PipeWire's own untouched values, which is what a stream really reports until its
+        // `Props` param arrives: `build_app_stream` reads the node's property dict, and volume
+        // lives on a param instead. `publish_audio` is where the two meet.
+        assert_eq!(app.volume, 1.0);
+        assert!(!app.muted);
     }
 
     #[test]
@@ -913,8 +1109,8 @@ mod tests {
             pid: 100 + node_id as i32,
             name: Some(format!("app-{node_id}")),
             process_name: None,
-            volume: APP_VOLUME_PLACEHOLDER,
-            muted: APP_MUTED_PLACEHOLDER,
+            volume: 1.0,
+            muted: false,
         }
     }
 
@@ -1013,6 +1209,72 @@ mod tests {
         );
     }
 
+    // ---- device_display_name / device_list ----
+
+    /// The two names a live `pw-dump` shows on this machine's analog output, verbatim. The point
+    /// of the fixture is that they differ: one routes, the other is read by a person.
+    fn analog_sink_props() -> HashMap<String, String> {
+        HashMap::from([
+            ("media.class".to_string(), "Audio/Sink".to_string()),
+            ("node.name".to_string(), "alsa_output.pci-0000_00_1f.3.analog-stereo".to_string()),
+            ("node.description".to_string(), "Built-in Audio Analog Stereo".to_string()),
+            ("node.nick".to_string(), "ALC256 Analog".to_string()),
+        ])
+    }
+
+    #[test]
+    fn device_display_name_prefers_the_description_over_the_nick_and_the_node_name() {
+        assert_eq!(device_display_name(&analog_sink_props()), Some("Built-in Audio Analog Stereo".to_string()));
+    }
+
+    #[test]
+    fn device_display_name_falls_back_through_nick_to_node_name() {
+        let mut props = analog_sink_props();
+        props.remove("node.description");
+        assert_eq!(device_display_name(&props), Some("ALC256 Analog".to_string()));
+
+        props.remove("node.nick");
+        assert_eq!(device_display_name(&props), Some("alsa_output.pci-0000_00_1f.3.analog-stereo".to_string()));
+    }
+
+    #[test]
+    fn device_display_name_is_none_for_a_node_with_no_name_at_all() {
+        let props = HashMap::from([("media.class".to_string(), "Audio/Sink".to_string())]);
+        assert_eq!(device_display_name(&props), None);
+    }
+
+    #[test]
+    fn device_list_marks_the_metadata_named_device_active_and_orders_by_id() {
+        let names = HashMap::from([(70, "bluez_output.headset".to_string()), (59, "alsa_output.analog".to_string())]);
+        let descriptions = HashMap::from([(70, "WH-1000XM4".to_string()), (59, "Built-in Audio Analog Stereo".to_string())]);
+
+        let devices = device_list(&names, &descriptions, Some("bluez_output.headset"));
+
+        assert_eq!(
+            devices,
+            vec![
+                AudioDevice { id: 59, name: "Built-in Audio Analog Stereo".to_string(), active: false },
+                AudioDevice { id: 70, name: "WH-1000XM4".to_string(), active: true },
+            ]
+        );
+    }
+
+    #[test]
+    fn device_list_falls_back_to_the_node_name_when_no_description_was_seen() {
+        // A device with no readable name is still one a config can switch to, so it stays in the
+        // list under whatever name exists rather than being dropped out of reach.
+        let names = HashMap::from([(59, "alsa_output.analog".to_string())]);
+
+        let devices = device_list(&names, &HashMap::new(), None);
+
+        assert_eq!(devices, vec![AudioDevice { id: 59, name: "alsa_output.analog".to_string(), active: true }]);
+    }
+
+    #[test]
+    fn device_list_is_empty_with_nothing_tracked() {
+        assert_eq!(device_list(&HashMap::new(), &HashMap::new(), Some("anything")), Vec::new());
+    }
+
     // ---- AudioState ----
 
     #[test]
@@ -1021,13 +1283,21 @@ mod tests {
         // long trailing digits once serde_json widens it (0.3_f32 as f64 != 0.3_f64), which
         // would make this equality check about float precision instead of about field shape.
         let stream = sample_stream(1);
-        let state = AudioState { volume: 0.5, muted: false, apps: vec![stream.clone()] };
+        let state = AudioState {
+            volume: 0.5,
+            muted: false,
+            sinks: vec![AudioDevice { id: 59, name: "Built-in Audio Analog Stereo".to_string(), active: true }],
+            sources: vec![AudioDevice { id: 60, name: "Built-in Audio Analog Stereo".to_string(), active: true }],
+            apps: vec![stream.clone()],
+        };
         let json = serde_json::to_value(&state).unwrap();
         assert_eq!(
             json,
             serde_json::json!({
                 "volume": 0.5,
                 "muted": false,
+                "sinks": [{ "id": 59, "name": "Built-in Audio Analog Stereo", "active": true }],
+                "sources": [{ "id": 60, "name": "Built-in Audio Analog Stereo", "active": true }],
                 "apps": [{
                     "id": stream.id,
                     "pid": stream.pid,
@@ -1040,25 +1310,40 @@ mod tests {
         );
     }
 
-    // ---- MixerState::publish_audio (master-volume wiring, exercised through the public state) ----
+    // ---- MixerState::publish_audio (the wiring, exercised through the published snapshot) ----
 
-    #[test]
-    fn publish_audio_combines_master_volume_and_app_snapshot() {
-        let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (video_updates, _video_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut state = MixerState {
+    /// Everything `publish_audio` reads, with the PipeWire proxies left empty. Built through a
+    /// helper rather than repeated per test: `MixerState` has fourteen fields and only four of
+    /// them are ever the subject of one of these tests.
+    fn mixer_state(updates: UnboundedSender<AudioState>, video_updates: UnboundedSender<Vec<VideoSourceApp>>) -> MixerState {
+        MixerState {
             apps: AudioApps::new(),
             video_sources: VideoSourceApps::new(),
             nodes: HashMap::new(),
             updates,
             video_updates,
-            sink_names: HashMap::from([(59, "alsa_output.pci-...analog-stereo".to_string())]),
-            sink_volumes: HashMap::from([(59, MasterVolume { volume: 0.3, muted: false })]),
+            sink_names: HashMap::new(),
+            sink_descriptions: HashMap::new(),
+            source_names: HashMap::new(),
+            source_descriptions: HashMap::new(),
+            app_volumes: HashMap::new(),
+            sink_volumes: HashMap::new(),
             sink_nodes: HashMap::new(),
-            default_sink_name: Some("alsa_output.pci-...analog-stereo".to_string()),
+            default_sink_name: None,
+            default_source_name: None,
             metadata: None,
             metadata_id: None,
-        };
+        }
+    }
+
+    #[test]
+    fn publish_audio_combines_master_volume_and_app_snapshot() {
+        let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (video_updates, _video_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = mixer_state(updates, video_updates);
+        state.sink_names = HashMap::from([(59, "alsa_output.pci-...analog-stereo".to_string())]);
+        state.sink_volumes = HashMap::from([(59, MasterVolume { volume: 0.3, muted: false })]);
+        state.default_sink_name = Some("alsa_output.pci-...analog-stereo".to_string());
         state.apps.upsert(sample_stream(1));
 
         state.publish_audio();
@@ -1073,19 +1358,7 @@ mod tests {
     fn publish_audio_reports_the_master_volume_default_with_no_sink_tracked() {
         let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (video_updates, _video_rx) = tokio::sync::mpsc::unbounded_channel();
-        let state = MixerState {
-            apps: AudioApps::new(),
-            video_sources: VideoSourceApps::new(),
-            nodes: HashMap::new(),
-            updates,
-            video_updates,
-            sink_names: HashMap::new(),
-            sink_volumes: HashMap::new(),
-            sink_nodes: HashMap::new(),
-            default_sink_name: None,
-            metadata: None,
-            metadata_id: None,
-        };
+        let state = mixer_state(updates, video_updates);
 
         state.publish_audio();
 
@@ -1093,5 +1366,60 @@ mod tests {
         assert_eq!(published.volume, MasterVolume::default().volume);
         assert_eq!(published.muted, MasterVolume::default().muted);
         assert!(published.apps.is_empty());
+        assert!(published.sinks.is_empty());
+        assert!(published.sources.is_empty());
+    }
+
+    #[test]
+    fn publish_audio_overlays_a_streams_own_props_reading_onto_its_entry() {
+        // The half docs/adr/0053 decision 3 shipped as a placeholder. A stream's identity comes
+        // from an `info` event and its volume from a `param` event, and this is the one place
+        // the two are joined.
+        let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (video_updates, _video_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = mixer_state(updates, video_updates);
+        state.apps.upsert(sample_stream(1));
+        state.app_volumes = HashMap::from([(1, MasterVolume { volume: 0.42, muted: true })]);
+
+        state.publish_audio();
+
+        let published = rx.try_recv().expect("publish_audio should have sent a snapshot");
+        assert_eq!(published.apps[0].volume, 0.42);
+        assert!(published.apps[0].muted);
+    }
+
+    #[test]
+    fn publish_audio_leaves_a_stream_whose_props_have_not_arrived_at_pipewires_own_untouched_values() {
+        let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (video_updates, _video_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = mixer_state(updates, video_updates);
+        state.apps.upsert(sample_stream(1));
+        state.app_volumes = HashMap::from([(99, MasterVolume { volume: 0.42, muted: true })]);
+
+        state.publish_audio();
+
+        let published = rx.try_recv().expect("publish_audio should have sent a snapshot");
+        assert_eq!(published.apps[0].volume, 1.0, "another stream's reading must not leak onto this one");
+        assert!(!published.apps[0].muted);
+    }
+
+    #[test]
+    fn publish_audio_reports_sinks_and_sources_with_their_own_active_flags() {
+        let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (video_updates, _video_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = mixer_state(updates, video_updates);
+        state.sink_names = HashMap::from([(59, "alsa_output.analog".to_string()), (70, "bluez_output.headset".to_string())]);
+        state.sink_descriptions = HashMap::from([(59, "Built-in Audio Analog Stereo".to_string()), (70, "WH-1000XM4".to_string())]);
+        state.default_sink_name = Some("bluez_output.headset".to_string());
+        state.source_names = HashMap::from([(60, "alsa_input.analog".to_string())]);
+        state.source_descriptions = HashMap::from([(60, "Built-in Microphone".to_string())]);
+        state.default_source_name = Some("alsa_input.analog".to_string());
+
+        state.publish_audio();
+
+        let published = rx.try_recv().expect("publish_audio should have sent a snapshot");
+        assert_eq!(published.sinks.iter().map(|sink| sink.active).collect::<Vec<_>>(), [false, true]);
+        assert_eq!(published.sinks[1].name, "WH-1000XM4");
+        assert_eq!(published.sources, vec![AudioDevice { id: 60, name: "Built-in Microphone".to_string(), active: true }]);
     }
 }
