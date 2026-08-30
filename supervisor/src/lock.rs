@@ -69,6 +69,12 @@ pub enum LockEvent {
     Authenticated(shared::PamOutcome),
     /// The Renderer holding the lock said what became of it.
     Reported(shared::LockOutcome),
+    /// The process holding `ext_session_lock_v1` died without reporting anything (docs/adr/0058
+    /// decision 4). Not a [`Self::Reported`] variant, because every one of those is the holder
+    /// describing its own lock, and the whole problem here is that there is no holder left to
+    /// describe anything. The *session* is still locked at the compositor, which is required not
+    /// to unlock on client death; what ended is this shell's ability to speak for it.
+    RendererLost,
 }
 
 /// The whole transition table, pure and synchronous so every case is unit-testable without a
@@ -128,6 +134,26 @@ pub fn apply(state: &mut LockState, event: LockEvent) {
             state.requested = false;
             state.authenticating = false;
             state.error.clear();
+        }
+        // `active` means "this shell holds the lock", and after a crash it does not, even though
+        // the session is still locked. Clearing it is what lets a replacement re-acquire at all:
+        // [`LockController::lock`] drops a request while `active`, on the correct assumption that a
+        // live Renderer already holds one.
+        //
+        // `authenticating` clears in the same arm, which is not tidiness but the invariant
+        // [`accepts_outcome`] documents: every transition that clears `active` releases the
+        // conversation slot too, so an answer this drops is never one whose flag stays stuck. The
+        // answer itself is refused by `accepts_outcome`'s `state.active` term, so a password typed
+        // into a lock screen whose process then died cannot order an unlock nobody authenticated.
+        //
+        // `acquisition` deliberately does not move. Only a confirmed `Locked` numbers a lock, and a
+        // replacement that re-acquires goes through exactly that; numbering one here would name a
+        // lock that was never taken. `error` is left alone so a refusal's reason survives to be
+        // read, and `LockEvent::LockRequested` clears it when the next attempt starts.
+        LockEvent::RendererLost => {
+            state.active = false;
+            state.requested = false;
+            state.authenticating = false;
         }
     }
 }
@@ -342,6 +368,57 @@ mod tests {
     /// otherwise be indistinguishable from one that left it alone.
     fn locked_with_one_failure() -> LockState {
         LockState { active: true, authenticating: true, attempts: 1, error: "authentication failed".to_string(), requested: false, acquisition: 4 }
+    }
+
+    #[test]
+    fn losing_the_renderer_clears_active_so_a_replacement_may_request_the_lock_again() {
+        let mut state = locked_with_one_failure();
+
+        apply(&mut state, LockEvent::RendererLost);
+
+        assert!(!state.active, "the lock object died with the process that held it");
+        assert!(!state.requested, "a request nothing will answer must not keep the swap gate shut forever");
+        // `LockController::lock` refuses while `active`, on the correct assumption that a live
+        // Renderer already holds one. Clearing it is the whole point: without this the replacement's
+        // re-acquisition is dropped before it reaches the wire (docs/adr/0058 decision 4).
+    }
+
+    #[test]
+    fn losing_the_renderer_rejects_a_pam_answer_that_was_already_in_flight() {
+        let mut state = locked_with_one_failure();
+        let in_flight = state.acquisition;
+
+        apply(&mut state, LockEvent::RendererLost);
+
+        assert!(
+            !accepts_outcome(&state, in_flight),
+            "a password answered against a lock whose holder has since died must not be applied: the unlock it would \
+             order is an unlock nobody authenticated for"
+        );
+    }
+
+    #[test]
+    fn losing_the_renderer_releases_the_authenticating_flag_it_was_holding() {
+        let mut state = locked_with_one_failure();
+
+        apply(&mut state, LockEvent::RendererLost);
+
+        // `accepts_outcome`'s doc states the invariant this keeps: every transition that clears
+        // `active` clears `authenticating` in the same arm, so a dropped answer is always one whose
+        // own flag some other transition already released. A stranded `authenticating` would refuse
+        // every future attempt through `may_authenticate`.
+        assert!(!state.authenticating, "the conversation's answer can no longer be applied, so its slot must be free");
+    }
+
+    #[test]
+    fn losing_the_renderer_does_not_renumber_the_acquisition() {
+        let mut state = locked_with_one_failure();
+
+        apply(&mut state, LockEvent::RendererLost);
+
+        // Only a confirmed `Locked` moves `acquisition`, and a replacement that re-acquires goes
+        // through exactly that. Bumping here too would number a lock that was never taken.
+        assert_eq!(state.acquisition, 4);
     }
 
     #[test]

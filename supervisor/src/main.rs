@@ -475,6 +475,12 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     let mut authoritative = Authoritative { generation_id: 0, child: boot_child };
     let mut next_generation_id: u32 = 1;
     let mut restart_brake = RestartBrake::new(RESTART_LIMIT, RESTART_WINDOW);
+    // docs/adr/0058 decision 4. Set when a Renderer dies holding the lock, spent when its
+    // replacement registers. Two flags rather than one because they answer different questions:
+    // `relock_when_connected` is the intent, and `relock_in_flight` is what lets the `LockReport`
+    // arm tell a re-acquisition's answer from an ordinary lock's and say the right thing about it.
+    let mut relock_when_connected = false;
+    let mut relock_in_flight = false;
 
     // The last `StateSnapshot` pushed for each capability to the authoritative generation, keyed
     // by capability name -- reused to hydrate a fresh Candidate's first evaluation with every
@@ -571,16 +577,18 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                         // replays every `last_snapshots` entry through the arm below, the same way
                         // a boot Renderer's does.
                         if was_locked {
-                            // ponytail: decision 4 is what turns this line into a recovery. Until
-                            // it lands the replacement comes up unlocked behind a compositor that
-                            // is still locked, which is exactly the quickshell failure this ADR
-                            // reproduced -- no worse than the Supervisor exiting, and no better.
-                            // Upgrade path: send `SetSessionLock { locked: true }` once the
-                            // replacement registers, and let the Renderer's own acquisition check
-                            // refuse it when the config on disk can no longer authenticate.
+                            // docs/adr/0058 decision 4. The lock object died with the process, so
+                            // the Supervisor's `active` no longer describes anything this shell
+                            // holds; `RendererLost` says so, and is what lets `lock()` through at
+                            // all, since it drops a request while `active`.
+                            //
+                            // The request waits for the replacement to register rather than going
+                            // out now: `send_frame_logged` needs a connection, and there is not one
+                            // until the new process connects.
+                            lock.record(lock::LockEvent::RendererLost);
+                            relock_when_connected = true;
                             eprintln!(
-                                "the session is still locked and generation {replacement_generation_id} will not retake the lock: \
-                                 re-acquisition is docs/adr/0058 decision 4 and is not built yet, so the way back in is a VT switch"
+                                "the session is still locked, so generation {replacement_generation_id} will be asked to retake the lock once it connects"
                             );
                         }
                     }
@@ -612,6 +620,21 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 if generation_id == authoritative.generation_id {
                     for snapshot in last_snapshots.values() {
                         send_frame_logged(&registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
+                    }
+                    // docs/adr/0058 decision 4, and it must come after the replay above: the lock
+                    // screen reads `oblisk.lock` and whatever else its tree samples, and a lock
+                    // acquired before hydration paints one frame of defaults on the one surface
+                    // where a blank frame is indistinguishable from a broken shell.
+                    //
+                    // No check here that the config can still authenticate. That predicate lives in
+                    // the Renderer, which refuses the lock and reports `Refused` when its tree has
+                    // no way to reach PAM (docs/adr/0052 decision 3) -- the same check a first lock
+                    // passes through, rather than a second copy of it here that could disagree.
+                    if relock_when_connected {
+                        relock_when_connected = false;
+                        relock_in_flight = true;
+                        eprintln!("asking generation {generation_id} to retake the session lock (docs/adr/0058 decision 4)");
+                        lock.lock();
                     }
                 }
             }
@@ -797,6 +820,20 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                     // Renderer answered, followed by a refusal (a config that declared no `lock`
                     // node, docs/adr/0052 decision 3), would otherwise leave a swap owed that
                     // nothing ever redeems, and the config could never reload again.
+                    if std::mem::take(&mut relock_in_flight) {
+                        match &report.outcome {
+                            shared::LockOutcome::Locked => eprintln!("the replacement retook the session lock; the lock screen is back on the glass"),
+                            // The outcome docs/adr/0058 decision 4 exists to report honestly. The
+                            // wording is deliberately not `lock_stays_authenticatable`'s, which ends
+                            // "the lock screen that is on screen still stands": after a crash
+                            // nothing is on screen but the compositor's own fallback.
+                            shared::LockOutcome::Refused(reason) => eprintln!(
+                                "the replacement could not retake the session lock: {reason}. The session stays locked with no lock screen on it, \
+                                 so the way back in is a VT switch (docs/adr/0058 decision 4)"
+                            ),
+                            other => eprintln!("the replacement's lock re-acquisition ended as {other:?} rather than a lock"),
+                        }
+                    }
                     lock.record(lock::LockEvent::Reported(report.outcome));
                     push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "lock", &lock.snapshot());
                     if !lock.defers_swap() && std::mem::take(&mut swap_owed_on_unlock) {
