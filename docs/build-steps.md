@@ -2624,6 +2624,12 @@ second shell over the running session. Found by running it. It sat there for twe
 deleted, because the flag they name is worth building. A config that fails to load should say so at a
 shell prompt, not by taking over the screen.
 
+Half of that is no longer true, by accident. docs/adr/0059 decision 1 makes the Renderer exit when
+the Supervisor's control socket is gone, and a Renderer launched from a shell prompt has no
+Supervisor at all, so the command above now exits `70` in a fraction of a second instead of holding
+the render node until someone finds it. The flag still does not exist and the command still
+validates nothing. What it no longer does is take over the session while failing to.
+
 ---
 
 ## 7. Continuation Testing & Validation Protocols

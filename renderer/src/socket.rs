@@ -78,9 +78,10 @@
 //!
 //! Deliberately deferred: real generation-ID assignment tied to process spawning (a later phase,
 //! once Phase 7/8's spawn primitives are wired to this transport) -- for now the generation ID
-//! comes from the `OBLISK_GENERATION_ID` env var, defaulting to `0`; reconnection if the
-//! connection drops (mirrors `supervisor/src/socket.rs`'s own "no accept-loop restart policy"
-//! ceiling, same reasoning, symmetric on this side).
+//! comes from the `OBLISK_GENERATION_ID` env var, defaulting to `0`. Reconnection if the
+//! connection drops is not deferred, it is refused: docs/adr/0059 decision 1 makes a dropped
+//! connection this process's exit, because the Supervisor holds every capability, every
+//! `process.run` child and PAM, so there is no useful shell left on this side to reconnect *with*.
 //!
 //! Real PBA handshake wiring (build-steps.md Phase 14, § 15.2-15.3, closing docs/adr/0019 items
 //! 1/3/6; Phase 15 item 2 adds `SecureSubmit`): `ReadySignal`, `PresentationEvidence` and
@@ -129,10 +130,11 @@ async fn connect_and_handshake(path: &Path, generation_id: u32) -> Result<UnixSt
     Ok(stream)
 }
 
-/// Spawns the dedicated connect-and-hold-open thread. Connection failures (no Supervisor
-/// listening yet, wrong path) are logged, not fatal -- build-steps.md doesn't yet define a
-/// startup-ordering guarantee between the two processes; the Wayland thread keeps running with
-/// nothing on the other end of its two channels.
+/// Spawns the dedicated connect-and-hold-open thread. A connection failure (wrong path, a
+/// Supervisor that is not there) logs and ends this thread, which drops `inbound_tx`, which the
+/// Wayland thread reads as `Disconnected` and exits on (docs/adr/0059 decision 1). There is no
+/// startup race to tolerate: `supervisor/src/main.rs` binds the control socket before it spawns
+/// the first Renderer, so nothing legitimate reaches this path with the Supervisor alive.
 pub fn spawn_client(generation_id: u32, inbound_tx: std::sync::mpsc::Sender<SupervisorFrame>, outbound_rx: mpsc::UnboundedReceiver<RendererFrame>) {
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread().enable_io().build() {

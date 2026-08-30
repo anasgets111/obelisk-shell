@@ -629,12 +629,11 @@ pub fn run(
         // channel now (docs/adr/0039), so a burst of `StateSnapshot` pushes must not be spread
         // one per 15ms poll tick the way a lone `ActivateDraw` nonce could afford to be.
         //
-        // ponytail: `try_recv`'s `Err` collapses `Disconnected` and `Empty` alike, so a dead
-        // socket thread (pump exited, see `crate::socket`) reads the same as an idle one -- this
-        // process spins its 15ms poll forever with a live but unreachable shell. Predates this
-        // diff, but the blast radius is wider now that the VM and scene live on this same
-        // surviving thread (docs/adr/0039). Not fixed here: adding an exit path on disconnect is
-        // a policy change outside this refactor's scope.
+        // `Disconnected` is a separate answer from `Empty` here, and that is docs/adr/0059
+        // decision 1. It used to be one answer: `while let Ok(frame)` treated a dead socket thread
+        // (pump exited, see `crate::socket`) exactly like an idle one, so killing the Supervisor
+        // left this process spinning its 15ms poll forever at 17.8% of a core, painting a shell
+        // with no capability data behind it and no way to reach one.
         // One turn is three ordered stages: drain everything, re-resolve once, then draw. An
         // `ActivateDraw` nonce is therefore collected here rather than serviced in place. Drawing
         // in the loop body painted whatever layout the scene happened to hold at that instant, so
@@ -648,7 +647,22 @@ pub fn run(
         // one owes the Supervisor its own `PresentationEvidence` per surface, so none may be
         // dropped by coalescing.
         let mut draw_nonces: Vec<u64> = Vec::new();
-        while let Ok(frame) = inbound_rx.try_recv() {
+        loop {
+            let frame = match inbound_rx.try_recv() {
+                Ok(frame) => frame,
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                // `std::process::exit`, not `app.exit = true`. Breaking the loop returns from `run`
+                // and drops `App`, and SCTK's `SessionLockInner::Drop` sends a bare
+                // `ext_session_lock_v1.destroy`, which is the `invalid_destroy` protocol error once
+                // `locked` has been sent -- the one error docs/adr/0052 was built to stay away
+                // from. SCTK calls that choice failing secure and it is right, but the error is
+                // avoidable: skipping the destructor closes the connection instead, which the
+                // compositor treats as the same lock client death and logs as nothing.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("[oblisk-renderer] {}", supervisor_gone_report(app.session_lock.is_some()));
+                    std::process::exit(EXIT_SUPERVISOR_GONE);
+                }
+            };
             match app.client.handle_frame(frame) {
                 FrameOutcome::Handled => {}
                 FrameOutcome::ActivateDraw(nonce) => draw_nonces.push(nonce),
@@ -1088,6 +1102,32 @@ const LOCK_DENIED: &str =
 const LOCK_TORN_DOWN: &str =
     "the compositor ended the session lock through its own mechanism; the session is unlocked and the lock screen is gone \
      (`ext_session_lock_v1::finished` after `locked`)";
+
+/// The exit code this process uses when the Supervisor's control socket is gone (docs/adr/0059
+/// decision 1). Nobody is left to read it -- the process that classifies Renderer exit codes is the
+/// one that just died -- so this is for a journal and a `$status`, not for a handshake. Distinct
+/// from `0` because this is not a clean exit, and distinct from `1` because it is not a failure of
+/// anything this process was asked to do.
+const EXIT_SUPERVISOR_GONE: i32 = 70;
+
+/// What this process says on its way out when the Supervisor's control socket is gone, split on
+/// whether it holds `ext_session_lock_v1` at that moment (docs/adr/0059 decisions 1 and 2).
+///
+/// Pure and split out because the locked half is the one message here that can mislead into an
+/// unrecoverable state, and docs/adr/0058 decision 4 already caught the neighbouring version of
+/// that mistake: a refusal ending "the lock screen that is on screen still stands" is true of a
+/// vetoed reload and false of a process that is exiting.
+fn supervisor_gone_report(holds_session_lock: bool) -> &'static str {
+    if holds_session_lock {
+        "the Supervisor's control socket is gone while this Renderer holds the session lock. PAM runs in the Supervisor (docs/adr/0028), so this \
+         lock screen can no longer authenticate anyone, and exiting without unlocking is what keeps a `kill` from being a way past a lock screen. \
+         The session stays locked behind whatever the compositor puts up for a lock client that died, and the way back in is a VT switch \
+         (docs/adr/0059 decision 2)"
+    } else {
+        "the Supervisor's control socket is gone, so this Renderer has no capability data, no `process.run` and no PAM left to serve. Exiting \
+         rather than painting a shell that still takes clicks and answers none of them (docs/adr/0059 decision 1)"
+    }
+}
 
 /// What one `SetSessionLock` asks this process to do, decided before any Wayland object is touched
 /// (docs/adr/0042, docs/adr/0052 decisions 3 and 4).
@@ -4804,6 +4844,34 @@ smithay_client_toolkit::delegate_dispatch2!(App);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_supervisor_that_vanished_while_the_lock_was_up_reports_a_locked_session_and_not_a_lock_screen() {
+        // docs/adr/0059 decision 2, and it is the trap docs/adr/0058 decision 4 already named once:
+        // `lock_stays_authenticatable`'s refusal ends with "the lock screen that is on screen still
+        // stands", which is true of a refused reload and false of this. This process is about to
+        // exit, so what is left on the glass is the compositor's own fallback, and the message must
+        // send the reader to a VT rather than to a password field that no longer exists.
+        let report = supervisor_gone_report(true);
+        assert!(report.contains("VT"), "the locked report must name the only way back in: {report}");
+        assert!(!report.contains("still stands"), "nothing this process painted is still on screen: {report}");
+
+        // And it must not read as an unlock. Exiting while holding the lock is what keeps the
+        // session secure (SCTK's own `SessionLockInner::Drop` comment calls the same choice
+        // "failing secure"), so a message saying the session was unlocked would be a lie about the
+        // one fact a reader of this line most needs.
+        assert!(!report.contains("unlocked"), "the exit does not unlock: {report}");
+    }
+
+    #[test]
+    fn a_supervisor_that_vanished_with_no_lock_up_says_nothing_about_locks() {
+        // The two cases cost different things and read differently. A Renderer that dies unlocked
+        // costs a bar, which is the same split docs/adr/0058 decision 2 makes on the other side of
+        // the boundary.
+        let report = supervisor_gone_report(false);
+        assert!(!report.contains("VT"), "no lock was up, so a VT switch is not the story: {report}");
+        assert_ne!(report, supervisor_gone_report(true));
+    }
 
     #[test]
     fn a_lock_is_refused_when_the_config_declares_no_lock_surface() {

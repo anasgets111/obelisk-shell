@@ -173,6 +173,33 @@ fn classify_departure(status: std::process::ExitStatus) -> RendererDeparture {
     }
 }
 
+/// Why `run_supervisor` returned, and the process exit code it becomes (docs/adr/0059 decision 3).
+///
+/// The distinction exists for the service manager and nothing else. `packaging/oblisk-shell.service`
+/// restarts this process on every exit but one, so the one exit that must not be restarted needs a
+/// code of its own to be named in `RestartPreventExitStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shutdown {
+    /// `SIGINT`, `SIGTERM`, or every channel closing. Rerunning the shell is recovery.
+    Requested,
+    /// [`RestartBrake`] refused another respawn. Rerunning the shell hands the same config to a
+    /// fresh Renderer, which dies the same way, three more times, once a minute, forever.
+    RestartBrakeTripped,
+}
+
+impl Shutdown {
+    /// `3` is arbitrary in the way every sentinel exit code is arbitrary. What matters is that it
+    /// is not `0` (a clean exit, which this is not), not `1` (what `main`'s `?` already produces
+    /// for a startup failure), and not a code the shell conventions reserve for signals (128 and
+    /// up) or for "command not found" (127).
+    fn exit_code(self) -> i32 {
+        match self {
+            Shutdown::Requested => 0,
+            Shutdown::RestartBrakeTripped => 3,
+        }
+    }
+}
+
 /// docs/adr/0058 decision 3's stop condition: at most `limit` restarts inside any `window`.
 ///
 /// The brake is the decision, not the respawn. A config that kills the Renderer on evaluation kills
@@ -244,10 +271,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     if std::env::var_os("OBLISK_PAM_WORKER").is_some() {
         return pam_worker::run_worker();
     }
-    tokio::runtime::Runtime::new()?.block_on(run_supervisor())
+    // `std::process::exit` rather than returning: the exit code is the whole point of the
+    // `Shutdown` value, and `main`'s `Result` can only ever produce `0` or `1` (docs/adr/0059
+    // decision 3). Every teardown `run_supervisor` owns has already run by the time it returns.
+    let shutdown = tokio::runtime::Runtime::new()?.block_on(run_supervisor())?;
+    std::process::exit(shutdown.exit_code());
 }
 
-async fn run_supervisor() -> Result<(), Box<dyn Error>> {
+async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     let connection = zbus::Connection::system().await?;
     let subject = current_session_subject()?;
 
@@ -522,6 +553,9 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     // Set only by the departure arm below, so the shutdown reap can tell "the Renderer is still
     // running and needs reaping" from "it is already gone and `wait` has already collected it".
     let mut renderer_departed = false;
+    // Every `break` below leaves this alone except the brake's, which is the one exit a service
+    // manager must not restart into (docs/adr/0059 decision 3).
+    let mut shutdown = Shutdown::Requested;
 
     loop {
         tokio::select! {
@@ -560,6 +594,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                          handed rather than a transient (docs/adr/0058 decision 3)",
                         RESTART_WINDOW.as_secs()
                     );
+                    shutdown = Shutdown::RestartBrakeTripped;
                     break;
                 }
                 let replacement_generation_id = next_generation_id;
@@ -1163,7 +1198,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     // Best-effort: `socket::bind`'s own stale-file removal covers a missed unlink (a crash,
     // `SIGKILL`) on the *next* boot regardless, so a failure here isn't fatal to anything.
     let _ = std::fs::remove_file(&socket_path);
-    Ok(())
+    Ok(shutdown)
 }
 
 #[cfg(test)]
@@ -1181,6 +1216,25 @@ mod tests {
 
     fn killed_by(signal: i32) -> std::process::ExitStatus {
         std::process::ExitStatus::from_raw(signal)
+    }
+
+    #[test]
+    fn a_tripped_restart_brake_exits_with_a_code_a_service_manager_will_not_restart() {
+        // docs/adr/0059 decision 3. systemd's own default start limit (5 starts in 10s) catches a
+        // fast restart loop without help. The brake's give-up is not fast: three Renderers have to
+        // die first, and `RESTART_WINDOW` is 60s, so a restart policy that could not tell this exit
+        // from a signal would rerun the whole stack about once a minute, forever, under every rate
+        // limit systemd applies by default. The code is what carries the difference to the unit.
+        assert_ne!(Shutdown::RestartBrakeTripped.exit_code(), Shutdown::Requested.exit_code());
+        assert_ne!(Shutdown::RestartBrakeTripped.exit_code(), 0, "a give-up is not a clean exit");
+    }
+
+    #[test]
+    fn a_requested_shutdown_exits_cleanly_so_a_restart_policy_treats_it_as_one() {
+        // SIGTERM at session end is the ordinary way this process dies, and it must not look like
+        // a failure -- `RestartPreventExitStatus` names one code, so every other exit has to mean
+        // "restarting me is recovery".
+        assert_eq!(Shutdown::Requested.exit_code(), 0);
     }
 
     #[test]
