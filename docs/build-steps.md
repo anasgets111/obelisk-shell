@@ -1915,9 +1915,19 @@ changes, and `os.execute` is `nil`.
 > and `components/pill.lua` (the second of which requires a module of its own, so it also pins
 > transitive resolution), and a config that deletes `package` failing its next reload loudly.
 >
-> **Still not covered: the reload itself.** Nothing has yet edited `config/theme.lua` against a
-> running session and watched the bar recolour without a restart, which is the one check that
-> exercises the watcher and the loader together.
+> **The reload itself now runs.** Against a live session, editing `BG` in `config/theme.lua` painted
+> the bar dark red and reverting it painted the bar back, with no restart between them: three scene
+> applications of six surfaces each, one at startup and one per edit. That is the one check that
+> exercises the watcher and the loader together, and both halves of ADR-0047 needed it. Neither
+> `package.path` resolving `config.theme` inside the config directory nor the dropped
+> `package.loaded` had ever run outside a unit test.
+>
+> The log alone does not prove it, which is worth recording because the obvious automated check is
+> the weak one. Counting applied scenes cannot attribute them: the wallpaper went from `1200.0` to
+> `1166.0` between the first batch and the second, which is the bar's 34px exclusive zone landing,
+> and that reconfigure drives a re-resolve on its own. Three batches for two edits is equally
+> consistent with one edit doing nothing and the compositor supplying the extra. Only the colour on
+> the glass separates those, and only a human watching the screen saw it.
 >
 > One limit worth recording, met while trying to test deeper: a bare `Loader` cannot `require` an
 > indicator, because an indicator reads `oblisk.audio` at require time and the `oblisk` table is
