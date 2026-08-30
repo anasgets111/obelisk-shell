@@ -93,6 +93,26 @@ to the lock it was started for) and gives the re-acquired lock its own identity 
 Where a compositor refuses the takeover, this degrades to what the user already has today, a locked
 session and a VT switch, and it must say so rather than retry into the brake.
 
+**Refined after writing this ADR: the replacement re-acquires only if the config on disk still
+passes the acquisition predicate.** "Take the lock again" is not enough on its own, and the reason
+is that a crash destroys every protection a reload enjoys. A reload while locked is defended four
+ways: deleting the `lock` node is topology so `defers_swap` queues it until unlock; an apply that
+would leave the lock tree unable to authenticate is vetoed by `lock_stays_authenticatable`; a failed
+evaluation leaves the prior applied scene untouched; and restyling is deliberately left to apply
+live. Every one of those is a property of a *live* generation. The veto compares against the scene
+on screen, rollback restores a prior scene, and the swap gate protects the process holding the lock
+object. After a crash there is no scene on screen, no prior scene, and no process.
+
+So a replacement evaluates whatever `shell.lua` says on disk now, with no memory of what worked when
+the lock was taken. What saves this is that ADR-0052 decision 3's check is a precondition rather than
+a rollback. Exactly one `textfield` carrying a `secure_submit` for `("lock", "authenticate")` is a
+question a process with no history can still answer. A replacement that cannot satisfy it must
+refuse the lock and say so, rather than present a lock screen with no way out.
+
+One implementation trap this creates: `lock_stays_authenticatable`'s refusal message ends with "the
+lock screen that is on screen still stands". After a crash nothing is on screen but the compositor's
+fallback, so the respawn path must not reuse that wording.
+
 ## Consequences
 
 **ADR-0042's swap gate stays, and is still the primary defence.** Deferring a generation swap while
@@ -112,6 +132,17 @@ spinning its 15ms poll at 17.8% of a core with a shell nobody can reach. It surv
 like an idle one (the `ponytail:` at `renderer/src/wayland/mod.rs:634`). This ADR does not fix that
 direction. It is named here so the next reader does not mistake the crash path being covered for
 the process boundary being covered.
+
+## Rejected: pin the last known-good config for a lock-time respawn
+
+Since a replacement loses the tree that was working, the Supervisor could keep the last config that
+successfully took the lock and hand the replacement that instead of what is on disk.
+
+Rejected as more mechanism than the problem needs. The acquisition predicate above already catches
+the case this would defend against, and pinning buys that at the cost of silently running code the
+user has since edited, on the one screen where an unexplained surprise is least recoverable. A user
+who broke their lock config and crashed their Renderer is better served by a refusal that names the
+reason than by a lock screen built from a file they no longer have.
 
 ## Rejected: let a session manager restart the whole stack
 
