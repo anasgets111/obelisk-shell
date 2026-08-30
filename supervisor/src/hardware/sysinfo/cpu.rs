@@ -10,10 +10,9 @@ pub struct CpuSample {
     pub idle_total: u64,
 }
 
-/// Parses `/proc/stat`'s aggregate `cpu` line (the first line -- `cpuN` per-core lines are
-/// rejected, this only ever wants the aggregate). Tolerant of fewer than the full 10 fields
-/// (older kernels), as long as at least `user nice system idle` (4) are present -- matches
-/// `/proc/stat`'s own documented minimum.
+/// Parses `/proc/stat`'s aggregate `cpu` line (the first line; `cpuN` per-core lines are
+/// rejected). Tolerant of fewer than the full 10 fields (older kernels), as long as at least
+/// `user nice system idle` (4) are present, matching `/proc/stat`'s documented minimum.
 pub fn parse_stat_line(line: &str) -> Option<CpuSample> {
     let mut fields = line.split_whitespace();
     if fields.next()? != "cpu" {
@@ -30,7 +29,7 @@ pub fn parse_stat_line(line: &str) -> Option<CpuSample> {
 
 /// The busy-percentage delta between two samples (docs/adr/0035: `busy = total -
 /// (idle+iowait)`, `percent = 100 * busy_delta / total_delta`). `0` if no time elapsed
-/// between the two samples (`total_delta == 0`) rather than dividing by zero.
+/// (`total_delta == 0`) rather than dividing by zero.
 pub fn delta_percent(prev: &CpuSample, current: &CpuSample) -> u8 {
     let total_delta = current.total.saturating_sub(prev.total);
     if total_delta == 0 {
@@ -42,8 +41,7 @@ pub fn delta_percent(prev: &CpuSample, current: &CpuSample) -> u8 {
 }
 
 /// Reads and parses `{proc_root}/stat`'s aggregate `cpu` line. `proc_root` is a parameter,
-/// never a hardcoded `/proc` (docs/oblisk-tdd-test-harness.md's mandate) -- the real caller
-/// passes `Path::new("/proc")`, tests point it at a `tempfile::tempdir()`.
+/// never hardcoded `/proc` (docs/oblisk-tdd-test-harness.md's mandate).
 pub fn read_sample(proc_root: &std::path::Path) -> std::io::Result<CpuSample> {
     let content = std::fs::read_to_string(proc_root.join("stat"))?;
     let line = content.lines().next().unwrap_or("");

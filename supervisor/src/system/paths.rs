@@ -1,22 +1,15 @@
 //! Where `state.json` lives on disk (docs/oblisk-idl-api-specs.md §2.11: `system.state` is
-//! "loaded from `$XDG_STATE_HOME/oblisk/state.json`"). Split out from `controller.rs` because
-//! it is the one seam in this capability that touches the filesystem layout rather than time or
-//! JSON shape, and keeping it a free function over plain `Path` arguments (no `std::env` call
-//! inside it) is what makes it directly testable -- the same shape
-//! `dbus::notifications::icon::default_trusted_icon_roots` / `validate_trusted_path` split into:
-//! a thin env-reading wrapper the caller owns, and a pure resolver this module owns.
+//! "loaded from `$XDG_STATE_HOME/oblisk/state.json`"). Split out from `controller.rs`: a thin
+//! env-reading wrapper the caller owns, and this pure resolver over plain `Path` arguments
+//! (no `std::env` call inside it), which is what makes it directly testable.
 
 use std::path::{Path, PathBuf};
 
 /// `home`/`xdg_state_home` are both roots the caller already resolved from the real environment
-/// (`SystemController::new`'s job, mirroring `PrivacyController::new`'s `proc_root`/
-/// `video4linux_root` parameters) -- this function never reads `std::env` itself, so every case
-/// the base-directory spec distinguishes is reachable from a test without touching the process
-/// environment.
+/// -- this function never reads `std::env` itself, so every case is reachable from a test.
 ///
 /// `xdg_state_home` present wins outright, per the spec: `$XDG_STATE_HOME/oblisk/state.json`.
-/// Absent, it falls back to `<home>/.local/state/oblisk/state.json`, the base-directory spec's
-/// own default for `XDG_STATE_HOME` when unset.
+/// Absent, it falls back to `<home>/.local/state/oblisk/state.json`.
 pub fn resolve_state_path(home: &Path, xdg_state_home: Option<&Path>) -> PathBuf {
     match xdg_state_home {
         Some(dir) => dir.join("oblisk").join("state.json"),

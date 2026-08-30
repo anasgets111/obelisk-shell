@@ -1,9 +1,5 @@
 //! [`UpdatesController`]: the `oblisk.updates` write-action dispatcher and state owner
-//! (ADR-0034). Same interval-suspend-at-zero *shape* as `hardware::sysinfo::controller`'s
-//! watch-channel scheduler, but deliberately zero shared code -- the ADR's own instruction
-//! ("the user asked for these to have nothing to do with each other"), so this is a fresh,
-//! independent implementation, not a shared helper. Split from `updates` -- see `updates/mod.rs`
-//! for the module-level doc.
+//! (ADR-0034). Split from `updates` -- see `updates/mod.rs` for the module-level doc.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -18,10 +14,9 @@ use super::install::{needs_reboot, parse_install_step};
 use super::pacman_conf::resolve_repo_servers;
 use crate::process;
 
-/// `oblisk.updates`'s combined payload. `check_error`/`install_error` are `None` when nothing's
-/// gone wrong -- not a fabricated empty string. `install_total_steps == 0` while `installing` is
-/// true means the transaction size isn't known yet (pacman hasn't printed it), matching the
-/// dotfiles' `UpdateService.qml`'s `progressDeterminate` concept without a separate bool field.
+/// `oblisk.updates`'s combined payload. `check_error`/`install_error` are `None` when
+/// nothing's gone wrong, not a fabricated empty string. `install_total_steps == 0` while
+/// `installing` is true means the transaction size isn't known yet (pacman hasn't printed it).
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct UpdatesState {
     pub count: u32,
@@ -41,9 +36,8 @@ pub enum UpdatesSignal {
     Changed,
 }
 
-/// `updates:configure({interval})`'s `arguments: [{interval}]` -- a table argument (mirrors
-/// `sysinfo:configure`'s shape, ADR-0034's own choice of braces in `updates:configure({interval})`
-/// over a bare positional arg), even though there's only one field today.
+/// `updates:configure({interval})`'s `arguments: [{interval}]` -- a table argument (ADR-0034),
+/// even though there's only one field today.
 pub fn parse_configure_args(arguments: &[serde_json::Value]) -> Option<u64> {
     arguments.first()?.as_object()?.get("interval")?.as_u64()
 }
@@ -58,8 +52,8 @@ fn poll_mode(interval: Duration) -> PollMode {
     if interval.is_zero() { PollMode::Dormant } else { PollMode::Ticking(interval) }
 }
 
-/// `Clone` (mirrors `IdleController`/`KeyboardController`) so `main.rs` can hand a cheap
-/// `Arc`-backed copy to the `tokio::spawn`ed task `updates:install()`'s dispatch arm needs.
+/// `Clone` so `main.rs` can hand a cheap `Arc`-backed copy to the `tokio::spawn`ed task
+/// `updates:install()`'s dispatch arm needs.
 #[derive(Clone)]
 pub struct UpdatesController {
     state: Arc<Mutex<UpdatesState>>,
@@ -69,10 +63,8 @@ pub struct UpdatesController {
 
 impl UpdatesController {
     /// `pacman_conf_path`/`pacman_db_root` (real defaults `/etc/pacman.conf`/`/var/lib/pacman`)
-    /// are injected, not hardcoded (`docs/oblisk-tdd-test-harness.md`'s convention). Starts
-    /// dormant (`Duration::ZERO`) -- nothing checks for updates until Lua calls
-    /// `updates:configure` at least once, matching every other opt-in interval mechanism already
-    /// in this codebase.
+    /// are injected, not hardcoded. Starts dormant (`Duration::ZERO`) -- nothing checks for
+    /// updates until Lua calls `updates:configure` at least once.
     pub fn new(pacman_conf_path: PathBuf, pacman_db_root: PathBuf, events: UnboundedSender<UpdatesSignal>) -> Self {
         let state = Arc::new(Mutex::new(UpdatesState::default()));
         let (interval_tx, interval_rx) = watch::channel(Duration::ZERO);
@@ -86,16 +78,11 @@ impl UpdatesController {
         }
     }
 
-    /// `updates:install()`. A no-op (logged) if an install is already running -- pacman itself
-    /// doesn't support two concurrent transactions against the same db lock, so a second
-    /// `install()` call while one is in flight would just fail loudly against that lock; better
-    /// to short-circuit here with a clear log line. The check-and-set is one atomic critical
-    /// section under a single lock acquisition (Correctness review): two `updates:install()`
-    /// commands dispatched close together each land in their own `tokio::spawn`ed task on
-    /// `main.rs`'s multi-thread runtime, so a check and a *separate* later set (two lock
-    /// acquisitions, as this used to be) leaves a real window for both to observe `installing
-    /// == false` and both launch a real `pkexec pacman -Syu` concurrently against the same
-    /// system pacman db.
+    /// `updates:install()`. A no-op (logged) if an install is already running -- pacman doesn't
+    /// support two concurrent transactions against the same db lock. The check-and-set is one
+    /// atomic critical section under a single lock acquisition: two `install()` calls dispatched
+    /// close together could otherwise both observe `installing == false` and both launch
+    /// `pkexec pacman -Syu` concurrently against the same db.
     pub async fn install(&self) {
         {
             let mut guard = self.state.lock().unwrap();
@@ -119,20 +106,13 @@ impl UpdatesController {
     }
 }
 
-/// Copies `pacman_db_root`'s `local/` subdirectory (the installed-package metadata `alpm` reads
-/// -- `sync/` doesn't need pre-copying, `check_for_updates`'s own `update(true)` overwrites it
-/// with a fresh download regardless of what's there) into a fresh `tempfile::tempdir()`, then
-/// runs [`check_for_updates`] against that throwaway copy -- never the real
-/// `pacman_db_root` (`checkupdates`'s own real-world approach, ADR-0034).
+/// Copies `pacman_db_root`'s `local/` subdirectory (the installed-package metadata `alpm`
+/// reads) into a fresh `tempfile::tempdir()`, then checks against that throwaway copy, never
+/// the real `pacman_db_root` (`checkupdates`'s approach, ADR-0034).
 ///
-/// Known limitation (Correctness review, not fixed): no coordination against a concurrently
-/// running real install (`run_install`) mutating this same `local/` directory. A scheduled
-/// check that happens to overlap an in-flight install can surface a spurious, transient
-/// `check_error` (a file disappearing mid-copy) or copy a momentarily inconsistent snapshot --
-/// self-heals on the next scheduled check either way, never corrupts real state (this function
-/// only ever reads the real db, the throwaway copy is discarded after each check). Real
-/// cross-task coordination to close this window is more machinery than a self-healing,
-/// read-only race justifies right now.
+/// Known limitation: no coordination against a concurrently running real install mutating
+/// this same `local/` directory. An overlapping check can surface a spurious, transient
+/// `check_error` or copy an inconsistent snapshot -- self-heals on the next scheduled check.
 fn check_against_a_throwaway_copy(pacman_conf_path: &Path, pacman_db_root: &Path) -> Result<Vec<UpdateCandidate>, String> {
     let throwaway = tempfile::tempdir().map_err(|err| format!("failed to create a throwaway temp dir: {err}"))?;
     let local_src = pacman_db_root.join("local");
@@ -160,11 +140,9 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Runs until every `UpdatesController` (and its `Clone`s) drops. `alpm`'s types aren't `Send`
-/// (raw C pointers under the hood), and the sync itself is genuinely blocking network I/O, so
-/// each check runs inside `tokio::task::spawn_blocking` -- never awaited inline, matching this
-/// codebase's async-hygiene rule (build-steps.md Phase 9) for the same reason
-/// `hardware::idle::notify::connect_wayland_idle`'s real-Wayland setup does.
+/// Runs until every `UpdatesController` (and its `Clone`s) drops. `alpm`'s types aren't
+/// `Send` and the sync is genuinely blocking network I/O, so each check runs inside
+/// `tokio::task::spawn_blocking`, never awaited inline.
 async fn run_check_task(pacman_conf_path: PathBuf, pacman_db_root: PathBuf, mut interval_rx: watch::Receiver<Duration>, state: Arc<Mutex<UpdatesState>>, events: UnboundedSender<UpdatesSignal>) {
     loop {
         let interval = *interval_rx.borrow_and_update();
@@ -176,13 +154,9 @@ async fn run_check_task(pacman_conf_path: PathBuf, pacman_db_root: PathBuf, mut 
             }
             PollMode::Ticking(duration) => {
                 let mut ticker = tokio::time::interval(duration);
-                // Correctness review: a check can genuinely run longer than a short configured
-                // interval (real network I/O, unlike sysinfo's fast local sysfs/procfs reads).
-                // `tokio::time::interval`'s default `MissedTickBehavior::Burst` would then fire
-                // every missed tick back-to-back the moment the slow check finally returns to
-                // this `select!`, hammering the mirrors instead of settling back into the
-                // configured cadence -- `Delay` instead just resumes ticking `duration` after
-                // the check actually finished.
+                // A check can genuinely run longer than a short configured interval (real
+                // network I/O); the default `Burst` behavior would then fire every missed tick
+                // back-to-back, hammering the mirrors -- `Delay` resumes ticking after the check finishes.
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 ticker.tick().await; // tokio::time::interval's first tick fires immediately; consume it unused
                 loop {
@@ -223,13 +197,10 @@ fn now_unix() -> i64 {
 }
 
 /// The real, system-modifying install: `pkexec pacman -Syu --noconfirm` against the real
-/// `/etc/pacman.conf`/`/var/lib/pacman` as root, no throwaway anything (unlike `check`'s
-/// read-only sync). Streams stdout line by line, parsing progress via
-/// `install::parse_install_step` and writing it into `state` as it goes -- the capability owns
-/// install + progress, Lua never sees raw subprocess output (ADR-0034). Assumes `state.installing`
-/// is already `true` and its progress fields already reset -- `UpdatesController::install`'s own
-/// atomic check-and-set does that, as one critical section with the "already running?" check
-/// (Correctness review); this function only ever runs once that's already been established.
+/// `/etc/pacman.conf`/`/var/lib/pacman` as root, no throwaway copy. Streams stdout line by
+/// line, parsing progress via [`parse_install_step`] and writing it into `state` as it goes --
+/// Lua never sees raw subprocess output (ADR-0034). Assumes `state.installing` and its
+/// progress fields are already set by [`UpdatesController::install`]'s atomic check-and-set.
 async fn run_install(state: Arc<Mutex<UpdatesState>>, events: UnboundedSender<UpdatesSignal>) {
     let child = match process::spawn_group_leader_piped("pkexec", &["pacman".to_string(), "-Syu".to_string(), "--noconfirm".to_string()], &[]) {
         Ok(child) => child,
@@ -245,19 +216,13 @@ async fn run_install(state: Arc<Mutex<UpdatesState>>, events: UnboundedSender<Up
     run_install_with_child(state, events, child).await;
 }
 
-/// Split from [`run_install`] so the stdout-driven progress loop can be exercised against a
-/// stub child process in a test, without needing a real `pkexec`/`pacman` on the test machine.
-/// Sends `UpdatesSignal::Changed` on every parsed progress line, not just at the end -- ADR-0034:
-/// install's progress fields "ride the updates signal" the same way a check's results do, so a
-/// live install shows incremental per-package progress to Lua, not just a start/end jump.
+/// Split from [`run_install`] so the stdout-driven progress loop can be tested against a stub
+/// child process, without a real `pkexec`/`pacman`. Sends `UpdatesSignal::Changed` on every
+/// parsed progress line (ADR-0034), not just at the end.
 async fn run_install_with_child(state: Arc<Mutex<UpdatesState>>, events: UnboundedSender<UpdatesSignal>, mut child: tokio::process::Child) {
-    // Drained concurrently on its own task, not left unread (Correctness review): a real
-    // `pacman -Syu` upgrade routinely writes one "installed as .pacnew"/conflict warning per
-    // touched config file to stderr -- easily enough to fill the pipe's ~64KiB kernel buffer on
-    // a moderate upgrade. Once full, pacman's own `write()` to stderr blocks, which blocks the
-    // whole (single-threaded) pacman process, which means it never produces more stdout and
-    // never exits -- `child.wait().await` below would then never return, wedging `installing`
-    // at `true` permanently. Logged (not silently discarded) so real warnings stay visible.
+    // Drained concurrently on its own task, not left unread: a real `pacman -Syu` upgrade can
+    // write enough stderr warnings to fill the pipe's ~64KiB kernel buffer, which blocks
+    // pacman's single-threaded process and wedges `installing` at `true` forever. Logged, not discarded.
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
@@ -267,9 +232,8 @@ async fn run_install_with_child(state: Arc<Mutex<UpdatesState>>, events: Unbound
         });
     }
 
-    // Plain local `Vec`, not `Arc<Mutex<_>>` (Standards review): every read and write happens
-    // sequentially within this one function's own loop, never shared with another task -- unlike
-    // `state`, which genuinely is shared with `UpdatesController::snapshot()`.
+    // Plain local `Vec`, not `Arc<Mutex<_>>`: every read/write happens sequentially within
+    // this loop, never shared with another task -- unlike `state`.
     let mut installed_packages: Vec<String> = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         let mut lines = BufReader::new(stdout).lines();
@@ -291,12 +255,8 @@ async fn run_install_with_child(state: Arc<Mutex<UpdatesState>>, events: Unbound
     guard.installing = false;
     match status {
         Ok(status) if status.success() => {
-            // Accumulates (OR), never overwrites: a reboot owed from an earlier install this
-            // process lifetime (e.g. a kernel package updated, then the user ran a second,
-            // unrelated install without rebooting in between) must not be silently cleared just
-            // because *this* install didn't itself touch the kernel. Only a real reboot resets
-            // it, via a fresh `UpdatesState::default()` on the next Supervisor startup -- self-
-            // caught while addressing the Spec review's staleness question, not a filed finding.
+            // Accumulates (OR), never overwrites: a reboot owed from an earlier install must
+            // not be cleared just because this install didn't touch the kernel.
             guard.reboot_required |= needs_reboot(&installed_packages);
         }
         Ok(status) => guard.install_error = Some(format!("pkexec pacman exited with {status}")),
@@ -359,8 +319,7 @@ mod tests {
         assert_eq!(snapshot.install_current_package, "gnome-autoar");
         assert_eq!(snapshot.install_error, None);
 
-        // Correctness: progress must ride the updates signal per-line, not just at the end
-        // (ADR-0034) -- two progress lines plus the final completion signal.
+        // Correctness: progress must ride the updates signal per-line, not just at the end (ADR-0034).
         let mut signal_count = 0;
         while events_rx.try_recv().is_ok() {
             signal_count += 1;

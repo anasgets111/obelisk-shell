@@ -1,9 +1,8 @@
 //! `json` global table (`oblisk-idl-api-specs.md` § 3.3, docs/adr/0057, build-steps.md section 6
 //! item 2) -- the config's only reader for structured subprocess output.
 //!
-//! `process.run`'s `out_cb` fires once per line, newline stripped
-//! (`supervisor/src/process/registry.rs` reads the child through `BufReader::lines()`), so a config
-//! polling `lsblk --json` accumulates lines and decodes the buffer. Without a decoder every such
+//! `process.run`'s `out_cb` fires once per line, newline stripped, so a config polling
+//! `lsblk --json` accumulates lines and decodes the buffer. Without a decoder every such
 //! subprocess is fire-and-forget; with one it is a data source.
 //!
 //! There is no `json.encode`. ponytail: a config cannot build a JSON argument to hand a subprocess,
@@ -16,41 +15,30 @@ use mlua::{IntoLua, Lua, LuaSerdeExt, MultiValue, Value};
 /// The one JSON-to-Lua mapping this engine has. Both callers go through it: a pushed capability
 /// payload (`Loader::to_lua_value`) and `json.decode` below.
 ///
-/// docs/build-steps.md Phase 19 item 16: mlua's serde bridge defaults
-/// `serialize_none_to_null`/`serialize_unit_to_null` to true, which maps `Value::Null` to a
-/// lightuserdata sentinel rather than Lua `nil` -- and lightuserdata is truthy, so
-/// `if payload.field then` took the branch that assumes a real value. Both options are turned
-/// off here so `null` becomes `nil` instead. That also erases the key from the table entirely
-/// rather than leaving it present with a nil-ish value, which is the part a reader coming from
-/// JSON will not expect: it is the same semantics every `x or default` idiom in Lua already
-/// assumes, and it is why `to_lua_value_maps_a_json_null_field_to_a_nil_that_is_absent_from_the_table`
-/// counts keys instead of just comparing `== nil` (indexing a genuinely absent key returns
-/// `nil` too).
+/// mlua's serde bridge defaults `serialize_none_to_null`/`serialize_unit_to_null` to true, which
+/// maps `Value::Null` to a lightuserdata sentinel rather than Lua `nil` -- and lightuserdata is
+/// truthy, so `if payload.field then` took the branch that assumes a real value (docs/build-steps.md
+/// Phase 19 item 16). Both options are turned off here so `null` becomes `nil`, which also erases
+/// the key from the table entirely rather than leaving it present with a nil-ish value.
 ///
-/// The cost, since it is not free and a config author will meet it: a `null` sitting in a JSON
-/// *array* now leaves a hole, and `ipairs` stops at a hole. Measured on `[1, null, 3]`:
-/// `ipairs` yields one element, while `#` returns 3 and `xs[3]` still reads back 3. The old
-/// sentinel filled the hole, so `ipairs` walked all three. This matters because iterating a
-/// capability's list with `ipairs` is exactly what `dev-config/oblisk/shell.lua` already does
-/// for `network.available_networks`. It is still the right trade: a null *field* is the shape
-/// every payload actually has (`icon_path`, `toggle_state`, `icon_name` in a tray menu), a
-/// null array *element* is not one any capability produces today, and the alternative leaves
-/// every optional field truthy. `to_lua_value_a_null_array_element_leaves_a_hole_ipairs_stops_at`
-/// pins the behavior so it is a known quantity rather than a surprise.
+/// The cost: a `null` sitting in a JSON *array* now leaves a hole, and `ipairs` stops at a hole.
+/// Measured on `[1, null, 3]`: `ipairs` yields one element, while `#` returns 3 and `xs[3]` still
+/// reads back 3. Still the right trade: a null *field* is the shape every payload actually has
+/// (`icon_path`, `toggle_state`, `icon_name` in a tray menu), a null array *element* is not one any
+/// capability produces today, and the alternative leaves every optional field truthy.
 pub fn to_lua(lua: &Lua, json: &serde_json::Value) -> mlua::Result<Value> {
     let options = mlua::serde::ser::Options::new().serialize_none_to_null(false).serialize_unit_to_null(false);
     lua.to_value_with(json, options)
 }
 
-/// Both ways this can fail, flattened into the one message `json.decode` hands back. Keeping the
-/// conversion failure inside the `nil`-plus-message contract rather than letting it raise is the
-/// point: a convention a config has to `pcall` around anyway is not a convention, it is a raise with
-/// extra steps. The two are still told apart by their wording, because bad input is the config
-/// author's problem and a conversion failure is this engine's.
+/// Both ways this can fail, flattened into the one message `json.decode` hands back: a convention
+/// a config has to `pcall` around anyway is not a convention, it is a raise with extra steps. The
+/// two are told apart by their wording -- bad input is the config author's problem, a conversion
+/// failure is this engine's.
 ///
 /// The conversion arm is not reached by any test and may not be reachable at all today, since
-/// `from_slice` enforces its own recursion limit and rejects anything deep enough to trouble the
-/// serializer first. It is handled because [`register`]'s doc comment promises it is.
+/// `from_slice` enforces its own recursion limit and rejects anything deep enough first. Handled
+/// because [`register`]'s doc comment promises it is.
 fn decode(lua: &Lua, bytes: &[u8]) -> Result<Value, String> {
     let json: serde_json::Value = serde_json::from_slice(bytes).map_err(|err| err.to_string())?;
     to_lua(lua, &json).map_err(|err| format!("decoded, but could not be converted to a Lua value: {err}"))
@@ -59,28 +47,26 @@ fn decode(lua: &Lua, bytes: &[u8]) -> Result<Value, String> {
 /// Registers the `json` global with `json.decode(text)`.
 ///
 /// The return convention is Lua's own, not cjson's: one value on success, `nil` plus a message on
-/// failure, matching `io.open`. Raising was the alternative and it is wrong here, because a decode
-/// failure is a *routine* path rather than an exceptional one -- `out_cb` delivers a line at a time,
-/// so a config either decodes a partial buffer on every line or decodes whatever a failing
-/// subprocess printed to stdout instead of JSON. Making that raise would put a `pcall` around every
-/// call site. One value on success rather than a trailing `nil` is load-bearing too: with three
-/// arguments `table.insert` reads the second as a *position*, so `table.insert(t, decoded, nil)`
-/// raises "bad argument #2 to 'insert' (number expected, got table)" and inserts nothing. Measured,
-/// not assumed. Accumulating decoded values into a table is the obvious thing to write.
+/// failure, matching `io.open`. Raising is wrong here because a decode failure is a *routine*
+/// path -- `out_cb` delivers a line at a time, so a config often decodes a partial buffer or a
+/// failing subprocess's non-JSON stdout, and raising would put a `pcall` around every call site.
+/// One value on success rather than a trailing `nil` is load-bearing too: with three arguments
+/// `table.insert` reads the second as a *position*, so `table.insert(t, decoded, nil)` raises
+/// "bad argument #2 to 'insert' (number expected, got table)" and inserts nothing. Measured, not
+/// assumed.
 ///
-/// The convention has one ambiguous case, pinned by
+/// One ambiguous case, pinned by
 /// `decode_of_a_bare_top_level_null_is_indistinguishable_from_a_decode_failure`: a bare top-level
-/// `null` decodes successfully to `nil`, which `if t then` reads as failure. Both mean "no data", so
-/// the confusion is harmless, and the fix (a sentinel for a successful null) would reintroduce
-/// exactly the truthy-lightuserdata bug [`to_lua`] exists to avoid.
+/// `null` decodes successfully to `nil`, which `if t then` reads as failure. Both mean "no data",
+/// and the fix (a sentinel for a successful null) would reintroduce the truthy-lightuserdata bug
+/// [`to_lua`] exists to avoid.
 ///
-/// The argument is an `mlua::LuaString`, not a Rust `String`, so a subprocess emitting a non-UTF-8
-/// byte reaches serde as a decode error the config can read instead of an mlua argument-conversion
-/// error raised past its `if err then` check.
+/// The argument is an `mlua::LuaString`, not a Rust `String`, so a non-UTF-8 byte reaches serde as
+/// a decode error the config can read instead of an mlua argument-conversion error raised past its
+/// `if err then` check.
 ///
-/// So `json.decode` does not raise on any input, well-formed or not. The one thing that still can is
-/// Lua failing to allocate the message string itself, which is the same allocation failure every
-/// other call in this file would hit and is not something a config can handle anyway.
+/// `json.decode` does not raise on any input, well-formed or not, short of Lua failing to allocate
+/// the message string itself.
 pub fn register(lua: &Lua) -> mlua::Result<()> {
     let table = lua.create_table()?;
     table.set(
@@ -149,8 +135,7 @@ mod tests {
     fn decode_returns_one_value_on_success_so_it_can_be_forwarded_straight_into_another_call() {
         let lua = lua_with_json();
         // With three arguments `table.insert` reads the second as a position, so a decoder that
-        // always returned a trailing nil would raise here rather than insert, breaking the most
-        // obvious way to accumulate decoded values.
+        // always returned a trailing nil would raise here rather than insert.
         let count: i64 = lua
             .load(r#"local t = {} table.insert(t, json.decode('{"a":1}')) return #t"#)
             .eval()
@@ -174,8 +159,6 @@ mod tests {
         assert!(message.is_some());
     }
 
-    /// The one place the `nil`-plus-message convention is genuinely ambiguous, pinned so it is a
-    /// known quantity rather than a surprise: see the `decode` doc comment.
     #[test]
     fn decode_of_a_bare_top_level_null_is_indistinguishable_from_a_decode_failure() {
         let lua = lua_with_json();
@@ -184,10 +167,8 @@ mod tests {
         assert_eq!(message, None, "it succeeded, so there is no message -- but `if t then` cannot tell that apart from a parse error");
     }
 
-    /// A real captured `niri msg -j focused-window` line, which is what `dev-config`'s
-    /// `refresh_window_title` decodes. Worth pinning against a synthetic fixture because this one
-    /// carries both things that go wrong in practice: a non-ASCII title the shaper has to survive,
-    /// and a `null` nested two levels deep inside `layout`.
+    /// A real captured `niri msg -j focused-window` line, worth pinning over a synthetic fixture
+    /// because it carries a non-ASCII title and a `null` nested two levels deep inside `layout`.
     #[test]
     fn decode_reads_a_real_niri_focused_window_line_including_its_nested_nulls() {
         let lua = lua_with_json();

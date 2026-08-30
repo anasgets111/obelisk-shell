@@ -1,6 +1,5 @@
 //! Node constructors (`oblisk-idl-api-specs.md` § 5.2/§ 6.1) and `VirtualNode`, the loader's
-//! shallow, unvalidated table-to-Rust conversion (`docs/oblisk-tdd-test-harness.md` § 4.1 names
-//! both this type and `renderer/tests/test_lua_marshalling.rs`).
+//! shallow, unvalidated table-to-Rust conversion.
 //!
 //! ponytail: `deserialize_lua_table` is shallow on purpose -- it reads `kind` and copies every
 //! other key as-is into `properties`, never recursing into a nested `children`/`child` table. A
@@ -20,14 +19,10 @@ use mlua::{Lua, Table, Value};
 /// `panel`, § 6.2's `window`, § 6.3's `popup` and § 6.4's `lock` (ADR-0040: these are surface
 /// *roles*; "surface" is the umbrella term covering all four).
 ///
-/// `lock` was held out of this array through Phase 22 on the argument that a lock surface's
-/// lifetime is the lock's rather than the config's, so a constructor here would be claiming
-/// `shell.lua` decides when one exists. docs/adr/0052 decision 2 retires that argument: a
-/// constructor decides where a declaration is *written*, and docs/adr/0049 already separated that
-/// from when the Wayland object exists. `window` and `popup` are both in this array and neither
-/// owns an `xdg_toplevel` or an `xdg_popup` until `visible` says so; `lock` is the same shape with
-/// the compositor's `locked` event as its trigger instead of a signal. Without a constructor here
-/// § 6.4's "declaring it says what the lock screen looks like" has nowhere to be written at all.
+/// `lock` joined this array under docs/adr/0052 decision 2: a constructor decides where a
+/// declaration is *written*, which docs/adr/0049 already separated from when the Wayland object
+/// exists. `window` and `popup` own no `xdg_toplevel`/`xdg_popup` until `visible` says so; `lock`
+/// is the same shape with the compositor's `locked` event as its trigger instead of a signal.
 const NODE_KINDS: [&str; 13] =
     ["rect", "row", "column", "text", "icon", "image", "button", "list", "textfield", "panel", "window", "popup", "lock"];
 
@@ -50,9 +45,8 @@ pub enum DeserializeError {
 }
 
 /// Registers every [`NODE_KINDS`] entry as Lua-callable sugar: each takes the props table Lua
-/// passed and tags it with `kind`, matching `docs/oblisk-tdd-test-harness.md` § 4.1's own worked
-/// example ("Echo table structure back to Rust"). One loop over the array rather than a list
-/// spelled out again here, so adding a role is one edit.
+/// passed and tags it with `kind`. One loop over the array rather than a list spelled out again
+/// here, so adding a role is one edit.
 pub fn register_node_constructors(lua: &Lua) -> mlua::Result<()> {
     for kind in NODE_KINDS {
         lua.globals().set(
@@ -160,9 +154,8 @@ mod tests {
 
     #[test]
     fn window_and_popup_are_constructors_a_config_can_call() {
-        // The two roles docs/adr/0040 decision 1 gives a config beside `panel`. Named explicitly
-        // rather than left to the loop above, because the loop passes whatever the array happens
-        // to hold and this is the pair build-steps.md Phase 22 exists to add.
+        // Named explicitly rather than left to the loop above, since the loop passes whatever
+        // the array happens to hold.
         let lua = lua_with_constructors();
         assert!(NODE_KINDS.contains(&"window") && NODE_KINDS.contains(&"popup"));
         let table: Table = lua.load(r#"return popup { id = "menu", parent = "bar" }"#).eval().unwrap();
@@ -172,9 +165,8 @@ mod tests {
 
     #[test]
     fn image_is_a_constructor_and_is_the_one_kind_section_5_2_does_not_list() {
-        // docs/adr/0054 decision 3 adds this outside § 5.2's eight, so it is pinned by name: the
-        // loop above passes whatever the array holds, and an edit that dropped `image` back out
-        // would take the wallpaper and every album art with it silently.
+        // docs/adr/0054 decision 3 adds this outside § 5.2's eight; pinned by name so an edit
+        // that dropped it would fail loudly rather than take the wallpaper with it silently.
         let lua = lua_with_constructors();
         assert!(NODE_KINDS.contains(&"image"));
         let table: Table = lua.load(r#"return image { source = "/tmp/wall.png", fit = "cover" }"#).eval().unwrap();
@@ -185,10 +177,8 @@ mod tests {
 
     #[test]
     fn lock_is_a_constructor_a_config_can_call_because_declaring_one_is_not_locking() {
-        // The reversal docs/adr/0052 decision 2 records. Phase 22 left `lock` out of the array on
-        // purpose, so this is pinned by name rather than by the loop above: the loop would go on
-        // passing if a later edit dropped the entry, and the whole point of § 6.4 is that a config
-        // gets to author the lock screen's tree.
+        // Pinned by name (docs/adr/0052 decision 2) rather than by the loop above, which would go
+        // on passing if a later edit dropped the entry.
         let lua = lua_with_constructors();
         assert!(NODE_KINDS.contains(&"lock"));
         let table: Table = lua.load(r#"return lock { id = "screen-lock" }"#).eval().unwrap();

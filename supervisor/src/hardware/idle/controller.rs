@@ -27,45 +27,29 @@ pub fn parse_inhibit_args(arguments: &[serde_json::Value]) -> Option<String> {
 
 
 
-/// Bound on [`connect_wayland_idle`]'s background `spawn_blocking` task (see [`IdleController::new`]).
-/// A local Wayland roundtrip against an already-running compositor completes in well under a
-/// second in every observed live-tested run against niri; 5 seconds is generous headroom for a
-/// busy compositor while still keeping a genuinely hung/misbehaving one (the failure mode this
-/// bound exists for -- observed live once as a real deadlock, every thread parked, no CPU used,
-/// for 60+ seconds with no timeout in place) bounded to a short, human-noticeable window instead
-/// of wedging notify setup indefinitely. Notify-setup-specific, not reused from `reload.rs`'s
-/// `PBA_TIMINGS` -- those bound a real Renderer's EGL/GL bring-up plus IPC round trips end to
-/// end, an unrelated order of magnitude from one local `wl_display.sync()`.
+/// Bound on [`connect_wayland_idle`]'s background `spawn_blocking` task (see
+/// [`IdleController::new`]). A local Wayland roundtrip completes well under a second against
+/// niri; 5s is generous headroom while still bounding a genuinely hung compositor (observed
+/// live once as a real deadlock, 60+ seconds with no timeout) to a human-noticeable window.
 const IDLE_NOTIFY_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct IdleController {
     /// `tokio::sync::RwLock`, not a bare `Arc<NotifyState>`: starts `Inert` and is swapped to
     /// `Live` in place by the background setup task [`IdleController::new`] spawns, so
-    /// constructing an `IdleController` itself never blocks on Wayland at all -- see this
-    /// module's doc comment and [`IdleController::new`].
+    /// constructing an `IdleController` never blocks on Wayland.
     notify: Arc<RwLock<NotifyState>>,
     inhibit: Arc<LiveInhibit>,
 }
 
 impl IdleController {
     /// Constructs both halves and returns immediately. `system_bus` is the Supervisor's
-    /// already-established `zbus::Connection::system()` (the same one NetworkManager/BlueZ/polkit
-    /// share) -- inhibit rides it directly, no new connection (ADR-0032), and has no fallible
-    /// construction step of its own (see [`LiveInhibit::system_bus`]'s doc comment for why its
-    /// proxy isn't built here).
+    /// already-established `zbus::Connection::system()`; inhibit rides it directly (ADR-0032).
     ///
-    /// Notify starts [`NotifyState::Inert`] and stays that way until (if ever) a background task
-    /// -- spawned here, not awaited -- finishes [`connect_wayland_idle`] inside
-    /// `tokio::task::spawn_blocking` (it's a genuinely blocking, synchronous function; running it
-    /// inline on the async executor is exactly the anti-pattern docs/build-steps.md Phase 9 warns
-    /// against for blocking calls in async code) within [`IDLE_NOTIFY_SETUP_TIMEOUT`]. This is
-    /// deliberate, not an oversight: a real hang was observed live against niri inside that
-    /// function's `roundtrip()` with no timeout in place, and it wedged the whole Supervisor
-    /// because `main.rs` used to `.await` this constructor directly before opening the control
-    /// socket. Returning immediately here, with the real setup relegated to a background task
-    /// that can only ever *upgrade* `Inert` to `Live` (never block boot), makes that class of bug
-    /// structurally impossible regardless of what `main.rs` calls next.
+    /// Notify starts [`NotifyState::Inert`] and only upgrades to `Live` from a background task
+    /// running [`connect_wayland_idle`] inside `spawn_blocking`, bounded by
+    /// [`IDLE_NOTIFY_SETUP_TIMEOUT`] -- its `roundtrip()` hung once live against niri with no
+    /// timeout, and awaiting it directly here would wedge the whole Supervisor.
     pub async fn new(system_bus: zbus::Connection, events_tx: UnboundedSender<shared::IdleEvent>) -> Self {
         let notify = Arc::new(RwLock::new(NotifyState::Inert));
 
@@ -103,10 +87,9 @@ impl IdleController {
 
     /// `idle:register_threshold(sec, on_idle, on_resume)`'s Supervisor-side half
     /// (docs/oblisk-supervisor-services-dbus.md §7.1; ADR-0032): a silent no-op when notify is
-    /// inert (either permanently degraded, or the background setup task from
-    /// [`IdleController::new`] just hasn't finished yet -- both look identical from here, by
-    /// design), otherwise the pure fan-out decision ([`register_threshold_entry`]) followed by
-    /// the real Wayland object creation exactly when that decision says a new listener is needed.
+    /// inert (degraded or still setting up -- indistinguishable here), otherwise the fan-out
+    /// decision ([`register_threshold_entry`]) plus real Wayland object creation for a new
+    /// listener.
     pub async fn register_threshold(&self, generation_id: u32, sec: u64) {
         let notify = self.notify.read().await;
         let NotifyState::Live(live) = &*notify else {
@@ -131,32 +114,14 @@ impl IdleController {
     }
 
     /// `idle:inhibit(reason)` (ADR-0032): the refcount decision ([`apply_inhibit`]), the real
-    /// `Inhibit` D-Bus call (attempted exactly on the global 0->1 transition), and the resulting
-    /// `fd`/count write all happen under one held `state` lock for the whole call -- not
-    /// released between steps and re-acquired later. `release_inhibit`/`reset_registrations`
-    /// need that same lock, so neither can run at all until this call either commits (writes
-    /// `fd`) or rolls its own count bump back on failure and returns; there is no window in
-    /// which they could observe or act on a partially-applied inhibit (Correctness review, Fix
-    /// 1 -- this closes two races a prior "decide, unlock, await, re-lock, write" version had):
+    /// `Inhibit` D-Bus call (on the global 0->1 transition), and the resulting `fd`/count write
+    /// all happen under one held `state` lock -- releasing it between steps reopens two races:
+    /// a concurrent `release_inhibit` reading a stale zero count while a real fd is still in
+    /// flight (leak), or a concurrent `inhibit`/`release_inhibit` pair writing `fd` out of
+    /// order (clobber).
     ///
-    /// - **Leak**: generation 1 calls `inhibit` (0->1, about to await the D-Bus call) while a
-    ///   concurrent `release_inhibit` for the same generation is also in flight. With the lock
-    ///   held for the whole `inhibit` call, that `release_inhibit` cannot even read `counts`
-    ///   until `inhibit` has already written the real `fd` (or rolled its count back on
-    ///   failure) and released the lock -- so `release_inhibit` always sees the count *after*
-    ///   the open actually committed, never a stale zero it could no-op against while a real fd
-    ///   is still on its way in.
-    /// - **Clobber**: generation A holds the only inhibit and calls `release_inhibit` (1->0,
-    ///   about to null `fd`) while generation B calls `inhibit` (0->1) concurrently. `inhibit`
-    ///   cannot acquire the lock -- and so cannot open a fresh fd -- until `release_inhibit` has
-    ///   finished nulling the old one and released the lock; B's fresh fd write can therefore
-    ///   never land before A's null write and get wiped out by it.
-    ///
-    /// A silent no-op (nothing bumped, no D-Bus call attempted) if building the login1 proxy
-    /// fails for this call -- see [`LiveInhibit::system_bus`]'s doc comment for why that proxy
-    /// is built fresh here rather than once at startup (Fix 2). A failed `Inhibit` call itself
-    /// rolls its own count bump back too -- an open that never actually happened must not leave
-    /// this generation believing it holds an inhibit it doesn't.
+    /// A silent no-op if building the login1 proxy fails (built fresh, not cached -- see
+    /// [`LiveInhibit::system_bus`]). A failed `Inhibit` call rolls its count bump back too.
     pub async fn inhibit(&self, generation_id: u32, reason: &str) {
         let mut state = self.inhibit.state.lock().await;
 
@@ -190,9 +155,8 @@ impl IdleController {
     }
 
     /// `idle:release_inhibit()` (ADR-0032): the refcount decision ([`apply_release_inhibit`])
-    /// and the resulting `fd` clear happen under the same held `state` lock as
-    /// [`IdleController::inhibit`] -- see its doc comment for why that matters. Dropping
-    /// `OwnedFd` closes it, which releases the logind lock.
+    /// and the `fd` clear happen under the same held `state` lock as [`IdleController::inhibit`].
+    /// Dropping `OwnedFd` closes it, releasing the logind lock.
     pub async fn release_inhibit(&self, generation_id: u32) {
         let mut state = self.inhibit.state.lock().await;
         if apply_release_inhibit(&mut state.counts, generation_id).should_close_fd {
@@ -202,13 +166,9 @@ impl IdleController {
 
     /// The notify + inhibit halves of `reset_registrations` (ADR-0006/ADR-0032): drops
     /// `generation_id`'s threshold fan-out entries and zeros its inhibit count, closing the
-    /// shared fd if that was the last generation holding it, under the same held `state` lock
-    /// [`IdleController::inhibit`]/[`IdleController::release_inhibit`] use -- a reload or crash
-    /// racing a concurrent `inhibit`/`release_inhibit` for the same generation gets the same
-    /// serialization guarantee they get from each other. No D-Bus/Wayland round trip needed
-    /// either way (a `HashMap` mutation and, at most, dropping an already-open `OwnedFd`), but
-    /// this is still `async` (not sync) purely because acquiring a `tokio::sync::Mutex` always
-    /// is -- its caller (`main.rs`) already runs inside an async context.
+    /// shared fd if it was the last holder -- under the same `state` lock
+    /// [`IdleController::inhibit`]/[`IdleController::release_inhibit`] use, so a reload or
+    /// crash racing either is serialized.
     pub async fn reset_registrations(&self, generation_id: u32) {
         {
             let notify = self.notify.read().await;

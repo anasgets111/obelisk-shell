@@ -1,20 +1,13 @@
-//! Supervisor-side Unix control-socket listener (build-steps.md Phase 9).
+//! Supervisor-side Unix control-socket listener.
 //!
 //! Binds at `$XDG_RUNTIME_DIR/oblisk-shell.sock`, not `/tmp` -- world-writable and unsuitable
-//! for a socket that will eventually carry secure textfield submissions (ADR-0005). Accepts
-//! more than one live connection at once: during a generation swap, Generation `N` and
-//! Candidate `N+1` are both connected simultaneously (`CONTEXT.md`'s Candidate and
-//! Authoritative generation entries). Every connection sends a `shared::ConnectionHandshake`
-//! as its first frame, before any other traffic; this module registers the connection by
-//! `generation_id` so a later caller can address a specific generation instead of assuming
-//! exactly one peer.
+//! for a socket that will carry secure textfield submissions (ADR-0005). Accepts more than
+//! one live connection at once: during a generation swap, Generation `N` and Candidate `N+1`
+//! are both connected simultaneously, each registered by `generation_id`.
 //!
-//! Deliberately deferred, per build-steps.md Phase 9's own scope and
-//! docs/adr/0020-control-socket-transport-without-dispatch-or-pba-wiring.md: the
-//! command-dispatch routing table (`oblisk-idl-api-specs.md` § 3.2's ~30 write commands).
-//! Inbound frames are decoded as `shared::RendererFrame` (Phase 13 widened this from a bare
-//! `shared::CommandEnvelope` to also carry `ReevaluateReport`, see docs/adr/0024) and forwarded
-//! to the caller as-is, not routed to any capability handler yet.
+//! Deliberately deferred (docs/adr/0020): the command-dispatch routing table
+//! (`oblisk-idl-api-specs.md` § 3.2's ~30 write commands). Inbound frames are decoded as
+//! `shared::RendererFrame` (docs/adr/0024) and forwarded to the caller as-is.
 
 use std::collections::HashMap;
 use std::io;
@@ -34,12 +27,10 @@ pub struct InboundFrame {
     pub frame: RendererFrame,
 }
 
-/// A registry entry paired with a monotonic token identifying *which* connection registered
-/// it. Needed because two connections can legitimately claim the same `generation_id` in
-/// sequence (a reconnect, or -- until real generation-ID assignment exists, see
-/// docs/adr/0020-control-socket-transport-without-dispatch-or-pba-wiring.md item 5 -- simply
-/// two Renderer processes both defaulting to `OBLISK_GENERATION_ID=0`): without the token, the
-/// old connection's cleanup would unregister the new one's live entry out from under it.
+/// A registry entry paired with a monotonic token identifying which connection registered it.
+/// Needed because two connections can legitimately claim the same `generation_id` in sequence
+/// (a reconnect, or duplicate `OBLISK_GENERATION_ID=0` defaults, docs/adr/0020 item 5):
+/// without the token, the old connection's cleanup would unregister the new one's live entry.
 struct Entry {
     token: u64,
     tx: UnboundedSender<Vec<u8>>,
@@ -58,8 +49,7 @@ pub struct GenerationRegistry {
 pub enum SendFrameError {
     /// `serde_json::to_vec` failed on the frame itself.
     Serialize(serde_json::Error),
-    /// No connection is currently registered for the target generation (already disconnected,
-    /// or never connected).
+    /// No connection is currently registered for the target generation.
     NoConnection { generation_id: u32 },
 }
 
@@ -76,13 +66,8 @@ impl std::error::Error for SendFrameError {}
 
 impl GenerationRegistry {
     /// Queues `payload` for delivery to `generation_id`'s connection. Returns `false` if no
-    /// connection is currently registered for that generation (already disconnected, or
-    /// never connected).
-    ///
-    /// `main.rs`'s real caller landed in Phase 11 (docs/adr/0022): every audio `StateSnapshot`
-    /// push goes through here. [`Self::send_frame`] (Phase 14) is built on top of this for
-    /// every other caller, so it's the one place raw bytes actually cross into a connection's
-    /// outbound channel.
+    /// connection is registered for that generation. The one place raw bytes cross into a
+    /// connection's outbound channel (docs/adr/0022); [`Self::send_frame`] builds on this.
     pub fn send_to(&self, generation_id: u32, payload: Vec<u8>) -> bool {
         let connections = self.connections.lock().unwrap();
         match connections.get(&generation_id) {
@@ -92,9 +77,7 @@ impl GenerationRegistry {
     }
 
     /// Encodes and sends `frame` to `generation_id`'s connection. The one place every
-    /// `SupervisorFrame` send goes through now -- previously `main.rs` had its own free
-    /// `push_frame` duplicating this exact encode-and-log-on-failure shape; `SocketCandidateLink`
-    /// (Phase 14) is this method's second real caller, worth consolidating for.
+    /// `SupervisorFrame` send goes through.
     pub fn send_frame(&self, generation_id: u32, frame: &SupervisorFrame) -> Result<(), SendFrameError> {
         let payload = serde_json::to_vec(frame).map_err(SendFrameError::Serialize)?;
         if self.send_to(generation_id, payload) {
@@ -104,20 +87,17 @@ impl GenerationRegistry {
         }
     }
 
-    /// Registers `tx` for `generation_id`, replacing any prior connection registered under
-    /// the same id, and returns a token that must be passed back to [`Self::unregister`] so
-    /// only the connection that's still current gets removed. `pub(crate)` rather than private:
-    /// `reload_link.rs`'s own tests register a fake connection directly to exercise
-    /// `SocketCandidateLink`'s `send_frame` calls without a real `UnixListener`.
+    /// Registers `tx` for `generation_id`, replacing any prior connection registered under the
+    /// same id, and returns a token that must be passed back to [`Self::unregister`] so only
+    /// the connection that's still current gets removed.
     pub(crate) fn register(&self, generation_id: u32, tx: UnboundedSender<Vec<u8>>) -> u64 {
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         self.connections.lock().unwrap().insert(generation_id, Entry { token, tx });
         token
     }
 
-    /// Removes `generation_id`'s entry only if it's still the one registered under `token`.
-    /// A connection whose entry was already replaced by a newer one for the same
-    /// `generation_id` no-ops here instead of evicting the newer, live connection.
+    /// Removes `generation_id`'s entry only if it's still the one registered under `token` --
+    /// a superseded connection's cleanup no-ops instead of evicting the newer, live entry.
     fn unregister(&self, generation_id: u32, token: u64) {
         let mut connections = self.connections.lock().unwrap();
         if connections.get(&generation_id).is_some_and(|entry| entry.token == token) {
@@ -132,10 +112,9 @@ impl GenerationRegistry {
 }
 
 /// Binds the listener at `path`, first removing a stale socket file left behind by an
-/// unclean prior shutdown (a crash, `SIGKILL`) -- `UnixListener::bind` fails with `AddrInUse` on
-/// an existing path otherwise, which would brick every restart. `main.rs`'s own clean-shutdown
-/// path (`SIGINT`/`SIGTERM`) unlinks `path` itself on the way out, so this is defense-in-depth
-/// for the unclean case, not the only cleanup path.
+/// unclean prior shutdown (a crash, `SIGKILL`) -- `UnixListener::bind` fails with `AddrInUse`
+/// on an existing path otherwise. `main.rs`'s clean-shutdown path unlinks `path` itself; this
+/// is defense-in-depth for the unclean case.
 fn bind(path: &Path) -> Result<UnixListener, io::Error> {
     if path.exists() {
         std::fs::remove_file(path)?;
@@ -144,16 +123,10 @@ fn bind(path: &Path) -> Result<UnixListener, io::Error> {
 }
 
 /// Binds the control socket at `path` and spawns the accept loop as a background task. Returns
-/// the [`GenerationRegistry`] (to address specific generations later), a channel receiving every
-/// inbound frame decoded and tagged with its sender's generation, and a channel receiving each
-/// `generation_id` the instant its connection finishes registering.
-///
-/// That third channel exists so `main.rs` can replay a capability's already-known
-/// `StateSnapshot`s to a generation the moment it connects -- otherwise a push attempted between
-/// a controller hydrating (e.g. `NetworkController`/`BluetoothController::new`, both constructed
-/// before this function even runs) and the boot Renderer's own connection completing would hit
-/// [`SendFrameError::NoConnection`] and be dropped, not just delayed, with nothing to ever
-/// re-deliver it if no later event happens to push a fresh snapshot.
+/// the [`GenerationRegistry`], a channel receiving every inbound frame tagged with its
+/// sender's generation, and a channel reporting each `generation_id` the instant its
+/// connection finishes registering -- so `main.rs` can replay a capability's already-known
+/// `StateSnapshot`s the moment a generation connects, rather than dropping a push mid-hydration.
 pub fn spawn_listener(path: &Path) -> Result<(GenerationRegistry, mpsc::UnboundedReceiver<InboundFrame>, mpsc::UnboundedReceiver<u32>), io::Error> {
     let listener = bind(path)?;
     let registry = GenerationRegistry::default();
@@ -205,8 +178,7 @@ async fn handle_connection(
 
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let token = registry.register(generation_id, outbound_tx);
-    // Best-effort: if `main.rs`'s receiver has already been dropped (e.g. mid-shutdown), there's
-    // no snapshot replay to do for a connection that's about to be torn down anyway.
+    // Best-effort: a dropped receiver (mid-shutdown) just means no snapshot replay is needed.
     let _ = connected_tx.send(generation_id);
 
     let writer = tokio::spawn(async move {
@@ -223,8 +195,7 @@ async fn handle_connection(
                 let _ = inbound_tx.send(InboundFrame { generation_id, frame });
             }
             Err(FramingError::Decode(err)) => {
-                // A malformed frame doesn't kill the connection -- only a transport-level
-                // failure (below) does.
+                // A malformed frame doesn't kill the connection -- only a transport failure does.
                 eprintln!("control-socket frame from generation {generation_id} failed to decode as RendererFrame: {err}");
             }
             Err(_) => break,

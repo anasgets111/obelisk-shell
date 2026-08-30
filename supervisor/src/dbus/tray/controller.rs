@@ -32,20 +32,16 @@ impl TrayController {
     /// (ADR-0031's "dual-role dance"): with `DoNotQueue` unset, zbus 5's own
     /// `request_name_with_flags` never returns `Err(NameTaken)` for this case -- it queues
     /// instead, returning `Ok(RequestNameReply::InQueue)` (verified against zbus 5.19.0's
-    /// `Connection::request_name_with_flags` source: `RequestNameReply::Exists` -- the only reply
-    /// mapped to `Err`, is only reachable when `DoNotQueue` *is* set). So every `Ok` reply here
-    /// (`PrimaryOwner`, `InQueue`, or `AlreadyOwner`) is a real success path; only a hard `Err`
-    /// (e.g. no session bus at all) is logged as a genuine failure, and even that doesn't stop
-    /// construction -- the Watcher object is still attached and `RegisterStatusNotifierHost` is
-    /// still attempted, same "degrade to inert, don't take the Supervisor down" precedent
-    /// `BluetoothController::new` already established for missing hardware/daemons.
+    /// `Connection::request_name_with_flags` source: `RequestNameReply::Exists`, the only reply
+    /// mapped to `Err`, is only reachable when `DoNotQueue` is set). So every `Ok` reply here is
+    /// a real success path; only a hard `Err` is logged as a genuine failure, and even that
+    /// doesn't stop construction.
     ///
     /// The `StatusNotifierWatcher` object is attached at [`WATCHER_OBJECT_PATH`] regardless of
     /// who ends up owning the name, then `RegisterStatusNotifierHost` is called against the
-    /// well-known name itself (not a resolved unique name) -- D-Bus routing delivers that call to
-    /// whichever process actually owns it, so this works identically whether this process won the
-    /// name (a self-call, routed through the bus daemon back to this same object) or lost it to a
-    /// real DE session already running one.
+    /// well-known name itself (not a resolved unique name) -- D-Bus routing delivers that call
+    /// to whichever process actually owns it, so this works identically whether this process
+    /// won the name or lost it to a real DE session already running one.
     pub async fn new(connection: zbus::Connection, events: UnboundedSender<TraySignal>) -> Self {
         match connection.request_name_with_flags(WATCHER_BUS_NAME, BitFlags::<RequestNameFlags>::empty()).await {
             Ok(reply) => eprintln!("tray: RequestName({WATCHER_BUS_NAME}) -> {reply}"),
@@ -55,10 +51,9 @@ impl TrayController {
         let registry: ItemRegistry = Arc::new(Mutex::new(HashMap::new()));
         let host_registered = Arc::new(Mutex::new(false));
         let watcher = StatusNotifierWatcher { connection: connection.clone(), registry: registry.clone(), host_registered, events: events.clone() };
-        // Logged-and-continue, not `?`-propagated (Standards review): an export failure here must
-        // not abort the whole Supervisor, same "degrade to inert" precedent `BluetoothController::
-        // new` already established -- this controller still constructs and every other tray
-        // functionality (or at minimum the rest of Supervisor) keeps working either way.
+        // Logged-and-continue, not `?`-propagated: an export failure here must not abort the
+        // whole Supervisor -- this controller still constructs and every other tray
+        // functionality keeps working either way.
         if let Err(err) = connection.object_server().at(WATCHER_OBJECT_PATH, watcher).await {
             eprintln!("tray: failed to export StatusNotifierWatcher at {WATCHER_OBJECT_PATH}: {err}");
         }
@@ -84,21 +79,18 @@ impl TrayController {
     }
 
     /// Fully inert controller: empty registry, no forwarder tasks, nothing exported on any
-    /// connection. Used when a dedicated session-bus connection for the tray host itself couldn't
-    /// even be established -- same "degrade to inert, don't take the Supervisor down" precedent
-    /// `dbus::tray`'s own module doc comment and `TrayController::new` already apply to a lost
-    /// `RequestName` race; a session bus genuinely not being available in some environment is not
-    /// a reason to abort Supervisor boot either. Every read/write action behaves exactly as it
-    /// would against a live controller that simply has no tray items registered yet (`build_state`
+    /// connection. Used when a dedicated session-bus connection for the tray host itself
+    /// couldn't even be established. Every read/write action behaves exactly as it would
+    /// against a live controller that simply has no tray items registered yet (`build_state`
     /// returns an empty `TrayState`, every `find_*` lookup misses).
     pub fn inert(events: UnboundedSender<TraySignal>) -> Self {
         Self { registry: Arc::new(Mutex::new(HashMap::new())), events }
     }
 
-    /// Full, live re-derivation of `tray.items` from the entire tracked registry (mirrors
-    /// `dbus::bluetooth::build_device_lists`'s "no debounce" discipline). Synchronous: every
-    /// registry entry's `last_known` is already up to date (the forwarder tasks recompute it
-    /// before ever sending a [`TraySignal`]), so no further D-Bus round trip is needed here.
+    /// Full, live re-derivation of `tray.items` from the entire tracked registry. Synchronous:
+    /// every registry entry's `last_known` is already up to date (the forwarder tasks
+    /// recompute it before ever sending a [`TraySignal`]), so no further D-Bus round trip is
+    /// needed here.
     pub fn build_state(&self) -> TrayState {
         TrayState { items: self.registry.lock().unwrap().values().map(|entry| entry.last_known.clone()).collect() }
     }
@@ -154,12 +146,10 @@ impl TrayController {
     }
 
     /// `tray:menu_will_show(id, submenu_id)`: calls `AboutToShow(submenu_id)` (DBusMenu's own
-    /// lazy-population signal -- ADR-0031), then re-fetches and re-pushes the item's *entire*
-    /// menu tree. A full re-fetch, not an in-place splice of just `submenu_id`'s own children:
-    /// this codebase's established "no debounce, no incremental patching" discipline
-    /// (`dbus::bluetooth`/`dbus::network`) applies here too, and menu trees are human-scale
-    /// (ADR-0031's own "Consequences" section), so the extra round trip costs nothing a user
-    /// would notice.
+    /// lazy-population signal, ADR-0031), then re-fetches and re-pushes the item's entire menu
+    /// tree. A full re-fetch, not an in-place splice of just `submenu_id`'s own children: menu
+    /// trees are human-scale (ADR-0031's own "Consequences" section), so the extra round trip
+    /// costs nothing a user would notice.
     pub async fn menu_will_show(&self, id: &str, submenu_id: i32) {
         let Some((key, _)) = self.find_item_id(id) else {
             eprintln!("tray: menu_will_show({id:?}, {submenu_id}) failed: {}", TrayActionError::UnknownItem);

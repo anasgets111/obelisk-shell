@@ -5,18 +5,15 @@
 //! evaluation, with no socket in scope -- so it can't write the outbound `"process"`/`"run"`
 //! `CommandEnvelope` directly. [`ProcessRegistry`] instead queues it onto the same
 //! `mpsc::UnboundedSender<RendererFrame>` every other outbound frame goes to, which the socket
-//! thread's `renderer/src/socket.rs`-side `pump` drains and writes (docs/adr/0039) -- the same
-//! "queue it, let the owning loop actually write it" shape as every other outbound frame here.
+//! thread's `pump` drains and writes (docs/adr/0039).
 //!
-//! `Rc<RefCell<_>>`, not `Arc<Mutex<_>>` -- [`ProcessRegistry`] is confined to the one Wayland
-//! dispatch thread, alongside the Lua VM whose closures drive it, matching
-//! `lua::signal::Signal::Live` and `supervisor/src/audio/mixer.rs`'s `Rc<RefCell<MixerState>>`.
+//! `Rc<RefCell<_>>`, not `Arc<Mutex<_>>`: [`ProcessRegistry`] is confined to the one Wayland
+//! dispatch thread, alongside the Lua VM whose closures drive it.
 //!
 //! Callback calling convention (not pinned down by the spec docs, decided here -- see
 //! docs/adr/0026): `out_cb(line, stream)` with `stream` the Lua string `"stdout"`/`"stderr"` (the
-//! wire type stays a real `shared::ProcessStream` enum; Lua itself has no enums, so a plain string
-//! is the idiomatic callback argument shape). `exit_cb(code)` with `code` an integer or `nil`,
-//! `Option<i32>`'s own natural `IntoLua` mapping.
+//! wire type stays a real `shared::ProcessStream` enum; Lua has no enums). `exit_cb(code)` with
+//! `code` an integer or `nil`, `Option<i32>`'s own natural `IntoLua` mapping.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -91,11 +88,9 @@ impl ProcessRegistry {
         self.send(process_command(generation_id, "kill", Vec::new(), id));
     }
 
-    /// `SupervisorFrame::ProcessOutput` dispatch (`renderer/src/socket.rs`'s `handle_frame`):
-    /// invokes `id`'s registered `out_cb`. A stale/unknown `id` (a frame arriving for a since-
-    /// forgotten generation, or a wire desync) is silently ignored -- this codebase's established
-    /// tolerance for a frame that doesn't match any live state, matching `SocketCandidateLink`'s
-    /// own "log and drop" precedent one layer up.
+    /// `SupervisorFrame::ProcessOutput` dispatch: invokes `id`'s registered `out_cb`. A
+    /// stale/unknown `id` (a frame for a since-forgotten generation, or a wire desync) is
+    /// silently ignored.
     pub fn dispatch_output(&self, id: u64, stream: ProcessStream, line: String) {
         let out_cb = self.0.borrow().pending.get(&id).map(|p| p.out_cb.clone());
         let Some(out_cb) = out_cb else { return };
@@ -105,8 +100,7 @@ impl ProcessRegistry {
     }
 
     /// `SupervisorFrame::ProcessExited` dispatch: invokes `id`'s registered `exit_cb` and forgets
-    /// the id -- the callback pair's last use, matching `ProcessHandle`'s own lifetime (the
-    /// Supervisor's registry entry is gone by the time this frame is sent, see docs/adr/0026).
+    /// the id, the callback pair's last use (docs/adr/0026).
     pub fn dispatch_exit(&self, id: u64, code: Option<i32>) {
         let exit_cb = self.0.borrow_mut().pending.remove(&id).map(|p| p.exit_cb);
         let Some(exit_cb) = exit_cb else { return };
@@ -139,8 +133,7 @@ impl UserData for ProcessHandle {
 }
 
 /// Registers the `process` global table with `process.run(cmd, args, out_cb, exit_cb)`. `mlua`'s
-/// own argument type-checking on this closure's signature is § 3.2's validation ("`cmd` is
-/// string, `args` array table of strings, callbacks are Lua functions") in full.
+/// own argument type-checking on this closure's signature is § 3.2's validation in full.
 pub fn register(lua: &Lua, registry: ProcessRegistry) -> mlua::Result<()> {
     let table = lua.create_table()?;
     table.set(
@@ -158,8 +151,6 @@ mod tests {
 
     use super::*;
 
-    /// Unwraps the one frame shape this module ever queues, so each test below asserts on the
-    /// `CommandEnvelope` itself rather than re-matching the wrapper every time.
     fn queued_command(rx: &mut mpsc::UnboundedReceiver<RendererFrame>) -> Option<CommandEnvelope> {
         match rx.try_recv().ok()? {
             RendererFrame::Command(envelope) => Some(envelope),
@@ -229,17 +220,14 @@ mod tests {
     fn process_run_rejects_a_non_string_cmd() {
         let (lua, _registry, _rx) = lua_with_process(0);
 
-        // A table, not a number -- mlua's `String` extraction follows Lua's own `lua_tolstring`
-        // numeric-coercion rule (`42` -> `"42"`), which isn't the gap this test is after; a table
+        // A table, not a number: mlua's `String` extraction coerces `42` to `"42"`, but a table
         // has no such coercion and must still be rejected.
         let err = lua.load(r#"process.run({}, {}, function() end, function() end)"#).exec().unwrap_err();
         assert!(err.to_string().contains("string"), "expected a type error mentioning string, got: {err}");
     }
 
-    /// Reads a probe global back out after a callback pushed into it -- callbacks are called with
-    /// no other observable side channel, so this is the standard way this codebase's Lua tests
-    /// (`renderer/src/socket.rs`'s `rescue_state`) confirm a callback actually ran with the right
-    /// arguments.
+    /// Reads a probe global back out after a callback pushed into it: callbacks have no other
+    /// observable side channel.
     fn probe_table(lua: &Lua) -> mlua::Table {
         lua.load("probe = probe or {}; return probe").eval().unwrap()
     }
@@ -277,8 +265,6 @@ mod tests {
         let probe = probe_table(&lua);
         assert_eq!(probe.get::<i64>("code").unwrap(), 3);
 
-        // A second exit report for the same id (e.g. a stray duplicate) must not fire exit_cb
-        // again -- dispatch_exit already forgot it.
         lua.load("probe = nil").exec().unwrap();
         registry.dispatch_exit(0, Some(99));
         let is_nil: bool = lua.load("return probe == nil").eval().unwrap();

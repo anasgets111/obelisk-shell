@@ -3,18 +3,17 @@
 //!
 //! Hosts `org.kde.StatusNotifierWatcher` at `/StatusNotifierWatcher` and client-handles every
 //! registered `org.kde.StatusNotifierItem` (plus its optional `com.canonical.dbusmenu` menu).
-//! Mirrors `dbus::bluetooth`'s shapes throughout: hand-written `#[zbus::proxy]` traits (ADR-0031:
-//! no crate reuse -- `system-tray` has a source-verified pixmap-squaring bug and wouldn't save
-//! the security-critical bounds-checking/PNG-encoding work this controller has to do regardless),
-//! a `*Controller` struct holding the proxies/registry write actions need, a `HashMap<Key, Entry>`
-//! dynamic per-object registry hydrated live and kept live via per-item forwarder tasks (one
-//! `JoinHandle` per tracked object, aborted on removal), and pure pretty-printable/parsing helper
-//! functions unit-testable without a live D-Bus connection.
+//! Hand-written `#[zbus::proxy]` traits (ADR-0031: no crate reuse -- `system-tray` has a
+//! source-verified pixmap-squaring bug and wouldn't save the security-critical
+//! bounds-checking/PNG-encoding work this controller has to do regardless), a `*Controller`
+//! struct holding the proxies/registry write actions need, a `HashMap<Key, Entry>` dynamic
+//! per-object registry hydrated live and kept live via per-item forwarder tasks (one
+//! `JoinHandle` per tracked object, aborted on removal), and pure pretty-printable/parsing
+//! helper functions unit-testable without a live D-Bus connection.
 //!
-//! Unlike BlueZ's `ObjectManager`-driven liveness (`InterfacesRemoved`), the base SNI spec has no
-//! signal telling a host when a client unregisters -- liveness is tracked via
-//! `org.freedesktop.DBus.NameOwnerChanged`: one global forwarder task removes every registry entry
-//! for a unique name the instant that name drops off the bus (see
+//! The base SNI spec has no signal telling a host when a client unregisters -- liveness is
+//! tracked via `org.freedesktop.DBus.NameOwnerChanged`: one global forwarder task removes
+//! every registry entry for a unique name the instant that name drops off the bus (see
 //! [`registry::spawn_name_owner_changed_forwarder`]).
 //!
 //! ponytail: `TrayController::new` never fails outright, same reasoning as
@@ -114,17 +113,15 @@ pub fn parse_activate_menu_item_args(arguments: &[serde_json::Value]) -> Option<
 }
 
 /// `tray:menu_will_show(id, submenu_id)`'s `arguments: [id, submenu_id]` -- same shape as
-/// [`parse_activate_menu_item_args`], kept as a distinct function so each write action's parser
-/// matches its own command name at the call site (mirrors `dbus::network`'s
-/// `parse_connect_args`/`parse_ssid_arg` staying separate despite overlapping shapes).
+/// [`parse_activate_menu_item_args`], kept as a distinct function so each write action's
+/// parser matches its own command name at the call site.
 pub fn parse_menu_will_show_args(arguments: &[serde_json::Value]) -> Option<(String, i32)> {
     parse_activate_menu_item_args(arguments)
 }
 
 /// `oblisk.tray`'s action dispatch (ADR-0037): owns the action match, argument parse, and
-/// write-action spawn for every `tray` `CommandEnvelope` -- `main.rs` routes the whole
-/// capability here with one arm. Write actions are `tokio::spawn`ed rather than awaited inline
-/// (ADR-0031/ADR-0029).
+/// write-action spawn for every `tray` `CommandEnvelope`. Write actions are `tokio::spawn`ed
+/// rather than awaited inline (ADR-0031).
 pub fn dispatch(controller: &TrayController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     match params.action.as_str() {
@@ -160,15 +157,12 @@ pub fn dispatch(controller: &TrayController, envelope: &shared::CommandEnvelope)
 mod test_support {
     use tokio::net::UnixStream;
 
-    /// A connected pair of p2p zbus connections, no bus daemon involved -- based on
-    /// `dbus::bluetooth`'s own test helper of the same name (see its doc comment for why both
-    /// builders must be driven concurrently via `try_join!`), with one addition: the server side
-    /// (`connection`, the first element -- what `register_item`'s own outgoing proxy calls use as
-    /// `self.connection`) gets a short `method_timeout`. Unlike bluetooth's tests, which only ever
-    /// call *into* the agent side, `register_item`'s real code path calls *out* from this side
-    /// (property reads against the fabricated `StatusNotifierItem`, plus Fix 5's own
-    /// `NameHasOwner` liveness check) to a peer that never registers any object server handler for
-    /// them -- with zbus's default (multi-second) per-call timeout, each such call would hang
+    /// A connected pair of p2p zbus connections, no bus daemon involved, with one addition:
+    /// the server side (`connection`, what `register_item`'s own outgoing proxy calls use as
+    /// `self.connection`) gets a short `method_timeout`. `register_item`'s real code path
+    /// calls out from this side (property reads against the fabricated `StatusNotifierItem`,
+    /// plus a `NameHasOwner` liveness check) to a peer that never registers any object server
+    /// handler for them -- with zbus's default per-call timeout, each such call would hang
     /// until it lapses instead of erroring quickly, and `register_item` awaits several of them
     /// sequentially.
     pub(super) async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {

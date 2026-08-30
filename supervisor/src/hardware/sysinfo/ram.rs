@@ -1,8 +1,7 @@
 //! `ram_percent`/`swap_percent` sourcing: `/proc/meminfo` (docs/adr/0035).
 
-/// The four `/proc/meminfo` fields `ram_percent`/`swap_percent` need. `mem_available` is
-/// used as-is (docs/adr/0035: it's already the kernel's own considered-free estimate, not
-/// reinvented from `Buffers`/`Cached`).
+/// The four `/proc/meminfo` fields `ram_percent`/`swap_percent` need. `mem_available` is used
+/// as-is (docs/adr/0035: the kernel's own considered-free estimate, not reinvented from `Buffers`/`Cached`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemInfo {
     pub mem_total: u64,
@@ -12,15 +11,13 @@ pub struct MemInfo {
 }
 
 /// Parses `/proc/meminfo`'s `key:   value kB` lines into a [`MemInfo`]. `None` if
-/// `MemTotal`/`MemAvailable` are missing -- those two are load-bearing; `SwapTotal`/
-/// `SwapFree` default to `0` if absent (a swapless kernel build still normally emits them,
-/// but tolerating their absence costs nothing and avoids a needless failure mode).
+/// `MemTotal`/`MemAvailable` are missing -- those two are load-bearing; `SwapTotal`/`SwapFree`
+/// default to `0` if absent, since tolerating their absence costs nothing.
 pub fn parse_meminfo(text: &str) -> Option<MemInfo> {
     let mut values = std::collections::HashMap::new();
     for line in text.lines() {
-        // A blank or colon-less line is skipped, not fatal to the whole parse (Correctness
-        // review) -- `str::lines()` yields an empty "" element for a blank line, which has no
-        // ':' to split on.
+        // A blank or colon-less line is skipped, not fatal -- `str::lines()` yields "" for a
+        // blank line, which has no ':' to split on.
         let Some((key, rest)) = line.split_once(':') else { continue };
         if let Some(value) = rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok()) {
             values.insert(key, value);
@@ -86,9 +83,7 @@ mod tests {
 
     #[test]
     fn parse_meminfo_skips_a_blank_or_colon_less_line_instead_of_aborting_the_whole_parse() {
-        // A blank line partway through must not discard the fields already seen around it --
-        // `str::lines()` yields an empty "" element for a blank line, which has no ':' to
-        // split on (Correctness review).
+        // A blank line partway through must not discard the fields already seen around it.
         let info = super::parse_meminfo("MemTotal: 1000 kB\n\nMemAvailable: 400 kB\n").expect("a stray blank line must not abort the whole parse");
         assert_eq!(info.mem_total, 1000);
         assert_eq!(info.mem_available, 400);

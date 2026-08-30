@@ -8,9 +8,8 @@ pub mod locks;
 
 pub use controller::{KeyboardController, KeyboardSignal, parse_set_backlight_args, parse_switch_layout_args};
 
-/// `oblisk.keyboard`'s action dispatch (ADR-0037): `set_backlight` is a D-Bus write and gets
-/// `tokio::spawn`ed (ADR-0029); `switch_layout` is synchronous (it only forwards through the
-/// compositor link's own channel -- docs/adr/0034).
+/// `oblisk.keyboard`'s action dispatch (ADR-0037): `set_backlight` is a D-Bus write, so it gets
+/// `tokio::spawn`ed (ADR-0029); `switch_layout` is synchronous, forwarding through the compositor link's own channel (docs/adr/0034).
 pub fn dispatch(controller: &KeyboardController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     match params.action.as_str() {

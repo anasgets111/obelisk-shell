@@ -4,17 +4,15 @@
 use std::path::{Path, PathBuf};
 
 /// Milli-Celsius to whole Celsius, rounded to the nearest degree (half away from zero), not
-/// truncated toward zero (Correctness review: plain integer division on a negative reading,
-/// e.g. `-500 / 1000 == 0`, silently reports `0°C` instead of `-1°C` for a sensor reading
-/// -0.5°C).
+/// truncated toward zero -- plain integer division on a negative reading (e.g. `-500 / 1000 == 0`)
+/// silently reports `0°C` instead of `-1°C`.
 fn round_milli_c(milli_c: i64) -> i64 {
     if milli_c >= 0 { (milli_c + 500) / 1000 } else { (milli_c - 500) / 1000 }
 }
 
-/// Resolves the first chip directory under `hwmon_root` whose `name` file matches an entry
-/// in `preference`, trying `preference` in order (docs/adr/0035: preference-list order wins
-/// over directory iteration order -- a lower-preference chip in an earlier-sorted directory
-/// must not win over a higher-preference chip in a later one).
+/// Resolves the first chip directory under `hwmon_root` whose `name` file matches an entry in
+/// `preference`, trying `preference` in order (docs/adr/0035) -- preference-list order wins
+/// over directory iteration order.
 pub fn resolve_chip(hwmon_root: &Path, preference: &[&str]) -> Option<PathBuf> {
     let entries: Vec<PathBuf> = std::fs::read_dir(hwmon_root).ok()?.filter_map(|entry| entry.ok().map(|entry| entry.path())).collect();
     for wanted in preference {
@@ -29,11 +27,9 @@ pub fn resolve_chip(hwmon_root: &Path, preference: &[&str]) -> Option<PathBuf> {
     None
 }
 
-/// Every `tempN_input` sensor under `chip_dir` whose paired `tempN_label` matches `Core
-/// \d+`, converted from milli-Celsius to whole Celsius and sorted by the label's core index
-/// (not by filename or directory-listing order -- a chip's `tempN_input` numbering doesn't
-/// necessarily follow core index order). The package-level aggregate sensor
-/// (`"Package id 0"` on `coretemp`) and any unlabeled sensor (`acpitz`) are excluded.
+/// Every `tempN_input` sensor under `chip_dir` whose paired `tempN_label` matches `Core \d+`,
+/// converted to whole Celsius and sorted by the label's core index, not filename or directory
+/// order. The package-level aggregate sensor and any unlabeled sensor are excluded.
 pub fn read_cores(chip_dir: &Path) -> Vec<i64> {
     let core_label = regex::Regex::new(r"^Core (\d+)$").expect("static regex must compile");
     let Ok(entries) = std::fs::read_dir(chip_dir) else {
@@ -57,11 +53,9 @@ pub fn read_cores(chip_dir: &Path) -> Vec<i64> {
     cores.into_iter().map(|(_, milli_c)| round_milli_c(milli_c)).collect()
 }
 
-/// Reads the lowest-numbered `tempN_input` sensor under `chip_dir`, regardless of its label
-/// (or absence of one) -- used both for the `acpitz` single-zone fallback (no per-core
-/// labeling exists to filter on) and `temp_gpu`'s "primary sensor" reading (docs/adr/0035).
-/// Milli-Celsius converted to whole Celsius. `None` if the directory has no `tempN_input`
-/// files at all.
+/// Reads the lowest-numbered `tempN_input` sensor under `chip_dir`, regardless of its label --
+/// used for both the `acpitz` fallback and `temp_gpu`'s primary-sensor read. `None` if no
+/// `tempN_input` files exist.
 fn read_primary_sensor(chip_dir: &Path) -> Option<i64> {
     let entries = std::fs::read_dir(chip_dir).ok()?;
     let lowest = entries
@@ -93,9 +87,8 @@ pub enum CoreTempSource {
 }
 
 /// Resolves `temp_cores`'s source: the CPU chip preference list first, then the `acpitz`
-/// fallback, then unavailable (docs/adr/0035). Call once, at controller construction --
-/// chips don't hotplug for onboard sensors, so re-scanning every tick would be pure waste.
-/// [`read_temp_cores_from`] does the actual per-tick read against the resolved result.
+/// fallback, then unavailable (docs/adr/0035). Call once, at construction -- chips don't
+/// hotplug for onboard sensors, so re-scanning every tick would be pure waste.
 pub fn resolve_temp_cores_source(hwmon_root: &Path) -> CoreTempSource {
     if let Some(chip_dir) = resolve_chip(hwmon_root, CPU_TEMP_PREFERENCE) {
         return CoreTempSource::PerCore(chip_dir);
@@ -107,8 +100,7 @@ pub fn resolve_temp_cores_source(hwmon_root: &Path) -> CoreTempSource {
 }
 
 /// `temp_cores`, read from an already-resolved [`CoreTempSource`] -- the per-tick half of the
-/// resolve-once/read-per-tick split (docs/adr/0035). No directory scan for chip resolution
-/// happens here, only the sensor-file reads a tick actually needs.
+/// resolve-once/read-per-tick split (docs/adr/0035); no directory scan happens here.
 pub fn read_temp_cores_from(source: &CoreTempSource) -> Vec<i64> {
     match source {
         CoreTempSource::PerCore(chip_dir) => read_cores(chip_dir),
@@ -133,10 +125,8 @@ pub fn read_temp_gpu_from(gpu_chip: Option<&Path>) -> i64 {
 mod tests {
     use super::*;
 
-    /// Resolves and reads `temp_cores` in one call -- production code never does this (it
-    /// resolves once at construction and reads per-tick, see [`resolve_temp_cores_source`]/
-    /// [`read_temp_cores_from`]), but tests exercising end-to-end behavior want the
-    /// one-call convenience.
+    /// Resolves and reads `temp_cores` in one call, for tests exercising end-to-end behavior --
+    /// production code resolves once and reads per-tick separately.
     fn resolve_and_read_temp_cores(hwmon_root: &Path) -> Vec<i64> {
         read_temp_cores_from(&resolve_temp_cores_source(hwmon_root))
     }
@@ -166,10 +156,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let chip_dir = dir.path().join("hwmon6");
         std::fs::create_dir_all(&chip_dir).unwrap();
-        // Real values captured from this machine's coretemp. Deliberately written with a
-        // higher temp-file-number sensor (temp30, Core 28) carrying a *lower* core index
-        // than temp6 (Core 4) -- proves sorting is by the label's core index, not by
-        // filename or `read_dir`'s (unspecified) iteration order.
+        // Real captured values, deliberately mis-ordered: temp30/Core 28 has a lower core index
+        // than temp6/Core 4, proving sort is by core index, not filename order.
         write_sensor(&chip_dir, 1, "Package id 0", 92000); // excluded: not a per-core sensor
         write_sensor(&chip_dir, 30, "Core 28", 65000);
         write_sensor(&chip_dir, 2, "Core 0", 57000);
@@ -266,8 +254,7 @@ mod tests {
 
     #[test]
     fn read_temp_gpu_is_the_idl_sentinel_when_no_gpu_chip_is_present() {
-        // The real dev machine this was designed against: no amdgpu/nouveau/nvidia hwmon
-        // chip at all (integrated graphics, no discrete GPU thermal zone).
+        // This dev machine has no amdgpu/nouveau/nvidia hwmon chip (integrated graphics only).
         let dir = tempfile::tempdir().unwrap();
         write_chip(dir.path(), "hwmon6", "coretemp");
         assert_eq!(resolve_and_read_temp_gpu(dir.path()), -1);
@@ -350,9 +337,8 @@ mod tests {
     #[test]
     fn resolve_chip_prefers_earlier_preference_entries_over_directory_order() {
         let dir = tempfile::tempdir().unwrap();
-        // hwmon0 (a lexicographically-earlier directory) carries the lower-preference chip;
-        // hwmon1 carries the higher-preference one. Preference-list order must win, not
-        // directory iteration order.
+        // hwmon0 (lexicographically earlier) carries the lower-preference chip; preference-list
+        // order must win over directory iteration order.
         write_chip(dir.path(), "hwmon0", "coretemp");
         write_chip(dir.path(), "hwmon1", "k10temp");
 

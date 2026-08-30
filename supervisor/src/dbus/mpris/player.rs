@@ -32,8 +32,7 @@ pub struct PlayerState {
     pub position_updated_at: i64,
     /// `-1` when `mpris:length` is absent/malformed (a live stream, or a player that simply
     /// doesn't report it) -- matches `backlight_pct`/`temp_gpu`'s established "genuine
-    /// unavailable, not a fabricated zero" sentinel, independently confirmed by Quickshell's own
-    /// `bInternalLength` binding (ADR-0036).
+    /// unavailable, not a fabricated zero" sentinel (ADR-0036).
     pub length: i64,
 }
 
@@ -44,12 +43,10 @@ pub(super) struct PlayerEntry {
     /// `mpris:trackid`, cached for `SetPosition`'s required `TrackId` argument (ADR-0036) --
     /// not an IDL-declared `PlayerState` field, so it isn't part of what gets pushed to Lua.
     pub(super) cached_trackid: Option<String>,
-    /// `None` only in the brief window between this entry's insert and its forwarder task's own
-    /// spawn completing (`register_player` inserts before spawning, precisely so the forwarder's
-    /// very first resync -- which zbus's `PropertyStream` can fire immediately on subscribe,
-    /// replaying its already-cached current value -- always finds a real entry to write into;
-    /// Correctness review caught the reverse ordering racing that replay into a permanently dead
-    /// forwarder on the very first player it ever registered).
+    /// `None` only in the brief window between this entry's insert and its forwarder task's
+    /// own spawn completing (`register_player` inserts before spawning, so the forwarder's
+    /// very first resync -- which can fire immediately on subscribe, replaying its cached
+    /// current value -- always finds a real entry to write into).
     forwarder: Option<JoinHandle<()>>,
 }
 
@@ -57,25 +54,19 @@ pub(super) type PlayerRegistry = Arc<Mutex<HashMap<String, PlayerEntry>>>;
 
 /// `CLOCK_MONOTONIC`, in microseconds -- cross-process comparable on this machine (unlike
 /// `std::time::Instant`, which Rust deliberately keeps opaque/non-serializable), matching the
-/// IDL's own "Monotonic clock timestamp in microseconds" declaration for `position_updated_at`.
-/// Known open gap, not this capability's to close (ADR-0036's Consequences): the IDL's only other
-/// declared clock, `system.time` (§2.11, unbuilt), is a 1Hz whole-second epoch -- not comparable
-/// to this at microsecond resolution. Whatever the Renderer/Lua eventually reads "now" from for
-/// its own interpolation math needs to share this same clock and resolution; that's downstream
-/// Lua-runtime work, not decided here.
+/// IDL's "Monotonic clock timestamp in microseconds" declaration for `position_updated_at`.
+/// Known open gap (ADR-0036's Consequences): `system.time` (§2.11, unbuilt) is a 1Hz
+/// whole-second epoch, not comparable to this at microsecond resolution.
 pub(super) fn monotonic_micros() -> i64 {
     let now: std::time::Duration = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC).map(std::time::Duration::from).unwrap_or_default();
     i64::try_from(now.as_micros()).unwrap_or(i64::MAX)
 }
 
 /// Re-reads every field `PlayerState` needs from `player`/`root` and folds it into `previous`
-/// (track-identity caching for `album_art_path`/`length` -- ADR-0036, CONTEXT.md "Track
-/// identity"). Always succeeds: every individual property read degrades to `previous`'s own last
-/// value on its own failure, never the whole entry (ADR-0036, matches `dbus::bluetooth`/
-/// `dbus::tray`'s existing precedent) -- a real player that's merely had one transient read
-/// hiccup keeps its last-known state rather than losing live updates permanently (Correctness +
-/// Spec review: an earlier version returned `None` on a `PlaybackStatus` read failure alone,
-/// which its only caller, the forwarder loop, treated as fatal and broke on).
+/// (track-identity caching for `album_art_path`/`length`, ADR-0036). Always succeeds: every
+/// individual property read degrades to `previous`'s own last value on its own failure, never
+/// the whole entry -- a real player that's merely had one transient read hiccup keeps its
+/// last-known state rather than losing live updates permanently.
 struct Resynced {
     state: PlayerState,
     identity: TrackIdentity,
@@ -105,11 +96,10 @@ async fn resync(bus_name: &str, player: &MprisPlayerProxy<'static>, root: &Mpris
     let player_identity = root.identity().await.unwrap_or_default();
     let position = player.position().await.unwrap_or(0);
 
-    // A full Metadata read failure (the GetAll call itself erroring, not just one key inside it
-    // being absent) means "we learned nothing new this round" -- every metadata-derived field
-    // (title/artist/art/length/trackid/identity) keeps its previous value verbatim rather than
-    // resetting to empty defaults, which would otherwise register as a spurious track change and
-    // defeat the same-track caching below (Correctness review).
+    // A full Metadata read failure (the GetAll call erroring, not just one key inside it being
+    // absent) means "we learned nothing new this round" -- every metadata-derived field keeps
+    // its previous value verbatim rather than resetting to empty defaults, which would
+    // otherwise register as a spurious track change.
     let Ok(metadata) = player.metadata().await else {
         eprintln!("mpris: Metadata read failed for {bus_name}; keeping the last known title/artist/art/length/trackid this round");
         let state = PlayerState {
@@ -159,19 +149,17 @@ async fn resync(bus_name: &str, player: &MprisPlayerProxy<'static>, root: &Mpris
 }
 
 /// Binds `bus_name`'s player/root proxies, runs one initial [`resync`], inserts the resulting
-/// entry, and only then spawns its live forwarder task -- returns early (logged) if the initial
-/// bind fails outright, or if `CanControl` is `false` (matches Quickshell's own
-/// `MediaService.qml:32` filter, `players.filter(player => !!player?.canControl)` -- a source
-/// that can't be controlled at all isn't meaningfully useful in a status-bar UI; a real,
-/// observable exclusion, not silently absorbed into "any read failure" -- ADR-0036).
+/// entry, and only then spawns its live forwarder task -- returns early (logged) if the
+/// initial bind fails outright, or if `CanControl` is `false` (a source that can't be
+/// controlled isn't meaningfully useful in a status-bar UI -- a real, observable exclusion,
+/// not silently absorbed into "any read failure", ADR-0036).
 ///
 /// Insert-then-spawn, not spawn-then-insert: zbus's `#[zbus(property)]`-generated
 /// `receive_*_changed` streams replay their already-cached current value immediately on
 /// subscribe, so the forwarder's very first `select!` can resolve before this function would
-/// otherwise have gotten around to inserting the entry -- its resulting write-back would then
-/// find nothing and `break`, permanently freezing the player at its initial snapshot (Correctness
-/// review, confirmed live: this was consistently hit on the very first player registered in a
-/// fresh session). Inserting first closes that window entirely.
+/// otherwise have inserted the entry -- its write-back would then find nothing and `break`,
+/// permanently freezing the player at its initial snapshot. Confirmed live: consistently hit
+/// on the first player registered in a fresh session. Inserting first closes that window.
 pub(super) async fn register_player(connection: &zbus::Connection, registry: &PlayerRegistry, events: &UnboundedSender<MprisSignal>, bus_name: String) {
     let player = match bind_player(connection, &bus_name).await {
         Ok(player) => player,
@@ -219,11 +207,10 @@ pub(super) async fn register_player(connection: &zbus::Connection, registry: &Pl
 
 /// Runs until every one of `PlaybackStatus`/`Metadata`'s generated `receive_*_changed` streams
 /// and the real `Seeked` signal all end, re-running [`resync`] on any of them and updating the
-/// registry entry in place -- no debounce, no incremental patching (matches
-/// `dbus::bluetooth`/`dbus::tray`/`dbus::keyboard`'s established "full re-derivation on any
-/// relevant event" discipline). `Position` itself has no `receive_position_changed` trigger: the
-/// real freedesktop spec explicitly excludes `Position` from `PropertiesChanged` (too
-/// high-frequency), so `Seeked` is the only live signal for a position change on its own.
+/// registry entry in place -- no debounce, no incremental patching. `Position` itself has no
+/// `receive_position_changed` trigger: the real freedesktop spec explicitly excludes
+/// `Position` from `PropertiesChanged` (too high-frequency), so `Seeked` is the only live
+/// signal for a position change on its own.
 fn spawn_player_forwarder(bus_name: String, player: MprisPlayerProxy<'static>, root: MprisRootProxy<'static>, registry: PlayerRegistry, events: UnboundedSender<MprisSignal>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut playback_status = player.receive_playback_status_changed().await;

@@ -1,19 +1,13 @@
 //! `oblisk.workspaces` capability: per-output workspace state and the focused window
-//! (`docs/oblisk-idl-api-specs.md` § 2.9), read off niri's IPC event stream
-//! (docs/adr/0056, `docs/build-steps.md` Phase 28 item 3).
+//! (`docs/oblisk-idl-api-specs.md` § 2.9), read off niri's IPC event stream (docs/adr/0056).
 //!
-//! A top-level module rather than a tenant of `hardware/` or `dbus/`: it is neither a device nor a
-//! D-Bus interface, it is one compositor's Unix socket, which is the same reason `privacy`,
-//! `updates` and `system` sit here.
+//! A top-level module rather than a tenant of `hardware/` or `dbus/`: it is one compositor's
+//! Unix socket, not a device or a D-Bus interface.
 //!
-//! One compositor, no trait (docs/adr/0056 decision 1). `keyboard`'s `CompositorLink` has two
-//! implementors and was deliberately scoped to layout; this has one implementor and a trait with
-//! one implementor is speculative generality by this repo's own review checklist. What is shared
-//! with `keyboard` is the verified part with no per-capability shape, `detect_compositor()` and
-//! `CompositorKind`. A session that is not niri never pushes, and `oblisk.workspaces` stays `nil`,
-//! which is `brightness`'s missing-backlight posture applied unchanged: § 2.9 has no absence
-//! sentinel, and an empty `outputs` array would read as "this compositor has no workspaces"
-//! rather than "nobody asked this compositor".
+//! One compositor, no trait (docs/adr/0056 decision 1): a trait with one implementor is
+//! speculative generality. A session that is not niri never pushes, so `oblisk.workspaces`
+//! stays `nil` -- § 2.9 has no absence sentinel, and an empty `outputs` array would read as
+//! "no workspaces" rather than "nobody asked".
 
 pub mod controller;
 

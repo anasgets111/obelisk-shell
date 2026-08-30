@@ -1,6 +1,5 @@
-//! [`BatteryController`]: the `oblisk.battery` state owner. Read-only telemetry (§ 2.2) -- no
-//! write actions, the same posture `PrivacyController` already has. Split from `battery` --
-//! see `battery/mod.rs` for the module-level doc.
+//! [`BatteryController`]: the `oblisk.battery` state owner. Read-only telemetry (§ 2.2) --
+//! no write actions. Split from `battery` -- see `battery/mod.rs` for the module-level doc.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -13,14 +12,8 @@ use udev::MonitorSocket;
 use super::super::read_attr;
 
 /// `oblisk.battery`'s full payload (§ 2.2). Field names are the `StateSnapshot` JSON keys
-/// verbatim -- the Renderer routes them straight into the Lua `oblisk.battery` signal table by
-/// name, unchanged, so they may not be renamed. `Default` (`false`, `0`, `false`) already is
-/// the correct "no battery hardware" answer § 2.2 wants for a desktop, not a fabricated
-/// placeholder -- no separate sentinel constant is needed the way `KeyboardState::backlight_pct`
-/// needed `-1`, because a bare `bool`/`u8` triple has no missing-hardware case that overlaps a
-/// real reading (unlike a backlight percent, `0%` battery and `0%` "not present" are the same
-/// externally-observable state to a config, and the IDL's own `present: false` field is what
-/// actually distinguishes them).
+/// verbatim -- may not be renamed. `Default` (`false`, `0`, `false`) is itself the correct
+/// "no battery hardware" answer for a desktop, not a placeholder needing a sentinel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub struct BatteryState {
     pub present: bool,
@@ -28,19 +21,15 @@ pub struct BatteryState {
     pub charging: bool,
 }
 
-/// One shared signal, `Changed` only (mirrors `PrivacySignal`/`KeyboardSignal`/`SysinfoSignal`).
+/// One shared signal, `Changed` only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatterySignal {
     Changed,
 }
 
-/// § 2.2's whole device-selection correctness problem, as one pure predicate: `entry_dir`
-/// qualifies as the/a system battery only if its `type` is exactly `Battery` (a `Mains` adapter
-/// or a USB power-delivery source, both real siblings on this dev machine's own
-/// `/sys/class/power_supply/`, never qualify), and its `scope` is not `Device` -- a `Device`
-/// scope marks a peripheral's battery (a wireless mouse, a bluetooth headset), not the system
-/// battery. An absent `scope` file (this dev machine's real `BAT0` has none) means system scope,
-/// the common case for a laptop's own battery, so it passes.
+/// § 2.2's battery-selection predicate: `type` must be exactly `Battery` (excludes `Mains`
+/// adapters and USB-PD sources), and `scope` must not be `Device` (a peripheral's battery,
+/// not the system's). An absent `scope` file means system scope.
 fn is_system_battery(entry_dir: &Path) -> bool {
     if read_attr(entry_dir, "type").as_deref() != Some("Battery") {
         return false;
@@ -48,40 +37,31 @@ fn is_system_battery(entry_dir: &Path) -> bool {
     read_attr(entry_dir, "scope").as_deref() != Some("Device")
 }
 
-/// Picks the one power-supply entry under `power_supply_root` that [`is_system_battery`]
-/// qualifies, in sorted-by-name order (not `read_dir`'s unspecified order) so the choice is
-/// deterministic across boots -- relevant on the rare two-battery laptop (`BAT0`/`BAT1`), where
-/// readdir order isn't guaranteed to put `BAT0` first. `None` on a missing/unreadable root or
-/// when nothing qualifies (the common desktop case, or a directory of only `Mains`/`USB`/
-/// `Device`-scoped entries).
+/// Picks the one entry [`is_system_battery`] qualifies, in sorted-by-name order (not
+/// `read_dir`'s unspecified order) for a deterministic choice across boots on a two-battery
+/// laptop. `None` if nothing qualifies.
 fn select_system_battery(power_supply_root: &Path) -> Option<PathBuf> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(power_supply_root).ok()?.flatten().map(|entry| entry.path()).collect();
     entries.sort();
     entries.into_iter().find(|entry| is_system_battery(entry))
 }
 
-/// `battery.charging`: true exactly when `status` is `Charging` or `Full` (§ 2.2's own
-/// wording). An exact match, not `contains("harging")` or similar: `Not charging` -- a real
-/// fourth value this dev machine's own `BAT0` currently reports, distinct from `Discharging` --
-/// contains "charging" as a substring, so a substring test would invert this exact case.
+/// `battery.charging`: true exactly when `status` is `Charging` or `Full`. An exact match,
+/// not a substring test -- `Not charging` (a real fourth status value) contains "charging"
+/// as a substring and would wrongly match.
 fn charging_from_status(status: &str) -> bool {
     status == "Charging" || status == "Full"
 }
 
-/// `battery.percent`: `capacity` clamped to `[0, 100]` -- some firmware reports over 100 (not
-/// this dev machine's own `BAT0`, which reports a plain in-range `59`, but § 2.2 doesn't
-/// guarantee the file stays in range either). A missing or unparseable `capacity` reads as `0`
-/// rather than panicking or carrying forward a stale value -- the same "degrade to the honest
-/// default, don't fabricate" posture `percent_from_capacity`'s sibling readers already take
-/// throughout this codebase.
+/// `battery.percent`: `capacity` clamped to `[0, 100]` -- some firmware reports over 100.
+/// Missing/unparseable `capacity` reads as `0` rather than panicking.
 fn percent_from_capacity(capacity: Option<&str>) -> u8 {
     capacity.and_then(|text| text.parse::<u32>().ok()).unwrap_or(0).min(100) as u8
 }
 
-/// Reads the whole `oblisk.battery` state from a real (or fixture) `/sys/class/power_supply/`
-/// tree in one pass: [`select_system_battery`] first, then `capacity`/`status` off the winner.
-/// No qualifying entry -- the common desktop case -- is `BatteryState::default()`, the correct
-/// answer § 2.2 wants, not an error to log or a state to special-case.
+/// Reads the whole `oblisk.battery` state in one pass: [`select_system_battery`] first, then
+/// `capacity`/`status` off the winner. No qualifying entry is `BatteryState::default()`, the
+/// correct answer, not an error.
 pub fn read_battery_state(power_supply_root: &Path) -> BatteryState {
     let Some(entry) = select_system_battery(power_supply_root) else {
         return BatteryState::default();
@@ -91,15 +71,8 @@ pub fn read_battery_state(power_supply_root: &Path) -> BatteryState {
     BatteryState { present: true, percent, charging }
 }
 
-/// Cadence for the fallback path only -- [`run_battery_poll_loop`], used when
-/// [`build_power_supply_watch`] can't stand up the real udev `power_supply` watch at all, or
-/// [`run_battery_watch_loop`]'s own watch fd errors mid-run (both now rare: `udev`'s `send`
-/// feature is enabled in `Cargo.toml`, which is what makes `MonitorBuilder`/`MonitorSocket`
-/// `Send` and lets the watch below exist as a `tokio::spawn`ed task in the first place -- see
-/// `build_power_supply_watch`'s own doc comment for the mechanics). The primary path is the
-/// udev watch, not this: a battery's `percent` drifts slowly, but `charging` flips the instant
-/// a charger is plugged or unplugged, and that instant matters to a config in a way `percent`'s
-/// drift doesn't.
+/// Cadence for the fallback path only. The udev watch is primary: `charging` flips instantly
+/// on plug/unplug, which matters more than `percent`'s slow drift.
 ///
 /// ponytail: 30s is a round-number guess for the fallback's staleness budget, not measured
 /// against anything -- it only matters on the already-degraded path (no working udev watch), so
@@ -108,21 +81,15 @@ pub fn read_battery_state(power_supply_root: &Path) -> BatteryState {
 /// (docs/adr/0035) is the pattern to reach for rather than hardcoding a different constant here.
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-/// `Clone` (mirrors `KeyboardController`) even though nothing here currently spawns a second
-/// task off a cloned handle. Not `Clone`, matching `PrivacyController` and `LockController`:
-/// § 2.2 has no write action, so nothing needs a second handle, and deriving it "for parity"
-/// would be a capability with no caller.
+/// Not `Clone`: § 2.2 has no write action, so nothing needs a second handle.
 pub struct BatteryController {
     state: Arc<Mutex<BatteryState>>,
 }
 
 impl BatteryController {
-    /// `power_supply_root` (real default `/sys/class/power_supply`) follows this codebase's
-    /// sysfs-root-injection convention (`proc_root`/`hwmon_root`/`leds_root`/
-    /// `video4linux_root`), the same thing that makes [`read_battery_state`] testable against a
-    /// fixture directory. Returns immediately; [`run_battery_task`] does the real reading (udev-
-    /// watch-driven, with a poll fallback -- see its own doc comment) in a spawned task, matching
-    /// every other event-driven controller's "construction never blocks on I/O" shape.
+    /// `power_supply_root` (real default `/sys/class/power_supply`) is injected for
+    /// testability. Returns immediately; [`run_battery_task`] does the real reading in a
+    /// spawned task.
     pub fn new(power_supply_root: PathBuf, events: UnboundedSender<BatterySignal>) -> Self {
         let state = Arc::new(Mutex::new(BatteryState::default()));
         tokio::spawn(run_battery_task(power_supply_root, Arc::clone(&state), events));
@@ -134,14 +101,9 @@ impl BatteryController {
     }
 }
 
-/// Reads the initial state before entering either wait mode (a config needs battery state
-/// immediately, not after the first watch event or poll tick -- matches
-/// `privacy::controller::run_camera_task`'s own "initial scan, then the event loop" ordering),
-/// then hands off to [`run_battery_watch_loop`], the real udev-driven primary path. Degrades to
-/// [`run_battery_poll_loop`] only if [`build_power_supply_watch`] itself fails to stand up --
-/// a laptop with a working battery and a broken udev socket (no permission to open a netlink
-/// socket, an exhausted fd table, or similar) must still show a battery, not go permanently
-/// dark just because its preferred update path didn't come up.
+/// Reads the initial state, sends it, then hands off to [`run_battery_watch_loop`]. Falls
+/// back to [`run_battery_poll_loop`] only if [`build_power_supply_watch`] fails to stand up --
+/// a broken udev socket must not leave a working battery unreported.
 async fn run_battery_task(power_supply_root: PathBuf, state: Arc<Mutex<BatteryState>>, events: UnboundedSender<BatterySignal>) {
     let initial = read_battery_state(&power_supply_root);
     *state.lock().expect("battery state mutex poisoned") = initial;
@@ -158,41 +120,23 @@ async fn run_battery_task(power_supply_root: PathBuf, state: Arc<Mutex<BatterySt
     }
 }
 
-/// Builds the real `power_supply` subsystem udev watch (§ 2.2; docs/build-steps.md line 98's
-/// original justification for the `udev` dependency -- this is its first real caller): a
-/// monitor filtered to just that one subsystem, `listen()`ed, with its netlink socket's raw fd
-/// registered against tokio's IO driver via `AsyncFd` so [`run_battery_watch_loop`] can `await`
-/// readability instead of ticking. Needs `udev`'s `send` feature (Cargo.toml) to typecheck at
-/// all -- `MonitorBuilder`/`MonitorSocket` must be `Send` to live inside the `tokio::spawn`ed
-/// future `run_battery_task` hands them to. Fails at whichever of socket allocation, the
-/// subsystem filter, or `AsyncFd` registration breaks first; the caller treats any of the three
-/// the same way, by falling back to [`POLL_INTERVAL`] polling.
+/// Builds the `power_supply` subsystem udev watch (§ 2.2; docs/build-steps.md line 98). Needs
+/// `udev`'s `send` feature (Cargo.toml) to typecheck -- `MonitorBuilder`/`MonitorSocket` must
+/// be `Send` to live inside the `tokio::spawn`ed future.
 fn build_power_supply_watch() -> std::io::Result<AsyncFd<MonitorSocket>> {
     let socket = udev::MonitorBuilder::new()?.match_subsystem("power_supply")?.listen()?;
     AsyncFd::new(socket)
 }
 
-/// The primary path: awaits the udev `power_supply` watch's fd becoming readable, drains every
-/// pending netlink message (a single plug/unplug can fire more than one message for the one
-/// subsystem change, and level-triggered readiness would otherwise immediately re-fire on
-/// whatever's left undrained), then re-reads the full state and only writes `state`/sends
-/// [`BatterySignal::Changed`] when it actually differs from `previous`. This push-on-change
-/// filter is doing more work here than it did under the old poll-only design: udev wakes this
-/// loop on *every* `power_supply` subsystem change, including the many this capability doesn't
-/// report at all (`voltage_now`, `energy_now`, and similar attributes churn on a live battery
-/// far more often than `capacity`/`status` do), so most wakeups are expected to be filtered out
-/// here, not most ticks being redundant the way the old poll loop's filter mostly saw. Falls
-/// back to [`run_battery_poll_loop`] if the watch's fd itself ever errors mid-run (rare --
-/// effectively only a reactor shutdown), the same "degrade, don't go dark" reason
-/// [`build_power_supply_watch`]'s own failure does.
+/// Awaits the udev watch's fd becoming readable, drains pending netlink messages (a single
+/// plug/unplug can fire more than one; level-triggered readiness would otherwise re-fire on
+/// anything left undrained), then re-reads and pushes only on an actual change. Most wakeups
+/// get filtered out here since udev fires on every `power_supply` change, not just the ones
+/// this capability reports. Falls back to [`run_battery_poll_loop`] if the fd errors.
 ///
-/// `watch` is taken `mut` and polled with `readable_mut` rather than `readable`: `readable`
-/// takes `&self` and its guard borrows `&AsyncFd<MonitorSocket>`, which needs `MonitorSocket:
-/// Sync` to be `Send` across the `.await` inside this loop's error arm -- and only `udev`'s
-/// `send` feature is enabled in `Cargo.toml`, not `sync` (confirmed live: `readable` fails
-/// `tokio::spawn`'s `Send` bound with exactly that error). `readable_mut` takes `&mut self`
-/// instead, so its guard only needs `MonitorSocket: Send`, which the enabled feature already
-/// gives it -- no further Cargo.toml change needed.
+/// Uses `readable_mut` (not `readable`): only `udev`'s `send` feature is enabled (Cargo.toml),
+/// not `sync`, and `readable`'s guard needs `MonitorSocket: Sync` to be `Send` across `.await` --
+/// `readable_mut`'s guard only needs `MonitorSocket: Send`, which is already enabled.
 async fn run_battery_watch_loop(
     mut watch: AsyncFd<MonitorSocket>,
     power_supply_root: PathBuf,
@@ -222,10 +166,8 @@ async fn run_battery_watch_loop(
     }
 }
 
-/// The fallback path (see [`POLL_INTERVAL`]'s own doc comment for the two ways this gets
-/// reached instead of [`run_battery_watch_loop`]): re-reads on a fixed timer instead of a real
-/// event, with the same push-on-change filter as the primary path, so the two paths are
-/// observably identical to a config -- just at different latency.
+/// The fallback path: re-reads on a fixed timer instead of a real event, same push-on-change
+/// filter as the primary path.
 async fn run_battery_poll_loop(power_supply_root: PathBuf, mut previous: BatteryState, state: Arc<Mutex<BatteryState>>, events: UnboundedSender<BatterySignal>) {
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     ticker.tick().await; // tokio::time::interval's first tick fires immediately; the caller's initial (or pre-fallback) read already covers it

@@ -1,6 +1,5 @@
 //! [`PrivacyController`]: the `oblisk.privacy` state owner. Read-only telemetry (ADR-0034) --
-//! no write actions, unlike every capability with a `parse_*_args`/dispatch arm in `main.rs`.
-//! Split from `privacy` -- see `privacy/mod.rs` for the module-level doc.
+//! no write actions. Split from `privacy` -- see `privacy/mod.rs` for the module-level doc.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -25,7 +24,7 @@ pub struct PrivacyState {
     pub camera_users: Vec<CameraUser>,
 }
 
-/// One shared signal, `Changed` only (mirrors `KeyboardSignal`/`SysinfoSignal`).
+/// One shared signal, `Changed` only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrivacySignal {
     Changed,
@@ -33,11 +32,8 @@ pub enum PrivacySignal {
 
 /// Combines a set of kernel-detected `/dev/videoN` opener pids with the latest PipeWire
 /// `Video/Source` enrichment snapshot into the `camera_users` list: PipeWire's `app_name` wins
-/// when a pid matches a tracked video-source node (the portal-routed subset PipeWire can see,
-/// ADR-0034), else `/proc/{pid}/comm`, else a `pid {n}` placeholder so a real opener is never
-/// silently dropped just because neither name source resolved. Pure and unit-testable: the
-/// pid-to-name resolution is exactly what a real rescan does, just with `proc_root`/`pipewire`
-/// as parameters instead of live state.
+/// when a pid matches a tracked video-source node, else `/proc/{pid}/comm`, else a `pid {n}`
+/// placeholder so a real opener is never silently dropped. Pure and unit-testable.
 fn resolve_camera_users(proc_root: &Path, devices: &[PathBuf], pipewire: &[VideoSourceApp]) -> Vec<CameraUser> {
     let mut pids: Vec<u32> = devices.iter().flat_map(|device| find_device_openers(proc_root, &device.to_string_lossy())).collect();
     pids.sort_unstable();
@@ -62,11 +58,8 @@ pub struct PrivacyController {
 
 impl PrivacyController {
     /// `proc_root`/`video4linux_root` (real defaults `/proc`/`/sys/class/video4linux`) follow
-    /// this codebase's sysfs/procfs root-injection convention. `video_sources` is the receiving
-    /// half of `audio::mixer::run`'s `video_updates` channel -- one PipeWire connection shared
-    /// with `oblisk.audio`, not a second one (ADR-0034). Returns immediately; the real inotify
-    /// watch and initial scan happen in a spawned task, matching every other event-driven
-    /// controller's "construction never blocks on I/O" shape.
+    /// this codebase's sysfs/procfs root-injection convention. `video_sources` is one PipeWire
+    /// connection shared with `oblisk.audio` (ADR-0034). Returns immediately.
     pub fn new(proc_root: PathBuf, video4linux_root: &Path, video_sources: UnboundedReceiver<Vec<VideoSourceApp>>, events: UnboundedSender<PrivacySignal>) -> Self {
         let state = Arc::new(Mutex::new(PrivacyState::default()));
         let devices = super::video::enumerate_video_devices(video4linux_root);
@@ -79,20 +72,13 @@ impl PrivacyController {
     }
 }
 
-/// Watches every resolved video device for `OPEN`/`CLOSE` (confirmed live-reliable on this dev
-/// machine -- see `privacy::video`'s module doc comment), and separately drains
-/// `video_sources` for PipeWire enrichment updates. Either one triggers a full rescan/rebuild of
-/// `camera_users` (no debounce, no incremental patching -- matches every other capability's
-/// "full re-derive on any relevant event" discipline already established in this codebase).
-/// Logs and returns without ever *updating* `state` if inotify itself can't be initialized or
-/// no video devices exist -- `camera_users` stays at its empty default, the same "degrade
-/// gracefully, don't fake activity" posture every other missing-capability path here already
-/// takes. Still sends one `PrivacySignal::Changed` before returning on each of these paths
-/// (Correctness review): without it, `main.rs` never pushes even the empty `StateSnapshot`, so
-/// `last_snapshots["privacy"]` -- what a newly-connecting generation gets hydrated from -- never
-/// gets seeded at all. On the very common "no camera hardware" case (most desktop/server
-/// machines), every client for the process's whole lifetime would otherwise see `oblisk.privacy`
-/// as never having existed, not as "reports empty" -- a real, client-visible difference.
+/// Watches every resolved video device for `OPEN`/`CLOSE` (confirmed live-reliable, see
+/// `privacy::video`'s module doc), and separately drains `video_sources` for PipeWire
+/// enrichment updates. Either one triggers a full rescan/rebuild of `camera_users`, no debounce.
+///
+/// Logs and returns without ever updating `state` if inotify can't be initialized or no video
+/// devices exist. Still sends one `PrivacySignal::Changed` before returning on each of these
+/// paths: without it, a newly-connecting generation never gets even the empty state seeded.
 async fn run_camera_task(proc_root: PathBuf, devices: Vec<PathBuf>, state: Arc<Mutex<PrivacyState>>, mut video_sources: UnboundedReceiver<Vec<VideoSourceApp>>, events: UnboundedSender<PrivacySignal>) {
     if devices.is_empty() {
         eprintln!("privacy: no /dev/videoN devices found; camera_users will stay empty");

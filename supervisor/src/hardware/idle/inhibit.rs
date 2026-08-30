@@ -1,15 +1,13 @@
 //! Inhibit half of `oblisk.idle` (ADR-0032): `org.freedesktop.login1.Manager.Inhibit` on the
 //! existing system-bus connection -- per-generation refcount arithmetic, the hand-written
-//! Login1Manager proxy, and the shared inhibit-fd/refcount state.
-//! Split from `dbus::idle` -- see `hardware/idle/mod.rs` for the module-level doc.
+//! Login1Manager proxy, and the shared inhibit-fd/refcount state. Split from `dbus::idle` --
+//! see `hardware/idle/mod.rs` for the module-level doc.
 
 use std::collections::HashMap;
 
 
-/// What one refcount transition means for the single shared inhibit fd: whether this call must
-/// open it (the global 0->1 transition) or close it (the global ->0 transition). Never both --
-/// [`apply_inhibit`] can only ever report `should_open_fd`, [`apply_release_inhibit`]/
-/// [`cleanup_generation_inhibit`] can only ever report `should_close_fd`.
+/// What one refcount transition means for the shared inhibit fd: open it (0->1) or close it
+/// (->0), never both -- [`apply_inhibit`] only reports `should_open_fd`, the others only `should_close_fd`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InhibitTransition {
     pub should_open_fd: bool,
@@ -21,8 +19,8 @@ fn total(counts: &HashMap<u32, u32>) -> u32 {
 }
 
 /// `idle:inhibit(reason)`'s refcount half: increments `generation_id`'s own count.
-/// `should_open_fd` is `true` exactly when the *global* total across every generation was zero
-/// before this call (ADR-0032's "opens the fd on 0->1").
+/// `should_open_fd` is true exactly when the *global* total was zero before this call
+/// (ADR-0032's "opens the fd on 0->1").
 pub fn apply_inhibit(counts: &mut HashMap<u32, u32>, generation_id: u32) -> InhibitTransition {
     let total_before = total(counts);
     *counts.entry(generation_id).or_insert(0) += 1;
@@ -30,11 +28,8 @@ pub fn apply_inhibit(counts: &mut HashMap<u32, u32>, generation_id: u32) -> Inhi
 }
 
 /// `idle:release_inhibit()`'s refcount half: decrements `generation_id`'s own count.
-/// `should_close_fd` is `true` exactly when the global total was non-zero before this call and
-/// drops to zero because of it (ADR-0032's "closes it on 1->0"). Releasing a generation whose
-/// count is already zero (or that never inhibited at all) is a silent no-op -- `saturating_sub`
-/// never underflows, and `should_close_fd` stays `false` since the global total didn't actually
-/// change.
+/// `should_close_fd` is true exactly when the global total drops to zero because of this call.
+/// Releasing an already-zero generation is a silent no-op -- `saturating_sub` never underflows.
 pub fn apply_release_inhibit(counts: &mut HashMap<u32, u32>, generation_id: u32) -> InhibitTransition {
     let total_before = total(counts);
     if let Some(count) = counts.get_mut(&generation_id) {
@@ -44,12 +39,9 @@ pub fn apply_release_inhibit(counts: &mut HashMap<u32, u32>, generation_id: u32)
     InhibitTransition { should_open_fd: false, should_close_fd: total_before > 0 && total_after == 0 }
 }
 
-/// The inhibit half of `reset_registrations` (ADR-0006/ADR-0032): zeros `generation_id`'s entire
-/// count in one step (a crashed/reloading generation's count is dropped outright, not decremented
-/// once) -- "the same per-generation reset `reset_registrations` already triggers on reload or
-/// crash zeros this count too". `should_close_fd` follows the same global-total-reaches-zero rule
-/// as [`apply_release_inhibit`], so a crashed generation holding the *only* live inhibit still
-/// releases the real fd instead of leaking it.
+/// The inhibit half of `reset_registrations` (ADR-0006/ADR-0032): zeros `generation_id`'s
+/// entire count in one step. `should_close_fd` follows the same global-total-reaches-zero rule
+/// as [`apply_release_inhibit`], so a crashed generation holding the only inhibit still releases the fd.
 pub fn cleanup_generation_inhibit(counts: &mut HashMap<u32, u32>, generation_id: u32) -> InhibitTransition {
     let total_before = total(counts);
     counts.remove(&generation_id);
@@ -69,10 +61,8 @@ pub(crate) trait Login1Manager {
     fn inhibit(&self, what: &str, who: &str, why: &str, mode: &str) -> zbus::Result<zbus::zvariant::OwnedFd>;
 }
 
-/// `what`/`who`/`mode` are fixed by ADR-0032: `what` scoped to `"idle"` only (not
-/// `"sleep"`/`"shutdown"`/lid-switch -- those govern unrelated system actions nothing here asked
-/// for), `who` identifies this process, `mode = "block"` is the only mode that actually blocks
-/// systemd's auto-suspend-on-idle action rather than merely delaying it.
+/// `what`/`who`/`mode` are fixed by ADR-0032: `mode = "block"` is the only mode that actually
+/// blocks systemd's auto-suspend-on-idle rather than merely delaying it.
 pub(crate) const INHIBIT_WHAT: &str = "idle";
 pub(crate) const INHIBIT_WHO: &str = "oblisk";
 pub(crate) const INHIBIT_MODE: &str = "block";
@@ -85,21 +75,11 @@ pub(crate) struct InhibitState {
 }
 
 pub(crate) struct LiveInhibit {
-    /// The Supervisor's already-established system-bus connection (shared with NetworkManager/
-    /// BlueZ/polkit -- ADR-0032, no new connection). `Login1ManagerProxy` is built fresh from
-    /// this on every [`IdleController::inhibit`] call rather than cached at construction time
-    /// (Correctness review, Fix 2): caching a proxy built once at startup would freeze a single
-    /// `Proxy::new` failure into a permanent, process-lifetime inhibit outage, directly
-    /// contradicting ADR-0032's "its only failure mode is the `Inhibit` call itself failing
-    /// per-request... not a startup-time capability gap". `Proxy::new` performs no D-Bus round
-    /// trip of its own (this trait declares no cached properties), so rebuilding it per call
-    /// costs nothing worth caching against.
+    /// The Supervisor's already-established system-bus connection. `Login1ManagerProxy` is built
+    /// fresh per [`IdleController::inhibit`] call, not cached -- caching would freeze one startup failure into a permanent outage.
     pub(crate) system_bus: zbus::Connection,
-    /// `tokio::sync::Mutex`, not `std::sync::Mutex` (Correctness review, Fix 1): the refcount
-    /// decision, the `Inhibit` D-Bus call, and the `fd` write must run as one atomic critical
-    /// section with the lock held throughout -- `std::sync::Mutex`'s guard cannot be held across
-    /// an `.await` point, `tokio::sync::Mutex`'s can. See [`IdleController::inhibit`]'s doc
-    /// comment for the two races this closes.
+    /// `tokio::sync::Mutex`, not `std::sync::Mutex`: the refcount decision, D-Bus call, and `fd`
+    /// write run as one critical section with the lock held across an `.await`, which `std::sync::Mutex` can't do.
     pub(crate) state: tokio::sync::Mutex<InhibitState>,
 }
 
@@ -211,8 +191,7 @@ mod tests {
 
     use tokio::net::UnixStream;
 
-    /// A connected pair of p2p zbus connections, no bus daemon involved -- same pattern as
-    /// `dbus::tray`/`dbus::polkit`/`dbus::bluetooth`'s own `p2p_pair` helpers.
+    /// A connected pair of p2p zbus connections, no bus daemon involved.
     async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {
         let (a, b) = UnixStream::pair().expect("failed to create a unix socket pair");
         let guid = zbus::Guid::generate();
@@ -221,10 +200,8 @@ mod tests {
         tokio::try_join!(server_builder.build(), client_builder.build()).expect("p2p handshake")
     }
 
-    /// A stand-in for logind's own `org.freedesktop.login1.Manager` object, exported on the peer
-    /// end of a p2p connection. Returns a real, valid fd (`/dev/null`, opened fresh) so the proxy
-    /// call this test drives gets back something a real `OwnedFd` can wrap -- the actual fd's
-    /// provenance doesn't matter to this test, only that one comes back at all.
+    /// A stand-in for logind's own `org.freedesktop.login1.Manager`. Returns a real fd
+    /// (`/dev/null`) so the proxy call under test gets back a real `OwnedFd` to wrap.
     struct StubLogin1Manager {
         calls: tokio::sync::mpsc::UnboundedSender<(String, String, String, String)>,
     }
@@ -262,8 +239,7 @@ mod tests {
             .expect("failed to build a p2p Login1ManagerProxy");
 
         let fd = proxy.inhibit("idle", "oblisk", "playing a video", "block").await.expect("Inhibit call should succeed");
-        // A real fd came back -- `OwnedFd`'s own `Drop` closing it cleanly (no panic) is itself
-        // part of what this assertion is checking.
+        // OwnedFd's own Drop closing it cleanly (no panic) is itself part of this assertion.
         drop(fd);
 
         let (what, who, why, mode) = calls_rx.recv().await.expect("stub Login1Manager never received Inhibit");

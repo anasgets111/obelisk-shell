@@ -1,22 +1,19 @@
 //! Kernel-level camera detection half of `oblisk.privacy` (ADR-0034): which processes have a
 //! `/dev/videoN` capture device open, found by a `fuser`-equivalent scan of `/proc/*/fd/*`
-//! symlinks -- inotify `OPEN`/`CLOSE` events on the device node itself are what triggers a
-//! rescan (verified live-reliable on this dev machine: opening then closing `/dev/video0`
-//! fired real `IN_OPEN` then `IN_CLOSE_NOWRITE` events, a different, VFS-level mechanism from
-//! the sysfs-attribute-notify path that turned out unreliable for keyboard lock LEDs -- see
-//! `hardware::keyboard::locks`'s module doc comment). The `/sys/class/video4linux/video<n>/
-//! streaming` fast-path flag ADR-0034 also proposed is deliberately not implemented here: this
-//! dev machine's real UVC webcam doesn't expose it despite running kernel 7.1 (well past the
-//! "6.3+" threshold), so it can't be verified live, and the fd-scan below is sufficient and
-//! already needed on its own -- the flag would only ever save a scan, never replace one, since
-//! `camera_users` needs the actual opener pids regardless. Left for the ADR's Upgrade path.
+//! symlinks -- inotify `OPEN`/`CLOSE` events on the device node trigger a rescan (verified
+//! live-reliable: opening then closing `/dev/video0` fired real `IN_OPEN`/`IN_CLOSE_NOWRITE`
+//! events, a different, VFS-level mechanism from the sysfs-attribute-notify path that turned
+//! out unreliable for keyboard lock LEDs -- see `hardware::keyboard::locks`'s module doc).
+//!
+//! The `/sys/class/video4linux/video<n>/streaming` fast-path flag ADR-0034 also proposed is
+//! deliberately not implemented: this dev machine's real UVC webcam doesn't expose it despite
+//! running past the "6.3+" threshold, so it can't be verified live, and the fd-scan below is
+//! sufficient and already needed on its own regardless. Left for the ADR's upgrade path.
 
 use std::path::{Path, PathBuf};
 
-/// Every `/dev/videoN` device this machine's kernel currently advertises, resolved once
-/// (cameras don't typically hotplug on the machines this targets; a USB webcam plugged in after
-/// boot won't be picked up -- a documented limitation, not a design goal here, matching the
-/// resolve-once precedent `sysinfo::temp`/`keyboard::backlight` already established).
+/// Every `/dev/videoN` device this machine's kernel currently advertises, resolved once --
+/// cameras don't typically hotplug, so a USB webcam plugged in after boot won't be picked up.
 pub fn enumerate_video_devices(video4linux_root: &Path) -> Vec<PathBuf> {
     let mut devices = Vec::new();
     let Ok(entries) = std::fs::read_dir(video4linux_root) else { return devices };
@@ -36,9 +33,7 @@ pub fn enumerate_video_devices(video4linux_root: &Path) -> Vec<PathBuf> {
 
 /// A `fuser`-equivalent: every pid with an open file descriptor whose target resolves to
 /// exactly `device_path`, found by scanning `<proc_root>/*/fd/*` symlinks. `proc_root` is
-/// injected (`docs/oblisk-tdd-test-harness.md`'s mandate) -- tests build a fake tree with real
-/// `std::os::unix::fs::symlink` fd entries, not string-literal mocks. A pid with more than one
-/// fd open on the same device appears once, not once per fd.
+/// injected for testing. A pid with more than one fd open on the same device appears once.
 pub fn find_device_openers(proc_root: &Path, device_path: &str) -> Vec<u32> {
     let mut pids = Vec::new();
     let Ok(proc_entries) = std::fs::read_dir(proc_root) else { return pids };
@@ -56,8 +51,6 @@ pub fn find_device_openers(proc_root: &Path, device_path: &str) -> Vec<u32> {
 
 /// Reads `<proc_root>/<pid>/comm` -- the fallback app name for an opener PipeWire's
 /// `Video/Source` enrichment doesn't have a matching node for (a raw V4L2 user, ADR-0034).
-/// Unlike `audio::mixer::resolve_process_name` (which hardcodes `/proc`), this takes an
-/// injected root, following this module's own testing convention throughout.
 pub fn read_comm(proc_root: &Path, pid: u32) -> Option<String> {
     let text = std::fs::read_to_string(proc_root.join(pid.to_string()).join("comm")).ok()?;
     Some(text.trim_end().to_string())

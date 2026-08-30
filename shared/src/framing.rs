@@ -1,19 +1,17 @@
 //! 4-byte big-endian length-prefixed wire framing (build-steps.md Phase 9).
 //!
-//! Generic over `AsyncRead`/`AsyncWrite` so both a real `UnixStream` and an in-memory duplex
-//! pipe drive the same code in tests -- no filesystem needed to exercise framing correctness.
-//! Uses `AsyncReadExt::read_exact`/`AsyncWriteExt::write_all` directly per Phase 9's own text:
-//! no converting to a blocking `std::net` socket, no busy-poll sleep loop.
+//! Generic over `AsyncRead`/`AsyncWrite` so both a real `UnixStream` and an in-memory duplex pipe
+//! drive the same code in tests -- no filesystem needed to exercise framing correctness.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Ceiling on a single frame's payload length. Checked against the 4-byte length prefix
-/// before any payload bytes are read, so a malformed or hostile prefix can't force an
-/// unbounded allocation (up to 4 GiB from a `u32` alone) -- this socket is slated to carry
-/// secure textfield submissions later (ADR-0005).
+/// Ceiling on a single frame's payload length, checked against the 4-byte length prefix before
+/// any payload bytes are read, so a malformed or hostile prefix can't force an unbounded
+/// allocation (up to 4 GiB from a `u32` alone) -- this socket carries secure textfield submissions
+/// (ADR-0005).
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Error)]
@@ -37,8 +35,8 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, payload: &[u8]) 
     Ok(())
 }
 
-/// Reads one frame: a 4-byte big-endian length prefix, then exactly that many bytes.
-/// Rejects an oversized declared length before allocating the payload buffer.
+/// Reads one frame: a 4-byte big-endian length prefix, then exactly that many bytes. Rejects an
+/// oversized declared length before allocating the payload buffer.
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, FramingError> {
     let mut len_bytes = [0u8; 4];
     reader.read_exact(&mut len_bytes).await?;
@@ -95,9 +93,8 @@ mod tests {
 
     #[tokio::test]
     async fn read_frame_rejects_an_oversized_declared_length_before_reading_any_payload() {
-        // A buffer smaller than the claimed length: if read_frame allocated first and then
-        // tried to fill that allocation, this would hang waiting for bytes that never
-        // arrive. It must reject based on the length prefix alone.
+        // A buffer smaller than the claimed length: if read_frame allocated first and then tried
+        // to fill it, this would hang waiting for bytes that never arrive.
         let (mut a, mut b) = tokio::io::duplex(8);
         let oversized_len = (MAX_FRAME_LEN as u32) + 1;
         a.write_all(&oversized_len.to_be_bytes()).await.unwrap();

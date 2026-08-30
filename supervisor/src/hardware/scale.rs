@@ -1,23 +1,17 @@
 //! Raw-brightness/percent conversion shared by every `hardware` capability that scales a
-//! `[0, max]` device reading against a `[0, 100]` percent: `keyboard`'s UPower backlight (ADR-
-//! 0034) and `brightness`'s sysfs backlight (docs/adr/0053) both call these. Split out of
-//! `keyboard::backlight` -- a display-brightness module importing from a module named `keyboard`
-//! would be Feature Envy, so the shared math moved to a sibling both can reach instead.
+//! `[0, max]` device reading against a `[0, 100]` percent: `keyboard`'s UPower backlight
+//! (docs/adr/0034) and `brightness`'s sysfs backlight (docs/adr/0053) both call these.
 
 /// Converts a raw `[0, max]` brightness reading into a `[0, 100]` percent, round-half-away-
-/// from-zero (matches `sysinfo::temp::round_milli_c`'s rounding convention). `max <= 0` (no
-/// backlight hardware, or a malformed reading) returns the IDL's `-1` unavailable sentinel --
-/// the same convention `temp_gpu` already established -- rather than dividing by zero or
-/// fabricating a `0`. `keyboard` reports this sentinel straight through; `brightness` never sees
-/// it, because it excludes any device with a non-positive `max_brightness` at selection time
-/// instead (§ 2.3 has no sentinel to report -- see `brightness/mod.rs`'s own doc comment).
+/// from-zero. `max <= 0` returns the IDL's `-1` unavailable sentinel rather than dividing by
+/// zero or fabricating a `0`; `brightness` never sees it since it excludes non-positive
+/// `max_brightness` devices at selection time.
 pub fn percent_from_raw(brightness: i32, max: i32) -> i32 {
     if max <= 0 {
         return -1;
     }
-    // i64 intermediates (Correctness review): `100 * brightness` in `i32` overflows once
-    // `max`/`brightness` exceeds `i32::MAX / 100` -- a malformed or buggy `GetMaxBrightness`
-    // reply shouldn't be able to panic (debug) or silently wrap (release) this arithmetic.
+    // i64 intermediates: `100 * brightness` in `i32` overflows once `max`/`brightness` exceeds
+    // `i32::MAX / 100` -- must not panic (debug) or silently wrap (release).
     let brightness = i64::from(brightness.clamp(0, max));
     let max64 = i64::from(max);
     let scaled = 100 * brightness;
@@ -27,10 +21,7 @@ pub fn percent_from_raw(brightness: i32, max: i32) -> i32 {
 
 /// The inverse of [`percent_from_raw`]: converts a `[0, 100]` percent into the raw `[0, max]`
 /// scale a `SetBrightness` call expects, round-half-away-from-zero, clamped to `[0, max]`. `pct`
-/// is taken as `u64` straight from each caller's own `parse_*_args` (never validated to `<= 100`
-/// at parse time, matching every other numeric `parse_*_args` in this codebase -- e.g.
-/// `idle::parse_register_args`'s unclamped seconds) -- clamping happens here, the one place that
-/// actually needs the bound.
+/// is unvalidated `u64` from the caller's `parse_*_args`; clamping happens here.
 pub fn raw_from_percent(pct: u64, max: i32) -> i32 {
     if max <= 0 {
         return 0;
@@ -69,8 +60,6 @@ mod tests {
 
     #[test]
     fn percent_from_raw_does_not_overflow_on_a_malformed_near_i32_max_reading() {
-        // Correctness review: a buggy/malformed GetMaxBrightness reply this large must not panic
-        // (debug) or silently wrap (release) the `100 * brightness` intermediate.
         assert_eq!(percent_from_raw(i32::MAX, i32::MAX), 100);
         assert_eq!(percent_from_raw(i32::MAX / 2, i32::MAX), 50);
     }

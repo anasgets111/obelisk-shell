@@ -41,10 +41,9 @@ pub(super) enum RegistrationError {
     InvalidName(String),
     Dbus(String),
     /// `service` was already a unique name (`:N.M`) but didn't equal the real, authenticated
-    /// sender of this `RegisterStatusNotifierItem` call (Correctness review: a connection can only
-    /// ever truthfully claim its own unique name -- `header.sender()` is filled in by the bus
-    /// daemon itself and cannot be spoofed by the calling process, so any mismatch here means the
-    /// caller fabricated a unique name it doesn't own).
+    /// sender of this `RegisterStatusNotifierItem` call: a connection can only ever truthfully
+    /// claim its own unique name -- `header.sender()` is filled in by the bus daemon and
+    /// cannot be spoofed, so any mismatch here means the caller fabricated a name it doesn't own.
     UniqueNameMismatch { claimed: String, sender: String },
 }
 
@@ -63,11 +62,10 @@ impl std::fmt::Display for RegistrationError {
 
 impl std::error::Error for RegistrationError {}
 
-/// Resolves `RegisterStatusNotifierItem`'s `service` argument plus the calling message's sender
-/// into `(unique_name, object_path)` -- the registry key this controller actually uses
-/// (ADR-0031's "registry keys on the resolved D-Bus unique name" decision). The well-known-name
-/// branch is the only one that performs I/O (`GetNameOwner`); the other two are resolved
-/// synchronously from already-known data.
+/// Resolves `RegisterStatusNotifierItem`'s `service` argument plus the calling message's
+/// sender into `(unique_name, object_path)` -- the registry key this controller actually uses
+/// (ADR-0031). The well-known-name branch is the only one that performs I/O (`GetNameOwner`);
+/// the other two are resolved synchronously.
 pub(super) async fn resolve_registration(connection: &zbus::Connection, service: &str, sender: Option<&str>) -> Result<(OwnedUniqueName, OwnedObjectPath), RegistrationError> {
     match classify_service_arg(service) {
         RegistrationTarget::ObjectPathFromSender { object_path } => {
@@ -77,15 +75,14 @@ pub(super) async fn resolve_registration(connection: &zbus::Connection, service:
             Ok((unique_name, object_path))
         }
         RegistrationTarget::UniqueName { unique_name } => {
-            // A connection can only ever truthfully claim its own real unique name (Correctness
-            // review, security bug: unbounded ghost-registry DoS) -- reject any claimed unique
-            // name that doesn't equal the real, bus-daemon-authenticated sender of this call. A
-            // well-behaved client's self-claimed unique name is always its own, so this rejects
-            // nothing legitimate; it only closes the fabrication vector (any session-bus peer
-            // could otherwise call `RegisterStatusNotifierItem(":999.1")` repeatedly with distinct
-            // made-up names, each planting a registry entry with forwarder tasks that can never be
-            // cleaned up, since `NameOwnerChanged`-based removal only fires for a name that was
-            // ever real and then genuinely disconnects).
+            // A connection can only ever truthfully claim its own real unique name: reject any
+            // claimed unique name that doesn't equal the real, bus-daemon-authenticated sender
+            // of this call. A well-behaved client's self-claimed unique name is always its own,
+            // so this rejects nothing legitimate; it only closes the fabrication vector -- any
+            // session-bus peer could otherwise call `RegisterStatusNotifierItem(":999.1")`
+            // repeatedly with distinct made-up names, planting registry entries that can never
+            // be cleaned up, since `NameOwnerChanged` removal only fires for a name that was
+            // ever real and then genuinely disconnects.
             let sender = sender.ok_or(RegistrationError::NoSender)?;
             if unique_name != sender {
                 return Err(RegistrationError::UniqueNameMismatch { claimed: unique_name, sender: sender.to_string() });

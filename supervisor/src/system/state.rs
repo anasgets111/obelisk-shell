@@ -1,28 +1,18 @@
 //! Loading `system.state` (docs/oblisk-idl-api-specs.md §2.11: "a reactive, read-only dictionary
 //! of persistent states"). Read once, at [`SystemController::new`](super::controller::
 //! SystemController::new) time, and never again -- this codebase has no write path to
-//! `state.json` yet (only `system:write_state`'s IDL row exists, §3.2, unbuilt), so re-reading
-//! a file nothing in this process ever changes on a timer would be pure waste, the same
-//! resolve-once argument `SysinfoController::new` makes for its hwmon chip lookup.
+//! `state.json` yet (only `system:write_state`'s IDL row exists, §3.2, unbuilt).
 
 use std::path::Path;
 
 /// Every failure mode collapses to an empty JSON object rather than an error or a panic:
 ///
-/// - **Missing file**: the ordinary first-run case. A config that has never called
-///   `system:write_state` has no `state.json` yet, and that is not a fault.
-/// - **Unreadable file** (permissions, not-a-regular-file, ...): `read_to_string`'s `Err` is
-///   folded into the same case as missing. Nothing downstream distinguishes "absent" from
-///   "present but inaccessible" -- both mean the dictionary this signal promises has no content
-///   to serve, and a lock screen's clock must still be able to tick either way (§2.11's `time`
-///   is a separate field on the same struct and does not depend on this succeeding).
-/// - **Malformed JSON**: same degrade. A syntax error in a file this process did not write
-///   itself (or a hand-edit) must not turn a persistent-state read into a boot-blocking error.
-/// - **Well-formed JSON that isn't a top-level object** (an array, a string, a number, `null`):
-///   §2.11 promises `system.state` as a dictionary (Lua `table` keyed by string), so a top-level
-///   JSON array or scalar is not a shape this signal can honor, and is treated the same as
-///   malformed rather than passed through as something Lua would see as a numerically-indexed
-///   table instead of a dictionary.
+/// - **Missing file**: the ordinary first-run case -- no `state.json` yet is not a fault.
+/// - **Unreadable file**: folded into the same case as missing. Nothing downstream
+///   distinguishes "absent" from "present but inaccessible".
+/// - **Malformed JSON**: same degrade -- a hand-edit syntax error must not block boot.
+/// - **Well-formed JSON that isn't a top-level object**: §2.11 promises a dictionary (Lua
+///   `table` keyed by string), so an array or scalar is treated the same as malformed.
 pub fn load_state(path: &Path) -> serde_json::Value {
     let Ok(contents) = std::fs::read_to_string(path) else {
         return empty_object();

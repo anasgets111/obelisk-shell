@@ -1,7 +1,6 @@
 //! The one snapshot-push path (ADR-0037): bump the capability's revision counter, serialize,
-//! send to the authoritative generation, record in `last_snapshots`. Replaces the previous
-//! one-near-identical-function-per-capability family (docs/adr/0029's `revisions`/
-//! `last_snapshots` maps) -- the capability name was the only real datum ever varying.
+//! send to the authoritative generation, record in `last_snapshots`. Replaces a previous
+//! one-function-per-capability family (docs/adr/0029's `revisions`/`last_snapshots` maps).
 
 use std::collections::HashMap;
 
@@ -10,9 +9,7 @@ use shared::SupervisorFrame;
 use crate::{send_frame_logged, socket};
 
 /// Bumps and returns `capability`'s own state-version counter (ADR-0004; docs/adr/0029
-/// generalizes the old single `audio_revision: u32` into this map, keyed by capability name).
-/// Starts at `1` for a capability's first-ever push, matching the old `audio_revision`'s own
-/// `0`-initialized-then-pre-incremented behavior.
+/// generalizes this into a map keyed by capability name). Starts at `1` for a first push.
 pub(crate) fn bump_revision(revisions: &mut HashMap<String, u32>, capability: &str) -> u32 {
     let revision = revisions.entry(capability.to_string()).or_insert(0);
     *revision += 1;
@@ -20,10 +17,8 @@ pub(crate) fn bump_revision(revisions: &mut HashMap<String, u32>, capability: &s
 }
 
 /// Bumps `capability`'s revision and pushes `state` as a fresh `StateSnapshot` to the
-/// authoritative generation, recording it in `last_snapshots` (docs/adr/0029), the same
-/// per-capability hydration map a freshly-promoted PBA candidate is seeded from. The
-/// `debug_assert` is ADR-0037's roster check: a capability pushed here but missing from
-/// `shared::CAPABILITIES` would boot with no pre-seeded Lua global on the Renderer side.
+/// authoritative generation, recording it in `last_snapshots` (docs/adr/0029), the map a
+/// freshly-promoted PBA candidate is seeded from. `debug_assert` is ADR-0037's roster check.
 pub(crate) fn push_snapshot(
     registry: &socket::GenerationRegistry,
     generation_id: u32,

@@ -1,12 +1,7 @@
 //! `pacman.conf`/mirrorlist parsing for `oblisk.updates` (ADR-0034): the real, non-hardcoded
-//! repo list and mirror server set this machine's pacman is actually configured with. The
-//! ADR's own empirical `alpm` verification hardcoded `core`/`extra`/`multilib`, but this dev
-//! machine's real `/etc/pacman.conf` has five repos (`core`, `extra`, `multilib`,
-//! `chaotic-aur`, `omarchy`), in two different real forms: `core`/`extra`/`multilib`/
-//! `chaotic-aur` each `Include =` a mirrorlist file, while `omarchy` inlines a single
-//! `Server =` line directly in `pacman.conf` with no `Include` at all -- both real, both
-//! handled here, confirmed by reading this machine's actual file rather than assuming the
-//! common case is the only case.
+//! repo list and mirror server set this machine's pacman is actually configured with. This
+//! dev machine's real `/etc/pacman.conf` has repos in two forms -- most `Include =` a
+//! mirrorlist file, `omarchy` inlines a `Server =` line directly -- both handled here.
 
 use std::path::Path;
 
@@ -23,9 +18,8 @@ fn strip_comment_and_trim(line: &str) -> &str {
 }
 
 /// Parses `text` (real `pacman.conf` syntax) into every non-`[options]` section's name, its
-/// `Include = ` paths, and its inline `Server = ` lines, in file order. Pure -- no filesystem
-/// access, so the section/key parsing itself is directly testable against literal `pacman.conf`
-/// text without needing real mirrorlist files.
+/// `Include = ` paths, and its inline `Server = ` lines, in file order. Pure -- directly
+/// testable against literal `pacman.conf` text without needing real mirrorlist files.
 fn parse_pacman_conf(text: &str) -> Vec<(String, Vec<String>, Vec<String>)> {
     let mut repos = Vec::new();
     let mut current: Option<(String, Vec<String>, Vec<String>)> = None;
@@ -79,13 +73,8 @@ fn substitute(template: &str, repo_name: &str) -> String {
 
 /// Parses `pacman_conf_path` and resolves every configured repo's full mirror server list --
 /// `Server =` lines directly under its section, plus every `Include =` file's own `Server =`
-/// lines (an `Include` path in real `pacman.conf` is already absolute, e.g.
-/// `/etc/pacman.d/mirrorlist`, so no separate root-injection parameter is needed here the way
-/// `sysinfo`'s `proc_root`/`hwmon_root` need one -- a test's fake `pacman.conf` just points its
-/// own `Include =` line at another real file inside the same `tempfile::tempdir()`). Silently
-/// skips a repo whose `Include` file can't be read (logs nothing here -- `check::check_for_
-/// updates`'s caller-level log covers a repo that ends up with zero servers, matching every
-/// other missing-capability path's single log point rather than one per failure cause).
+/// lines. No root-injection parameter needed: an `Include` path in real `pacman.conf` is
+/// already absolute. Silently skips a repo whose `Include` file can't be read.
 pub fn resolve_repo_servers(pacman_conf_path: &Path) -> Vec<RepoServers> {
     let Ok(text) = std::fs::read_to_string(pacman_conf_path) else { return Vec::new() };
 

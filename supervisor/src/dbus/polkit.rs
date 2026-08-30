@@ -1,21 +1,14 @@
-//! Polkit authentication agent registration handshake (build-steps.md Phase 5, point 1).
+//! Polkit authentication agent registration handshake.
 //!
-//! `build-steps.md` names the registration method `org.freedesktop.PolicyKit1.Authority.
-//! RegisterAgent`. That's an approximation, not the real D-Bus method name: verified
-//! against polkit's own source (`polkit_authority_register_authentication_agent_with_options`
-//! in `src/polkit/polkitauthority.c`, and the shipped introspection XML), the real method
-//! is `RegisterAuthenticationAgent`, signature `(subject: (sa{sv}), locale: s,
-//! object_path: s) -> ()`. `RegisterAuthenticationAgentWithOptions` exists too (adds an
-//! `a{sv}` options dict, e.g. for `fallback`), but nothing here needs it yet.
+//! The real D-Bus method (verified against polkit's own source and introspection XML) is
+//! `RegisterAuthenticationAgent(subject: (sa{sv}), locale: s, object_path: s) -> ()`, not
+//! `RegisterAgent` as build-steps.md names it. `RegisterAuthenticationAgentWithOptions` exists
+//! too (adds an `a{sv}` options dict, e.g. `fallback`) but nothing here needs it yet. The
+//! call-out uses `zbus_polkit`'s `Authority` proxy and `Subject` type directly rather than
+//! hand-deriving matching zvariant types (docs/adr/0013).
 //!
-//! The client call-out (`RegisterAuthenticationAgent`/`UnregisterAuthenticationAgent`) uses
-//! `zbus_polkit`'s `Authority` proxy and `Subject` type directly rather than hand-deriving
-//! matching zvariant types: see docs/adr/0013-polkit-agent-registration-uses-zbus-polkit-for-the-authority-proxy.md.
-//!
-//! The agent side -- `org.freedesktop.PolicyKit1.AuthenticationAgent`, the interface polkitd
-//! calls back into once we're registered -- has no maintained crate wrapping it, so
-//! `AuthenticationAgent` below is hand-written against the signature verified from the same
-//! polkit source (`src/polkitagent/polkitagentlistener.c`):
+//! The agent side, `org.freedesktop.PolicyKit1.AuthenticationAgent`, has no maintained crate,
+//! so `AuthenticationAgent` below is hand-written against the verified signature:
 //! `BeginAuthentication(action_id: s, message: s, icon_name: s, details: a{ss}, cookie: s,
 //! identities: a(sa{sv})) -> ()` and `CancelAuthentication(cookie: s) -> ()`.
 
@@ -27,9 +20,7 @@ use zbus::zvariant::{OwnedValue, Value};
 pub use zbus_polkit::policykit1::{AuthorityProxy, Subject};
 
 /// Object path this agent is exported at on our own unique connection name. Any path under
-/// our control is valid (the spec's `object_path` argument is caller-chosen, not fixed) --
-/// this mirrors LXQt's `/org/lxqt/PolicyKit1/AuthenticationAgent` convention rather than
-/// reusing polkitd's own default agent path.
+/// our control is valid -- the spec's `object_path` argument is caller-chosen, not fixed.
 pub const AGENT_OBJECT_PATH: &str = "/org/oblisk/PolicyKit1/AuthenticationAgent";
 
 /// Builds the `unix-session` `Subject` for the session this process is running in.
@@ -53,9 +44,8 @@ pub fn current_session_subject() -> Result<Subject, std::env::VarError> {
 
 /// One `BeginAuthentication` call as polkitd sent it, parsed off the wire.
 ///
-/// `Eq` is deliberately not derived (unlike most other wire-shaped structs in this codebase):
-/// `identities`' `OwnedValue` can hold a `zvariant::Value::F64`, and `f64` only implements
-/// `PartialEq`, not `Eq`.
+/// `Eq` is deliberately not derived: `identities`' `OwnedValue` can hold a
+/// `zvariant::Value::F64`, and `f64` only implements `PartialEq`, not `Eq`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BeginAuthenticationCall {
     pub action_id: String,
@@ -67,9 +57,8 @@ pub struct BeginAuthenticationCall {
 }
 
 /// The uid to authenticate as and to report back via `AuthenticationAgentResponse2`, parsed
-/// from `BeginAuthentication`'s own `identities` list. Per `Identity`'s doc comment (this
-/// module, `zbus_polkit`'s own source): a `unix-user` identity carries its uid under the
-/// `"uid"` key, typed `uint32`.
+/// from `BeginAuthentication`'s `identities` list: a `unix-user` identity carries its uid
+/// under the `"uid"` key, typed `uint32`.
 ///
 /// ponytail: takes the *first* `unix-user` identity in the list, not all of them. polkitd can
 /// list multiple identities that could satisfy an action (e.g. every member of `wheel`) --
@@ -112,8 +101,7 @@ impl AuthenticationAgent {
         cookie: String,
         identities: Vec<(String, HashMap<String, OwnedValue>)>,
     ) {
-        // A dropped receiver just means whoever should have consumed this challenge isn't
-        // listening (e.g. mid-shutdown); not a reason to fail the D-Bus call.
+        // A dropped receiver just means nobody is listening (e.g. mid-shutdown); not a reason to fail the D-Bus call.
         let _ = self.challenges.send(BeginAuthenticationCall { action_id, message, icon_name, details, cookie, identities });
     }
 
@@ -123,11 +111,9 @@ impl AuthenticationAgent {
     }
 }
 
-/// Registers `agent` as the polkit authentication agent for `subject`/`locale`.
-///
-/// Exports `agent` on `connection`'s object server at `object_path` *before* calling
-/// `RegisterAuthenticationAgent`, so a `BeginAuthentication` callback arriving right after
-/// registration succeeds always finds a live object to dispatch to.
+/// Registers `agent` as the polkit authentication agent for `subject`/`locale`. Exports
+/// `agent` on `connection`'s object server *before* calling `RegisterAuthenticationAgent`, so
+/// a callback arriving right after registration succeeds always finds a live object.
 pub async fn register_agent(
     connection: &zbus::Connection,
     agent: AuthenticationAgent,
@@ -148,11 +134,8 @@ mod tests {
 
     /// A stand-in for polkitd's own `org.freedesktop.PolicyKit1.Authority` object, exported
     /// on the peer end of a p2p connection so `register_agent`'s real wire call can be
-    /// exercised without a live system bus (docs/oblisk-tdd-test-harness.md §2.2's mock
-    /// D-Bus seam, adapted to zbus 5.x: that doc's `#[dbus_interface]` is zbus 3.x's macro
-    /// name, renamed to `#[zbus::interface]` by zbus 5.x -- verified against the vendored
-    /// zbus_macros-5.19.0 source, `zbus::interface` is what's re-exported from `zbus::lib.rs`
-    /// today).
+    /// exercised without a live system bus. `#[zbus::interface]` is zbus 5.x's rename of
+    /// zbus 3.x's `#[dbus_interface]` macro (docs/oblisk-tdd-test-harness.md §2.2).
     struct MockAuthority {
         calls: mpsc::UnboundedSender<(Subject, String, String)>,
     }
@@ -164,11 +147,9 @@ mod tests {
         }
     }
 
-    /// A connected pair of p2p zbus connections, no bus daemon involved. Mirrors the
-    /// pattern zbus's own `tests/e2e.rs` (`iface_and_proxy_unix_p2p`) uses -- crucially,
-    /// building both ends concurrently via `try_join!`, not one after the other: the SASL
-    /// handshake needs both peers reading and writing at once, so awaiting the server's
-    /// `.build()` to completion before even starting the client's deadlocks.
+    /// A connected pair of p2p zbus connections, no bus daemon involved. Mirrors zbus's own
+    /// `tests/e2e.rs` (`iface_and_proxy_unix_p2p`) -- crucially, building both ends concurrently
+    /// via `try_join!`: the SASL handshake needs both peers reading and writing at once.
     async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {
         let (a, b) = UnixStream::pair().expect("failed to create a unix socket pair");
         let guid = zbus::Guid::generate();

@@ -8,9 +8,8 @@ pub mod temp;
 
 pub use controller::{SysinfoController, SysinfoSignal, parse_configure_args};
 
-/// `oblisk.sysinfo`'s action dispatch (ADR-0037): `configure` is synchronous (it only rewrites
-/// the shared config under its lock and nudges the watch channels -- docs/adr/0035), so nothing
-/// here spawns.
+/// `oblisk.sysinfo`'s action dispatch (ADR-0037): `configure` is synchronous, so nothing here
+/// spawns -- it only rewrites the shared config under its lock and nudges the watch channels (docs/adr/0035).
 pub fn dispatch(controller: &SysinfoController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     match params.action.as_str() {

@@ -1,8 +1,7 @@
-//! Backlight half of `oblisk.keyboard` (ADR-0034, as corrected against this dev machine's real
+//! Backlight half of `oblisk.keyboard` (ADR-0034, corrected against this machine's real
 //! `org.freedesktop.UPower.KbdBacklight` introspection): the hand-written `KbdBacklight` proxy.
-//! Raw-brightness/percent conversion moved to `hardware::scale` (docs/adr/0053) once `brightness`
-//! needed the same math -- see that module's own doc comment. Split from `hardware::keyboard` --
-//! see `hardware/keyboard/mod.rs` for the module-level doc.
+//! Raw-brightness/percent conversion lives in `hardware::scale` (docs/adr/0053), shared with
+//! `brightness`. Split from `hardware::keyboard` -- see `hardware/keyboard/mod.rs`.
 
 #[zbus::proxy(
     interface = "org.freedesktop.UPower.KbdBacklight",
@@ -24,8 +23,7 @@ pub(crate) trait KbdBacklight {
 mod tests {
     use super::*;
 
-    // ---- KbdBacklightProxy (real D-Bus call, p2p pattern -- mirrors idle::inhibit's
-    // Login1ManagerProxy test) ----
+    // ---- KbdBacklightProxy (real D-Bus call, p2p pattern) ----
 
     use tokio::net::UnixStream;
 

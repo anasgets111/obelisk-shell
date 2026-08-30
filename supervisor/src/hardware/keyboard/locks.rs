@@ -1,21 +1,13 @@
-//! Lock-state (caps/num/scroll) half of `oblisk.keyboard` (ADR-0034, as corrected against this
-//! dev machine's real, live-tested behavior: sysfs LED `brightness` files do NOT fire inotify
-//! `MODIFY` events on this kernel when the `input_leds` driver changes them itself -- confirmed
-//! by physically toggling Caps Lock twice under `inotifywait -m` and observing zero events
-//! despite the file's value genuinely changing. evdev's `EV_LED` event stream is therefore
-//! primary (it's the kernel's own live-notification mechanism for this exact state); sysfs is
-//! a permission-independent, read-once-at-construction static fallback, not the reverse of
-//! what was first proposed. Split from `hardware::keyboard` -- see `hardware/keyboard/mod.rs`
-//! for the module-level doc.
+//! Lock-state (caps/num/scroll) half of `oblisk.keyboard` (ADR-0034): sysfs LED `brightness`
+//! files do NOT fire inotify `MODIFY` events on this kernel when `input_leds` changes them
+//! itself (confirmed live: toggling Caps Lock under `inotifywait -m` shows zero events). evdev's
+//! `EV_LED` stream is therefore primary; sysfs is a permission-independent, read-once fallback.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Resolved sysfs LED node paths for all three lock indicators. All-or-nothing: if any one
-/// lock's LED node is missing, [`resolve_lock_leds`] returns `None` for the whole triple rather
-/// than mixing sources per-lock -- real hardware exposes all three as siblings under one input
-/// device (this dev machine's are `input3::capslock`/`input3::numlock`/`input3::scrolllock`) or
-/// none at all.
+/// Resolved sysfs LED node paths for all three lock indicators. All-or-nothing: if any one is
+/// missing, [`resolve_lock_leds`] returns `None` for the whole triple -- real hardware exposes all three as siblings, or none at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockLeds {
     pub caps: PathBuf,
@@ -24,8 +16,7 @@ pub struct LockLeds {
 }
 
 /// Scans `leds_root` for a subdirectory whose name ends with `::<suffix>` -- kernel LED-class
-/// naming is `<device>::<function>`, and matching only the suffix is robust to whatever
-/// `<device>` prefix a given machine's keyboard driver happens to use.
+/// naming is `<device>::<function>`, so matching only the suffix is robust to any `<device>` prefix.
 fn find_led(leds_root: &Path, suffix: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(leds_root).ok()?;
     for entry in entries.flatten() {
@@ -41,9 +32,7 @@ pub fn resolve_lock_leds(leds_root: &Path) -> Option<LockLeds> {
 }
 
 /// Reads one LED's `brightness` file. Kernel LED-class brightness is `0` = off, nonzero = on
-/// (this dev machine's own lock LEDs report `max_brightness = 1`, i.e. genuinely boolean, but
-/// nothing in the kernel LED-class ABI guarantees that on every machine, so `!= 0` is the
-/// correct test, not `== 1`).
+/// -- `!= 0` is correct, not `== 1`, since `max_brightness` isn't guaranteed to be `1`.
 pub fn read_led_on(led_dir: &Path) -> io::Result<bool> {
     let text = std::fs::read_to_string(led_dir.join("brightness"))?;
     Ok(text.trim().parse::<i64>().unwrap_or(0) != 0)

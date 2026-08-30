@@ -1,18 +1,14 @@
-//! Shared SHM icon-spooling helpers for `dbus::tray` and `dbus::notifications` (code-review
-//! finding 6: both controllers spooled bounds-checked PNG bytes to
-//! `/dev/shm/oblisk-$UID/{subdir}/...` and each defined a byte-for-byte identical `PngEncodeError`
-//! plus its own copy of the "make the dir, write the file, hand back the path" shape -- only the
-//! subdirectory name and the upstream pixel-source-to-PNG-bytes step actually differ between them,
-//! so those two stay local to each controller (`tray::encode_argb32_to_png` reorders ARGB->RGBA
-//! from `IconPixmap`; `notifications::encode_image_data_to_png` encodes an already-RGB(A)
-//! `image-data` hint) while this module holds only the truly shared PNG-error type and the
+//! Shared SHM icon-spooling helpers for `dbus::tray` and `dbus::notifications`: both spool
+//! bounds-checked PNG bytes to `/dev/shm/oblisk-$UID/{subdir}/...` and shared a byte-for-byte
+//! identical `PngEncodeError` plus the "make the dir, write the file, hand back the path"
+//! shape. Only the subdirectory name and the pixel-source-to-PNG-bytes step differ, so those
+//! stay local to each controller; this module holds only the shared PNG-error type and the
 //! directory/write mechanics.
 
 use std::path::PathBuf;
 
 /// PNG encoding failure -- wraps the `png` crate's own error type. Shared because both
-/// controllers' encoders hit the same `png::Encoder`/`png::Writer` API, just with different
-/// pixel-source shapes upstream of it.
+/// controllers' encoders hit the same `png::Encoder`/`png::Writer` API.
 #[derive(Debug)]
 pub enum PngEncodeError {
     Png(png::EncodingError),

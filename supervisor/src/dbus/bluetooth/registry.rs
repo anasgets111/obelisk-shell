@@ -17,14 +17,12 @@ use super::BluetoothSignal;
 // Device registry.
 // ---------------------------------------------------------------------------------------------
 
-/// One tracked `Device1` object. `mac` is cached at registration time (read once via `Device1`'s
-/// own `Address` property) rather than re-read live on every lookup -- resolving `pair`/`connect`/
-/// `disconnect`/`forget`'s `mac` argument back to an object path only needs a synchronous
-/// `HashMap` scan this way, with no `.await` (and therefore no held-across-`.await` lock) in the
-/// hot path. `forwarder` is this device's own signal-forwarder task (mirrors
-/// `dbus::network::spawn_wifi_signal_forwarder`'s shape, one instance per device instead of one
-/// for the whole Wi-Fi device) -- aborted on `InterfacesRemoved` so it doesn't keep polling a
-/// D-Bus object that no longer exists.
+/// One tracked `Device1` object. `mac` is cached at registration time (read once via
+/// `Device1`'s own `Address` property) rather than re-read live on every lookup: resolving
+/// `pair`/`connect`/`disconnect`/`forget`'s `mac` argument back to an object path only needs a
+/// synchronous `HashMap` scan this way, with no `.await` in the hot path. `forwarder` is this
+/// device's own signal-forwarder task, aborted on `InterfacesRemoved` so it doesn't keep
+/// polling a D-Bus object that no longer exists.
 pub(super) struct DeviceEntry {
     pub(super) mac: String,
     pub(super) device: Device1Proxy<'static>,
@@ -36,11 +34,9 @@ pub(super) type DeviceRegistry = Arc<Mutex<HashMap<OwnedObjectPath, DeviceEntry>
 
 /// Binds `path` as a `Device1`, caches its `Address`, optionally binds `Battery1` (only if
 /// `has_battery`), spawns this device's own signal forwarder, and inserts the resulting entry
-/// into `devices`. Used both by [`BluetoothController::new`]'s startup hydration (one call per
-/// `Device1`-bearing path `GetManagedObjects` returns) and by the `ObjectManager` forwarder's
-/// `InterfacesAdded` handler (one call per newly-added `Device1`-bearing path) -- the exact same
-/// registration work either way. Logs and skips (never registers a half-built entry) on any
-/// D-Bus failure.
+/// into `devices`. Used both by startup hydration (one call per `Device1`-bearing path
+/// `GetManagedObjects` returns) and by the `ObjectManager` forwarder's `InterfacesAdded`
+/// handler. Logs and skips (never registers a half-built entry) on any D-Bus failure.
 pub(super) async fn register_device(connection: &zbus::Connection, devices: &DeviceRegistry, path: OwnedObjectPath, has_battery: bool, events: UnboundedSender<BluetoothSignal>) {
     let device = match bind_device(connection, path.clone()).await {
         Ok(device) => device,
@@ -68,33 +64,28 @@ pub(super) async fn register_device(connection: &zbus::Connection, devices: &Dev
         None
     };
     let forwarder = spawn_device_signal_forwarder(device.clone(), battery.clone(), events);
-    // `insert` returns the prior value at this key, if any -- real BlueZ can emit a *second*
-    // `InterfacesAdded` for a path this registry already tracks (e.g. `Battery1` attaching to an
-    // already-known `Device1` once GATT battery-service discovery finishes after connection).
-    // Dropping a `JoinHandle` does not abort its task, so without this the old forwarder would
-    // leak forever (an un-abortable task holding a live D-Bus subscription) and every later
-    // property change on this device would fire `DeviceRegistryChanged` twice, once from each
-    // still-running forwarder (Correctness review).
+    // `insert` returns the prior value at this key, if any -- real BlueZ can emit a second
+    // `InterfacesAdded` for a path this registry already tracks (e.g. `Battery1` attaching to
+    // an already-known `Device1` once GATT discovery finishes). Dropping a `JoinHandle` does
+    // not abort its task, so without this the old forwarder would leak forever and every later
+    // property change would fire `DeviceRegistryChanged` twice.
     let previous = devices.lock().unwrap().insert(path, DeviceEntry { mac, device, battery, forwarder });
     if let Some(previous) = previous {
         previous.forwarder.abort();
     }
 }
 
-/// Runs until `device`'s connection drops (or, in the ordinary case, until `main.rs`'s side of
-/// `events` is dropped), forwarding `Connected`/`Paired`/`Name` property changes -- and, only if
-/// `battery` is `Some`, `Battery1.Percentage` changes -- as [`BluetoothSignal::DeviceRegistryChanged`].
-/// One instance per tracked device (mirrors `dbus::network::spawn_wifi_signal_forwarder`'s shape,
-/// instantiated per-device instead of once); its `JoinHandle` lives in the device's own
-/// [`DeviceEntry`] and is aborted on `InterfacesRemoved`, not left to run its natural course.
+/// Runs until `device`'s connection drops, forwarding `Connected`/`Paired`/`Name` property
+/// changes -- and, only if `battery` is `Some`, `Battery1.Percentage` changes -- as
+/// [`BluetoothSignal::DeviceRegistryChanged`]. One instance per tracked device; its
+/// `JoinHandle` lives in the device's own [`DeviceEntry`] and is aborted on
+/// `InterfacesRemoved`, not left to run its natural course.
 ///
-/// The `Battery1.Percentage` branch is folded into the same `select!` as the other three (rather
-/// than spawned as a second task) so this function returns exactly one `JoinHandle` -- the
-/// registry entry has room for only one, and a second, un-aborted task per battery-equipped
-/// device would leak on `InterfacesRemoved`. `battery`'s absence is modeled as a
-/// `std::future::pending()` arm rather than an `Option<Stream>` `if`-guard: it's simpler than
-/// unifying a `PropertyStream<bool>` and a `PropertyStream<u8>` behind one type, and a pending
-/// future just never wins the race, exactly as if that arm didn't exist.
+/// The `Battery1.Percentage` branch is folded into the same `select!` as the other three
+/// (rather than spawned as a second task) so this function returns exactly one `JoinHandle` --
+/// the registry entry has room for only one. `battery`'s absence is modeled as a
+/// `std::future::pending()` arm rather than an `Option<Stream>` `if`-guard: simpler than
+/// unifying a `PropertyStream<bool>` and a `PropertyStream<u8>` behind one type.
 fn spawn_device_signal_forwarder(device: Device1Proxy<'static>, battery: Option<Battery1Proxy<'static>>, events: UnboundedSender<BluetoothSignal>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut connected_changed = device.receive_connected_changed().await;
@@ -132,20 +123,16 @@ fn spawn_device_signal_forwarder(device: Device1Proxy<'static>, battery: Option<
 
 /// Runs until `added`/`removed` end, mutating `devices` directly (registering a fresh
 /// [`DeviceEntry`] on `InterfacesAdded`, removing and aborting one on `InterfacesRemoved`) and
-/// forwarding [`BluetoothSignal::DeviceRegistryChanged`] after each mutation -- mirrors
-/// `dbus::network::spawn_wifi_signal_forwarder`'s shape, but (unlike that task, which only
-/// forwards a tag and leaves rebuilding to `main.rs`) this one also owns the registry mutation
-/// itself: unlike NetworkManager's fixed Wi-Fi device set, resolving `pair`/`connect`/
-/// `disconnect`/`forget`'s `mac` argument needs a registry that's already up to date the moment a
-/// command arrives, not just eventually consistent once `main.rs` gets around to reacting to a
-/// signal.
+/// forwarding [`BluetoothSignal::DeviceRegistryChanged`] after each mutation. Unlike a task
+/// that only forwards a tag and leaves rebuilding to `main.rs`, this one also owns the
+/// registry mutation itself: resolving `pair`/`connect`/`disconnect`/`forget`'s `mac` argument
+/// needs a registry that's already up to date the moment a command arrives.
 ///
 /// Takes the already-subscribed `added`/`removed` streams rather than the bare
-/// `ObjectManagerProxy` (and subscribing internally): the *subscription* must complete before
-/// [`BluetoothController::new`]'s own `GetManagedObjects()` hydration call runs, not after this
-/// task actually gets scheduled -- otherwise any device added or removed on the bus in the window
-/// between `GetManagedObjects()` returning and a subscription completing would be silently and
-/// permanently missed, with nothing to ever re-sync the registry afterward (Correctness review).
+/// `ObjectManagerProxy`: the subscription must complete before [`BluetoothController::new`]'s
+/// own `GetManagedObjects()` hydration call runs, not after this task gets scheduled --
+/// otherwise a device added or removed on the bus in that window would be silently and
+/// permanently missed.
 pub(super) fn spawn_object_manager_forwarder<A, R>(connection: zbus::Connection, mut added: A, mut removed: R, devices: DeviceRegistry, events: UnboundedSender<BluetoothSignal>)
 where
     A: tokio_stream::Stream<Item = zbus::fdo::InterfacesAdded> + Unpin + Send + 'static,
@@ -163,24 +150,20 @@ where
                         if events.send(BluetoothSignal::DeviceRegistryChanged).is_err() { break; }
                     } else if has_battery {
                         // `InterfacesAdded` reports only interfaces newly present at this exact
-                        // signal, not the path's full interface set (org.freedesktop.DBus.
-                        // ObjectManager semantics) -- BlueZ commonly emits `Device1` first (on
-                        // pair/connect) and a *second*, `Battery1`-only `InterfacesAdded` on the
-                        // same path once GATT battery-service discovery finishes afterward.
-                        // Re-running `register_device` (with `has_battery: true`) on an
-                        // already-tracked path is exactly the case its own doc comment already
-                        // describes: it rebinds `Device1` (harmless -- the path already has that
-                        // interface), binds `Battery1`, spawns a fresh forwarder that now covers
-                        // `Percentage`, and its `insert` aborts the old, battery-less forwarder.
+                        // signal, not the path's full interface set -- BlueZ commonly emits
+                        // `Device1` first (on pair/connect) and a second, `Battery1`-only
+                        // `InterfacesAdded` on the same path once GATT battery-service
+                        // discovery finishes. Re-running `register_device` here rebinds
+                        // `Device1` (harmless), binds `Battery1`, and its `insert` aborts the
+                        // old, battery-less forwarder.
                         let path: OwnedObjectPath = args.object_path().to_owned().into();
                         let already_tracked = devices.lock().unwrap().contains_key(&path);
                         if already_tracked {
                             register_device(&connection, &devices, path, true, events.clone()).await;
                             if events.send(BluetoothSignal::DeviceRegistryChanged).is_err() { break; }
                         }
-                        // else: a `Battery1`-only event with no prior `Device1` for this path --
-                        // shouldn't normally happen, but there's nothing to attach it to yet, so
-                        // skip it, matching resolve_device's own skip-on-unknown-path style.
+                        // else: a `Battery1`-only event with no prior `Device1` -- shouldn't
+                        // normally happen, but there's nothing to attach it to yet, so skip it.
                     }
                 }
                 Some(signal) = removed.next() => {
@@ -201,12 +184,10 @@ where
     });
 }
 
-/// Runs until `adapter`'s connection drops, forwarding `Powered`/`Discovering` property changes
-/// as [`BluetoothSignal::AdapterChanged`] -- mirrors `dbus::network::spawn_wifi_signal_forwarder`'s
-/// shape at the adapter level, needed so `bluetooth.enabled`/`bluetooth.discovering` stay correct
-/// after any change BlueZ makes on its own (a completed/expired discovery session, or Bluetooth
-/// toggled by something other than this controller's own `set_enabled`), not just after this
-/// controller's own writes.
+/// Runs until `adapter`'s connection drops, forwarding `Powered`/`Discovering` property
+/// changes as [`BluetoothSignal::AdapterChanged`] -- needed so `bluetooth.enabled`/
+/// `bluetooth.discovering` stay correct after any change BlueZ makes on its own, not just
+/// after this controller's own writes.
 pub(super) fn spawn_adapter_signal_forwarder(adapter: Adapter1Proxy<'static>, events: UnboundedSender<BluetoothSignal>) {
     tokio::spawn(async move {
         let mut powered_changed = adapter.receive_powered_changed().await;

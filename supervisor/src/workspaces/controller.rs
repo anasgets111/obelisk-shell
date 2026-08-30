@@ -9,12 +9,9 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::hardware::keyboard::layout::{CompositorKind, detect_compositor};
 
-/// `oblisk.workspaces`'s full payload (§ 2.9). Field names are the JSON keys verbatim: the
-/// Renderer routes them straight into the Lua `oblisk.workspaces` table by name.
-///
-/// `active_client` is `Option` because § 2.9 says so ("or `nil` if none focused"), and it is
-/// omitted rather than serialized as `null` so a config's `if oblisk.workspaces.active_client`
-/// reads the same as every other absent-key case in this codebase.
+/// `oblisk.workspaces`'s full payload (§ 2.9). Field names are the JSON keys verbatim.
+/// `active_client` is `Option` (§ 2.9: "or `nil` if none focused"), omitted rather than
+/// serialized as `null`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct WorkspacesState {
     pub outputs: Vec<OutputWorkspaces>,
@@ -22,25 +19,22 @@ pub struct WorkspacesState {
     pub active_client: Option<ActiveClient>,
 }
 
-/// One output's workspace state. `workspaces` is docs/adr/0056 decision 3's addition to § 2.9,
-/// which specifies two workspace ids per output and nothing that turns either into something a
-/// config can draw.
+/// One output's workspace state. `workspaces` is docs/adr/0056 decision 3's addition to
+/// § 2.9.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OutputWorkspaces {
     pub name: String,
     pub active_workspace: u64,
-    /// docs/adr/0056 decision 4: niri's focus is one workspace across every output, and § 2.9
-    /// puts the field inside the per-output structure. Present only on the output that actually
-    /// holds focus, so `out.focused_workspace ~= nil` is the "is this the focused monitor" test.
+    /// docs/adr/0056 decision 4: present only on the output that actually holds focus, so
+    /// `out.focused_workspace ~= nil` is the "is this the focused monitor" test.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub focused_workspace: Option<u64>,
     pub workspaces: Vec<WorkspaceEntry>,
 }
 
-/// `id` is niri's stable, monitor-independent identity: it is what `active_workspace` and
+/// `id` is niri's stable, monitor-independent identity: what `active_workspace`/
 /// `focused_workspace` refer to and what `workspaces:focus(id)` takes. `idx` is the 1-based
-/// position on that output, which is what a user's keybind and a bar's button label both mean,
-/// and it is explicitly not stable across a reorder. `name` is niri's optional named workspace.
+/// position on that output (what a keybind/button label means), not stable across a reorder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkspaceEntry {
     pub id: u64,
@@ -50,9 +44,8 @@ pub struct WorkspaceEntry {
 }
 
 /// § 2.9's `active_client`, minus `is_fullscreen` (docs/adr/0056 decision 5: niri-ipc 26.4.0's
-/// `Window` has no such field, its event stream never reports one, and a fabricated `false`
-/// would be wrong for exactly the windows a fullscreen check exists to find). `class` is niri's
-/// `app_id`: `class` is X11's `WM_CLASS`, and a Wayland toplevel has an `app_id` instead.
+/// `Window` has no such field, and a fabricated `false` would be wrong for fullscreen windows).
+/// `class` is niri's `app_id`: X11's `WM_CLASS` has no Wayland equivalent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ActiveClient {
     pub title: String,
@@ -60,24 +53,16 @@ pub struct ActiveClient {
     pub is_floating: bool,
 }
 
-/// One shared signal, `Changed` only (mirrors `BatterySignal`/`BrightnessSignal`).
+/// One shared signal, `Changed` only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspacesSignal {
     Changed,
 }
 
 /// Folds niri's two event-stream state parts into § 2.9's payload. Pure, so the whole mapping
-/// (grouping, ordering, the two `Option` decisions, `app_id` standing in for `class`) is unit
-/// tested without a compositor.
-///
-/// Outputs are ordered by connector name and each output's workspaces by `idx`, both so a config
-/// looping over them draws the same thing twice in a row. `HashMap` iteration order is not an
-/// order, and a bar whose buttons shuffled on every push would be this function's fault.
-///
-/// An output with no active workspace is not listed at all rather than given a fabricated id.
-/// niri guarantees "every output has one active workspace", so this is a branch that should not
-/// be reachable, and the alternative (an `Option` a config has to unwrap for a case that cannot
-/// happen) costs every real config something to handle nothing.
+/// is unit tested without a compositor. Outputs are ordered by connector name and each
+/// output's workspaces by `idx` -- `HashMap` iteration order is not an order. An output with
+/// no active workspace is omitted rather than given a fabricated id (should be unreachable).
 pub fn derive_state(workspaces: &HashMap<u64, niri_ipc::Workspace>, windows: &HashMap<u64, niri_ipc::Window>) -> WorkspacesState {
     let mut by_output: HashMap<&str, Vec<&niri_ipc::Workspace>> = HashMap::new();
     for workspace in workspaces.values() {
@@ -109,16 +94,15 @@ pub fn derive_state(workspaces: &HashMap<u64, niri_ipc::Workspace>, windows: &Ha
     WorkspacesState { outputs, active_client }
 }
 
-/// `workspaces:focus(id)`'s `arguments: [id]`. Shape check only, matching every other numeric
-/// `parse_*_args` in this codebase: whether the id names a workspace that exists is niri's
-/// question, and it answers it by doing nothing.
+/// `workspaces:focus(id)`'s `arguments: [id]`. Shape check only: whether the id names a
+/// workspace that exists is niri's question, answered by doing nothing.
 pub fn parse_focus_args(arguments: &[serde_json::Value]) -> Option<u64> {
     arguments.first()?.as_u64()
 }
 
-/// `Clone` is deliberately absent: unlike `BrightnessController`, nothing here is handed to a
-/// spawned future. [`WorkspacesController::focus`] spawns its own OS thread and moves only the
-/// id, because niri's socket is a blocking `std::net::UnixStream` and not tokio-aware.
+/// `Clone` is deliberately absent: nothing here is handed to a spawned future.
+/// [`WorkspacesController::focus`] spawns its own OS thread and moves only the id, because
+/// niri's socket is a blocking `std::net::UnixStream`, not tokio-aware.
 pub struct WorkspacesController {
     state: Arc<Mutex<WorkspacesState>>,
     compositor: Option<CompositorKind>,
@@ -145,14 +129,10 @@ impl WorkspacesController {
         self.state.lock().expect("workspaces state mutex poisoned").clone()
     }
 
-    /// `workspaces:focus(id)`. A fresh connection per call, for the reason `NiriLink::
-    /// switch_layout`'s own doc comment records: `read_events` consumes and shuts down the write
-    /// half of the event-stream socket, so the reader's connection genuinely cannot also send
-    /// this write.
-    ///
-    /// `WorkspaceReferenceArg::Id`, not `Index`: `id` is the stable identity this capability
-    /// reports as `active_workspace`/`focused_workspace`, and `idx` shifts under a reorder, so
-    /// addressing by index would focus a different workspace than the one the config named.
+    /// `workspaces:focus(id)`. A fresh connection per call: `read_events` consumes and shuts
+    /// down the write half of the event-stream socket, so the reader's connection can't also
+    /// send this write. `WorkspaceReferenceArg::Id`, not `Index`: `idx` shifts under a
+    /// reorder, so addressing by index could focus the wrong workspace.
     pub fn focus(&self, id: u64) {
         if self.compositor != Some(CompositorKind::Niri) {
             eprintln!("workspaces: focus({id}) called but this session has no workspace implementor; ignored");
@@ -174,19 +154,9 @@ impl WorkspacesController {
     }
 }
 
-/// Connects, asks for the event stream, and folds every event into niri's own two state parts on
-/// its own OS thread (`niri_ipc::socket::Socket` wraps a blocking `std::net::UnixStream`, the
-/// same reason `NiriLink::new` and `audio::mixer::run` each take a thread rather than a task).
-///
-/// This is the second event-stream connection this process holds, `keyboard`'s being the first
-/// (docs/adr/0056 decision 2). Both replay niri's full startup state to a reader that discards
-/// most of it, which costs a few kilobytes once per boot and buys each capability its own
-/// lifetime.
-///
-/// `EventStreamStatePart::apply` returns the event back when its part ignored it, so one `if let`
-/// chains the two parts without matching on the event kind here: niri's own reducer already knows
-/// which events belong to which part, and duplicating that match would be a second place to
-/// forget a variant when niri adds one.
+/// Connects, asks for the event stream, and folds every event into niri's own two state parts
+/// on its own OS thread (blocking `std::net::UnixStream`). `EventStreamStatePart::apply`
+/// returns the event back when its part ignored it, so one `if let` chains both parts.
 ///
 /// ponytail: that reducer panics rather than degrading on two events, `WindowClosed` and
 /// `WindowLayoutsChanged` naming a window it has never seen (both are a bare `.expect` in
@@ -240,11 +210,8 @@ fn spawn_niri_reader(state: Arc<Mutex<WorkspacesState>>, events: UnboundedSender
                 niri_windows.apply(event);
             }
 
-            // niri replays workspaces and windows as two separate events at startup, so the
-            // first workspace push lands before any window is known and a second push follows
-            // immediately with `active_client` filled in. Two pushes on a boot, not one, and
-            // deliberately not debounced: a timer to save one snapshot would add a whole
-            // scheduling concern to a controller that otherwise has none.
+            // niri replays workspaces and windows as two separate startup events, so the first
+            // push lands before any window is known. Deliberately not debounced.
             let current = derive_state(&niri_workspaces.workspaces, &niri_windows.windows);
             if current != previous {
                 *state.lock().expect("workspaces state mutex poisoned") = current.clone();
@@ -261,10 +228,8 @@ fn spawn_niri_reader(state: Arc<Mutex<WorkspacesState>>, events: UnboundedSender
 mod tests {
     use super::*;
 
-    /// Both fixtures are built by deserializing niri's own wire JSON rather than by struct
-    /// literal, and the shapes are copied from a live `niri msg -j workspaces` / `-j windows` on
-    /// a real session. A struct literal would still compile if niri renamed a field; this stops
-    /// at the same place a real event stream would.
+    /// Both fixtures deserialize niri's own wire JSON rather than a struct literal, copied from
+    /// a live `niri msg -j workspaces`/`-j windows` -- this would break if niri renamed a field.
     fn workspace(id: u64, idx: u8, output: &str, is_active: bool, is_focused: bool) -> niri_ipc::Workspace {
         serde_json::from_value(serde_json::json!({
             "id": id, "idx": idx, "name": null, "output": output,
@@ -294,9 +259,7 @@ mod tests {
 
     #[test]
     fn derive_state_groups_by_output_and_orders_outputs_and_workspaces_deterministically() {
-        // Inserted out of order on purpose: the input is a `HashMap`, whose iteration order is
-        // not an order, and a bar whose buttons shuffled between two identical pushes would be
-        // this function's fault rather than the config's.
+        // Inserted out of order on purpose: `HashMap` iteration order is not an order.
         let workspaces = map(vec![
             (9, workspace(9, 3, "eDP-1", false, false)),
             (2, workspace(2, 1, "DP-2", true, false)),
@@ -314,9 +277,8 @@ mod tests {
 
     #[test]
     fn derive_state_reports_the_active_workspace_by_id_not_by_index() {
-        // niri's `id` and `idx` are decorrelated in general (a reorder moves `idx` and leaves
-        // `id` alone), so a mapping that reached for the wrong one would still pass on a fresh
-        // session where they happen to agree. These deliberately disagree.
+        // `id` and `idx` deliberately disagree: a reorder moves `idx` and leaves `id` alone, so
+        // a mapping that reached for the wrong one would still pass if they happened to agree.
         let workspaces = map(vec![(42, workspace(42, 1, "eDP-1", true, true))]);
 
         let state = derive_state(&workspaces, &HashMap::new());
@@ -388,8 +350,7 @@ mod tests {
 
     #[test]
     fn derive_state_has_no_active_client_when_no_window_holds_focus() {
-        // Real, not hypothetical: focusing a layer-shell surface (a launcher, this shell's own
-        // panel) leaves every toplevel unfocused.
+        // Real, not hypothetical: focusing a layer-shell surface leaves every toplevel unfocused.
         let windows = map(vec![(14, window(14, "Sign in | Slack", "slack", false, false))]);
 
         assert_eq!(derive_state(&HashMap::new(), &windows).active_client, None);
@@ -397,10 +358,8 @@ mod tests {
 
     #[test]
     fn active_client_carries_no_is_fullscreen_key_at_all() {
-        // Pins docs/adr/0056 decision 5. niri-ipc 26.4.0 cannot answer this field, and a
-        // fabricated `false` would be wrong for exactly the windows a fullscreen check exists
-        // to find. If a later niri gains the field, this test is what says the omission was a
-        // decision rather than an oversight.
+        // Pins docs/adr/0056 decision 5: if a later niri gains `is_fullscreen`, this test says
+        // the omission was a decision.
         let windows = map(vec![(2, window(2, "a title", "kitty", true, false))]);
 
         let json = serde_json::to_value(derive_state(&HashMap::new(), &windows)).unwrap();

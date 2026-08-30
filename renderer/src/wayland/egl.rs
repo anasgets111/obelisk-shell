@@ -15,14 +15,12 @@ pub struct ConfigAttribs {
     pub alpha_size: egl::Int,
 }
 
-/// Phase 3 requires a config that can back an on-screen window surface, render GLES3,
-/// and give exactly 8-bit-per-channel ARGB (docs/build-steps.md Phase 3, point 2).
+/// Phase 3 requires a config that can back an on-screen window surface, render GLES3, and give
+/// exactly 8-bit-per-channel ARGB (docs/build-steps.md Phase 3, point 2).
 ///
-/// `eglChooseConfig` is supposed to only return matches, but its attribute lists are
-/// bitmask supersets (a config can advertise support for more renderable client APIs
-/// or surface types than requested) and driver behavior around exact-vs-minimum
-/// component sizes is inconsistent enough to be worth re-validating directly rather
-/// than trusting the first candidate returned.
+/// `eglChooseConfig` is supposed to only return matches, but its attribute lists are bitmask
+/// supersets and driver behavior around exact-vs-minimum component sizes is inconsistent enough
+/// to be worth re-validating directly rather than trusting the first candidate returned.
 pub fn satisfies_requirements(attrs: ConfigAttribs) -> bool {
     attrs.surface_type & egl::WINDOW_BIT != 0
         && attrs.renderable_type & egl::OPENGL_ES3_BIT != 0
@@ -142,8 +140,7 @@ mod tests {
 
     #[test]
     fn accepts_config_with_extra_bits_set() {
-        // A config supporting ES2 *and* ES3, and both pbuffer and window surfaces,
-        // still satisfies the requirement bitmasks.
+        // Supporting ES2 as well as ES3, and pbuffer as well as window, still satisfies the mask.
         let mut attrs = full_match();
         attrs.surface_type |= egl::PBUFFER_BIT;
         attrs.renderable_type |= egl::OPENGL_ES2_BIT;

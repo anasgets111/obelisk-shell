@@ -28,11 +28,9 @@ impl Default for SysinfoState {
 /// every time its `watch::Receiver` reports a changed interval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollMode {
-    /// `interval == 0`: no `tokio::time::interval` armed at all, the task's loop awaits only
-    /// `watch::Receiver::changed()`.
+    /// `interval == 0`: no `tokio::time::interval` armed; the loop awaits only `watch::Receiver::changed()`.
     Dormant,
-    /// `interval != 0`: the task's loop races `tokio::time::interval(_).tick()` against
-    /// `watch::Receiver::changed()`.
+    /// `interval != 0`: the loop races `tokio::time::interval(_).tick()` against `watch::Receiver::changed()`.
     Ticking(Duration),
 }
 
@@ -40,10 +38,8 @@ pub fn poll_mode(interval: Duration) -> PollMode {
     if interval.is_zero() { PollMode::Dormant } else { PollMode::Ticking(interval) }
 }
 
-/// Wakes `main.rs`'s `select!` to push a fresh `StateSnapshot` -- matches
-/// `dbus::tray::TraySignal`/`dbus::notifications::NotificationsSignal`'s single-variant shape
-/// (every mutation collapses to "go rebuild and push") rather than a bare `()`, keeping the
-/// `select!` arm's match self-documenting the same way its siblings are.
+/// Wakes `main.rs`'s `select!` to push a fresh `StateSnapshot`. A single-variant enum, not a
+/// bare `()`, keeps the `select!` arm self-documenting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SysinfoSignal {
     Changed,
@@ -59,10 +55,9 @@ pub struct SysinfoConfigure {
     pub temp_interval: Option<u64>,
 }
 
-/// `sysinfo:configure(cfg)`'s `arguments: [cfg]` -- the first capability action in this
-/// codebase taking a table argument rather than positional ones. `arguments[0]` is a JSON
-/// object; any *present* key with the wrong type drops the whole call (`None`), matching
-/// every other `parse_*_args`'s malformed-shape handling -- no partial-apply.
+/// `sysinfo:configure(cfg)`'s `arguments: [cfg]` -- takes a table argument rather than
+/// positional ones. `arguments[0]` is a JSON object; any present key with the wrong type
+/// drops the whole call (`None`) -- no partial-apply.
 pub fn parse_configure_args(arguments: &[serde_json::Value]) -> Option<SysinfoConfigure> {
     let table = arguments.first()?.as_object()?;
     let read_seconds = |key: &str| -> Option<Option<u64>> {
@@ -79,10 +74,8 @@ pub fn parse_configure_args(arguments: &[serde_json::Value]) -> Option<SysinfoCo
 }
 
 /// Owns the three watch-driven poll tasks and the state they write into. Not `Clone` --
-/// `configure` is a synchronous, non-blocking local operation (no D-Bus/IPC round trip), so
-/// callers hold `&SysinfoController` directly rather than cloning it into a spawned task, the
-/// same shape `notifications::set_sound`/`set_dnd` already use for their own synchronous
-/// local mutations.
+/// `configure` is a synchronous, non-blocking local operation, so callers hold
+/// `&SysinfoController` directly rather than cloning it into a spawned task.
 pub struct SysinfoController {
     state: std::sync::Arc<std::sync::Mutex<SysinfoState>>,
     cpu_interval: tokio::sync::watch::Sender<Duration>,
@@ -91,13 +84,10 @@ pub struct SysinfoController {
 }
 
 impl SysinfoController {
-    /// Spawns the three tasks, all starting dormant (`Duration::ZERO` -- docs/adr/0035: no
-    /// polling until Lua calls `configure` at least once). `signal_tx` is shared by all
-    /// three; each sends [`SysinfoSignal::Changed`] after actually updating `state` on a real
-    /// tick (never on a dormant no-op), which is what wakes `main.rs`'s `select!` arm to push
-    /// a fresh `StateSnapshot`. The temp chip(s) are resolved here, once, before the temp task
-    /// is even spawned (docs/adr/0035) -- `hwmon_root` itself is never threaded into the task,
-    /// only the already-resolved source/chip are.
+    /// Spawns the three tasks, all starting dormant (`Duration::ZERO`, no polling until Lua
+    /// calls `configure`). `signal_tx` is shared by all three; each sends [`SysinfoSignal::Changed`]
+    /// only after actually updating `state` on a real tick. The temp chip(s) are resolved here,
+    /// once, before the temp task is spawned -- `hwmon_root` itself is never threaded into the task.
     pub fn new(proc_root: std::path::PathBuf, hwmon_root: std::path::PathBuf, signal_tx: tokio::sync::mpsc::UnboundedSender<SysinfoSignal>) -> Self {
         let state = std::sync::Arc::new(std::sync::Mutex::new(SysinfoState::default()));
 
@@ -115,12 +105,9 @@ impl SysinfoController {
         Self { state, cpu_interval, ram_interval, temp_interval }
     }
 
-    /// Applies a parsed `sysinfo:configure(cfg)` call -- a present interval overrides that
-    /// task's watch value (waking it from dormant, resuming it at a new cadence, or
-    /// suspending it at `0`); an absent one leaves that task untouched. `send` only errors if
-    /// every receiver already dropped (the task panicked), in which case there's nothing
-    /// left to notify -- logged, not propagated, matching this codebase's existing
-    /// send-failure posture (`send_frame_logged`).
+    /// Applies a parsed `sysinfo:configure(cfg)` call -- a present interval overrides that task's
+    /// watch value (waking it from dormant, resuming at a new cadence, or suspending at `0`); an
+    /// absent one leaves it untouched. `send` only errors if the task panicked; logged, not propagated.
     pub fn configure(&self, cfg: SysinfoConfigure) {
         if let Some(sec) = cfg.cpu_interval
             && self.cpu_interval.send(Duration::from_secs(sec)).is_err()
@@ -140,23 +127,17 @@ impl SysinfoController {
     }
 
     /// The current combined state -- what `main.rs`'s signal-channel `select!` arm clones and
-    /// pushes as a fresh `StateSnapshot` (mirrors `tray`/`notifications`' own
-    /// `build_state()`-then-push shape).
+    /// pushes as a fresh `StateSnapshot`.
     pub fn snapshot(&self) -> SysinfoState {
         self.state.lock().expect("sysinfo state mutex poisoned").clone()
     }
 }
 
-/// `cpu_percent`'s task: keeps the previous `/proc/stat` sample in its own loop-local state
-/// across ticks (docs/adr/0035 -- the interval itself is the sampling window). The first tick
-/// after a cold start or a resume-from-suspend only stores a sample, no delta exists yet to
-/// publish. Each of the three task loops below is a near-identical dormant/ticking cycle
-/// (docs/adr/0035's suspend-at-zero mechanism) with only the tick body differing -- kept as
-/// three separate functions rather than one generic driver: a closure returning a `Future`
-/// that borrows the closure's own captured state cannot escape a plain `FnMut` in today's
-/// stable Rust (confirmed by trying it), and `snapshot.rs`'s `push_*_snapshot` family already
-/// sets this codebase's own precedent for "duplicated per-capability function" over fighting
-/// the borrow checker for a generic one.
+/// `cpu_percent`'s task: keeps the previous `/proc/stat` sample in loop-local state across
+/// ticks; the first tick after a cold start or resume only stores a sample, no delta yet. The
+/// three task loops below are near-identical, kept as separate functions since a closure
+/// returning a `Future` that borrows its own captured state can't escape a plain `FnMut` in
+/// stable Rust.
 async fn run_cpu_task(
     proc_root: std::path::PathBuf,
     mut interval_rx: tokio::sync::watch::Receiver<Duration>,
@@ -168,12 +149,8 @@ async fn run_cpu_task(
         let interval = *interval_rx.borrow_and_update();
         match poll_mode(interval) {
             PollMode::Dormant => {
-                // Discard any sample carried over from before going dormant (Correctness
-                // review): `/proc/stat`'s counters are cumulative since boot, so a delta taken
-                // against a pre-dormant sample after an arbitrarily long suspension would
-                // silently publish "average busy% across the entire dormant gap" as the first
-                // value on resume, not a live reading -- the same cold-start treatment applies
-                // here as at task startup.
+                // Discard any sample from before going dormant -- /proc/stat's counters are
+                // cumulative since boot, so a stale delta would publish a bogus averaged reading.
                 previous = None;
                 if interval_rx.changed().await.is_err() {
                     return; // every SysinfoController that could reconfigure this task is gone
@@ -258,13 +235,10 @@ async fn run_ram_task(
     }
 }
 
-/// `temp_cores`/`temp_gpu`'s task -- both read from one hwmon pass on every tick
-/// (docs/adr/0035: `temp_gpu` rides `temp_interval` alongside `temp_cores`, no separate
-/// interval). `core_source`/`gpu_chip` are already-resolved (docs/adr/0035: chip resolution
-/// happens once, in `SysinfoController::new`, before this task is even spawned -- chips
-/// don't hotplug for onboard sensors, so re-scanning `hwmon_root` on every tick would be pure
-/// waste). Only the per-tick sensor-file reads (`temp::read_temp_cores_from`/
-/// `read_temp_gpu_from`) happen here.
+/// `temp_cores`/`temp_gpu`'s task -- both read from one hwmon pass per tick (`temp_gpu` rides
+/// `temp_interval`, no separate interval). `core_source`/`gpu_chip` are resolved once in
+/// `SysinfoController::new`, before this task spawns -- onboard sensors don't hotplug, so
+/// re-scanning `hwmon_root` every tick would be pure waste.
 async fn run_temp_task(
     core_source: super::temp::CoreTempSource,
     gpu_chip: Option<std::path::PathBuf>,

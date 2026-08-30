@@ -1,27 +1,20 @@
 //! `updates:install()` for `oblisk.updates` (ADR-0034): runs `pkexec pacman -Syu --noconfirm`
 //! via `process::spawn_group_leader_piped`, routing privilege elevation through Oblisk's
-//! already-registered polkit agent (`dbus::polkit`, Phase 5) -- `pkexec` itself is what talks
-//! to polkit and triggers our own agent's interactive prompt, not a manual `CheckAuthorization`
-//! call from this code (ADR-0034: "routes through Oblisk's existing polkit agent... not a new
-//! escalation mechanism"). Runs the real system `pacman` against the real `/etc/pacman.conf`
-//! and `/var/lib/pacman` as root -- unlike `check.rs`'s read-only `alpm` sync against a
-//! throwaway copy, install is the real, system-modifying operation, so there is no throwaway
-//! anything here.
+//! already-registered polkit agent (`dbus::polkit`) -- `pkexec` itself talks to polkit and
+//! triggers our own agent's interactive prompt, not a manual `CheckAuthorization` call. Runs
+//! the real system `pacman` against the real `/etc/pacman.conf`/`/var/lib/pacman` as root, no
+//! throwaway copy (unlike `check.rs`'s read-only sync).
 //!
 //! Progress parsing (`parse_install_step`) is best-effort against pacman's well-known real
-//! stdout format (`"(2/5) installing nss (3.127-1 -> 3.128-1)"`) -- not independently
-//! live-verified end-to-end against a real privileged run in this session: an actual system
-//! upgrade is exactly the kind of hard-to-reverse action this session doesn't take without the
-//! user's own hands on the keyboard for the polkit password prompt. Same honestly-flagged-gap
-//! posture ADR-0034's own `alpm`/`fakeroot` verification already sets a precedent for ("not
-//! independently confirmed against libalpm's C source... flagged, not blocking") -- a wrong
-//! progress-line match only misses a cosmetic UI update, never affects whether the install
-//! itself succeeds (that's read from the real process exit status, not the parsed lines).
+//! stdout format (`"(2/5) installing nss (3.127-1 -> 3.128-1)"`), not independently verified
+//! end-to-end against a real privileged run: an actual system upgrade needs the user's own
+//! hands on the keyboard for the polkit password prompt. A wrong progress-line match only
+//! misses a cosmetic UI update -- install success is read from the real process exit status,
+//! not the parsed lines.
 
 /// One parsed `(current/total) installing|upgrading|reinstalling <package> ...` line from
 /// `pacman`'s real install-phase output. `None` for every other line (database-sync messages,
-/// download progress bars, blank lines) -- `run_install`'s reader just leaves the previous
-/// progress in place for those, rather than treating "didn't match" as an error.
+/// download progress bars, blank lines) -- the reader just leaves the previous progress in place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallStep {
     pub current: u32,
@@ -41,12 +34,11 @@ pub fn parse_install_step(line: &str) -> Option<InstallStep> {
     Some(InstallStep { current, total, package })
 }
 
-/// Whether `package_names` includes a Linux kernel package (`linux`, or `linux-<variant>` such
-/// as `linux-lts`/`linux-zen`/`linux-hardened`) -- the common desktop-tooling heuristic for
-/// "this update needs a reboot to take effect" (ADR-0034's `rebootRequired`, borrowed from the
-/// dotfiles' `UpdateService.qml`). A heuristic, not an authoritative signal (a firmware or glibc
-/// update can also warrant a reboot without a kernel package being involved) -- documented as
-/// such, not treated as exhaustive.
+/// Whether `package_names` includes a Linux kernel package (`linux`, or `linux-<variant>`
+/// such as `linux-lts`/`linux-zen`/`linux-hardened`) -- the common desktop-tooling heuristic
+/// for "this update needs a reboot to take effect" (ADR-0034's `rebootRequired`). A heuristic,
+/// not authoritative: a firmware or glibc update can also warrant a reboot without a kernel
+/// package being involved.
 pub fn needs_reboot(package_names: &[String]) -> bool {
     package_names.iter().any(|name| name == "linux" || name.starts_with("linux-"))
 }

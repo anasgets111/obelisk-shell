@@ -1,13 +1,6 @@
 //! BlueZ Bluetooth D-Bus controller (`oblisk.bluetooth`, build-steps.md; docs/oblisk-supervisor-
 //! services-dbus.md §5; docs/oblisk-idl-api-specs.md §2.6; docs/adr/0030).
 //!
-//! Mirrors `dbus::network`'s controller/state/signal shape (a controller holding the proxies it
-//! needs, a plain accumulator struct pushed as a `StateSnapshot`, write actions `tokio::spawn`ed
-//! rather than awaited inline, a per-object signal-forwarder task feeding a tagged enum into a
-//! channel `main.rs`'s own `select!` drains) and `dbus::polkit`'s shape for the one hand-written
-//! `#[zbus::interface]` this module needs (`Agent1`, mirroring `AuthenticationAgent` almost
-//! exactly: export on the `ObjectServer` before the registration call that makes it live).
-//!
 //! Every proxy here is hand-written against BlueZ's own D-Bus API docs (ADR-0030's "no
 //! maintained zbus proxy crate" decision) -- `org.freedesktop.DBus.ObjectManager` is the one
 //! exception, reusing `zbus::fdo::ObjectManagerProxy` rather than hand-rolling a duplicate.
@@ -40,8 +33,8 @@
 
 use serde::Serialize;
 
-/// Object path this Supervisor's `org.bluez.Agent1` is exported at on its own unique connection
-/// name -- mirrors `dbus::polkit::AGENT_OBJECT_PATH`'s naming convention.
+/// Object path this Supervisor's `org.bluez.Agent1` is exported at on its own unique
+/// connection name.
 pub const AGENT_OBJECT_PATH: &str = "/org/oblisk/Bluez/Agent1";
 
 pub mod agent;
@@ -62,8 +55,7 @@ pub struct ConnectedDevice {
     /// property failed to read) -- per the IDL comment, not a sentinel invented here.
     pub battery: i32,
     /// Always `None` this round -- codec query/control is deferred (ADR-0030): it needs a live
-    /// PipeWire `Device` proxy this controller has no business owning (that channel is an
-    /// `audio`-capability concern, not `bluetooth`'s).
+    /// PipeWire `Device` proxy, an `audio`-capability concern, not `bluetooth`'s.
     pub codec: Option<String>,
     pub category: String,
 }
@@ -85,8 +77,8 @@ pub struct BluetoothState {
     pub discovered_devices: Vec<DiscoveredDevice>,
 }
 
-/// What the signal-forwarder tasks (see [`BluetoothController::new`]) report back to `main.rs`'s
-/// own top-level `select!` -- mirrors `dbus::network::NetworkSignal`'s shape.
+/// What the signal-forwarder tasks (see [`BluetoothController::new`]) report back to
+/// `main.rs`'s own top-level `select!`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BluetoothSignal {
     /// The adapter's own `Powered` or `Discovering` property changed.
@@ -96,16 +88,14 @@ pub enum BluetoothSignal {
     DeviceRegistryChanged,
     /// Sent by [`BluetoothController::clear_discovered`], not a forwarder: a
     /// `bluetooth:start_discovery()` was just dispatched and `discovered_devices` must clear
-    /// immediately, before `StartDiscovery`'s D-Bus round trip completes (docs/adr/0030,
-    /// matching NM's `scanning = true` immediate-flip pattern). A distinct variant, not
-    /// [`DeviceRegistryChanged`](Self::DeviceRegistryChanged): a full registry re-derivation
-    /// here would instantly undo the clear it exists to perform.
+    /// immediately, before `StartDiscovery`'s D-Bus round trip completes (docs/adr/0030). A
+    /// distinct variant, not [`DeviceRegistryChanged`](Self::DeviceRegistryChanged): a full
+    /// registry re-derivation here would instantly undo the clear it exists to perform.
     DiscoveryCleared,
 }
 
-/// Failure modes a `bluetooth:*` write action can hit before ever reaching BlueZ itself. Logged
-/// via `Display` at the call site, not user-facing -- mirrors `dbus::network::ConnectError`'s
-/// shape.
+/// Failure modes a `bluetooth:*` write action can hit before ever reaching BlueZ itself.
+/// Logged via `Display` at the call site, not user-facing.
 #[derive(Debug)]
 enum BluetoothActionError {
     NoAdapter,
@@ -159,10 +149,9 @@ pub fn parse_mac_arg(arguments: &[serde_json::Value]) -> Option<String> {
 }
 
 /// `oblisk.bluetooth`'s action dispatch (ADR-0037): owns the action match, argument parse, and
-/// write-action spawn for every `bluetooth` `CommandEnvelope` -- `main.rs` routes the whole
-/// capability here with one arm. Write actions are `tokio::spawn`ed rather than awaited inline
-/// (ADR-0030/ADR-0029). `stop_discovery` mutates no local state on purpose: the last
-/// `discovered_devices` snapshot stays visible (ADR-0030).
+/// write-action spawn for every `bluetooth` `CommandEnvelope`. Write actions are
+/// `tokio::spawn`ed rather than awaited inline (ADR-0030). `stop_discovery` mutates no local
+/// state on purpose: the last `discovered_devices` snapshot stays visible.
 pub fn dispatch(controller: &BluetoothController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     match params.action.as_str() {
