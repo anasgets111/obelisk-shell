@@ -136,6 +136,58 @@ struct Authoritative {
     child: tokio::process::Child,
 }
 
+/// How the authoritative Renderer's process ended (docs/adr/0058 decision 2).
+///
+/// Three variants rather than a bare `ExitStatus` because the message a human needs differs by
+/// variant, and because `Clean` is not a crash: `main()`'s own shutdown reaps the Renderer and that
+/// reap must never be reported as a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RendererDeparture {
+    Clean,
+    Failed { code: i32 },
+    Signalled { signal: i32 },
+}
+
+/// Signal before code, and the order is the decision: a signalled child has no exit code at all, so
+/// asking `code()` first returns `None` and throws away the only fact that says what happened.
+fn classify_departure(status: std::process::ExitStatus) -> RendererDeparture {
+    use std::os::unix::process::ExitStatusExt;
+
+    if let Some(signal) = status.signal() {
+        return RendererDeparture::Signalled { signal };
+    }
+    match status.code() {
+        Some(0) => RendererDeparture::Clean,
+        Some(code) => RendererDeparture::Failed { code },
+        // Neither a code nor a signal is not a shape `wait(2)` produces on Linux. Named rather than
+        // left to an `unreachable!()`, because this runs on the path that handles a crash and a
+        // panic here would answer a dead Renderer by killing the process that can still recover it.
+        None => RendererDeparture::Failed { code: -1 },
+    }
+}
+
+/// The line a human reads when the Renderer goes away, carrying whether a lock was live at the time
+/// (docs/adr/0058 decision 2).
+///
+/// The lock clause is the point. A Renderer that dies unlocked costs a bar and the log can be read
+/// tomorrow. One that dies holding `ext_session_lock_v1` costs the session now: the compositor is
+/// required not to unlock when a lock client dies, so nothing short of a replacement taking the
+/// lock over, or a VT switch, gets the user back in.
+fn departure_report(departure: RendererDeparture, generation_id: u32, lock_active: bool) -> String {
+    let what = match departure {
+        RendererDeparture::Clean => "exited cleanly".to_string(),
+        RendererDeparture::Failed { code } => format!("exited with code {code}"),
+        RendererDeparture::Signalled { signal } => format!("was killed by signal {signal}"),
+    };
+    let lock = if lock_active {
+        ", and it held the session lock: the compositor does not unlock when a lock client dies, so the session stays \
+         locked until a replacement takes the lock over (docs/adr/0058)"
+    } else {
+        ""
+    };
+    format!("generation {generation_id}'s renderer {what}{lock}")
+}
+
 
 /// Branches into the PAM worker's own minimal, tokio-free code path (ADR-0028) before falling
 /// through to the normal Supervisor. This must run *before* any D-Bus/tokio-runtime/audio-thread
@@ -414,6 +466,9 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     let mut memory_sampler = memory::sampler_from_env();
+    // Set only by the departure arm below, so the shutdown reap can tell "the Renderer is still
+    // running and needs reaping" from "it is already gone and `wait` has already collected it".
+    let mut renderer_departed = false;
 
     loop {
         tokio::select! {
@@ -423,6 +478,28 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
             }
             _ = sigterm.recv() => {
                 eprintln!("SIGTERM received, shutting down");
+                break;
+            }
+            // docs/adr/0058 decision 1. The one process this whole Supervisor exists to feed was
+            // the only thing here nobody watched, and the failure is quiet by construction: a dead
+            // Renderer sends no frames, and a healthy idle one sends no frames either. Without this
+            // arm the difference never reaches the `select!` at all. It surfaces minutes later as
+            // every push failing with "no connection registered for generation 0", by which point
+            // the log says what is broken but not that anything broke.
+            status = authoritative.child.wait() => {
+                let departure = match status {
+                    Ok(status) => classify_departure(status),
+                    Err(err) => {
+                        eprintln!("failed to wait on generation {}'s renderer: {err}", authoritative.generation_id);
+                        RendererDeparture::Failed { code: -1 }
+                    }
+                };
+                eprintln!("{}", departure_report(departure, authoritative.generation_id, lock.snapshot().active));
+                renderer_departed = true;
+                // Shutting down is the honest interim, not the destination: docs/adr/0058
+                // decision 3 replaces this `break` with a braked respawn. A Supervisor with no
+                // Renderer can do nothing except fail every push it is handed, so ending here and
+                // freeing the socket beats spinning on capability channels nobody will read.
                 break;
             }
             Some(_) = memory::tick_sampler(&mut memory_sampler) => {
@@ -948,7 +1025,13 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     // reap the authoritative Renderer and every still-live `process.run` child rather than exit
     // out from under them. `reap_process_group` is SIGTERM-then-SIGKILL (process::DEFAULT_REAP_GRACE),
     // the same grace this codebase already gives every other reap.
-    if let Err(err) = process::reap_process_group(&mut authoritative.child, process::DEFAULT_REAP_GRACE).await {
+    // Skipped when the departure arm already collected it: `reap_process_group` starts by asking
+    // for the pid, which tokio clears once `wait` has returned, so reaping a Renderer that is
+    // already gone logs "child has no pid; already reaped" as a failure right underneath the crash
+    // report that explains it. The exit is not a failure to reap, and should not read as one.
+    if !renderer_departed
+        && let Err(err) = process::reap_process_group(&mut authoritative.child, process::DEFAULT_REAP_GRACE).await
+    {
         eprintln!("failed to reap authoritative generation {}'s renderer on shutdown: {err}", authoritative.generation_id);
     }
     reap_all_processes(&mut processes).await;
@@ -960,7 +1043,58 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::process::ExitStatusExt;
+
     use super::*;
+
+    /// The raw `wait(2)` status for a normal exit with `code`, which is what `ExitStatus::from_raw`
+    /// wants. Written out rather than inlined so the `<< 8` appears once and the tests below read
+    /// as the cases they are.
+    fn exited(code: i32) -> std::process::ExitStatus {
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    fn killed_by(signal: i32) -> std::process::ExitStatus {
+        std::process::ExitStatus::from_raw(signal)
+    }
+
+    #[test]
+    fn a_renderer_that_exits_zero_is_not_a_crash() {
+        assert_eq!(classify_departure(exited(0)), RendererDeparture::Clean);
+    }
+
+    #[test]
+    fn a_renderer_that_exits_nonzero_carries_its_code() {
+        assert_eq!(classify_departure(exited(101)), RendererDeparture::Failed { code: 101 });
+    }
+
+    #[test]
+    fn a_renderer_killed_by_a_signal_reports_the_signal_not_an_exit_code() {
+        // The OOM killer's SIGKILL, and the shape a `wait` status makes easiest to misread: a
+        // signalled child has no exit code at all, so a classifier that reaches for `code()` first
+        // reports `None` and loses the only fact that says what happened.
+        assert_eq!(classify_departure(killed_by(9)), RendererDeparture::Signalled { signal: 9 });
+    }
+
+    #[test]
+    fn a_departure_while_locked_says_the_session_stays_locked() {
+        let report = departure_report(RendererDeparture::Signalled { signal: 9 }, 3, true);
+
+        assert!(report.contains("signal 9"), "the signal has to survive into the message: {report}");
+        assert!(
+            report.contains("session stays locked"),
+            "a Renderer that died holding the lock is a different emergency from one that died without it, and the \
+             message is the only place that distinction reaches a human: {report}"
+        );
+    }
+
+    #[test]
+    fn a_departure_while_unlocked_does_not_mention_the_lock() {
+        let report = departure_report(RendererDeparture::Failed { code: 101 }, 3, false);
+
+        assert!(report.contains("code 101"), "{report}");
+        assert!(!report.contains("locked"), "an unlocked crash must not cry lock: {report}");
+    }
 
     #[test]
     fn is_current_reload_matches_only_the_most_recently_sent_sequence() {
