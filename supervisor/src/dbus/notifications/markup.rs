@@ -12,10 +12,10 @@ use super::NotificationSpan;
 // Markup allowlist parser (TDD seam 2): five constructs, everything else stripped.
 // -------------------------------------------------------------------------------------------
 
-/// Matches one HTML-ish tag (`<name ...>`, `</name>`, or a self-closing `<name .../>`), double-
-/// quoted attribute values only -- matching every example in the spec docs and ADR-0033's own
-/// grammar. `regex`'s guaranteed-linear-time matching keeps this "non-backtracking", the same
-/// property §1.1's superseded flat-text sanitizer named explicitly.
+/// Matches one HTML-ish tag (`<name ...>`, `</name>`, or a self-closing `<name .../>`),
+/// double-quoted attribute values only, matching ADR-0033's grammar. `regex`'s guaranteed
+/// linear-time matching keeps this non-backtracking, the same property §1.1's superseded
+/// flat-text sanitizer named explicitly.
 static TAG_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"</?[a-zA-Z][a-zA-Z0-9]*(?:\s+[a-zA-Z_:][a-zA-Z0-9_:-]*\s*=\s*"[^"]*")*\s*/?>"#)
         .expect("TAG_PATTERN is a valid, hand-checked regex literal")
@@ -38,16 +38,15 @@ enum ClassifiedTag {
     /// instead, since it isn't a usable anchor construct.
     OpenAnchor(String),
     CloseAnchor,
-    /// `<img src="PATH">` (self-closing or not; `alt`, if present, is parsed but discarded --
-    /// nothing in this round's scope reads it). No `src` is [`ClassifiedTag::Ignored`].
+    /// `<img src="PATH">` (self-closing or not; `alt`, if present, is parsed but discarded). No
+    /// `src` is [`ClassifiedTag::Ignored`].
     Image(String),
-    /// `<script>`/`<style>` -- the opening half of an opaque block whose entire content (including
-    /// any markup inside it) is discarded up to its matching close tag.
+    /// `<script>`/`<style>` -- the opening half of an opaque block whose entire content is
+    /// discarded up to its matching close tag.
     OpaqueOpen(String),
     /// Anything else: an unrecognized element, a malformed construct, or an allowed tag missing a
-    /// required attribute. The tag markup itself is stripped; unlike `OpaqueOpen`, its surrounding
-    /// text is not touched -- only script/style content is executable/non-visual enough to drop
-    /// outright (§1.1's original "strips out all executable scripts, style tags" carried forward).
+    /// required attribute. The tag itself is stripped; unlike `OpaqueOpen`, surrounding text is
+    /// not touched -- only script/style content is dropped outright (§1.1).
     Ignored,
 }
 
@@ -96,8 +95,8 @@ fn is_closing_tag_named(raw: &str, opaque_name: &str) -> bool {
 }
 
 /// Flushes `current` into a new [`NotificationSpan::Text`] carrying the currently-active style,
-/// if it's non-empty. A no-op otherwise -- callers flush unconditionally on every style change and
-/// at end-of-input, so most calls see an already-empty `current`.
+/// if non-empty. A no-op otherwise -- callers flush unconditionally on every style change and at
+/// end-of-input, so most calls see an already-empty `current`.
 fn flush_text(spans: &mut Vec<NotificationSpan>, current: &mut String, bold: u32, italic: u32, underline: u32, href: Option<String>) {
     if current.is_empty() {
         return;
@@ -106,16 +105,16 @@ fn flush_text(spans: &mut Vec<NotificationSpan>, current: &mut String, bold: u32
 }
 
 /// Parses `input` into [`NotificationSpan`]s, accepting exactly `<b>`, `<i>`, `<u>`,
-/// `<a href="URL">`, `<img src="PATH" alt="ALT">` (self-closing or not) and rejecting/stripping
-/// everything else (ADR-0033). Pure grammar only -- an `<img>`'s `src` is carried through
-/// unvalidated; the real filesystem/path-trust check is a separate step ([`validate_trusted_path`],
-/// applied by [`sanitize_body`]) so this function stays testable with no filesystem I/O.
+/// `<a href="URL">`, `<img src="PATH" alt="ALT">` and rejecting/stripping everything else
+/// (ADR-0033). Pure grammar only -- an `<img>`'s `src` is carried through unvalidated; the real
+/// filesystem/path-trust check is a separate step ([`validate_trusted_path`], via
+/// [`sanitize_body`]) so this function stays testable with no filesystem I/O.
 ///
-/// Style depth counters (not a generic stack) mean nesting composes naturally
-/// (`<b><i>x</i></b>` is both bold and italic) and an *unclosed* allowed tag simply applies its
-/// style through to end-of-input instead of erroring -- the same lenient convention real
-/// notification daemons (mako) use for malformed markup. `href` uses a real stack since nested
-/// anchors with different targets are meaningful; the innermost one wins.
+/// Style depth counters, not a generic stack: nesting composes naturally (`<b><i>x</i></b>` is
+/// both bold and italic) and an unclosed allowed tag simply applies its style through to
+/// end-of-input instead of erroring, the same lenient convention real notification daemons
+/// (mako) use. `href` uses a real stack since nested anchors with different targets are
+/// meaningful; the innermost one wins.
 pub(super) fn parse_markup(input: &str) -> Vec<NotificationSpan> {
     let mut spans = Vec::new();
     let mut current = String::new();

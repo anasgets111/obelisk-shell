@@ -19,11 +19,9 @@ pub(super) enum ExpiryPolicy {
     After(Duration),
 }
 
-/// `expire_timeout`'s resolution (docs/oblisk-supervisor-services-dbus.md §1; ADR-0033's
-/// "Critical urgency ignores `expire_timeout`" policy fix): critical never expires regardless of
-/// what the sender requested; otherwise `0` means never, a negative value means "use the server
-/// default" ([`DEFAULT_EXPIRE_MS`], matching mako/dunst), and a positive value is that many
-/// milliseconds.
+/// `expire_timeout`'s resolution (§1; ADR-0033): critical never expires regardless of what the
+/// sender requested; otherwise `0` means never, a negative value means "use the server default"
+/// ([`DEFAULT_EXPIRE_MS`], matching mako/dunst), and a positive value is that many milliseconds.
 pub(super) fn resolve_expiry(urgency: Urgency, expire_timeout: i32) -> ExpiryPolicy {
     if urgency == Urgency::Critical {
         return ExpiryPolicy::Never;
@@ -41,9 +39,8 @@ pub(super) fn resolve_expiry(urgency: Urgency, expire_timeout: i32) -> ExpiryPol
 // -------------------------------------------------------------------------------------------
 
 /// Whether a notification's sound should play (ADR-0033): never without a registered sound for
-/// its tier; never while do-not-disturb is on unless the notification is critical (critical
-/// bypasses DND, mirroring the same bypass [`resolve_expiry`] already applies to `expire_timeout`);
-/// otherwise yes.
+/// its tier; never while do-not-disturb is on unless critical (the same bypass [`resolve_expiry`]
+/// applies to `expire_timeout`); otherwise yes.
 pub(super) fn should_play_sound(dnd: bool, urgency: Urgency, sound_registered: bool) -> bool {
     if !sound_registered {
         return false;
@@ -54,16 +51,12 @@ pub(super) fn should_play_sound(dnd: bool, urgency: Urgency, sound_registered: b
     true
 }
 
-/// Resolves *which* sound file (if any) a single `Notify` call plays -- the source-selection half
-/// that [`should_play_sound`]'s DND/urgency gate doesn't need to know about; that function only
-/// ever sees the result's `is_some()`. Resolution order (ADR-0033: "Sound: Lua sets the per-urgency
-/// default, a client's own `sound-file` hint overrides it for that one notification,
-/// `suppress-sound` always wins to silence"): `suppress` forces `None` unconditionally, regardless
-/// of what either argument carries; else `client_sound_file` (already validated through the same
-/// path-trust boundary as `image-path` -- [`validate_trusted_path`]) plays instead of the tier
-/// default; else `tier_default` (the urgency's `set_sound` registration, if any) plays; else nothing
-/// plays. `hints["sound-name"]` never reaches this function at all -- it isn't honored (ADR-0033),
-/// same YAGNI call already made for bare icon theme names.
+/// Resolves which sound file (if any) a single `Notify` call plays -- the source-selection half
+/// [`should_play_sound`]'s DND/urgency gate doesn't need to know about. Resolution order
+/// (ADR-0033): `suppress` forces `None` unconditionally; else `client_sound_file` (already
+/// validated through the same path-trust boundary as `image-path`) plays instead of the tier
+/// default; else `tier_default` plays; else nothing. `hints["sound-name"]` never reaches this
+/// function -- it isn't honored.
 pub(super) fn resolve_sound_path(suppress: bool, client_sound_file: Option<PathBuf>, tier_default: Option<PathBuf>) -> Option<PathBuf> {
     if suppress {
         return None;
@@ -78,13 +71,12 @@ pub(super) fn resolve_sound_path(suppress: bool, client_sound_file: Option<PathB
 // orphaned so the caller deletes it in the same step.
 // -------------------------------------------------------------------------------------------
 
-/// Allocates the next monotonic incarnation stamp for a piece of content being placed at some id
-/// (finding 2). Every `Notify` call bumps this and stamps its [`Notification`] with the result --
-/// a fresh arrival and a `replaces_id` update alike -- so a spawned expiry timer can capture "the
-/// incarnation I was scheduled for" and later tell whether a newer `Notify` call already
-/// superseded it ([`find_expiring_entry`]). No wraparound guard analogous to
-/// [`resolve_notification_id`]'s: a `u64` exhausting within one process's lifetime isn't a real
-/// scenario to guard against.
+/// Allocates the next monotonic incarnation stamp for a piece of content being placed at some
+/// id. Every `Notify` call bumps this and stamps its [`Notification`] with the result, so a
+/// spawned expiry timer can capture the incarnation it was scheduled for and later tell whether
+/// a newer `Notify` call already superseded it ([`find_expiring_entry`]). No wraparound guard
+/// analogous to [`resolve_notification_id`]'s: a `u64` exhausting in one process's lifetime
+/// isn't a real scenario.
 pub(super) fn next_incarnation(counter: &mut u64) -> u64 {
     let value = *counter;
     *counter = counter.wrapping_add(1);

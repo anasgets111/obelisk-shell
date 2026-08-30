@@ -41,10 +41,9 @@ impl From<zbus::Error> for ConnectError {
     }
 }
 
-/// `[2400, 2500]` -> `"2.4 GHz"`, `[4900, 5900]` -> `"5 GHz"`, `[5925, 7125]` -> `"6 GHz"`
-/// (docs/oblisk-supervisor-services-dbus.md §4.2). `None` outside all three ranges -- real Wi-Fi
-/// hardware's `Frequency` property always falls inside one of them, so this is an honest "no
-/// band" rather than a guessed default.
+/// `[2400, 2500]` -> `"2.4 GHz"`, `[4900, 5900]` -> `"5 GHz"`, `[5925, 7125]` -> `"6 GHz"` (§4.2).
+/// `None` outside all three ranges -- real Wi-Fi hardware always falls inside one, so this is an
+/// honest "no band" rather than a guessed default.
 pub(super) fn resolve_band(freq_mhz: u32) -> Option<&'static str> {
     match freq_mhz {
         2400..=2500 => Some("2.4 GHz"),
@@ -56,18 +55,14 @@ pub(super) fn resolve_band(freq_mhz: u32) -> Option<&'static str> {
 
 /// Whether an access point requires a security key: it advertises `PRIVACY` (WEP, the only case
 /// that flag alone signals) or either RSN (WPA2/3) or WPA1 key-management flags are non-empty.
-/// Mirrors `rusty_network_manager`'s own `show_wifi_networks` example's
-/// `ap_security_flags_to_security` logic, reduced to the boolean this codebase's IDL needs.
 pub(super) fn access_point_is_secure(flags: u32, wpa_flags: u32, rsn_flags: u32) -> bool {
     let flags = NM80211ApFlags::from_bits_truncate(flags);
     flags.contains(NM80211ApFlags::PRIVACY) || wpa_flags != 0 || rsn_flags != 0
 }
 
-/// Merges duplicate SSIDs keeping the highest signal strength, then serializes the top 20
-/// (docs/oblisk-supervisor-services-dbus.md §4.2). Ties within the same SSID keep whichever
-/// entry was seen first -- NetworkManager doesn't report the same physical AP object twice in
-/// one `GetAccessPoints` call, so a tie only happens between two distinct BSSIDs broadcasting
-/// the same SSID, and picking either one is equally correct for display purposes.
+/// Merges duplicate SSIDs keeping the highest signal strength, then serializes the top 20 (§4.2).
+/// Ties within the same SSID keep whichever entry was seen first -- a tie only happens between
+/// two distinct BSSIDs broadcasting the same SSID, and picking either is equally correct.
 pub(super) fn dedup_and_top20(aps: Vec<AccessPointInfo>) -> Vec<AccessPointInfo> {
     let mut best: HashMap<String, AccessPointInfo> = HashMap::new();
     for ap in aps {
@@ -80,9 +75,8 @@ pub(super) fn dedup_and_top20(aps: Vec<AccessPointInfo>) -> Vec<AccessPointInfo>
 }
 
 /// Whether a `SettingsConnectionProxy::get_settings()` result's `connection.autoconnect` allows
-/// autoconnect -- absent means NetworkManager's own default of `true`, matching ADR-0029's
-/// "`connection.autoconnect != false`" phrasing exactly (only an explicit `false` disqualifies
-/// a profile).
+/// autoconnect -- absent means NetworkManager's own default of `true` (ADR-0029: only an
+/// explicit `false` disqualifies a profile).
 pub(super) fn connection_wants_autoconnect(settings: &HashMap<String, HashMap<String, OwnedValue>>) -> bool {
     settings
         .get("connection")
@@ -92,8 +86,8 @@ pub(super) fn connection_wants_autoconnect(settings: &HashMap<String, HashMap<St
 }
 
 /// Whether a `SettingsConnectionProxy::get_settings()` result is a Wi-Fi profile for `ssid`
-/// (used by `forget`, which must delete every matching profile, not just the first --
-/// docs/oblisk-supervisor-services-dbus.md §4.3 says "profiles", plural).
+/// (used by `forget`, which must delete every matching profile, not just the first -- §4.3 says
+/// "profiles", plural).
 pub(super) fn settings_match_ssid(settings: &HashMap<String, HashMap<String, OwnedValue>>, ssid: &str) -> bool {
     settings
         .get("802-11-wireless")
@@ -103,11 +97,10 @@ pub(super) fn settings_match_ssid(settings: &HashMap<String, HashMap<String, Own
 }
 
 /// The `network:connect(ssid, hidden)` intent plus the `secure_submit` secret, boiled down to
-/// "open or WPA-PSK" before any zbus-specific `Value` wrapping happens -- kept unit-testable
-/// without a live D-Bus connection. An empty secret means an open network (ADR-0029); a
-/// non-empty one must be valid UTF-8 to become NM's `802-11-wireless-security.psk` (a D-Bus
-/// string) -- see the module doc comment on [`ConnectError::InvalidSecret`] for why an invalid
-/// encoding fails loudly instead of lossily mangling the password.
+/// "open or WPA-PSK" before any zbus-specific `Value` wrapping -- kept unit-testable without a
+/// live D-Bus connection. An empty secret means an open network (ADR-0029); a non-empty one must
+/// be valid UTF-8 to become NM's `802-11-wireless-security.psk`, a D-Bus string -- an invalid
+/// encoding fails loudly ([`ConnectError::InvalidSecret`]) instead of lossily mangling it.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ConnectionIntent {
     pub(super) ssid: String,
@@ -122,10 +115,9 @@ pub(super) fn connection_intent(ssid: &str, hidden: bool, secret: &[u8]) -> Resu
         match String::from_utf8(secret.to_vec()) {
             Ok(psk) => Some(psk),
             Err(err) => {
-                // The invalid-UTF-8 bytes are still a plaintext-password copy even though they
-                // never became a `String` -- zeroize them before propagating, same discipline as
-                // the valid-UTF-8 `psk` below (ADR-0005/ADR-0014). The message is captured first
-                // since `FromUtf8Error::into_bytes` consumes the error.
+                // The invalid-UTF-8 bytes are still a plaintext-password copy -- zeroize before
+                // propagating (ADR-0005/ADR-0014). Message captured first since
+                // FromUtf8Error::into_bytes consumes the error.
                 let message = err.to_string();
                 let mut bytes = err.into_bytes();
                 bytes.zeroize();
@@ -136,10 +128,9 @@ pub(super) fn connection_intent(ssid: &str, hidden: bool, secret: &[u8]) -> Resu
     Ok(ConnectionIntent { ssid: ssid.to_string(), hidden, psk })
 }
 
-/// Builds the minimal connection dict `AddAndActivateConnection2` needs for `intent`
-/// (docs/oblisk-supervisor-services-dbus.md §4.3): `802-11-wireless-security` is present only
-/// for a secured (non-empty-secret) intent, and `hidden`/`scan-ssid` are only set when the
-/// intent's `hidden` flag is set.
+/// Builds the minimal connection dict `AddAndActivateConnection2` needs for `intent` (§4.3):
+/// `802-11-wireless-security` is present only for a secured intent, and `hidden`/`scan-ssid`
+/// only when the intent's `hidden` flag is set.
 pub(super) fn build_connection_dict(intent: &ConnectionIntent) -> HashMap<&str, HashMap<&str, Value<'_>>> {
     let mut dict: HashMap<&str, HashMap<&str, Value>> = HashMap::new();
 
@@ -153,10 +144,9 @@ pub(super) fn build_connection_dict(intent: &ConnectionIntent) -> HashMap<&str, 
     wireless.insert("mode", Value::new("infrastructure"));
     if intent.hidden {
         wireless.insert("hidden", Value::new(true));
-        // Not a real NM setting key (NM's own hidden-network probing is driven by `hidden`
-        // alone) -- included anyway because docs/oblisk-supervisor-services-dbus.md §4.3 asks
-        // for both explicitly, and an extra key NetworkManager doesn't recognize in this dict is
-        // silently ignored rather than rejected.
+        // Not a real NM setting key (hidden-network probing is driven by hidden alone) --
+        // included anyway since §4.3 asks for both explicitly, and an extra key NM doesn't
+        // recognize is silently ignored rather than rejected.
         wireless.insert("scan-ssid", Value::new(true));
     }
     dict.insert("802-11-wireless", wireless);
@@ -171,10 +161,8 @@ pub(super) fn build_connection_dict(intent: &ConnectionIntent) -> HashMap<&str, 
     dict
 }
 
-/// `network:set_networking_enabled(en)`'s `arguments: [en]` -- shares `main.rs`'s
-/// `process_run_args`-style "parse or log and drop" convention. Defined once in `dbus` (shared
-/// with `bluetooth::parse_bool_arg`) and re-exported here so `network::parse_bool_arg` keeps
-/// working unchanged at every call site.
+/// `network:set_networking_enabled(en)`'s `arguments: [en]`. Defined once in `dbus` (shared with
+/// `bluetooth::parse_bool_arg`) and re-exported here.
 pub use crate::dbus::parse_bool_arg;
 
 /// `network:connect(ssid, hidden)`'s `arguments: [ssid, hidden]`.

@@ -1,84 +1,51 @@
 //! PipeWire registry listener for per-app audio streams (build-steps.md Phase 6, point 2).
 //!
-//! `build-steps.md` says to map a stream node's owning process via `sec.pid` or
-//! `node.client-id`. Checked against `pipewire-rs` 0.10.1's own `keys` module and, on a
-//! machine with a running `pipewire`/`pipewire-pulse`, against real `pw-dump` output:
-//! neither name is real, and the closer of the two real keys (`pipewire.sec.pid`, set on
-//! the *Client* object) turns out to be the wrong property for this job -- for any stream
-//! routed through `pipewire-pulse` (i.e. most PulseAudio-API clients), every client's
-//! `pipewire.sec.pid` is `pipewire-pulse`'s own pid, not the application's. The property
-//! that actually carries the owning application's pid is `application.process.id`
-//! (`PW_KEY_APP_PROCESS_ID`), set directly on the stream *node*'s own properties, matching
-//! `/proc/{pid}/comm` for the real app in every case checked. See
-//! docs/adr/0016-pipewire-app-stream-pid-uses-application-process-id-not-sec-pid.md.
+//! A stream node's owning process pid is `application.process.id` (`PW_KEY_APP_PROCESS_ID`),
+//! set on the stream node's own properties -- not `sec.pid`/`node.client-id` (not real
+//! `pipewire-rs` keys) and not `pipewire.sec.pid` (set on the Client object, but for a stream
+//! routed through `pipewire-pulse` that's `pipewire-pulse`'s own pid, not the application's).
+//! Matches `/proc/{pid}/comm` for the real app in every case checked. See docs/adr/0016.
 //!
-//! `media.class == "Stream/Output/Audio"` (`PW_KEY_MEDIA_CLASS`) is exactly as `build-steps.md`
-//! names it -- verified against `/usr/include/pipewire-0.3/pipewire/keys.h` and real
-//! `pw-dump` output for playback streams.
+//! `media.class == "Stream/Output/Audio"` identifies a playback stream, verified against real
+//! `pw-dump` output.
 //!
-//! [`on_global`] only checks `media.class` at registry `global` time, then always binds a
-//! matching node rather than also requiring `application.process.id` to be present yet.
-//! Checked live against a running `pipewire`/`pipewire-pulse` (not assumed): a
-//! `pipewire-pulse`-routed stream's `global` event fires before `pipewire-pulse` pushes the
-//! `application.process.id`/`application.name` properties onto the node, so filtering on the
-//! full parse at `global` time missed every such stream. The pid arrives moments later
-//! through the bound node's own `info` event -- that's what [`build_app_stream`] runs against
-//! in [`on_global`]'s node listener.
+//! [`on_global`] checks `media.class` at registry `global` time and always binds a matching
+//! node, without also requiring `application.process.id` yet: a `pipewire-pulse`-routed
+//! stream's `global` event fires before `pipewire-pulse` pushes
+//! `application.process.id`/`application.name` onto the node, so filtering on the full parse at
+//! `global` time misses every such stream. The pid arrives moments later through the bound
+//! node's own `info` event, which [`build_app_stream`] runs against.
 //!
-//! `info` fires on *any* change PipeWire tracks for the node, not just a props change --
-//! state transitions (RUNNING <-> IDLE/SUSPENDED, e.g. buffering, XRUNs, cork/uncork) and
-//! params/ports changes all trigger it too. Checked against `pipewire-rs` 0.10.1's `node.rs`
-//! and upstream PipeWire's `protocol-native.c`/`impl-node.c`: `NodeInfoRef::props()` returns
-//! `Some(&DictRef)` on every `info` call, but the C marshaller only fills real entries into
-//! that dict when `change_mask` includes `PW_NODE_CHANGE_MASK_PROPS` -- any other kind of
-//! `info` event carries a non-null but *empty* dict. So [`on_global`]'s node listener checks
-//! `NodeInfoRef::change_mask()` for `NodeChangeMask::PROPS` before running
-//! [`build_app_stream`] against `info.props()`; a non-PROPS `info` event leaves the tracked
-//! entry untouched instead of being misread as the stream disappearing. No separate
-//! node-added vs. node-properties-changed plumbing is needed; both funnel through the same
-//! `info` callback, gated on `change_mask`.
+//! `info` fires on any change PipeWire tracks for the node, not just a props change -- state
+//! transitions (RUNNING <-> IDLE/SUSPENDED), params, and ports changes all trigger it too.
+//! `NodeInfoRef::props()` returns `Some(&DictRef)` on every `info` call, but PipeWire's C
+//! marshaller only fills real entries into that dict when `change_mask` includes
+//! `PW_NODE_CHANGE_MASK_PROPS`; any other kind of `info` event carries a non-null but empty
+//! dict. So the node listener checks `NodeInfoRef::change_mask()` for `NodeChangeMask::PROPS`
+//! before running [`build_app_stream`], leaving a non-PROPS event's tracked entry untouched
+//! rather than misreading it as the stream disappearing.
 //!
-//! Re-review question: is the very first `info` call PipeWire delivers after
-//! `registry.bind()` guaranteed to carry `NodeChangeMask::PROPS`? If it weren't, a node whose
-//! properties never changed again after that first call would never make it into `apps` at
-//! all -- [`apply_info_event`] would no-op forever and the stream would silently never
-//! appear. Checked against upstream PipeWire 1.6.8's `src/pipewire/impl-node.c`: every new
-//! client bind to a node global runs through `global_bind` (the node's `pw_global` bind
-//! callback), which unconditionally runs `this->info.change_mask = PW_NODE_CHANGE_MASK_ALL;
-//! pw_node_resource_info(resource, &this->info);` immediately after creating that client's
-//! resource -- before any other event can reach it. So the first `info` a freshly bound
-//! resource ever receives always has every change-mask bit set, PROPS included.
-//! `src/modules/module-protocol-native/protocol-native.c`'s `node_marshal_info` (the wire
-//! marshaller for that event) only substitutes a null dict when `change_mask &
-//! PW_NODE_CHANGE_MASK_PROPS` is unset, so the `ALL` mask carries a real props dict too, not
-//! just the bit. Later `info` calls for that same node id go through a different path --
-//! `emit_info_changed` in `impl-node.c`, which forwards only whichever bits actually changed
-//! (state, params, ports, or props) -- so `change_mask` only needs gating from the second
-//! call on; the first is unconditional by construction, not by luck.
+//! The very first `info` call after `registry.bind()` is guaranteed to carry
+//! `NodeChangeMask::PROPS`: upstream PipeWire's `global_bind` (`impl-node.c`) unconditionally
+//! sets `change_mask = PW_NODE_CHANGE_MASK_ALL` before any other event can reach a freshly
+//! bound resource, and `protocol-native.c`'s marshaller only nulls the props dict when the
+//! PROPS bit is unset, so `ALL` always carries a real dict. Later `info` calls go through
+//! `emit_info_changed` instead, which forwards only the bits that actually changed. Confirmed
+//! live too: `pw-mon` attached before starting `paplay` showed the node's first `added:` block
+//! already carrying a full `properties:` section, with no earlier emptier `info` event.
 //!
-//! Confirmed live, not just from source: `pw-mon` attached before starting `paplay` (so the
-//! stream's node didn't exist yet) showed the node's very first `added:` block already
-//! carrying a full `properties:` section -- `application.name = "paplay"`,
-//! `application.process.id = "2673372"`, `node.name = "paplay"`,
-//! `media.class = "Stream/Output/Audio"` -- with no earlier, emptier `info` event for that
-//! node id preceding it. No code change follows from this: [`apply_info_event`]'s
-//! `has_props_change` gate was already correct, it just wasn't documented as covering the
-//! first call too.
-//!
-//! ponytail: the `media.class` filter itself still only runs once, at `global` time. A node
-//! whose `media.class` starts as something else and only later changes to
-//! `Stream/Output/Audio` won't be picked up (we never bound it, so we're not listening to its
-//! `info` events). Real clients set `media.class` once at stream creation and don't mutate it
-//! -- if that ever stops being true, the fix is binding every `ObjectType::Node`
-//! unconditionally and filtering inside the `info` callback instead.
+//! ponytail: the `media.class` filter runs once, at `global` time. A node whose `media.class`
+//! starts as something else and only later changes to `Stream/Output/Audio` won't be picked up
+//! -- real clients set `media.class` once at creation and don't mutate it. If that stops being
+//! true, the fix is binding every `ObjectType::Node` unconditionally and filtering inside the
+//! `info` callback instead.
 //!
 //! Master output volume/mute (§ 2.4, docs/adr/0053 decision 3) is a second, mostly independent
-//! tracking job layered onto the same registry listener: `Audio/Sink` nodes' `SPA_PARAM_Props`
-//! param (via `param` events, not `info`) and the `default` `Metadata` object's
-//! `default.audio.sink` key (which names the master sink by `node.name`). See [`master`]'s own
-//! module doc comment for what was checked live about that pod's shape and the linear/cubic
-//! volume conversion -- this file only wires the PipeWire event plumbing; [`master`] holds the
-//! pure parsing and resolution logic.
+//! tracking job on the same registry listener: `Audio/Sink` nodes' `SPA_PARAM_Props` param (via
+//! `param` events, not `info`) and the `default` `Metadata` object's `default.audio.sink` key
+//! (which names the master sink by `node.name`). This file only wires the PipeWire event
+//! plumbing; [`master`] holds the pure parsing and resolution logic, including the linear/cubic
+//! volume conversion.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -97,63 +64,54 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use super::master;
 
-/// `media.class` value stream playback nodes carry. Verified against real `pw-dump` output,
-/// not just `build-steps.md`'s text -- see the module doc comment.
+/// `media.class` value stream playback nodes carry. Verified against real `pw-dump` output --
+/// see the module doc comment.
 const STREAM_OUTPUT_AUDIO: &str = "Stream/Output/Audio";
 
 /// `media.class` value a camera-capture PipeWire node carries (docs/adr/0034). Tracked here,
 /// not a second PipeWire connection, purely as a name-enrichment source for `oblisk.privacy`'s
-/// camera detection -- PipeWire only sees the portal-routed subset of camera users (ADR-0034),
-/// so this is supplementary to that capability's own kernel-level detection, never primary.
+/// camera detection -- PipeWire only sees the portal-routed subset of camera users, so this is
+/// supplementary to that capability's own kernel-level detection, never primary.
 const VIDEO_SOURCE: &str = "Video/Source";
 
 /// `media.class` value an input capture device node carries (§ 2.4's `sources`). Unlike
 /// [`AUDIO_SINK`], a source is never bound: § 2.4's source object is `id`/`name`/`active`, all
-/// three answerable from the `global` event's own props plus the default-source metadata key, so
-/// there is nothing a proxy or a `param` listener would add.
+/// answerable from the `global` event's own props plus the default-source metadata key.
 ///
-/// No monitor filter, deliberately. PulseAudio synthesizes a `.monitor` source per sink and
-/// every mixer UI filters those back out; a native PipeWire registry does not, and `pw-dump` on
-/// this machine lists exactly one `Audio/Source` (the analog input) beside one `Audio/Sink`,
-/// with no monitor node between them. A filter written against a node kind this registry never
-/// emits would be dropping real devices on the guess that some of them are fake.
+/// No monitor filter, deliberately: PulseAudio synthesizes a `.monitor` source per sink, but a
+/// native PipeWire registry does not, and `pw-dump` on this machine lists exactly one
+/// `Audio/Source` beside one `Audio/Sink`, no monitor node between them.
 const AUDIO_SOURCE: &str = "Audio/Source";
 
 /// The sink node property naming which of its device's routes it plays through. Not in
-/// `pipewire-rs`'s `keys` module (checked), so it is spelled out here; read live off `pw-dump`,
-/// where this machine's analog output carries `card.profile.device = 7` and the matching `Route`
-/// object on device 49 carries `device: 7`.
+/// `pipewire-rs`'s `keys` module, so spelled out here; read live off `pw-dump`, where this
+/// machine's analog output carries `card.profile.device = 7` and the matching `Route` object on
+/// device 49 carries `device: 7`.
 const CARD_PROFILE_DEVICE: &str = "card.profile.device";
 
 /// One playback stream node PipeWire has advertised, filtered to
 /// `media.class == "Stream/Output/Audio"` and resolved to its owning process.
 ///
-/// `Serialize`: this is what `main.rs` puts in a `StateSnapshot`'s `payload` (Phase 11) --
-/// pushed to the Renderer over the control socket as-is. Field names match § 2.4's spelling
-/// (`id`, `name`) as of docs/adr/0053 decision 3, not this module's own `node_id`/`app_name`
-/// naming from before that ADR. `pid`/`process_name` are kept even though § 2.4 doesn't list
-/// them -- docs/adr/0016 exists because finding the owning process was genuinely hard, and
-/// discarding that answer to match the spec's table exactly would throw away the one part of
-/// this payload that took real work (docs/adr/0053 decision 3).
+/// `Serialize`: this is what `main.rs` puts in a `StateSnapshot`'s `payload`, pushed to the
+/// Renderer over the control socket as-is. Field names match § 2.4's spelling (`id`, `name`,
+/// docs/adr/0053 decision 3). `pid`/`process_name` are kept even though § 2.4 doesn't list them
+/// -- docs/adr/0016 exists because finding the owning process was genuinely hard, and discarding
+/// that answer would throw away the one part of this payload that took real work.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AppStream {
     /// PipeWire registry id of the stream node -- the key [`AudioApps`] tracks entries by.
-    /// `id` per § 2.4 ("WirePlumber client playback node ID"); this codebase called it `node_id`
-    /// before docs/adr/0053.
     pub id: u32,
     /// `application.process.id`: the pid PipeWire recorded for the stream's owning process.
     pub pid: i32,
-    /// `application.name`, if the client set one. `name` per § 2.4; this codebase called it
-    /// `app_name` before docs/adr/0053.
+    /// `application.name`, if the client set one.
     pub name: Option<String>,
     /// `/proc/{pid}/comm` for `pid`, if the process still existed when this stream was seen.
     pub process_name: Option<String>,
     /// § 2.4's per-app volume, range `[0.0, 1.0]`. Read from this stream node's own
-    /// `SPA_PARAM_Props`, through the same cube-root conversion the master sink uses (see
-    /// [`master`]): a stream stores `channelVolumes` cubed exactly as a sink does, confirmed with
-    /// `pw-cli enum-params <id> Props` against a live playback stream. `1.0` until that param
-    /// arrives, which is PipeWire's own untouched value and what a stream that has never been
-    /// adjusted really reports.
+    /// `SPA_PARAM_Props` through the same cube-root conversion the master sink uses (see
+    /// [`master`]): a stream stores `channelVolumes` cubed exactly as a sink does, confirmed
+    /// with `pw-cli enum-params <id> Props` against a live playback stream. `1.0` until that
+    /// param arrives, PipeWire's own untouched value for a stream never adjusted.
     pub volume: f32,
     /// § 2.4's per-app mute, from the same `Props` param as `volume`.
     pub muted: bool,
@@ -193,8 +151,8 @@ fn is_stream_output_audio(props: &impl PropsLookup) -> bool {
 
 /// Which of the two node kinds this listener tracks a `global` event as, decided once at
 /// `global` time and carried into the bound node's `info` closure -- an `info` event's own
-/// props dict can be empty (a state-only change, see the module doc comment), so the kind can't
-/// be re-derived from every `info` call, only remembered from the classification made here.
+/// props dict can be empty (a state-only change), so the kind can't be re-derived from every
+/// `info` call, only remembered from the classification made here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NodeKind {
     Audio,
@@ -212,9 +170,8 @@ fn classify(props: &impl PropsLookup) -> Option<NodeKind> {
 }
 
 /// Parses `props` into a [`ParsedStream`] if it's a `Stream/Output/Audio` node with a valid
-/// `application.process.id`. `None` for anything else (sinks, sources, non-audio streams, or
-/// a stream missing or mangling the pid -- including a stream node PipeWire hasn't finished
-/// populating yet, see the module doc comment).
+/// `application.process.id`. `None` for anything else, including a stream node PipeWire hasn't
+/// finished populating yet (see the module doc comment).
 fn parse_stream_props(props: &impl PropsLookup) -> Option<ParsedStream> {
     if !is_stream_output_audio(props) {
         return None;
@@ -241,29 +198,23 @@ fn build_app_stream(node_id: u32, props: &impl PropsLookup) -> Option<AppStream>
         pid: parsed.pid,
         name: parsed.app_name,
         process_name,
-        // What PipeWire itself reports for a stream nobody has touched, and what a live
-        // `pw-cli enum-params <id> Props` shows for every stream on this machine. Replaced by
-        // the real reading as soon as this node's own `Props` param arrives, which the same
-        // "first event carries the full current state" contract `MasterVolume::default`'s
-        // ponytail records puts one main-loop iteration away. Not `MasterVolume::default()`'s
-        // `0.0`: that is the right unknown for a master volume nothing has resolved yet, and it
-        // is the wrong one here, where silence is a state a stream can really be in.
+        // What PipeWire itself reports for a stream nobody has touched, confirmed with a live
+        // pw-cli enum-params <id> Props. Replaced as soon as this node's own Props param
+        // arrives. Not MasterVolume::default()'s 0.0: that's the right unknown for a master
+        // volume nothing has resolved yet, wrong here, where silence is a state a stream can
+        // really be in.
         volume: 1.0,
         muted: false,
     })
 }
 
 /// Applies one bound node's `info` event to `apps`. `has_props_change` is whether the event's
-/// `change_mask` included `NodeChangeMask::PROPS` -- PipeWire's wire marshalling only fills in
-/// real entries in the event's props dict when the change is actually a props change; a
-/// state-only transition (RUNNING <-> IDLE/SUSPENDED), or a params- or ports-only info event,
-/// carries an *empty* props dict instead (see the module doc comment). Skipping the
-/// upsert/remove decision on those is what keeps a still-live stream from being dropped just
-/// because PipeWire notified us about something unrelated to its properties. Gating
-/// unconditionally like this doesn't risk a node that never gets tracked: PipeWire's
-/// `global_bind` always sends the *first* `info` call for a freshly bound node with every
-/// change-mask bit set, PROPS included -- see the module doc comment's citation of
-/// `impl-node.c`/`protocol-native.c` and the live `pw-mon` verification.
+/// `change_mask` included `NodeChangeMask::PROPS` -- a state-only or params/ports-only info
+/// event carries an empty props dict instead (see the module doc comment). Skipping the
+/// upsert/remove decision on those keeps a still-live stream from being dropped over an
+/// unrelated notification. Safe to gate unconditionally: PipeWire's `global_bind` always sends
+/// the first `info` call for a freshly bound node with every change-mask bit set, PROPS
+/// included.
 fn apply_info_event(apps: &mut AudioApps, node_id: u32, has_props_change: bool, props: Option<&impl PropsLookup>) {
     if !has_props_change {
         return;
@@ -307,11 +258,7 @@ impl AudioApps {
 }
 
 /// The full `oblisk.audio` payload (§ 2.4, docs/adr/0053 decision 3): master output
-/// volume/mute plus the per-app stream list. Before this ADR the published payload was a bare
-/// JSON array of [`AppStream`]s with no home for a master scalar -- adding one forced the outer
-/// shape to change regardless, so the field renames landed in the same move rather than leaving
-/// a payload that matched neither the old code nor § 2.4.
-///
+/// volume/mute plus the per-app stream list.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AudioState {
     /// Master output volume, range `[0.0, 1.0]` -- see [`master`]'s module doc comment for how
@@ -324,14 +271,14 @@ pub struct AudioState {
     pub apps: Vec<AppStream>,
 }
 
-/// One § 2.4 `sinks`/`sources` entry. Both arrays are the same three fields, so they are the same
-/// type: an output and an input differ in which `media.class` produced them and in nothing a
-/// config reads.
+/// One § 2.4 `sinks`/`sources` entry. Both arrays are the same three fields, so they are the
+/// same type: an output and an input differ in which `media.class` produced them and in
+/// nothing a config reads.
 ///
 /// `name` is § 2.4's "user-friendly description", which is `node.description` (`"Built-in Audio
 /// Analog Stereo"`), not the `node.name` the metadata keys route by
 /// (`"alsa_output.pci-0000_00_1f.3.analog-stereo"`). Both exist on every device this machine
-/// advertises and only one of them is meant for a person.
+/// advertises, and only one is meant for a person.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AudioDevice {
     /// PipeWire registry id, which is what `audio:set_default_sink(id)` takes.
@@ -344,8 +291,6 @@ pub struct AudioDevice {
 
 /// The two names every tracked device carries, one per purpose. `node_name` is what the
 /// `default.audio.*` metadata keys route by; `description` is what § 2.4's arrays show a person.
-/// One struct per device rather than a map per field: this capability tracks six things about a
-/// sink, and six maps keyed by the same id is the shape `AudioApps` already exists to avoid.
 #[derive(Debug, Clone, Default)]
 struct DeviceNames {
     node_name: String,
@@ -353,25 +298,24 @@ struct DeviceNames {
 }
 
 impl DeviceNames {
-    /// § 2.4's `name`, falling back to the routing name when nothing friendlier was advertised: a
-    /// device with no readable name is still one a config can switch to, and dropping it from the
-    /// list would make it unreachable rather than merely unlabelled.
+    /// § 2.4's `name`, falling back to the routing name when nothing friendlier was advertised:
+    /// a device with no readable name is still one a config can switch to.
     fn display(&self) -> String {
         self.description.clone().unwrap_or_else(|| self.node_name.clone())
     }
 }
 
-/// One tracked `Audio/Sink`, as data. Everything the read path publishes and everything the write
-/// path needs to find the hardware, with no PipeWire handle in it: the bound proxies live beside
-/// this in `sink_nodes`, which is what keeps this struct constructible in a test.
+/// One tracked `Audio/Sink`, as data. Everything the read path publishes and the write path
+/// needs to find the hardware, with no PipeWire handle in it: the bound proxies live beside
+/// this in `sink_nodes`, keeping this struct constructible in a test.
 #[derive(Debug, Clone, Default)]
 struct SinkEntry {
     names: DeviceNames,
-    /// The raw `Props` last read off this node, or `None` before its first `param` event. Raw
-    /// rather than the derived [`master::MasterVolume`] because the write path needs the channel
-    /// count and the mute the caller is not changing.
+    /// The raw `Props` last read off this node, or `None` before its first `param` event. Raw,
+    /// not the derived [`master::MasterVolume`]: the write path needs the channel count and the
+    /// mute the caller is not changing.
     props: Option<master::RawSinkProps>,
-    /// The hardware device behind this sink, for the sinks that have one. `None` for a virtual or
+    /// The hardware device behind this sink, for sinks that have one. `None` for a virtual or
     /// null sink, whose volume really does live on the node.
     route: Option<SinkRoute>,
 }
@@ -396,9 +340,8 @@ fn device_list<'a>(devices: impl Iterator<Item = (u32, &'a DeviceNames)> + Clone
 
 /// § 2.4's "user-friendly description" for a device node, in PipeWire's own order of
 /// friendliness: `node.description` ("Built-in Audio Analog Stereo"), then `node.nick` ("ALC256
-/// Analog"), then `node.name` as the last resort. All three were read off this machine's live
-/// `pw-dump` rather than assumed; the first two are absent on stream nodes and present on every
-/// sink and source.
+/// Analog"), then `node.name` as the last resort. All three read off this machine's live
+/// `pw-dump`; the first two are absent on stream nodes and present on every sink and source.
 fn device_display_name(props: &impl PropsLookup) -> Option<String> {
     props
         .get_prop(*keys::NODE_DESCRIPTION)
@@ -421,8 +364,7 @@ pub struct VideoSourceApp {
 }
 
 /// Parses `props` into a [`VideoSourceApp`] if it's a `Video/Source` node with a valid
-/// `application.process.id` -- mirrors [`parse_stream_props`]'s shape exactly, one field
-/// simpler.
+/// `application.process.id` -- mirrors [`parse_stream_props`], one field simpler.
 fn parse_video_source_props(node_id: u32, props: &impl PropsLookup) -> Option<VideoSourceApp> {
     if props.get_prop(*keys::MEDIA_CLASS) != Some(VIDEO_SOURCE) {
         return None;
@@ -433,8 +375,7 @@ fn parse_video_source_props(node_id: u32, props: &impl PropsLookup) -> Option<Vi
 }
 
 /// Applies one bound `Video/Source` node's `info` event -- mirrors [`apply_info_event`]'s
-/// props-change gating exactly (same PipeWire event-ordering quirks, see the module doc
-/// comment; nothing about that behavior is specific to the audio case).
+/// props-change gating exactly (the same PipeWire event-ordering quirks, not specific to audio).
 fn apply_video_info_event(sources: &mut VideoSourceApps, node_id: u32, has_props_change: bool, props: Option<&impl PropsLookup>) {
     if !has_props_change {
         return;
@@ -448,9 +389,8 @@ fn apply_video_info_event(sources: &mut VideoSourceApps, node_id: u32, has_props
 }
 
 /// Live `Video/Source` node list, keyed by PipeWire node id -- mirrors [`AudioApps`]'s shape
-/// exactly (duplicated rather than made generic over the two: this codebase's own precedent
-/// for two near-identical small collections is to keep them boring and separate, e.g.
-/// `hardware::sysinfo::controller`'s three near-identical task-loop functions).
+/// (duplicated rather than made generic over the two: this codebase keeps small near-identical
+/// collections boring and separate rather than generic).
 #[derive(Debug, Default)]
 pub struct VideoSourceApps {
     sources: HashMap<u32, VideoSourceApp>,
@@ -482,15 +422,15 @@ impl VideoSourceApps {
 
 /// One § 3.2 audio write, crossing from the tokio runtime into the PipeWire loop.
 ///
-/// A channel, and not a method call, because every proxy this thread holds is `!Send` and the
-/// loop that dispatches them is the thread's own blocking `main_loop.run()`. `pipewire::channel`
-/// exists for exactly this: it hands the loop an eventfd to poll beside its own sources, so a
-/// command is applied between two PipeWire events rather than racing them.
+/// A channel, not a method call: every proxy this thread holds is `!Send`, and the loop that
+/// dispatches them is the thread's own blocking `main_loop.run()`. `pipewire::channel` hands the
+/// loop an eventfd to poll beside its own sources, so a command applies between two PipeWire
+/// events rather than racing them.
 ///
-/// Ids are PipeWire registry ids, matching what § 2.4's `sinks`/`sources`/`apps` arrays report,
-/// and are resolved against the live maps at apply time. An id whose node has gone away since
-/// the config read it is logged and dropped: PipeWire recycles registry ids, so acting on a
-/// stale one is how a volume change lands on somebody else's stream.
+/// Ids are PipeWire registry ids, matching § 2.4's `sinks`/`sources`/`apps` arrays, resolved
+/// against the live maps at apply time. An id whose node has gone away since the config read it
+/// is logged and dropped: PipeWire recycles registry ids, so acting on a stale one is how a
+/// volume change lands on somebody else's stream.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AudioCommand {
     SetMasterVolume(f32),
@@ -503,15 +443,14 @@ pub enum AudioCommand {
 }
 
 /// Shared state the registry/node listener closures mutate: the running app/video-source lists,
-/// plus the bound `Node` proxies (and their listeners) that keep property-change events
-/// flowing, plus where updated snapshots get sent. Held for the thread's whole lifetime -- see
-/// the `run` doc comment for what a graceful shutdown would need that doesn't exist yet.
+/// the bound `Node` proxies (and their listeners) that keep property-change events flowing, and
+/// where updated snapshots get sent. Held for the thread's whole lifetime -- see the `run` doc
+/// comment for what a graceful shutdown would need that doesn't exist yet.
 ///
 /// The `sink_*`/`metadata*`/`default_sink_name` fields are § 2.4's master-volume tracking
-/// (docs/adr/0053 decision 3) -- see the module doc comment and [`master`] for what they hold and
-/// why. `sink_nodes` is separate from `nodes` (which only ever held stream/video-source proxies
-/// before this) because a sink's proxy needs to outlive its own, differently-shaped `param`
-/// listener rather than the `info` listener every entry in `nodes` carries.
+/// (docs/adr/0053 decision 3) -- see [`master`]. `sink_nodes` is separate from `nodes` (which
+/// only holds stream/video-source proxies) because a sink's proxy outlives its own,
+/// differently-shaped `param` listener rather than the `info` listener `nodes` entries carry.
 struct MixerState {
     apps: AudioApps,
     video_sources: VideoSourceApps,
@@ -526,7 +465,7 @@ struct MixerState {
     /// data a test can build.
     sink_nodes: HashMap<u32, (pw::node::Node, pw::node::NodeListener)>,
     /// `Audio/Source` node id -> its two names. No proxy and no listener beside them: § 2.4's
-    /// source object needs nothing a `global` event does not already carry (see [`AUDIO_SOURCE`]).
+    /// source object needs nothing a `global` event doesn't already carry (see [`AUDIO_SOURCE`]).
     sources: HashMap<u32, DeviceNames>,
     /// Bound ALSA `Device` proxies and their `param` listeners. Bound only for the write path:
     /// a hardware sink's volume lives on its device's `Route` param, not on the node, so without
@@ -536,7 +475,7 @@ struct MixerState {
     /// A write needs the index, and only the device's own `Route` param reports it.
     device_routes: HashMap<(u32, i32), i32>,
     /// `Stream/Output/Audio` node id -> that stream's own raw `Props` values. The same type a
-    /// sink uses, because it is the same pod shape parsed by the same function.
+    /// sink uses, since it's the same pod shape parsed by the same function.
     app_props: HashMap<u32, master::RawSinkProps>,
     /// The `node.name` the `default` metadata object's `default.audio.sink` and
     /// `default.audio.source` keys currently name, or `None` before that property has ever
@@ -544,9 +483,8 @@ struct MixerState {
     default_sink_name: Option<String>,
     default_source_name: Option<String>,
     /// The bound `default` `Metadata` proxy/listener, and the registry id it was bound from (so
-    /// `global_remove` can tell whether a removed id was this object -- `Metadata` itself exposes
-    /// no id accessor). `None` until `on_global` finds the `metadata.name == "default"` global,
-    /// which normally exists from PipeWire startup.
+    /// `global_remove` can tell whether a removed id was this object -- `Metadata` exposes no id
+    /// accessor). `None` until `on_global` finds the `metadata.name == "default"` global.
     metadata: Option<(pw::metadata::Metadata, pw::metadata::MetadataListener)>,
     metadata_id: Option<u32>,
 }
@@ -560,11 +498,9 @@ impl MixerState {
             self.sinks.iter().map(|(&id, sink)| (id, sink.names.node_name.as_str())),
             |id| self.sinks.get(&id).and_then(|sink| sink.props.clone()),
         );
-        // Applied here rather than inside `AudioApps` because a stream's identity and a stream's
-        // volume arrive on two different PipeWire events (`info` and `param`) with no ordering
-        // between them, and folding the volume into the entry at `info` time would overwrite a
-        // reading that had already landed. `AudioApps` stays the list of streams; this is the
-        // one place the two halves meet.
+        // Applied here, not inside AudioApps: a stream's identity and volume arrive on two
+        // different PipeWire events (info and param) with no ordering between them, and folding
+        // volume into the entry at info time would overwrite a reading already landed.
         let apps = self
             .apps
             .snapshot()
@@ -594,22 +530,21 @@ impl MixerState {
 /// relevant node-added/-properties-changed/-removed/param-changed event, and an updated snapshot
 /// of [`VideoSourceApp`]s over `video_updates` on the equivalent video events (docs/adr/0034) --
 /// one PipeWire connection, two independent capabilities' worth of data, each publishing only on
-/// its own changes (never a video change triggering an audio republish or vice versa). Blocks the
-/// calling thread -- call from a dedicated `std::thread::spawn`, never from an async task:
-/// `pipewire-rs`'s event loop and the `Rc`-based listener state here are single-threaded and
-/// non-`Send`.
+/// its own changes. Blocks the calling thread -- call from a dedicated `std::thread::spawn`,
+/// never an async task: `pipewire-rs`'s event loop and the `Rc`-based listener state here are
+/// single-threaded and non-`Send`.
 ///
-/// `updates` only reaches a log line in `main()` for now, not Lua -- see
-/// docs/adr/0017-audio-apps-lua-ipc-push-deferred.md for why and what unblocks it. `video_updates`
-/// feeds `privacy::PrivacyController`'s name-enrichment (docs/adr/0034), not a log line.
+/// `updates` only reaches a log line in `main()` for now, not Lua -- see docs/adr/0017 for why
+/// and what unblocks it. `video_updates` feeds `privacy::PrivacyController`'s name-enrichment
+/// (docs/adr/0034), not a log line.
 ///
-/// ponytail: no shutdown path -- `main_loop.run()` returns only when the process exits.
-/// Phase 7/8's reload orchestrator is what would give this a `main_loop.quit()` trigger to
-/// react to; nothing calls for that yet.
+/// ponytail: no shutdown path -- `main_loop.run()` returns only when the process exits. Phase
+/// 7/8's reload orchestrator is what would give this a `main_loop.quit()` trigger to react to;
+/// nothing calls for that yet.
 ///
-/// Logs and returns if PipeWire can't be reached at all (no `pipewire` daemon running)
-/// rather than panicking: audio/video-source tracking is one optional subsystem, not a reason
-/// to take the whole supervisor down.
+/// Logs and returns if PipeWire can't be reached at all (no daemon running) rather than
+/// panicking: audio/video-source tracking is one optional subsystem, not a reason to take the
+/// whole supervisor down.
 pub fn run(updates: UnboundedSender<AudioState>, video_updates: UnboundedSender<Vec<VideoSourceApp>>, commands: AudioCommandReceiver) {
     if let Err(err) = run_inner(updates, video_updates, commands) {
         eprintln!("pipewire registry listener stopped: {err}");
@@ -654,10 +589,9 @@ fn run_inner(updates: UnboundedSender<AudioState>, video_updates: UnboundedSende
         metadata_id: None,
     }));
 
-    // Weak, not a clone of `registry` itself: the listener this builds is a hook stored on
-    // `registry`'s own C object, so a strong `RegistryRc` captured here would keep itself
-    // alive forever (same self-reference `pipewire-rs`'s own `pw-mon` example avoids the
-    // same way for its main-loop signal handlers).
+    // Weak, not a clone of registry itself: the listener this builds is a hook stored on
+    // registry's own C object, so a strong RegistryRc captured here would keep itself alive
+    // forever.
     let registry_weak = registry.downgrade();
     let state_for_global = Rc::clone(&state);
     let state_for_remove = Rc::clone(&state);
@@ -678,8 +612,8 @@ fn run_inner(updates: UnboundedSender<AudioState>, video_updates: UnboundedSende
             state.app_props.remove(&id);
             if state.devices.remove(&id).is_some() {
                 // A removed device takes every route index it published with it, keyed by its
-                // own global id. Leaving them would let a later device reusing that id inherit
-                // route indices that belong to hardware which is no longer plugged in.
+                // own global id, so a later device reusing that id doesn't inherit route indices
+                // for hardware that's no longer plugged in.
                 state.device_routes.retain(|&(device_id, _), _| device_id != id);
             }
             if state.metadata_id == Some(id) {
@@ -688,19 +622,13 @@ fn run_inner(updates: UnboundedSender<AudioState>, video_updates: UnboundedSende
                 state.default_sink_name = None;
                 state.default_source_name = None;
             }
-            // Audio publishes unconditionally on every removal, exactly matching this
-            // capability's pre-existing, already-shipped behavior (Spec review: an earlier
-            // version of this diff made this conditional on `id` actually having been a
-            // tracked audio stream, which is a real behavior change to `oblisk.audio`'s publish
-            // cadence -- ADR-0034 scopes this whole extension as name-enrichment for privacy
-            // only, not a change to already-shipped audio semantics, however arguably-better
-            // that change might be on its own). Video is new code with no prior behavior to
-            // preserve, so it publishes only when `id` actually was a tracked video source --
-            // see `VideoSourceApps::remove`'s doc comment. The sink/metadata cleanup above runs
-            // unconditionally for the same reason: `publish_audio` recomputes master state from
-            // whatever's left in `sink_names`/`sink_props`/`default_sink_name` on every call,
-            // so a stale entry for a removed sink would otherwise linger until some other event
-            // happened to overwrite it.
+            // Audio publishes unconditionally on every removal, matching this capability's
+            // already-shipped behavior (ADR-0034 scopes this extension as privacy name-
+            // enrichment, not a change to audio's publish cadence). Video is new code, so it
+            // publishes only when `id` was actually a tracked video source (see
+            // VideoSourceApps::remove). Sink/metadata cleanup runs unconditionally for the same
+            // reason: publish_audio recomputes master state from whatever's left on every call,
+            // so a stale sink entry would otherwise linger until some other event overwrote it.
             state.apps.remove(id);
             state.publish_audio();
             if state.video_sources.remove(id) {
@@ -709,9 +637,8 @@ fn run_inner(updates: UnboundedSender<AudioState>, video_updates: UnboundedSende
         })
         .register();
 
-    // Held for the loop's lifetime: dropping the `AttachedReceiver` detaches the eventfd source
-    // and every later command is silently discarded, which is why this is bound rather than left
-    // to a `let _ =`.
+    // Held for the loop's lifetime: dropping the AttachedReceiver detaches the eventfd source
+    // and every later command is silently discarded.
     let state_for_command = Rc::clone(&state);
     let _attached_commands = commands.attach(main_loop.loop_(), move |command| apply_command(&state_for_command, command));
 
@@ -722,8 +649,8 @@ fn run_inner(updates: UnboundedSender<AudioState>, video_updates: UnboundedSende
 /// Handles one registry `global` event: routes `Node` globals to [`on_node_global`] (audio
 /// stream, video source, or `Audio/Sink` -- see [`classify`] and [`bind_sink`]) and the `default`
 /// `Metadata` global to [`bind_default_metadata`] (§ 2.4's default-sink routing). Anything else
-/// (other object types, other `Metadata` objects like `settings`/`filters`/`route-settings` --
-/// checked live via `pw-mon`, see the module doc comment) is ignored.
+/// (other object types, other `Metadata` objects like `settings`/`filters`/`route-settings`,
+/// checked live via `pw-mon`) is ignored.
 fn on_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryRc, obj: &GlobalObject<&DictRef>) {
     match obj.type_ {
         ObjectType::Node => on_node_global(state, registry, obj),
@@ -733,26 +660,23 @@ fn on_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryR
     }
 }
 
-/// `media.class` value an output audio device node carries (§ 2.4's master volume lives here, not
-/// on any `Stream/Output/Audio` node). Verified against real `pw-dump` output, not just assumed
-/// from `PW_KEY_MEDIA_CLASS`'s general shape -- see [`master`]'s module doc comment.
+/// `media.class` value an output audio device node carries (§ 2.4's master volume lives here,
+/// not on any `Stream/Output/Audio` node). Verified against real `pw-dump` output -- see
+/// [`master`]'s module doc comment.
 const AUDIO_SINK: &str = "Audio/Sink";
 
 /// PipeWire's own key for a `Metadata` object's name (`"settings"`, `"default"`,
 /// `"route-settings"`, etc. -- a machine advertises several). Not in `pipewire-rs`'s `keys`
-/// module (checked: `pipewire::keys` has no `METADATA_NAME` or similar), so this is spelled out
-/// directly; confirmed against live `pw-mon` output (`metadata.name = "default"` on the global
-/// this file needs) rather than assumed.
+/// module, so spelled out directly; confirmed against live `pw-mon` output (`metadata.name =
+/// "default"` on the global this file needs).
 const METADATA_NAME: &str = "metadata.name";
 
 /// The metadata key naming § 2.4's master output device. Confirmed live with `pw-metadata`'s own
-/// dump (`key:'default.audio.sink' value:'{"name":"alsa_output...stereo"}'`), see [`master`]'s
-/// module doc comment.
+/// dump (`key:'default.audio.sink' value:'{"name":"alsa_output...stereo"}'`).
 const DEFAULT_AUDIO_SINK_KEY: &str = "default.audio.sink";
 
 /// The metadata key naming § 2.4's default input device. Same JSON shape as
-/// [`DEFAULT_AUDIO_SINK_KEY`], confirmed on the same live `pw-metadata` dump
-/// (`key:'default.audio.source' value:'{"name":"alsa_input...stereo"}'`).
+/// [`DEFAULT_AUDIO_SINK_KEY`], confirmed on the same live `pw-metadata` dump.
 const DEFAULT_AUDIO_SOURCE_KEY: &str = "default.audio.source";
 
 /// The `type_` a `default.audio.*` metadata value carries. Read straight off `pw-metadata`'s own
@@ -770,14 +694,13 @@ enum DefaultDevice {
 
 /// Handles one `Node` `global` event: classifies it by `media.class` (audio stream, video
 /// source, `Audio/Sink`, or neither -- see [`classify`]). `Audio/Sink` is handled separately by
-/// [`bind_sink`], not folded into [`classify`]'s [`NodeKind`], because a sink needs a `param`
-/// listener (§ 2.4's master volume) instead of the `info` listener every [`NodeKind`] variant
-/// here uses -- the two event kinds and the state they update don't overlap enough to share this
-/// function's body. For the stream/video-source path: binds the node so its `info` event --
-/// gated to only the calls that actually carry a props change, see the module doc comment --
-/// extracts the pid, resolves whatever this kind needs, and keeps the matching list current.
-/// Doesn't require the full parse to succeed here: `application.process.id` can still be missing
-/// at `global` time (see the module doc comment) and shows up in a later `info` call instead.
+/// [`bind_sink`], not folded into [`classify`]'s [`NodeKind`]: a sink needs a `param` listener
+/// (§ 2.4's master volume) instead of the `info` listener every [`NodeKind`] variant here uses.
+/// For the stream/video-source path: binds the node so its `info` event -- gated to only the
+/// calls that carry a props change, see the module doc comment -- extracts the pid and keeps
+/// the matching list current. Doesn't require the full parse to succeed here:
+/// `application.process.id` can still be missing at `global` time and shows up in a later `info`
+/// call instead.
 fn on_node_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryRc, obj: &GlobalObject<&DictRef>) {
     if obj.props.and_then(|props| props.get_prop(*keys::MEDIA_CLASS)) == Some(AUDIO_SINK) {
         bind_sink(state, registry, obj);
@@ -814,13 +737,12 @@ fn on_node_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Regi
                 }
             }
         })
-        // § 2.4's per-app `volume`/`muted`, which docs/adr/0053 decision 3 shipped as
-        // placeholders because this listener did not exist. It is the same pod, the same parse
-        // and the same cube root `bind_sink` already runs for the master sink, on a node that
-        // happens to be a stream: verified with `pw-cli enum-params <id> Props` against a live
-        // playback stream, which carries `channelVolumes` and `mute` exactly as a sink does.
+        // § 2.4's per-app volume/muted: the same pod, parse, and cube root bind_sink already
+        // runs for the master sink, on a node that happens to be a stream -- verified with
+        // pw-cli enum-params <id> Props against a live playback stream, which carries
+        // channelVolumes and mute exactly as a sink does.
         //
-        // A video source has no `Props` param worth reading, and never gets subscribed below, so
+        // A video source has no Props param worth reading and never gets subscribed below, so
         // this callback simply never fires for one.
         .param(move |_seq, param_type, _index, _next, param| {
             if param_type != pw::spa::param::ParamType::Props {
@@ -830,11 +752,10 @@ fn on_node_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Regi
             let Ok((_, value)) = PodDeserializer::deserialize_from::<Value>(pod.as_bytes()) else {
                 return;
             };
-            // Same `channelVolumes`-must-be-present filter the master sink needs, and needed
-            // here for the same reason: a node can advertise more than one object under
-            // `ParamType::Props`, and reading a non-mixer one as a mixer object reports a volume
-            // of zero. See `master::extract_sink_props`'s own doc comment for the live probe
-            // that found it.
+            // Same channelVolumes-must-be-present filter the master sink needs: a node can
+            // advertise more than one object under ParamType::Props, and reading a non-mixer one
+            // as a mixer object reports a volume of zero. See extract_sink_props's own doc
+            // comment for the live probe that found it.
             let Some(raw) = master::extract_sink_props(&value) else {
                 return;
             };
@@ -853,37 +774,30 @@ fn on_node_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Regi
 
 /// Binds an `Audio/Sink` node (§ 2.4's master volume) and subscribes to its `Props` param, which
 /// is where PipeWire keeps volume/mute -- not the `info` props dict `on_node_global`'s
-/// stream/video-source path reads, see the module doc comment and [`master`]. `node.name` is
-/// read once, straight from the `global` event's already-known props: checked live (`pw-dump`),
-/// a sink's `node.name` is present from its very first `global` event, unlike a stream node's
-/// `application.process.id` (see the module doc comment) -- so, unlike streams, no `info`
-/// listener is needed here at all, only `param`.
+/// stream/video-source path reads (see [`master`]). `node.name` is read once, straight from the
+/// `global` event's already-known props: checked live, a sink's `node.name` is present from its
+/// very first `global` event, unlike a stream node's `application.process.id` -- so, unlike
+/// streams, no `info` listener is needed here at all, only `param`.
 ///
 /// The `param` callback below relies on [`master::extract_sink_props`] returning `None` for a
-/// `Props` event that isn't the mixer one -- a sink delivers *two* separate `Props` objects per
+/// `Props` event that isn't the mixer one -- a sink delivers two separate `Props` objects per
 /// subscription/change (mixer keys, then unrelated ALSA device settings with no mixer keys at
 /// all), and writing the second one's absence-of-data into `sink_props` as a zeroed volume was
-/// a real bug this codebase shipped and fixed; see [`master::extract_sink_props`]'s doc comment
-/// for what was checked live to find it.
+/// a real bug this codebase shipped and fixed.
 fn bind_sink(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryRc, obj: &GlobalObject<&DictRef>) {
     let node_id = obj.id;
     let Some(props) = obj.props else { return };
     let Some(node_name) = props.get_prop(*keys::NODE_NAME) else { return };
     let names = DeviceNames { node_name: node_name.to_string(), description: device_display_name(props) };
 
-    // Bound before anything is recorded, not after: a sink whose bind fails never gets a `Props`
-    // subscription and so never gets a volume either. Recording its name unconditionally used to
-    // leave `master::resolve_default_device` free to resolve to a node whose props can never
-    // arrive, and `compute_master` would then report `MasterVolume::default()`'s 0.0 forever, on
-    // a capability that (unlike `battery`'s `present` flag) has no way to say "unknown" instead
-    // of a number that looks like a real 0%. See docs/adr/0053: § 2.4 doesn't specify such a
-    // flag, so the fix is not creating the stuck state rather than adding a sentinel field.
+    // Bound before anything is recorded, not after: a sink whose bind fails never gets a Props
+    // subscription and so never gets a volume either. Recording its name unconditionally would
+    // leave resolve_default_device free to resolve to a node whose props can never arrive, and
+    // compute_master would then report MasterVolume::default()'s 0.0 forever -- a number that
+    // looks like a real 0% on a capability with no "unknown" sentinel (docs/adr/0053).
     let node: pw::node::Node = match registry.bind(obj) {
         Ok(node) => node,
         Err(err) => {
-            // The only silent failure path this file used to have -- every other bind failure
-            // here just drops one entry from a live list, so returning quietly costs nothing; a
-            // failed sink bind instead sat there forever as a wrong-looking master volume.
             eprintln!("audio: failed to bind Audio/Sink node {node_id}: {err}");
             return;
         }
@@ -910,13 +824,12 @@ fn bind_sink(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryR
             }
             state_mut.publish_audio();
         })
-        // The route comes from `info`, not from the `global` event, and that is not a style
-        // choice. Checked live: a sink's `global` props carry `media.class` and `node.name` but
-        // not `device.id` or `card.profile.device`, and `pw-dump` shows both only under the
-        // node's full `info` props. Reading them at `global` time returns `None`, `write_master`
-        // then takes the node path, and the write is accepted and silently discarded. This is the
-        // same "the `global` event carries a subset" trap this module's own doc comment records
-        // for a stream node's `application.process.id`.
+        // The route comes from info, not from the global event, and that is not a style choice.
+        // Checked live: a sink's global props carry media.class and node.name but not device.id
+        // or card.profile.device, both present only under the node's full info props. Reading
+        // them at global time returns None, write_master then takes the node path, and the
+        // write is accepted and silently discarded -- the same "global carries a subset" trap
+        // the module doc comment records for a stream node's application.process.id.
         .info(move |info| {
             if !info.change_mask().contains(pw::node::NodeChangeMask::PROPS) {
                 return;
@@ -928,10 +841,9 @@ fn bind_sink(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryR
         })
         .register();
 
-    // Requested after registering the listener above (rather than before, like the probe this
-    // module doc comment describes) purely to match this file's existing bind-then-listen-then-
-    // subscribe ordering elsewhere; nothing dispatches either call until `main_loop.run()`, so
-    // the two orderings are behaviorally identical on a single-threaded event loop.
+    // Requested after registering the listener above, matching this file's existing bind-then-
+    // listen-then-subscribe ordering elsewhere; nothing dispatches either call until
+    // main_loop.run(), so the two orderings are behaviorally identical here.
     node.subscribe_params(&[pw::spa::param::ParamType::Props]);
 
     let mut state_mut = state.borrow_mut();
@@ -941,9 +853,9 @@ fn bind_sink(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryR
 }
 
 /// The hardware device behind a sink, from the sink node's own `global` props. Both keys are
-/// present together or not at all: read live off `pw-dump`, this machine's analog output carries
-/// `device.id = 49` and `card.profile.device = 7`, and a sink with no hardware behind it carries
-/// neither. `None` means the sink's volume really does live on its node.
+/// present together or not at all: this machine's analog output carries `device.id = 49` and
+/// `card.profile.device = 7`, and a sink with no hardware behind it carries neither. `None`
+/// means the sink's volume really does live on its node.
 fn parse_sink_route(props: &impl PropsLookup) -> Option<SinkRoute> {
     let device_id = props.get_prop(*keys::DEVICE_ID)?.parse().ok()?;
     let profile_device = props.get_prop(CARD_PROFILE_DEVICE)?.parse().ok()?;
@@ -952,12 +864,9 @@ fn parse_sink_route(props: &impl PropsLookup) -> Option<SinkRoute> {
 
 /// Records an `Audio/Source` node's two names. No `registry.bind`, no proxy, no listener: § 2.4's
 /// source object is `id`, `name` and `active`, and the `global` event already carries the first
-/// two while the third comes from the `default.audio.source` metadata key. Binding one would buy
-/// a `Props` param nothing in § 2.4 reads.
-///
-/// The asymmetry with [`bind_sink`] is worth stating plainly rather than looking like an
-/// oversight: a sink is bound because § 2.4 asks for the master `volume`/`muted`, which only its
-/// `Props` param has. A source has no such field in the spec.
+/// two while the third comes from the `default.audio.source` metadata key. The asymmetry with
+/// [`bind_sink`] is deliberate, not an oversight: a sink is bound because § 2.4 asks for the
+/// master `volume`/`muted`, which only its `Props` param has. A source has no such field.
 fn track_source(state: &Rc<RefCell<MixerState>>, obj: &GlobalObject<&DictRef>) {
     let Some(props) = obj.props else { return };
     let Some(node_name) = props.get_prop(*keys::NODE_NAME) else { return };
@@ -969,8 +878,8 @@ fn track_source(state: &Rc<RefCell<MixerState>>, obj: &GlobalObject<&DictRef>) {
 /// Binds the one `Metadata` global whose `metadata.name` is `"default"` -- the object that
 /// publishes `default.audio.sink` (§ 2.4's routing), among several other `default.*` keys this
 /// capability doesn't need. A machine advertises multiple `Metadata` objects (`settings`,
-/// `filters`, `route-settings`, etc. -- confirmed live via `pw-mon`); every non-matching one is
-/// left unbound.
+/// `filters`, `route-settings`, confirmed live via `pw-mon`); every non-matching one is left
+/// unbound.
 fn bind_default_metadata(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryRc, obj: &GlobalObject<&DictRef>) {
     if obj.props.and_then(|props| props.get_prop(METADATA_NAME)) != Some("default") {
         return;
@@ -985,20 +894,18 @@ fn bind_default_metadata(state: &Rc<RefCell<MixerState>>, registry: &pw::registr
     let listener = metadata
         .add_listener_local()
         .property(move |_subject, key, _type_, value| {
-            // Two keys off the same object, and the `default` metadata carries several this
-            // capability does not read (`default.configured.audio.sink`, `default.video.source`,
-            // all confirmed on a live `pw-metadata` dump). `default.configured.*` in particular
-            // is not the same fact: on this machine it names a Bluetooth device that is not
-            // connected, while `default.audio.sink` names the analog output actually in use.
+            // The default metadata carries several keys this capability does not read
+            // (default.configured.audio.sink, default.video.source). default.configured.* is
+            // not the same fact: on this machine it names a Bluetooth device that isn't
+            // connected, while default.audio.sink names the analog output actually in use.
             let field = match key {
                 Some(DEFAULT_AUDIO_SINK_KEY) => DefaultDevice::Sink,
                 Some(DEFAULT_AUDIO_SOURCE_KEY) => DefaultDevice::Source,
                 _ => return 0,
             };
             let mut state_mut = state_for_property.borrow_mut();
-            // `value: None` means the property was cleared (see `Metadata::property`'s own doc
-            // comment) -- treated the same as "no default known", which
-            // `master::resolve_default_device` already falls back from.
+            // value: None means the property was cleared -- treated the same as "no default
+            // known", which resolve_default_device already falls back from.
             let name = value.and_then(master::parse_default_device_name);
             match field {
                 DefaultDevice::Sink => state_mut.default_sink_name = name,
@@ -1020,9 +927,8 @@ fn bind_default_metadata(state: &Rc<RefCell<MixerState>>, registry: &pw::registr
 /// PipeWire recycles ids.
 ///
 /// No optimistic state update anywhere here. A successful write comes back as a `param` or
-/// `property` event on the same loop, which is what publishes the new value, and that is also
-/// what makes a volume changed by `wpctl` or a headset button look identical to one this shell
-/// asked for.
+/// `property` event on the same loop, which publishes the new value -- also what makes a volume
+/// changed by `wpctl` or a headset button look identical to one this shell asked for.
 fn apply_command(state: &Rc<RefCell<MixerState>>, command: AudioCommand) {
     match command {
         AudioCommand::SetMasterVolume(volume) => {
@@ -1037,8 +943,8 @@ fn apply_command(state: &Rc<RefCell<MixerState>>, command: AudioCommand) {
             write_master(state, node_id, Some(channel_volumes), None);
         }
         AudioCommand::SetMasterMuted(muted) => {
-            // Only the node id is needed: a mute write carries no `channelVolumes`, so unlike
-            // `SetMasterVolume` it does not have to know how many channels the sink has.
+            // Only the node id is needed: a mute write carries no channelVolumes, so unlike
+            // SetMasterVolume it does not need to know how many channels the sink has.
             let Some((node_id, _)) = resolve_master(state) else {
                 eprintln!("audio: set_muted({muted}) has no resolved default sink to write to; ignored");
                 return;
@@ -1064,9 +970,8 @@ fn apply_command(state: &Rc<RefCell<MixerState>>, command: AudioCommand) {
             };
             write_node_props(state, id, Some(channel_volumes), None);
         }
-        // No `app_props` lookup, for the same reason `SetMasterMuted` has none: a mute write
-        // needs no channel count. `write_node_props` already refuses an id with no bound node,
-        // which is the check that actually matters.
+        // No app_props lookup, same reason SetMasterMuted has none: a mute write needs no
+        // channel count. write_node_props already refuses an id with no bound node.
         AudioCommand::SetAppMuted { id, muted } => write_node_props(state, id, None, Some(muted)),
         AudioCommand::SetDefaultSink(id) => write_default_device(state, DefaultDevice::Sink, id),
         AudioCommand::SetDefaultSource(id) => write_default_device(state, DefaultDevice::Source, id),
@@ -1075,7 +980,7 @@ fn apply_command(state: &Rc<RefCell<MixerState>>, command: AudioCommand) {
 
 /// The default sink's node id and its last-read `Props`, or `None` when no sink has resolved yet
 /// (the same window `master::compute_master` falls back over). Cloned out from behind the
-/// `RefCell` rather than held across the write, because the write borrows the same state again.
+/// `RefCell`, not held across the write, because the write borrows the same state again.
 fn resolve_master(state: &Rc<RefCell<MixerState>>) -> Option<(u32, master::RawSinkProps)> {
     let state = state.borrow();
     let node_id = master::resolve_default_device(state.default_sink_name.as_deref(), state.sinks.iter().map(|(&id, sink)| (id, sink.names.node_name.as_str())))?;
@@ -1089,14 +994,12 @@ fn resolve_master(state: &Rc<RefCell<MixerState>>) -> Option<(u32, master::RawSi
 /// succeeds and does nothing.** Found by running it, not by reading: `pw-cli set-param 59 Props
 /// '{ mute: true }'` against this machine's analog sink was accepted and had no effect, while the
 /// same write against a stream node worked immediately. The volume lives on the ALSA `Device`'s
-/// `Route` param, which the node's `channelVolumes` only mirrors, and the mirror is restored the
-/// moment anything writes over it. `pw-cli set-param 49 Route '{ index: 2, device: 7, props: {
-/// channelVolumes: [...] }, save: true }'` moved the volume; that is what this builds.
+/// `Route` param, which the node's `channelVolumes` only mirrors, restored the moment anything
+/// writes over it. `pw-cli set-param 49 Route '{ index: 2, device: 7, props: { channelVolumes:
+/// [...] }, save: true }'` moved the volume; that is what this builds.
 ///
 /// So the route path is used whenever one is known, and the node path is the fallback for a sink
-/// with no device behind it (a virtual or null sink), where the node really is the owner. Getting
-/// this the other way round is the failure this codebase keeps meeting: accepted, unlogged, and
-/// wrong.
+/// with no device behind it (a virtual or null sink), where the node really is the owner.
 fn write_master(state: &Rc<RefCell<MixerState>>, node_id: u32, channel_volumes: Option<Vec<f32>>, muted: Option<bool>) {
     let route = state.borrow().sinks.get(&node_id).and_then(|sink| sink.route);
     match route {
@@ -1133,8 +1036,8 @@ fn write_device_route(state: &Rc<RefCell<MixerState>>, node_id: u32, route: Sink
     device.set_param(pw::spa::param::ParamType::Route, 0, pod);
 }
 
-/// Sends one `SPA_PARAM_Props` object to a node. This is the write that works for a stream, and
-/// the fallback for a sink with no hardware device behind it (see [`write_master`]).
+/// Sends one `SPA_PARAM_Props` object to a node. The write that works for a stream, and the
+/// fallback for a sink with no hardware device behind it (see [`write_master`]).
 ///
 /// The serialized bytes are held in a local for the whole call: `Pod::from_bytes` borrows them,
 /// and `set_param` reads through that borrow into C, so letting the `Vec` drop early would hand
@@ -1158,8 +1061,8 @@ fn write_node_props(state: &Rc<RefCell<MixerState>>, node_id: u32, channel_volum
 
 /// `audio:set_default_sink(id)`/`set_default_source(id)`. The metadata keys name a device by
 /// `node.name`, not by registry id, so the id a config read off § 2.4's array is translated back
-/// through the same entry that produced it. `subject` is `0`, which is what a system-wide default
-/// is keyed under and what `pw-metadata`'s own dump shows (`update: id:0 key:'default.audio.sink'`).
+/// through the same entry that produced it. `subject` is `0`, what a system-wide default is
+/// keyed under (`pw-metadata`'s own dump shows `update: id:0 key:'default.audio.sink'`).
 fn write_default_device(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice, id: u32) {
     let state = state.borrow();
     let node_name = match kind {
@@ -1182,10 +1085,10 @@ fn write_default_device(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice, id
     metadata.set_property(0, key, Some(METADATA_JSON_TYPE), Some(&value));
 }
 
-/// Binds an ALSA `Device` global and subscribes to its `Route` param, which is the only place a
-/// route's active index is published. Bound purely for the write path: nothing in § 2.4 reads a
-/// device, and without this a `set_volume` on a hardware sink would be accepted and silently
-/// dropped (see [`write_master`]).
+/// Binds an ALSA `Device` global and subscribes to its `Route` param, the only place a route's
+/// active index is published. Bound purely for the write path: nothing in § 2.4 reads a device,
+/// and without this a `set_volume` on a hardware sink would be accepted and silently dropped
+/// (see [`write_master`]).
 ///
 /// Only `device.api == "alsa"` devices are bound. This machine also advertises `v4l2` and
 /// `libcamera` devices, which have no audio routes at all.
@@ -1229,8 +1132,7 @@ mod tests {
     use super::*;
 
     /// A `Video/Source` node's properties, shaped after real `pw-dump` output for a portal-
-    /// routed camera stream (`application.process.id`/`application.name` on the node, same
-    /// convention `zen_browser_stream_props` already established for audio streams).
+    /// routed camera stream.
     fn camera_stream_props() -> HashMap<String, String> {
         HashMap::from([
             ("media.class".to_string(), "Video/Source".to_string()),
@@ -1319,8 +1221,7 @@ mod tests {
     }
 
     /// A real `Stream/Output/Audio` node's properties, recorded via `pw-dump` from a Zen
-    /// browser playback stream routed through `pipewire-pulse` on a live system -- not
-    /// invented from the spec text.
+    /// browser playback stream routed through `pipewire-pulse` on a live system.
     fn zen_browser_stream_props() -> HashMap<String, String> {
         HashMap::from([
             ("media.class".to_string(), "Stream/Output/Audio".to_string()),
@@ -1375,11 +1276,9 @@ mod tests {
 
     #[test]
     fn resolve_process_name_reads_proc_comm_for_a_real_process() {
-        // Uses this test process's own pid rather than spawning a child: forking a fresh
-        // process just to immediately read back its pid raced, under this sandbox's
-        // parallel test threads, with the pid transiently aliasing another thread in this
-        // same binary -- a sandbox pid-allocator quirk, not a real Linux guarantee, but the
-        // test doesn't need a spawned child to exercise the real /proc/{pid}/comm path.
+        // Uses this test process's own pid rather than spawning a child: a fresh child's pid
+        // raced, under this sandbox's parallel test threads, with transiently aliasing another
+        // thread in this same binary. The test doesn't need a spawned child either way.
         let pid = std::process::id() as i32;
         let name = resolve_process_name(pid).expect("this process's own /proc entry must be readable");
         assert!(!name.is_empty());
@@ -1407,9 +1306,8 @@ mod tests {
         assert_eq!(app.pid, pid as i32);
         assert_eq!(app.name, Some("Test App".to_string()));
         assert_eq!(app.process_name, expected_process_name);
-        // PipeWire's own untouched values, which is what a stream really reports until its
-        // `Props` param arrives: `build_app_stream` reads the node's property dict, and volume
-        // lives on a param instead. `publish_audio` is where the two meet.
+        // PipeWire's own untouched values: build_app_stream reads the node's property dict, and
+        // volume lives on a param instead. publish_audio is where the two meet.
         assert_eq!(app.volume, 1.0);
         assert!(!app.muted);
     }
@@ -1458,15 +1356,13 @@ mod tests {
     #[test]
     fn apply_info_event_keeps_a_tracked_stream_through_a_state_only_info_event() {
         let mut apps = AudioApps::new();
-        // First info event: PipeWire's PROPS-bearing bind-time event, full props. Not just an
-        // assumption -- `global_bind` in upstream `impl-node.c` guarantees this is what the
-        // real first call always looks like, see the module doc comment.
+        // First info event: PipeWire's PROPS-bearing bind-time event, full props -- guaranteed
+        // by upstream global_bind, see the module doc comment.
         apply_info_event(&mut apps, 1, true, Some(&zen_browser_stream_props()));
         assert_eq!(apps.snapshot().len(), 1, "the initial props-bearing info event should track the stream");
 
-        // Second info event: a state-only transition (e.g. RUNNING -> IDLE). PipeWire doesn't
-        // set the PROPS bit for these, and sends an empty props dict -- not evidence the node
-        // stopped being a Stream/Output/Audio node with a valid pid.
+        // Second info event: a state-only transition (e.g. RUNNING -> IDLE), which sends an
+        // empty props dict -- not evidence the node stopped being an audio stream.
         let state_only_props: HashMap<String, String> = HashMap::new();
         apply_info_event(&mut apps, 1, false, Some(&state_only_props));
 
@@ -1509,8 +1405,7 @@ mod tests {
     #[test]
     fn app_stream_serializes_with_the_spec_field_spelling() {
         // docs/adr/0053 decision 3: node_id -> id, app_name -> name; pid/process_name kept
-        // (docs/adr/0016); volume/muted added (currently placeholders, see
-        // APP_VOLUME_PLACEHOLDER's doc comment).
+        // (docs/adr/0016).
         let stream = AppStream { id: 7, pid: 999, name: Some("Zen".to_string()), process_name: None, volume: 1.0, muted: false };
         let json = serde_json::to_value(&stream).unwrap();
         assert_eq!(
@@ -1528,8 +1423,8 @@ mod tests {
 
     // ---- device_display_name / device_list ----
 
-    /// The two names a live `pw-dump` shows on this machine's analog output, verbatim. The point
-    /// of the fixture is that they differ: one routes, the other is read by a person.
+    /// The two names a live `pw-dump` shows on this machine's analog output, verbatim: one
+    /// routes, the other is read by a person.
     fn analog_sink_props() -> HashMap<String, String> {
         HashMap::from([
             ("media.class".to_string(), "Audio/Sink".to_string()),
@@ -1590,8 +1485,6 @@ mod tests {
 
     #[test]
     fn device_list_falls_back_to_the_node_name_when_no_description_was_seen() {
-        // A device with no readable name is still one a config can switch to, so it stays in the
-        // list under whatever name exists rather than being dropped out of reach.
         let names = tracked(&[(59, "alsa_output.analog", None)]);
 
         let devices = device_list(names.iter().map(|(&id, names)| (id, names)), None);
@@ -1608,9 +1501,9 @@ mod tests {
 
     #[test]
     fn audio_state_serializes_as_the_flat_shape_docs_adr_0053_specifies() {
-        // 0.5, not e.g. 0.3: an f32 that isn't exactly representable in f64 serializes with
-        // long trailing digits once serde_json widens it (0.3_f32 as f64 != 0.3_f64), which
-        // would make this equality check about float precision instead of about field shape.
+        // 0.5, not e.g. 0.3: an f32 not exactly representable in f64 serializes with long
+        // trailing digits once serde_json widens it, making this check about float precision
+        // instead of field shape.
         let stream = sample_stream(1);
         let state = AudioState {
             volume: 0.5,
@@ -1642,14 +1535,14 @@ mod tests {
     // ---- MixerState::publish_audio (the wiring, exercised through the published snapshot) ----
 
     /// One device's raw `Props` at a given linear volume, so a test says the number it means
-    /// rather than its cube. `master::master_volume_from_props` reads these back.
+    /// rather than its cube.
     fn props_at(linear: f32, muted: bool) -> master::RawSinkProps {
         master::RawSinkProps { mute: muted, channel_volumes: master::cubed_channel_volumes(linear, 2).expect("two channels is not zero") }
     }
 
-    /// Everything `publish_audio` reads, with every PipeWire proxy map left empty. Built through
-    /// a helper rather than repeated per test, because only a handful of these fields is ever the
-    /// subject of one of these tests and the rest is noise in every one of them.
+    /// Everything `publish_audio` reads, with every PipeWire proxy map left empty. A helper
+    /// rather than repeated per test: only a handful of fields is ever the subject of a given
+    /// test, and the rest is noise.
     fn mixer_state(updates: UnboundedSender<AudioState>, video_updates: UnboundedSender<Vec<VideoSourceApp>>) -> MixerState {
         MixerState {
             apps: AudioApps::new(),
@@ -1705,9 +1598,8 @@ mod tests {
 
     #[test]
     fn publish_audio_overlays_a_streams_own_props_reading_onto_its_entry() {
-        // The half docs/adr/0053 decision 3 shipped as a placeholder. A stream's identity comes
-        // from an `info` event and its volume from a `param` event, and this is the one place
-        // the two are joined.
+        // A stream's identity comes from an info event and its volume from a param event; this
+        // is the one place the two are joined.
         let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (video_updates, _video_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut state = mixer_state(updates, video_updates);

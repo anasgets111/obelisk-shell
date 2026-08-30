@@ -3,37 +3,25 @@
 //!
 //! This module is the ordering/gating state machine only: the numbered sequence build-steps.md
 //! draws (Overlapping Spawn, State Hydration, Null-Buffer Staging, Activate Draw, Evidence
-//! Verification, Swap & Reap), implemented against two real primitives and one seam:
+//! Verification, Swap & Reap), against two real primitives and one seam:
 //!
 //! - Real process lifecycle: [`process::spawn_group_leader`] and [`process::reap_process_group`]
-//!   (Phase 7, `supervisor/src/process/mod.rs`) do the actual spawning and reaping.
+//!   do the actual spawning and reaping.
 //! - [`CandidateLink`]: an operation-level trait over the control socket. `socket::
-//!   SocketCandidateLink` (Phase 14) is its real implementation; a fake still drives this
-//!   module's own tests -- see the trait doc comment for the § reference each method maps to.
-//!   `shared::StateSnapshot` is reused as-is for state hydration's payload (§ 15.2 point 1 names
-//!   exactly this: "a state snapshot pushed by the Supervisor"). `shared::CommandEnvelope` is
-//!   *not* reused for `ActivateDraw`: § 7.2's envelope is a generation-guarded wrapper around a
-//!   Lua-initiated *write action* traveling Renderer -> Supervisor (capability/action/arguments/
-//!   expected_revision), the opposite direction and a different shape from a Supervisor-issued
-//!   one-off activation nonce -- forcing it on would invent a mismatched payload rather than
-//!   reuse a real fit.
+//!   SocketCandidateLink` is the real implementation; a fake drives this module's own tests.
 //!
-//! What this module does *not* build -- see
-//! docs/adr/0025-pba-orchestrator-wired-with-atomic-per-candidate-promotion.md: true independent
-//! per-output timing (ADR-0003 describes each output transferring the moment its own evidence
-//! lands, with no barrier on its siblings; this module still gates the Swap on *all* expected
-//! surface_ids within one shared `evidence_timeout` -- a deliberate, safety-motivated
-//! simplification, not the full per-output model) and a partial-candidate-abort primitive.
+//! Not built here (docs/adr/0025): true independent per-output timing (ADR-0003's model, where
+//! each output transfers the moment its own evidence lands with no barrier on siblings -- this
+//! module gates the Swap on all expected surface_ids within one shared `evidence_timeout`
+//! instead, a deliberate safety-motivated simplification) and a partial-candidate-abort
+//! primitive.
 //!
-//! Failure semantics (not spelled out by § 15's happy-path text, chosen as the reading
-//! consistent with PBA's whole point -- never a black frame, never an unverified swap): any
-//! failure before every expected surface_id's presentation evidence is verified -- a link error,
-//! an unexpected/duplicate surface_id, or a deadline expiring -- aborts the Candidate (reaps its
-//! process group) and leaves Generation `N` untouched and still authoritative. `run_pba` itself
-//! never touches Generation `N` at all any more (see [`PbaOutcome`]'s doc comment) -- reaping it
-//! is the caller's job, once the caller has sent the Swap messages. All four [`CandidateLink`]
-//! steps are deadline-gated, not just two: `ready_timeout` bounds both `push_state_snapshot` and
-//! `recv_ready_signal`, and `evidence_timeout` bounds both `send_activate_draw` and the whole
+//! Failure semantics, chosen as the reading consistent with PBA's whole point (never a black
+//! frame, never an unverified swap): any failure before every expected surface_id's evidence is
+//! verified aborts the Candidate and leaves Generation `N` untouched. `run_pba` never touches `N`
+//! (see [`PbaOutcome`]) -- reaping it is the caller's job, after sending the Swap messages. All
+//! four [`CandidateLink`] steps are deadline-gated: `ready_timeout` bounds `push_state_snapshot`
+//! and `recv_ready_signal`, `evidence_timeout` bounds `send_activate_draw` and the whole
 //! evidence-collection loop -- see [`PbaTimings`] and [`drive_handshake`].
 
 use std::io;
@@ -51,54 +39,47 @@ pub trait CandidateLink {
     /// What a control-link call can fail with.
     type Error: std::fmt::Debug;
 
-    /// § 15.2 point 1 / build-steps.md step 2 ("State Hydration"): push every pre-cached
-    /// per-capability state snapshot down to the Candidate so it can hydrate its signals without
-    /// querying the system itself (docs/adr/0029 generalizes this from a single audio-only
-    /// snapshot to one per known capability).
+    /// § 15.2 point 1 / step 2 ("State Hydration"): push every pre-cached per-capability state
+    /// snapshot down to the Candidate so it can hydrate its signals without querying the system
+    /// itself (docs/adr/0029).
     async fn push_state_snapshot(&mut self, snapshots: &[shared::StateSnapshot]) -> Result<(), Self::Error>;
 
-    /// § 15.2 points 2-3 / build-steps.md step 3 ("Null-Buffer Staging"): block until the
-    /// Candidate signals it has completed its Wayland layer-shell handshake and committed its
-    /// null buffers -- i.e. it's ready to receive `ActivateDraw`. Returns the exact set of
-    /// surface_ids the Candidate staged null buffers for; `run_pba` uses this as the expected
-    /// set for evidence collection (docs/adr/0025 item 2).
+    /// § 15.2 points 2-3 / step 3 ("Null-Buffer Staging"): block until the Candidate signals it
+    /// has completed its Wayland layer-shell handshake and committed its null buffers, i.e. it's
+    /// ready for `ActivateDraw`. Returns the surface_ids it staged null buffers for; `run_pba`
+    /// uses this as the expected set for evidence collection (docs/adr/0025 item 2).
     async fn recv_ready_signal(&mut self) -> Result<Vec<String>, Self::Error>;
 
-    /// § 15.2 point 3 / build-steps.md step 4 ("Activate Draw"): write the unique, nonce-bound
-    /// `ActivateDraw` command telling the Candidate to compile its layout and draw its first
-    /// GPU frame.
+    /// § 15.2 point 3 / step 4 ("Activate Draw"): write the unique, nonce-bound `ActivateDraw`
+    /// command telling the Candidate to compile its layout and draw its first GPU frame.
     async fn send_activate_draw(&mut self, nonce: u64) -> Result<(), Self::Error>;
 
-    /// § 15.3 point 4 / build-steps.md step 5 ("Evidence Verification"): block until the
-    /// Candidate transmits one piece of presentation evidence for `nonce` -- confirmation the
-    /// compositor's `wp_presentation_feedback` `presented` callback fired for one tracked
-    /// surface's frame. Returns which surface_id this evidence is for. Called once per expected
-    /// surface_id by `run_pba`'s evidence-collection loop.
+    /// § 15.3 point 4 / step 5 ("Evidence Verification"): block until the Candidate transmits one
+    /// piece of presentation evidence for `nonce` -- confirmation the compositor's
+    /// `wp_presentation_feedback` `presented` callback fired for one tracked surface. Returns
+    /// which surface_id this evidence is for. Called once per expected surface_id.
     async fn recv_presentation_evidence(&mut self, nonce: u64) -> Result<String, Self::Error>;
 }
 
 /// Which step of § 15.2-15.3's sequence a [`PbaFailure`] happened during.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
-    /// § 15.2 point 1 / build-steps.md step 2.
+    /// § 15.2 point 1 / step 2.
     StateHydration,
-    /// § 15.2 points 2-3 / build-steps.md step 3.
+    /// § 15.2 points 2-3 / step 3.
     NullBufferStaging,
-    /// § 15.2 point 3 / build-steps.md step 4.
+    /// § 15.2 point 3 / step 4.
     ActivateDraw,
-    /// § 15.3 / build-steps.md step 5.
+    /// § 15.3 / step 5.
     EvidenceVerification,
 }
 
-/// Why a PBA reload didn't reach a successful [`PbaOutcome`]. Every variant except
-/// `SpawnFailed` implies the Candidate's process group was aborted (reaped) before returning --
-/// see the module doc comment's failure-semantics paragraph. Generation `N` is never touched by
-/// any of these -- `run_pba` never touches `N` at all any more, on any path (see `PbaOutcome`'s
-/// doc comment).
+/// Why a PBA reload didn't reach a successful [`PbaOutcome`]. Every variant except `SpawnFailed`
+/// implies the Candidate's process group was aborted (reaped) before returning. Generation `N`
+/// is never touched by any of these (see `PbaOutcome`'s doc comment).
 #[derive(Debug)]
 pub enum PbaFailure<E> {
-    /// Step 1 (Overlapping Spawn) itself failed. There's no Candidate process to abort --
-    /// nothing was spawned.
+    /// Step 1 (Overlapping Spawn) itself failed -- there's no Candidate process to abort.
     SpawnFailed(io::Error),
     /// A `CandidateLink` call returned an error during `stage`.
     Link { stage: Stage, source: E },
@@ -106,25 +87,23 @@ pub enum PbaFailure<E> {
     /// during `stage`.
     Timeout { stage: Stage },
     /// The Candidate reported evidence for a surface_id `recv_ready_signal` never announced, or
-    /// reported the same surface_id twice -- a wire-protocol-level desync, not an ordinary
-    /// timeout or link error.
+    /// reported the same surface_id twice -- a wire-protocol desync, not an ordinary timeout or
+    /// link error.
     UnexpectedEvidence { stage: Stage, surface_id: String },
-    /// A failure above happened, and the abort-reap of the Candidate's process group that
-    /// followed it *also* failed. Both are kept rather than the reap error replacing the
-    /// original, so nothing about why the reload failed in the first place gets lost.
+    /// A failure above happened, and the abort-reap that followed it also failed. Both are kept
+    /// rather than the reap error replacing the original, so nothing about why the reload
+    /// failed gets lost.
     AbortReapFailed { original: Box<PbaFailure<E>>, reap_error: io::Error },
 }
 
 /// A completed PBA reload: Generation `N+1` (`candidate`) is confirmed presented on every
-/// expected surface. `promoted_surfaces` is every surface_id that completed presentation-
-/// evidence verification, in `ReadySignal`'s order. Unlike earlier versions of this module,
-/// `run_pba` does **not** reap Generation `N` (`superseded`) any more, and doesn't even take it
-/// as a parameter -- § 15.4's own ordering is Input Deselection -> Candidate Promotion -> Reap,
-/// and the Swap messages (`DeselectInput`/`PromoteGeneration`) go to two different connections
-/// (`superseded`'s and the candidate's), while `CandidateLink` is deliberately scoped to only
-/// the candidate's connection. So the caller sends the Swap messages for each of
-/// `promoted_surfaces`, then reaps `superseded` itself via `process::reap_process_group`
-/// directly -- see `main.rs`'s `TopologyChanged` handling.
+/// expected surface. `promoted_surfaces` is every surface_id that completed evidence
+/// verification, in `ReadySignal`'s order. `run_pba` does not reap Generation `N`
+/// (`superseded`), and doesn't even take it as a parameter: § 15.4's ordering is Input
+/// Deselection -> Candidate Promotion -> Reap, and the Swap messages
+/// (`DeselectInput`/`PromoteGeneration`) go to two different connections while `CandidateLink`
+/// is scoped to only the candidate's. The caller sends those Swap messages, then reaps
+/// `superseded` itself via `process::reap_process_group` (see `main.rs`'s `TopologyChanged`).
 #[derive(Debug)]
 pub struct PbaOutcome {
     pub candidate: Child,
@@ -132,15 +111,14 @@ pub struct PbaOutcome {
 }
 
 /// Runs steps 2-5 (State Hydration through Evidence Verification) against an already-spawned
-/// Candidate's `link`. Split out from [`run_pba`] so its one job -- drive the handshake and
-/// tag any failure with the [`Stage`] it happened during -- stays separate from spawn/abort/
-/// reap, which need the Candidate's process handle that this function never touches.
+/// Candidate's `link`. Split out from [`run_pba`] so its one job -- drive the handshake and tag
+/// any failure with the [`Stage`] it happened during -- stays separate from spawn/abort/reap,
+/// which need the Candidate's process handle this function never touches.
 ///
 /// Evidence collection loops over every surface_id `recv_ready_signal` returned, wrapped in one
-/// `timeout(evidence_timeout, ...)` for the whole loop -- not one timeout per surface -- since
-/// § 15.4's promotion gate is "all expected surface_ids within one shared deadline" (docs/adr/
-/// 0025 item 3), not N independent per-surface deadlines. Returns the confirmed surface_ids in
-/// `expected`'s order once every one has reported.
+/// `timeout(evidence_timeout, ...)` for the whole loop, not one per surface: § 15.4's promotion
+/// gate is all expected surface_ids within one shared deadline (docs/adr/0025 item 3). Returns
+/// the confirmed surface_ids in `expected`'s order once every one has reported.
 async fn drive_handshake<L: CandidateLink>(
     link: &mut L,
     snapshots: &[shared::StateSnapshot],
@@ -183,8 +161,7 @@ async fn drive_handshake<L: CandidateLink>(
 
 /// Aborts a Candidate that failed before evidence verification: reaps its process group and
 /// folds a reap error into `failure` rather than discarding either. The one place that ever
-/// reaps a Candidate on a failure path, so every `drive_handshake` error goes through the same
-/// cleanup instead of each caller re-implementing it.
+/// reaps a Candidate on a failure path.
 async fn abort_candidate<E>(candidate: &mut Child, grace: Duration, failure: PbaFailure<E>) -> PbaFailure<E> {
     match process::reap_process_group(candidate, grace).await {
         Ok(_) => failure,
@@ -194,14 +171,11 @@ async fn abort_candidate<E>(candidate: &mut Child, grace: Duration, failure: Pba
 
 /// The three durations [`run_pba`] gates on: how long to wait for the Candidate's ready signal
 /// and its presentation evidence before treating the reload as failed, and how long to give a
-/// process group to honor `SIGTERM` before escalating to `SIGKILL` (passed straight through to
-/// [`process::reap_process_group`]). Each of `ready_timeout` and `evidence_timeout` actually
-/// bounds two handshake steps, not one: § 15.2's "state hydration and ready-signal wait" and
-/// § 15.3's "activate draw and evidence wait" are each one logical stage, so `ready_timeout`
-/// gates both `push_state_snapshot` and `recv_ready_signal`, and `evidence_timeout` gates both
-/// `send_activate_draw` and `recv_presentation_evidence` -- see [`drive_handshake`]. Grouped into
-/// one struct purely to keep `run_pba`'s parameter count reasonable -- these three don't share
-/// any invariant with each other.
+/// process group to honor `SIGTERM` before escalating to `SIGKILL` (passed to
+/// [`process::reap_process_group`]). `ready_timeout` and `evidence_timeout` each bound two
+/// handshake steps, not one -- § 15.2's hydration+ready-wait and § 15.3's activate+evidence-wait
+/// are each one logical stage (see [`drive_handshake`]). Grouped into one struct purely to keep
+/// `run_pba`'s parameter count reasonable; these three share no invariant with each other.
 #[derive(Debug, Clone, Copy)]
 pub struct PbaTimings {
     pub ready_timeout: Duration,
@@ -209,22 +183,18 @@ pub struct PbaTimings {
     pub reap_grace: Duration,
 }
 
-/// Runs one full PBA reload (§ 15.1-15.4, build-steps.md's numbered steps 1-5):
+/// Runs one full PBA reload (§ 15.1-15.4, steps 1-5):
 ///
 /// 1. **Overlapping Spawn**: spawns the Candidate via [`process::spawn_group_leader`], passing
-///    `candidate_envs` through unchanged (e.g. `OBLISK_GENERATION_ID`/`OBLISK_PBA_CANDIDATE` --
-///    see `main.rs`).
+///    `candidate_envs` through unchanged (e.g. `OBLISK_GENERATION_ID`/`OBLISK_PBA_CANDIDATE`).
 /// 2. **State Hydration** through 5. **Evidence Verification**: see [`drive_handshake`] and
 ///    [`CandidateLink`].
 ///
-/// Step 6 (**Swap & Reap**) is *not* implemented here any more -- see [`PbaOutcome`]'s doc
-/// comment for why reaping `superseded` moved to the caller, alongside sending § 15.4's Swap
-/// messages (`DeselectInput`/`PromoteGeneration`), which never had any code in this module to
-/// begin with (they cross a different connection than `CandidateLink` is scoped to).
+/// Step 6 (**Swap & Reap**) is not implemented here -- see [`PbaOutcome`] for why reaping
+/// `superseded` moved to the caller, alongside sending § 15.4's Swap messages.
 ///
-/// Any failure in steps 1-5 aborts the Candidate and leaves the (still-authoritative, still
-/// untouched by this function) superseded generation alone -- see the module doc comment's
-/// failure-semantics paragraph.
+/// Any failure in steps 1-5 aborts the Candidate and leaves the still-authoritative superseded
+/// generation alone.
 pub async fn run_pba<L: CandidateLink>(
     candidate_cmd: &str,
     candidate_args: &[String],
@@ -262,7 +232,7 @@ mod tests {
     }
 
     /// Polls `condition` until it's true or `timeout` elapses -- avoids a flaky single-shot
-    /// check immediately after a reap, matching `process::mod`'s own test helper.
+    /// check immediately after a reap.
     async fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -280,8 +250,8 @@ mod tests {
     struct FakeLinkError(String);
 
     /// What `push_state_snapshot`/`recv_ready_signal`/`send_activate_draw` should do, configured
-    /// up front per test. `recv_ready_signal`'s payload (which surfaces it reports) is a
-    /// separate field on [`FakeCandidateLink`] -- this only governs Ok/Err/hang.
+    /// up front per test. This only governs Ok/Err/hang; `recv_ready_signal`'s reported surfaces
+    /// are a separate field on [`FakeCandidateLink`].
     enum StepBehavior {
         Succeed,
         Fail,
@@ -291,15 +261,13 @@ mod tests {
     }
 
     /// What one `recv_presentation_evidence` call should do -- popped off a queue, one entry per
-    /// call, so a test can script a sequence (two surfaces succeed, a third hangs; the same
-    /// surface_id reported twice; a surface_id never announced by `recv_ready_signal`).
+    /// call, so a test can script a sequence.
     enum EvidenceOutcome {
         /// Reports evidence for this surface_id.
         Return(String),
         Fail,
         /// Never resolves -- same "wedged Candidate" role as `StepBehavior::Hang`. Also what an
-        /// empty queue falls back to, since a test that never expects this call to matter
-        /// (evidence collection never reached, e.g. `ready` itself hangs) needn't populate it.
+        /// empty queue falls back to, for a test that never expects this call to matter.
         Hang,
     }
 
@@ -316,9 +284,8 @@ mod tests {
     }
 
     impl FakeCandidateLink {
-        /// The common case: one expected surface (`"main_bar"`), `push_state_snapshot`/
-        /// `send_activate_draw` always succeed immediately, `ready` and the one evidence call
-        /// are configured explicitly.
+        /// The common case: one expected surface ("main_bar"), hydration/activate always
+        /// succeed, `ready` and the one evidence call are configured explicitly.
         fn new(ready: StepBehavior, evidence: EvidenceOutcome) -> Self {
             Self::with_steps(StepBehavior::Succeed, ready, vec!["main_bar".to_string()], StepBehavior::Succeed, VecDeque::from([evidence]))
         }
@@ -381,9 +348,8 @@ mod tests {
     const SHORT_DEADLINE: Duration = Duration::from_millis(80);
     const GRACE: Duration = Duration::from_millis(200);
 
-    /// `PbaTimings` with `reap_grace` fixed to [`GRACE`] -- what every test below wants, since
-    /// none of them are exercising the reap-grace/escalation behavior itself (that's
-    /// `process::mod`'s own test coverage).
+    /// `PbaTimings` with `reap_grace` fixed to [`GRACE`] -- none of the tests below exercise the
+    /// reap-grace/escalation behavior itself (that's `process::mod`'s own coverage).
     fn timings(ready_timeout: Duration, evidence_timeout: Duration) -> PbaTimings {
         PbaTimings { ready_timeout, evidence_timeout, reap_grace: GRACE }
     }
@@ -418,8 +384,8 @@ mod tests {
     #[tokio::test]
     async fn run_pba_promotes_all_expected_surfaces_in_readysignals_order_regardless_of_arrival_order() {
         let expected = vec!["main_bar".to_string(), "overlay_canvas".to_string(), "wallpaper_layer@DP-1".to_string()];
-        // Evidence arrives in a different order than `expected` lists them -- proves the
-        // returned `promoted_surfaces` order comes from ReadySignal, not arrival order.
+        // Evidence arrives in a different order than expected lists them, proving
+        // promoted_surfaces order comes from ReadySignal, not arrival order.
         let arrival_order = VecDeque::from([
             EvidenceOutcome::Return("overlay_canvas".to_string()),
             EvidenceOutcome::Return("wallpaper_layer@DP-1".to_string()),
@@ -531,11 +497,10 @@ mod tests {
         assert!(matches!(failure, PbaFailure::Timeout { stage: Stage::ActivateDraw }));
     }
 
-    /// Polls for `path` to contain a parseable pid, up to `timeout`. Used below to recover the
-    /// spawned Candidate's own pid on a failure path, where `run_pba` doesn't return the
-    /// `Child` -- the Candidate writes its own `$$` to `path` before blocking, since it's
-    /// `exec`'d into the shell's own pid (no fork in between) and thus identical to
-    /// `Child::id()`.
+    /// Polls for `path` to contain a parseable pid, up to `timeout`. Used to recover the spawned
+    /// Candidate's own pid on a failure path where `run_pba` doesn't return the `Child` -- the
+    /// Candidate writes its own `$$` to `path` before blocking, since it's `exec`'d into the
+    /// shell's own pid and thus identical to `Child::id()`.
     async fn wait_for_pidfile(path: &std::path::Path, timeout: Duration) -> Option<i32> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -551,10 +516,9 @@ mod tests {
         }
     }
 
-    /// A pid-per-test-run file rather than matching on a shared command line -- `cargo test`
-    /// runs these tests in parallel, and several of them spawn near-identical commands, so a
-    /// name-based check (e.g. `pgrep -f`) would false-positive on a sibling test's own live
-    /// child.
+    /// A pid-per-test-run file rather than matching on a shared command line -- tests run in
+    /// parallel and several spawn near-identical commands, so a name-based check would
+    /// false-positive on a sibling test's own live child.
     fn unique_pidfile() -> std::path::PathBuf {
         let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("system clock").as_nanos();
         std::env::temp_dir().join(format!("oblisk-reload-test-{}-{unique}.pid", std::process::id()))
@@ -589,9 +553,8 @@ mod tests {
     #[tokio::test]
     async fn run_pba_times_out_and_aborts_the_candidate_when_one_of_three_expected_surfaces_never_reports_evidence() {
         let expected = vec!["main_bar".to_string(), "overlay_canvas".to_string(), "wallpaper_layer@DP-1".to_string()];
-        // Only two of the three surfaces "would have" succeeded -- the third's queue entry is
-        // simply absent, which `recv_presentation_evidence` treats as a hang (see
-        // `EvidenceOutcome::Hang`'s doc comment).
+        // The third surface's queue entry is simply absent, which recv_presentation_evidence
+        // treats as a hang.
         let evidence = VecDeque::from([
             EvidenceOutcome::Return("main_bar".to_string()),
             EvidenceOutcome::Return("overlay_canvas".to_string()),
@@ -742,7 +705,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_until_helper_reports_false_on_a_condition_that_never_becomes_true() {
-        // Self-check for the polling helper above, mirroring process::mod's own test.
+        // Self-check for the polling helper above.
         let became_true = wait_until(Duration::from_millis(30), || false).await;
         assert!(!became_true);
     }

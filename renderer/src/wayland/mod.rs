@@ -44,45 +44,35 @@ use crate::text::atlas::TextPainter;
 use crate::text::shaping::ShapingHandle;
 use crate::text::snap::LogicalRect;
 
-/// A live window surface bound to the shared EGL context, once its first configure
-/// has arrived. Holds the native window alongside the EGL surface: per wayland-egl's
-/// contract, `WlEglSurface` must outlive the EGL surface built from it -- fields are
-/// declared in the order Rust drops them (top to bottom), so `egl_surface` goes first.
-///
-/// That order is a necessary condition, not a sufficient one. `khronos_egl::Surface` is a plain
-/// copyable handle with no `Drop` of its own, so dropping this struct destroys the
-/// `wl_egl_window` and nothing else; the matching `eglDestroySurface` is
-/// [`App::destroy_surface_by_id`]'s job, which is why that is the only sanctioned way to retire
-/// a bound surface.
+/// A window surface bound to the shared EGL context after its first configure.
+/// Field order matters: wayland-egl requires `WlEglSurface` to outlive the EGL surface
+/// built from it, and Rust drops fields top to bottom, so `egl_surface` is declared first.
+/// `khronos_egl::Surface` has no `Drop` of its own, so dropping this struct never calls
+/// `eglDestroySurface` -- only [`App::destroy_surface_by_id`] does that.
 struct BoundSurface {
     egl_surface: EglSurface,
     #[allow(dead_code)]
     native_window: WlEglSurface,
 }
 
-/// Logs an EGL/Wayland bind-time failure in a consistent shape across `bind_and_clear`'s
-/// fallible steps. Takes the surface id rather than a role since docs/adr/0038 deleted the roles:
-/// the id is `"{id}@{output}"`, which names the config's own surface *and* the monitor it failed
-/// on, where a role could name neither.
+/// Logs an EGL/Wayland bind-time failure for `bind_and_clear`'s fallible steps. `surface_id`
+/// is `"{id}@{output}"` (docs/adr/0038), naming both the config's surface and the monitor it
+/// failed on.
 fn log_bind_failure(surface_id: &str, stage: &str, err: impl std::fmt::Display) {
     eprintln!("[oblisk-renderer] {surface_id}: {stage} failed: {err}");
 }
 
-/// § 6.1's `visible`, as the compositor currently sees it (docs/adr/0038 decision 2: within a live
-/// generation `visible` maps and unmaps a surface without destroying it, so toggling a launcher
-/// costs a commit rather than a process spawn).
+/// § 6.1's `visible`, as the compositor currently sees it (docs/adr/0038 decision 2: within a
+/// live generation, `visible` maps and unmaps a surface without destroying it).
 ///
-/// Three states rather than two, and the middle one is the protocol's, not a convenience.
-/// `zwlr_layer_surface_v1`'s own description spells the re-map procedure out: "The client can
-/// re-map the surface by performing a commit without any buffer attached, waiting for a configure
-/// event and handling it as usual." Attaching a buffer before that configure arrives would break
-/// that rule, and the same wait applies to a surface's very first map, so both share this state.
+/// Three states, not two: `zwlr_layer_surface_v1` requires a re-map to commit with no buffer
+/// attached and wait for a configure before attaching one, and a surface's first map obeys the
+/// same rule, so both share `AwaitingConfigure`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MapState {
-    /// The resolved root's `visible` is `false`. Either no buffer was ever attached (a panel
-    /// declared invisible at startup) or a null buffer unmapped it. Nothing may be painted here,
-    /// and -- see [`App::unmap`] -- nothing may be *committed* here either, since a commit with no
-    /// buffer attached is exactly how the protocol says a client re-maps.
+    /// `visible` is false: no buffer was ever attached, or a null buffer unmapped one. Nothing
+    /// may be painted or committed here -- see [`App::unmap`] -- since an empty commit is the
+    /// re-map.
     Unmapped,
     /// The map (or re-map) commit is out and the compositor has not configured the surface yet.
     AwaitingConfigure,
@@ -99,131 +89,78 @@ impl MapState {
     }
 }
 
-/// The protocol object one tracked surface's `wl_surface` has been given a role by, together with
-/// the spec that object's state was last set from (§ 6, docs/adr/0040 decision 1). One enum rather
-/// than two parallel `Vec<TrackedSurface>`s, because everything *around* the role object -- the EGL
-/// binding, the paint pass, the input routing, the PBA staging -- is identical across roles and
-/// indexes into one `App::surfaces`; splitting the vec would fork all of it.
+/// The protocol object a tracked surface's `wl_surface` has been given a role by, plus the spec
+/// its state was last set from (§ 6, docs/adr/0040 decision 1). One enum, not a `Vec` per role,
+/// because the EGL binding, paint pass, input routing and PBA staging are identical across roles
+/// and all index one `App::surfaces`.
 ///
-/// **The variants differ in exactly one thing, and it is the whole of docs/adr/0049 decision 1: how
-/// long the Wayland object lives.** A `panel`'s is created at generation startup and kept for the
-/// generation's whole life, with `visible` mapping and unmapping it. A `window`'s exists only while
-/// shown, which is why its object is an `Option` and a panel's is not.
+/// Variants differ in how long the Wayland object lives (docs/adr/0049 decision 1): a `panel`'s
+/// lives for the generation, a `window`'s or `popup`'s only while shown, hence `Option`.
 enum TrackedRole {
     Panel {
         layer: LayerSurface,
-        /// The `panel` spec this surface's layer-shell state was last set from -- the diff baseline
-        /// [`spec_update`] compares a freshly resolved root against, so a re-resolve pushes only
-        /// the fields that actually moved (docs/adr/0038 decision 2, build-steps.md Phase 20
-        /// item 1).
-        ///
-        /// Also the standing answer to "what is this surface's anchor and is it exclusive", which
-        /// [`App::apply_exclusive_zone`] needs once a `configure` says how large the surface is.
+        /// The diff baseline [`spec_update`] compares a fresh resolve against, so only fields
+        /// that actually moved are pushed (docs/adr/0038 decision 2). Also the standing
+        /// anchor/exclusive answer [`App::apply_exclusive_zone`] needs once `configure` reports
+        /// a size.
         spec: PanelSpec,
-        /// This surface's output's logical size, the basis a `SizeMode::Percent` resolves against.
-        ///
-        /// Kept per surface rather than read back from `SurfaceInstance::available`, which is the
-        /// same number only until the first `configure`: `set_instance_size` then replaces
-        /// `available` with the size the compositor granted, so resolving a percent against it on a
-        /// later re-resolve would take a percentage of a percentage and shrink the surface on every
-        /// push.
-        ///
-        /// Panel-only because `layer_extent_for` is: § 6.2 gives a `window` no `width`/`height` at
-        /// all, so a toplevel has no size request to resolve a percent for.
+        /// This surface's output's logical size, the basis `SizeMode::Percent` resolves against.
+        /// Kept per surface rather than read from `SurfaceInstance::available`: `set_instance_size`
+        /// overwrites `available` with the compositor-granted size after the first configure, so
+        /// resolving a percent against it later would take a percentage of a percentage and
+        /// shrink the surface on every push. Panel-only: § 6.2 gives a `window` no `width`/
+        /// `height` to resolve.
         output_size: layout::LogicalSize,
     },
     Window {
-        /// `None` whenever `visible` is false, which for this role means the `xdg_toplevel`, its
-        /// `xdg_surface` and its `wl_surface` do not exist at all (docs/adr/0049 decision 1). This
-        /// is the memory win that ADR gives: a declared-but-never-shown window costs one retained
-        /// node and zero Wayland objects, buffers, or EGL surfaces.
+        /// `None` when `visible` is false: the `xdg_toplevel`, `xdg_surface` and `wl_surface`
+        /// do not exist at all (docs/adr/0049 decision 1). A declared-but-never-shown window
+        /// costs one retained node and zero Wayland objects.
         window: Option<Window>,
-        /// The `window` spec this toplevel's state was last set from, kept for the same reason a
-        /// panel's is: [`window_update`]'s diff baseline. Maintained even while `window` is `None`,
-        /// so the toplevel [`App::show_window`] creates is built from the spec the last re-resolve
-        /// produced rather than the one the evaluation happened to parse.
+        /// This toplevel's state's diff baseline for [`window_update`]. Maintained even while
+        /// `window` is `None`, so [`App::show_window`] builds from the last re-resolve's spec.
         spec: WindowSpec,
     },
     Popup {
-        /// `None` whenever this popup is not currently shown, for the same reason a `window`'s is
-        /// and one stronger: `xdg_positioner` is consumed by `get_popup`, so a popup created once
-        /// is anchored once (docs/adr/0049's opening argument). Every open builds a fresh
-        /// positioner, a fresh `wl_surface` and a fresh `xdg_popup`.
+        /// `None` when not shown. `xdg_positioner` is consumed by `get_popup`, so a popup
+        /// anchored once cannot be re-anchored (docs/adr/0049); every open builds a fresh
+        /// positioner, `wl_surface` and `xdg_popup`.
         popup: Option<Popup>,
-        /// The `popup` spec the next open will be built from. Unlike a `panel`'s or a `window`'s
-        /// this is **not** a diff baseline, because there is nothing to diff against: every field
-        /// on it is an `xdg_positioner` request, the positioner is consumed at creation, and
-        /// `xdg_popup.reposition` -- the one request that could move a live popup -- is deliberately
-        /// not built (docs/adr/0040, build-steps.md Phase 22's "deliberately deferred"). So this is
-        /// a store, re-read whole at the next [`App::show_popup`].
+        /// The spec the next open builds from -- not a diff baseline like a panel's or window's:
+        /// every field is an `xdg_positioner` request consumed at creation, so this is a plain
+        /// store, re-read whole at the next [`App::show_popup`].
         spec: PopupSpec,
-        /// docs/adr/0051 decision 2's latch: [`App::pointer_input_count`] as it stood when the
-        /// compositor dismissed this popup, or `None` if it has not been dismissed. No replacement
-        /// may be created while that counter is still unmoved.
+        /// docs/adr/0051 decision 2's latch: [`App::pointer_input_count`] when the compositor
+        /// dismissed this popup, or `None` if not dismissed. No replacement is created while
+        /// the counter is unmoved -- without the latch, a click-outside livelocks: `popup_done`
+        /// destroys the object but leaves `visible = true`, so the next re-resolve reopens it
+        /// for the same click-outside, forever.
         ///
-        /// Without the latch a click-outside is a livelock rather than a dismissal. `popup_done`
-        /// destroys the object but leaves the resolved tree still saying `visible = true`, so the
-        /// next re-resolve would create a second popup for the same click-outside to dismiss,
-        /// forever. A config with no `on_dismiss` at all is not a config error and must not be that.
-        ///
-        /// A count rather than the `bool` decision 2 first asked for, per docs/adr/0051's first
-        /// amendment: the `visible = false` edge that was supposed to clear it is unobservable in
-        /// the case that matters, so the bool latched permanently and the dropdown died with the
-        /// generation. See [`popup_visibility_action`], which reads it.
-        ///
-        /// Per declaration and per generation: it lives here, so a PBA swap starts every popup
-        /// unlatched, which is correct because a new generation has shown nothing yet.
+        /// A count, not the bool decision 2 first specified (docs/adr/0051's first amendment):
+        /// the `visible = false` edge meant to clear it is unobservable in this case, so a bool
+        /// latches permanently. See [`popup_visibility_action`], which reads this.
         dismissed_at: Option<u64>,
-        /// Which of [`App::show_popup`]'s refusals was last logged for this run of `visible = true`,
-        /// or `None` if none has been. docs/adr/0049's amendment says a refusal is *logged once*,
-        /// and this is the once.
-        ///
-        /// Which one, rather than a bool per reason, because all three refusals answer the same
-        /// question and a config hits them one at a time: a `parent` that names a hidden window
-        /// still logs its line after the serial refusal already logged its own. Three parallel
-        /// bools would be the same state clumped into three fields nothing keeps in step.
-        ///
-        /// It is not a second latch and deliberately does not stop the retry. A popup declared
-        /// `visible = true` outright is refused on every re-resolve until one of them happens to be
-        /// input-driven, and then it opens -- which is the rule working, not a special case, because
-        /// the click that armed that serial is real user input. What must not repeat is the line: a
-        /// re-resolve runs per capability push (ADR-0044 decision 2), so an unconditional
-        /// `eprintln!` here writes several lines a second for as long as the config says `true`.
-        ///
-        /// Cleared on the same two edges the object's own lifetime turns on: a successful create,
-        /// and `visible` resolving false. So a config that fixes itself says so again if it breaks
-        /// again.
+        /// Which of [`App::show_popup`]'s refusals was last logged for this `visible = true`
+        /// run, or `None` if none has been -- docs/adr/0049's amendment: log a refusal once,
+        /// not once per re-resolve. Not a second latch: it does not stop retries, only repeated
+        /// logging. Cleared on a successful create or `visible = false`.
         refusal_logged: Option<PopupRefusal>,
     },
     Lock {
-        /// The output this lock surface covers, held from the moment the instance was expanded
-        /// rather than looked up again when the lock is taken. `get_lock_surface` takes a
-        /// `wl_output` and § 6.4 gives a `lock` no `monitor` to name one with, so the instance's
-        /// own output is the only possible answer -- and it is docs/adr/0041's output tracking
-        /// rather than a second source of it, since [`App::create_surfaces`] is handed this proxy
-        /// by the same map that places a `panel`.
+        /// The output this lock surface covers, held from instance expansion rather than
+        /// looked up when the lock is taken: § 6.4 gives a `lock` no `monitor` to name one with.
         output: wl_output::WlOutput,
-        /// `None` until this process holds the lock (docs/adr/0052 decision 2). The `Option` is a
-        /// `window`'s with the trigger moved: a `window`'s object appears when the config says
-        /// `visible`, and a lock surface's appears when the *compositor* has granted the lock, so
-        /// a declared lock screen costs one retained node and zero Wayland objects for as long as
-        /// the session is unlocked, which is nearly always.
-        ///
-        /// **Dropping this handle is the teardown, and nothing else is.**
-        /// `SessionLockSurfaceInner::Drop` sends `ext_session_lock_surface_v1.destroy`, which the
-        /// protocol *recommends* once the surface's `wl_output` global is gone and which makes the
-        /// compositor "fall back to rendering a solid color" on an output that is still there. So
-        /// the only two things that may clear this are an output removal
-        /// ([`App::destroy_surface_by_id`], which drops the whole entry) and the end of the lock
-        /// ([`App::teardown_lock_surfaces`]).
+        /// `None` until this process holds the lock (docs/adr/0052 decision 2). Dropping this
+        /// handle is the teardown and nothing else is: `SessionLockSurfaceInner::Drop` sends
+        /// `ext_session_lock_surface_v1.destroy`, which makes the compositor fall back to a
+        /// solid color on outputs still present. Cleared only by an output removal
+        /// ([`App::destroy_surface_by_id`]) or the end of the lock ([`App::teardown_lock_surfaces`]).
         surface: Option<SessionLockSurface>,
     },
 }
 
 impl TrackedRole {
-    /// This surface's `wl_surface`, or `None` for a `window` or `popup` that is not currently shown
-    /// -- the one question every role-agnostic path in this file asks (finding a surface by the one
-    /// a `Dispatch` callback names, staging a null buffer, requesting presentation feedback).
+    /// This surface's `wl_surface`, or `None` for a `window`/`popup` not currently shown.
     fn wl_surface(&self) -> Option<&wl_surface::WlSurface> {
         match self {
             TrackedRole::Panel { layer, .. } => Some(layer.wl_surface()),
@@ -234,34 +171,23 @@ impl TrackedRole {
     }
 
     /// This surface as something an `xdg_popup` can be rooted under, or `None` if it cannot be one
-    /// (§ 6.3's `parent`, docs/adr/0051 decision 1).
-    ///
-    /// A `window` or a `popup` that is not currently shown answers `None`, and that is the honest
-    /// answer rather than a missing case: there is no surface to root under, so the popup asking is
-    /// not created either.
+    /// (§ 6.3's `parent`, docs/adr/0051 decision 1). A `window`/`popup` not currently shown answers
+    /// `None`, so the popup asking is not created either.
     fn as_popup_parent(&self) -> Option<PopupParent> {
         match self {
             TrackedRole::Panel { layer, .. } => Some(PopupParent::Layer(layer.clone())),
             TrackedRole::Window { window, .. } => window.as_ref().map(|w| PopupParent::Xdg(w.xdg_surface().clone())),
             TrackedRole::Popup { popup, .. } => popup.as_ref().map(|p| PopupParent::Xdg(p.xdg_surface().clone())),
-            // Never, and not for want of a mapped surface. `ext_session_lock_surface_v1` is neither
-            // an `xdg_surface` nor a `zwlr_layer_surface_v1`, and those two are the whole of what
-            // `xdg_surface.get_popup` and layer-shell's `get_popup` accept, so there is no request
-            // that would root a popup here. That also happens to be the answer the protocol wants:
-            // while the session is locked the compositor shows lock surfaces and nothing else
-            // (docs/adr/0042), so a dropdown over a lock screen belongs in the lock screen's own
-            // tree rather than in a second surface.
+            // `ext_session_lock_surface_v1` is neither an `xdg_surface` nor a `zwlr_layer_surface_v1`,
+            // the only two `get_popup` accepts, so no request can root a popup here. That matches the
+            // protocol anyway: while locked the compositor shows lock surfaces only (docs/adr/0042).
             TrackedRole::Lock { .. } => None,
         }
     }
 }
 
-/// Why [`App::show_popup`] declined to open a popup, remembered so the same line is not written
-/// again on the next re-resolve while a different one still is (docs/adr/0049's amendment).
-///
-/// Each is a config-visible condition that can persist for the life of a generation, and a
-/// re-resolve runs per capability push (ADR-0044 decision 2), so an unguarded `eprintln!` on any of
-/// them writes several lines a second.
+/// Why [`App::show_popup`] declined to open a popup, remembered so the line is not repeated on
+/// the next re-resolve while the same refusal still holds (docs/adr/0049's amendment).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PopupRefusal {
     /// `grab = true` and no input event armed a serial this turn (docs/adr/0051 decision 3).
@@ -273,15 +199,13 @@ enum PopupRefusal {
     HiddenParent,
 }
 
-/// The two ways a popup gets rooted, which differ in *when* rather than in what (build-steps.md
-/// Phase 22 item 2).
+/// The two ways a popup gets rooted, which differ in when rather than what.
 ///
-/// `Popup::from_surface` takes an `Option<&xdg_surface>` and roots the popup at creation, which
-/// covers a `window` and a nested `popup`. A `panel` cannot go through that argument at all: its
-/// surface has a layer-shell role and no `xdg_surface`, so layer-shell supplies its own
-/// `zwlr_layer_surface_v1.get_popup` taking the raw `xdg_popup` back. That one has to be sent
-/// *after* the popup object exists and *before* the initial commit, which is exactly why
-/// [`Popup::new`] cannot be used here: it commits for you.
+/// `Popup::from_surface` takes an `Option<&xdg_surface>` and roots at creation, covering a
+/// `window` or nested `popup`. A `panel`'s surface has a layer-shell role and no `xdg_surface`,
+/// so layer-shell's own `zwlr_layer_surface_v1.get_popup` sends the raw `xdg_popup` back, which
+/// must happen after the popup object exists and before the initial commit, so [`Popup::new`],
+/// which commits for you, cannot be used here.
 enum PopupParent {
     Layer(LayerSurface),
     Xdg(xdg_surface::XdgSurface),
@@ -290,25 +214,17 @@ enum PopupParent {
 struct TrackedSurface {
     role: TrackedRole,
     bound: Option<BoundSurface>,
-    /// § 15's "surface_id", and since docs/adr/0038 the *instance* id
-    /// (`layout::instance::SurfaceInstance::instance_id`): `"{id}@{output}"` for a panel and the
-    /// bare declared `id` for a window, which has no output to qualify it with. This is the one id
-    /// space Lua, the retained `Scene`, this `wl_surface`, and the PBA handshake all share --
-    /// before this it was a fixed Rust-owned role's label, which overlapped none of them, which is
-    /// why `layout::paint::paint_tree` had no caller.
+    /// § 15's "surface_id", the instance id: `"{id}@{output}"` for a panel, bare `id` for a
+    /// window. The one id space Lua, the retained `Scene`, this `wl_surface` and the PBA
+    /// handshake all share.
     surface_id: String,
     map_state: MapState,
-    /// Set once this surface's null buffer has been committed (PBA candidate mode only, § 15.2
-    /// points 2-3). Irrelevant, always `false`, outside candidate mode.
-    ///
-    /// Never set for a `window` that is not shown, and that is why [`candidate_has_staged`] exists
-    /// rather than the gate being a plain `all(null_buffered)`: staging happens on a configure, and
-    /// a window with no `xdg_toplevel` will never get one.
+    /// Set once this surface's null buffer is committed (PBA candidate mode only, § 15.2 points
+    /// 2-3); always `false` outside candidate mode. Never set for a `window` not shown, since
+    /// staging happens on a configure it will never get -- see [`candidate_has_staged`].
     null_buffered: bool,
-    /// The most recent `configure` event's size, remembered so [`App::activate_draw`] has a real
-    /// size to bind its EGL window surface to -- in candidate mode, the first configure doesn't
-    /// bind EGL at all (see [`App::bind_and_clear`]), so this is the only place that size
-    /// survives until `ActivateDraw` arrives.
+    /// The most recent `configure` size, so [`App::activate_draw`] has a real size to bind EGL
+    /// to: in candidate mode the first configure doesn't bind EGL (see [`App::bind_and_clear`]).
     configured_size: (u32, u32),
 }
 
@@ -318,106 +234,79 @@ pub struct App {
     compositor_state: CompositorState,
     seat_state: SeatState,
     layer_shell: LayerShell,
-    /// `xdg_wm_base`, plus the `zxdg_decoration_manager_v1` `XdgShell::bind` picks up alongside it
-    /// (build-steps.md Phase 22 items 1 and 4). `None` on a compositor advertising no xdg-shell,
-    /// which is legal if odd -- a `panel`-only config still works there, and a declared `window`
-    /// says so once instead of taking the process down.
+    /// `xdg_wm_base`, plus the `zxdg_decoration_manager_v1` `XdgShell::bind` picks up alongside it.
+    /// `None` on a compositor advertising no xdg-shell: a `panel`-only config still works there,
+    /// and a declared `window` says so once instead of taking the process down.
     xdg_shell: Option<XdgShell>,
     /// `ext_session_lock_manager_v1`, or the knowledge that the compositor advertises none
-    /// (docs/adr/0042, build-steps.md Phase 23). Unlike `xdg_shell` this is not an `Option`: SCTK
-    /// wraps the global in a `GlobalProxy`, so the absent case is carried inside and surfaces as a
-    /// `GlobalError::MissingGlobal` from `lock` -- which is where it belongs, since docs/adr/0052
-    /// decision 4 wants "this compositor cannot lock" reported as a *refusal of a lock command*
-    /// rather than as a bind failure at startup that nobody asked for.
-    ///
-    /// Not in `registry_handlers![OutputState, SeatState]` either, and correctly so:
-    /// `SessionLockState` is not a `RegistryHandler`. It binds once from the `GlobalList` in
-    /// [`run`] and has no interest in later registry churn.
+    /// (docs/adr/0042). Not an `Option` like `xdg_shell`: SCTK wraps the global in a
+    /// `GlobalProxy`, so the absent case surfaces as `GlobalError::MissingGlobal` from `lock`
+    /// itself, a refusal of a lock command rather than a startup bind failure (docs/adr/0052
+    /// decision 4). Not in `registry_handlers![OutputState, SeatState]`: `SessionLockState` is
+    /// not a `RegistryHandler`; it binds once from the `GlobalList` in [`run`].
     session_lock_state: SessionLockState,
-    /// The live `ext_session_lock_v1`, from the moment `lock` is sent until the lock ends by any of
-    /// its three routes: an unlock the Supervisor ordered, a denial, or a teardown the compositor
-    /// performed itself.
+    /// The live `ext_session_lock_v1`, from the moment `lock` is sent until the lock ends: an
+    /// unlock the Supervisor ordered, a denial, or a compositor teardown.
     ///
-    /// `Some` with `is_locked()` still false is the in-flight window between the request and the
-    /// compositor's answer, and that window is the whole reason `finished` is two different events
-    /// (docs/adr/0042, build-steps.md Phase 23 item 2) -- see [`finished_outcome`], which reads
-    /// exactly that flag. One field rather than a phase enum beside it, because SCTK already keeps
-    /// the flag and a second copy here could only ever disagree with it.
+    /// `Some` with `is_locked()` still false is the in-flight window between request and answer,
+    /// which is why `finished` is two different events (docs/adr/0042) -- see
+    /// [`finished_outcome`].
     session_lock: Option<SessionLock>,
     egl: egl::EglState,
     gl: Option<glow::Context>,
-    /// The one `ShapingHandle` for the whole process; `client` holds a clone of it, so
-    /// content-sizing and painting share one worker thread and one `FontSystem`
-    /// (docs/adr/0023 item 8, closed by docs/adr/0039 decision 3).
+    /// The one `ShapingHandle` for the process; `client` holds a clone, so content-sizing and
+    /// painting share one worker thread and one `FontSystem` (docs/adr/0039 decision 3).
     shaping: ShapingHandle,
     text_painter: Option<TextPainter>,
-    /// One image cache for the whole process, beside the one `TextPainter`, for the same reason:
-    /// it is keyed by file path and pixel size, so a tray icon drawn on the bar and the same icon
-    /// drawn in a popup are one upload, not one per surface (`CONTEXT.md`, **Image cache**). Not
-    /// an `Option` unlike `text_painter`, which needs a live GL context to construct; this needs
-    /// one only when it loads, and every load already goes through a `&mut Canvas`.
+    /// One image cache for the process, keyed by file path and pixel size, so an icon drawn on
+    /// the bar and the same icon in a popup are one upload, not one per surface (`CONTEXT.md`,
+    /// **Image cache**).
     image_cache: ImageCache,
-    /// The Lua VM, the `Loader`, the retained `Scene`, the live signals, and the reload
-    /// bookkeeping, all owned by this dispatch state rather than by a separate thread
-    /// (docs/adr/0039). `mlua::Lua` is `!Send`, so `App` is `!Send` too -- fine, since
-    /// `wayland-client` puts no `Send` bound on the dispatch state.
+    /// The Lua VM, `Loader`, retained `Scene`, live signals and reload bookkeeping (docs/adr/0039).
+    /// `mlua::Lua` is `!Send`, so `App` is too -- fine, since `wayland-client` puts no `Send`
+    /// bound on the dispatch state.
     client: RendererClient,
     surfaces: Vec<TrackedSurface>,
     exit: bool,
-    /// `OBLISK_PBA_CANDIDATE` is set (build-steps.md Phase 14, § 15.2) -- read once in [`run`]
-    /// and stored here rather than re-reading the env var on every configure event.
+    /// `OBLISK_PBA_CANDIDATE` is set (§ 15.2) -- read once in [`run`], not re-read per configure.
     is_pba_candidate: bool,
-    /// Set once [`App::maybe_send_ready_signal`] has sent `ReadySignal` -- a one-time signal,
-    /// never resent even if a later spurious configure re-triggers the check.
+    /// Set once [`App::maybe_send_ready_signal`] has sent `ReadySignal`: a one-time signal, never
+    /// resent even if a later spurious configure re-triggers the check.
     ready_signal_sent: bool,
-    /// Set once [`run`]'s startup sequence has evaluated the config and built its surfaces.
-    ///
-    /// The initial `wl_output` burst is dispatched inside `run`'s own two roundtrips, so
-    /// `OutputHandler` fires *before* any of that -- which is exactly what seeds the `screens`
-    /// signal in time for the evaluation to loop over it (docs/adr/0041 decision 2), and equally
-    /// exactly why [`App::handle_output_change`] must not do the rest of its job that early:
-    /// there is no evaluation to expand, no surface to reconcile, and asking the Supervisor to
-    /// reload a generation that has not applied anything yet buys one whole redundant evaluate/
-    /// report/apply round trip on every boot.
+    /// Set once [`run`]'s startup sequence has evaluated the config and built its surfaces. The
+    /// initial `wl_output` burst dispatches inside `run`'s own two roundtrips, before the
+    /// evaluation that seeds `screens` from it (docs/adr/0041 decision 2), so
+    /// [`App::handle_output_change`] must not run its full job that early: there is no
+    /// evaluation to expand yet.
     startup_complete: bool,
     /// Every frame this thread sends the Supervisor goes here; the socket thread's `pump` drains
-    /// it and writes each one to the wire (docs/adr/0039). `UnboundedSender::send` is
-    /// synchronous and non-blocking, so it's safe to call from inside a `Dispatch` callback.
+    /// it and writes it to the wire. `UnboundedSender::send` is synchronous and non-blocking, so
+    /// it's safe to call from inside a `Dispatch` callback.
     outbound_tx: tokio::sync::mpsc::UnboundedSender<RendererFrame>,
-    /// This Renderer's own generation id, stamped into every `SecureSubmit` it writes
-    /// (build-steps.md Phase 15 item 2) -- read once in `main` from `OBLISK_GENERATION_ID`.
+    /// This Renderer's own generation id, stamped into every `SecureSubmit` it writes -- read
+    /// once in `main` from `OBLISK_GENERATION_ID`.
     generation_id: u32,
     presentation_time: PresentationTimeState,
-    /// Cloned once in [`run`] so [`App::activate_draw`] (called from the poll loop, not a
-    /// `Dispatch` callback) can still request `wp_presentation_feedback` -- `QueueHandle` is a
-    /// cheap, `Clone`, reference-counted handle.
+    /// Cloned once in [`run`] so [`App::activate_draw`], called from the poll loop rather than a
+    /// `Dispatch` callback, can still request `wp_presentation_feedback`.
     queue_handle: QueueHandle<App>,
     /// The `ActivateDraw` nonce currently being drawn, if any -- tags every
-    /// `wp_presentation_feedback` `presented` event reported while it's in flight. PBA only
-    /// drives one handshake at a time (docs/adr/0025 item 5), so one field, not a per-surface
-    /// map, is enough.
+    /// `wp_presentation_feedback` `presented` event while in flight. PBA drives one handshake at
+    /// a time, so one field, not a per-surface map, is enough.
     active_nonce: Option<u64>,
-    /// The seat's pointer, once it advertised one (build-steps.md Phase 21 item 1). Kept alive
-    /// because dropping the proxy destroys the protocol object, and with it every
-    /// `enter`/`press`/`release` this shell is interactive because of -- the same reasoning
-    /// `BoundSurface`'s `#[allow(dead_code)]` fields already document.
-    ///
-    /// One, not one per seat: [`SeatHandler::new_capability`] takes whichever seat announced the
-    /// capability into one slot, so this whole file is single-seat, and a second seat's pointer
-    /// would need a second `armed` beside it rather than sharing this one.
+    /// The seat's pointer, once advertised. Kept alive because dropping the proxy destroys the
+    /// protocol object and with it every `enter`/`press`/`release`. One, not one per seat:
+    /// [`SeatHandler::new_capability`] takes whichever seat announced the capability into this
+    /// one slot, so this file is single-seat.
     pointer: Option<wl_pointer::WlPointer>,
-    /// The seat's keyboard, once it advertised one (build-steps.md Phase 21 item 2). Kept alive for
-    /// the same reason `pointer` is, and single-seat for the same reason.
-    ///
-    /// This shell reads no keys off it. It is bound for its `enter`/`leave` alone, which is the only
-    /// way a client learns which of its surfaces `keyboard_interactivity` (Phase 20) actually won
+    /// The seat's keyboard, once advertised. Kept alive and single-seat for the same reason
+    /// `pointer` is. This shell reads no keys off it directly; it is bound for `enter`/`leave`
+    /// alone, the only way a client learns which surface `keyboard_interactivity` actually won
     /// focus for.
     keyboard: Option<wl_keyboard::WlKeyboard>,
-    /// The instance id of the surface holding keyboard focus, if any of this process's surfaces
-    /// does (docs/adr/0050's consequences).
-    ///
-    /// [`focus_is_still_armed`] reads it on every keystroke: a `secure_submit` field is armed only
-    /// while the surface that declared it is the one this names.
+    /// The instance id of the surface holding keyboard focus, if any (docs/adr/0050's
+    /// consequences). [`focus_is_still_armed`] reads it on every keystroke: a `secure_submit`
+    /// field is armed only while the surface that declared it is the one this names.
     ///
     /// ponytail: nothing *else* consumes it, because § 5.2 has no `on_key` for a keysym to route to
     /// and docs/adr/0050 explicitly declines to invent one. Upgrade path: an IDL key-handler
@@ -429,32 +318,21 @@ pub struct App {
     /// amendment, [`ArmedSerial`]).
     input_serial: Option<ArmedSerial>,
     /// Every `BTN_LEFT` press and release this process has seen, counted (docs/adr/0051's first
-    /// amendment). Monotonic and never reset: it is compared against, never read for a total.
-    ///
-    /// This is what makes the dismissal latch clearable. `input_serial` cannot do the job -- it is
-    /// deliberately cleared at the end of each poll turn, so by the time a *later* turn asks "has
-    /// the user asked again since the dismissal", there is nothing left to compare. Counting the
-    /// same two events costs one `u64` and survives the disarm.
-    ///
-    /// Counting the *release* as well as the press is what makes the reopen work whatever order the
-    /// compositor batches a dismissal in. The grab breaks at the press, so `popup_done` cannot
-    /// arrive after the matching release; whether it lands before the press or between the two, one
-    /// of them still increments this after [`App::latch_popup`] stamped it, and the end-of-turn
-    /// `apply_popup_visibility` sees a moved counter.
+    /// amendment). Monotonic and never reset. Makes the dismissal latch clearable: `input_serial`
+    /// is cleared at the end of each poll turn, so a later turn has nothing to compare "has the
+    /// user asked again" against. Counting both press and release, not just press, means the
+    /// reopen works whatever order the compositor batches a dismissal in relative to `popup_done`.
     pointer_input_count: u64,
     /// The focused `secure_submit` field and the surface it lives on, set by the press that focused
     /// a `textfield` (docs/adr/0050 decision 4, [`focused_target`]) or by keyboard focus landing on
     /// a surface with a sole one ([`sole_secure_submit`]). `None` means no frame at all -- see
     /// [`submit_frame_for`]. Written only through [`App::focus_secure_submit`].
     focused_secure_submit: Option<FocusedField>,
-    /// Accumulates the focused field's keystrokes until Enter completes them (build-steps.md
-    /// Phase 15 item 2, Phase 23 item 3; ADR-0005/ADR-0009/ADR-0027) -- never surfaced to Lua.
-    ///
-    /// **Its lifetime belongs to `focused_secure_submit`, not to any transport event.** Every
-    /// write to the field above goes through [`App::focus_secure_submit`], which zeroizes this
-    /// on any change of destination, because bytes typed for one field must never be readdressed
-    /// to the next one's capability -- see [`retarget_secure_submit`] for the leak that rule
-    /// closes.
+    /// Accumulates the focused field's keystrokes until Enter completes them (ADR-0005/
+    /// ADR-0009/ADR-0027) -- never surfaced to Lua. Its lifetime belongs to `focused_secure_submit`,
+    /// not to any transport event: every write goes through [`App::focus_secure_submit`], which
+    /// zeroizes this on any change of destination -- see [`retarget_secure_submit`] for the leak
+    /// that rule closes.
     secure_buffer: shared::SecureBuffer,
 }
 
@@ -472,25 +350,21 @@ pub fn run(
 
     let compositor_state = CompositorState::bind(&globals, &qh)?;
     let layer_shell = LayerShell::bind(&globals, &qh)?;
-    // Optional, unlike layer-shell's: a compositor with no `xdg_wm_base` is legal, and a config
-    // declaring only panels works fine there. Logged and carried, the same tolerance
-    // `PresentationTimeState::bind` already applies to a protocol that may not
-    // be advertised -- `create_surfaces` is what says which `window` went unbuilt, since only it
-    // knows there was one.
+    // Optional, unlike layer-shell's: a compositor with no `xdg_wm_base` is legal, and a
+    // panel-only config works fine there. `create_surfaces` is what says which `window` went
+    // unbuilt, since only it knows there was one.
     let xdg_shell = XdgShell::bind(&globals, &qh)
         .inspect_err(|err| log_bind_failure("<xdg-shell>", "xdg_wm_base::bind", err))
         .ok();
     let output_state = OutputState::new(&globals, &qh);
     let seat_state = SeatState::new(&globals, &qh);
-    // Deliberately not `?` and deliberately not logged: `SessionLockState::new` cannot fail. It
-    // stores a `GlobalProxy`, so a compositor advertising no `ext_session_lock_manager_v1` is
-    // indistinguishable from one that does until something actually asks for a lock, which is the
-    // only point at which anyone cares (docs/adr/0052 decision 4).
+    // Not `?`, not logged: `SessionLockState::new` cannot fail. It stores a `GlobalProxy`, so a
+    // missing `ext_session_lock_manager_v1` surfaces only when something asks for a lock
+    // (docs/adr/0052 decision 4).
     let session_lock_state = SessionLockState::new(&globals, &qh);
     let registry_state = RegistryState::new(&globals);
-    // Stable protocol, no `staging`/`unstable` Cargo feature needed -- `PresentationTimeState::
-    // bind` tolerates a compositor that doesn't advertise it (later `feedback()` calls fail with
-    // `GlobalError::MissingGlobal` instead of failing this whole bind).
+    // Stable protocol. `PresentationTimeState::bind` tolerates a compositor that doesn't
+    // advertise it -- later `feedback()` calls fail with `GlobalError::MissingGlobal` instead.
     let presentation_time = PresentationTimeState::bind(&globals, &qh);
 
     let egl_state = egl::init(conn.backend().display_ptr() as *mut c_void)?;
@@ -498,8 +372,8 @@ pub fn run(
     let is_pba_candidate = std::env::var("OBLISK_PBA_CANDIDATE").is_ok();
 
     // One `ShapingHandle` for the process: `App` keeps this one, `RendererClient` gets a clone
-    // (docs/adr/0039 decision 3). `Loader::new()` runs inside `start`, on this thread, because
-    // `mlua::Lua` is `!Send` -- the move this whole phase is about.
+    // (docs/adr/0039 decision 3). `Loader::new()` runs on this thread because `mlua::Lua` is
+    // `!Send`.
     let shaping = ShapingHandle::spawn();
     let client = RendererClient::start(shaping.clone(), outbound_tx.clone(), generation_id)?;
 
@@ -553,15 +427,13 @@ pub fn run(
     // ponytail: this runs inside the PBA ready window -- no layer surface exists until it
     // returns, so `maybe_send_ready_signal` cannot fire until after this call, and the
     // Supervisor's `ready_timeout` is 2s (`supervisor/src/main.rs`'s `PBA_TIMINGS`). The first
-    // `text` node's shaping blocks on `ShapingHandle::shape` until the worker's `FontSystem::new()`
-    // finishes, eating into that same 2s budget. The § 15.2 ordering (evaluate before bind) is
-    // required, not incidental, so this stays sequential -- not a fix, just the accepted cost.
+    // `text` node's shaping blocks on `ShapingHandle::shape` until `FontSystem::new()` finishes,
+    // eating into that budget -- accepted cost, not a fix, since § 15.2 requires evaluate-before-
+    // bind ordering.
     //
-    // The `screens` seed goes *before* the evaluation, not after, and that ordering is the whole
-    // point of the signal (docs/adr/0041 decision 2): a config's top-level `for _, screen in
-    // ipairs(screens:get())` loop runs during this evaluation, so a list seeded afterwards would
-    // declare no per-monitor panels at all on the first pass. The two roundtrips above are what
-    // make the real list available this early.
+    // `screens` is seeded before the evaluation, not after (docs/adr/0041 decision 2): a config's
+    // top-level `for _, screen in ipairs(screens:get())` loop runs during this evaluation, so a
+    // list seeded afterwards would declare no per-monitor panels on the first pass.
     let screens = app.screens(None);
     let outputs = geometries_from(&screens);
     app.client.set_screens(screens_payload(&screens));
@@ -575,8 +447,7 @@ pub fn run(
         };
         if panel.topology.monitor != "All" && !outputs.iter().any(|output| output.name == panel.topology.monitor) {
             // `expand_instances` is pure and returns nothing for a miss; the log belongs here,
-            // where the real output list is, so a config naming an unplugged monitor says so once
-            // at startup rather than silently producing no surface.
+            // with the real output list, so an unplugged monitor says so once at startup.
             eprintln!(
                 "[oblisk-renderer] surface {:?} targets monitor {:?}, which is not connected; no surface created for it",
                 panel.topology.id, panel.topology.monitor
@@ -584,108 +455,86 @@ pub fn run(
         }
     }
     app.client.set_instances(instances.clone());
-    // The first resolve, and it is validation rather than anything anyone sees. § 15.2 forces
-    // evaluation before binding, so no surface has been configured yet and there is no configured
-    // size to resolve against -- each instance uses its *output's* logical size instead, which the
-    // two roundtrips above already know. Nothing paints this: a Candidate null-buffers before it
-    // draws anything, and non-candidate mode's first draw happens on first configure, which is
-    // after `set_instance_size` has replaced the size with the one the compositor chose. So a bar
-    // is briefly resolved at full screen height here and never once painted that way.
+    // The first resolve is validation, not anything anyone sees. § 15.2 forces evaluate-before-
+    // bind, so no surface is configured yet; each instance resolves against its output's logical
+    // size instead. Nothing paints this: a Candidate null-buffers first, and non-candidate mode's
+    // first draw happens on the first configure, after `set_instance_size` replaces the size with
+    // the compositor's own. A bar is briefly resolved at full screen height here and never painted
+    // that way.
     //
-    // Both ways this can fail -- the evaluation itself, or the apply -- already logged their own
-    // specific error and set `oblisk.rescue` inside `RendererClient`, so this line only adds the
-    // consequence a reader needs from out here.
+    // Both failure modes (evaluation, apply) already logged their own error and set
+    // `oblisk.rescue` inside `RendererClient`; this line only adds the consequence.
     if !app.client.apply_instances() {
         eprintln!("[oblisk-renderer] no scene was applied at startup; surfaces still bind, and paint nothing until a reload or a push produces one");
     }
 
     app.create_surfaces(&qh, &specs, &instances);
     if app.is_pba_candidate {
-        // The configure-driven check in `bind_and_clear` covers every surface that gets a
-        // configure, and a generation whose every declared surface is a `window` with `visible =
-        // false` gets none at all -- no `xdg_toplevel` exists to be configured (docs/adr/0049
-        // decision 1). Without this call such a Candidate would never announce itself and would die
-        // on `ready_timeout`. A no-op in every other case, since no panel has been configured yet
-        // at this point and the gate refuses.
+        // `bind_and_clear`'s configure-driven check misses a generation whose every surface is a
+        // `window` with `visible = false`: no `xdg_toplevel` exists to be configured
+        // (docs/adr/0049 decision 1), so without this call such a Candidate never announces
+        // itself and dies on `ready_timeout`. A no-op otherwise, since the gate refuses this early.
         app.maybe_send_ready_signal();
     }
     // From here on an output event owns the whole job: there is an evaluation to expand and
     // surfaces to reconcile against it (see `App::startup_complete`).
     app.startup_complete = true;
 
-    // Replaces `event_queue.blocking_dispatch(&mut app)?` (used through Phase 13): a real
-    // Wayland event might not arrive for a long time after `ActivateDraw` is sent, since nothing
-    // else happens on these mostly-static surfaces once staged -- this loop also checks
-    // `inbound_rx` on a bounded latency instead of blocking indefinitely on the Wayland
-    // connection's fd alone. The existing immediate-draw behavior on first configure (non-
-    // candidate mode) is unaffected -- it still happens synchronously inside the `configure`
-    // handler, which `dispatch_pending` still calls.
+    // A real Wayland event might not arrive for a long time after `ActivateDraw` is sent, since
+    // nothing else happens on these mostly-static surfaces once staged, so this loop checks
+    // `inbound_rx` on a bounded latency instead of blocking indefinitely on the connection's fd
+    // alone. Non-candidate mode's immediate draw on first configure is unaffected: it still
+    // happens synchronously inside the `configure` handler, which `dispatch_pending` still calls.
     loop {
         event_queue.dispatch_pending(&mut app)?;
         if app.exit {
             break;
         }
         // Drain, not one-per-pass: every `SupervisorFrame` reaches this thread through this
-        // channel now (docs/adr/0039), so a burst of `StateSnapshot` pushes must not be spread
-        // one per 15ms poll tick the way a lone `ActivateDraw` nonce could afford to be.
+        // channel (docs/adr/0039), so a burst of `StateSnapshot` pushes must not be spread one
+        // per 15ms poll tick.
         //
-        // `Disconnected` is a separate answer from `Empty` here, and that is docs/adr/0059
-        // decision 1. It used to be one answer: `while let Ok(frame)` treated a dead socket thread
-        // (pump exited, see `crate::socket`) exactly like an idle one, so killing the Supervisor
-        // left this process spinning its 15ms poll forever at 17.8% of a core, painting a shell
-        // with no capability data behind it and no way to reach one.
+        // `Disconnected` is a separate answer from `Empty` here (docs/adr/0059 decision 1). It
+        // used to be one: `while let Ok(frame)` treated a dead socket thread the same as an idle
+        // one, so killing the Supervisor left this process spinning its 15ms poll forever at
+        // 17.8% of a core, painting a shell with no capability data and no way to reach one.
         //
-        // One turn is three ordered stages: drain everything, re-resolve once, then draw. An
-        // `ActivateDraw` nonce is therefore collected here rather than serviced in place. Drawing
-        // in the loop body painted whatever layout the scene happened to hold at that instant, so
-        // a `StateSnapshot` and an `ActivateDraw` arriving in the same drain -- snapshot first,
-        // which is exactly the PBA hydrate-then-activate order (§ 15.2) -- hydrated the signal,
-        // painted the *pre-push* layout, and only then re-resolved. Nothing requests another draw
-        // after a re-resolve (that gating is build-steps.md Phase 19 items 6 through 11), so that
-        // stale frame was the one the Supervisor accepted as presentation evidence.
-        //
-        // A `Vec`, not a single nonce: two `ActivateDraw`s in one drain would be unusual, but each
-        // one owes the Supervisor its own `PresentationEvidence` per surface, so none may be
-        // dropped by coalescing.
+        // An `ActivateDraw` nonce is collected here rather than serviced in place: drawing inside
+        // the loop body painted whatever layout the scene held at that instant, so a
+        // `StateSnapshot` and an `ActivateDraw` arriving in the same drain painted the pre-push
+        // layout and only then re-resolved -- the stale frame is what the Supervisor accepted as
+        // presentation evidence. A `Vec`, not one nonce: two `ActivateDraw`s in one drain each owe
+        // their own `PresentationEvidence`, so none may be dropped by coalescing.
         let mut draw_nonces: Vec<u64> = Vec::new();
         loop {
             let frame = match inbound_rx.try_recv() {
                 Ok(frame) => frame,
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                // `std::process::exit`, not `app.exit = true`. Breaking the loop returns from `run`
+                // `std::process::exit`, not `app.exit = true`: breaking the loop returns from `run`
                 // and drops `App`, and SCTK's `SessionLockInner::Drop` sends a bare
-                // `ext_session_lock_v1.destroy`, which is the `invalid_destroy` protocol error once
-                // `locked` has been sent -- the one error docs/adr/0052 was built to stay away
-                // from. SCTK calls that choice failing secure and it is right, but the error is
-                // avoidable: skipping the destructor closes the connection instead, which the
-                // compositor treats as the same lock client death and logs as nothing.
+                // `ext_session_lock_v1.destroy`, which is `invalid_destroy` once `locked` has been
+                // sent -- the one error docs/adr/0052 exists to avoid. Skipping the destructor
+                // closes the connection instead, which the compositor treats as the same lock
+                // client death and logs as nothing.
                 //
-                // `is_some()`, not SCTK's `is_locked()`, and the two disagree for the few
-                // milliseconds between the `lock` request and the `locked` event being dispatched.
-                // Both readings are wrong somewhere in that window, so the choice is which way to
-                // be wrong: `is_some()` can claim a lock the compositor has not granted yet, which
-                // sends someone to a VT they did not need. `is_locked()` can miss a `locked` that is
-                // on the wire but undispatched (the same race the `SetSessionLock` arm above pays a
-                // round trip to close), which tells someone their shell merely died while they are
-                // looking at a lock screen they cannot get past. Over-reporting is the safe half.
+                // `is_some()`, not SCTK's `is_locked()`: the two disagree for the few milliseconds
+                // between the `lock` request and the `locked` event being dispatched. `is_some()`
+                // can claim a lock not yet granted, sending someone to a VT unnecessarily.
+                // `is_locked()` can miss a `locked` that is on the wire but undispatched, telling
+                // someone their shell merely died while looking at a lock screen they cannot get
+                // past. Over-reporting is the safe half.
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // Flush first, and this is the load-bearing line rather than tidiness. A
-                    // `SetSessionLock { locked: true }` serviced earlier in *this same drain* left
-                    // an `ext_session_lock_manager_v1.lock` request sitting in the connection's
-                    // write buffer: SCTK's `SessionLockState::lock` only enqueues, the acquire path
-                    // deliberately skips the round trip the unlock path pays for, and the turn's
-                    // only `event_queue.flush()` is below the drain. Exiting from here would skip
-                    // it, so the request would die in the buffer while `session_lock` is already
-                    // `Some` and the message above claims a locked session that the compositor was
-                    // never asked for. That is not a new way past a lock screen -- anything that can
-                    // kill the Supervisor mid-command can kill it a moment earlier and stop the lock
-                    // outright -- but it is a message telling someone the session is secure when it
-                    // is not, which is the one thing this path must never do.
+                    // Flush first -- load-bearing, not tidiness. A `SetSessionLock { locked: true }`
+                    // serviced earlier in this same drain left an `ext_session_lock_manager_v1.lock`
+                    // request sitting in the write buffer: `SessionLockState::lock` only enqueues,
+                    // and the turn's only `event_queue.flush()` is below the drain. Exiting from
+                    // here would skip it, so the request dies in the buffer while `session_lock` is
+                    // already `Some` -- the message below would then claim a locked session the
+                    // compositor was never asked for, which this path must never say.
                     //
-                    // Flushing sends only requests this process already decided to make. It does not
-                    // send `ext_session_lock_v1.destroy`: that lives in SCTK's `Drop`, which
-                    // `std::process::exit` still skips, which is what keeps the exit clean of
-                    // `invalid_destroy`.
+                    // Flushing sends only requests already decided on. It does not send
+                    // `ext_session_lock_v1.destroy`: that lives in SCTK's `Drop`, which
+                    // `std::process::exit` skips, keeping the exit clean of `invalid_destroy`.
                     if let Err(err) = event_queue.flush() {
                         eprintln!("[oblisk-renderer] the last flush before exiting failed ({err}); a session lock requested in this same turn may never have reached the compositor");
                     }
@@ -696,44 +545,34 @@ pub fn run(
             match app.client.handle_frame(frame) {
                 FrameOutcome::Handled => {}
                 FrameOutcome::ActivateDraw(nonce) => draw_nonces.push(nonce),
-                // Serviced here in the drain rather than collected the way a draw nonce is, and the
-                // difference is what each one needs from the rest of this turn. A draw has to land
-                // *after* the re-resolve below or it paints the pre-push layout, which is the whole
-                // argument the comment above makes. A lock reads nothing a re-resolve produces:
-                // whether this config declares a `lock` surface at all is a fact about the tracked
-                // surface set (docs/adr/0052 decision 3), and no capability push can change it.
-                // Deferring it would buy nothing and cost a poll turn on the one command whose
-                // entire point is that the screen goes secure now.
+                // Serviced here, not collected like a draw nonce: a draw must land after the
+                // re-resolve below or it paints the pre-push layout, but a lock reads nothing a
+                // re-resolve produces -- whether this config declares a `lock` surface is a fact
+                // about the tracked surface set (docs/adr/0052 decision 3) that no capability push
+                // changes. Deferring would cost a poll turn on the one command whose whole point is
+                // that the screen goes secure now.
                 FrameOutcome::SetSessionLock(locked) => {
-                    // A round trip before an *unlock*, and only before an unlock. SCTK sets the
-                    // `locked` flag its `SessionLock::unlock` is gated on when
-                    // `ext_session_lock_v1::locked` is **dispatched**, not when the compositor sends
-                    // it, and this drain runs in a different turn from `dispatch_pending` above --
-                    // the poll at the bottom of the previous turn may well have timed out with
-                    // `locked` already on the wire. `unlock()` would then be a silent no-op and the
-                    // `Drop` immediately after it would send the plain `destroy` that the protocol
-                    // XML calls out by name: "it is a protocol error to make this request if the
-                    // locked event was sent". That is `invalid_destroy`, which kills the connection
-                    // with the session still locked -- the exact unrecoverable state docs/adr/0052
-                    // exists to keep the user out of. `roundtrip` closes it by definition: the
-                    // compositor's `wl_callback` cannot arrive before everything it sent earlier.
+                    // A round trip before an unlock, and only before an unlock. SCTK gates
+                    // `SessionLock::unlock` on `ext_session_lock_v1::locked` being dispatched, not
+                    // sent, and this drain runs in a different turn from `dispatch_pending` above,
+                    // so `locked` may already be on the wire but undispatched. `unlock()` would then
+                    // be a silent no-op and the `Drop` right after would send the plain `destroy`
+                    // the protocol XML forbids once `locked` was sent -- `invalid_destroy`, which
+                    // kills the connection with the session still locked, the state docs/adr/0052
+                    // exists to prevent. `roundtrip` closes it: a `wl_callback` cannot arrive before
+                    // everything sent earlier.
                     //
-                    // The acquire path needs none of this and deliberately does not pay for it. Its
-                    // inputs are the tracked surface set and `session_lock.is_some()`, both of which
-                    // this thread owns outright, and an undispatched `locked` can only make
-                    // `session_lock` already `Some`, which [`lock_command`] answers `Nothing`.
-                    // Blocking the one command whose whole point is that the screen goes secure now
-                    // on a compositor round trip would be a real cost for no fact gained.
+                    // The acquire path pays none of this: its inputs are the tracked surface set
+                    // and `session_lock.is_some()`, both owned by this thread, and an undispatched
+                    // `locked` can only make `session_lock` already `Some`, which [`lock_command`]
+                    // answers `Nothing`.
                     //
-                    // **Deliberately not `?`.** Propagating here would return from `run` between
-                    // the correct password and `unlock_and_destroy`, killing the client with the
-                    // session still locked -- and the compositor does not unlock when a lock client
-                    // dies, so the user's only way back in would be a VT switch. That is the exact
-                    // outcome this whole path exists to prevent, reached by the error handling
-                    // rather than by the protocol. Every `DispatchError` this can raise means the
-                    // connection is already broken, so the unlock attempt below may well send
-                    // nothing; attempting it costs one failed flush and is strictly better than
-                    // exiting without trying. What is *not* acceptable is skipping the attempt.
+                    // Deliberately not `?`: propagating here would return from `run` between the
+                    // correct password and `unlock_and_destroy`, killing the client with the session
+                    // still locked, and the compositor does not unlock when a lock client dies. Every
+                    // `DispatchError` this can raise means the connection is already broken, so the
+                    // unlock attempt below may send nothing -- but attempting it costs one failed
+                    // flush and beats exiting without trying.
                     if !locked && let Err(err) = event_queue.roundtrip(&mut app) {
                         eprintln!(
                             "[oblisk-renderer] the round trip before an unlock failed ({err}); attempting the unlock anyway rather than exiting with the session locked"
@@ -749,45 +588,38 @@ pub fn run(
         if app.exit {
             break;
         }
-        // Once per turn, after the drain above has emptied `inbound_rx` -- not inside that
-        // `while` loop's body (ADR-0044 decision 2). A burst of `StateSnapshot` pushes marks the
-        // dirty flag repeatedly while draining, but `DirtyFlag::take` only reports it once, so
-        // this coalesces the whole burst into a single `Scene::apply` per poll turn instead of one
-        // per pushed frame -- and, per the comment above, it lands before this turn's draw.
+        // Once per turn, after the drain above empties `inbound_rx`, not inside that loop's body
+        // (ADR-0044 decision 2). A burst of `StateSnapshot` pushes marks the dirty flag repeatedly
+        // while draining, but `DirtyFlag::take` only reports it once, so this coalesces the burst
+        // into one `Scene::apply` per poll turn, landing before this turn's draw.
         //
-        // A re-resolve that actually changed the retained scene is repainted immediately. This is
-        // *not* build-steps.md Phase 19 item 9's frame gating, and the two must not be confused:
-        // item 9 is `wl_surface::frame()` plus a `frame_pending` flag, so the loop blocks when
-        // nothing is happening instead of waking on the 15ms poll below. This is the other half --
-        // the one that makes a capability push actually reach the screen at all, rather than
-        // stopping at a resolved tree in memory. Item 9 still has to be built on top of it.
-        // Two statements, in this order, because they are the two halves of one commit. The first
-        // *stages* everything the re-resolve changed about each surface itself -- the layer-shell
-        // fields layer-shell permits changing in place, the input region, and whether the surface
-        // is mapped at all (docs/adr/0038 decision 2, build-steps.md Phase 20 items 1 and 5). All
-        // of that is double-buffered `wl_surface` state, so none of it takes effect until a
-        // commit, and the second statement's `swap_buffers` is that commit. Committing per field
-        // instead would show the compositor a half-updated surface between requests.
+        // A re-resolve that changed the retained scene is repainted immediately. This is not
+        // frame-pending gating (`wl_surface::frame()`, which blocks the loop when idle instead of
+        // waking on the 15ms poll) -- it is the other half, the one that makes a capability push
+        // reach the screen at all rather than stopping at a resolved tree in memory.
+        // Two statements, the two halves of one commit. The first stages everything the
+        // re-resolve changed about each surface -- layer-shell fields permitted to change in
+        // place, the input region, whether it is mapped (docs/adr/0038 decision 2). All of that
+        // is double-buffered `wl_surface` state, so none of it takes effect until the second
+        // statement's `swap_buffers` commits it. Committing per field would show the compositor a
+        // half-updated surface between requests.
         if app.client.re_resolve_if_dirty() {
             app.apply_resolved_surface_state();
             app.repaint_mapped_surfaces();
         }
-        // The disarm half of docs/adr/0049's amendment, and it has to be here rather than inside
-        // the `if` above. `dispatch_pending` at the top of this turn armed `input_serial` if a
-        // `BTN_LEFT` press or release arrived; `apply_resolved_surface_state` directly above is the
-        // only thing that reads it, because it is the only thing that creates a popup. Clearing it
-        // unconditionally is what makes the IDL's "a popup may only be opened in response to real
-        // user input" fall out of the mechanism instead of being a rule bolted on: a notification
-        // arriving over D-Bus marks the scene dirty and re-resolves on some later turn, finds
-        // nothing armed, and a `grab = true` popup it tried to open is refused. Clearing inside the
-        // `if` would leak a click's serial across every turn until the *next* re-resolve, which is
-        // exactly the window that rule exists to close.
+        // The disarm half of docs/adr/0049's amendment, and it must be here, not inside the `if`
+        // above. `dispatch_pending` armed `input_serial` if a `BTN_LEFT` press or release arrived
+        // this turn; `apply_resolved_surface_state` above is the only reader, since it is the only
+        // thing that creates a popup. Clearing unconditionally makes "a popup may only open in
+        // response to real user input" fall out of the mechanism: a D-Bus notification marking the
+        // scene dirty finds nothing armed on its later re-resolve, and a `grab = true` popup it
+        // tries to open is refused. Clearing inside the `if` would leak a click's serial across
+        // every turn until the next re-resolve.
         app.input_serial = None;
         // Once a turn, so a focused `secure_submit` field whose surface this process tore down --
-        // a lock screen the compositor `finished`, a `window` whose `visible` went false -- does not
-        // sit there holding a half-typed password until some later keystroke happens to notice. The
-        // load-bearing check is the one in `App::apply_secure_key`; this one is the residency
-        // ceiling, and it is deliberately the narrower of the two.
+        // a lock screen the compositor `finished`, a `window` whose `visible` went false -- doesn't
+        // sit holding a half-typed password until a later keystroke notices. The load-bearing
+        // check is in `App::apply_secure_key`; this is the narrower residency ceiling.
         app.drop_secure_focus_if_its_surface_is_gone();
         for nonce in draw_nonces {
             app.activate_draw(nonce);
@@ -838,10 +670,9 @@ fn anchor_for(anchor: node::Anchor) -> Anchor {
     flags
 }
 
-/// § 6.1's `keyboard_interactivity` to the protocol's own field. Note what this replaced: every
-/// surface used to take a hardcoded mode per Rust-owned role, so a launcher wanting `Exclusive`
-/// and an OSD wanting `None` could not coexist (docs/adr/0038's rejected-alternative list names
-/// this as the second reason the fixed role set had to go).
+/// § 6.1's `keyboard_interactivity` to the protocol's own field. Before docs/adr/0038 every
+/// surface took a hardcoded mode per Rust-owned role, so a launcher wanting `Exclusive` and an
+/// OSD wanting `None` could not coexist.
 fn keyboard_interactivity_for(mode: node::KeyboardInteractivity) -> KeyboardInteractivity {
     match mode {
         node::KeyboardInteractivity::None => KeyboardInteractivity::None,
@@ -854,10 +685,9 @@ fn keyboard_interactivity_for(mode: node::KeyboardInteractivity) -> KeyboardInte
 ///
 /// `0` is the protocol's own "the anchors decide this axis" convention, which is what both
 /// `SizeMode::Fill` and `SizeMode::Content` mean here. `Content` reaching this is the ordinary
-/// case rather than an edge one -- it is `parse_size_mode`'s answer for an omitted `width`/
-/// `height`, and a surface has no content size at creation time anyway, since nothing has been
-/// measured and no output has been configured. A percent is the one form that needs the output,
-/// which is why this takes it.
+/// case, not an edge one: it is `parse_size_mode`'s answer for an omitted `width`/`height`, and
+/// a surface has no content size at creation time anyway. A percent is the one form that needs
+/// the output, which is why this takes it.
 fn layer_extent_for(mode: SizeMode, output_extent: f32) -> u32 {
     match mode {
         SizeMode::Fill | SizeMode::Content => 0,
@@ -870,15 +700,13 @@ fn layer_extent_for(mode: SizeMode, output_extent: f32) -> u32 {
 ///
 /// `zwlr_layer_surface_v1::set_size`: "If you pass 0 for either value, the compositor will assign
 /// it... You must set your anchor to opposite edges in the dimensions you omit; not doing so is a
-/// protocol error." A protocol error kills the whole Wayland connection, and therefore the whole
-/// shell -- so a config writing `panel { anchor = { top = true }, height = "Fill" }` would take
-/// the Renderer down with no recoverable failure and nothing on screen to say why.
+/// protocol error." A protocol error kills the whole Wayland connection, so a config writing
+/// `panel { anchor = { top = true }, height = "Fill" }` would take the Renderer down with nothing
+/// on screen to say why.
 ///
-/// Nothing checked this before docs/adr/0038, because every size was a Rust constant chosen to be
-/// valid. Now the config picks it, which makes this a trust boundary. The answer is to refuse the
-/// one surface with a log naming the axis, not to invent a size for it: guessing the output extent
-/// would silently give a config author a full-screen bar where they asked for an auto-sized one,
-/// and they would have no idea why.
+/// Now that the config picks sizes, this is a trust boundary: refuse the surface with a log
+/// naming the axis, not invent a size for it -- guessing would silently give a config author a
+/// full-screen bar where they asked for an auto-sized one.
 fn ambiguous_zero_axis(size: (u32, u32), anchor: node::Anchor) -> Option<&'static str> {
     if size.0 == 0 && !(anchor.left && anchor.right) {
         return Some("width");
@@ -890,18 +718,15 @@ fn ambiguous_zero_axis(size: (u32, u32), anchor: node::Anchor) -> Option<&'stati
 }
 
 /// The exclusive zone for a surface the config marked `exclusive`, derived from the size the
-/// compositor actually configured rather than guessed at creation time (build-steps.md Phase 20
-/// item 4). That is the whole reason this is a configure-time computation: at `get_layer_surface`
-/// time a `"Fill"`-sized bar has no height yet, so any zone set there would be a guess the
-/// compositor then contradicts.
+/// compositor actually configured, not guessed at creation time: a `"Fill"`-sized bar has no
+/// height at `get_layer_surface` time, so any zone set there would be a guess the compositor
+/// then contradicts.
 ///
-/// One rule, on whichever axis the anchor pins the surface to a single edge: anchored top or
-/// bottom but not both reserves its configured height; left or right but not both reserves its
-/// width. Everything else is `0`, and that covers three shapes for the same reason -- a surface
-/// anchored on all four edges, one anchored on none, and one anchored to a single *corner* all
-/// leave the edge to reserve against genuinely ambiguous, and the protocol's own exclusive-zone
-/// wording only defines the strip cases. A bar (`top`, `left`, `right`) is the common case and
-/// lands on the height branch: it is pinned vertically to one edge and spans horizontally.
+/// One rule: anchored top or bottom but not both reserves its configured height; left or right
+/// but not both reserves its width. Everything else is `0` -- all four edges, no edges, or a
+/// single corner all leave the edge to reserve against ambiguous, and the protocol's own
+/// exclusive-zone wording only defines the strip cases. A bar (`top`, `left`, `right`) lands on
+/// the height branch: pinned vertically to one edge, spanning horizontally.
 fn exclusive_zone_for(anchor: node::Anchor, configured_size: (u32, u32)) -> i32 {
     let (width, height) = configured_size;
     let one_vertical_edge = anchor.top != anchor.bottom;
@@ -913,20 +738,20 @@ fn exclusive_zone_for(anchor: node::Anchor, configured_size: (u32, u32)) -> i32 
     }
 }
 
-/// One press waiting for its release (docs/adr/0050 decision 2): a click is a press *and* a
-/// release on the same node, so that a user who presses a button, notices the mistake and drags
-/// off it releases harmlessly.
+/// One press waiting for its release (docs/adr/0050 decision 2): a click is a press and a
+/// release on the same node, so a user who presses a button, notices the mistake, and drags off
+/// it releases harmlessly.
 ///
-/// "Same node" is this pair and not a node identity, because a `ResolvedNode` has none --
-/// `NodeId` lives on `RetainedNode` and does not survive `to_resolved`. The rect is the proxy, and
-/// the case it gets "wrong" it gets right anyway: a re-resolve between press and release that
-/// moves the button cancels the click, which is what a real identity would also answer for a
-/// button that moved out from under the pointer.
+/// "Same node" is this pair, not a node identity: `ResolvedNode` has none (`NodeId` lives on
+/// `RetainedNode`, dropped by `to_resolved`). The rect is the proxy, and the case it gets
+/// "wrong" it gets right anyway: a re-resolve between press and release that moves the button
+/// cancels the click, the same answer a real identity would give for a button moved out from
+/// under the pointer.
 #[derive(Debug, Clone, PartialEq)]
 struct ArmedClick {
     instance_id: String,
     rect: LogicalRect,
-    /// The evdev code the press carried, so the release has to be the *same* button and not merely
+    /// The evdev code the press carried, so the release must be the same button, not merely
     /// a button (docs/adr/0050's second amendment).
     ///
     /// ponytail: one armed click, so chording drops both. `armed` is a single `Option`, and a
@@ -944,26 +769,23 @@ struct ArmedClick {
 /// (docs/adr/0049's amendment, docs/adr/0051 decision 1). Armed by [`PointerHandler::pointer_frame`]
 /// and cleared by [`run`]'s poll loop at the end of the same turn.
 ///
-/// Decision 2 of docs/adr/0049 claimed the re-resolve that creates a popup "is still running inside
+/// docs/adr/0049 decision 2 claimed the re-resolve that creates a popup "is still running inside
 /// input dispatch, so the engine has the serial of the event that caused it". It is not:
-/// `re_resolve_if_dirty` runs in the poll loop, after `dispatch_pending` has returned, so by then
-/// the dispatch callback's stack -- and any serial sitting on it -- is gone. Restructuring the loop
-/// to resolve inside dispatch would put a full `Scene::apply`, arbitrary Lua, and Wayland object
-/// creation inside a `Dispatch` callback, reentering the queue being dispatched from. So the serial
-/// lives in a field for the length of one turn instead of on a stack, and the rule it protects is
-/// unchanged: a re-resolve driven by anything other than input finds nothing here.
+/// `re_resolve_if_dirty` runs in the poll loop, after `dispatch_pending` returns, so the dispatch
+/// callback's stack -- and any serial on it -- is gone by then. Resolving inside dispatch would put
+/// a full `Scene::apply`, arbitrary Lua and Wayland object creation inside a `Dispatch` callback,
+/// reentering the queue being dispatched from. So the serial lives in a field for one turn instead
+/// of on a stack; a re-resolve driven by anything other than input still finds nothing here.
 ///
-/// **Both a press and a release arm it, latest wins.** A click fires on the release (docs/adr/0050
-/// decision 2), so the release's serial is the one a popup opened by `on_click` actually carries,
-/// and it is the more recent of the two. `xdg_shell` asks only that the serial come from "a real
-/// input event (button press, key press, touch down)" and leaves whether it was recent enough to the
-/// compositor, which answers a refusal with an immediate `popup_done` -- a normal outcome
-/// (docs/adr/0051 decision 3), not an error.
+/// Both a press and a release arm it, latest wins: a click fires on the release (docs/adr/0050
+/// decision 2), so the release's serial is the one an `on_click` popup actually carries. `xdg_shell`
+/// only asks that the serial come from "a real input event (button press, key press, touch down)"
+/// and leaves recency to the compositor, which answers a refusal with an immediate `popup_done`
+/// -- normal (docs/adr/0051 decision 3), not an error.
 ///
-/// `instance_id` rather than the tracked index: `self.surfaces` is a `Vec` an output change removes
-/// from (`destroy_surface_by_id`), and a monitor unplugged between the click and the poll turn's
-/// re-resolve would leave an index naming a different surface. The id is stable and is what
-/// `is_instance_of` compares against anyway.
+/// `instance_id`, not the tracked index: `self.surfaces` is a `Vec` an output change removes from
+/// (`destroy_surface_by_id`), and an unplugged monitor between click and re-resolve would leave an
+/// index naming a different surface. The id is stable and is what `is_instance_of` compares anyway.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ArmedSerial {
     serial: u32,
@@ -980,35 +802,27 @@ enum PopupAction {
     Nothing,
 }
 
-/// Decision 2's latch as a state machine, split out because it is the one part of the popup path
-/// that is pure and the one part whose mistake is a livelock rather than a missing window.
+/// Decision 2's latch as a state machine, split out because it is the pure part of the popup
+/// path, where a mistake is a livelock rather than a missing window.
 ///
-/// `dismissed_at` is [`App::pointer_input_count`] as it stood when the compositor dismissed this
-/// popup, and `pointer_input` is what that counter reads now. **A popup is latched only while no
-/// pointer input has arrived since its dismissal**, which is docs/adr/0051's first amendment: the
-/// `visible = false` edge decision 2 named is unobservable in the one case that matters, so a latch
-/// keyed on it alone is permanent. The counter is the fact that separates a livelock from a person
-/// reaching for the dropdown a second time.
+/// `dismissed_at` is [`App::pointer_input_count`] when the compositor dismissed this popup;
+/// `pointer_input` is what that counter reads now. A popup is latched only while no pointer
+/// input has arrived since its dismissal (docs/adr/0051's first amendment): the `visible = false`
+/// edge decision 2 named is unobservable in the case that matters, so a latch keyed on it alone
+/// would be permanent.
 ///
-/// The latch is *read* here and cleared by the caller on the same `visible = false` this returns
-/// `Destroy` or `Nothing` for. That split is deliberate: the clear is a write and this function
-/// makes no writes, and expressing "false clears it" as a returned action would need a fourth
-/// variant that every caller would have to remember to pair with the other three.
+/// The latch is read here and cleared by the caller on the same `visible = false` this returns
+/// `Destroy` or `Nothing` for -- this function makes no writes.
 ///
-/// The four interesting rows:
-///
-/// - `visible = true`, no object, dismissed with the counter unmoved: **nothing**. This is the whole
-///   of decision 2. A compositor dismissal leaves the resolved tree still saying `true`, so without
-///   the latch the next re-resolve creates a second popup for the same click-outside to dismiss,
-///   forever -- and a config with no `on_dismiss` at all is not a config error.
-/// - `visible = true`, no object, dismissed but the counter has moved: **create**. The user clicked
-///   again, which is the amendment's whole point.
-/// - `visible = false`, no object: **nothing**, and the caller still clears the latch. That is what
-///   reopens the path: a config's own `on_dismiss` writing `visible = false` clears it immediately,
-///   and a config without one clears it on the next deliberate close.
+/// - `visible = true`, no object, dismissed with the counter unmoved: **nothing** (decision 2).
+///   Without the latch, the next re-resolve would recreate the popup for the same click-outside
+///   to dismiss, forever, and a config with no `on_dismiss` is not a config error.
+/// - `visible = true`, no object, dismissed but the counter moved: **create**. The user clicked
+///   again.
+/// - `visible = false`, no object: **nothing**, and the caller still clears the latch.
 /// - `visible = true`, object already exists: **nothing**. Every re-resolve runs
-///   `apply_resolved_state` for every surface (one dirty flag for the whole scene), so a popup that
-///   is simply still open passes through here on every capability push.
+///   `apply_resolved_state` for every surface, so an already-open popup passes through here on
+///   every capability push.
 fn popup_visibility_action(visible: bool, exists: bool, dismissed_at: Option<u64>, pointer_input: u64) -> PopupAction {
     let latched = dismissed_at == Some(pointer_input);
     match (visible, exists) {
@@ -1018,30 +832,15 @@ fn popup_visibility_action(visible: bool, exists: bool, dismissed_at: Option<u64
     }
 }
 
-/// § 5.1's `visible` at the moment [`App::create_surfaces`] first builds one instance, given what
-/// its resolved tree says (`None` when it has none) and which role was declared.
+/// § 5.1's `visible` at the moment [`App::create_surfaces`] first builds one instance, given
+/// what its resolved tree says (`None` when it has none) and which role was declared.
 ///
-/// **The fallback is role-aware, and that is the whole of this function.** An absent tree means the
-/// startup apply failed, and `Scene::apply` rolls its whole surface map back on error, so when one
-/// instance has no tree none of them does. For a `panel`, whose Wayland object exists either way and
-/// whose `visible` only maps and unmaps it (docs/adr/0038 decision 2), treating that as visible is
-/// the "keep the shell up" fallback the rest of this file follows: the bar comes up, painting
-/// nothing, and the next successful re-resolve fills it in.
-///
-/// The other three roles all answer `false`, and each for its own reason rather than by sharing a
-/// fallback arm. For the two docs/adr/0049 decision 1 gives create-and-destroy semantics, an absent
-/// tree would create an `xdg_toplevel` for every declared `window` and an `xdg_popup` for every
-/// declared `popup`, so one failed apply opens the dev config's empty `settings` window, which
-/// claims a tile and takes focus. An absent tree is not a declaration of `visible = true`.
-///
-/// A `lock` is the fourth answer and it is a different kind of `false`: § 6.4 gives a `lock` no
-/// `visible` property at all, because the compositor owns when those surfaces exist
-/// (docs/adr/0042), and [`App::create_surfaces`] accordingly hands this value to `create_panel`,
-/// `create_window` and `create_popup` and *not* to `create_lock`. So the value is unread for this
-/// role today, and `false` is still the only answer worth writing down: it is the one that stays
-/// correct if a future caller does read it, since a `lock` that has not been granted is not up.
-/// Spelling all four arms out is what stopped `Lock` being silently absorbed into a `matches!`
-/// fallback the moment the role was added.
+/// Role-aware fallback: an absent tree means the startup apply failed and rolled back
+/// (`Scene::apply` restores its pre-call state on error), so a `panel` (docs/adr/0038 decision 2)
+/// treats it as visible -- "keep the shell up", painting nothing until the next re-resolve.
+/// `window`/`popup` have create-and-destroy semantics (docs/adr/0049 decision 1), so an absent
+/// tree is not a declaration of `visible = true`. A `lock` has no `visible` property at all
+/// (§ 6.4, docs/adr/0042); `false` is the answer that stays correct if a future caller reads it.
 fn starting_visible(resolved: Option<bool>, roster: &SurfaceSpec) -> bool {
     resolved.unwrap_or(match roster {
         SurfaceSpec::Panel(_) => true,
@@ -1049,19 +848,15 @@ fn starting_visible(resolved: Option<bool>, roster: &SurfaceSpec) -> bool {
     })
 }
 
-/// One surface's [`SurfaceSpec`] re-derived from its resolved properties, and the § 6 role word for
-/// the log line if it fails (docs/adr/0049's second amendment).
+/// One surface's [`SurfaceSpec`] re-derived from its resolved properties, and the § 6 role word
+/// for the log line if it fails (docs/adr/0049's second amendment).
 ///
-/// `roster` contributes only the role. Everything else comes from `properties`, which is a
-/// `resolve_properties` result and so has already read each `Signal` exactly once for this pass
-/// (ADR-0044 decision 1). The role cannot come from the properties instead: `kind` is what
-/// `crate::socket`'s `surface_specs` matched on to build the roster in the first place, and a
-/// resolved tree that disagreed with it would be a reconcile bug rather than something to re-decide
-/// here.
+/// `roster` contributes only the role; everything else comes from `properties`, already read
+/// once this pass (ADR-0044 decision 1). The role cannot come from properties instead: `kind` is
+/// what built the roster, and a disagreeing resolved tree would be a reconcile bug.
 ///
-/// One caller, [`App::create_surfaces`]. [`App::apply_resolved_state`] does the same three parses
-/// inline because it dispatches on the *tracked* role rather than on a roster entry, and each arm
-/// hands its result to a different applier -- there is no shared `SurfaceSpec` for it to build.
+/// One caller, [`App::create_surfaces`]; [`App::apply_resolved_state`] does the same parses
+/// inline since it dispatches on the tracked role, not a roster entry.
 fn resolved_surface_spec(
     roster: &SurfaceSpec,
     properties: &HashMap<String, Value>,
@@ -1075,12 +870,9 @@ fn resolved_surface_spec(
 }
 
 /// docs/adr/0052 decision 3's refusal, as the sentence the user reads. A config that declares no
-/// `lock` node cannot be locked, and the reasoning is worth stating where it is enforced: acquiring
-/// the lock anyway paints nothing, the protocol guarantees the compositor will not unlock on client
-/// death (docs/adr/0042), and the only way out is a VT switch and killing the shell. Locking a user
-/// out of their own session over a config omission is not fail-secure, it is a denial of service
-/// spelled the same way. Fail-secure is about a lock that was taken; this is one that never was, and
-/// nothing was protected by it a moment earlier.
+/// `lock` node cannot be locked: acquiring anyway paints nothing, the compositor never unlocks on
+/// client death (docs/adr/0042), and the only way out is a VT switch. Locking a user out over a
+/// config omission is not fail-secure, it is a denial of service spelled the same way.
 const NO_LOCK_DECLARED: &str =
     "this config declares no `lock` surface (§ 6.4), so locking the session would leave a black screen with no password field and no way back \
      in short of a VT switch; the lock was refused (docs/adr/0052 decision 3)";
@@ -1094,17 +886,15 @@ const UNLOCK_TARGET: (&str, &str) = ("lock", "authenticate");
 
 /// The second half of docs/adr/0052 decision 3's refusal, and the one the guard was missing.
 ///
-/// `node::lock_spec` requires an `id` and nothing else -- `child` is optional -- so `lock { id =
-/// "x" }` is a legal declaration that resolves to a surface with no password field, an empty input
-/// region and a transparent buffer. Counting tracked `lock` instances therefore said "a lock screen
-/// exists" for exactly the black screen the decision refuses the lock to avoid, reached *through*
-/// the guard rather than around it. The condition that actually matters is not whether a `lock`
-/// node was written but whether the tree under it holds a [`UNLOCK_TARGET`] field, because that is
-/// the only thing in a config that can produce the `SecureSubmit` the Supervisor answers with an
-/// unlock.
+/// `node::lock_spec` requires only an `id` -- `child` is optional -- so `lock { id = "x" }` is a
+/// legal declaration that resolves to a surface with no password field, an empty input region and
+/// a transparent buffer. Counting tracked `lock` instances said "a lock screen exists" for exactly
+/// the black screen the decision refuses to allow, reached through the guard rather than around
+/// it. What matters is not whether a `lock` node was written but whether the tree under it holds
+/// a [`UNLOCK_TARGET`] field, the only thing that can produce the `SecureSubmit` an unlock answers.
 ///
-/// A separate sentence from [`NO_LOCK_DECLARED`] because they are separate edits: one config is
-/// missing a `lock` node, the other is missing a `textfield` inside the one it has.
+/// A separate sentence from [`NO_LOCK_DECLARED`]: one config is missing a `lock` node, the other
+/// is missing a `textfield` inside the one it has.
 const LOCK_CANNOT_AUTHENTICATE: &str =
     "this config's `lock` surface (§ 6.4) does not hold exactly one `textfield` with `secure_submit = { capability = \"lock\", action = \"authenticate\" }` \
      and nothing else, so the compositor handing it keyboard focus would arm no field, nothing on it could ever authenticate, and the only way back in \
@@ -1117,36 +907,33 @@ const LOCK_NEVER_GRANTED: &str =
     "the session lock was given up before the compositor ever granted it (no `ext_session_lock_v1::locked` arrived), so nothing was unlocked";
 
 /// The other half of `finished`: the compositor answered the `lock` request with an immediate
-/// refusal instead of `locked`. Almost always another lock client already holds the session lock,
-/// which the protocol names first among its reasons, but it is compositor policy and not something
-/// this side of the wire can narrow down further -- so the message says what is known and does not
-/// guess.
+/// refusal instead of `locked`. Almost always another lock client already holds the session,
+/// but it is compositor policy that this side of the wire cannot narrow down further, so the
+/// message says what is known and does not guess.
 const LOCK_DENIED: &str =
     "the compositor denied the session lock; another lock client most likely holds it already (`ext_session_lock_v1::finished` arrived in place \
      of `locked`)";
 
 /// What `oblisk.rescue` says when the compositor tore down a lock that really was up. Not a
-/// failure of anything this process did, and the message says so: docs/adr/0052 decision 4 routes
-/// it here rather than to `oblisk.lock`'s `error` because there is no lock screen left on the glass
-/// to read a message on -- the ordinary scene is what came back.
+/// failure of anything this process did: docs/adr/0052 decision 4 routes it here, not to
+/// `oblisk.lock`'s `error`, because there is no lock screen left on the glass to read a message on.
 const LOCK_TORN_DOWN: &str =
     "the compositor ended the session lock through its own mechanism; the session is unlocked and the lock screen is gone \
      (`ext_session_lock_v1::finished` after `locked`)";
 
 /// The exit code this process uses when the Supervisor's control socket is gone (docs/adr/0059
-/// decision 1). Nobody is left to read it -- the process that classifies Renderer exit codes is the
-/// one that just died -- so this is for a journal and a `$status`, not for a handshake. Distinct
-/// from `0` because this is not a clean exit, and distinct from `1` because it is not a failure of
-/// anything this process was asked to do.
+/// decision 1). Nobody is left to read it -- the process that classifies exit codes just died --
+/// so this is for a journal and `$status`, not a handshake. Distinct from `0` (not a clean exit)
+/// and from `1` (not a failure of anything this process was asked to do).
 const EXIT_SUPERVISOR_GONE: i32 = 70;
 
 /// What this process says on its way out when the Supervisor's control socket is gone, split on
 /// whether it holds `ext_session_lock_v1` at that moment (docs/adr/0059 decisions 1 and 2).
 ///
-/// Pure and split out because the locked half is the one message here that can mislead into an
-/// unrecoverable state, and docs/adr/0058 decision 4 already caught the neighbouring version of
-/// that mistake: a refusal ending "the lock screen that is on screen still stands" is true of a
-/// vetoed reload and false of a process that is exiting.
+/// Pure and split out because the locked half can mislead into an unrecoverable state:
+/// docs/adr/0058 decision 4 already caught the neighbouring mistake, where a refusal ending "the
+/// lock screen that is on screen still stands" is true of a vetoed reload and false of a process
+/// that is exiting.
 fn supervisor_gone_report(holds_session_lock: bool) -> &'static str {
     if holds_session_lock {
         "the Supervisor's control socket is gone while this Renderer holds the session lock. PAM runs in the Supervisor (docs/adr/0028), so this \
@@ -1163,8 +950,8 @@ fn supervisor_gone_report(holds_session_lock: bool) -> &'static str {
 /// (docs/adr/0042, docs/adr/0052 decisions 3 and 4).
 ///
 /// Pure and separate because the two interesting answers are refusals, and a refusal that only
-/// exists inside a `&mut self` method that also talks to the compositor is a refusal nothing can
-/// test. See [`lock_command`].
+/// exists inside a `&mut self` method that also talks to the compositor is untestable. See
+/// [`lock_command`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LockCommand {
     /// Call `SessionLockState::lock` and create the surfaces.
@@ -1179,29 +966,25 @@ enum LockCommand {
 
 /// One `SetSessionLock`, resolved against what this process is already holding.
 ///
-/// `locked = true` has four answers and only one of them is "take the lock". Two of the other three
-/// are refusals, and docs/adr/0052 decision 3 is both: the lock must be refused *here*, before
-/// `SessionLockState::lock` is called, because a lock that was granted and then found unusable is
-/// exactly the black screen the decision exists to prevent, and the protocol guarantees the
-/// compositor will not unlock when the client dies.
+/// `locked = true` has four answers and only one is "take the lock". Two of the other three are
+/// refusals, and docs/adr/0052 decision 3 is both: the lock must be refused here, before
+/// `SessionLockState::lock` is called, because a lock granted and then found unusable is exactly
+/// the black screen the decision exists to prevent.
 ///
-/// The two refusals ask two different questions, and both have to be asked. `declares_lock` is a
-/// question about the tracked surface set, which is the only place "is there a `lock` instance"
-/// lives. `can_authenticate` is a question about that instance's *resolved tree*, and it is the one
-/// the first check cannot stand in for: `lock { id = "x" }` declares an instance and resolves to
+/// The two refusals ask different questions, and both have to be asked. `declares_lock` asks about
+/// the tracked surface set. `can_authenticate` asks about that instance's resolved tree, and the
+/// first check cannot stand in for it: `lock { id = "x" }` declares an instance that resolves to
 /// nothing typable (see [`LOCK_CANNOT_AUTHENTICATE`]). Refusing on the first and granting on the
-/// second would be decision 3 enforced against the config that forgot the node and waived for the
-/// config that forgot its contents, which land the user in the same place.
+/// second would waive decision 3 for a config that forgot the node's contents while enforcing it
+/// for one that forgot the node.
 ///
-/// The compositor-cannot-lock case is deliberately **not** an input. `SessionLockState` keeps its
-/// `ext_session_lock_manager_v1` in a `GlobalProxy` and `lock` answers `GlobalError::MissingGlobal`
-/// when there is none, so asking a second time here would mean reading the registry directly and
-/// keeping two answers to one question in step. The caller maps that `Err` to a `Refuse` with the
-/// error's own words.
+/// The compositor-cannot-lock case is deliberately not an input: `SessionLockState` keeps
+/// `ext_session_lock_manager_v1` in a `GlobalProxy`, and `lock` answers `GlobalError::MissingGlobal`
+/// when there is none, so the caller maps that `Err` to a `Refuse` with the error's own words.
 ///
-/// `locked = false` against nothing held is `Nothing` rather than `Release`, and that is not
-/// defensive tidying: `unlock_and_destroy` on a lock that never got `locked` is the protocol's own
-/// `invalid_unlock` error, and this is the guard that makes the unlock path unable to send one.
+/// `locked = false` against nothing held is `Nothing`, not `Release`: `unlock_and_destroy` on a
+/// lock that never got `locked` is the protocol's own `invalid_unlock` error, and this is the
+/// guard that keeps the unlock path from sending one.
 fn lock_command(locked: bool, declares_lock: bool, can_authenticate: bool, lock_held: bool) -> LockCommand {
     match (locked, lock_held) {
         (false, true) => LockCommand::Release,
@@ -1215,35 +998,29 @@ fn lock_command(locked: bool, declares_lock: bool, can_authenticate: bool, lock_
 /// What one ordered release actually did, given whether `ext_session_lock_v1::locked` had been
 /// dispatched on the lock object being given up (docs/adr/0052 decision 4).
 ///
-/// `Unlocked` is a state transition and the Supervisor's `lock::apply` moves its `active` flag on
-/// it, so reporting one for a lock that was never granted tells the Supervisor the session went
-/// from locked to unlocked when it was never locked at all. SCTK's `SessionLock::unlock` is a no-op
-/// below `is_locked()`, so on that branch literally nothing was sent and there is nothing to
-/// announce as having cleared -- [`LOCK_NEVER_GRANTED`] says so instead.
+/// `Unlocked` is a state transition the Supervisor's `lock::apply` moves its `active` flag on, so
+/// reporting one for a lock never granted would tell the Supervisor the session went from locked
+/// to unlocked when it was never locked. SCTK's `SessionLock::unlock` is a no-op below
+/// `is_locked()`, so nothing was sent and [`LOCK_NEVER_GRANTED`] says so instead.
 fn release_outcome(was_locked: bool) -> LockOutcome {
     if was_locked { LockOutcome::Unlocked } else { LockOutcome::Refused(LOCK_NEVER_GRANTED.to_string()) }
 }
 
-/// Which of `ext_session_lock_v1::finished`'s **two** events this one is (docs/adr/0042,
-/// build-steps.md Phase 23 item 2), decided by the one fact that separates them: whether `locked`
-/// was ever sent on this lock object.
+/// Which of `ext_session_lock_v1::finished`'s two events this one is (docs/adr/0042), decided by
+/// the fact that separates them: whether `locked` was ever sent on this lock object.
 ///
-/// The protocol puts both on one event and describes each separately. "The finished event should be
-/// sent immediately on creation of this object if the compositor decides that the locked event will
-/// not be sent" is a *denial*, typically because another lock client already holds the lock, and
-/// nothing was ever protected by it. "If the locked event is sent on creation of this object the
-/// finished event may still be sent at some later time" is a lock that was really up and that the
-/// compositor then ended through its own secure mechanism, leaving the session unlocked without
-/// anyone here asking for it.
+/// The protocol puts both on one event. "The finished event should be sent immediately on
+/// creation of this object if the compositor decides that the locked event will not be sent" is a
+/// denial, typically because another lock client already holds it. "If the locked event is sent on
+/// creation of this object the finished event may still be sent at some later time" is a lock that
+/// was really up and that the compositor then ended through its own secure mechanism.
 ///
-/// They must not collapse into one report. The Supervisor routes them differently (`lock::apply`),
-/// and a denial is a failure the user has to see while a teardown is a state change the user
-/// already lived through. Build-steps.md Phase 23 item 2 says neither may be swallowed, and this is
-/// where the two are told apart.
+/// They must not collapse into one report: the Supervisor routes them differently (`lock::apply`),
+/// a denial is a failure the user has to see while a teardown is a state change already lived
+/// through.
 ///
 /// `was_locked` is SCTK's own flag: its `Dispatch2` for `ext_session_lock_v1` sets it on `Locked`
-/// and never clears it, including not on `Finished`, so it answers exactly this question and no
-/// bookkeeping of ours can drift from it.
+/// and never clears it, including not on `Finished`, so no bookkeeping of ours can drift from it.
 fn finished_outcome(was_locked: bool) -> LockOutcome {
     if was_locked { LockOutcome::Finished } else { LockOutcome::Refused(LOCK_DENIED.to_string()) }
 }
@@ -1251,11 +1028,11 @@ fn finished_outcome(was_locked: bool) -> LockOutcome {
 /// Which tracked surface a popup roots under (docs/adr/0051 decision 1), as an index into the same
 /// iterator's order.
 ///
-/// § 6.3's `parent` names a declared `id`, and a declared `id` is not one surface: `monitor = "All"`
-/// expands a `panel` per output (docs/adr/0038 decision 3), so `parent = "bar"` on a two-monitor
-/// session names two layer surfaces and `get_popup` takes exactly one. The tie-break is the click
-/// that armed the grab: a dropdown belongs to the monitor it was opened on, and that event already
-/// names a surface, so this costs a field on [`ArmedSerial`] rather than a second mechanism.
+/// § 6.3's `parent` names a declared `id`, not one surface: `monitor = "All"` expands a `panel`
+/// per output (docs/adr/0038 decision 3), so `parent = "bar"` on a two-monitor session names two
+/// layer surfaces and `get_popup` takes exactly one. The tie-break is the click that armed the
+/// grab: a dropdown belongs to the monitor it was opened on, which costs a field on [`ArmedSerial`]
+/// rather than a second mechanism.
 ///
 /// ponytail: with nothing armed -- a `grab = false` popup opened by a D-Bus notification -- this
 /// falls back to the *first* instance of the named parent, which on a multi-monitor session is
@@ -1278,17 +1055,15 @@ fn parent_instance_index<'a>(instance_ids: impl Iterator<Item = &'a str>, parent
 
 /// The size one `xdg_popup` configure asks for, as a buffer size.
 ///
-/// A configure's `width`/`height` are the compositor's answer and are taken as given, the same way
-/// a `Some` axis of an `xdg_toplevel` configure is: the compositor may have slid, flipped or
-/// resized the popup to keep it on screen (§ 6.3's `constraint_adjustment`), and the size it lands
-/// on is the one that has to be painted.
+/// A configure's `width`/`height` are the compositor's answer, taken as given: it may have slid,
+/// flipped or resized the popup to keep it on screen (§ 6.3's `constraint_adjustment`), and the
+/// size it lands on is what has to be painted.
 ///
-/// A non-positive axis falls back to the size the positioner asked for. That is a guard against
-/// `smithay_client_toolkit`, not against a compositor: `PopupInner` seeds its pending dimensions at
-/// `-1` and reports whatever they hold when the wrapping `xdg_surface.configure` arrives, so a
-/// configure that reached the `xdg_surface` without an `xdg_popup.configure` before it would hand
-/// this `-1`. xdg-shell requires that ordering, but a `-1` reaching `WlEglSurface::new` is a
-/// crash-shaped failure and the spec's own requested size is right there.
+/// A non-positive axis falls back to the size the positioner asked for -- a guard against SCTK,
+/// not the compositor: `PopupInner` seeds its pending dimensions at `-1` and reports whatever they
+/// hold when `xdg_surface.configure` arrives, so a configure reaching `xdg_surface` without an
+/// `xdg_popup.configure` first would hand this `-1`, and that reaching `WlEglSurface::new` is a
+/// crash-shaped failure.
 ///
 /// At least 1 on both axes, for [`toplevel_size_for`]'s reason: a `wl_egl_window` of 0 is invalid.
 fn popup_size_for(configured: (i32, i32), spec: &PopupSpec) -> (u32, u32) {
@@ -1354,18 +1129,15 @@ fn positioner_constraint(adjustment: ConstraintAdjustment) -> xdg_positioner::Co
 /// as the protocol order it is (positioner, surface, popup, root, grab, commit) rather than as six
 /// requests inline.
 ///
-/// Every field is sent, including the ones whose value equals the protocol default. The positioner
-/// is built fresh per open and destroyed with the call, so there is no live object for a diff to
-/// spare and nothing carried over from a previous popup -- "send what changed" has no meaning here,
-/// unlike on a `panel`'s live layer surface.
+/// Every field is sent, including ones equal to the protocol default: the positioner is built
+/// fresh per open and destroyed with the call, so there is no live object to diff against.
 ///
-/// Rounded rather than truncated on the way to `i32`: these are logical pixels a `button`'s resolved
-/// rect handed the config through `on_click` (docs/adr/0050 decision 3), so a rect at `x = 996.6`
-/// belongs one pixel right of `996`, not on it.
+/// Rounded, not truncated, on the way to `i32`: these are logical pixels a `button`'s resolved
+/// rect handed the config through `on_click` (docs/adr/0050 decision 3), so `x = 996.6` belongs
+/// one pixel right of `996`, not on it.
 ///
-/// The two sizes are clamped to at least 1. `node::parse_popup_extent` and `node::parse_anchor_rect`
-/// already refuse a zero, so this only catches a positive value that rounds to zero, which
-/// `set_size` and the positioner's own completeness rule both reject.
+/// The two sizes are clamped to at least 1: `node::parse_popup_extent`/`parse_anchor_rect` already
+/// refuse a zero, so this only catches a positive value that rounds to zero.
 fn configure_positioner(positioner: &XdgPositioner, spec: &PopupSpec) {
     let round = |n: f32| n.round() as i32;
     positioner.set_size(round(spec.width).max(1), round(spec.height).max(1));
@@ -1384,15 +1156,13 @@ fn configure_positioner(positioner: &XdgPositioner, spec: &PopupSpec) {
 /// The innermost `button` in a [`layout::hit::hit_path`] result carrying a callable `on_click`, as
 /// that button's absolute rect and its function (docs/adr/0050 decision 1).
 ///
-/// Scans from the deep end, which is the whole reason hit-testing returns a path: the deepest node
-/// under the pointer is normally the `button`'s `text` child, and it has no `on_click`. A `button`
-/// without one is transparent to this scan rather than a barrier, so a plain `button` nested inside
-/// a handled one still lets the outer one fire.
+/// Scans from the deep end: the deepest node under the pointer is normally the `button`'s `text`
+/// child, which has no `on_click`. A `button` without one is transparent to this scan, not a
+/// barrier, so a plain `button` nested inside a handled one still lets the outer one fire.
 ///
-/// `on_click` must be a `Value::Function`. Anything else the config wrote under that key -- a
-/// string, a table -- is simply not a click handler; `layout::node` has no parser for the key
-/// (§ 5.2 leaves it opaque, docs/adr/0021 item 2), so this predicate is the only place its type is
-/// ever checked.
+/// `on_click` must be a `Value::Function`; anything else the config wrote there is not a click
+/// handler. `layout::node` has no parser for the key (§ 5.2 leaves it opaque), so this predicate
+/// is the only place its type is checked.
 fn clickable_button<'a>(path: &[&'a layout::ResolvedNode]) -> Option<(LogicalRect, &'a Function)> {
     path.iter().enumerate().rev().find_map(|(depth, node)| {
         if node.kind != "button" {
@@ -1408,9 +1178,8 @@ fn clickable_button<'a>(path: &[&'a layout::ResolvedNode]) -> Option<(LogicalRec
 /// Both answers one press wants out of decision 1's single traversal: the `button` that would fire,
 /// and the destination the innermost `textfield` addresses the next secret to.
 ///
-/// One struct rather than two lookups because they come from one [`layout::hit::hit_path`] call.
-/// Walking twice would be two answers to one event, and a re-resolve landing between the walks
-/// could make them disagree about a tree that no longer exists.
+/// One struct, not two lookups: both come from one [`layout::hit::hit_path`] call. Walking twice
+/// would be two answers to one event, and a re-resolve between the walks could make them disagree.
 struct PointerHit {
     button: Option<(LogicalRect, Function)>,
     /// `Err` is a malformed `secure_submit` on the innermost `textfield` -- see [`focused_target`].
@@ -1420,10 +1189,9 @@ struct PointerHit {
 /// The `secure_submit` destination the innermost `textfield` in a hit path names (docs/adr/0050
 /// decision 4, § 5.2 item 8).
 ///
-/// `Ok(None)` deliberately collapses two cases nothing downstream can tell apart: the path holds no
-/// `textfield` at all, and the innermost one declared no `secure_submit`. Both mean the next
-/// completed submit has nowhere to go, and § 5.2 item 8 makes the property optional precisely so a
-/// masked field can exist without one.
+/// `Ok(None)` collapses two cases nothing downstream tells apart: no `textfield` on the path, and
+/// the innermost one declaring no `secure_submit`. Both mean the next completed submit has nowhere
+/// to go.
 ///
 /// ponytail: focus is therefore stored as its destination rather than as a node identity, so a
 /// focused field with no destination is indistinguishable from no focus at all. Nothing reads focus
@@ -1440,14 +1208,12 @@ fn focused_target(path: &[&layout::ResolvedNode]) -> Result<Option<node::SecureS
 /// The frame a completed `wp-text-input-v3` submit produces, or `None` when no focused `textfield`
 /// named a destination for it (docs/adr/0050 decision 4).
 ///
-/// `None` is the whole point of this function. Before it, the submit was addressed to
-/// `"unknown"/"unknown"`, which no Supervisor capability routes -- a password put on the wire for
-/// nobody, when ADR-0005's entire premise is that this buffer travels to exactly one named
-/// destination. Sending nothing is the only safe answer to "whose password is this?".
+/// `None` is the point: before it, the submit was addressed to `"unknown"/"unknown"`, which no
+/// Supervisor capability routes -- a password put on the wire for nobody. Sending nothing is the
+/// only safe answer to "whose password is this?".
 ///
-/// The buffer is zeroized on both branches, and on the branch that sends nothing it is the only
-/// thing that happens: a dropped submit must not leave the accumulated secret sitting in `App`
-/// waiting for the next field to pick it up.
+/// The buffer is zeroized on both branches; on the branch that sends nothing it is the only thing
+/// that happens, so a dropped submit never leaves the accumulated secret sitting in `App`.
 fn submit_frame_for(
     generation_id: u32,
     target: Option<&node::SecureSubmitTarget>,
@@ -1467,22 +1233,17 @@ fn submit_frame_for(
 
 /// A focused `secure_submit` field, together with the surface whose tree declared it.
 ///
-/// **The surface id is the half the fourth review's defects 2 and 3 were both missing.** Focus used
-/// to be nothing but a destination, so nothing could tell "the field on the surface that currently
-/// has the keyboard" from "the field on a surface this process destroyed ten seconds ago". Two holes
-/// fell out of that, and they are the same hole: [`KeyboardHandler::enter`]'s early returns moved
-/// `keyboard_focus` on and left the old field armed, and every destruction path
-/// ([`App::teardown_lock_surfaces`], [`App::destroy_surface_by_id`], [`App::hide_window`]) tore down
-/// the `wl_surface` that owned the field while the target and the half-typed secret stayed live.
-/// The traced consequence of the second is the login password: type one on the lock screen, let the
-/// compositor send `finished`, and the plaintext sits in `App::secure_buffer` still addressed to
-/// `("lock", "authenticate")` with later bar keystrokes appending to it. `wl_keyboard.leave` is what
-/// used to be relied on to notice, and the protocol does not require a compositor to send one for a
-/// surface the client itself destroyed.
+/// The surface id is what a past review's defects 2 and 3 were both missing: focus used to be
+/// nothing but a destination, so nothing could tell "the field on the surface that currently has
+/// the keyboard" from "the field on a surface this process destroyed ten seconds ago". Concretely:
+/// type a password on the lock screen, let the compositor send `finished`, and the plaintext sits
+/// in `App::secure_buffer` still addressed to `("lock", "authenticate")` with later bar keystrokes
+/// appending to it -- `wl_keyboard.leave` was relied on to notice, but the protocol does not
+/// require a compositor to send one for a surface the client itself destroyed.
 ///
-/// So the field is bound to its surface and [`focus_is_still_armed`] is the one question every
+/// So the field is bound to its surface, and [`focus_is_still_armed`] is the one question every
 /// keystroke asks, rather than a clearing call bolted onto each of the five or six sites that can
-/// take a surface away -- which is exactly the shape that left the hole to begin with.
+/// take a surface away.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FocusedField {
     /// The `"{id}@{output}"` instance id of the surface the field was declared on.
@@ -1492,28 +1253,25 @@ struct FocusedField {
 
 /// The one place `App::focused_secure_submit` is ever written, and the reason it is one place.
 ///
-/// **A `shared::SecureBuffer`'s lifetime belongs to the field the bytes were typed into, not to the
-/// transport that carried them.** While `zwp_text_input_v3` was the only writer that looked like a
-/// property of its `leave` event, and the scrub lived there. It never was: three other sites cleared
-/// or *reassigned* the focus target and left the plaintext behind -- `KeyboardHandler::leave`,
-/// `SeatHandler::remove_capability`'s keyboard arm, and the press in `PointerHandler::pointer_frame`
-/// that retargets outright. The traced consequence is a credential leak with no lock involved: type
-/// a login password into the lock screen's field and press nothing, let the compositor tear the lock
-/// surfaces down, take keyboard focus on a bar whose sole `secure_submit` is `("network",
-/// "connect")`, type a Wi-Fi PSK, press Enter, and [`submit_frame_for`] addresses
-/// `<login password><psk>` to the network capability. That is precisely the routing docs/adr/0005
-/// exists to make impossible.
+/// A `shared::SecureBuffer`'s lifetime belongs to the field the bytes were typed into, not to the
+/// transport that carried them. Three sites cleared or reassigned the focus target and left the
+/// plaintext behind -- `KeyboardHandler::leave`, `SeatHandler::remove_capability`'s keyboard arm,
+/// and the retargeting press in `PointerHandler::pointer_frame`. Concretely: type a login password
+/// into the lock screen's field and press nothing, let the compositor tear the lock surfaces down,
+/// take keyboard focus on a bar whose sole `secure_submit` is `("network", "connect")`, type a
+/// Wi-Fi PSK, press Enter, and [`submit_frame_for`] addresses `<login password><psk>` to the
+/// network capability -- exactly the routing docs/adr/0005 exists to make impossible.
 ///
-/// So the rule is enforced on the *transition* rather than at each site that performs one: any
-/// change of destination, including one field to another directly, scrubs. A fifth caller added
-/// later inherits it by construction instead of having to remember it.
+/// So the rule is enforced on the transition, not at each site that performs one: any change of
+/// destination, including one field to another directly, scrubs. A fifth caller inherits it by
+/// construction.
 ///
-/// Re-arming the *same* destination deliberately does not scrub. A press decides focus
+/// Re-arming the same destination deliberately does not scrub: a press decides focus
 /// unconditionally (docs/adr/0050 decision 4), so clicking twice in the field being typed into
-/// arrives here with the target unchanged, and wiping there would delete half an entry.
+/// arrives here with the target unchanged.
 ///
-/// A free function taking both halves rather than a `&mut self` method, so the property is testable
-/// without a live Wayland connection -- the same reason [`secure_submit_frame`] is one.
+/// A free function, not a `&mut self` method, so the property is testable without a live Wayland
+/// connection -- the same reason [`secure_submit_frame`] is one.
 fn retarget_secure_submit(focused: &mut Option<FocusedField>, buffer: &mut shared::SecureBuffer, next: Option<FocusedField>) {
     if *focused != next {
         buffer.zeroize();
@@ -1532,15 +1290,13 @@ fn unlocks_the_session(target: &node::SecureSubmitTarget) -> bool {
 
 /// Every `secure_submit` destination a resolved tree declares, in document order.
 ///
-/// Whole-tree, unlike [`focused_target`], and the difference is what each answer is for: a press
-/// names one node, so it walks a hit path and takes the innermost. These two callers have no node
-/// to start from -- one is asking what a surface as a whole offers before a single event has
-/// arrived on it.
+/// Whole-tree, unlike [`focused_target`]: a press names one node and walks a hit path for the
+/// innermost, but these callers have no node to start from -- asking what a surface offers before
+/// any event has arrived on it.
 ///
-/// A malformed `secure_submit` contributes nothing rather than an error. The config bug is already
-/// reported where it can name the surface it is on (the press path logs it), and neither caller
-/// here has a use for a second copy: a field whose destination cannot be parsed is a field nothing
-/// can address a secret to, which is exactly what "not a candidate" means.
+/// A malformed `secure_submit` contributes nothing rather than an error: the config bug is already
+/// reported where it can name the surface (the press path logs it), and a field whose destination
+/// cannot be parsed is a field nothing can address a secret to.
 fn secure_submit_targets(tree: &layout::ResolvedNode) -> Vec<node::SecureSubmitTarget> {
     let mut found = Vec::new();
     let mut stack = vec![tree];
@@ -1555,22 +1311,17 @@ fn secure_submit_targets(tree: &layout::ResolvedNode) -> Vec<node::SecureSubmitT
     found
 }
 
-/// The destination a surface takes on *keyboard* focus, when its tree declares exactly one
-/// (build-steps.md Phase 23 item 3).
+/// The destination a surface takes on keyboard focus, when its tree declares exactly one.
 ///
-/// **Why keyboard focus focuses a field at all.** Until this, `focused_secure_submit` was set only
-/// by a pointer press, which made a lock screen require a mouse click before a keystroke could
-/// reach `shared::SecureBuffer` -- on the one surface whose entire purpose is to accept a password
-/// with the rest of the session hidden behind it. A lock surface has to be typable the moment the
-/// compositor hands it keyboard focus, and the compositor saying "this surface has the keyboard" is
-/// the only signal available before the user has touched anything.
+/// Why keyboard focus focuses a field at all: without it, `focused_secure_submit` was set only by
+/// a pointer press, requiring a mouse click before a keystroke could reach `shared::SecureBuffer`
+/// on the one surface whose purpose is to accept a password. A lock surface must be typable the
+/// moment the compositor hands it keyboard focus.
 ///
-/// **Exactly one, deliberately.** With two `secure_submit` fields on one surface there is no
-/// non-arbitrary answer to "whose password is this?", and guessing is the thing
-/// [`submit_frame_for`] already refuses to do (docs/adr/0050 decision 4). Zero is the same answer
-/// for the same reason. Both cases leave focus alone for a press to decide, which is what a
-/// multi-field surface has always needed anyway; the rule buys the single-field case, which is
-/// every lock screen and every password prompt.
+/// Exactly one, deliberately: with two `secure_submit` fields there is no non-arbitrary answer to
+/// "whose password is this?", the guess [`submit_frame_for`] already refuses to make (docs/adr/0050
+/// decision 4). Zero is the same answer. Both cases leave focus alone for a press to decide, which
+/// buys the single-field case: every lock screen and password prompt.
 fn sole_secure_submit(tree: &layout::ResolvedNode) -> Option<node::SecureSubmitTarget> {
     let mut targets = secure_submit_targets(tree);
     (targets.len() == 1).then(|| targets.remove(0))
@@ -1579,21 +1330,19 @@ fn sole_secure_submit(tree: &layout::ResolvedNode) -> Option<node::SecureSubmitT
 /// What `focused_secure_submit` becomes when keyboard focus arrives on `surface_id`, given that
 /// surface's resolved tree and whatever is focused now.
 ///
-/// **A total function, which is defect 2.** [`KeyboardHandler::enter`] used to spell its two
-/// "nothing to arm" cases -- an untracked surface, and a tracked one declaring no sole
-/// `secure_submit` -- as early returns that moved `keyboard_focus` on and left
-/// `focused_secure_submit` exactly as it was. `apply_secure_key` gates on the focus alone, so
-/// keystrokes arriving on a surface with no password field went on accumulating into the *previous*
-/// surface's field and could still be submitted to that field's capability. Every case answers here,
-/// and `enter` pushes the answer through [`App::focus_secure_submit`] whatever it is, so "nothing to
-/// arm" is the scrub it always should have been.
+/// A total function -- defect 2. [`KeyboardHandler::enter`] used to spell its "nothing to arm"
+/// cases (an untracked surface, a tracked one with no sole `secure_submit`) as early returns that
+/// moved `keyboard_focus` on and left `focused_secure_submit` unchanged. `apply_secure_key` gates
+/// on focus alone, so keystrokes on a surface with no password field kept accumulating into the
+/// previous surface's field and could still be submitted to its capability. Every case answers
+/// here, pushed through [`App::focus_secure_submit`], so "nothing to arm" is the scrub it always
+/// should have been.
 ///
-/// **What survives an `enter` is a field on the surface that is entering, and only that.** A press
-/// on a surface declaring several `secure_submit` fields picks one that [`sole_secure_submit`]
-/// deliberately refuses to pick, and the compositor's `enter` for that same surface commonly follows
-/// the press that caused it -- so discarding the press's choice would make a multi-field surface
-/// untypable by clicking. Requiring the tree to still declare that destination is what keeps a
-/// reload from leaving the choice pointing at a field the config has since deleted.
+/// What survives an `enter` is a field on the surface that is entering, and only that: a press on
+/// a surface with several `secure_submit` fields picks one that [`sole_secure_submit`] refuses to
+/// pick, and the compositor's `enter` commonly follows that press, so discarding it would make a
+/// multi-field surface untypable by clicking. Requiring the tree to still declare that destination
+/// keeps a reload from pointing at a field the config has since deleted.
 fn focus_on_enter(surface_id: Option<&str>, tree: Option<&layout::ResolvedNode>, current: Option<&FocusedField>) -> Option<FocusedField> {
     let (id, tree) = (surface_id?, tree?);
     if let Some(current) = current.filter(|field| field.surface_id == id && secure_submit_targets(tree).contains(&field.target)) {
@@ -1605,15 +1354,14 @@ fn focus_on_enter(surface_id: Option<&str>, tree: Option<&layout::ResolvedNode>,
 /// Whether a focused field is still armed: its own surface both holds the keyboard and still exists
 /// as a live `wl_surface` in this process.
 ///
-/// **Both clauses, and neither is redundant.** The keyboard clause is defect 2: a pointer press arms
-/// focus on whatever surface it landed on, so without it a field on a `keyboard_interactivity =
-/// none` panel stays armed while another surface is the one actually receiving keys. The liveness
-/// clause is defect 3: a `wl_surface` this process destroyed may never produce a `leave` at all, so
-/// the field on a torn-down lock screen would otherwise stay armed with a login password in it.
+/// Both clauses, neither redundant. The keyboard clause is defect 2: a pointer press arms focus on
+/// whatever surface it landed on, so without it a field on a `keyboard_interactivity = none` panel
+/// stays armed while another surface actually receives keys. The liveness clause is defect 3: a
+/// `wl_surface` this process destroyed may never produce a `leave`, so the field on a torn-down
+/// lock screen would otherwise stay armed with a login password in it.
 ///
-/// Asked at the point of use rather than enforced at each site that can break it. There are five or
-/// six such sites today and the next one added would inherit nothing; this way a field is armed only
-/// while both facts are true, by construction.
+/// Asked at the point of use rather than enforced at each of the five or six sites that can break
+/// it, so a field is armed only while both facts are true, by construction.
 fn focus_is_still_armed(field: &FocusedField, keyboard_focus: Option<&str>, its_surface_is_live: bool) -> bool {
     keyboard_focus == Some(field.surface_id.as_str()) && its_surface_is_live
 }
@@ -1622,21 +1370,16 @@ fn focus_is_still_armed(field: &FocusedField, keyboard_focus: Option<&str>, its_
 /// [`lock_command`]'s `can_authenticate` reads, and it is deliberately built out of
 /// [`sole_secure_submit`] rather than out of [`secure_submit_targets`].
 ///
-/// **The guard that grants the lock and the rule that arms the keyboard must be one predicate.**
-/// They were two: admission asked whether *any* field in the tree unlocks, focus armed only a
-/// *sole* field. A lock screen with two `secure_submit` fields therefore passed the guard, took the
-/// lock -- which the compositor will not release when the client dies -- and then armed nothing when
-/// the compositor handed the surface keyboard focus. On a keyboard-only machine, or with the second
-/// field buried in a subtree the user cannot see to click, the only way back into the session was a
-/// VT switch. Two predicates that agree in the common case are not a guard; this is one function
-/// with two callers.
+/// The guard that grants the lock and the rule that arms the keyboard must be one predicate. They
+/// were two: admission asked whether any field in the tree unlocks, focus armed only a sole field.
+/// A lock screen with two `secure_submit` fields passed the guard, took the lock -- which the
+/// compositor will not release when the client dies -- and then armed nothing when the compositor
+/// handed the surface keyboard focus, leaving a VT switch as the only way back in.
 ///
-/// Sole-and-unlocking is the right rule of the two, and not merely the stricter one. `any` is not
-/// implementable as a focus rule at all: with two destinations there is no non-arbitrary answer to
-/// "whose password is this?", which is the guess [`submit_frame_for`] already refuses to make
-/// (docs/adr/0050 decision 4). Weakening focus to match `any` would mean picking one field by
-/// document order and sending a lock password to whatever capability that field happened to name.
-/// So the focus rule stays, and admission is what moves to meet it.
+/// Sole-and-unlocking is the right rule, not merely the stricter one: `any` is not implementable
+/// as a focus rule at all, since with two destinations there is no non-arbitrary answer to "whose
+/// password is this?" (the guess [`submit_frame_for`] already refuses to make, docs/adr/0050
+/// decision 4). So the focus rule stays, and admission moves to meet it.
 pub(crate) fn tree_can_authenticate(tree: &layout::ResolvedNode) -> bool {
     sole_secure_submit(tree).as_ref().is_some_and(unlocks_the_session)
 }
@@ -1655,49 +1398,41 @@ enum SecureKeyAction<'a> {
     Ignore,
 }
 
-/// One `wl_keyboard` key, as an edit to a focused `secure_submit` buffer (build-steps.md Phase 23
-/// item 3).
+/// One `wl_keyboard` key, as an edit to a focused `secure_submit` buffer.
 ///
-/// **Why the keyboard and not `zwp_text_input_v3`.** text-input-v3 only ever produces a
-/// `commit_string` when the compositor has an input method bound to the seat, so on an ordinary
-/// session with no IME running -- the normal case, and the case on the machine this was found on --
-/// not one byte reached `shared::SecureBuffer`, no `SecureSubmit` was ever built, and a lock that
-/// had been granted could not be authenticated out of at all. It is also the security-correct
-/// transport independently of that: a password must not be routed through an input method, which is
-/// why swaylock and hyprlock read xkb directly and do not bind text-input either.
+/// Why the keyboard and not `zwp_text_input_v3`: text-input-v3 only produces a `commit_string`
+/// when the compositor has an input method bound to the seat, so on an ordinary session with no
+/// IME running, no byte reached `shared::SecureBuffer` and a granted lock could not be
+/// authenticated out of at all. It is also the security-correct transport independently of that:
+/// a password must not be routed through an input method, which is why swaylock and hyprlock read
+/// xkb directly too.
 ///
-/// **So the `zwp_text_input_v3` binding is gone entirely, and this is what replaced it.** Keeping
-/// it would have left two independent writers on one `shared::SecureBuffer` -- this one and
-/// `handle_text_input_event`'s `done` arm -- with an IME able to land a character through both, and
-/// a live `ContentPurpose::Password` session sitting open beside the keyboard reader for a protocol
-/// docs/adr/0027's amendment says must never see a password in the first place. Nothing else
-/// consumed it: `on_change`/`on_submit` were never wired to anything, so the bridge served only the
-/// one field kind that must not use it. Deleted rather than left dormant, since a dormant enabled
-/// text-input object is still an IME session the compositor may route keystrokes into.
+/// The `zwp_text_input_v3` binding is gone entirely. Keeping it would have left two independent
+/// writers on one `shared::SecureBuffer`, with an IME able to land a character through both, and a
+/// live `ContentPurpose::Password` session open beside the keyboard reader -- exactly what
+/// docs/adr/0027's amendment says must never see a password. Deleted rather than left dormant: a
+/// dormant enabled text-input object is still an IME session the compositor may route keystrokes
+/// into.
 ///
-/// docs/adr/0027 still records the design and it is still the right one for the *other* field kind:
-/// what brings the binding back is an ordinary Lua-readable `textfield` with `on_change`/`on_submit`
-/// (§ 5.2 item 8's unmasked half), which needs IME composition and must not be a raw keysym reader.
-/// That one binds without `ContentPurpose::Password`, writes a Lua-visible buffer rather than this
-/// one, and shares nothing with this path but the node kind.
+/// docs/adr/0027 still records the right design for the *other* field kind: an ordinary
+/// Lua-readable `textfield` with `on_change`/`on_submit` (§ 5.2 item 8's unmasked half) needs IME
+/// composition and must not be a raw keysym reader, binds without `ContentPurpose::Password`, and
+/// shares nothing with this path but the node kind.
 ///
-/// **This adds no IDL surface, and § 5.2 still declares no key handler.** Nothing here reaches Lua:
-/// the bytes go into a native buffer and out to the Supervisor, which is the whole definition of a
-/// `secure_submit` field (docs/adr/0005), and a key that does not land in one is [`Ignore`d]. The
-/// old comment on the empty `press_key` was right that docs/adr/0050 does not invent an `on_key`
-/// property; it stays right, because this is not one.
+/// This adds no IDL surface: the bytes go into a native buffer and out to the Supervisor, the whole
+/// definition of a `secure_submit` field (docs/adr/0005), and a key that does not land in one is
+/// [`Ignore`d]. § 5.2 still declares no `on_key`.
 ///
 /// [`Ignore`d]: SecureKeyAction::Ignore
 ///
-/// **Control characters are filtered by their text, not by an allow-list of keysyms.** `utf8` is
-/// `Some` for Escape, Tab and Return alike -- xkbcommon hands back the C0 control character -- so an
+/// Control characters are filtered by their text, not an allow-list of keysyms: `utf8` is `Some`
+/// for Escape, Tab and Return alike (xkbcommon hands back the C0 control character), so an
 /// unfiltered append would bury an ESC byte inside a secret and leave PAM rejecting it for no
 /// visible reason.
 ///
-/// `repeat` exists for one case: a held Enter must not submit twice. A submit zeroizes the buffer as
-/// it reads it (see [`secure_submit_frame`]), so the repeat would send an *empty* password to PAM
-/// and spend one of the user's attempts on it. Characters and Backspace repeat normally, which is
-/// what every text field does.
+/// `repeat` exists for one case: a held Enter must not submit twice. A submit zeroizes the buffer
+/// as it reads it (see [`secure_submit_frame`]), so a repeat would send an empty password to PAM
+/// and spend one of the user's attempts on it.
 fn secure_key_action<'a>(event: &'a KeyEvent, repeat: bool) -> SecureKeyAction<'a> {
     match event.keysym {
         Keysym::Return | Keysym::KP_Enter => {
@@ -1708,10 +1443,10 @@ fn secure_key_action<'a>(event: &'a KeyEvent, repeat: bool) -> SecureKeyAction<'
             }
         }
         Keysym::BackSpace => SecureKeyAction::Backspace,
-        // Escape used to fall through to the control-character filter below and be ignored, which
-        // left one Backspace per character as the only way to abandon a mistyped password -- on the
-        // one surface where getting it wrong costs a counted PAM attempt. Every other password
-        // prompt clears on Escape; so does this one.
+        // Escape used to fall through to the control-character filter and be ignored, leaving one
+        // Backspace per character as the only way to abandon a mistyped password -- costly on a
+        // surface where a wrong attempt is counted by PAM. Every other password prompt clears on
+        // Escape; so does this one.
         Keysym::Escape => SecureKeyAction::Clear,
         _ => match event.utf8.as_deref() {
             Some(text) if !text.is_empty() && !text.chars().any(char::is_control) => SecureKeyAction::Append(text),
@@ -1723,15 +1458,13 @@ fn secure_key_action<'a>(event: &'a KeyEvent, repeat: bool) -> SecureKeyAction<'
 /// The name `on_click`'s second argument carries for one evdev button code, or `None` for a button
 /// this engine does not hand to Lua at all.
 ///
-/// A string rather than the raw `273` or a normalized `1`/`2`/`3`, because every categorical value
-/// that crosses this boundary already is one: `fit` (`image::Fit::from_str`), `layer` and `anchor`
-/// (`layout::node::parse_layer`/`parse_anchor`), `align_h` (`parse_align`). docs/adr/0050's second
-/// amendment argues the rest of it and is the place to change if this is ever revisited.
+/// A string, not the raw `273` or a normalized `1`/`2`/`3`: every categorical value crossing this
+/// boundary already is one (`fit`, `layer`, `anchor`, `align_h`). docs/adr/0050's second amendment
+/// argues the rest and is the place to change if revisited.
 ///
-/// `None` means the press never arms and the release never fires, which is what an unhandled button
-/// already did. The set that fires has to equal the set a config can name: handed `"other"` for
-/// `BTN_TASK`, a config cannot tell it from `BTN_EXTRA`, cannot write a correct handler for either,
-/// and would instead run whatever was written for the left button.
+/// `None` means the press never arms and the release never fires, matching an unhandled button.
+/// The set that fires has to equal the set a config can name: handed `"other"` for `BTN_TASK`, a
+/// config cannot tell it from `BTN_EXTRA` and would run whatever was written for the left button.
 ///
 /// ponytail: back and forward do nothing, on a mouse that has them. Three of the eight `BTN_*`
 /// codes `smithay_client_toolkit::seat::pointer` names are handled here and the other five are
@@ -1751,12 +1484,11 @@ fn pointer_button_name(code: u32) -> Option<&'static str> {
 
 /// Whether a release of `button` ends the press `armed` is holding, whether or not it completes it.
 ///
-/// The pair of [`release_completes_click`] and the narrower of the two. Completing needs the same
-/// surface, the same rect and the same button; ending needs only the same button, because dragging
-/// off the node and releasing ends the press exactly as clicking does. What must not end it is a
-/// release of a *different* button: that event is the release of some other press, and clearing the
-/// slot for it throws away a press that is still live. Pressing left, pressing right, then
-/// releasing left used to do that, and lost the right click as well as the left one.
+/// The narrower half of the pair with [`release_completes_click`]. Completing needs the same
+/// surface, rect and button; ending needs only the same button, since dragging off the node and
+/// releasing ends the press exactly as clicking does. A release of a different button must not end
+/// it: pressing left, pressing right, then releasing left used to clear the slot and lose the
+/// right click as well as the left one.
 fn release_ends_press(armed: Option<&ArmedClick>, button: u32) -> bool {
     armed.is_some_and(|armed| armed.button == button)
 }
@@ -1764,10 +1496,10 @@ fn release_ends_press(armed: Option<&ArmedClick>, button: u32) -> bool {
 /// Whether a release on `instance_id`, over the button at `released_on`, completes `armed`
 /// (docs/adr/0050 decision 2).
 ///
-/// Both halves have to be a *button* hit, not merely the same coordinates: a release that lands in
-/// the armed rect but on something that is no longer a handled button (the config re-resolved and
-/// put a plain `rect` there) is not the click the press started. `released_on` is therefore
-/// [`clickable_button`]'s answer for the release, not the raw pointer position.
+/// Both halves must be a button hit, not merely the same coordinates: a release landing in the
+/// armed rect but on something no longer a handled button (a re-resolve put a plain `rect` there)
+/// is not the click the press started. `released_on` is [`clickable_button`]'s answer for the
+/// release, not the raw pointer position.
 fn release_completes_click(armed: Option<&ArmedClick>, instance_id: &str, released_on: Option<LogicalRect>, button: u32) -> bool {
     match (armed, released_on) {
         (Some(armed), Some(rect)) => armed.instance_id == instance_id && armed.rect == rect && armed.button == button,
@@ -1778,16 +1510,12 @@ fn release_completes_click(armed: Option<&ArmedClick>, instance_id: &str, releas
 /// `on_click`'s single argument: the button's rect as `{ x, y, width, height }` in its surface's
 /// logical coordinates (docs/adr/0050 decision 3).
 ///
-/// The rect travels *to* the callback, not back from it. § 6's `popup` entry and docs/adr/0040
-/// both say the anchor rect is "passed straight from the rect `button`'s `on_click` hands back",
-/// which read as a Rust-side return value would be unimplementable -- the engine does not know
-/// which `popup` a click was meant to open, and it already has the button's rect. "Hands back"
-/// is the round trip through the config: `on_click = function(rect) menu_anchor:set(rect) end`,
-/// with the `popup` declaring `anchor_rect = menu_anchor` (build-steps.md Phase 22 item 2).
-/// `Err` names the step as well as carrying the error, because the two failures are not the same
-/// bug: a rect table this engine could not build is the engine's, and a handler that raised is the
-/// config's. [`App::fire_on_click`] prints the pair, and merging them would tell a config author to
-/// look at their own Lua for a fault that is not there.
+/// The rect travels to the callback, not back from it. § 6's `popup` entry says the anchor rect is
+/// "passed straight from the rect `button`'s `on_click` hands back", which is the round trip
+/// through the config: `on_click = function(rect) menu_anchor:set(rect) end`, with the `popup`
+/// declaring `anchor_rect = menu_anchor`. `Err` names the step as well as the error: a rect table
+/// this engine could not build is the engine's bug, a handler that raised is the config's, and
+/// merging them would send a config author looking at their own Lua for a fault that isn't there.
 fn call_on_click(lua: &Lua, on_click: &Function, rect: LogicalRect, button: &str) -> Result<(), (&'static str, mlua::Error)> {
     let argument = rect_table(lua, rect).map_err(|e| ("could not build on_click's rect argument", e))?;
     on_click.call::<()>((argument, button)).map_err(|e| ("on_click raised, ignoring it", e))
@@ -1808,23 +1536,21 @@ fn rect_table(lua: &Lua, rect: LogicalRect) -> mlua::Result<Table> {
 /// `ActivateDraw` -- one function, called from [`App::maybe_send_ready_signal`], and the same
 /// [`MapState::presents`] predicate [`App::activate_draw`] skips on.
 ///
-/// The two sets have to be *identical*, and both directions of a mismatch are fatal in
+/// The two sets must be identical; both directions of a mismatch are fatal in
 /// `supervisor/src/reload.rs`'s `drive_handshake`. Announcing a surface that never draws leaves
-/// `while collected.len() < expected.len()` waiting for evidence that cannot arrive, until
-/// `evidence_timeout` fires. Drawing one that was not announced trips
-/// `!expected.contains(&surface_id)` and aborts the Candidate as `PbaFailure::UnexpectedEvidence`.
+/// `while collected.len() < expected.len()` waiting for evidence that cannot arrive until
+/// `evidence_timeout`. Drawing one that was not announced trips `!expected.contains(&surface_id)`
+/// and aborts the Candidate as `PbaFailure::UnexpectedEvidence`.
 ///
-/// A panel declared `visible = false` is what forces the filter: docs/adr/0038 decision 2 still
-/// *creates* it, so it exists as a `TrackedSurface` and stages like every other surface, but it
-/// never presents a frame, so it must not be in the expected set. A `window` or `popup` declared
-/// `visible = false` reaches the same answer by a shorter route, since docs/adr/0049 decision 1 does
-/// not create its role object at all. A `popup` is the strongest case of the three: a Candidate is
-/// frozen in [`App::apply_visibility`] and has no armed serial to grab with, so a declared popup
-/// never presents during a handshake whatever its `visible` says.
+/// A panel declared `visible = false` forces the filter: docs/adr/0038 decision 2 still creates
+/// it, so it stages like every other surface but never presents a frame. `window`/`popup` declared
+/// `visible = false` reach the same answer by a shorter route (docs/adr/0049 decision 1 does not
+/// create their role object at all). A `popup` is strongest: a Candidate freezes
+/// [`App::apply_visibility`] and has no armed serial to grab with, so it never presents during a
+/// handshake whatever `visible` says.
 ///
-/// An empty result is legal, not a degenerate case -- `drive_handshake`'s collection loop exits
-/// immediately on an empty expected set, so a generation whose every surface starts hidden
-/// completes its handshake.
+/// An empty result is legal, not a degenerate case: `drive_handshake`'s collection loop exits
+/// immediately on an empty expected set.
 fn presenting_surface_ids<'a>(surfaces: impl Iterator<Item = (&'a str, MapState)>) -> Vec<String> {
     surfaces
         .filter(|(_, state)| state.presents())
@@ -1836,23 +1562,20 @@ fn presenting_surface_ids<'a>(surfaces: impl Iterator<Item = (&'a str, MapState)
 /// [`App::maybe_send_ready_signal`]'s gate (§ 15.2 points 2-3). Takes `(null_buffered, exists)` per
 /// surface, where `exists` is whether the surface currently has a Wayland object at all.
 ///
-/// The second half is what build-steps.md Phase 22 item 1's "PBA's null-buffer staging needs no new
-/// branch" missed, and it is a gate rather than a staging difference. The *staging* really does
-/// generalize: xdg-shell's initial-commit discipline is layer-shell's, so a shown `window` attaches
-/// a null buffer on its first configure through the identical code path. What does not generalize is
-/// the assumption underneath the old `all(null_buffered)` gate -- that every tracked surface gets a
-/// configure. A `panel` always does, because it is created and initially committed at startup even
-/// when `visible` is false. A `window` declared `visible = false` has no `xdg_toplevel` at all
-/// (docs/adr/0049 decision 1), so no configure is coming, `null_buffered` would stay false forever,
-/// and the Candidate would never send its `ReadySignal` -- a `ready_timeout` hang on every config
-/// that declares a hidden window, which is the shape the dev config already has. A `popup` widens
-/// that from "a hidden window" to "any declared popup": a Candidate freezes `visible`
-/// ([`App::apply_visibility`]) and has no armed serial to grab with, so a popup's `xdg_popup` never
-/// exists during a handshake at all.
+/// The `exists` half is a gate, not a staging difference. Staging really does generalize:
+/// xdg-shell's initial-commit discipline is layer-shell's, so a shown `window` attaches a null
+/// buffer on its first configure the same way. What does not generalize is the assumption
+/// underneath a plain `all(null_buffered)` -- that every tracked surface gets a configure. A
+/// `panel` always does, since it is created and committed at startup even when `visible` is false.
+/// A `window` declared `visible = false` has no `xdg_toplevel` at all (docs/adr/0049 decision 1),
+/// so no configure ever arrives, `null_buffered` stays false forever, and the Candidate would
+/// never send `ReadySignal` -- a `ready_timeout` hang on any config declaring a hidden window,
+/// which the dev config already does. A `popup` widens that further: a Candidate freezes `visible`
+/// ([`App::apply_visibility`]), so a popup's `xdg_popup` never exists during a handshake at all.
 ///
-/// A surface with no object has nothing to stage and nothing to present, so it is complete by
-/// construction. It is filtered out of the announced set by [`presenting_surface_ids`] on the same
-/// `MapState::Unmapped` that makes it objectless here, which is what keeps the two in step.
+/// A surface with no object has nothing to stage or present, so it is complete by construction.
+/// [`presenting_surface_ids`] filters it out on the same `MapState::Unmapped` that makes it
+/// objectless here, keeping the two in step.
 fn candidate_has_staged(surfaces: impl Iterator<Item = (bool, bool)>) -> bool {
     surfaces.into_iter().all(|(null_buffered, exists)| null_buffered || !exists)
 }
@@ -1870,26 +1593,22 @@ fn candidate_has_staged(surfaces: impl Iterator<Item = (bool, bool)>) -> bool {
 /// a known budget (`resolve_and_reconcile`'s own `ponytail:` names that second pass).
 const UNCONFIGURED_WINDOW_SIZE: (f32, f32) = (640.0, 480.0);
 
-/// The size a toplevel's buffer takes for one `xdg_toplevel` configure (build-steps.md Phase 22
-/// item 1).
+/// The size a toplevel's buffer takes for one `xdg_toplevel` configure.
 ///
-/// A `Some` axis is the compositor's and is taken as given: `xdg_toplevel::configure`'s own wording
-/// makes a maximized or fullscreen size binding, and a tiling compositor sizes every window this
-/// way, so on niri this is the only branch that ever runs.
+/// A `Some` axis is the compositor's, taken as given: `xdg_toplevel::configure`'s wording makes a
+/// maximized or fullscreen size binding, and a tiling compositor sizes every window this way, so
+/// on niri this is the only branch that ever runs.
 ///
 /// A `None` axis is "the client picks" ("If this value is None, you may set the size of the window
-/// as you wish"), which is the ordinary first configure on a floating compositor. What it picks is
-/// the config's own `min_size` for that axis, falling back to [`UNCONFIGURED_WINDOW_SIZE`], then
-/// clamped by `max_size`. The hints are what a config can actually say about a window's size, and on
-/// this branch the client holds the pen: § 6.2's "advisory" caveat is about what the *compositor*
-/// may do with them, not a licence to ignore our own numbers when nobody else has chosen.
+/// as you wish"), the ordinary first configure on a floating compositor. It picks the config's own
+/// `min_size` for that axis, falling back to [`UNCONFIGURED_WINDOW_SIZE`], then clamped by
+/// `max_size`: § 6.2's "advisory" caveat is about what the compositor may do with these numbers,
+/// not a licence to ignore them when nobody else has chosen.
 ///
 /// A zero `max_size` axis is not a maximum of zero: `set_max_size`'s own "0 means no expected
-/// maximum size in the given dimension", the same reading [`node::window_spec`]'s parser applies
-/// when it refuses a maximum below a minimum.
+/// maximum size in the given dimension", the same reading [`node::window_spec`]'s parser applies.
 ///
-/// At least 1 on both axes, because a `wl_egl_window` of 0 is invalid and a window has to attach a
-/// buffer to map at all.
+/// At least 1 on both axes: a `wl_egl_window` of 0 is invalid.
 fn toplevel_size_for(new_size: (Option<std::num::NonZeroU32>, Option<std::num::NonZeroU32>), spec: &WindowSpec) -> (u32, u32) {
     let axis = |configured: Option<std::num::NonZeroU32>, fallback: f32, min: f32, max: f32| -> u32 {
         if let Some(configured) = configured {
@@ -1909,23 +1628,21 @@ fn toplevel_size_for(new_size: (Option<std::num::NonZeroU32>, Option<std::num::N
     )
 }
 
-/// The `xdg_toplevel` requests one *live* toplevel needs after a re-resolve changed its `window`
+/// The `xdg_toplevel` requests one live toplevel needs after a re-resolve changed its `window`
 /// properties (§ 6.2, docs/adr/0049's second amendment). `None` per field means "unchanged, send
-/// nothing", exactly as [`SpecUpdate`] does for a panel and for the same reason: all four are
-/// double-buffered, so re-sending an unchanged value is noise rather than an error.
+/// nothing", as [`SpecUpdate`] does for a panel: all four are double-buffered, so re-sending an
+/// unchanged value is noise, not an error.
 ///
-/// **Every one of § 6.2's protocol-facing fields is here, which is the difference from a panel.**
-/// `SpecUpdate` deliberately omits [`node::SurfaceTopology`]'s five, because `get_layer_surface`
-/// fixes them at creation. A toplevel has no such set: `xdg-shell.xml` says of `set_app_id` that it
-/// "can be sent after the xdg_toplevel has been mapped to update the property", `set_title` is the
-/// same shape, and both size hints are ordinary double-buffered requests. So a changed `title` is an
-/// in-place update, never a recreate, and the only field left out is `id`, which is the reconcile
-/// identity rather than a protocol field.
+/// Every one of § 6.2's protocol-facing fields is here, unlike a panel: `SpecUpdate` omits
+/// [`node::SurfaceTopology`]'s five because `get_layer_surface` fixes them at creation, but a
+/// toplevel has no such set (`xdg-shell.xml` allows `set_app_id`/`set_title` after mapping, and
+/// both size hints are ordinary double-buffered requests). So a changed `title` is always an
+/// in-place update, and the only field left out is `id`, the reconcile identity rather than a
+/// protocol field.
 ///
-/// `Option<Option<SizeHint>>` reads oddly and is the honest type: the outer layer is "did it move",
-/// the inner one is § 6.2's own absent-versus-present distinction, and "moved to absent" is a real
-/// transition that has to reach `set_min_size(None)` -- which the protocol spells as a zero, meaning
-/// unset.
+/// `Option<Option<SizeHint>>` is the honest type: the outer layer is "did it move", the inner one
+/// is § 6.2's own absent-versus-present distinction, and "moved to absent" is a real transition
+/// that has to reach `set_min_size(None)`, which the protocol spells as a zero, meaning unset.
 #[derive(Debug, Default, PartialEq)]
 struct WindowUpdate {
     title: Option<String>,
@@ -1949,21 +1666,17 @@ fn size_hint_pair(hint: Option<SizeHint>) -> Option<(u32, u32)> {
     hint.map(|hint| (hint.width.max(0.0) as u32, hint.height.max(0.0) as u32))
 }
 
-/// The layer-shell requests one *live* surface needs after a re-resolve changed its `panel`
+/// The layer-shell requests one live surface needs after a re-resolve changed its `panel`
 /// properties -- `margin`, `keyboard_interactivity`, size, and the `exclusive` flag the zone is
-/// derived from (docs/adr/0038 decision 2, § 6.1, build-steps.md Phase 20 item 1). `None` per
-/// field means "unchanged, send nothing": these are all double-buffered, so re-sending an
-/// unchanged value is not wrong, just noise on the wire that the diff exists to avoid.
+/// derived from (docs/adr/0038 decision 2, § 6.1). `None` per field means "unchanged, send
+/// nothing": these are all double-buffered, so resending an unchanged value is just wire noise.
 ///
 /// [`SurfaceTopology`](node::SurfaceTopology)'s five fields -- `id`, `layer`, `anchor`, `monitor`,
-/// `namespace` -- are deliberately absent, and that is a statement rather than an omission. The
-/// protocol cannot change a surface's namespace or output at all (`get_layer_surface` consumes
-/// both), and an edit to any of the five is a topology change `crate::socket`'s `handle_reevaluate`
-/// routes to a generation swap, where the Candidate builds its own surfaces from its own
-/// evaluation. So they cannot legitimately differ between `applied` and `fresh` here: every one of
-/// them is `is_structural_property`, copied through raw and refused a `Signal`
-/// (`layout::node::reject_signal_in_structural_field`), precisely so a live surface can never be
-/// asked to move.
+/// `namespace` -- are deliberately absent. The protocol cannot change a surface's namespace or
+/// output at all (`get_layer_surface` consumes both), and an edit to any of the five is a topology
+/// change `crate::socket::handle_reevaluate` routes to a generation swap instead. So they cannot
+/// legitimately differ between `applied` and `fresh` here: each is `is_structural_property`,
+/// copied through raw and refused a `Signal` (`layout::node::reject_signal_in_structural_field`).
 ///
 /// `output` is the surface's *output's* logical size, not its configured size -- see
 /// [`TrackedSurface::output_size`] for why the two must not be confused.
@@ -2013,11 +1726,10 @@ struct LayerSpec<'a> {
     keyboard_interactivity: KeyboardInteractivity,
 }
 
-/// One connected output, exactly as `wl_output` reports it (docs/adr/0041 decision 2). This is the
-/// single source both consumers read: the `screens` Lua signal a config loops over to declare
-/// per-monitor panels, and the [`OutputGeometry`] list `layout::instance::expand_instances` matches
-/// `monitor` against. Two sources would let a config's own arithmetic and the engine's layout
-/// disagree about how large a monitor is.
+/// One connected output, exactly as `wl_output` reports it (docs/adr/0041 decision 2). The single
+/// source both consumers read: the `screens` Lua signal a config loops over to declare per-monitor
+/// panels, and the [`OutputGeometry`] list `layout::instance::expand_instances` matches `monitor`
+/// against -- two sources would let a config's arithmetic and the engine's layout disagree.
 #[derive(Debug, Clone, PartialEq)]
 struct Screen {
     name: String,
@@ -2032,9 +1744,9 @@ struct Screen {
 /// The `smithay_client_toolkit::output::OutputInfo` fields [`screen_entry`] reads, lifted off it
 /// by [`App::screens`].
 ///
-/// A separate struct rather than the real thing because `OutputInfo` is `#[non_exhaustive]` with
-/// no public constructor: a function taking one could never be built in a unit test, and every
-/// decision in this conversion (the `logical_size` fallback, millihertz to Hz, the positional name
+/// A separate struct, not the real thing: `OutputInfo` is `#[non_exhaustive]` with no public
+/// constructor, so a function taking one could never be built in a unit test -- and every decision
+/// in this conversion (the `logical_size` fallback, millihertz to Hz, the positional name
 /// fallback) is exactly what wants testing in a file with no headless Wayland harness.
 struct OutputFacts {
     name: Option<String>,
@@ -2048,11 +1760,10 @@ struct OutputFacts {
 
 /// One output's `screens` entry, or `None` for an output whose size cannot be known.
 ///
-/// `logical_size` first (`xdg_output`/`wl_output` v4's compositor-space size, which is what a layer
-/// surface's own coordinates are in), falling back to the current `Mode`'s `dimensions` for a
-/// compositor that reports no logical size. An output with neither yields nothing rather than a
-/// default, since a made-up size would resolve every surface on that monitor against a fiction --
-/// the caller logs the miss, the same split `layout::instance::expand_instances` already uses.
+/// `logical_size` first (`xdg_output`/`wl_output` v4's compositor-space size, the space a layer
+/// surface's own coordinates are in), falling back to the current `Mode`'s `dimensions`. An output
+/// with neither yields nothing rather than a default: a made-up size would resolve every surface
+/// on that monitor against a fiction, and the caller logs the miss.
 ///
 /// ponytail: a nameless output (a compositor below `wl_output` v4) takes a positional
 /// `"output-{index}"` id, carried over from the deleted `wallpaper_surface_id`. It keeps the shell
@@ -2109,10 +1820,10 @@ impl App {
     /// Every connected output as [`Screen`] describes it, skipping (with a log) any whose size
     /// `wl_output` cannot answer for.
     ///
-    /// `departing` is the output an `output_destroyed` event is announcing, which must be excluded
-    /// by hand: `smithay_client_toolkit`'s `remove_global` calls `OutputHandler::output_destroyed`
-    /// *before* removing the output from its own `OutputState`, so a plain read of `outputs()` from
-    /// inside that callback still lists the monitor that just went away. `None` everywhere else.
+    /// `departing` is the output an `output_destroyed` event is announcing, excluded by hand: SCTK's
+    /// `remove_global` calls `OutputHandler::output_destroyed` before removing the output from its
+    /// own `OutputState`, so a plain `outputs()` read from inside that callback still lists it.
+    /// `None` everywhere else.
     fn screens(&self, departing: Option<&wl_output::WlOutput>) -> Vec<Screen> {
         let mut screens = Vec::new();
         for (index, output) in self.output_state.outputs().enumerate() {
@@ -2165,10 +1876,7 @@ impl App {
     }
 
     /// One tracked surface per surface instance, built from the evaluation that declared it
-    /// (docs/adr/0038 decision 1, docs/adr/0049 decision 1, build-steps.md Phase 20 items 1 and 2
-    /// and Phase 22 item 1). This replaced `create_main_bar`/`create_overlay_canvas`/
-    /// `create_wallpaper_layers`, which ran *before* any Lua had been evaluated and discarded every
-    /// field the config wrote.
+    /// (docs/adr/0038 decision 1, docs/adr/0049 decision 1).
     ///
     /// The roles diverge in what "create" means, and only there. A `panel` gets its
     /// `zwlr_layer_surface_v1` here whatever its `visible` says, because that object lives as long
@@ -2180,16 +1888,14 @@ impl App {
     /// no spec cannot happen; it is skipped with a log rather than panicking, on the same
     /// "keep the shell up" principle as every other failure in this file.
     ///
-    /// **`specs` contributes the roster, not the field values** ([`resolved_surface_spec`],
-    /// [`starting_visible`]). It is parsed from the evaluation's *unresolved* properties, which is
-    /// what makes it the wrong thing to build a surface out of: the caller resolves the scene
-    /// between parsing it and calling this, so every signal-bound field in it is still at its
-    /// parser placeholder. What it is right for is which declarations exist and what role each one
-    /// is, neither of which a re-resolve can change (docs/adr/0049 decision 3).
+    /// `specs` contributes the roster, not the field values ([`resolved_surface_spec`],
+    /// [`starting_visible`]): it is parsed from the evaluation's unresolved properties, so every
+    /// signal-bound field in it is still at its parser placeholder. What it is right for is which
+    /// declarations exist and what role each is, neither of which a re-resolve can change
+    /// (docs/adr/0049 decision 3).
     ///
-    /// Called with the whole instance set at startup and with only the *added* instances on a
-    /// monitor hotplug (see [`App::handle_output_change`]) -- the same function either way, since
-    /// "build the surface this instance names" is the same job in both.
+    /// Called with the whole instance set at startup and with only the added instances on a monitor
+    /// hotplug (see [`App::handle_output_change`]) -- the same function either way.
     fn create_surfaces(&mut self, qh: &QueueHandle<App>, specs: &[SurfaceSpec], instances: &[SurfaceInstance]) {
         // Re-read per call rather than snapshotted once at startup: this now also runs from an
         // output event, where the whole point is that the output list has just changed.
@@ -2212,19 +1918,16 @@ impl App {
             // this line and the `&mut self` creates below are free to run.
             let tree = self.client.scene().surface(&instance.instance_id);
             let visible = starting_visible(tree.as_ref().map(|tree| tree.visible), roster);
-            // Built from the *resolved* properties, exactly as [`App::apply_resolved_state`] builds
-            // it on every later pass (docs/adr/0049's second amendment). `run` parses `specs` out of
-            // the evaluation's raw properties, before `resolve_properties` has run, so a
-            // signal-bound field is still at its parser placeholder there -- and for a popup that is
-            // permanent damage rather than one stale frame: every `PopupSpec` field is an
-            // `xdg_positioner` request, the positioner is consumed by `get_popup`, and
-            // `xdg_popup.reposition` is deliberately not built, so a popup shown from the roster
-            // spec keeps `DEFERRED_POPUP_EXTENT`'s 1x1-at-(0,0) placeholder for its whole life.
+            // Built from the resolved properties, as `apply_resolved_state` builds it on every
+            // later pass (docs/adr/0049's second amendment). `run` parses `specs` from the raw,
+            // pre-resolve properties, so a signal-bound field is still at its parser placeholder --
+            // and for a popup that is permanent damage, not one stale frame: every `PopupSpec`
+            // field is an `xdg_positioner` request the positioner consumes at `get_popup`, and
+            // `xdg_popup.reposition` is not built, so a popup shown from the roster spec keeps
+            // `DEFERRED_POPUP_EXTENT`'s 1x1-at-(0,0) placeholder for its whole life.
             //
-            // A `panel` goes through the same path rather than being special-cased, and that is not
-            // scope creep: `resolve_properties` copies structural properties through raw, so a
-            // panel's topology is identical either way, and re-deriving from the resolved tree is
-            // what `apply_spec_change` already does on every later pass.
+            // A `panel` goes through the same path: `resolve_properties` copies structural
+            // properties through raw, so its topology is identical either way.
             let spec = match tree.as_ref().map(|tree| resolved_surface_spec(roster, &tree.properties)) {
                 Some((_, Ok(fresh))) => fresh,
                 Some((role, Err(err))) => {
@@ -2245,26 +1948,22 @@ impl App {
             }
         }
         // The "and any new outputs as they are advertised" half of `ext-session-lock-v1`'s own
-        // expectation (docs/adr/0042, build-steps.md Phase 23 item 1). A no-op unless a lock is
-        // being held right now, which at startup it never is; on a monitor hotplug it is what gives
-        // the freshly advertised output its lock surface instead of leaving the compositor to paint
-        // a solid colour there.
+        // expectation (docs/adr/0042). A no-op unless a lock is held right now; on a monitor
+        // hotplug it gives the freshly advertised output its lock surface instead of leaving the
+        // compositor to paint a solid color there.
         self.ensure_lock_surfaces(qh);
     }
 
     /// [`App::create_surfaces`]'s `lock` arm: the tracking entry always, the
     /// `ext_session_lock_surface_v1` never from here (docs/adr/0052 decision 2).
     ///
-    /// The entry exists for [`App::create_window`]'s reason and for one that is stronger. It is what
-    /// makes the retained scene resolve this instance's tree at all, which is what lets an in-place
-    /// reload restyle a live lock screen; and it is the **only** record that this config declares a
-    /// lock screen, which is the fact docs/adr/0052 decision 3 refuses a lock on the absence of.
-    /// [`App::set_session_lock`] asks that question by looking for these entries, so there is no
-    /// second roster to keep in step with this one.
+    /// The entry is what makes the retained scene resolve this instance's tree at all, letting an
+    /// in-place reload restyle a live lock screen, and it is the only record that this config
+    /// declares a lock screen -- the fact docs/adr/0052 decision 3 refuses a lock on the absence of.
+    /// [`App::set_session_lock`] asks that question by looking for these entries.
     ///
     /// No `visible` is consulted and there is none to consult: `layout::node::lock_spec` refuses the
-    /// property outright, because the compositor owns this surface's lifetime end to end. The
-    /// resolved tree's default `true` is not a statement the config made.
+    /// property outright, since the compositor owns this surface's lifetime end to end.
     ///
     /// The `wl_output` is kept rather than the output's name, for the reason [`TrackedRole::Lock`]
     /// gives: `get_lock_surface` takes the proxy, and this is the one place it is already in hand.
@@ -2286,30 +1985,25 @@ impl App {
     /// One `ext_session_lock_surface_v1` for every declared `lock` instance that does not have one
     /// yet, or nothing at all if this process holds no lock (build-steps.md Phase 23 item 1).
     ///
-    /// **Idempotent per output, and that is a protocol requirement rather than tidiness.** A second
-    /// lock surface on one output is a `duplicate_output` error, which kills the connection with the
-    /// session still locked. `layout::instance::expand_instances` produces one `lock` instance per
-    /// output *per declared lock spec* (docs/adr/0052 decision 2), so "this instance already has a
-    /// surface" and "this output already has one" are the same test only while a config declares at
-    /// most one `lock` -- which is exactly what `crate::socket`'s `surface_specs` now refuses to let
-    /// through, for this invariant. The `surface: None` in the pattern below is the per-instance
-    /// half; that refusal is the other half, and neither is sufficient alone.
+    /// Idempotent per output, a protocol requirement, not tidiness: a second lock surface on one
+    /// output is a `duplicate_output` error, killing the connection with the session still locked.
+    /// `expand_instances` produces one `lock` instance per output per declared lock spec
+    /// (docs/adr/0052 decision 2), so "this instance already has a surface" and "this output already
+    /// has one" agree only while a config declares at most one `lock` -- which `crate::socket`'s
+    /// `surface_specs` now refuses to let through. The `surface: None` pattern below is the
+    /// per-instance half of that invariant; the refusal is the other half.
     ///
-    /// Three callers, one job, because "make the set of lock surfaces match the set of outputs" is
-    /// the same job whenever either set moves. Right after `lock` succeeds, because the protocol
-    /// asks clients to "immediately create lock surfaces for all outputs currently present" -- the
-    /// compositor may wait for them before it sends `locked`, precisely to avoid showing a blank
-    /// frame first, and a client that waits for `locked` to create them guarantees that blank frame
+    /// Three callers, one job: "make the set of lock surfaces match the set of outputs" is the same
+    /// job whenever either set moves. Right after `lock` succeeds, since the protocol asks clients to
+    /// immediately create lock surfaces for all outputs present -- the compositor may wait for them
+    /// before sending `locked`, and a client that waits for `locked` first guarantees a blank frame
     /// for however long the compositor's time limit is. Again on `locked` itself, for an output
-    /// advertised inside that window. And from [`App::create_surfaces`], which is the hotplug path.
+    /// advertised inside that window. And from [`App::create_surfaces`], the hotplug path.
     ///
-    /// **No commit here, and this is the one role where that is not an oversight.** Every other
-    /// create path in this file ends in the initial commit its shell protocol requires;
-    /// `ext_session_lock_surface_v1` inverts the rule -- "Committing the surface before acking the
-    /// first configure is a protocol error" -- and the compositor sends that first configure
-    /// immediately on `get_lock_surface`. So `MapState::AwaitingConfigure` here means what it means
-    /// everywhere else, the ordinary [`App::bind_and_clear`] path does the whole map, and SCTK has
-    /// already acked by the time it runs.
+    /// No commit here, and this is the one role where that is not an oversight: every other create
+    /// path ends in the initial commit its shell protocol requires, but "committing the surface
+    /// before acking the first configure is a protocol error" here, and the compositor sends that
+    /// first configure immediately on `get_lock_surface`.
     fn ensure_lock_surfaces(&mut self, qh: &QueueHandle<App>) {
         // Cloned out of `self` so the `&mut self` calls in the loop are free to run; `SessionLock`
         // is an `Arc` handle, so this is a refcount bump and not a second lock.
@@ -2336,19 +2030,18 @@ impl App {
     ///
     /// The order is [`App::destroy_surface_by_id`]'s minus its last step: `eglDestroySurface` and
     /// `wl_egl_window_destroy` first ([`App::release_bound`]), then the `SessionLockSurface` handle,
-    /// whose `Drop` sends `destroy` and then destroys the `wl_surface` underneath it. A
-    /// `wl_egl_window` still pointing at a destroyed `wl_surface` is the failure that order exists
-    /// to prevent, and it does not care which protocol destroyed the surface.
+    /// whose `Drop` sends `destroy` and then destroys the `wl_surface`. A `wl_egl_window` still
+    /// pointing at a destroyed `wl_surface` is the failure that order prevents.
     ///
-    /// The entries survive because the declarations did. A `lock` instance is one retained node for
+    /// The entries survive because the declarations did: a `lock` instance is one retained node for
     /// as long as the config declares it, and the next lock builds its surfaces again through
-    /// [`App::ensure_lock_surfaces`] -- the same shape a `window` has when `visible` goes false.
+    /// [`App::ensure_lock_surfaces`].
     ///
-    /// **When this runs relative to the unlock is load-bearing.** On the ordered-unlock path it runs
-    /// *after* `unlock_and_destroy`, because destroying a lock surface whose output is still active
-    /// while the session is still locked makes the compositor "fall back to rendering a solid
-    /// color" -- a visible flash between the password being accepted and the desktop coming back.
-    /// On the `finished` path there is no such window: the compositor has already ended the lock.
+    /// When this runs relative to the unlock is load-bearing. On the ordered-unlock path it runs
+    /// after `unlock_and_destroy`: destroying a lock surface whose output is still active while the
+    /// session is still locked makes the compositor fall back to rendering a solid color, a visible
+    /// flash between the password being accepted and the desktop coming back. On the `finished` path
+    /// there is no such window: the compositor has already ended the lock.
     fn teardown_lock_surfaces(&mut self) {
         for index in 0..self.surfaces.len() {
             if !matches!(self.surfaces[index].role, TrackedRole::Lock { surface: Some(_), .. }) {
@@ -2367,25 +2060,20 @@ impl App {
     /// decision is [`lock_command`], which is pure and tested; this is the protocol traffic it does
     /// not do.
     ///
-    /// `declares_lock` is counted off the tracked surface set rather than off the roster or the
-    /// scene, because that set is the one place the question has a single answer: `create_lock`
-    /// pushes an entry per `lock` instance and `destroy_surface_by_id` removes it with its output.
-    /// A session with no outputs at all therefore declares no lock instance and is refused, which is
-    /// right -- there is no screen to lock.
+    /// `declares_lock` is counted off the tracked surface set, not the roster or the scene: that set
+    /// is the one place the question has a single answer, since `create_lock` pushes an entry per
+    /// `lock` instance and `destroy_surface_by_id` removes it with its output.
     ///
-    /// `can_authenticate` is the second question and it goes to the *scene*, because that is where
-    /// the answer lives: a tracked instance says a `lock` node was written, and only its resolved
-    /// tree says whether anything under it could ever produce the `SecureSubmit` that unlocks (see
-    /// [`LOCK_CANNOT_AUTHENTICATE`]). The per-tree answer is [`tree_can_authenticate`], which is the
-    /// *same* predicate keyboard focus arms on -- see its doc comment for why two nearly-equal rules
-    /// here strand the machine. `any`, not `all`, across the instances: one lock surface per output
-    /// is the protocol's requirement and they all resolve from the same declaration, so a single
-    /// typable one is the config being correct rather than a partial answer.
+    /// `can_authenticate` goes to the scene: a tracked instance says a `lock` node was written, and
+    /// only its resolved tree says whether anything under it could ever produce the `SecureSubmit`
+    /// that unlocks (see [`LOCK_CANNOT_AUTHENTICATE`]). The per-tree answer is
+    /// [`tree_can_authenticate`], the same predicate keyboard focus arms on. `any`, not `all`, across
+    /// instances: one lock surface per output is the protocol's requirement and they all resolve
+    /// from the same declaration, so a single typable one is the config being correct.
     ///
-    /// A `lock` that fails at the protocol level is a refusal and not a crash, which is the same
-    /// tolerance [`App::show_window`] applies to a missing `xdg_wm_base`: the shell keeps painting,
-    /// and the one thing that did not happen says so through the channel docs/adr/0052 decision 4
-    /// named for it.
+    /// A `lock` that fails at the protocol level is a refusal, not a crash, the same tolerance
+    /// [`App::show_window`] applies to a missing `xdg_wm_base`: the shell keeps painting, and the one
+    /// thing that did not happen says so through the channel docs/adr/0052 decision 4 named for it.
     fn set_session_lock(&mut self, qh: &QueueHandle<App>, locked: bool) {
         let lock_instances: Vec<String> = self
             .surfaces
@@ -2423,31 +2111,24 @@ impl App {
         }
     }
 
-    /// `unlock_and_destroy`, and **the only path in this process that performs one** (docs/adr/0042,
+    /// `unlock_and_destroy`, and the only path in this process that performs one (docs/adr/0042,
     /// docs/adr/0052's consequences).
     ///
-    /// It is reachable from exactly one place: a `SetSessionLock { locked: false }`, which the
-    /// Supervisor sends only from the `pam_outcomes` arm of its `select!` loop, on a
-    /// `PamOutcome::Success`. The PAM conversation itself is spawned off that loop rather than
-    /// awaited inside the `secure_submit(lock, authenticate)` arm that starts it, so the arm that
-    /// *begins* an attempt and the arm that *orders* the unlock are two, but the property is
-    /// unchanged and is the reason this comment exists: `LockController::unlock` still has exactly
-    /// one call site and it is still reached only on a `Success`, which makes "never unlock except
-    /// on a successful authentication" a property of one call site in the Supervisor rather than a
-    /// rule the Renderer has to be trusted with. **No convenience path may be added here** -- not on
-    /// shutdown, not on a `finished`, not on a config reload. SCTK's `Drop` deliberately does not
-    /// unlock, and the reason is the whole security model: a Renderer that dies while locked leaves
-    /// the session locked, and anything in this file that unlocked on its own initiative would be
-    /// the one way to turn a crash into an unlocked desktop.
+    /// Reachable from exactly one place: a `SetSessionLock { locked: false }`, which the Supervisor
+    /// sends only from the `pam_outcomes` arm of its `select!` loop, on a `PamOutcome::Success`.
+    /// That makes "never unlock except on a successful authentication" a property of one call site
+    /// in the Supervisor rather than a rule the Renderer has to be trusted with. No convenience
+    /// path may be added here -- not on shutdown, not on a `finished`, not on a config reload.
+    /// SCTK's `Drop` deliberately does not unlock, and the reason is the whole security model: a
+    /// Renderer that dies while locked leaves the session locked, and anything in this file that
+    /// unlocked on its own initiative would be the one way to turn a crash into an unlocked desktop.
     ///
     /// `SessionLock::unlock` is itself a no-op unless `is_locked()`, so the in-flight case -- a
     /// `lock` request whose `locked` has not arrived -- sends nothing and the `Drop` below sends the
-    /// plain `destroy` the protocol requires there instead. That is not belt-and-braces on top of
-    /// [`lock_command`]'s guard; it is SCTK's guarantee, and it is what makes the two cases one
-    /// function. **It is also why [`run`] round-trips before calling this** -- `is_locked()` is set
-    /// when `locked` is *dispatched*, not when the compositor sends it, so without that round trip
-    /// a `locked` sitting unread on the wire would make this send a plain `destroy` that the
-    /// compositor answers with `invalid_destroy`.
+    /// plain `destroy` the protocol requires there instead. That is also why [`run`] round-trips
+    /// before calling this: `is_locked()` is set when `locked` is dispatched, not when the
+    /// compositor sends it, so without that round trip an unread `locked` would make this send a
+    /// plain `destroy` that the compositor answers with `invalid_destroy`.
     ///
     /// The report matches what happened rather than what was asked for ([`release_outcome`]): a
     /// no-op `unlock` released nothing, and the Supervisor's `active` flag moves on these reports.
@@ -2479,18 +2160,15 @@ impl App {
     /// A lock that was asked for and did not happen: logged, pushed to `oblisk.rescue`, and reported
     /// (docs/adr/0052 decision 4).
     ///
-    /// `rescue` is the right channel and the ADR's reasoning is worth restating where the write
-    /// happens: a refused lock leaves the *ordinary* scene on the glass, so there is no lock screen
-    /// for the message to appear on, and `rescue` is rendered by the config's own surfaces. The
-    /// wrong-password case is the opposite and deliberately does not come here -- it happens with
-    /// the lock surfaces mapped and everything else hidden, so it reaches the config as `oblisk.lock`
-    /// state instead.
+    /// `rescue` is the right channel: a refused lock leaves the ordinary scene on the glass, so there
+    /// is no lock screen for the message to appear on, and `rescue` is rendered by the config's own
+    /// surfaces. The wrong-password case is the opposite and does not come here: it happens with the
+    /// lock surfaces mapped and everything else hidden, reaching the config as `oblisk.lock` instead.
     ///
-    /// Nothing clears this again on purpose. A later successful evaluation clears `rescue` on its
-    /// own success path (`RendererClient::handle_reevaluate`), which is exactly the event that
-    /// matters: the ordinary way out of `NO_LOCK_DECLARED` is editing the config to declare a lock
-    /// screen, and that edit *is* a re-evaluation. Clearing it on a subsequent successful lock
-    /// instead would stamp on an unrelated evaluation failure that had nothing to do with locking.
+    /// Nothing clears this again on purpose: a later successful evaluation clears `rescue` on its own
+    /// success path (`RendererClient::handle_reevaluate`), the event that matters -- the ordinary way
+    /// out of `NO_LOCK_DECLARED` is editing the config to declare a lock screen, which is itself a
+    /// re-evaluation.
     fn refuse_lock(&mut self, reason: &str) {
         eprintln!("[oblisk-renderer] the session lock was refused: {reason}");
         self.client.set_rescue_state(true, reason);
@@ -2549,12 +2227,11 @@ impl App {
 
         // § 6.1's `visible`. A panel declared `visible = false` is still created (docs/adr/0038
         // decision 2: `visible` maps and unmaps, it does not create and destroy). It still performs
-        // the initial commit directly above, which `get_layer_surface` requires before any configure
-        // arrives and which does not map anything on its own; what makes it invisible is that no
-        // buffer is ever attached, and `MapState::Unmapped` is what keeps `paint_surface` from
-        // attaching one. No *unmap* commit is needed or wanted here, since on an already-bufferless
-        // surface that is the protocol's re-map procedure rather than an unmap -- see
-        // [`App::remap`], which measured both sides of this distinction against a real compositor.
+        // the initial commit above, required by `get_layer_surface` before any configure arrives;
+        // what makes it invisible is that no buffer is ever attached, and `MapState::Unmapped` is
+        // what keeps `paint_surface` from attaching one. No unmap commit is needed here: on an
+        // already-bufferless surface that would be the protocol's re-map procedure, not an unmap --
+        // see [`App::remap`], which measured this against a real compositor.
         self.surfaces.push(TrackedSurface {
             role: TrackedRole::Panel { layer, spec: spec.clone(), output_size: instance.available },
             bound: None,
@@ -2589,15 +2266,14 @@ impl App {
     /// [`App::create_surfaces`]'s `popup` arm: the tracking entry always, the `xdg_popup` only if
     /// this popup is already shown (docs/adr/0049 decision 1, docs/adr/0051 decision 1).
     ///
-    /// The entry exists for [`App::create_window`]'s reason, restated by docs/adr/0051's
-    /// consequences: the instance is what makes the scene resolve the popup's tree at all, and
-    /// `visible` is read off that resolved tree. Twenty declared popups still cost twenty retained
-    /// nodes and zero Wayland objects, which is docs/adr/0049's memory claim intact.
+    /// The entry exists for [`App::create_window`]'s reason: it is what makes the scene resolve the
+    /// popup's tree, which `visible` is read off. Twenty declared popups still cost twenty retained
+    /// nodes and zero Wayland objects.
     ///
     /// A popup declared `visible = true` at startup with § 6.3's default `grab = true` is refused by
-    /// [`App::show_popup`] and says so once, which is correct rather than a startup failure: nothing
-    /// has been clicked, so there is no serial, and a dropdown that cannot be dismissed by clicking
-    /// outside it is worse than one that did not open (docs/adr/0049's amendment).
+    /// [`App::show_popup`] and says so once, which is correct, not a startup failure: nothing has been
+    /// clicked, so there is no serial, and a dropdown that cannot be dismissed by clicking outside it
+    /// is worse than one that did not open (docs/adr/0049's amendment).
     fn create_popup(&mut self, qh: &QueueHandle<App>, spec: &PopupSpec, instance: &SurfaceInstance, visible: bool) {
         self.surfaces.push(TrackedSurface {
             role: TrackedRole::Popup { popup: None, spec: spec.clone(), dismissed_at: None, refusal_logged: None },
@@ -2613,8 +2289,8 @@ impl App {
         }
     }
 
-    /// One `wl_output` appeared, changed, or went away (build-steps.md Phase 20 items 2 and 6).
-    /// Two jobs, one handler, because one event owes both.
+    /// One `wl_output` appeared, changed, or went away. Two jobs, one handler, because one event
+    /// owes both.
     ///
     /// First, the `screens` signal (docs/adr/0041 decision 2). Everything below is gated on that
     /// push reporting a real change: `update_output` also fires for things `screens` does not
@@ -2623,15 +2299,13 @@ impl App {
     ///
     /// Second, the instance set (docs/adr/0038 decision 3). A `monitor = "All"` declaration expands
     /// to one instance per output, so an output appearing adds an instance and one going away
-    /// removes it, **in place with no generation swap** -- plugging in a monitor is not a config
-    /// edit, and the set of *declared* surfaces has not moved.
+    /// removes it, in place with no generation swap -- plugging in a monitor is not a config edit.
     ///
-    /// Finally [`crate::socket::RendererClient::request_reload`], which is the other half and the
-    /// one this cannot do itself: a config that loops over `screens` declares genuinely different
-    /// surface ids before and after, which is a topology change and so a generation swap
-    /// (docs/adr/0041 decision 3). Only the Supervisor decides that. The two do not conflict --
-    /// a candidate builds its own surface set from its own evaluation, so whatever this reconciled
-    /// here is discarded along with the rest of this generation if a swap does happen.
+    /// Finally [`crate::socket::RendererClient::request_reload`], the half this cannot do itself: a
+    /// config that loops over `screens` declares genuinely different surface ids before and after,
+    /// which is a topology change and so a generation swap (docs/adr/0041 decision 3), decided only
+    /// by the Supervisor. The two do not conflict: a candidate builds its own surface set from its
+    /// own evaluation, so whatever this reconciled here is discarded if a swap does happen.
     ///
     /// ponytail: an output change landing inside a PBA Candidate's own ready window is not
     /// handled. `maybe_send_ready_signal` announces the surfaces this process will present exactly
@@ -2657,12 +2331,11 @@ impl App {
         for instance_id in &reconcile.removed {
             self.destroy_surface_by_id(instance_id);
         }
-        // A surviving *panel*'s `output_size` is the basis a `SizeMode::Percent` resolves against,
-        // so a mode change that resized the monitor under it has to move it -- `fresh` carries the
-        // output's *current* logical size, while the instance set deliberately keeps the size the
-        // compositor configured each surface to (see `reconcile_instances`). A `window` has no such
-        // field: § 6.2 gives it no size request, and the seed `expand_instances` hands its instance
-        // is superseded by the first configure.
+        // A surviving panel's `output_size` is the basis a `SizeMode::Percent` resolves against, so
+        // a mode change that resized the monitor under it has to move it -- `fresh` carries the
+        // output's current logical size, while the instance set keeps the size the compositor
+        // configured each surface to (see `reconcile_instances`). A `window` has no such field:
+        // § 6.2 gives it no size request.
         for instance in &fresh {
             if let Some(TrackedRole::Panel { output_size, .. }) =
                 self.surfaces.iter_mut().find(|s| s.surface_id == instance.instance_id).map(|s| &mut s.role)
@@ -2688,11 +2361,10 @@ impl App {
         let Some(bound) = self.surfaces[index].bound.take() else {
             return;
         };
-        // `eglDestroySurface`, by hand, because `khronos_egl::Surface` is a plain copyable handle
-        // with no `Drop` -- without this every unplugged monitor and every closed window leaks one
-        // EGL surface. It has to come before the `wl_egl_window` is destroyed, since
-        // [`BoundSurface`]'s own contract is that the `WlEglSurface` outlives the EGL surface built
-        // from it.
+        // `eglDestroySurface`, by hand: `khronos_egl::Surface` is a plain copyable handle with no
+        // `Drop`, so without this every unplugged monitor and closed window leaks one EGL surface.
+        // Must come before the `wl_egl_window` is destroyed, per [`BoundSurface`]'s contract that
+        // the `WlEglSurface` outlives the EGL surface built from it.
         if let Err(err) = self.egl.instance.destroy_surface(self.egl.display, bound.egl_surface) {
             log_bind_failure(&self.surfaces[index].surface_id, "eglDestroySurface", err);
         }
@@ -2703,22 +2375,21 @@ impl App {
 
     /// Destroys one surface instance: its role object, its `wl_surface`, its `wl_egl_window`, and
     /// its EGL surface (docs/adr/0038 decision 3's removal half). A no-op for an id this process has
-    /// no surface for, which is the normal case for the second of the two events an unplugged
-    /// monitor produces -- `zwlr_layer_surface_v1::closed` and `OutputHandler::output_destroyed`
-    /// both arrive, in either order, and whichever comes first does the work.
+    /// no surface for, the normal case for the second of the two events an unplugged monitor
+    /// produces -- `zwlr_layer_surface_v1::closed` and `OutputHandler::output_destroyed` both arrive,
+    /// in either order, and whichever comes first does the work.
     ///
-    /// Teardown runs outermost-first, and the explicit steps below are what make that so rather
-    /// than leaving it to field order (`TrackedSurface` declares `role` before `bound`, so a plain
-    /// drop would destroy the `wl_surface` out from under the `wl_egl_window` still pointing at it):
+    /// Teardown runs outermost-first, and the explicit steps below are what make that so rather than
+    /// leaving it to field order (`TrackedSurface` declares `role` before `bound`, so a plain drop
+    /// would destroy the `wl_surface` out from under the `wl_egl_window` still pointing at it):
     ///
-    /// 0. Every popup rooted under this surface ([`App::drop_child_popups`]), because xdg-shell
-    ///    refuses to destroy an `xdg_surface` that still has one.
+    /// 0. Every popup rooted under this surface ([`App::drop_child_popups`]): xdg-shell refuses to
+    ///    destroy an `xdg_surface` that still has one.
     /// 1. `eglDestroySurface`, by hand ([`App::release_bound`]).
     /// 2. `BoundSurface`'s drop, which is `wl_egl_window_destroy` (also `release_bound`).
-    /// 3. The role object's drop, which destroys the role (`zwlr_layer_surface_v1`, or an
-    ///    `xdg_toplevel` preceded by its decoration object) and then the `wl_surface`, in that
-    ///    order -- both protocols require it and `smithay_client_toolkit` implements it, so it is
-    ///    not this function's job.
+    /// 3. The role object's drop, destroying the role (`zwlr_layer_surface_v1`, or an `xdg_toplevel`
+    ///    preceded by its decoration object) and then the `wl_surface`, in that order -- both
+    ///    protocols require it and SCTK implements it.
     fn destroy_surface_by_id(&mut self, instance_id: &str) {
         let Some(index) = self.surfaces.iter().position(|s| s.surface_id == instance_id) else {
             return;
@@ -2737,30 +2408,26 @@ impl App {
     /// derive the exclusive zone from it, bind EGL if this surface has not been bound yet, and
     /// paint.
     ///
-    /// PBA candidate mode (`self.is_pba_candidate`, build-steps.md Phase 14, § 15.2 points 2-3)
-    /// stops after the null buffer instead: a first configure commits a null buffer directly on
-    /// the raw `wl_surface` rather than binding EGL at all -- the Candidate stays invisible,
-    /// occupying zero on-screen coordinates, until [`App::activate_draw`] does the real EGL bind
-    /// later.
+    /// PBA candidate mode (`self.is_pba_candidate`, § 15.2 points 2-3) stops after the null buffer
+    /// instead: a first configure commits a null buffer directly on the raw `wl_surface` rather
+    /// than binding EGL at all -- the Candidate stays invisible, occupying zero on-screen
+    /// coordinates, until [`App::activate_draw`] does the real EGL bind later.
     ///
-    /// Role-agnostic since build-steps.md Phase 22 item 1, and that is the ADR-0040 decision 4
-    /// claim made literal: xdg-shell's initial-commit discipline is `zwlr_layer_surface_v1`'s, so
-    /// an `xdg_toplevel` configure lands here through the same path with nothing branching on which
-    /// protocol asked. The two callers differ only in where the size comes from -- layer-shell
-    /// hands one over, and a toplevel's may be the client's to pick (see [`toplevel_size_for`]).
+    /// Role-agnostic: xdg-shell's initial-commit discipline is `zwlr_layer_surface_v1`'s
+    /// (ADR-0040 decision 4), so an `xdg_toplevel` configure lands here through the same path with
+    /// nothing branching on which protocol asked. The two callers differ only in where the size
+    /// comes from -- layer-shell hands one over, a toplevel's may be the client's to pick (see
+    /// [`toplevel_size_for`]).
     fn bind_and_clear(&mut self, index: usize, width: u32, height: u32) {
         self.surfaces[index].configured_size = (width, height);
-        // Only here does a real size for this instance exist (build-steps.md Phase 20 item 4,
-        // closing docs/adr/0023 item 6): the startup resolve used the whole output's size, and
-        // this replaces it with what the compositor actually granted, marking the scene dirty so
-        // the next poll turn re-resolves against it.
+        // Only here does a real size for this instance exist: the startup resolve used the whole
+        // output's size, and this replaces it with what the compositor actually granted, marking
+        // the scene dirty so the next poll turn re-resolves against it.
         //
-        // So the `paint_surface` at the bottom of this function draws the *previous* resolve, and
-        // `run`'s loop repaints with the corrected one on the very next turn -- `dispatch_pending`
-        // and `re_resolve_if_dirty` are two statements apart, so that is sub-frame, not a visible
-        // lag. Re-resolving here instead would run one whole `Scene::apply` per configure in a
-        // startup burst rather than one for the burst, which is the coalescing ADR-0044 decision 2
-        // built the flag for.
+        // So `paint_surface` below draws the previous resolve, and `run`'s loop repaints with the
+        // corrected one on the very next turn -- sub-frame, not a visible lag. Re-resolving here
+        // instead would run one whole `Scene::apply` per configure in a startup burst rather than
+        // one for the burst, the coalescing ADR-0044 decision 2 built the flag for.
         self.client.set_instance_size(
             &self.surfaces[index].surface_id,
             layout::LogicalSize { width: width as f32, height: height as f32 },
@@ -2774,10 +2441,10 @@ impl App {
         }
         self.apply_exclusive_zone(index);
         // The other half of the poll loop's `re_resolve_if_dirty` hook, reached from the other
-        // direction. It matters most on the *first* configure: no input region has ever been set
-        // at that point, and a fullscreen transparent panel whose configured size happens to equal
-        // its output's marks the scene clean, so no later re-resolve would arrive to set one and
-        // the surface would swallow every click meant for the window behind it.
+        // direction. Matters most on the first configure: no input region has ever been set at
+        // that point, and a fullscreen transparent panel whose configured size equals its output's
+        // marks the scene clean, so no later re-resolve would set one and the surface would
+        // swallow every click meant for the window behind it.
         self.apply_resolved_state(index);
 
         if self.is_pba_candidate {
@@ -2797,22 +2464,19 @@ impl App {
                 // only commit that can carry the state staged directly above.
                 surface.commit();
             } else {
-                // `visible = false`: no buffer was ever attached, so this surface is *already* in
-                // the invisible state § 15.2 point 3 asks a Candidate to reach, and committing it
-                // is exactly the protocol's re-map procedure. Marked staged without touching the
-                // wire, so `maybe_send_ready_signal`'s "every surface has staged" gate still
-                // completes -- the surface is then filtered out of the announced set itself, by
-                // `presenting_surface_ids`.
+                // `visible = false`: no buffer was ever attached, so this surface is already in
+                // the invisible state § 15.2 point 3 asks a Candidate to reach. Marked staged
+                // without touching the wire, so `maybe_send_ready_signal`'s gate still completes --
+                // the surface is filtered out of the announced set by `presenting_surface_ids`.
                 self.surfaces[index].null_buffered = true;
             }
             self.maybe_send_ready_signal();
             return;
         }
 
-        // `!= Mapped` rather than "is unmapped": `apply_resolved_state` directly above may have
-        // just issued a *re-map* commit, and the protocol's own wait applies to that too -- the
-        // configure answering it has not arrived yet, so no buffer may be attached in this pass.
-        // The unmapped case additionally takes deliberately no commit here: see [`App::unmap`].
+        // `!= Mapped`, not "is unmapped": `apply_resolved_state` above may have just issued a
+        // re-map commit, and the protocol's wait applies to that too -- the configure answering it
+        // has not arrived, so no buffer may be attached this pass. See [`App::unmap`].
         if self.surfaces[index].map_state != MapState::Mapped {
             return;
         }
@@ -2822,11 +2486,10 @@ impl App {
         }
         // A repeat configure carrying a new size (a mode change, an exclusive zone shifting a
         // neighbour) has to move the `wl_egl_window` too, or the surface keeps rendering into a
-        // buffer sized at its first configure while the canvas draws at the new one. This is
-        // `wayland-egl`'s own resize request, not a rebind: the `WlEglSurface` and the EGL surface
-        // built from it both stay valid. It went unnoticed before docs/adr/0038 only because the
-        // one surface that drew anything drew a fixed proof string; the resized frame is real
-        // content now.
+        // buffer sized at its first configure. This is `wayland-egl`'s own resize request, not a
+        // rebind: the `WlEglSurface` and the EGL surface built from it both stay valid. It went
+        // unnoticed before docs/adr/0038 because the one surface that drew anything drew a fixed
+        // proof string; the resized frame is real content now.
         if let Some(bound) = self.surfaces[index].bound.as_ref() {
             bound.native_window.resize(width.max(1) as i32, height.max(1) as i32, 0, 0);
         }
@@ -2837,22 +2500,19 @@ impl App {
     /// [`exclusive_zone_for`]) for a surface the config marked `exclusive`, and an explicit `0`
     /// for one it did not.
     ///
-    /// The explicit `0` is what changed with build-steps.md Phase 20 item 1. This used to leave a
-    /// non-exclusive surface alone entirely, on the correct-at-the-time reasoning that the
-    /// protocol's default zone is already 0 -- true only while `exclusive` could never change.
-    /// It is a `Signal`-bindable property (docs/adr/0038 decision 2 lists the exclusive zone among
-    /// the fields layer-shell accepts on a live surface), so a dock turning `exclusive = false`
-    /// has to *take back* the zone it previously reserved, and the default is no help once a real
-    /// value has been sent.
+    /// The explicit `0` matters: this used to leave a non-exclusive surface alone entirely, on the
+    /// reasoning that the protocol's default zone is already 0 -- true only while `exclusive` could
+    /// never change. It is a `Signal`-bindable property (docs/adr/0038 decision 2), so a dock
+    /// turning `exclusive = false` has to take back the zone it previously reserved, and the
+    /// default is no help once a real value has been sent.
     ///
-    /// Stages only; the caller's commit carries it. Committing here would have been wrong in two
-    /// separate ways once `visible` landed: it would split one surface update across several
-    /// commits, and on an unmapped surface a commit with no buffer attached is the protocol's own
-    /// re-map procedure (see [`App::unmap`]).
+    /// Stages only; the caller's commit carries it. Committing here would split one surface update
+    /// across several commits, and on an unmapped surface a commit with no buffer attached is the
+    /// protocol's own re-map procedure (see [`App::unmap`]).
     ///
-    /// A no-op on a `window`, and the protocol is why rather than an omission: an exclusive zone is
-    /// `zwlr_layer_surface_v1`'s own request, and a toplevel reserves no screen area -- reserving
-    /// space is what makes a surface a shell component instead of a window (§ 6.1, § 6.2).
+    /// A no-op on a `window`: an exclusive zone is `zwlr_layer_surface_v1`'s own request, and a
+    /// toplevel reserves no screen area -- reserving space is what makes a surface a shell component
+    /// instead of a window (§ 6.1, § 6.2).
     fn apply_exclusive_zone(&mut self, index: usize) {
         let tracked = &self.surfaces[index];
         let TrackedRole::Panel { layer, spec, .. } = &tracked.role else {
@@ -2864,7 +2524,7 @@ impl App {
 
     /// [`App::apply_resolved_state`] for every tracked surface, which is what the poll loop calls
     /// after a re-resolve actually changed the retained scene. Every surface, not the changed
-    /// ones, for exactly the reason [`App::repaint_bound_surfaces`] gives: ADR-0044 decision 2's
+    /// ones, for exactly the reason [`App::repaint_mapped_surfaces`] gives: ADR-0044 decision 2's
     /// dirty flag is one flag for the whole scene.
     fn apply_resolved_surface_state(&mut self) {
         for index in 0..self.surfaces.len() {
@@ -2874,30 +2534,26 @@ impl App {
 
     /// Pushes one surface's freshly resolved root back to the compositor: the protocol fields its
     /// role permits changing on a live object, the input region, and whether the surface is shown
-    /// at all (docs/adr/0038 decision 2, docs/adr/0049 decisions 1-2, § 6.1's `visible` and
-    /// `margin` rows, § 6.2's `title` row, build-steps.md Phase 20 items 1 and 5 and Phase 22
-    /// items 1 and 5).
+    /// at all (docs/adr/0038 decision 2, docs/adr/0049 decisions 1-2).
     ///
-    /// **This is where a `window`'s authoritative [`WindowSpec`] is derived, and the "resolved" is
-    /// the whole point** (docs/adr/0049's second amendment). `crate::socket`'s `surface_specs`
-    /// parses the *unresolved* properties, which is right for a `panel`'s topology fields -- they
-    /// reject a `Signal` on purpose, because `get_layer_surface` fixes them at creation. A
-    /// `window`'s `title` is the opposite case: § 6.2 spells it as `string`/`Signal` precisely so it
-    /// can move, and parsing it at evaluation time would freeze it at whatever the file last saw.
-    /// `tree.properties` here is a `resolve_properties` result, so every `Signal` in it has already
-    /// been read exactly once for this pass (ADR-0044 decision 1) -- one read, at the one point the
-    /// surface is being reconciled, which is the same read `visible` and the input region below use.
+    /// This is where a `window`'s authoritative [`WindowSpec`] is derived, and "resolved" is the
+    /// whole point (docs/adr/0049's second amendment). `crate::socket::surface_specs` parses the
+    /// unresolved properties, which is right for a `panel`'s topology fields -- they reject a
+    /// `Signal` on purpose, since `get_layer_surface` fixes them at creation. A `window`'s `title`
+    /// is the opposite case: § 6.2 spells it as `string`/`Signal` precisely so it can move, and
+    /// parsing it at evaluation time would freeze it at whatever the file last saw. `tree.properties`
+    /// here is a `resolve_properties` result, so every `Signal` in it has already been read exactly
+    /// once for this pass (ADR-0044 decision 1) -- the same read `visible` and the input region
+    /// below use.
     ///
-    /// All three pushes are double-buffered `wl_surface` state and are therefore *staged* here, not
+    /// All three pushes are double-buffered `wl_surface` state and are therefore staged here, not
     /// committed: the caller's commit -- `paint_surface`'s `swap_buffers` on a mapped surface, the
-    /// candidate branch's own commit on a staging Candidate -- carries the whole update at once.
-    /// The exceptions are the map, unmap, create and destroy transitions, which are commits (or
-    /// object lifetimes) by definition and perform their own.
+    /// candidate branch's own commit on a staging Candidate -- carries the whole update at once. The
+    /// exceptions are the map, unmap, create and destroy transitions, which are commits by definition.
     ///
-    /// The spec push runs **before** `apply_visibility`, and for a `window` that ordering is
-    /// load-bearing rather than incidental: a `visible` flip from false to true creates the
-    /// `xdg_toplevel` out of the stored spec, so the spec has to be this pass's before the object
-    /// is built from it.
+    /// The spec push runs before `apply_visibility`, and for a `window` that ordering is load-bearing:
+    /// a `visible` flip from false to true creates the `xdg_toplevel` out of the stored spec, so the
+    /// spec must be this pass's before the object is built from it.
     fn apply_resolved_state(&mut self, index: usize) {
         let surface_id = self.surfaces[index].surface_id.clone();
         // Owned, so the immutable borrow of `self.client` ends before the `&mut self` calls below.
@@ -2924,13 +2580,12 @@ impl App {
                 ),
             },
             TrackedRole::Popup { .. } => match node::popup_spec(&tree.properties) {
-                // A store, not a diff, and the protocol is why: every field on a `PopupSpec` is an
-                // `xdg_positioner` request, the positioner is consumed by `get_popup`, and
-                // `xdg_popup.reposition` is deliberately not built. So there is nothing to send at
-                // a live popup and nothing a diff could find -- what this push buys is that the
-                // *next* `show_popup` builds its positioner from this pass's `anchor_rect`, which
-                // is the whole of docs/adr/0049's second amendment. The click that opens a dropdown
-                // writes the button's rect to a `state` signal on the same turn this reads it.
+                // A store, not a diff: every field on a `PopupSpec` is an `xdg_positioner` request
+                // consumed by `get_popup`, and `xdg_popup.reposition` is not built. So there is
+                // nothing to send at a live popup -- what this push buys is that the next
+                // `show_popup` builds its positioner from this pass's `anchor_rect` (docs/adr/0049's
+                // second amendment). The click that opens a dropdown writes the button's rect to a
+                // `state` signal on the same turn this reads it.
                 Ok(fresh) => {
                     if let TrackedRole::Popup { spec, .. } = &mut self.surfaces[index].role {
                         *spec = fresh;
@@ -2940,21 +2595,15 @@ impl App {
                     "[oblisk-renderer] {surface_id}: re-resolved popup properties are invalid, keeping the last applied ones: {err}"
                 ),
             },
-            // Nothing to push, and § 6.4 is the reason rather than an omission. A lock surface has
-            // no protocol field a config could set: `ext_session_lock_surface_v1` has exactly one
-            // request, `ack_configure`, and the size arrives in the configure rather than being
-            // asked for, so a re-parsed `LockSpec` would carry an `id` this surface already has and
-            // nothing else to send.
+            // Nothing to push, and § 6.4 is why, not an omission: a lock surface has no protocol
+            // field a config could set (`ext_session_lock_surface_v1` has exactly one request,
+            // `ack_configure`, and the size arrives in the configure rather than being asked for).
             //
-            // The create path *does* call `node::lock_spec`, through [`resolved_surface_spec`], and
-            // the two are not in disagreement: that call exists to rebuild a `SurfaceSpec` for
-            // `create_surfaces` to dispatch its four-arm `match` on, and its `Err` is what makes a
-            // `lock` whose resolved properties are invalid fall back to the roster rather than being
-            // created from them. Here there is no `match` to feed and no object to create, so the
-            // parse would produce a value with no consumer. What does still run for a lock is
-            // everything past this match: the input region, computed from the same resolved tree as
-            // any other surface's, and `apply_visibility`, which deliberately does nothing for this
-            // role.
+            // The create path does call `node::lock_spec`, through [`resolved_surface_spec`], but
+            // not in disagreement: that call rebuilds a `SurfaceSpec` for `create_surfaces`'s
+            // four-arm `match`, with no equivalent here to feed. What does still run for a lock is
+            // everything past this match: the input region, and `apply_visibility`, which
+            // deliberately does nothing for this role.
             TrackedRole::Lock { .. } => {}
         }
         self.apply_input_region(index, &tree);
@@ -2982,11 +2631,11 @@ impl App {
             layer.set_keyboard_interactivity(keyboard_interactivity_for(mode));
         }
         if let Some(size) = update.size {
-            // The same guard `create_panel` runs, and it has to run again here rather than only
-            // at creation: `width`/`height` are ordinary resolvable properties, so a `Signal` can
-            // turn a fixed height into `"Fill"` at runtime, and a `set_size` of 0 on a singly
-            // anchored axis is a protocol error that kills the connection and the whole shell with
-            // it (see [`ambiguous_zero_axis`]).
+            // The same guard `create_panel` runs, and it must run again here, not only at
+            // creation: `width`/`height` are resolvable properties, so a `Signal` can turn a fixed
+            // height into `"Fill"` at runtime, and a `set_size` of 0 on a singly anchored axis is a
+            // protocol error that kills the connection and the whole shell (see
+            // [`ambiguous_zero_axis`]).
             if let Some(axis) = ambiguous_zero_axis(size, fresh.topology.anchor) {
                 eprintln!(
                     "[oblisk-renderer] surface {:?} resolved to a {axis} of 0 without anchoring both {axis} edges, \
@@ -3014,14 +2663,12 @@ impl App {
     }
 
     /// Diffs one toplevel's freshly resolved `window` spec against the one its `xdg_toplevel` state
-    /// was last set from and sends only what moved (§ 6.2, build-steps.md Phase 22 item 1; see
-    /// [`window_update`] for which fields and why all of them qualify).
+    /// was last set from and sends only what moved (§ 6.2; see [`window_update`] for which fields).
     ///
-    /// Sends nothing while the window is not shown, and stores the spec anyway. That is not a
-    /// dropped update: `visible = false` means there is no `xdg_toplevel` to send a request to
-    /// (docs/adr/0049 decision 1), and [`App::show_window`] builds the next one out of exactly this
-    /// stored spec. So a `title` that changed three times while the window was closed opens with
-    /// the third one.
+    /// Sends nothing while the window is not shown, and stores the spec anyway -- not a dropped
+    /// update: `visible = false` means there is no `xdg_toplevel` to send a request to (docs/adr/0049
+    /// decision 1), and [`App::show_window`] builds the next one out of exactly this stored spec. So
+    /// a `title` that changed three times while closed opens with the third one.
     fn apply_window_change(&mut self, index: usize, fresh: WindowSpec) {
         let TrackedRole::Window { window, spec: applied } = &mut self.surfaces[index].role else {
             return;
@@ -3048,30 +2695,25 @@ impl App {
         }
     }
 
-    /// `wl_surface::set_input_region` from this surface's own resolved tree (§ 5.1,
-    /// docs/adr/0038 decision 5, build-steps.md Phase 20 item 5), closing docs/adr/0023 item 5.
+    /// `wl_surface::set_input_region` from this surface's own resolved tree (§ 5.1, docs/adr/0038
+    /// decision 5).
     ///
     /// Per surface, not for one overlay. Three cases fall out of the same code rather than needing
-    /// three branches, which is the generalization the ADR asks for: a root with no visible
-    /// children yields an empty region and every click passes through to whatever is behind it
-    /// (the boot-time empty region the deleted `create_overlay_canvas` set, now the ordinary
-    /// answer for any surface with nothing drawn in it); a root whose child fills it yields a
-    /// region covering the surface, which is what the protocol default already is, so a tightly
-    /// sized bar is a no-op and deliberately gets no special case; and anything in between -- a
-    /// fullscreen transparent panel holding one small OSD -- gets exactly its visible content.
+    /// three branches: a root with no visible children yields an empty region, so every click
+    /// passes through to whatever is behind it; a root whose child fills it yields a region
+    /// covering the surface, the protocol default already, so a tightly sized bar is a no-op; and
+    /// anything in between -- a fullscreen transparent panel holding one small OSD -- gets exactly
+    /// its visible content.
     ///
-    /// The scale is `1.0`, matching `paint_surface`'s for the same reason its `ponytail:` gives:
-    /// nothing calls `set_buffer_scale`, so surface-local coordinates and the framebuffer are both
-    /// at scale 1, and passing a real scale here alone would put the input region on a physical
-    /// grid the drawn content is not on.
+    /// The scale is `1.0`, matching `paint_surface`'s for the same reason: nothing calls
+    /// `set_buffer_scale`, so surface-local coordinates and the framebuffer are both at scale 1.
     ///
     /// Not diffed against the last region pushed, unlike the spec fields: this only runs when the
-    /// scene actually re-resolved, and the full GPU repaint that follows on the same turn costs
-    /// orders of magnitude more than one `wl_region` round of requests.
+    /// scene actually re-resolved, and the full GPU repaint that follows costs orders of magnitude
+    /// more than one `wl_region` round of requests.
     ///
-    /// Skipped for a `window` that is not shown, which is the only role-aware line in it: there is
-    /// no `wl_surface` to set a region on, and [`App::show_window`]'s first re-resolve after the
-    /// window opens sets one.
+    /// Skipped for a `window` that is not shown: there is no `wl_surface` to set a region on, and
+    /// [`App::show_window`]'s first re-resolve after the window opens sets one.
     fn apply_input_region(&mut self, index: usize, tree: &layout::ResolvedNode) {
         let Some(surface) = self.surfaces[index].role.wl_surface().cloned() else {
             return;
@@ -3079,10 +2721,10 @@ impl App {
         let region = match Region::new(&self.compositor_state) {
             Ok(region) => region,
             Err(e) => {
-                // Not fatal, unlike `create_overlay_canvas`'s version of this: the only failure
-                // `Region::new` reports is a missing `wl_compositor`, which cannot happen here
-                // because `CompositorState::bind` in `run` already succeeded against it. Killing
-                // a working shell over an unreachable branch is the worse trade.
+                // Not fatal: the only failure `Region::new` reports is a missing `wl_compositor`,
+                // which cannot happen here since `CompositorState::bind` in `run` already
+                // succeeded against it. Killing a working shell over an unreachable branch is the
+                // worse trade.
                 log_bind_failure(&self.surfaces[index].surface_id.clone(), "wl_compositor::create_region", e);
                 return;
             }
@@ -3092,31 +2734,25 @@ impl App {
         }
         surface.set_input_region(Some(region.wl_region()));
         // `region` drops here, destroying the `wl_region` -- `wl_surface::set_input_region` copies
-        // its contents, so the object has no reason to outlive the request. Same shape the deleted
-        // `create_overlay_canvas` used.
+        // its contents, so the object has no reason to outlive the request.
     }
 
     /// Applies § 5.1's `visible` to a live surface, by whichever mechanism the role's lifetime rule
     /// calls for (docs/adr/0038 decision 2, docs/adr/0049 decisions 1-2).
     ///
-    /// **The same Lua-facing property, two different mechanics underneath, and this is the one
-    /// function where that divergence lives.** A `panel`'s Wayland object outlives every flip, so
+    /// The same Lua-facing property, two different mechanics underneath, and this is the one
+    /// function where that divergence lives. A `panel`'s Wayland object outlives every flip, so
     /// `visible` is a map or an unmap commit. A `window`'s exists only while shown, so `visible` is
-    /// a create or a destroy. Nothing new drives either: a `state` write marks the scene dirty
-    /// (ADR-0044 decision 5), the poll loop re-resolves, and `apply_resolved_state` calls this with
-    /// whatever the fresh tree says.
+    /// a create or a destroy.
     ///
-    /// **Frozen for a PBA Candidate**, and that is the one line in this file where a mistake hangs
-    /// the shell rather than failing a test. `maybe_send_ready_signal` announces the surfaces this
-    /// process will present and `activate_draw` draws exactly that set; if `visible` could move
-    /// between those two points -- and it can, since § 15.2 point 2 hydrates a Candidate with
-    /// cached capability state precisely in that window -- the announced set and the drawn set
-    /// would disagree, which is either an `evidence_timeout` hang or a `PbaFailure::
-    /// UnexpectedEvidence` abort (see [`presenting_surface_ids`]). Freezing makes them agree by
-    /// construction rather than by two functions being kept in step by hand. The deferred change
-    /// applies on the first re-resolve after promotion clears `is_pba_candidate`, which is the
-    /// next capability push; a Candidate's whole life is the handshake, so there is nothing else
-    /// that window could be for.
+    /// Frozen for a PBA Candidate, and that is the one line in this file where a mistake hangs the
+    /// shell rather than failing a test. `maybe_send_ready_signal` announces the surfaces this process
+    /// will present and `activate_draw` draws exactly that set; if `visible` could move between those
+    /// two points -- and it can, since § 15.2 point 2 hydrates a Candidate with cached capability
+    /// state precisely in that window -- the announced and drawn sets would disagree, which is either
+    /// an `evidence_timeout` hang or a `PbaFailure::UnexpectedEvidence` abort (see
+    /// [`presenting_surface_ids`]). Freezing makes them agree by construction. The deferred change
+    /// applies on the first re-resolve after promotion clears `is_pba_candidate`.
     fn apply_visibility(&mut self, index: usize, visible: bool) {
         if self.is_pba_candidate {
             return;
@@ -3138,19 +2774,16 @@ impl App {
                 (MapState::AwaitingConfigure | MapState::Mapped, false) => self.hide_window(index),
                 _ => {}
             },
-            // Its own function rather than a third arm of the same `map_state` match, because a
-            // popup answers on two inputs and not one: docs/adr/0051 decision 2's latch is the
-            // second, and a dismissed popup sits in `MapState::Unmapped` with `visible` still true
-            // -- a state the other two roles never reach.
+            // Its own function, not a third `map_state` arm: a popup answers on two inputs, not
+            // one -- docs/adr/0051 decision 2's latch is the second, and a dismissed popup sits in
+            // `MapState::Unmapped` with `visible` still true, a state the other two roles never reach.
             TrackedRole::Popup { .. } => self.apply_popup_visibility(index, visible),
-            // The one role where `visible` is not a property at all. `layout::node::lock_spec`
-            // refuses the key outright, so the `true` this is called with is `parse_visible`'s
-            // default and not something the config said. A lock surface's lifetime is the
-            // compositor's from end to end -- created once `locked` arrives, destroyed at
-            // `unlock_and_destroy` -- and between those two points the protocol requires one on
-            // every output, so acting on a `visible` here could only destroy a surface the
-            // compositor is still showing and make it fall back to a solid colour (docs/adr/0042,
-            // docs/adr/0052 decision 2).
+            // The one role where `visible` is not a property at all: `layout::node::lock_spec`
+            // refuses the key, so the `true` this is called with is `parse_visible`'s default. A
+            // lock surface's lifetime is the compositor's end to end -- created once `locked`
+            // arrives, destroyed at `unlock_and_destroy` -- so acting on `visible` here could only
+            // destroy a surface the compositor is still showing (docs/adr/0042, docs/adr/0052
+            // decision 2).
             TrackedRole::Lock { .. } => {}
         }
     }
@@ -3158,15 +2791,14 @@ impl App {
     /// [`App::apply_visibility`]'s `popup` arm (docs/adr/0049 decision 2, docs/adr/0051 decision 2).
     ///
     /// The decision itself is [`popup_visibility_action`], which is pure and tested; this is the
-    /// writes it does not make. The latch clear is one of them, and it is unconditional on the
-    /// `visible = false` edge rather than paired with a `Destroy`: a popup the compositor dismissed
-    /// is already objectless, so the false edge that reopens its path is exactly the one where
-    /// there is nothing left to destroy.
+    /// writes it does not make. The latch clear is unconditional on the `visible = false` edge rather
+    /// than paired with a `Destroy`: a popup the compositor dismissed is already objectless, so the
+    /// false edge that reopens its path is exactly the one where there is nothing left to destroy.
     ///
     /// That edge is kept even though docs/adr/0051's first amendment made it no longer the only way
-    /// out of the latch. It is still correct and still the ordinary case: a config whose
-    /// `on_dismiss` writes `visible = false` reopens the path on the turn it does so, without
-    /// waiting for the pointer count to move.
+    /// out of the latch: it is still the ordinary case, since a config whose `on_dismiss` writes
+    /// `visible = false` reopens the path on the turn it does so, without waiting for the pointer
+    /// count to move.
     fn apply_popup_visibility(&mut self, index: usize, visible: bool) {
         let TrackedRole::Popup { popup, dismissed_at, .. } = &self.surfaces[index].role else {
             return;
@@ -3187,28 +2819,26 @@ impl App {
     }
 
     /// Creates this window's `xdg_toplevel` and performs the initial commit `xdg_surface` requires
-    /// (§ 6.2, docs/adr/0040 decisions 4 and 5, docs/adr/0049 decision 1, build-steps.md Phase 22
-    /// items 1 and 4).
+    /// (§ 6.2, docs/adr/0040 decisions 4 and 5, docs/adr/0049 decision 1).
     ///
-    /// The whole sequence is the layer-shell one with a different constructor, which is exactly what
-    /// ADR-0040 decision 4 predicted: create the surface, send the role's state, commit with **no
-    /// buffer attached**, and wait for the configure before anything may be drawn. `MapState::
-    /// AwaitingConfigure` is that wait, shared verbatim with the panel path.
+    /// The whole sequence is the layer-shell one with a different constructor: create the surface,
+    /// send the role's state, commit with no buffer attached, and wait for the configure before
+    /// anything may be drawn. `MapState::AwaitingConfigure` is that wait, shared verbatim with the
+    /// panel path.
     ///
-    /// SCTK does the two things it would be easy to get wrong here. It acks each `xdg_surface.
-    /// configure` itself, through the wrapping `xdg_surface` rather than the role object
-    /// (`shell/xdg/window/inner.rs`'s `Dispatch2<XdgSurface, _>`), so nothing in this file acks;
-    /// and `XdgShell::bind` already picked up `zxdg_decoration_manager_v1` alongside `xdg_wm_base`,
-    /// so `WindowDecorations::RequestServer` plus [`Window::request_decoration_mode`] is the whole
-    /// of build-steps.md Phase 22 item 4 and there is no second global to bind.
+    /// SCTK does two things it would be easy to get wrong here. It acks each `xdg_surface.configure`
+    /// itself, through the wrapping `xdg_surface` rather than the role object
+    /// (`shell/xdg/window/inner.rs`'s `Dispatch2<XdgSurface, _>`), so nothing in this file acks; and
+    /// `XdgShell::bind` already picked up `zxdg_decoration_manager_v1` alongside `xdg_wm_base`, so
+    /// `WindowDecorations::RequestServer` plus [`Window::request_decoration_mode`] is the whole of
+    /// decoration handling and there is no second global to bind.
     ///
     /// No `set_window_geometry`: `xdg_surface`'s own default is the bounding box of the surface and
     /// its subsurfaces, this shell draws its content edge to edge with no client-side shadow to
-    /// exclude, and there are no subsurfaces. Sending the default back would be ceremony.
+    /// exclude, and there are no subsurfaces.
     ///
-    /// A compositor with no xdg-shell leaves the window unbuilt, logged once per attempt: not
-    /// fatal, on the same "keep the shell up" principle every other failure in this file follows --
-    /// the panels still paint.
+    /// A compositor with no xdg-shell leaves the window unbuilt, logged once per attempt: not fatal,
+    /// on the same "keep the shell up" principle every other failure in this file follows.
     fn show_window(&mut self, qh: &QueueHandle<App>, index: usize) {
         let Some(xdg_shell) = self.xdg_shell.as_ref() else {
             eprintln!(
@@ -3224,11 +2854,11 @@ impl App {
 
         let surface = self.compositor_state.create_surface(qh);
         let window = xdg_shell.create_window(surface, WindowDecorations::RequestServer, qh);
-        // Asked for explicitly as well as through `WindowDecorations::RequestServer`, because the
-        // two reach different objects: the constructor argument decides whether a
-        // `zxdg_toplevel_decoration_v1` is created at all, and this is the `set_mode` on it. Whatever
-        // the compositor answers with is accepted -- `WindowHandler::configure` logs a client-side
-        // grant and carries on undecorated rather than faking a frame (ADR-0040 decision 4, § 6.2).
+        // Asked for explicitly as well as through `WindowDecorations::RequestServer`: the two reach
+        // different objects, the constructor argument decides whether a
+        // `zxdg_toplevel_decoration_v1` is created at all, and this is the `set_mode` on it.
+        // Whatever the compositor answers with is accepted -- `WindowHandler::configure` logs a
+        // client-side grant and carries on undecorated rather than faking a frame.
         window.request_decoration_mode(Some(DecorationMode::Server));
         window.set_title(spec.title.clone());
         window.set_app_id(spec.app_id.clone());
@@ -3253,11 +2883,10 @@ impl App {
     /// Destroys this window's `xdg_toplevel` and everything hanging off it, leaving the tracking
     /// entry behind so a later `visible = true` can build a fresh one (docs/adr/0049 decision 1).
     ///
-    /// Teardown order is [`App::destroy_surface_by_id`]'s, reused rather than restated: EGL surface
-    /// by hand, then the `wl_egl_window`, then the role object. Dropping the [`Window`] handle is
-    /// that last step -- `smithay_client_toolkit`'s `WindowInner::drop` destroys the decoration
-    /// object, then the `xdg_toplevel`, then the `xdg_surface`, then the `wl_surface`, which is the
-    /// order xdg-shell requires and not this function's to re-derive.
+    /// Teardown order is [`App::destroy_surface_by_id`]'s: EGL surface by hand, then the
+    /// `wl_egl_window`, then the role object. Dropping the [`Window`] handle is that last step --
+    /// SCTK's `WindowInner::drop` destroys the decoration object, then the `xdg_toplevel`, then the
+    /// `xdg_surface`, then the `wl_surface`, the order xdg-shell requires.
     ///
     /// `configured_size` is cleared with the binding (inside `release_bound`), because the next
     /// toplevel gets its own configure and must not paint into a stale one.
@@ -3276,28 +2905,25 @@ impl App {
     }
 
     /// Creates this popup's `xdg_positioner` and `xdg_popup`, roots it under one parent instance,
-    /// takes the grab if § 6.3 asked for one, and performs the initial commit (§ 6.3,
-    /// docs/adr/0040 decision 2, docs/adr/0049 decisions 1-2, docs/adr/0051 decisions 1 and 3,
-    /// build-steps.md Phase 22 items 2 and 3).
+    /// takes the grab if § 6.3 asked for one, and performs the initial commit (§ 6.3, docs/adr/0040
+    /// decision 2, docs/adr/0049 decisions 1-2, docs/adr/0051 decisions 1 and 3).
     ///
-    /// **The order below is the protocol's and every step of it is load-bearing.** Build the
-    /// positioner and set every field, because `get_popup` reads it once and consumes it. Create the
+    /// The order below is the protocol's and every step of it is load-bearing. Build the positioner
+    /// and set every field, because `get_popup` reads it once and consumes it. Create the
     /// `wl_surface` and the popup with [`Popup::from_surface`], not [`Popup::new`] -- `new` sends the
-    /// initial commit for you, which is fatal for a `panel` parent whose rooting request has not
-    /// been sent yet ("If you do not specify a parent surface, you must configure the parent using
-    /// an alternate function such as `LayerSurface::get_popup` prior to committing the surface, or
-    /// you will get an `invalid_popup_parent` protocol error"). Root it. Take the grab, which "must
-    /// be requested before the popup is mapped" or the compositor raises `invalid_grab`. Then
-    /// commit, and wait for the configure in [`MapState::AwaitingConfigure`] exactly as the other
-    /// two roles do.
+    /// initial commit for you, which is fatal for a `panel` parent whose rooting request has not been
+    /// sent yet ("If you do not specify a parent surface, you must configure the parent using an
+    /// alternate function such as `LayerSurface::get_popup` prior to committing the surface, or you
+    /// will get an `invalid_popup_parent` protocol error"). Root it. Take the grab, which "must be
+    /// requested before the popup is mapped" or the compositor raises `invalid_grab`. Then commit,
+    /// and wait for the configure in [`MapState::AwaitingConfigure`] exactly as the other two roles do.
     ///
-    /// `grab = true` with nothing armed refuses to create the popup **at all**, rather than creating
-    /// one without its grab (docs/adr/0049's amendment, docs/adr/0051 decision 3). A dropdown that
-    /// cannot be dismissed by clicking outside it is worse than one that did not open: the
-    /// click-outside dismissal is the whole reason docs/adr/0040 reached for a real `xdg_popup`
-    /// instead of a second `panel`. A grab the *compositor* refuses is a different thing and needs
-    /// no branch here -- it arrives as an immediate `popup_done` and goes through
-    /// [`PopupHandler::done`] like a click-outside, which § 6.3 says to treat as a normal outcome.
+    /// `grab = true` with nothing armed refuses to create the popup at all, rather than creating one
+    /// without its grab (docs/adr/0049's amendment, docs/adr/0051 decision 3). A dropdown that cannot
+    /// be dismissed by clicking outside it is worse than one that did not open. A grab the compositor
+    /// refuses is a different thing and needs no branch here: it arrives as an immediate `popup_done`
+    /// and goes through [`PopupHandler::done`] like a click-outside, which § 6.3 treats as a normal
+    /// outcome.
     ///
     /// SCTK acks each `xdg_surface.configure` itself before calling [`PopupHandler::configure`]
     /// (`shell/xdg/popup.rs`'s `Dispatch2<XdgSurface, _>`), so nothing here acks. The grab is the one
@@ -3339,9 +2965,9 @@ impl App {
         };
 
         // The armed surface is consulted whether or not a grab was asked for: docs/adr/0051
-        // decision 1 is about which *instance* of the declared parent a dropdown belongs to, and a
-        // `grab = false` popup opened by a click belongs to the monitor that click landed on just
-        // as much as a grabbing one does.
+        // decision 1 is about which instance of the declared parent a dropdown belongs to, and a
+        // `grab = false` popup opened by a click belongs to that monitor just as much as a
+        // grabbing one does.
         let parent_index = parent_instance_index(
             self.surfaces.iter().map(|tracked| tracked.surface_id.as_str()),
             &spec.parent,
@@ -3392,9 +3018,8 @@ impl App {
         }
         // The initial commit `xdg_surface` requires, and the line every step above had to precede.
         popup.wl_surface().commit();
-        // `positioner` drops at the end of this function, which destroys the `xdg_positioner`. That
-        // is the protocol's own lifecycle -- `get_popup` has already copied its state -- and
-        // `XdgPositioner`'s `Drop` is what sends it.
+        // `positioner` drops at the end of this function, destroying the `xdg_positioner` -- the
+        // protocol's own lifecycle, since `get_popup` has already copied its state.
 
         if let TrackedRole::Popup { popup: slot, refusal_logged, .. } = &mut self.surfaces[index].role {
             *slot = Some(popup);
@@ -3410,8 +3035,7 @@ impl App {
     /// Destroys this popup's `xdg_popup` and every popup nested under it, leaving the tracking
     /// entries behind so a later `visible = true` can build fresh ones (docs/adr/0049 decision 1).
     ///
-    /// **Children first, which is the protocol's requirement and not merely docs/adr/0040's
-    /// preference**: `xdg_popup`'s own description makes destroying a parent before its child a
+    /// Children first: `xdg_popup`'s own description makes destroying a parent before its child a
     /// protocol error. [`App::shown_popups_under`] produces exactly that order.
     ///
     /// A nested child is latched on the way down. It never received a `popup_done` of its own --
@@ -3430,22 +3054,22 @@ impl App {
     /// returns them in that order. The surface at `index` is left alone: its own teardown is the
     /// caller's, and the three callers differ in what that is.
     ///
-    /// **Every path that destroys a surface owes this call, and the protocol is why.** wlroots
-    /// rejects destroying an `xdg_surface` whose popup list is non-empty, which takes the Wayland
-    /// connection and the whole shell down with it. [`App::hide_popup`] was the only path that did
-    /// it, so a `popup { parent = "settings" }` that was open when the config wrote
-    /// `settings_open = false` destroyed its parent's `xdg_toplevel` underneath a live `xdg_popup`;
-    /// output removal did the same to a popup parented to a per-output panel. On a compositor that
-    /// tolerates it the popup was instead left with an object and `MapState::Mapped`, which
-    /// [`popup_visibility_action`] answers `Nothing` to forever.
+    /// Every path that destroys a surface owes this call, and the protocol is why: wlroots rejects
+    /// destroying an `xdg_surface` whose popup list is non-empty, which takes the Wayland connection
+    /// and the whole shell down with it. [`App::hide_popup`] was once the only path that did it, so a
+    /// `popup { parent = "settings" }` that was open when the config wrote `settings_open = false`
+    /// destroyed its parent's `xdg_toplevel` underneath a live `xdg_popup`; output removal did the
+    /// same to a popup parented to a per-output panel. On a compositor that tolerates it the popup
+    /// was instead left with an object and `MapState::Mapped`, which [`popup_visibility_action`]
+    /// answers `Nothing` to forever.
     ///
-    /// The latch is deliberately **not** set here, and only `hide_popup` sets it on what this
-    /// returns. A parent going away is not a compositor dismissal: the child's own `visible` never
-    /// moved, so the declarative answer is that it reappears the moment its parent does, on the
-    /// first re-resolve after that. Latching would make it wait for pointer input instead, which a
-    /// parent window reopened by a D-Bus notification never produces. The cost is that each
-    /// re-resolve while the parent is away runs a [`App::show_popup`] that refuses at the `parent`
-    /// check, which is a handful of branches and one throttled log line ([`PopupRefusal`]).
+    /// The latch is deliberately not set here, and only `hide_popup` sets it on what this returns. A
+    /// parent going away is not a compositor dismissal: the child's own `visible` never moved, so the
+    /// declarative answer is that it reappears the moment its parent does, on the first re-resolve
+    /// after that. Latching would make it wait for pointer input instead, which a parent window
+    /// reopened by a D-Bus notification never produces. The cost is that each re-resolve while the
+    /// parent is away runs a [`App::show_popup`] that refuses at the `parent` check, a handful of
+    /// branches and one throttled log line ([`PopupRefusal`]).
     fn drop_child_popups(&mut self, index: usize) -> Vec<usize> {
         let mut nested = Vec::new();
         self.shown_popups_under(index, &mut nested);
@@ -3496,18 +3120,18 @@ impl App {
         }
     }
 
-    /// Every currently shown popup rooted under the surface at `index`, appended deepest-first --
-    /// the order [`App::hide_popup`] destroys in.
+    /// Every currently shown popup rooted under the surface at `index`, appended deepest-first -- the
+    /// order [`App::hide_popup`] destroys in.
     ///
     /// Post-order over the parent tree, so a grandchild is appended before its parent and a parent
-    /// before `index` itself (which this never appends; the caller owns that). Siblings come out in
-    /// tracked order, and that is fine rather than sloppy: xdg-shell constrains a popup against its
-    /// *parent*, and two popups under one parent constrain each other not at all.
+    /// before `index` itself (never appended; the caller owns that). Siblings come out in tracked
+    /// order, which is fine: xdg-shell constrains a popup against its parent, and two popups under
+    /// one parent constrain each other not at all.
     ///
-    /// Cannot recurse forever, and not because of a depth guard. A popup is only counted here while
-    /// it holds an object, and a popup cannot hold one unless its parent held one first
-    /// ([`App::show_popup`] refuses otherwise), so a `parent` cycle in a config -- including a popup
-    /// naming itself -- has no member that ever opens.
+    /// Cannot recurse forever, not because of a depth guard: a popup is only counted here while it
+    /// holds an object, and it cannot hold one unless its parent held one first ([`App::show_popup`]
+    /// refuses otherwise), so a `parent` cycle in a config -- including a popup naming itself -- has
+    /// no member that ever opens.
     fn shown_popups_under(&self, index: usize, out: &mut Vec<usize>) {
         let parent_id = self.surfaces[index].surface_id.clone();
         let children: Vec<usize> = (0..self.surfaces.len())
@@ -3523,15 +3147,12 @@ impl App {
     }
 
     /// `zwlr_layer_surface_v1`'s own unmap procedure, taken literally: "Attaching a null buffer to
-    /// a layer surface unmaps it." One commit, no destroyed protocol objects, which is the whole
-    /// point of docs/adr/0038 decision 2 -- toggling a launcher costs this instead of a process
-    /// spawn.
+    /// a layer surface unmaps it." One commit, no destroyed protocol objects, the whole point of
+    /// docs/adr/0038 decision 2 -- toggling a launcher costs this instead of a process spawn.
     ///
-    /// This is the commit the staged state above it rides on, and it is the *only* commit an
-    /// unmapped surface ever gets. Nothing else in this file may commit one, because the same
-    /// description spells out that "the client can re-map the surface by performing a commit
-    /// without any buffer attached" -- a stray bookkeeping commit on an unmapped surface would
-    /// silently re-map it.
+    /// This is the only commit an unmapped surface ever gets. Nothing else in this file may commit
+    /// one, because the same description says "the client can re-map the surface by performing a
+    /// commit without any buffer attached" -- a stray bookkeeping commit here would silently re-map it.
     fn unmap(&mut self, index: usize) {
         let TrackedRole::Panel { layer, .. } = &self.surfaces[index].role else {
             return;
@@ -3547,35 +3168,33 @@ impl App {
     ///
     /// Every layer-shell field is re-sent, not just the ones a diff would find, because the same
     /// description says an unmapped surface "returns to the state it had right after
-    /// layer_shell.get_layer_surface". `anchor` is included for that reason alone: it is a
-    /// topology field that can never *change* on a live surface, but it can be reset out from
-    /// under one. The exclusive zone is not re-sent here because it is not a spec field -- the
-    /// configure re-derives it from the size the compositor grants.
+    /// layer_shell.get_layer_surface". `anchor` is included for that reason alone: it is a topology
+    /// field that can never change on a live surface, but it can be reset out from under one. The
+    /// exclusive zone is not re-sent: it is not a spec field, and the configure re-derives it from
+    /// the size the compositor grants.
     ///
     /// `set_size` needs no [`ambiguous_zero_axis`] guard: the applied spec's size is only ever one
-    /// that already passed it, in [`App::create_panel`] or in [`App::apply_spec_change`], which both
+    /// that already passed it, in [`App::create_panel`] or [`App::apply_spec_change`], which both
     /// refuse rather than store a size the protocol would reject.
     ///
-    /// **Two starting states share this one request sequence and end in different `MapState`s**,
-    /// and the difference is the compositor's, not a choice made here. Measured against niri with
+    /// Two starting states share this one request sequence and end in different `MapState`s, and the
+    /// difference is the compositor's, not a choice made here. Measured against niri with
     /// `WAYLAND_DEBUG=1`:
     ///
-    /// - A panel declared `visible = false` at startup was *never mapped*. It performed the
-    ///   initial commit `get_layer_surface` requires, was configured, and was acked; it simply
-    ///   never attached a buffer. Its layer-surface state was never reset, so the commit below
-    ///   changes nothing the compositor has an opinion about and **no configure comes back**. The
-    ///   surface is already in the "acked a configure, may attach a buffer" state the protocol
-    ///   describes, so it goes straight to [`MapState::Mapped`] and the next
-    ///   [`App::repaint_mapped_surfaces`] binds and draws it.
-    /// - A surface that really was mapped and then null-buffered *has* been reset, so this commit
-    ///   is a fresh initial commit and a configure does come back. Attaching a buffer before
-    ///   acking it is exactly what `get_layer_surface`'s description forbids, so that case waits
-    ///   in [`MapState::AwaitingConfigure`] and lets `bind_and_clear` handle the configure with no
-    ///   re-map special case at all.
+    /// - A panel declared `visible = false` at startup was never mapped: it performed the initial
+    ///   commit `get_layer_surface` requires, was configured and acked, but never attached a buffer.
+    ///   Its layer-surface state was never reset, so the commit below changes nothing the compositor
+    ///   has an opinion about and no configure comes back. It goes straight to [`MapState::Mapped`]
+    ///   and the next [`App::repaint_mapped_surfaces`] binds and draws it.
+    /// - A surface that really was mapped and then null-buffered has been reset, so this commit is a
+    ///   fresh initial commit and a configure does come back. Attaching a buffer before acking it is
+    ///   exactly what `get_layer_surface`'s description forbids, so that case waits in
+    ///   [`MapState::AwaitingConfigure`] and lets `bind_and_clear` handle the configure with no
+    ///   re-map special case.
     ///
-    /// `bound.is_some()` is the honest test for which of the two this is: an EGL surface exists
-    /// only for a surface that has been through the bind-and-paint path, and every trip through it
-    /// ends in a `swap_buffers`, so the two questions are the same question.
+    /// `bound.is_some()` is the honest test for which of the two this is: an EGL surface exists only
+    /// for a surface that has been through the bind-and-paint path, and every trip through it ends
+    /// in a `swap_buffers`, so the two questions are the same question.
     fn remap(&mut self, index: usize) {
         let was_mapped = self.surfaces[index].bound.is_some();
         let TrackedRole::Panel { layer, spec, output_size } = &self.surfaces[index].role else {
@@ -3676,15 +3295,14 @@ impl App {
         true
     }
 
-    /// Draws one bound surface's whole retained tree (build-steps.md Phase 19 items 6 and 8):
-    /// make its EGL surface current, resize the shared canvas to it, clear, walk the resolved tree
-    /// with [`layout::paint::paint_tree`], and swap.
+    /// Draws one bound surface's whole retained tree: make its EGL surface current, resize the
+    /// shared canvas to it, clear, walk the resolved tree with [`layout::paint::paint_tree`], and
+    /// swap.
     ///
-    /// **One `TextPainter` serves every surface**, and that is the item 8 claim this is the first
-    /// production code to rest on. All surfaces share one EGL context; under EGL a context owns
-    /// its GL objects while a surface is only the framebuffer being drawn into, so
+    /// One `TextPainter` serves every surface. All surfaces share one EGL context; under EGL a
+    /// context owns its GL objects while a surface is only the framebuffer being drawn into, so
     /// `eglMakeCurrent` with a different draw surface leaves the canvas's textures, shaders and
-    /// glyph atlas valid. What genuinely is per surface is the canvas's *viewport*, which is what
+    /// glyph atlas valid. What genuinely is per surface is the canvas's viewport, which is what
     /// `TextPainter::resize` (and so `Canvas::set_size`) sets on every call here. If a live run
     /// ever shows otherwise, one canvas per surface is the fallback, not a redesign.
     ///
@@ -3772,14 +3390,13 @@ impl App {
         }
     }
 
-    /// Repaints every mapped surface, after a re-resolve actually changed the scene. Every
-    /// surface, not the changed ones: ADR-0044 decision 2's dirty flag is one flag for the whole
-    /// scene, so which surfaces changed is not information this process has (that flag's own
-    /// `ponytail:` records the same ceiling).
+    /// Repaints every mapped surface, after a re-resolve actually changed the scene. Every surface,
+    /// not the changed ones: ADR-0044 decision 2's dirty flag is one flag for the whole scene, so
+    /// which surfaces changed is not information this process has.
     ///
-    /// This is also the commit that carries everything [`App::apply_resolved_surface_state`]
-    /// staged for each surface on the same poll turn -- `paint_surface` ends in `swap_buffers`,
-    /// which is a `wl_surface` commit.
+    /// This is also the commit that carries everything [`App::apply_resolved_surface_state`] staged
+    /// for each surface on the same poll turn -- `paint_surface` ends in `swap_buffers`, a `wl_surface`
+    /// commit.
     fn repaint_mapped_surfaces(&mut self) {
         for index in 0..self.surfaces.len() {
             if self.surfaces[index].map_state != MapState::Mapped {
@@ -3807,13 +3424,12 @@ impl App {
 
     /// § 15.2 points 2-3: once every tracked surface has staged, computes the surface_id list the
     /// Supervisor will expect presentation evidence from and queues it once as a `ReadySignal`. A
-    /// no-op if it's already been sent, or if some surface hasn't staged yet -- called on every
-    /// candidate-mode configure, since any of them might be the one that completes the set.
+    /// no-op if already sent, or if some surface hasn't staged yet -- called on every candidate-mode
+    /// configure, since any of them might be the one that completes the set.
     ///
-    /// Two different sets, deliberately. The *gate* is every surface, because a Candidate is not
-    /// ready until each one has been dealt with. The *payload* is only the surfaces that will
-    /// present a frame, because a panel declared `visible = false` never will -- see
-    /// [`presenting_surface_ids`] for what each direction of a mismatch costs.
+    /// Two different sets, deliberately: the gate is every surface, since a Candidate is not ready
+    /// until each has been dealt with, but the payload is only the surfaces that will present a frame
+    /// -- see [`presenting_surface_ids`] for what each direction of a mismatch costs.
     fn maybe_send_ready_signal(&mut self) {
         let staged = candidate_has_staged(
             self.surfaces.iter().map(|s| (s.null_buffered, s.role.wl_surface().is_some())),
@@ -3829,15 +3445,14 @@ impl App {
     }
 
     /// § 15.3: draws the first real frame in response to `ActivateDraw`, requesting
-    /// `wp_presentation_feedback` for each surface drawn. `nonce` is remembered as `active_nonce`
-    /// so the later `presented` callback (this file's `PresentationTimeHandler` impl) knows
-    /// which handshake attempt to tag its evidence with.
+    /// `wp_presentation_feedback` for each surface drawn. `nonce` is remembered as `active_nonce` so
+    /// the later `presented` callback knows which handshake attempt to tag its evidence with.
     ///
     /// The surfaces that present, not every tracked surface: exactly the set
     /// `maybe_send_ready_signal` announced, filtered by the same [`MapState::presents`] predicate
-    /// over a `map_state` that [`App::apply_visibility`] holds still for a Candidate's whole life.
-    /// That is what makes the announced set and the drawn set identical rather than merely similar
-    /// -- see [`presenting_surface_ids`] for why "similar" is a hang.
+    /// over a `map_state` [`App::apply_visibility`] holds still for a Candidate's whole life. That is
+    /// what makes the announced and drawn sets identical rather than merely similar -- see
+    /// [`presenting_surface_ids`] for why "similar" is a hang.
     fn activate_draw(&mut self, nonce: u64) {
         self.active_nonce = Some(nonce);
         for index in 0..self.surfaces.len() {
@@ -3850,14 +3465,12 @@ impl App {
             }
         }
         // Promotion completes this process's PBA handshake -- from now on it behaves like an
-        // ordinary (non-candidate) authoritative generation for the rest of its life, so a later
-        // `configure` (resize, output change, a duplicate ack round trip -- all routine on a live
-        // compositor) must fall through to `bind_and_clear`'s ordinary EGL-bind/resize path
-        // instead of re-taking the null-buffer-staging branch forever (Correctness review: that
-        // branch no-ops once `null_buffered` is already `true`, permanently disabling resize).
-        // `activate_draw_one` already populated `tracked.bound` in the exact shape the
-        // non-candidate path expects, so flipping this alone is enough -- no other state needs
-        // adjusting.
+        // ordinary (non-candidate) generation, so a later `configure` (resize, output change, a
+        // duplicate ack) must fall through to `bind_and_clear`'s ordinary EGL-bind/resize path
+        // instead of re-taking the null-buffer-staging branch forever: that branch no-ops once
+        // `null_buffered` is already `true`, permanently disabling resize. `activate_draw_one`
+        // already populated `tracked.bound` in the shape the non-candidate path expects, so
+        // flipping this alone is enough.
         self.is_pba_candidate = false;
     }
 
@@ -3936,17 +3549,17 @@ impl App {
     /// The half of [`App::prune_secure_focus`] that does not wait for a keystroke: a field whose
     /// surface this process destroyed is dropped, and its buffer scrubbed, on the next poll turn.
     ///
-    /// **Only the liveness clause, deliberately.** `prune_secure_focus`'s other clause is about
-    /// *routing* -- which surface is receiving keys -- and it is only ever wrong at the moment a key
-    /// arrives, which is where it is asked. Applying it once a turn would also disarm the field a
-    /// press on a multi-field surface just chose, in the window before the compositor's matching
-    /// `enter` lands, and `sole_secure_submit` cannot re-choose it (see [`focus_on_enter`]).
+    /// Only the liveness clause, deliberately: `prune_secure_focus`'s other clause is about routing --
+    /// which surface is receiving keys -- and it is only ever wrong at the moment a key arrives, which
+    /// is where it is asked. Applying it once a turn would also disarm the field a press on a
+    /// multi-field surface just chose, in the window before the compositor's matching `enter` lands,
+    /// and `sole_secure_submit` cannot re-choose it (see [`focus_on_enter`]).
     ///
-    /// What this buys is the residency ceiling defect 3 named: type a password on the lock screen,
-    /// let the compositor send `finished`, and `teardown_lock_surfaces` destroys the `wl_surface`
-    /// without the protocol requiring any `leave` to follow. Without this the plaintext would sit in
-    /// `secure_buffer`, still addressed to `("lock", "authenticate")`, until some later keystroke
-    /// happened to notice -- which on a session where the user walks away is never.
+    /// What this buys is the residency ceiling defect 3 named: type a password on the lock screen, let
+    /// the compositor send `finished`, and `teardown_lock_surfaces` destroys the `wl_surface` with no
+    /// `leave` required to follow. Without this the plaintext would sit in `secure_buffer`, still
+    /// addressed to `("lock", "authenticate")`, until some later keystroke happened to notice -- which
+    /// on a session where the user walks away is never.
     fn drop_secure_focus_if_its_surface_is_gone(&mut self) {
         let gone = self.focused_secure_submit.as_ref().is_some_and(|field| !self.surface_is_live(&field.surface_id));
         if gone {
@@ -3956,18 +3569,16 @@ impl App {
     }
 
     /// One key event applied to the focused `secure_submit` field, or nothing at all when no field
-    /// is focused (build-steps.md Phase 23 item 3, docs/adr/0005).
+    /// is focused (docs/adr/0005).
     ///
-    /// The focus check is the gate, and `focused_secure_submit` is exactly the right one to gate on:
-    /// it is `Some` only when some field named a destination for the next secret, so a keystroke
-    /// that reaches the buffer already has somewhere to be sent. A `textfield` with no
-    /// `secure_submit` leaves it `None` (see [`focused_target`]), and a key arriving then is
-    /// dropped rather than accumulated -- there is no destination to address it to, and buffering
-    /// a password for a field that can never submit it is a secret held for no reason.
+    /// The focus check is the gate: `focused_secure_submit` is `Some` only when some field named a
+    /// destination for the next secret, so a keystroke that reaches the buffer already has somewhere
+    /// to be sent. A `textfield` with no `secure_submit` leaves it `None` (see [`focused_target`]),
+    /// and a key arriving then is dropped rather than accumulated -- buffering a password for a field
+    /// that can never submit it is a secret held for no reason.
     ///
-    /// Nothing here touches Lua. That is the whole of docs/adr/0005: the bytes go from the
-    /// `KeyEvent` into a native `shared::SecureBuffer` and out to the Supervisor, and no Lua value
-    /// is ever built from them.
+    /// Nothing here touches Lua: the bytes go from the `KeyEvent` into a native `shared::SecureBuffer`
+    /// and out to the Supervisor, and no Lua value is ever built from them.
     fn apply_secure_key(&mut self, event: &KeyEvent, repeat: bool) {
         // Before the gate, not after it: the gate reads `focused_secure_submit` alone, and a focus
         // whose surface is gone or is no longer the one receiving keys is exactly the state this key
@@ -3984,11 +3595,11 @@ impl App {
             SecureKeyAction::Backspace => {
                 self.secure_buffer.pop_char();
             }
-            // Through the seam in both directions rather than reaching for the buffer directly: the
-            // scrub Escape wants *is* the one `retarget_secure_submit` performs on a transition, and
-            // re-arming the identical field immediately afterwards is what leaves the user still in
-            // it, free to retype. A fifth writer of `secure_buffer` with its own idea of what
-            // clearing means is what this file has spent two reviews avoiding.
+            // Through the seam in both directions, not the buffer directly: the scrub Escape wants
+            // is the one `retarget_secure_submit` performs on a transition, and re-arming the
+            // identical field immediately after leaves the user still in it, free to retype. A
+            // fifth writer of `secure_buffer` with its own idea of clearing is what this file has
+            // spent two reviews avoiding.
             SecureKeyAction::Clear => {
                 let field = self.focused_secure_submit.clone();
                 self.focus_secure_submit(None);
@@ -4000,15 +3611,14 @@ impl App {
     }
 
     /// A completed `secure_submit`: builds the outgoing frame out of the accumulated buffer and
-    /// queues it for the socket thread. [`submit_frame_for`] both performs the one sanctioned read
-    /// and leaves `self.secure_buffer` scrubbed and empty on either branch, ready for the next
-    /// entry.
+    /// queues it for the socket thread. [`submit_frame_for`] performs the one sanctioned read and
+    /// leaves `self.secure_buffer` scrubbed and empty on either branch.
     ///
     /// [`submit_frame_for`] refuses on two counts and both end here: no focused destination
-    /// (docs/adr/0050 decision 4) and an empty buffer. Logged rather than silent, because a user who
-    /// pressed enter deserves an explanation somewhere for why nothing happened, and it is almost
-    /// always a `textfield` missing its `secure_submit` table -- the empty case explains itself on
-    /// the glass, since there is nothing in the field.
+    /// (docs/adr/0050 decision 4) and an empty buffer. Logged rather than silent: a user who pressed
+    /// enter deserves an explanation, and it is almost always a `textfield` missing its
+    /// `secure_submit` table -- the empty case explains itself on the glass, since there is nothing
+    /// in the field.
     fn finish_secure_submit(&mut self) {
         let target = self.focused_secure_submit.as_ref().map(|field| &field.target);
         let Some(frame) = submit_frame_for(self.generation_id, target, &mut self.secure_buffer) else {
@@ -4025,18 +3635,18 @@ impl App {
     /// One hit-test of surface `index` at `position`, answering both of [`PointerHit`]'s questions
     /// (docs/adr/0050 decisions 1 and 4).
     ///
-    /// `position` is surface-local and *logical*, which is the space `layout::hit` walks
-    /// `ResolvedNode::rect` in, so there is no conversion here at all. That holds only while
-    /// `paint_surface` paints at scale `1.0` and nothing calls `wl_surface::set_buffer_scale`;
-    /// docs/adr/0050's consequences name this as the third caller the HiDPI change from Phase 20
-    /// has to move together with `paint_surface` and `apply_input_region`.
+    /// `position` is surface-local and logical, the space `layout::hit` walks `ResolvedNode::rect` in,
+    /// so there is no conversion here. That holds only while `paint_surface` paints at scale `1.0` and
+    /// nothing calls `wl_surface::set_buffer_scale`; docs/adr/0050's consequences name this as a
+    /// caller that a future HiDPI change has to move together with `paint_surface` and
+    /// `apply_input_region`.
     ///
-    /// A surface with no resolved tree answers the same as a point that missed everything: no
-    /// button, and no focused destination. There is nothing under the pointer either way.
+    /// A surface with no resolved tree answers the same as a point that missed everything: no button,
+    /// no focused destination.
     ///
-    /// Owned on the way out, every part. `Scene::surface` clones into a `ResolvedNode` (the same
-    /// property `paint_surface` relies on), so the borrow of `self.client` ends on that line, and
-    /// both the `Function` and the target are cloned out of the local tree before it is dropped.
+    /// Owned on the way out, every part: `Scene::surface` clones into a `ResolvedNode` (the same
+    /// property `paint_surface` relies on), so the borrow of `self.client` ends on that line, and both
+    /// the `Function` and the target are cloned out of the local tree before it is dropped.
     fn hit_under(&self, index: usize, position: (f64, f64)) -> PointerHit {
         let Some(tree) = self.client.scene().surface(&self.surfaces[index].surface_id) else {
             return PointerHit { button: None, focus: Ok(None) };
@@ -4049,20 +3659,13 @@ impl App {
         }
     }
 
-    /// Calls one `button`'s `on_click` with its rect (docs/adr/0050 decision 3) and marks the
-    /// scene dirty.
+    /// Calls one `button`'s `on_click` with its rect (docs/adr/0050 decision 3).
     ///
     /// A raise is logged against the surface it happened on and swallowed. A broken `on_click` is
     /// a config bug, and a config bug must not take a shell that is otherwise painting down with
     /// it; docs/adr/0046's rescue path is for an evaluation that failed, not for one misbehaving
     /// handler, so this deliberately does not set `self.exit` and deliberately does not enter
     /// rescue.
-    ///
-    /// The dirty mark is not conditional on the call succeeding: a handler that raised halfway
-    /// may already have written whatever it wrote. Nothing re-resolves here -- `run`'s poll loop
-    /// calls `dispatch_pending` (which is where this runs) at the top of the same turn whose
-    /// `re_resolve_if_dirty`/`repaint_mapped_surfaces` pair then picks the mark up, so a click is
-    /// on screen one turn later without this function knowing anything about painting.
     fn fire_on_click(&mut self, instance_id: &str, rect: LogicalRect, button: &str, on_click: &Function) {
         // Nothing marks the scene dirty here. A handler that changes what is painted does it by
         // writing a `state(name, initial)` signal, and `signal:set()` marks the flag itself
@@ -4073,15 +3676,13 @@ impl App {
     }
 }
 
-/// Builds one `RendererFrame::SecureSubmit` out of `buffer` (build-steps.md Phase 15 item 2;
-/// ADR-0005/ADR-0027).
+/// Builds one `RendererFrame::SecureSubmit` out of `buffer` (ADR-0005/ADR-0027).
 ///
 /// The one sanctioned read (`expose_secret`) and the explicit `.zeroize()` of the source buffer
 /// sit on adjacent lines here, so the accumulated secret stops existing the instant it has been
 /// copied into the outgoing envelope -- not left to `Drop`, and not left live while the frame
 /// travels to the socket thread. The frame's own plaintext copy is the socket thread's to scrub,
-/// immediately after its wire write (`crate::socket`'s `pump`); that is as close to the write as
-/// this side of the channel can get, and it is where the pre-ADR-0039 code did it too.
+/// immediately after its wire write (`crate::socket`'s `pump`).
 ///
 /// A free function, not a `&mut self` method, for [`retarget_secure_submit`]'s reason: it makes the
 /// whole read/zeroize contract directly unit-testable, which nothing involving a live `wl_surface`
@@ -4109,10 +3710,9 @@ impl SeatHandler for App {
     ///
     /// Idempotent by the `is_none` guards, not by trusting the compositor: `wl_seat::capabilities`
     /// is a full re-statement of the current set on every change, so a seat that gains a keyboard
-    /// re-announces its pointer, and SCTK turns each announcement into this call. Creating a
-    /// second `wl_pointer` there would leave two objects delivering the same events into one
-    /// `armed` slot, and a second `wl_keyboard` two `enter`/`leave` streams into one
-    /// `keyboard_focus`.
+    /// re-announces its pointer, and SCTK turns each announcement into this call. A second
+    /// `wl_pointer` would deliver duplicate events into one `armed` slot, and a second
+    /// `wl_keyboard` two `enter`/`leave` streams into one `keyboard_focus`.
     fn new_capability(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, capability: Capability) {
         match capability {
             Capability::Pointer if self.pointer.is_none() => match self.seat_state.get_pointer(qh, &seat) {
@@ -4170,13 +3770,8 @@ impl SeatHandler for App {
     fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
 }
 
-/// Pointer input to `on_click` (build-steps.md Phase 21 item 1, docs/adr/0050).
-///
-/// No `delegate_pointer!` call accompanies this, and adding one would not compile: this SCTK has
-/// no such macro, and `PointerData<U>` carries a blanket `Dispatch2<WlPointer, D>` impl
-/// (src/seat/pointer/mod.rs:209) that the file-wide `delegate_dispatch2!(App)` at the bottom
-/// already turns into the `Dispatch<WlPointer, PointerData<()>>` half of `get_pointer`'s bound.
-/// This trait is the only half left to supply.
+/// Pointer input to `on_click` (docs/adr/0050). See `delegate_dispatch2!(App)` at the bottom of
+/// this file for why no `delegate_pointer!` call accompanies this.
 impl PointerHandler for App {
     fn pointer_frame(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _pointer: &wl_pointer::WlPointer, events: &[PointerEvent]) {
         for event in events {
@@ -4261,17 +3856,11 @@ impl PointerHandler for App {
     }
 }
 
-/// Which surface the compositor gave keyboard focus to (build-steps.md Phase 21 item 2).
-///
-/// `keyboard_interactivity` (Phase 20 item 1) is the client's half of this: it tells the compositor
-/// whether a surface may be focused at all. `wl_keyboard`'s `enter`/`leave` is the only way the
-/// client learns what the compositor decided, which is the whole reason this trait is implemented.
-///
-/// No `delegate_keyboard!` accompanies it, for the same reason `PointerHandler` has no
-/// `delegate_pointer!`: `KeyboardData<D, U>` carries a blanket `Dispatch2<WlKeyboard, D>` impl
-/// (src/seat/keyboard/mod.rs:494) that the file-wide `delegate_dispatch2!(App)` at the bottom
-/// already turns into the `Dispatch<WlKeyboard, KeyboardData<App, ()>>` half of `get_keyboard`'s
-/// bound. Adding the macro would collide with it.
+/// Which surface the compositor gave keyboard focus to. `keyboard_interactivity` is the client's
+/// half of this: it tells the compositor whether a surface may be focused at all. `wl_keyboard`'s
+/// `enter`/`leave` is the only way the client learns what the compositor decided. See
+/// `delegate_dispatch2!(App)` at the bottom of this file for why no `delegate_keyboard!` call
+/// accompanies this.
 impl KeyboardHandler for App {
     fn enter(
         &mut self,
@@ -4334,14 +3923,12 @@ impl KeyboardHandler for App {
         eprintln!("[oblisk-renderer] keyboard focus left {left}");
     }
 
-    // A key reaches exactly one place and it is not a config. § 5.2 still declares no key-handler
-    // property on any node, and docs/adr/0050's consequences section still says this ADR does not
-    // invent one, so a keysym arriving here has nowhere in Lua to go and is not offered one. What it
-    // does have is the `secure_submit` field docs/adr/0005 defines as the node whose bytes bypass
-    // the VM entirely: [`App::apply_secure_key`] pushes them into a native `shared::SecureBuffer`
-    // and out to the Supervisor without a Lua value ever existing. That is engine-internal handling
-    // for a field whose whole definition is that the password never enters the Lua VM, so it adds no
-    // IDL surface. See [`secure_key_action`] for why this is the keyboard and not text-input.
+    // A key reaches exactly one place and it is not a config: § 5.2 declares no key-handler
+    // property on any node, and docs/adr/0050's consequences say this ADR does not invent one. What
+    // it does have is the `secure_submit` field docs/adr/0005 defines: [`App::apply_secure_key`]
+    // pushes bytes into a native `shared::SecureBuffer` and out to the Supervisor without a Lua
+    // value ever existing, adding no IDL surface. See [`secure_key_action`] for why this is the
+    // keyboard and not text-input.
     fn press_key(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _keyboard: &wl_keyboard::WlKeyboard, _serial: u32, event: KeyEvent) {
         self.apply_secure_key(&event, false);
     }
@@ -4419,16 +4006,15 @@ impl App {
     /// Resolves a raw `wl_surface` (as handed back by a `wp_presentation_feedback` callback, a
     /// pointer event, or a keyboard focus event) to the tracked surface that owns it.
     ///
-    /// `None` is routine rather than exceptional on every one of those paths: a `wl_pointer`,
-    /// a `wl_keyboard` and a feedback object are all per seat or per commit, not per surface, so
-    /// any of them can name a surface this process has since destroyed -- through an output change,
-    /// or a `visible` flip that took a `window`'s toplevel away (docs/adr/0049 decision 1).
+    /// `None` is routine, not exceptional, on every one of those paths: a `wl_pointer`, a
+    /// `wl_keyboard` and a feedback object are all per seat or per commit, not per surface, so any of
+    /// them can name a surface this process has since destroyed -- an output change, or a `visible`
+    /// flip that took a `window`'s toplevel away (docs/adr/0049 decision 1).
     fn index_of_surface(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
         self.surfaces.iter().position(|s| s.role.wl_surface() == Some(surface))
     }
 
-    /// [`App::index_of_surface`]'s answer as the surface id -- shared by `presented`/`discarded`,
-    /// which both used to inline the same lookup independently (Standards review).
+    /// [`App::index_of_surface`]'s answer as the surface id -- shared by `presented`/`discarded`.
     fn surface_id_for(&self, surface: &wl_surface::WlSurface) -> Option<&str> {
         self.index_of_surface(surface).map(|index| self.surfaces[index].surface_id.as_str())
     }
@@ -4511,15 +4097,14 @@ impl OutputHandler for App {
 }
 
 impl LayerShellHandler for App {
-    /// `zwlr_layer_surface_v1::closed` means *this* surface is gone and must be destroyed -- the
-    /// compositor sends it when the output the surface was on is destroyed, which is exactly
-    /// docs/adr/0038 decision 3's removal half arriving by the layer-shell route instead of the
-    /// `wl_output` one. It is not a shutdown signal.
+    /// `zwlr_layer_surface_v1::closed` means this surface is gone and must be destroyed -- the
+    /// compositor sends it when the output the surface was on is destroyed, docs/adr/0038
+    /// decision 3's removal half arriving by the layer-shell route instead of the `wl_output` one.
+    /// It is not a shutdown signal.
     ///
-    /// This used to set `self.exit`, which was defensible while one hardcoded bar was the only
-    /// surface and is not once a config declares N of them across M monitors: unplugging one
-    /// external display would have killed a shell still painting on the laptop panel, which is
-    /// precisely the generation-swap-free in-place handling the ADR forbids swapping for.
+    /// This used to set `self.exit`, defensible while one hardcoded bar was the only surface but
+    /// not once a config declares N of them across M monitors: unplugging one external display
+    /// would have killed a shell still painting on the laptop panel.
     ///
     /// ponytail: a compositor that closes *every* surface therefore leaves this process alive with
     /// nothing on screen rather than exiting. That is the right answer for the hotplug case (the
@@ -4550,32 +4135,21 @@ impl LayerShellHandler for App {
     }
 }
 
-/// `xdg_toplevel` for the `window` role (build-steps.md Phase 22 items 1 and 4, § 6.2).
-///
-/// No `delegate_xdg_shell!`/`delegate_xdg_window!` accompanies it, and neither exists in this SCTK
-/// to add: `smithay-client-toolkit-0.21.1` ships exactly two `delegate_*` macros
-/// (`delegate_dispatch2!` and `delegate_registry!`, checked against `src/`). Every user-data type
-/// this role needs -- `WindowData` for the `xdg_surface`, the `xdg_toplevel` and the
-/// `zxdg_toplevel_decoration_v1`, and `GlobalData` for `xdg_wm_base`, `xdg_wm_dialog_v1` and
-/// `zxdg_decoration_manager_v1` -- carries its own blanket `Dispatch2` impl, which the file-wide
-/// `delegate_dispatch2!(App)` at the bottom turns into the `Dispatch` half of `XdgShell::bind`'s and
-/// `create_window`'s bounds. The same thing Phase 21 found for `PointerData` and `KeyboardData`;
-/// this trait is the only half left to supply.
+/// `xdg_toplevel` for the `window` role (§ 6.2). See `delegate_dispatch2!(App)` at the bottom of
+/// this file for why no `delegate_xdg_shell!`/`delegate_xdg_window!` call accompanies this.
 impl WindowHandler for App {
-    /// `xdg_toplevel::close`, which is **a request and not a command**: "The client may choose to
-    /// ignore this request", and § 6.2 makes that the config's call rather than the engine's -- the
-    /// callback may decline by doing nothing, and the window stays open until the config sets
-    /// `visible = false`.
+    /// `xdg_toplevel::close`, a request, not a command: "The client may choose to ignore this
+    /// request", and § 6.2 makes that the config's call -- the callback may decline by doing
+    /// nothing, and the window stays open until the config sets `visible = false`.
     ///
-    /// So this deliberately destroys nothing. Closing on behalf of a config that did not ask would
-    /// take the decision away from the one place docs/adr/0049 decision 2 puts it, and would leave
-    /// the scene's `visible` saying `true` about a window that no longer exists -- which the next
-    /// re-resolve would answer by creating a second one.
+    /// So this deliberately destroys nothing: closing on behalf of a config that did not ask would
+    /// take the decision away from docs/adr/0049 decision 2 and leave the scene's `visible` saying
+    /// `true` about a window that no longer exists, which the next re-resolve would answer by
+    /// creating a second one.
     ///
-    /// The Lua call has `fire_on_click`'s shape for `fire_on_click`'s reasons: the `Function` is
-    /// cloned out of the resolved tree so no borrow of `self.client` is live while Lua runs inside
-    /// it, and a raise is logged and swallowed rather than taking down a shell that is otherwise
-    /// painting.
+    /// The Lua call has `fire_on_click`'s shape: the `Function` is cloned out of the resolved tree
+    /// so no borrow of `self.client` is live while Lua runs, and a raise is logged and swallowed
+    /// rather than taking down a shell that is otherwise painting.
     fn request_close(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, window: &Window) {
         let Some(index) = self.index_of_surface(window.wl_surface()) else {
             return;
@@ -4606,19 +4180,17 @@ impl WindowHandler for App {
     /// verbatim with layer-shell.
     ///
     /// `WindowConfigure` carries three things layer-shell has no analogue for, and this handles
-    /// exactly one of them:
+    /// exactly one:
     ///
     /// - `new_size`, whose axes are `Option` because a toplevel may be told to pick for itself.
     ///   [`toplevel_size_for`] is that decision.
     /// - `decoration_mode`, logged on the first configure of a mapping when the compositor granted
     ///   client-side decorations. Logged and nothing more: ADR-0040 decision 4 and § 6.2 both refuse
-    ///   a client-side titlebar frame, so an undecorated window is the accepted outcome rather than
-    ///   a failure. Only the first, because a configure repeats on every resize and the mode
-    ///   practically never moves after the initial one.
-    /// - `state` (`is_maximized`, `is_fullscreen`, `is_activated`, the tiled set) and
-    ///   `capabilities`, deliberately unread. § 5.2 and § 6.2 give a config nothing to bind them to,
-    ///   and their one consequence that matters -- a fullscreen or maximized configure is binding --
-    ///   already reaches this shell as a `Some` axis of `new_size`, which is taken as given.
+    ///   a client-side titlebar frame, so an undecorated window is the accepted outcome. Only the
+    ///   first, since a configure repeats on every resize and the mode rarely moves after that.
+    /// - `state` and `capabilities`, deliberately unread: § 5.2 and § 6.2 give a config nothing to
+    ///   bind them to, and their one consequence that matters -- a fullscreen or maximized
+    ///   configure is binding -- already reaches this shell as a `Some` axis of `new_size`.
     fn configure(
         &mut self,
         _conn: &Connection,
@@ -4644,17 +4216,12 @@ impl WindowHandler for App {
     }
 }
 
-/// `xdg_popup` for the `popup` role (build-steps.md Phase 22 items 2, 3 and 5; § 6.3).
-///
-/// No `delegate_xdg_popup!` accompanies it and none exists in this SCTK to add, for
-/// [`WindowHandler`]'s reason exactly: `PopupData` carries its own blanket `Dispatch2` impls for
-/// both `xdg_surface` and `xdg_popup`, which the file-wide `delegate_dispatch2!(App)` at the bottom
-/// turns into the `Dispatch` half of `Popup::from_surface`'s bounds. This trait is the only half
-/// left to supply, and it has exactly two methods.
+/// `xdg_popup` for the `popup` role (§ 6.3). See `delegate_dispatch2!(App)` at the bottom of this
+/// file for why no `delegate_xdg_popup!` call accompanies this.
 impl PopupHandler for App {
     /// One `xdg_surface.configure`, already acked by SCTK before this runs (see
     /// [`App::show_popup`]). Everything after the size decision is `bind_and_clear`, shared verbatim
-    /// with layer-shell and with the toplevel path.
+    /// with layer-shell and the toplevel path.
     ///
     /// [`PopupConfigure`] carries two things this deliberately does not read.
     ///
@@ -4664,9 +4231,8 @@ impl PopupHandler for App {
     /// - `kind`, which is `Initial` on every configure this shell will ever see. The other two
     ///   variants are `Reactive` (needs `xdg_positioner::set_reactive`, which
     ///   [`configure_positioner`] does not send) and `Reposition` (needs `xdg_popup.reposition`),
-    ///   and build-steps.md Phase 22 defers both by name -- a fresh popup per open covers a dropdown
-    ///   that opens under different buttons, and only an anchor that moves *while* a popup is open
-    ///   needs either.
+    ///   both deliberately not built -- a fresh popup per open covers a dropdown that opens under
+    ///   different buttons, and only an anchor that moves while a popup is open needs either.
     fn configure(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, popup: &Popup, configure: PopupConfigure) {
         let Some(index) = self.index_of_surface(popup.wl_surface()) else {
             return;
@@ -4678,30 +4244,27 @@ impl PopupHandler for App {
         self.bind_and_clear(index, width, height);
     }
 
-    /// `xdg_popup.popup_done`, which is **not a request** and is the whole reason docs/adr/0040
-    /// reached for a real `xdg_popup` instead of a second `panel`: the compositor dismissing the
-    /// popup on click-outside, which layer-shell has no compositor-agnostic way to do.
+    /// `xdg_popup.popup_done`, not a request, and the whole reason docs/adr/0040 reached for a real
+    /// `xdg_popup` instead of a second `panel`: the compositor dismissing the popup on click-outside,
+    /// which layer-shell has no compositor-agnostic way to do.
     ///
     /// Three things happen, and the order matters. The object is destroyed, children first
     /// ([`App::hide_popup`]). docs/adr/0051 decision 2's latch is set, so no replacement appears
-    /// unasked. Then § 6.3's `on_dismiss` fires, into a config that finds the popup already gone --
-    /// which is the honest state, since it *is* gone.
+    /// unasked. Then § 6.3's `on_dismiss` fires, into a config that finds the popup already gone.
     ///
-    /// **Deliberately not [`WindowHandler::request_close`]'s rule, and docs/adr/0051 decision 2 says
-    /// why.** `close` is a request the client may ignore, so that path destroys nothing and lets the
-    /// config decide. `popup_done` is not a request: the object is already gone and the only
-    /// question left is whether a replacement appears. The engine must not trust the config to
-    /// answer it -- a config with no `on_dismiss` at all is not a config error, and without the
-    /// latch it would be a livelock, with each re-resolve creating a popup for the same
+    /// Deliberately not [`WindowHandler::request_close`]'s rule: `close` is a request the client may
+    /// ignore, so that path destroys nothing and lets the config decide. `popup_done` is not a
+    /// request: the object is already gone, and the engine must not trust the config to answer
+    /// whether a replacement appears -- a config with no `on_dismiss` is not a config error, and
+    /// without the latch it would be a livelock, each re-resolve creating a popup for the same
     /// click-outside to dismiss.
     ///
-    /// A grab the compositor *denied* arrives here too, immediately after `show_popup` asked for
-    /// one, and needs no branch: § 6.3 calls that a normal outcome and nothing on this side of the
-    /// wire distinguishes it from a click-outside (docs/adr/0051 decision 3).
+    /// A grab the compositor denied arrives here too, immediately after `show_popup` asked for one,
+    /// and needs no branch: § 6.3 calls that a normal outcome (docs/adr/0051 decision 3).
     ///
-    /// The Lua call has [`App::fire_on_click`]'s shape for its reasons: the `Function` is cloned out
-    /// of the resolved tree so no borrow of `self.client` is live while Lua runs inside it, and a
-    /// raise is logged and swallowed rather than taking down a shell that is otherwise painting.
+    /// The Lua call has [`App::fire_on_click`]'s shape: the `Function` is cloned out of the resolved
+    /// tree so no borrow of `self.client` is live while Lua runs, and a raise is logged and
+    /// swallowed rather than taking down a shell that is otherwise painting.
     fn done(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, popup: &Popup) {
         let Some(index) = self.index_of_surface(popup.wl_surface()) else {
             return;
@@ -4732,34 +4295,25 @@ impl PopupHandler for App {
     }
 }
 
-/// `ext_session_lock_v1` for the session lock (build-steps.md Phase 23, docs/adr/0042,
-/// docs/adr/0052).
+/// `ext_session_lock_v1` for the session lock (docs/adr/0042, docs/adr/0052). See
+/// `delegate_dispatch2!(App)` at the bottom of this file for why no `delegate_session_lock!` call
+/// accompanies this.
 ///
-/// No `delegate_session_lock!` accompanies it and none exists in this SCTK to add, for
-/// [`WindowHandler`]'s reason exactly: `GlobalData`, `SessionLockData` and `SessionLockSurfaceData`
-/// each carry their own blanket `Dispatch2` impl covering `ext_session_lock_manager_v1`,
-/// `ext_session_lock_v1` and `ext_session_lock_surface_v1`, which the file-wide
-/// `delegate_dispatch2!(App)` at the bottom turns into the `Dispatch` half of `SessionLockState::
-/// new`'s, `lock`'s and `create_lock_surface`'s bounds the moment this trait is implemented. This
-/// trait is the only half left to supply, and it has exactly three methods.
-///
-/// `SessionLockState` is also absent from `registry_handlers![OutputState, SeatState]`, and that is
-/// correct rather than forgotten: it is not a `RegistryHandler`. It binds from the `GlobalList` once
-/// in [`run`] and its `GlobalProxy` carries the "not advertised" case for [`App::set_session_lock`]
-/// to report.
+/// `SessionLockState` is also absent from `registry_handlers![OutputState, SeatState]`, correctly:
+/// it is not a `RegistryHandler`. It binds from the `GlobalList` once in [`run`], and its
+/// `GlobalProxy` carries the "not advertised" case for [`App::set_session_lock`] to report.
 impl SessionLockHandler for App {
     /// The compositor granted the lock: the session is now locked, every other client's content is
     /// hidden, and this process is responsible for what is on screen until it unlocks
     /// (docs/adr/0042).
     ///
-    /// The surface creation here is normally a no-op, and that is deliberate.
-    /// [`App::set_session_lock`] already created one per output the moment `lock` succeeded, because
-    /// the protocol asks clients to create them immediately and lets the compositor wait for them
-    /// before sending this event, specifically so the user does not see a blank frame first. What
-    /// this call catches is an output advertised inside that window, which
-    /// [`App::ensure_lock_surfaces`] handles idempotently rather than by a second code path.
+    /// The surface creation here is normally a no-op, deliberately: [`App::set_session_lock`]
+    /// already created one per output the moment `lock` succeeded, since the protocol asks clients
+    /// to create them immediately and lets the compositor wait for them before sending this event,
+    /// so the user does not see a blank frame first. What this call catches is an output advertised
+    /// inside that window, handled idempotently by [`App::ensure_lock_surfaces`].
     ///
-    /// The lock handle is re-stored rather than compared against the one `lock` returned. It is the
+    /// The lock handle is re-stored rather than compared against the one `lock` returned: it is the
     /// same `Arc`, SCTK's dispatch flipped `is_locked()` on it before calling in here, and storing
     /// it costs a refcount bump while removing the only way the two could ever disagree.
     fn locked(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, session_lock: SessionLock) {
@@ -4770,38 +4324,34 @@ impl SessionLockHandler for App {
         self.report_lock(LockOutcome::Locked);
     }
 
-    /// **Two different events**, told apart by [`finished_outcome`] and never swallowed
-    /// (build-steps.md Phase 23 item 2). Arriving before any `locked`, the compositor denied the
-    /// request. Arriving after one, it ended a lock that was really up, through its own secure
-    /// mechanism.
+    /// Two different events, told apart by [`finished_outcome`] and never swallowed. Arriving
+    /// before any `locked`, the compositor denied the request. Arriving after one, it ended a lock
+    /// that was really up, through its own secure mechanism.
     ///
-    /// Both set `rescue`, per docs/adr/0052 decision 4, and the test that puts them there is not
-    /// severity but whether there is a lock screen left to read a message on. There is not: a denial
-    /// never put one up, and a teardown took the one that was up away, so in both cases the ordinary
-    /// scene is what the user is looking at and `rescue` is what the ordinary scene renders.
+    /// Both set `rescue` (docs/adr/0052 decision 4), and the test is not severity but whether there
+    /// is a lock screen left to read a message on. There is not: a denial never put one up, and a
+    /// teardown took the one that was up away, so in both cases the ordinary scene is what the user
+    /// is looking at and `rescue` is what it renders.
     ///
-    /// **Which teardown verb to send is decided by `is_locked()`, and the protocol leaves no
-    /// choice.** `ext-session-lock-v1` says of `finished`: "the client should make either the
-    /// destroy request or the unlock_and_destroy request, depending on whether or not the locked
-    /// event was received on this object", and of `ext_session_lock_v1.destroy`: "it is a protocol
-    /// error to make this request if the locked event was sent, the unlock_and_destroy request must
-    /// be used instead". That is unconditional, so a post-`locked` `finished` answered with a plain
-    /// `destroy` is an `invalid_destroy` every time, and losing the connection here is the worst of
-    /// the available outcomes: the compositor has already decided the lock is over, so the session
-    /// ends up unlocked *and* the shell is dead, with the `rescue` message set two lines below
-    /// never reaching a surface.
+    /// Which teardown verb to send is decided by `is_locked()`, and the protocol leaves no choice.
+    /// `ext-session-lock-v1` says of `finished`: "the client should make either the destroy request
+    /// or the unlock_and_destroy request, depending on whether or not the locked event was received
+    /// on this object", and of `ext_session_lock_v1.destroy`: "it is a protocol error to make this
+    /// request if the locked event was sent, the unlock_and_destroy request must be used instead".
+    /// So a post-`locked` `finished` answered with a plain `destroy` is `invalid_destroy` every
+    /// time, and losing the connection here is the worst outcome available: the session ends up
+    /// unlocked and the shell is dead, with the `rescue` message set below never reaching a surface.
     ///
-    /// This is not the convenience path docs/adr/0042 forbids. That rule is about *initiating* an
-    /// unlock, and the compositor initiated this one through its own secure mechanism -- `finished`
-    /// is documented as "the compositor has decided that the session lock should be destroyed".
-    /// `unlock_and_destroy` here is the cleanup verb for a lock that is already over, not a way to
-    /// end one that is still up. The one path that ends a live lock is still
-    /// [`App::release_session_lock`], reached only from a `SetSessionLock { locked: false }`.
+    /// This is not the convenience path docs/adr/0042 forbids: that rule is about initiating an
+    /// unlock, and the compositor initiated this one through its own secure mechanism --
+    /// `finished` is documented as "the compositor has decided that the session lock should be
+    /// destroyed". The one path that ends a live lock is still [`App::release_session_lock`],
+    /// reached only from a `SetSessionLock { locked: false }`.
     ///
     /// Both verbs are `type="destructor"`, and `wayland-backend` refuses a request on an
     /// already-destroyed object client-side rather than putting it on the wire, so
-    /// `SessionLockInner::Drop`'s unconditional `destroy` after this `unlock` is a no-op rather than
-    /// a second teardown. SCTK's own `SessionLock::unlock` is written against that same guarantee.
+    /// `SessionLockInner::Drop`'s unconditional `destroy` after this `unlock` is a no-op, not a
+    /// second teardown.
     fn finished(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, session_lock: SessionLock) {
         let outcome = finished_outcome(session_lock.is_locked());
         // Ahead of dropping the lock object, unlike the ordered-unlock path: there is no
@@ -4830,21 +4380,19 @@ impl SessionLockHandler for App {
     }
 
     /// One `ext_session_lock_surface_v1.configure`, already acked by SCTK's own `Dispatch2` before
-    /// this runs -- so nothing here acks, exactly as nothing in the `window` and `popup` paths acks
-    /// their `xdg_surface`.
+    /// this runs -- so nothing here acks, exactly as the `window` and `popup` paths don't ack their
+    /// `xdg_surface`.
     ///
     /// Everything after the lookup is [`App::bind_and_clear`], shared verbatim with the other three
-    /// roles. The size is taken as given with no [`toplevel_size_for`]-style negotiation, and there
-    /// is nothing to negotiate: a lock surface covers its output, the compositor knows that output's
-    /// size, and committing a buffer that does not match the acked size is the protocol's own
-    /// `dimensions_mismatch` error.
+    /// roles. The size is taken as given with no negotiation: a lock surface covers its output, the
+    /// compositor knows that output's size, and committing a buffer that does not match the acked
+    /// size is the protocol's own `dimensions_mismatch` error.
     ///
     /// This is also the event that maps the surface. `ensure_lock_surfaces` left it in
-    /// `MapState::AwaitingConfigure` and performed no initial commit, because
+    /// `MapState::AwaitingConfigure` and performed no initial commit, since
     /// `ext_session_lock_surface_v1` forbids one before the first ack; `bind_and_clear` flips that
-    /// to `Mapped`, binds EGL, paints the resolved tree, and the `eglSwapBuffers` is the commit that
-    /// carries the first buffer -- which is precisely what the protocol asks for in response to a
-    /// configure.
+    /// to `Mapped`, binds EGL, paints the resolved tree, and `eglSwapBuffers` is the commit that
+    /// carries the first buffer.
     fn configure(
         &mut self,
         _conn: &Connection,
@@ -4868,6 +4416,15 @@ impl ProvidesRegistryState for App {
     registry_handlers![OutputState, SeatState];
 }
 
+// This SCTK (`smithay-client-toolkit-0.21.1`, checked against `src/`) ships exactly two
+// `delegate_*` macros: `delegate_dispatch2!` and `delegate_registry!`. `PointerData`,
+// `KeyboardData`, `WindowData`, `PopupData`, `GlobalData` and `SessionLockData`/
+// `SessionLockSurfaceData` each carry their own blanket `Dispatch2` impl, which the line below
+// turns into the `Dispatch` half every bind/create call needs -- so `PointerHandler`,
+// `KeyboardHandler`, `WindowHandler`, `PopupHandler` and `SessionLockHandler` are implemented
+// above with no matching `delegate_pointer!`/`delegate_keyboard!`/`delegate_xdg_shell!`/
+// `delegate_xdg_popup!`/`delegate_session_lock!` call: none of those macros exist in this SCTK to
+// add, and each trait is the only half left to supply.
 delegate_registry!(App);
 smithay_client_toolkit::delegate_dispatch2!(App);
 
@@ -4877,27 +4434,20 @@ mod tests {
 
     #[test]
     fn a_supervisor_that_vanished_while_the_lock_was_up_reports_a_locked_session_and_not_a_lock_screen() {
-        // docs/adr/0059 decision 2, and it is the trap docs/adr/0058 decision 4 already named once:
-        // `lock_stays_authenticatable`'s refusal ends with "the lock screen that is on screen still
-        // stands", which is true of a refused reload and false of this. This process is about to
-        // exit, so what is left on the glass is the compositor's own fallback, and the message must
-        // send the reader to a VT rather than to a password field that no longer exists.
+        // docs/adr/0059 decision 2: this process is about to exit, so the message must send the
+        // reader to a VT, not to a password field that no longer exists (docs/adr/0058 decision 4's
+        // "still stands" trap).
         let report = supervisor_gone_report(true);
         assert!(report.contains("VT"), "the locked report must name the only way back in: {report}");
         assert!(!report.contains("still stands"), "nothing this process painted is still on screen: {report}");
 
-        // And it must not read as an unlock. Exiting while holding the lock is what keeps the
-        // session secure (SCTK's own `SessionLockInner::Drop` comment calls the same choice
-        // "failing secure"), so a message saying the session was unlocked would be a lie about the
-        // one fact a reader of this line most needs.
+        // Must not read as an unlock: exiting while holding the lock is what keeps the session
+        // secure (SCTK's own `SessionLockInner::Drop` calls this "failing secure").
         assert!(!report.contains("unlocked"), "the exit does not unlock: {report}");
     }
 
     #[test]
     fn a_supervisor_that_vanished_with_no_lock_up_says_nothing_about_locks() {
-        // The two cases cost different things and read differently. A Renderer that dies unlocked
-        // costs a bar, which is the same split docs/adr/0058 decision 2 makes on the other side of
-        // the boundary.
         let report = supervisor_gone_report(false);
         assert!(!report.contains("VT"), "no lock was up, so a VT switch is not the story: {report}");
         assert_ne!(report, supervisor_gone_report(true));
@@ -4905,33 +4455,28 @@ mod tests {
 
     #[test]
     fn a_lock_is_refused_when_the_config_declares_no_lock_surface() {
-        // docs/adr/0052 decision 3, and the refusal has to happen before `SessionLockState::lock` is
-        // called: a lock that was granted and then painted nothing is a black screen with no
-        // password field, and the protocol guarantees the compositor will not unlock on client
-        // death, so the only way out would be a VT switch.
+        // docs/adr/0052 decision 3: the refusal must happen before `SessionLockState::lock` is
+        // called, since a lock granted and then painted nothing is a black screen with no way out
+        // but a VT switch.
         assert_eq!(lock_command(true, false, false, false), LockCommand::Refuse(NO_LOCK_DECLARED));
         assert_eq!(lock_command(true, true, true, false), LockCommand::Acquire);
     }
 
     #[test]
     fn a_lock_screen_with_no_password_field_is_refused_as_loudly_as_no_lock_screen_at_all() {
-        // `lock_spec` requires only an `id` and makes `child` optional, so `lock { id = "x" }` is a
-        // legal declaration that resolves to an empty tree: a transparent buffer, an empty input
-        // region, and nothing to type into. Granting the lock for it reaches docs/adr/0052 decision
-        // 3's black screen *through* the guard instead of around it, so the tracked-surface test is
-        // not enough on its own -- the tree has to hold a field that can actually reach PAM.
+        // `lock { id = "x" }` is a legal declaration that resolves to an empty tree, reaching
+        // docs/adr/0052 decision 3's black screen through the guard instead of around it, so the
+        // tracked-surface test alone is not enough.
         assert_eq!(lock_command(true, true, false, false), LockCommand::Refuse(LOCK_CANNOT_AUTHENTICATE));
-        // And the two refusals stay distinct: "you declared no lock screen" and "your lock screen
-        // has no password field" are different edits to make to a config.
+        // The two refusals stay distinct: different edits to make to a config.
         assert_ne!(NO_LOCK_DECLARED, LOCK_CANNOT_AUTHENTICATE);
     }
 
     #[test]
     fn a_repeated_lock_or_unlock_command_touches_no_protocol_object() {
-        // `locked = true` while already holding one would be a second `ext_session_lock_v1`, which
-        // the compositor answers with an immediate `finished` on the new object -- reported as a
-        // denial of a lock this process already has. `locked = false` while holding none would be
-        // `unlock_and_destroy` on nothing, which is the protocol's `invalid_unlock` error.
+        // `locked = true` while already holding one would be a second `ext_session_lock_v1`,
+        // denied by the compositor. `locked = false` while holding none would be
+        // `unlock_and_destroy` on nothing, the protocol's `invalid_unlock` error.
         assert_eq!(lock_command(true, true, true, true), LockCommand::Nothing);
         assert_eq!(lock_command(false, true, true, false), LockCommand::Nothing);
         assert_eq!(lock_command(false, false, false, false), LockCommand::Nothing);
@@ -4939,9 +4484,8 @@ mod tests {
 
     #[test]
     fn only_a_locked_false_command_against_a_held_lock_releases() {
-        // The single `Release` in the whole table, and docs/adr/0042 is why it is worth a test of
-        // its own: `unlock_and_destroy` has exactly one reachable caller in this process, and the
-        // Supervisor sends the command that reaches it only on a `PamOutcome::Success`.
+        // The single `Release` in the table: `unlock_and_destroy` has exactly one reachable caller
+        // in this process, reached only on a `PamOutcome::Success` (docs/adr/0042).
         assert_eq!(lock_command(false, true, true, true), LockCommand::Release);
         assert_eq!(lock_command(false, false, false, true), LockCommand::Release);
     }
@@ -4949,30 +4493,27 @@ mod tests {
     #[test]
     fn releasing_a_lock_the_compositor_never_granted_does_not_report_it_as_unlocked() {
         // The Supervisor's `lock::apply` moves its `active` flag on these reports alone, so an
-        // `Unlocked` for a lock that was never `locked` tells it a transition happened that did
-        // not: SCTK's `SessionLock::unlock` is a no-op below `is_locked()`, so nothing was
-        // released and the session was never secured in the first place.
+        // `Unlocked` for a lock that was never `locked` would tell it a transition happened that
+        // did not: SCTK's `SessionLock::unlock` is a no-op below `is_locked()`.
         assert_eq!(release_outcome(true), LockOutcome::Unlocked);
         assert_eq!(release_outcome(false), LockOutcome::Refused(LOCK_NEVER_GRANTED.to_string()));
     }
 
     #[test]
     fn finished_before_a_locked_is_a_denial_and_finished_after_one_is_a_teardown() {
-        // build-steps.md Phase 23 item 2: one event, two meanings, neither of which may be
-        // swallowed. A denial is a failure the user has to see; a teardown is a state change they
-        // already lived through, and the Supervisor routes the two differently.
+        // One event, two meanings, neither may be swallowed: a denial is a failure the user has to
+        // see, a teardown is a state change already lived through, and the Supervisor routes them
+        // differently.
         assert_eq!(finished_outcome(false), LockOutcome::Refused(LOCK_DENIED.to_string()));
         assert_eq!(finished_outcome(true), LockOutcome::Finished);
     }
 
     #[test]
     fn a_declared_but_unlocked_lock_instance_neither_hangs_nor_joins_the_pba_ready_set() {
-        // The bug the popup slice hit, asked of the fourth role. A `lock` instance owns zero Wayland
-        // objects until `locked` arrives, so it reaches both PBA gates as `(null_buffered: false,
-        // exists: false)` and `MapState::Unmapped` -- complete by construction for the staging gate
-        // (nothing to stage), absent from the announced set (it will present no frame). Getting
-        // either wrong is a `ready_timeout` hang or an `UnexpectedEvidence` abort, and the two
-        // answers have to agree.
+        // A `lock` instance owns zero Wayland objects until `locked` arrives, so it reaches both PBA
+        // gates as `(null_buffered: false, exists: false)` and `MapState::Unmapped` -- complete by
+        // construction for the staging gate, absent from the announced set. Getting either wrong is
+        // a `ready_timeout` hang or an `UnexpectedEvidence` abort.
         assert!(candidate_has_staged([(false, false)].into_iter()));
         assert!(presenting_surface_ids([("screen-lock@eDP-1", MapState::Unmapped)].into_iter()).is_empty());
     }
@@ -5131,9 +4672,8 @@ mod tests {
 
     #[test]
     fn a_screen_sized_from_its_logical_size_alone_reports_a_refresh_of_zero() {
-        // `Mode`'s own docs allow a zero refresh rate for a virtual output, so zero is already
-        // this field's "no real answer" value -- an output with no current mode at all reads the
-        // same way rather than needing a separate nil case a config would have to guard.
+        // `Mode`'s own docs allow a zero refresh rate for a virtual output, so zero is already this
+        // field's "no real answer" value, and an output with no current mode reads the same way.
         let mut facts = facts(Some("HEADLESS-1"));
         facts.current_mode = None;
         assert_eq!(screen_entry(0, &facts).unwrap().refresh, 0.0);
@@ -5195,9 +4735,8 @@ mod tests {
 
     #[test]
     fn a_candidate_stages_when_every_surface_that_has_a_wayland_object_has_null_buffered() {
-        // The `all(null_buffered)` gate this replaced was correct while every tracked surface was a
-        // panel, because a panel always gets a configure -- it is created and initially committed
-        // at startup even when `visible` is false.
+        // A plain `all(null_buffered)` gate is correct only while every tracked surface is a panel:
+        // a panel always gets a configure, since it is committed at startup even when hidden.
         assert!(candidate_has_staged([(true, true), (true, true)].into_iter()));
         assert!(!candidate_has_staged([(true, true), (false, true)].into_iter()));
     }
@@ -5205,9 +4744,8 @@ mod tests {
     #[test]
     fn a_window_declared_invisible_has_nothing_to_stage_and_must_not_hold_the_ready_signal() {
         // docs/adr/0049 decision 1 creates no `xdg_toplevel` for it, so no configure is coming and
-        // `null_buffered` would stay false forever. Under the old gate that is a `ready_timeout`
-        // hang on every config declaring a hidden window, which `dev-config/oblisk/shell.lua`
-        // already does.
+        // `null_buffered` would stay false forever -- a `ready_timeout` hang under a plain gate, on
+        // any config declaring a hidden window (the dev config does).
         assert!(candidate_has_staged([("bar", true, true), ("settings", false, false)].into_iter().map(|(_, n, e)| (n, e))));
         assert!(candidate_has_staged([(false, false)].into_iter()), "a surface with no object at all is complete by construction");
     }
@@ -5228,9 +4766,8 @@ mod tests {
 
     #[test]
     fn a_configured_toplevel_axis_is_the_compositors_and_is_taken_as_given() {
-        // A tiling compositor sizes every window, and `xdg_toplevel::configure`'s own wording makes
-        // a maximized or fullscreen size binding rather than advisory. On niri this is the only
-        // branch that ever runs.
+        // A tiling compositor sizes every window: `xdg_toplevel::configure` makes a maximized or
+        // fullscreen size binding, not advisory. On niri this is the only branch that ever runs.
         let mut spec = settings_window();
         spec.min_size = Some(SizeHint { width: 320.0, height: 240.0 });
         spec.max_size = Some(SizeHint { width: 1280.0, height: 800.0 });
@@ -5262,8 +4799,7 @@ mod tests {
         spec.min_size = Some(SizeHint { width: 900.0, height: 900.0 });
         spec.max_size = Some(SizeHint { width: 400.0, height: 0.0 });
         // A zero `max_size` axis is not a maximum of zero: `set_max_size`'s own "0 means no
-        // expected maximum size in the given dimension", the same reading `node::window_spec`
-        // applies when it refuses a maximum below a minimum.
+        // expected maximum size in the given dimension".
         assert_eq!(toplevel_size_for((None, None), &spec), (400, 900));
     }
 
@@ -5275,11 +4811,9 @@ mod tests {
 
     #[test]
     fn every_window_field_is_pushed_on_its_own_and_only_when_it_moved() {
-        // All four, unlike a panel's diff: `xdg-shell.xml` says a `set_app_id` "can be sent after
-        // the xdg_toplevel has been mapped to update the property", `set_title` is the same shape,
-        // and both size hints are ordinary double-buffered requests. Nothing here is fixed at
-        // creation the way a layer surface's namespace is, so a changed `title` is an in-place
-        // update rather than a recreate.
+        // All four, unlike a panel's diff: `xdg-shell.xml` allows `set_app_id`/`set_title` after
+        // mapping, and both size hints are ordinary double-buffered requests, so a changed `title`
+        // is an in-place update, not a recreate.
         let applied = settings_window();
 
         let mut renamed = applied.clone();
@@ -5384,10 +4918,9 @@ mod tests {
 
     #[test]
     fn a_size_change_a_signal_could_make_is_refused_by_the_same_guard_creation_uses() {
-        // `height` is an ordinary resolvable property, so a `Signal` can turn a fixed 32 into
-        // `"Fill"` at runtime -- and `set_size(_, 0)` on a surface anchored to one vertical edge
-        // is a protocol error that kills the connection and the whole shell with it. The guard has
-        // to run on the update path, not only at creation.
+        // A `Signal` can turn a fixed 32 into `"Fill"` at runtime, and `set_size(_, 0)` on a surface
+        // anchored to one vertical edge is a protocol error that kills the shell. The guard has to
+        // run on the update path, not only at creation.
         let applied = panel("bar");
         let mut filled = applied.clone();
         filled.height = SizeMode::Fill;
@@ -5502,10 +5035,8 @@ mod tests {
         assert_eq!(pointer_button_name(BTN_LEFT), Some("left"));
         assert_eq!(pointer_button_name(BTN_RIGHT), Some("right"));
         assert_eq!(pointer_button_name(BTN_MIDDLE), Some("middle"));
-        // A side button, a browser-back button, and a code off the end of the mouse range. Each
-        // answers `None`, which is what stops the press arming: a config cannot tell these apart,
-        // so firing `on_click` for one would run a handler written for a button the user did not
-        // press.
+        // A side button, a browser-back button, and a code off the end of the mouse range: each
+        // answers `None`, since a config cannot tell them apart.
         assert_eq!(pointer_button_name(0x113), None);
         assert_eq!(pointer_button_name(0x116), None);
         assert_eq!(pointer_button_name(0), None);
@@ -5600,11 +5131,10 @@ mod tests {
 
     #[test]
     fn moving_focus_between_two_secure_submit_fields_zeroizes_what_the_first_accumulated() {
-        // The credential leak this seam exists to close, and the one transition three separate
-        // call sites used to get wrong: the lock screen's `("lock", "authenticate")` field
+        // The credential leak this seam closes: the lock screen's `("lock", "authenticate")` field
         // accumulates a login password, focus moves to the bar's `("network", "connect")` field
-        // without an Enter in between, and the next submit carried `<login password><psk>` to the
-        // network capability. Nothing may survive a change of destination.
+        // without an Enter in between, and the next submit used to carry `<login password><psk>`
+        // to the network capability.
         let mut focused = Some(field("screen@DP-1", "lock", "authenticate"));
         let mut buffer = shared::SecureBuffer::new();
         buffer.push_str("hunter2");
@@ -5617,11 +5147,10 @@ mod tests {
 
     #[test]
     fn the_same_destination_on_a_different_surface_is_a_different_field() {
-        // The surface half of the identity, and it is load-bearing rather than decorative. Two
-        // surfaces may perfectly well both declare `("lock", "authenticate")` -- the lock screen on
-        // each of two monitors does, since one declaration expands to one instance per output. With
-        // the destination alone as the identity, focus moving between them compared equal and the
-        // scrub was skipped, so the entry begun on one output carried on into the other.
+        // The surface half of the identity is load-bearing: two surfaces may both declare
+        // `("lock", "authenticate")` -- a lock screen on each of two monitors does. With the
+        // destination alone as the identity, focus moving between them compared equal and the
+        // scrub was skipped.
         let mut focused = Some(field("screen@eDP-1", "lock", "authenticate"));
         let mut buffer = shared::SecureBuffer::new();
         buffer.push_str("hunter2");
@@ -5634,10 +5163,9 @@ mod tests {
     #[test]
     fn clearing_focus_zeroizes_the_buffer_and_re_focusing_the_same_field_does_not() {
         // Two halves of the same rule. Clearing is `leave`/`capability_lost`, where no submit is
-        // ever coming for the bytes, so they must not sit in `App` waiting for the next `enter` to
-        // arm a destination for them. Re-arming the *same* destination is a press landing in the
-        // field the user is already typing into (docs/adr/0050 decision 4 makes the press decide
-        // focus unconditionally), and wiping there would delete half a password mid-entry.
+        // ever coming for the bytes. Re-arming the same destination is a press landing in the field
+        // already being typed into (docs/adr/0050 decision 4), and wiping there would delete half
+        // a password mid-entry.
         let mut focused = Some(field("screen@TEST", "lock", "authenticate"));
         let mut buffer = shared::SecureBuffer::new();
         buffer.push_str("hunter2");
@@ -5682,9 +5210,8 @@ mod tests {
 
     #[test]
     fn a_submit_with_no_focused_target_sends_nothing_and_still_zeroizes_the_buffer() {
-        // docs/adr/0050 decision 4: the old placeholder addressed this to `"unknown"/"unknown"`,
-        // which no Supervisor capability routes -- a password on the wire for no one. The scrub is
-        // the half that is not optional.
+        // docs/adr/0050 decision 4: addressing this to `"unknown"/"unknown"` would put a password
+        // on the wire for no one. The scrub is the half that is not optional.
         let mut buffer = shared::SecureBuffer::new();
         buffer.push_str("hunter2");
 
@@ -5694,20 +5221,17 @@ mod tests {
 
     #[test]
     fn an_enter_on_an_empty_field_sends_nothing() {
-        // Not free, which is why it is refused rather than merely useless: the Supervisor routes a
-        // `("lock", "authenticate")` submit straight into PAM, so an Enter that said nothing spends
-        // one of the user's counted attempts and one `pam_unix` failure delay.
+        // Not free: the Supervisor routes a `("lock", "authenticate")` submit straight into PAM, so
+        // an Enter that said nothing spends one of the user's counted attempts.
         let mut buffer = shared::SecureBuffer::new();
         assert_eq!(submit_frame_for(4, Some(&target("lock", "authenticate")), &mut buffer), None);
     }
 
     #[test]
     fn keyboard_focus_arriving_on_nothing_typable_disarms_whatever_was_armed() {
-        // Both of `KeyboardHandler::enter`'s "nothing to arm" cases, which used to be early returns
-        // that moved `keyboard_focus` on and left the *previous* surface's field armed: keystrokes
-        // then went on accumulating into that field's secret and could still be submitted to its
-        // capability. `enter` now pushes this answer through `App::focus_secure_submit` whatever it
-        // is, so `None` disarms and scrubs.
+        // Both of `KeyboardHandler::enter`'s "nothing to arm" cases, once early returns that left
+        // the previous surface's field armed while keystrokes kept accumulating into it. `enter`
+        // now pushes this answer through `App::focus_secure_submit` whatever it is.
         let lua = Lua::new();
         let untypable = tree_with(&lua, vec![textfield(&lua, None)]);
         let armed = field("screen@TEST", "lock", "authenticate");
@@ -5739,11 +5263,10 @@ mod tests {
     #[test]
     fn a_field_is_armed_only_while_its_own_surface_holds_the_keyboard_and_still_exists() {
         // The one question every keystroke asks, in place of a clearing call bolted onto each of the
-        // five or six sites that can take a surface away. The liveness half is the traced leak:
-        // type a login password on the lock screen, the compositor sends `finished`,
-        // `teardown_lock_surfaces` destroys the `wl_surface`, and no `leave` is required to follow
-        // it -- so the plaintext stayed live in `App::secure_buffer`, still addressed to
-        // `("lock", "authenticate")`, with later bar keystrokes appending to it.
+        // five or six sites that can take a surface away. The liveness half is the traced leak: type
+        // a login password on the lock screen, the compositor sends `finished`,
+        // `teardown_lock_surfaces` destroys the `wl_surface` with no `leave` required to follow, so
+        // the plaintext used to stay live in `App::secure_buffer`.
         let armed = field("screen@TEST", "lock", "authenticate");
         assert!(focus_is_still_armed(&armed, Some("screen@TEST"), true));
         assert!(!focus_is_still_armed(&armed, Some("screen@TEST"), false), "its `wl_surface` is gone, whether or not a `leave` ever came");
@@ -5762,9 +5285,8 @@ mod tests {
 
     #[test]
     fn keyboard_focus_takes_the_one_secure_submit_field_a_surface_declares() {
-        // The rule that makes a lock screen typable without a click. `focused_secure_submit` used
-        // to be set only by a pointer press, so the one surface whose whole job is to accept a
-        // password needed a mouse click before a keystroke could reach `SecureBuffer` at all.
+        // The rule that makes a lock screen typable without a click: `focused_secure_submit` used
+        // to be set only by a pointer press.
         let lua = Lua::new();
         let tree = tree_with(&lua, vec![textfield(&lua, Some(secure_submit_table(&lua, "lock", "authenticate")))]);
 
@@ -5796,11 +5318,10 @@ mod tests {
 
     #[test]
     fn the_lock_admission_guard_and_the_keyboard_focus_rule_are_one_predicate() {
-        // Defect D: `lock_command`'s `can_authenticate` asked whether *any* field unlocks, while
-        // keyboard focus arms only a surface's *sole* field. A lock tree with two `secure_submit`
-        // fields passed the guard, took the lock, and then armed nothing on `enter` -- on a
-        // keyboard-only machine the session could not be left except by a VT switch. The two now
-        // read the same answer out of the same function, so they cannot drift apart.
+        // Defect D: `lock_command`'s `can_authenticate` asked whether any field unlocks, while
+        // keyboard focus arms only a surface's sole field. A lock tree with two `secure_submit`
+        // fields passed the guard, took the lock, and armed nothing on `enter` -- a keyboard-only
+        // machine could then only leave the session by a VT switch.
         let lua = Lua::new();
         let typable = tree_with(&lua, vec![textfield(&lua, Some(secure_submit_table(&lua, "lock", "authenticate")))]);
         assert!(tree_can_authenticate(&typable));
@@ -5836,10 +5357,9 @@ mod tests {
 
     #[test]
     fn a_focused_secure_field_reads_the_keyboard_directly() {
-        // Phase 23 item 3's actual claim, which `zwp_text_input_v3` alone did not deliver: that
-        // path only produces a `commit_string` when the compositor has an input method bound, so on
-        // a session with no IME -- the normal case -- not one byte ever reached `SecureBuffer` and
-        // the lock could not be authenticated out of.
+        // `zwp_text_input_v3` alone did not deliver this: it only produces a `commit_string` when
+        // the compositor has an input method bound, so on a session with no IME not one byte
+        // reached `SecureBuffer`.
         assert_eq!(secure_key_action(&key(Keysym::a, Some("a")), false), SecureKeyAction::Append("a"));
         assert_eq!(secure_key_action(&key(Keysym::Return, Some("\r")), false), SecureKeyAction::Submit);
         assert_eq!(secure_key_action(&key(Keysym::KP_Enter, Some("\r")), false), SecureKeyAction::Submit);
@@ -5885,10 +5405,8 @@ mod tests {
 
     #[test]
     fn on_click_takes_the_button_name_as_a_second_argument_beside_the_rect() {
-        // Second argument, not a fifth field on the rect table. Every handler written against the
-        // one-argument form keeps working untouched, because Lua drops arguments a function does
-        // not declare, and the table the config forwards to a `popup`'s `anchor_rect` stays four
-        // fields wide instead of carrying a `button` into the positioner.
+        // Second argument, not a fifth field on the rect table: every handler written against the
+        // one-argument form keeps working, since Lua drops arguments a function does not declare.
         let lua = Lua::new();
         let seen: Function = lua
             .load(r#"seen = {} return function(rect, button) seen.x, seen.w, seen.button = rect.x, rect.width, button end"#)
@@ -5948,10 +5466,8 @@ mod tests {
     #[test]
     fn a_failed_startup_apply_leaves_panels_up_and_windows_and_popups_closed() {
         // The apply rolls its whole surface map back on error, so this is what every instance sees
-        // at once. A panel comes up painting nothing, which is the "keep the shell up" fallback the
-        // rest of this file follows; a window or popup created here would be a Wayland object the
-        // config never asked for, and with the dev config that is an empty `settings` window
-        // claiming a tile and taking focus.
+        // at once. A panel comes up painting nothing (the "keep the shell up" fallback); a window
+        // or popup created here would be a Wayland object the config never asked for.
         assert!(starting_visible(None, &SurfaceSpec::Panel(panel("bar"))));
         assert!(!starting_visible(None, &SurfaceSpec::Window(window("settings"))));
         assert!(!starting_visible(None, &SurfaceSpec::Popup(popup_spec_fixture())));
@@ -5973,10 +5489,9 @@ mod tests {
 
     #[test]
     fn a_new_surfaces_spec_comes_from_the_resolved_tree_not_the_evaluations_roster() {
-        // docs/adr/0049's second amendment at the one site that was still reading the roster. The
-        // roster's `anchor_rect` is `DEFERRED_POPUP_EXTENT`'s 1x1 placeholder whenever the config
-        // signal-bound it, and a popup shown from that keeps it for its whole life: the positioner
-        // is consumed by `get_popup` and `xdg_popup.reposition` is not built.
+        // docs/adr/0049's second amendment: the roster's `anchor_rect` is `DEFERRED_POPUP_EXTENT`'s
+        // 1x1 placeholder whenever the config signal-bound it, and a popup shown from that keeps it
+        // for its whole life since the positioner is consumed by `get_popup`.
         let lua = Lua::new();
         let rect = rect_table(&lua, LogicalRect { x: 40.0, y: 4.0, width: 86.0, height: 24.0 }).unwrap();
         let properties = HashMap::from([
@@ -6031,11 +5546,9 @@ mod tests {
     #[test]
     fn a_click_arriving_after_the_dismissal_clears_the_latch_in_the_same_turn() {
         // docs/adr/0051's first amendment. Under a grab niri delivers the closing click to the
-        // parent bar as well, so `popup_done` and the button's `on_click` land in one batch:
-        // `on_dismiss` writes false, `on_click` writes true, and the end-of-turn sample reads true.
-        // The value of `visible` cannot separate the two cases; whether the user asked again can,
-        // and `popup_done` is dispatched before the pointer events that follow it, so the counter
-        // has already moved by the time visibility is applied.
+        // parent bar too, so `popup_done` and the button's `on_click` land in one batch and
+        // `visible` alone cannot separate the two cases -- but `popup_done` dispatches before the
+        // pointer events that follow it, so the counter has already moved.
         assert_eq!(popup_visibility_action(true, false, Some(9), 10), PopupAction::Create);
     }
 
@@ -6068,9 +5581,8 @@ mod tests {
 
     #[test]
     fn a_popup_with_nothing_armed_falls_back_to_the_first_instance_of_its_parent() {
-        // The `grab = false` popup opened by a D-Bus notification. There is no better answer
-        // available -- § 6.3 gives such a popup no way to say which monitor it means -- and the
-        // ponytail on `parent_instance_index` names the upgrade path.
+        // The `grab = false` popup opened by a D-Bus notification: § 6.3 gives it no way to say
+        // which monitor it means (see `parent_instance_index`'s ponytail).
         let instances = ["bar@eDP-1", "bar@DP-1"];
         assert_eq!(parent_instance_index(instances.into_iter(), "bar", None), Some(0));
     }
@@ -6106,10 +5618,9 @@ mod tests {
 
     #[test]
     fn a_popup_configure_with_no_size_falls_back_to_what_the_positioner_asked_for() {
-        // `PopupInner` seeds its pending dimensions at `-1` and reports whatever they hold when the
-        // wrapping `xdg_surface.configure` arrives. xdg-shell requires an `xdg_popup.configure`
-        // first, but a `-1` reaching `WlEglSurface::new` is a crash and the requested size is right
-        // there.
+        // `PopupInner` seeds its pending dimensions at `-1` and reports whatever they hold when
+        // `xdg_surface.configure` arrives; a `-1` reaching `WlEglSurface::new` is a crash and the
+        // requested size is right there.
         assert_eq!(popup_size_for((-1, -1), &popup_spec_fixture()), (200, 120));
         assert_eq!(popup_size_for((180, 0), &popup_spec_fixture()), (180, 120), "per axis, not all or nothing");
     }
@@ -6141,10 +5652,9 @@ mod tests {
 
     #[test]
     fn section_6_3s_center_is_the_protocols_none_on_both_requests() {
-        // The one value with no entry of its own in either protocol enum. The XML is what makes
-        // this a translation rather than a fudge: with no edge specified the anchor point is "in
-        // the center of the anchor rectangle", and a gravity of `none` centers the surface "over
-        // the anchor point on any axis that had no gravity specified".
+        // The XML is what makes this a translation, not a fudge: with no edge specified the anchor
+        // point is "in the center of the anchor rectangle", and a gravity of `none` centers the
+        // surface "over the anchor point on any axis that had no gravity specified".
         assert_eq!(positioner_anchor(PopupAnchor::Center), xdg_positioner::Anchor::None);
         assert_eq!(positioner_gravity(PopupAnchor::Center), xdg_positioner::Gravity::None);
     }

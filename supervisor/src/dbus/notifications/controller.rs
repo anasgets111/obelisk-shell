@@ -25,8 +25,7 @@ use super::{
 // ActionInvoked reply encoding (TDD seam 4).
 // -------------------------------------------------------------------------------------------
 
-/// `ActionInvoked`'s `action_key` for a completed inline reply (ADR-0033/Noctalia convention:
-/// `"inline-reply::<text>"`).
+/// `ActionInvoked`'s `action_key` for a completed inline reply (ADR-0033: `"inline-reply::<text>"`).
 fn format_reply_action_key(text: &str) -> String {
     format!("inline-reply::{text}")
 }
@@ -41,10 +40,8 @@ fn actions_have_reply(actions: &[String]) -> bool {
 
 // -------------------------------------------------------------------------------------------
 // D-Bus interface + controller. `NotificationsController` is both the exported
-// `org.freedesktop.Notifications` object (its `#[zbus::interface]` methods below) and the cheap-
-// clone handle `main.rs` holds for write-command dispatch -- unlike `dbus::tray`'s split
-// (`StatusNotifierWatcher` vs. `TrayController`), one type serves both roles here since both need
-// the same queue/DND/sound state and the same signal-emitting capability.
+// `org.freedesktop.Notifications` object and the cheap-clone handle `main.rs` holds for
+// write-command dispatch -- unlike `dbus::tray`'s split, one type serves both roles here.
 // -------------------------------------------------------------------------------------------
 
 struct NotificationsQueueState {
@@ -61,11 +58,8 @@ impl NotificationsQueueState {
     }
 }
 
-/// `NotificationClosed`'s `reason` argument (docs/oblisk-supervisor-services-dbus.md §1's base
-/// spec, plus ADR-0033's repurposing of the spec's undefined/reserved `4` for Oblisk's own
-/// FIFO-eviction cap -- not a base-spec concept). Replaces the raw `u32` literals every call site
-/// used to pass, matching this capability's own enum-heavy style elsewhere (`Urgency`,
-/// `ExpiryPolicy`, `IconInput`).
+/// `NotificationClosed`'s `reason` argument (§1's base spec, plus ADR-0033's repurposing of the
+/// spec's undefined/reserved `4` for Oblisk's own FIFO-eviction cap).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 enum CloseReason {
@@ -84,9 +78,8 @@ impl From<CloseReason> for u32 {
 #[derive(Clone)]
 pub struct NotificationsController {
     /// `Some` only when this process actually owns `org.freedesktop.Notifications` on a live
-    /// session-bus connection -- `None` degrades every signal emission to a silent no-op (ADR-0033/
-    /// `TrayController::inert`'s precedent), while queue/DND/sound state stays fully functional
-    /// either way (they're pure Supervisor state, not dependent on the D-Bus server being live).
+    /// session-bus connection -- `None` degrades every signal emission to a silent no-op, while
+    /// queue/DND/sound state stays fully functional either way.
     connection: Option<zbus::Connection>,
     state: Arc<Mutex<NotificationsQueueState>>,
     events: UnboundedSender<NotificationsSignal>,
@@ -95,10 +88,9 @@ pub struct NotificationsController {
 }
 
 impl NotificationsController {
-    /// Requests `org.freedesktop.Notifications` with `DoNotQueue` set (unlike tray's dual-role
-    /// dance): a real desktop might already have `mako`/`dunst` running and owning this name, and
-    /// that's a genuine "someone else already provides this service" outcome to degrade to inert
-    /// for, not a race to queue behind (ADR-0033: "don't panic, don't retry-loop").
+    /// Requests `org.freedesktop.Notifications` with `DoNotQueue` set: a real desktop might
+    /// already have `mako`/`dunst` running and owning this name, a genuine "someone else already
+    /// provides this" outcome to degrade to inert for, not a race to queue behind (ADR-0033).
     pub async fn new(connection: zbus::Connection, events: UnboundedSender<NotificationsSignal>, sound_tx: SoundSender) -> Self {
         let state = Arc::new(Mutex::new(NotificationsQueueState::new()));
         let trusted_roots = Arc::new(default_trusted_icon_roots());
@@ -131,9 +123,7 @@ impl NotificationsController {
 
     /// Fully inert controller: no D-Bus connection, but a real, working queue/DND/sound-registry
     /// state -- used when the session bus itself couldn't be reached at all. Every write command
-    /// still behaves sensibly (an empty queue for `dismiss`/`reply` to miss against, `set_dnd`/
-    /// `set_sound` still mutate real in-memory state), it's only signal emission and `Notify`
-    /// arriving over D-Bus that can never happen (`TrayController::inert`'s precedent).
+    /// still behaves sensibly; only signal emission and `Notify` arriving over D-Bus never happen.
     pub fn inert(events: UnboundedSender<NotificationsSignal>, sound_tx: SoundSender) -> Self {
         Self { connection: None, state: Arc::new(Mutex::new(NotificationsQueueState::new())), events, sound_tx, trusted_roots: Arc::new(default_trusted_icon_roots()) }
     }
@@ -159,9 +149,9 @@ impl NotificationsController {
     }
 
     /// Resolves `Notify`'s icon precedence ([`resolve_icon_input`]) into a final, spooled/
-    /// validated `icon_path`. `image-data`/`icon_data` get bounds-checked ([`image_data_is_valid`])
-    /// and PNG-encoded/spooled to SHM; `image-path`/`app_icon` (after stripping a `file://` scheme,
-    /// if present) run through the same [`validate_trusted_path`] boundary body-markup images use.
+    /// validated `icon_path`. `image-data`/`icon_data` get bounds-checked and PNG-encoded/spooled
+    /// to SHM; `image-path`/`app_icon` run through the same [`validate_trusted_path`] boundary
+    /// body-markup images use.
     async fn resolve_and_spool_icon(&self, id: u32, image_data: Option<RawImageData>, image_path: Option<String>, app_icon: Option<String>, icon_data: Option<RawImageData>) -> Option<String> {
         match resolve_icon_input(image_data, image_path, app_icon, icon_data) {
             IconInput::ImageData(raw) | IconInput::IconData(raw) => spool_raw_image(id, &raw),
@@ -170,12 +160,10 @@ impl NotificationsController {
         }
     }
 
-    /// Fires once, at the end of the [`Duration`] a `notify()` call scheduled it for -- `id` and
-    /// `incarnation` together identify exactly which `Notify` call's content this timer is for
-    /// (finding 2). [`find_expiring_entry`] is the recheck: if a `replaces_id` update already
-    /// landed new content at `id` since this timer was spawned, `incarnation` no longer matches
-    /// and this is a silent no-op -- the newer timer that replace itself spawned will expire the
-    /// replacement correctly, on its own schedule.
+    /// Fires once, at the end of the `Duration` a `notify()` call scheduled it for -- `id` and
+    /// `incarnation` together identify which `Notify` call's content this timer is for.
+    /// [`find_expiring_entry`] is the recheck: if a `replaces_id` update already landed new
+    /// content at `id`, `incarnation` no longer matches and this is a silent no-op.
     async fn expire_if_still_present(&self, id: u32, incarnation: u64) {
         let icon_to_delete = {
             let mut state = self.state.lock().unwrap();
@@ -192,11 +180,10 @@ impl NotificationsController {
         let _ = self.events.send(NotificationsSignal::Changed);
     }
 
-    /// `notifications:dismiss(id)` (docs/oblisk-idl-api-specs.md §3.2): removes the entry, cancels
-    /// nothing explicitly (the pending expiry task's own recheck-before-acting sees it's gone and
-    /// no-ops -- ADR-0033/this capability's own "no cancellation-handle system" choice), emits
+    /// `notifications:dismiss(id)` (§3.2): removes the entry, cancels nothing explicitly (the
+    /// pending expiry task's own recheck-before-acting sees it's gone and no-ops), emits
     /// `NotificationClosed(id, reason=Dismissed)`, and signals a fresh `StateSnapshot` push. A
-    /// silent, logged no-op for an unknown id.
+    /// logged no-op for an unknown id.
     pub async fn dismiss(&self, id: u32) {
         let removed = {
             let mut state = self.state.lock().unwrap();
@@ -214,9 +201,8 @@ impl NotificationsController {
     }
 
     /// `notifications:reply(id, text)` (ADR-0033): confirms the notification `has_reply`, emits
-    /// `ActionInvoked(id, format_reply_action_key(text))`, and removes it from the queue -- "a
-    /// replied-to notification is done". Logged no-ops for an unknown id or one that doesn't accept
-    /// a reply.
+    /// `ActionInvoked(id, format_reply_action_key(text))`, and removes it -- a replied-to
+    /// notification is done. Logged no-ops for an unknown id or one with no reply.
     pub async fn reply(&self, id: u32, text: String) {
         let removed = {
             let mut state = self.state.lock().unwrap();
@@ -241,8 +227,8 @@ impl NotificationsController {
     }
 
     /// `notifications:set_sound(urgency, path)` (ADR-0033): registers `path` for `urgency`'s tier
-    /// if it passes the same path-trust validator as icon references. An invalid/untrusted path is
-    /// a logged no-op, not a panic.
+    /// if it passes the same path-trust validator as icon references. An invalid/untrusted path
+    /// is a logged no-op.
     pub fn set_sound(&self, urgency: Urgency, path: &str) {
         match validate_trusted_path(path, &self.trusted_roots) {
             Some(validated) => {
@@ -252,16 +238,15 @@ impl NotificationsController {
         }
     }
 
-    /// `notifications:set_dnd(enabled)` (ADR-0033): flips the Supervisor-global toggle and signals
-    /// a fresh `StateSnapshot` push (`notifications.dnd`). Gates sound only -- `notifications.feed`
-    /// keeps receiving everything regardless.
+    /// `notifications:set_dnd(enabled)` (ADR-0033): flips the Supervisor-global toggle. Gates
+    /// sound only -- `notifications.feed` keeps receiving everything regardless.
     pub fn set_dnd(&self, enabled: bool) {
         self.state.lock().unwrap().dnd = enabled;
         let _ = self.events.send(NotificationsSignal::Changed);
     }
 
     /// Full re-derivation of `notifications.feed`/`notifications.dnd` from current state --
-    /// synchronous, no D-Bus round trip needed (mirrors `dbus::tray::TrayController::build_state`).
+    /// synchronous, no D-Bus round trip needed.
     pub fn build_state(&self) -> NotificationsState {
         let state = self.state.lock().unwrap();
         NotificationsState { feed: feed_view(&state.queue), dnd: state.dnd }
@@ -336,8 +321,8 @@ impl NotificationsController {
                 if let Some(path) = icon_path {
                     delete_icon_file(&path);
                 }
-                // finding 3: a FIFO eviction past NOTIFICATION_QUEUE_CAP is a real close, not just
-                // an icon-file cleanup -- the evicted id is gone from the queue for good.
+                // A FIFO eviction past NOTIFICATION_QUEUE_CAP is a real close, not just an
+                // icon-file cleanup -- the evicted id is gone from the queue for good.
                 self.emit_notification_closed(evicted_id, CloseReason::Evicted).await;
             }
             None => {}
@@ -367,11 +352,10 @@ impl NotificationsController {
         id
     }
 
-    /// `CloseNotification(id)` (docs/oblisk-supervisor-services-dbus.md §1): removes the entry (if
-    /// present) and emits `NotificationClosed(id, reason=ClosedByMethod)`. A `dismiss()` write
-    /// command emits the same signal with `reason=Dismissed` instead -- the two are distinct wire
-    /// callers of the same removal primitive ([`remove_by_id`]), so this is not just
-    /// [`NotificationsController::dismiss`] under another name.
+    /// `CloseNotification(id)` (§1): removes the entry (if present) and emits
+    /// `NotificationClosed(id, reason=ClosedByMethod)`. A `dismiss()` write command emits the
+    /// same signal with `reason=Dismissed` instead -- distinct wire callers of the same removal
+    /// primitive ([`remove_by_id`]).
     #[zbus(name = "CloseNotification")]
     async fn close_notification(&self, id: u32) {
         let removed = {
@@ -397,13 +381,10 @@ impl NotificationsController {
         ("oblisk".to_string(), "oblisk".to_string(), "0.1.0".to_string(), "1.2".to_string())
     }
 
-    /// `reason` is [`CloseReason`] as its raw wire `u32` (the signal's own D-Bus signature is fixed
-    /// by the base spec, so the enum can't appear here directly): 1 = expired, 2 = dismissed via
-    /// `dismiss()`, 3 = `CloseNotification`, 4 = FIFO eviction -- a real desktop-notification-spec
-    /// "undefined/reserved" value repurposed for a case the base spec never anticipated, since
-    /// Oblisk's hard 100-cap is not a base-spec concept (ADR-0033). All four are emitted by this
-    /// controller: `notify()`'s own eviction path emits `reason=4` when [`push_new`]/
-    /// [`replace_or_push`] report a [`QueueCleanup::Evicted`].
+    /// `reason` is [`CloseReason`] as its raw wire `u32` (the signal's D-Bus signature is fixed by
+    /// the base spec): 1 = expired, 2 = dismissed via `dismiss()`, 3 = `CloseNotification`,
+    /// 4 = FIFO eviction -- a base-spec "undefined/reserved" value repurposed for Oblisk's hard
+    /// 100-cap (ADR-0033).
     #[zbus(signal, name = "NotificationClosed")]
     async fn notification_closed(signal_emitter: &zbus::object_server::SignalEmitter<'_>, id: u32, reason: u32) -> zbus::Result<()>;
 
@@ -412,9 +393,8 @@ impl NotificationsController {
 }
 
 // -------------------------------------------------------------------------------------------
-// Write-command argument parsers (docs/oblisk-idl-api-specs.md §3.2, ADR-0033's added rows).
-// `set_dnd` reuses `dbus::parse_bool_arg` directly at the call site (tray/idle/network/bluetooth's
-// established convention) rather than a redundant wrapper here.
+// Write-command argument parsers (§3.2, ADR-0033's added rows). set_dnd reuses
+// dbus::parse_bool_arg directly at the call site rather than a redundant wrapper here.
 // -------------------------------------------------------------------------------------------
 
 /// `notifications:dismiss(id)`'s `arguments: [id]`.
