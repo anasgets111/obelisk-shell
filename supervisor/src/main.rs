@@ -49,6 +49,13 @@ use snapshot::push_snapshot;
 /// configurable (docs/adr/0024 item 6).
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 
+/// docs/adr/0058 decision 3. Three inside a minute: enough that a Renderer killed by a transient
+/// (an OOM under memory pressure that has since passed, a GPU reset) comes back without a human,
+/// and few enough that a config which kills every Renderer it is handed stops after three tries
+/// rather than flickering a lock screen indefinitely.
+const RESTART_LIMIT: usize = 3;
+const RESTART_WINDOW: Duration = Duration::from_secs(60);
+
 /// § 15.2/15.3's ready-signal and evidence-verification deadlines (`reload::PbaTimings`).
 /// Seconds, not minutes, matching `reload.rs`'s own test constants' order of magnitude scaled up
 /// for a real Candidate that has to actually bind Wayland/EGL rather than a fake resolving
@@ -163,6 +170,45 @@ fn classify_departure(status: std::process::ExitStatus) -> RendererDeparture {
         // left to an `unreachable!()`, because this runs on the path that handles a crash and a
         // panic here would answer a dead Renderer by killing the process that can still recover it.
         None => RendererDeparture::Failed { code: -1 },
+    }
+}
+
+/// docs/adr/0058 decision 3's stop condition: at most `limit` restarts inside any `window`.
+///
+/// The brake is the decision, not the respawn. A config that kills the Renderer on evaluation kills
+/// every replacement it is handed, and an unbraked loop turns one dead bar into a lock screen that
+/// flickers back every few hundred milliseconds, which is harder to escape than the dead shell it
+/// was meant to fix.
+///
+/// A sliding window rather than a total count, because a Renderer that dies once a day for a month
+/// is a bug to chase in the log, not a loop to stop restarting, and a total count would eventually
+/// refuse to restart a shell that had been healthy since the last reboot.
+struct RestartBrake {
+    limit: usize,
+    window: Duration,
+    /// Restart instants inside the current window, oldest first. Bounded by `limit`, so a `VecDeque`
+    /// of a handful of `Instant`s rather than anything that needs pruning on a timer.
+    recent: std::collections::VecDeque<std::time::Instant>,
+}
+
+impl RestartBrake {
+    fn new(limit: usize, window: Duration) -> Self {
+        RestartBrake { limit, window, recent: std::collections::VecDeque::new() }
+    }
+
+    /// Records a restart attempt at `now` and answers whether it may proceed.
+    ///
+    /// `now` is a parameter rather than read from the clock inside, so the window can be tested
+    /// across an hour without a test that takes an hour.
+    fn allow(&mut self, now: std::time::Instant) -> bool {
+        while self.recent.front().is_some_and(|at| now.duration_since(*at) >= self.window) {
+            self.recent.pop_front();
+        }
+        if self.recent.len() >= self.limit {
+            return false;
+        }
+        self.recent.push_back(now);
+        true
     }
 }
 
@@ -428,6 +474,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
         process::spawn_group_leader(&renderer_path_str, &[], &[("OBLISK_GENERATION_ID".to_string(), "0".to_string())])?;
     let mut authoritative = Authoritative { generation_id: 0, child: boot_child };
     let mut next_generation_id: u32 = 1;
+    let mut restart_brake = RestartBrake::new(RESTART_LIMIT, RESTART_WINDOW);
 
     // The last `StateSnapshot` pushed for each capability to the authoritative generation, keyed
     // by capability name -- reused to hydrate a fresh Candidate's first evaluation with every
@@ -494,13 +541,54 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                         RendererDeparture::Failed { code: -1 }
                     }
                 };
-                eprintln!("{}", departure_report(departure, authoritative.generation_id, lock.snapshot().active));
+                let was_locked = lock.snapshot().active;
+                eprintln!("{}", departure_report(departure, authoritative.generation_id, was_locked));
                 renderer_departed = true;
-                // Shutting down is the honest interim, not the destination: docs/adr/0058
-                // decision 3 replaces this `break` with a braked respawn. A Supervisor with no
-                // Renderer can do nothing except fail every push it is handed, so ending here and
-                // freeing the socket beats spinning on capability channels nobody will read.
-                break;
+
+                // docs/adr/0058 decision 3. The brake is checked before the spawn, not after a
+                // failure, because the loop this defends against is one where every spawn succeeds
+                // and every Renderer then dies on the same config.
+                if !restart_brake.allow(std::time::Instant::now()) {
+                    eprintln!(
+                        "giving up: {RESTART_LIMIT} renderers have died within {}s, which is a config that kills whatever it is \
+                         handed rather than a transient (docs/adr/0058 decision 3)",
+                        RESTART_WINDOW.as_secs()
+                    );
+                    break;
+                }
+                let replacement_generation_id = next_generation_id;
+                next_generation_id += 1;
+                match process::spawn_group_leader(
+                    &renderer_path_str,
+                    &[],
+                    &[("OBLISK_GENERATION_ID".to_string(), replacement_generation_id.to_string())],
+                ) {
+                    Ok(child) => {
+                        authoritative = Authoritative { generation_id: replacement_generation_id, child };
+                        renderer_departed = false;
+                        eprintln!("spawned generation {replacement_generation_id} to replace it");
+                        // Hydration needs no code here: the replacement's `connected` registration
+                        // replays every `last_snapshots` entry through the arm below, the same way
+                        // a boot Renderer's does.
+                        if was_locked {
+                            // ponytail: decision 4 is what turns this line into a recovery. Until
+                            // it lands the replacement comes up unlocked behind a compositor that
+                            // is still locked, which is exactly the quickshell failure this ADR
+                            // reproduced -- no worse than the Supervisor exiting, and no better.
+                            // Upgrade path: send `SetSessionLock { locked: true }` once the
+                            // replacement registers, and let the Renderer's own acquisition check
+                            // refuse it when the config on disk can no longer authenticate.
+                            eprintln!(
+                                "the session is still locked and generation {replacement_generation_id} will not retake the lock: \
+                                 re-acquisition is docs/adr/0058 decision 4 and is not built yet, so the way back in is a VT switch"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("could not spawn a replacement renderer: {err}");
+                        break;
+                    }
+                }
             }
             Some(_) = memory::tick_sampler(&mut memory_sampler) => {
                 memory::log_sample("steady state", &[(authoritative.generation_id, &authoritative.child)]);
@@ -1094,6 +1182,55 @@ mod tests {
 
         assert!(report.contains("code 101"), "{report}");
         assert!(!report.contains("locked"), "an unlocked crash must not cry lock: {report}");
+    }
+
+    #[test]
+    fn the_brake_allows_restarts_up_to_its_limit() {
+        let start = std::time::Instant::now();
+        let mut brake = RestartBrake::new(3, Duration::from_secs(60));
+
+        for attempt in 0..3 {
+            assert!(brake.allow(start + Duration::from_secs(attempt)), "restart {attempt} is within the limit");
+        }
+    }
+
+    #[test]
+    fn the_brake_stops_a_crash_loop_once_the_limit_is_reached_inside_the_window() {
+        let start = std::time::Instant::now();
+        let mut brake = RestartBrake::new(3, Duration::from_secs(60));
+        for attempt in 0..3 {
+            brake.allow(start + Duration::from_secs(attempt));
+        }
+
+        assert!(
+            !brake.allow(start + Duration::from_secs(4)),
+            "a config that kills every Renderer it is handed must stop being handed Renderers"
+        );
+    }
+
+    #[test]
+    fn the_brake_forgets_restarts_older_than_its_window() {
+        let start = std::time::Instant::now();
+        let mut brake = RestartBrake::new(3, Duration::from_secs(60));
+        for attempt in 0..3 {
+            brake.allow(start + Duration::from_secs(attempt));
+        }
+
+        // A crash an hour after the last one is not the same incident, and a brake that counted it
+        // as one would refuse to restart a shell that had been healthy all day.
+        assert!(brake.allow(start + Duration::from_secs(3600)), "the window has long passed");
+    }
+
+    #[test]
+    fn a_slow_crash_loop_never_trips_the_brake() {
+        let start = std::time::Instant::now();
+        let mut brake = RestartBrake::new(3, Duration::from_secs(60));
+
+        // One crash per window, forever. Deliberately allowed: this is a Renderer that dies rarely,
+        // which is a bug to chase in the log, not a loop to stop restarting.
+        for attempt in 0..10 {
+            assert!(brake.allow(start + Duration::from_secs(attempt * 61)), "crash {attempt} stands alone in its window");
+        }
     }
 
     #[test]
