@@ -634,6 +634,7 @@ pub fn run(
         // (pump exited, see `crate::socket`) exactly like an idle one, so killing the Supervisor
         // left this process spinning its 15ms poll forever at 17.8% of a core, painting a shell
         // with no capability data behind it and no way to reach one.
+        //
         // One turn is three ordered stages: drain everything, re-resolve once, then draw. An
         // `ActivateDraw` nonce is therefore collected here rather than serviced in place. Drawing
         // in the loop body painted whatever layout the scene happened to hold at that instant, so
@@ -658,6 +659,15 @@ pub fn run(
                 // from. SCTK calls that choice failing secure and it is right, but the error is
                 // avoidable: skipping the destructor closes the connection instead, which the
                 // compositor treats as the same lock client death and logs as nothing.
+                //
+                // `is_some()`, not SCTK's `is_locked()`, and the two disagree for the few
+                // milliseconds between the `lock` request and the `locked` event being dispatched.
+                // Both readings are wrong somewhere in that window, so the choice is which way to
+                // be wrong: `is_some()` can claim a lock the compositor never granted, which sends
+                // someone to a VT they did not need. `is_locked()` can miss a `locked` that is on
+                // the wire but undispatched (the same race the `SetSessionLock` arm above pays a
+                // round trip to close), which tells someone their shell merely died while they are
+                // looking at a lock screen they cannot get past. Over-reporting is the safe half.
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     eprintln!("[oblisk-renderer] {}", supervisor_gone_report(app.session_lock.is_some()));
                     std::process::exit(EXIT_SUPERVISOR_GONE);

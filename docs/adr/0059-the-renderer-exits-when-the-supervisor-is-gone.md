@@ -62,6 +62,19 @@ protocol error ADR-0052 was built to stay away from. Skipping the destructor clo
 instead. The compositor reads that as the same lock client death and logs nothing, which the nested
 run confirms: not one protocol error in the compositor's log across all three cases.
 
+Which of the two "am I holding the lock" predicates the message reads is a decision of its own, and
+they disagree for the few milliseconds between the `lock` request going out and the compositor's
+`locked` being dispatched. Both readings are wrong somewhere in that window, so the question is
+which way to be wrong. Claiming a lock the compositor never granted sends someone to a VT they did
+not need. Missing a `locked` that is on the wire but undispatched tells someone their shell merely
+died while they are looking at a lock screen they cannot get past. The message over-reports on
+purpose.
+
+The exit also does not race a frame that was already in flight. `std::sync::mpsc` reports
+`Disconnected` only once the queue is empty, verified rather than read off the documentation, so a
+Supervisor that sends `SetSessionLock { locked: false }` and dies in the same breath still gets its
+unlock serviced before this path runs.
+
 ## Decision 3: a tripped restart brake exits with a code that means "do not restart"
 
 The Supervisor now returns a `Shutdown` rather than `()`, and the brake's give-up becomes exit `3`.

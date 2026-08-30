@@ -167,6 +167,93 @@ pub fn defers_swap(state: &LockState) -> bool {
     state.active || state.requested
 }
 
+/// What one [`shared::LockOutcome`] says about the *compositor's* session lock, which is a
+/// different question from the one [`apply`] answers (docs/adr/0060).
+///
+/// `LockState.active` means "this shell holds the lock". The compositor's lock outlives that:
+/// [`LockEvent::RendererLost`] clears `active` while the session stays locked, because the protocol
+/// requires a compositor not to unlock when a lock client dies. Reading the marker off `active`
+/// would therefore erase the one fact a restarted Supervisor needs, so it is read off the outcome
+/// instead, where `RendererLost` cannot reach it at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionLock {
+    Taken,
+    Released,
+    Unchanged,
+}
+
+/// Matched exhaustively rather than with a wildcard: a new [`shared::LockOutcome`] variant is a new
+/// answer to "is the session locked", and the compiler should make someone decide it rather than
+/// defaulting it to [`SessionLock::Unchanged`] on a path this quiet.
+pub fn compositor_lock_change(outcome: &shared::LockOutcome) -> SessionLock {
+    match outcome {
+        shared::LockOutcome::Locked => SessionLock::Taken,
+        shared::LockOutcome::Unlocked | shared::LockOutcome::Finished => SessionLock::Released,
+        // Nothing was taken, so nothing was released either. A refusal must leave a marker an
+        // earlier generation set alone: the session it describes is still locked.
+        shared::LockOutcome::Refused(_) => SessionLock::Unchanged,
+    }
+}
+
+/// The one piece of lock state that outlives the Supervisor process (docs/adr/0060): a file in
+/// `$XDG_RUNTIME_DIR` that exists exactly while the compositor is locked.
+///
+/// It exists because a restarted Supervisor's [`LockState`] is `Default`, so `active` is false
+/// while the compositor is still locked from before, and the new shell paints its bar behind a lock
+/// fallback where nothing can see it. That is the failure docs/adr/0058 measured in quickshell and
+/// rejected "let a session manager restart the whole stack" over; docs/adr/0059 made the restart
+/// real, so this is what keeps that door shut.
+///
+/// A file rather than anything richer because the question is a boolean and the storage has to
+/// survive `SIGKILL`, which rules out every in-process option. `$XDG_RUNTIME_DIR` rather than a
+/// config or state directory because it goes away with the user's last session, which is what
+/// bounds how stale the answer can get: within one login a set marker means the compositor really
+/// was locked and nothing unlocked it.
+pub struct SessionLockedFlag {
+    path: std::path::PathBuf,
+}
+
+impl SessionLockedFlag {
+    /// The marker at an explicit path. `main.rs` builds one from
+    /// [`shared::session_locked_flag_path`]; tests build one in a temp directory.
+    pub fn at(path: std::path::PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Whether the compositor was locked when whoever wrote this last spoke.
+    ///
+    /// A read error reads as "not locked" the way a missing file does, and that is the wrong
+    /// direction on purpose: the alternative is a Supervisor that cannot read one file and
+    /// therefore locks the screen at every boot until someone works out why.
+    pub fn is_set(&self) -> bool {
+        self.path.exists()
+    }
+
+    /// Idempotent in both directions, because both repeat in ordinary use: two `Locked` reports
+    /// across two acquisitions, and a `Finished` landing after an `Unlocked` already cleared it.
+    ///
+    /// Failures are logged and swallowed. Neither direction can be made to matter enough to stop a
+    /// shell over: a marker that failed to appear costs a relock after a crash that may never
+    /// happen, and one that failed to clear costs one password prompt at the next start.
+    pub fn apply(&self, change: SessionLock) {
+        match change {
+            SessionLock::Taken => {
+                if let Err(err) = std::fs::File::create(&self.path) {
+                    eprintln!("lock: could not write {} ; a Supervisor restart will not know the session is locked: {err}", self.path.display());
+                }
+            }
+            SessionLock::Released => {
+                if let Err(err) = std::fs::remove_file(&self.path)
+                    && err.kind() != std::io::ErrorKind::NotFound
+                {
+                    eprintln!("lock: could not remove {} ; the next Supervisor start will lock the screen: {err}", self.path.display());
+                }
+            }
+            SessionLock::Unchanged => {}
+        }
+    }
+}
+
 /// Whether a `secure_submit(lock, authenticate)` may start a PAM conversation. Two independent
 /// refusals, both about who gets to drive real PAM attempts against the session user:
 ///
@@ -360,6 +447,79 @@ pub fn dispatch(controller: &LockController, envelope: &shared::CommandEnvelope)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_the_compositor_confirming_a_lock_sets_the_marker_and_only_a_release_clears_it() {
+        // The marker answers a different question from `LockState.active`. `active` means "this
+        // shell holds the lock" and a refusal never took one, so a `Refused` must leave whatever
+        // the file already said alone rather than clearing a lock some earlier generation really
+        // did take.
+        assert_eq!(compositor_lock_change(&shared::LockOutcome::Locked), SessionLock::Taken);
+        assert_eq!(compositor_lock_change(&shared::LockOutcome::Unlocked), SessionLock::Released);
+        assert_eq!(compositor_lock_change(&shared::LockOutcome::Finished), SessionLock::Released);
+        assert_eq!(compositor_lock_change(&shared::LockOutcome::Refused("no lock node".into())), SessionLock::Unchanged);
+    }
+
+    #[test]
+    fn a_renderer_that_died_holding_the_lock_leaves_the_marker_set() {
+        // The whole point of the file. `LockEvent::RendererLost` clears `LockState.active` because
+        // this shell no longer holds anything, but the compositor is still locked and is required
+        // not to unlock on client death -- so a marker driven off `active` would erase the one fact
+        // a restarted Supervisor needs. Driving it off `LockOutcome` instead means `RendererLost`
+        // cannot reach it at all, which is the property this asserts: it is not a `Reported`.
+        let dir = tempfile::tempdir().unwrap();
+        let flag = SessionLockedFlag::at(dir.path().join("oblisk-session-locked"));
+        flag.apply(compositor_lock_change(&shared::LockOutcome::Locked));
+
+        let mut state = LockState::default();
+        apply(&mut state, LockEvent::Reported(shared::LockOutcome::Locked));
+        apply(&mut state, LockEvent::RendererLost);
+
+        assert!(!state.active, "the crash means this shell holds nothing");
+        assert!(flag.is_set(), "but the session is still locked, and the marker is what says so");
+    }
+
+    #[test]
+    fn the_marker_survives_the_process_that_wrote_it_and_reads_false_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oblisk-session-locked");
+        assert!(!SessionLockedFlag::at(path.clone()).is_set(), "a fresh login has no marker");
+
+        SessionLockedFlag::at(path.clone()).apply(SessionLock::Taken);
+        // A different `SessionLockedFlag` value entirely, which is what a restarted Supervisor is.
+        assert!(SessionLockedFlag::at(path.clone()).is_set());
+
+        SessionLockedFlag::at(path.clone()).apply(SessionLock::Released);
+        assert!(!SessionLockedFlag::at(path).is_set());
+    }
+
+    #[test]
+    fn applying_the_same_change_twice_is_not_an_error() {
+        // Both directions repeat in ordinary use: two `Locked` reports across two acquisitions, and
+        // a `Finished` arriving after an `Unlocked` already cleared it. Removing a file that is not
+        // there must not be treated as a failure to clear.
+        let dir = tempfile::tempdir().unwrap();
+        let flag = SessionLockedFlag::at(dir.path().join("oblisk-session-locked"));
+        flag.apply(SessionLock::Released);
+        assert!(!flag.is_set());
+        flag.apply(SessionLock::Taken);
+        flag.apply(SessionLock::Taken);
+        assert!(flag.is_set());
+        flag.apply(SessionLock::Released);
+        flag.apply(SessionLock::Released);
+        assert!(!flag.is_set());
+    }
+
+    #[test]
+    fn an_unchanged_verdict_touches_nothing_in_either_direction() {
+        let dir = tempfile::tempdir().unwrap();
+        let flag = SessionLockedFlag::at(dir.path().join("oblisk-session-locked"));
+        flag.apply(SessionLock::Unchanged);
+        assert!(!flag.is_set());
+        flag.apply(SessionLock::Taken);
+        flag.apply(SessionLock::Unchanged);
+        assert!(flag.is_set(), "a refusal after a real lock must not erase it");
+    }
+
     use super::*;
 
     /// A state mid-session with one failure already recorded, so a transition's effect on

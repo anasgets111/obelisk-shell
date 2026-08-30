@@ -20,6 +20,19 @@ pub fn control_socket_path() -> io::Result<PathBuf> {
     Ok(PathBuf::from(runtime_dir).join("oblisk-shell.sock"))
 }
 
+/// Where the "the compositor is locked and nothing of ours holds it" marker lives (docs/adr/0060).
+/// Beside the control socket deliberately: both are per-login runtime state, and `$XDG_RUNTIME_DIR`
+/// going away with the user's last session is what bounds how stale this file can get.
+///
+/// Only `supervisor` reads or writes it -- the Renderer holds the protocol object but never the
+/// decision (docs/adr/0042) -- but it sits here rather than in `supervisor` so that one function's
+/// neighbourhood is the only place that knows the runtime directory's layout.
+pub fn session_locked_flag_path() -> io::Result<PathBuf> {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;
+    Ok(PathBuf::from(runtime_dir).join("oblisk-session-locked"))
+}
+
 /// The capability roster (ADR-0037; CONTEXT.md's Capability roster entry): every
 /// snapshot-hydrated capability name. Each is also the Lua name it appears under, as
 /// `oblisk.<name>` (§ 2, build-steps.md Phase 25 item 3), and the `capability` field of every
