@@ -2362,6 +2362,47 @@ Supervisor-only through `inotify`. It has no caller. ADR-0047's recursive watch 
 ADR-0048 removed file reading from Lua, which was the one remaining "something external changed"
 trigger a config could have noticed and nothing else would. Build it if a caller appears.
 
+### Phase 30: The Guard Rule
+
+Implement the read half of IDL § 7.3. Phase 25 item 2 built the write half: every `CommandEnvelope`
+now carries the `generation_id` that sent it and the `expected_revision` its config was reacting to.
+The Supervisor reads neither. `main.rs`'s `RendererFrame::Command` arm matches on
+`params.capability` and dispatches, so a write from a superseded generation is accepted today, which
+§ 7.3 says must not happen.
+
+Both inputs are already in scope at that arm. `authoritative.generation_id` is the ledger § 7.3 calls
+for, and `revisions: HashMap<String, u32>` is the per-capability counter `snapshot::bump_revision`
+maintains. This is a guard clause, not a subsystem.
+
+1. **Drop a command from a superseded generation.** `params.generation_id < authoritative
+   .generation_id` is the whole test. Not `!=`: under ADR-0024 a candidate generation evaluates its
+   config *before* it is authoritative, so its id is legitimately greater, and `!=` would drop every
+   write a reload makes. Which raises item 2.
+2. **Decide whether a candidate may write at all.** A candidate's config calling `oblisk.audio:set`
+   during evaluation moves real hardware, and ADR-0024's rollback guarantee cannot take that back.
+   The alternatives are: let it through (a rolled-back config leaves the volume where it put it),
+   drop it (a config cannot configure the machine it is booting on), or queue it until the swap
+   commits. This is a trade-off with no obviously right answer and it is hard to reverse once
+   configs depend on the behaviour. Write the ADR before writing the code.
+3. **The revision guard needs a narrower rule than "stale".** Read literally, § 7.3 drops any command
+   whose `expected_revision` is behind the Supervisor's, which breaks continuous controls. Dragging a
+   volume slider sends `set` at revision 5, the Supervisor applies it, bumps to 6 and pushes; the
+   next drag frame is already in flight stamped 5, and a literal reading drops it. The user sees the
+   slider stick. § 7.3 was written against the generational swap race, not against a config that
+   writes faster than a snapshot round trip.
+4. **`expected_revision: 0` means "never hydrated", not "stale".** Phase 25 established that
+   `bump_revision` starts at 1, so no push can produce `0`. `process` stamps `0` on purpose because
+   it holds no state to be stale about. A guard that compares `0` against a live counter drops
+   `process.run` entirely, so exempt capabilities with no entry in `revisions`.
+5. **Log the drop.** § 7.3 says "instantly drops the packet" and says nothing about telling anyone.
+   A silently dropped `set` is the same debugging shape as Phase 29's missing icons and Phase 25's
+   frozen bindings: the config looks right and nothing happens. One `eprintln!` naming the
+   capability, the action, and which of the two guards fired.
+
+Deliberately not built: a reply frame telling the Renderer its command was dropped. § 7.1 has no
+such frame, and adding one makes every write a round trip. The log line is for whoever is debugging
+the config, not for the config.
+
 ---
 
 ## 6. The gap ledger: measured against a shell that already ships
