@@ -6,14 +6,8 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath};
 use super::proxies::bind_agent_manager;
 use super::AGENT_OBJECT_PATH;
 
-// ---------------------------------------------------------------------------------------------
-// Hand-written org.bluez.Agent1 (ADR-0030: Just-Works-only pairing, enforced by our own agent).
-// ---------------------------------------------------------------------------------------------
-
 /// `org.bluez.Error.Rejected` as a properly-named D-Bus error reply -- `zbus::fdo::Error::Failed`
-/// would carry the wrong error name (`org.freedesktop.DBus.Error.Failed`), so this is a small
-/// custom `DBusError`-derived type instead, mirroring the derive macro's own documented example
-/// (`zbus_macros::DBusError`'s doc comment) almost verbatim.
+/// would carry the wrong error name (`org.freedesktop.DBus.Error.Failed`).
 #[derive(Debug, zbus::DBusError)]
 #[zbus(prefix = "org.bluez.Error")]
 enum AgentError {
@@ -22,13 +16,13 @@ enum AgentError {
     Rejected(String),
 }
 
-/// `org.bluez.Agent1`, registered as the sole pairing agent for this session (ADR-0030). Method
-/// bodies are verbatim per the ADR: `RequestPinCode`/`RequestPasskey`/`DisplayPinCode` reject
-/// (legacy PIN-only devices cannot pair through this controller -- an intentional limitation, not
-/// an oversight: `bluetooth:pair(mac)` takes no PIN/passkey argument). `RequestConfirmation`/
-/// `DisplayPasskey`/`AuthorizeService`/`RequestAuthorization` auto-accept unconditionally --
-/// there is no UI to ask a human, and refusing would silently break `connect()` for already-
-/// trusted or SSP-Just-Works devices. `Cancel`/`Release` are no-ops.
+/// `org.bluez.Agent1`, registered as the sole pairing agent for this session (ADR-0030).
+/// `RequestPinCode`/`RequestPasskey`/`DisplayPinCode` reject (legacy PIN-only devices cannot
+/// pair through this controller -- `bluetooth:pair(mac)` takes no PIN/passkey argument).
+/// `RequestConfirmation`/`DisplayPasskey`/`AuthorizeService`/`RequestAuthorization`
+/// auto-accept unconditionally: there is no UI to ask a human, and refusing would silently
+/// break `connect()` for already-trusted or SSP-Just-Works devices. `Cancel`/`Release` are
+/// no-ops.
 struct BluetoothAgent;
 
 #[zbus::interface(name = "org.bluez.Agent1")]
@@ -64,15 +58,14 @@ impl BluetoothAgent {
     async fn release(&self) {}
 }
 
-/// Exports [`BluetoothAgent`] on `connection`'s object server, then registers it with capability
-/// `"NoInputNoOutput"` (forces Just Works for any SSP-capable peer, ADR-0030) and requests it as
-/// the system default -- so a pairing attempt triggered outside our own `pair()` (e.g.
-/// `bluetoothctl`) hits this policy too, not BlueZ's undocumented built-in fallback. Every step is
-/// logged-and-continue, not `?`-propagated: a machine with no `bluetoothd` running must not take
-/// the whole Supervisor down over a pairing agent it doesn't need yet (see the module doc
-/// comment). Exports the agent object *before* calling `RegisterAgent`, same ordering
-/// `dbus::polkit::register_agent` uses, so a callback arriving right after registration always
-/// finds a live object to dispatch to.
+/// Exports [`BluetoothAgent`] on `connection`'s object server, then registers it with
+/// capability `"NoInputNoOutput"` (forces Just Works for any SSP-capable peer, ADR-0030) and
+/// requests it as the system default -- so a pairing attempt triggered outside our own
+/// `pair()` (e.g. `bluetoothctl`) hits this policy too. Every step is logged-and-continue,
+/// not `?`-propagated: a machine with no `bluetoothd` running must not take the whole
+/// Supervisor down over a pairing agent it doesn't need yet. Exports the agent object
+/// *before* calling `RegisterAgent`, so a callback right after registration always finds a
+/// live object to dispatch to.
 pub(super) async fn register_agent_best_effort(connection: &zbus::Connection) {
     if let Err(err) = connection.object_server().at(AGENT_OBJECT_PATH, BluetoothAgent).await {
         eprintln!("bluetooth: failed to export the Agent1 object at {AGENT_OBJECT_PATH}: {err}");
@@ -101,18 +94,13 @@ pub(super) async fn register_agent_best_effort(connection: &zbus::Connection) {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::net::UnixStream;
 
-    // ---- BluetoothAgent (mirrors dbus::polkit's own p2p-connection test harness) ----
-
-    /// A connected pair of p2p zbus connections, no bus daemon involved -- copied from
-    /// `dbus::polkit`'s own test helper of the same name (see its doc comment for why both
-    /// builders must be driven concurrently via `try_join!`).
+    /// A connected pair of p2p zbus connections, no bus daemon involved. Both builders must
+    /// be driven concurrently via `try_join!`.
     async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {
         let (a, b) = UnixStream::pair().expect("failed to create a unix socket pair");
         let guid = zbus::Guid::generate();

@@ -7,10 +7,6 @@ use zbus::zvariant::Value;
 
 use super::proxies::{DBusMenuProxy, raw_menu_layout_to_value};
 
-// -------------------------------------------------------------------------------------------
-// DBusMenu layout parsing (ADR-0031: parsed by hand, recursively, from the raw zvariant Value).
-// -------------------------------------------------------------------------------------------
-
 /// One node of a DBusMenu layout tree, already resolved into what `tray.items[].menu` needs
 /// (docs/oblisk-idl-api-specs.md §2.14).
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -27,7 +23,7 @@ pub struct MenuItem {
 
 /// Unwraps a nested D-Bus variant (`Value::Value(Box<Value>)`) down to the real payload --
 /// DBusMenu's `av` (array-of-variant) children come back this way, one variant layer per
-/// element (mirrors `zvariant::Value::downcast`'s own unwrap-one-`Value::Value`-layer handling).
+/// element.
 fn unwrap_variant<'a>(value: &'a Value<'_>) -> &'a Value<'a> {
     match value {
         Value::Value(inner) => unwrap_variant(inner),
@@ -63,24 +59,22 @@ fn dict_str_key<'a>(key: &'a Value<'_>) -> Option<&'a str> {
     }
 }
 
-/// Hard cap on [`parse_menu_node`]'s own recursion depth (Correctness review: a `GetLayout`
-/// reply's tree structure is entirely controlled by whichever process registered the tray item's
-/// `Menu` object -- any session-bus peer -- so a well-formed but deeply nested reply, each level a
-/// trivial, legally-encoded 3-field structure easily within normal D-Bus message size limits,
-/// could otherwise stack-overflow this task via unbounded Rust recursion). Generous for any real,
-/// human-authored menu (DBusMenu trees nested more than a handful of levels deep don't happen in
-/// practice) while staying well under any realistic native-stack-overflow threshold.
+/// Hard cap on [`parse_menu_node`]'s own recursion depth: a `GetLayout` reply's tree
+/// structure is controlled by whichever session-bus peer registered the tray item's `Menu`
+/// object, so a deeply nested but legally-encoded reply could otherwise stack-overflow this
+/// task via unbounded Rust recursion. Generous for any real, human-authored menu -- DBusMenu
+/// trees nested more than a handful of levels deep don't happen in practice.
 const MAX_MENU_DEPTH: u32 = 32;
 
 /// Parses one `(ia{sv}av)`-shaped DBusMenu layout node -- `id`, its properties dict, and its
 /// `av` children array -- recursively into a [`MenuItem`] tree. `None` on any structural
-/// mismatch (not the real DBusMenu wire shape this was built against); a missing/malformed
-/// property falls back to its DBusMenu spec default rather than failing the whole node.
+/// mismatch; a missing/malformed property falls back to its DBusMenu spec default rather
+/// than failing the whole node.
 ///
-/// `depth` is this node's own recursion depth (`0` for the tree's root, `fetch_menu_via`'s only
-/// caller). At [`MAX_MENU_DEPTH`], this node itself still parses normally (id/properties), but its
-/// `children` are truncated to empty instead of recursing further -- logged, since a legitimate
-/// app should never hit this.
+/// `depth` is this node's own recursion depth (`0` for the tree's root). At
+/// [`MAX_MENU_DEPTH`], this node itself still parses normally, but its `children` are
+/// truncated to empty instead of recursing further -- logged, since a legitimate app should
+/// never hit this.
 pub(super) fn parse_menu_node(value: &Value<'_>, depth: u32) -> Option<MenuItem> {
     let structure = match unwrap_variant(value) {
         Value::Structure(structure) => structure,
@@ -146,7 +140,7 @@ mod tests {
 
     use super::*;
 
-    // ---- parse_menu_node (against real zvariant Value/Structure literals, not a re-derivation) ----
+    // ---- parse_menu_node ----
 
     fn menu_node_value<'a>(id: i32, properties: Vec<(&'a str, Value<'a>)>, children: Vec<Value<'a>>) -> Value<'a> {
         let mut dict = Dict::new(&Signature::Str, &Signature::Variant);
@@ -254,10 +248,10 @@ mod tests {
 
     #[test]
     fn parse_menu_node_truncates_at_the_depth_cap_without_panicking_or_overflowing() {
-        // A chain well deeper than MAX_MENU_DEPTH -- each level a trivial, legally-encoded node,
-        // exactly the shape a malicious (or just buggy) GetLayout reply could hand this parser
-        // (Correctness review: unbounded recursion through this tree is a stack-overflow DoS any
-        // session-bus peer registering a tray item's Menu object could otherwise trigger).
+        // A chain well deeper than MAX_MENU_DEPTH: a malicious (or just buggy) GetLayout reply
+        // could hand this parser exactly this shape, and unbounded recursion through it is a
+        // stack-overflow DoS any session-bus peer registering a tray item's Menu object could
+        // otherwise trigger.
         fn deep_chain(remaining: u32, id: i32) -> Value<'static> {
             if remaining == 0 {
                 menu_node_value(id, vec![], vec![])

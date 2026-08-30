@@ -1,13 +1,10 @@
-//! Discovery: which session-bus names `oblisk.mpris` tracks, and how it finds them. Split from
-//! `dbus::mpris` -- see `dbus/mpris/mod.rs` for the module-level doc.
+//! Discovery: which session-bus names `oblisk.mpris` tracks, and how it finds them. Split
+//! from `dbus::mpris` -- see `dbus/mpris/mod.rs` for the module-level doc.
 //!
-//! Unlike `dbus::tray` (items register themselves via an explicit call, liveness tracked only by
-//! `NameOwnerChanged` removal) or `dbus::bluetooth` (`ObjectManager`-driven), MPRIS players never
-//! register with anything -- discovery is active: `ListNames` scanned once at startup, then
-//! `NameOwnerChanged` watched for the same prefix going forward for both arrival and departure.
-//! This exact shape (`registerExisting()` + a service watcher on `"org.mpris.MediaPlayer2*"`) is
-//! independently validated by Quickshell's own `MprisWatcher` (`watcher.cpp`), a mature real-world
-//! implementation -- confirmed here rather than invented from scratch (ADR-0036).
+//! MPRIS players never register with anything -- discovery is active: `ListNames` scanned
+//! once at startup, then `NameOwnerChanged` watched for the same prefix going forward for
+//! both arrival and departure (ADR-0036, independently validated by Quickshell's own
+//! `MprisWatcher`).
 
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::StreamExt;
@@ -18,13 +15,11 @@ use super::player::{PlayerRegistry, register_player, unregister_player};
 pub(super) const MPRIS_SERVICE_PREFIX: &str = "org.mpris.MediaPlayer2.";
 const EXCLUDED_SUFFIX: &str = "playerctld";
 
-/// True for any real MPRIS player bus name this capability should track -- the discovery prefix,
-/// minus `playerctld` (the `playerctl` project's own aggregator: it transparently mirrors
-/// whichever real player is active, including its own `Identity`/`DesktopEntry` -- confirmed via
-/// live introspection to be the only reliable exclusion signal, since no property distinguishes
-/// it from the player it's proxying; ADR-0036). Excluding it here does not affect anything that
-/// talks to it directly (media keys, the `playerctl` CLI) -- only `oblisk.mpris`'s own discovered-
-/// player list.
+/// True for any real MPRIS player bus name this capability should track -- the discovery
+/// prefix, minus `playerctld` (the `playerctl` project's own aggregator: it transparently
+/// mirrors whichever real player is active, including its own `Identity`/`DesktopEntry` --
+/// confirmed via live introspection to be the only reliable exclusion signal; ADR-0036).
+/// Excluding it here only affects `oblisk.mpris`'s own discovered-player list.
 pub(super) fn is_trackable_player(bus_name: &str) -> bool {
     bus_name.strip_prefix(MPRIS_SERVICE_PREFIX).is_some_and(|suffix| !suffix.is_empty() && suffix != EXCLUDED_SUFFIX)
 }
@@ -60,19 +55,17 @@ async fn discover_existing(connection: &zbus::Connection, dbus_proxy: &zbus::fdo
     }
 }
 
-/// Binds `org.freedesktop.DBus`, subscribes to `NameOwnerChanged` *before* running the initial
-/// [`discover_existing`] scan, then spawns the ongoing forwarder loop over that already-live
-/// subscription. Degrades to "no discovery" (logged) if `org.freedesktop.DBus` can't be bound, or
-/// if the subscription itself fails -- matches `dbus::tray`'s own "degrade to inert, don't take
-/// the Supervisor down" precedent for a session bus that isn't fully available.
+/// Binds `org.freedesktop.DBus`, subscribes to `NameOwnerChanged` *before* running the
+/// initial [`discover_existing`] scan, then spawns the ongoing forwarder loop over that
+/// already-live subscription. Degrades to "no discovery" (logged) if either bind or
+/// subscribe fails.
 ///
-/// Subscribe-then-scan, not scan-then-subscribe (Correctness review): `receive_name_owner_changed`
-/// installs the real D-Bus match rule as soon as it completes. Scanning first left a real window
-/// where a player that appeared or disappeared between the `ListNames` reply and the subscription
-/// being installed was silently missed forever -- nothing else would ever trigger its
-/// registration (or its removal) later. A `NameOwnerChanged` landing on this subscription before
-/// `discover_existing`'s own scan reaches that same name is a harmless double-registration,
-/// already safely handled by `register_player`'s insert-returns-previous-abort logic.
+/// Subscribe-then-scan, not scan-then-subscribe: scanning first leaves a window where a
+/// player that appears or disappears between the `ListNames` reply and the subscription
+/// being installed is silently missed forever. A `NameOwnerChanged` landing on this
+/// subscription before `discover_existing`'s own scan reaches that name is a harmless
+/// double-registration, already handled by `register_player`'s insert-returns-previous-abort
+/// logic.
 pub(super) async fn spawn_discovery(connection: zbus::Connection, registry: PlayerRegistry, events: UnboundedSender<MprisSignal>) {
     let dbus_proxy = match zbus::fdo::DBusProxy::new(&connection).await {
         Ok(proxy) => proxy,

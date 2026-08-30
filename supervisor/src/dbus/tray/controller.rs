@@ -17,10 +17,6 @@ use super::registration::sanitize_unique_name;
 use super::registry::{ItemKey, ItemRegistry, spawn_name_owner_changed_forwarder};
 use super::watcher::StatusNotifierWatcher;
 
-// -------------------------------------------------------------------------------------------
-// Controller.
-// -------------------------------------------------------------------------------------------
-
 #[derive(Clone)]
 pub struct TrayController {
     registry: ItemRegistry,
@@ -29,19 +25,15 @@ pub struct TrayController {
 
 impl TrayController {
     /// Requests `org.kde.StatusNotifierWatcher` with no `ReplaceExisting`/`DoNotQueue` flags
-    /// (ADR-0031's "dual-role dance"): with `DoNotQueue` unset, zbus 5's own
-    /// `request_name_with_flags` never returns `Err(NameTaken)` for this case -- it queues
-    /// instead, returning `Ok(RequestNameReply::InQueue)` (verified against zbus 5.19.0's
-    /// `Connection::request_name_with_flags` source: `RequestNameReply::Exists`, the only reply
-    /// mapped to `Err`, is only reachable when `DoNotQueue` is set). So every `Ok` reply here is
-    /// a real success path; only a hard `Err` is logged as a genuine failure, and even that
-    /// doesn't stop construction.
+    /// (ADR-0031's "dual-role dance"): with `DoNotQueue` unset, zbus never returns
+    /// `Err(NameTaken)` for this case -- it queues instead, returning `Ok(InQueue)`. So every
+    /// `Ok` reply here is a real success path; only a hard `Err` is logged as a genuine
+    /// failure, and even that doesn't stop construction.
     ///
-    /// The `StatusNotifierWatcher` object is attached at [`WATCHER_OBJECT_PATH`] regardless of
-    /// who ends up owning the name, then `RegisterStatusNotifierHost` is called against the
-    /// well-known name itself (not a resolved unique name) -- D-Bus routing delivers that call
-    /// to whichever process actually owns it, so this works identically whether this process
-    /// won the name or lost it to a real DE session already running one.
+    /// The `StatusNotifierWatcher` object is attached at [`WATCHER_OBJECT_PATH`] regardless
+    /// of who owns the name, then `RegisterStatusNotifierHost` is called against the
+    /// well-known name (not a resolved unique name) -- D-Bus routing delivers that call to
+    /// whichever process actually owns it.
     pub async fn new(connection: zbus::Connection, events: UnboundedSender<TraySignal>) -> Self {
         match connection.request_name_with_flags(WATCHER_BUS_NAME, BitFlags::<RequestNameFlags>::empty()).await {
             Ok(reply) => eprintln!("tray: RequestName({WATCHER_BUS_NAME}) -> {reply}"),
@@ -52,8 +44,7 @@ impl TrayController {
         let host_registered = Arc::new(Mutex::new(false));
         let watcher = StatusNotifierWatcher { connection: connection.clone(), registry: registry.clone(), host_registered, events: events.clone() };
         // Logged-and-continue, not `?`-propagated: an export failure here must not abort the
-        // whole Supervisor -- this controller still constructs and every other tray
-        // functionality keeps working either way.
+        // whole Supervisor -- this controller still constructs either way.
         if let Err(err) = connection.object_server().at(WATCHER_OBJECT_PATH, watcher).await {
             eprintln!("tray: failed to export StatusNotifierWatcher at {WATCHER_OBJECT_PATH}: {err}");
         }
@@ -78,19 +69,17 @@ impl TrayController {
         Self { registry, events }
     }
 
-    /// Fully inert controller: empty registry, no forwarder tasks, nothing exported on any
-    /// connection. Used when a dedicated session-bus connection for the tray host itself
-    /// couldn't even be established. Every read/write action behaves exactly as it would
-    /// against a live controller that simply has no tray items registered yet (`build_state`
-    /// returns an empty `TrayState`, every `find_*` lookup misses).
+    /// Fully inert controller: empty registry, no forwarder tasks, nothing exported. Used
+    /// when a dedicated session-bus connection for the tray host couldn't be established.
+    /// Every read/write action behaves as it would against a live controller with no items
+    /// registered yet.
     pub fn inert(events: UnboundedSender<TraySignal>) -> Self {
         Self { registry: Arc::new(Mutex::new(HashMap::new())), events }
     }
 
-    /// Full, live re-derivation of `tray.items` from the entire tracked registry. Synchronous:
-    /// every registry entry's `last_known` is already up to date (the forwarder tasks
-    /// recompute it before ever sending a [`TraySignal`]), so no further D-Bus round trip is
-    /// needed here.
+    /// Full, live re-derivation of `tray.items` from the entire tracked registry.
+    /// Synchronous: every registry entry's `last_known` is already up to date (the forwarder
+    /// tasks recompute it before ever sending a [`TraySignal`]).
     pub fn build_state(&self) -> TrayState {
         TrayState { items: self.registry.lock().unwrap().values().map(|entry| entry.last_known.clone()).collect() }
     }
@@ -145,11 +134,10 @@ impl TrayController {
         }
     }
 
-    /// `tray:menu_will_show(id, submenu_id)`: calls `AboutToShow(submenu_id)` (DBusMenu's own
-    /// lazy-population signal, ADR-0031), then re-fetches and re-pushes the item's entire menu
-    /// tree. A full re-fetch, not an in-place splice of just `submenu_id`'s own children: menu
-    /// trees are human-scale (ADR-0031's own "Consequences" section), so the extra round trip
-    /// costs nothing a user would notice.
+    /// `tray:menu_will_show(id, submenu_id)`: calls `AboutToShow(submenu_id)` (DBusMenu's
+    /// lazy-population signal, ADR-0031), then re-fetches and re-pushes the item's entire
+    /// menu tree. A full re-fetch, not an in-place splice: menu trees are human-scale
+    /// (ADR-0031), so the extra round trip costs nothing a user would notice.
     pub async fn menu_will_show(&self, id: &str, submenu_id: i32) {
         let Some((key, _)) = self.find_item_id(id) else {
             eprintln!("tray: menu_will_show({id:?}, {submenu_id}) failed: {}", TrayActionError::UnknownItem);

@@ -16,10 +16,6 @@ use super::item::{TrayItem, fetch_tray_item_base};
 use super::menu::fetch_menu_via;
 use super::proxies::{DBusMenuProxy, StatusNotifierItemProxy, bind_dbusmenu, bind_item};
 
-// -------------------------------------------------------------------------------------------
-// Registry.
-// -------------------------------------------------------------------------------------------
-
 pub(super) struct ItemEntry {
     pub(super) item: StatusNotifierItemProxy<'static>,
     pub(super) menu: Option<DBusMenuProxy<'static>>,
@@ -33,10 +29,8 @@ pub(super) type ItemRegistry = Arc<Mutex<HashMap<ItemKey, ItemEntry>>>;
 
 /// Binds `unique_name`/`object_path` as a `StatusNotifierItem`, hydrates its full [`TrayItem`]
 /// (including its menu tree, if it has one -- ADR-0031's "eager top-level fetch"), spawns its
-/// signal forwarder(s), and inserts the resulting entry into `registry`. Used both by
-/// `RegisterStatusNotifierItem` and, in principle, by any future re-registration path. Aborts and
-/// replaces a prior entry at the same key rather than leaking its forwarder tasks (mirrors
-/// `dbus::bluetooth::register_device`'s own `insert`-returns-previous handling).
+/// signal forwarder(s), and inserts the resulting entry into `registry`. Aborts and replaces
+/// a prior entry at the same key rather than leaking its forwarder tasks.
 pub(super) async fn register_item(
     connection: &zbus::Connection,
     registry: &ItemRegistry,
@@ -68,20 +62,15 @@ pub(super) async fn register_item(
 
     let key: ItemKey = (unique_name.clone(), object_path.clone());
 
-    // Narrow TOCTOU guard (Correctness review): every `.await` above (property reads, an
-    // optional GetLayout) is a window in which the registering connection could have
-    // disconnected -- NameOwnerChanged-based cleanup (spawn_name_owner_changed_forwarder) only
-    // ever removes an entry that already exists, so a disconnect landing in that window would
-    // otherwise plant an unreachable ghost entry no later signal can ever remove (a narrower
-    // version of the fabricated-unique-name bug resolve_registration's UniqueName branch now
-    // rejects -- but for a connection that legitimately existed and then genuinely disconnected
-    // mid-registration, not a fabricated one). One more liveness check, right here before the
-    // insert below (nothing else `.await`s between this and it), narrows that whole multi-await
-    // window down to a single check-then-insert. Reuses the same org.freedesktop.DBus mechanism
-    // resolve_registration's WellKnownName branch already uses for GetNameOwner. Best-effort: a
-    // failure to even ask (proxy bind or the call itself erroring) proceeds with the insert rather
-    // than blocking a legitimate registration on an unrelated D-Bus hiccup -- this narrows the
-    // race, it doesn't need to be perfect.
+    // Narrow TOCTOU guard: every `.await` above (property reads, an optional GetLayout) is a
+    // window in which the registering connection could have disconnected --
+    // NameOwnerChanged-based cleanup only ever removes an entry that already exists, so a
+    // disconnect landing in that window would otherwise plant an unreachable ghost entry no
+    // later signal can ever remove. One more liveness check right here, before the insert
+    // below (nothing else `.await`s between this and it), narrows that whole multi-await
+    // window down to a single check-then-insert. Best-effort: a failure to even ask proceeds
+    // with the insert rather than blocking a legitimate registration on an unrelated D-Bus
+    // hiccup -- this narrows the race, it doesn't need to be perfect.
     if let Ok(dbus_proxy) = zbus::fdo::DBusProxy::new(connection).await {
         match dbus_proxy.name_has_owner(BusName::from(unique_name.clone())).await {
             Ok(false) => {
@@ -108,12 +97,11 @@ pub(super) async fn register_item(
     Ok(())
 }
 
-/// Runs until every `NewX` signal stream ends, re-fetching the full [`TrayItem`] (base properties
-/// plus, if `menu` is `Some`, a full menu-tree refetch via the already-bound proxy) on any of
-/// them and updating the registry entry in place -- no debounce, no fine-grained per-property
-/// patching (mirrors `dbus::bluetooth`/`dbus::network`'s established "full re-derivation on any
-/// relevant event" discipline). One instance per tracked item; its `JoinHandle` lives in the
-/// item's own [`ItemEntry`] and is aborted on unregistration.
+/// Runs until every `NewX` signal stream ends, re-fetching the full [`TrayItem`] (base
+/// properties plus, if `menu` is `Some`, a full menu-tree refetch via the already-bound
+/// proxy) on any of them and updating the registry entry in place -- no debounce, no
+/// fine-grained per-property patching. One instance per tracked item; its `JoinHandle` lives
+/// in the item's own [`ItemEntry`] and is aborted on unregistration.
 fn spawn_item_signal_forwarder(
     item: StatusNotifierItemProxy<'static>,
     unique_name: OwnedUniqueName,

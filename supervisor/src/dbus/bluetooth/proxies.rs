@@ -3,10 +3,6 @@
 
 use zbus::zvariant::{ObjectPath, OwnedObjectPath};
 
-// ---------------------------------------------------------------------------------------------
-// Hand-written proxies (ADR-0030: no maintained zbus proxy crate for BlueZ).
-// ---------------------------------------------------------------------------------------------
-
 #[zbus::proxy(interface = "org.bluez.Adapter1", default_service = "org.bluez")]
 pub(super) trait Adapter1 {
     #[zbus(name = "StartDiscovery")]
@@ -87,14 +83,8 @@ pub(super) trait AgentManager1 {
     fn request_default_agent(&self, agent: &ObjectPath<'_>) -> zbus::Result<()>;
 }
 
-/// Small convenience wrappers around each proxy's own macro-generated `builder()` -- unlike
-/// `dbus::network`'s `bind_*` helpers, these aren't working around a lifetime-elision bug (the
-/// macro-generated `builder()` here already lets the caller bind past the `&Connection`
-/// argument's own borrow -- verified against vendored `zbus_macros-5.19.0`'s proxy-macro output:
-/// `impl<'p> Proxy<'p> { pub fn builder(conn: &Connection) -> Builder<'p, Self> }`, where `'p` is
-/// the impl block's own free lifetime parameter, not elided from `conn`'s borrow). They exist
-/// purely to keep every per-path `.path(path)?.build().await` call site one line instead of
-/// three.
+/// Small convenience wrappers around each proxy's own macro-generated `builder()`, purely to
+/// keep every per-path `.path(path)?.build().await` call site one line instead of three.
 pub(super) async fn bind_adapter(connection: &zbus::Connection, path: OwnedObjectPath) -> zbus::Result<Adapter1Proxy<'static>> {
     Adapter1Proxy::builder(connection).path(path)?.build().await
 }
@@ -111,10 +101,9 @@ pub(super) async fn bind_object_manager(connection: &zbus::Connection) -> zbus::
     zbus::fdo::ObjectManagerProxy::builder(connection).destination("org.bluez")?.path("/")?.build().await
 }
 
-/// Subscribes to `object_manager`'s `InterfacesAdded`/`InterfacesRemoved` signals, returning both
-/// streams already-live rather than a proxy [`spawn_object_manager_forwarder`] would have to
-/// subscribe through itself later -- see that function's own doc comment for why the ordering
-/// this enables (subscribe, then hydrate via `GetManagedObjects()`) matters.
+/// Subscribes to `object_manager`'s `InterfacesAdded`/`InterfacesRemoved` signals, returning
+/// both streams already-live, so a caller can subscribe before hydrating via
+/// `GetManagedObjects()` without missing anything that changes in between.
 pub(super) async fn subscribe_object_manager(
     object_manager: &zbus::fdo::ObjectManagerProxy<'static>,
 ) -> zbus::Result<(zbus::fdo::InterfacesAddedStream, zbus::fdo::InterfacesRemovedStream)> {

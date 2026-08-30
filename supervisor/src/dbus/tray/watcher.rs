@@ -9,10 +9,6 @@ use super::TraySignal;
 use super::registration::resolve_registration;
 use super::registry::{ItemRegistry, register_item};
 
-// -------------------------------------------------------------------------------------------
-// org.kde.StatusNotifierWatcher.
-// -------------------------------------------------------------------------------------------
-
 pub(super) struct StatusNotifierWatcher {
     pub(super) connection: zbus::Connection,
     pub(super) registry: ItemRegistry,
@@ -44,9 +40,9 @@ impl StatusNotifierWatcher {
 
     #[zbus(name = "RegisterStatusNotifierHost")]
     async fn register_status_notifier_host(&self, _service: String, #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>) {
-        // Accepted trivially (ADR-0031): Oblisk is the only host that matters to this
-        // controller's own item-registration logic; this exists for spec completeness (we may
-        // be registering ourselves as our own host too, see TrayController::new).
+        // Accepted trivially (ADR-0031): Oblisk is the only host that matters here; this
+        // exists for spec completeness (we may register ourselves as our own host too, see
+        // TrayController::new).
         let was_registered = {
             let mut guard = self.host_registered.lock().unwrap();
             let was = *guard;
@@ -94,16 +90,14 @@ mod tests {
     use super::super::{DEFAULT_ITEM_OBJECT_PATH, RawIconPixmap, RawToolTip, WATCHER_OBJECT_PATH};
     use super::super::test_support::p2p_pair;
 
-    // ---- resolve_registration / register_status_notifier_item (Correctness review: unbounded
-    //      ghost-registry/task-leak DoS via a fabricated unique name -- a connection can only ever
-    //      truthfully claim its own real unique name, so a claimed `:N.M` must equal the real,
-    //      bus-daemon-authenticated sender) ----
+    // ---- resolve_registration / register_status_notifier_item: a fabricated unique name
+    //      must be rejected, since a connection can only ever truthfully claim its own real
+    //      unique name (the bus-daemon-authenticated sender) ----
 
-    /// Builds a real `RegisterStatusNotifierItem` method-call `Message` carrying `sender` in its
-    /// own `SENDER` header field -- constructed locally (no live dispatch needed), so the
-    /// `Header<'_>` this yields via `.header()` is exactly what `header.sender()` would return for
-    /// a real call from that unique name, letting these tests exercise the real interface method
-    /// (not just `resolve_registration` in isolation) with a controlled, authenticated sender.
+    /// Builds a real `RegisterStatusNotifierItem` method-call `Message` carrying `sender` in
+    /// its own `SENDER` header field, so `header.sender()` returns exactly what a real call
+    /// from that unique name would -- lets these tests exercise the real interface method,
+    /// not just `resolve_registration` in isolation.
     fn register_call_message(sender: &str) -> zbus::Message {
         zbus::Message::method_call(WATCHER_OBJECT_PATH, "RegisterStatusNotifierItem")
             .expect("valid method-call builder")
@@ -119,15 +113,12 @@ mod tests {
     }
 
     /// Minimal server-side stub answering only the `org.kde.StatusNotifierItem` properties
-    /// `fetch_tray_item_base`/`register_item` actually read for a real registration to complete --
-    /// a bare p2p connection with nothing exported on the peer's object server never replies to
-    /// these at all (no bus daemon to synthesize an `UnknownObject` error on its behalf), so
-    /// `register_item`'s real outbound calls would otherwise hang forever instead of erroring or
-    /// returning quickly (confirmed live: without this, the "accepts" test below hung until
-    /// SIGKILL'd). Mirrors `dbus::bluetooth`'s own p2p test pattern of exporting the real handler
-    /// before any call can reach it. `Menu` returns `"/"` so `register_item`'s own
-    /// `path.as_str() != "/"` check skips the whole DBusMenu/GetLayout path, keeping this stub to
-    /// exactly the properties needed and nothing more.
+    /// `fetch_tray_item_base`/`register_item` actually read -- a bare p2p connection with
+    /// nothing exported on the peer's object server never replies to these at all, so
+    /// `register_item`'s real outbound calls would otherwise hang forever (confirmed live:
+    /// without this, the "accepts" test below hung until SIGKILL'd). `Menu` returns `"/"` so
+    /// `register_item`'s own `path.as_str() != "/"` check skips the whole DBusMenu/GetLayout
+    /// path.
     struct StubStatusNotifierItem;
 
     #[zbus::interface(name = "org.kde.StatusNotifierItem")]
@@ -166,10 +157,9 @@ mod tests {
         }
     }
 
-    /// Minimal server-side stub answering `org.freedesktop.DBus.NameHasOwner` -- Fix 5's own
-    /// pre-insert liveness check calls this against `self.connection`; on a bare p2p connection
-    /// nothing else would ever answer it either (same "no bus daemon to fall back on" reasoning as
-    /// [`StubStatusNotifierItem`]'s own doc comment).
+    /// Minimal server-side stub answering `org.freedesktop.DBus.NameHasOwner` -- the
+    /// pre-insert liveness check in `register_item` calls this against `self.connection`; on
+    /// a bare p2p connection nothing else would ever answer it either.
     struct StubDBusDaemon;
 
     #[zbus::interface(name = "org.freedesktop.DBus")]

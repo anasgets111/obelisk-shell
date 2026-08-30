@@ -4,12 +4,10 @@
 //! Hosts `org.kde.StatusNotifierWatcher` at `/StatusNotifierWatcher` and client-handles every
 //! registered `org.kde.StatusNotifierItem` (plus its optional `com.canonical.dbusmenu` menu).
 //! Hand-written `#[zbus::proxy]` traits (ADR-0031: no crate reuse -- `system-tray` has a
-//! source-verified pixmap-squaring bug and wouldn't save the security-critical
-//! bounds-checking/PNG-encoding work this controller has to do regardless), a `*Controller`
-//! struct holding the proxies/registry write actions need, a `HashMap<Key, Entry>` dynamic
-//! per-object registry hydrated live and kept live via per-item forwarder tasks (one
-//! `JoinHandle` per tracked object, aborted on removal), and pure pretty-printable/parsing
-//! helper functions unit-testable without a live D-Bus connection.
+//! source-verified pixmap-squaring bug), a `*Controller` struct holding the write-action
+//! proxies, a `HashMap<Key, Entry>` dynamic per-object registry kept live via per-item
+//! forwarder tasks (one `JoinHandle` per tracked object, aborted on removal), and pure
+//! pretty-printable/parsing helpers unit-testable without a live D-Bus connection.
 //!
 //! The base SNI spec has no signal telling a host when a client unregisters -- liveness is
 //! tracked via `org.freedesktop.DBus.NameOwnerChanged`: one global forwarder task removes
@@ -54,10 +52,6 @@ pub mod registry;
 pub mod watcher;
 
 pub use controller::TrayController;
-
-// -------------------------------------------------------------------------------------------
-// State shape pushed as `oblisk.tray`'s StateSnapshot (docs/oblisk-idl-api-specs.md §2.14).
-// -------------------------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct TrayState {
@@ -158,13 +152,10 @@ mod test_support {
     use tokio::net::UnixStream;
 
     /// A connected pair of p2p zbus connections, no bus daemon involved, with one addition:
-    /// the server side (`connection`, what `register_item`'s own outgoing proxy calls use as
-    /// `self.connection`) gets a short `method_timeout`. `register_item`'s real code path
-    /// calls out from this side (property reads against the fabricated `StatusNotifierItem`,
-    /// plus a `NameHasOwner` liveness check) to a peer that never registers any object server
-    /// handler for them -- with zbus's default per-call timeout, each such call would hang
-    /// until it lapses instead of erroring quickly, and `register_item` awaits several of them
-    /// sequentially.
+    /// the server side gets a short `method_timeout`. `register_item`'s real code path calls
+    /// out from this side to a peer that never registers any object server handler for some
+    /// calls -- with zbus's default timeout, each would hang until it lapses instead of
+    /// erroring quickly, and `register_item` awaits several sequentially.
     pub(super) async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {
         let (a, b) = UnixStream::pair().expect("failed to create a unix socket pair");
         let guid = zbus::Guid::generate();

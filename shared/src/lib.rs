@@ -9,11 +9,10 @@ mod secure_buffer;
 pub use secure_buffer::SecureBuffer;
 pub use zeroize::{Zeroize, Zeroizing};
 
-/// Where the control socket lives, derived from `$XDG_RUNTIME_DIR`. Both
-/// `supervisor` (the listener) and `renderer` (the client) resolve this the same way, so it
-/// lives here instead of being reimplemented on each side (build-steps.md Phase 9: not
-/// `/tmp`, which is world-writable and unsuitable for a socket that will eventually carry
-/// secure textfield submissions, ADR-0005).
+/// Where the control socket lives, derived from `$XDG_RUNTIME_DIR`. Shared so `supervisor`
+/// (listener) and `renderer` (client) resolve it identically. Not `/tmp`, which is
+/// world-writable and unsuitable for a socket that carries secure textfield submissions
+/// (ADR-0005).
 pub fn control_socket_path() -> io::Result<PathBuf> {
     let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;
@@ -21,12 +20,9 @@ pub fn control_socket_path() -> io::Result<PathBuf> {
 }
 
 /// Where the "the compositor is locked and nothing of ours holds it" marker lives (docs/adr/0060).
-/// Beside the control socket deliberately: both are per-login runtime state, and `$XDG_RUNTIME_DIR`
-/// going away with the user's last session is what bounds how stale this file can get.
-///
-/// Only `supervisor` reads or writes it -- the Renderer holds the protocol object but never the
-/// decision (docs/adr/0042) -- but it sits here rather than in `supervisor` so that one function's
-/// neighbourhood is the only place that knows the runtime directory's layout.
+/// Beside the control socket deliberately: both are per-login runtime state bounded by
+/// `$XDG_RUNTIME_DIR` going away with the session. Only `supervisor` reads or writes it -- the
+/// Renderer holds the protocol object but never the decision (docs/adr/0042).
 pub fn session_locked_flag_path() -> io::Result<PathBuf> {
     let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;
@@ -34,18 +30,16 @@ pub fn session_locked_flag_path() -> io::Result<PathBuf> {
 }
 
 /// The capability roster (ADR-0037; CONTEXT.md's Capability roster entry): every
-/// snapshot-hydrated capability name. Each is also the Lua name it appears under, as
-/// `oblisk.<name>` (§ 2, build-steps.md Phase 25 item 3), and the `capability` field of every
-/// command written through it (§ 3.2) -- one string for all three, so a config that reads
-/// `oblisk.audio` cannot write to something else.
+/// snapshot-hydrated capability name. Each name is also the Lua name it appears under, as
+/// `oblisk.<name>` (§ 2), and the `capability` field of every command written through it (§ 3.2)
+/// -- one string for all three, so a config that reads `oblisk.audio` cannot write to something
+/// else.
 ///
-/// The Renderer seeds every rostered name onto the `oblisk` table at construction, so each one
-/// exists from a generation's first evaluation and reads `nil` until its first `StateSnapshot`
-/// arrives -- uniformly, including `sysinfo`, which stays `nil` indefinitely until
-/// `sysinfo:configure` wakes its dormant pollers. The Supervisor's `push_snapshot`
-/// debug-asserts membership, so a capability added there without a roster entry fails on its
-/// first push in development rather than as an index-into-nil error in a user's `shell.lua` at
-/// boot. `idle` is deliberately absent: it's event-shaped, not snapshot state (ADR-0032).
+/// The Renderer seeds every rostered name onto `oblisk` at construction, so each reads `nil`
+/// until its first `StateSnapshot` (including `sysinfo`, dormant until `sysinfo:configure`).
+/// The Supervisor's `push_snapshot` debug-asserts membership, so an off-roster capability fails
+/// loudly in development rather than as an index-into-nil error in a user's `shell.lua`. `idle`
+/// is deliberately absent: it's event-shaped, not snapshot state (ADR-0032).
 pub const CAPABILITIES: &[&str] = &[
     "audio", "network", "bluetooth", "tray", "notifications", "mpris", "sysinfo", "keyboard", "privacy", "updates", "lock", "battery", "system",
     "brightness", "workspaces", "power",
@@ -70,11 +64,10 @@ pub struct CommandParams {
     pub expected_revision: u32,
 }
 
-/// Emitted by the Supervisor on system changes to hydrate active Lua signals.
-/// `capability` names which live Lua signal this hydrates (e.g. `"audio"`, `"network"`) --
-/// `renderer/src/socket.rs`'s `apply_state_snapshot` routes by this field instead of hardcoding
-/// one global signal (docs/adr/0029; `CONTEXT.md`'s Capability/Dependency snapshot entries).
-/// `revision` is that capability's own state-version counter (see ADR-0004).
+/// Emitted by the Supervisor on system changes to hydrate active Lua signals. `capability`
+/// names which live Lua signal this hydrates; `renderer/src/socket.rs`'s `apply_state_snapshot`
+/// routes by this field (docs/adr/0029). `revision` is that capability's own state-version
+/// counter (ADR-0004).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StateSnapshot {
     pub capability: String,
@@ -82,37 +75,32 @@ pub struct StateSnapshot {
     pub payload: serde_json::Value,
 }
 
-/// Identifies a connection's generation. Sent as the very first frame on every new
-/// control-socket connection, before any other traffic, so the Supervisor's listener can
-/// address commands and pushes to the right generation instead of assuming exactly one peer
-/// (build-steps.md Phase 9; CONTEXT.md's Candidate and Authoritative generation entries).
+/// Identifies a connection's generation. Sent as the first frame on every new control-socket
+/// connection, so the Supervisor's listener can address commands and pushes to the right
+/// generation instead of assuming exactly one peer.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConnectionHandshake {
     pub generation_id: u32,
 }
 
-/// Supervisor -> Renderer: re-evaluate `shell.lua` now (build-steps.md Phase 13; CONTEXT.md,
-/// Watcher). `sequence` is echoed back on every response so a superseded round trip (a second
-/// file-change event fires before the first round trip completes) can be told apart from the
-/// current one -- same correlation role `reload::run_pba`'s `nonce: u64` plays for
-/// `ActivateDraw`.
+/// Supervisor -> Renderer: re-evaluate `shell.lua` now. `sequence` is echoed back on every
+/// response so a superseded round trip (a second file-change event fires before the first
+/// completes) can be told apart from the current one.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReevaluateRequest {
     pub sequence: u64,
 }
 
 /// Renderer -> Supervisor: the outcome of one [`ReevaluateRequest`]. The Renderer classifies
-/// Unchanged-vs-TopologyChanged itself (it already holds both the old and new topology) -- the
-/// Supervisor only needs the verdict to decide which dispatch branch to run (CONTEXT.md's
-/// Watcher entry: "owns the swap-vs-in-place decision, not the reload's execution").
+/// Unchanged-vs-TopologyChanged itself; the Supervisor only needs the verdict to pick a dispatch
+/// branch, not to run the reload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ReevaluateReport {
     Unchanged { sequence: u64 },
     TopologyChanged { sequence: u64 },
-    /// `shell.lua` failed to evaluate (syntax/runtime error, invalid top-level return, or a
-    /// surface whose topology fields don't type-check). The Renderer has already kept its prior
-    /// applied scene untouched and entered rescue state locally -- `error` is for the
-    /// Supervisor's own logging only.
+    /// `shell.lua` failed to evaluate. The Renderer has already kept its prior applied scene
+    /// untouched and entered rescue state locally -- `error` is for the Supervisor's own
+    /// logging only.
     Failed { sequence: u64, error: String },
 }
 
@@ -123,9 +111,8 @@ pub struct ApplyPendingReload {
     pub sequence: u64,
 }
 
-/// § 15.2 point 3 / build-steps.md Phase 8 step 4 ("Activate Draw"), now sent for real (Phase 14).
-/// Matches `reload::CandidateLink::send_activate_draw`'s existing `nonce: u64` shape -- see
-/// docs/adr/0019 for why this is not `CommandEnvelope` (wrong direction/shape).
+/// § 15.2 point 3 ("Activate Draw"). Not a `CommandEnvelope` -- wrong direction/shape
+/// (docs/adr/0019).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActivateDraw {
     pub nonce: u64,
@@ -133,15 +120,14 @@ pub struct ActivateDraw {
 
 /// § 15.2 points 2-3 ("Null-Buffer Staging"): the Candidate's one-time report that every tracked
 /// Wayland surface has committed its null buffer and is staged, waiting for `ActivateDraw`.
-/// `surfaces` is the exact set `reload::CandidateLink::recv_presentation_evidence` must later see
-/// evidence for -- see docs/adr/0025 item 2 for why this is a surface_id, not a monitor id.
+/// `surfaces` is a surface_id list, not a monitor id list (docs/adr/0025 item 2).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReadySignal {
     pub surfaces: Vec<String>,
 }
 
-/// § 15.3 point 4 ("Evidence Verification"), per surface (docs/adr/0019 item 5, ADR-0003).
-/// One message per surface_id that received its `wp_presentation_feedback` `presented` event.
+/// § 15.3 point 4 ("Evidence Verification"): one message per surface_id that received its
+/// `wp_presentation_feedback` `presented` event (docs/adr/0019 item 5).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PresentationEvidence {
     pub nonce: u64,
@@ -149,24 +135,21 @@ pub struct PresentationEvidence {
 }
 
 /// § 15.4 point 1 ("Input Deselection"): tells the superseded generation to stop treating
-/// `surface_id` as authoritative. Real, called, currently-empty effect on the Renderer side --
-/// see docs/adr/0025 item 4 (no real per-surface input-region/focus wiring exists yet).
+/// `surface_id` as authoritative. No per-surface input-region/focus wiring exists yet to hand
+/// this to (docs/adr/0025 item 4).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeselectInput {
     pub surface_id: String,
 }
 
 /// § 15.4 point 2 ("Candidate Promotion"): tells the newly-promoted generation it now owns
-/// `surface_id`. Same real-but-currently-inert status as `DeselectInput` -- see docs/adr/0025 item 4.
+/// `surface_id`. Currently inert for the same reason as `DeselectInput`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromoteGeneration {
     pub surface_id: String,
 }
 
-/// Which of a `process.run`-spawned child's streams one [`ProcessOutputLine`] came from. A real
-/// enum, not a bare `"stdout"`/`"stderr"` string tag -- this codebase's Baseline Smells reject
-/// that as Primitive Obsession, and [`ReevaluateReport`] already sets the "real enum" precedent
-/// for a wire-level tag like this.
+/// Which of a `process.run`-spawned child's streams one [`ProcessOutputLine`] came from.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProcessStream {
     Stdout,
@@ -174,11 +157,9 @@ pub enum ProcessStream {
 }
 
 /// Supervisor -> Renderer: `"idled"` or `"resumed"`, one `ext_idle_notification_v1` event
-/// (docs/adr/0032). A real enum, not a bare string tag -- [`ProcessStream`]'s own doc comment
-/// already sets this codebase's "Baseline Smells reject that as Primitive Obsession" precedent
-/// for a wire-level state tag like this one. `#[serde(rename)]` on each variant, not the derived
-/// `Idled`/`Resumed`, because ADR-0032 pins the wire value to the protocol's own lowercase event
-/// names (`"idled"`/`"resumed"`), not Rust's PascalCase variant spelling.
+/// (docs/adr/0032). `#[serde(rename)]` on each variant, not the derived `Idled`/`Resumed`:
+/// ADR-0032 pins the wire value to the protocol's own lowercase event names, not Rust's
+/// PascalCase spelling.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum IdleState {
     #[serde(rename = "idled")]
@@ -188,12 +169,9 @@ pub enum IdleState {
 }
 
 /// Supervisor -> Renderer: one `ext_idle_notification_v1` `idled`/`resumed` event, fanned out to
-/// `generation_id` (docs/adr/0032; CONTEXT.md's Idle threshold entry). `threshold_sec` is the
-/// distinct duration this event's listener was created for -- the Renderer looks up its own
-/// registered callback by this value. Dispatched straight to that callback, not through the
-/// `StateSnapshot`/`revision` signal-table path: idle is event-shaped, not pollable state
-/// (ADR-0032's own reasoning for why this needed a new `SupervisorFrame` variant instead of
-/// reusing `StateSnapshot`).
+/// `generation_id` (docs/adr/0032). `threshold_sec` is the duration this event's listener was
+/// created for -- the Renderer looks up its own registered callback by this value, not through
+/// the `StateSnapshot`/`revision` path: idle is event-shaped, not pollable state.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IdleEvent {
     pub generation_id: u32,
@@ -201,11 +179,9 @@ pub struct IdleEvent {
     pub state: IdleState,
 }
 
-/// Supervisor -> Renderer: one line of a `process.run`-spawned child's stdout/stderr
-/// (`docs/oblisk-supervisor-services-dbus.md` § 12's "No Lua Blockage" half; `oblisk-idl-api-
-/// specs.md` § 3.2/3.3). `id` is the same value the Renderer assigned in the `"process"`/`"run"`
-/// `CommandEnvelope.id` that spawned it -- see docs/adr/0026 for why the id is assigned
-/// client-side rather than handed back by the Supervisor.
+/// Supervisor -> Renderer: one line of a `process.run`-spawned child's stdout/stderr. `id` is
+/// the same value the Renderer assigned in the `"process"`/`"run"` `CommandEnvelope.id` that
+/// spawned it -- assigned client-side rather than handed back by the Supervisor (docs/adr/0026).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProcessOutputLine {
     pub id: u64,
@@ -215,28 +191,23 @@ pub struct ProcessOutputLine {
 
 /// Supervisor -> Renderer: `id`'s `process.run`-spawned child has exited. `code` is absent
 /// exactly when [`std::process::ExitStatus::code()`] itself would return `None` -- killed by
-/// signal (`process_handle:kill()`, or a superseded generation's own § 12 reap), or never spawned
-/// at all (a `process.run` whose underlying spawn failed).
+/// signal, or never spawned at all.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProcessExited {
     pub id: u64,
     pub code: Option<i32>,
 }
 
-/// Renderer -> Supervisor: one completed `textfield` `secure_submit` (build-steps.md Phase 15
-/// item 2; ADR-0005/ADR-0009/ADR-0027). `secret` is the accumulated `wp-text-input-v3` input,
-/// read once from a `shared::SecureBuffer` via its one sanctioned read (`expose_secret`) --
-/// never routed through [`CommandParams::arguments`], whose `Vec<serde_json::Value>` would leave
-/// an intermediate plaintext copy `.zeroize()` can never reach (ADR-0027, ADR-0014). The Renderer
-/// `.zeroize()`s the source `SecureBuffer` the instant it has been read into this frame (see
-/// `renderer/src/wayland/mod.rs`'s `secure_submit_frame`) and this frame's own plaintext copy the
+/// Renderer -> Supervisor: one completed `textfield` `secure_submit` (ADR-0005/ADR-0009/ADR-0027).
+/// `secret` is read once from a `shared::SecureBuffer` via its one sanctioned read
+/// (`expose_secret`) -- never routed through [`CommandParams::arguments`], whose
+/// `Vec<serde_json::Value>` would leave an intermediate plaintext copy `.zeroize()` can never
+/// reach. The Renderer zeroizes the source `SecureBuffer` the instant it is read into this frame
+/// (`renderer/src/wayland/mod.rs`'s `secure_submit_frame`) and this frame's own plaintext copy the
 /// instant its wire write completes (`renderer/src/socket.rs`'s `pump`). `Zeroize`/`ZeroizeOnDrop`
-/// *are* this type's job too, as a backstop: a bare `SecureSubmit` now crosses an unbounded
-/// channel on its own (docs/adr/0039 collapsed the old `SecureSubmitPayload` wrapper whose
-/// `SecureBuffer` field used to carry this protection), so every path that drops the frame instead
-/// of writing it -- the outbound send failing because the socket thread is gone, or a frame still
-/// buffered when `outbound_rx` itself is dropped -- must scrub `secret` on drop, not just on the
-/// happy-path write.
+/// are a backstop: this frame crosses an unbounded channel with no wrapper protecting it, so any
+/// path that drops it instead of writing it -- send failing because the socket thread is gone, or
+/// still buffered when `outbound_rx` is dropped -- must scrub `secret` on drop too.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct SecureSubmit {
     pub generation_id: u32,
@@ -246,30 +217,28 @@ pub struct SecureSubmit {
 }
 
 /// Supervisor -> Renderer: take or release the `ext_session_lock_v1` session lock (ADR-0042,
-/// ADR-0052 decision 1). One command for both directions rather than a `Lock`/`Unlock` pair,
-/// because the Renderer's job is the same either way: make the lock state match this flag and
-/// report what happened.
+/// ADR-0052 decision 1). One command for both directions rather than a `Lock`/`Unlock` pair: the
+/// Renderer's job is the same either way, make the lock state match this flag and report what
+/// happened.
 ///
 /// `locked = false` is the *only* thing that may call `unlock_and_destroy`, and the Supervisor
-/// sends it only after its PAM worker returned [`PamOutcome::Success`] -- ADR-0042's "never call
-/// `unlock_and_destroy` except on a successful authentication" is a property of that one call site,
-/// not a rule the Renderer is trusted to keep.
+/// sends it only after its PAM worker returned [`PamOutcome::Success`] -- that guarantee lives at
+/// that one call site, not as a rule the Renderer is trusted to keep.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SetSessionLock {
     pub locked: bool,
 }
 
-/// What became of the lock, reported by the Renderer that holds it (ADR-0052 decision 4). Four
-/// distinct real events, not a `bool` plus a message: the Supervisor gates generation swaps on
-/// this (ADR-0042), and "never acquired" and "acquired then torn down by the compositor" need
-/// different handling even though both end with the session unlocked.
+/// What became of the lock, reported by the Renderer that holds it (ADR-0052 decision 4). The
+/// Supervisor gates generation swaps on this (ADR-0042), and "never acquired" needs different
+/// handling from "acquired then torn down" even though both end unlocked.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum LockOutcome {
     /// `ext_session_lock_v1::locked` arrived. Lock surfaces are up and swaps are blocked.
     Locked,
-    /// The lock was never acquired, for the reason carried here: the config declared no `lock`
-    /// node (ADR-0052 decision 3), the compositor denied the request with an immediate `finished`,
-    /// or `ext_session_lock_manager_v1` is not advertised at all.
+    /// The lock was never acquired: no `lock` node declared (ADR-0052 decision 3), the compositor
+    /// denied the request with an immediate `finished`, or `ext_session_lock_manager_v1` isn't
+    /// advertised at all.
     Refused(String),
     /// `finished` after a `Locked`: the compositor tore the lock down through its own secure
     /// mechanism. Not a denial, and not something the Supervisor asked for.
@@ -279,17 +248,16 @@ pub enum LockOutcome {
 }
 
 /// Renderer -> Supervisor: one [`LockOutcome`] per lock state change. The connection already
-/// carries the sending generation's id, so this does not repeat it (same shape as
-/// [`ReevaluateReport`]).
+/// carries the sending generation's id, so this doesn't repeat it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LockReport {
     pub outcome: LockOutcome,
 }
 
-/// Every frame the Supervisor can push to a Renderer connection, adjacently tagged so a single
-/// read loop can dispatch on `kind` without the connection needing a separate channel per
-/// message shape. `content = "data"` (not internally-tagged) because [`ReevaluateReport`] is
-/// itself an enum, which can't merge into an internally-tagged wrapper's flat object.
+/// Every frame the Supervisor can push to a Renderer connection, adjacently tagged so one read
+/// loop can dispatch on `kind`. `content = "data"` (not internally-tagged) because
+/// [`ReevaluateReport`] is itself an enum, which can't merge into an internally-tagged wrapper's
+/// flat object.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", content = "data")]
 pub enum SupervisorFrame {
@@ -306,10 +274,8 @@ pub enum SupervisorFrame {
 }
 
 /// Every frame a Renderer connection can send to the Supervisor, same tagging scheme as
-/// [`SupervisorFrame`]. `Command` is § 7.2's existing Lua-write-action envelope; `ReevaluateReport`
-/// is Phase 13's new reload verdict; `ReadySignal`/`PresentationEvidence` are Phase 14's PBA
-/// handshake reports -- all travel Renderer -> Supervisor, so they share one wire enum instead of
-/// separately-typed read loops.
+/// [`SupervisorFrame`]. `Command` is § 7.2's Lua-write-action envelope; `ReevaluateReport` is the
+/// reload verdict; `ReadySignal`/`PresentationEvidence` are the PBA handshake reports.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", content = "data")]
 pub enum RendererFrame {
@@ -322,29 +288,20 @@ pub enum RendererFrame {
     /// Asks the Supervisor to *start* a reload cycle for this generation: bump the sequence it
     /// owns and send the [`ReevaluateRequest`] carrying it (docs/adr/0041 decision 4).
     ///
-    /// Carries no sequence, and that is the point. The Supervisor is the only holder of
-    /// `next_sequence`, and `supervisor/src/main.rs`'s `is_current_reload` drops any report whose
-    /// sequence is not the one it most recently sent -- so a Renderer that fabricated one would
-    /// have its own `ReevaluateReport` discarded as stale. This asks for a cycle instead of
-    /// starting one, which keeps the whole existing reload path (evaluate, diff topology, report
-    /// `Unchanged`/`TopologyChanged`/`Failed`, Supervisor decides in-place versus swap) intact
-    /// with a second trigger rather than a second mechanism.
-    ///
-    /// Named for what it is rather than for its cause: the `inotify` watcher's own trigger is the
-    /// same request arriving by a different route, and a `wl_output` change (this variant's first
-    /// caller, `renderer/src/wayland/mod.rs`'s `OutputHandler`) is only the second one.
+    /// Carries no sequence: the Supervisor is the only holder of `next_sequence`, and
+    /// `supervisor/src/main.rs`'s `is_current_reload` drops any report whose sequence isn't the
+    /// one it most recently sent, so a Renderer that fabricated one would have its own
+    /// `ReevaluateReport` discarded as stale.
     RequestReload,
 }
 
-/// The Supervisor's own PAM worker subprocess's one-shot result, written once to the
-/// worker's stdout as a single `shared::framing` JSON frame when its PAM conversation ends
-/// (ADR-0028) -- never reused as a `RendererFrame`/`SupervisorFrame` variant; this crosses a
-/// completely different process boundary (Supervisor <-> its own re-exec'd PAM worker, not
-/// Supervisor <-> Renderer). Mirrors Quickshell's own PAM exit-code taxonomy (ADR-0028), minus
-/// its `OtherError` case: every failure that isn't a PAM-level outcome (spawn failure, a pipe
-/// I/O error, a wedged worker timing out, an undecodable frame) surfaces as an `io::Result::Err`
-/// from `supervisor::pam_worker::exchange_over` instead, outside this enum entirely -- there's
-/// no code path left that would ever construct a sixth "something else went wrong" variant here.
+/// The Supervisor's own PAM worker subprocess's one-shot result, written once to the worker's
+/// stdout as a single `shared::framing` JSON frame when its PAM conversation ends (ADR-0028).
+/// Crosses a different process boundary than `RendererFrame`/`SupervisorFrame` (Supervisor <->
+/// its own re-exec'd PAM worker), so it is never reused as one. No `OtherError` variant: every
+/// failure that isn't a PAM-level outcome (spawn failure, pipe I/O error, a wedged worker timing
+/// out, an undecodable frame) surfaces as an `io::Result::Err` from
+/// `supervisor::pam_worker::exchange_over` instead, outside this enum entirely.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PamOutcome {
     Success,
@@ -361,34 +318,20 @@ pub enum PamOutcome {
 const DEV_CONFIG_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../dev-config/oblisk");
 
 /// `~/.config/oblisk/`, resolved via `$XDG_CONFIG_HOME` falling back to `$HOME/.config` (XDG
-/// Base Directory order), hand-rolled rather than a new `dirs`-style dependency -- same
-/// one-function reasoning `control_socket_path` already used for `$XDG_RUNTIME_DIR`. Both
-/// `supervisor` (watches this directory) and `renderer` (reads `shell.lua` from it) resolve it
-/// identically.
+/// Base Directory order). Both `supervisor` (watches this directory) and `renderer` (reads
+/// `shell.lua` from it) resolve it identically.
 ///
-/// A debug build looks in the workspace's `dev-config/oblisk/` first, so `cargo run -p supervisor`
-/// boots against the tracked dev config with no environment set up. Before this, a bare
-/// `cargo run` read `~/.config/oblisk/shell.lua`, which does not exist on a developer's machine,
-/// and the run came up with no config at all. The surfaces still appeared, because at the time
-/// they were created from a fixed Rust-owned role set rather than from the config, so the only
-/// symptom was one `failed to read shell.lua` line in a wall of startup logging. docs/adr/0038
-/// closed that hole from the other end: a config that fails to load now produces no surfaces at
-/// all, which is loud.
-///
-/// `$XDG_CONFIG_HOME` still wins in both builds, which is what makes the dev branch safe to add
-/// rather than a second source of truth: it is how a debug build tests against a real config
-/// directory, and it keeps the existing `XDG_CONFIG_HOME=dev-config` invocation working
-/// unchanged. Release builds never see the dev branch at all -- `debug_assertions` is off, so
-/// `DEV_CONFIG_DIR` is not even compiled in, and no build-machine path reaches a shipped binary.
+/// A debug build looks in the workspace's `dev-config/oblisk/` first, so `cargo run -p
+/// supervisor` boots against the tracked dev config with no environment set up. `$XDG_CONFIG_HOME`
+/// still wins in both builds, so the dev branch is not a second source of truth. Release builds
+/// never see it at all: `debug_assertions` is off, so `DEV_CONFIG_DIR` isn't compiled in.
 pub fn config_dir() -> io::Result<PathBuf> {
     if let Some(xdg_config_home) = std::env::var_os("XDG_CONFIG_HOME") {
         return Ok(PathBuf::from(xdg_config_home).join("oblisk"));
     }
 
-    // Checked rather than assumed: a debug binary run away from the tree it was built in (moved,
-    // copied to another machine, `cargo install --debug`) has a `DEV_CONFIG_DIR` pointing at
-    // nothing. Falling through to the XDG path there is what keeps such a binary usable instead
-    // of failing on a path only the build machine ever had.
+    // A debug binary run away from the tree it was built in has a DEV_CONFIG_DIR pointing at
+    // nothing, so this is checked rather than assumed.
     #[cfg(debug_assertions)]
     if std::fs::metadata(DEV_CONFIG_DIR).is_ok() {
         return Ok(PathBuf::from(DEV_CONFIG_DIR));
@@ -399,9 +342,7 @@ pub fn config_dir() -> io::Result<PathBuf> {
     Ok(PathBuf::from(home).join(".config").join("oblisk"))
 }
 
-/// `config_dir()` joined with `shell.lua` -- the file Phase 13 makes real (build-steps.md
-/// Phase 13; `renderer/src/lua/mod.rs`'s and `renderer/src/socket.rs`'s doc comments both named
-/// this as their own missing piece).
+/// `config_dir()` joined with `shell.lua`, the real config entry point.
 pub fn shell_lua_path() -> io::Result<PathBuf> {
     Ok(config_dir()?.join("shell.lua"))
 }
@@ -454,8 +395,7 @@ mod tests {
 
     #[test]
     fn state_snapshot_routes_by_capability_not_just_payload_shape() {
-        // ADR-0029: two capabilities can carry structurally identical payloads -- `capability`
-        // is what tells them apart, not the payload's own shape.
+        // ADR-0029: `capability` tells two structurally identical payloads apart.
         let audio = StateSnapshot { capability: "audio".to_string(), revision: 1, payload: serde_json::json!({}) };
         let network = StateSnapshot { capability: "network".to_string(), revision: 1, payload: serde_json::json!({}) };
         assert_ne!(audio, network);
@@ -602,10 +542,8 @@ mod tests {
 
     #[test]
     fn renderer_frame_request_reload_is_a_bare_kind_with_no_data() {
-        // The one payload-free frame either direction has, so the adjacent tagging is worth
-        // pinning: serde omits `data` entirely for a unit variant, and the decoder must accept
-        // that shape (docs/adr/0041 decision 4 -- the sequence stays the Supervisor's, so there
-        // is nothing for this frame to carry).
+        // The one payload-free frame either direction has: serde omits `data` entirely for a
+        // unit variant, and the decoder must accept that shape.
         let wire = serde_json::to_value(RendererFrame::RequestReload).unwrap();
         assert_eq!(wire, serde_json::json!({ "kind": "RequestReload" }));
 
@@ -634,10 +572,8 @@ mod tests {
         assert_eq!(parsed, frame);
     }
 
-    /// Regression test for a CONFIRMED correctness finding: a bare `SecureSubmit` now crosses an
-    /// unbounded channel on its own (docs/adr/0039 collapsed the old `SecureSubmitPayload`
-    /// wrapper), so this type must scrub its own `secret` on zeroize/drop rather than relying on
-    /// a wrapper that no longer exists.
+    /// A bare `SecureSubmit` crosses an unbounded channel with no wrapper protecting it, so this
+    /// type must scrub its own `secret` on zeroize/drop.
     #[test]
     fn zeroizing_a_secure_submit_clears_its_secret() {
         let mut submit =
@@ -701,11 +637,8 @@ mod tests {
         assert!(path.ends_with("oblisk/shell.lua"));
     }
 
-    /// The dev branch is only worth anything if the baked-in path is real, and a `concat!` of
-    /// `CARGO_MANIFEST_DIR` is exactly the kind of thing that compiles fine while pointing at
-    /// nothing. This is what catches the crate being moved or the workspace being restructured
-    /// without this constant following: it reads the file `config_dir` exists to find, rather
-    /// than asserting on the string.
+    /// Catches the crate being moved or the workspace restructured without `DEV_CONFIG_DIR`
+    /// following: reads the file `config_dir` exists to find, rather than asserting on the string.
     #[cfg(debug_assertions)]
     #[test]
     fn the_baked_in_dev_config_path_holds_a_real_shell_lua() {
@@ -717,15 +650,11 @@ mod tests {
         );
     }
 
-    /// `$XDG_CONFIG_HOME` must keep winning in a debug build, which is the whole reason the dev
-    /// branch is safe: it is how a debug build is pointed at a real config directory, and it is
-    /// what keeps the existing `XDG_CONFIG_HOME=dev-config` invocation resolving to the same
-    /// place it always did. Without this the dev branch would be a second source of truth that
-    /// silently overrides the documented one.
+    /// `$XDG_CONFIG_HOME` must keep winning in a debug build, or the dev branch would be a second
+    /// source of truth that silently overrides the documented one.
     ///
     /// Sets a process-global for the duration, so it is deliberately the only test here that
-    /// touches the environment. The one other `config_dir` caller above asserts on a suffix both
-    /// branches share, so it stays correct whichever way it interleaves with this.
+    /// touches the environment.
     #[test]
     fn xdg_config_home_still_wins_over_the_dev_config_directory() {
         let previous = std::env::var_os("XDG_CONFIG_HOME");

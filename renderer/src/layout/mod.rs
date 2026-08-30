@@ -2,19 +2,14 @@
 //! `docs/oblisk-layout-engine-geometry.md` § 3-5, `CONTEXT.md`'s "Retained scene"/
 //! "Retained-scene transaction"/"Lease" entries).
 //!
-//! `node.rs` turns a `lua::VirtualNode`'s raw, untyped properties into the typed geometry values
-//! this module's constraint/size/position passes need, and resolves the `Signal` handles among
-//! them once per node per pass (`node::resolve_properties`, build-steps.md Phase 19 items 1 and
-//! 5). `scene.rs` runs those passes and owns the `Scene`: the persistent node tree one
-//! generation's `Loader::evaluate` output is reconciled into on every `apply`, instead of being
-//! rebuilt from scratch.
+//! `node.rs` turns a `lua::VirtualNode`'s raw properties into typed geometry values and resolves
+//! `Signal` handles once per node per pass (`node::resolve_properties`). `scene.rs` runs those
+//! passes and owns the `Scene`: the persistent node tree each generation's `Loader::evaluate`
+//! output reconciles into on `apply`, rather than being rebuilt from scratch.
 //!
-//! Scope ceilings recorded in docs/adr/0023, minus the ones later phases lifted: `list` is an
-//! unsupported node kind (`textfield` became one in Phase 15, and a `Signal` in a geometry
-//! property now resolves rather than being rejected -- docs/adr/0044 decision 1); `rect`/`button`/
-//! `panel` containers use a stacking positioning model with no formula in § 3.2; overlay
-//! input-region computation is pure but not yet wired to a live `wl_surface::set_input_region`
-//! call; the lease/retiring mechanism has no real GPU resource to guard yet.
+//! Scope ceilings from docs/adr/0023: `rect`/`button`/`panel` containers use a stacking
+//! positioning model with no formula in § 3.2; the lease/retiring mechanism has no real GPU
+//! resource to guard yet.
 
 pub mod hit;
 pub mod instance;

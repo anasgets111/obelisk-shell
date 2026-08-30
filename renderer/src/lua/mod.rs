@@ -1,16 +1,10 @@
-//! Lua VM bootstrap and the loader (build-steps.md Phase 10; `CONTEXT.md`, Loader): evaluates
-//! `shell.lua` into the top-level `panel` node(s) and their topology, reused for both a
-//! candidate's first evaluation and the authoritative generation's re-evaluation on an in-place
-//! reload.
+//! Lua VM bootstrap and the loader (`CONTEXT.md`, Loader): evaluates `shell.lua` into the
+//! top-level `panel` node(s) and their topology, reused for both a candidate's first evaluation
+//! and the authoritative generation's re-evaluation on an in-place reload.
 //!
 //! [`Loader::evaluate_file`] reads the real `~/.config/oblisk/shell.lua` (`shared::shell_lua_path`)
-//! and is `renderer/src/socket.rs`'s real entry point (build-steps.md Phase 13): both the
-//! Renderer's own startup evaluation and every Supervisor-triggered `Reevaluate` round trip call
-//! it, replacing Phase 11's hardcoded proof-of-wiring literal.
-
-// `#[allow(dead_code)]` came off here per ADR-0044 decision 1: `layout::node`'s property parsers
-// now run every resolved value through `check_number`/`check_integer`/`check_string` (build-steps.md
-// Phase 19 item 1), so this module has a real production caller, not just its own tests.
+//! and is `renderer/src/socket.rs`'s real entry point: both the Renderer's own startup evaluation
+//! and every Supervisor-triggered `Reevaluate` round trip call it.
 pub mod capability;
 pub mod marshal;
 pub mod json;
@@ -22,12 +16,11 @@ pub use nodes::VirtualNode;
 
 use mlua::{Lua, Table, Value};
 
-/// What a config's VM loads, and the reason it is spelled out rather than left as mlua's
-/// `StdLib::ALL_SAFE` (docs/adr/0048). `ALL_SAFE` is everything but `debug` and `ffi`, which leaves
-/// `io` and `os` whole. ADR-0039 put the Lua VM on the Wayland thread, so `io.read` or
-/// `os.execute` in a `computed` freezes every surface on every monitor until it returns, and
-/// ADR-0021's 5ms cap does not catch it: the cap is an instruction-count hook and a thread parked
-/// in a syscall executes no instructions.
+/// What a config's VM loads, spelled out rather than mlua's `StdLib::ALL_SAFE` (docs/adr/0048):
+/// `ALL_SAFE` leaves `io` and `os` whole, and the Lua VM runs on the Wayland thread (docs/adr/0039),
+/// so `io.read` or `os.execute` in a `computed` freezes every surface on every monitor until it
+/// returns -- the 5ms CPU cap (docs/adr/0021) cannot catch it, since it's an instruction-count hook
+/// and a thread parked in a syscall executes no instructions.
 ///
 /// `IO` is absent outright. `OS` is loaded here only so [`restrict_os`] can lift the four calls
 /// worth keeping out of it; nothing else in that library survives the next line of `Loader::new`.
@@ -42,17 +35,16 @@ const OS_CALLS_THAT_CANNOT_BLOCK: [&str; 4] = ["time", "date", "clock", "getenv"
 
 /// Replaces the `os` global with a table holding only [`OS_CALLS_THAT_CANNOT_BLOCK`].
 ///
-/// An allowlist rather than deleting the dangerous keys, so a call added to the library by a future
-/// Lua or mlua is excluded by default instead of arriving unnoticed. Copying the real functions
-/// rather than reimplementing them keeps `os.date`'s whole strftime surface exact; a hand-written
-/// substitute would drift from what a config author reads in the Lua manual.
+/// An allowlist rather than deleting the dangerous keys, so a call added to the library by a
+/// future Lua or mlua is excluded by default instead of arriving unnoticed. Copying the real
+/// functions rather than reimplementing them keeps `os.date`'s whole strftime surface exact.
 ///
 /// `package.loaded` gets the same table, and that is the load-bearing half. `require` answers out
 /// of `package.loaded`, which holds its own reference to the table a library was loaded into, so
 /// replacing the global alone would hand the full library straight back to `local os =
-/// require("os")`. This matters for `os` and only `os`: `io` is never in [`config_stdlib`], so it
-/// has no `package.loaded` entry to reclaim. Measured under the old `ALL_SAFE` VM, where both were
-/// loaded, `require("io")` did return a working `io.open`, which is what named the hole.
+/// require("os")`. Measured under the old `ALL_SAFE` VM, `require("io")` did return a working
+/// `io.open`, which is what named the hole. `io` is never in [`config_stdlib`], so it has no
+/// `package.loaded` entry to reclaim -- this matters for `os` and only `os`.
 fn restrict_os(lua: &Lua) -> mlua::Result<()> {
     let full: Table = lua.globals().get("os")?;
     let kept = lua.create_table()?;
@@ -65,30 +57,24 @@ fn restrict_os(lua: &Lua) -> mlua::Result<()> {
 
 /// Points `require` at the config directory and nothing else (docs/adr/0047 decision 1).
 ///
-/// Replacing Lua's compiled-in default rather than prepending to it. Measured before this existed,
-/// the default was `/usr/local/share/lua/5.4/?.lua;...;./?.lua;./?/init.lua`, and both halves are
-/// wrong here. The system entries let a same-named module installed system wide shadow the config's
-/// own. The `./` entries resolve against the process's working directory, which nothing in the
-/// Supervisor sets, so a split config worked when started from its own directory and failed from
-/// anywhere else: the failure mode that passes every test run by hand and breaks under systemd.
+/// Replaces Lua's compiled-in default (`/usr/local/share/lua/5.4/?.lua;...;./?.lua;./?/init.lua`)
+/// rather than prepending to it. The system entries let a same-named module installed system
+/// wide shadow the config's own. The `./` entries resolve against the process's working
+/// directory, which nothing in the Supervisor sets, so a split config worked when started from
+/// its own directory and failed from anywhere else -- the failure mode that passes every test run
+/// by hand and breaks under systemd. Installed Lua libraries become unreachable as a result, which
+/// is the right default for a shell config; a user-declared path list appended here is the
+/// upgrade path for luarocks, not a silent restoration of the system default.
 ///
-/// Installed Lua libraries become unreachable, which is the right default for a shell config. The
-/// upgrade if someone genuinely wants luarocks is a user-declared path list appended here, not a
-/// silent restoration of the system default.
-///
-/// `package.cpath` is deliberately left alone. mlua's safe mode already replaces the C searchers
-/// and makes `package.loadlib` raise, so a stale `cpath` loads nothing; ADR-0047 records this so
-/// nobody reaches for `Lua::unsafe_new` to fix an unrelated problem, since loading a `.so` into the
-/// Renderer would discard the memory-safety argument the whole process boundary exists for.
+/// `package.cpath` is deliberately left alone: mlua's safe mode already replaces the C searchers
+/// and makes `package.loadlib` raise, so a stale `cpath` loads nothing.
 ///
 /// Three limits with no fix at this boundary, because `package.path` is a plain Lua string with no
-/// escape syntax at all. A config directory whose path is not valid UTF-8 is substituted lossily. A
-/// `;` in it reads as the separator between two search entries, splitting the path into two wrong
-/// ones. A `?` in it is a substitution marker, and Lua replaces *every* `?` in an entry with the
-/// module name, not only the trailing one, so the search runs against a corrupted directory rather
-/// than failing to find anything. All three are silent. None is expressible in `package.path`, so
-/// the only real fix is rejecting such a directory at startup, which is not worth building for a
-/// path that is `$XDG_CONFIG_HOME/oblisk` or `~/.config/oblisk`.
+/// escape syntax. A config directory path that isn't valid UTF-8 is substituted lossily. A `;` in
+/// it splits the path into two wrong search entries. A `?` in it gets replaced by Lua along with
+/// the real substitution marker, corrupting the search rather than failing to find anything. All
+/// three are silent and none is expressible in `package.path`, so the only real fix is rejecting
+/// such a directory at startup -- not worth building for a path that is `$XDG_CONFIG_HOME/oblisk`.
 fn point_package_path_at(lua: &Lua, config_dir: &std::path::Path) -> mlua::Result<()> {
     let dir = config_dir.display();
     lua.globals().get::<Table>("package")?.set("path", format!("{dir}/?.lua;{dir}/?/init.lua"))
@@ -98,9 +84,8 @@ fn point_package_path_at(lua: &Lua, config_dir: &std::path::Path) -> mlua::Resul
 /// -- each call is a fresh evaluation of its `source` argument, not an incremental re-run.
 pub struct Loader {
     lua: Lua,
-    /// The `package.loaded` keys the standard library occupies, captured before any config has run.
-    /// Everything else in that table got there through a config's own `require`, which is what makes
-    /// this the allowlist [`Loader::forget_config_modules`] subtracts from. Captured rather than
+    /// The `package.loaded` keys the standard library occupies, captured before any config has
+    /// run -- the allowlist [`Loader::forget_config_modules`] subtracts from. Captured rather than
     /// hardcoded so a change to [`config_stdlib`] cannot leave a name behind to be evicted as if a
     /// config had loaded it.
     standard_modules: std::collections::HashSet<String>,
@@ -119,10 +104,9 @@ pub enum LoaderError {
     #[error("failed to read shell.lua: {0}")]
     Io(#[from] std::io::Error),
     /// A surface evaluated cleanly and had a valid top-level shape, but one of its topology
-    /// fields (`id`/`layer`/`anchor`/`monitor`, § 6.1) didn't type-check
-    /// (`renderer/src/socket.rs`'s `surfaces_topology`). Distinct from [`Self::InvalidTopLevelReturn`]
-    /// -- that variant's fixed message is about the *shape* of the top-level return, which is
-    /// wrong for a field-level error inside an otherwise-valid surface.
+    /// fields (`id`/`layer`/`anchor`/`monitor`, § 6.1) didn't type-check. Distinct from
+    /// [`Self::InvalidTopLevelReturn`], whose fixed message is about the *shape* of the top-level
+    /// return, which is wrong for a field-level error inside an otherwise-valid surface.
     #[error("shell.lua's surface topology is invalid: {0}")]
     InvalidTopology(String),
 }
@@ -135,8 +119,8 @@ impl From<nodes::DeserializeError> for LoaderError {
 
 /// What one `Loader::evaluate` call produces: the top-level `panel` node(s), each still
 /// carrying its own topology fields (`id`/`layer`/`anchor`/`monitor`/`exclusive`, § 6.1) directly
-/// in its `properties` bag -- readable without walking into `child` (see `nodes.rs`'s doc
-/// comment). This is the cheap-to-diff output Phase 13's Watcher will compare across reloads.
+/// in its `properties` bag -- readable without walking into `child`. This is the cheap-to-diff
+/// output the Watcher compares across reloads.
 #[derive(Debug)]
 pub struct LoadOutput {
     pub surfaces: Vec<VirtualNode>,
@@ -145,12 +129,10 @@ pub struct LoadOutput {
 impl Loader {
     /// `dirty` is the generation's one scene-dirty flag (ADR-0044 decision 2), threaded through to
     /// the `state(name, initial)` global so a config's own `:set()` marks the same flag every
-    /// capability push does. `renderer/src/socket.rs`'s `RendererClient::start` creates it before
-    /// the loader for exactly this reason; see `signal::register`.
+    /// capability push does.
     ///
-    /// `config_dir` is where `require` looks and nowhere else (see [`point_package_path_at`]). It
-    /// is the directory holding the `shell.lua` this loader will evaluate, so the two are passed
-    /// from one place rather than each resolving the environment separately.
+    /// `config_dir` is where `require` looks and nowhere else ([`point_package_path_at`]) -- the
+    /// directory holding the `shell.lua` this loader will evaluate.
     pub fn new(dirty: signal::DirtyFlag, config_dir: &std::path::Path) -> mlua::Result<Self> {
         let lua = Lua::new_with(config_stdlib(), mlua::LuaOptions::default())?;
         restrict_os(&lua)?;
@@ -162,16 +144,15 @@ impl Loader {
         Ok(Loader { lua, standard_modules })
     }
 
-    /// Evaluates `source` directly, under a generic `shell.lua` chunk name. Test-only since
-    /// `evaluate_file` started naming the chunk after the real path: production always has a path
-    /// to name, and a test fixture never does.
+    /// Evaluates `source` directly, under a generic `shell.lua` chunk name. Test-only: production
+    /// always has a real path to name, and a test fixture never does.
     #[cfg(test)]
     pub fn evaluate(&self, source: &str) -> Result<LoadOutput, LoaderError> {
         self.evaluate_named(source, "shell.lua")
     }
 
     /// Reads `path` and evaluates it exactly like [`Self::evaluate`] -- the real `shell.lua`
-    /// entry point (build-steps.md Phase 13). See the module doc comment.
+    /// entry point.
     pub fn evaluate_file(&self, path: &std::path::Path) -> Result<LoadOutput, LoaderError> {
         let source = std::fs::read_to_string(path)?;
         self.evaluate_named(&source, &path.display().to_string())
@@ -180,13 +161,13 @@ impl Loader {
     /// `name` is the chunk name Lua prefixes onto every error raised out of `source`, so it is
     /// what a config author reads when their edit is rejected. Without it mlua names the chunk
     /// after *this* Rust call site: a live session reported a typo in `shell.lua` as
-    /// "renderer/src/lua/mod.rs:74:127", which points a reader at the engine's source instead of
-    /// their own file for a line number (127) that was theirs all along.
+    /// "renderer/src/lua/mod.rs:74:127", pointing a reader at the engine's source for a line
+    /// number that was theirs all along.
     ///
     /// The leading `@` is Lua's own marker for "this name is a file path" (`lua_Debug.source`),
-    /// and it is load-bearing rather than cosmetic: without it Lua treats the name as inline
-    /// source text and renders it as `[string "/mnt/Work/0Coding/1Rust/oblisk-shell/dev-conf..."]`,
-    /// truncating the path at 60-odd characters right where the filename would be.
+    /// and it is load-bearing: without it Lua treats the name as inline source text and renders
+    /// it as `[string "/mnt/Work/0Coding/1Rust/oblisk-shell/dev-conf..."]`, truncating the path
+    /// right where the filename would be.
     fn evaluate_named(&self, source: &str, name: &str) -> Result<LoadOutput, LoaderError> {
         self.forget_config_modules()?;
         let value: Value = self.lua.load(source).set_name(format!("@{name}")).eval()?;
@@ -194,34 +175,28 @@ impl Loader {
     }
 
     /// Creates a fresh, empty Lua table on this `Loader`'s own VM -- lets a caller build an
-    /// initial value for [`signal::Signal::new_live`] (e.g. `renderer/src/socket.rs`'s `rescue`
-    /// signal) without reaching into a private `Lua` field.
+    /// initial value for [`signal::Signal::new_live`] without reaching into a private `Lua` field.
     pub fn create_table(&self) -> mlua::Result<Table> {
         self.lua.create_table()
     }
 
     /// The `Lua` state itself, for a caller that needs to resolve a `Signal` (ADR-0044 decision
-    /// 1). `layout::Scene::apply` and everything it calls need this to reach
-    /// `signal::Signal::get_value`, which takes `&Lua` rather than recovering one from `self`
-    /// (see that method's doc comment).
+    /// 1): `layout::Scene::apply` needs this to reach `signal::Signal::get_value`, which takes
+    /// `&Lua` rather than recovering one from `self`.
     pub fn lua(&self) -> &Lua {
         &self.lua
     }
 
     /// Registers `value` as a global Lua name, visible to every later `evaluate` call on this
-    /// `Loader`. The node constructors and `computed` already register their own globals
-    /// internally at [`Loader::new`] time; this is the same mechanism exposed for a caller
-    /// outside this module -- Phase 11 uses it to give a [`signal::Signal`] a name a `shell.lua`
-    /// script can reference.
+    /// `Loader` -- the same mechanism the node constructors and `computed` use internally at
+    /// [`Loader::new`] time, exposed for a caller outside this module.
     pub fn set_global<T: mlua::IntoLua>(&self, name: &str, value: T) -> mlua::Result<()> {
         self.lua.globals().set(name, value)
     }
 
-    /// Registers the `process` global table (`process.run`/`ProcessHandle:kill()`,
-    /// build-steps.md Phase 15 item 1) onto this `Loader`'s own VM -- the same "expose a bit of
-    /// Lua for a caller outside this module" shape as [`Self::set_global`]/[`Self::create_table`],
-    /// needed here because registering a whole table-with-a-closure can't go through either of
-    /// those alone.
+    /// Registers the `process` global table (`process.run`/`ProcessHandle:kill()`) onto this
+    /// `Loader`'s own VM -- needed here because registering a whole table-with-a-closure can't go
+    /// through [`Self::set_global`]/[`Self::create_table`] alone.
     pub fn register_process(&self, registry: process::ProcessRegistry) -> mlua::Result<()> {
         process::register(&self.lua, registry)
     }
@@ -230,10 +205,8 @@ impl Loader {
     /// `Value` is tied to the state that created it). Turns a pushed `StateSnapshot`'s
     /// `serde_json::Value` payload into something a `LiveSignalHandle::set` call can store.
     ///
-    /// Delegates to [`json::to_lua`], which is also what `json.decode` calls: a config must not
-    /// meet one `null` mapping on `oblisk.tray.items` and a different one on the output of
-    /// `lsblk --json`, with nothing in the language to tell the two apart. See that function for
-    /// what the mapping is and what it costs.
+    /// Delegates to [`json::to_lua`], which is also what `json.decode` calls, so a config meets
+    /// one `null` mapping everywhere rather than a different one per source.
     pub fn to_lua_value(&self, json: &serde_json::Value) -> mlua::Result<Value> {
         json::to_lua(&self.lua, json)
     }
@@ -241,12 +214,10 @@ impl Loader {
     /// Drops every module a config's own `require` put in `package.loaded`, leaving the standard
     /// library alone (docs/adr/0047 decision 2).
     ///
-    /// This is the one place ADR-0044 and ADR-0047 interact, and neither is wrong on its own.
-    /// ADR-0044 decision 4 keeps one VM per generation and does not reset it on an in-place reload;
-    /// `require` caches by module name. Together they mean an edited `widgets/clock.lua` would be
-    /// re-required from cache, so `shell.lua` re-runs against the old copy and the screen does not
-    /// change. That reads as a reload that silently did nothing, which is why it is worth its own
-    /// step rather than being left to be discovered.
+    /// ADR-0044 decision 4 keeps one VM per generation and does not reset it on an in-place
+    /// reload; `require` caches by module name. Together they mean an edited `widgets/clock.lua`
+    /// would be re-required from cache, so `shell.lua` re-runs against the old copy and the
+    /// screen does not change -- a reload that silently did nothing.
     ///
     /// Names are collected before any are removed, rather than cleared during the walk: mlua's
     /// iterator holds the table for the length of the traversal, and a config with two modules
@@ -277,12 +248,12 @@ fn loaded_module_names(lua: &Lua) -> mlua::Result<std::collections::HashSet<Stri
         .collect()
 }
 
-/// Appended to the "surface N is a X" error, because in practice there is one cause and a config
-/// author cannot see it by reading their own file. Lua 5.4's `require` returns two values, the
-/// module and the loader data (its file path), where 5.3 returned one. A call in the last position
-/// of a table constructor expands to all of its values, so the natural entry point for a split
-/// config, `return { require(a), require(b) }`, is a three-element list whose last element is a
-/// string. Found by running `dev-config/oblisk/shell.lua` after it was split across 32 files.
+/// Appended to the "surface N is a X" error, because a config author cannot see this cause by
+/// reading their own file. Lua 5.4's `require` returns two values, the module and the loader data
+/// (its file path), where 5.3 returned one. A call in the last position of a table constructor
+/// expands to all of its values, so the natural entry point for a split config, `return {
+/// require(a), require(b) }`, is a three-element list whose last element is a string. Found by
+/// running `dev-config/oblisk/shell.lua` after it was split across 32 files.
 const REQUIRE_RETURNS_TWO_VALUES: &str = ". If that element came from a `require` in the last \
 position of this table, note that Lua 5.4's `require` returns the module *and* its file path, and a \
 call in last position expands to both: bind it to a local first";
@@ -302,10 +273,9 @@ fn collect_surfaces(value: Value) -> Result<Vec<VirtualNode>, LoaderError> {
     }
 
     // Read each element as a `Value` and type-check it here rather than letting
-    // `sequence_values::<Table>()` convert. mlua's own failure is
-    // `error converting Lua string to table`, which names neither which element nor what it held,
-    // and arrives as `LoaderError::Eval` so the config author is told their file failed to
-    // *evaluate* when it evaluated fine and returned the wrong thing.
+    // `sequence_values::<Table>()` convert: mlua's own failure, "error converting Lua string to
+    // table", names neither the element nor what it held, and arrives as `LoaderError::Eval` even
+    // though the file evaluated fine and returned the wrong thing.
     let mut surfaces = Vec::new();
     for (index, entry) in table.sequence_values::<Value>().enumerate() {
         let entry = entry.map_err(LoaderError::from)?;
@@ -327,21 +297,15 @@ fn collect_surfaces(value: Value) -> Result<Vec<VirtualNode>, LoaderError> {
     Ok(surfaces)
 }
 
-/// § 6's roles, at the root where § 6 puts them -- all four of them (docs/adr/0040 decision 1),
-/// since gating on `panel` alone was correct only while `panel` was the only role that existed and
-/// rejected a `window` or `popup` here, before the scene or any spec parser ever saw it
-/// (build-steps.md Phase 22).
+/// § 6's roles, at the root where § 6 puts them -- all four (docs/adr/0040 decision 1).
 ///
-/// `lock` had its own rejecting arm through Phase 22, on the argument that a lock surface's
-/// lifetime is the lock's rather than the config's, so the root of `shell.lua` was the wrong
-/// *place* to write one. docs/adr/0052 decision 2 reverses that, and the reversal is not a change
-/// of mind about lifetimes: the lifetime claim was true and stays true. What the arm got wrong was
-/// treating "where the declaration lives" and "when the Wayland object exists" as one question,
-/// which docs/adr/0049 had already split for the two roles sitting beside it. A `window` is
-/// admitted here and owns no `xdg_toplevel` until `visible` resolves true; a `lock` is admitted
-/// here and owns no `ext_session_lock_surface_v1` until the compositor sends `locked`. Refusing it
-/// left § 6.4's `child` -- the whole authored lock screen -- with no legal place to be written, so
-/// the rejection cost the feature rather than protecting the lifetime.
+/// `lock` is admitted here even though its Wayland object's lifetime is the lock's, not the
+/// config's: docs/adr/0052 decision 2 treats "where the declaration lives" and "when the Wayland
+/// object exists" as separate questions, the same split docs/adr/0049 already made for `window`
+/// (admitted here, owns no `xdg_toplevel` until `visible` resolves true) and `popup`. A `lock`
+/// owns no `ext_session_lock_surface_v1` until the compositor sends `locked`; refusing it at the
+/// root would leave § 6.4's `child` -- the whole authored lock screen -- with no legal place to
+/// be written.
 fn require_surface(node: &VirtualNode) -> Result<(), LoaderError> {
     match node.kind.as_str() {
         "panel" | "window" | "popup" | "lock" => Ok(()),
@@ -359,10 +323,7 @@ mod tests {
         Loader::new(signal::DirtyFlag::new(), &std::env::temp_dir()).unwrap()
     }
 
-    /// docs/adr/0047 decision 1. Before this, `package.path` was Lua's compiled-in default, so a
-    /// `require` searched `/usr/local/share/lua/5.4/` and then `./`, which is whatever directory
-    /// the Supervisor happened to be launched from. A config split across files worked when
-    /// started from its own directory and broke from anywhere else.
+    /// docs/adr/0047 decision 1.
     #[test]
     fn require_resolves_a_module_inside_the_config_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -374,8 +335,7 @@ mod tests {
         assert_eq!(label, "tick");
     }
 
-    /// The `?/init.lua` half of the same decision, which is what makes `require "widgets"` resolve
-    /// a directory rather than only `require "widgets.clock"` resolving a file.
+    /// The `?/init.lua` half: `require "widgets"` resolves a directory, not just a file.
     #[test]
     fn require_resolves_a_directory_through_its_init_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -387,9 +347,6 @@ mod tests {
         assert_eq!(label, "index");
     }
 
-    /// Replacing the default rather than prepending to it, so a same-named module installed system
-    /// wide can never shadow the config's own. The `./?.lua` entry is the one that matters most:
-    /// it resolves against the process's working directory, which nothing in the Supervisor sets.
     #[test]
     fn package_path_reaches_nowhere_but_the_config_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -402,11 +359,9 @@ mod tests {
         }
     }
 
-    /// docs/adr/0047 decision 2, and the one place ADR-0044 and ADR-0047 interact. ADR-0044
-    /// decision 4 keeps one VM alive across an in-place reload, and `require` caches by module name
-    /// in `package.loaded`. Together those two mean an edit to a required module would re-run
-    /// `shell.lua` against the stale cached copy and change nothing on screen, which looks exactly
-    /// like a reload that silently did not happen.
+    /// docs/adr/0047 decision 2, the one place ADR-0044 and ADR-0047 interact: without a module
+    /// cache clear, an edit to a required module would re-run `shell.lua` against the stale
+    /// cached copy, a reload that silently does nothing.
     #[test]
     fn a_re_evaluation_sees_an_edited_required_module_rather_than_the_cached_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -423,8 +378,8 @@ mod tests {
         assert_eq!(accent(&second), "second", "the re-evaluation ran against the cached module, so the edit did nothing");
     }
 
-    /// The other half of the same decision: clearing has to stop at the config's own modules. A
-    /// `require "string"` returning nil would break `string.format`, which every config uses.
+    /// The other half: clearing has to stop at the config's own modules, or `require "string"`
+    /// returning nil would break `string.format`.
     #[test]
     fn clearing_the_module_cache_leaves_the_standard_library_loaded() {
         let dir = tempfile::tempdir().unwrap();
@@ -443,14 +398,10 @@ mod tests {
         output.surfaces[0].properties.get("background").unwrap().as_string().unwrap().to_string_lossy().to_string()
     }
 
-    /// Phase 26's acceptance shape, against the config this repo actually ships rather than a
-    /// fixture: `dev-config/oblisk/shell.lua` is split across directories and reaches them through
-    /// `require`. Same precedent as `crate::image`'s resvg test, which renders the real
-    /// `dev-config/oblisk/wallpaper.svg`.
-    ///
-    /// Dotted names rather than a bare one, because that is the shape a real config uses and it is
-    /// the half of `package.path`'s template that a flat fixture never exercises: `config.theme`
-    /// only resolves if `?` is substituted into a path with a directory component in it.
+    /// Against the config this repo actually ships rather than a fixture:
+    /// `dev-config/oblisk/shell.lua` is split across directories and reaches them through
+    /// `require`. Dotted names, not a bare one: `config.theme` only resolves if `?` is
+    /// substituted into a path with a directory component, which a flat fixture never exercises.
     #[test]
     fn require_resolves_the_nested_modules_the_shipped_dev_config_actually_splits_out() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk");
@@ -459,16 +410,15 @@ mod tests {
         let accent: String = loader.lua().load(r#"return require("config.theme").ACCENT"#).eval().unwrap();
         assert!(accent.starts_with('#') && accent.len() == 9, "the palette entry has to be a #rrggbbaa string, got `{accent}`");
 
-        // A component two directories deep, which also proves a module can `require` a module of
-        // its own: `components.pill` reads `config.theme` before it returns.
+        // Also proves a module can `require` a module of its own: `components.pill` reads
+        // `config.theme` before it returns.
         let is_builder: bool = loader.lua().load(r#"return type(require("components.pill")) == "function""#).eval().unwrap();
         assert!(is_builder, "a component has to come back as the builder it returns");
     }
 
-    /// `forget_config_modules` runs before every evaluation and reads `package.loaded`, so a config
-    /// that removes `package` reaches into the *next* reload rather than only its own. Pinned
-    /// because a reload that stops working is the exact failure Phase 26 exists to remove, and
-    /// because the answer should be a reported error rather than a silent no-op.
+    /// `forget_config_modules` runs before every evaluation and reads `package.loaded`, so a
+    /// config that removes `package` reaches into the *next* reload rather than only its own. The
+    /// answer must be a reported error, not a silent no-op.
     #[test]
     fn a_config_that_deletes_the_package_table_fails_its_next_reload_loudly() {
         let dir = tempfile::tempdir().unwrap();
@@ -480,10 +430,8 @@ mod tests {
     }
 
     /// The contract every split config rests on: a required module runs in the same VM as
-    /// `shell.lua`, so it sees the node constructors and the engine's globals without being handed
-    /// them. Pinned because the alternative (each module taking a table of dependencies from
-    /// `shell.lua`) is a different config style entirely, and nothing in the engine would complain
-    /// if this quietly stopped being true.
+    /// `shell.lua`, so it sees the node constructors and the engine's globals without being
+    /// handed them. Nothing in the engine would complain if this quietly stopped being true.
     #[test]
     fn a_required_module_sees_the_same_globals_shell_lua_does() {
         let dir = tempfile::tempdir().unwrap();
@@ -502,16 +450,13 @@ mod tests {
         assert!(output.surfaces[0].properties.contains_key("child"), "a node built in a required module has to survive into the tree");
     }
 
-    /// Found by running the shipped config: the surface list held a seventh element that was a file
-    /// path string, and the engine reported `shell.lua failed to evaluate: error converting Lua
-    /// string to table`. That names neither which element nor what it was, and it blames evaluation
-    /// for a problem in the returned value.
-    ///
-    /// The cause is worth the engine knowing about, because it is not a typo a config author would
-    /// spot. Lua 5.4's `require` returns *two* values, the module and the loader data (its file
-    /// path), where 5.3 returned one. A call in the last position of a table constructor expands to
-    /// all of its values, so `return { require(a), require(b) }` is a three-element list whose last
-    /// element is a string. That is the natural way to write a split config's entry point.
+    /// Found by running the shipped config: the surface list held a seventh element that was a
+    /// file path string, and the engine reported `shell.lua failed to evaluate: error converting
+    /// Lua string to table` -- naming neither the element nor what it was, and blaming evaluation
+    /// for a problem in the returned value. Not a typo a config author would spot: Lua 5.4's
+    /// `require` returns two values, and a call in the last position of a table constructor
+    /// expands to both, so `return { require(a), require(b) }` naturally becomes a three-element
+    /// list whose last element is a string.
     #[test]
     fn a_non_node_in_the_surface_list_names_which_element_and_what_it_was() {
         let loader = test_loader();
@@ -531,10 +476,8 @@ mod tests {
         loader.lua().load(format!("return ({expr}) == nil")).eval().unwrap()
     }
 
-    /// docs/adr/0048: every one of these blocks the thread that dispatches Wayland events, and
-    /// ADR-0021's 5ms cap cannot catch it, because the cap is an instruction-count hook and a
-    /// thread parked in a syscall executes no instructions. One `os.execute` in a `computed`
-    /// freezes every surface on every monitor until the child exits.
+    /// docs/adr/0048: each of these blocks the Wayland dispatch thread, and the 5ms CPU cap can't
+    /// catch it since a thread parked in a syscall executes no instructions.
     #[test]
     fn the_config_vm_has_no_blocking_stdlib_call_left_to_stall_wayland_dispatch() {
         let loader = test_loader();
@@ -544,8 +487,7 @@ mod tests {
         }
     }
 
-    /// The four ADR-0048 keeps: they read process-local state and return without a syscall that
-    /// waits. Cutting them would break the clock every bar has.
+    /// The four ADR-0048 keeps. Cutting them would break the clock every bar has.
     #[test]
     fn the_config_vm_keeps_the_four_os_calls_that_cannot_block() {
         let loader = test_loader();
@@ -556,9 +498,9 @@ mod tests {
         assert!(year >= 2024, "os.date has to be the real one, not a stub: got {year}");
     }
 
-    /// The hole a denylist leaves. `require` reads `package.loaded`, which keeps its own reference
-    /// to the table a library was loaded into, so removing a global alone hands the full library
-    /// straight back to `local io = require("io")`.
+    /// The hole a denylist leaves: `require` reads `package.loaded`, which keeps its own reference
+    /// to the loaded table, so removing a global alone hands the full library back to `local io =
+    /// require("io")`.
     #[test]
     fn require_cannot_hand_back_the_stdlib_the_vm_just_dropped() {
         let loader = test_loader();
@@ -600,9 +542,7 @@ mod tests {
 
     #[test]
     fn evaluate_accepts_a_window_and_a_popup_at_the_top_level_beside_a_panel() {
-        // § 6 returns all four roles at the root and docs/adr/0040 decision 1 makes three of them
-        // a config's to declare, so gating on `panel` alone rejected two thirds of § 6 before the
-        // scene ever saw them (build-steps.md Phase 22).
+        // docs/adr/0040 decision 1: all four § 6 roles are a config's to declare at the root.
         let loader = test_loader();
         let output = loader
             .evaluate(
@@ -619,10 +559,8 @@ mod tests {
 
     #[test]
     fn evaluate_accepts_a_top_level_lock_because_declaring_one_is_not_the_same_as_locking() {
-        // Replaces the Phase 22 test that asserted the opposite, per docs/adr/0052 decision 2.
-        // The lifetime claim that test rested on is still true -- the compositor decides when a
-        // lock surface exists -- but it is a claim about the Wayland object, and this function
-        // only ever decided where the declaration may be written.
+        // docs/adr/0052 decision 2: the compositor still decides when the lock surface exists;
+        // this function only ever decided where the declaration may be written.
         let loader = test_loader();
         let output = loader.evaluate(r##"return lock { id = "screen", child = rect { background = "#000000FF" } }"##).unwrap();
         assert_eq!(output.surfaces.len(), 1);
@@ -631,9 +569,8 @@ mod tests {
 
     #[test]
     fn a_top_level_return_of_an_unknown_kind_names_all_four_roles_it_could_have_been() {
-        // The catch-all is the only place a config author learns the roster, so it has to list
-        // `lock` now that `lock` is admitted -- an omission here reads as "not built yet", which
-        // is exactly the wrong impression the Phase 22 arm used to give.
+        // The catch-all is the only place a config author learns the roster, so it must list
+        // `lock` -- an omission here reads as "not built yet".
         let loader = test_loader();
         let err = loader.evaluate(r#"return { kind = "rect" }"#).unwrap_err();
         let LoaderError::InvalidTopLevelReturn(message) = err else {
@@ -670,11 +607,10 @@ mod tests {
         assert_eq!(output.surfaces[0].properties.get("muted").unwrap(), &Value::Boolean(false));
     }
 
-    /// docs/build-steps.md Phase 19 item 16: a JSON `null` must reach Lua as `nil`, which erases
-    /// the key from the table rather than leaving a typed-but-absent value in it. Checking only
-    /// `item.icon_path == nil` would not catch this -- indexing a table for a missing key also
-    /// returns `nil` in Lua -- so this counts the table's own keys to prove `icon_path` never
-    /// landed in it at all.
+    /// A JSON `null` must reach Lua as `nil`, erasing the key rather than leaving a
+    /// typed-but-absent value. Checking only `item.icon_path == nil` wouldn't catch this --
+    /// indexing a missing key also returns `nil` -- so this counts the table's own keys to prove
+    /// `icon_path` never landed in it at all.
     #[test]
     fn to_lua_value_maps_a_json_null_field_to_a_nil_that_is_absent_from_the_table() {
         let loader = test_loader();
@@ -702,12 +638,11 @@ mod tests {
         assert_eq!(output.surfaces[0].properties.get("path_is_nil").unwrap(), &Value::Boolean(true));
     }
 
-    /// This is the actual bug from docs/build-steps.md Phase 19 item 16, not a stand-in for it:
-    /// mlua's default `serialize_none_to_null` maps JSON `null` to a lightuserdata sentinel, and
-    /// lightuserdata is truthy in Lua, so a live Telegram tray item's `icon_path = null` made
-    /// `if item.icon_path then` take the branch that assumes a real path. Checking the Lua *type*
-    /// of the converted value would still pass for that sentinel; only a truthiness check like
-    /// this one distinguishes it from real `nil`.
+    /// The actual bug: mlua's default `serialize_none_to_null` maps JSON `null` to a
+    /// lightuserdata sentinel, and lightuserdata is truthy in Lua, so a live Telegram tray item's
+    /// `icon_path = null` made `if item.icon_path then` take the branch that assumes a real path.
+    /// Checking the Lua *type* of the converted value would still pass for that sentinel; only a
+    /// truthiness check like this one distinguishes it from real `nil`.
     #[test]
     fn to_lua_value_a_null_field_is_falsy_not_a_truthy_lightuserdata_sentinel() {
         let loader = test_loader();
@@ -723,10 +658,9 @@ mod tests {
         assert_eq!(result, "falsy");
     }
 
-    /// The live tray payload's nulls sit inside `items[1]`, not at the top level (a Telegram item
-    /// arrived as `icon_name = "org.telegram.desktop-mute-symbolic", icon_path = null`). This
-    /// catches a fix that only handles a top-level null and still leaves the truthy sentinel one
-    /// table level down, which is where the real bug actually lived.
+    /// The live tray payload's nulls sit inside `items[1]`, not at the top level. Catches a fix
+    /// that only handles a top-level null and still leaves the truthy sentinel one table level
+    /// down, which is where the real bug lived.
     #[test]
     fn to_lua_value_a_null_nested_inside_an_array_element_is_also_nil() {
         let loader = test_loader();
@@ -749,13 +683,10 @@ mod tests {
         assert_eq!(result, "falsy");
     }
 
-    /// The trade this fix accepts, pinned so it stays a known quantity. Mapping `null` to `nil`
-    /// leaves a hole when the null is an array *element* rather than a field value, and `ipairs`
-    /// stops at a hole, while `#` and direct indexing still see past it. The old lightuserdata
-    /// sentinel filled the hole, so `ipairs` walked the whole array. No capability payload
-    /// produces a null array element today (their nulls are all optional *fields*), but
-    /// `dev-config/oblisk/shell.lua` does iterate capability lists with `ipairs`, so this is the
-    /// shape a config would meet first if one ever did.
+    /// The trade this fix accepts: mapping `null` to `nil` leaves a hole when the null is an
+    /// array *element*, and `ipairs` stops at a hole, while `#` and direct indexing see past it.
+    /// No capability payload produces a null array element today (their nulls are all optional
+    /// *fields*), but `dev-config/oblisk/shell.lua` iterates capability lists with `ipairs`.
     #[test]
     fn to_lua_value_a_null_array_element_leaves_a_hole_ipairs_stops_at() {
         let loader = test_loader();
@@ -765,15 +696,13 @@ mod tests {
 
         let ipairs_count: i64 = loader.lua().load("local n = 0 for _ in ipairs(state.xs) do n = n + 1 end return n").eval().unwrap();
         assert_eq!(ipairs_count, 1, "ipairs must stop at the hole the nil leaves");
-        // Reachable past the hole by index, which is what makes this a hole rather than a
-        // truncation: a config that indexes directly still sees the third element.
+        // Reachable past the hole by index: a hole, not a truncation.
         let third: i64 = loader.lua().load("return state.xs[3]").eval().unwrap();
         assert_eq!(third, 3);
     }
 
-    /// Negative control: turning off `serialize_none_to_null`/`serialize_unit_to_null` should only
-    /// change how `Value::Null` maps. This guards against the same edit disturbing how ordinary
-    /// numbers, strings, booleans, and array elements round-trip.
+    /// Negative control: turning off `serialize_none_to_null`/`serialize_unit_to_null` should
+    /// only change how `Value::Null` maps, not ordinary numbers, strings, booleans or arrays.
     #[test]
     fn to_lua_value_leaves_non_null_fields_unchanged() {
         let loader = test_loader();
@@ -819,9 +748,7 @@ mod tests {
     }
 
     /// A config author reads this string and nothing else when their edit is rejected, so it has
-    /// to name their file and their line. Before the chunk name was set, a live session reported a
-    /// syntax error on line 127 of `shell.lua` as "renderer/src/lua/mod.rs:74:127", which sends
-    /// the reader into the engine's source for a line number that was theirs.
+    /// to name their file and their line, not "renderer/src/lua/mod.rs:74:127".
     #[test]
     fn an_evaluation_error_names_the_config_file_not_this_source_file() {
         let dir = tempfile::tempdir().unwrap();

@@ -3,19 +3,16 @@
 //! `state(name, initial)` (ADR-0044 decision 5).
 //!
 //! Lua never constructs a bare `Signal` itself -- § 1.2 exposes it as Rust-owned userdata handed
-//! *to* Lua, never built *by* Lua from a raw value. `Signal::try_new_direct` is the Rust-side
-//! entry point Phase 11 will call once there's a real `StateSnapshot` value to wrap; this phase
-//! only exercises it from tests.
+//! *to* Lua, never built *by* Lua from a raw value.
 //!
 //! ponytail: `computed`/`map` recompute their function fresh on every `:get()` call -- no
 //! memoization, no dependency-invalidation graph. Deciding *when* a cached computed value goes
-//! stale is the Watcher's job (`CONTEXT.md`, Watcher; build-steps.md Phase 13), not this loader's.
-//! Recomputing on every read is the correct, simple baseline until something needs the graph.
+//! stale is the Watcher's job (`CONTEXT.md`, Watcher), not this loader's. Recomputing on every
+//! read is the correct, simple baseline until something needs the graph.
 //!
 //! `computed(dependencies, fn)` calls `fn` with each dependency's *current value* as a positional
-//! argument (`fn(dep1_value, dep2_value, ...)`), not the `Signal` handles themselves -- the spec
-//! doesn't literally pin this calling convention down, and passing already-unwrapped values means
-//! every `computed` body doesn't have to redundantly call `:get()` on each of its own dependencies.
+//! argument, not the `Signal` handles themselves, so a `computed` body doesn't have to
+//! redundantly call `:get()` on each of its own dependencies.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -35,11 +32,9 @@ const CPU_CAP: Duration = Duration::from_millis(5);
 /// seconds.
 const CHECK_EVERY_N_INSTRUCTIONS: u32 = 1000;
 
-/// The recursion bound for [`Signal::get_value`]'s `Computed` arm (build-steps.md Phase 19 item
-/// 3, defect 3): how many of those calls may be live on the stack at once before the next one
-/// returns an `mlua::Error` instead of recursing further. At most this many levels are admitted;
-/// the level past it is refused, the same "at most N levels" boundary `layout::scene`'s
-/// `MAX_TREE_DEPTH` uses.
+/// The recursion bound for [`Signal::get_value`]'s `Computed` arm: how many of those calls may be
+/// live on the stack at once before the next one returns an `mlua::Error` instead of recursing
+/// further -- the same "at most N levels" boundary `layout::scene`'s `MAX_TREE_DEPTH` uses.
 ///
 /// It bounds *both* shapes of `get_value` recursion, because [`CpuBudget::enter`] runs before
 /// dependency resolution rather than around the closure call alone:
@@ -54,10 +49,9 @@ const CHECK_EVERY_N_INSTRUCTIONS: u32 = 1000;
 /// The 5ms CPU cap alone cannot be this bound: a dependency chain does no Lua work between
 /// levels, so the instruction hook may never fire before the guard page does.
 ///
-/// A legitimate dependency chain is shallow -- a handful of `map` calls, not dozens -- so 32 is
-/// generous headroom above anything reasonable, and is the more expensive of the two caps per
-/// level. See `layout::scene::MAX_TREE_DEPTH` for the measured compounded stack cost of this
-/// constant and that one together, which is what actually sets both.
+/// A legitimate dependency chain is shallow, so 32 is generous headroom. See
+/// `layout::scene::MAX_TREE_DEPTH` for the measured compounded stack cost of this constant and
+/// that one together, which is what actually sets both.
 const MAX_SIGNAL_NESTING_DEPTH: usize = 32;
 
 /// The one message both cap gates raise, so a caller matching on it does not have to know which
@@ -67,15 +61,13 @@ const CPU_CAP_EXCEEDED: &str = "computed/map exceeded its 5ms CPU budget";
 #[derive(Clone)]
 enum SignalKind {
     // ponytail: only `Signal::try_new_direct` constructs this variant, and that constructor has
-    // no production caller yet either (see its own doc comment) -- exercised by tests only.
+    // no production caller yet either -- exercised by tests only.
     #[allow(dead_code)]
     Direct(Value),
     Computed { deps: Vec<Signal>, func: Function },
-    /// A value Rust can overwrite after construction (`Signal::new_live`/`LiveSignalHandle`,
-    /// Phase 11). `Rc<RefCell<_>>`, not `Arc<Mutex<_>>`: the `Loader` this lives on stays
-    /// confined to one dedicated OS thread (the Wayland dispatch thread, docs/adr/0039),
-    /// the same single-threaded-state convention `supervisor/src/audio/mixer.rs`'s
-    /// `Rc<RefCell<MixerState>>` already uses.
+    /// A value Rust can overwrite after construction (`Signal::new_live`/`LiveSignalHandle`).
+    /// `Rc<RefCell<_>>`, not `Arc<Mutex<_>>`: the `Loader` this lives on stays confined to one
+    /// dedicated OS thread (the Wayland dispatch thread, docs/adr/0039).
     Live(Rc<RefCell<Value>>),
     /// Lua-authored state (ADR-0044 decision 5): the one signal kind `Signal::set` accepts, built
     /// by the `state(name, initial)` global and written from a config's own `on_click`.
@@ -83,12 +75,12 @@ enum SignalKind {
     /// A fourth variant rather than a reuse of `Live`, even though the storage is identical.
     /// ADR-0044 makes capability signals read-only to Lua, and a `set` that accepted `Live` would
     /// let a config overwrite the network SSID the Supervisor just pushed, with every reader
-    /// downstream believing it. Keeping the writable kind distinct makes that rule a fact the type
-    /// system holds rather than a comment `set` has to remember, and makes it testable.
+    /// downstream believing it. Keeping the writable kind distinct makes that rule a fact the
+    /// type system holds rather than a comment `set` has to remember, and makes it testable.
     ///
-    /// Carries its own `DirtyFlag` clone rather than reaching for one at write time, for the same
-    /// reason [`LiveSignalHandle`] does: `set` is a `UserData` method with no `RendererClient` in
-    /// reach, and every signal in a generation shares the one flag decision 2 specifies anyway.
+    /// Carries its own `DirtyFlag` clone rather than reaching for one at write time: `set` is a
+    /// `UserData` method with no `RendererClient` in reach, and every signal in a generation
+    /// shares the one flag decision 2 specifies anyway.
     State { cell: Rc<RefCell<Value>>, dirty: DirtyFlag },
 }
 
@@ -104,13 +96,13 @@ impl SignalKind {
     }
 }
 
-/// The marshalling boundary (`marshal.rs`, § 1.1) applied to one Lua-authored value: the
-/// types § 1.1 constrains (`Number`/`Integer`/`String`) are checked, and every other shape passes
-/// through untouched since the spec places no extra constraint on it.
+/// The marshalling boundary (`marshal.rs`, § 1.1) applied to one Lua-authored value: the types
+/// § 1.1 constrains (`Number`/`Integer`/`String`) are checked, every other shape passes through
+/// untouched.
 ///
-/// Shared by [`Signal::try_new_direct`], [`Signal::new_state`] and `set`, which all guard the same
-/// thing: a value hand-authored in Lua crossing into Rust. `Signal::new_live` deliberately does
-/// not, because its value came out of a Rust struct (see that constructor's doc comment).
+/// Shared by [`Signal::try_new_direct`], [`Signal::new_state`] and `set`, which all guard a value
+/// hand-authored in Lua crossing into Rust. `Signal::new_live` deliberately does not, since its
+/// value came out of a Rust struct.
 fn check_lua_authored(value: &Value) -> Result<(), marshal::MarshalError> {
     match value {
         Value::Number(n) => {
@@ -134,14 +126,13 @@ pub struct Signal(SignalKind);
 
 impl Signal {
     /// Wraps `value` as a `Direct` signal, enforcing the marshalling boundary (`marshal.rs`) on
-    /// the types it constrains (`Number`/`Integer`/`String`); every other Lua value shape passes
-    /// through untouched, since § 1.1 places no extra constraint on it.
+    /// the types it constrains (`Number`/`Integer`/`String`); every other shape passes through
+    /// untouched.
     ///
-    /// ponytail: no production caller yet -- every live value this phase pushes goes through
-    /// `Signal::new_live` instead (Rust-pushed, not Lua-authored, so the marshalling boundary
-    /// this guards doesn't apply the same way; see `new_live`'s own doc comment). A real
-    /// Lua-constructed `Direct` signal is still a future phase's job. Exercised by this module's
-    /// tests only.
+    /// ponytail: no production caller yet -- every live value pushed today goes through
+    /// `Signal::new_live` instead (Rust-pushed, not Lua-authored, so this boundary doesn't apply
+    /// the same way). A real Lua-constructed `Direct` signal is still a future phase's job.
+    /// Exercised by this module's tests only.
     #[allow(dead_code)]
     pub fn try_new_direct(value: Value) -> Result<Self, marshal::MarshalError> {
         check_lua_authored(&value)?;
@@ -151,9 +142,8 @@ impl Signal {
     /// The signal behind `state(name, initial)` (ADR-0044 decision 5): writable from Lua through
     /// `signal:set(value)`, which marks `dirty` so the next poll turn re-resolves.
     ///
-    /// Marshal-checked, unlike [`Self::new_live`] and exactly like [`Self::try_new_direct`]:
-    /// `initial` is written in `shell.lua`, so it is a hand-authored value crossing into Rust,
-    /// which is the boundary `marshal.rs` exists for.
+    /// Marshal-checked, unlike [`Self::new_live`]: `initial` is written in `shell.lua`, so it is
+    /// a hand-authored value crossing into Rust, the boundary `marshal.rs` exists for.
     pub fn new_state(initial: Value, dirty: DirtyFlag) -> Result<Self, marshal::MarshalError> {
         check_lua_authored(&initial)?;
         Ok(Signal(SignalKind::State { cell: Rc::new(RefCell::new(initial)), dirty }))
@@ -161,15 +151,13 @@ impl Signal {
 
     /// A signal Rust can push new values into after construction via the paired
     /// [`LiveSignalHandle`] -- `try_new_direct`'s marshalling checks don't apply here: the value
-    /// arrives already `serde_json`-serialized from a Rust struct (e.g. `AppStream`), which can't
-    /// produce a NaN/Inf/oversized string the way hand-authored Lua can. `try_new_direct` guards
-    /// Lua-authored values crossing into Rust; this is a value Rust itself produced.
+    /// arrives already `serde_json`-serialized from a Rust struct, which can't produce a
+    /// NaN/Inf/oversized string the way hand-authored Lua can.
     ///
     /// `dirty` is the scene-dirty flag (ADR-0044 decision 2) the paired [`LiveSignalHandle`]
     /// marks on every `set`. Every live signal in one generation shares the same `DirtyFlag`
-    /// (`renderer/src/socket.rs`'s `RendererClient` holds the clone that reads and clears it),
-    /// because decision 2's "one flag for the whole scene" means there is exactly one to share,
-    /// not one per capability.
+    /// (`renderer/src/socket.rs`'s `RendererClient` holds the clone that reads and clears it):
+    /// decision 2's "one flag for the whole scene" means there is exactly one to share.
     pub fn new_live(initial: Value, dirty: DirtyFlag) -> (Self, LiveSignalHandle) {
         let cell = Rc::new(RefCell::new(initial));
         (Signal(SignalKind::Live(Rc::clone(&cell))), LiveSignalHandle(cell, dirty))
@@ -179,48 +167,39 @@ impl Signal {
     /// on every read like any other (ADR-0044 decision 3, no memoization).
     ///
     /// Lifted out of the Lua-facing `map` method so a Rust caller can build the same thing --
-    /// `lua::capability::Capability` delegates its own `map` here, because `oblisk.lock` has to
-    /// read exactly like the ten bare capability globals beside it and a second, hand-rolled
-    /// `Computed` construction there would be a second place for that to drift.
+    /// `lua::capability::Capability` delegates its own `map` here, so `oblisk.lock` reads exactly
+    /// like the bare capability globals beside it instead of a second, drift-prone construction.
     pub(crate) fn mapped(&self, func: Function) -> Signal {
         Signal(SignalKind::Computed { deps: vec![self.clone()], func })
     }
 
-    /// Reads this signal's current value (ADR-0044 decision 1, `CONTEXT.md`'s Signal resolution
-    /// entry). `pub(crate)`, not private: `layout::node`'s property parsers call this directly to
-    /// resolve a `Signal` userdata found in a property slot, instead of rejecting it -- the same
-    /// method `Signal::get`'s Lua-facing method already calls, just reachable from Rust now too.
-    /// `&Lua` is threaded in rather than recovered from `self`, because a `Computed` signal's
-    /// closure runs under a [`CpuBudget`], which needs a real `Lua` to install its
-    /// instruction-count hook on -- mlua 0.12 exposes no way to recover a `Lua` from an
-    /// `AnyUserData`/`Value` (checked the vendored source under `~/.cargo/registry`; no such
-    /// accessor exists), so there is nothing to recover it from.
+    /// Reads this signal's current value (ADR-0044 decision 1). `pub(crate)`, not private:
+    /// `layout::node`'s property parsers call this directly to resolve a `Signal` userdata found
+    /// in a property slot instead of rejecting it. `&Lua` is threaded in rather than recovered
+    /// from `self`, because a `Computed` signal's closure runs under a [`CpuBudget`], which needs
+    /// a real `Lua` to install its instruction-count hook on -- mlua 0.12 exposes no way to
+    /// recover a `Lua` from an `AnyUserData`/`Value`.
     pub(crate) fn get_value(&self, lua: &Lua) -> mlua::Result<Value> {
         match &self.0 {
             SignalKind::Direct(value) => Ok(value.clone()),
             SignalKind::Live(cell) => Ok(cell.borrow().clone()),
             SignalKind::State { cell, .. } => Ok(cell.borrow().clone()),
             SignalKind::Computed { deps, func } => {
-                // The budget is entered *before* dependency resolution, not around `func.call`
-                // alone, and that ordering is the whole point (see [`CpuBudget`]): it makes the
-                // deadline-stack depth equal the true `get_value` nesting depth, so
+                // Entered *before* dependency resolution, not around `func.call` alone: this
+                // makes the deadline-stack depth equal the true `get_value` nesting depth, so
                 // MAX_SIGNAL_NESTING_DEPTH bounds dependency chains as well as body nesting, and
-                // it keeps the outermost deadline live across the entire dependency graph rather
-                // than restarting the 5ms clock at every leaf.
+                // keeps the outermost deadline live across the whole dependency graph rather than
+                // restarting the 5ms clock at every leaf.
                 let budget = CpuBudget::enter(lua)?;
 
                 // ponytail: resolving every dependency on every read, with no memoization
-                // (ADR-0044 decision 3, and this module's header), makes evaluation exponential
-                // in graph depth for a diamond-shaped graph -- `computed({s, s}, f)` stacked N
-                // deep evaluates `s` 2^N times, measured at 1,048,575 closure calls for N = 20.
-                // N = 30 is about a billion calls. The 5ms budget entered just above is the only
-                // thing that makes that survivable instead of fatal: it is shared by the whole
-                // graph rather than restarting per leaf, so the evaluation is cut off with an
-                // error. Memoizing a dependency's resolved value for the duration of one
-                // outermost `get_value` -- a per-evaluation cache keyed on signal identity, which
-                // would collapse the DAG back to linear -- is the upgrade path if a real config
-                // ever grows a diamond deep enough to notice. Not built now: ADR-0044 decision 3
-                // says no memoization, and no config has needed it.
+                // (ADR-0044 decision 3), makes evaluation exponential in graph depth for a
+                // diamond-shaped graph -- `computed({s, s}, f)` stacked N deep evaluates `s` 2^N
+                // times, measured at 1,048,575 closure calls for N = 20. The 5ms budget entered
+                // just above is what makes that survivable: shared by the whole graph rather than
+                // restarting per leaf, so the evaluation is cut off with an error. Memoizing a
+                // dependency's resolved value for one outermost `get_value` is the upgrade path
+                // if a real config ever grows a diamond deep enough to notice; not built now.
                 let mut args = Vec::with_capacity(deps.len());
                 for dep in deps {
                     args.push(dep.get_value(lua)?);
@@ -234,16 +213,15 @@ impl Signal {
 }
 
 /// The Rust-side handle to a [`Signal::new_live`] signal's storage: lets Rust push a new value in
-/// after construction, e.g. on every received `StateSnapshot` (Phase 11). The paired `Signal`
-/// (Lua-side) always reads whatever was last set here -- no memoization, matching every other
-/// `Signal` kind in this file.
+/// after construction, e.g. on every received `StateSnapshot`. The paired `Signal` (Lua-side)
+/// always reads whatever was last set here -- no memoization, matching every other `Signal` kind
+/// in this file.
 #[derive(Clone)]
 pub struct LiveSignalHandle(Rc<RefCell<Value>>, DirtyFlag);
 
 impl LiveSignalHandle {
-    /// Writes `value` and marks the shared scene dirty (ADR-0044 decision 2, `CONTEXT.md`'s
-    /// Dirty scene entry): every push, not just this capability's own next read, has to make the
-    /// next poll turn re-resolve the whole scene, since decision 3 rejects a per-signal
+    /// Writes `value` and marks the shared scene dirty (ADR-0044 decision 2): every push has to
+    /// make the next poll turn re-resolve the whole scene, since decision 3 rejects a per-signal
     /// dependency graph that could narrow that down.
     pub fn set(&self, value: Value) {
         *self.0.borrow_mut() = value;
@@ -254,13 +232,12 @@ impl LiveSignalHandle {
 /// The one scene-dirty flag ADR-0044 decision 2 specifies: a single `bool`, shared by every
 /// [`LiveSignalHandle`] in a generation and by the `RendererClient` that reads and clears it, not
 /// a per-signal or per-surface set. `Rc<Cell<bool>>`, not `Arc<AtomicBool>`: this lives entirely
-/// on the Wayland dispatch thread (docs/adr/0039), the same single-threaded-state reasoning
-/// `SignalKind::Live`'s `Rc<RefCell<Value>>` documents above.
+/// on the Wayland dispatch thread (docs/adr/0039).
 ///
 /// `ponytail:` one flag for the whole scene means any push re-resolves every surface, including
 /// one that reads nothing from the capability that changed. The upgrade path is a per-surface
 /// flag keyed on which signals a surface actually reads, which needs read-tracking that doesn't
-/// exist yet (ADR-0044 decision 2's own ceiling).
+/// exist yet.
 #[derive(Clone)]
 pub struct DirtyFlag(Rc<Cell<bool>>);
 
@@ -269,19 +246,18 @@ impl DirtyFlag {
         Self(Rc::new(Cell::new(false)))
     }
 
-    /// `pub(crate)` since build-steps.md Phase 20 item 4: a `configure` carrying a new size for one
-    /// surface instance means exactly what a capability push means -- the resolved geometry no
-    /// longer matches its inputs -- so `crate::socket::RendererClient::set_instance_size` marks
-    /// this same flag rather than adding a second mechanism beside it (ADR-0044 decision 2).
+    /// `pub(crate)`: a `configure` carrying a new size for one surface instance means exactly
+    /// what a capability push means -- the resolved geometry no longer matches its inputs -- so
+    /// `crate::socket::RendererClient::set_instance_size` marks this same flag rather than adding
+    /// a second mechanism beside it (ADR-0044 decision 2).
     pub(crate) fn mark(&self) {
         self.0.set(true);
     }
 
     /// Reads and clears the flag in one step -- the "drain first, then re-resolve once" rule
     /// (ADR-0044 decision 2): `wayland::run`'s poll loop drains every pending inbound frame
-    /// before calling this once, so a burst of `StateSnapshot` pushes marks the flag repeatedly
-    /// but this only ever reports it once, coalescing the burst into a single re-resolve instead
-    /// of one per push.
+    /// before calling this once, coalescing a burst of `StateSnapshot` pushes into a single
+    /// re-resolve instead of one per push.
     pub fn take(&self) -> bool {
         self.0.replace(false)
     }
@@ -298,9 +274,7 @@ impl UserData for Signal {
         methods.add_method("get", |lua, this, ()| this.get_value(lua));
         methods.add_method("map", |_, this, f: Function| Ok(this.mapped(f)));
         // ADR-0044 decision 5's write path, and the only one Lua has. Every other kind is refused
-        // by name rather than by a type error, because the config author who typed
-        // `network:set(...)` needs to be told *why* a capability signal will not take a value,
-        // not just that the call did not work.
+        // by name rather than by a type error, so `network:set(...)` says *why* it refuses.
         methods.add_method("set", |_, this, value: Value| {
             let SignalKind::State { cell, dirty } = &this.0 else {
                 return Err(mlua::Error::runtime(format!(
@@ -324,11 +298,10 @@ impl UserData for Signal {
 /// re-running the config on an in-place reload finds the signal it built last time still holding
 /// whatever the user's last click left in it, and an open dropdown stays open across a config edit.
 ///
-/// It lives in `Lua::set_app_data`, the same per-`Lua` storage [`CpuBudget::enter`] keeps its
-/// deadline stack in, and that placement is why the map needs no explicit lifetime management:
-/// decision 4 keeps the VM alive across an in-place reload, so anything hung off the `Lua`
-/// outlives an evaluation by construction, and a generation swap is a new process with a new VM,
-/// which is decision 5's "named state dies on a generation swap" falling out for free.
+/// Lives in `Lua::set_app_data`, the same per-`Lua` storage [`CpuBudget::enter`] keeps its
+/// deadline stack in, so it needs no explicit lifetime management: decision 4 keeps the VM alive
+/// across an in-place reload, and a generation swap is a new process with a new VM, which is
+/// decision 5's "named state dies on a generation swap" falling out for free.
 #[derive(Default)]
 struct StateRegistry(HashMap<String, Signal>);
 
@@ -346,21 +319,18 @@ struct StateRegistry(HashMap<String, Signal>);
 /// stack, and enforcement hands back to the outer call instead of vanishing.
 ///
 /// The governing deadline is `stack[0]`, the outermost live call's -- not the innermost
-/// (`stack.last()`, this code's original design; build-steps.md Phase 19 item 3 defect 3,
-/// `docs/adr/0021`'s amendment). Reading the innermost meant a monotonically deepening recursion
-/// always saw the *freshest* deadline, recomputed from `Instant::now()` at every new level's own
-/// push, so the check could never observe an expired budget no matter how long the whole chain
-/// ran. `stack[0]` makes "5ms" mean what § 1.2 says: a budget for the evaluation as a whole, not
-/// a per-level allowance that resets on every recursive `:get()`.
+/// (`stack.last()`, this code's original design). Reading the innermost meant a monotonically
+/// deepening recursion always saw the *freshest* deadline, recomputed from `Instant::now()` at
+/// every new level's own push, so the check could never observe an expired budget no matter how
+/// long the whole chain ran. `stack[0]` makes "5ms" mean what § 1.2 says: a budget for the
+/// evaluation as a whole, not a per-level allowance that resets on every recursive `:get()`.
 ///
 /// `stack[0]` is also, specifically, the *minimum*, so this is `first()` and not `iter().min()`:
-/// every deadline is `Instant::now() + CPU_CAP` on `Instant`'s monotonic clock, `CPU_CAP` is a
-/// constant, and entries are pushed and popped strictly LIFO by this guard's own construction and
-/// `Drop`. A later push therefore always carries a later-or-equal deadline than the one beneath
-/// it, so the vector is non-decreasing and its first element is its minimum. That matters because
-/// the hook runs every [`CHECK_EVERY_N_INSTRUCTIONS`] instructions: `first()` is O(1) where
-/// `min()` walked up to [`MAX_SIGNAL_NESTING_DEPTH`] `Instant`s per fire. Do not "fix" it to
-/// `last()` either -- that is the per-level reset this design exists to avoid.
+/// every deadline is `Instant::now() + CPU_CAP`, and entries are pushed and popped strictly LIFO,
+/// so the vector is non-decreasing and its first element is its minimum. That matters because the
+/// hook runs every [`CHECK_EVERY_N_INSTRUCTIONS`] instructions: `first()` is O(1) where `min()`
+/// walked up to [`MAX_SIGNAL_NESTING_DEPTH`] `Instant`s per fire. Do not "fix" it to `last()`
+/// either -- that is the per-level reset this design exists to avoid.
 struct CpuBudget<'lua> {
     lua: &'lua Lua,
 }
@@ -369,10 +339,10 @@ impl<'lua> CpuBudget<'lua> {
     /// Claims one nesting level, refusing past [`MAX_SIGNAL_NESTING_DEPTH`].
     ///
     /// The hook is installed *before* the deadline is pushed, so no early return can leave the
-    /// stack unbalanced (build-steps.md Phase 19 item 3): an install failure returns with nothing
-    /// pushed and nothing to pop, where pushing first would have stranded an entry that the
-    /// depth-1 branch then never revisits, silently disabling the cap for the rest of the VM's
-    /// life. No Lua runs between the install and the push, and the hook tolerates an empty stack.
+    /// stack unbalanced: an install failure returns with nothing pushed and nothing to pop, where
+    /// pushing first would have stranded an entry that the depth-1 branch never revisits, silently
+    /// disabling the cap for the rest of the VM's life. No Lua runs between the install and the
+    /// push, and the hook tolerates an empty stack.
     fn enter(lua: &'lua Lua) -> mlua::Result<Self> {
         if lua.app_data_ref::<Vec<Instant>>().is_none() {
             lua.set_app_data(Vec::<Instant>::new());
@@ -384,14 +354,12 @@ impl<'lua> CpuBudget<'lua> {
             )));
         }
         if depth == 0 {
-            // `set_global_hook`, not `set_hook`: mlua's per-thread hook (`HookKind::Thread`) is
-            // keyed by Lua thread in a registry table, so a coroutine created by a `computed`
-            // body inherited the hook C function from `lua_newthread` (lstate.c copies `hook`,
-            // `hookmask` and `basehookcount` from the creating thread) but found no callback for
-            // itself and *disabled* the hook on that thread. Measured: 5.75s of uninterrupted Lua
-            // inside `coroutine.create`/`resume`, returning `Ok`. `HookKind::Global` stores one
-            // callback on the `Lua` itself and `global_hook_proc` reads it whichever thread it
-            // fires on, so the inherited hook resolves and the cap covers coroutines too.
+            // `set_global_hook`, not `set_hook`: mlua's per-thread hook is keyed by Lua thread, so
+            // a coroutine created by a `computed` body inherited the hook C function from
+            // `lua_newthread` but found no callback for itself and *disabled* the hook on that
+            // thread -- measured 5.75s of uninterrupted Lua inside `coroutine.create`/`resume`,
+            // returning `Ok`. `HookKind::Global` stores one callback on the `Lua` itself, read
+            // whichever thread it fires on, so the inherited hook resolves and covers coroutines.
             lua.set_global_hook(
                 mlua::HookTriggers {
                     every_nth_instruction: Some(CHECK_EVERY_N_INSTRUCTIONS),
@@ -412,20 +380,20 @@ impl<'lua> CpuBudget<'lua> {
         Ok(Self { lua })
     }
 
-    /// The second gate on the 5ms budget, at the Rust boundary rather than inside the VM
-    /// (build-steps.md Phase 19 item 3). The hook raises an ordinary Lua error inside the running
-    /// function, so a `pcall` in a `computed` body catches it and carries on -- measured, a body
-    /// looping over `pcall(function() ... end)` ran 7.5x the cap and returned a partially
-    /// computed `Ok` value. Checking the governing deadline again once the call has returned
-    /// makes a caught-and-ignored hook error an `Err` anyway: config Lua can catch the hook, but
-    /// it cannot catch this.
+    /// The second gate on the 5ms budget, at the Rust boundary rather than inside the VM. The
+    /// hook raises an ordinary Lua error inside the running function, so a `pcall` in a
+    /// `computed` body catches it and carries on -- measured, a body looping over
+    /// `pcall(function() ... end)` ran 7.5x the cap and returned a partially computed `Ok` value.
+    /// Checking the governing deadline again once the call has returned makes a
+    /// caught-and-ignored hook error an `Err` anyway: config Lua can catch the hook, but it
+    /// cannot catch this.
     ///
     /// ponytail: this gate only runs when the call *returns*. A body that both swallows the hook
     /// error and never returns (`while true do pcall(f) end`) still spins until a hook fire
-    /// happens to land on an instruction outside the `pcall`, which is eventually but not
-    /// promptly. Bounding that properly needs preemption this VM cannot offer from inside itself;
-    /// the upgrade path is the generation-swap process boundary (`docs/adr/0039`), which can kill
-    /// a wedged renderer outright.
+    /// happens to land on an instruction outside the `pcall`, eventually but not promptly.
+    /// Bounding that properly needs preemption this VM cannot offer from inside itself; the
+    /// upgrade path is the generation-swap process boundary (docs/adr/0039), which can kill a
+    /// wedged renderer outright.
     fn check_not_exceeded(&self) -> mlua::Result<()> {
         if governing_deadline_expired(self.lua) {
             return Err(mlua::Error::runtime(CPU_CAP_EXCEEDED));
@@ -443,11 +411,10 @@ impl Drop for CpuBudget<'_> {
             stack.len()
         };
         if remaining == 0 {
-            // Both, and in this order: `remove_global_hook` clears the callback so any coroutine
-            // that inherited the hook mask stops calling back (mlua's `global_hook_proc` then
-            // clears its own thread's hook on its next fire), and `remove_hook` clears the mask on
-            // *this* thread now, so unrelated top-level Lua after a finished evaluation is not
-            // paying for a hook that is about to no-op anyway.
+            // Both, in this order: `remove_global_hook` clears the callback so an inheriting
+            // coroutine stops calling back, and `remove_hook` clears the mask on *this* thread
+            // now, so unrelated Lua after a finished evaluation isn't paying for a hook that
+            // would otherwise just no-op.
             self.lua.remove_global_hook();
             self.lua.remove_hook();
         }
@@ -455,29 +422,24 @@ impl Drop for CpuBudget<'_> {
 }
 
 /// Whether the outermost live [`CpuBudget`]'s deadline has passed. `first()`, not `min()` or
-/// `last()`: see [`CpuBudget`]'s doc comment for the monotonicity argument that makes `first()`
-/// the minimum and why the other two are wrong. An empty stack (no evaluation in flight) is never
-/// expired, which is what lets [`CpuBudget::enter`] install the hook before its first push.
+/// `last()`: see [`CpuBudget`]'s doc comment for why. An empty stack (no evaluation in flight) is
+/// never expired, which is what lets [`CpuBudget::enter`] install the hook before its first push.
 fn governing_deadline_expired(lua: &Lua) -> bool {
     lua.app_data_ref::<Vec<Instant>>()
         .and_then(|stack| stack.first().copied())
         .is_some_and(|deadline| Instant::now() > deadline)
 }
 
-/// Registers the `computed(dependencies, fn)` global (§ 1.2) and the `state(name, initial)` global
-/// (ADR-0044 decision 5). `dependencies` must be an array of `Signal` userdata handles.
-///
 /// The one answer to "does this Lua userdata resolve like a signal?", and the `Signal` to
 /// resolve it through.
 ///
 /// Two userdata types answer yes. [`Signal`] is the obvious one. `capability::Capability` is the
-/// other, and it is why this function exists at all: build-steps.md Phase 25 item 3 put every
-/// § 2 capability behind a `Capability` so the same object could be read and commanded, which
-/// means `computed({oblisk.audio}, f)` and `content = oblisk.mpris` now hand the engine a
-/// `Capability` where they used to hand it a bare `Signal`. Without one shared answer here, the
-/// namespace move would have turned every live capability binding in every config into a value
-/// the resolver skipped, and a skipped property is a *literal*, so every bar would have frozen
-/// at its first frame with nothing logged.
+/// other, and it is why this function exists: every § 2 capability sits behind a `Capability` so
+/// the same object can be read and commanded, which means `computed({oblisk.audio}, f)` and
+/// `content = oblisk.mpris` hand the engine a `Capability` rather than a bare `Signal`. Without
+/// one shared answer here, every live capability binding in every config would be a value the
+/// resolver skipped, and a skipped property is a *literal*, so every bar would freeze at its
+/// first frame with nothing logged.
 pub fn from_userdata(ud: &mlua::AnyUserData) -> Option<Signal> {
     if let Ok(signal) = ud.borrow::<Signal>() {
         return Some(signal.clone());
@@ -491,11 +453,13 @@ pub fn is_signal(ud: &mlua::AnyUserData) -> bool {
     ud.is::<Signal>() || ud.is::<crate::lua::capability::Capability>()
 }
 
+/// Registers the `computed(dependencies, fn)` global (§ 1.2) and the `state(name, initial)`
+/// global (ADR-0044 decision 5). `dependencies` must be an array of `Signal` userdata handles.
+///
 /// `dirty` is decision 2's one scene-dirty flag, taken explicitly rather than fished out of
 /// `app_data` at call time: a hidden coupling that fails inside a config author's own `state()`
-/// call, because nobody stashed the flag, is worse than threading one argument through the call
-/// sites. It must be the same flag `Signal::new_live` hands out and `RendererClient` drains, or a
-/// `:set()` would mark a flag nothing reads.
+/// call is worse than threading one argument through. It must be the same flag `Signal::new_live`
+/// hands out and `RendererClient` drains, or a `:set()` would mark a flag nothing reads.
 pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
     lua.globals().set(
         "computed",
@@ -584,8 +548,8 @@ mod tests {
 
     #[test]
     fn set_marks_the_scene_dirty_flag_and_a_plain_get_does_not() {
-        // ADR-0044 decision 5: `:set()` marks dirty through decision 2's flag. Reading must not,
-        // or every layout-time resolve would re-dirty the scene it was resolving.
+        // Reading must not mark dirty, or every layout-time resolve would re-dirty the scene it
+        // was resolving.
         let (lua, dirty) = lua_with_state();
         lua.load(r#"s = state("count", 0)"#).exec().unwrap();
         assert!(!dirty.take(), "constructing a state signal changes nothing that is painted");
@@ -599,9 +563,8 @@ mod tests {
 
     #[test]
     fn the_same_state_name_returns_the_same_signal_and_ignores_the_second_initial() {
-        // ADR-0044 decision 5's whole point: an in-place reload re-runs the config, and `state`
-        // has to hand back the signal holding the value the user's last click left in it rather
-        // than resetting it to what the config literal says.
+        // ADR-0044 decision 5's whole point: an in-place reload must hand back the signal holding
+        // the user's last click, not reset it to what the config literal says.
         let (lua, _dirty) = lua_with_state();
         let result: i64 = lua
             .load(
@@ -632,10 +595,9 @@ mod tests {
 
     #[test]
     fn set_on_a_live_capability_signal_is_refused_because_capability_values_are_read_only_to_lua() {
-        // The security-relevant one. If `:set()` accepted a `Live` signal, a config could
-        // overwrite the network SSID the Supervisor just pushed, and every reader downstream would
-        // believe it. ADR-0044 makes capability signals read-only to Lua; the separate `State`
-        // variant is what makes that a type-level fact rather than a comment.
+        // The security-relevant one: if `:set()` accepted a `Live` signal, a config could
+        // overwrite the network SSID the Supervisor just pushed, and every reader downstream
+        // would believe it.
         let (lua, dirty) = lua_with_state();
         let (signal, _handle) = Signal::new_live(Value::Integer(1), dirty.clone());
         lua.globals().set("network", signal).unwrap();
@@ -665,7 +627,7 @@ mod tests {
 
     #[test]
     fn state_refuses_an_initial_value_that_fails_the_marshalling_boundary() {
-        // `state`'s initial is Lua-authored, which is exactly the boundary `marshal.rs` guards.
+        // `state`'s initial is Lua-authored, the boundary `marshal.rs` guards.
         let (lua, _dirty) = lua_with_state();
         let err = lua.load(r#"return state("bad", 0/0)"#).eval::<Value>().unwrap_err();
         assert!(err.to_string().contains("finite"), "a NaN initial must be refused by name: {err}");
@@ -720,8 +682,8 @@ mod tests {
 
     #[test]
     fn computed_reflects_a_later_direct_signal_reconstruction_not_a_stale_cache() {
-        // No memoization: rebuilding the dependency signal under the same global name and
-        // re-reading the computed's :get() must observe the new value, not a cached first read.
+        // No memoization: rebuilding the dependency signal under the same name must be observed
+        // by a later :get(), not a cached first read.
         let lua = Lua::new();
         register(&lua, DirtyFlag::new()).unwrap();
         lua.globals().set("a", Signal::try_new_direct(Value::Integer(1)).unwrap()).unwrap();
@@ -754,9 +716,8 @@ mod tests {
 
     #[test]
     fn a_nested_get_call_inside_a_computed_body_does_not_strip_the_outer_calls_cap() {
-        // A computed body reading a *second* Signal (an upvalue/global, not just its declared
-        // `dependencies`) re-enters `call_with_cpu_cap` before the outer call returns. The inner
-        // call must hand enforcement back to the outer one on return, not erase it.
+        // A computed body reading a *second* Signal re-enters the budget before the outer call
+        // returns. The inner call must hand enforcement back to the outer one, not erase it.
         let lua = Lua::new();
         register(&lua, DirtyFlag::new()).unwrap();
         lua.globals().set("a", Signal::try_new_direct(Value::Integer(1)).unwrap()).unwrap();
@@ -789,11 +750,9 @@ mod tests {
 
     #[test]
     fn a_self_referential_computed_is_rejected_with_a_nesting_depth_error_not_an_abort() {
-        // build-steps.md Phase 19 item 3, defect 3: `loop = computed({}, function() return
-        // loop:get() end)` recurses through Signal::get_value with no bound the CPU cap can stop
-        // (see MAX_SIGNAL_NESTING_DEPTH's doc comment: it recursed the process into a stack
-        // overflow before this cap existed -- observed with this exact test run alone, recorded
-        // in the task report).
+        // `loop = computed({}, function() return loop:get() end)` recurses through
+        // Signal::get_value with no bound the CPU cap can stop -- before this cap existed, this
+        // exact test recursed the process into a `fatal runtime error: stack overflow`.
         let lua = Lua::new();
         register(&lua, DirtyFlag::new()).unwrap();
         let start = Instant::now();
@@ -846,10 +805,10 @@ mod tests {
 
     #[test]
     fn a_long_map_dependency_chain_is_rejected_by_the_nesting_cap_not_a_stack_overflow() {
-        // build-steps.md Phase 19 item 3: a dependency *chain* nests `Signal::get_value` frames
-        // without nesting any Lua call, so it is the shape the nesting cap has to bound. Before
-        // the deadline push moved to wrap dependency resolution, a chain this long aborted the
-        // process with `fatal runtime error: stack overflow`; the cap never saw depth above 1.
+        // A dependency *chain* nests `Signal::get_value` frames without nesting any Lua call, so
+        // it is the shape the nesting cap has to bound. Before the deadline push moved to wrap
+        // dependency resolution, a chain this long aborted the process with `fatal runtime error:
+        // stack overflow`; the cap never saw depth above 1.
         let lua = lua_with_signal("a", Value::Integer(1));
         let err = lua.load(map_chain_source(200)).eval::<i64>().unwrap_err();
         assert!(
@@ -885,16 +844,15 @@ mod tests {
 
     #[test]
     fn a_diamond_dependency_graph_is_cut_off_by_the_shared_cpu_budget() {
-        // ADR-0044 decision 3's "no memoization" makes a diamond graph exponential in depth: each
-        // level evaluates its single dependency once per reference. 20 levels is 2^20 - 1 closure
-        // calls, which ran to completion in 1.9s returning Ok(1048576) before the deadline covered
-        // dependency resolution. The one deadline the outermost `get_value` pushes is what bounds
-        // it now: instrumented, the cap fires after roughly 3,200 closure calls.
+        // ADR-0044 decision 3's "no memoization" makes a diamond graph exponential in depth: 20
+        // levels is 2^20 - 1 closure calls, which ran to completion in 1.9s returning Ok(1048576)
+        // before the deadline covered dependency resolution. The one deadline the outermost
+        // `get_value` pushes is what bounds it now: instrumented, the cap fires after roughly
+        // 3,200 closure calls.
         //
-        // The graph is built in a separate `exec` so `start` times only the evaluation. Building
-        // it is itself exponential and dominates the wall clock -- `Signal` is `Clone` by value,
-        // so `computed({s, s}, f)` deep-copies `s` twice and the "diamond" is a 2^20-node tree in
-        // memory, not a shared DAG. That construction cost is not what this test is about.
+        // The graph is built in a separate `exec` so `start` times only the evaluation: building
+        // it is itself exponential and dominates the wall clock (`Signal` is `Clone` by value, so
+        // `computed({s, s}, f)` deep-copies `s` twice, making a 2^20-node tree, not a shared DAG).
         let lua = lua_with_signal("a", Value::Integer(1));
         lua.load("for _ = 1, 20 do a = computed({a, a}, function(x, y) return x + y end) end").exec().unwrap();
 
@@ -908,9 +866,9 @@ mod tests {
 
     #[test]
     fn a_pcall_swallowing_the_hook_error_still_fails_at_the_rust_boundary() {
-        // The hook raises an ordinary Lua error inside the running function, so a `pcall` in the
-        // body catches it and carries on with a partially computed value. Bounded iteration
-        // counts, not `while true`, so a regression here is a slow test rather than a hung runner.
+        // The hook raises an ordinary Lua error, so a `pcall` in the body catches it and carries
+        // on with a partially computed value. Bounded iteration, not `while true`, so a
+        // regression here is a slow test rather than a hung runner.
         let lua = lua_with_signal("a", Value::Integer(1));
         let result: mlua::Result<i64> = lua
             .load(
@@ -935,9 +893,9 @@ mod tests {
     #[test]
     fn a_coroutine_body_is_covered_by_the_cpu_cap() {
         // `Lua::set_hook` installs per Lua thread, so work done inside `coroutine.create`/`resume`
-        // ran entirely unhooked: measured 5.75s returning `Ok`. Bounded iteration count so a
-        // regression is slow rather than a permanent hang; the elapsed assertion is what catches
-        // the coroutine escaping the hook, since the Rust-boundary gate would error either way.
+        // used to run entirely unhooked: measured 5.75s returning `Ok`. The elapsed assertion is
+        // what catches the coroutine escaping the hook, since the Rust-boundary gate would error
+        // either way.
         let lua = lua_with_signal("a", Value::Integer(1));
         let start = Instant::now();
         let result: mlua::Result<i64> = lua
@@ -984,7 +942,7 @@ mod tests {
     }
 
     /// A `Capability` is a userdata the resolver has to see through, or every `oblisk.<name>`
-    /// bound live into a property silently becomes a literal (see [`from_userdata`]).
+    /// bound live into a property silently becomes a literal.
     #[test]
     fn from_userdata_sees_through_a_capability_to_its_read_signal() {
         use crate::lua::capability::{Capability, CommandSender};
@@ -1002,8 +960,7 @@ mod tests {
 
     #[test]
     fn from_userdata_and_is_signal_agree() {
-        // The two answer the same question and list the same types; this is what stops one of
-        // them growing a third type the other does not know about.
+        // Stops one of the two growing a third type the other does not know about.
         use crate::lua::capability::{Capability, CommandSender};
 
         let lua = Lua::new();

@@ -15,11 +15,6 @@ use super::proxies::{MprisPlayerProxy, MprisRootProxy, bind_player, bind_root};
 use super::watcher::player_id;
 use tokio::sync::mpsc::UnboundedSender;
 
-// -------------------------------------------------------------------------------------------
-// State shape pushed as part of `oblisk.mpris`'s StateSnapshot (docs/oblisk-idl-api-specs.md
-// §2.8).
-// -------------------------------------------------------------------------------------------
-
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct PlayerState {
     pub id: String,
@@ -31,8 +26,7 @@ pub struct PlayerState {
     pub position: i64,
     pub position_updated_at: i64,
     /// `-1` when `mpris:length` is absent/malformed (a live stream, or a player that simply
-    /// doesn't report it) -- matches `backlight_pct`/`temp_gpu`'s established "genuine
-    /// unavailable, not a fabricated zero" sentinel (ADR-0036).
+    /// doesn't report it) -- a genuine unavailable, not a fabricated zero (ADR-0036).
     pub length: i64,
 }
 
@@ -44,9 +38,8 @@ pub(super) struct PlayerEntry {
     /// not an IDL-declared `PlayerState` field, so it isn't part of what gets pushed to Lua.
     pub(super) cached_trackid: Option<String>,
     /// `None` only in the brief window between this entry's insert and its forwarder task's
-    /// own spawn completing (`register_player` inserts before spawning, so the forwarder's
-    /// very first resync -- which can fire immediately on subscribe, replaying its cached
-    /// current value -- always finds a real entry to write into).
+    /// own spawn completing (the forwarder's very first resync can fire immediately on
+    /// subscribe, so `register_player` inserts before spawning).
     forwarder: Option<JoinHandle<()>>,
 }
 
@@ -62,11 +55,10 @@ pub(super) fn monotonic_micros() -> i64 {
     i64::try_from(now.as_micros()).unwrap_or(i64::MAX)
 }
 
-/// Re-reads every field `PlayerState` needs from `player`/`root` and folds it into `previous`
-/// (track-identity caching for `album_art_path`/`length`, ADR-0036). Always succeeds: every
-/// individual property read degrades to `previous`'s own last value on its own failure, never
-/// the whole entry -- a real player that's merely had one transient read hiccup keeps its
-/// last-known state rather than losing live updates permanently.
+/// Re-reads every field `PlayerState` needs from `player`/`root` and folds it into
+/// `previous` (track-identity caching for `album_art_path`/`length`, ADR-0036). Always
+/// succeeds: every individual property read degrades to `previous`'s own last value on
+/// failure, never the whole entry.
 struct Resynced {
     state: PlayerState,
     identity: TrackIdentity,
@@ -90,16 +82,16 @@ async fn resync(bus_name: &str, player: &MprisPlayerProxy<'static>, root: &Mpris
             previous.as_ref().map(|p| p.state.play_state.clone()).unwrap_or_default()
         }
     };
-    // `player_identity` is `MediaPlayer2.Identity`, the player's own human-readable name (e.g.
-    // "mpv", "Mozilla zen") -- unrelated to `TrackIdentity` (`identity`/`new_identity` below),
-    // the composite trackid+url+title key this function uses to detect a real track change.
+    // `player_identity` is `MediaPlayer2.Identity`, the player's own human-readable name --
+    // unrelated to `TrackIdentity` (`identity`/`new_identity` below), the composite key this
+    // function uses to detect a real track change.
     let player_identity = root.identity().await.unwrap_or_default();
     let position = player.position().await.unwrap_or(0);
 
-    // A full Metadata read failure (the GetAll call erroring, not just one key inside it being
+    // A full Metadata read failure (the GetAll call erroring, not one key inside it being
     // absent) means "we learned nothing new this round" -- every metadata-derived field keeps
-    // its previous value verbatim rather than resetting to empty defaults, which would
-    // otherwise register as a spurious track change.
+    // its previous value rather than resetting to empty, which would register as a spurious
+    // track change.
     let Ok(metadata) = player.metadata().await else {
         eprintln!("mpris: Metadata read failed for {bus_name}; keeping the last known title/artist/art/length/trackid this round");
         let state = PlayerState {
@@ -148,18 +140,17 @@ async fn resync(bus_name: &str, player: &MprisPlayerProxy<'static>, root: &Mpris
     Resynced { state, identity: new_identity, trackid }
 }
 
-/// Binds `bus_name`'s player/root proxies, runs one initial [`resync`], inserts the resulting
-/// entry, and only then spawns its live forwarder task -- returns early (logged) if the
-/// initial bind fails outright, or if `CanControl` is `false` (a source that can't be
-/// controlled isn't meaningfully useful in a status-bar UI -- a real, observable exclusion,
-/// not silently absorbed into "any read failure", ADR-0036).
+/// Binds `bus_name`'s player/root proxies, runs one initial [`resync`], inserts the
+/// resulting entry, and only then spawns its live forwarder task -- returns early (logged)
+/// if the initial bind fails, or if `CanControl` is `false` (a source that can't be
+/// controlled isn't meaningfully useful in a status-bar UI, ADR-0036).
 ///
-/// Insert-then-spawn, not spawn-then-insert: zbus's `#[zbus(property)]`-generated
-/// `receive_*_changed` streams replay their already-cached current value immediately on
-/// subscribe, so the forwarder's very first `select!` can resolve before this function would
-/// otherwise have inserted the entry -- its write-back would then find nothing and `break`,
-/// permanently freezing the player at its initial snapshot. Confirmed live: consistently hit
-/// on the first player registered in a fresh session. Inserting first closes that window.
+/// Insert-then-spawn, not spawn-then-insert: zbus's generated `receive_*_changed` streams
+/// replay their cached current value immediately on subscribe, so the forwarder's first
+/// `select!` can resolve before this function would otherwise have inserted the entry --
+/// its write-back would then find nothing and `break`, permanently freezing the player at
+/// its initial snapshot. Confirmed live: consistently hit on the first player registered in
+/// a fresh session.
 pub(super) async fn register_player(connection: &zbus::Connection, registry: &PlayerRegistry, events: &UnboundedSender<MprisSignal>, bus_name: String) {
     let player = match bind_player(connection, &bus_name).await {
         Ok(player) => player,
@@ -205,12 +196,12 @@ pub(super) async fn register_player(connection: &zbus::Connection, registry: &Pl
     let _ = events.send(MprisSignal::Changed);
 }
 
-/// Runs until every one of `PlaybackStatus`/`Metadata`'s generated `receive_*_changed` streams
-/// and the real `Seeked` signal all end, re-running [`resync`] on any of them and updating the
-/// registry entry in place -- no debounce, no incremental patching. `Position` itself has no
-/// `receive_position_changed` trigger: the real freedesktop spec explicitly excludes
-/// `Position` from `PropertiesChanged` (too high-frequency), so `Seeked` is the only live
-/// signal for a position change on its own.
+/// Runs until every one of `PlaybackStatus`/`Metadata`'s generated `receive_*_changed`
+/// streams and the real `Seeked` signal all end, re-running [`resync`] on any of them and
+/// updating the registry entry in place -- no debounce, no incremental patching. `Position`
+/// has no `receive_position_changed` trigger: the real freedesktop spec excludes it from
+/// `PropertiesChanged` (too high-frequency), so `Seeked` is the only live signal for a
+/// position change on its own.
 fn spawn_player_forwarder(bus_name: String, player: MprisPlayerProxy<'static>, root: MprisRootProxy<'static>, registry: PlayerRegistry, events: UnboundedSender<MprisSignal>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut playback_status = player.receive_playback_status_changed().await;

@@ -2,10 +2,9 @@
 //!
 //! The real D-Bus method (verified against polkit's own source and introspection XML) is
 //! `RegisterAuthenticationAgent(subject: (sa{sv}), locale: s, object_path: s) -> ()`, not
-//! `RegisterAgent` as build-steps.md names it. `RegisterAuthenticationAgentWithOptions` exists
-//! too (adds an `a{sv}` options dict, e.g. `fallback`) but nothing here needs it yet. The
-//! call-out uses `zbus_polkit`'s `Authority` proxy and `Subject` type directly rather than
-//! hand-deriving matching zvariant types (docs/adr/0013).
+//! `RegisterAgent` as build-steps.md names it. The call-out uses `zbus_polkit`'s `Authority`
+//! proxy and `Subject` type directly rather than hand-deriving matching zvariant types
+//! (docs/adr/0013).
 //!
 //! The agent side, `org.freedesktop.PolicyKit1.AuthenticationAgent`, has no maintained crate,
 //! so `AuthenticationAgent` below is hand-written against the verified signature:
@@ -134,8 +133,7 @@ mod tests {
 
     /// A stand-in for polkitd's own `org.freedesktop.PolicyKit1.Authority` object, exported
     /// on the peer end of a p2p connection so `register_agent`'s real wire call can be
-    /// exercised without a live system bus. `#[zbus::interface]` is zbus 5.x's rename of
-    /// zbus 3.x's `#[dbus_interface]` macro (docs/oblisk-tdd-test-harness.md §2.2).
+    /// exercised without a live system bus (docs/oblisk-tdd-test-harness.md §2.2).
     struct MockAuthority {
         calls: mpsc::UnboundedSender<(Subject, String, String)>,
     }

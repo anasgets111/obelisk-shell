@@ -29,34 +29,31 @@ pub struct LogicalSize {
 /// many node levels are admitted, and the level past it is refused, the same "at most N levels"
 /// boundary `lua::signal`'s `MAX_SIGNAL_NESTING_DEPTH` uses. Applies to both a literal cyclic tree
 /// (`r.children = { r }`) and a computed `children` signal that manufactures fresh depth on every
-/// read (`docs/adr/0021`'s amendment, build-steps.md Phase 19 item 3 defect 2): both recurse
-/// through this same function, so one counter catches both.
+/// read: both recurse through this same function, so one counter catches both.
 ///
-/// It exists to turn an abort into a `LayoutError`, not to express a design limit. Sizing it means
+/// Exists to turn an abort into a `LayoutError`, not to express a design limit. Sizing it means
 /// sizing it *together with* `MAX_SIGNAL_NESTING_DEPTH`, because the two recursions compound: a
 /// node level resolves its `children` property, and that resolution can nest signals. Measured on
-/// a 2 MiB debug-build test thread (the tightest stack this runs on; in production `wayland::run`
-/// owns the Lua VM on the process main thread, 8 MiB by default), stack cost is additive and
-/// linear in each:
+/// a 2 MiB debug-build test thread (the tightest stack this runs on; production owns the Lua VM on
+/// the process main thread, 8 MiB by default), stack cost is additive and linear in each:
 ///
 /// - 5,216 B per `resolve_and_reconcile` level;
 /// - 14,864 B per nested `Signal::get_value` level of the expensive kind (a `computed` body
-///   calling `:get()`, so a full Rust-to-Lua-to-Rust round trip); a plain dependency chain
-///   (`s:map(f):map(g)`) is 1,840 B per level, so the body-nesting figure is the worst case.
+///   calling `:get()`); a plain dependency chain (`s:map(f):map(g)`) is 1,840 B per level, so the
+///   body-nesting figure is the worst case.
 ///
 /// The signal nest is popped before descending to the next node level, so it is paid once rather
 /// than per level: the compounded worst case is `MAX_TREE_DEPTH * 5216 +
 /// MAX_SIGNAL_NESTING_DEPTH * 14864`. Verified against the model at (60, 24): predicted 669,696 B,
 /// measured 669,808 B.
 ///
-/// That is why this is 64 and not the 128 it started at. 128 with a 32-deep signal nest peaks at
-/// 1,143,296 B, roughly 1.8x margin on a 2 MiB stack -- and 1.8x flatters itself, since the
-/// measurement spans only the recursive frames and not the mlua/Lua frames below the deepest one
-/// or the error-formatting frames the refusal itself runs at full depth. 64 peaks at 809,472 B,
-/// roughly 2.6x, while still leaving 4x headroom above the 10 to 15 levels a real `shell.lua`
-/// produces. `MAX_SIGNAL_NESTING_DEPTH` keeps its 32 because it is the cap that now also bounds
-/// dependency chains, the shape a real config is likeliest to grow; the tree cap was the cheaper
-/// lever, at 2.85x fewer bytes per level.
+/// 64, not the 128 it started at: 128 with a 32-deep signal nest peaks at 1,143,296 B, roughly 1.8x
+/// margin on a 2 MiB stack, and the measurement spans only the recursive frames, not the mlua/Lua
+/// frames below the deepest one or the error-formatting frames the refusal itself runs at full
+/// depth. 64 peaks at 809,472 B, roughly 2.6x, while leaving 4x headroom above the 10 to 15 levels
+/// a real `shell.lua` produces. `MAX_SIGNAL_NESTING_DEPTH` keeps its 32 because it is the cap that
+/// also bounds dependency chains, the shape a real config is likeliest to grow; the tree cap was
+/// the cheaper lever, at 2.85x fewer bytes per level.
 const MAX_TREE_DEPTH: u32 = 64;
 
 
@@ -67,13 +64,12 @@ pub struct NodeId(u64);
 /// properties for a future paint stage. Reused by `Scene::surface` and by `overlay_input_regions`.
 ///
 /// `properties` holds **resolved** values, never a `Signal` handle: `node::resolve_properties` ran
-/// over this node's raw map exactly once, at the top of the pass that produced this node
-/// (build-steps.md Phase 19 item 5). So this tree is a snapshot of one pass, which is what makes
-/// it safe for a later paint stage to read a colour or a radius straight off it without resolving
-/// anything itself -- and what guarantees the value it paints is the same one layout measured.
-/// The structural keys are the deliberate exception: `node::is_structural_property` copies them
-/// through raw on the kinds whose parsers read them, and those parsers reject a `Signal` outright,
-/// so no handle reaches here by that route either.
+/// over this node's raw map exactly once, at the top of the pass that produced this node. So this
+/// tree is a snapshot of one pass, which is what makes it safe for a later paint stage to read a
+/// colour or a radius straight off it without resolving anything itself. The structural keys are
+/// the deliberate exception: `node::is_structural_property` copies them through raw on the kinds
+/// whose parsers read them, and those parsers reject a `Signal` outright, so no handle reaches
+/// here by that route either.
 ///
 /// ponytail: absent and nil are one state in this map. `node::resolve_properties` omits a key whose
 /// signal resolved to `Value::Nil` (ADR-0044 decision 1's amendment), so a `background` bound to a
@@ -132,18 +128,16 @@ impl RetainedNode {
 /// **surface instance** by that instance's `"{id}@{output}"` id (`CONTEXT.md`, Surface instance;
 /// `layout::instance`).
 ///
-/// Instance-keyed, not declared-id-keyed, and that is a real distinction rather than a naming
-/// choice: a laptop panel and a 4K external genuinely need two resolved trees, because a surface
-/// targeting `monitor = "All"` gets one `zwlr_layer_surface_v1` per output and each of those is
-/// configured to a different size. One tree per declared surface cannot serve both -- whichever
-/// output resolved last would decide the geometry the other one painted.
+/// Instance-keyed, not declared-id-keyed: a laptop panel and a 4K external genuinely need two
+/// resolved trees, because a surface targeting `monitor = "All"` gets one `zwlr_layer_surface_v1`
+/// per output and each is configured to a different size. One tree per declared surface cannot
+/// serve both -- whichever output resolved last would decide the geometry the other one painted.
 ///
 /// This *refines* docs/adr/0045 decision 5 rather than replacing it. The surface `id` is still the
 /// reconcile identity: `apply` finds a fresh `VirtualNode` by `node::parse_surface_id` exactly as
-/// before, and a surface's `id` is still both its topology identity (`node::SurfaceTopology`) and
-/// its reconcile identity (`node::parse_surface_id`'s doc comment). What the key adds is the
-/// output half, and that half is stable for an instance's whole life -- an instance is created for
-/// one output and dies with it -- so the pair is as much an identity as the `id` alone was.
+/// before. What the key adds is the output half, stable for an instance's whole life -- an
+/// instance is created for one output and dies with it -- so the pair is as much an identity as
+/// the `id` alone was.
 ///
 /// Everything below a surface's root reconciles through `pair_children_by_id_then_position`: an
 /// optional, per-parent-scoped `id` pairs only against the same `id`, and the children carrying
@@ -172,45 +166,34 @@ impl Scene {
     }
 
     /// Reconciles one retained tree per entry in `instances` into the retained scene, each keyed by
-    /// its `instance_id` and resolved against that instance's own `available` size
-    /// (build-steps.md Phase 20 items 2 and 4; this is what replaced `socket.rs`'s deleted
-    /// hardcoded 1920x40 placeholder size, closing docs/adr/0023 item 6).
+    /// its `instance_id` and resolved against that instance's own `available` size (build-steps.md
+    /// Phase 20 items 2 and 4).
     ///
-    /// The two arguments answer two different questions and neither implies the other.
-    /// `fresh_surfaces` is what the config *declared*; `instances` is what the compositor is
-    /// actually being asked to map (`layout::instance::expand_instances`). So a declared surface
-    /// with no instance -- a `monitor` naming an unplugged display -- resolves not at all, which is
-    /// correct: there is no output to resolve it against and nothing on screen for it to be. The
-    /// reverse, an instance naming a surface `fresh_surfaces` does not contain, is a caller bug
-    /// rather than a config one (the two come from the same evaluation), so it raises
+    /// The two arguments answer different questions and neither implies the other. `fresh_surfaces`
+    /// is what the config *declared*; `instances` is what the compositor is actually being asked to
+    /// map (`layout::instance::expand_instances`). A declared surface with no instance -- a
+    /// `monitor` naming an unplugged display -- resolves not at all: there is no output to resolve
+    /// it against. The reverse, an instance naming a surface `fresh_surfaces` does not contain, is
+    /// a caller bug rather than a config one (the two come from the same evaluation), so it raises
     /// [`LayoutError::InvalidProperty`] rather than being skipped.
     ///
     /// An instance id present in the retained scene but absent from `instances` this cycle is left
-    /// untouched: a `surface` disappearing entirely is a topology change (`CONTEXT.md`), handled
-    /// by a generation swap, not this in-place apply.
+    /// untouched: a `surface` disappearing entirely is a topology change (`CONTEXT.md`), handled by
+    /// a generation swap, not this in-place apply.
     ///
     /// `admit` is a veto on the *finished* apply, run once after every instance has reconciled and
-    /// before this returns `Ok`. It exists because some invariants are not properties of any one
-    /// node and cannot be checked as the walk builds one: `crate::socket`'s lock guard has to ask
-    /// whether the whole resolved lock tree is still authenticatable, which is only answerable once
-    /// the tree exists. An `Err` from it takes the same road an `Err` from the walk takes -- the
-    /// snapshot below is restored and the caller keeps the scene it had -- which is why this is a
-    /// parameter here rather than a check bolted on at the call sites: a caller that noticed the
-    /// problem after `apply` returned `Ok` would have nothing left to roll back with.
+    /// before this returns `Ok`. Some invariants are not properties of any one node and cannot be
+    /// checked as the walk builds one -- `crate::socket`'s lock guard has to ask whether the whole
+    /// resolved lock tree is still authenticatable, which is only answerable once the tree exists.
+    /// An `Err` from it takes the same road an `Err` from the walk takes: the snapshot below is
+    /// restored and the caller keeps the scene it had.
     ///
     /// Rolls back to exactly its pre-call state on `Err` (`CONTEXT.md`, Rollback; `socket.rs`'s
-    /// `handle_reevaluate` already assumes this -- it deliberately leaves `applied_topology`
-    /// unchanged on a failed apply). Before property resolve could call back into Lua (ADR-0044
-    /// decision 1), every property was an inert `mlua::Value`, so a config that applied once
-    /// always applied again and a plain remove-then-insert-per-surface loop was safe. Now a
-    /// Signal getter can fail at any depth inside `resolve_and_reconcile`, partway through
-    /// mutating `self.next_id` (`alloc_id`) and `self.retiring` (`retire_child_first`), and
-    /// partway through a multi-surface `fresh_surfaces` list. Snapshotting `surfaces`/`next_id`/
-    /// `retiring` up front and restoring the snapshot wholesale on any error is the smallest
-    /// change that actually holds the invariant for all three -- `resolve_and_reconcile` still
-    /// takes retained state by value and still mutates `next_id`/`retiring` as it walks, so
-    /// nothing short of restoring a pre-walk snapshot undoes that once an error has propagated
-    /// up from an arbitrary depth.
+    /// `handle_reevaluate` already assumes this). A Signal getter can fail at any depth inside
+    /// `resolve_and_reconcile`, partway through mutating `self.next_id` and `self.retiring`, and
+    /// partway through a multi-surface `fresh_surfaces` list, so snapshotting
+    /// `surfaces`/`next_id`/`retiring` up front and restoring the snapshot wholesale on any error is
+    /// the smallest change that holds the invariant for all three.
     ///
     /// ponytail: the snapshot is taken unconditionally, so every apply deep-clones the retained
     /// tree whether or not anything fails, and item 2's dirty flag turns that into once per
@@ -224,13 +207,11 @@ impl Scene {
     /// arbitrary depth with `next_id` and `retiring` already mutated. Removing the snapshot needs
     /// the whole fresh tree resolved into a separate tree first, which is a second traversal and a
     /// second allocation to save a clone that is already O(nodes).
-    /// The unguarded spelling, and it is `cfg(test)` so it cannot become a production call site.
-    ///
-    /// Every fixture in this crate applies a tree with nothing to veto, and threading a `|_| Ok(())`
-    /// through each of them would only make the real callers' guard easier to leave off by
-    /// accident. Gating it on `test` is what keeps [`Scene::apply_admitting`] the *only* way
-    /// production code applies a scene, which is the property `crate::socket`'s lock veto depends
-    /// on: a fourth apply site added later cannot silently skip it.
+    /// The unguarded spelling, gated `#[cfg(test)]` so it cannot become a production call site.
+    /// Threading a `|_| Ok(())` through every fixture would only make the real callers' guard
+    /// easier to leave off by accident; gating this on `test` keeps [`Scene::apply_admitting`] the
+    /// *only* way production code applies a scene, which is the property `crate::socket`'s lock
+    /// veto depends on.
     #[cfg(test)]
     pub fn apply(
         &mut self,
@@ -303,35 +284,31 @@ impl Scene {
         let available = instance.available;
         let existing = self.surfaces.remove(&key);
         // The root's one resolve for this pass, gated by the same admissibility check its children
-        // get in the loop below, for the same reason: resolution runs Lua, so a node the walk will
-        // refuse must not run any first. Every node below this one is resolved by its own parent,
-        // in the child loop that needs its `margin` before it can recurse (build-steps.md Phase 19
-        // item 5).
+        // get in the loop below: resolution runs Lua, so a node the walk will refuse must not run
+        // any first. Every node below this one is resolved by its own parent, in the child loop
+        // that needs its `margin` before it can recurse.
         ensure_node_admissible(&fresh.kind, 0)?;
         let properties = node::resolve_properties(&fresh.properties, &fresh.kind, lua)?;
         // **An unsized `window` or `lock` root is its surface** (build-steps.md Phase 22 item 1,
-        // Phase 23). A `panel` root sizes itself from § 6.1's `width`/`height`, which are also its
-        // `zwlr_layer_surface_v1::set_size` request; § 6.2 gives a `window` neither, because a
-        // toplevel's size is the compositor's and arrives as an `xdg_toplevel` configure that
-        // `set_instance_size` has already turned into this `available`.
+        // Phase 23). A `panel` root sizes itself from § 6.1's `width`/`height`; § 6.2 gives a
+        // `window` neither, because a toplevel's size is the compositor's, arriving as an
+        // `xdg_toplevel` configure `set_instance_size` has already turned into this `available`.
         //
         // Without this the root fell to `parse_size_mode`'s `Content` default, and a
-        // `Content`-sized parent hands its children a budget of zero (see `child_budget` in
-        // `resolve_and_reconcile`), so `child = column { width = "Fill" }` -- the obvious way to
-        // write a window -- resolved to nothing and the toplevel mapped a fully transparent buffer.
-        // Measured against niri, which configured the window at its 1920x1168 tile and had a 0x0
-        // tree painted into it.
+        // `Content`-sized parent hands its children a budget of zero, so `child = column { width =
+        // "Fill" }` -- the obvious way to write a window -- resolved to nothing and the toplevel
+        // mapped a fully transparent buffer. Measured against niri, which configured the window at
+        // its 1920x1168 tile and had a 0x0 tree painted into it.
         //
-        // § 6.4's `lock` is the same case and a worse failure. It has no `width` or `height` at all
-        // -- `layout::node::lock_spec` refuses both -- so it can only ever fall to `Content`, and
-        // the surface it fills is the whole output. A zero-sized lock root paints a transparent
-        // buffer over a locked session, which is the black screen with no password field
-        // docs/adr/0052 decision 3 refuses the lock to avoid. Sizing the root from `available` is
-        // also just what § 6.4 states in words: a lock surface covers its output.
+        // § 6.4's `lock` is the same case and a worse failure: it has no `width` or `height` at all
+        // (`layout::node::lock_spec` refuses both), so it can only ever fall to `Content`, and the
+        // surface it fills is the whole output. A zero-sized lock root paints a transparent buffer
+        // over a locked session, the black screen with no password field docs/adr/0052 decision 3
+        // refuses the lock to avoid.
         //
         // Only the `Content` default is overridden, per axis. A `window` that does write a `width`
-        // is writing a property § 6.2 does not define, and the answer to that is to honour it like
-        // any other node's rather than to silently discard it. A `lock` cannot reach that branch,
+        // is writing a property § 6.2 does not define, and the answer is to honour it like any
+        // other node's rather than to silently discard it. A `lock` cannot reach that branch,
         // because the spec parser rejected the config before the scene ever saw it.
         let forced = if matches!(fresh.kind.as_str(), "window" | "lock") {
             (
@@ -433,14 +410,11 @@ impl Scene {
     }
 }
 
-/// All four § 6 roles are here per docs/adr/0040 decision 1 (build-steps.md Phase 22 for `window`
-/// and `popup`, Phase 23 for `lock`). Every one of them is a surface container: a role for a
-/// `wl_surface`, a `child` tree inside it, and no layout model of their own beyond the stacking one
-/// docs/adr/0023 item 4 already gives `panel`. `lock` was held out while docs/adr/0042 left its
-/// declaration site open; docs/adr/0052 decision 2 settled that a `lock` is returned at the root
-/// like the rest, and from this function's point of view it was never the interesting question --
-/// this admits a *node kind* into the walk, and a lock screen's tree has to be walked whether or
-/// not the compositor has handed out a surface to paint it into.
+/// All four § 6 roles are here per docs/adr/0040 decision 1. Every one is a surface container: a
+/// role for a `wl_surface`, a `child` tree inside it, and no layout model of their own beyond the
+/// stacking one docs/adr/0023 item 4 already gives `panel`. `lock` is admitted the same way
+/// (docs/adr/0052 decision 2): this admits a *node kind* into the walk, and a lock screen's tree
+/// has to be walked whether or not the compositor has handed out a surface to paint it into.
 fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
     match kind {
         "panel" | "window" | "popup" | "lock" | "rect" | "row" | "column" | "text" | "icon" | "image" | "button" | "list" | "textfield" => Ok(()),
@@ -458,10 +432,9 @@ fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
 /// calls back into Lua (ADR-0044 decision 1), so running it before these checks executes a rejected
 /// node's `Signal` getters on its behalf: measured, a self-generating `children` signal's body ran
 /// 64 times against a 64-level cap, because the parent at the last admitted level resolved the
-/// child's whole property map -- running its `children` closure -- before recursing into the check
-/// that refused that child. The kind case is worse than one wasted level: every property getter of
-/// an unsupported-kind node ran, arbitrary Lua side effects for a node that never entered the
-/// accepted tree.
+/// child's whole property map before recursing into the check that refused that child. The kind
+/// case is worse: every property getter of an unsupported-kind node ran, arbitrary Lua side
+/// effects for a node that never entered the accepted tree.
 ///
 /// `depth` is the level the node being checked would occupy, so a parent at `depth` checks its
 /// children at `depth + 1` -- the same number the recursive call is handed, and the same
@@ -501,12 +474,9 @@ fn ensure_node_admissible(kind: &str, depth: u32) -> Result<(), LayoutError> {
 /// `textfield` (`oblisk-idl-api-specs.md` § 5.2 item 8) is a leaf like `text`/`icon`: it never
 /// takes `children`. Its own properties (`mask_character`, `secure_submit`, `on_change`,
 /// `on_submit`) ride along unvalidated in `RetainedNode.properties`, same as `button`'s `on_click`.
-/// Nothing paints them yet, and `on_change`/`on_submit` are still wired to nothing at all. What
-/// *does* read `secure_submit` out of the resolved tree is `renderer/src/wayland/mod.rs`'s keyboard
-/// path, off the scene graph rather than through it: the buffer and the focus target live on `App`,
-/// because docs/adr/0005 says a masked field's bytes never become an `mlua::Value`. ADR-0009 named
-/// that a `TextInputService`; this slice inlines the two fields onto `App` instead of extracting
-/// the type.
+/// What *does* read `secure_submit` out of the resolved tree is `renderer/src/wayland/mod.rs`'s
+/// keyboard path, off the scene graph rather than through it: the buffer and the focus target live
+/// on `App`, because docs/adr/0005 says a masked field's bytes never become an `mlua::Value`.
 fn children_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Vec<VirtualNode>, LayoutError> {
     match kind {
         "panel" | "window" | "popup" | "lock" => Ok(node::parse_single_child(properties, "child")?
@@ -604,8 +574,6 @@ fn stretch_forced_size(
 /// That matters because nothing bounds sibling count -- a config can emit
 /// `for i = 1, 10000 do c[i] = rect { id = "n" .. i } end` -- and this runs on the Wayland dispatch
 /// thread at capability-push cadence (ADR-0044 decision 2's dirty flag), not once per config edit.
-/// Every temporary below is sized to this parent's own children and dropped on return, so peak
-/// allocation stays proportional to the widest single parent rather than to the whole tree.
 fn pair_children_by_id_then_position(
     scene: &mut Scene,
     fresh_children: &[VirtualNode],
@@ -686,27 +654,22 @@ fn pair_children_by_id_then_position(
 /// is `Some` only when the caller already matched `fresh`'s kind at this position (§ 4).
 ///
 /// `forced_width`/`forced_height` let the caller override this node's own size in an axis instead
-/// of resolving it from `width`/`height` -- how a `Stretch` cross-alignment (§ 3.3) is applied
-/// when the parent's own size in that axis is already known: the parent computes the forced size
-/// *before* recursing here, so this node's own children get positioned against the final,
-/// stretched size in the same pass instead of being patched afterward (which would leave a
-/// stretched node's own descendants positioned against its pre-stretch size). `None` (the normal
-/// case, and always the case when the parent's own axis is itself `Content`-sized, since its
-/// final size isn't known until after its children resolve) falls back to the usual
+/// of resolving it from `width`/`height` -- how a `Stretch` cross-alignment (§ 3.3) is applied when
+/// the parent's own size in that axis is already known: the parent computes the forced size
+/// *before* recursing here, so this node's own children get positioned against the final, stretched
+/// size in the same pass instead of being patched afterward. `None` (the normal case, and always
+/// the case when the parent's own axis is itself `Content`-sized) falls back to the usual
 /// `width`/`height`-mode resolution.
 ///
-/// `properties` arrives already resolved -- `node::resolve_properties` has run over this node's
-/// raw map exactly once for this pass, replacing every `Signal` with its current value
-/// (build-steps.md Phase 19 item 5). The caller does that rather than this function, because a
-/// parent has to read a child's `margin` to compute the budget it recurses with, so the one read
-/// has to happen in the parent's loop; `Scene::apply_one_surface` does it for a surface root,
-/// which has no parent. Everything from here down -- this node's own parsing,
-/// `intrinsic_content_size`, `position_children`, and the `RetainedNode` this returns -- reads that
-/// one map, so a `Signal` behind a property is read exactly once per node per pass and the sizing
-/// and positioning passes cannot disagree about *it*. They can still disagree about a property
-/// whose resolved value is a plain table with an `__index` metamethod, which every `table.get`
-/// re-runs: see `node::parse_edge_insets`'s `ponytail:`, since `margin` is the property both passes
-/// read and the one that shape breaks.
+/// `properties` arrives already resolved -- `node::resolve_properties` has run over this node's raw
+/// map exactly once for this pass, replacing every `Signal` with its current value. The caller does
+/// that rather than this function, because a parent has to read a child's `margin` to compute the
+/// budget it recurses with, so the one read has to happen in the parent's loop; `apply_one_instance`
+/// does it for a surface root, which has no parent. Everything from here down reads that one map,
+/// so a `Signal` behind a property is read exactly once per node per pass and the sizing and
+/// positioning passes cannot disagree about *it*. They can still disagree about a property whose
+/// resolved value is a plain table with an `__index` metamethod, which every `table.get` re-runs:
+/// see `node::parse_edge_insets`'s `ponytail:`, since `margin` is the property both passes read.
 // Ten parameters, but each is load-bearing for this single recursive pass (§ 3's "single...
 // pass", see the module doc comment); splitting them into a struct would just be a bag carrying
 // the same ten fields through the same one caller.
@@ -892,8 +855,7 @@ fn intrinsic_content_size(
         // `image` has no intrinsic size, unlike `icon`: knowing a file's own dimensions means
         // decoding it, and this pass has no canvas to decode against and runs on every
         // `Scene::apply`. So an `image` takes the box § 5.1's `width`/`height` give it and
-        // measures nothing without one, the same as an empty `rect` (build-steps.md Phase 29 item
-        // 1). A wallpaper wants `Fill` and a bar's album art wants a number; neither needs this.
+        // measures nothing without one, the same as an empty `rect`.
         "image" => Ok(LogicalSize::default()),
         "rect" if children.is_empty() => Ok(LogicalSize::default()),
         "row" => {
@@ -920,10 +882,7 @@ fn intrinsic_content_size(
         }
         // `list` sizes exactly like `column` -- ADR-0045 decision 3 and § 5.2 item 7 say nothing
         // about a list's geometry, only its reconciliation, so this is this slice's own
-        // interpretation, the same way ADR-0023 item 4 labels the stacking model as one. Sharing
-        // `column`'s arm rather than duplicating its body is deliberate: the two are the same
-        // vertical-stack formula, and a future divergence should be a real design decision, not
-        // drift between two copies nobody remembers to keep in sync.
+        // interpretation, the same way ADR-0023 item 4 labels the stacking model as one.
         //
         // ponytail: no horizontal list. A repeated tray (icons flowing left to right) can't be
         // expressed today, and neither upgrade path is built because both cost more than this
@@ -1122,12 +1081,10 @@ fn position_children(
 /// `crate::wayland::App::apply_input_region`, which is the only place a Wayland object exists to
 /// push it to.
 ///
-/// Per surface since docs/adr/0038 decision 5, which is why the name is the one thing here that
-/// still says "overlay": § 5.1's bounding-box union was written for a single fullscreen
-/// `overlay_canvas` and was not deleted with it, it was generalized. It applies to any surface
-/// whose visible content is smaller than the surface itself -- load-bearing for a fullscreen
-/// transparent panel, an empty region (so clicks pass straight through) for one with nothing
-/// visible in it, and a no-op for a tightly-sized bar whose child fills it.
+/// Per surface since docs/adr/0038 decision 5. Applies to any surface whose visible content is
+/// smaller than the surface itself -- load-bearing for a fullscreen transparent panel, an empty
+/// region (so clicks pass straight through) for one with nothing visible in it, and a no-op for a
+/// tightly-sized bar whose child fills it.
 ///
 /// ponytail: direct children only, not a recursive union over the whole visible subtree. A panel
 /// whose child is a full-surface transparent container holding one small button therefore claims
@@ -1199,8 +1156,6 @@ mod tests {
 
     #[test]
     fn a_signal_valued_width_resolves_to_its_current_value_in_the_resolved_node() {
-        // The Scene::apply seam (ADR-0044 decision 1): a Signal in a geometry slot must reach
-        // the ResolvedNode's rect, not error the whole apply.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let lua = mlua::Lua::new();
@@ -1222,9 +1177,6 @@ mod tests {
 
     #[test]
     fn a_state_signal_in_a_property_resolves_at_layout_time_and_a_set_between_applies_moves_it() {
-        // ADR-0044 decision 5's end of the seam: a `state` signal is a `Signal` like any other, so
-        // `resolve_properties` reads it with no new arm, and what a handler's `:set()` wrote is
-        // what the next apply lays out.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let lua = mlua::Lua::new();
@@ -1299,7 +1251,6 @@ mod tests {
 
     #[test]
     fn row_intrinsic_width_sums_children_plus_spacing_gaps() {
-        // Hand-computed: two 10-wide children + 1 gap of 5 = 25, independent of the resolve code.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
@@ -1326,9 +1277,6 @@ mod tests {
 
     #[test]
     fn a_childs_own_margin_pushes_it_inward_and_widens_the_rows_footprint() {
-        // Hand-computed: child at x=0 has margin.left=4 -> lands at x=4. The row's own intrinsic
-        // width is the child's 10 plus its margin.left+right (4+4) = 18, independent of the
-        // resolve code.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
@@ -1360,9 +1308,6 @@ mod tests {
 
     #[test]
     fn stretching_a_child_that_itself_has_children_repositions_its_descendants_too() {
-        // Regression test for the CONFIRMED correctness finding: a Stretch child that grows must
-        // reposition its own children against the new, larger size in the same pass -- not leave
-        // them positioned against the pre-stretch size.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
@@ -1479,8 +1424,6 @@ mod tests {
         let column = &scene.surface("bar@TEST").unwrap().children[0];
         assert_eq!(column.rect.width, 40.0, "20 wide child plus 10 of padding on each side");
         assert_eq!(column.rect.height, 36.0, "20 tall child plus 8 of padding top and bottom");
-        // The child sits at the padding offset, which is the half that already worked, and is
-        // what makes the sizes above the ones that keep it inside the box.
         assert_eq!(column.children[0].rect.x, 10.0);
         assert_eq!(column.children[0].rect.y, 8.0);
     }
@@ -1540,10 +1483,6 @@ mod tests {
     fn an_unsupported_top_level_kind_is_rejected() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        // `list` used to be this fixture's example kind, back when it was registered as a Lua
-        // constructor but rejected by `ensure_supported_kind` (build-steps.md Phase 19 item 12).
-        // It is a real kind now, so a raw table naming a kind no constructor registers at all is
-        // what "unsupported" actually means going forward.
         let (_lua, surface) = surface_from(r#"panel { id = "bar", child = { kind = "banana" } }"#);
         let err = apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap_err();
         assert!(matches!(err, LayoutError::UnsupportedNodeKind(k) if k == "banana"));
@@ -1561,10 +1500,6 @@ mod tests {
 
     #[test]
     fn image_is_a_supported_leaf_with_no_intrinsic_size_and_icon_still_has_one() {
-        // docs/adr/0054 decision 3 and build-steps.md Phase 29 item 1. The pair is asserted
-        // together because the asymmetry is the decision: `icon` measures to its `size` because a
-        // config states it, and `image` measures nothing because the only way to know a file's
-        // dimensions is to decode it, and this pass has no canvas.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
@@ -1584,11 +1519,6 @@ mod tests {
 
     #[test]
     fn an_image_given_a_box_takes_that_box() {
-        // The other half of the rule above: no intrinsic size is not no size. This is how a
-        // wallpaper (`Fill` on both axes, docs/adr/0055) and a bar's album art (two numbers) each
-        // get their geometry, and both go through § 5.1's base properties rather than anything
-        // `image` owns. The root `panel` is `Fill` too: a `Content`-sized parent hands a `Fill`
-        // child a zero budget, so the wallpaper config has to say so on both nodes.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
@@ -1602,9 +1532,6 @@ mod tests {
 
     #[test]
     fn textfield_is_a_supported_leaf_kind_carrying_its_properties_unvalidated() {
-        // build-steps.md Phase 15 item 2 / ADR-0027: `textfield` becomes a valid, parseable
-        // scene-node kind here; no GPU painting or `wp-text-input-v3` wiring reads its
-        // properties from the scene graph in this slice (see `children_of`'s doc comment).
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
@@ -1623,9 +1550,6 @@ mod tests {
 
     #[test]
     fn one_declared_surface_resolves_one_tree_per_instance_each_against_its_own_size() {
-        // The instance-keyed scene, directly (this type's doc comment, `CONTEXT.md`'s Surface
-        // instance entry): a `"Fill"`-sized panel on two outputs of different sizes resolves to
-        // two different widths, which one tree per declared surface cannot express.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(r#"panel { id = "bar", width = "Fill", height = "Fill" }"#);
@@ -1664,8 +1588,6 @@ mod tests {
 
     #[test]
     fn an_instance_naming_a_surface_the_evaluation_did_not_declare_is_a_caller_bug() {
-        // Instances and declarations come from the same evaluation, so this can only be a bug in
-        // whatever expanded them -- distinct from the legal "declared but no instance" case above.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(r#"panel { id = "bar", width = 10, height = 10 }"#);
@@ -1684,12 +1606,6 @@ mod tests {
 
     #[test]
     fn a_veto_from_admit_takes_the_same_rollback_road_a_failed_walk_takes() {
-        // `apply_admitting`'s guard is a veto on the *finished* scene, which is the only shape that
-        // works for an invariant no single node can answer -- `crate::socket`'s lock guard asks
-        // whether the whole resolved lock tree is still authenticatable. Refusing after the walk is
-        // only safe if the refusal unwinds exactly as far as a mid-walk `Err` does, so this pins
-        // that: the second apply is rejected and the first apply's tree is still what `surface`
-        // hands back.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, v1) = surface_from(r#"panel { id = "bar", width = 10, height = 10 }"#);
@@ -1714,12 +1630,6 @@ mod tests {
 
     #[test]
     fn a_failed_apply_leaves_the_scene_exactly_as_it_was() {
-        // The rollback invariant this fix establishes: `Scene::apply` returning `Err` must not
-        // observably mutate the `Scene` at all. Apply a good tree, capture its `NodeId`s, then
-        // apply a tree whose property resolve fails partway (a Signal getter erroring, ADR-0044
-        // decision 1) and assert everything -- surfaces, `NodeId`s, `retiring`, `next_id` -- is
-        // unchanged. Checking only `surfaces` wouldn't catch a `next_id` bump or a stray
-        // `retiring` entry left over from the aborted pass.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
@@ -1738,11 +1648,6 @@ mod tests {
         let next_id_before = scene.next_id;
         let retiring_before = scene.retiring_ids();
 
-        // A getter that errors on read: `resolve_properties` propagates that as a `LayoutError`
-        // while building the row's second child's resolved map, after the first child's map (and
-        // the row's, and the surface's) was built successfully this pass. The failure is therefore
-        // partway through the walk, with `next_id` and `retiring` already mutated -- which is the
-        // state this test exists to prove `apply` rolls back.
         let lua2 = mlua::Lua::new();
         register_node_constructors(&lua2).unwrap();
         crate::lua::signal::register(&lua2, crate::lua::signal::DirtyFlag::new()).unwrap();
@@ -1850,7 +1755,6 @@ mod tests {
         let outer_id = scene.surfaces.get("bar@TEST").unwrap().children[0].children[0].id;
         let inner_id = scene.surfaces.get("bar@TEST").unwrap().children[0].children[0].children[0].id;
 
-        // Remove the whole subtree by shrinking the row to zero children.
         let (_lua2, surface_v2) =
             surface_from(r#"panel { id = "bar", child = row { children = {} } }"#);
         apply_at(&mut scene, &[surface_v2], full(), &shaping, &_lua2).unwrap();
@@ -1890,10 +1794,6 @@ mod tests {
 
     #[test]
     fn a_self_referential_literal_tree_is_rejected_with_a_layout_error() {
-        // build-steps.md Phase 19 item 3, defect 1: `local r = rect {}; r.children = { r }`
-        // recurses through resolve_and_reconcile with no bound. Before the depth cap this aborted
-        // the process with a stack overflow rather than returning an Err; see this test's sibling
-        // run alone (`-- --test-threads=1`) for the observed abort, recorded in the task report.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let lua = mlua::Lua::new();
@@ -1919,12 +1819,6 @@ mod tests {
 
     #[test]
     fn a_computed_children_signal_generating_fresh_depth_is_rejected_with_a_layout_error() {
-        // build-steps.md Phase 19 item 3, defect 2: `resolve_properties`' "a Signal resolved to
-        // another Signal" guard never fires here, because each read of `children` answers with a
-        // fresh Table rather than a Signal. The recursion is pure Rust through
-        // resolve_and_reconcile -- one `resolve_properties` per node level, each running the
-        // generator once more -- so the same tree-depth cap that catches defect 1 must catch this
-        // too (verified, not assumed, per the task brief).
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let lua = mlua::Lua::new();
@@ -1944,14 +1838,6 @@ mod tests {
             .unwrap();
         let surface = deserialize_lua_table(&table).unwrap();
 
-        // Either cap is a pass, because the property under test is "bounded, not aborted". Two
-        // caps race here and which one wins is a scheduling detail: every tree level resolves its
-        // own `children` signal in a fresh `Signal::get_value`, so each level gets a fresh 5ms
-        // budget, and on a loaded machine (the whole suite in parallel) one level can be
-        // descheduled past 5ms and refuse before the tree ever reaches MAX_TREE_DEPTH. Observed
-        // roughly once in ten full-suite runs as `InvalidProperty { property: "children", detail:
-        // "Signal getter failed: runtime error: computed/map exceeded its 5ms CPU budget" }`.
-        // Asserting only `TreeTooDeep` would make this test a load meter.
         let err = apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap_err();
         let capped = matches!(err, LayoutError::TreeTooDeep { .. })
             || matches!(&err, LayoutError::InvalidProperty { detail, .. } if detail.contains("5ms CPU budget"));
@@ -1978,15 +1864,11 @@ mod tests {
 
     #[test]
     fn a_tree_at_the_depth_cap_is_accepted_and_one_level_past_it_is_rejected() {
-        // Both caps mean the same thing: at most N levels are admitted, the N+1th is refused. The
-        // `>` this used to be admitted MAX_TREE_DEPTH + 1 levels while its message claimed
-        // MAX_TREE_DEPTH, and refused on the level after that.
         let deepest = MAX_TREE_DEPTH as usize;
         let shaping = ShapingHandle::spawn();
         let lua = mlua::Lua::new();
         register_node_constructors(&lua).unwrap();
 
-        // panel + (deepest - 2) rows + rect == exactly MAX_TREE_DEPTH levels.
         let mut scene = Scene::new();
         apply_at(&mut scene, &[surface_nested(&lua, deepest - 2)], full(), &shaping, &lua).unwrap();
 
@@ -2001,9 +1883,6 @@ mod tests {
 
     #[test]
     fn a_legitimately_deep_but_reasonable_tree_still_applies() {
-        // The cap must not be tightenable into rejecting a real config: a bar with nested
-        // rows/columns runs 10-15 levels deep (MAX_TREE_DEPTH's doc comment), so 20 levels of
-        // plain nesting -- well above any real shell.lua -- must still apply cleanly.
         const NESTING: usize = 20;
         let mut lua_src = String::from(r#"panel { id = "bar", child = "#);
         for _ in 0..NESTING {
@@ -2020,7 +1899,6 @@ mod tests {
         let (_lua, surface) = surface_from(&lua_src);
         apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
 
-        // NESTING `row` levels plus one final descent into the innermost `rect`.
         let mut node = scene.surface("bar@TEST").unwrap();
         for _ in 0..=NESTING {
             assert_eq!(node.children.len(), 1);
@@ -2032,11 +1910,6 @@ mod tests {
 
     #[test]
     fn an_identified_child_keeps_its_node_id_across_applies_when_a_sibling_is_inserted_above_it() {
-        // docs/adr/0045 decision 2: an id-bearing sibling pairs by id, not by position, so
-        // inserting a fresh node above it must not shift it onto a different retained
-        // counterpart. Under the pre-ADR-0045 purely-positional rule (ADR-0023 § 4) this fails:
-        // index 0's retained node gets handed to whatever fresh child now sits at index 0 (the
-        // newly inserted one), not to "keep".
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
@@ -2064,10 +1937,6 @@ mod tests {
 
     #[test]
     fn an_unidentified_child_list_keeps_node_ids_across_applies_by_position_only() {
-        // docs/adr/0045 decision 2's "degrades to today's behavior when a config uses no ids at
-        // all": with no id anywhere, pairing falls back exactly to index order, so an id-less
-        // list is unaffected by this slice -- inserting above a sibling still shifts it onto a
-        // different retained counterpart, unlike the identified case above.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
@@ -2096,13 +1965,6 @@ mod tests {
 
     #[test]
     fn a_mixed_child_list_keeps_identified_node_ids_across_applies_and_the_rest_only_by_position() {
-        // v1: [B (no id), anchor (id), C (no id)]. v2 inserts a new unidentified node between
-        // anchor and C: [B, anchor, NEW, C]. Once "anchor" claims its retained counterpart by
-        // id, the *remaining* fresh/retained subsequences are [B, NEW, C] against [B's old node,
-        // C's old node] -- a plain positional zip (decision 2's fallback), so B (unmoved ahead of
-        // the insertion) keeps its slot, but the insertion still bumps C onto a fresh id. This is
-        // the same "no special treatment for unidentified nodes" the dedicated positional test
-        // shows in isolation; here it holds even with an identified sibling in the same parent.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
@@ -2142,8 +2004,6 @@ mod tests {
 
     #[test]
     fn duplicate_sibling_ids_are_rejected_as_a_layout_error() {
-        // docs/adr/0045 decision 1: a duplicate id among siblings is a LayoutError routed to
-        // rescue, not silent last-one-wins.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
@@ -2161,8 +2021,6 @@ mod tests {
 
     #[test]
     fn the_same_id_under_two_different_parents_does_not_collide() {
-        // docs/adr/0045 decision 1: id is scoped to its parent, not the tree, so two nodes under
-        // different parents may share one -- what makes a reusable component composable.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
@@ -2180,9 +2038,6 @@ mod tests {
 
     #[test]
     fn a_signal_valued_id_is_rejected() {
-        // docs/adr/0045 decision 1: id follows SurfaceTopology's four fields (ADR-0044's
-        // amendment banner) in rejecting a Signal outright rather than resolving it -- a
-        // reconcile identity that changes from pass to pass is meaningless.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let lua = mlua::Lua::new();
@@ -2209,9 +2064,6 @@ mod tests {
 
     #[test]
     fn a_retained_identified_child_whose_id_vanishes_is_retired_child_first_when_the_fresh_list_empties() {
-        // docs/adr/0045 decision 2's last sentence: a retained child whose id disappears is
-        // retired through the existing child-first path (`CONTEXT.md`, Lease), same as any other
-        // removed subtree -- an identified child gets no special teardown.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
@@ -2240,12 +2092,6 @@ mod tests {
 
     #[test]
     fn a_fresh_id_that_matches_nothing_gets_a_new_node_id_and_the_vanished_id_is_retired() {
-        // docs/adr/0045 decision 2, both directions of "an id means the same node and only the
-        // same node": retained [a, b, c] against fresh [b, c, d]. `d` is a brand new declaration,
-        // so it must not fall through to the positional pool and inherit `a`'s NodeId (and with
-        // it `a`'s whole retained subtree, which a paint stage keying GPU resources on NodeId
-        // would then paint `d` into). `a` left the config, so it must be retired, not silently
-        // handed to `d`.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
@@ -2286,11 +2132,6 @@ mod tests {
 
     #[test]
     fn an_anonymous_fresh_child_never_inherits_an_identified_retained_node() {
-        // The other direction of the same rule: an unidentified fresh child pairs positionally
-        // only against unidentified retained children. Retained [x (id), anon] against fresh
-        // [anon, anon] must hand the retained *anonymous* node to fresh slot 0 and retire `x`;
-        // drawing `x` out of a shared positional pool would let an id-less node inherit the
-        // identity of one that was explicitly named.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
@@ -2328,9 +2169,6 @@ mod tests {
 
     #[test]
     fn removing_an_id_retires_the_old_node_and_allocates_a_new_one() {
-        // Adding or removing an `id` is a change of identity, not a cosmetic edit: a node that
-        // stops declaring one is a different node from docs/adr/0045's point of view, so its
-        // retained counterpart is retired and the anonymous replacement allocates fresh.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) =
@@ -2353,10 +2191,6 @@ mod tests {
 
     #[test]
     fn a_vanished_id_is_retired_child_first_even_when_fresh_slots_are_still_unmatched() {
-        // The non-empty companion to the test above: the fresh list is the *same length* as the
-        // retained one, so there is an unclaimed slot the old fallthrough would have filled from
-        // the leftover pool. Retiring must depend on whether the id was claimed, not on whether
-        // the fresh list ran short.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
@@ -2387,18 +2221,6 @@ mod tests {
 
     #[test]
     fn many_identified_siblings_reconcile_in_reversed_order_without_a_quadratic_scan() {
-        // A config is free to emit thousands of identified siblings
-        // (`for i = 1, 10000 do c[i] = rect { id = "n" .. i } end`), and this pairing runs on the
-        // Wayland dispatch thread at capability-push cadence (ADR-0044 decision 2's dirty flag),
-        // so it must be linear. N is 2000 because that is where the gap is unmistakable without
-        // making the suite slow: reversed order is the worst case for the old nested `position`
-        // scan plus `Vec::remove`, and this test measured 0.80s against it versus 0.06s against
-        // the map lookup, both in a debug test build. A regression to quadratic therefore shows up
-        // as a test that visibly drags, without a flaky wall-clock assertion in the test itself.
-        //
-        // Correctness is what is asserted: every re-emitted id keeps its NodeId despite the
-        // reversal, the one id that was dropped is retired, and the one id that is new allocates
-        // fresh rather than inheriting the dropped node.
         const N: usize = 2000;
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
@@ -2412,8 +2234,6 @@ mod tests {
         apply_at(&mut scene, &[surface_v1], full(), &shaping, &_lua1).unwrap();
         let before: Vec<NodeId> = scene.surfaces.get("bar@TEST").unwrap().children[0].children.iter().map(|c| c.id).collect();
 
-        // Reversed, with "n0" replaced by a never-seen "fresh" so the run also covers the
-        // no-counterpart path at scale.
         let mut v2_children = String::new();
         v2_children.push_str("rect { id = \"fresh\", width = 1, height = 1 },\n");
         for i in (1..N).rev() {
@@ -2455,15 +2275,6 @@ mod tests {
 
     #[test]
     fn an_impure_margin_closure_positions_a_child_inside_the_size_its_parent_was_measured_at() {
-        // build-steps.md Phase 19 item 5's headline defect. `margin` used to be resolved four
-        // separate times in one apply (the parent loop, both `intrinsic_content_size` folds, and
-        // `position_children`), each an independent `Signal::get_value`, so a closure that is not
-        // a pure function of unchanged state answered differently within one pass: the row was
-        // measured 12 wide from the second read and positioned its child at x 4 from the fourth,
-        // a 10-wide child spanning 4..14 inside a 12-wide parent. That breaks the invariant
-        // `intrinsic_content_size`'s own comment states -- the sizing and positioning passes "must
-        // agree, or a child would be sized to fit but then overlap or leave a gap once
-        // positioned".
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let lua = mlua::Lua::new();
@@ -2486,10 +2297,6 @@ mod tests {
 
     #[test]
     fn a_signal_valued_property_resolves_exactly_once_per_apply() {
-        // The mechanism behind the test above, asserted directly: one pass, one answer per
-        // property. `margin` is the property measured at four reads, so it is the one counted
-        // here. This is not the memoization docs/adr/0044 decision 3 rejects -- nothing is cached
-        // past the end of this apply, and the next one resolves again.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let lua = mlua::Lua::new();
@@ -2506,9 +2313,6 @@ mod tests {
 
     #[test]
     fn a_second_apply_resolves_the_property_again_rather_than_reusing_the_first_passes_answer() {
-        // The other side of the same rule: resolve-once is scoped to one pass, so a push-driven
-        // re-resolve (docs/adr/0044 decision 2) reads the signal again. A cache across applies
-        // would be the memoization decision 3 refuses.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let lua = mlua::Lua::new();
@@ -2522,10 +2326,6 @@ mod tests {
 
     #[test]
     fn the_resolved_tree_holds_a_signals_current_value_not_the_handle() {
-        // build-steps.md Phase 19 item 5: `ResolvedNode::properties` is a snapshot of one pass,
-        // which is what makes it safe for a later paint stage to read a colour or a radius off it
-        // without resolving anything itself. A property no parser reads yet (`background`) is the
-        // honest test of that, since only the resolve step can have replaced it.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let lua = mlua::Lua::new();
@@ -2553,14 +2353,6 @@ mod tests {
 
     #[test]
     fn a_child_whose_kind_is_rejected_never_runs_its_property_getters() {
-        // Resolution calls back into Lua (docs/adr/0044 decision 1), so *when* it happens relative
-        // to the checks is observable from the config's side. Resolving a child's map in the parent
-        // loop and only then recursing into `ensure_supported_kind` meant every property getter of
-        // a node the walk was about to refuse ran first: arbitrary Lua side effects on behalf of a
-        // node that never enters the accepted tree. `ensure_node_admissible` runs in the parent
-        // loop ahead of the resolve, so nothing of a refused child is evaluated. The depth cap is
-        // the same ordering and the same fix -- one level's worth of generator body, rather than a
-        // whole property map.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let lua = mlua::Lua::new();
@@ -2646,10 +2438,6 @@ mod tests {
 
     #[test]
     fn a_surface_with_nothing_visible_in_it_claims_no_input_at_all() {
-        // The click-through case, and since docs/adr/0038 decision 5 it is the ordinary answer for
-        // any surface rather than a boot-time special case for one overlay: an empty region means
-        // every pointer event reaches the application window behind the surface. A root whose only
-        // child is hidden and a root with no children at all must agree about that.
         let hidden_child = ResolvedNode {
             kind: "rect".to_string(),
             rect: LogicalRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 },
@@ -2672,9 +2460,6 @@ mod tests {
 
     #[test]
     fn a_child_that_fills_its_surface_claims_the_whole_surface() {
-        // The "no-op for a tightly-sized bar" build-steps.md Phase 20 item 5 predicts: the region
-        // this produces is what the protocol default already is, which is why the wiring needs no
-        // special case to skip it.
         let root = ResolvedNode {
             kind: "panel".to_string(),
             rect: LogicalRect { x: 0.0, y: 0.0, width: 1920.0, height: 32.0 },
@@ -2694,9 +2479,6 @@ mod tests {
 
     #[test]
     fn a_list_resolves_one_child_per_source_element_in_source_order() {
-        // build-steps.md Phase 19 item 12: `list` expands `source` via `itemfn`, one child per
-        // element, in the order `source` lists them -- catches both "list is still rejected as an
-        // unsupported kind" and a `children_of` arm that drops or reorders elements.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
@@ -2715,10 +2497,6 @@ mod tests {
 
     #[test]
     fn a_list_with_key_keeps_existing_items_node_ids_when_a_new_element_is_inserted_at_the_front() {
-        // The reason this item exists (docs/adr/0045 decision 3): `key(element)` becomes the
-        // generated child's `id`, so `pair_children_by_id_then_position` (ADR-0045 decisions 1-2)
-        // pairs list items by key rather than by index -- an insertion at the front must not
-        // shift every existing item onto the wrong retained node.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let itemfn = r#"function(item) return rect { width = item.n, height = 1 } end"#;
@@ -2758,11 +2536,6 @@ mod tests {
 
     #[test]
     fn a_list_without_key_rebuilds_every_item_from_the_insertion_point_on() {
-        // The documented contrast to the test above (docs/adr/0045 decision 3: "without key,
-        // items match by index and every item below an insertion rebuilds"). With no key, list
-        // items pair positionally, same as an id-less literal child list -- inserting at the
-        // front silently hands the old position-0 retained node to whatever now sits at position
-        // 0, rather than to the logical item that used to be there.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let itemfn = r#"function(item) return rect { width = item, height = 1 } end"#;
@@ -2791,10 +2564,6 @@ mod tests {
 
     #[test]
     fn a_duplicate_list_key_is_rejected_naming_key_not_id() {
-        // build-steps.md Phase 19 item 12 / ADR-0045 decision 3: a duplicate key is caught during
-        // list expansion, before either key reaches `pair_children_by_id_then_position`, so the
-        // message names `key` -- the property the config author actually wrote -- rather than
-        // reusing `duplicate_sibling_ids_are_rejected_as_a_layout_error`'s "id" message.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
@@ -2813,7 +2582,6 @@ mod tests {
 
     #[test]
     fn a_list_with_no_source_is_a_layout_error_naming_source() {
-        // Error case from build-steps.md Phase 19 item 12: `source` missing entirely.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
@@ -2825,7 +2593,6 @@ mod tests {
 
     #[test]
     fn a_list_source_that_is_not_a_table_is_a_layout_error_naming_source() {
-        // Error case: `source` present but not resolving to a table/array.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
@@ -2919,8 +2686,6 @@ mod tests {
 
     #[test]
     fn a_list_sizes_and_positions_like_a_column() {
-        // Design decision 5: a `list` lays out exactly like a `column` -- vertical stack, own
-        // width the widest child, own height the summed children plus spacing gaps.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua, surface) = surface_from(
@@ -2940,11 +2705,6 @@ mod tests {
 
     #[test]
     fn window_and_popup_are_supported_kinds_carrying_a_single_child() {
-        // docs/adr/0040 decision 1's other two roles. Both are top-level nodes, siblings of
-        // `panel` in what `shell.lua` returns, and both take `child` rather than `children`
-        // (§ 6.2, § 6.3). Written as raw tables because this module's fixture builds a
-        // `VirtualNode` straight from a table rather than going through `lua::nodes`'s
-        // constructors, which is what keeps the walk under test and not the registration.
         for kind in ["window", "popup"] {
             let mut scene = Scene::new();
             let shaping = ShapingHandle::spawn();
@@ -2962,9 +2722,6 @@ mod tests {
 
     #[test]
     fn a_window_or_popup_root_stacks_and_stretches_its_child_exactly_as_a_panel_does() {
-        // Neither role has a layout model of its own: both are surface containers, so they take
-        // the stacking model docs/adr/0023 item 4 already gives `panel`, including the
-        // `Stretch` forcing in `stretch_forced_size`.
         for kind in ["window", "popup"] {
             let mut scene = Scene::new();
             let shaping = ShapingHandle::spawn();
@@ -2981,11 +2738,6 @@ mod tests {
 
     #[test]
     fn an_unsized_window_root_is_the_surface_so_a_fill_child_actually_fills_it() {
-        // § 6.2 gives a `window` no `width`/`height`, because a toplevel's size is the compositor's
-        // and reaches `available` as an `xdg_toplevel` configure. Left to `parse_size_mode`'s
-        // `Content` default the root would hand its children a zero budget, and the obvious way to
-        // write a window -- a `Fill` child -- resolved to nothing, so the toplevel mapped a fully
-        // transparent buffer. Measured against niri (build-steps.md Phase 22 item 1).
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (lua, surface) =
@@ -2999,9 +2751,6 @@ mod tests {
 
     #[test]
     fn a_window_root_that_does_write_a_size_still_gets_the_size_it_wrote() {
-        // Per axis, and only the `Content` default is overridden: a `window` writing a `width` is
-        // writing a property § 6.2 does not define, and honouring it is better than silently
-        // discarding it.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (lua, surface) = surface_from(r#"{ kind = "window", id = "settings", width = 400, child = rect { width = "Fill", height = "Fill" } }"#);
@@ -3013,12 +2762,6 @@ mod tests {
 
     #[test]
     fn a_popup_root_needs_no_forcing_because_section_6_3_requires_both_of_its_sizes() {
-        // The counterpart question to `an_unsized_window_root_...`, asked rather than assumed
-        // (build-steps.md Phase 22 item 2). A `window` needed the `Content`-default override
-        // because § 6.2 gives it no size at all; § 6.3 requires a popup to state both, and gives it
-        // no `"Fill"`, so `parse_size_mode` reads real numbers here and a `Fill` child fills them
-        // through the ordinary path. A popup that omits a size never reaches this pass at all --
-        // `node::popup_spec` fails the evaluation first.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (lua, surface) = surface_from(
@@ -3035,10 +2778,6 @@ mod tests {
 
     #[test]
     fn a_lock_is_a_supported_kind_carrying_a_single_child_and_stretching_it_like_a_panel() {
-        // § 6.4's role, admitted into the walk by docs/adr/0052 decision 2. Two properties on the
-        // node, one of them `child`, so the whole of what this stage owes a `lock` is: walk the
-        // child, and stack it the way every other surface container stacks one (docs/adr/0023
-        // item 4). No size on the fixture, because § 6.4 gives a `lock` none to write.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (lua, surface) = surface_from(
@@ -3055,12 +2794,6 @@ mod tests {
 
     #[test]
     fn an_unsized_lock_root_is_its_output_so_a_fill_child_covers_the_locked_screen() {
-        // The `window` sizing fix, applied to the role that cannot opt out of needing it: § 6.4
-        // gives a `lock` no `width`/`height` at all and `node::lock_spec` refuses both, so the root
-        // can only ever reach `parse_size_mode`'s `Content` default. A `Content` root hands its
-        // children a zero budget, so a `Fill` child would paint nothing into a surface covering the
-        // whole output -- a transparent buffer over a locked session, which is the black screen
-        // docs/adr/0052 decision 3 refuses a lock to avoid.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (lua, surface) = surface_from(
@@ -3075,7 +2808,6 @@ mod tests {
 
     #[test]
     fn an_unsupported_top_level_kind_is_still_rejected() {
-        // The other half of adding two kinds: the list is still a list, not a catch-all.
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (lua, surface) = surface_from(r#"{ kind = "dialog", id = "s", child = rect {} }"#);

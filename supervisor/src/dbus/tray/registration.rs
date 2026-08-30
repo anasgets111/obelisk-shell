@@ -6,11 +6,6 @@ use zbus::zvariant::OwnedObjectPath;
 
 use super::DEFAULT_ITEM_OBJECT_PATH;
 
-// -------------------------------------------------------------------------------------------
-// Registration-string resolution (ADR-0031: pure classification, TDD'd; the D-Bus round trip
-// for the well-known-name branch is a thin async wrapper around it).
-// -------------------------------------------------------------------------------------------
-
 /// How `RegisterStatusNotifierItem`'s raw `service` argument classifies, before any D-Bus I/O
 /// (ADR-0031). Pure and total: every `&str` lands in exactly one branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,9 +36,9 @@ pub(super) enum RegistrationError {
     InvalidName(String),
     Dbus(String),
     /// `service` was already a unique name (`:N.M`) but didn't equal the real, authenticated
-    /// sender of this `RegisterStatusNotifierItem` call: a connection can only ever truthfully
-    /// claim its own unique name -- `header.sender()` is filled in by the bus daemon and
-    /// cannot be spoofed, so any mismatch here means the caller fabricated a name it doesn't own.
+    /// sender of this call: a connection can only ever truthfully claim its own unique name
+    /// (bus-daemon-filled, unspoofable), so any mismatch means the caller fabricated a name
+    /// it doesn't own.
     UniqueNameMismatch { claimed: String, sender: String },
 }
 
@@ -76,13 +71,11 @@ pub(super) async fn resolve_registration(connection: &zbus::Connection, service:
         }
         RegistrationTarget::UniqueName { unique_name } => {
             // A connection can only ever truthfully claim its own real unique name: reject any
-            // claimed unique name that doesn't equal the real, bus-daemon-authenticated sender
-            // of this call. A well-behaved client's self-claimed unique name is always its own,
-            // so this rejects nothing legitimate; it only closes the fabrication vector -- any
-            // session-bus peer could otherwise call `RegisterStatusNotifierItem(":999.1")`
-            // repeatedly with distinct made-up names, planting registry entries that can never
-            // be cleaned up, since `NameOwnerChanged` removal only fires for a name that was
-            // ever real and then genuinely disconnects.
+            // claimed unique name that doesn't equal the real, bus-daemon-authenticated
+            // sender. Otherwise any session-bus peer could call
+            // `RegisterStatusNotifierItem(":999.1")` repeatedly with made-up names, planting
+            // registry entries `NameOwnerChanged` can never clean up (it only fires for a
+            // name that was ever real and then genuinely disconnects).
             let sender = sender.ok_or(RegistrationError::NoSender)?;
             if unique_name != sender {
                 return Err(RegistrationError::UniqueNameMismatch { claimed: unique_name, sender: sender.to_string() });
@@ -152,10 +145,9 @@ mod tests {
     }
 
 
-    // ---- resolve_registration / register_status_notifier_item (Correctness review: unbounded
-    //      ghost-registry/task-leak DoS via a fabricated unique name -- a connection can only ever
-    //      truthfully claim its own real unique name, so a claimed `:N.M` must equal the real,
-    //      bus-daemon-authenticated sender) ----
+    // ---- resolve_registration / register_status_notifier_item: a fabricated unique name
+    //      must be rejected, since a connection can only ever truthfully claim its own real
+    //      unique name (the bus-daemon-authenticated sender) ----
 
     use super::super::test_support::p2p_pair;
 
@@ -174,9 +166,8 @@ mod tests {
     #[tokio::test]
     async fn resolve_registration_rejects_a_fabricated_unique_name() {
         let (connection, _peer) = p2p_pair().await;
-        // The real sender is :1.5, but `service` claims a completely different, never-connected
-        // unique name -- exactly the `RegisterStatusNotifierItem(":999.1")` attack the Correctness
-        // review describes.
+        // The real sender is :1.5, but `service` claims a completely different,
+        // never-connected unique name.
         match resolve_registration(&connection, ":999.1", Some(":1.5")).await {
             Err(RegistrationError::UniqueNameMismatch { claimed, sender }) => {
                 assert_eq!(claimed, ":999.1");

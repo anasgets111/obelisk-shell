@@ -17,33 +17,29 @@ pub struct LogicalPoint {
 
 /// Every node containing `point`, root-first and deepest-last; empty if the point misses `root`.
 ///
-/// A path, not a topmost node, because the only tree anyone writes is a `button` whose child is a
-/// `text`: the deepest node under the pointer has no `on_click`, and returning it alone would mean
-/// no button ever fires (docs/adr/0050 decision 1). Each caller scans the result from the deep end
-/// for the kind it wants -- one traversal, however many questions.
+/// A path, not a topmost node: the only tree anyone writes is a `button` whose child is a `text`,
+/// and the deepest node under the pointer has no `on_click`, so returning it alone would mean no
+/// button ever fires (docs/adr/0050 decision 1). Each caller scans the result from the deep end
+/// for the kind it wants.
 ///
 /// Three rules, all load-bearing:
 ///
 /// - **Containment gates descent.** A node whose rect does not hold the point is not entered and
-///   neither are its children, which is what makes this a path rather than a set. It also makes
-///   the hittable region of an overflowing child exactly its intersection with every ancestor,
-///   which is exactly the region `layout::paint::paint_node`'s `intersect_scissor` chain draws it
-///   in. Hitting and painting therefore agree on overflow without either walk carrying a clip
-///   rect. (docs/adr/0050's own ponytail note predates Phase 19 item 17's clipping and says paint
-///   does not clip; it does.)
-/// - **Children in reverse.** `paint_node` paints them in declaration order, so the last one is on
-///   top, so the last one is asked first. The first child that yields a hit wins.
+///   neither are its children. This makes the hittable region of an overflowing child exactly its
+///   intersection with every ancestor -- the same region `paint::paint_node`'s `intersect_scissor`
+///   chain draws it in, so hitting and painting agree on overflow without either walk carrying a
+///   clip rect.
+/// - **Children in reverse.** `paint_node` paints in declaration order, so the last child is on
+///   top and is asked first; the first child that yields a hit wins.
 /// - **Half-open bounds**, `rect.x <= point.x < rect.x + rect.width`. Two buttons sharing an edge
-///   must not both claim it, and a zero-area rect must contain nothing; both fall out of this one
-///   comparison.
+///   must not both claim it, and a zero-area rect must contain nothing.
 ///
-/// `ResolvedNode::rect` is parent-relative (see `paint_node`, which adds the same running origin
-/// this does), so the absolute rect of a node this returns is only recoverable from the path that
-/// reached it -- [`absolute_rect`] is that recovery, and it is why the return type is the whole
-/// chain rather than a node and its depth.
+/// `ResolvedNode::rect` is parent-relative, so the absolute rect of a hit node is only recoverable
+/// from the path that reached it -- [`absolute_rect`] does that recovery, which is why the return
+/// type is the whole chain rather than a node and its depth.
 ///
-/// No depth bound of its own: `layout::scene::MAX_TREE_DEPTH` already refuses a tree deeper than
-/// 64 levels at resolve time, so nothing this walks can recurse further than that.
+/// No depth bound of its own: `layout::scene::MAX_TREE_DEPTH` refuses a tree deeper than 64 levels
+/// at resolve time.
 pub fn hit_path(root: &ResolvedNode, point: LogicalPoint) -> Vec<&ResolvedNode> {
     let mut path = Vec::new();
     descend(root, point, 0.0, 0.0, &mut path);
@@ -145,10 +141,6 @@ mod tests {
 
     #[test]
     fn a_childs_rect_is_read_relative_to_its_parent_not_to_the_surface() {
-        // The bug this pins: `layout::paint::paint_node` accumulates `origin + rect.x` down the
-        // tree, so a button at rect.x = 10 inside a row at rect.x = 40 paints at 50. Reading the
-        // button's rect as absolute would make it hittable at 10..30, where nothing is drawn, and
-        // dead at 50..70, where it is.
         let root = node(
             "panel",
             (0.0, 0.0, 100.0, 32.0),
@@ -181,8 +173,6 @@ mod tests {
 
     #[test]
     fn two_overlapping_siblings_resolve_to_the_later_declared_one() {
-        // Declaration order is paint order (`paint_node` iterates `children` forward), so the
-        // later sibling is drawn on top and must be the one a click reaches.
         let root = node(
             "panel",
             (0.0, 0.0, 100.0, 32.0),
@@ -215,8 +205,6 @@ mod tests {
 
     #[test]
     fn a_text_inside_a_button_still_leaves_the_button_findable_from_the_deep_end() {
-        // Decision 1's whole reason for returning a path: the deepest node is the `text`, and the
-        // caller's own scan is what turns that into "the innermost button".
         let root = node(
             "panel",
             (0.0, 0.0, 100.0, 32.0),

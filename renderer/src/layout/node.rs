@@ -1,39 +1,28 @@
 //! Typed property parsing for the layout engine (build-steps.md Phase 12,
-//! `docs/oblisk-idl-api-specs.md` § 5.1). `renderer/src/lua/nodes.rs`'s `VirtualNode` deliberately
-//! left every property as a raw `mlua::Value` -- this module is the "actual consumer that needs
-//! typed, validated properties" that file's own doc comment named as Phase 12's job.
+//! `docs/oblisk-idl-api-specs.md` § 5.1). `lua::nodes::VirtualNode` leaves every property as a raw
+//! `mlua::Value`; this module turns it into typed, validated properties.
 //!
-//! A `Value::UserData` holding a `Signal` (§ 1.2) is resolved rather than rejected
-//! (build-steps.md Phase 19 item 1, ADR-0044 decision 1, `CONTEXT.md`'s Signal resolution entry),
-//! and every one of those reads happens in exactly one place: [`resolve_properties`], run once per
-//! node per pass (build-steps.md Phase 19 item 5). The parsers below therefore take plain values
-//! and no `&Lua` -- they see a map in which every `Signal` has already been read once, so two
-//! parsers reading the same property in the same pass see the same signal answer.
+//! A `Value::UserData` holding a `Signal` (§ 1.2) is resolved rather than rejected (ADR-0044
+//! decision 1), and every one of those reads happens in exactly one place: [`resolve_properties`],
+//! run once per node per pass. The parsers below take plain values and no `&Lua` -- they see a map
+//! where every `Signal` has already been read once, so two parsers reading the same property in the
+//! same pass see the same answer.
 //!
-//! That is the whole of the guarantee, and it is worth stating narrowly: it covers a `Signal` and
-//! nothing else. A plain Lua table carrying an `__index` metamethod is not a `Signal`, so it is
-//! copied into the resolved map as the table it is, and every `table.get` a parser makes still
-//! runs that metamethod afresh -- a `margin` of that shape reproduces the exact
-//! measured-against-one-answer, positioned-against-another defect item 5 names, with no signal
-//! involved. See [`parse_edge_insets`]'s `ponytail:` for that hole and what closing it costs.
+//! That guarantee covers a `Signal` and nothing else: a plain Lua table with an `__index`
+//! metamethod is copied in as-is, and every `table.get` a parser makes still runs that metamethod
+//! afresh -- see [`parse_edge_insets`]'s `ponytail:` for the hole this leaves and what closing it
+//! costs.
 //!
-//! Resolution happens exactly once per property: if a signal's result is itself a `Signal` (a
-//! fresh `Value::UserData`), that's an error rather than a second read. That guard only stops a
-//! signal resolving directly to another signal; it is not a recursion bound, and it does nothing
-//! for a computed signal whose getter returns a fresh table on every call (e.g. a `children`
-//! signal that builds new node tables each read), which recurses as deep as the getter wants to go
-//! through `resolve_and_reconcile` and `deserialize_lua_table`. That one is bounded elsewhere:
-//! `layout::scene::MAX_TREE_DEPTH` caps the recursion and raises [`LayoutError::TreeTooDeep`]
-//! (build-steps.md Phase 19 item 3), so it is a rejected config rather than the stack overflow it
-//! used to be.
+//! Resolution happens exactly once per property: a signal resolving to another `Signal` is an
+//! error, not a second read. That guard is not a recursion bound -- a computed signal whose getter
+//! returns fresh depth on every call recurses through `resolve_and_reconcile` and
+//! `deserialize_lua_table` as deep as the getter wants. `layout::scene::MAX_TREE_DEPTH` is what caps
+//! that and raises [`LayoutError::TreeTooDeep`].
 //!
-//! [`SurfaceTopology`]'s five fields (`parse_surface_id`/`parse_layer`/`parse_anchor`/
-//! `parse_monitor`/`parse_namespace`) and every node's optional `id` (`parse_node_id`,
-//! docs/adr/0045 decision 1) are the carve-outs and keep rejecting a `Signal` outright -- see
-//! [`reject_signal_in_structural_field`]'s doc comment for why. A `panel`'s remaining § 6.1
-//! properties (`keyboard_interactivity`, `exclusive`, `margin`, `width`/`height`) are *not*
-//! carve-outs: layer-shell accepts each of them on a live surface, so a `Signal` in one resolves
-//! normally.
+//! [`SurfaceTopology`]'s five fields and every node's optional `id` (docs/adr/0045 decision 1) are
+//! structural carve-outs that keep rejecting a `Signal` outright -- see
+//! [`reject_signal_in_structural_field`]. A `panel`'s remaining § 6.1 properties are not carve-outs:
+//! layer-shell accepts each on a live surface, so a `Signal` in one resolves normally.
 
 use std::collections::{HashMap, HashSet};
 
@@ -128,25 +117,21 @@ pub(crate) fn invalid(property: &str, detail: impl Into<String>) -> LayoutError 
 }
 
 /// Longest prefix of a rejected value's `Debug` form this file will ever put in an error message.
-/// 200 bytes, not `marshal::MAX_STRING_BYTES` (64KB): that cap answers "how much of a *string
-/// property* is a legitimate value," a config author's call about the accepted path. This one
-/// answers "how much of a rejected value belongs in one line of `rescue`'s `error_log` (§ 2.10),"
-/// a much smaller budget -- a human scrolling past it needs enough bytes to recognize the value,
-/// not a paste buffer, and even a 64KB truncated dump would still read as a bad log line even
-/// though it would no longer reintroduce the pathological allocation this exists to stop.
+/// 200 bytes, not `marshal::MAX_STRING_BYTES` (64KB): that cap answers how much of a *string
+/// property* is a legitimate value; this one answers how much of a rejected value belongs in one
+/// line of `rescue`'s `error_log` (§ 2.10) -- enough bytes for a human to recognize the value, not
+/// a paste buffer.
 const MAX_ERROR_VALUE_PREVIEW_BYTES: usize = 200;
 
-/// `pub(crate)` rather than private: `layout::scene`'s `list` node (build-steps.md Phase 19 item
-/// 12) rejects a bad `source`/`itemfn`/`key` value from outside this module and needs the same
-/// bounded preview, not a second copy of this truncation logic.
+/// `pub(crate)` since `layout::scene`'s `list` node (build-steps.md Phase 19 item 12) rejects a bad
+/// `source`/`itemfn`/`key` value from outside this module and needs the same bounded preview.
 ///
 /// Renders a `Value` for an [`invalid`] detail without ever formatting its `Debug` form in full
-/// first (docs/build-steps.md Phase 19 item 13). `format!("{value:?}")` on an oversized
-/// `Value::String` allocates and escapes the whole thing before any truncation could run --
-/// `rect { radius = string.rep("x", 20 * 1024 * 1024) }` would format 20 MB on the Wayland
-/// dispatch thread before the error even reaches `rescue`. `marshal::check_string`'s 64KB cap
-/// never runs on this path, because it lives in [`checked_string`], which a value rejected for
-/// having the wrong *type* never reaches.
+/// first. `format!("{value:?}")` on an oversized `Value::String` allocates and escapes the whole
+/// thing before any truncation could run -- `rect { radius = string.rep("x", 20 * 1024 * 1024) }`
+/// would format 20 MB on the Wayland dispatch thread before the error even reaches `rescue`.
+/// `marshal::check_string`'s 64KB cap never runs here: it lives in [`checked_string`], which a
+/// value rejected for having the wrong *type* never reaches.
 ///
 /// Measured on this machine, formatting a Lua string of each size against this function:
 ///
@@ -156,30 +141,17 @@ const MAX_ERROR_VALUE_PREVIEW_BYTES: usize = 200;
 /// | 20 MB | 23.96 ms | 0.0057 ms |
 /// | 100 MB | 93.88 ms | 0.0061 ms |
 ///
-/// The right-hand column being flat is the point, and is what separates this from a helper that
-/// formats first and truncates after: cost here is a function of the cap, not of the input. The
-/// left-hand column is why it matters at all. 23.96 ms is more than a whole frame at 60fps, and
-/// build-steps.md Phase 19 item 6's third commit made this per-frame rather than per-apply:
-/// `layout::paint` is the first thing that ever validates a `background` or a `radius`, and it
-/// does so while drawing, on the Wayland dispatch thread. One `background = 5` in one node used
-/// to pay that on every frame.
+/// Cost here is a function of the cap, not of the input. 23.96 ms is more than a whole frame at
+/// 60fps, and `layout::paint` validates a `background` or `radius` while drawing, on the Wayland
+/// dispatch thread -- so this runs per frame, not per apply.
 ///
-/// A timing assertion is not the regression test for this. A naive format-then-truncate still
-/// came in under a 50 ms bound at 20 MB, so a threshold loose enough to be stable on other
-/// hardware is too loose to catch the bug. What catches it deterministically is that a
-/// format-then-truncate cannot report the value's true length, which
-/// `oversized_string_property_error_still_names_type_and_shows_a_recognizable_prefix` asserts on.
+/// `oversized_string_property_error_still_names_type_and_shows_a_recognizable_prefix` is the
+/// regression test: a naive format-then-truncate still comes in under a loose timing bound, so what
+/// it actually asserts on is that format-then-truncate cannot report the value's true length.
 ///
-/// Checked against mlua 0.12's actual `Debug` impls (`value.rs`, `table.rs`, `function.rs`,
-/// `userdata.rs`, `string.rs`, `thread.rs`, `types.rs`) rather than assumed: `Value::String` is
-/// the only unbounded case. `Value::fmt`'s non-alternate branch writes `String({s:?})`, and
-/// `LuaString`'s own `Debug` formats every byte of the string, escaped, whether as a `str` or as
-/// `bstr::BStr`. Every other variant that can hold non-trivial data (`Table`, `Function`,
-/// `Thread`, `UserData`) instead derives or hand-writes `debug_tuple(...).field(&self.0)` over a
-/// `ValueRef`, whose own `Debug` is `Ref({:p})` -- a fixed-width pointer, regardless of how large
-/// the table is or how many upvalues the closure carries. `Integer`/`Number`/`Boolean`/`Nil`/
-/// `LightUserData` are already bounded by their own type. So only the `String` arm needs a
-/// separate path here; every other variant formats exactly as it always has.
+/// `Value::String` is the only unbounded `Debug` case in mlua 0.12: every other variant that can
+/// hold non-trivial data (`Table`, `Function`, `Thread`, `UserData`) derives or hand-writes a
+/// `Debug` over a `ValueRef`, whose own `Debug` is a fixed-width pointer regardless of size.
 pub(crate) fn preview_for_error(value: &Value) -> String {
     let Value::String(s) = value else {
         return format!("{value:?}");
@@ -202,19 +174,17 @@ pub(crate) fn preview_for_error(value: &Value) -> String {
 }
 
 /// Runs a numeric `Value` through the marshalling boundary (`lua::marshal`, ADR-0044 decision 1)
-/// before this parser's own application-level range checks (e.g. `parse_size_mode`'s `[0, 8192]`)
-/// ever see it -- catches a NaN/Inf `f64` `Number` or an out-of-2^53-range `Integer`, whether it
-/// arrived as a literal or came out of resolving a `Signal` via [`resolve_properties`]: both are
-/// equally Lua-authored values crossing into Rust, exactly what `marshal::check_number`/
-/// `check_integer` were written to guard (`renderer/src/lua/marshal.rs`'s module doc comment).
+/// before this parser's own range checks (e.g. `parse_size_mode`'s `[0, 8192]`) ever see it --
+/// catches a NaN/Inf `f64` or an out-of-2^53-range `Integer`, whether literal or resolved from a
+/// `Signal` via [`resolve_properties`].
 ///
-/// `marshal::check_number` alone isn't sufficient here, though: it only guards the `f64`
-/// representation, and a finite `f64` like `1e300` sails through it and then overflows to
-/// `f32::INFINITY` on the narrowing cast below. A caller with no further range check (e.g.
-/// `parse_spacing`) would otherwise hand that `Inf` straight into layout arithmetic -- `inf * 0.0`
-/// is `NaN`, and `snap_to_physical`'s final `as i32` silently saturates a `NaN` rect to `0` instead
-/// of ever raising an error. So the finiteness check re-runs after the cast, on the `f32`, naming
-/// the same property a non-finite literal would.
+/// `marshal::check_number` alone is not enough: it only guards the `f64` representation, and a
+/// finite `f64` like `1e300` sails through it and then overflows to `f32::INFINITY` on the
+/// narrowing cast below. A caller with no further range check (e.g. `parse_spacing`) would hand
+/// that `Inf` straight into layout arithmetic -- `inf * 0.0` is `NaN`, and `snap_to_physical`'s
+/// final `as i32` silently saturates a `NaN` rect to `0` instead of raising an error. So the
+/// finiteness check re-runs after the cast, on the `f32`, naming the same property a non-finite
+/// literal would.
 fn value_as_f32(property: &str, value: &Value) -> Result<Option<f32>, LayoutError> {
     match value {
         Value::Integer(i) => {
@@ -245,9 +215,8 @@ fn checked_string(property: &str, s: &mlua::LuaString) -> Result<String, LayoutE
 }
 
 /// Strict `#RRGGBB` / `#RRGGBBAA` hex colour parsing (§ 5.2's `rect.background`, `border_color`,
-/// `text.foreground`). No 3-digit shorthand, no named colours, no bare digits without `#` --
-/// § 5.2 documents none of them, and accepting one here would commit the project to a convenience
-/// syntax the IDL never specified.
+/// `text.foreground`). No 3-digit shorthand, no named colours, no bare digits without `#` -- § 5.2
+/// specifies none of them.
 fn parse_hex_color(property: &str, s: &str) -> Result<Rgba, LayoutError> {
     let Some(digits) = s.strip_prefix('#') else {
         return Err(invalid(
@@ -288,106 +257,81 @@ fn parse_hex_color(property: &str, s: &str) -> Result<Rgba, LayoutError> {
 }
 
 /// Whether `property` is one [`resolve_properties`] copies through untouched on a node of this
-/// `kind`, so that [`reject_signal_in_structural_field`] still sees a raw `Value::UserData` and can
-/// refuse it -- see that function's doc comment for why these and nothing else. Resolving them
-/// there and rejecting afterwards would be unimplementable: once a signal has been read, the value
-/// in the map is indistinguishable from a literal.
+/// `kind`, so [`reject_signal_in_structural_field`] still sees a raw `Value::UserData` and can
+/// refuse it. Resolving then rejecting afterwards is unimplementable: once a signal has been read,
+/// the value in the map is indistinguishable from a literal.
 ///
-/// Kind-aware, because a skip is only sound where a parser actually runs to do the rejecting.
-/// `id` is skipped on every kind: [`parse_node_id`] reads it on every node and [`parse_surface_id`]
-/// on a surface root, so a `Signal` in it is refused wherever it appears. `layer`/`anchor`/
-/// `monitor`/`namespace` are read by [`surface_topology`] alone, which `layout::scene`'s
-/// `Scene::apply_one_surface` calls on top-level surfaces and nowhere else -- so on a `rect` no
-/// parser ever looks at them, and skipping them there would copy a live `Signal` handle straight
-/// into `layout::scene::RetainedNode::properties` with nothing left to reject it. That would
-/// falsify the "never a `Signal`" invariant `layout::scene::ResolvedNode::properties` documents and
-/// hands to the paint stage, which is told it may read a colour or a radius off the map directly.
-/// Below a surface these four are ordinary properties and resolve like any other.
+/// Kind-aware, because a skip is only sound where a parser actually runs to do the rejecting. `id`
+/// is skipped on every kind ([`parse_node_id`]/[`parse_surface_id`] read it wherever it appears).
+/// `layer`/`anchor`/`monitor`/`namespace` are read by [`surface_topology`] alone, called only on
+/// top-level surfaces -- so on a `rect` no parser looks at them, and skipping them there would copy
+/// a live `Signal` handle into `layout::scene::RetainedNode::properties`, falsifying the "never a
+/// `Signal`" invariant `ResolvedNode::properties` hands to the paint stage. Below a surface these
+/// four are ordinary properties and resolve like any other.
 ///
-/// `namespace` joins the carve-out for the same protocol reason `monitor` is already in it
-/// (`CONTEXT.md`, Topology change): `zwlr_layer_shell_v1::get_layer_surface` fixes a namespace at
-/// creation and no request changes it on a live surface, so a value that could drift after the
-/// topology diff would leave the compositor matching rules (Hyprland's `layerrule`) against a
-/// string the config no longer says. The in-place `panel` fields -- `keyboard_interactivity`,
-/// `exclusive`, `margin`, `width`/`height` -- are deliberately *not* here: layer-shell permits
-/// changing each of them on a live surface, so a `Signal` in one resolves normally
-/// (docs/adr/0044 decision 1) and the next pass simply applies the new value.
+/// `namespace` joins the carve-out for the same protocol reason `monitor` is already in it:
+/// `zwlr_layer_shell_v1::get_layer_surface` fixes a namespace at creation and no request changes it
+/// on a live surface. The in-place `panel` fields -- `keyboard_interactivity`, `exclusive`,
+/// `margin`, `width`/`height` -- are deliberately *not* here: layer-shell permits changing each on a
+/// live surface, so a `Signal` in one resolves normally (docs/adr/0044 decision 1).
 ///
-/// **`window`, `popup` and `lock` add nothing to the carve-out** (build-steps.md Phase 22 and
-/// Phase 23), and the same live-object test is what says so. On a `window`, `set_title` and
-/// `set_app_id` are both requests on a mapped toplevel -- the XML says so of `set_app_id` in as
-/// many words -- and `set_min_size`/`set_max_size` are double-buffered requests, so none of the
-/// four is fixed at creation the way a namespace is. On a `popup`, the whole `xdg_positioner` is
-/// consumed by `get_popup` and rebuilt on every open (docs/adr/0049 decision 1), so `parent`,
-/// `anchor_rect`, `anchor`, `gravity` and the rest are re-read each time and a `Signal` in any of
-/// them is the intended way to drive one -- § 6.3's `anchor_rect` is specified as arriving from a
-/// click. A `lock` settles the question by having nothing to answer it about: § 6.4's whole
-/// property list is `id` and `child`, and `layout::node::lock_spec` refuses the four properties a
-/// config might reach for anyway, so the carve-out would have to name a property that cannot
-/// appear. All three roles' `id` is already covered by the universal arm below, because it is a
-/// reconcile identity rather than a protocol field.
+/// `window`, `popup` and `lock` add nothing to the carve-out (build-steps.md Phase 22 and 23), by
+/// the same live-object test: a `window`'s `set_title`/`set_app_id`/`set_min_size`/`set_max_size`
+/// are all valid requests on a mapped toplevel; a `popup`'s whole `xdg_positioner` is rebuilt on
+/// every open (docs/adr/0049 decision 1), so `parent`/`anchor_rect`/`anchor`/`gravity` are meant to
+/// carry a `Signal`; a `lock`'s § 6.4 property list is only `id` and `child`. All three roles' `id`
+/// is already covered by the universal arm, since it is a reconcile identity rather than a protocol
+/// field.
 fn is_structural_property(kind: &str, property: &str) -> bool {
     property == "id" || (kind == "panel" && matches!(property, "layer" | "anchor" | "monitor" | "namespace"))
 }
 
-/// One node's raw property map with every `Signal` replaced by its current value (build-steps.md
-/// Phase 19 item 5, ADR-0044 decision 1, `CONTEXT.md`'s Signal resolution entry). Called once per
-/// node per pass, at the point that node enters reconciliation; everything downstream -- this
-/// module's parsers, `layout::scene`'s sizing and positioning passes, and what the pass stores in
+/// One node's raw property map with every `Signal` replaced by its current value (ADR-0044
+/// decision 1). Called once per node per pass, at the point that node enters reconciliation;
+/// everything downstream -- this module's parsers, `layout::scene`'s sizing/positioning passes, and
 /// `RetainedNode::properties` -- reads the result rather than the raw map.
 ///
 /// Once, and once is load-bearing. `Signal::get_value` runs a `computed` signal's Lua closure, and
 /// a closure that is not a pure function of unchanged state (`os.clock()`, `math.random`, an
 /// accumulator upvalue) answers differently on every call. `margin` used to be read four separate
-/// times in one `Scene::apply` -- the parent's child loop, both `intrinsic_content_size` folds and
-/// `position_children` -- so a row could be measured against one answer and position its child
-/// against another, breaking the sizing-and-positioning agreement `intrinsic_content_size`'s own
-/// comment names. One read per property is what makes the resolved tree a snapshot of one pass
-/// instead of four disagreeing reads. It is also what stops ADR-0021's per-`get_value` 5ms budget
-/// being bought four times over for one property.
+/// times in one `Scene::apply`, so a row could be measured against one answer and position its
+/// child against another. One read per property makes the resolved tree a snapshot of one pass, and
+/// stops ADR-0021's per-`get_value` 5ms budget being paid four times over for one property.
 ///
-/// The snapshot is a snapshot of the *signals*, and only of them. A value that is a plain table
-/// with an `__index` metamethod is copied through as that table, and each `table.get` a parser
-/// makes runs the metamethod again, so a `margin` of that shape still measures against one answer
-/// and positions against another. See [`parse_edge_insets`]'s `ponytail:`.
+/// The snapshot is a snapshot of the *signals*, and only of them. A plain table with an `__index`
+/// metamethod is copied through as that table, and each `table.get` a parser makes runs the
+/// metamethod again, so a `margin` of that shape still measures against one answer and positions
+/// against another. See [`parse_edge_insets`]'s `ponytail:`.
 ///
-/// This is **not** the memoization ADR-0044 decision 3 rejects. That decision is about caching
-/// *across* pushes, which needs an invalidation rule no push has; this caches nothing beyond the
-/// single pass it runs in, and the next pass resolves everything again from scratch.
+/// Not the memoization ADR-0044 decision 3 rejects: that decision is about caching *across* pushes,
+/// which needs an invalidation rule no push has; this caches nothing beyond the single pass it runs
+/// in.
 ///
 /// Per entry:
 ///
 /// - a key [`is_structural_property`] names for this node's `kind` is copied through raw, signal
 ///   and all;
 /// - a `Value::UserData` holding a `Signal` is read through `Signal::get_value` and the *result*
-///   stored in its place, under the same rules a parser would then apply to a literal;
+///   stored in its place, under the same rules a parser would apply to a literal;
 /// - a result that is itself a `Signal` is an error naming the property, not a second read:
 ///   chasing it to a fixed point is an unbounded loop on a cyclic construction;
-/// - a result of `Value::Nil` **omits the key entirely**, which is what makes ADR-0044 decision
-///   1's amendment ("a signal resolving to nil means the property is absent") fall out of the map
-///   itself rather than being re-checked in every parser. Two reasons it is the consistent rule,
-///   and the second is why it is not merely a convenience. First: `crate::socket`'s
-///   `RendererClient::run_startup_evaluation` runs before `crate::wayland::run`'s poll loop has
-///   drained a single inbound frame, so every `shared::CAPABILITIES` signal still reads `nil` at
-///   the first `Scene::apply`; without this a config binding a bare capability signal
-///   (`visible = audio`), the exact shape decision 1 exists to enable, fails layout at boot and
-///   the shell comes up blank. Second: a Lua table cannot store a `nil` value, so `visible = nil`
-///   in a config drops the key before it ever reaches `properties`, which makes an explicit `Nil`
-///   reachable only through a signal -- treating the two spellings of "no value here" differently
-///   would be a distinction no config author could see;
-/// - everything else, including a `UserData` that is not a `Signal`, is copied through unchanged.
-///   A non-signal userdata is nothing this function knows how to read, so it is left for whichever
-///   parser consumes it to reject with its own message.
+/// - a result of `Value::Nil` **omits the key entirely** -- ADR-0044 decision 1's amendment ("a
+///   signal resolving to nil means the property is absent") falls out of the map itself rather
+///   than being re-checked in every parser. This matters at boot:
+///   `RendererClient::run_startup_evaluation` runs before the poll loop has drained a single
+///   inbound frame, so every `shared::CAPABILITIES` signal still reads `nil` at the first
+///   `Scene::apply`, and a config binding a bare capability signal must not fail layout there. It
+///   also matches a Lua table's own inability to store `nil`, so `visible = nil` in a config and a
+///   signal resolving to nil read the same;
+/// - everything else, including a `UserData` that is not a `Signal`, is copied through unchanged,
+///   left for whichever parser consumes it to reject with its own message.
 ///
-/// Every property resolves, including the ones no parser reads today. That is deliberate, not an
-/// oversight: the resolved map is what a later paint stage reads a colour or a radius straight off
-/// (`layout::scene::ResolvedNode::properties`), and § 5.1 puts no property out of a `Signal`'s
-/// reach, so there is no subset it would be safe to skip. The consequence is stated plainly rather
-/// than argued away: a getter that raises fails the whole apply, even for a property nothing
-/// downstream would have looked at. That is the same treatment every other bad property value
-/// gets, and the alternative is unavailable anyway -- deferring the error to whoever reads the key
-/// means keeping the getter around to re-run at that point, which is exactly the second read this
-/// function exists to prevent.
+/// Every property resolves, including ones no parser reads today: the resolved map is what the
+/// paint stage reads a colour or radius straight off (`ResolvedNode::properties`), and § 5.1 puts
+/// no property out of a `Signal`'s reach, so there is no subset safe to skip. A getter that raises
+/// fails the whole apply, even for a property nothing downstream looked at -- deferring the error
+/// would mean keeping the getter around to re-run later, which is the second read this function
+/// exists to prevent.
 ///
 /// ponytail: one fresh `HashMap` per node per pass, its `String` keys cloned with it. Honestly
 /// counted, that is not a new allocation: the code before this built exactly one map per node per
@@ -461,32 +405,26 @@ pub fn resolve_properties(
 /// The carve-outs from decision 1's "parsers resolve a `Signal`" rule: [`SurfaceTopology`]'s five
 /// fields (`parse_surface_id`/`parse_layer`/`parse_anchor`/`parse_monitor`/`parse_namespace`) and
 /// every node's optional `id` ([`parse_node_id`], docs/adr/0045 decision 1) keep rejecting one
-/// outright, the same way every parser used to (this function used to be named `reject_signal` and
-/// back every one of them, then narrowed to the topology fields alone -- ADR-0044's amendment
-/// banner -- before widening again here to cover `id`).
+/// outright, the same way every parser used to.
 ///
-/// The unifying reason, which is why these six and nothing else: each is read exactly once per
-/// evaluation and a *structural* decision is then made from it and acted on -- where a surface is
-/// placed, or which retained node a fresh one is. A `Signal` is free to change between passes, so
-/// admitting one here would leave a decision already taken resting on a value that no longer
-/// holds, with nothing left to re-check it. Every other property is read for the geometry or
-/// appearance of the pass it was read in, so a later change simply produces different output on
-/// the next pass, which is the point of a signal.
+/// The unifying reason: each is read exactly once per evaluation and a *structural* decision is
+/// then made from it and acted on -- where a surface is placed, or which retained node a fresh one
+/// is. A `Signal` is free to change between passes, so admitting one here would leave a decision
+/// already taken resting on a value that no longer holds, with nothing left to re-check it. Every
+/// other property is read for the geometry or appearance of the pass it was read in, so a later
+/// change simply produces different output on the next pass.
 ///
-/// Concretely: `surface_topology` runs on every `Scene::apply` so `renderer/src/socket.rs`'s
-/// `handle_reevaluate` can diff it against `applied_topology` and choose swap-versus-in-place
-/// (ADR-0001) -- a surface could otherwise move layer or monitor with no swap. And `id` is
-/// `pair_children_by_id_then_position`'s reconcile identity, matched once per `Scene::apply` to
-/// pair a fresh child against its retained counterpart -- a value that could change between the
-/// match and whatever reads it afterward would make "the same node as last time" itself
-/// ambiguous. ADR-0044 decision 1 doesn't carve either out explicitly -- it's a gap in the ADR,
-/// not a case the ADR considered and rejected.
+/// Concretely: `surface_topology` runs on every `Scene::apply` so `socket.rs`'s `handle_reevaluate`
+/// can diff it against `applied_topology` and choose swap-versus-in-place (ADR-0001) -- a surface
+/// could otherwise move layer or monitor with no swap. `id` is `pair_children_by_id_then_position`'s
+/// reconcile identity, matched once per `Scene::apply` to pair a fresh child against its retained
+/// counterpart -- a value that could change between the match and whatever reads it afterward would
+/// make "the same node as last time" itself ambiguous. ADR-0044 decision 1 doesn't carve either out
+/// explicitly; it's a gap in the ADR, not a case it considered and rejected.
 ///
 /// This only works because [`resolve_properties`] copies the keys [`is_structural_property`] names
-/// through raw: these six parsers are the only ones that read the un-resolved value, and they have
-/// to, since a resolved signal is indistinguishable from a literal by the time it reaches a map.
-/// That skip is scoped to the kind whose parsers actually run, which is what keeps "copied through
-/// raw" from meaning "never checked by anyone" -- see [`is_structural_property`].
+/// through raw: these six parsers are the only ones that read the un-resolved value, since a
+/// resolved signal is indistinguishable from a literal by the time it reaches a map.
 fn reject_signal_in_structural_field(property: &str, value: &Value) -> Result<(), LayoutError> {
     if matches!(value, Value::UserData(_)) {
         return Err(LayoutError::UnsupportedSignalProperty(property.to_string()));
@@ -494,28 +432,27 @@ fn reject_signal_in_structural_field(property: &str, value: &Value) -> Result<()
     Ok(())
 }
 
-/// Whether `property` currently holds a live [`Signal`], which is the one thing an **unresolved**
-/// property map can say that a resolved one cannot: "this pass is not in a position to check it"
+/// Whether `property` currently holds a live [`Signal`] -- the one thing an **unresolved** property
+/// map can say that a resolved one cannot: "this pass is not in a position to check it"
 /// (docs/adr/0049's second amendment).
 ///
-/// Only ever true on the evaluation-time pass, and that is what makes it safe to act on.
-/// [`resolve_properties`] reads every `Signal` it is handed and stores the *result* in its place,
-/// refusing a result that is itself a `Signal`, so no map that has been through it can hold one --
-/// except under a key [`is_structural_property`] copies through raw, and those keys are exactly the
-/// ones [`reject_signal_in_structural_field`] refuses outright instead of deferring.
+/// Only ever true on the evaluation-time pass. [`resolve_properties`] reads every `Signal` it is
+/// handed and stores the *result* in its place, refusing a result that is itself a `Signal`, so no
+/// map that has been through it can hold one -- except under a key [`is_structural_property`]
+/// copies through raw, and those keys are exactly the ones
+/// [`reject_signal_in_structural_field`] refuses outright instead of deferring.
 ///
-/// A parser that consults this is saying one thing, and it is the amendment's own split. On the
-/// pass that reads raw properties (`crate::socket`'s `surface_specs`, which runs before any getter
-/// has been called and must not call one), a signal-bound property is skipped and left at the
-/// parser's documented placeholder; the authoritative value is re-read from the resolved tree by
-/// `crate::wayland::App::apply_resolved_state` before anything is built from it. A *literal* is
-/// still fully validated on that pass, so a config typo fails fast into docs/adr/0046's `rescue`
-/// log rather than surfacing as an `xdg_positioner` protocol error at first open.
+/// A parser that consults this is applying the amendment's split: on the pass that reads raw
+/// properties (`crate::socket`'s `surface_specs`, which runs before any getter has been called and
+/// must not call one), a signal-bound property is skipped and left at the parser's documented
+/// placeholder; the authoritative value is re-read from the resolved tree by
+/// `App::apply_resolved_state` before anything is built from it. A *literal* is still fully
+/// validated on that pass, so a config typo fails fast into docs/adr/0046's `rescue` log rather than
+/// surfacing as an `xdg_positioner` protocol error at first open.
 ///
-/// Without this the amendment's "a property holding a `Signal` is skipped there" was a claim with
-/// no implementation: every parser below rejected a raw `Value::UserData` with a type error, so
-/// `anchor_rect = popup_anchor` -- the exact spelling docs/adr/0050 decision 3 tells a config to
-/// write -- failed the whole evaluation.
+/// Without this, `anchor_rect = popup_anchor` -- the spelling docs/adr/0050 decision 3 tells a
+/// config to write -- would fail the whole evaluation: every parser below rejects a raw
+/// `Value::UserData` with a type error otherwise.
 fn is_deferred_signal(properties: &HashMap<String, Value>, property: &str) -> bool {
     matches!(properties.get(property), Some(Value::UserData(ud)) if is_signal(ud))
 }
@@ -630,12 +567,10 @@ fn table_number(property: &str, table: &mlua::Table, key: &str) -> Result<Option
 /// per-property budget multiplication [`resolve_properties`]'s own `ponytail:` records; not built
 /// here.
 ///
-/// Scalar shorthand -- a bare number broadcasts to all four edges -- used to live only in front of
-/// `border_width` (docs/build-steps.md Phase 19 item 15: item 6's second commit added it there and
-/// nowhere else). Moved in here so `margin` and `padding` get it from the same place instead of two
-/// more copies of the same wrapper. It carries no range check of its own: see
-/// [`check_geometry_range`]'s doc comment for why `border_width` keeps a bound this function does
-/// not apply to `margin`/`padding`.
+/// Scalar shorthand -- a bare number broadcasts to all four edges -- shared by `margin`, `padding`
+/// and `border_width` (docs/build-steps.md Phase 19 item 15). Carries no range check of its own:
+/// see [`check_geometry_range`]'s doc comment for why `border_width` keeps a bound this function
+/// does not apply to `margin`/`padding`.
 pub fn parse_edge_insets(
     properties: &HashMap<String, Value>,
     property: &str,
@@ -693,32 +628,20 @@ pub fn parse_background(properties: &HashMap<String, Value>) -> Result<Option<Rg
 }
 
 /// Shared `[0, 8192]` bound for `radius` and `border_width` -- the same range [`parse_size_mode`]
-/// already enforces for `width`/`height` (§ 5.1's base property table), applied here because these
-/// are geometry on the same node kind with no bound of their own otherwise. Traced in femtovg
-/// 0.26: `radius = -4` silently draws square corners (`path.rs:458` treats anything under 0.1 as
+/// already enforces for `width`/`height` (§ 5.1's base property table). Traced in femtovg 0.26:
+/// `radius = -4` silently draws square corners (`path.rs:458` treats anything under 0.1 as
 /// unrounded) and `border_width = -4` clamps to 0.0 and multiplies paint alpha by zero, so both
-/// negative ends fail silently rather than raising. The upper end is the one that matters most:
-/// above roughly 8.4e6, `curve_divisions` (`path/cache.rs:911`) computes `acos(1.0) == 0.0`,
-/// divides by it, and `inf as u32` saturates to `u32::MAX` as a stroke-loop bound in
-/// `round_join`/`round_cap_start` -- billions of iterations and tens of gigabytes of vertices on
-/// the Wayland dispatch thread. `[0, 8192]` alone doesn't make that reachability obvious, which is
-/// worth spelling out here so a future reader doesn't widen the bound without knowing why it was
-/// chosen.
+/// negative ends fail silently rather than raising. The upper end matters most: above roughly
+/// 8.4e6, `curve_divisions` (`path/cache.rs:911`) computes `acos(1.0) == 0.0`, divides by it, and
+/// `inf as u32` saturates to `u32::MAX` as a stroke-loop bound in `round_join`/`round_cap_start` --
+/// billions of iterations and tens of gigabytes of vertices on the Wayland dispatch thread.
 ///
-/// **Decision (docs/build-steps.md Phase 19 item 15): this bound stays private to `radius` and
-/// `border_width`, not extended to `margin`/`padding` when the latter two picked up
-/// [`parse_edge_insets`]'s scalar shorthand.** § 5.1's base property table gives `margin` and
-/// `padding` no "Valid Range" entry at all -- unlike `width`/`height`, whose row spells out
-/// `[0, 8192]` -- so nothing in the spec asks for a bound here. `parse_edge_insets` never checked a
-/// range before this change either; margin and padding both already accepted an out-of-range value,
-/// including negative, since the function only rejected the wrong Lua type. `layout::scene`'s
-/// `position_children` reads a negative margin the same way CSS does: it is subtracted into a
-/// child's footprint and slot size on the main and cross axis, so `margin = -8` deliberately pulls a
-/// child closer to (or over) its neighbor. That is layout math, not a femtovg stroke input, and
-/// nothing in `position_children` special-cases a negative or reads the value as anything other than
-/// an offset -- no crash mode like `border_width`'s curve-divisions blowup applies here. So a config
-/// relying on negative margin to overlap or tighten siblings keeps working exactly as before: this
-/// slice only adds the scalar shorthand to `margin`/`padding`, and adds no new restriction on either.
+/// This bound stays private to `radius` and `border_width`, not extended to `margin`/`padding`:
+/// § 5.1 gives `margin`/`padding` no "Valid Range" entry at all, unlike `width`/`height`, and
+/// `layout::scene`'s `position_children` reads a negative margin the same way CSS does -- subtracted
+/// into a child's footprint and slot size, so `margin = -8` deliberately pulls a child closer to (or
+/// over) its neighbor. That is layout math, not a femtovg stroke input, with no crash mode like
+/// `border_width`'s curve-divisions blowup.
 fn check_geometry_range(property: &str, n: f32) -> Result<(), LayoutError> {
     if !(0.0..=8192.0).contains(&n) {
         return Err(invalid(
@@ -877,17 +800,14 @@ pub fn parse_spacing(properties: &HashMap<String, Value>) -> Result<f32, LayoutE
 }
 
 /// Absent `content` defaults to the empty string. It used to be required, but decision 1's nil
-/// rule (docs/adr/0044) means a `text` bound to a bare, not-yet-pushed capability signal --
-/// `text { content = oblisk.mpris.title }`, the ADR's headline example -- resolves `content` to
-/// absent at boot, since every rostered signal reads `nil` until its first `StateSnapshot` and
-/// `run_startup_evaluation` runs before the poll loop drains one. Rejecting that would reject the
-/// whole tree and boot a blank shell. Once nil means absent, the parser cannot tell that state
-/// apart from an omitted key anyway, so a default is the only option, not one of several. See
-/// docs/adr/0044's amendment banner for the full argument, and build-steps.md Phase 19 item 6.
+/// rule (docs/adr/0044) means a `text` bound to a bare, not-yet-pushed capability signal resolves
+/// `content` to absent at boot, since every rostered signal reads `nil` until its first
+/// `StateSnapshot` and `run_startup_evaluation` runs before the poll loop drains one. Rejecting
+/// that would reject the whole tree and boot a blank shell.
 ///
-/// Accepted cost: a misspelled `content` key now renders an empty node instead of being rejected.
-/// That is the better failure for a shell that has to boot, and `oblisk.rescue` still exists for
-/// the failures that matter.
+/// Accepted cost: a misspelled `content` key now renders an empty node instead of being rejected --
+/// the better failure for a shell that has to boot; `oblisk.rescue` still exists for the failures
+/// that matter.
 pub fn parse_content(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     parse_optional_string(properties, "content")
 }
@@ -963,19 +883,14 @@ pub fn parse_font_size(properties: &HashMap<String, Value>) -> Result<f32, Layou
         .ok_or_else(|| invalid("font_size", format!("expected a number, got {}", preview_for_error(value))))
 }
 
-/// Absent `size` defaults to 12.0, same rationale and same amendment as [`parse_content`]
-/// (docs/adr/0044's amendment banner, build-steps.md Phase 19 item 6): `icon` was the second
-/// property the amendment names as still failing after decision 1's nil rule alone. The rule is
-/// decision 1's, amended, not decision 2's -- decision 2 is the dirty flag, and landing it is only
-/// what exposed the gap.
+/// Absent `size` defaults to 12.0, the same nil-rule rationale as [`parse_content`] (docs/adr/0044's
+/// amendment banner): `icon` was the second property the amendment names as still failing after
+/// decision 1's nil rule alone. Same accepted cost: `icon { sizee = 24 }` now renders a
+/// 12.0-sized icon instead of being rejected.
 ///
-/// Carries the same accepted cost as [`parse_content`], stated separately because it is a separate
-/// property a config can misspell: `icon { sizee = 24 }` now renders a 12.0-sized icon instead of
-/// being rejected.
-/// `oblisk-idl-api-specs.md` § 5.2 documents `size` with no default of its own, so the number is
-/// picked to match this file's own convention instead: it is [`parse_font_size`]'s default,
-/// making `text` and `icon` -- the two leaf kinds sized by one numeric property -- agree, so an
-/// icon dropped inline with default-sized text lands at the same visual scale.
+/// § 5.2 documents `size` with no default of its own, so this matches [`parse_font_size`]'s
+/// default: `text` and `icon` are the two leaf kinds sized by one numeric property, so an icon
+/// dropped inline with default-sized text lands at the same visual scale.
 pub fn parse_icon_size(properties: &HashMap<String, Value>) -> Result<f32, LayoutError> {
     let Some(value) = properties.get("size") else {
         return Ok(12.0);
@@ -1003,39 +918,34 @@ fn parse_string_property(properties: &HashMap<String, Value>, property: &str, de
 }
 
 /// A top-level surface's `id`: required, unique among the surfaces in one config, and keys
-/// `Scene::apply`'s `HashMap` (`docs/oblisk-layout-engine-geometry.md` § 4). Also, since
-/// docs/adr/0045, this same property is the surface's *reconcile* identity -- the root of a
-/// tree is the one node whose retained counterpart is found by key lookup rather than by
-/// [`parse_node_id`]'s per-parent pairing, because a surface has no parent to be scoped within.
-/// One property name, one meaning ("which node is this, across two applies"), read by two
-/// different call sites for what happens to be two different purposes at the root versus
-/// everywhere below it -- decision 5 is explicit that this is not a second mechanism to build,
-/// just the existing one restated at the level below.
+/// `Scene::apply`'s `HashMap` (`docs/oblisk-layout-engine-geometry.md` § 4). Since docs/adr/0045,
+/// this same property is also the surface's *reconcile* identity: the root of a tree is the one
+/// node whose retained counterpart is found by key lookup rather than by [`parse_node_id`]'s
+/// per-parent pairing, because a surface has no parent to be scoped within -- decision 5 is
+/// explicit that this is the same mechanism restated at the level below, not a second one.
 pub fn parse_surface_id(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     parse_string_property(properties, "id", None)
 }
 
 /// The optional `id` base property on every node kind, one level below a surface's root
-/// (`docs/oblisk-layout-engine-geometry.md` § 4, docs/adr/0045 decisions 1-2). `None` means "no
-/// id" and is not an error -- `pair_children_by_id_then_position` pairs a child that carries none
-/// positionally against the other id-less children, exactly ADR-0023's original rule applied to
-/// that subsequence. Adding or dropping an `id` is therefore a change of identity, not a cosmetic
-/// edit: the retained counterpart is retired and a new node allocated. Rejects a `Signal` via
-/// [`reject_signal_in_structural_field`] for the same reason [`parse_surface_id`] already does:
-/// this is a reconcile identity, decided once at match time, not a value that should be able to
-/// drift between the fresh tree and whatever the match produces.
+/// (docs/adr/0045 decisions 1-2). `None` means "no id" and is not an error --
+/// `pair_children_by_id_then_position` pairs a child that carries none positionally against the
+/// other id-less children (ADR-0023's original rule applied to that subsequence). Adding or
+/// dropping an `id` is a change of identity, not a cosmetic edit: the retained counterpart is
+/// retired and a new node allocated. Rejects a `Signal` via [`reject_signal_in_structural_field`]
+/// for the same reason [`parse_surface_id`] does: this is a reconcile identity, decided once at
+/// match time, not a value that should drift between the fresh tree and whatever the match
+/// produces.
 ///
-/// Non-UTF-8 bytes are refused rather than converted, unlike [`checked_string`]'s lossy handling
-/// of display-oriented properties like `content`. An id is an *equality key*: with
-/// `to_string_lossy`, `"\xFF"` and `"\xFE"` both become `U+FFFD` and two genuinely distinct ids
-/// compare equal, so `pair_children_by_id_then_position`'s duplicate check would reject a valid
-/// config and a fresh child could claim the wrong retained counterpart. A garbled glyph in a
-/// label is cosmetic; a garbled identity silently rebinds a node's retained subtree.
+/// Non-UTF-8 bytes are refused rather than converted, unlike [`checked_string`]'s lossy handling of
+/// display-oriented properties like `content`. An id is an *equality key*: with `to_string_lossy`,
+/// `"\xFF"` and `"\xFE"` both become `U+FFFD` and two genuinely distinct ids compare equal, so
+/// `pair_children_by_id_then_position`'s duplicate check would reject a valid config and a fresh
+/// child could claim the wrong retained counterpart.
 ///
 /// Scoping ("unique among siblings, not across the tree") and duplicate rejection are
-/// `pair_children_by_id_then_position`'s job, not this parser's -- a duplicate can only be
-/// detected by comparing this node's id against its siblings', which this function has no
-/// visibility into.
+/// `pair_children_by_id_then_position`'s job, not this parser's: a duplicate can only be detected
+/// by comparing this node's id against its siblings', which this function has no visibility into.
 pub fn parse_node_id(properties: &HashMap<String, Value>) -> Result<Option<String>, LayoutError> {
     let Some(value) = properties.get("id") else {
         return Ok(None);
@@ -1063,16 +973,13 @@ pub enum LayerKind {
 }
 
 /// § 6.1's `layer` (`"Background"`/`"Bottom"`/`"Top"`/`"Overlay"`). Required, same shape as
-/// [`parse_surface_id`] -- every existing fixture in this repo already sets it.
+/// [`parse_surface_id`].
 ///
-/// **Validating since build-steps.md Phase 20.** This used to return the raw `String`, on the
-/// stated grounds that Phase 13 only needed it for topology-diff equality (`CONTEXT.md`, Topology
-/// change) and nothing bound a real `zwlr_layer_surface_v1` with it -- see docs/adr/0024. Phase 20
-/// is what makes that false: `crate::wayland::App::create_panel` now creates one layer surface per
-/// instance straight from this value (docs/adr/0038 decision 1), so an unrecognized string is a
-/// config error the author must see rather than a silent fall to some default layer. A typo'd
-/// `layer = "Toop"` that quietly stacked a bar on `Background` would be a far worse failure than a
-/// rejected config, because nothing on screen would say why.
+/// Validates rather than passing the raw string through: `crate::wayland::App::create_panel`
+/// creates one layer surface per instance straight from this value (docs/adr/0038 decision 1), so
+/// an unrecognized string is a config error the author must see rather than a silent fall to some
+/// default layer -- a typo'd `layer = "Toop"` that quietly stacked a bar on `Background` would be a
+/// far worse failure than a rejected config, because nothing on screen would say why.
 pub fn parse_layer(properties: &HashMap<String, Value>) -> Result<LayerKind, LayoutError> {
     match parse_string_property(properties, "layer", None)?.as_str() {
         "Background" => Ok(LayerKind::Background),
@@ -1127,10 +1034,7 @@ pub fn parse_monitor(properties: &HashMap<String, Value>) -> Result<String, Layo
 
 /// § 6.1's `namespace`: the layer-shell namespace string the compositor sees, and the key its own
 /// rules match on (Hyprland's `layerrule` for blur and animations). Defaults to `"oblisk-{id}"`,
-/// which is what makes every `panel` addressable from a compositor config without the author
-/// having to name one -- before docs/adr/0038 this was hardcoded per Rust-owned role
-/// (`"oblisk-main-bar"`, `"oblisk-overlay-canvas"`, `"oblisk-wallpaper"`) and a user could not
-/// write a rule against their own panel at all.
+/// which makes every `panel` addressable from a compositor config without the author naming one.
 ///
 /// A [`SurfaceTopology`] field, not an in-place one: `get_layer_surface` takes the namespace at
 /// creation and the protocol has no request to change it afterwards, so an edit to it is a
@@ -1306,13 +1210,12 @@ pub fn parse_title(properties: &HashMap<String, Value>) -> Result<String, Layout
 /// toplevel's half of the same problem, and without a default nobody could write a `windowrule`
 /// against their own window without naming an app id by hand.
 ///
-/// **Not** an [`is_structural_property`] carve-out, and the protocol is what decides that rather
-/// than a preference. `xdg-shell.xml`'s own `set_app_id` description: "Like other properties, a
-/// set_app_id request can be sent after the xdg_toplevel has been mapped to update the property."
-/// So it changes on a live object, which is the test `keyboard_interactivity` passes and
-/// `namespace` fails -- `get_layer_surface` fixes a namespace at creation, `set_app_id` fixes
-/// nothing. A `window`'s `id` is a carve-out, but it already is one on every kind: it is the
-/// reconcile identity, not a protocol field (docs/adr/0045 decision 1).
+/// **Not** an [`is_structural_property`] carve-out, and the protocol decides that: `xdg-shell.xml`'s
+/// own `set_app_id` description says a request "can be sent after the xdg_toplevel has been mapped
+/// to update the property" -- it changes on a live object, the test `keyboard_interactivity` passes
+/// and `namespace` fails (`get_layer_surface` fixes a namespace at creation; `set_app_id` fixes
+/// nothing). A `window`'s `id` is a carve-out on every kind regardless: it is the reconcile
+/// identity, not a protocol field (docs/adr/0045 decision 1).
 pub fn parse_app_id(properties: &HashMap<String, Value>, id: &str) -> Result<String, LayoutError> {
     let default = format!("oblisk-{id}");
     // Deferred on the evaluation-time pass for [`parse_title`]'s reason: `set_app_id` is a request
@@ -1395,14 +1298,12 @@ fn check_max_size_above_min(min: Option<SizeHint>, max: Option<SizeHint>) -> Res
 /// A `window` is a **top-level** node returned from `shell.lua`, a sibling of `panel`, not
 /// something nested inside a panel's child tree (docs/adr/0040 decision 1).
 ///
-/// **No `WindowTopology`, and that is a finding rather than an omission.** [`PanelSpec`] carries
-/// one because five of a panel's fields are fixed at `get_layer_surface` time. A toplevel's are
-/// not: `set_title`, `set_app_id`, `set_min_size` and `set_max_size` are all requests on a live
-/// toplevel (checked against `xdg-shell.xml`, not assumed), and `visible` creates and destroys the
+/// **No `WindowTopology`.** [`PanelSpec`] carries one because five of a panel's fields are fixed at
+/// `get_layer_surface` time. A toplevel's are not: `set_title`, `set_app_id`, `set_min_size` and
+/// `set_max_size` are all requests on a live toplevel, and `visible` creates and destroys the
 /// object rather than swapping the generation (docs/adr/0049 decisions 1-3). What is left is `id`,
 /// and an `id` changing is adding one declaration and removing another, which docs/adr/0001 and
-/// docs/adr/0049 decision 3 already route to a swap on the *declared set*. A one-field struct
-/// restating a field this type already holds would be ceremony, not a fingerprint.
+/// docs/adr/0049 decision 3 already route to a swap on the *declared set*.
 ///
 /// § 6.2 gives a `window` no `monitor`: the compositor places a toplevel, so unlike a `panel` one
 /// declaration is one Wayland object, never one per output (docs/adr/0038 decision 3).
@@ -1606,39 +1507,32 @@ pub fn parse_popup_offset(properties: &HashMap<String, Value>) -> Result<PopupOf
 }
 
 /// § 6.3's `anchor_rect`, in the parent surface's logical coordinates. [`LogicalRect`] rather than
-/// a type of its own, and the reuse is exact rather than convenient: `crate::wayland`'s
-/// `rect_table` builds `on_click`'s single argument out of a `LogicalRect` (docs/adr/0050 decision
-/// 3), and § 6.3 says this property is "normally passed straight from the rect `button`'s
-/// `on_click` hands back", so the very same rect round-trips through the config and lands back in
-/// the type it left as.
+/// a type of its own: `crate::wayland`'s `rect_table` builds `on_click`'s single argument out of a
+/// `LogicalRect` (docs/adr/0050 decision 3), and § 6.3 says this property is "normally passed
+/// straight from the rect `button`'s `on_click` hands back", so the same rect round-trips through
+/// the config and lands back in the type it left as.
 ///
 /// Required. `x`/`y` default to 0 when the table omits them -- an origin at the parent's own
 /// top-left corner is a legitimate rect -- but `width`/`height` do not, because a zero size is
 /// precisely the failure this parser exists to catch. Two different protocol errors sit behind
-/// that, and § 6.3's flat "must be non-zero" hides the distinction: `set_anchor_rect` itself
-/// raises `invalid_input` only on a *negative* size, while a *zero* size leaves the positioner what
-/// `xdg_positioner`'s own description calls incomplete ("must have a non-zero size set by set_size,
-/// and a non-zero anchor rectangle set by set_anchor_rect"), which raises `invalid_positioner`
-/// later, at `get_popup`. Either way one config typo would take the Wayland connection down for
-/// the whole shell, so both are a [`LayoutError`] here.
+/// that: `set_anchor_rect` itself raises `invalid_input` only on a *negative* size, while a *zero*
+/// size leaves the positioner incomplete ("must have a non-zero size set by set_size, and a
+/// non-zero anchor rectangle set by set_anchor_rect"), which raises `invalid_positioner` later, at
+/// `get_popup`. Either way one config typo would take the Wayland connection down for the whole
+/// shell, so both are a [`LayoutError`] here.
+///
 /// What [`parse_anchor_rect`] and [`parse_popup_extent`] answer for a property whose value is a
-/// live `Signal`, which only the evaluation-time pass ever sees ([`is_deferred_signal`]).
+/// live `Signal`, which only the evaluation-time pass ever sees ([`is_deferred_signal`]). One
+/// logical pixel rather than zero: `xdg_positioner`'s own description calls a zero size or a zero
+/// anchor rectangle incomplete, and a placeholder that would itself be a protocol error is not a
+/// placeholder.
 ///
-/// One logical pixel rather than zero, because every [`PopupSpec`] that exists has to satisfy the
-/// type's own invariant whichever pass built it: `xdg_positioner`'s own description calls a zero
-/// size or a zero anchor rectangle incomplete, and `get_popup` answers that with
-/// `invalid_positioner`. A placeholder that would itself be a protocol error is not a placeholder.
-///
-/// It never reaches a compositor. docs/adr/0049's second amendment puts the authoritative spec in
-/// `crate::wayland::App::apply_resolved_state`, which re-derives it from the resolved tree and does
-/// so *before* `apply_visibility` can create anything from it, so the positioner is always fed the
-/// resolved value.
-///
-/// The one place it is observable is `layout::instance::expand_instances`, which seeds a popup
-/// instance's `available` from the declared `width`/`height`. A popup that signal-binds a size
-/// measures its child against 1x1 until its first configure replaces `available` with the size the
-/// compositor granted -- and it is not on screen before then, since no `xdg_popup` exists until
-/// `visible` resolves true (docs/adr/0049 decision 1).
+/// It never reaches a compositor: docs/adr/0049's second amendment re-derives the authoritative
+/// spec from the resolved tree in `App::apply_resolved_state`, before `apply_visibility` can create
+/// anything from it. The one place it is observable is `expand_instances`, which seeds a popup
+/// instance's `available` from the declared `width`/`height` -- a popup that signal-binds a size
+/// measures its child against 1x1 until its first configure replaces `available`, and it is not on
+/// screen before then, since no `xdg_popup` exists until `visible` resolves true.
 const DEFERRED_POPUP_EXTENT: f32 = 1.0;
 
 pub fn parse_anchor_rect(properties: &HashMap<String, Value>) -> Result<LogicalRect, LayoutError> {
@@ -1734,20 +1628,16 @@ pub fn parse_grab(properties: &HashMap<String, Value>) -> Result<bool, LayoutErr
 /// under a parent at creation (`xdg_surface.get_popup`, or `zwlr_layer_surface_v1.get_popup` for a
 /// layer-shell parent), and that parent is a *surface*, not a node.
 ///
-/// **No `PopupTopology`, and for a stronger reason than [`WindowSpec`] has.** A popup's Wayland
-/// object exists only while it is shown (docs/adr/0049 decision 1) and its `xdg_positioner` is
-/// consumed by `get_popup`, so every field on this type is re-read from scratch on every open.
-/// There is nothing here a generation swap could change that the next open would not have picked
-/// up anyway -- `parent` included, which is why it is an ordinary field and not a carve-out. What
-/// remains topology is the declaration itself: adding or removing a `popup` node changes the
-/// declared set, which docs/adr/0001 and docs/adr/0049 decision 3 route to a swap, while opening
-/// and closing one is explicitly a value change.
+/// **No `PopupTopology`, for a stronger reason than [`WindowSpec`] has.** A popup's Wayland object
+/// exists only while it is shown (docs/adr/0049 decision 1) and its `xdg_positioner` is consumed by
+/// `get_popup`, so every field on this type is re-read from scratch on every open -- `parent`
+/// included, which is why it is an ordinary field and not a carve-out. What remains topology is the
+/// declaration itself: adding or removing a `popup` node changes the declared set (docs/adr/0001,
+/// docs/adr/0049 decision 3), while opening and closing one is explicitly a value change.
 ///
 /// `on_dismiss` and `visible` are not fields here, same as [`WindowSpec`] and [`PanelSpec`]: the
-/// callback rides along in `layout::scene::RetainedNode::properties` like `on_click`, and `visible`
-/// is § 5.1 base state read by [`parse_visible`] during the reconcile walk. § 6.3 does not list
-/// `visible` among a popup's properties even though docs/adr/0049 decision 2 turns on it; § 5.1
-/// settles that, since every node has it.
+/// callback rides along in `RetainedNode::properties` like `on_click`, and `visible` is § 5.1 base
+/// state read by [`parse_visible`] during the reconcile walk.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PopupSpec {
     pub id: String,
@@ -1794,17 +1684,14 @@ pub fn popup_spec(properties: &HashMap<String, Value>) -> Result<PopupSpec, Layo
 /// carries what the Wayland side has to be told, not what the layout engine reads.
 ///
 /// So this is one field, and it stays a struct rather than collapsing into a
-/// `SurfaceSpec::Lock(String)`. [`lock_spec`] is where § 6.4's four refusals live, and a bare
-/// `String` variant would leave them with no parser to hang off -- `crate::socket`'s
-/// `surface_specs` would have had to grow a role-specific check inline, which is exactly the shape
-/// the three parsers beside this one exist to avoid.
+/// `SurfaceSpec::Lock(String)`: [`lock_spec`] is where § 6.4's four refusals live, and a bare
+/// `String` variant would leave them with no parser to hang off.
 ///
-/// **No `LockTopology`, and for a stronger reason than [`PopupSpec`] has.** A panel carries one
-/// because `get_layer_surface` fixes five fields at creation. A lock surface has *no* protocol
-/// field at all that a config could set: `ext_session_lock_surface_v1` has exactly one request,
-/// `ack_configure`, and the size arrives in the configure rather than being asked for. There is
-/// nothing for a topology diff to compare beyond the declaration's existence, which is what
-/// [`SurfaceFingerprint::Lock`] holds.
+/// **No `LockTopology`, for a stronger reason than [`PopupSpec`] has.** A lock surface has *no*
+/// protocol field at all that a config could set: `ext_session_lock_surface_v1` has exactly one
+/// request, `ack_configure`, and the size arrives in the configure rather than being asked for.
+/// There is nothing for a topology diff to compare beyond the declaration's existence, which is
+/// what [`SurfaceFingerprint::Lock`] holds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LockSpec {
     pub id: String,
@@ -1813,33 +1700,29 @@ pub struct LockSpec {
 /// § 6.4's parser. Refuses the properties § 6.4 says a `lock` does not have, then reads the one it
 /// does.
 ///
-/// **Refusing rather than ignoring is this parser's one real decision.** A config that writes
-/// `visible = false` on a lock screen believes it decides when the lock screen is up, and it does
-/// not: the compositor creates lock surfaces after `locked` and destroys them at
-/// `unlock_and_destroy`, and between those two points the protocol requires one on every output.
-/// Obeying the property would destroy a surface the compositor is still showing, which
-/// docs/adr/0042 records as the thing that makes it "fall back to rendering a solid color".
-/// Ignoring it silently would leave the wrong model in place until the author meets it from the
-/// other side, locked out of a session by a screen that did not do what they wrote. An error at
-/// evaluation lands in `rescue`'s `error_log` (§ 2.10, docs/adr/0046), where a human is reading and
-/// the session is not locked, so it is the cheapest place the correction can happen.
+/// **Refusing rather than ignoring is this parser's one real decision.** `visible = false` on a
+/// lock screen implies the config decides when the lock is up, and it does not: the compositor
+/// creates lock surfaces after `locked` and destroys them at `unlock_and_destroy`, and obeying the
+/// property mid-session would destroy a surface the compositor is still showing -- docs/adr/0042
+/// records that as what makes the compositor "fall back to rendering a solid color". Ignoring it
+/// silently would leave the wrong mental model in place until the author meets it from the other
+/// side, locked out by a screen that did not do what they wrote. An error lands in `rescue`'s
+/// `error_log` (§ 2.10, docs/adr/0046) at evaluation time, where a human is reading and the session
+/// is not locked -- the cheapest place the correction can happen.
 ///
-/// `monitor`, `anchor`, `width` and `height` get the same treatment for a weaker but sufficient
-/// reason: each is inert rather than dangerous -- a lock surface's geometry is entirely the
-/// compositor's configure, and it expands per output because the protocol says so rather than
-/// because a `monitor` asked (docs/adr/0052 decision 2) -- and a property that quietly does nothing
-/// is worse unreported than reported.
+/// `monitor`, `anchor`, `width` and `height` get the same treatment for a weaker reason: each is
+/// inert rather than dangerous (a lock surface's geometry is entirely the compositor's configure,
+/// and it expands per output because the protocol says so, not because a `monitor` asked --
+/// docs/adr/0052 decision 2), and a property that quietly does nothing is worse unreported than
+/// reported.
 ///
-/// The refusals run *before* `id` is read, which is the opposite order to [`popup_spec`]'s and
-/// deliberate. `lock { visible = false }` with no `id` has two problems, and "missing `id`" is the
-/// one the author already knows how to fix; leading with it would hide the one that says their
+/// The refusals run *before* `id` is read, deliberately: `lock { visible = false }` with no `id`
+/// has two problems, and leading with "missing `id`" would hide the one that says the author's
 /// whole mental model of the role is wrong.
 ///
-/// Nothing here consults [`is_deferred_signal`], and there is nothing for it to consult about. A
-/// refusal tests for the *key*, so a `Signal` under it is refused exactly as a literal is; `id` is
-/// in [`is_structural_property`]'s universal arm and rejects a `Signal` outright. § 6.4 leaves a
-/// `lock` no movable property at all, so the two-pass split docs/adr/0049's second amendment set up
-/// for `window` and `popup` has no second pass to do here.
+/// Nothing here consults [`is_deferred_signal`]: a refusal tests for the *key*, so a `Signal` under
+/// it is refused exactly as a literal is, and § 6.4 leaves a `lock` no movable property for the
+/// two-pass split docs/adr/0049's second amendment set up for `window` and `popup` to apply to.
 pub fn lock_spec(properties: &HashMap<String, Value>) -> Result<LockSpec, LayoutError> {
     for property in ["visible", "monitor", "anchor", "width", "height"] {
         if properties.contains_key(property) {
@@ -1905,21 +1788,15 @@ impl SurfaceSpec {
 /// carry their `id` alone: everything else they hold is either a request on a live object
 /// (`set_title`, `set_app_id`, the two size hints -- see [`WindowSpec`]'s own "no `WindowTopology`"
 /// note) or rebuilt per open (the whole `xdg_positioner`, docs/adr/0049 decision 1), so none of it
-/// can strand a live object the way a changed `namespace` would.
-///
-/// A `lock` reaches the same one-field answer from the other end. It holds nothing else to begin
-/// with: § 6.4 gives it `id` and `child`, and [`LockSpec`] explains why there is no protocol field
-/// under it for a diff to be about. So the only question a topology diff can ask about a lock
-/// declaration is whether it is still there, and `Lock(String)` is exactly that question.
+/// can strand a live object the way a changed `namespace` would. A `lock` reaches the same
+/// one-field answer from the other end: § 6.4 gives it `id` and `child` alone, so the only
+/// question a topology diff can ask about it is whether it is still there.
 ///
 /// What the three `id` arms *do* catch is the case docs/adr/0049 decision 3 names: adding or
 /// removing a declaration is a topology change for every role, including the three whose Wayland
-/// object comes and goes inside one generation. The panel-only fingerprint this replaced could not
-/// see a `window` appear at all, so an edit that added one reported `Unchanged` and reloaded in
-/// place into a generation that had built no surface for it. Deleting a `lock` mid-session is the
-/// sharpest case of the three: it is a topology change, so it is a swap, so docs/adr/0042's rule
-/// queues it until unlock and a live lock screen cannot lose its tree underneath it (docs/adr/0052,
-/// Consequences).
+/// object comes and goes inside one generation. Deleting a `lock` mid-session is the sharpest case:
+/// it is a topology change, so it is a swap, so docs/adr/0042's rule queues it until unlock and a
+/// live lock screen cannot lose its tree underneath it (docs/adr/0052, Consequences).
 ///
 /// The role itself is part of the fingerprint by construction: rewriting `panel { id = "x" }` as
 /// `window { id = "x" }` changes the variant, which is a different Wayland object entirely and so a
@@ -1974,21 +1851,19 @@ pub fn parse_children(properties: &HashMap<String, Value>) -> Result<Vec<Virtual
 /// A `list` node's children (`oblisk-idl-api-specs.md` § 5.2 item 7, docs/adr/0045 decision 3,
 /// build-steps.md Phase 19 item 12). Parallels [`parse_children`]'s role for
 /// `rect`/`row`/`column`/`button`, but a `list`'s children are never a literal Lua table: they are
-/// generated here, once per element of `source`, by calling `itemfn(element)` and deserializing
-/// the node table it returns the same way a literal child table is deserialized.
+/// generated here, once per element of `source`, by calling `itemfn(element)` and deserializing the
+/// node table it returns.
 ///
-/// `source` arrives already resolved. `resolve_properties` treats it like any other
-/// non-structural property, so a `Signal` there was read exactly once before this function ever
-/// runs (build-steps.md Phase 19 item 1) -- nothing here re-reads it, which is what "resolve
-/// through the existing Signal machinery" means: there is no second mechanism to build.
+/// `source` arrives already resolved: `resolve_properties` treats it like any other non-structural
+/// property, so a `Signal` there was read exactly once before this function ever runs.
 ///
 /// Without `key`, a generated child gets no `id` at all, so
 /// `layout::scene::pair_children_by_id_then_position` matches list items by position -- the same
 /// rule an id-less literal child already gets, and exactly what decision 3 specifies. With `key`,
-/// `key(element)` -- called on the source element, never on the node `itemfn` built, so a key is
-/// computable without building anything -- becomes that child's `id`, overwriting whatever `id`
-/// `itemfn`'s own node table carried: a list item's identity belongs to the list, and honoring an
-/// inner `id` instead would let two items that happen to declare the same one collide.
+/// `key(element)` -- called on the source element, never on the node `itemfn` built -- becomes that
+/// child's `id`, overwriting whatever `id` `itemfn`'s own node table carried: a list item's
+/// identity belongs to the list, and honoring an inner `id` instead would let two items that happen
+/// to declare the same one collide.
 ///
 /// Duplicate keys are rejected here, before any `id` reaches `pair_children_by_id_then_position`,
 /// so that function's own "duplicate id" message stays about a literal sibling `id` and a list
@@ -2093,16 +1968,13 @@ pub struct SecureSubmitTarget {
 /// (§ 5.2 item 8's own note: without it, a masked value is just unreadable from Lua).
 ///
 /// `secure_submit` is not in [`is_structural_property`]'s carve-out, so a signal-bound value
-/// arrives here already resolved by [`resolve_properties`] and this function never has to reject a
-/// raw `Value::UserData` the way [`parse_node_id`] does -- nothing reconciles a node by its
-/// `secure_submit`, so there is no structural decision here for a live-changing signal to
-/// undermine.
+/// arrives here already resolved -- nothing reconciles a node by its `secure_submit`, so there is
+/// no structural decision here for a live-changing signal to undermine.
 ///
 /// `capability`/`action` are refused non-UTF-8 rather than converted lossily, the same call
-/// [`parse_node_id`] makes for the same reason (see its non-UTF-8 doc comment): this pair
-/// addresses a secret to a Supervisor capability, so a lossy conversion could collapse two
-/// distinct byte strings onto the same name and route a password to a capability nobody
-/// registered.
+/// [`parse_node_id`] makes for the same reason: this pair addresses a secret to a Supervisor
+/// capability, so a lossy conversion could collapse two distinct byte strings onto the same name
+/// and route a password to a capability nobody registered.
 pub fn parse_secure_submit(
     properties: &HashMap<String, Value>,
 ) -> Result<Option<SecureSubmitTarget>, LayoutError> {
@@ -2249,9 +2121,6 @@ mod tests {
 
     #[test]
     fn height_content_error_names_omission_as_the_spelling() {
-        // Catches the message regressing to listing every mode except the one whose spelling is
-        // "leave the property out" -- docs/build-steps.md Phase 19 item 15. `"Content"` is not a
-        // valid literal, so an author reaching for it here needs the error itself to say so.
         let lua = lua();
         let table: mlua::Table = lua
             .load(r#"return { kind = "rect", height = "Content" }"#)
@@ -2287,8 +2156,6 @@ mod tests {
 
     #[test]
     fn padding_reads_named_edges_defaulting_absent_ones_to_zero() {
-        // Same table form as `margin`'s equivalent test, on the sibling property that shares
-        // `parse_edge_insets` -- proves the shorthand added below is additive, not a replacement.
         let lua = lua();
         let table: mlua::Table = lua
             .load(r#"return { kind = "rect", padding = { top = 4, left = 2 } }"#)
@@ -2309,8 +2176,6 @@ mod tests {
 
     #[test]
     fn margin_scalar_broadcasts_to_all_four_edges() {
-        // The change itself: `margin = 10` used to be rejected as "expected a table". Catches the
-        // shorthand not reaching `margin` when it moved off `border_width`'s private wrapper.
         let lua = lua();
         let table: mlua::Table = lua
             .load(r#"return { kind = "rect", margin = 10 }"#)
@@ -2325,7 +2190,6 @@ mod tests {
 
     #[test]
     fn padding_scalar_broadcasts_to_all_four_edges() {
-        // Same change as `margin`'s scalar test, on the other property named in item 15.
         let lua = lua();
         let table: mlua::Table = lua
             .load(r#"return { kind = "rect", padding = 10 }"#)
@@ -2340,12 +2204,6 @@ mod tests {
 
     #[test]
     fn margin_negative_value_is_accepted() {
-        // The range-check decision, tested directly: `border_width` rejects a value outside
-        // [0, 8192] (see `a_negative_border_width_is_rejected`), but `margin` never gained that
-        // check when it gained the scalar shorthand -- `position_children` (layout/scene.rs) reads
-        // a negative margin as a deliberate pull toward a neighbor, the same as CSS. Catches the
-        // range check leaking from `parse_border_width` into the shared `parse_edge_insets` and
-        // breaking that pattern.
         let lua = lua();
         let table: mlua::Table = lua
             .load(r#"return { kind = "rect", margin = -10 }"#)
@@ -2360,9 +2218,6 @@ mod tests {
 
     #[test]
     fn padding_negative_value_is_accepted() {
-        // Same decision as `margin_negative_value_is_accepted`, on `padding`. `padding` has no
-        // established use for a negative value the way `margin` does, but the two share
-        // `parse_edge_insets` and the decision covers the property, not a specific config pattern.
         let lua = lua();
         let table: mlua::Table = lua
             .load(r#"return { kind = "rect", padding = -10 }"#)
@@ -2401,8 +2256,6 @@ mod tests {
 
     #[test]
     fn a_signal_userdata_in_a_geometry_slot_resolves_to_its_current_value() {
-        // Replaces the old "rejected" test (docs/adr/0044 decision 1): `visible` is not a
-        // topology field, so it now resolves a `Signal` instead of erroring on one.
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::Boolean(false), crate::lua::signal::DirtyFlag::new()).0;
@@ -2419,16 +2272,12 @@ mod tests {
 
     #[test]
     fn text_content_absent_defaults_to_the_empty_string() {
-        // docs/adr/0044's amendment banner: `content` used to be required, but a `text` bound to a
-        // not-yet-pushed capability signal resolves to absent (decision 1's nil rule) and must
-        // still apply at boot, so absence now takes an empty-string default instead of erroring.
         let props = HashMap::new();
         assert_eq!(parse_content(&props).unwrap(), "");
     }
 
     #[test]
     fn a_signal_resolving_to_a_string_satisfies_content() {
-        // ADR-0044 decision 1, step 1: a Signal wrapping "hello" parses as "hello".
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let hello = lua.create_string("hello").unwrap();
@@ -2467,8 +2316,6 @@ mod tests {
 
     #[test]
     fn a_signal_resolving_to_another_signal_is_an_error() {
-        // ADR-0044 decision 1's "resolve exactly once": a Signal whose value is itself a Signal
-        // userdata is an error, not a second read to a fixed point.
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let inner = crate::lua::signal::Signal::new_live(Value::Integer(5), crate::lua::signal::DirtyFlag::new()).0;
@@ -2502,11 +2349,6 @@ mod tests {
 
     #[test]
     fn a_signal_resolving_to_nil_takes_each_parsers_absent_property_default() {
-        // ADR-0044 decision 1's nil rule: a signal resolving to `nil` means the property is
-        // absent, so every parser's own default applies instead of it erroring on the `Nil`.
-        // Without it a config binding any bare capability signal fails its very first
-        // `Scene::apply`, because `run_startup_evaluation` runs before the poll loop has drained
-        // a single `StateSnapshot`.
         let lua = lua();
         assert!(
             !props_with_nil_signal(&lua, "rect", "width").contains_key("width"),
@@ -2523,17 +2365,8 @@ mod tests {
         assert_eq!(parse_font_size(&props_with_nil_signal(&lua, "text", "font_size")).unwrap(), 12.0);
         assert!(parse_single_child(&props_with_nil_signal(&lua, "panel", "child"), "child").unwrap().is_none());
         assert!(parse_children(&props_with_nil_signal(&lua, "row", "children")).unwrap().is_empty());
-        // `content` and `size` joined this list under docs/adr/0044's amendment banner: they used
-        // to be the two properties this rule could not cover, because each was required and had no
-        // default of its own -- see the deleted
-        // `a_signal_resolving_to_nil_reports_a_required_property_as_missing_not_as_a_bad_value` test.
-        // Without a default here, `text { content = oblisk.mpris.title }` (ADR-0044's headline
-        // example) still rejects the whole tree at boot, since every rostered signal reads `nil`
-        // until its first `StateSnapshot`.
         assert_eq!(parse_content(&props_with_nil_signal(&lua, "text", "content")).unwrap(), "");
         assert_eq!(parse_icon_size(&props_with_nil_signal(&lua, "icon", "size")).unwrap(), 12.0);
-        // Phase 29's three. `icon.name` matters most here: the tray binds it straight to
-        // `oblisk.tray`, which reads `nil` until the Supervisor's first push.
         assert_eq!(parse_icon_name(&props_with_nil_signal(&lua, "icon", "name")).unwrap(), "");
         assert_eq!(parse_image_source(&props_with_nil_signal(&lua, "image", "source")).unwrap(), "");
         assert_eq!(parse_fit(&props_with_nil_signal(&lua, "image", "fit")).unwrap(), Fit::Cover);
@@ -2541,9 +2374,6 @@ mod tests {
 
     #[test]
     fn fit_rejects_a_mode_that_does_not_exist_rather_than_covering_silently() {
-        // `fit = "fill"` is the plausible wrong guess (CSS spells it `object-fit: fill`, which is
-        // this engine's `stretch`). Defaulting it to `cover` would draw something that looks
-        // nearly right and never say why it is not what was asked for.
         let lua = lua();
         let table: mlua::Table = lua.load(r#"return { kind = "image", fit = "fill" }"#).eval().unwrap();
         let err = parse_fit(&props_from_table(&table)).unwrap_err();
@@ -2555,8 +2385,6 @@ mod tests {
 
     #[test]
     fn an_image_source_that_is_not_a_string_is_rejected() {
-        // The same shape `content = 5` already has: a path is a string, and a number here is a
-        // config bug rather than something to coerce.
         let lua = lua();
         let table: mlua::Table = lua.load(r#"return { kind = "image", source = 5 }"#).eval().unwrap();
         assert!(parse_image_source(&props_from_table(&table)).is_err());
@@ -2566,11 +2394,6 @@ mod tests {
 
     #[test]
     fn spacing_of_1e300_is_rejected_instead_of_overflowing_to_inf() {
-        // CONFIRMED finding: marshal::check_number(1e300) is Ok (1e300 is a finite f64), but the
-        // very next line's `as f32` saturates it to f32::INFINITY. `spacing` has no range check
-        // of its own (unlike `parse_size_mode`'s `[0, 8192]`), so without this fix the Inf sails
-        // through to `intrinsic_content_size`'s `spacing * visible.len().saturating_sub(1) as f32`
-        // -- `inf * 0.0` is `NaN`, silently producing NaN geometry instead of a LayoutError.
         let lua = lua();
         let table: mlua::Table = lua
             .load(r#"return { kind = "row", spacing = 1e300 }"#)
@@ -2585,9 +2408,6 @@ mod tests {
 
     #[test]
     fn font_size_of_1e300_is_rejected_instead_of_overflowing_to_inf() {
-        // Same defeated-guard bug as spacing, on a different unranged property: `font_size`
-        // reaching `shaping.shape` as Inf would compute `line_height = inf * 1.2` instead of
-        // erroring.
         let lua = lua();
         let table: mlua::Table = lua
             .load(r#"return { kind = "text", font_size = 1e300 }"#)
@@ -2620,8 +2440,6 @@ mod tests {
 
     #[test]
     fn icon_size_absent_defaults_to_twelve() {
-        // Same amendment as `content` (docs/adr/0044): `size` used to be required. Default value
-        // matches `parse_font_size`'s own default -- see `parse_icon_size`'s doc comment for why.
         let props = HashMap::new();
         assert_eq!(parse_icon_size(&props).unwrap(), 12.0);
     }
@@ -2690,10 +2508,6 @@ mod tests {
 
     #[test]
     fn an_unrecognized_layer_is_a_config_error_not_a_silent_default() {
-        // build-steps.md Phase 20 item 3: this used to return the raw string, so a typo reached
-        // the topology diff intact and nothing ever validated it. Now `create_panel` binds a real
-        // `zwlr_layer_surface_v1` with it, and a typo that quietly stacked a bar on the wrong
-        // layer would be a worse failure than a rejected config -- nothing on screen would say why.
         let lua = lua();
         let table: mlua::Table = lua.load(r#"return { kind = "panel", layer = "Toop" }"#).eval().unwrap();
         let props = props_from_table(&table);
@@ -2753,8 +2567,6 @@ mod tests {
 
     #[test]
     fn namespace_absent_defaults_to_oblisk_dash_id() {
-        // § 6.1: "Defaults to `oblisk-{id}`". Before docs/adr/0038 the namespace was hardcoded per
-        // Rust-owned role, so no compositor rule could name a user's own panel.
         let lua = lua();
         let table: mlua::Table = lua.load(r#"return { kind = "panel", id = "launcher", layer = "Overlay" }"#).eval().unwrap();
         let props = props_from_table(&table);
@@ -2764,16 +2576,12 @@ mod tests {
 
     #[test]
     fn a_signal_in_namespace_on_a_panel_is_rejected_like_every_other_topology_field() {
-        // `get_layer_surface` fixes the namespace at creation and no request changes it on a live
-        // surface, so it is a topology field by protocol (`CONTEXT.md`, Topology change) and a
-        // handle that could drift after the diff has nothing left to re-check it.
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::String(lua.create_string("x").unwrap()), crate::lua::signal::DirtyFlag::new()).0;
         lua.globals().set("ns", signal).unwrap();
         let table: mlua::Table = lua.load(r#"return { kind = "panel", id = "bar", layer = "Top", namespace = ns }"#).eval().unwrap();
         let props = props_from_table(&table);
-        // `resolve_properties` must have copied it through raw for the parser to see a handle.
         let resolved = resolve_properties(&props, "panel", &lua).unwrap();
         assert!(matches!(parse_namespace(&resolved, "bar").unwrap_err(), LayoutError::UnsupportedSignalProperty(p) if p == "namespace"));
     }
@@ -2808,9 +2616,6 @@ mod tests {
 
     #[test]
     fn a_signal_in_keyboard_interactivity_resolves_rather_than_being_rejected() {
-        // The other side of the namespace test: layer-shell's `set_keyboard_interactivity` is
-        // valid on a live surface, so this is an in-place field and a `Signal` in it is legal
-        // (docs/adr/0044 decision 1). A launcher flipping focus mode from Lua is the point.
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::String(lua.create_string("Exclusive").unwrap()), crate::lua::signal::DirtyFlag::new()).0;
@@ -2864,11 +2669,6 @@ mod tests {
 
     #[test]
     fn a_signal_in_a_panels_five_in_place_fields_is_deferred_on_the_evaluation_pass() {
-        // The `panel` twin of the `window` and `popup` deferrals. docs/adr/0038 decision 2 lists all
-        // five as requests layer-shell accepts on a live surface, so § 5.1's blanket "any property
-        // accepts a `Signal`" applies and only this pass is unable to read one. Before this,
-        // `panel { exclusive = hide_bar }` failed the whole evaluation and dropped the shell to
-        // docs/adr/0046's rescue.
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let table: mlua::Table = lua
@@ -2888,9 +2688,6 @@ mod tests {
 
     #[test]
     fn a_signal_in_a_panels_topology_fields_is_still_rejected_on_the_evaluation_pass() {
-        // The line `is_structural_property` draws, and the deferrals above must not move it:
-        // `get_layer_surface` fixes `layer`, `anchor`, `monitor` and `namespace` at creation, so a
-        // handle that could drift after the topology diff has nothing left to re-check it.
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         for property in ["layer", "anchor", "monitor", "namespace"] {
@@ -2907,12 +2704,6 @@ mod tests {
 
     #[test]
     fn a_panel_roots_margin_is_the_anchor_offset_and_no_layout_pass_consumes_it() {
-        // build-steps.md Phase 20 item 3 item 4: on a `panel` root, `margin` means the layer-shell
-        // anchor offset, not layout spacing -- and there is no conflict with layout's own reading
-        // of the property because `layout::scene::Scene::apply_one_surface` passes `None` for both
-        // parent-margin arguments when it resolves a root, so nothing in layout consumes it. This
-        // proves the second half directly: an 80-wide root with a large `margin` still resolves to
-        // exactly 80 wide at exactly (0, 0), while `panel_spec` reads the same value as the offset.
         let lua = mlua::Lua::new();
         crate::lua::nodes::register_node_constructors(&lua).unwrap();
         let table: mlua::Table = lua
@@ -2955,8 +2746,6 @@ mod tests {
 
     #[test]
     fn a_signal_userdata_in_node_id_is_rejected() {
-        // docs/adr/0045 decision 1: id is a reconcile identity, decided once at match time, so it
-        // rejects a Signal the same way SurfaceTopology's five fields already do.
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::Boolean(true), crate::lua::signal::DirtyFlag::new()).0;
@@ -2969,10 +2758,6 @@ mod tests {
 
     #[test]
     fn resolve_properties_copies_a_structural_field_through_raw_so_it_can_still_be_rejected() {
-        // How the carve-out survives resolve-once (build-steps.md Phase 19 item 5): the resolve
-        // step skips a structural key entirely rather than resolving it and rejecting afterwards,
-        // because a resolved signal is indistinguishable from a literal by then. The rejection
-        // itself stays exactly where it was, in the five parsers that read the raw value.
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::Boolean(true), crate::lua::signal::DirtyFlag::new()).0;
@@ -2989,10 +2774,6 @@ mod tests {
 
     #[test]
     fn a_non_utf8_node_id_is_rejected_rather_than_lossily_converted() {
-        // An id is an equality key (docs/adr/0045 decision 1), so a lossy conversion would map
-        // every distinct invalid byte onto U+FFFD and make two genuinely different ids compare
-        // equal: the duplicate check would reject a valid config, and a fresh child could claim
-        // the wrong retained counterpart.
         let lua = lua();
         let table = lua.create_table().unwrap();
         table.set("kind", "rect").unwrap();
@@ -3007,8 +2788,6 @@ mod tests {
 
     #[test]
     fn two_distinct_non_utf8_ids_do_not_collapse_onto_one_replacement_character() {
-        // The specific collision the lossy conversion produced: "\xFF" and "\xFE" both became
-        // U+FFFD. Both are now refused outright, so neither can stand in for the other.
         let lua = lua();
         for byte in [b"\xff".as_slice(), b"\xfe".as_slice()] {
             let table = lua.create_table().unwrap();
@@ -3033,12 +2812,6 @@ mod tests {
 
     #[test]
     fn a_signal_in_layer_on_a_non_panel_node_resolves_instead_of_surviving_as_a_handle() {
-        // The skip list is kind-aware because `layer`/`anchor`/`monitor` are only ever parsed by
-        // `surface_topology`, which `layout::scene`'s `Scene::apply_one_surface` calls on top-level
-        // surfaces alone. Skipped unconditionally, a `rect { layer = someSignal }` copied the raw
-        // handle into `RetainedNode::properties` with no parser left to reject it, falsifying the
-        // "never a Signal" invariant `layout::scene::ResolvedNode::properties` hands the paint
-        // stage. On a `rect` these are ordinary properties, so they resolve like any other.
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         for property in ["layer", "anchor", "monitor"] {
@@ -3060,8 +2833,6 @@ mod tests {
 
     #[test]
     fn a_signal_in_layer_on_a_panel_still_survives_raw_for_parse_layer_to_reject() {
-        // The other half of kind-awareness: on a `panel`, `parse_layer` does run and does the
-        // rejecting, so the skip is still what makes that rejection reachable.
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::Boolean(true), crate::lua::signal::DirtyFlag::new()).0;
@@ -3167,11 +2938,6 @@ mod tests {
 
     #[test]
     fn a_non_ascii_colour_string_gets_the_hex_digit_diagnosis_not_a_byte_count() {
-        // CONFIRMED finding: "#日本語" is 3 characters but 9 UTF-8 bytes, so a length check run
-        // before the hex-digit check reports "got 9" -- an accurate byte count and a misleading
-        // character count. Every byte of a multi-byte sequence fails `is_ascii_hexdigit`, so the
-        // hex-digit check catches it first once the checks are reordered, and no digit count is
-        // named at all.
         let lua = lua();
         let table: mlua::Table = lua
             .load(r##"return { kind = "rect", background = "#日本語" }"##)
@@ -3278,8 +3044,6 @@ mod tests {
 
     #[test]
     fn a_negative_radius_is_rejected() {
-        // Traced consequence (femtovg 0.26 `path.rs:458`): a negative radius silently draws square
-        // corners instead of erroring, since anything under 0.1 is treated as unrounded.
         let lua = lua();
         let table: mlua::Table = lua
             .load(r#"return { kind = "rect", radius = -4 }"#)
@@ -3359,8 +3123,6 @@ mod tests {
 
     #[test]
     fn a_negative_border_width_is_rejected() {
-        // Traced consequence (femtovg 0.26): a negative border_width clamps to 0.0 and multiplies
-        // paint alpha by zero, so the border renders fully transparent with nothing logged.
         let lua = lua();
         let table: mlua::Table = lua
             .load(r#"return { kind = "rect", border_width = -4 }"#)
@@ -3391,8 +3153,6 @@ mod tests {
 
     #[test]
     fn border_width_table_form_out_of_range_edge_is_rejected() {
-        // The table form delegates to `parse_edge_insets` and range-checks the result afterwards --
-        // this is what proves that check actually runs on every edge, not just the scalar form.
         let lua = lua();
         let table: mlua::Table = lua
             .load(r#"return { kind = "rect", border_width = { top = 8193 } }"#)
@@ -3408,10 +3168,6 @@ mod tests {
 
     #[test]
     fn a_signal_nested_in_a_margin_edge_table_is_rejected_naming_the_edge() {
-        // CONFIRMED finding: `resolve_properties` only unwraps a Signal at the top level of the
-        // property map, so one nested inside a table value (`margin = { top = someSignal }`)
-        // survives into `parse_edge_insets`'s `edge` closure, which used to misreport it as "must
-        // be a number, got AnyUserData(Ref(0x...))" instead of the actionable Signal error.
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal =
@@ -3485,9 +3241,6 @@ mod tests {
 
     #[test]
     fn a_malformed_hex_on_a_non_top_edge_names_that_edge() {
-        // Fix 4's specific case: before the fix, only the closure's catch-all `other` arm
-        // interpolated `{key}` -- the `Value::String` arm (the one `checked_string`'s 64KB cap and
-        // `parse_hex_color`'s own errors go through) named neither the edge nor the content.
         let lua = lua();
         let table: mlua::Table = lua
             .load(r#"return { kind = "rect", border_color = { right = "not-a-color" } }"#)
@@ -3575,13 +3328,6 @@ mod tests {
 
     #[test]
     fn two_failing_properties_always_report_the_same_one() {
-        // `properties` is a `HashMap`, and std's `RandomState` seeds every instance differently, so
-        // iterating it in hash order made the reported property a coin flip: eight runs of one
-        // broken config named `beta, alpha, alpha, alpha, alpha, beta, beta, alpha`. A message
-        // landing in `rescue`'s `error_log` for a human, or in a bug report, has to be a function of
-        // the config alone -- hence the sort in `resolve_properties`. A fresh map per iteration is
-        // the point: re-resolving the *same* map would order the same way every time and prove
-        // nothing.
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let table: mlua::Table = lua
@@ -3608,10 +3354,6 @@ mod tests {
 
     #[test]
     fn oversized_string_property_error_message_is_bounded() {
-        // Catches docs/build-steps.md Phase 19 item 13's actual defect: before the fix, this
-        // error's `detail` was exactly as long as the offending Lua string (20 MB), because
-        // `format!("{value:?}")` formatted the whole thing into the message. A config author
-        // scrolling `rescue`'s error_log should see a short line, not a 20 MB one.
         let lua = lua();
         let table: mlua::Table = lua
             .load(r#"return { kind = "rect", radius = string.rep("Q", 20 * 1024 * 1024) }"#)
@@ -3632,11 +3374,6 @@ mod tests {
 
     #[test]
     fn oversized_string_property_error_still_names_type_and_shows_a_recognizable_prefix() {
-        // The length bound above is satisfiable by a helper that just drops all the diagnostic
-        // content, which would be a worse fix than the bug: a config author staring at the log
-        // needs to be able to tell "my string was too long" apart from "my string was the wrong
-        // type entirely." This checks the truncated message still carries the original type tag,
-        // a recognizable prefix of the actual bytes, and the real (untruncated) length.
         let lua = lua();
         let table: mlua::Table = lua
             .load(r#"return { kind = "rect", radius = string.rep("Q", 20 * 1024 * 1024) }"#)
@@ -3658,10 +3395,6 @@ mod tests {
 
     #[test]
     fn short_string_property_error_message_is_unchanged() {
-        // The `Value::String` arm is the only one this fix touches (see `preview_for_error`'s doc
-        // comment for why). This pins that an ordinary short string, well under the 200-byte
-        // preview cap, still renders exactly as mlua's own `Debug` would have before the fix --
-        // the common case pays nothing for the oversized-input guard.
         let lua = lua();
         let table: mlua::Table = lua
             .load(r#"return { kind = "rect", radius = "banana" }"#)
@@ -3677,10 +3410,6 @@ mod tests {
 
     #[test]
     fn non_string_variant_error_message_is_unchanged() {
-        // The helper has to pass every other `Value` variant through unchanged -- this is the
-        // "shown to work across the match, not just the string case" coverage. `Boolean`'s Debug
-        // is bounded by construction, so the fix has no work to do here; pinning the exact string
-        // proves `preview_for_error` really does fall through rather than reformatting it.
         let lua = lua();
         let table: mlua::Table = lua
             .load(r#"return { kind = "rect", radius = true }"#)
@@ -3793,10 +3522,6 @@ mod tests {
 
     #[test]
     fn secure_submit_non_utf8_capability_is_rejected_rather_than_lossily_converted() {
-        // capability/action are the routing key on a RendererFrame::SecureSubmit envelope
-        // (docs/adr/0005, docs/adr/0027) -- same call parse_node_id makes for the same reason
-        // (see its non-UTF-8 tests above): a lossy conversion could address a secret to a
-        // capability nobody registered.
         let lua = lua();
         let table = lua.create_table().unwrap();
         table.set("kind", "textfield").unwrap();
@@ -3812,7 +3537,6 @@ mod tests {
         );
     }
 
-    // --- `window` (§ 6.2) ---
 
     #[test]
     fn window_spec_reads_every_toplevel_field_in_one_pass() {
@@ -3849,8 +3573,6 @@ mod tests {
 
     #[test]
     fn window_title_absent_defaults_to_the_empty_string_rather_than_the_id() {
-        // § 6.2 documents no default, and a toplevel that never sends `set_title` has none.
-        // Substituting the `id` would put an internal identifier in the user's task switcher.
         let lua = lua();
         let table: mlua::Table = lua.load(r#"return { kind = "window", id = "settings" }"#).eval().unwrap();
         assert_eq!(window_spec(&props_from_table(&table)).unwrap().title, "");
@@ -3858,8 +3580,6 @@ mod tests {
 
     #[test]
     fn window_app_id_absent_defaults_to_oblisk_dash_id() {
-        // Same problem `parse_namespace` solves for layer-shell: without a default no config could
-        // write a compositor rule against its own window without naming an app_id by hand.
         let lua = lua();
         let table: mlua::Table = lua.load(r#"return { kind = "window", id = "settings" }"#).eval().unwrap();
         assert_eq!(window_spec(&props_from_table(&table)).unwrap().app_id, "oblisk-settings");
@@ -3867,8 +3587,6 @@ mod tests {
 
     #[test]
     fn window_min_size_and_max_size_are_absent_when_undeclared() {
-        // `None` is not `Some(0, 0)` restated: absent means the engine never sends the request,
-        // which is what "no expected maximum size in the given dimension" means in xdg-shell.xml.
         let lua = lua();
         let table: mlua::Table = lua.load(r#"return { kind = "window", id = "settings" }"#).eval().unwrap();
         let spec = window_spec(&props_from_table(&table)).unwrap();
@@ -3878,9 +3596,6 @@ mod tests {
 
     #[test]
     fn a_negative_window_min_size_axis_is_a_layout_error_rather_than_invalid_size() {
-        // xdg-shell.xml, `set_min_size`/`set_max_size`: "Using strictly negative values for width
-        // or height will result in an invalid_size error." A config typo must not kill the
-        // connection.
         let lua = lua();
         let table: mlua::Table = lua
             .load(r#"return { kind = "window", id = "settings", min_size = { width = -1, height = 240 } }"#)
@@ -3894,8 +3609,6 @@ mod tests {
 
     #[test]
     fn a_max_size_below_min_size_is_a_layout_error_rather_than_invalid_size() {
-        // xdg-shell.xml, `set_max_size`: "Requesting a maximum size to be smaller than the minimum
-        // size of a surface is illegal and will result in an invalid_size error."
         let lua = lua();
         let table: mlua::Table = lua
             .load(
@@ -3912,8 +3625,6 @@ mod tests {
 
     #[test]
     fn a_zero_max_size_axis_means_unset_and_does_not_collide_with_min_size() {
-        // Same request's own wording: "a value of zero in the request, means that the client has no
-        // expected maximum size in the given dimension" -- so 0 is not a maximum below the minimum.
         let lua = lua();
         let table: mlua::Table = lua
             .load(
@@ -3956,8 +3667,6 @@ mod tests {
 
     #[test]
     fn a_signal_in_a_window_title_resolves_because_set_title_is_valid_on_a_live_toplevel() {
-        // § 6.2 spells the `string` / `Signal` union out for `title`, and the protocol agrees:
-        // `set_title` is a request on a mapped toplevel, so this is an in-place field.
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(
@@ -3973,9 +3682,6 @@ mod tests {
 
     #[test]
     fn a_signal_in_a_window_app_id_resolves_because_set_app_id_is_valid_on_a_live_toplevel() {
-        // xdg-shell.xml, `set_app_id`: "Like other properties, a set_app_id request can be sent
-        // after the xdg_toplevel has been mapped to update the property." That is the whole test
-        // for `is_structural_property` membership, and `app_id` fails it -- unlike `namespace`.
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(
@@ -3991,8 +3697,6 @@ mod tests {
 
     #[test]
     fn a_signal_in_a_window_id_is_still_rejected_because_id_is_every_kinds_reconcile_identity() {
-        // `is_structural_property`'s universal `id` arm already covers `window`, so this needs no
-        // new carve-out -- docs/adr/0045 decision 1 and `parse_surface_id`'s own reasoning.
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(
@@ -4009,7 +3713,6 @@ mod tests {
         ));
     }
 
-    // --- `popup` (§ 6.3) ---
 
     /// Every popup fixture needs the four required properties, so only the property under test
     /// varies. `extra` is spliced in as further table entries, and a key it repeats *overrides* the
@@ -4056,8 +3759,6 @@ mod tests {
 
     #[test]
     fn a_popup_without_a_parent_is_rejected() {
-        // § 6.3: a `popup` is a top-level node like `panel`, and names its parent surface by id
-        // rather than sitting inside that surface's child tree.
         let lua = lua();
         let table: mlua::Table = lua
             .load(r#"return { kind = "popup", id = "menu", anchor_rect = { width = 1, height = 1 }, width = 8, height = 8 }"#)
@@ -4094,9 +3795,6 @@ mod tests {
 
     #[test]
     fn a_zero_size_anchor_rect_is_a_layout_error_rather_than_invalid_positioner() {
-        // xdg_positioner's own description: a positioner "must have a non-zero size set by
-        // set_size, and a non-zero anchor rectangle set by set_anchor_rect", or `get_popup` raises
-        // invalid_positioner.
         let lua = lua();
         for axis in ["width", "height"] {
             let props = popup_props(&lua, &format!(r#", anchor_rect = {{ x = 0, y = 0, width = 24, height = 24, {axis} = 0 }}"#));
@@ -4109,8 +3807,6 @@ mod tests {
 
     #[test]
     fn a_negative_anchor_rect_size_is_a_layout_error_rather_than_invalid_input() {
-        // `set_anchor_rect`: "If a negative size is set the invalid_input error is raised." That
-        // one fails earlier than the zero case, at the request rather than at `get_popup`.
         let lua = lua();
         let props = popup_props(&lua, r#", anchor_rect = { x = 0, y = 0, width = -24, height = 24 }"#);
         assert!(matches!(
@@ -4121,8 +3817,6 @@ mod tests {
 
     #[test]
     fn an_anchor_rect_omitting_x_and_y_defaults_them_to_zero() {
-        // Only the *size* is what the protocol calls incomplete; an origin at the parent's own
-        // top-left corner is a legitimate rect.
         let lua = lua();
         let props = popup_props(&lua, r#", anchor_rect = { width = 24, height = 24 }"#);
         let rect = popup_spec(&props).unwrap().anchor_rect;
@@ -4160,7 +3854,6 @@ mod tests {
 
     #[test]
     fn a_zero_popup_width_or_height_is_a_layout_error_rather_than_invalid_input() {
-        // `set_size`: "If a zero or negative size is set the invalid_input error is raised."
         let lua = lua();
         for axis in ["width", "height"] {
             let props = popup_props(&lua, &format!(r#", {axis} = 0"#));
@@ -4173,8 +3866,6 @@ mod tests {
 
     #[test]
     fn a_fill_popup_width_is_rejected_because_a_popup_has_no_fill() {
-        // § 6.3 gives `width`/`height` as plain integers, and `set_size` takes a concrete int:
-        // there is no surface for a popup to fill, so `"Fill"` is a config error, not a mode.
         let lua = lua();
         let props = popup_props(&lua, r#", width = "Fill""#);
         assert!(matches!(
@@ -4206,7 +3897,6 @@ mod tests {
 
     #[test]
     fn popup_anchor_and_gravity_absent_default_to_center() {
-        // The protocol's own default for both is `none`, which is what `Center` maps onto.
         let lua = lua();
         let spec = popup_spec(&popup_props(&lua, "")).unwrap();
         assert_eq!(spec.anchor, PopupAnchor::Center);
@@ -4225,8 +3915,6 @@ mod tests {
 
     #[test]
     fn an_unknown_popup_gravity_is_rejected_naming_the_property() {
-        // `set_gravity`: "If the gravity is not in the 'gravity' enum, an invalid_input error is
-        // raised." One parser, two properties, and the error still says which one.
         let lua = lua();
         let props = popup_props(&lua, r#", gravity = "Downward""#);
         assert!(matches!(
@@ -4237,8 +3925,6 @@ mod tests {
 
     #[test]
     fn constraint_adjustment_absent_defaults_to_flip_y_and_slide_x() {
-        // § 6.3 and docs/adr/0040 decision 3: dropdown behaviour, deliberately not the protocol's
-        // own default of no adjustment at all.
         let lua = lua();
         assert_eq!(
             popup_spec(&popup_props(&lua, "")).unwrap().constraint_adjustment,
@@ -4261,8 +3947,6 @@ mod tests {
 
     #[test]
     fn constraint_adjustment_is_a_set_so_order_and_repetition_do_not_change_it() {
-        // The compositor fixes the precedence (flip, then slide, then resize) and the request takes
-        // a bitmask, so the array is a set of permissions and its order carries no meaning.
         let lua = lua();
         let ordered = popup_spec(&popup_props(&lua, r#", constraint_adjustment = { "FlipY", "SlideX" }"#)).unwrap();
         let reversed = popup_spec(&popup_props(&lua, r#", constraint_adjustment = { "SlideX", "FlipY", "SlideX" }"#)).unwrap();
@@ -4306,8 +3990,6 @@ mod tests {
 
     #[test]
     fn popup_offset_may_be_negative_on_either_axis() {
-        // `set_offset` adds the offset to the anchor point, so pulling a dropdown up or left needs
-        // a negative and nothing in the request refuses one.
         let lua = lua();
         let props = popup_props(&lua, r#", offset = { x = -8, y = -2 }"#);
         assert_eq!(popup_spec(&props).unwrap().offset, PopupOffset { x: -8.0, y: -2.0 });
@@ -4325,8 +4007,6 @@ mod tests {
 
     #[test]
     fn popup_grab_absent_defaults_to_true() {
-        // § 6.3's default. A dropdown that cannot be dismissed by clicking outside it is the whole
-        // reason docs/adr/0040 reached for a real xdg_popup instead of a second panel.
         let lua = lua();
         assert!(popup_spec(&popup_props(&lua, "")).unwrap().grab);
     }
@@ -4343,11 +4023,6 @@ mod tests {
 
     #[test]
     fn a_signal_in_a_popup_anchor_rect_resolves_because_the_positioner_is_rebuilt_on_every_open() {
-        // docs/adr/0049 decision 1: a popup's Wayland object exists only while shown, and
-        // `xdg_positioner` is consumed by `get_popup`, so every positioner field is re-read at
-        // creation. Nothing here is a topology field, so nothing here is an
-        // `is_structural_property` carve-out either. This is the shape § 6.3 names: `on_click`
-        // writes the clicked rect to a `state` signal and the popup reads it back.
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let table: mlua::Table = lua
@@ -4364,8 +4039,6 @@ mod tests {
         );
     }
 
-    // --- the evaluation-time pass, where a `Signal` has not been read yet
-    // (docs/adr/0049's second amendment) ---
 
     /// The same fixture as [`popup_props`] but with every property under test bound to a live
     /// signal instead of a literal, and *not* run through [`resolve_properties`] -- which is
@@ -4385,15 +4058,6 @@ mod tests {
 
     #[test]
     fn a_signal_bound_popup_property_is_deferred_rather_than_rejected_before_it_resolves() {
-        // The half of the amendment that had no implementation. `surface_specs` parses the
-        // *unresolved* properties, so it sees the raw `Signal` the config wrote, and every parser
-        // below answered that with a type error -- which failed the whole evaluation for the exact
-        // spelling docs/adr/0050 decision 3 tells a config to use (`anchor_rect = menu_anchor`).
-        //
-        // The placeholders are non-zero because a `PopupSpec` has to satisfy `xdg_positioner`'s own
-        // completeness rule whichever pass built it, and they never reach a compositor:
-        // `apply_resolved_state` re-derives the spec from the resolved tree before
-        // `apply_visibility` can create anything from it.
         let lua = lua();
         let spec = popup_spec(&unresolved_popup_props(
             &lua,
@@ -4412,10 +4076,6 @@ mod tests {
 
     #[test]
     fn a_literal_typo_beside_a_deferred_signal_still_fails_on_the_evaluation_pass() {
-        // Deferral is per property, not per node: the amendment's whole point is that each pass
-        // checks what it is in a position to know, and a literal is something this pass knows. A
-        // typo in one still lands in docs/adr/0046's `rescue` log rather than waiting for a click
-        // that never comes.
         let lua = lua();
         assert!(matches!(
             popup_spec(&unresolved_popup_props(&lua, r#", anchor = "Middle""#)).unwrap_err(),
@@ -4425,12 +4085,6 @@ mod tests {
 
     #[test]
     fn a_signal_in_a_popup_parent_is_still_rejected_on_the_evaluation_pass() {
-        // Deliberately not deferred. `parent` decides which surface `get_popup` roots this popup
-        // under, and docs/adr/0051 decision 1 pins that to one parent instance chosen at creation
-        // -- a structural decision of exactly the kind `reject_signal_in_structural_field`'s
-        // reasoning covers, even though `parent` is not in `is_structural_property` (it has no
-        // reason to survive `resolve_properties` raw, because only this pass ever needs to refuse
-        // it).
         let lua = lua();
         assert!(matches!(
             popup_spec(&unresolved_popup_props(&lua, r#", parent = state("p", "bar")"#)).unwrap_err(),
@@ -4440,9 +4094,6 @@ mod tests {
 
     #[test]
     fn a_signal_in_a_window_title_app_id_or_size_hint_is_deferred_on_the_evaluation_pass_too() {
-        // The `window` twin of the same defect, latent only because the dev config writes all four
-        // as literals. Every one of these is a request on a live toplevel, so the resolved pass
-        // sends whatever the signal currently says and this pass sends nothing at all.
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let table: mlua::Table = lua
@@ -4459,12 +4110,9 @@ mod tests {
         assert_eq!(spec.app_id, "oblisk-w", "the same default an absent `app_id` takes");
         assert_eq!((spec.min_size, spec.max_size), (None, None), "absent means the request is simply not sent");
     }
-    // --- `lock` (§ 6.4) ---
 
     #[test]
     fn lock_spec_reads_the_id_and_that_is_the_whole_of_section_6_4() {
-        // § 6.4's property list is two entries long, and one of them (`child`) is the scene's to
-        // walk. A test that looked thin would be reporting the role accurately.
         let lua = lua();
         let table: mlua::Table = lua
             .load(r#"return { kind = "lock", id = "screen-lock", child = { kind = "rect" } }"#)
@@ -4485,10 +4133,6 @@ mod tests {
 
     #[test]
     fn every_property_section_6_4_denies_a_lock_is_refused_by_name_rather_than_ignored() {
-        // The decision `lock_spec`'s doc comment argues. Silently dropping `visible = false` would
-        // leave an author believing they control when the lock screen is up, and honouring it would
-        // destroy a surface the compositor is still showing (docs/adr/0042). Each property is
-        // checked on its own so a later edit cannot quietly drop one from the list.
         let lua = lua();
         for property in ["visible", "monitor", "anchor", "width", "height"] {
             let table: mlua::Table = lua
@@ -4505,9 +4149,6 @@ mod tests {
 
     #[test]
     fn a_refused_lock_property_wins_over_a_missing_id_because_it_is_the_error_that_teaches() {
-        // Ordering is deliberate and the opposite of `popup_spec`'s. "Missing `id`" is a mistake an
-        // author already knows how to fix; "a `lock` has no `visible`" is the one that corrects
-        // their model of the role, so it must not be hidden behind the easier message.
         let lua = lua();
         let table: mlua::Table = lua.load(r#"return { kind = "lock", visible = false }"#).eval().unwrap();
         assert!(matches!(
@@ -4518,9 +4159,6 @@ mod tests {
 
     #[test]
     fn a_signal_bound_lock_property_is_refused_on_the_evaluation_pass_like_a_literal_one() {
-        // A `lock` has nothing to defer (docs/adr/0049's second amendment has no work to do for
-        // § 6.4), and the refusals must not become a way to smuggle one past: they test for the
-        // key, not the value, so `visible = state(...)` is the same error `visible = false` is.
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let table: mlua::Table = lua
@@ -4535,9 +4173,6 @@ mod tests {
 
     #[test]
     fn a_signal_in_a_lock_id_is_rejected_by_the_universal_structural_arm_with_no_new_carve_out() {
-        // The answer to "does `lock` need an `is_structural_property` carve-out": no. `id` is
-        // already covered universally (docs/adr/0045 decision 1), and § 6.4 leaves no second
-        // property for a carve-out to name.
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let table: mlua::Table = lua.load(r#"return { kind = "lock", id = state("i", "screen-lock") }"#).eval().unwrap();
@@ -4550,10 +4185,6 @@ mod tests {
 
     #[test]
     fn a_lock_fingerprints_on_its_id_alone_so_only_its_existence_is_a_topology_change() {
-        // There is no in-place-mutable protocol field on `ext_session_lock_surface_v1` for a diff
-        // to be about -- its one request is `ack_configure`. Renaming the declaration is adding one
-        // and removing another, which is the swap docs/adr/0052's Consequences relies on to keep a
-        // live lock screen's tree from being deleted underneath it.
         let spec = SurfaceSpec::Lock(LockSpec { id: "screen-lock".to_string() });
         assert_eq!(spec.declared_id(), "screen-lock");
         assert_eq!(spec.fingerprint(), SurfaceFingerprint::Lock("screen-lock".to_string()));

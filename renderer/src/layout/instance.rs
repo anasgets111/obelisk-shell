@@ -2,52 +2,48 @@
 //! Surface instance; docs/adr/0038 decision 3; build-steps.md Phase 20 item 2 and Phase 22).
 //!
 //! One declared surface is not one Wayland surface. A `panel` with `monitor = "All"` targets every
-//! connected output, and each of those gets its own `zwlr_layer_surface_v1` with its own
-//! configured size -- which is exactly why the retained scene keys by the instance id rather than
-//! the declared one (see `layout::scene::Scene`'s doc comment). Everything here is pure: it takes
-//! the parsed specs and a snapshot of the outputs and returns the instances, with no Wayland types
-//! anywhere, which is what makes it the testable seam in a file whose neighbours have no headless
-//! harness at all.
+//! connected output, each with its own `zwlr_layer_surface_v1` and configured size -- why the
+//! retained scene keys by instance id rather than declared id (see `Scene`'s doc comment). Pure: no
+//! Wayland types, which makes it the testable seam in a file whose neighbours have no headless
+//! harness.
 //!
-//! Per-output is not one rule but three answers, and Phase 22 and Phase 23 are where that stops
-//! being the same statement. § 6.2 gives a `window` no `monitor` because the compositor places a
-//! toplevel, so one declaration is one instance no matter how many monitors are connected. § 6.4
-//! gives a `lock` no `monitor` for the opposite reason: the protocol requires a surface on every
-//! output, so one declaration is always every monitor. Only a `panel` expands per output because a
-//! property asked it to.
+//! Per-output resolves to three different answers per role: § 6.2 gives a `window` no `monitor`
+//! (the compositor places a toplevel, so one declaration is one instance regardless of monitor
+//! count); § 6.4 gives a `lock` no `monitor` for the opposite reason (the protocol requires a
+//! surface on every output, so one declaration is always every monitor); only a `panel` expands per
+//! output, because a property asked it to.
 
 use crate::layout::node::SurfaceSpec;
 use crate::layout::scene::LogicalSize;
 
 /// One `(panel, output)` pair (`CONTEXT.md`, Surface instance).
 ///
-/// `instance_id` is the one id space that Lua, the retained scene, the Wayland surface, and the
-/// PBA handshake all share since docs/adr/0038 -- `supervisor/src/reload.rs` already carried this
-/// `"{id}@{output}"` convention through PBA for wallpaper, and this generalizes it to every
-/// surface rather than inventing a second scheme next to it.
+/// `instance_id` is the one id space Lua, the retained scene, the Wayland surface, and the PBA
+/// handshake all share (docs/adr/0038): the `"{id}@{output}"` convention `supervisor/src/reload.rs`
+/// already used for wallpaper, generalized to every surface.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SurfaceInstance {
-    /// `"bar@DP-1"` for a `panel`, and the bare declared id (`"settings"`) for a `window`, which
-    /// has no output to qualify it with. Keys `layout::scene::Scene`'s surface map and names this
-    /// surface in every `ReadySignal`/`PresentationEvidence` frame.
+    /// `"bar@DP-1"` for a `panel`; the bare declared id (`"settings"`) for a `window`, which has no
+    /// output to qualify it with. Keys `Scene`'s surface map and names this surface in every
+    /// `ReadySignal`/`PresentationEvidence` frame.
     pub instance_id: String,
-    /// `"bar"`. What `layout::node::parse_surface_id` reads off the declared node, and what pairs
-    /// this instance back to its `VirtualNode` when the scene resolves.
+    /// `"bar"`. What `node::parse_surface_id` reads off the declared node; pairs this instance back
+    /// to its `VirtualNode` when the scene resolves.
     pub declared_id: String,
-    /// The output this instance lives on, or empty for a `window`: § 6.2 gives a toplevel no
-    /// `monitor` because the compositor is what places it, so there is no output to name.
+    /// The output this instance lives on, or empty for a `window` (§ 6.2 gives a toplevel no
+    /// `monitor`; the compositor places it).
     pub output: String,
-    /// The size this instance resolves its tree against. Seeded from the output's own logical size
-    /// at startup and replaced per instance by `crate::socket::RendererClient::set_instance_size`
-    /// once the compositor configures that surface -- the two differ for any surface smaller than
-    /// its output, which is every bar.
+    /// The size this instance resolves its tree against. Seeded from the output's logical size at
+    /// startup, replaced per instance by `RendererClient::set_instance_size` once the compositor
+    /// configures that surface -- differs from the output for any surface smaller than it, which is
+    /// every bar.
     pub available: LogicalSize,
 }
 
 /// One connected output, as far as instance expansion cares: a name to match `monitor` against and
-/// a size to seed `available` with. Deliberately not `smithay_client_toolkit::output::OutputInfo`
-/// -- `layout` holds no Wayland types, and `crate::wayland::App::output_geometries` is the one
-/// place that knows how to derive these two fields from a real `wl_output`.
+/// a size to seed `available` with. Not `smithay_client_toolkit::output::OutputInfo` -- `layout`
+/// holds no Wayland types; `crate::wayland::App::output_geometries` derives these from a real
+/// `wl_output`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutputGeometry {
     pub name: String,
@@ -57,63 +53,34 @@ pub struct OutputGeometry {
 /// Every instance `specs` declares against the currently connected `outputs`, per role
 /// (docs/adr/0038 decision 3, docs/adr/0049 decision 1).
 ///
-/// A **`panel`** expands per output. `monitor = "All"` (§ 6.1's default) produces one instance per
-/// output, in `outputs` order. Any other value produces one instance for the output whose name
-/// matches it, and **none at all** when no output matches. Returning nothing for a miss is the
-/// correct answer rather than a silent fallback to some other monitor: a config naming an unplugged
-/// display asked for a surface on that display, and putting it somewhere else would be the engine
-/// inventing placement policy. Logging the miss is the caller's job, not this function's -- it is
-/// pure so that it stays testable, and a log line here would fire once per re-expansion rather than
-/// once per config.
+/// **`panel`**: expands per output. `monitor = "All"` (§ 6.1 default) produces one instance per
+/// output, in `outputs` order; any other value matches the one output with that name, or produces
+/// no instance at all when nothing matches -- a config naming an unplugged display gets no surface
+/// rather than one placed elsewhere. Logging the miss is the caller's job; this stays pure. The
+/// `"{id}@{output}"` id form is uniform even for a single-output match (`monitor = "DP-1"` still
+/// yields `"bar@DP-1"`, not `"bar"`), so every consumer reads one shape.
 ///
-/// The `"{id}@{output}"` form is uniform across panels, with no special case for a single-output
-/// target. A config naming `monitor = "DP-1"` still gets `"bar@DP-1"`, not `"bar"`, so every
-/// consumer -- the scene, the Wayland surface map, the PBA handshake -- reads one shape rather than
-/// branching on how many outputs a surface happened to match.
+/// **`window`**: always exactly one instance, whatever `outputs` holds, including none -- the
+/// compositor places a toplevel, so there is no output to qualify the id with (docs/adr/0049
+/// decision 2). Its instance exists from startup even though its `xdg_toplevel` does not; that
+/// instance is what lets the scene resolve the window's tree, and `visible` reads off that tree.
+/// `available` seeds from the first output's logical size as a bound for measuring § 5.1's
+/// `Content` sizing against, not a size the window will have -- `RendererClient::set_instance_size`
+/// replaces it at the first `xdg_toplevel` configure. Zero when nothing is connected.
 ///
-/// A **`window`** expands to exactly one instance, whatever `outputs` holds, including none: the
-/// compositor places a toplevel, so there is no output for the id to be qualified by and no output
-/// list for the count to depend on. Its instance exists from startup even though its `xdg_toplevel`
-/// does not, and that is the point -- the instance is what makes the scene resolve the window's
-/// tree at all, and `visible` is read off that resolved tree (docs/adr/0049 decision 2).
+/// **`popup`**: one instance on its bare declared id, for a `window`'s reason and one more
+/// (docs/adr/0051 decision 1): expanding per parent instance would mean one `visible` signal drove
+/// `menu@eDP-1` and `menu@DP-1` both, opening a dropdown on every monitor from one click. Its
+/// parent is chosen at creation from the click that armed it, not here. `available` seeds from the
+/// popup's own § 6.3 `width`/`height` (both required, no `"Fill"`), since that size is
+/// `xdg_positioner::set_size`'s argument and so the budget its child is measured against.
 ///
-/// `available` seeds a window from the first output's logical size, which is a **bound for
-/// measuring content against, not a size the window will have**. A `window` root takes § 5.1's
-/// `Content` sizing (§ 6.2 gives it no `width`/`height`), so `available` only caps text wrapping
-/// until the first `xdg_toplevel` configure, at which point
-/// `crate::socket::RendererClient::set_instance_size` replaces it with the size the compositor
-/// granted -- exactly a panel's lifecycle. Zero when nothing is connected, which is honest: with no
-/// output there is no screen to measure against and nothing is being painted.
-///
-/// A **`popup`** expands to exactly one instance, for the same reason a `window` does and one more
-/// of its own (docs/adr/0051 decision 1). A popup is opened by one click, on one monitor, and it
-/// belongs there; expanding it per parent instance would give `click_menu@eDP-1` and
-/// `click_menu@DP-1` driven by *one* `visible` signal, so a single click would open a dropdown on
-/// every monitor. Its instance id is therefore the bare declared `id`, like a `window`'s, and the
-/// parent it roots under is chosen at creation from the click that armed it, not here.
-///
-/// Its `available` is seeded from the popup's own § 6.3 `width`/`height`, not from an output's, and
-/// that is the one place this differs from the other two roles. § 6.3 requires both and gives a
-/// popup no `"Fill"`, because a popup has nothing to fill: its size is `xdg_positioner::set_size`'s
-/// argument, so the declared size *is* the budget its child is measured against. The first
-/// `xdg_popup` configure replaces it through
-/// `crate::socket::RendererClient::set_instance_size`, exactly as it does for the other two.
-///
-/// A **`lock`** expands per output like a `panel`, on the same `"{id}@{output}"` id, and with no
-/// filter of any kind (docs/adr/0052 decision 2, build-steps.md Phase 23). The absence of the
-/// filter is the whole difference between the two, and it is the protocol's doing rather than a
-/// default: `ext-session-lock-v1` says the client "is expected to create lock surfaces for all
-/// outputs currently present", and a second surface on one output is a `duplicate_output` error, so
-/// there is exactly one legal answer per output. § 6.4 therefore gives a `lock` no `monitor` at
-/// all, and offering a choice with one legal value would be worse than not offering it. The
-/// per-output `available` matters here for the same reason it does for a `panel` and for more: a
-/// lock surface is sized by its own output's configure, and a laptop panel beside a 4K external
-/// cannot share one resolved tree.
-///
-/// Zero outputs produce zero lock instances, and that is not a hole to plug. There is no screen to
-/// lock, nothing is being painted, and the surfaces appear when the outputs do -- ADR-0042's
-/// "any new outputs as they are advertised" is a re-expansion through this same function, not a
-/// separate path.
+/// **`lock`**: expands per output like a `panel`, with no filter (docs/adr/0052 decision 2,
+/// build-steps.md Phase 23): `ext-session-lock-v1` requires "lock surfaces for all outputs
+/// currently present" and rejects a second surface on one output with `duplicate_output`, so there
+/// is exactly one legal answer per output and no choice for § 6.4 to offer. Zero outputs produce
+/// zero lock instances; the surfaces appear when the outputs do, through a re-expansion of this
+/// same function (ADR-0042).
 pub fn expand_instances(specs: &[SurfaceSpec], outputs: &[OutputGeometry]) -> Vec<SurfaceInstance> {
     let mut instances = Vec::new();
     for spec in specs {
@@ -159,16 +126,15 @@ pub fn expand_instances(specs: &[SurfaceSpec], outputs: &[OutputGeometry]) -> Ve
 }
 
 /// Whether `instance_id` names an instance of the surface declared as `declared_id` -- the inverse
-/// of the `"{id}@{output}"` rule [`expand_instances`] applies, and the only place that rule is read
-/// back rather than written.
+/// of the `"{id}@{output}"` rule [`expand_instances`] applies.
 ///
-/// One caller: `crate::wayland::App`'s popup parent lookup (docs/adr/0051 decision 1), which is
-/// handed a declared `parent` by § 6.3 and a set of *instances* by this module, and has to pair
-/// them across both spellings -- `"bar@eDP-1"` for a panel and the bare `"settings"` for a window.
+/// One caller: `crate::wayland::App`'s popup parent lookup (docs/adr/0051 decision 1), which pairs
+/// a declared `parent` (§ 6.3) against a set of *instances*, across both spellings -- `"bar@eDP-1"`
+/// for a panel, bare `"settings"` for a window.
 ///
-/// A prefix test rather than a split on `'@'`, because a declared id may itself contain one: § 6.1
-/// puts no character restriction on `id`, so `"a@b"` on output `"DP-1"` has to match `"a@b"` and
-/// `"a@b@DP-1"`, which a split on the *first* `'@'` gets wrong.
+/// A prefix test rather than a split on `'@'`: § 6.1 puts no character restriction on `id`, so
+/// `"a@b"` on output `"DP-1"` must match both `"a@b"` and `"a@b@DP-1"`, which splitting on the
+/// first `'@'` gets wrong.
 ///
 /// ponytail: the id space is ambiguous at the edges and this cannot fix that, only avoid making it
 /// worse. `"a@b@DP-1"` is what `panel { id = "a@b" }` produces on output `"DP-1"` *and* what
@@ -186,11 +152,11 @@ pub fn is_instance_of(instance_id: &str, declared_id: &str) -> bool {
 /// "monitor hotplug adds and removes instances in place, with no generation swap"), computed by
 /// [`reconcile_instances`].
 ///
-/// Three fields rather than one merged list because the caller does three different things with
-/// them: `added` needs a `zwlr_layer_surface_v1` built for it, `removed` needs one destroyed, and
-/// `instances` is the whole new set for `crate::socket::RendererClient::set_instances` to resolve
-/// against. An instance in neither `added` nor `removed` is deliberately untouched -- its surface
-/// keeps its EGL binding, its configure history, and its place on screen.
+/// Three fields because the caller does three things with them: `added` needs a
+/// `zwlr_layer_surface_v1` built, `removed` needs one destroyed, `instances` is the whole new set
+/// for `RendererClient::set_instances` to resolve against. An instance in neither list is
+/// deliberately untouched -- its surface keeps its EGL binding, configure history, and place on
+/// screen.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstanceReconcile {
     /// Every instance that should exist after the change, in `fresh` order.
@@ -203,16 +169,12 @@ pub struct InstanceReconcile {
 /// Diffs the instance set a generation is currently resolving against the one
 /// [`expand_instances`] produces from the outputs now connected.
 ///
-/// A retained instance is carried over from `current` **unchanged**, and that is the one thing
-/// this does that a plain re-expansion cannot. `expand_instances` seeds `available` from the
-/// output's own logical size; `crate::socket::RendererClient::set_instance_size` has since
-/// replaced it with the size the compositor actually configured that surface to (a bar's 1920x32,
-/// not its output's 1920x1080). Handing the re-expanded size back would resolve every surviving
-/// surface against its whole output until the next `configure`, and a surface whose size did not
-/// change gets no further configure at all, so it would simply stay wrong.
-///
-/// Pure, and testable for exactly the reason the module doc gives: `crate::wayland` has no
-/// headless harness, and this is where the add/remove/retain decision actually lives.
+/// A retained instance is carried over from `current` **unchanged** -- the one thing a plain
+/// re-expansion cannot do. `expand_instances` seeds `available` from the output's logical size;
+/// `RendererClient::set_instance_size` has since replaced it with the size the compositor actually
+/// configured (a bar's 1920x32, not its output's 1920x1080). Handing back the re-expanded size
+/// would resolve a surviving surface against its whole output until the next `configure`, which
+/// never comes for a surface whose size did not change -- it would simply stay wrong.
 pub fn reconcile_instances(current: &[SurfaceInstance], fresh: &[SurfaceInstance]) -> InstanceReconcile {
     let mut instances = Vec::with_capacity(fresh.len());
     let mut added = Vec::new();
@@ -278,9 +240,6 @@ mod tests {
             instances.iter().map(|i| i.instance_id.as_str()).collect::<Vec<_>>(),
             ["bar@eDP-1", "bar@DP-1"]
         );
-        // The whole reason the scene keys by instance rather than by declared id: a laptop panel
-        // and a 4K external resolve against genuinely different sizes, so one tree cannot serve
-        // both.
         assert_eq!(instances[0].available, LogicalSize { width: 1920.0, height: 1080.0 });
         assert_eq!(instances[1].available, LogicalSize { width: 3840.0, height: 2160.0 });
         assert_eq!(instances[0].declared_id, "bar");
@@ -293,16 +252,12 @@ mod tests {
         let instances = expand_instances(&[spec("dock", "DP-1")], &outputs);
 
         assert_eq!(instances.len(), 1);
-        // Uniform, with no single-output special case -- `"dock"` alone would make every consumer
-        // branch on how many outputs a surface happened to match.
         assert_eq!(instances[0].instance_id, "dock@DP-1");
         assert_eq!(instances[0].available, LogicalSize { width: 3840.0, height: 2160.0 });
     }
 
     #[test]
     fn a_monitor_that_matches_no_connected_output_produces_no_instance_at_all() {
-        // A config naming an unplugged monitor gets no surface, rather than one placed somewhere
-        // it did not ask for. The caller logs the miss; this function stays pure.
         let outputs = [output("eDP-1", 1920.0, 1080.0)];
         assert!(expand_instances(&[spec("bar", "HDMI-A-9")], &outputs).is_empty());
     }
@@ -314,8 +269,6 @@ mod tests {
 
     #[test]
     fn a_window_is_one_instance_addressed_by_its_bare_id_however_many_monitors_are_connected() {
-        // § 6.2 gives a `window` no `monitor` because the compositor places a toplevel, so the
-        // per-output expansion above is a `panel` rule rather than a surface rule.
         let outputs = [output("eDP-1", 1920.0, 1080.0), output("DP-1", 3840.0, 2160.0)];
         let instances = expand_instances(&[window("settings")], &outputs);
 
@@ -323,8 +276,6 @@ mod tests {
         assert_eq!(instances[0].instance_id, "settings", "no `@output` suffix: there is no output in the declaration to name");
         assert_eq!(instances[0].declared_id, "settings");
         assert!(instances[0].output.is_empty());
-        // A bound for measuring the `Content`-sized root against, replaced by `set_instance_size`
-        // at the first configure.
         assert_eq!(instances[0].available, LogicalSize { width: 1920.0, height: 1080.0 });
     }
 
@@ -349,11 +300,6 @@ mod tests {
 
     #[test]
     fn a_lock_expands_to_one_instance_per_output_with_no_filter_to_pass_first() {
-        // The protocol leaves one legal answer -- "lock surfaces for all outputs currently
-        // present", with a `duplicate_output` error for a second on one output -- so § 6.4 gives a
-        // `lock` no `monitor` to filter on (docs/adr/0042, docs/adr/0052 decision 2). Same
-        // `"{id}@{output}"` shape a `panel` gets, because every consumer downstream reads one id
-        // form and a lock instance is no more special to them than a bar on a second monitor is.
         let outputs = [output("eDP-1", 1920.0, 1080.0), output("DP-1", 3840.0, 2160.0)];
         let instances = expand_instances(&[lock("screen-lock")], &outputs);
 
@@ -363,26 +309,17 @@ mod tests {
         );
         assert_eq!(instances[0].declared_id, "screen-lock");
         assert_eq!(instances[1].output, "DP-1");
-        // Per-output sizing, for the reason a panel needs it and one more: a lock surface is sized
-        // by its own output's configure, so one resolved tree cannot serve both screens.
         assert_eq!(instances[0].available, LogicalSize { width: 1920.0, height: 1080.0 });
         assert_eq!(instances[1].available, LogicalSize { width: 3840.0, height: 2160.0 });
     }
 
     #[test]
     fn a_lock_with_no_outputs_connected_expands_to_nothing_rather_than_to_one_unplaced_instance() {
-        // Unlike a `window`, which is one instance whatever `outputs` holds. A lock surface is
-        // always attached to an output, so with none connected there is nothing to attach to and
-        // nothing being painted; the surfaces arrive when the outputs do, through a re-expansion
-        // of this same function rather than a second path.
         assert!(expand_instances(&[lock("screen-lock")], &[]).is_empty());
     }
 
     #[test]
     fn a_popup_gets_one_instance_on_its_bare_id_however_many_monitors_are_connected() {
-        // docs/adr/0051 decision 1. The tempting alternative -- one instance per parent instance,
-        // `menu@eDP-1` and `menu@DP-1` -- is wrong for the reason that makes it tempting: one
-        // `visible` signal drives both, so a single click would open a dropdown on every monitor.
         let instances = expand_instances(&[popup("menu", "bar")], &[output("eDP-1", 1920.0, 1080.0), output("DP-1", 3840.0, 2160.0)]);
 
         assert_eq!(instances.len(), 1);
@@ -393,9 +330,6 @@ mod tests {
 
     #[test]
     fn a_popups_available_is_its_own_declared_size_not_an_outputs() {
-        // The one seeding difference between the three roles, and § 6.3 is why: a popup has no
-        // `"Fill"` and both axes are required, because the declared size *is*
-        // `xdg_positioner::set_size`'s argument and so the budget its child is measured against.
         let instances = expand_instances(&[popup("menu", "bar")], &[output("eDP-1", 1920.0, 1080.0)]);
 
         assert_eq!(instances[0].available, LogicalSize { width: 200.0, height: 120.0 });
@@ -403,8 +337,6 @@ mod tests {
 
     #[test]
     fn a_popup_still_expands_with_no_outputs_connected_at_all() {
-        // For a `window`'s reason plus one of its own: a popup's size does not come from an output
-        // in the first place, so there is nothing an empty output list could take away.
         let instances = expand_instances(&[popup("menu", "bar")], &[]);
 
         assert_eq!(instances.len(), 1);
@@ -422,21 +354,13 @@ mod tests {
 
     #[test]
     fn is_instance_of_survives_a_declared_id_that_itself_contains_an_at_sign() {
-        // § 6.1 puts no character restriction on `id`, so splitting on the first `'@'` would fail
-        // to pair `"a@b@DP-1"` with the surface declared `"a@b"` that actually produced it.
         assert!(is_instance_of("a@b@DP-1", "a@b"));
         assert!(is_instance_of("a@b", "a@b"));
-        // And the ambiguity the ponytail names, asserted rather than left to be discovered: this is
-        // also what `id = "a"` on an output named `"b@DP-1"` would produce, and no rule reading one
-        // string can tell the two apart.
         assert!(is_instance_of("a@b@DP-1", "a"));
     }
 
     #[test]
     fn a_window_still_expands_with_no_outputs_connected_at_all() {
-        // A panel with nothing connected has no surface to be; a window still does, because the
-        // compositor owns its placement. Its instance is what makes the scene resolve the tree
-        // `visible` is then read off (docs/adr/0049 decision 2).
         let instances = expand_instances(&[window("settings"), spec("bar", "All")], &[]);
 
         assert_eq!(instances.iter().map(|i| i.instance_id.as_str()).collect::<Vec<_>>(), ["settings"]);
@@ -477,11 +401,6 @@ mod tests {
 
     #[test]
     fn a_retained_instance_keeps_the_size_the_compositor_configured_not_the_outputs_logical_size() {
-        // The whole reason this is not just `expand_instances`'s output. `expand_instances` seeds
-        // `available` from the output's logical size, and `RendererClient::set_instance_size`
-        // replaced it with the 1920x32 the compositor granted this bar. Handing the re-expanded
-        // 1920x1080 back would resolve the bar at full screen height until its next `configure`,
-        // and a surface whose size did not change gets no further configure at all.
         let current = [configured("bar@eDP-1", "bar", "eDP-1", 1920.0, 32.0)];
         let fresh = expand_instances(&[spec("bar", "All")], &[output("eDP-1", 1920.0, 1080.0)]);
 
@@ -509,9 +428,6 @@ mod tests {
 
     #[test]
     fn every_output_going_away_removes_every_instance_and_leaves_none() {
-        // A laptop lid closing with nothing else attached. The generation survives with no
-        // surfaces rather than exiting -- docs/adr/0038 decision 3 handles hotplug in place, and
-        // the outputs coming back is another output change, not a new generation.
         let current = [
             configured("bar@eDP-1", "bar", "eDP-1", 1920.0, 32.0),
             configured("dock@eDP-1", "dock", "eDP-1", 64.0, 1080.0),

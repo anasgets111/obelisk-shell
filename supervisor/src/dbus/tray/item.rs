@@ -10,10 +10,6 @@ use super::menu::MenuItem;
 use super::proxies::StatusNotifierItemProxy;
 use super::registration::sanitize_unique_name;
 
-// -------------------------------------------------------------------------------------------
-// TrayItem hydration.
-// -------------------------------------------------------------------------------------------
-
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct TrayItem {
     pub id: String,
@@ -43,10 +39,9 @@ fn flatten_tooltip(title: &str, text: &str) -> Option<String> {
 }
 
 /// Reads every property `tray.items` needs except `menu` (fetched separately -- see
-/// [`fetch_menu_via`] -- since the caller reuses an already-bound [`DBusMenuProxy`] rather than
-/// re-resolving `Menu`'s object path on every refresh). A property read failure degrades to that
-/// property's empty/default value rather than failing the whole item, matching this codebase's
-/// established `unwrap_or_default`/`unwrap_or(false)` discipline (`dbus::bluetooth`).
+/// [`fetch_menu_via`] -- since the caller reuses an already-bound [`DBusMenuProxy`] rather
+/// than re-resolving `Menu`'s object path on every refresh). A property read failure
+/// degrades to that property's empty/default value rather than failing the whole item.
 pub(super) async fn fetch_tray_item_base(item: &StatusNotifierItemProxy<'static>, unique_name: &OwnedUniqueName) -> TrayItem {
     let id_prop = item.id().await.unwrap_or_default();
     let title = item.title().await.unwrap_or_default();

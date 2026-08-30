@@ -11,10 +11,6 @@ use super::metadata::clamp_seek_target;
 use super::player::PlayerState;
 use super::watcher::{service_name_for_id, spawn_discovery};
 
-// -------------------------------------------------------------------------------------------
-// State shape pushed as `oblisk.mpris`'s StateSnapshot (docs/oblisk-idl-api-specs.md §2.8).
-// -------------------------------------------------------------------------------------------
-
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct MprisState {
     pub players: Vec<PlayerState>,
@@ -79,9 +75,8 @@ pub struct MprisController {
 
 impl MprisController {
     /// Spawns discovery (`ListNames` scan, then live `NameOwnerChanged` tracking) on
-    /// `connection` -- the session bus (MPRIS is a session-bus protocol, unlike
-    /// NetworkManager/BlueZ/polkit's system bus). Returns immediately; the registry starts
-    /// empty and fills in as `spawn_discovery`'s own tasks run.
+    /// `connection` -- the session bus (MPRIS, unlike NetworkManager/BlueZ/polkit's system
+    /// bus). Returns immediately; the registry fills in as discovery's tasks run.
     pub fn new(connection: zbus::Connection, events: UnboundedSender<MprisSignal>) -> Self {
         let registry: super::player::PlayerRegistry = Arc::new(Mutex::new(HashMap::new()));
         tokio::spawn(spawn_discovery(connection, registry.clone(), events));
@@ -96,8 +91,7 @@ impl MprisController {
 
     /// Full, live re-derivation of `mpris.players` from the entire tracked registry.
     /// Synchronous: every registry entry's `last_known` is already up to date (the forwarder
-    /// tasks recompute it before ever sending an [`MprisSignal`]), so no further D-Bus round
-    /// trip is needed here.
+    /// tasks recompute it before ever sending an [`MprisSignal`]).
     pub fn build_state(&self) -> MprisState {
         MprisState { players: self.registry.lock().unwrap().values().map(|entry| entry.last_known.clone()).collect() }
     }
@@ -122,22 +116,19 @@ impl MprisController {
         }
     }
 
-    /// `mpris:seek(id, pos_us)`: `SetPosition(cached trackid, clamped pos_us)` when a trackid
-    /// is cached, otherwise a relative `Seek` computed from the last known position -- some
-    /// real players never report `mpris:trackid` at all (ADR-0036). State
-    /// (`position`/`position_updated_at`) updates only once the real `Seeked`/
-    /// `PropertiesChanged` signal arrives, never optimistically here.
+    /// `mpris:seek(id, pos_us)`: `SetPosition(cached trackid, clamped pos_us)` when a
+    /// trackid is cached, otherwise a relative `Seek` from the last known position -- some
+    /// real players never report `mpris:trackid` (ADR-0036). State updates only once the
+    /// real `Seeked`/`PropertiesChanged` signal arrives, never optimistically here.
     pub async fn seek(&self, id: &str, pos_us: i64) {
         self.seek_to(id, pos_us).await;
     }
 
-    /// `mpris:seek_relative(id, off)`: same clamp-and-dispatch path as [`Self::seek`], computed
-    /// from a live `Position` read, not the registry's cached one. `Position` is excluded from
-    /// `PropertiesChanged` by the real MPRIS spec, so the cached value only advances when some
-    /// other property triggers a resync -- a player playing steadily with nothing else changing
-    /// can have an arbitrarily stale cached position. A live read costs one extra round trip
-    /// but is the only way to make "-10s" mean 10 seconds before now, not before whenever the
-    /// registry last resynced for an unrelated reason.
+    /// `mpris:seek_relative(id, off)`: same clamp-and-dispatch path as [`Self::seek`],
+    /// computed from a live `Position` read, not the registry's cached one -- `Position` is
+    /// excluded from `PropertiesChanged`, so the cached value can be arbitrarily stale. A
+    /// live read costs one extra round trip but is the only way to make "-10s" mean 10
+    /// seconds before now, not before whenever the registry last resynced.
     pub async fn seek_relative(&self, id: &str, off: i64) {
         let Some(position) = self.live_position(id).await else {
             eprintln!("mpris: seek_relative({id:?}, {off}) failed: {}", MprisActionError::UnknownPlayer);

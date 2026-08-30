@@ -6,10 +6,6 @@ use crate::dbus::shm_icons::{self, PngEncodeError};
 
 use super::MAX_PIXMAP_DIMENSION;
 
-// -------------------------------------------------------------------------------------------
-// Icon pipeline (ADR-0031: prefer IconName, decode IconPixmap only as fallback; pure functions).
-// -------------------------------------------------------------------------------------------
-
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct IconPixmap {
     pub(super) width: i32,
@@ -42,8 +38,8 @@ pub(super) enum IconSource {
 }
 
 /// Which icon source to use, and whether a pixmap decode is even necessary (ADR-0031's
-/// IconName-preference decision) -- kept separate from the pixmap *value* itself so this stays a
-/// cheap, pure decision function; the caller re-derives the actual largest pixmap via
+/// IconName-preference decision) -- kept separate from the pixmap *value* so this stays a
+/// cheap, pure decision; the caller re-derives the actual largest pixmap via
 /// [`largest_valid_pixmap`] only when this returns [`IconSource::Pixmap`].
 pub(super) fn resolve_icon_source(icon_name: &str, pixmaps: &[IconPixmap]) -> IconSource {
     if !icon_name.is_empty() {

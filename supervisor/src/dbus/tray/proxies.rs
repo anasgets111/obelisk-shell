@@ -10,10 +10,6 @@ use zbus::zvariant::{Array, Dict, OwnedObjectPath, OwnedValue, Signature, Str, S
 
 use super::{RawIconPixmap, RawToolTip};
 
-// -------------------------------------------------------------------------------------------
-// Hand-written proxies (ADR-0031: no maintained zbus proxy crate for SNI/DBusMenu).
-// -------------------------------------------------------------------------------------------
-
 #[zbus::proxy(interface = "org.kde.StatusNotifierItem")]
 pub(super) trait StatusNotifierItem {
     #[zbus(name = "Activate")]
@@ -62,18 +58,15 @@ pub(super) trait StatusNotifierItem {
     fn new_status(&self, status: String);
 }
 
-/// `GetLayout`'s `(ia{sv}av)` reply structure, decoded field-by-field via a real `#[derive(Type,
-/// Deserialize)]` struct (mirrors `zbus_polkit::policykit1::TemporaryAuthorization`'s own use of
-/// this exact pattern for a mixed-field D-Bus structure) rather than declaring the return type as
-/// a bare `zvariant::OwnedValue`. This matters for correctness, not just style: `Body::deserialize`
-/// checks the *declared Rust type's own static signature* against the real message's signature
-/// (`zvariant::DynamicDeserialize`'s blanket impl, `zvariant-5.15.0/src/type/dynamic.rs`) --
-/// `OwnedValue`'s own signature is always `"v"` (a bare variant), which does not equal the real
-/// wire signature `"(ia{sv}av)"`, so a proxy method declared to return `(u32, OwnedValue)` would
-/// fail every real `GetLayout` call with a signature-mismatch error. `properties`/`children` stay
-/// `OwnedValue`-typed (matching `a{sv}`/`av`'s own per-element `"v"` typing exactly) -- their
-/// *contents* are already fully decoded in memory once this struct itself deserializes
-/// successfully, which is what [`parse_menu_node`] walks.
+/// `GetLayout`'s `(ia{sv}av)` reply structure, decoded field-by-field via a real
+/// `#[derive(Type, Deserialize)]` struct rather than a bare `zvariant::OwnedValue`. This
+/// matters for correctness, not just style: `Body::deserialize` checks the declared Rust
+/// type's own static signature against the real message's signature, and `OwnedValue`'s
+/// signature is always `"v"` (a bare variant), which does not equal the real wire signature
+/// `"(ia{sv}av)"` -- a proxy method declared to return `(u32, OwnedValue)` would fail every
+/// real `GetLayout` call with a signature-mismatch error. `properties`/`children` stay
+/// `OwnedValue`-typed; their contents are already fully decoded once this struct
+/// deserializes successfully, which is what [`parse_menu_node`] walks.
 #[derive(Debug, Deserialize, Type)]
 pub(super) struct RawMenuLayout {
     id: i32,
@@ -82,10 +75,8 @@ pub(super) struct RawMenuLayout {
 }
 
 /// Reconstructs the `zvariant::Value::Structure` shape [`parse_menu_node`] expects from an
-/// already-decoded [`RawMenuLayout`] -- lets the top-level `GetLayout` reply and every recursive
-/// child (themselves already-decoded `Value::Structure`s once unwrapped, see
-/// [`parse_menu_node`]'s own children handling) share the exact same parsing logic instead of
-/// duplicating it for "the first level" vs. "every level after that".
+/// already-decoded [`RawMenuLayout`] -- lets the top-level `GetLayout` reply and every
+/// recursive child share the exact same parsing logic instead of duplicating it.
 pub(super) fn raw_menu_layout_to_value(raw: RawMenuLayout) -> Value<'static> {
     let mut properties = Dict::new(&Signature::Str, &Signature::Variant);
     for (key, value) in raw.properties {
@@ -155,15 +146,13 @@ mod tests {
     use super::*;
     use super::super::menu::parse_menu_node;
 
-    // ---- RawMenuLayout / raw_menu_layout_to_value (the real GetLayout wire-shape seam) ----
+    // ---- RawMenuLayout / raw_menu_layout_to_value ----
 
     #[test]
     fn raw_menu_layout_signature_matches_the_real_dbusmenu_wire_shape() {
-        // GetLayout's real reply signature (the DBusMenu spec's own "(ia{sv}av)") -- this is the
-        // exact check `zvariant::DynamicDeserialize`'s blanket impl performs against the live
-        // message at call time; a mismatch here means every real GetLayout call would fail with
-        // a signature-mismatch error despite this module's own tests passing (see
-        // RawMenuLayout's own doc comment).
+        // GetLayout's real reply signature (the DBusMenu spec's own "(ia{sv}av)") -- a mismatch
+        // here means every real GetLayout call would fail with a signature-mismatch error
+        // despite this module's own tests passing.
         assert_eq!(RawMenuLayout::SIGNATURE.to_string(), "(ia{sv}av)");
     }
 
