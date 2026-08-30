@@ -70,6 +70,29 @@ not need. Missing a `locked` that is on the wire but undispatched tells someone 
 died while they are looking at a lock screen they cannot get past. The message over-reports on
 purpose.
 
+A review of this change found the way that goes wrong, and it is worth the paragraph because the
+mistake is invisible from the exit path itself. A `SetSessionLock { locked: true }` serviced earlier
+in the *same* drain leaves an `ext_session_lock_manager_v1.lock` request in the connection's write
+buffer: SCTK's `SessionLockState::lock` only enqueues, the acquire path deliberately skips the round
+trip the unlock path pays for, and the turn's only flush sits below the drain. Exiting from inside
+the drain skipped it, so the request died in the buffer while `session_lock` was already `Some` and
+the message above announced a locked session the compositor had never been asked for.
+
+That is not a new way past a lock screen. Anything that can kill the Supervisor between the command
+and the flush can kill it a moment earlier and stop the lock outright. What it is is the one thing
+this path must never do, which is tell someone the session is secure when it is not. Reproduced
+deterministically with a stand-in Supervisor that sends the lock command and exits in the same
+breath, so the Renderer meets the frame and the disconnect in a single drain:
+
+| Renderer | what it printed | lock requests the compositor saw |
+| --- | --- | --- |
+| without the flush | the session stays locked, go to a VT | 0 |
+| with the flush | the same sentence | 1 |
+
+Flushing before the exit sends only requests this process had already decided to make, and it still
+does not send `ext_session_lock_v1.destroy`, which lives in the `Drop` that `std::process::exit`
+skips.
+
 The exit also does not race a frame that was already in flight. `std::sync::mpsc` reports
 `Disconnected` only once the queue is empty, verified rather than read off the documentation, so a
 Supervisor that sends `SetSessionLock { locked: false }` and dies in the same breath still gets its

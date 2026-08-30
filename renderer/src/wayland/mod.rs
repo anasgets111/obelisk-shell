@@ -663,12 +663,32 @@ pub fn run(
                 // `is_some()`, not SCTK's `is_locked()`, and the two disagree for the few
                 // milliseconds between the `lock` request and the `locked` event being dispatched.
                 // Both readings are wrong somewhere in that window, so the choice is which way to
-                // be wrong: `is_some()` can claim a lock the compositor never granted, which sends
-                // someone to a VT they did not need. `is_locked()` can miss a `locked` that is on
-                // the wire but undispatched (the same race the `SetSessionLock` arm above pays a
+                // be wrong: `is_some()` can claim a lock the compositor has not granted yet, which
+                // sends someone to a VT they did not need. `is_locked()` can miss a `locked` that is
+                // on the wire but undispatched (the same race the `SetSessionLock` arm above pays a
                 // round trip to close), which tells someone their shell merely died while they are
                 // looking at a lock screen they cannot get past. Over-reporting is the safe half.
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Flush first, and this is the load-bearing line rather than tidiness. A
+                    // `SetSessionLock { locked: true }` serviced earlier in *this same drain* left
+                    // an `ext_session_lock_manager_v1.lock` request sitting in the connection's
+                    // write buffer: SCTK's `SessionLockState::lock` only enqueues, the acquire path
+                    // deliberately skips the round trip the unlock path pays for, and the turn's
+                    // only `event_queue.flush()` is below the drain. Exiting from here would skip
+                    // it, so the request would die in the buffer while `session_lock` is already
+                    // `Some` and the message above claims a locked session that the compositor was
+                    // never asked for. That is not a new way past a lock screen -- anything that can
+                    // kill the Supervisor mid-command can kill it a moment earlier and stop the lock
+                    // outright -- but it is a message telling someone the session is secure when it
+                    // is not, which is the one thing this path must never do.
+                    //
+                    // Flushing sends only requests this process already decided to make. It does not
+                    // send `ext_session_lock_v1.destroy`: that lives in SCTK's `Drop`, which
+                    // `std::process::exit` still skips, which is what keeps the exit clean of
+                    // `invalid_destroy`.
+                    if let Err(err) = event_queue.flush() {
+                        eprintln!("[oblisk-renderer] the last flush before exiting failed ({err}); a session lock requested in this same turn may never have reached the compositor");
+                    }
                     eprintln!("[oblisk-renderer] {}", supervisor_gone_report(app.session_lock.is_some()));
                     std::process::exit(EXIT_SUPERVISOR_GONE);
                 }
