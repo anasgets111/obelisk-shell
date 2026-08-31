@@ -9,6 +9,31 @@
 use super::*;
 use crate::layout::secure_submit::{secure_submit_targets, sole_secure_submit};
 
+/// What one notch of a mouse wheel scrolls, in logical pixels, when the compositor sends a step
+/// count instead of a distance (docs/adr/0069 decision 6).
+///
+/// A flat 39, not three lines of anything: nothing here reads a font size, and a per-container step
+/// would need one the container does not carry. It is sized as roughly three lines of the 13px text
+/// the shipped config uses, which is the convention toolkits land on, and it is the only number in
+/// this file that is a choice rather than a measurement. A touchpad never reaches it, reporting real
+/// pixels that are used as sent.
+const WHEEL_STEP_PIXELS: f32 = 39.0;
+
+/// How far one wheel event scrolls, in logical pixels (docs/adr/0069 decision 6).
+///
+/// `pixels` is what a touchpad sends and is used as sent. `steps` is `value120`, where 120 is one
+/// logical notch, and is all a mouse wheel sends; it is only consulted when there is no distance,
+/// because a compositor that sends both sends the same motion twice.
+///
+/// Its own function so the arithmetic is testable: everything around it needs a live `wl_pointer`
+/// and a compositor to deliver a real notch.
+fn wheel_delta(pixels: f64, steps: i32) -> f32 {
+    if pixels != 0.0 {
+        return pixels as f32;
+    }
+    steps as f32 / 120.0 * WHEEL_STEP_PIXELS
+}
+
 /// One press waiting for its release (docs/adr/0050 decision 2): a click is a press and a
 /// release on the same node, so a user who presses a button, notices the mistake, and drags off
 /// it releases harmlessly.
@@ -576,6 +601,61 @@ impl App {
     /// `layout::hit` and `layout::hover` are both written against `ResolvedNode` and changing that
     /// is a wider edit than this slice. Do it when a profile names this, or when the second
     /// per-motion consumer arrives.
+    /// One notch or one swipe, applied to the innermost scrollable container under the pointer.
+    ///
+    /// **Pixels when the compositor sends them, a step when it does not** (docs/adr/0069 decision
+    /// 6). A touchpad reports `absolute` in logical pixels and a notched wheel reports only
+    /// `value120`, where 120 is one logical step. `discrete` is ignored: it is deprecated, and every
+    /// compositor that still sends it sends `value120` alongside.
+    ///
+    /// **Innermost wins and nothing chains.** A wheel over a list inside a scrollable panel moves
+    /// the list, and moves nothing when the list hits its end. Chaining to the parent is what a
+    /// browser does and is a rule with edge cases (when does the handoff happen, does it reset on a
+    /// new gesture) that no config here has asked for.
+    ///
+    /// The offset written is unclamped. `layout::scene`'s positioning pass owns the bound, because
+    /// it is the only place that knows the content extent, and it writes back what it used.
+    fn scroll_at(
+        &mut self,
+        index: usize,
+        position: (f64, f64),
+        horizontal_px: f64,
+        horizontal_steps: i32,
+        vertical_px: f64,
+        vertical_steps: i32,
+    ) {
+        if !crate::lua::signal::any_scroll_registered(self.client.lua()) {
+            return;
+        }
+        let surface_id = &self.surfaces[index].surface_id;
+        let Some(tree) = self.client.scene().surface(surface_id) else {
+            return;
+        };
+        let point = layout::hit::LogicalPoint { x: position.0 as f32, y: position.1 as f32 };
+        let path = layout::hit::hit_path(&tree, point);
+        // Innermost first, so the deepest scrollable container under the pointer takes it.
+        let Some((signal, axis)) = path.iter().rev().find_map(|node| {
+            let signal = layout::scene::scroll_signal_of(node)?;
+            let axis = layout::scene::scrolling_axis(&node.kind, &node.properties).ok()??;
+            Some((signal, axis))
+        }) else {
+            return;
+        };
+        let (pixels, steps) = match axis {
+            layout::scene::MainAxis::Horizontal => (horizontal_px, horizontal_steps),
+            layout::scene::MainAxis::Vertical => (vertical_px, vertical_steps),
+        };
+        let delta = wheel_delta(pixels, steps);
+        if delta == 0.0 {
+            return;
+        }
+        let Some(handle) = signal.scroll_handle() else {
+            return;
+        };
+        let current = signal.scroll_offset().unwrap_or(0.0);
+        handle.set_changed(mlua::Value::Number(f64::from(current + delta)));
+    }
+
     fn sync_hover(&mut self, index: usize, position: Option<(f64, f64)>) {
         // Before the tree is touched, because the tree is the expensive part: a config that never
         // called `hover(name)` has nothing to write and skips all of it.
@@ -793,9 +873,11 @@ impl PointerHandler for App {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
                     self.sync_hover(index, Some(event.position));
                 }
-                // `Axis`: nothing in § 5.2 reads scroll yet (build-steps.md section 6 ranks it
-                // next, and the open question there is what a scrollable container is).
-                _ => {}
+                // The wheel (docs/adr/0069). `Enter`/`Motion`/`Leave` above have already kept
+                // `sync_hover` fed, so the position this needs is the event's own.
+                PointerEventKind::Axis { horizontal, vertical, .. } => {
+                    self.scroll_at(index, event.position, horizontal.absolute, horizontal.value120, vertical.absolute, vertical.value120);
+                }
             }
         }
     }
@@ -904,6 +986,42 @@ impl KeyboardHandler for App {
 mod tests {
     use super::*;
     use crate::layout::secure_submit::tree_can_authenticate;
+
+    /// docs/adr/0069 decision 6. The rest of `scroll_at` needs a compositor to deliver a notch;
+    /// this is the half that does not.
+    #[test]
+    fn a_touchpads_pixels_are_used_as_sent_and_a_wheels_steps_are_converted() {
+        assert_eq!(wheel_delta(17.5, 0), 17.5, "a touchpad reports a distance and it is taken");
+        assert_eq!(wheel_delta(-17.5, 0), -17.5, "including upward");
+        assert_eq!(wheel_delta(0.0, 120), WHEEL_STEP_PIXELS, "one notch is one step");
+        assert_eq!(wheel_delta(0.0, -240), -2.0 * WHEEL_STEP_PIXELS, "two notches up");
+        assert_eq!(wheel_delta(0.0, 60), WHEEL_STEP_PIXELS / 2.0, "high-resolution wheels send fractions of a notch");
+    }
+
+    /// A compositor that sends both is sending the same motion twice, so the distance wins and the
+    /// step count is not added on top of it.
+    #[test]
+    fn a_step_count_is_ignored_when_a_distance_came_with_it() {
+        assert_eq!(wheel_delta(17.5, 120), 17.5);
+    }
+
+    #[test]
+    fn a_wheel_event_carrying_no_motion_scrolls_nothing() {
+        assert_eq!(wheel_delta(0.0, 0), 0.0);
+    }
+
+    /// The `value120` that would have been silently dropped by narrowing it to an `i16` first.
+    ///
+    /// Reachable rather than absurd: `AxisScroll::merge` sums `value120` across every axis event
+    /// queued before the next `Frame` (`ret.value120 += other.value120`, smithay-client-toolkit
+    /// 0.21.1), so one frame of dispatch lag behind a fast wheel accumulates past `i16::MAX`. The
+    /// old narrowing turned that into a delta of zero, which returns early without writing the
+    /// signal at all -- a hard flick scrolling nothing, at exactly the moment the client was
+    /// already behind.
+    #[test]
+    fn an_implausibly_large_step_count_still_scrolls_rather_than_becoming_zero() {
+        assert!(wheel_delta(0.0, 120 * 400) > 0.0);
+    }
 
     #[test]
     fn secure_submit_frame_carries_the_accumulated_secret_and_zeroizes_the_buffer_it_read() {

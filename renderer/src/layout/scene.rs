@@ -664,7 +664,7 @@ fn pair_children_by_id_then_position(
 /// and the four surface roles), whose children each get the whole content box on both axes and so
 /// have no remainder to share -- measured, and correct as it stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MainAxis {
+pub(crate) enum MainAxis {
     Horizontal,
     Vertical,
 }
@@ -1186,6 +1186,62 @@ fn cross_axis_offset(align: Align, container: f32, child: f32) -> f32 {
     }
 }
 
+/// The `Signal` behind a node's `scroll` property, or `None` if it declares none.
+///
+/// Unresolved in the slot because `layout::node::is_structural_property` says so, the same way
+/// `hover` arrives (docs/adr/0062 decision 3, docs/adr/0069 decision 4). Anything else there -- a
+/// number, a `state()` signal, a capability -- is silently inert rather than an error, matching
+/// `layout::hover::hover_signal`: `Signal::scroll_handle` refuses every kind this must not write,
+/// so a config naming the wrong thing gets no scrolling instead of a wheel writing somewhere it
+/// should not.
+pub(crate) fn scroll_signal_of(node: &ResolvedNode) -> Option<crate::lua::signal::Signal> {
+    scroll_signal(&node.properties)
+}
+
+/// Which axis this container scrolls along, or `None` when it does not flow at all.
+///
+/// `pub(crate)` for `wayland::input`'s wheel handler, which has to know whether a node under the
+/// pointer takes a horizontal or a vertical wheel before it writes anything. Reads a `list`'s
+/// `direction` through [`main_axis_of`], so a horizontal `list` takes a horizontal wheel.
+pub(crate) fn scrolling_axis(kind: &str, properties: &HashMap<String, Value>) -> Result<Option<MainAxis>, LayoutError> {
+    main_axis_of(kind, properties)
+}
+
+fn scroll_signal(properties: &HashMap<String, Value>) -> Option<crate::lua::signal::Signal> {
+    let Some(Value::UserData(ud)) = properties.get("scroll") else {
+        return None;
+    };
+    crate::lua::signal::from_userdata(ud)
+}
+
+/// How far this container is scrolled along its main axis, clamped to what there is to scroll, and
+/// written back so the signal holds the offset actually used (docs/adr/0069 decision 4).
+///
+/// `content_main` is the viewport and `total_main` the content, both already computed by the caller
+/// for its own alignment arithmetic, which is why this needed no new parameter threaded through the
+/// layout recursion.
+///
+/// A container with nothing to scroll returns 0 rather than erroring, so a `Content`-sized column
+/// (whose content and viewport are the same number by construction) is a no-op. That is the answer
+/// `Fill` gives in a `Content` parent and for the same reason: there is no remainder (decision 5).
+fn scroll_offset(properties: &HashMap<String, Value>, content_main: f32, total_main: f32) -> f32 {
+    let Some(signal) = scroll_signal(properties) else {
+        return 0.0;
+    };
+    let Some(asked) = signal.scroll_offset() else {
+        return 0.0;
+    };
+    let limit = (total_main - content_main).max(0.0);
+    let used = asked.clamp(0.0, limit);
+    if used != asked && let Some(handle) = signal.scroll_handle() {
+        // Quiet: this number is derived from the geometry of the pass that is running, so marking
+        // the scene dirty would schedule another pass to observe what this one already used.
+        handle.set_quiet(Value::Number(f64::from(used)));
+    }
+    used
+}
+
+
 /// § 3.3's top-down position/stretch pass, per kind. `own_width_known`/`own_height_known` are the
 /// same values `resolve_and_reconcile` already resolved for this node: `Some` means a `Stretch`
 /// child in that axis was already forced to its final size before it resolved (see
@@ -1232,11 +1288,16 @@ fn position_children(
             let total_main = visible_indices.iter().map(|&i| footprints[i]).sum::<f32>()
                 + spacing * visible_indices.len().saturating_sub(1) as f32;
             let spare = (content_width - total_main).max(0.0);
+            // Subtracted from the cursor, so a scrolled child sits left of the content box and the
+            // clip `layout::paint` already computes per node cuts it. Alignment still runs, and is
+            // a no-op whenever there is anything to scroll: `spare` is zero exactly when the
+            // content overflows, which is the only time the offset is non-zero.
+            let offset = scroll_offset(properties, content_width, total_main);
             let mut cursor = match main_align {
                 Align::Start | Align::Stretch => 0.0,
                 Align::Center => spare / 2.0,
                 Align::End => spare,
-            };
+            } - offset;
             for &i in &visible_indices {
                 let cross_align = node::parse_align(&children[i].properties, "align_v")?;
                 let slot_h = (content_height - margins[i].top - margins[i].bottom).max(0.0);
@@ -1267,11 +1328,12 @@ fn position_children(
             let total_main = visible_indices.iter().map(|&i| footprints[i]).sum::<f32>()
                 + spacing * visible_indices.len().saturating_sub(1) as f32;
             let spare = (content_height - total_main).max(0.0);
+            let offset = scroll_offset(properties, content_height, total_main);
             let mut cursor = match main_align {
                 Align::Start | Align::Stretch => 0.0,
                 Align::Center => spare / 2.0,
                 Align::End => spare,
-            };
+            } - offset;
             for &i in &visible_indices {
                 let cross_align = node::parse_align(&children[i].properties, "align_h")?;
                 let slot_w = (content_width - margins[i].left - margins[i].right).max(0.0);
@@ -1906,6 +1968,150 @@ mod tests {
         apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
         let row = &scene.surface("bar@TEST").unwrap().children[0];
         assert_eq!(row.children[0].rect.width, 0.0);
+    }
+
+    /// docs/adr/0069. Scrolling moves children within a viewport the clip already cuts them to.
+    fn scrolled(lua_src: &str, offset: f32) -> (mlua::Lua, Vec<f32>, f32) {
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua.load(lua_src).eval().unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+        let signal: mlua::AnyUserData = lua.load(r#"return scroll("s")"#).eval().unwrap();
+        let signal = crate::lua::signal::from_userdata(&signal).unwrap();
+        signal.scroll_handle().unwrap().set_changed(mlua::Value::Number(f64::from(offset)));
+
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap();
+        let container = &scene.surface("bar@TEST").unwrap().children[0];
+        let ys = container.children.iter().map(|c| c.rect.y).collect();
+        (lua, ys, signal.scroll_offset().unwrap())
+    }
+
+    const SCROLLED_COLUMN: &str = r#"panel { id = "bar", child = column { width = 100, height = 100, scroll = scroll("s"), children = {
+        rect { width = 10, height = 100 }, rect { width = 10, height = 100 }, rect { width = 10, height = 100 },
+    } } }"#;
+
+    #[test]
+    fn a_scroll_offset_moves_children_up_within_the_viewport() {
+        let (_lua, ys, used) = scrolled(SCROLLED_COLUMN, 120.0);
+        assert_eq!(ys, vec![-120.0, -20.0, 80.0], "every child shifts by the offset, first one out of the box");
+        assert_eq!(used, 120.0, "an in-range offset is used as asked");
+    }
+
+    #[test]
+    fn an_unscrolled_container_places_children_exactly_as_before() {
+        let (_lua, ys, _) = scrolled(SCROLLED_COLUMN, 0.0);
+        assert_eq!(ys, vec![0.0, 100.0, 200.0]);
+    }
+
+    /// The bound is content minus viewport: 300 of children in a 100 box leaves 200 to scroll.
+    #[test]
+    fn an_offset_past_the_end_is_clamped_and_written_back() {
+        let (_lua, ys, used) = scrolled(SCROLLED_COLUMN, 5_000.0);
+        assert_eq!(used, 200.0, "the signal holds what was used, not what the wheel asked for");
+        assert_eq!(ys, vec![-200.0, -100.0, 0.0], "so the last child sits at the top and nothing scrolls past it");
+    }
+
+    #[test]
+    fn a_negative_offset_is_clamped_to_the_top() {
+        let (_lua, ys, used) = scrolled(SCROLLED_COLUMN, -50.0);
+        assert_eq!(used, 0.0);
+        assert_eq!(ys[0], 0.0);
+    }
+
+    /// Decision 5: a container whose content and viewport are the same number by construction.
+    #[test]
+    fn a_content_sized_container_has_nothing_to_scroll() {
+        let (_lua, ys, used) = scrolled(
+            r#"panel { id = "bar", child = column { width = 100, scroll = scroll("s"), children = {
+                rect { width = 10, height = 100 }, rect { width = 10, height = 100 },
+            } } }"#,
+            80.0,
+        );
+        assert_eq!(used, 0.0, "no remainder, so the offset is clamped away rather than erroring");
+        assert_eq!(ys, vec![0.0, 100.0]);
+    }
+
+    /// Spacing counts toward the content extent, because `position_children` advances the cursor by
+    /// it. A bound computed without it would let the list scroll one gap short of its end.
+    #[test]
+    fn spacing_counts_toward_what_there_is_to_scroll() {
+        let (_lua, _ys, used) = scrolled(
+            r#"panel { id = "bar", child = column { width = 100, height = 100, spacing = 10, scroll = scroll("s"), children = {
+                rect { width = 10, height = 100 }, rect { width = 10, height = 100 },
+            } } }"#,
+            9_999.0,
+        );
+        assert_eq!(used, 110.0, "200 of children plus one 10px gap, less the 100 viewport");
+    }
+
+    #[test]
+    fn a_row_scrolls_horizontally() {
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua
+            .load(
+                r#"return panel { id = "bar", child = row { width = 100, height = 50, scroll = scroll("s"), children = {
+                    rect { width = 100, height = 10 }, rect { width = 100, height = 10 },
+                } } }"#,
+            )
+            .eval()
+            .unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+        let signal: mlua::AnyUserData = lua.load(r#"return scroll("s")"#).eval().unwrap();
+        let signal = crate::lua::signal::from_userdata(&signal).unwrap();
+        signal.scroll_handle().unwrap().set_changed(mlua::Value::Number(60.0));
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap();
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!(row.children[0].rect.x, -60.0, "a row takes the offset on x, not y");
+        assert_eq!(row.children[0].rect.y, 0.0);
+    }
+
+    /// A wheel must not be able to write a capability snapshot. `scroll_handle` refuses every kind
+    /// but its own, so binding the wrong signal scrolls nothing instead.
+    /// Alignment and scrolling can never both be in play, and this pins why rather than trusting it.
+    ///
+    /// `spare` is `(content - total).max(0)` and the scroll limit is `(total - content).max(0)`, so
+    /// one is zero whenever the other is not. Content that underfills its box aligns and cannot
+    /// scroll; content that overflows scrolls and has no spare to align with. A `Center` column with
+    /// a scroll offset set is therefore still centred, not centred-then-shifted.
+    #[test]
+    fn alignment_and_scrolling_are_mutually_exclusive_by_construction() {
+        let (_lua, ys, used) = scrolled(
+            r#"panel { id = "bar", child = column { width = 100, height = 300, align_v = "Center", scroll = scroll("s"), children = {
+                rect { width = 10, height = 50 }, rect { width = 10, height = 50 },
+            } } }"#,
+            999.0,
+        );
+        assert_eq!(used, 0.0, "100 of content in a 300 box leaves nothing to scroll");
+        assert_eq!(ys, vec![100.0, 150.0], "so the pair stays centred rather than being dragged off the top");
+    }
+
+    #[test]
+    fn a_scroll_property_naming_something_that_is_not_a_scroll_signal_is_inert() {
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua
+            .load(
+                r#"return panel { id = "bar", child = column { width = 100, height = 100, scroll = state("s", 120), children = {
+                    rect { width = 10, height = 100 }, rect { width = 10, height = 100 },
+                } } }"#,
+            )
+            .eval()
+            .unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap();
+        let column = &scene.surface("bar@TEST").unwrap().children[0];
+        let ys: Vec<f32> = column.children.iter().map(|c| c.rect.y).collect();
+        assert_eq!(ys, vec![0.0, 100.0], "a `state()` signal holding 120 scrolls nothing");
     }
 
     /// Found live against `dev-config`: a content-sized `column` with 8px of padding reported the

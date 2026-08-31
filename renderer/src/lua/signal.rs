@@ -135,6 +135,15 @@ enum SignalKind {
     /// from the one handle a node's `hover` property gave it. `None` on the rect signal itself,
     /// which is a hover signal in every other respect and is not a trigger for anything.
     Hover { cell: Rc<RefCell<Value>>, paired_rect: Option<Rc<RefCell<Value>>>, dirty: DirtyFlag },
+    /// How far a scrollable container has been scrolled along its main axis, in logical pixels
+    /// (docs/adr/0069). Written by `crate::wayland`'s pointer handler on a wheel and by
+    /// `layout::scene`'s positioning pass when it clamps; read by a config that wants to know.
+    ///
+    /// A fifth variant for [`SignalKind::Hover`]'s reason and not a reuse of it: the split is about
+    /// who may write, so `Signal::scroll_handle` hands out a write end for this kind alone and a
+    /// config naming `scroll = oblisk.network` gets no writer instead of a wheel that overwrites a
+    /// capability snapshot.
+    Scroll { cell: Rc<RefCell<Value>>, dirty: DirtyFlag },
     /// Lua-authored state (ADR-0044 decision 5): the one signal kind `Signal::set` accepts, built
     /// by the `state(name, initial)` global and written from a config's own `on_click`.
     ///
@@ -158,6 +167,7 @@ impl SignalKind {
             SignalKind::Computed { .. } => "a computed",
             SignalKind::Live(_) => "a capability",
             SignalKind::Hover { .. } => "a hover",
+            SignalKind::Scroll { .. } => "a scroll",
             SignalKind::State { .. } => "a state",
         }
     }
@@ -259,6 +269,42 @@ impl Signal {
         )
     }
 
+    /// A scroll offset, starting at the top (docs/adr/0069 decision 2).
+    ///
+    /// A plain number rather than a pair like [`Self::new_hover`]'s: the content extent a scrollbar
+    /// would also want is deliberately not published, because nothing draws one yet and the first
+    /// config that does is the place to decide what shape it should arrive in.
+    pub fn new_scroll(dirty: DirtyFlag) -> Self {
+        Signal(SignalKind::Scroll { cell: Rc::new(RefCell::new(Value::Number(0.0))), dirty })
+    }
+
+    /// The write end of a scroll signal, for the wheel handler and for the positioning pass that
+    /// clamps what the wheel asked for. `None` for every other kind, which is what keeps a wheel
+    /// off a capability signal.
+    pub(crate) fn scroll_handle(&self) -> Option<LiveSignalHandle> {
+        match &self.0 {
+            SignalKind::Scroll { cell, dirty } => Some(LiveSignalHandle(Rc::clone(cell), dirty.clone())),
+            _ => None,
+        }
+    }
+
+    /// This scroll signal's current offset, without a `Lua` to hand.
+    ///
+    /// [`Self::get_value`] would do, and needs a `&Lua` it cannot be given: `layout::scene`'s
+    /// `position_children` runs deep inside a pass that holds no VM reference, and threading one
+    /// down to read a number out of a `RefCell` would be a parameter on every frame of the layout
+    /// recursion for the benefit of one property.
+    pub(crate) fn scroll_offset(&self) -> Option<f32> {
+        match &self.0 {
+            SignalKind::Scroll { cell, .. } => match *cell.borrow() {
+                Value::Number(n) => Some(n as f32),
+                Value::Integer(n) => Some(n as f32),
+                _ => Some(0.0),
+            },
+            _ => None,
+        }
+    }
+
     /// The write end of a hover signal, for `crate::wayland`'s pointer handler. `None` for every
     /// other kind -- see [`Self::new_hover`] for why that refusal is the point rather than a
     /// missing case.
@@ -302,6 +348,7 @@ impl Signal {
             SignalKind::Direct(value) => Ok(value.clone()),
             SignalKind::Live(cell) => Ok(cell.borrow().clone()),
             SignalKind::Hover { cell, .. } => Ok(cell.borrow().clone()),
+            SignalKind::Scroll { cell, .. } => Ok(cell.borrow().clone()),
             SignalKind::State { cell, .. } => Ok(cell.borrow().clone()),
             SignalKind::Computed { deps, func } => {
                 // Entered *before* dependency resolution, not around `func.call` alone: this
@@ -354,6 +401,22 @@ impl LiveSignalHandle {
     /// event, which arrives at device rate, and one mark re-resolves every surface in the
     /// generation (ADR-0044 decision 2). Comparing first turns that into one re-resolve per
     /// hover boundary crossed rather than one per motion event.
+    /// Writes without marking the scene dirty, for a value the pass that is running *derived* from
+    /// its own geometry.
+    ///
+    /// `layout::scene`'s positioning pass is the only caller: it clamps a scroll offset against the
+    /// content extent it has just measured, and marking dirty there would schedule another pass to
+    /// observe a number this pass already used. Clamping is idempotent, so that second pass would
+    /// settle, but it would be a whole re-resolve to learn nothing.
+    ///
+    /// The cost is one frame of staleness, and only when the clamp actually bit: a config reading
+    /// `scroll("x")` in the same pass sees what the wheel asked for, and sees the clamped value from
+    /// the next pass on. That is invisible for the scroll itself, which is positioned from the
+    /// clamped number here, and matters only to a derived readout like a scrollbar.
+    pub(crate) fn set_quiet(&self, value: Value) {
+        *self.0.borrow_mut() = value;
+    }
+
     pub fn set_changed(&self, value: Value) -> bool {
         let unchanged = *self.0.borrow() == value;
         if unchanged {
@@ -439,6 +502,12 @@ pub fn any_hover_registered(lua: &Lua) -> bool {
     lua.app_data_ref::<HoverRegistry>().is_some_and(|registry| !registry.0.is_empty())
 }
 
+/// Whether this config ever called `scroll(name)`, so the wheel handler can skip walking a tree
+/// that has nothing to write. Same early-out [`any_hover_registered`] exists for.
+pub fn any_scroll_registered(lua: &Lua) -> bool {
+    lua.app_data_ref::<ScrollRegistry>().is_some_and(|registry| !registry.0.is_empty())
+}
+
 /// The `name -> Signal` map ADR-0044 decision 5 hangs `state` off: the *name* is the identity, so
 /// re-running the config on an in-place reload finds the signal it built last time still holding
 /// whatever the user's last click left in it, and an open dropdown stays open across a config edit.
@@ -459,6 +528,12 @@ struct StateRegistry(HashMap<String, Signal>);
 /// the config thought it owned.
 #[derive(Default)]
 struct HoverRegistry(HashMap<String, (Signal, Signal)>);
+
+/// The `name -> Signal` map behind `scroll(name)`, keyed the way [`HoverRegistry`] and the `state`
+/// registry are: the name is the identity, so an in-place reload finds the offset the user left and
+/// an open panel does not jump back to the top when the config is edited (docs/adr/0069 decision 2).
+#[derive(Default)]
+struct ScrollRegistry(HashMap<String, Signal>);
 
 /// An RAII claim on the 5ms evaluation budget, held for one `Computed` [`Signal::get_value`] --
 /// dependency resolution *and* the closure call, not the closure call alone. Entering pushes a
@@ -615,6 +690,7 @@ pub fn is_signal(ud: &mlua::AnyUserData) -> bool {
 pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
     let hover_dirty = dirty.clone();
     let rect_dirty = dirty.clone();
+    let scroll_dirty = dirty.clone();
     lua.globals().set(
         "computed",
         lua.create_function(|_, (deps, func): (Table, Function)| {
@@ -666,6 +742,21 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
     lua.globals().set(
         "hover_rect",
         lua.create_function(move |lua, name: String| Ok(hover_slot(lua, &rect_dirty, name)?.1))?,
+    )?;
+    lua.globals().set(
+        "scroll",
+        lua.create_function(move |lua, name: String| {
+            if lua.app_data_ref::<ScrollRegistry>().is_none() {
+                lua.set_app_data(ScrollRegistry::default());
+            }
+            let existing = lua.app_data_ref::<ScrollRegistry>().expect("just ensured the scroll registry exists").0.get(&name).cloned();
+            if let Some(signal) = existing {
+                return Ok(signal);
+            }
+            let signal = Signal::new_scroll(scroll_dirty.clone());
+            lua.app_data_mut::<ScrollRegistry>().expect("just ensured the scroll registry exists").0.insert(name, signal.clone());
+            Ok(signal)
+        })?,
     )
 }
 

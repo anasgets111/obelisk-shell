@@ -322,6 +322,9 @@ fn parse_hex_color(property: &str, s: &str) -> Result<Rgba, LayoutError> {
 fn is_structural_property(kind: &str, property: &str) -> bool {
     property == "id"
         || property == "hover"
+        // docs/adr/0069 decision 4: the positioning pass reads this signal's number *and* writes
+        // the clamped one back, so it needs the handle rather than a snapshot of it.
+        || property == "scroll"
         || (kind == "panel" && matches!(property, "layer" | "anchor" | "monitor" | "namespace"))
 }
 

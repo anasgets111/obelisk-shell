@@ -2532,6 +2532,28 @@ Three things are missing. They cost very different amounts, so keep them apart.
    usable: network access points, bluetooth devices, notification history, launcher results, SMS
    threads.
 
+   > **Built (docs/adr/0069), as an offset rather than a callback.** `scroll(name)` is a signal the
+   > engine writes, the third after `hover`/`hover_rect`, and a container claims it with a `scroll`
+   > property the way a node claims a hover. The wheel handler adds a delta and the positioning pass
+   > owns the bound, clamping against the content extent it has just measured and writing back what
+   > it used, because a config can see neither number and every list handed a raw delta would scroll
+   > past its own end.
+   >
+   > `on_scroll` is deliberately not built. The two places in the reference config that read
+   > `onWheel` want a value to change, not an event.
+   >
+   > The prediction above was right that this is layout and spec work rather than paint work, and
+   > wrong about the size: the missing half was not just an offset. Timing the pass first is what
+   > found that text shaping was most of it, which is its own entry above and landed before this.
+   >
+   > `Axis` was the last pointer event still being dropped, so `pointer_frame`'s `_ => {}` arm is
+   > gone and the match is exhaustive. Verified by unit test at three seams: the layout clamp, the
+   > signal's write gating, and the pixels-or-steps arithmetic, which was pulled out of `scroll_at`
+   > into `wheel_delta` precisely so it could be tested without a compositor. What no test reaches is
+   > `scroll_at` itself, which needs a real notch delivered to a real surface. Until someone spins a
+   > wheel over a list and watches it move, that seam is written and unconfirmed, the same gap items
+   > 1 and 2 record.
+
 ### Paint has four operations
 
 `layout::paint` fills a rounded rect, strokes up to four border edges, blits an image or icon, and
@@ -2721,8 +2743,10 @@ By modules unblocked per unit of work, which is not the same as by size.
 4. **`on_hover`.** ~~Two tooltips, a hover-to-open panel, a hover highlight, and every
    expand-on-hover affordance.~~ **Built (docs/adr/0062).** The engine may emit a signal, and this
    is the first one it emits.
-5. **`on_scroll` plus a scroll offset.** Clipping is built, so this is layout and spec work, not
-   paint work. Blocks every list-bearing panel until it lands.
+5. ~~**`on_scroll` plus a scroll offset.** Clipping is built, so this is layout and spec work, not
+   paint work. Blocks every list-bearing panel until it lands.~~ **Built (docs/adr/0069)**, as an
+   engine-written offset rather than a callback. Eight of the thirteen bar panels are unblocked,
+   including the two that already existed on the Lua side as 32-line stubs.
 6. **The animation model.** Largest item, scoped in section 5, and gated behind item 5 in practice;
    item 4 is no longer in front of it. An expanding pill has its hover now and snaps without the
    easing.
