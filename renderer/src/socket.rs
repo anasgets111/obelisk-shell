@@ -42,10 +42,12 @@ use tokio::sync::mpsc;
 
 use crate::layout::instance::SurfaceInstance;
 use crate::layout::node::{SurfaceFingerprint, SurfaceSpec};
+use crate::layout::secure_submit::lock_stays_authenticatable;
 use crate::layout::{self, Scene};
 use crate::lua::capability::{Capability, CapabilityHandle, CommandSender};
 use crate::lua::process::ProcessRegistry;
 use crate::lua::signal::{DirtyFlag, LiveSignalHandle};
+use crate::lua::surfaces::{evaluate_and_specs, surface_specs};
 use crate::lua::{self, Loader};
 use crate::text::shaping::ShapingHandle;
 
@@ -182,7 +184,8 @@ pub struct RendererClient {
     commands: CommandSender,
     rescue_handle: LiveSignalHandle,
     /// `oblisk.screens`'s handle (docs/adr/0041 decision 2) -- Renderer-sourced, so deliberately
-    /// not in `capabilities` above or `shared::CAPABILITIES`. See [`register_screens_signal`].
+    /// not in `capabilities` above or `shared::CAPABILITIES`. See `lua::namespace`'s
+    /// `register_screens_signal`.
     screens_handle: LiveSignalHandle,
     /// What `screens_handle` currently holds, mirrored as JSON so [`Self::set_screens`] can tell
     /// a real output change from a re-push of the same list.
@@ -240,17 +243,9 @@ impl RendererClient {
         Ok(client)
     }
 
-    /// Builds the whole `oblisk` namespace: every `shared::CAPABILITIES` roster name, the two
-    /// Renderer-sourced signals `rescue` and `screens`, and `version`.
-    ///
-    /// **Every roster name is pre-seeded here**, not left to [`Self::capability_handle`]'s lazy
-    /// path, so a `shell.lua` reading any rostered capability before its first push gets a live
-    /// signal reading `nil` instead of an index-into-nil error and rescue (ADR-0037). The lazy
-    /// path stays as the fallback for unrostered names.
-    ///
-    /// **One table, so a typo is a Lua error rather than silence.** § 6.4's `lock` node
-    /// constructor owns the global `lock`, and a bare `lock` signal used to silently overwrite it
-    /// and break every `lock { ... }` declaration (docs/adr/0052 decision 1).
+    /// The `oblisk` namespace is [`lua::namespace::build`]'s, not this function's: it is
+    /// construction rather than frame handling, and [`Self::capability_handle`] holds the lazy
+    /// fallback for an unrostered name because that one *is* reached from a `StateSnapshot`.
     fn new(
         loader: Loader,
         shell_lua_path: PathBuf,
@@ -262,47 +257,25 @@ impl RendererClient {
         // Taken off `commands` rather than passed alongside it: visibly one channel, not two
         // clones of one that could drift apart.
         let outbound_tx = commands.frames();
-        let oblisk = loader.create_table()?;
-        let mut seeded = HashMap::new();
-        for capability in shared::CAPABILITIES {
-            let (member, handle) = Capability::new(capability, dirty.clone(), commands.clone());
-            oblisk.set(*capability, member)?;
-            seeded.insert((*capability).to_string(), handle);
-        }
-        let rescue_handle = register_rescue_signal(&loader, &oblisk, dirty.clone())?;
-        // Seeded to an empty list (not `nil`) so a config looping over `oblisk.screens` iterates
-        // zero times rather than erroring, and set through `new_live`'s initial value rather than
-        // a `set` so seeding it does not mark the scene dirty before anything has ever applied.
-        let screens_payload = serde_json::Value::Array(Vec::new());
-        let screens_handle = register_screens_signal(&loader, &oblisk, dirty.clone(), &screens_payload)?;
-        oblisk.set("version", version_table(&loader)?)?;
-        // The directory the config was loaded from, so a config can name a file it ships beside
-        // itself. A string beside `version` rather than a capability: static process information,
-        // not something that pushes. The parent of `shell.lua` rather than a second call to
-        // `shared::config_dir()`, so this cannot disagree with the file actually loaded.
-        oblisk.set(
-            "config_dir",
-            shell_lua_path.parent().map(|dir| dir.to_string_lossy().into_owned()).unwrap_or_default(),
-        )?;
-        loader.set_global("oblisk", oblisk.clone())?;
+        let namespace = lua::namespace::build(&loader, &dirty, &commands, &shell_lua_path)?;
         Ok(Self {
             shell_lua_path,
             scene: Scene::new(),
             instances: Vec::new(),
             holds_session_lock: false,
             shaping,
-            capabilities: RefCell::new(seeded),
+            capabilities: RefCell::new(namespace.capabilities),
             commands,
-            rescue_handle,
-            screens_handle,
-            screens_payload,
-            // Matches the table `register_rescue_signal` already put in the signal.
+            rescue_handle: namespace.rescue,
+            screens_handle: namespace.screens,
+            screens_payload: namespace.screens_payload,
+            // Matches the table `lua::namespace::build` already put in the `rescue` signal.
             rescue_state: (false, String::new()),
             process_registry,
             dirty,
             state: ReloadState { applied_topology: None, applied_output: None, pending: None },
             outbound_tx,
-            oblisk,
+            oblisk: namespace.table,
             loader,
         })
     }
@@ -325,7 +298,7 @@ impl RendererClient {
         if self.rescue_state.0 == is_rescue && self.rescue_state.1 == error_log {
             return;
         }
-        match rescue_table(&self.loader, is_rescue, error_log) {
+        match lua::namespace::rescue_table(&self.loader, is_rescue, error_log) {
             Ok(table) => {
                 self.rescue_handle.set(mlua::Value::Table(table));
                 self.rescue_state = (is_rescue, error_log.to_string());
@@ -849,201 +822,6 @@ fn frame_label(frame: &RendererFrame) -> &'static str {
         RendererFrame::LockReport(_) => "LockReport",
         RendererFrame::RequestReload => "RequestReload",
     }
-}
-
-/// Builds the `{ is_rescue, error_log }` table and hangs it off the `oblisk` table as
-/// `oblisk.rescue` (§ 2.10). Returns the handle so later evaluations can update it.
-///
-/// A bare `lua::signal::Signal` and not a [`Capability`], for the same reason
-/// [`register_screens_signal`] is: this is Renderer-sourced, has no `dispatch` on the Supervisor
-/// side and no roster entry, so an `invoke` on it could only ever be a command the Supervisor
-/// drops.
-fn register_rescue_signal(loader: &Loader, oblisk: &mlua::Table, dirty: DirtyFlag) -> mlua::Result<LiveSignalHandle> {
-    let table = rescue_table(loader, false, "")?;
-    let (signal, handle) = lua::signal::Signal::new_live(mlua::Value::Table(table), dirty);
-    oblisk.set("rescue", signal)?;
-    Ok(handle)
-}
-
-/// Registers the reactive `oblisk.screens` signal (docs/adr/0041 decision 2), seeded with
-/// `initial`.
-///
-/// Deliberately outside `shared::CAPABILITIES` and outside `capabilities`, an exception to the
-/// shape ADR-0037 established that ADR-0041 decision 2 states as such: this is sourced in the
-/// Renderer from `smithay_client_toolkit`'s `OutputState`, not pushed by the Supervisor as a
-/// `StateSnapshot`, so the roster (the Supervisor's own dispatch and push list) has nothing to
-/// say about it. It sits in the same table anyway, because § 2.15 names this `oblisk.screens`
-/// like everything else in § 2.
-fn register_screens_signal(
-    loader: &Loader,
-    oblisk: &mlua::Table,
-    dirty: DirtyFlag,
-    initial: &serde_json::Value,
-) -> mlua::Result<LiveSignalHandle> {
-    let (signal, handle) = lua::signal::Signal::new_live(loader.to_lua_value(initial)?, dirty);
-    oblisk.set("screens", signal)?;
-    Ok(handle)
-}
-
-/// This Renderer binary's version as `{ major, minor, patch }` integers, from Cargo's own
-/// `CARGO_PKG_VERSION_*`.
-///
-/// A plain table, not a signal: it cannot change while the process runs. Registered on the day
-/// the namespace is built rather than on the day a config needs it, since a config written before
-/// any version exists has nothing to guard on, forever.
-///
-/// The Renderer's version and not the Supervisor's: they are the same number today because the
-/// workspace versions both together, but the day they diverge this is still the right one, since
-/// it is the process that hosts the VM and defines the API a config is written against.
-fn version_table(loader: &Loader) -> mlua::Result<mlua::Table> {
-    let table = loader.create_table()?;
-    let [major, minor, patch] = version_parts();
-    table.set("major", major)?;
-    table.set("minor", minor)?;
-    table.set("patch", patch)?;
-    Ok(table)
-}
-
-/// `expect` rather than a `0` fallback: a non-numeric `CARGO_PKG_VERSION_*` means the build is
-/// broken, and a version table that quietly reads `0.0.0` is worse than not booting -- a config
-/// would guard on it and take the wrong branch forever.
-fn version_parts() -> [u32; 3] {
-    [env!("CARGO_PKG_VERSION_MAJOR"), env!("CARGO_PKG_VERSION_MINOR"), env!("CARGO_PKG_VERSION_PATCH")]
-        .map(|part| part.parse().expect("Cargo's CARGO_PKG_VERSION_* are the numeric components of an already-parsed semver"))
-}
-
-fn rescue_table(loader: &Loader, is_rescue: bool, error_log: &str) -> mlua::Result<mlua::Table> {
-    let table = loader.create_table()?;
-    table.set("is_rescue", is_rescue)?;
-    table.set("error_log", error_log)?;
-    Ok(table)
-}
-
-/// Parses **every** declared surface by its own role and returns the whole roster (§ 6.1-6.4).
-/// A surface whose fields don't type-check fails with [`lua::LoaderError::InvalidTopology`], a
-/// distinct message from a top-level-return shape error.
-///
-/// **Parsing every role here is the point, even for properties nothing on this path sends.**
-/// § 6.2/6.3's properties become requests that raise protocol errors -- a zero `anchor_rect`
-/// answers `invalid_positioner`, a `max_size` under a `min_size` answers `invalid_size` -- and a
-/// protocol error kills the whole connection. A config typo must be a `layout::node::LayoutError`
-/// at evaluation instead, landing in `rescue`'s `error_log` (§ 2.10, docs/adr/0046).
-///
-/// **This is an evaluation-time, literal-only fast-fail, not the authoritative spec** for the two
-/// roles whose properties are meant to move (docs/adr/0049's second amendment): a `Signal` in a
-/// `window`'s `title` or a `popup`'s `anchor_rect` is **skipped** rather than rejected
-/// (`layout::node::is_deferred_signal`), carrying that parser's placeholder in its place; a
-/// *literal* is validated here in full. `crate::wayland::App::apply_resolved_state` builds the
-/// authoritative [`WindowSpec`](layout::node::WindowSpec)/[`PopupSpec`](layout::node::PopupSpec)
-/// from the *resolved* tree instead (ADR-0044 decision 1); resolving here too would double
-/// ADR-0021's per-getter budget on every monitor hotplug via
-/// [`RendererClient::applied_surface_specs`].
-///
-/// What *is* authoritative here is the roster and the fingerprint: which surfaces were declared,
-/// in what order, with what role. **§ 6.4's `lock` is authoritative here in full, and it is the
-/// only role that is** (docs/adr/0052 decision 2): `id` is structural and `child` is the scene's
-/// to walk, so [`lock_spec`](layout::node::lock_spec) consults `is_deferred_signal` nowhere.
-fn surface_specs(output: &lua::LoadOutput) -> Result<Vec<SurfaceSpec>, lua::LoaderError> {
-    let invalid = |err: layout::node::LayoutError| lua::LoaderError::InvalidTopology(err.to_string());
-    let mut specs = Vec::with_capacity(output.surfaces.len());
-    for surface in &output.surfaces {
-        specs.push(match surface.kind.as_str() {
-            "panel" => SurfaceSpec::Panel(layout::node::panel_spec(&surface.properties).map_err(invalid)?),
-            "window" => SurfaceSpec::Window(layout::node::window_spec(&surface.properties).map_err(invalid)?),
-            "popup" => SurfaceSpec::Popup(layout::node::popup_spec(&surface.properties).map_err(invalid)?),
-            "lock" => SurfaceSpec::Lock(layout::node::lock_spec(&surface.properties).map_err(invalid)?),
-            // Unreachable: `lua::require_surface` admits exactly the four § 6 roles above and
-            // rejects everything else. Named rather than left to a silent `_ => {}`, because that
-            // arm would let a fifth role reach a generation unvalidated.
-            other => return Err(lua::LoaderError::InvalidTopology(format!("`{other}` is not a surface role"))),
-        });
-    }
-    // **At most one `lock` in a config, and this is the only place that can say so.** Every other
-    // § 6 role may be declared any number of times, so the check is a property of the surface
-    // *set*, and this is the one function every declaration passes through on both the startup
-    // path and the `Reevaluate` path.
-    //
-    // The failure it prevents is unrecoverable rather than cosmetic.
-    // `layout::instance::expand_instances` emits one instance per lock spec per output, so two
-    // declarations make `crate::wayland::App::ensure_lock_surfaces` send two `get_lock_surface`
-    // for the same `wl_output`, and `ext-session-lock-v1` is explicit: "Attempting to create more
-    // than one lock surface for a given output is a duplicate_output protocol error." The
-    // compositor disconnects the client and does not unlock the session, leaving the user with a
-    // VT switch as the only way back in.
-    //
-    // There is also nothing coherent to admit: § 6.4 gives a `lock` no `monitor` and exactly one
-    // surface per output, so "two lock screens" names no arrangement a compositor could show.
-    let locks = specs.iter().filter(|spec| matches!(spec, SurfaceSpec::Lock(_))).count();
-    if locks > 1 {
-        return Err(lua::LoaderError::InvalidTopology(format!(
-            "this config declares {locks} `lock` surfaces; § 6.4 gives a `lock` no `monitor` and exactly one surface per output, so a config may \
-             declare at most one -- a second would ask the compositor for two lock surfaces on one output, which is `duplicate_output`, which kills \
-             the connection with the session still locked"
-        )));
-    }
-    Ok(specs)
-}
-
-// ponytail: this top-level evaluation is uncapped, unlike a `computed`/`map` closure's 5ms hook
-// (docs/adr/0021). docs/adr/0039 accepts this: a slow evaluation blocks the Wayland dispatch
-// thread it runs on, with no configure handling and no way to set `app.exit` until it returns --
-// `while true do end` in `shell.lua` wedges the whole process. Upgrade path: extend ADR-0021's
-// hook to cover `Loader::evaluate_file` itself, not just the closures it registers.
-fn evaluate_and_specs(loader: &Loader, shell_lua_path: &Path) -> Result<(lua::LoadOutput, Vec<SurfaceSpec>), lua::LoaderError> {
-    let output = loader.evaluate_file(shell_lua_path)?;
-    let specs = surface_specs(&output)?;
-    Ok((output, specs))
-}
-
-/// The veto `Scene::apply` runs on the finished scene while this process holds a session lock:
-/// the locked session must still be one the user can authenticate out of.
-///
-/// **Why this exists at all.** `layout::node::SurfaceFingerprint::Lock` carries only the `id`, so
-/// editing a lock's `child` -- and so its password field -- diffs as `Unchanged` and reloads in
-/// place, which the generation-swap gate does not police. Deleting the `textfield` while the lock
-/// screen is up would therefore apply immediately, and the compositor does not unlock when a
-/// lock client dies, so the way out would be a VT switch.
-///
-/// **It asks the apply what is on the glass, and holds no list of its own.** The arming side is
-/// one `bool` (see [`RendererClient::holds_session_lock`]); the `lock` instances are read out of
-/// the instance set this very apply is resolving. A remembered list could not survive a hotplug:
-/// `Scene` keeps a retired instance's tree, so a snapshot taken at grant time would vouch for a
-/// fossil nothing can paint while the live lock screen quietly lost its way out.
-///
-/// **`any`, not `all`, the same rule the grant used**, since a veto demanding all declared
-/// instances be typable would refuse every reload for the rest of a lock already granted. An
-/// empty set fails.
-///
-/// **Restyling a live lock screen must keep working**, which is why the veto asks the narrowest
-/// possible question rather than freezing the tree (docs/adr/0052 decision 2).
-///
-/// The predicate is `crate::wayland`'s `tree_can_authenticate`, not a copy of it: a second
-/// opinion about what makes a lock screen usable is how a lock gets granted against a rule the
-/// keyboard does not follow.
-fn lock_stays_authenticatable(scene: &Scene, instances: &[SurfaceInstance], holds_session_lock: bool) -> Result<(), layout::node::LayoutError> {
-    if !holds_session_lock {
-        return Ok(());
-    }
-    let mut locks = Vec::new();
-    for instance in instances {
-        let Some(tree) = scene.surface(&instance.instance_id) else {
-            continue;
-        };
-        if tree.kind == "lock" {
-            if crate::wayland::tree_can_authenticate(&tree) {
-                return Ok(());
-            }
-            locks.push(instance.instance_id.as_str());
-        }
-    }
-    Err(layout::node::invalid(
-        "child",
-        format!(
-            "this evaluation leaves the locked session's `lock` surfaces {locks:?} with no single `textfield` carrying \
-             `secure_submit = {{ capability = \"lock\", action = \"authenticate\" }}`, so the locked session would have no way back in \
-             but a VT switch; the reload was refused and the lock screen that is on screen still stands (§ 6.4, docs/adr/0052 decision 3)"
-        ),
-    ))
 }
 
 /// Logs each surface *instance*'s resolved geometry after a successful `scene.apply` --
@@ -1708,10 +1486,16 @@ mod tests {
             major = oblisk.version.major, minor = oblisk.version.minor, patch = oblisk.version.patch }"#;
         let output = client.loader.evaluate(probe).unwrap();
         let props = &output.surfaces[0].properties;
-        let [major, minor, patch] = version_parts();
-        assert_eq!(props.get("major").unwrap().as_integer(), Some(i64::from(major)));
-        assert_eq!(props.get("minor").unwrap().as_integer(), Some(i64::from(minor)));
-        assert_eq!(props.get("patch").unwrap().as_integer(), Some(i64::from(patch)));
+        // Read back through Lua and compared against Cargo's own string, rather than against a
+        // second call to the function that built the table: this asserts the number a config
+        // actually sees, not that one function agrees with itself. It also reaches
+        // `lua::namespace::version_parts`'s `expect`, which is why that function carries no
+        // narrower test of its own.
+        let field = |name: &str| props.get(name).unwrap().as_integer().unwrap();
+        assert_eq!(
+            format!("{}.{}.{}", field("major"), field("minor"), field("patch")),
+            env!("CARGO_PKG_VERSION")
+        );
     }
 
     #[test]
@@ -1723,13 +1507,6 @@ mod tests {
         let output = client.loader.evaluate(probe).unwrap();
         let dir = output.surfaces[0].properties.get("dir").unwrap().as_string().unwrap();
         assert_eq!(dir.to_string_lossy(), "/opt/oblisk-config");
-    }
-
-    #[test]
-    fn version_parts_are_the_crates_own_version() {
-        // Guards the `expect` in `version_parts`: fails the build instead of panicking at startup.
-        let [major, minor, patch] = version_parts();
-        assert_eq!(format!("{major}.{minor}.{patch}"), env!("CARGO_PKG_VERSION"));
     }
 
     /// `RendererClient::new` seeds the roster *after* `Loader::new` registered § 6.4's node

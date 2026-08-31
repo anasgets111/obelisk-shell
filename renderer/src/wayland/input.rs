@@ -7,7 +7,7 @@
 //! `enter` focuses, and what one key event does to the field currently focused.
 
 use super::*;
-use crate::wayland::lock::UNLOCK_TARGET;
+use crate::layout::secure_submit::{secure_submit_targets, sole_secure_submit};
 
 /// One press waiting for its release (docs/adr/0050 decision 2): a click is a press and a
 /// release on the same node, so a user who presses a button, notices the mistake, and drags off
@@ -89,26 +89,28 @@ fn clickable_button<'a>(path: &[&'a layout::ResolvedNode]) -> Option<(LogicalRec
 /// would be two answers to one event, and a re-resolve between the walks could make them disagree.
 struct PointerHit {
     button: Option<(LogicalRect, Function)>,
-    /// `Err` is a malformed `secure_submit` on the innermost `textfield` -- see [`focused_target`].
-    focus: Result<Option<node::SecureSubmitTarget>, node::LayoutError>,
+    focus: Option<node::SecureSubmitTarget>,
 }
 /// The `secure_submit` destination the innermost `textfield` in a hit path names (docs/adr/0050
 /// decision 4, § 5.2 item 8).
 ///
-/// `Ok(None)` collapses two cases nothing downstream tells apart: no `textfield` on the path, and
-/// the innermost one declaring no `secure_submit`. Both mean the next completed submit has nowhere
-/// to go.
+/// `None` collapses two cases nothing downstream tells apart: no `textfield` on the path, and the
+/// innermost one declaring no `secure_submit`. Both mean the next completed submit has nowhere to
+/// go. There is no third, malformed case any more: `node::paint_style` parses the destination while
+/// `Scene::apply` resolves the node, so a `secure_submit` that does not parse fails the whole pass
+/// and no tree carrying one ever reaches a pointer event.
 ///
 /// ponytail: focus is therefore stored as its destination rather than as a node identity, so a
 /// focused field with no destination is indistinguishable from no focus at all. Nothing reads focus
 /// for any other purpose yet -- there is no caret, no selection, and no `on_key` (docs/adr/0050's
 /// consequences). Upgrade path: carry the field's `NodeId` alongside the target once something has
 /// to paint or address the *field* rather than its submit.
-fn focused_target(path: &[&layout::ResolvedNode]) -> Result<Option<node::SecureSubmitTarget>, node::LayoutError> {
-    let Some(field) = path.iter().rev().find(|node| node.kind == "textfield") else {
-        return Ok(None);
+fn focused_target(path: &[&layout::ResolvedNode]) -> Option<node::SecureSubmitTarget> {
+    let field = path.iter().rev().find(|node| node.kind == "textfield")?;
+    let Some(node::PaintStyle::TextField { target, .. }) = &field.paint else {
+        return None;
     };
-    node::parse_secure_submit(&field.properties)
+    target.clone()
 }
 /// The frame a completed `wp-text-input-v3` submit produces, or `None` when no focused `textfield`
 /// named a destination for it (docs/adr/0050 decision 4).
@@ -181,51 +183,6 @@ fn retarget_secure_submit(focused: &mut Option<FocusedField>, buffer: &mut share
     }
     *focused = next;
 }
-/// Whether this `secure_submit` destination is the one that can end a session lock.
-///
-/// Named rather than compared inline because two callers want it for opposite reasons:
-/// `lock::lock_command` refuses a lock screen that has no such field, and nothing else in the file may
-/// quietly grow a second opinion about which pair unlocks. See [`UNLOCK_TARGET`].
-fn unlocks_the_session(target: &node::SecureSubmitTarget) -> bool {
-    (target.capability.as_str(), target.action.as_str()) == UNLOCK_TARGET
-}
-/// Every `secure_submit` destination a resolved tree declares, in document order.
-///
-/// Whole-tree, unlike [`focused_target`]: a press names one node and walks a hit path for the
-/// innermost, but these callers have no node to start from -- asking what a surface offers before
-/// any event has arrived on it.
-///
-/// A malformed `secure_submit` contributes nothing rather than an error: the config bug is already
-/// reported where it can name the surface (the press path logs it), and a field whose destination
-/// cannot be parsed is a field nothing can address a secret to.
-fn secure_submit_targets(tree: &layout::ResolvedNode) -> Vec<node::SecureSubmitTarget> {
-    let mut found = Vec::new();
-    let mut stack = vec![tree];
-    while let Some(node) = stack.pop() {
-        if node.kind == "textfield"
-            && let Ok(Some(target)) = node::parse_secure_submit(&node.properties)
-        {
-            found.push(target);
-        }
-        stack.extend(node.children.iter().rev());
-    }
-    found
-}
-/// The destination a surface takes on keyboard focus, when its tree declares exactly one.
-///
-/// Why keyboard focus focuses a field at all: without it, `focused_secure_submit` was set only by
-/// a pointer press, requiring a mouse click before a keystroke could reach `shared::SecureBuffer`
-/// on the one surface whose purpose is to accept a password. A lock surface must be typable the
-/// moment the compositor hands it keyboard focus.
-///
-/// Exactly one, deliberately: with two `secure_submit` fields there is no non-arbitrary answer to
-/// "whose password is this?", the guess [`submit_frame_for`] already refuses to make (docs/adr/0050
-/// decision 4). Zero is the same answer. Both cases leave focus alone for a press to decide, which
-/// buys the single-field case: every lock screen and password prompt.
-fn sole_secure_submit(tree: &layout::ResolvedNode) -> Option<node::SecureSubmitTarget> {
-    let mut targets = secure_submit_targets(tree);
-    (targets.len() == 1).then(|| targets.remove(0))
-}
 /// What `focused_secure_submit` becomes when keyboard focus arrives on `surface_id`, given that
 /// surface's resolved tree and whatever is focused now.
 ///
@@ -262,23 +219,6 @@ fn focus_on_enter(surface_id: Option<&str>, tree: Option<&layout::ResolvedNode>,
 /// it, so a field is armed only while both facts are true, by construction.
 fn focus_is_still_armed(field: &FocusedField, keyboard_focus: Option<&str>, its_surface_is_live: bool) -> bool {
     keyboard_focus == Some(field.surface_id.as_str()) && its_surface_is_live
-}
-/// Whether a `lock` surface's resolved tree can actually be authenticated out of -- the predicate
-/// `lock::lock_command`'s `can_authenticate` reads, and it is deliberately built out of
-/// [`sole_secure_submit`] rather than out of [`secure_submit_targets`].
-///
-/// The guard that grants the lock and the rule that arms the keyboard must be one predicate. They
-/// were two: admission asked whether any field in the tree unlocks, focus armed only a sole field.
-/// A lock screen with two `secure_submit` fields passed the guard, took the lock -- which the
-/// compositor will not release when the client dies -- and then armed nothing when the compositor
-/// handed the surface keyboard focus, leaving a VT switch as the only way back in.
-///
-/// Sole-and-unlocking is the right rule, not merely the stricter one: `any` is not implementable
-/// as a focus rule at all, since with two destinations there is no non-arbitrary answer to "whose
-/// password is this?" (the guess [`submit_frame_for`] already refuses to make, docs/adr/0050
-/// decision 4). So the focus rule stays, and admission moves to meet it.
-pub(crate) fn tree_can_authenticate(tree: &layout::ResolvedNode) -> bool {
-    sole_secure_submit(tree).as_ref().is_some_and(unlocks_the_session)
 }
 /// What one key event does to a focused `secure_submit` field.
 ///
@@ -603,7 +543,7 @@ impl App {
     /// the `Function` and the target are cloned out of the local tree before it is dropped.
     fn hit_under(&self, index: usize, position: (f64, f64)) -> PointerHit {
         let Some(tree) = self.client.scene().surface(&self.surfaces[index].surface_id) else {
-            return PointerHit { button: None, focus: Ok(None) };
+            return PointerHit { button: None, focus: None };
         };
         let point = layout::hit::LogicalPoint { x: position.0 as f32, y: position.1 as f32 };
         let path = layout::hit::hit_path(&tree, point);
@@ -803,21 +743,12 @@ impl PointerHandler for App {
                     self.pointer_input_count += 1;
                     let hit = self.hit_under(index, event.position);
                     // The press decides focus, not the release: decision 4 says a press whose path
-                    // holds a `textfield` focuses it, and a press that lands anywhere else clears
-                    // it. A malformed `secure_submit` is the config's bug, not this shell's, so it
-                    // is logged against the surface and treated as no destination -- refusing to
-                    // guess a capability is the same call `focused_target` documents.
-                    let focus = match hit.focus {
-                        Ok(target) => target,
-                        Err(e) => {
-                            eprintln!("[oblisk-renderer] {instance_id}: textfield has a malformed secure_submit, so it takes focus with no destination: {e}");
-                            None
-                        }
-                    }
+                    // holds a `textfield` focuses it, and a press that lands anywhere else clears it.
+                    //
                     // Bound to the surface the press landed on, per [`FocusedField`]: a field armed
                     // here stays armed only while that surface is both alive and the one the
                     // compositor is sending keys to.
-                    .map(|target| FocusedField { surface_id: instance_id.clone(), target });
+                    let focus = hit.focus.map(|target| FocusedField { surface_id: instance_id.clone(), target });
                     // Through the seam, because this is the site that *reassigns* rather than
                     // clears: a press moving from one `textfield` to another is the direct A-to-B
                     // transition [`retarget_secure_submit`] exists for.
@@ -972,6 +903,7 @@ impl KeyboardHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::secure_submit::tree_can_authenticate;
 
     #[test]
     fn secure_submit_frame_carries_the_accumulated_secret_and_zeroizes_the_buffer_it_read() {
@@ -1002,6 +934,7 @@ mod tests {
         }
         layout::ResolvedNode {
             kind: kind.to_string(),
+            paint: node::paint_style(kind, &properties).unwrap(),
             rect: LogicalRect { x, y, width, height },
             visible: true,
             properties,
@@ -1132,6 +1065,10 @@ mod tests {
         if let Some(value) = secure_submit {
             node.properties.insert("secure_submit".to_string(), value);
         }
+        // Re-derived rather than hand-written, because `layout::secure_submit` reads the parsed
+        // style now and `Scene::apply` is what fills it in production: a fixture that set it by
+        // hand could declare a destination the parser would never have found.
+        node.paint = node::paint_style(&node.kind, &node.properties).unwrap();
         node
     }
 
@@ -1147,7 +1084,7 @@ mod tests {
         let lua = Lua::new();
         let button = hit_node(&lua, "button", (0.0, 0.0, 40.0, 24.0), true);
         let root = hit_node(&lua, "panel", (0.0, 0.0, 100.0, 32.0), false);
-        assert_eq!(focused_target(&[&root, &button]).unwrap(), None);
+        assert_eq!(focused_target(&[&root, &button]), None);
     }
 
     #[test]
@@ -1160,7 +1097,7 @@ mod tests {
         let root = hit_node(&lua, "panel", (0.0, 0.0, 100.0, 32.0), false);
 
         assert_eq!(
-            focused_target(&[&root, &outer, &inner]).unwrap(),
+            focused_target(&[&root, &outer, &inner]),
             Some(node::SecureSubmitTarget { capability: "polkit".to_string(), action: "authenticate".to_string() })
         );
     }
@@ -1170,7 +1107,7 @@ mod tests {
         let lua = Lua::new();
         let field = textfield(&lua, None);
         let root = hit_node(&lua, "panel", (0.0, 0.0, 100.0, 32.0), false);
-        assert_eq!(focused_target(&[&root, &field]).unwrap(), None);
+        assert_eq!(focused_target(&[&root, &field]), None);
     }
 
     #[test]
@@ -1222,14 +1159,6 @@ mod tests {
         buffer.push_str("hunter2");
         retarget_secure_submit(&mut focused, &mut buffer, Some(field("screen@TEST", "lock", "authenticate")));
         assert_eq!(buffer.expose_secret(), b"hunter2", "re-focusing the same field must not eat the entry in progress");
-    }
-
-    #[test]
-    fn a_malformed_secure_submit_is_an_error_rather_than_a_guessed_destination() {
-        let lua = Lua::new();
-        let field = textfield(&lua, Some(Value::String(lua.create_string("polkit").unwrap())));
-        let root = hit_node(&lua, "panel", (0.0, 0.0, 100.0, 32.0), false);
-        assert!(focused_target(&[&root, &field]).is_err(), "a non-table secure_submit names no capability");
     }
 
     #[test]
@@ -1384,15 +1313,6 @@ mod tests {
         // One field, but pointed somewhere the Supervisor does not route an unlock through.
         let wrong_destination = tree_with(&lua, vec![textfield(&lua, Some(secure_submit_table(&lua, "polkit", "authenticate")))]);
         assert!(!tree_can_authenticate(&wrong_destination));
-    }
-
-    #[test]
-    fn only_the_lock_authenticate_pair_can_unlock_the_session() {
-        // supervisor/src/main.rs routes `("lock", "authenticate")` to the PAM worker and nothing
-        // else to it, so a lock screen whose field submits anywhere else can never unlock.
-        assert!(unlocks_the_session(&target("lock", "authenticate")));
-        assert!(!unlocks_the_session(&target("polkit", "authenticate")));
-        assert!(!unlocks_the_session(&target("lock", "cancel")));
     }
 
     fn key(keysym: Keysym, utf8: Option<&str>) -> KeyEvent {

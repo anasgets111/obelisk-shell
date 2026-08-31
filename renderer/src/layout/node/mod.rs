@@ -25,25 +25,31 @@
 //! layer-shell accepts each on a live surface, so a `Signal` in one resolves normally.
 
 mod content;
+mod paint_style;
 mod spec;
 mod style;
 mod surface;
 mod toplevel;
 
-pub use content::{
-    parse_content, parse_fit, parse_font_size, parse_foreground, parse_icon_name, parse_icon_size, parse_image_source,
-    parse_mask_character, parse_node_id, parse_placeholder,
-    parse_surface_id,
-};
+// The paint-only parsers are imported, not re-exported. They were `pub` for `layout::paint`, which
+// ran them itself on every node on every frame; [`paint_style`] is their only caller now
+// (docs/adr/0068), so the way to ask what a node paints is to ask for its `PaintStyle`. `super::*`
+// is what carries them into `paint_style.rs`.
+use content::{parse_fit, parse_font_size, parse_foreground, parse_icon_name, parse_image_source, parse_mask_character, parse_placeholder};
+use spec::parse_secure_submit;
+use style::{parse_background, parse_border_color, parse_border_width, parse_radius};
+
+pub use content::{parse_content, parse_icon_size, parse_node_id, parse_surface_id};
+pub use paint_style::{PaintStyle, paint_style};
 pub use spec::{
-    SecureSubmitTarget, SurfaceFingerprint, SurfaceSpec, lock_spec, parse_children, parse_list_children, parse_secure_submit, parse_single_child,
+    SecureSubmitTarget, SurfaceFingerprint, SurfaceSpec, lock_spec, parse_children, parse_list_children, parse_single_child,
 };
 // `wayland::tests`' and `instance::tests`' fixtures name it as `node::LockSpec`, but nothing in
 // this crate's non-test reachable set does.
 #[cfg(test)]
 pub use spec::LockSpec;
 pub use style::{
-    BorderColor, parse_align, parse_background, parse_border_color, parse_border_width, parse_edge_insets, parse_radius, parse_size_mode,
+    BorderColor, parse_align, parse_edge_insets, parse_size_mode,
     parse_list_direction, parse_spacing, parse_visible,
 };
 pub use surface::{Anchor, KeyboardInteractivity, LayerKind, PanelSpec, SurfaceTopology, panel_spec};
@@ -167,8 +173,9 @@ const MAX_ERROR_VALUE_PREVIEW_BYTES: usize = 200;
 /// | 100 MB | 93.88 ms | 0.0061 ms |
 ///
 /// Cost here is a function of the cap, not of the input. 23.96 ms is more than a whole frame at
-/// 60fps, and `layout::paint` validates a `background` or `radius` while drawing, on the Wayland
-/// dispatch thread -- so this runs per frame, not per apply.
+/// 60fps, which is what made this worth fixing while `layout::paint` still validated a `background`
+/// or a `radius` while drawing. It no longer does (docs/adr/0068): every parser here runs once per
+/// node per apply, so the cap now buys a bounded `rescue` message rather than a bounded frame.
 ///
 /// `oversized_string_property_error_still_names_type_and_shows_a_recognizable_prefix` is the
 /// regression test: a naive format-then-truncate still comes in under a loose timing bound, so what

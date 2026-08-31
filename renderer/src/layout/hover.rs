@@ -111,6 +111,7 @@ mod tests {
             rect: LogicalRect { x: rect.0, y: rect.1, width: rect.2, height: rect.3 },
             visible: true,
             properties,
+            paint: None,
             children,
         }
     }

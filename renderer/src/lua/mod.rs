@@ -8,9 +8,11 @@
 pub mod capability;
 pub mod marshal;
 pub mod json;
+pub mod namespace;
 pub mod nodes;
 pub mod process;
 pub mod signal;
+pub mod surfaces;
 
 pub use nodes::VirtualNode;
 

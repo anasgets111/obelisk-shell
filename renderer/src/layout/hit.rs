@@ -106,6 +106,7 @@ mod tests {
             rect: LogicalRect { x, y, width, height },
             visible: true,
             properties: HashMap::new(),
+            paint: None,
             children,
         }
     }

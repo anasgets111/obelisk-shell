@@ -1,6 +1,7 @@
 //! Leaf-node content parsers: text content, icon name/size, image source/fit, font size,
-//! foreground color, and the two identity strings (`id`, `surface_id`). None of these carry
-//! children or affect the box model -- they are read once per paint, not per layout pass.
+//! foreground color, and the two identity strings (`id`, `surface_id`). Most of these carry no
+//! children and do not affect the box model; [`paint_style`](super::paint_style) runs them once per
+//! node per pass, alongside the geometry parsers rather than after them.
 //!
 //! `parse_string_property` is `pub(super)`: `surface`, `toplevel` and `popup`-adjacent code in
 //! `toplevel` reuse it for `namespace`, `title`, `app_id` and the like.

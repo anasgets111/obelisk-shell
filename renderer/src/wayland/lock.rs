@@ -7,7 +7,7 @@
 //! `surface`.
 
 use super::*;
-use crate::wayland::input::tree_can_authenticate;
+use crate::layout::secure_submit::tree_can_authenticate;
 use crate::wayland::surface::MapState;
 use crate::wayland::surface::TrackedRole;
 
@@ -18,12 +18,6 @@ use crate::wayland::surface::TrackedRole;
 const NO_LOCK_DECLARED: &str =
     "this config declares no `lock` surface (§ 6.4), so locking the session would leave a black screen with no password field and no way back \
      in short of a VT switch; the lock was refused (docs/adr/0052 decision 3)";
-/// The `(capability, action)` pair that reaches PAM, and the only one that can ever end a session
-/// lock. `supervisor/src/main.rs` routes `SecureSubmit { capability: "lock", action:
-/// "authenticate" }` to the PAM worker and answers a `PamOutcome::Success` with the one
-/// `SetSessionLock { locked: false }` this process will ever see; every other pair lands in some
-/// other capability's dispatch and can no more unlock the session than a `print` could.
-pub(super) const UNLOCK_TARGET: (&str, &str) = ("lock", "authenticate");
 /// The second half of docs/adr/0052 decision 3's refusal, and the one the guard was missing.
 ///
 /// `node::lock_spec` requires only an `id` -- `child` is optional -- so `lock { id = "x" }` is a
@@ -31,7 +25,8 @@ pub(super) const UNLOCK_TARGET: (&str, &str) = ("lock", "authenticate");
 /// a transparent buffer. Counting tracked `lock` instances said "a lock screen exists" for exactly
 /// the black screen the decision refuses to allow, reached through the guard rather than around
 /// it. What matters is not whether a `lock` node was written but whether the tree under it holds
-/// a [`UNLOCK_TARGET`] field, the only thing that can produce the `SecureSubmit` an unlock answers.
+/// a `layout::secure_submit`'s `UNLOCK_TARGET` field, the only thing that can produce the
+/// `SecureSubmit` an unlock answers.
 ///
 /// A separate sentence from [`NO_LOCK_DECLARED`]: one config is missing a `lock` node, the other
 /// is missing a `textfield` inside the one it has.

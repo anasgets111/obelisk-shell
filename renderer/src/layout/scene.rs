@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use mlua::{Lua, Value};
 
 use crate::layout::instance::SurfaceInstance;
-use crate::layout::node::{self, Align, EdgeInsets, LayoutError, SizeMode};
+use crate::layout::node::{self, Align, EdgeInsets, LayoutError, PaintStyle, SizeMode};
 use crate::lua::nodes::VirtualNode;
 use crate::text::shaping::{ShapeRequest, ShapingHandle};
 use crate::text::snap::{LogicalRect, PhysicalRect, snap_to_physical};
@@ -60,13 +60,16 @@ const MAX_TREE_DEPTH: u32 = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(u64);
 
-/// The public, ID-less output of one node's resolution: geometry plus a full passthrough of its
-/// properties for a future paint stage. Reused by `Scene::surface` and by `overlay_input_regions`.
+/// The public, ID-less output of one node's resolution: geometry, this node's parsed paint
+/// properties, and a passthrough of the raw property map for the readers that want a Lua value
+/// rather than a parsed one (`hover`, `on_close`, `on_dismiss`, and the surface-role specs
+/// `wayland::surface::apply_resolved_state` re-derives at configure cadence). Reused by
+/// `Scene::surface` and by `overlay_input_regions`.
 ///
 /// `properties` holds **resolved** values, never a `Signal` handle: `node::resolve_properties` ran
 /// over this node's raw map exactly once, at the top of the pass that produced this node. So this
-/// tree is a snapshot of one pass, which is what makes it safe for a later paint stage to read a
-/// colour or a radius straight off it without resolving anything itself. The structural keys are
+/// tree is a snapshot of one pass, which is what makes it safe for a later reader to take a value
+/// straight off it without resolving anything itself. The structural keys are
 /// the deliberate exception: `node::is_structural_property` copies them through raw on the kinds
 /// whose parsers read them, and those parsers reject a `Signal` outright, so no handle reaches
 /// here by that route either.
@@ -76,19 +79,23 @@ pub struct NodeId(u64);
 /// capability signal that currently reads `nil` is indistinguishable here from a `background` the
 /// config never set. For every property a parser in `layout::node` reads that is exactly right --
 /// each has a documented default and the two spellings of "no value here" must agree, which is the
-/// argument that rule rests on. For the paint-only properties this comment tells a paint stage to
-/// trust, it is a real difference collapsed: that stage will apply its own built-in default to a
-/// property the config did bind, at precisely the moments a capability has not answered yet (every
-/// `CAPABILITIES` global reads `nil` until the first `StateSnapshot` drains, so this is the state
-/// at boot, not an edge case). Distinguishing them means a third state in the map, `Value::Nil`
-/// retained as "bound but unresolved", and every parser here re-learning to treat it as absent --
-/// not worth it before a paint stage exists to have the opinion.
+/// argument that rule rests on. For the paint-only properties it is a real difference collapsed:
+/// `node::paint_style` applies the parser's documented default to a property the config did bind,
+/// at precisely the moments a capability has not answered yet (every `CAPABILITIES` global reads
+/// `nil` until the first `StateSnapshot` drains, so this is the state at boot, not an edge case).
+/// Distinguishing them means a third state in the map, `Value::Nil` retained as "bound but
+/// unresolved", and every parser here re-learning to treat it as absent. Still not worth it: the
+/// collapse costs one boot frame painted at the default, and the value it is waiting on arrives on
+/// the next turn.
 #[derive(Debug, Clone)]
 pub struct ResolvedNode {
     pub kind: String,
     pub rect: LogicalRect,
     pub visible: bool,
     pub properties: HashMap<String, Value>,
+    /// This node's paint properties, parsed here rather than by `layout::paint` on every frame
+    /// (`node::paint_style`'s module doc comment says why). `None` for a kind that draws nothing.
+    pub paint: Option<PaintStyle>,
     pub children: Vec<ResolvedNode>,
 }
 
@@ -105,6 +112,7 @@ struct RetainedNode {
     rect: LogicalRect,
     visible: bool,
     properties: HashMap<String, Value>,
+    paint: Option<PaintStyle>,
     children: Vec<RetainedNode>,
 }
 
@@ -115,6 +123,7 @@ impl RetainedNode {
             rect: self.rect,
             visible: self.visible,
             properties: self.properties.clone(),
+            paint: self.paint.clone(),
             children: self
                 .children
                 .iter()
@@ -391,6 +400,7 @@ impl Scene {
             rect,
             visible,
             properties,
+            paint,
             children,
         } = node;
         for child in children {
@@ -404,6 +414,7 @@ impl Scene {
                 rect,
                 visible,
                 properties,
+                paint,
                 children: Vec::new(),
             },
         ));
@@ -699,6 +710,9 @@ fn resolve_and_reconcile(
     let visible = node::parse_visible(&properties)?;
     let width_mode = node::parse_size_mode(&properties, "width")?;
     let height_mode = node::parse_size_mode(&properties, "height")?;
+    // Before `intrinsic_content_size`, which sizes a `text` from the `content` and `font_size`
+    // parsed here rather than parsing them a second time.
+    let paint = node::paint_style(kind, &properties)?;
 
     let own_width_known = forced_width.or_else(|| resolve_non_content(width_mode, available.width));
     let own_height_known = forced_height.or_else(|| resolve_non_content(height_mode, available.height));
@@ -783,7 +797,7 @@ fn resolve_and_reconcile(
     // this the children are placed past the edge of the box meant to contain them (measured live
     // against dev-config, where a padded column reported its child's bare height at both 8px and
     // 50px of padding -- build-steps.md Phase 19 item 14).
-    let intrinsic = intrinsic_content_size(kind, &properties, &new_children, text_wrap_width, shaping)?;
+    let intrinsic = intrinsic_content_size(kind, &properties, paint.as_ref(), &new_children, text_wrap_width, shaping)?;
     let own_width = own_width_known.unwrap_or(intrinsic.width + padding.horizontal());
     let own_height = own_height_known.unwrap_or(intrinsic.height + padding.vertical());
     let size = LogicalSize {
@@ -804,6 +818,7 @@ fn resolve_and_reconcile(
         },
         visible,
         properties,
+        paint,
         children: new_children,
     })
 }
@@ -825,14 +840,20 @@ fn flow_kind<'a>(kind: &'a str, properties: &HashMap<String, Value>) -> Result<&
 fn intrinsic_content_size(
     kind: &str,
     properties: &HashMap<String, Value>,
+    paint: Option<&PaintStyle>,
     children: &[RetainedNode],
     text_wrap_width: f32,
     shaping: &ShapingHandle,
 ) -> Result<LogicalSize, LayoutError> {
     match flow_kind(kind, properties)? {
         "text" => {
-            let content = node::parse_content(properties)?;
-            let font_size = node::parse_font_size(properties)?;
+            // `node::paint_style` gives every `text` a `PaintStyle::Text`, and `flow_kind` cannot
+            // route another kind here, so the arm is total -- the same shape as `children_of`'s
+            // `unreachable!` below.
+            let Some(PaintStyle::Text { content, font_size, .. }) = paint else {
+                unreachable!("a `text` node always carries a `PaintStyle::Text`")
+            };
+            let (content, font_size) = (content.clone(), *font_size);
             // A wrap width of 0 means nothing is known yet (a Content-sized text inside a
             // Content-sized ancestor with no room resolved so far) -- treat that as unconstrained
             // rather than forcing every word onto its own line.
@@ -1549,6 +1570,19 @@ mod tests {
             surface_from(r#"panel { id = "bar", child = row { children = { { kind = "banana" } } } }"#);
         let err = apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap_err();
         assert!(matches!(err, LayoutError::UnsupportedNodeKind(k) if k == "banana"));
+    }
+
+    /// The coverage docs/adr/0068 widened, pinned so it stays deliberate. `layout::paint::build_node`
+    /// returned before any parser on an invisible node, so this config used to boot fine and fail
+    /// only once something made the node visible.
+    #[test]
+    fn a_malformed_paint_property_on_an_invisible_node_still_fails_the_pass() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) =
+            surface_from(r#"panel { id = "bar", child = rect { visible = false, background = 5 } }"#);
+        let err = apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap_err();
+        assert!(matches!(err, LayoutError::InvalidProperty { property, .. } if property == "background"));
     }
 
     #[test]
@@ -2449,6 +2483,7 @@ mod tests {
             },
             visible: true,
             properties: HashMap::new(),
+            paint: None,
             children: Vec::new(),
         };
         let hidden_child = ResolvedNode {
@@ -2461,6 +2496,7 @@ mod tests {
             },
             visible: false,
             properties: HashMap::new(),
+            paint: None,
             children: Vec::new(),
         };
         let root = ResolvedNode {
@@ -2473,6 +2509,7 @@ mod tests {
             },
             visible: true,
             properties: HashMap::new(),
+            paint: None,
             children: vec![visible_child, hidden_child],
         };
 
@@ -2496,6 +2533,7 @@ mod tests {
             rect: LogicalRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 },
             visible: false,
             properties: HashMap::new(),
+            paint: None,
             children: Vec::new(),
         };
         let mut root = ResolvedNode {
@@ -2503,6 +2541,7 @@ mod tests {
             rect: LogicalRect { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0 },
             visible: true,
             properties: HashMap::new(),
+            paint: None,
             children: vec![hidden_child],
         };
         assert!(overlay_input_regions(&root, 1.0).is_empty());
@@ -2518,11 +2557,13 @@ mod tests {
             rect: LogicalRect { x: 0.0, y: 0.0, width: 1920.0, height: 32.0 },
             visible: true,
             properties: HashMap::new(),
+            paint: None,
             children: vec![ResolvedNode {
                 kind: "row".to_string(),
                 rect: LogicalRect { x: 0.0, y: 0.0, width: 1920.0, height: 32.0 },
                 visible: true,
                 properties: HashMap::new(),
+                paint: None,
                 children: Vec::new(),
             }],
         };

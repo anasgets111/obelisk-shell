@@ -45,9 +45,6 @@ use crate::text::shaping::ShapingHandle;
 use crate::text::snap::LogicalRect;
 
 mod input;
-// `socket.rs` asks this one question of the keyboard's own rule (docs/adr/0052 decision 2),
-// so it is re-exported rather than making the whole module crate-visible for it.
-pub(crate) use input::tree_can_authenticate;
 mod layer;
 mod lock;
 mod output;

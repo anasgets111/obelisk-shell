@@ -1091,19 +1091,20 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    this is diagnostics quality rather than a security boundary. It is written down because a fourth
    copy of a bad pattern is how it becomes the convention.
 
-   Item 6's own third commit then changed the cadence this is paid at, which is what turns it from
-   untidy into a real problem. `Scene::apply` never parses the paint properties, so `layout::paint`
-   is the first thing that ever validates a `background` or a `radius`, and it does that while
-   drawing. A malformed value is logged and treated as absent rather than failing the apply, since
-   there is no rollback available mid-frame with a GL context bound. So once `paint_tree` has a
-   production caller, one `background = 5` in one node formats and prints on every frame, on the
-   Wayland dispatch thread, at whatever rate item 9's frame callbacks fire.
+   Item 6's own third commit then changed the cadence this is paid at, and for a while that turned
+   it from untidy into a real problem: `Scene::apply` did not parse the paint properties, so
+   `layout::paint` was the first thing that ever validated a `background` or a `radius`, and it did
+   that while drawing. A malformed value was logged and treated as absent rather than failing the
+   apply, so one `background = 5` in one node formatted and printed on every frame.
 
-   Rate-limiting the log is the wrong fix and would hide the real one. Paint properties should be
-   parsed once at apply time, where a failure already has somewhere to go: a `LayoutError` that
-   rolls back and reaches `rescue`, exactly as a bad `align_v` does today. That is the same "parse
-   geometry once into the retained node" that item 5 defers, and both halves want doing together,
-   which is why this is recorded here rather than bolted onto a paint commit.
+   **Fixed.** `node::paint_style` parses every paint property once, while `Scene::apply` resolves
+   the node, and a failure rolls back and reaches `rescue` exactly as a bad `align_v` does. The
+   per-frame log is gone with the five log-and-default draw builders it lived in. It went alone,
+   against the note above: the geometry half it was waiting to be paired with does not exist, since
+   those parsers already run at apply time under the right failure rule. See docs/adr/0068.
+
+   The 20 MB interpolation itself is untouched. It is now paid once per failed apply rather than
+   once per frame, which is the cadence the original judgement assumed.
 14. **A container's content size must include its own padding.** Measured live: a content-sized
    `column` holding one 15.6-tall `text` reports 15.6 whether its padding is 8 or 50 on every edge.
    `scene.rs` parses `padding` to inset the box it lays children out in, but no arm of

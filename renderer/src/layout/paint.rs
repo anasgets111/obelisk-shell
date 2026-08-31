@@ -1,11 +1,15 @@
 //! Draws a resolved layout tree onto a shared femtovg canvas (build-steps.md Phase 19 item 6).
 //!
 //! Two halves, and the split is the point. [`build`] walks a `layout::scene::ResolvedNode` tree
-//! (`Scene::surface`'s output) through `layout::node`'s paint-property parsers (`parse_background`,
-//! `parse_radius`, `parse_border_color`, `parse_border_width`, `parse_foreground`) and flattens it
-//! into a [`DisplayList`] of plain Rust data. [`execute`] turns that list into femtovg draw calls
-//! on `text::atlas::TextPainter`'s canvas, the same canvas `draw_line` already draws glyphs on --
-//! one canvas, one flush per surface per frame.
+//! (`Scene::surface`'s output) and flattens it into a [`DisplayList`] of plain Rust data.
+//! [`execute`] turns that list into femtovg draw calls on `text::atlas::TextPainter`'s canvas, the
+//! same canvas `draw_line` already draws glyphs on -- one canvas, one flush per surface per frame.
+//!
+//! Nothing here parses. `node::paint_style` did that while `Scene::apply` resolved the node, so
+//! [`build_node`] reads a typed `node::PaintStyle` and this module names no property and holds no
+//! `mlua::Value`. It used to run all fourteen paint-property parsers on every node on every frame,
+//! because the list comparison below is what makes a frame skippable and the parse was the price of
+//! finding out nothing had changed.
 //!
 //! They were one function until the list existed. Splitting them buys two things a single walk
 //! could not: `wayland::App::paint_surface` compares this frame's list against the one it last
@@ -25,14 +29,11 @@
 //! descends rather than trusting `rect.x`/`rect.y` as already-absolute. Get this wrong and every
 //! subtree nests at the surface's top-left corner instead of its real position.
 
-use std::collections::HashMap;
-
 use femtovg::renderer::OpenGl;
 use femtovg::{Canvas, Color, Paint, Path};
-use mlua::Value;
 
 use crate::image::{self, Fit, ImageCache};
-use crate::layout::node::{self, BorderColor, EdgeInsets, LayoutError, Rgba};
+use crate::layout::node::{self, BorderColor, EdgeInsets, PaintStyle, Rgba};
 use crate::layout::scene::ResolvedNode;
 use crate::text::atlas::TextPainter;
 use crate::text::snap::{snap_border_band, snap_to_physical, LogicalRect, PhysicalRect};
@@ -126,69 +127,6 @@ pub struct SecureField<'a> {
     pub filled: usize,
 }
 
-/// `textfield` (§ 5.2 item 8): the placeholder while empty, one `mask_character` per typed
-/// character once it is not.
-///
-/// Until this existed the arm drew nothing, and `lock.lua` carried a comment measuring what that
-/// cost: a lock screen that "swallows keystrokes while showing no masked characters at all". That
-/// is worse than cosmetic. `pam_unix` answers a wrong password with a two second `pam_fail_delay`
-/// and `pam_faillock` locks the account after three, so typing blind means a typo is invisible,
-/// indistinguishable from a slow unlock, and three of them lock you out of your own session for
-/// ten minutes.
-///
-/// Only the focused field fills. An unfocused one shows its placeholder, which is also the honest
-/// thing to draw: `input::retarget_secure_submit` zeroizes the buffer whenever focus moves, so
-/// there is no typed state left anywhere else to represent.
-fn textfield_draw(properties: &HashMap<String, Value>, focus: Option<&SecureField>) -> Option<Draw> {
-    let declared = match node::parse_secure_submit(properties) {
-        Ok(target) => target,
-        Err(e) => {
-            log_paint_error("textfield", "secure_submit", &e);
-            None
-        }
-    };
-    let filled = focus
-        .filter(|focus| declared.as_ref().is_some_and(|declared| declared == focus.target))
-        .map_or(0, |focus| focus.filled);
-
-    let content = if filled == 0 {
-        match node::parse_placeholder(properties) {
-            Ok(placeholder) => placeholder,
-            Err(e) => {
-                log_paint_error("textfield", "placeholder", &e);
-                String::new()
-            }
-        }
-    } else {
-        match node::parse_mask_character(properties) {
-            Ok(mask) => mask.repeat(filled),
-            Err(e) => {
-                log_paint_error("textfield", "mask_character", &e);
-                "\u{2022}".repeat(filled)
-            }
-        }
-    };
-    if content.is_empty() {
-        return None;
-    }
-
-    let font_size = match node::parse_font_size(properties) {
-        Ok(size) => size,
-        Err(e) => {
-            log_paint_error("textfield", "font_size", &e);
-            12.0
-        }
-    };
-    let color = match node::parse_foreground(properties) {
-        Ok(color) => color,
-        Err(e) => {
-            log_paint_error("textfield", "foreground", &e);
-            Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
-        }
-    };
-    Some(Draw::Text { content, font_size, color })
-}
-
 /// Flattens `root` into the list of draws it would produce, touching no canvas and no GL context.
 ///
 /// Pure, so the whole paint stage is testable without EGL for the first time: every existing test
@@ -257,25 +195,12 @@ fn build_node(
         return;
     }
 
-    let draw = match node.kind.as_str() {
-        // row/column/button have no paint properties of their own beyond the base `rect` ones
-        // (§ 5.2), and a surface root paints exactly like a rect -- one code path serves all
-        // seven. All four surface roles, not just `panel`: § 6.2, § 6.3 and § 6.4 give a `window`,
-        // a `popup` and a `lock` the same § 5.1 base properties § 6.1 gives a `panel`, so a
-        // background or a border on any of those roots is the same fill this already draws.
-        "rect" | "row" | "column" | "button" | "panel" | "window" | "popup" | "lock" => Some(box_draw(&node.kind, &node.properties)),
-        "text" => Some(text_draw(&node.properties)),
-        "icon" => icon_draw(&node.properties, rect, scale),
-        "image" => image_draw(&node.properties, rect, scale),
-        "textfield" => textfield_draw(&node.properties, focus),
-        // Every other kind draws nothing. Named rather than left to a bare catch-all:
-        // `layout::scene::ensure_supported_kind`'s list bounds this arm, so a new kind added there
-        // without a decision here draws nothing silently, on purpose. On a lock surface that
-        // silence is a transparent buffer over a locked session, which is the black screen
-        // docs/adr/0052 decision 3 refuses a lock to avoid, reached by another route.
-        _ => None,
-    };
-    if let Some(draw) = draw {
+    // `node.kind` is not consulted at all: `node::paint_style` already made that decision, once,
+    // while `Scene::apply` resolved this node. A kind it does not recognise carries no style and
+    // draws nothing, which stays deliberate -- on a lock surface that silence is a transparent
+    // buffer over a locked session, the black screen docs/adr/0052 decision 3 refuses a lock to
+    // avoid, reached by another route.
+    if let Some(draw) = node.paint.as_ref().and_then(|style| draw_for(style, rect, scale, focus)) {
         out.push(DrawCmd { rect, clip, draw });
     }
 
@@ -302,8 +227,8 @@ pub fn paint_tree(painter: &mut TextPainter, images: &mut ImageCache, root: &Res
     execute(painter, images, &build(root, scale, None), scale);
 }
 
-/// Draws an already-built list. Split from [`build`] so the canvas half holds no parsing and the
-/// parsing half holds no canvas -- which is what makes a list comparable, and [`build`] testable
+/// Draws an already-built list. Split from [`build`] so the canvas half holds no geometry and the
+/// geometry half holds no canvas -- which is what makes a list comparable, and [`build`] testable
 /// without an EGL context.
 pub fn execute(painter: &mut TextPainter, images: &mut ImageCache, list: &DisplayList, scale: f32) {
     // Before the draws, never during them: the previous frame's flush has happened, this one has
@@ -349,101 +274,97 @@ pub fn execute(painter: &mut TextPainter, images: &mut ImageCache, list: &Displa
 }
 
 
-/// One paint-property parse gone wrong: logged and treated as absent/default rather than
-/// aborting the whole tree walk over one node's malformed `background`/`radius`/`border_*` --
-/// `Scene::apply` never calls these parsers, so this is genuinely the first validation a bad
-/// literal like `background = 5` ever meets, and a config error in one node's paint properties
-/// shouldn't blank the surface around it.
+/// One node's parsed paint properties as the draw they produce, or `None` when they produce none.
 ///
-/// ponytail: one line per bad property per node per call, and once `paint_tree` has a real caller
-/// that is per frame, not per config edit. A single `background = 5` becomes an unbounded log
-/// stream on the Wayland dispatch thread, and each line re-formats the rejected value's whole
-/// `Debug` form, which build-steps.md Phase 19 item 13 measures at 20 MB for a hostile string. That
-/// item judged the cost acceptable while it was paid once per apply; this pass is what changes the
-/// cadence, and item 13 now records that. The real fix is not rate-limiting here: it is parsing
-/// paint properties once at apply time, where a failure reaches `rescue` and rolls back the way a
-/// bad `align_v` already does, instead of being logged past on every frame. That is the same
-/// "parse geometry once into the retained node" item 5 defers, and it wants both halves at once.
-fn log_paint_error(kind: &str, property: &str, err: &LayoutError) {
-    eprintln!("[oblisk-renderer] paint: {kind}.{property}: {err}");
-}
-
-/// The shared paint of `rect`/`row`/`column`/`button` and all three surface roles: background
-/// fill, then borders (`oblisk-idl-api-specs.md` § 5.2 item 1).
-fn box_draw(kind: &str, properties: &HashMap<String, Value>) -> Draw {
-    let radius = match node::parse_radius(properties) {
-        Ok(r) => r,
-        Err(e) => {
-            log_paint_error(kind, "radius", &e);
-            0.0
-        }
-    };
-    let background = match node::parse_background(properties) {
-        Ok(color) => color,
-        Err(e) => {
-            log_paint_error(kind, "background", &e);
-            None
-        }
-    };
-    let colors = match node::parse_border_color(properties) {
-        Ok(c) => c,
-        Err(e) => {
-            log_paint_error(kind, "border_color", &e);
-            BorderColor::default()
-        }
-    };
-    let widths = match node::parse_border_width(properties) {
-        Ok(w) => w,
-        Err(e) => {
-            log_paint_error(kind, "border_width", &e);
-            EdgeInsets::default()
-        }
-    };
-    Draw::Box { background, radius, colors, widths }
-}
-
-/// `icon` (§ 5.2 item 5): resolve the theme name, then draw the file (build-steps.md Phase 29
-/// item 3). This is the arm that was `"icon" => {}` from Phase 19 until docs/adr/0054 settled
-/// which side of the process boundary the resolver lives on.
+/// `scale` and `focus` are the whole reason this is here rather than in `node::paint_style`: an
+/// `icon` or an `image` needs the physical pixel count its resolved rect works out to, and a
+/// `textfield` needs to know whether it holds the keyboard. Both are arithmetic over parsed data.
 ///
-/// `Contain` rather than `Cover`, and the *shorter* edge as the resolved size: `size` is § 5.2's
-/// "bounding box diameter", so an icon in a box that is not square should sit inside it whole
-/// rather than be cropped to fill it. An icon is the one case where showing less of the image is
-/// never the right answer.
-fn icon_draw(properties: &HashMap<String, Value>, rect: LogicalRect, scale: f32) -> Option<Draw> {
-    let name = match node::parse_icon_name(properties) {
-        Ok(name) => name,
-        Err(e) => {
-            log_paint_error("icon", "name", &e);
-            return None;
-        }
-    };
-    Some(Draw::Icon { name, px: physical_edge(rect.width.min(rect.height), scale) })
-}
+/// Nothing here can fail. A malformed paint property never reaches this function: `Scene::apply`
+/// refused the tree that carried it (see `node::paint_style`'s module doc comment), which is what
+/// replaced the per-frame log-and-default this function used to be five of.
+fn draw_for(style: &PaintStyle, rect: LogicalRect, scale: f32, focus: Option<&SecureField>) -> Option<Draw> {
+    match style {
+        // The shared paint of `rect`/`row`/`column`/`button` and all four surface roles: background
+        // fill, then borders (`oblisk-idl-api-specs.md` § 5.2 item 1).
+        PaintStyle::Box { background, radius, colors, widths } => Some(Draw::Box {
+            background: *background,
+            radius: *radius,
+            colors: *colors,
+            widths: *widths,
+        }),
 
-/// `image` (docs/adr/0054 decision 3): draw the file at `source`, fitted by `fit`.
-fn image_draw(properties: &HashMap<String, Value>, rect: LogicalRect, scale: f32) -> Option<Draw> {
-    let source = match node::parse_image_source(properties) {
-        Ok(source) => source,
-        Err(e) => {
-            log_paint_error("image", "source", &e);
-            return None;
+        // `text` (§ 5.2 item 4): `content` through `TextPainter`, at `rect`, coloured by
+        // `foreground`.
+        //
+        // ponytail: a `Content`-sized `text` box comes from cosmic-text's measurement
+        // (`layout::scene::intrinsic_content_size`), while `build_node`'s clip cuts this draw off at
+        // that same box -- so if femtovg ever renders wider than cosmic-text measured, the clip
+        // shaves the overrun off the right edge instead of letting it paint over a neighbour.
+        // Checked against the current font chain (single-face Noto Sans, no fallback triggered)
+        // with a scratch test rendering unclipped and scanning pixels past the measured edge, for
+        // both a short string at 24px and a 53-character string at 32px: femtovg's `measure_text`
+        // agreed with cosmic-text's `shape()` to within 0.0001px on the longer string, and the last
+        // lit (non-background) pixel in both cases sat 3-4 physical pixels inside the measured edge,
+        // not past it. No shaving observed on this chain. It is still the correct outcome if a
+        // future font or fallback face renders wider than it measures: the alternative is the
+        // overrun landing on whatever sits to the right, which is the exact bug this fixes.
+        PaintStyle::Text { content, font_size, color } => Some(Draw::Text {
+            content: content.clone(),
+            font_size: *font_size,
+            color: *color,
+        }),
+
+        // `icon` (§ 5.2 item 5): the theme name, resolved to a file by [`execute`]
+        // (build-steps.md Phase 29 item 3, docs/adr/0054).
+        //
+        // `Contain` rather than `Cover`, and the *shorter* edge as the resolved size: `size` is
+        // § 5.2's "bounding box diameter", so an icon in a box that is not square should sit inside
+        // it whole rather than be cropped to fill it. An icon is the one case where showing less of
+        // the image is never the right answer.
+        PaintStyle::Icon { name } => Some(Draw::Icon {
+            name: name.clone(),
+            px: physical_edge(rect.width.min(rect.height), scale),
+        }),
+
+        // `image` (docs/adr/0054 decision 3): the file at `source`, fitted by `fit`. An empty
+        // `source` is the absent-key default, so it draws nothing rather than reaching the cache
+        // with a path of "".
+        //
+        // The *longer* edge, unlike an icon's: `Cover` scales the image up until it covers the box,
+        // so rasterizing an SVG wallpaper against the shorter edge would upload it at exactly the
+        // resolution the fit is about to scale past.
+        PaintStyle::Image { source, fit } => (!source.is_empty()).then(|| Draw::Image {
+            source: source.clone(),
+            fit: *fit,
+            px: physical_edge(rect.width.max(rect.height), scale),
+        }),
+
+        // `textfield` (§ 5.2 item 8): the placeholder while empty, one `mask_character` per typed
+        // character once it is not.
+        //
+        // Until this existed the arm drew nothing, and `lock.lua` carried a comment measuring what
+        // that cost: a lock screen that "swallows keystrokes while showing no masked characters at
+        // all". That is worse than cosmetic. `pam_unix` answers a wrong password with a two second
+        // `pam_fail_delay` and `pam_faillock` locks the account after three, so typing blind means a
+        // typo is invisible, indistinguishable from a slow unlock, and three of them lock you out of
+        // your own session for ten minutes.
+        //
+        // Only the focused field fills. An unfocused one shows its placeholder, which is also the
+        // honest thing to draw: `input::retarget_secure_submit` zeroizes the buffer whenever focus
+        // moves, so there is no typed state left anywhere else to represent.
+        PaintStyle::TextField { target, placeholder, mask, font_size, color } => {
+            let filled = focus
+                .filter(|focus| target.as_ref().is_some_and(|declared| declared == focus.target))
+                .map_or(0, |focus| focus.filled);
+            let content = if filled == 0 { placeholder.clone() } else { mask.repeat(filled) };
+            (!content.is_empty()).then_some(Draw::Text {
+                content,
+                font_size: *font_size,
+                color: *color,
+            })
         }
-    };
-    if source.is_empty() {
-        return None;
     }
-    let fit = match node::parse_fit(properties) {
-        Ok(fit) => fit,
-        Err(e) => {
-            log_paint_error("image", "fit", &e);
-            Fit::default()
-        }
-    };
-    // The *longer* edge, unlike [`icon_draw`]: `Cover` scales the image up until it covers the
-    // box, so rasterizing an SVG wallpaper against the shorter edge would upload it at exactly the
-    // resolution the fit is about to scale past.
-    Some(Draw::Image { source, fit, px: physical_edge(rect.width.max(rect.height), scale) })
 }
 
 /// The shared half of [`Draw::Icon`] and [`Draw::Image`]: cache lookup, then one `fill_path` over
@@ -587,48 +508,6 @@ fn paint_border_edge(canvas: &mut Canvas<OpenGl>, color: Option<Rgba>, width: f3
     let mut path = Path::new();
     path.rect(edge_rect.x, edge_rect.y, edge_rect.width, edge_rect.height);
     canvas.fill_path(&path, &Paint::color(Color::rgbaf(color.r, color.g, color.b, color.a)));
-}
-
-/// `text` (`oblisk-idl-api-specs.md` § 5.2 item 4): `content` through `TextPainter`, at `rect`,
-/// coloured by `foreground`. A parse error on `font_size`/`foreground` falls back to the same
-/// defaults those parsers already return for an absent key, so a malformed value degrades to
-/// "as if omitted" rather than blanking the node's text entirely.
-///
-/// ponytail: a `Content`-sized `text` box comes from cosmic-text's measurement
-/// (`layout::scene::intrinsic_content_size`), while `paint_node`'s clip now cuts this draw off at
-/// that same box -- so if femtovg ever renders wider than cosmic-text measured, the clip shaves
-/// the overrun off the right edge instead of letting it paint over a neighbour. Checked against
-/// the current font chain (single-face Noto Sans, no fallback triggered) with a scratch test
-/// rendering unclipped and scanning pixels past the measured edge, for both a short string at
-/// 24px and a 53-character string at 32px: femtovg's `measure_text` agreed with cosmic-text's
-/// `shape()` to within 0.0001px on the longer string, and the last lit (non-background) pixel in
-/// both cases sat 3-4 physical pixels inside the measured edge, not past it. No shaving observed
-/// on this chain. It is still the correct outcome if a future font or fallback face renders wider
-/// than it measures: the alternative is the overrun landing on whatever sits to the right, which
-/// is the exact bug this item fixes.
-fn text_draw(properties: &HashMap<String, Value>) -> Draw {
-    let content = match node::parse_content(properties) {
-        Ok(c) => c,
-        Err(e) => {
-            log_paint_error("text", "content", &e);
-            String::new()
-        }
-    };
-    let font_size = match node::parse_font_size(properties) {
-        Ok(s) => s,
-        Err(e) => {
-            log_paint_error("text", "font_size", &e);
-            12.0
-        }
-    };
-    let color = match node::parse_foreground(properties) {
-        Ok(c) => c,
-        Err(e) => {
-            log_paint_error("text", "foreground", &e);
-            Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
-        }
-    };
-    Draw::Text { content, font_size, color }
 }
 
 #[cfg(test)]

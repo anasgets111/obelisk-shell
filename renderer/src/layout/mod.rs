@@ -17,6 +17,7 @@ pub mod instance;
 pub mod node;
 pub mod paint;
 pub mod scene;
+pub mod secure_submit;
 
 // ponytail: this is the module's real, tested public surface, but `socket.rs`'s `RendererClient`
 // (the only caller outside `layout` today) only needs `Scene`/`LogicalSize`, below, to call
