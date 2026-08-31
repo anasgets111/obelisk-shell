@@ -1,52 +1,90 @@
--- Mirrors Volume.qml.
+-- Mirrors Volume.qml: a circle showing one glyph, which grows to show the percentage while the
+-- pointer is on it.
 --
--- Volume, real as of docs/adr/0053 decision 3. `audio.volume` is the cube root of PipeWire's
--- `channelVolumes`, which is the number `wpctl` and `pactl` show and the one a user recognises as
--- "the volume"; the raw linear value would read 3% where this reads 30%.
--- § 5.2 item 5's own worked example (`"audio-volume-high"`), which makes this the natural place to
--- prove `icon` resolves a theme name and re-resolves it when the signal pushes. `:map` rather than
--- `label`: a nil `audio` should resolve to no icon at all, and `label`'s "--" placeholder would go
--- to the theme lookup as if it were a name.
+-- The expansion is two properties, not an animation. `hover` is a signal the engine writes
+-- (docs/adr/0062), so the button's `width` reads it and the readout's `visible` reads it, and the
+-- control is wide exactly while it is hovered. The mirror tweens the width over 147ms; this snaps,
+-- because nothing in the engine interpolates a property between two resolves.
+--
+-- Click mutes. The mirror puts mute on the middle button and a drag on the left, and a drag needs
+-- pointer motion tracked into a value, which § 5.1's press-carries-a-rect model does not do.
 local theme = require("config.theme")
+local icons = require("config.icons")
 local util = require("lib.util")
 local cell = require("components.cell")
-local pill = require("components.pill")
-local meter = require("components.meter")
 local ui_state = require("lib.ui_state")
 
-local volume_icon = oblisk.audio:map(util.volume_icon_name)
+local SLOT = "volume"
+local hovered = hover(SLOT)
 
--- The icon and the readout are one `button`: clicking mutes, clicking again unmutes. This is the
--- § 3.2 audio write path's live proof, and `toggle_mute` is the one action of the seven that takes
--- no arguments, so it is also the one a click can express without inventing a gesture this engine
--- does not have. Volume steps and a device picker want a scroll wheel and a popup list, and the
--- config vocabulary for both is a separate slice.
---
--- Nothing here updates the pill optimistically. The new state arrives back through PipeWire's own
--- `Props` event, which is what makes a mute from this bar and a mute from `wpctl` look identical.
-local volume_module = pill({
-    icon { name = volume_icon, size = 14 },
-    -- The readout is the button and the icon beside it is not, which is the shape
-    -- every pill here uses: a `button` is a stacking container (`scene.rs` positions
-    -- its children independently rather than in a line), so it holds one child. Wrapping a `row`
-    -- in it to get both drew the icon's box and none of its pixels.
-    button {
-        height = 18,
+local function volume_glyph(a)
+    if a == nil then
+        return icons.vol_muted
+    end
+    if a.muted then
+        return icons.vol_muted
+    end
+    local level = (a.volume or 0) * 100
+    if level < 1 then
+        return icons.vol_zero
+    elseif level < 33 then
+        return icons.vol_low
+    elseif level < 66 then
+        return icons.vol_mid
+    end
+    return icons.vol_high
+end
+
+-- Muted sits on the content ground rather than the control ground, which is the mirror's own way of
+-- saying "this is off" without changing the glyph's colour as well as its shape.
+local ground = oblisk.audio:map(function(a)
+    return (a ~= nil and a.muted) and theme.GLASS_CONTENT or theme.GLASS_CONTROL
+end)
+
+return button {
+    width = hovered:map(function(is_hovered)
+        return is_hovered and theme.volume_expanded_width or theme.item_width
+    end),
+    height = theme.item_height,
+    align_v = "Center",
+    hover = hovered,
+    radius = theme.item_radius,
+    background = computed({ oblisk.audio, hovered }, function(a, is_hovered)
+        if is_hovered then
+            return theme.GLASS_CONTROL_HOVER
+        end
+        return (a ~= nil and a.muted) and theme.GLASS_CONTENT or theme.GLASS_CONTROL
+    end),
+    border_width = theme.border_width,
+    border_color = hovered:map(function(is_hovered)
+        return is_hovered and theme.GLASS_BORDER_HOVER or theme.GLASS_BORDER
+    end),
+    on_click = function(_, mouse_button)
+        if mouse_button ~= "left" then
+            return
+        end
+        oblisk.audio:invoke("toggle_mute")
+        ui_state.arm_osd("volume")
+    end,
+    children = { row {
+        width = "Fill",
+        height = "Fill",
+        align_h = "Center",
         align_v = "Center",
-        on_click = function()
-            oblisk.audio:invoke("toggle_mute")
-            ui_state.arm_osd("volume")
-        end,
-        children = { cell(util.label(oblisk.audio, function(a)
-            if a.muted then
-                return "muted"
-            end
-            return string.format("vol %d%%", math.floor(a.volume * 100 + 0.5))
-        end), theme.FG) },
-    },
-    meter(oblisk.audio, function(a)
-        return a.muted and 0 or a.volume * 100
-    end, theme.MAUVE),
-})
-
-return volume_module
+        spacing = theme.spacing.xs,
+        children = {
+            cell(oblisk.audio:map(volume_glyph), ground:map(theme.text_contrast), theme.icon.lg, { align_v = "Center" }),
+            cell(util.label(oblisk.audio, function(a)
+                if a.muted then
+                    return "muted"
+                end
+                return string.format("%d%%", math.floor(a.volume * 100 + 0.5))
+            -- The percentage exists only while the control is wide enough for it. This was declared
+            -- on the row instead, which held the glyph too, so the collapsed control was an empty
+            -- circle and the volume was the one indicator on the bar showing nothing at all. A
+            -- hidden child costs no width and no spacing either: `layout::scene`'s row arm sums
+            -- footprints over the visible children and multiplies spacing by that count.
+            end), theme.text_contrast(theme.GLASS_CONTROL_HOVER), theme.font.sm, { align_v = "Center", visible = hovered }),
+        },
+    } },
+}

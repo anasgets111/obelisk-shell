@@ -31,19 +31,24 @@ return window {
         section_header("system"),
         cell(util.label(oblisk.system, function(s)
             return "up since " .. os.date("%H:%M:%S", s.time)
-        end), theme.DIM, 11),
+        end), theme.DIM, theme.font.xs),
         cell(util.label(oblisk.audio, function(a)
             return string.format("%d playback stream(s)", util.count(a.apps))
-        end), theme.DIM, 11),
+        end), theme.DIM, theme.font.xs),
         cell(util.label(oblisk.screens, function(s)
             return string.format("%d output(s)", #s)
-        end), theme.DIM, 11),
+        end), theme.DIM, theme.font.xs),
         sysinfo_module,
     }, {
         width = "Fill",
         height = "Fill",
-        padding = { top = 14, right = 14, bottom = 14, left = 14 },
-        spacing = 8,
+        padding = {
+            top = theme.spacing.lg,
+            right = theme.spacing.lg,
+            bottom = theme.spacing.lg,
+            left = theme.spacing.lg,
+        },
+        spacing = theme.spacing.sm,
         radius = 0,
     }),
 }

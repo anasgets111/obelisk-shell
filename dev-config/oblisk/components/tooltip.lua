@@ -35,11 +35,11 @@ return function(opts)
         anchor = "BottomLeft",
         gravity = "BottomRight",
         constraint_adjustment = { "FlipY", "SlideX" },
-        offset = { x = 0, y = 4 },
+        offset = { x = 0, y = theme.panel_gap },
         child = panel_card(opts.children, {
-            background = "#181825ee",
-            border_width = 1,
-            border_color = theme.SURFACE,
+            background = theme.GLASS,
+            border_width = theme.border_width,
+            border_color = theme.BORDER,
         }),
     }
 end

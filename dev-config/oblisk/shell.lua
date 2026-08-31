@@ -1,7 +1,14 @@
 -- Development bar. Two jobs, and they pull in opposite directions often enough to be worth naming:
--- it is the fixture that exercises the engine against a real session (`XDG_CONFIG_HOME=dev-config
--- target/debug/supervisor`), and it is the worked example of what a config for this shell looks
--- like. Where those conflict the fixture wins, and the comment says so.
+-- it is the fixture that exercises the engine against a real session (`cargo build --workspace &&
+-- XDG_CONFIG_HOME=dev-config target/debug/supervisor`), and it is the worked example of what a
+-- config for this shell looks like. Where those conflict the fixture wins, and the comment says so.
+--
+-- `cargo build --workspace` first, and it is not optional. The Supervisor finds the Renderer as a
+-- filesystem sibling of its own binary (`supervisor/src/generation.rs`'s `renderer_binary_path`),
+-- not as a Cargo dependency, so `cargo run -p supervisor` rebuilds one half of the stack and
+-- launches whatever `target/debug/renderer` happens to be. That fails as a *config* error: a
+-- Renderer older than the `fonts` global reports `attempt to call a nil value (global 'fonts')` at
+-- the declaration below and points at this file, which is the last place the fault actually is.
 --
 -- Laid out like a bar people actually run, because it is copied from one: the zones and the order
 -- of the modules in them are `~/.config/quickshell`'s, down to the clock sitting last on the right
@@ -64,6 +71,11 @@ local launcher = require("modules.global.launcher")
 local battery_tooltip = require("modules.bar.indicators.battery").tooltip
 local clock_tooltip = require("modules.bar.indicators.date_time").tooltip
 local launcher_tooltip = require("modules.bar.indicators.launcher_button").tooltip
+-- New with the icon-only bar, and not decoration. A circle with a wifi glyph in it says how strong
+-- the signal is and nothing about which network, which is fine on the bar and useless without
+-- somewhere to read the rest -- so the two indicators that lost their labels grew a tooltip each.
+local network_tooltip = require("modules.bar.indicators.network").tooltip
+local bluetooth_tooltip = require("modules.bar.indicators.bluetooth").tooltip
 local lock_screen = require("modules.global.lock")
 
 return {
@@ -76,6 +88,8 @@ return {
     battery_tooltip,
     clock_tooltip,
     launcher_tooltip,
+    network_tooltip,
+    bluetooth_tooltip,
     launcher,
     lock_screen,
 }

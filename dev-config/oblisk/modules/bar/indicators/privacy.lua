@@ -1,23 +1,24 @@
--- Mirrors PrivacyIndicator.qml.
+-- Mirrors PrivacyIndicator.qml, one circle of its three: a red glyph while something has the
+-- camera open, absent otherwise.
 --
--- Only rendered when something is actually using the camera, which is the whole point: a privacy
--- indicator that is always visible is not an indicator.
+-- The mirror also draws a microphone and a screen-share circle. `PrivacyState` in
+-- `supervisor/src/privacy/controller.rs` is one field, `camera_users`, so there is nothing behind
+-- the other two and drawing them would mean drawing two alerts that can never fire.
+--
+-- Red ground rather than a red word. `text_contrast` picks the glyph colour against it, so the
+-- alert reads at a glance and does not need "cam:" spelled out beside it -- which is what this
+-- module used to do, in a 96px box, permanently reserved whether anything was recording or not.
 local theme = require("config.theme")
+local icons = require("config.icons")
 local util = require("lib.util")
-local cell = require("components.cell")
-local pill = require("components.pill")
+local icon_button = require("components.icon_button")
 
-return row {
-    height = "Fill",
-    align_v = "Center",
+-- A read-only alert: `on_activate` is nil, so this draws as a `row` rather than a `button`. There
+-- is no command to hang off a click -- the mirror's microphone circle toggles the source mute, and
+-- § 4.1's audio row has neither the command nor a field to read the result back from.
+return icon_button(icons.camera, nil, {
+    background = theme.RED,
     visible = util.shown_when(oblisk.privacy, function(p)
-        return #(p.camera_users or {}) > 0
+        return #((p or {}).camera_users or {}) > 0
     end),
-    children = { pill({ cell(util.label(oblisk.privacy, function(p)
-        local users = p.camera_users or {}
-        -- Truncated like every other readout here. An app name arrives from whichever process
-        -- opened the camera and has no length this config controls, and the pill is only ever up
-        -- while a camera is live, which is the worst moment for the bar to reflow.
-        return "cam: " .. util.truncate((users[1] or {}).app_name or "?", 10)
-    end), theme.RED) }, "#45253aff") },
-}
+})

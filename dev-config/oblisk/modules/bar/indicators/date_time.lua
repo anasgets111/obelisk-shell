@@ -1,26 +1,23 @@
--- Mirrors DateTimeDisplay.qml.
+-- Mirrors DateTimeDisplay.qml, which is one control holding the notification state and the clock
+-- rather than two sitting beside each other.
 --
--- The clock, and the whole reason `system` exists (docs/adr/0053). `system.time` is a unix epoch in
--- seconds pushed once per wall-clock second, so `os.date` formats it the same way it would format
--- `os.time()`. The difference is that this one moves: `os.date(os.time())` freezes at whatever
--- instant the config was evaluated, because nothing re-evaluates it.
+-- The date and the time are one string, not two cells. `%a %d %b  %H:%M` reads as a clock; a dim
+-- date cell next to a large time cell reads as two modules that happen to be adjacent, which is
+-- what this drew before. The mirror's own format is `TimeService.format("datetime")`.
+--
+-- Seconds are gone with them. A clock that ticks every second is a re-resolve every second for a
+-- digit nobody reads on a bar, and § 4.2's `system.time` pushes at whatever cadence it pushes at
+-- either way.
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
 local tooltip = require("components.tooltip")
 
-local clock = cell(util.label(oblisk.system, function(s)
-    return os.date("%H:%M:%S", s.time)
-end), theme.FG, 15)
-
-local date = cell(util.label(oblisk.system, function(s)
-    return os.date("%a %d %b", s.time)
-end), theme.DIM, 11)
-
--- Quickshell's DateTimeDisplay opens a mini calendar and a weather panel on hover. There is no
--- calendar node and no weather capability, so this is the part of that tooltip the data supports:
--- the full date `%a %d %b` had to truncate, and the seconds the pill does not show.
 local SLOT = "clock"
+
+local clock = cell(util.label(oblisk.system, function(s)
+    return os.date("%a %d %b  %H:%M", s.time)
+end), theme.text_contrast(theme.GLASS_CONTROL), theme.font.sm, { align_v = "Center" })
 
 local clock_tooltip = tooltip({
     id = "clock_tooltip",
@@ -30,11 +27,11 @@ local clock_tooltip = tooltip({
     children = {
         cell(util.label(oblisk.system, function(s)
             return os.date("%A %d %B %Y", s.time)
-        end), theme.FG, 12),
+        end), theme.FG, theme.font.sm),
         cell(util.label(oblisk.system, function(s)
             return os.date("%H:%M:%S %Z", s.time)
-        end), theme.DIM, 11),
+        end), theme.DIM, theme.font.xs),
     },
 })
 
-return { clock = clock, date = date, slot = SLOT, tooltip = clock_tooltip }
+return { clock = clock, slot = SLOT, tooltip = clock_tooltip }

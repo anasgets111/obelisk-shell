@@ -5,11 +5,11 @@ local theme = require("config.theme")
 
 return function(signal, read, color, width)
     return row {
-        width = width or 40,
-        height = 6,
+        width = width or theme.s(40, 30),
+        height = theme.s(6, 4),
         align_v = "Center",
         background = theme.SURFACE,
-        radius = 3,
+        radius = theme.s(3, 2),
         children = { rect {
             width = signal:map(function(value)
                 if value == nil then
@@ -28,7 +28,7 @@ return function(signal, read, color, width)
             end),
             height = "Fill",
             background = color,
-            radius = 3,
+            radius = theme.s(3, 2),
         } },
     }
 end

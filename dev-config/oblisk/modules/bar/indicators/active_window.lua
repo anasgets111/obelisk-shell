@@ -3,7 +3,6 @@
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
-local pill = require("components.pill")
 
 -- The first `process.run` in this config, and the reason `json.decode` exists (docs/adr/0057,
 -- build-steps.md section 6 item 2). `niri msg -j focused-window` reports something no capability
@@ -15,6 +14,10 @@ local pill = require("components.pill")
 -- the child through `BufReader::lines()`, so a pretty-printed document arrives in pieces and only
 -- `exit_cb` knows the buffer is whole.
 local window_title = state("window_title", "click for the focused window")
+
+-- The same budget `modules/bar/indicators/media.lua` uses, because the two share the centre zone
+-- one at a time and a title that changed width when the player stopped would move the whole bar.
+local TITLE_LIMIT = 44
 
 -- Every answer arrives after the click that asked for it, and nothing cancels a request the config
 -- has moved on from: `exit_cb` fires whenever the child exits, however stale its question has
@@ -55,7 +58,7 @@ local function refresh_window_title()
             window_title:set(err and "undecodable" or "nothing focused")
             return
         end
-        window_title:set(util.truncate(window.title or "untitled", 28))
+        window_title:set(window.title or "untitled")
     end)
 end
 
@@ -75,26 +78,43 @@ local focused_icon = icon {
         local entry = util.app_entry(applications, client and client.class)
         return (entry and entry.icon) or ""
     end),
-    size = 14,
+    size = theme.icon.lg,
+    align_v = "Center",
 }
 
-local window_title_module = pill({
-    focused_icon,
-    button {
-        width = 210,
-        height = 24,
-        on_click = function(_, button)
-            if button == "left" then
-                refresh_window_title()
-            else
-                claim_title_request()
-                window_title:set("click for the focused window")
-            end
-        end,
-        -- `text.content` takes a signal directly (ADR-0044), so this needs no `label` wrapper: the
-        -- signal already holds a string on every path above, including both failure paths.
-        children = { cell(window_title, theme.DIM) },
+-- No pill. `ActiveWindow.qml` puts the icon and the title straight on the bar with no ground behind
+-- them, which is what makes the centre read as a caption rather than as one more control. The
+-- button is still the click target and still has no background of its own.
+local window_title_module = row {
+    height = theme.item_height,
+    align_v = "Center",
+    spacing = theme.spacing.sm,
+    children = {
+        focused_icon,
+        button {
+            -- Content-sized, so the centre zone is its own content's width and lands on the bar's
+            -- midpoint. It was a fixed 216px box with the title centred inside it, which centres
+            -- nothing: the icon sat at the box's left edge and the title in its middle.
+            height = theme.item_height,
+            align_v = "Center",
+            on_click = function(_, button)
+                if button == "left" then
+                    refresh_window_title()
+                else
+                    claim_title_request()
+                    window_title:set("click for the focused window")
+                end
+            end,
+            -- `text.content` takes a signal directly (ADR-0044), so this needs no `label` wrapper:
+            -- the signal already holds a string on every path above, including both failure paths.
+            -- Capped at a codepoint budget rather than elided into a box, for the reason
+            -- `lib/util.lua`'s `truncate` gives: a window title is unbounded and this node has to
+            -- stay its own width for the zone around it to centre.
+            children = { cell(window_title:map(function(title)
+                return util.truncate(title, TITLE_LIMIT)
+            end), theme.FG, theme.font.sm, { align_v = "Center" }) },
+        },
     },
-})
+}
 
 return window_title_module

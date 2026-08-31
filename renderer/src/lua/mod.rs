@@ -428,6 +428,17 @@ mod tests {
         Loader::new(signal::DirtyFlag::new(), &dir).unwrap()
     }
 
+    /// `config/theme.lua` as the config's own modules see it, for the assertions below that would
+    /// otherwise pin a pixel count the theme owns.
+    fn theme_of(loader: &Loader) -> Table {
+        loader.lua().load(r#"return require("config.theme")"#).eval().expect("the shipped theme loads")
+    }
+
+    /// One step of one scale, e.g. `theme.radius.md`.
+    fn theme_number(theme: &Table, scale: &str, step: &str) -> i64 {
+        theme.get::<Table>(scale).expect("scale").get::<i64>(step).expect("step")
+    }
+
     fn child_table(output: &LoadOutput) -> Table {
         let Value::Table(child) = output.surfaces[0].properties.get("child").unwrap() else {
             panic!("surface's `child` did not come back as a table");
@@ -443,8 +454,14 @@ mod tests {
             .unwrap();
         let card = child_table(&output);
         assert_eq!(card.get::<String>("kind").unwrap(), "column");
-        assert_eq!(card.get::<i64>("radius").unwrap(), 10);
-        assert_eq!(card.get::<i64>("spacing").unwrap(), 6);
+        // Against `config/theme.lua`'s own tokens rather than against numbers. These were `10` and
+        // `6` until the theme grew a responsive scale, and a literal here pins the wrong thing
+        // twice over: it fails on any screen that is not 1080p, and it passes when a caller writes
+        // the number out by hand instead of naming the step. What has to hold is that the card
+        // spends the tokens.
+        let theme = theme_of(&loader);
+        assert_eq!(card.get::<i64>("radius").unwrap(), theme_number(&theme, "radius", "md"));
+        assert_eq!(card.get::<i64>("spacing").unwrap(), theme_number(&theme, "spacing", "xs"));
         let children: Table = card.get("children").unwrap();
         assert_eq!(children.raw_len(), 1);
     }
@@ -520,8 +537,9 @@ mod tests {
             .unwrap();
         let track = child_table(&output);
         assert_eq!(track.get::<String>("kind").unwrap(), "button");
-        assert_eq!(track.get::<i64>("width").unwrap(), 34);
-        assert_eq!(track.get::<i64>("height").unwrap(), 18);
+        let theme = theme_of(&loader);
+        assert_eq!(track.get::<i64>("height").unwrap(), theme_number(&theme, "control", "xs"));
+        assert!(track.get::<i64>("width").unwrap() > track.get::<i64>("height").unwrap(), "a switch is wider than it is tall");
 
         let on_click: Function = track.get("on_click").unwrap();
         let rect = loader.lua().create_table().unwrap();
@@ -580,21 +598,6 @@ mod tests {
         assert_eq!(label.get::<String>("content").unwrap(), "enabled");
         let toggle_node: Table = children.get(2).unwrap();
         assert_eq!(toggle_node.get::<String>("kind").unwrap(), "button");
-    }
-
-    /// `modules/bar/indicators/sys_tray.lua`'s tray count: a badge is a filled `row` around
-    /// whatever `content` (a literal string or a `Signal`) its caller hands it.
-    #[test]
-    fn badge_wraps_content_in_a_small_filled_row() {
-        let loader = dev_config_loader();
-        let output = loader.evaluate(r#"local badge = require("components.badge") return panel { id = "p", child = badge("3") }"#).unwrap();
-        let row = child_table(&output);
-        assert_eq!(row.get::<String>("kind").unwrap(), "row");
-        assert_eq!(row.get::<i64>("height").unwrap(), 16);
-        let children: Table = row.get("children").unwrap();
-        let text_node: Table = children.get(1).unwrap();
-        assert_eq!(text_node.get::<String>("kind").unwrap(), "text");
-        assert_eq!(text_node.get::<String>("content").unwrap(), "3");
     }
 
     /// `forget_config_modules` runs before every evaluation and reads `package.loaded`, so a

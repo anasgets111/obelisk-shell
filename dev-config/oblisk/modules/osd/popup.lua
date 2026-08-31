@@ -20,22 +20,24 @@ local volume_row = row {
     width = "Fill",
     height = "Fill",
     align_v = "Center",
-    spacing = 10,
-    padding = { left = 14, right = 14 },
+    spacing = theme.spacing.md,
+    padding = { left = theme.spacing.lg, right = theme.spacing.lg },
     visible = ui_state.osd_kind:map(function(kind)
         return kind == "volume"
     end),
     children = {
-        icon { name = oblisk.audio:map(util.volume_icon_name), size = 20 },
+        icon { name = oblisk.audio:map(util.volume_icon_name), size = theme.icon.lg },
         meter(oblisk.audio, function(a)
             return a.muted and 0 or a.volume * 100
-        end, theme.MAUVE, 120),
+        end, theme.MAUVE, "Fill"),
         text {
             content = util.label(oblisk.audio, function(a)
                 return a.muted and "muted" or string.format("%d%%", math.floor(a.volume * 100 + 0.5))
             end),
             foreground = theme.FG,
-            font_size = 13,
+            font_size = theme.font.sm,
+            width = theme.s(44, 34),
+            text_align = "End",
         },
     },
 }
@@ -44,22 +46,24 @@ local brightness_row = row {
     width = "Fill",
     height = "Fill",
     align_v = "Center",
-    spacing = 10,
-    padding = { left = 14, right = 14 },
+    spacing = theme.spacing.md,
+    padding = { left = theme.spacing.lg, right = theme.spacing.lg },
     visible = ui_state.osd_kind:map(function(kind)
         return kind == "brightness"
     end),
     children = {
-        text { content = "sun", foreground = theme.FG, font_size = 13 },
+        icon { name = "display-brightness", size = theme.icon.md },
         meter(oblisk.brightness, function(b)
             return b.percent
-        end, theme.YELLOW, 120),
+        end, theme.YELLOW, "Fill"),
         text {
             content = util.label(oblisk.brightness, function(b)
                 return string.format("%d%%", b.percent)
             end),
             foreground = theme.FG,
-            font_size = 13,
+            font_size = theme.font.sm,
+            width = theme.s(44, 34),
+            text_align = "End",
         },
     },
 }
@@ -72,17 +76,17 @@ return panel {
     -- protocol centers an axis with neither of its edges anchored. Explicit `width`/`height` are
     -- required because `bottom` alone doesn't anchor both edges of either axis.
     anchor = { bottom = true },
-    margin = { bottom = 56 },
-    width = 260,
-    height = 44,
+    margin = { bottom = theme.s(56, 40) },
+    width = theme.osd_width,
+    height = theme.osd_height,
     visible = ui_state.osd_visible,
     child = column {
         width = "Fill",
         height = "Fill",
-        background = "#181825ee",
-        radius = 10,
-        border_width = 1,
-        border_color = theme.SURFACE,
+        background = theme.GLASS,
+        radius = theme.radius.md,
+        border_width = theme.border_width,
+        border_color = theme.BORDER,
         children = { volume_row, brightness_row },
     },
 }

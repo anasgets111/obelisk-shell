@@ -15,9 +15,9 @@
 -- property uniformly) and unproven for a `Signal` nested inside a `margin` table's own fields.
 local theme = require("config.theme")
 
-local TRACK_WIDTH = 34
-local TRACK_HEIGHT = 18
-local THUMB = 14
+local TRACK_WIDTH = theme.s(34, 28)
+local TRACK_HEIGHT = theme.control.xs
+local THUMB = TRACK_HEIGHT - theme.s(4, 3)
 
 local function read_bool(value, read)
     if value == nil then
@@ -44,7 +44,7 @@ return function(signal, read, on_change)
             width = "Fill",
             height = "Fill",
             radius = TRACK_HEIGHT / 2,
-            padding = { top = 2, right = 2, bottom = 2, left = 2 },
+            padding = { top = theme.s(2, 1), right = theme.s(2, 1), bottom = theme.s(2, 1), left = theme.s(2, 1) },
             background = on:map(function(v)
                 return v and theme.GREEN or theme.SURFACE
             end),

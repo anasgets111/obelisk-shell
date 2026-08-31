@@ -1,11 +1,15 @@
 -- Mirrors CenterSide.qml, which shows the media widget while something is playing and the focused
 -- window's title otherwise.
 --
--- One at a time, and that is a width constraint rather than a style choice. This zone is 20% of the
--- bar, about 380px on a 1920px output, and the two modules together are wider than that. QML gets
--- the same effect from a `Loader` that is only `active` while `MediaService.playbackAvailable`;
--- here it is `visible`, which is the same thing to the layout because an invisible child
--- contributes nothing to its parent's size (`resolve_sizes` in scene.rs).
+-- One at a time. QML gets that from a `Loader` that is only `active` while
+-- `MediaService.playbackAvailable`; here it is `visible`, which is the same thing to the layout
+-- because an invisible child contributes nothing to its parent's size (`resolve_sizes` in
+-- scene.rs).
+--
+-- Content-sized between two `Fill` sides, so it is exactly as wide as whatever is showing and its
+-- midpoint is the bar's midpoint whatever that turns out to be. `modules/bar/init.lua` has the
+-- arithmetic that retired.
+local theme = require("config.theme")
 local media = require("modules.bar.indicators.media")
 local window_title_module = require("modules.bar.indicators.active_window")
 
@@ -33,10 +37,9 @@ local title_slot = row {
 }
 
 return row {
-    width = "13%",
     height = "Fill",
     align_h = "Center",
     align_v = "Center",
-    spacing = 8,
+    spacing = theme.spacing.sm,
     children = { media_slot, title_slot },
 }

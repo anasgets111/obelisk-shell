@@ -68,6 +68,27 @@ end
 -- base property (§ 5.1) and takes a signal like any other, so a module can hide itself on the same
 -- pass that resolves its text, and a hidden child is skipped by the row's own positioning rather
 -- than laid out at zero width.
+-- A codepoint budget, and the one place `components/cell.lua`'s argument against character counts
+-- does not apply. That component is right that a box is the better unit: it elides against pixels
+-- and the caller never guesses. But eliding needs a bounded box, and the two modules in the bar's
+-- centre zone need the opposite -- a node exactly as wide as its content, so the content-sized zone
+-- between two `Fill` sides puts its midpoint on the bar's midpoint. Bound the box and a short title
+-- floats somewhere inside a fixed reservation instead, which is what "(1) WhatsApp" sitting a
+-- hundred pixels left of centre was.
+--
+-- ponytail: the ceiling is that "WWWW" and "iiii" are the same four codepoints and twice different
+-- widths, so this cuts to a ragged pixel width. The upgrade is a `max_width` on `text` that lets
+-- the engine measure and elide while still reporting the string's own width when it fits, which is
+-- a layout change rather than a config one.
+function util.truncate(value, limit)
+    local s = tostring(value or "")
+    local count = utf8.len(s)
+    if count == nil or count <= limit then
+        return s
+    end
+    return s:sub(1, utf8.offset(s, limit + 1) - 1) .. "..."
+end
+
 function util.shown_when(signal, predicate)
     return signal:map(function(value)
         if value == nil then
@@ -76,19 +97,6 @@ function util.shown_when(signal, predicate)
         local ok, shown = pcall(predicate, value)
         return ok and shown or false
     end)
-end
-
--- `text` has no truncation, no ellipsis and no max width (it wraps to its parent and that is all),
--- so a 200-character track title would push every module to its right off the bar. Truncating in
--- Lua is the only lever a config has today.
---
--- `utf8.offset` rather than `string.sub`, because `string.sub` counts bytes: cutting a track title
--- at byte 28 lands mid-scalar on any non-ASCII text and produces a string the shaper cannot render.
-function util.truncate(s, limit)
-    if utf8.len(s) == nil or utf8.len(s) <= limit then
-        return s
-    end
-    return string.sub(s, 1, utf8.offset(s, limit + 1) - 1) .. "..."
 end
 
 return util

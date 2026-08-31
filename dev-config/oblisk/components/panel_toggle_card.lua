@@ -1,16 +1,20 @@
 -- A label next to a `components/toggle.lua`, the settings-row shape `modules/bar/panels/settings.lua`
--- wants for `bluetooth.enabled` and every boolean capability after it. Content-sized rather than
--- `width = "Fill"` with the toggle pinned to the far edge, which was a `row` bug this engine no
--- longer has -- see `components/panel_header.lua` for the same note and the same one-property fix.
+-- wants for `bluetooth.enabled` and every boolean capability after it.
+--
+-- Spread rather than content-sized: the label takes `width = "Fill"` and the switch sits against the
+-- far edge, which is what `Components/PanelToggleCard.qml` does and what a settings list has to do
+-- to read as a column of switches rather than a ragged row of pairs. That needed the `Fill` fix in
+-- `scene.rs`; `components/panel_header.lua` carries the same note.
 local theme = require("config.theme")
 local cell = require("components.cell")
 local toggle = require("components.toggle")
 
 return function(label, signal, read, on_change)
     return row {
-        height = 24,
+        width = "Fill",
+        height = theme.control.sm,
         align_v = "Center",
-        spacing = 10,
-        children = { cell(label, theme.FG), toggle(signal, read, on_change) },
+        spacing = theme.spacing.md,
+        children = { cell(label, theme.FG, nil, { width = "Fill" }), toggle(signal, read, on_change) },
     }
 end

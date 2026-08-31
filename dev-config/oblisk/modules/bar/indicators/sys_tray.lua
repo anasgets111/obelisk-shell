@@ -1,57 +1,54 @@
--- Mirrors SysTray.qml.
+-- Mirrors SysTray.qml: the registered `StatusNotifierItem`s laid out horizontally, each item its
+-- own borderless button carrying that application's own icon.
 --
--- The one `list` in this file, and the only node kind whose children do not exist as a literal Lua
--- table: they are generated one per `source` element (ADR-0045 decision 3). A tray is exactly that
--- shape, so this is where it belongs rather than in a synthetic fixture.
+-- Themed icons here, not glyphs, and that split is the point of `components/icon_button.lua`'s
+-- note: a tray item ships its own artwork and nobody gets to recolour it. Everything else on this
+-- bar is a glyph precisely because this config chooses those and does not choose these.
 --
--- `key` is what makes reconciliation stable across pushes: without it a tray item appearing at the
--- front would renumber every sibling and reconcile each one against the wrong previous node.
--- § 2.5 populates exactly one of `icon_name` and `icon_path` per item and never both, which is
--- why one `icon` node handles both: docs/adr/0054 decision 2 makes an absolute `name` its own path,
--- so the `or` below is the whole branch. Falling back to the app's name keeps an item visible when
--- a theme has nothing under the name it reported, rather than leaving a 16px hole.
+-- No ground, and absent when the tray is empty. It was a glass pill of a fixed 135px, which on a
+-- session that registers nothing is an empty box sitting on the bar looking like a control that
+-- failed to load, and on a session that registers two is a box with a lot of nothing to the right
+-- of them. The width is still capped, because a `row` does not shrink its children and a dozen
+-- registrations would otherwise push the clock off the edge; with no ground behind it that cap
+-- reads as whitespace rather than as a container.
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
-local pill = require("components.pill")
 
--- No count badge. It sat beside the icons showing how many of them there were, which is a number
--- the icons already are: anyone who can see two icons does not need a "2" next to them, and on a
--- bar where every zone is fighting for width it was the one module paying for a readout that says
--- nothing the thing beside it does not.
+local SCROLL = scroll("sys_tray")
 
-return pill({
-    list {
-        -- The tray is the reason `direction` exists on `list` (§ 5.2 item 7). A `list` laid out
-        -- exactly like a `column` until now, so a tray of three icons stacked downwards inside a
-        -- 34px bar and all but the first were clipped away -- the no-horizontal-list ponytail
-        -- `layout::scene` used to carry, met by the module it was written about.
-        direction = "Horizontal",
-        spacing = 6,
-        align_v = "Center",
-        -- `computed` over both, where `oblisk.tray:map` alone would do: `itemfn` reads
-        -- `oblisk.applications` for its icon fallback below, and a `list` only rebuilds its items
-        -- when its own `source` changes. Depending on tray alone would leave an item that
-        -- registered before the first applications scan landed showing its name as text forever,
-        -- because nothing would ask `itemfn` to run again once the entry it needed existed.
-        source = computed({ oblisk.tray, oblisk.applications }, function(t)
-            return (t and t.items) or {}
-        end),
-        itemfn = function(item)
-            -- The item's own icon first, then its `.desktop` entry's, then its name as text. The
-            -- middle step is the third `oblisk.applications` consumer (docs/adr/0061): an item
-            -- that registers with neither an `IconName` nor an `IconPixmap` used to fall straight
-            -- through to a truncated string, and its `Id` is usually the application's own name,
-            -- which `util.app_entry` can match against a desktop entry.
-            local entry = util.app_entry(oblisk.applications:get(), item.name or item.id)
-            local art = item.icon_name or item.icon_path or (entry and entry.icon)
-            if art then
-                return icon { name = art, size = 16 }
-            end
-            return cell(util.truncate(item.name or item.id or "?", 10), theme.DIM, 11)
-        end,
-        key = function(item)
-            return tostring(item.id)
-        end,
-    },
-})
+-- Bounded, so a session that registers a dozen items scrolls rather than taking the whole zone
+-- (docs/adr/0069). The mirror has no cap because a QML `RowLayout` shrinks its children; a `row`
+-- here does not.
+local TRAY_WIDTH = theme.s(150, 110)
+
+local function items_of(t)
+    return (t and t.items) or {}
+end
+
+return list {
+    width = TRAY_WIDTH,
+    direction = "Horizontal",
+    spacing = theme.spacing.xs,
+    align_v = "Center",
+    scroll = SCROLL,
+    visible = util.shown_when(oblisk.tray, function(t)
+        return #items_of(t) > 0
+    end),
+    source = computed({ oblisk.tray, oblisk.applications }, items_of),
+    itemfn = function(item)
+        local entry = util.app_entry(oblisk.applications:get(), item.name or item.id)
+        local art = item.icon_name or item.icon_path or (entry and entry.icon)
+        if art then
+            return icon { name = art, size = theme.icon.md, align_v = "Center" }
+        end
+        -- No artwork registered, which happens, and is what the faint smudge between the
+        -- bluetooth circle and the clock was: two 9px letters at `DIM` next to a row of 22px
+        -- glyphs reads as a rendering fault rather than as a fallback. Same weight as the icons
+        -- it stands in for.
+        return cell((item.name or item.id or "?"):sub(1, 2), theme.FG, theme.font.sm, { align_v = "Center" })
+    end,
+    key = function(item)
+        return tostring(item.id)
+    end,
+}

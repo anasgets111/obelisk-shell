@@ -36,6 +36,16 @@ local function close_panel()
     panel_open:set(false)
 end
 
+-- Whether `kind` is the panel currently on screen, which is `ShellUiState.isPanelOpen(kind)` in the
+-- mirror and what every bar indicator binds its accent ring to. Both signals are needed: `panel_kind`
+-- keeps its last value after a dismissal, so reading it alone leaves the indicator that opened the
+-- popup ringed after the popup is gone.
+local function panel_showing(kind)
+    return computed({ panel_open, panel_kind }, function(open, current)
+        return open and current == kind
+    end)
+end
+
 -- The volume/brightness OSD's state: which reading `modules/osd/popup.lua` shows, and whether the
 -- corner overlay is up at all. Lives here rather than in that file because arming it is a write a
 -- bar button issues, and `modules/bar/indicators/volume.lua` and `modules/bar/panels/power_menu.lua`
@@ -81,6 +91,7 @@ return {
     panel_kind = panel_kind,
     open_panel = open_panel,
     close_panel = close_panel,
+    panel_showing = panel_showing,
     osd_kind = osd_kind,
     osd_visible = osd_visible,
     arm_osd = arm_osd,

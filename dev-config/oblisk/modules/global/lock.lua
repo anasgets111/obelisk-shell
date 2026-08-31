@@ -24,7 +24,7 @@ local cell = require("components.cell")
 -- capability says; this reports what you typed.
 local password_field = textfield {
     width = "Fill",
-    height = 28,
+    height = theme.control.md,
     placeholder = "password",
     mask_character = "*",
     secure_submit = { capability = "lock", action = "authenticate" },
@@ -46,7 +46,7 @@ end), theme.RED)
 -- cheapest possible proof that `system` keeps pushing while the session is locked.
 local lock_clock = cell(util.label(oblisk.system, function(s)
     return os.date("%H:%M", s.time)
-end), theme.FG, 48)
+end), theme.FG, theme.font.hero)
 
 -- Declared, not open. § 6.4 gives a `lock` an `id` and a `child` and nothing else: no `visible`,
 -- no `monitor`, no size, because the compositor decides when these surfaces exist and the
@@ -63,17 +63,22 @@ return lock {
         background = "#11111bff",
         align_h = "Center",
         align_v = "Center",
-        spacing = 18,
+        spacing = theme.spacing.lg,
         children = {
             lock_clock,
             column {
-                width = 380,
-                padding = { top = 20, right = 20, bottom = 20, left = 20 },
-                spacing = 10,
+                width = theme.s(380, 300),
+                padding = {
+                    top = theme.spacing.xl,
+                    right = theme.spacing.xl,
+                    bottom = theme.spacing.xl,
+                    left = theme.spacing.xl,
+                },
+                spacing = theme.spacing.md,
                 background = theme.BG,
-                radius = 12,
-                border_width = 1,
-                border_color = theme.SURFACE,
+                radius = theme.radius.md,
+                border_width = theme.border_width,
+                border_color = theme.BORDER,
                 children = { cell("locked", theme.FG), password_field, lock_status },
             },
             cell(util.label(oblisk.battery, function(b)
@@ -81,7 +86,7 @@ return lock {
                     return ""
                 end
                 return string.format("battery %d%%%s", b.percent, b.charging and " charging" or "")
-            end), theme.DIM, 11),
+            end), theme.DIM, theme.font.xs),
         },
     },
 }

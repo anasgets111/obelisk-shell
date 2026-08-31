@@ -1,16 +1,31 @@
--- Mirrors SystemInfoWidget.qml.
+-- Mirrors SystemInfoWidget.qml's collapsed form: a glyph per readout with its number beside it,
+-- rather than one run of "cpu 12% ram 34%".
 --
--- sysinfo has no data and will read "--" forever on a live session. Left in rather than deleted,
--- because the reason is worth seeing: its pollers start dormant (`watch::channel(Duration::ZERO)`)
--- and only `sysinfo:configure({cpu_interval = ...})` wakes them, which needs the Lua write path
--- from Phase 25. The field names below are the real ones (`cpu_percent`, not `cpu_pct`); the
--- previous version of this file read `cpu_pct` and would have silently shown 0% forever the day
--- Phase 25 landed, which nobody would have caught because dormant and wrong look identical here.
+-- Not on the bar. `modules/bar/panels/settings.lua` is what shows it, and the mirror's own widget
+-- is behind an expander for the same reason: two percentages take more room than a bar has once
+-- everything else on it is a circle.
 local theme = require("config.theme")
+local icons = require("config.icons")
 local util = require("lib.util")
 local cell = require("components.cell")
 local pill = require("components.pill")
 
-return pill({ cell(util.label(oblisk.sysinfo, function(s)
-    return string.format("cpu %d%% ram %d%%", s.cpu_percent or 0, s.ram_percent or 0)
-end), theme.DIM, 11) })
+local function readout(glyph, read)
+    return row {
+        align_v = "Center",
+        spacing = theme.spacing.xs,
+        children = {
+            cell(glyph, theme.DIM, theme.icon.sm, { align_v = "Center" }),
+            cell(util.label(oblisk.sysinfo, read), theme.FG, theme.font.xs, { align_v = "Center" }),
+        },
+    }
+end
+
+return pill({
+    readout(icons.cpu, function(s)
+        return string.format("%d%%", s.cpu_percent or 0)
+    end),
+    readout(icons.ram, function(s)
+        return string.format("%d%%", s.ram_percent or 0)
+    end),
+})

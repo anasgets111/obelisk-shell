@@ -5,5 +5,5 @@
 local theme = require("config.theme")
 
 return function(content)
-    return text { content = content, foreground = theme.DIM, font_size = 10 }
+    return text { content = content, foreground = theme.DIM, font_size = theme.font.xs }
 end

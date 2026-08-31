@@ -14,10 +14,15 @@ return function(children, opts)
     return column {
         width = opts.width,
         height = opts.height,
-        padding = opts.padding or { top = 10, right = 12, bottom = 10, left = 12 },
-        spacing = opts.spacing or 6,
+        padding = opts.padding or {
+            top = theme.spacing.sm,
+            right = theme.spacing.md,
+            bottom = theme.spacing.sm,
+            left = theme.spacing.md,
+        },
+        spacing = opts.spacing or theme.spacing.xs,
         background = opts.background or theme.BG,
-        radius = opts.radius or 10,
+        radius = opts.radius or theme.radius.md,
         border_width = opts.border_width,
         border_color = opts.border_color,
         children = children,

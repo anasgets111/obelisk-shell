@@ -1112,6 +1112,8 @@ mod tests {
                 ("battery_tooltip", "popup"),
                 ("clock_tooltip", "popup"),
                 ("launcher_tooltip", "popup"),
+                ("network_tooltip", "popup"),
+                ("bluetooth_tooltip", "popup"),
                 ("launcher", "window"),
                 ("lock_screen", "lock"),
             ]
@@ -1128,14 +1130,6 @@ mod tests {
         for child in &node.children {
             hover_region_centres(child, x, y, out);
         }
-    }
-
-    /// The one region centre this test's assertions are written against, and a panic naming the
-    /// count if the bar ever grows a second before it.
-    fn centre_of_the_hover_region(node: &crate::layout::ResolvedNode, x: f32, y: f32) -> Option<layout::hit::LogicalPoint> {
-        let mut centres = Vec::new();
-        hover_region_centres(node, x, y, &mut centres);
-        centres.first().copied()
     }
 
     #[test]
@@ -1223,30 +1217,48 @@ mod tests {
             tooltip.anchor_rect
         );
 
+        // Every region on the bar is tried, not just the first one the walk finds. `HoverWrite`
+        // carries the signal and no name, so there is no way to ask for the battery's region by
+        // slot; the first region used to be the battery's only because nothing to its left declared
+        // one. It now sits behind four circles that do, and `centres.first()` quietly turned this
+        // into a test of the power button.
+        //
+        // Trying all of them tests the stronger claim anyway: exactly one region on this bar opens
+        // the battery tooltip, so a slot renamed on either side fails here rather than passing with
+        // the wrong module hovered.
         let bar = client.scene.surface("bar@TEST").unwrap();
-        let centre = centre_of_the_hover_region(&bar, 0.0, 0.0).expect("the dev config declares a hover region");
-        let writes = layout::hover::hover_writes(&bar, Some(centre));
-        // The bar declares several regions now, and a point inside one is outside the rest. Every
-        // write is applied the way `App::sync_hover` applies them, because turning the others *off*
-        // is half of what the walk is for.
-        assert_eq!(writes.iter().filter(|write| write.hovered).count(), 1, "a point is inside exactly one region");
-        for write in writes {
-            write.signal.hover_handle().unwrap().set_changed(mlua::Value::Boolean(write.hovered));
-            let Some(rect) = write.rect else {
-                continue;
-            };
-            // Built here rather than reached for through `crate::wayland::input`, which is private:
-            // the shape is § 6.3's `anchor_rect`, and a wrong one fails the re-resolve asserted
-            // just below rather than passing quietly.
-            let table = client.lua().create_table().unwrap();
-            table.set("x", rect.x).unwrap();
-            table.set("y", rect.y).unwrap();
-            table.set("width", rect.width).unwrap();
-            table.set("height", rect.height).unwrap();
-            write.signal.hover_rect_handle().unwrap().set_changed(mlua::Value::Table(table));
+        let mut centres = Vec::new();
+        hover_region_centres(&bar, 0.0, 0.0, &mut centres);
+        assert!(centres.len() > 1, "the shipped bar declares more than one hover region");
+
+        let mut opened_by = 0;
+        for centre in centres {
+            let writes = layout::hover::hover_writes(&bar, Some(centre));
+            // A point inside one region is outside the rest. Every write is applied the way
+            // `App::sync_hover` applies them, because turning the others *off* is half of what the
+            // walk is for.
+            assert_eq!(writes.iter().filter(|write| write.hovered).count(), 1, "a point is inside exactly one region");
+            for write in writes {
+                write.signal.hover_handle().unwrap().set_changed(mlua::Value::Boolean(write.hovered));
+                let Some(rect) = write.rect else {
+                    continue;
+                };
+                // Built here rather than reached for through `crate::wayland::input`, which is
+                // private: the shape is § 6.3's `anchor_rect`, and a wrong one fails the re-resolve
+                // asserted just below rather than passing quietly.
+                let table = client.lua().create_table().unwrap();
+                table.set("x", rect.x).unwrap();
+                table.set("y", rect.y).unwrap();
+                table.set("width", rect.width).unwrap();
+                table.set("height", rect.height).unwrap();
+                write.signal.hover_rect_handle().unwrap().set_changed(mlua::Value::Table(table));
+            }
+            client.re_resolve_if_dirty();
+            if tooltip_is_up(&client) {
+                opened_by += 1;
+            }
         }
-        assert!(client.re_resolve_if_dirty(), "a hover that changed re-resolves the scene");
-        assert!(tooltip_is_up(&client), "hovering the battery pill opens its tooltip");
+        assert_eq!(opened_by, 1, "exactly one hover region on the bar opens the battery tooltip");
 
         // And closes again. `anchor_rect` keeps the rect it was last given rather than clearing,
         // which is what stops § 6.3's non-zero rule failing the evaluation on the way out.
@@ -1383,20 +1395,30 @@ mod tests {
         // because only one is visible at a time.
         let host = client.scene.surface("panel_host").expect("the panel host must resolve");
         let card = &host.children[0];
-        let tallest = card.children.iter().map(|section| section.rect.height).fold(0.0_f32, f32::max);
+        // The *fixed* rows, not the section. Every panel body is a `height = "Fill"` column ending
+        // in a `list` with a `scroll` of its own (docs/adr/0069), so a section's own height is the
+        // card's content height by construction and comparing it against the popup measures nothing.
+        // What can still overflow is the rows above the list, which are content-sized and have to
+        // leave the list somewhere to live.
+        let fixed_extent = |section: &crate::layout::ResolvedNode| -> f32 {
+            section.children.iter().filter(|row| row.visible && row.kind != "list").map(|row| row.rect.height).sum()
+        };
+        // Read off the card rather than hard-coded: `panel_card`'s padding is its own to change, and
+        // the first child's offset is that padding.
+        let content_height = card.rect.height - 2.0 * card.children.first().map_or(0.0, |first| first.rect.y);
+        let tallest = card.children.iter().map(fixed_extent).fold(0.0_f32, f32::max);
         let widest = card.children.iter().map(|section| section.rect.width).fold(0.0_f32, f32::max);
-        // `panel_card`'s defaults: 10px top and bottom, 12px left and right.
         assert!(
-            tallest + 20.0 <= host.rect.height,
-            "the tallest bar panel is {:.0}px in a {:.0}px popup; its last rows will be cut off",
-            tallest + 20.0,
-            host.rect.height
+            tallest <= content_height,
+            "a bar panel's fixed rows are {tallest:.0}px in {content_height:.0}px of card; its list has no room left"
         );
+        // Derived the same way and for the same reason: the hard-coded 24 assumed `spacing.md` was
+        // 12px, and it is 11px once the responsive scale has been through it, so this compared a
+        // `Fill` section against a card two pixels narrower than the one it was filling.
+        let content_width = card.rect.width - 2.0 * card.children.first().map_or(0.0, |first| first.rect.x);
         assert!(
-            widest + 24.0 <= host.rect.width,
-            "the widest bar panel is {:.0}px in a {:.0}px popup; it will paint past the edge",
-            widest + 24.0,
-            host.rect.width
+            widest <= content_width,
+            "a bar panel is {widest:.0}px in {content_width:.0}px of card; it will paint past the edge"
         );
     }
 
