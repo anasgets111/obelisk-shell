@@ -2642,6 +2642,51 @@ A gap ledger reads worse than the situation is.
   icons come from a real icon theme, and those are full-colour SVGs that already render correctly.
   The bug is real and still worth fixing. It is not on the path to this shell.
 
+### Measured while scoping the viewport: shaping was most of a layout pass
+
+Scrolling was going to re-run `Scene::apply` per wheel event, so the pass got timed before the
+design was settled. Release build, one `list` of N rows in a 400x600 panel, p50 over 100 applies:
+
+| rows | bare `rect` | `+ text` | `+ text + icon` |
+| :--- | :--- | :--- | :--- |
+| 200 | 0.75ms | 4.02ms | 4.86ms |
+| 500 | 1.95ms | 10.61ms | 12.78ms |
+
+Text was 82% of that pass, and reconciliation, property resolution and 500 `itemfn` calls together
+are the bare-`rect` floor. The shipped dev config, eleven surfaces, sat at 1.66ms.
+
+Text is not all shaping, and the split only became visible once the cache below existed to subtract
+one half from the other. Of the 8.66ms text added to a 500-row pass, shaping is 6.64ms and
+allocation is 2.02ms. So shaping was 63% of the text pass and 52% of the text-plus-icon one. An
+earlier draft of this section called the whole 82% shaping; it was measuring text.
+
+That is not a scroll problem. `Scene::apply` re-measured every text node on every pass, and ADR-0044
+decision 2's dirty flag made a pass a per-push event, so every capability push through a text-bearing
+tree was paying it. `layout::scene` already named the fix and declined it: "the remaining fix is a
+shape cache keyed on (text, font_size, max_width); not built here."
+
+Built now, on `ShapingHandle` rather than inside the worker, because a worker-side memo still pays an
+`mpsc` round trip and a thread wake per node. Same benchmark after:
+
+| case | before | after |
+| :--- | :--- | :--- |
+| shipped dev config | 1.66ms | 1.03ms |
+| 200 rows, text + icon | 4.86ms | 2.19ms |
+| 500 rows, text + icon | 12.78ms | 6.14ms |
+| 500 rows, bare `rect` (control) | 1.95ms | 1.96ms |
+
+Two rows carry the argument. The control is flat, so the win is not the benchmark warming up. And
+the saving is 6.64ms in both text variants, to the same two decimals, which is what a memo on
+measurement should look like: the icon costs 2.17ms before and after, because the cache has nothing
+to say about it.
+
+Two things worth keeping in view. The cache is bounded at 4096 entries and cleared whole on
+overflow, because a clock shapes a string nobody asks for twice once a second; full it is about
+400KB against ADR-0043's 50MB-per-monitor budget. And the residual is now allocation, not
+measurement: cached, 500 text nodes still cost about 2ms over the floor in `content.clone()`, the
+`String` `node::paint_style` builds per node per pass, and one hash per lookup. Interning is the next
+move if it ever matters, and it did not before, because shaping hid it.
+
 ### The ranking
 
 By modules unblocked per unit of work, which is not the same as by size.

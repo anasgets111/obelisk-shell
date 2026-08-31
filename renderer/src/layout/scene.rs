@@ -1062,14 +1062,18 @@ fn intrinsic_content_size(
             // Content-sized ancestor with no room resolved so far) -- treat that as unconstrained
             // rather than forcing every word onto its own line.
             let max_width = (text_wrap_width > 0.0).then_some(text_wrap_width);
-            // ponytail: this reshapes every text node on every `Scene::apply`, and there is no
-            // cache -- `ShapingHandle::shape` blocks on a cross-thread round trip to the shaping
-            // worker for each call (see `crate::text::shaping`). That was once per config edit; it
-            // is now up to once per poll turn (ADR-0044 decision 2's dirty flag), so a bar with 20
-            // text nodes on a 15ms poll driven by a high-frequency capability is roughly 1300
-            // blocking round trips per second on the Wayland dispatch thread, which is also the
-            // thread that answers `configure` and runs the VM (docs/adr/0039). The remaining fix
-            // is a shape cache keyed on (text, font_size, max_width); not built here.
+            // This asks per text node per `Scene::apply`, which ADR-0044 decision 2's dirty flag
+            // turned from once per config edit into once per push. `ShapingHandle::shape` now
+            // answers a repeat from its own memo without crossing the channel, so the round trip
+            // named here is paid once per distinct (text, size, line height, wrap width) rather
+            // than once per call. Measured on a 500-row list: 12.8ms per pass before, 6.1ms after,
+            // against a 2.0ms floor for the same list drawing no text at all.
+            //
+            // ponytail: what is left is not shaping. Cached, 500 text nodes still cost about 2ms
+            // over that floor, and it is allocation rather than measurement -- `content.clone()`
+            // just above, the `String` `node::paint_style` builds per node per pass, and hashing
+            // the text once per lookup. Interning a node's string across passes is the next move
+            // if this ever matters; it did not before the cache landed, because shaping hid it.
             let shaped = shaping.shape(ShapeRequest {
                 text: content,
                 font_size,

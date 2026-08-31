@@ -14,8 +14,9 @@
 //! order, leaving a `text` node's box measured roughly 30% narrower than the glyphs painted
 //! into it.
 
+use std::collections::HashMap;
 use std::env;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
@@ -70,15 +71,56 @@ enum Request {
     ResolvedPrimaryFamily(mpsc::Sender<String>),
 }
 
+/// How many measured strings [`ShapingHandle`] remembers before it drops the lot.
+///
+/// Sized against the working set, which is the text on screen: the shipped dev config resolves
+/// about twenty text nodes, and the largest list this engine is meant to carry (a notification
+/// history, a full launcher) is a few hundred. 4096 holds all of that with room left for churn.
+///
+/// Churn is the reason there is a bound at all. A clock shapes a string nobody will ask for again
+/// every second, so an unbounded map grows by 86,400 dead entries a day. At this cap it clears
+/// roughly hourly instead and costs one cold pass, a few milliseconds, once.
+///
+/// Full, the map holds on the order of 400KB: 4096 entries of a short `String` plus four integers
+/// and two floats, with `HashMap`'s own overhead. That is under one percent of docs/adr/0043's
+/// 50MB-per-monitor budget, which is what makes a cap this generous the cheap choice.
+const SHAPE_CACHE_CAPACITY: usize = 4096;
+
+/// What a measurement is keyed by: every field of a [`ShapeRequest`], so a request this cannot
+/// tell apart from another genuinely shapes the same.
+///
+/// Keying on a subset would be a wrong-answer bug rather than a slow one, which is why
+/// `line_height` is here even though every caller today derives it as `font_size * 1.2`.
+///
+/// Floats are held as bit patterns because `f32` is not `Hash` or `Eq`. That makes equality here
+/// stricter than `==` in both directions, and both are the harmless direction: two `NaN` sizes with
+/// the same bit pattern share an entry where `==` would call them different, and `0.0` and `-0.0`
+/// get separate entries where `==` would call them equal. The first re-uses a measurement of the
+/// same request; the second wastes one entry on a duplicate. Neither can return another request's
+/// answer, which is the only outcome that would be a bug.
+#[derive(PartialEq, Eq, Hash)]
+struct ShapeKey {
+    text: String,
+    font_size: u32,
+    line_height: u32,
+    max_width: Option<u32>,
+}
+
 /// A handle to a dedicated shaping worker thread and its warm font cache.
 ///
 /// `Clone` clones the request `Sender` alone, so every clone still addresses the one worker
 /// thread and `FontSystem` -- what lets `wayland::App` and the `RendererClient` it owns share a
 /// warm font cache instead of each paying `FontSystem::new()`'s ~1s startup (docs/adr/0023 item
 /// 8, closed by docs/adr/0039 decision 3).
+///
+/// The measurement cache is `Arc`-shared for the same reason and hangs on this side of the
+/// channel rather than inside the worker, which is the whole point of it: a worker-side cache
+/// would still pay an `mpsc` round trip and a thread wake per text node, and measured against a
+/// 500-row list those are a real fraction of the 17us each node costs, not a rounding error.
 #[derive(Clone)]
 pub struct ShapingHandle {
     requests: mpsc::Sender<Request>,
+    cache: Arc<Mutex<HashMap<ShapeKey, ShapeResult>>>,
 }
 
 impl ShapingHandle {
@@ -113,19 +155,82 @@ impl ShapingHandle {
                 }
             })
             .expect("failed to spawn oblisk-text-shaping thread");
-        Self { requests: tx }
+        Self { requests: tx, cache: Arc::new(Mutex::new(HashMap::new())) }
     }
 
-    /// Shapes `request` on the worker thread and blocks until the result comes back.
-    /// Panics if the worker thread has died: a bug, not a recoverable runtime state.
+    /// Measures `request`, from [`SHAPE_CACHE_CAPACITY`]'s memo when it has been asked before and
+    /// from the worker thread otherwise. Blocks only on a miss.
+    ///
+    /// Nothing invalidates an entry, because nothing can change one. The font chain is resolved
+    /// once inside [`ShapingHandle::spawn`] and never reloaded, so a given key shapes to the same
+    /// box for the life of the process.
+    ///
+    /// Why this exists: `Scene::apply` re-measures every text node it resolves, and ADR-0044
+    /// decision 2's dirty flag turned that from once per config edit into once per push. Measured
+    /// on a 500-row list, this memo takes 6.64ms off a 10.61ms pass, and takes exactly the same
+    /// 6.64ms off the 12.78ms variant that also draws an icon, which is what says the saving is
+    /// measurement and not something else moving.
+    ///
+    /// Panics on a miss if the worker thread has died: a bug, not a recoverable runtime state. A
+    /// hit does not reach the worker at all, so a key measured while it was alive keeps answering
+    /// after it dies. That is correct rather than lucky (nothing can change what a key measures to)
+    /// but it does mean the first symptom of a dead worker is the next new string, not the next
+    /// call.
     pub fn shape(&self, request: ShapeRequest) -> ShapeResult {
+        // The text moves into the key rather than being cloned into it, so a hit allocates
+        // nothing and only a miss pays for the copy the worker needs.
+        let key = ShapeKey {
+            text: request.text,
+            font_size: request.font_size.to_bits(),
+            line_height: request.line_height.to_bits(),
+            max_width: request.max_width.map(f32::to_bits),
+        };
+        // A poisoned lock is recovered rather than propagated: this map is a pure memo, so a panic
+        // while holding it can leave no invariant broken, and refusing to measure text because an
+        // unrelated thread died would take the shell down over a cache.
+        if let Some(hit) = self.cache.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
+            return *hit;
+        }
+
         let (reply_tx, reply_rx) = mpsc::channel();
         self.requests
-            .send(Request::Shape(request, reply_tx))
+            .send(Request::Shape(
+                ShapeRequest {
+                    text: key.text.clone(),
+                    font_size: f32::from_bits(key.font_size),
+                    line_height: f32::from_bits(key.line_height),
+                    max_width: key.max_width.map(f32::from_bits),
+                },
+                reply_tx,
+            ))
             .expect("oblisk-text-shaping worker thread died");
-        reply_rx
+        let result = reply_rx
             .recv()
-            .expect("oblisk-text-shaping worker thread died before replying")
+            .expect("oblisk-text-shaping worker thread died before replying");
+
+        let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        // Cleared wholesale rather than evicted one entry at a time. An LRU needs a recency order
+        // maintained on every hit, which is work on the path this exists to make cheap, and the
+        // thing that overflows this map is a clock producing strings nobody asks for twice -- so
+        // the entries worth keeping are re-measured on the next pass anyway.
+        //
+        // ponytail: a working set genuinely larger than the cap would re-shape everything on every
+        // pass, which is slower than no cache at all because it also pays the hashing. Nothing this
+        // engine renders is near it (the largest list measured is 500 rows), and the fix when
+        // something is would be an LRU rather than a bigger number.
+        if cache.len() >= SHAPE_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(key, result);
+        result
+    }
+
+    /// How many measurements are memoized. Test-only: production has no reason to ask, and a
+    /// getter that reports it would invite a caller to reason about cache state instead of
+    /// treating [`shape`](Self::shape) as the pure function it is.
+    #[cfg(test)]
+    fn cached_len(&self) -> usize {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner).len()
     }
 
     /// Returns the loaded font chain's shared bytes, in chain order -- what femtovg (no system
@@ -256,6 +361,73 @@ fn detect_locale() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn req(text: &str, font_size: f32) -> ShapeRequest {
+        ShapeRequest { text: text.into(), font_size, line_height: font_size * 1.2, max_width: None }
+    }
+
+    #[test]
+    fn the_same_request_is_measured_once_and_remembered() {
+        let handle = ShapingHandle::spawn();
+        let first = handle.shape(req("network access point 1", 13.0));
+        assert_eq!(handle.cached_len(), 1);
+        let second = handle.shape(req("network access point 1", 13.0));
+        assert_eq!(handle.cached_len(), 1, "asking again must not add a second entry");
+        assert_eq!(first, second);
+    }
+
+    /// The bug a subset key would cause: a hit that returns another request's box. Each of these
+    /// differs from the first in exactly one field, including `line_height`, which every caller
+    /// derives from `font_size` today and which a three-field key would therefore have dropped.
+    #[test]
+    fn every_field_of_a_request_is_part_of_its_identity() {
+        let handle = ShapingHandle::spawn();
+        handle.shape(req("abc", 13.0));
+        for (label, request) in [
+            ("text", ShapeRequest { text: "abd".into(), font_size: 13.0, line_height: 15.6, max_width: None }),
+            ("font_size", ShapeRequest { text: "abc".into(), font_size: 26.0, line_height: 15.6, max_width: None }),
+            ("line_height", ShapeRequest { text: "abc".into(), font_size: 13.0, line_height: 40.0, max_width: None }),
+            ("max_width", ShapeRequest { text: "abc".into(), font_size: 13.0, line_height: 15.6, max_width: Some(10.0) }),
+        ] {
+            let before = handle.cached_len();
+            handle.shape(request);
+            assert_eq!(handle.cached_len(), before + 1, "a request differing only in `{label}` must not hit");
+        }
+    }
+
+    /// A clock is why this bound exists: it shapes a string nobody asks for twice, once a second,
+    /// forever. Driven here with distinct strings rather than by waiting.
+    #[test]
+    fn the_cache_clears_rather_than_growing_past_its_cap() {
+        let handle = ShapingHandle::spawn();
+        for i in 0..SHAPE_CACHE_CAPACITY {
+            handle.shape(req(&format!("{i}"), 13.0));
+        }
+        assert_eq!(handle.cached_len(), SHAPE_CACHE_CAPACITY, "the cap is where it clears, not before");
+        handle.shape(req("one too many", 13.0));
+        assert_eq!(handle.cached_len(), 1, "the map is dropped whole, keeping only the request that overflowed it");
+    }
+
+    #[test]
+    fn a_clone_shares_the_cache_rather_than_starting_its_own() {
+        let handle = ShapingHandle::spawn();
+        let clone = handle.clone();
+        handle.shape(req("shared", 13.0));
+        clone.shape(req("shared", 13.0));
+        assert_eq!(clone.cached_len(), 1, "`wayland::App` and the client it owns must not measure the same string twice");
+    }
+
+    /// Cheap to hold and worth pinning: a cached answer has to be the answer the worker gave, not
+    /// merely some answer. Compared against a second handle, whose cache is cold.
+    #[test]
+    fn a_cached_measurement_equals_what_the_worker_returns_cold() {
+        let warm = ShapingHandle::spawn();
+        let first = warm.shape(req("Oblisk", 14.0));
+        let cached = warm.shape(req("Oblisk", 14.0));
+        let cold = ShapingHandle::spawn().shape(req("Oblisk", 14.0));
+        assert_eq!(cached, first);
+        assert_eq!(cached, cold);
+    }
 
     #[test]
     fn shapes_nonempty_text_to_a_nonzero_box() {
