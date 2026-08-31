@@ -80,9 +80,21 @@ fn begin_reload(registry: &socket::GenerationRegistry, generation_id: u32, next_
 /// but the `connected.recv()` arm below replays `last_snapshots` once it registers, so nothing
 /// pushed before that point is lost.
 fn send_frame_logged(registry: &socket::GenerationRegistry, generation_id: u32, frame: &SupervisorFrame) {
-    if let Err(err) = registry.send_frame(generation_id, frame) {
-        eprintln!("failed to push {frame:?} to generation {generation_id}: {err}");
+    let Err(err) = registry.send_frame(generation_id, frame) else {
+        return;
+    };
+    // A snapshot that misses the boot window is the one failure here that is routine, and it was
+    // being reported like the ones that are not: thirteen `failed to push` lines, each carrying a
+    // whole serialized payload, before the Renderer had even drawn a frame. That is how a
+    // `failed to push` line that does mean something stops being read.
+    if let (SupervisorFrame::StateSnapshot(snapshot), socket::SendFrameError::NoConnection { .. }) = (frame, &err) {
+        eprintln!(
+            "generation {generation_id} has not connected yet, so {} revision {} waits for the replay",
+            snapshot.capability, snapshot.revision
+        );
+        return;
     }
+    eprintln!("failed to push {frame:?} to generation {generation_id}: {err}");
 }
 
 /// The malformed-arguments log line every capability's `dispatch` adapter shares (ADR-0037).
