@@ -8,15 +8,23 @@ pub mod temp;
 
 pub use controller::{SysinfoController, SysinfoSignal, parse_configure_args};
 
+/// Every action `oblisk.sysinfo:invoke(...)` accepts. `dispatch` matches this rather than a string,
+/// so a variant with no arm (or an arm with no variant) fails the build.
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SysinfoAction {
+    Configure,
+}
+
 /// `oblisk.sysinfo`'s action dispatch (ADR-0037): `configure` is synchronous, so nothing here
 /// spawns -- it only rewrites the shared config under its lock and nudges the watch channels (docs/adr/0035).
 pub fn dispatch(controller: &SysinfoController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
-    match params.action.as_str() {
-        "configure" => match parse_configure_args(&params.arguments) {
+    let Some(action) = crate::parse_action::<SysinfoAction>(params) else { return };
+    match action {
+        SysinfoAction::Configure => match parse_configure_args(&params.arguments) {
             Some(cfg) => controller.configure(cfg),
             None => crate::log_malformed_command(params),
         },
-        _ => crate::log_unknown_action(params),
     }
 }

@@ -33,13 +33,25 @@ pub mod sound;
 pub use controller::{NotificationsController, parse_dismiss_args, parse_reply_args, parse_set_sound_args};
 pub use sound::run_sound_player;
 
+/// Every action `oblisk.notifications:invoke(...)` accepts. `dispatch` matches this rather than a string,
+/// so a variant with no arm (or an arm with no variant) fails the build.
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationsAction {
+    Dismiss,
+    Reply,
+    SetSound,
+    SetDnd,
+}
+
 /// `oblisk.notifications`'s action dispatch (ADR-0037): `dismiss`/`reply` emit D-Bus signals and
 /// get `tokio::spawn`ed (ADR-0029); `set_sound`/`set_dnd` only write Supervisor-held state under
 /// its lock (ADR-0033), so they run inline.
 pub fn dispatch(controller: &NotificationsController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
-    match params.action.as_str() {
-        "dismiss" => match parse_dismiss_args(&params.arguments) {
+    let Some(action) = crate::parse_action::<NotificationsAction>(params) else { return };
+    match action {
+        NotificationsAction::Dismiss => match parse_dismiss_args(&params.arguments) {
             Some(id) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
@@ -48,7 +60,7 @@ pub fn dispatch(controller: &NotificationsController, envelope: &shared::Command
             }
             None => crate::log_malformed_command(params),
         },
-        "reply" => match parse_reply_args(&params.arguments) {
+        NotificationsAction::Reply => match parse_reply_args(&params.arguments) {
             Some((id, text)) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
@@ -57,15 +69,14 @@ pub fn dispatch(controller: &NotificationsController, envelope: &shared::Command
             }
             None => crate::log_malformed_command(params),
         },
-        "set_sound" => match parse_set_sound_args(&params.arguments) {
+        NotificationsAction::SetSound => match parse_set_sound_args(&params.arguments) {
             Some((urgency, path)) => controller.set_sound(urgency, &path),
             None => crate::log_malformed_command(params),
         },
-        "set_dnd" => match crate::dbus::parse_bool_arg(&params.arguments) {
+        NotificationsAction::SetDnd => match crate::dbus::parse_bool_arg(&params.arguments) {
             Some(enabled) => controller.set_dnd(enabled),
             None => crate::log_malformed_command(params),
         },
-        _ => crate::log_unknown_action(params),
     }
 }
 

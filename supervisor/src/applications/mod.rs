@@ -17,14 +17,24 @@ pub mod scan;
 pub use controller::{ApplicationsController, ApplicationsSignal, LaunchError};
 pub use scan::application_dirs;
 
+/// Every action `oblisk.applications:invoke(...)` accepts. `dispatch` matches this rather than a string,
+/// so a variant with no arm (or an arm with no variant) fails the build.
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationsAction {
+    Refresh,
+    Launch,
+}
+
 /// `oblisk.applications`'s action dispatch (ADR-0037). Both actions are synchronous here:
 /// `refresh` hands the actual scan to `spawn_blocking` itself, and `launch` spawns a detached
 /// child without waiting for it.
 pub fn dispatch(controller: &ApplicationsController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
-    match params.action.as_str() {
-        "refresh" => controller.refresh(),
-        "launch" => match params.arguments.first().and_then(serde_json::Value::as_str) {
+    let Some(action) = crate::parse_action::<ApplicationsAction>(params) else { return };
+    match action {
+        ApplicationsAction::Refresh => controller.refresh(),
+        ApplicationsAction::Launch => match params.arguments.first().and_then(serde_json::Value::as_str) {
             Some(id) => {
                 if let Err(err) = controller.launch(id) {
                     let reason = match err {
@@ -41,6 +51,5 @@ pub fn dispatch(controller: &ApplicationsController, envelope: &shared::CommandE
             }
             None => crate::log_malformed_command(params),
         },
-        _ => crate::log_unknown_action(params),
     }
 }

@@ -21,14 +21,25 @@ pub mod notify;
 
 pub use controller::{IdleController, parse_inhibit_args, parse_register_args};
 
+/// Every action `oblisk.idle:invoke(...)` accepts. `dispatch` matches this rather than a string,
+/// so a variant with no arm (or an arm with no variant) fails the build.
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IdleAction {
+    Register,
+    Inhibit,
+    ReleaseInhibit,
+}
+
 /// `oblisk.idle`'s action dispatch (ADR-0037): owns the action match, argument parse, and
 /// write-action spawn for every `idle` `CommandEnvelope`. Every action carries the
 /// registering generation's own id (ADR-0032/ADR-0006).
 pub fn dispatch(controller: &IdleController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     let generation_id = params.generation_id;
-    match params.action.as_str() {
-        "register" => match parse_register_args(&params.arguments) {
+    let Some(action) = crate::parse_action::<IdleAction>(params) else { return };
+    match action {
+        IdleAction::Register => match parse_register_args(&params.arguments) {
             Some(sec) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
@@ -37,7 +48,7 @@ pub fn dispatch(controller: &IdleController, envelope: &shared::CommandEnvelope)
             }
             None => crate::log_malformed_command(params),
         },
-        "inhibit" => match parse_inhibit_args(&params.arguments) {
+        IdleAction::Inhibit => match parse_inhibit_args(&params.arguments) {
             Some(reason) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
@@ -46,12 +57,11 @@ pub fn dispatch(controller: &IdleController, envelope: &shared::CommandEnvelope)
             }
             None => crate::log_malformed_command(params),
         },
-        "release_inhibit" => {
+        IdleAction::ReleaseInhibit => {
             let controller = controller.clone();
             tokio::spawn(async move {
                 controller.release_inhibit(generation_id).await;
             });
         }
-        _ => crate::log_unknown_action(params),
     }
 }

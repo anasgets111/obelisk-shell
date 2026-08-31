@@ -11,82 +11,110 @@
 //! the same type describe itself. Rust doc comments become LuaCATS descriptions, so the prose lives
 //! next to the field it documents instead of in a parallel file that goes stale.
 //!
-//! ponytail: [`CAPABILITY_COMMANDS`] is still hand-written, because a command list lives in
-//! `match` arms rather than in a type. It cannot drift silently -- `commands_match_dispatch`
-//! parses those arms out of the source and compares -- but the check is a source grep, and the
-//! upgrade path is a `#[derive(Deserialize, JsonSchema)]` action enum per capability, parsed at
-//! the socket boundary so `dispatch` matches exhaustively and this table disappears.
+//! The command half is derived the same way. Each capability's actions are a
+//! `#[derive(Deserialize, JsonSchema)]` enum next to its `dispatch`, and `parse_action` at the
+//! socket boundary is what turns the wire string into one. The names Lua may pass to `invoke` are
+//! that enum's variants, so an action with no dispatch arm, or an arm with no action, fails the
+//! build rather than the golden test.
+//!
+//! ponytail: argument types stay `...`. The next step is a payload enum (`Set(u32)`) carrying its
+//! parsed arguments, which would delete all 19 `parse_*_args` functions, but
+//! `CommandParams.arguments` is a positional array and serde reads a single-field variant as a
+//! newtype, which wants the bare value rather than a one-element array. Typed arguments cost an
+//! IDL change to named arguments (docs/oblisk-idl-api-specs.md § 7.2), not a derive.
 
 use std::collections::BTreeMap;
 
 use schemars::{Schema, schema_for};
 
-/// The one place a capability name is tied to the type it pushes. That mapping exists nowhere else
-/// in the tree: `push_snapshot` takes `&impl Serialize`, so the type is inferred at each of the 17
-/// call sites and no table names them together. `every_capability_has_a_schema` is what keeps this
-/// honest against `shared::CAPABILITIES`.
-fn capability_schemas() -> Vec<(&'static str, Schema)> {
+/// The one place a capability name is tied to the type it pushes and to the enum of actions it
+/// accepts. Neither mapping exists anywhere else in the tree: `push_snapshot` takes
+/// `&impl Serialize`, so the payload type is inferred at each of the 17 call sites, and an action
+/// enum is named only by its own `dispatch`. `every_capability_has_a_schema` keeps this honest
+/// against `shared::CAPABILITIES`. `None` is a read-only capability, which gets the plain `invoke`
+/// it inherits from `Capability`.
+fn capability_schemas() -> Vec<(&'static str, Schema, Option<Schema>)> {
     vec![
-        ("applications", schema_for!(crate::applications::controller::ApplicationsState)),
-        ("audio", schema_for!(crate::audio::mixer::AudioState)),
-        ("battery", schema_for!(crate::hardware::battery::controller::BatteryState)),
-        ("bluetooth", schema_for!(crate::dbus::bluetooth::BluetoothState)),
-        ("brightness", schema_for!(crate::hardware::brightness::controller::BrightnessState)),
-        ("keyboard", schema_for!(crate::hardware::keyboard::controller::KeyboardState)),
-        ("lock", schema_for!(crate::lock::LockState)),
-        ("mpris", schema_for!(crate::dbus::mpris::controller::MprisState)),
-        ("network", schema_for!(crate::dbus::network::NetworkState)),
-        ("notifications", schema_for!(crate::dbus::notifications::NotificationsState)),
-        ("power", schema_for!(crate::dbus::power::controller::PowerState)),
-        ("privacy", schema_for!(crate::privacy::controller::PrivacyState)),
-        ("sysinfo", schema_for!(crate::hardware::sysinfo::controller::SysinfoState)),
-        ("system", schema_for!(crate::system::controller::SystemState)),
-        ("tray", schema_for!(crate::dbus::tray::TrayState)),
-        ("updates", schema_for!(crate::updates::controller::UpdatesState)),
-        ("workspaces", schema_for!(crate::workspaces::controller::WorkspacesState)),
+        (
+            "applications",
+            schema_for!(crate::applications::controller::ApplicationsState),
+            Some(schema_for!(crate::applications::ApplicationsAction)),
+        ),
+        ("audio", schema_for!(crate::audio::mixer::AudioState), Some(schema_for!(crate::audio::AudioAction))),
+        ("battery", schema_for!(crate::hardware::battery::controller::BatteryState), None),
+        (
+            "bluetooth",
+            schema_for!(crate::dbus::bluetooth::BluetoothState),
+            Some(schema_for!(crate::dbus::bluetooth::BluetoothAction)),
+        ),
+        (
+            "brightness",
+            schema_for!(crate::hardware::brightness::controller::BrightnessState),
+            Some(schema_for!(crate::hardware::brightness::BrightnessAction)),
+        ),
+        (
+            "keyboard",
+            schema_for!(crate::hardware::keyboard::controller::KeyboardState),
+            Some(schema_for!(crate::hardware::keyboard::KeyboardAction)),
+        ),
+        ("lock", schema_for!(crate::lock::LockState), Some(schema_for!(crate::lock::LockAction))),
+        (
+            "mpris",
+            schema_for!(crate::dbus::mpris::controller::MprisState),
+            Some(schema_for!(crate::dbus::mpris::MprisAction)),
+        ),
+        (
+            "network",
+            schema_for!(crate::dbus::network::NetworkState),
+            Some(schema_for!(crate::dbus::network::NetworkAction)),
+        ),
+        (
+            "notifications",
+            schema_for!(crate::dbus::notifications::NotificationsState),
+            Some(schema_for!(crate::dbus::notifications::NotificationsAction)),
+        ),
+        (
+            "power",
+            schema_for!(crate::dbus::power::controller::PowerState),
+            Some(schema_for!(crate::dbus::power::PowerAction)),
+        ),
+        ("privacy", schema_for!(crate::privacy::controller::PrivacyState), None),
+        (
+            "sysinfo",
+            schema_for!(crate::hardware::sysinfo::controller::SysinfoState),
+            Some(schema_for!(crate::hardware::sysinfo::SysinfoAction)),
+        ),
+        ("system", schema_for!(crate::system::controller::SystemState), None),
+        ("tray", schema_for!(crate::dbus::tray::TrayState), Some(schema_for!(crate::dbus::tray::TrayAction))),
+        (
+            "updates",
+            schema_for!(crate::updates::controller::UpdatesState),
+            Some(schema_for!(crate::updates::UpdatesAction)),
+        ),
+        (
+            "workspaces",
+            schema_for!(crate::workspaces::controller::WorkspacesState),
+            Some(schema_for!(crate::workspaces::WorkspacesAction)),
+        ),
     ]
 }
-
-/// Every `capability:invoke(name, ...)` a `dispatch` accepts, in the order its `match` writes them.
-/// A capability with no commands is read-only and gets a plain `invoke` inherited from `Capability`.
-///
-/// Kept in dispatch order rather than sorted, so a diff against the source reads straight down.
-const CAPABILITY_COMMANDS: &[(&str, &[&str])] = &[
-    ("applications", &["refresh", "launch"]),
-    (
-        "audio",
-        &[
-            "set_volume",
-            "set_muted",
-            "toggle_mute",
-            "set_default_sink",
-            "set_default_source",
-            "set_app_volume",
-            "set_app_muted",
-        ],
-    ),
-    ("battery", &[]),
-    ("bluetooth", &["set_enabled", "start_discovery", "stop_discovery", "connect", "disconnect", "pair", "forget"]),
-    ("brightness", &["set"]),
-    ("keyboard", &["set_backlight", "switch_layout"]),
-    ("lock", &["lock"]),
-    ("mpris", &["control", "seek", "seek_relative"]),
-    ("network", &["scan", "connect", "forget", "set_wifi_enabled", "set_ethernet_enabled", "set_networking_enabled"]),
-    ("notifications", &["dismiss", "reply", "set_sound", "set_dnd"]),
-    ("power", &["set_profile"]),
-    ("privacy", &[]),
-    ("sysinfo", &["configure"]),
-    ("system", &[]),
-    ("tray", &["activate", "menu_will_show", "activate_menu_item"]),
-    ("updates", &["configure", "install"]),
-    ("workspaces", &["focus"]),
-];
 
 /// The Lua class name for a capability's payload, e.g. `audio` -> `AudioState`. Taken from the
 /// schema's own `title`, which schemars fills in with the Rust type name, so a renamed struct
 /// renames the Lua class without a second edit here.
 fn payload_class(schema: &Schema) -> String {
     schema.get("title").and_then(|t| t.as_str()).unwrap_or("table").to_string()
+}
+
+/// An action enum's variants as the wire strings a config passes to `invoke`, in declaration
+/// order. schemars renders a fieldless enum as a bare `enum` array of its `rename_all` spellings,
+/// which is exactly the list `parse_action` accepts.
+fn action_names(schema: &Schema) -> Vec<String> {
+    let value = serde_json::to_value(schema).expect("a schema serializes");
+    value
+        .get("enum")
+        .and_then(|e| e.as_array())
+        .map_or_else(Vec::new, |v| v.iter().filter_map(|n| n.as_str()).map(str::to_string).collect())
 }
 
 /// `audio` -> `AudioCapability`.
@@ -253,7 +281,7 @@ pub fn render() -> String {
     // Every `$defs` entry across every capability, deduplicated by name and sorted, so the output
     // is stable whatever order the roster is in.
     let mut defs: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-    for (_, schema) in &schemas {
+    for (_, schema, _) in &schemas {
         let value = serde_json::to_value(schema).expect("a schema serializes");
         if let Some(entries) = value.get("$defs").and_then(|d| d.as_object()) {
             for (name, body) in entries {
@@ -268,7 +296,7 @@ pub fn render() -> String {
     for (name, body) in &defs {
         render_class(name, body, &mut out);
     }
-    for (_, schema) in &schemas {
+    for (_, schema, _) in &schemas {
         let value = serde_json::to_value(schema).expect("a schema serializes");
         render_class(&payload_class(schema), &value, &mut out);
     }
@@ -276,10 +304,10 @@ pub fn render() -> String {
     out.push_str(
         "\n--- Capabilities -------------------------------------------------------------------------------\n",
     );
-    for (capability, schema) in &schemas {
+    for (capability, schema, actions) in &schemas {
         let class = capability_class(capability);
         let payload = payload_class(schema);
-        let commands = CAPABILITY_COMMANDS.iter().find(|(name, _)| name == capability).map_or(&[][..], |(_, c)| *c);
+        let commands = actions.as_ref().map_or_else(Vec::new, action_names);
         out.push_str(&format!("\n---@class {class}: Capability\nlocal {class} = {{}}\n"));
         out.push_str(&format!("---@return {payload}\nfunction {class}:get() end\n"));
         out.push_str(&format!(
@@ -409,108 +437,8 @@ mod tests {
 
     #[test]
     fn every_capability_has_a_schema() {
-        let declared: BTreeSet<&str> = super::capability_schemas().into_iter().map(|(name, _)| name).collect();
+        let declared: BTreeSet<&str> = super::capability_schemas().into_iter().map(|(name, ..)| name).collect();
         let expected: BTreeSet<&str> = shared::CAPABILITIES.iter().copied().collect();
         assert_eq!(declared, expected, "capability_schemas is out of step with shared::CAPABILITIES");
-    }
-
-    #[test]
-    fn every_capability_has_a_command_list() {
-        let declared: BTreeSet<&str> = super::CAPABILITY_COMMANDS.iter().map(|(name, _)| *name).collect();
-        let expected: BTreeSet<&str> = shared::CAPABILITIES.iter().copied().collect();
-        assert_eq!(declared, expected, "CAPABILITY_COMMANDS is out of step with shared::CAPABILITIES");
-    }
-
-    /// Reads the actions out of every `match params.action.as_str()` in the crate and compares them
-    /// against [`super::CAPABILITY_COMMANDS`].
-    ///
-    /// This is the check that would have caught `notifications` claiming seven commands where
-    /// `dispatch` has four. It is a source grep, and it is scoped to exactly one `match` expression
-    /// so it cannot pick up an unrelated string arm the way a bare `grep '"x" =>'` did: brace depth
-    /// is tracked from the `match` and only depth-1 arms count.
-    #[test]
-    fn commands_match_dispatch() {
-        let mut found: std::collections::BTreeMap<String, BTreeSet<String>> = std::collections::BTreeMap::new();
-        for source in rust_sources(Path::new(env!("CARGO_MANIFEST_DIR")).join("src")) {
-            let text = std::fs::read_to_string(&source).expect("a source file this build compiled is readable");
-            for actions in action_matches(&text) {
-                // The capability a dispatch belongs to is its module path, which for every one of
-                // these is the directory or file name: `dbus/network/mod.rs` -> `network`.
-                let name = capability_of(&source);
-                if let Some(name) = name {
-                    found.entry(name).or_default().extend(actions);
-                }
-            }
-        }
-        for (capability, commands) in super::CAPABILITY_COMMANDS {
-            let expected: BTreeSet<String> = commands.iter().map(|c| (*c).to_string()).collect();
-            let actual = found.get(*capability).cloned().unwrap_or_default();
-            assert_eq!(actual, expected, "{capability}'s dispatch arms and CAPABILITY_COMMANDS disagree");
-        }
-    }
-
-    fn rust_sources(root: PathBuf) -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        let mut stack = vec![root];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    out.push(path);
-                }
-            }
-        }
-        out
-    }
-
-    /// The `"name" =>` arms at depth 1 of every `match params.action.as_str()` block in `text`.
-    fn action_matches(text: &str) -> Vec<Vec<String>> {
-        let mut blocks = Vec::new();
-        for (start, _) in text.match_indices("action.as_str() {") {
-            let body = &text[start..];
-            let mut depth = 0usize;
-            let mut arms = Vec::new();
-            for (i, c) in body.char_indices() {
-                match c {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    '"' if depth == 1 => {
-                        let rest = &body[i + 1..];
-                        if let Some(end) = rest.find('"') {
-                            let name = &rest[..end];
-                            // Only a string that is the head of an arm, i.e. followed by `=>`.
-                            let after = rest[end + 1..].trim_start();
-                            if after.starts_with("=>") && name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
-                                arms.push(name.to_string());
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            blocks.push(arms);
-        }
-        blocks
-    }
-
-    /// `src/dbus/network/mod.rs` -> `network`; `src/lock.rs` -> `lock`.
-    fn capability_of(path: &Path) -> Option<String> {
-        let stem = path.file_stem()?.to_str()?;
-        let name = if stem == "mod" || stem == "controller" || stem == "registry" {
-            path.parent()?.file_name()?.to_str()?
-        } else {
-            stem
-        };
-        shared::CAPABILITIES.iter().find(|c| **c == name).map(|c| (*c).to_string())
     }
 }

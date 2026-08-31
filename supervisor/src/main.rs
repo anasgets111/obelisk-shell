@@ -102,6 +102,22 @@ pub(crate) fn log_unknown_action(params: &shared::CommandParams) {
     eprintln!("{}: unknown action {:?} from generation {}", params.capability, params.action, params.generation_id);
 }
 
+/// Reads `params.action` as a capability's action enum, logging and returning `None` when it names
+/// no variant. Serde owns the string-to-variant mapping, so the spellings a capability accepts are
+/// its enum's variants and nothing else -- there is no second list of action names anywhere, and
+/// `supervisor/src/stubs.rs` generates the Lua side from the same enum.
+pub(crate) fn parse_action<A: serde::de::DeserializeOwned>(params: &shared::CommandParams) -> Option<A> {
+    use serde::de::IntoDeserializer;
+    let action: Result<A, serde::de::value::Error> = A::deserialize(params.action.as_str().into_deserializer());
+    match action {
+        Ok(action) => Some(action),
+        Err(_) => {
+            log_unknown_action(params);
+            None
+        }
+    }
+}
+
 /// Why `run_supervisor` returned, and the process exit code it becomes (docs/adr/0059 decision 3).
 /// `packaging/oblisk-shell.service` restarts this process on every exit but one, so that exit
 /// needs a code of its own to be named in `RestartPreventExitStatus`.

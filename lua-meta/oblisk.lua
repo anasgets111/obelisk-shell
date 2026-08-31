@@ -360,7 +360,7 @@ function BluetoothCapability:get() end
 ---@param fn fun(value: BluetoothState): any
 ---@return Signal
 function BluetoothCapability:map(fn) end
----@param command "set_enabled"|"start_discovery"|"stop_discovery"|"connect"|"disconnect"|"pair"|"forget"
+---@param command "set_enabled"|"start_discovery"|"stop_discovery"|"pair"|"connect"|"disconnect"|"forget"
 ---@param ... any
 function BluetoothCapability:invoke(command, ...) end
 
@@ -415,7 +415,7 @@ function NetworkCapability:get() end
 ---@param fn fun(value: NetworkState): any
 ---@return Signal
 function NetworkCapability:map(fn) end
----@param command "scan"|"connect"|"forget"|"set_wifi_enabled"|"set_ethernet_enabled"|"set_networking_enabled"
+---@param command "set_networking_enabled"|"set_wifi_enabled"|"set_ethernet_enabled"|"scan"|"connect"|"forget"
 ---@param ... any
 function NetworkCapability:invoke(command, ...) end
 
@@ -475,7 +475,7 @@ function TrayCapability:get() end
 ---@param fn fun(value: TrayState): any
 ---@return Signal
 function TrayCapability:map(fn) end
----@param command "activate"|"menu_will_show"|"activate_menu_item"
+---@param command "activate"|"activate_menu_item"|"menu_will_show"
 ---@param ... any
 function TrayCapability:invoke(command, ...) end
 

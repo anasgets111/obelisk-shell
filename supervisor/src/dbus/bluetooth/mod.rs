@@ -148,14 +148,29 @@ pub fn parse_mac_arg(arguments: &[serde_json::Value]) -> Option<String> {
     Some(arguments.first()?.as_str()?.to_string())
 }
 
+/// Every action `oblisk.bluetooth:invoke(...)` accepts. `dispatch` matches this rather than a string,
+/// so a variant with no arm (or an arm with no variant) fails the build.
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BluetoothAction {
+    SetEnabled,
+    StartDiscovery,
+    StopDiscovery,
+    Pair,
+    Connect,
+    Disconnect,
+    Forget,
+}
+
 /// `oblisk.bluetooth`'s action dispatch (ADR-0037): owns the action match, argument parse, and
 /// write-action spawn for every `bluetooth` `CommandEnvelope`. Write actions are
 /// `tokio::spawn`ed rather than awaited inline (ADR-0030). `stop_discovery` mutates no local
 /// state on purpose: the last `discovered_devices` snapshot stays visible.
 pub fn dispatch(controller: &BluetoothController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
-    match params.action.as_str() {
-        "set_enabled" => match parse_bool_arg(&params.arguments) {
+    let Some(action) = crate::parse_action::<BluetoothAction>(params) else { return };
+    match action {
+        BluetoothAction::SetEnabled => match parse_bool_arg(&params.arguments) {
             Some(enabled) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
@@ -164,20 +179,20 @@ pub fn dispatch(controller: &BluetoothController, envelope: &shared::CommandEnve
             }
             None => crate::log_malformed_command(params),
         },
-        "start_discovery" => {
+        BluetoothAction::StartDiscovery => {
             controller.clear_discovered();
             let controller = controller.clone();
             tokio::spawn(async move {
                 controller.start_discovery().await;
             });
         }
-        "stop_discovery" => {
+        BluetoothAction::StopDiscovery => {
             let controller = controller.clone();
             tokio::spawn(async move {
                 controller.stop_discovery().await;
             });
         }
-        "pair" => match parse_mac_arg(&params.arguments) {
+        BluetoothAction::Pair => match parse_mac_arg(&params.arguments) {
             Some(mac) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
@@ -186,7 +201,7 @@ pub fn dispatch(controller: &BluetoothController, envelope: &shared::CommandEnve
             }
             None => crate::log_malformed_command(params),
         },
-        "connect" => match parse_mac_arg(&params.arguments) {
+        BluetoothAction::Connect => match parse_mac_arg(&params.arguments) {
             Some(mac) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
@@ -195,7 +210,7 @@ pub fn dispatch(controller: &BluetoothController, envelope: &shared::CommandEnve
             }
             None => crate::log_malformed_command(params),
         },
-        "disconnect" => match parse_mac_arg(&params.arguments) {
+        BluetoothAction::Disconnect => match parse_mac_arg(&params.arguments) {
             Some(mac) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
@@ -204,7 +219,7 @@ pub fn dispatch(controller: &BluetoothController, envelope: &shared::CommandEnve
             }
             None => crate::log_malformed_command(params),
         },
-        "forget" => match parse_mac_arg(&params.arguments) {
+        BluetoothAction::Forget => match parse_mac_arg(&params.arguments) {
             Some(mac) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
@@ -213,7 +228,6 @@ pub fn dispatch(controller: &BluetoothController, envelope: &shared::CommandEnve
             }
             None => crate::log_malformed_command(params),
         },
-        _ => crate::log_unknown_action(params),
     }
 }
 

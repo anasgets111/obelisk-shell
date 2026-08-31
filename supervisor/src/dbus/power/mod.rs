@@ -19,13 +19,22 @@ pub mod controller;
 
 pub use controller::{PowerController, PowerSignal, parse_set_profile_args};
 
+/// Every action `oblisk.power:invoke(...)` accepts. `dispatch` matches this rather than a string,
+/// so a variant with no arm (or an arm with no variant) fails the build.
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerAction {
+    SetProfile,
+}
+
 /// `oblisk.power`'s action dispatch (ADR-0037): `set_profile` writes a D-Bus property, so it gets
 /// `tokio::spawn`ed (ADR-0029), the same shape `brightness::dispatch` uses for its own D-Bus
 /// write.
 pub fn dispatch(controller: &PowerController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
-    match params.action.as_str() {
-        "set_profile" => match parse_set_profile_args(&params.arguments) {
+    let Some(action) = crate::parse_action::<PowerAction>(params) else { return };
+    match action {
+        PowerAction::SetProfile => match parse_set_profile_args(&params.arguments) {
             Some(profile) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
@@ -34,6 +43,5 @@ pub fn dispatch(controller: &PowerController, envelope: &shared::CommandEnvelope
             }
             None => crate::log_malformed_command(params),
         },
-        _ => crate::log_unknown_action(params),
     }
 }

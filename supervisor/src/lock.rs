@@ -373,18 +373,26 @@ impl LockController {
     }
 }
 
-/// `oblisk.lock`'s action dispatch (docs/adr/0037). Neither action takes arguments, so unlike
-/// `keyboard` there is no `parse_*_args` sibling.
+/// Every action `oblisk.lock:invoke(...)` accepts. `dispatch` matches this rather than a string,
+/// so a variant with no arm (or an arm with no variant) fails the build.
 ///
-/// Locking is the one direction a config may command. There is no `unlock` action: a lock
+/// Locking is the one direction a config may command. There is no `unlock` variant: a lock
 /// screen's `button` callbacks run while its Lua tree is the only thing on the glass, so an
 /// `unlock` action would be a one-click path past PAM -- exactly what docs/adr/0042 forbids.
-/// `"unlock"` falls through to [`crate::log_unknown_action`] like any other unanswered name.
+/// `"unlock"` names no variant, so it is logged and dropped like any other unanswered name.
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LockAction {
+    Lock,
+}
+
+/// `oblisk.lock`'s action dispatch (docs/adr/0037). `lock` takes no arguments, so unlike
+/// `keyboard` there is no `parse_*_args` sibling.
 pub fn dispatch(controller: &LockController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
-    match params.action.as_str() {
-        "lock" => controller.lock(),
-        _ => crate::log_unknown_action(params),
+    let Some(action) = crate::parse_action::<LockAction>(params) else { return };
+    match action {
+        LockAction::Lock => controller.lock(),
     }
 }
 

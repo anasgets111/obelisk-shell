@@ -12,6 +12,20 @@ pub mod mixer;
 
 use mixer::{AudioCommand, AudioCommandSender};
 
+/// Every action `oblisk.audio:invoke(...)` accepts. `dispatch` matches this rather than a string,
+/// so a variant with no arm (or an arm with no variant) fails the build.
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioAction {
+    SetVolume,
+    SetMuted,
+    ToggleMute,
+    SetDefaultSink,
+    SetDefaultSource,
+    SetAppVolume,
+    SetAppMuted,
+}
+
 /// `oblisk.audio`'s action dispatch (ADR-0037). Unlike every other capability's adapter, this one
 /// has no controller to call: each action becomes an [`AudioCommand`] on the channel into the
 /// PipeWire thread, and nothing here awaits a result.
@@ -22,19 +36,19 @@ use mixer::{AudioCommand, AudioCommandSender};
 /// is a decision rather than a gap in the match.
 pub fn dispatch(commands: &AudioCommandSender, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
-    let command = match params.action.as_str() {
-        "set_volume" => parse_volume_arg(&params.arguments).map(AudioCommand::SetMasterVolume),
-        "set_muted" => crate::dbus::parse_bool_arg(&params.arguments).map(AudioCommand::SetMasterMuted),
-        "toggle_mute" => Some(AudioCommand::ToggleMasterMute),
-        "set_default_sink" => parse_id_arg(&params.arguments).map(AudioCommand::SetDefaultSink),
-        "set_default_source" => parse_id_arg(&params.arguments).map(AudioCommand::SetDefaultSource),
-        "set_app_volume" => {
+    let Some(action) = crate::parse_action::<AudioAction>(params) else { return };
+    let command = match action {
+        AudioAction::SetVolume => parse_volume_arg(&params.arguments).map(AudioCommand::SetMasterVolume),
+        AudioAction::SetMuted => crate::dbus::parse_bool_arg(&params.arguments).map(AudioCommand::SetMasterMuted),
+        AudioAction::ToggleMute => Some(AudioCommand::ToggleMasterMute),
+        AudioAction::SetDefaultSink => parse_id_arg(&params.arguments).map(AudioCommand::SetDefaultSink),
+        AudioAction::SetDefaultSource => parse_id_arg(&params.arguments).map(AudioCommand::SetDefaultSource),
+        AudioAction::SetAppVolume => {
             parse_id_and_volume_args(&params.arguments).map(|(id, volume)| AudioCommand::SetAppVolume { id, volume })
         }
-        "set_app_muted" => {
+        AudioAction::SetAppMuted => {
             parse_id_and_bool_args(&params.arguments).map(|(id, muted)| AudioCommand::SetAppMuted { id, muted })
         }
-        _ => return crate::log_unknown_action(params),
     };
     let Some(command) = command else {
         return crate::log_malformed_command(params);

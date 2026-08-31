@@ -455,13 +455,27 @@ impl NetworkController {
     }
 }
 
+/// Every action `oblisk.network:invoke(...)` accepts. `dispatch` matches this rather than a string,
+/// so a variant with no arm (or an arm with no variant) fails the build.
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkAction {
+    SetNetworkingEnabled,
+    SetWifiEnabled,
+    SetEthernetEnabled,
+    Scan,
+    Connect,
+    Forget,
+}
+
 /// `oblisk.network`'s action dispatch (ADR-0037). Write actions are `tokio::spawn`ed rather than
 /// awaited inline (ADR-0029); `connect` only stashes its intent, the actual connect runs when
 /// the paired `secure_submit(network, connect)` arrives.
 pub fn dispatch(controller: &NetworkController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
-    match params.action.as_str() {
-        "set_networking_enabled" => match parse_bool_arg(&params.arguments) {
+    let Some(action) = crate::parse_action::<NetworkAction>(params) else { return };
+    match action {
+        NetworkAction::SetNetworkingEnabled => match parse_bool_arg(&params.arguments) {
             Some(enabled) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
@@ -470,7 +484,7 @@ pub fn dispatch(controller: &NetworkController, envelope: &shared::CommandEnvelo
             }
             None => crate::log_malformed_command(params),
         },
-        "set_wifi_enabled" => match parse_bool_arg(&params.arguments) {
+        NetworkAction::SetWifiEnabled => match parse_bool_arg(&params.arguments) {
             Some(enabled) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
@@ -479,7 +493,7 @@ pub fn dispatch(controller: &NetworkController, envelope: &shared::CommandEnvelo
             }
             None => crate::log_malformed_command(params),
         },
-        "set_ethernet_enabled" => match parse_bool_arg(&params.arguments) {
+        NetworkAction::SetEthernetEnabled => match parse_bool_arg(&params.arguments) {
             Some(enabled) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
@@ -488,18 +502,18 @@ pub fn dispatch(controller: &NetworkController, envelope: &shared::CommandEnvelo
             }
             None => crate::log_malformed_command(params),
         },
-        "scan" => {
+        NetworkAction::Scan => {
             controller.mark_scanning();
             let controller = controller.clone();
             tokio::spawn(async move {
                 controller.scan().await;
             });
         }
-        "connect" => match parse_connect_args(&params.arguments) {
+        NetworkAction::Connect => match parse_connect_args(&params.arguments) {
             Some((ssid, hidden)) => controller.stash_connect_intent(PendingNetworkConnect { ssid, hidden }),
             None => crate::log_malformed_command(params),
         },
-        "forget" => match parse_ssid_arg(&params.arguments) {
+        NetworkAction::Forget => match parse_ssid_arg(&params.arguments) {
             Some(ssid) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
@@ -508,7 +522,6 @@ pub fn dispatch(controller: &NetworkController, envelope: &shared::CommandEnvelo
             }
             None => crate::log_malformed_command(params),
         },
-        _ => crate::log_unknown_action(params),
     }
 }
 

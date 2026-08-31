@@ -13,12 +13,21 @@ pub mod controller;
 
 pub use controller::{BrightnessController, BrightnessSignal, parse_set_args};
 
+/// Every action `oblisk.brightness:invoke(...)` accepts. `dispatch` matches this rather than a string,
+/// so a variant with no arm (or an arm with no variant) fails the build.
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BrightnessAction {
+    Set,
+}
+
 /// `oblisk.brightness`'s action dispatch (ADR-0037): `set` makes a real D-Bus call (logind),
 /// so it gets `tokio::spawn`ed (ADR-0029).
 pub fn dispatch(controller: &BrightnessController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
-    match params.action.as_str() {
-        "set" => match parse_set_args(&params.arguments) {
+    let Some(action) = crate::parse_action::<BrightnessAction>(params) else { return };
+    match action {
+        BrightnessAction::Set => match parse_set_args(&params.arguments) {
             Some(pct) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
@@ -27,6 +36,5 @@ pub fn dispatch(controller: &BrightnessController, envelope: &shared::CommandEnv
             }
             None => crate::log_malformed_command(params),
         },
-        _ => crate::log_unknown_action(params),
     }
 }

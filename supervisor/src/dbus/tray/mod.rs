@@ -113,13 +113,24 @@ pub fn parse_menu_will_show_args(arguments: &[serde_json::Value]) -> Option<(Str
     parse_activate_menu_item_args(arguments)
 }
 
+/// Every action `oblisk.tray:invoke(...)` accepts. `dispatch` matches this rather than a string,
+/// so a variant with no arm (or an arm with no variant) fails the build.
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TrayAction {
+    Activate,
+    ActivateMenuItem,
+    MenuWillShow,
+}
+
 /// `oblisk.tray`'s action dispatch (ADR-0037): owns the action match, argument parse, and
 /// write-action spawn for every `tray` `CommandEnvelope`. Write actions are `tokio::spawn`ed
 /// rather than awaited inline (ADR-0031).
 pub fn dispatch(controller: &TrayController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
-    match params.action.as_str() {
-        "activate" => match parse_activate_args(&params.arguments) {
+    let Some(action) = crate::parse_action::<TrayAction>(params) else { return };
+    match action {
+        TrayAction::Activate => match parse_activate_args(&params.arguments) {
             Some((id, x, y)) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
@@ -128,7 +139,7 @@ pub fn dispatch(controller: &TrayController, envelope: &shared::CommandEnvelope)
             }
             None => crate::log_malformed_command(params),
         },
-        "activate_menu_item" => match parse_activate_menu_item_args(&params.arguments) {
+        TrayAction::ActivateMenuItem => match parse_activate_menu_item_args(&params.arguments) {
             Some((id, menu_item_id)) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
@@ -137,7 +148,7 @@ pub fn dispatch(controller: &TrayController, envelope: &shared::CommandEnvelope)
             }
             None => crate::log_malformed_command(params),
         },
-        "menu_will_show" => match parse_menu_will_show_args(&params.arguments) {
+        TrayAction::MenuWillShow => match parse_menu_will_show_args(&params.arguments) {
             Some((id, submenu_id)) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
@@ -146,7 +157,6 @@ pub fn dispatch(controller: &TrayController, envelope: &shared::CommandEnvelope)
             }
             None => crate::log_malformed_command(params),
         },
-        _ => crate::log_unknown_action(params),
     }
 }
 
