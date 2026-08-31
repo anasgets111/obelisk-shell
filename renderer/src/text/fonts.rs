@@ -20,10 +20,14 @@ use fontdb::{Database, Family, Query};
 /// equal what was asked for) doesn't apply: whatever fontconfig returns for them *is* the answer.
 const GENERIC_ALIASES: &[&str] = &["sans-serif", "serif", "monospace", "cursive", "fantasy"];
 
-/// Until the Lua `fonts = {...}` declaration lands, every surface resolves against this chain: a
-/// system sans serif, then CJK coverage, then color emoji (docs/adr/0043 decision 2), covering
-/// codepoints that arrive from outside the shell's own strings (MPRIS titles, notification
-/// bodies, window titles).
+/// What a config that declares no `fonts { ... }` gets: a system sans serif, then CJK coverage,
+/// then color emoji (docs/adr/0043 decision 2), covering codepoints that arrive from outside the
+/// shell's own strings (MPRIS titles, notification bodies, window titles).
+///
+/// This is the fallback, not the chain. `crate::lua::fonts` records what a config asked for and
+/// `ShapingHandle::set_chain` installs it after the startup evaluation. A shell drawing its chrome
+/// with Nerd Font private-use glyphs has to declare one: none of the three families here carries
+/// those codepoints, so without a declaration they render as tofu.
 pub const DEFAULT_CHAIN: &[&str] = &["sans-serif", "Noto Sans CJK JP", "Noto Color Emoji"];
 
 /// A font chain resolved to loaded faces: the database holding exactly those faces, and the

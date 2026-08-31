@@ -45,6 +45,29 @@ number and a real-GPU number are not comparable.
 
 ## Decision 2: fonts are declared in config, not discovered from the system
 
+> **Built.** `fonts { "Family", ... }` is a global the config calls, recorded into `Lua::app_data`
+> the way `state`, `hover` and `scroll` are, and installed by `ShapingHandle::set_chain` after the
+> startup evaluation and before the first paint. That ordering is what makes a rebuild beat a
+> respawn: the worker replaces its `FontSystem` in place and keeps its mapped faces, and
+> `TextPainter` is built lazily on a surface's first paint, so femtovg picks up the new chain
+> without being told. The shape cache is cleared with it, since every entry was measured against
+> the faces being replaced.
+>
+> Read once, at startup. Editing the declaration in a live config changes nothing until restart,
+> and `renderer/src/lua/fonts.rs` records why that is a decision rather than an omission.
+>
+> This turned out to matter more than a memory decision. The reference config draws its entire
+> chrome with Nerd Font private-use glyphs as `text`, and `DEFAULT_CHAIN` resolves to Noto Sans and
+> Noto Color Emoji, neither of which carries those codepoints. Until this landed, that shell's icons
+> could not be drawn at all, on a machine with the font installed.
+>
+> Per-node `font_family` is deliberately not built. Both readers fall back per glyph across the
+> whole chain, so the codepoint picks the face and one chain covers body text beside glyph chrome.
+> A node-level family is only needed to choose between two faces that both have the glyph, which is
+> one call site in the reference config, and it is the half that carries the real hazard: shaping
+> and paint select faces through different mechanisms, and `text::shaping`'s module doc already
+> records what it cost when those two disagreed.
+
 This is the largest risk to the budget and the one with the clearest fix.
 
 `cosmic_text::FontSystem::new()` calls `Database::load_system_fonts()`, which eagerly parses face

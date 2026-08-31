@@ -35,6 +35,22 @@
 -- `return { require(...), require(...) }` puts one more element in this list than it has surfaces,
 -- a string like "/path/to/lock.lua", and the engine then reports `error converting Lua string to
 -- table` with no clue which entry is wrong. `local x = require(...)` takes the first value and nothing else.
+-- The font chain, in fallback order, and it has to be declared before anything measures text.
+-- `femtovg` and `cosmic-text` both fall back across it per glyph, so one chain covers body text and
+-- the Nerd Font private-use glyphs the Quickshell config draws its whole chrome with: the codepoint
+-- picks the face, not the node. Without this the engine resolves `sans-serif` and those glyphs
+-- render as tofu, which is what they did until the `fonts` declaration existed (docs/adr/0043
+-- decision 2).
+--
+-- Read once, at startup. Editing this list re-evaluates and changes nothing until the shell is
+-- restarted; `renderer/src/lua/fonts.rs` says why.
+fonts {
+    "CaskaydiaCove Nerd Font Propo",
+    "Noto Sans",
+    "Noto Sans CJK JP",
+    "Noto Color Emoji",
+}
+
 local wallpaper = require("modules.global.wallpaper")
 local bar = require("modules.bar")
 local notifications = require("modules.notification.popup")

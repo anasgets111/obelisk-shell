@@ -5,6 +5,7 @@
 //! [`Loader::evaluate_file`] reads the real `~/.config/oblisk/shell.lua` (`shared::shell_lua_path`)
 //! and is `renderer/src/socket.rs`'s real entry point: both the Renderer's own startup evaluation
 //! and every Supervisor-triggered `Reevaluate` round trip call it.
+pub mod fonts;
 pub mod capability;
 pub mod marshal;
 pub mod json;
@@ -141,6 +142,7 @@ impl Loader {
         point_package_path_at(&lua, config_dir)?;
         nodes::register_node_constructors(&lua)?;
         json::register(&lua)?;
+        fonts::register(&lua)?;
         signal::register(&lua, dirty)?;
         let standard_modules = loaded_module_names(&lua)?;
         Ok(Loader { lua, standard_modules })

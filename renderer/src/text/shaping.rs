@@ -64,6 +64,10 @@ impl AsRef<[u8]> for FontData {
 enum Request {
     Shape(ShapeRequest, mpsc::Sender<ShapeResult>),
     FontChainData(mpsc::Sender<Vec<FontData>>),
+    /// Replace the chain this worker measures against, once, after the config has said what it
+    /// wants (docs/adr/0043 decision 2). Replies when the new `FontSystem` is live, so the caller
+    /// knows the next `font_chain_data` will answer with the new faces rather than the old.
+    SetChain(Vec<String>, mpsc::Sender<()>),
     // Test-only, `#[cfg(test)]` rather than `#[allow(dead_code)]`: nothing outside a test binary
     // sends this. The production diagnostic for the resolved chain is `fonts::resolve_chain`'s
     // own `eprintln!`.
@@ -131,12 +135,12 @@ impl ShapingHandle {
         thread::Builder::new()
             .name("oblisk-text-shaping".into())
             .spawn(move || {
-                let ResolvedFonts { mut db, primary_family } = fonts::resolve_chain(fonts::DEFAULT_CHAIN);
+                let ResolvedFonts { mut db, mut primary_family } = fonts::resolve_chain(fonts::DEFAULT_CHAIN);
                 // Mapped once, before the `Database` is handed to cosmic-text: neither the chain
                 // nor its load order changes again for this `FontSystem`'s lifetime, and doing it
                 // here is what leaves the shared mappings *in* the database for cosmic-text to
                 // find rather than mapping the same files a second time.
-                let chain_data = font_chain_data(&mut db);
+                let mut chain_data = font_chain_data(&mut db);
                 let mut font_system = FontSystem::new_with_locale_and_db(detect_locale(), db);
                 while let Ok(request) = rx.recv() {
                     match request {
@@ -146,6 +150,17 @@ impl ShapingHandle {
                         }
                         Request::FontChainData(reply) => {
                             let _ = reply.send(chain_data.clone());
+                        }
+                        Request::SetChain(chain, reply) => {
+                            // Rebuilt rather than respawned: a new worker would drop the mapped
+                            // faces and every measurement taken so far, and the caller has already
+                            // cleared the cache for the same reason this rebuild exists.
+                            let borrowed: Vec<&str> = chain.iter().map(String::as_str).collect();
+                            let ResolvedFonts { db: mut new_db, primary_family: new_primary } = fonts::resolve_chain(&borrowed);
+                            chain_data = font_chain_data(&mut new_db);
+                            font_system = FontSystem::new_with_locale_and_db(detect_locale(), new_db);
+                            primary_family = new_primary;
+                            let _ = reply.send(());
                         }
                         #[cfg(test)]
                         Request::ResolvedPrimaryFamily(reply) => {
@@ -161,9 +176,9 @@ impl ShapingHandle {
     /// Measures `request`, from [`SHAPE_CACHE_CAPACITY`]'s memo when it has been asked before and
     /// from the worker thread otherwise. Blocks only on a miss.
     ///
-    /// Nothing invalidates an entry, because nothing can change one. The font chain is resolved
-    /// once inside [`ShapingHandle::spawn`] and never reloaded, so a given key shapes to the same
-    /// box for the life of the process.
+    /// Nothing invalidates an entry while the chain stands, because nothing else can change one.
+    /// [`ShapingHandle::set_chain`] is the one thing that can, and it clears the whole map rather
+    /// than trying to decide which measurements the new faces would have changed.
     ///
     /// Why this exists: `Scene::apply` re-measures every text node it resolves, and ADR-0044
     /// decision 2's dirty flag turned that from once per config edit into once per push. Measured
@@ -223,6 +238,32 @@ impl ShapingHandle {
         }
         cache.insert(key, result);
         result
+    }
+
+    /// Replaces the font chain every reader measures and paints against, and drops every
+    /// measurement taken under the old one.
+    ///
+    /// Called once, after the startup evaluation, with whatever chain the config declared. The
+    /// ordering is what makes this work rather than a respawn: `ShapingHandle::spawn` runs before
+    /// any Lua has been read (`wayland/mod.rs`), and `TextPainter` is built lazily on a surface's
+    /// first paint, which is after. So femtovg picks up the new faces on its own, provided the
+    /// caller drops any painter it already built.
+    ///
+    /// The cache is cleared, and that is correctness rather than hygiene: every entry in it was
+    /// measured against faces this call is replacing.
+    ///
+    /// A no-op for an empty chain. A config that declares no fonts keeps
+    /// [`fonts::DEFAULT_CHAIN`], and one that declares a chain no font on the system can honour
+    /// would otherwise leave `TextPainter::new` with nothing to load and the shell with no text at
+    /// all.
+    pub fn set_chain(&self, chain: &[String]) {
+        if chain.is_empty() {
+            return;
+        }
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.requests.send(Request::SetChain(chain.to_vec(), reply_tx)).expect("oblisk-text-shaping worker thread died");
+        let _ = reply_rx.recv();
     }
 
     /// How many measurements are memoized. Test-only: production has no reason to ask, and a
@@ -364,6 +405,42 @@ mod tests {
 
     fn req(text: &str, font_size: f32) -> ShapeRequest {
         ShapeRequest { text: text.into(), font_size, line_height: font_size * 1.2, max_width: None }
+    }
+
+    /// The chain a config declares has to reach the worker, or `fonts { ... }` is a no-op that
+    /// looks like it worked. Uses the two families the shipped dev config names, and skips rather
+    /// than fails on a machine that has neither installed.
+    #[test]
+    fn a_declared_chain_replaces_the_one_the_worker_started_with() {
+        let handle = ShapingHandle::spawn();
+        let before = handle.resolved_primary_family();
+        let wanted = "CaskaydiaCove Nerd Font Propo".to_string();
+        handle.set_chain(std::slice::from_ref(&wanted));
+        let after = handle.resolved_primary_family();
+        if after == before {
+            eprintln!("skip: {wanted} is not installed, so the chain could not change");
+            return;
+        }
+        assert_eq!(after, wanted, "the worker measures against what the config asked for");
+    }
+
+    #[test]
+    fn an_empty_declaration_leaves_the_default_chain_standing() {
+        let handle = ShapingHandle::spawn();
+        let before = handle.resolved_primary_family();
+        handle.set_chain(&[]);
+        assert_eq!(handle.resolved_primary_family(), before, "declaring nothing is not declaring an empty chain");
+    }
+
+    /// Every entry was measured against faces the new chain replaces, so keeping any of them would
+    /// be answering with the old font's metrics under the new font's name.
+    #[test]
+    fn setting_a_chain_drops_every_measurement_taken_under_the_old_one() {
+        let handle = ShapingHandle::spawn();
+        handle.shape(req("Oblisk", 14.0));
+        assert_eq!(handle.cached_len(), 1);
+        handle.set_chain(&["Noto Sans".to_string()]);
+        assert_eq!(handle.cached_len(), 0);
     }
 
     #[test]

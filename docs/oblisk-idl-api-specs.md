@@ -412,6 +412,18 @@ Receives input focus and pointer events.
 
 > **This row is most of the pointer model, and the model is now complete.** The frame handler in `renderer/src/wayland/input.rs` matches `Press`, `Release` and `Leave` for clicks, `Enter`/`Motion`/`Leave` for hover (`hover` below), and `Axis` for the wheel (`scroll` below). Nothing is dropped: the match over `PointerEventKind` is exhaustive and the `_ => {}` arm that used to swallow the rest is gone. The design decision this paragraph asked for, what a scrollable container *is*, is docs/adr/0069.
 
+#### Fonts (`fonts`)
+The font chain this shell measures and paints with, in fallback order (docs/adr/0043 decision 2).
+
+*   `fonts(chain)` (Global, called at the top level of `shell.lua`. Takes an array of family-name strings. Refused if any entry is not a string, naming which one, because Lua would otherwise coerce a number into a family nobody can find)
+    *   `chain`: `table` (Family names as fontconfig resolves them, e.g. `"CaskaydiaCove Nerd Font Propo"`. An entry no font on the system matches is skipped with a diagnostic rather than substituted, so a typo costs that entry and not the chain)
+
+> **One chain, and the codepoint picks the face.** Both readers fall back per glyph across the whole chain in order: a Nerd Font first and a sans face second gives glyph chrome and body text from one declaration, with no node saying which it wants. There is no per-node `font_family`.
+
+> **Declaring nothing keeps the default**, which is `sans-serif`, `Noto Sans CJK JP`, `Noto Color Emoji`. None of those carries Nerd Font private-use glyphs, so a shell drawing its chrome that way has to declare a chain or draw tofu.
+
+> **Read once, at startup.** Editing the declaration re-evaluates like any other edit and changes nothing until the shell restarts. A chain change invalidates every measurement in the shell, which is closer to a topology change than to the in-place restyle a reload is for.
+
 #### Hover (`hover`, `hover(name)`, `hover_rect(name)`)
 A **hover slot** is engine-written reactive state naming one region of one surface: whether the pointer is inside it, and where it is. Declared on any node, read from anywhere (docs/adr/0062).
 

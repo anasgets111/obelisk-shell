@@ -281,6 +281,12 @@ pub fn run(
     let outputs = geometries_from(&screens);
     app.client.set_screens(screens_payload(&screens));
     let specs = app.client.run_startup_evaluation().unwrap_or_default();
+    // After the evaluation, because `fonts { ... }` is a global the config calls; before any
+    // surface has painted, because `TextPainter` loads the chain lazily on a surface's first paint
+    // and so picks this up without being told (`ShapingHandle::set_chain` says why that ordering is
+    // what makes a rebuild beat a respawn). A config that declares nothing leaves the default
+    // chain standing.
+    app.shaping.set_chain(&crate::lua::fonts::declared_chain(app.client.lua()));
     let instances = expand_instances(&specs, &outputs);
     for spec in &specs {
         let SurfaceSpec::Panel(panel) = spec else {
