@@ -182,6 +182,7 @@ impl App {
             map_state: MapState::Unmapped,
             null_buffered: false,
             configured_size: (0, 0),
+            last_painted: None,
         });
     }
 

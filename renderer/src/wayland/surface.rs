@@ -184,6 +184,19 @@ pub(super) struct TrackedSurface {
     /// The most recent `configure` size, so [`App::activate_draw`] has a real size to bind EGL
     /// to: in candidate mode the first configure doesn't bind EGL (see [`App::bind_and_clear`]).
     pub(super) configured_size: (u32, u32),
+    /// What this surface last actually painted, and at what size, so [`App::paint_surface`] can
+    /// skip a repaint that would put down identical pixels.
+    ///
+    /// Carries the size as well as the list because the same list at a new size is a different
+    /// frame: the EGL surface behind it was resized and its buffer holds nothing. Cleared
+    /// outright when the surface is (re)bound, since a fresh `EGLSurface`'s buffers are undefined
+    /// and the pixels this recorded are gone with the old one.
+    ///
+    /// `None` means "must paint", which is the correct answer for every state this cannot vouch
+    /// for. Getting the invalidation wrong in the other direction leaves a stale frame on screen
+    /// with nothing to trigger a redraw, so every branch that cannot prove the buffer still holds
+    /// what this says clears it.
+    pub(super) last_painted: Option<((u32, u32), layout::paint::DisplayList)>,
 }
 /// § 5.1's `visible` at the moment [`App::create_surfaces`] first builds one instance, given
 /// what its resolved tree says (`None` when it has none) and which role was declared.
@@ -820,11 +833,14 @@ impl App {
 
         eprintln!("[oblisk-renderer] {surface_id} up: {width}x{height}, EGL context current");
         self.surfaces[index].bound = Some(BoundSurface { egl_surface, native_window });
+        // A new `EGLSurface`'s buffers hold nothing, so whatever the old one had painted is gone
+        // and the next paint must be unconditional.
+        self.surfaces[index].last_painted = None;
         true
     }
 
     /// Draws one bound surface's whole retained tree: make its EGL surface current, resize the
-    /// shared canvas to it, clear, walk the resolved tree with [`layout::paint::paint_tree`], and
+    /// shared canvas to it, clear, draw the surface's [`layout::paint::DisplayList`], and
     /// swap.
     ///
     /// One `TextPainter` serves every surface. All surfaces share one EGL context; under EGL a
@@ -859,6 +875,36 @@ impl App {
         let surface_id = self.surfaces[index].surface_id.clone();
         let (width, height) = self.surfaces[index].configured_size;
         let (width, height) = (width.max(1), height.max(1));
+
+        // Built before anything touches the GL context, because the whole point is what this
+        // skips. An unchanged surface costs one tree walk here instead of an `eglMakeCurrent`, a
+        // full-surface clear, every draw call in the tree, and an `eglSwapBuffers` the compositor
+        // then has to composite into the screen.
+        //
+        // This is what stops the 1920x1200 wallpaper being redrawn once a second because the
+        // clock's seconds digit advanced. ADR-0044 decision 2's dirty flag is one flag for the
+        // whole scene, so [`App::repaint_mapped_surfaces`] has to offer every mapped surface a
+        // repaint; comparing the display list is how a surface declines one.
+        //
+        // An absent tree gives an empty list rather than an early return: a surface whose tree
+        // went away should paint nothing over its old contents, and it has to reach the clear and
+        // the swap below to do that.
+        let tree = self.client.scene().surface(&surface_id);
+        // Scoped so the immutable borrow of `self` that `secure_field_for` holds ends before the
+        // painter is borrowed mutably below. Nothing in the list borrows it: `Draw::Text` owns its
+        // string.
+        let list = {
+            let focus = self.secure_field_for(&surface_id);
+            tree.as_ref().map(|tree| layout::paint::build(tree, 1.0, focus.as_ref())).unwrap_or_default()
+        };
+        if self
+            .surfaces[index]
+            .last_painted
+            .as_ref()
+            .is_some_and(|(painted_size, painted)| *painted_size == (width, height) && *painted == list)
+        {
+            return;
+        }
 
         // Another surface's own paint may have made a different EGL surface current on this
         // thread since this one last drew -- the context is shared across every surface, so it is
@@ -902,20 +948,19 @@ impl App {
             }
         }
 
-        // Owned (`Scene::surface` clones into a `ResolvedNode`), so the immutable borrow of
-        // `self.client` ends before `self.text_painter` is borrowed mutably below.
-        let tree = self.client.scene().surface(&surface_id);
         if let Some(painter) = self.text_painter.as_mut() {
             painter.resize(width, height);
-            if let Some(tree) = tree.as_ref() {
-                layout::paint::paint_tree(painter, &mut self.image_cache, tree, 1.0);
-            }
+            layout::paint::execute(painter, &mut self.image_cache, &list, 1.0);
         }
 
         if let Err(e) = self.egl.instance.swap_buffers(self.egl.display, egl_surface) {
             log_bind_failure(&surface_id, "eglSwapBuffers", e);
             self.exit = true;
+            return;
         }
+        // Only after the swap actually committed: recording a frame that never reached the
+        // compositor would let the next identical list skip a paint the screen never got.
+        self.surfaces[index].last_painted = Some(((width, height), list));
     }
 
     /// Repaints every mapped surface, after a re-resolve actually changed the scene. Every surface,

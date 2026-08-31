@@ -31,7 +31,8 @@ mod surface;
 mod toplevel;
 
 pub use content::{
-    parse_content, parse_fit, parse_font_size, parse_foreground, parse_icon_name, parse_icon_size, parse_image_source, parse_node_id,
+    parse_content, parse_fit, parse_font_size, parse_foreground, parse_icon_name, parse_icon_size, parse_image_source,
+    parse_mask_character, parse_node_id, parse_placeholder,
     parse_surface_id,
 };
 pub use spec::{

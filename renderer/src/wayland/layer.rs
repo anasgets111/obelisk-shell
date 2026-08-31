@@ -231,6 +231,7 @@ impl App {
             map_state: if visible { MapState::AwaitingConfigure } else { MapState::Unmapped },
             null_buffered: false,
             configured_size: (0, 0),
+            last_painted: None,
         });
     }
 

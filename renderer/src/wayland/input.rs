@@ -449,6 +449,9 @@ impl App {
     /// the field directly anywhere else reopens it.
     fn focus_secure_submit(&mut self, next: Option<FocusedField>) {
         retarget_secure_submit(&mut self.focused_secure_submit, &mut self.secure_buffer, next);
+        // A focus change zeroizes the buffer, so the field that had dots must be repainted without
+        // them -- the same reason a keystroke sets this.
+        self.secure_input_changed = true;
     }
 
     /// Whether `instance_id` is still a surface this process has a live `wl_surface` for.
@@ -493,6 +496,21 @@ impl App {
     /// `leave` required to follow. Without this the plaintext would sit in `secure_buffer`, still
     /// addressed to `("lock", "authenticate")`, until some later keystroke happened to notice -- which
     /// on a session where the user walks away is never.
+    /// The focused `secure_submit` field's state, if the field lives on `surface_id`.
+    ///
+    /// Here rather than in `wayland::surface` because [`FocusedField`]'s halves are this module's:
+    /// it is the one place that knows a focus is a surface plus a `{ capability, action }` pair,
+    /// and `paint` should not learn that shape to ask one question.
+    ///
+    /// The count, never the bytes -- see `layout::paint::SecureField`.
+    pub(super) fn secure_field_for(&self, surface_id: &str) -> Option<layout::paint::SecureField<'_>> {
+        let focused = self.focused_secure_submit.as_ref()?;
+        if focused.surface_id != surface_id {
+            return None;
+        }
+        Some(layout::paint::SecureField { target: &focused.target, filled: self.secure_buffer.char_count() })
+    }
+
     pub(super) fn drop_secure_focus_if_its_surface_is_gone(&mut self) {
         let gone = self.focused_secure_submit.as_ref().is_some_and(|field| !self.surface_is_live(&field.surface_id));
         if gone {
@@ -520,6 +538,9 @@ impl App {
         if self.focused_secure_submit.is_none() {
             return;
         }
+        // Every arm below moves what the field draws: two change the character count and the
+        // third clears it. Set once here rather than in each.
+        self.secure_input_changed = true;
         match secure_key_action(event, repeat) {
             SecureKeyAction::Append(text) => self.secure_buffer.push_str(text),
             // `pop_char` zeroizes the bytes it drops rather than only shortening the buffer, which

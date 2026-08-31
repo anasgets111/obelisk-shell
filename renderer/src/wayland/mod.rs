@@ -165,6 +165,20 @@ pub struct App {
     /// zeroizes this on any change of destination -- see `input::retarget_secure_submit` for the leak
     /// that rule closes.
     secure_buffer: shared::SecureBuffer,
+    /// A keystroke or a focus change has moved what the focused `secure_submit` field should
+    /// draw, and no capability push has marked the scene dirty to carry it to the screen.
+    ///
+    /// Needed because typing changes no property in the retained tree: the bytes live in
+    /// `secure_buffer`, outside the scene entirely (ADR-0005), so `re_resolve_if_dirty` has
+    /// nothing to notice. Without this the mask would appear only when something unrelated
+    /// happened to repaint -- on a lock screen with a clock, once a second, which is worse than
+    /// not drawing it at all.
+    ///
+    /// A repaint, never a re-resolve: the tree is genuinely unchanged, and only the display list
+    /// differs (`layout::paint::SecureField` is an input to `build`, not part of the tree). The
+    /// list comparison in `App::paint_surface` then narrows this to the one surface holding the
+    /// field, so a keystroke repaints the lock screen and nothing else.
+    secure_input_changed: bool,
 }
 
 /// The Renderer's main thread: Wayland dispatch, EGL, and (since docs/adr/0039) the Lua VM, the
@@ -241,6 +255,7 @@ pub fn run(
         pointer_input_count: 0,
         focused_secure_submit: None,
         secure_buffer: shared::SecureBuffer::new(),
+        secure_input_changed: false,
     };
 
     // Outputs (and the seat) arrive as a burst of registry + wl_seat/wl_output events after
@@ -434,8 +449,15 @@ pub fn run(
         // is double-buffered `wl_surface` state, so none of it takes effect until the second
         // statement's `swap_buffers` commits it. Committing per field would show the compositor a
         // half-updated surface between requests.
-        if app.client.re_resolve_if_dirty() {
+        let re_resolved = app.client.re_resolve_if_dirty();
+        // Taken unconditionally so a keystroke that arrived alongside a capability push does not
+        // stay pending: the repaint below covers both, and leaving the flag set would repaint
+        // again next turn for nothing.
+        let typed = std::mem::take(&mut app.secure_input_changed);
+        if re_resolved {
             app.apply_resolved_surface_state();
+        }
+        if re_resolved || typed {
             app.repaint_mapped_surfaces();
         }
         // The disarm half of docs/adr/0049's amendment, and it must be here, not inside the `if`

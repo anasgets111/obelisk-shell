@@ -76,6 +76,21 @@ impl SecureBuffer {
         self.bytes.is_empty()
     }
 
+    /// How many characters have been typed, for a masked field to draw that many mask glyphs.
+    ///
+    /// Characters, not [`Self::len`]'s bytes: a password with one non-ASCII character would
+    /// otherwise draw two or three dots for one keystroke, and a user counting dots against what
+    /// they typed is the entire reason a mask is drawn at all.
+    ///
+    /// Counting non-continuation bytes rather than decoding: the same `(byte & 0xC0) != 0x80`
+    /// test [`Self::pop_char`] already uses to find a scalar boundary, and it touches the bytes
+    /// without copying any of them out. This is the only read that is not `expose_secret`, and
+    /// what it discloses is the length -- which is exactly what a row of dots on screen
+    /// discloses anyway.
+    pub fn char_count(&self) -> usize {
+        self.bytes.iter().filter(|byte| (*byte & 0xC0) != 0x80).count()
+    }
+
     /// The one sanctioned read: crossing the trust boundary to serialize this secret into an
     /// outgoing IPC envelope. Callers must call `.zeroize()` right after (ADR-0005) -- don't
     /// rely on `Drop` alone.
@@ -87,6 +102,28 @@ impl SecureBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn char_count_counts_characters_not_bytes() {
+        let mut buf = SecureBuffer::new();
+        buf.push_str("pa\u{00df}w\u{00f6}rd");
+        assert_eq!(buf.len(), 9, "two of these seven characters are two bytes each");
+        assert_eq!(buf.char_count(), 7, "a masked field must draw one dot per keystroke, not per byte");
+    }
+
+    #[test]
+    fn char_count_follows_a_backspace() {
+        let mut buf = SecureBuffer::new();
+        buf.push_str("ab\u{00e9}");
+        assert_eq!(buf.char_count(), 3);
+        assert!(buf.pop_char());
+        assert_eq!(buf.char_count(), 2, "deleting one multi-byte character removes exactly one dot");
+    }
+
+    #[test]
+    fn an_empty_buffer_has_no_characters() {
+        assert_eq!(SecureBuffer::new().char_count(), 0);
+    }
 
     #[test]
     fn push_str_is_readable_via_expose_secret() {

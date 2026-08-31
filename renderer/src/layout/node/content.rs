@@ -37,6 +37,27 @@ pub fn parse_icon_name(properties: &HashMap<String, Value>) -> Result<String, La
 /// `image.source` (docs/adr/0054 decision 3): an absolute path, never a theme name. The split from
 /// [`parse_icon_name`] is the whole difference between the two node kinds, so they do not share a
 /// property spelling either.
+/// `textfield.placeholder` (§ 5.2 item 8): what an empty field shows. Defaults to `""`, the same
+/// boot-tolerance [`parse_content`] takes.
+pub fn parse_placeholder(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
+    parse_optional_string(properties, "placeholder")
+}
+
+/// `textfield.mask_character` (§ 5.2 item 8): the glyph drawn once per typed character.
+///
+/// Defaults to U+2022 BULLET, which is what a password field looks like everywhere else. An empty
+/// string is honoured as "draw nothing", since a config that wants a field revealing no length at
+/// all has said so explicitly. Anything longer than one character is truncated to the first rather
+/// than rejected: the property names a *character*, and a whole tree is not worth failing over a
+/// config that wrote two.
+pub fn parse_mask_character(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
+    let declared = parse_optional_string(properties, "mask_character")?;
+    if !properties.contains_key("mask_character") {
+        return Ok("\u{2022}".to_string());
+    }
+    Ok(declared.chars().next().map(String::from).unwrap_or_default())
+}
+
 pub fn parse_image_source(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     parse_optional_string(properties, "source")
 }

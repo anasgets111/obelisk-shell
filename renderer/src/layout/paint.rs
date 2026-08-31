@@ -1,10 +1,19 @@
 //! Draws a resolved layout tree onto a shared femtovg canvas (build-steps.md Phase 19 item 6).
 //!
-//! This module is the caller for `layout::node`'s paint-property parsers (`parse_background`,
-//! `parse_radius`, `parse_border_color`, `parse_border_width`, `parse_foreground`). It walks a
-//! `layout::scene::ResolvedNode` tree (`Scene::surface`'s output) and turns each node's
-//! already-resolved properties into femtovg draw calls on `text::atlas::TextPainter`'s canvas, the
-//! same canvas `draw_line` already draws glyphs on -- one canvas, one flush per surface per frame.
+//! Two halves, and the split is the point. [`build`] walks a `layout::scene::ResolvedNode` tree
+//! (`Scene::surface`'s output) through `layout::node`'s paint-property parsers (`parse_background`,
+//! `parse_radius`, `parse_border_color`, `parse_border_width`, `parse_foreground`) and flattens it
+//! into a [`DisplayList`] of plain Rust data. [`execute`] turns that list into femtovg draw calls
+//! on `text::atlas::TextPainter`'s canvas, the same canvas `draw_line` already draws glyphs on --
+//! one canvas, one flush per surface per frame.
+//!
+//! They were one function until the list existed. Splitting them buys two things a single walk
+//! could not: `wayland::App::paint_surface` compares this frame's list against the one it last
+//! painted and skips the whole draw plus `eglSwapBuffers` when they match, and [`build`] is
+//! testable without standing up an EGL context. Measured on an idle bar with a clock: the
+//! 1920x1200 wallpaper went from repainting roughly twice a second to never, and niri's own CPU
+//! fell about a third with it, since a full-surface commit made the compositor recomposite the
+//! screen behind it.
 //!
 //! Draws in tree order, parent then children: that is what makes the stacking model docs/adr/0023
 //! item 4 already implements resolve overlaps the same way layout resolved them -- a later sibling
@@ -12,7 +21,7 @@
 //! false`) and its whole subtree draw nothing, the same collapse
 //! `layout::scene::resolve_and_reconcile` picked for row/column space reservation.
 //!
-//! `ResolvedNode.rect` is parent-relative, so [`paint_node`] accumulates an absolute origin as it
+//! `ResolvedNode.rect` is parent-relative, so [`build_node`] accumulates an absolute origin as it
 //! descends rather than trusting `rect.x`/`rect.y` as already-absolute. Get this wrong and every
 //! subtree nests at the surface's top-left corner instead of its real position.
 
@@ -26,31 +35,184 @@ use crate::image::{self, Fit, ImageCache};
 use crate::layout::node::{self, BorderColor, EdgeInsets, LayoutError, Rgba};
 use crate::layout::scene::ResolvedNode;
 use crate::text::atlas::TextPainter;
-use crate::text::snap::{snap_border_band, snap_to_physical, LogicalRect};
+use crate::text::snap::{snap_border_band, snap_to_physical, LogicalRect, PhysicalRect};
 
-/// Draws `root` and its whole subtree onto `painter`'s canvas, then flushes once. `scale` is the
-/// physical/logical pixel ratio `text::snap::snap_to_physical` and `TextPainter::draw_line` take
-/// everywhere else in this crate -- every existing call site in `wayland::mod` hardcodes `1.0`
-/// today, and this function makes no different assumption.
+/// What one node actually draws, with every paint property already parsed. The variants are the
+/// four kind arms that draw anything; a `textfield` or an unrecognised kind contributes no
+/// [`DrawCmd`] at all rather than an empty variant here.
 ///
-/// `crate::wayland::App::paint_surface` is the production caller, since build-steps.md Phase 20
-/// item 4: `socket.rs`'s `RendererClient` keys a `Scene` by the `id` a config writes, and
-/// `wayland::App` keys a `wl_surface` the same way since docs/adr/0038 decision 1 deleted the
-/// fixed Rust-owned role enum that used to keep the two id spaces from overlapping.
-pub fn paint_tree(painter: &mut TextPainter, images: &mut ImageCache, root: &ResolvedNode, scale: f32) {
-    // Before the walk, never during it: the previous frame's flush has happened, this one has
-    // recorded nothing yet, so this is the only point where deleting a texture cannot pull it out
-    // from under a queued draw call (see `ImageCache::release_evicted`).
-    images.release_evicted(painter.canvas_mut());
-    paint_node(painter, images, root, 0.0, 0.0, scale);
-    painter.canvas_mut().flush();
+/// Plain Rust data on purpose, and that is the whole point of this type. The alternative --
+/// deriving `PartialEq` on `ResolvedNode` and comparing trees -- cannot work: its properties are a
+/// `HashMap<String, mlua::Value>`, and mlua compares tables by identity, so a signal resolving to
+/// a table yields a fresh unequal table every pass (the same trap `Signal::set_changed` documents
+/// for hover rects). Nothing below holds a Lua value, so equality means what it says.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Draw {
+    /// `rect`/`row`/`column`/`button` and all four surface roles: the fill, then the border.
+    Box { background: Option<Rgba>, radius: f32, colors: BorderColor, widths: EdgeInsets },
+    Text { content: String, font_size: f32, color: Rgba },
+    /// The theme *name*, not the resolved path: [`execute`] does the `image::icons::resolve`
+    /// lookup. Keeping the filesystem hit out of [`build`] is what lets the build run on every
+    /// re-resolve without touching the icon theme, and the name plus the size is what decides the
+    /// pixels either way.
+    Icon { name: String, px: u32 },
+    Image { source: String, fit: Fit, px: u32 },
+}
+
+/// One drawable node: what, where, and the clip it draws under.
+///
+/// `clip` is the intersection of this node's snapped box with every ancestor's, computed during
+/// [`build`] rather than rebuilt from a `save`/`intersect_scissor`/`restore` nest at draw time.
+/// The two are equivalent because every clip here is an axis-aligned rect, intersection is
+/// associative, and this crate applies no canvas transform (`TextPainter::resize` calls
+/// `set_size(w, h, 1.0)` and nothing else touches it).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DrawCmd {
+    pub rect: LogicalRect,
+    pub clip: PhysicalRect,
+    pub draw: Draw,
+}
+
+/// Everything one surface draws, in draw order (parent before child, earlier sibling before
+/// later), flattened out of the tree.
+///
+/// Exists to be compared. `wayland::App::paint_surface` keeps the list it last painted and skips
+/// the whole paint plus `eglSwapBuffers` when the new one is equal, which is what stops a
+/// 1920x1200 wallpaper being redrawn every second because a clock's seconds digit advanced.
+/// Before this, `repaint_mapped_surfaces` repainted every mapped surface on every re-resolve,
+/// because ADR-0044 decision 2's single dirty flag left the process no way to tell which surface
+/// had changed. This gives it one without touching that flag: the flag still says *something*
+/// changed, and the list says *what*.
+///
+/// Float equality is the right comparison here even though it is usually the wrong one. Both
+/// sides come from the same parsers over the same property values, so an unchanged input is
+/// bit-identical, not merely close. A `NaN` compares unequal to itself and so repaints forever,
+/// which is the safe direction to fail: too many frames, never a stale one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DisplayList {
+    pub commands: Vec<DrawCmd>,
+}
+
+/// A clip that excludes nothing, which is what the canvas starts with before any scissor is
+/// pushed. Intersecting against it is the identity, so [`build`] can treat the root like every
+/// other node instead of special-casing it.
+const UNCLIPPED: PhysicalRect = PhysicalRect { x0: i32::MIN, y0: i32::MIN, x1: i32::MAX, y1: i32::MAX };
+
+/// Overlap of two snapped boxes. Empty (`x1 <= x0` or `y1 <= y0`) means nothing can draw, which
+/// [`build_node`] treats as a whole-subtree skip -- a child's clip is this intersected further,
+/// so it can only be empty too.
+fn intersect(a: PhysicalRect, b: PhysicalRect) -> PhysicalRect {
+    PhysicalRect { x0: a.x0.max(b.x0), y0: a.y0.max(b.y0), x1: a.x1.min(b.x1), y1: a.y1.min(b.y1) }
+}
+
+fn is_empty(clip: PhysicalRect) -> bool {
+    clip.x1 <= clip.x0 || clip.y1 <= clip.y0
+}
+
+/// The focused `secure_submit` field's state, as much of it as paint is allowed to know.
+///
+/// A count, never the bytes. `shared::SecureBuffer` has one sanctioned read (`expose_secret`,
+/// into an outgoing IPC envelope) and this is deliberately not it: ADR-0005 keeps a typed secret
+/// out of the Lua VM, and a display list that carried the characters would put it somewhere just
+/// as wrong -- a `Draw::Text` this process clones, compares and keeps in `last_painted` until the
+/// surface changes.
+///
+/// `target` rather than a node id because that is what the input layer actually tracks:
+/// `wayland::input::FocusedField` names a surface and a `{ capability, action }` pair, and the
+/// node that declared that pair is the focused one.
+pub struct SecureField<'a> {
+    pub target: &'a node::SecureSubmitTarget,
+    /// `shared::SecureBuffer::char_count`, so one glyph is drawn per keystroke.
+    pub filled: usize,
+}
+
+/// `textfield` (§ 5.2 item 8): the placeholder while empty, one `mask_character` per typed
+/// character once it is not.
+///
+/// Until this existed the arm drew nothing, and `lock.lua` carried a comment measuring what that
+/// cost: a lock screen that "swallows keystrokes while showing no masked characters at all". That
+/// is worse than cosmetic. `pam_unix` answers a wrong password with a two second `pam_fail_delay`
+/// and `pam_faillock` locks the account after three, so typing blind means a typo is invisible,
+/// indistinguishable from a slow unlock, and three of them lock you out of your own session for
+/// ten minutes.
+///
+/// Only the focused field fills. An unfocused one shows its placeholder, which is also the honest
+/// thing to draw: `input::retarget_secure_submit` zeroizes the buffer whenever focus moves, so
+/// there is no typed state left anywhere else to represent.
+fn textfield_draw(properties: &HashMap<String, Value>, focus: Option<&SecureField>) -> Option<Draw> {
+    let declared = match node::parse_secure_submit(properties) {
+        Ok(target) => target,
+        Err(e) => {
+            log_paint_error("textfield", "secure_submit", &e);
+            None
+        }
+    };
+    let filled = focus
+        .filter(|focus| declared.as_ref().is_some_and(|declared| declared == focus.target))
+        .map_or(0, |focus| focus.filled);
+
+    let content = if filled == 0 {
+        match node::parse_placeholder(properties) {
+            Ok(placeholder) => placeholder,
+            Err(e) => {
+                log_paint_error("textfield", "placeholder", &e);
+                String::new()
+            }
+        }
+    } else {
+        match node::parse_mask_character(properties) {
+            Ok(mask) => mask.repeat(filled),
+            Err(e) => {
+                log_paint_error("textfield", "mask_character", &e);
+                "\u{2022}".repeat(filled)
+            }
+        }
+    };
+    if content.is_empty() {
+        return None;
+    }
+
+    let font_size = match node::parse_font_size(properties) {
+        Ok(size) => size,
+        Err(e) => {
+            log_paint_error("textfield", "font_size", &e);
+            12.0
+        }
+    };
+    let color = match node::parse_foreground(properties) {
+        Ok(color) => color,
+        Err(e) => {
+            log_paint_error("textfield", "foreground", &e);
+            Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+        }
+    };
+    Some(Draw::Text { content, font_size, color })
+}
+
+/// Flattens `root` into the list of draws it would produce, touching no canvas and no GL context.
+///
+/// Pure, so the whole paint stage is testable without EGL for the first time: every existing test
+/// in this module below has to stand up a headless pbuffer and read pixels back, and none of them
+/// could say "these two trees paint the same" at all.
+pub fn build(root: &ResolvedNode, scale: f32, focus: Option<&SecureField>) -> DisplayList {
+    let mut commands = Vec::new();
+    build_node(root, 0.0, 0.0, scale, UNCLIPPED, focus, &mut commands);
+    DisplayList { commands }
 }
 
 /// One node, then its children (tree order, see this module's doc comment). `origin_x`/`origin_y`
 /// is the absolute position of this node's parent's content box -- added to `node.rect.x`/`.y`
 /// (parent-relative) to get this node's absolute rect, which is in turn what the next recursion
 /// level's origin becomes.
-fn paint_node(painter: &mut TextPainter, images: &mut ImageCache, node: &ResolvedNode, origin_x: f32, origin_y: f32, scale: f32) {
+fn build_node(
+    node: &ResolvedNode,
+    origin_x: f32,
+    origin_y: f32,
+    scale: f32,
+    clip: PhysicalRect,
+    focus: Option<&SecureField>,
+    out: &mut Vec<DrawCmd>,
+) {
     if !node.visible {
         return;
     }
@@ -61,26 +223,25 @@ fn paint_node(painter: &mut TextPainter, images: &mut ImageCache, node: &Resolve
 
     // build-steps.md Phase 19 item 17: a node's own draw and its whole subtree are clipped to
     // this box, snapped the same way `draw_line` snaps its glyph origin so the clip edge and the
-    // glyph's physical placement agree. `intersect_scissor`, not `scissor`: `save`/`restore` nest
-    // through the recursive call below, and `intersect_scissor` composes the new box with whatever
-    // clip a parent already pushed, so a child can only shrink the clipped region further -- never
-    // escape its parent's box the way `scissor` (which replaces the active clip outright) would.
+    // glyph's physical placement agree. Intersected with the ancestors' clip rather than
+    // replacing it, so a child can only shrink the clipped region further, never escape its
+    // parent's box.
     //
     // ponytail: clipping is the floor, not the finished behavior (build-steps.md Phase 19 item
     // 17 names this directly). § 3.2 gives `text` a wrap at the available width, and
     // `layout::scene::intrinsic_content_size` already measures a `Content`-sized text box against
     // exactly that width (its `text_wrap_width` local, passed to `ShapingHandle::shape` as
     // `max_width`) -- but `ShapeResult` returns only a bounding `width`/`height`, not the wrapped
-    // lines that produced it, and `paint_text` re-reads the raw `content` string and hands the
-    // whole thing to `draw_line` in one `fill_text` call. So a box sized correctly for N wrapped
-    // lines gets one unwrapped line painted into it, and this clip cuts that line off at the
-    // first line's width instead of showing the rest on line two. The honest fix is paint asking
-    // for the same wrapped line breaks layout already measured with, not a new clip strategy.
+    // lines that produced it, and `Draw::Text` carries the raw `content` string that `draw_line`
+    // renders in one `fill_text` call. So a box sized correctly for N wrapped lines gets one
+    // unwrapped line painted into it, and this clip cuts that line off at the first line's width
+    // instead of showing the rest on line two. The honest fix is paint asking for the same
+    // wrapped line breaks layout already measured with, not a new clip strategy.
     //
     // ponytail: this clip is always rectangular, so a node with `radius > 0.0` clips overflowing
     // children to square corners while its own background underneath is rounded -- an escaping
     // child's corner pixels sit outside the round fill but inside the square clip. femtovg's
-    // `intersect_rounded_scissor` exists and `paint_box` already computes `radius` for this exact
+    // `intersect_rounded_scissor` exists and `Draw::Box` already carries `radius` for this exact
     // node, but that function's own doc comment (femtovg 0.26.0 src/lib.rs:895-899) only gives
     // exact rounded corners "when this is the first active scissor or... the previous clip is a
     // containing rectangle with the same transform" -- false in general here, since a nested
@@ -88,48 +249,105 @@ fn paint_node(painter: &mut TextPainter, images: &mut ImageCache, node: &Resolve
     // rounded corners that are exact for a root node and silently degrade to square for anything
     // nested under one, this keeps the clip rectangular everywhere; switching to
     // `intersect_rounded_scissor` is the upgrade path once a config actually needs it.
-    let physical = snap_to_physical(rect, scale);
-    painter.canvas_mut().save();
-    painter.canvas_mut().intersect_scissor(
-        physical.x0 as f32,
-        physical.y0 as f32,
-        (physical.x1 - physical.x0) as f32,
-        (physical.y1 - physical.y0) as f32,
-    );
+    let clip = intersect(clip, snap_to_physical(rect, scale));
+    // Nothing in this subtree can put down a pixel, so none of it reaches the list. Behaviourally
+    // identical to the `save`/`intersect_scissor`/`restore` walk this replaced, which recursed
+    // into fully-clipped children and had every draw discarded by the scissor.
+    if is_empty(clip) {
+        return;
+    }
 
-    match node.kind.as_str() {
+    let draw = match node.kind.as_str() {
         // row/column/button have no paint properties of their own beyond the base `rect` ones
         // (§ 5.2), and a surface root paints exactly like a rect -- one code path serves all
         // seven. All four surface roles, not just `panel`: § 6.2, § 6.3 and § 6.4 give a `window`,
         // a `popup` and a `lock` the same § 5.1 base properties § 6.1 gives a `panel`, so a
         // background or a border on any of those roots is the same fill this already draws.
-        "rect" | "row" | "column" | "button" | "panel" | "window" | "popup" | "lock" => {
-            paint_box(painter.canvas_mut(), &node.kind, &node.properties, rect, scale)
-        }
-        "text" => paint_text(painter, &node.properties, rect, scale),
-        "icon" => paint_icon(painter.canvas_mut(), images, &node.properties, rect, scale),
-        "image" => paint_image(painter.canvas_mut(), images, &node.properties, rect, scale),
-        // `textfield` reaches here, and drawing nothing is the spec-correct answer: § 5.2 item 8
-        // gives it only `placeholder`/`mask_character`/`secure_submit`/`on_change`/`on_submit`, no
-        // paint properties at all. What it does need drawn (placeholder, masked value, a caret) is
-        // input state this module cannot see, and belongs with Phase 21's input routing.
-        //
-        // Named rather than left to a bare catch-all: `layout::scene::ensure_supported_kind`'s
-        // list bounds this arm, so a new kind added there without a decision here draws nothing
-        // silently, on purpose. On a lock surface that silence is a transparent buffer over a
-        // locked session, which is the black screen docs/adr/0052 decision 3 refuses a lock to
-        // avoid, reached by another route.
-        _ => {}
+        "rect" | "row" | "column" | "button" | "panel" | "window" | "popup" | "lock" => Some(box_draw(&node.kind, &node.properties)),
+        "text" => Some(text_draw(&node.properties)),
+        "icon" => icon_draw(&node.properties, rect, scale),
+        "image" => image_draw(&node.properties, rect, scale),
+        "textfield" => textfield_draw(&node.properties, focus),
+        // Every other kind draws nothing. Named rather than left to a bare catch-all:
+        // `layout::scene::ensure_supported_kind`'s list bounds this arm, so a new kind added there
+        // without a decision here draws nothing silently, on purpose. On a lock surface that
+        // silence is a transparent buffer over a locked session, which is the black screen
+        // docs/adr/0052 decision 3 refuses a lock to avoid, reached by another route.
+        _ => None,
+    };
+    if let Some(draw) = draw {
+        out.push(DrawCmd { rect, clip, draw });
     }
 
     for child in &node.children {
-        paint_node(painter, images, child, x, y, scale);
+        build_node(child, x, y, scale, clip, focus, out);
     }
-
-    // Inside the clip, not after it: a child's own `save`/`restore` pair balances within this
-    // one, so the subtree above painted under this node's box as well as its own.
-    painter.canvas_mut().restore();
 }
+
+/// Draws `root` and its whole subtree onto `painter`'s canvas, then flushes once. `scale` is the
+/// physical/logical pixel ratio `text::snap::snap_to_physical` and `TextPainter::draw_line` take
+/// everywhere else in this crate -- every existing call site in `wayland::mod` hardcodes `1.0`
+/// today, and this function makes no different assumption.
+///
+/// `crate::wayland::App::paint_surface` is the production caller, since build-steps.md Phase 20
+/// item 4: `socket.rs`'s `RendererClient` keys a `Scene` by the `id` a config writes, and
+/// `wayland::App` keys a `wl_surface` the same way since docs/adr/0038 decision 1 deleted the
+/// fixed Rust-owned role enum that used to keep the two id spaces from overlapping.
+/// Test-only since the skip landed: production paints through [`build`] and [`execute`]
+/// separately, because `wayland::App::paint_surface` has to compare the list between the two.
+/// Kept because every pixel test below is written against "paint this tree and read the
+/// framebuffer", and routing them through the same two calls would say nothing extra.
+#[cfg(test)]
+pub fn paint_tree(painter: &mut TextPainter, images: &mut ImageCache, root: &ResolvedNode, scale: f32) {
+    execute(painter, images, &build(root, scale, None), scale);
+}
+
+/// Draws an already-built list. Split from [`build`] so the canvas half holds no parsing and the
+/// parsing half holds no canvas -- which is what makes a list comparable, and [`build`] testable
+/// without an EGL context.
+pub fn execute(painter: &mut TextPainter, images: &mut ImageCache, list: &DisplayList, scale: f32) {
+    // Before the draws, never during them: the previous frame's flush has happened, this one has
+    // recorded nothing yet, so this is the only point where deleting a texture cannot pull it out
+    // from under a queued draw call (see `ImageCache::release_evicted`).
+    images.release_evicted(painter.canvas_mut());
+    for command in &list.commands {
+        // `scissor`, not `intersect_scissor`: the intersection with every ancestor's box is
+        // already in `command.clip` (see [`DrawCmd`]), so each draw sets the finished clip
+        // outright instead of rebuilding it through a save/restore nest.
+        painter.canvas_mut().scissor(
+            command.clip.x0 as f32,
+            command.clip.y0 as f32,
+            (command.clip.x1 - command.clip.x0) as f32,
+            (command.clip.y1 - command.clip.y0) as f32,
+        );
+        let rect = command.rect;
+        match &command.draw {
+            Draw::Box { background, radius, colors, widths } => {
+                // `None` skips the fill entirely; `Some` with alpha 0 still paints a transparent
+                // rect -- `parse_background`'s own doc comment calls this distinction deliberate,
+                // so both arms matter even though a transparent fill is invisible either way.
+                if let Some(color) = background {
+                    fill_rect(painter.canvas_mut(), rect, *radius, *color);
+                }
+                paint_border(painter.canvas_mut(), rect, *radius, *colors, *widths, scale);
+            }
+            Draw::Text { content, font_size, color } => painter.draw_line(content, rect, *font_size, scale, *color),
+            Draw::Icon { name, px } => {
+                // `u16` is `freedesktop-icons`'s own size type, and a theme has no directory above
+                // 512 anyway.
+                if let Some(path) = image::icons::resolve(name, (*px).min(512) as u16) {
+                    draw_file(painter.canvas_mut(), images, &path, Fit::Contain, rect, *px);
+                }
+            }
+            Draw::Image { source, fit, px } => {
+                draw_file(painter.canvas_mut(), images, std::path::Path::new(source), *fit, rect, *px)
+            }
+        }
+    }
+    painter.canvas_mut().reset_scissor();
+    painter.canvas_mut().flush();
+}
+
 
 /// One paint-property parse gone wrong: logged and treated as absent/default rather than
 /// aborting the whole tree walk over one node's malformed `background`/`radius`/`border_*` --
@@ -152,7 +370,7 @@ fn log_paint_error(kind: &str, property: &str, err: &LayoutError) {
 
 /// The shared paint of `rect`/`row`/`column`/`button` and all three surface roles: background
 /// fill, then borders (`oblisk-idl-api-specs.md` § 5.2 item 1).
-fn paint_box(canvas: &mut Canvas<OpenGl>, kind: &str, properties: &HashMap<String, Value>, rect: LogicalRect, scale: f32) {
+fn box_draw(kind: &str, properties: &HashMap<String, Value>) -> Draw {
     let radius = match node::parse_radius(properties) {
         Ok(r) => r,
         Err(e) => {
@@ -160,16 +378,13 @@ fn paint_box(canvas: &mut Canvas<OpenGl>, kind: &str, properties: &HashMap<Strin
             0.0
         }
     };
-
-    match node::parse_background(properties) {
-        // `None` skips the fill entirely; `Some` with alpha 0 still paints a transparent rect --
-        // `parse_background`'s own doc comment calls this distinction deliberate, so both arms
-        // below matter even though a transparent fill is invisible either way.
-        Ok(Some(color)) => fill_rect(canvas, rect, radius, color),
-        Ok(None) => {}
-        Err(e) => log_paint_error(kind, "background", &e),
-    }
-
+    let background = match node::parse_background(properties) {
+        Ok(color) => color,
+        Err(e) => {
+            log_paint_error(kind, "background", &e);
+            None
+        }
+    };
     let colors = match node::parse_border_color(properties) {
         Ok(c) => c,
         Err(e) => {
@@ -184,7 +399,7 @@ fn paint_box(canvas: &mut Canvas<OpenGl>, kind: &str, properties: &HashMap<Strin
             EdgeInsets::default()
         }
     };
-    paint_border(canvas, rect, radius, colors, widths, scale);
+    Draw::Box { background, radius, colors, widths }
 }
 
 /// `icon` (§ 5.2 item 5): resolve the theme name, then draw the file (build-steps.md Phase 29
@@ -195,33 +410,28 @@ fn paint_box(canvas: &mut Canvas<OpenGl>, kind: &str, properties: &HashMap<Strin
 /// "bounding box diameter", so an icon in a box that is not square should sit inside it whole
 /// rather than be cropped to fill it. An icon is the one case where showing less of the image is
 /// never the right answer.
-fn paint_icon(canvas: &mut Canvas<OpenGl>, images: &mut ImageCache, properties: &HashMap<String, Value>, rect: LogicalRect, scale: f32) {
+fn icon_draw(properties: &HashMap<String, Value>, rect: LogicalRect, scale: f32) -> Option<Draw> {
     let name = match node::parse_icon_name(properties) {
         Ok(name) => name,
         Err(e) => {
             log_paint_error("icon", "name", &e);
-            return;
+            return None;
         }
     };
-    let px = physical_edge(rect.width.min(rect.height), scale);
-    // `u16` is `freedesktop-icons`'s own size type, and a theme has no directory above 512 anyway.
-    let Some(path) = image::icons::resolve(&name, px.min(512) as u16) else {
-        return;
-    };
-    draw_file(canvas, images, &path, Fit::Contain, rect, px);
+    Some(Draw::Icon { name, px: physical_edge(rect.width.min(rect.height), scale) })
 }
 
 /// `image` (docs/adr/0054 decision 3): draw the file at `source`, fitted by `fit`.
-fn paint_image(canvas: &mut Canvas<OpenGl>, images: &mut ImageCache, properties: &HashMap<String, Value>, rect: LogicalRect, scale: f32) {
+fn image_draw(properties: &HashMap<String, Value>, rect: LogicalRect, scale: f32) -> Option<Draw> {
     let source = match node::parse_image_source(properties) {
         Ok(source) => source,
         Err(e) => {
             log_paint_error("image", "source", &e);
-            return;
+            return None;
         }
     };
     if source.is_empty() {
-        return;
+        return None;
     }
     let fit = match node::parse_fit(properties) {
         Ok(fit) => fit,
@@ -230,14 +440,13 @@ fn paint_image(canvas: &mut Canvas<OpenGl>, images: &mut ImageCache, properties:
             Fit::default()
         }
     };
-    // The *longer* edge, unlike `paint_icon`: `Cover` scales the image up until it covers the box,
-    // so rasterizing an SVG wallpaper against the shorter edge would upload it at exactly the
+    // The *longer* edge, unlike [`icon_draw`]: `Cover` scales the image up until it covers the
+    // box, so rasterizing an SVG wallpaper against the shorter edge would upload it at exactly the
     // resolution the fit is about to scale past.
-    let px = physical_edge(rect.width.max(rect.height), scale);
-    draw_file(canvas, images, std::path::Path::new(&source), fit, rect, px);
+    Some(Draw::Image { source, fit, px: physical_edge(rect.width.max(rect.height), scale) })
 }
 
-/// The shared half of [`paint_icon`] and [`paint_image`]: cache lookup, then one `fill_path` over
+/// The shared half of [`Draw::Icon`] and [`Draw::Image`]: cache lookup, then one `fill_path` over
 /// exactly the rect the image occupies.
 ///
 /// The fill path is the *fitted* rect, not the node's box. femtovg clamps to the edge outside a
@@ -397,7 +606,7 @@ fn paint_border_edge(canvas: &mut Canvas<OpenGl>, color: Option<Rgba>, width: f3
 /// on this chain. It is still the correct outcome if a future font or fallback face renders wider
 /// than it measures: the alternative is the overrun landing on whatever sits to the right, which
 /// is the exact bug this item fixes.
-fn paint_text(painter: &mut TextPainter, properties: &HashMap<String, Value>, rect: LogicalRect, scale: f32) {
+fn text_draw(properties: &HashMap<String, Value>) -> Draw {
     let content = match node::parse_content(properties) {
         Ok(c) => c,
         Err(e) => {
@@ -419,7 +628,7 @@ fn paint_text(painter: &mut TextPainter, properties: &HashMap<String, Value>, re
             Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
         }
     };
-    painter.draw_line(&content, rect, font_size, scale, color);
+    Draw::Text { content, font_size, color }
 }
 
 #[cfg(test)]
@@ -554,6 +763,215 @@ mod tests {
         }];
         scene.apply(&[surface], &instances, &shaping, lua).unwrap();
         scene.surface("bar@TEST").unwrap()
+    }
+
+    // ---- display list (`build`), the seam that needs no EGL context ----
+
+    /// The property this whole optimisation rests on: same tree in, same list out. If this can
+    /// ever fail for an unchanged scene, `paint_surface`'s skip repaints every frame anyway and
+    /// the wallpaper is back to redrawing at the clock's cadence.
+    #[test]
+    fn the_same_tree_builds_an_equal_list_so_an_unchanged_surface_can_be_skipped() {
+        let lua = Lua::new();
+        let src = r##"return panel { id = "bar", width = 200, height = 40, background = "#112233ff",
+            child = text { content = "12:00:00", foreground = "#ffffffff" } }"##;
+        let tree = resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 });
+        let list = build(&tree, 1.0, None);
+        assert!(!list.commands.is_empty(), "an empty list would make this pass for the wrong reason");
+        assert_eq!(list, build(&tree, 1.0, None));
+    }
+
+    /// The other half, and the one that would make a skip dangerous if it failed: a changed
+    /// string has to change the list, or the surface would keep showing a stale clock forever.
+    #[test]
+    fn changing_only_a_texts_content_changes_the_list() {
+        let lua = Lua::new();
+        let panel = |content: &str| {
+            format!(r##"return panel {{ id = "bar", width = 200, height = 40,
+                child = text {{ content = "{content}", foreground = "#ffffffff" }} }}"##)
+        };
+        let size = LogicalSize { width: 200.0, height: 40.0 };
+        let before = build(&resolved_surface(&lua, &panel("12:00:00"), size), 1.0, None);
+        let after = build(&resolved_surface(&Lua::new(), &panel("12:00:01"), size), 1.0, None);
+        assert_ne!(before, after, "a new seconds digit must reach the list, or the paint gets skipped");
+    }
+
+    /// `visible = false` collapses the node and everything under it, the same rule the tree walk
+    /// this replaced applied -- so an invisible subtree costs nothing to compare, not just
+    /// nothing to draw.
+    #[test]
+    fn an_invisible_node_and_its_children_contribute_nothing() {
+        let lua = Lua::new();
+        let src = r##"return panel { id = "bar", width = 200, height = 40, background = "#112233ff",
+            child = rect { visible = false, background = "#ff0000ff", width = 50, height = 20,
+                   child = text { content = "hidden", foreground = "#ffffffff" } } }"##;
+        let list = build(&resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 }), 1.0, None);
+        assert!(
+            !list.commands.iter().any(|c| matches!(&c.draw, Draw::Text { content, .. } if content == "hidden")),
+            "an invisible node's child reached the list: {list:?}"
+        );
+    }
+
+    /// Draw order is tree order, which is what makes docs/adr/0023 item 4's stacking model come
+    /// out right: a child is painted after the parent it covers.
+    #[test]
+    fn a_parents_box_is_listed_before_its_childs() {
+        let lua = Lua::new();
+        let src = r##"return panel { id = "bar", width = 200, height = 40, background = "#112233ff",
+            child = rect { background = "#445566ff", width = 50, height = 20 } }"##;
+        let list = build(&resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 }), 1.0, None);
+        let backgrounds: Vec<_> = list
+            .commands
+            .iter()
+            .filter_map(|c| match &c.draw {
+                Draw::Box { background: Some(color), .. } => Some(*color),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(backgrounds.len(), 2, "both boxes should be listed: {list:?}");
+        // #112233 then #445566: the root's own fill is listed first, the child that covers it
+        // second, so replaying the list in order reproduces the stacking.
+        assert_eq!(
+            (backgrounds[0].b * 255.0).round() as u8,
+            0x33,
+            "the panel root's own background must be listed first, got {backgrounds:?}"
+        );
+        assert_eq!((backgrounds[1].b * 255.0).round() as u8, 0x66, "the child must be listed after the parent it paints over");
+    }
+
+    /// A child's clip is its own box intersected with its parent's, never wider. This is the
+    /// invariant that lets [`execute`] call `scissor` outright instead of rebuilding an
+    /// `intersect_scissor` nest.
+    #[test]
+    fn a_childs_clip_never_escapes_its_parents_box() {
+        let lua = Lua::new();
+        let src = r##"return panel { id = "bar", width = 200, height = 40,
+            child = rect { background = "#445566ff", width = 40, height = 10,
+                child = rect { background = "#778899ff", width = 500, height = 500 } } }"##;
+        let list = build(&resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 }), 1.0, None);
+        let clips: Vec<_> = list.commands.iter().map(|c| c.clip).collect();
+        for pair in clips.windows(2) {
+            let (outer, inner) = (pair[0], pair[1]);
+            assert!(
+                inner.x0 >= outer.x0 && inner.y0 >= outer.y0 && inner.x1 <= outer.x1 && inner.y1 <= outer.y1,
+                "a descendant clip {inner:?} escaped its ancestor {outer:?}"
+            );
+        }
+    }
+
+    /// A node scrolled or positioned entirely outside its parent draws nothing, so it earns no
+    /// entry -- and, more usefully, moving it around off-screen produces no list change and so no
+    /// repaint.
+    #[test]
+    fn a_subtree_clipped_to_nothing_is_left_out_entirely() {
+        let lua = Lua::new();
+        let src = r##"return panel { id = "bar", width = 200, height = 40,
+            child = rect { background = "#445566ff", width = 0, height = 0,
+                child = text { content = "offscreen", foreground = "#ffffffff" } } }"##;
+        let list = build(&resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 }), 1.0, None);
+        assert!(
+            !list.commands.iter().any(|c| matches!(&c.draw, Draw::Text { content, .. } if content == "offscreen")),
+            "a zero-area parent clips its child to nothing, so neither belongs in the list: {list:?}"
+        );
+    }
+
+    // ---- textfield masking ----
+
+    fn lock_target() -> node::SecureSubmitTarget {
+        node::SecureSubmitTarget { capability: "lock".to_string(), action: "authenticate".to_string() }
+    }
+
+    /// One surface holding the dev config's own password field.
+    fn password_surface(lua: &Lua) -> ResolvedNode {
+        let src = r##"return panel { id = "bar", width = 200, height = 40,
+            child = textfield { width = "Fill", height = 28, placeholder = "password",
+                mask_character = "*",
+                secure_submit = { capability = "lock", action = "authenticate" } } }"##;
+        resolved_surface(lua, src, LogicalSize { width: 200.0, height: 40.0 })
+    }
+
+    fn drawn_text(list: &DisplayList) -> Vec<String> {
+        list.commands
+            .iter()
+            .filter_map(|c| match &c.draw {
+                Draw::Text { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_unfocused_password_field_shows_its_placeholder() {
+        let lua = Lua::new();
+        let list = build(&password_surface(&lua), 1.0, None);
+        assert_eq!(drawn_text(&list), vec!["password".to_string()]);
+    }
+
+    /// The fix for typing blind: four keystrokes are four glyphs on screen.
+    #[test]
+    fn a_focused_password_field_draws_one_mask_character_per_typed_character() {
+        let lua = Lua::new();
+        let target = lock_target();
+        let list = build(&password_surface(&lua), 1.0, Some(&SecureField { target: &target, filled: 4 }));
+        assert_eq!(drawn_text(&list), vec!["****".to_string()]);
+    }
+
+    #[test]
+    fn a_focused_but_empty_password_field_still_shows_its_placeholder() {
+        let lua = Lua::new();
+        let target = lock_target();
+        let list = build(&password_surface(&lua), 1.0, Some(&SecureField { target: &target, filled: 0 }));
+        assert_eq!(drawn_text(&list), vec!["password".to_string()]);
+    }
+
+    /// Focus is a `{ capability, action }` pair, so a field addressed somewhere else must not
+    /// fill just because some other field is focused on the same surface. This is the same
+    /// routing rule `input::retarget_secure_submit` enforces for the bytes themselves.
+    #[test]
+    fn a_field_addressed_to_another_capability_does_not_draw_the_focused_fields_characters() {
+        let lua = Lua::new();
+        let elsewhere = node::SecureSubmitTarget { capability: "network".to_string(), action: "connect".to_string() };
+        let list = build(&password_surface(&lua), 1.0, Some(&SecureField { target: &elsewhere, filled: 9 }));
+        assert_eq!(drawn_text(&list), vec!["password".to_string()], "a PSK's length must not leak onto the lock screen's field");
+    }
+
+    /// The count is all paint ever gets (see [`SecureField`]), so there is no path by which a
+    /// typed character reaches the list. Asserted because a display list is cloned, compared and
+    /// retained in `last_painted` -- exactly the places ADR-0005 keeps a secret out of.
+    #[test]
+    fn a_masked_field_draws_only_the_mask_character() {
+        let lua = Lua::new();
+        let target = lock_target();
+        let list = build(&password_surface(&lua), 1.0, Some(&SecureField { target: &target, filled: 6 }));
+        let drawn = drawn_text(&list);
+        assert_eq!(drawn, vec!["******".to_string()]);
+        assert!(drawn[0].chars().all(|c| c == '*'), "nothing but the mask glyph may reach the list");
+    }
+
+    /// § 5.2 item 8 makes `mask_character` optional, and a field that omits it should still look
+    /// like a password field rather than draw nothing.
+    #[test]
+    fn a_field_without_a_mask_character_falls_back_to_a_bullet() {
+        let lua = Lua::new();
+        let src = r##"return panel { id = "bar", width = 200, height = 40,
+            child = textfield { width = "Fill", height = 28,
+                secure_submit = { capability = "lock", action = "authenticate" } } }"##;
+        let tree = resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 });
+        let target = lock_target();
+        let list = build(&tree, 1.0, Some(&SecureField { target: &target, filled: 3 }));
+        assert_eq!(drawn_text(&list), vec!["\u{2022}\u{2022}\u{2022}".to_string()]);
+    }
+
+    /// The property this feature needs from the display list: typing has to change it, or
+    /// `paint_surface` skips the repaint and the dots never appear.
+    #[test]
+    fn each_typed_character_changes_the_list_so_the_repaint_is_not_skipped() {
+        let lua = Lua::new();
+        let tree = password_surface(&lua);
+        let target = lock_target();
+        let three = build(&tree, 1.0, Some(&SecureField { target: &target, filled: 3 }));
+        let four = build(&tree, 1.0, Some(&SecureField { target: &target, filled: 4 }));
+        assert_ne!(three, four);
     }
 
     /// `#RRGGBBAA` at logical `(x, y)` from `canvas.screenshot()` -- femtovg's own `screenshot`
