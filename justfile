@@ -73,3 +73,35 @@ fmt:
 clean:
     cargo clean
 
+# Install layout. `PREFIX` is where it goes, `DESTDIR` is a staging root for a package build, so a
+# PKGBUILD is `just install PREFIX=/usr DESTDIR="$pkgdir"` and nothing else.
+#
+# The Renderer lands in `lib/oblisk`, off `$PATH`, and `bin/oblisk` is a symlink into it. That works
+# because `current_exe` reads `/proc/self/exe`, which is already symlink-resolved, so the Supervisor
+# still finds its sibling. One command on the user's path, and the pair cannot drift apart.
+#
+# No service unit. Oblisk is started from the compositor's own config, the way a bar is:
+# `spawn-at-startup "oblisk"` in niri, `exec-once = oblisk` in Hyprland, `exec oblisk` in sway.
+prefix := "/usr/local"
+destdir := ""
+
+install: release
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="{{destdir}}{{prefix}}"
+    install -Dm755 target/release/oblisk          "$root/lib/oblisk/oblisk"
+    install -Dm755 target/release/oblisk-renderer "$root/lib/oblisk/oblisk-renderer"
+    install -dm755                                "$root/bin"
+    ln -sfn ../lib/oblisk/oblisk                  "$root/bin/oblisk"
+    for stub in lua-meta/*.lua; do
+        install -Dm644 "$stub" "$root/share/oblisk/lua-meta/$(basename "$stub")"
+    done
+    install -Dm644 share/starter/shell.lua        "$root/share/oblisk/starter/shell.lua"
+    echo "installed to $root"
+
+uninstall:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="{{destdir}}{{prefix}}"
+    rm -rf "$root/lib/oblisk" "$root/share/oblisk" "$root/bin/oblisk"
+    echo "removed from $root"
