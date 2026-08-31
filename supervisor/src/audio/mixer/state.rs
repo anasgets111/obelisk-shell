@@ -33,7 +33,7 @@ const VIDEO_SOURCE: &str = "Video/Source";
 /// docs/adr/0053 decision 3). `pid`/`process_name` are kept even though § 2.4 doesn't list them
 /// -- docs/adr/0016 exists because finding the owning process was genuinely hard, and discarding
 /// that answer would throw away the one part of this payload that took real work.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AppStream {
     /// PipeWire registry id of the stream node -- the key [`AudioApps`] tracks entries by.
     pub id: u32,
@@ -151,7 +151,12 @@ fn build_app_stream(node_id: u32, props: &impl PropsLookup) -> Option<AppStream>
 /// unrelated notification. Safe to gate unconditionally: PipeWire's `global_bind` always sends
 /// the first `info` call for a freshly bound node with every change-mask bit set, PROPS
 /// included.
-pub(super) fn apply_info_event(apps: &mut AudioApps, node_id: u32, has_props_change: bool, props: Option<&impl PropsLookup>) {
+pub(super) fn apply_info_event(
+    apps: &mut AudioApps,
+    node_id: u32,
+    has_props_change: bool,
+    props: Option<&impl PropsLookup>,
+) {
     if !has_props_change {
         return;
     }
@@ -195,7 +200,7 @@ impl AudioApps {
 
 /// The full `oblisk.audio` payload (§ 2.4, docs/adr/0053 decision 3): master output
 /// volume/mute plus the per-app stream list.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AudioState {
     /// Master output volume, range `[0.0, 1.0]` -- see [`master`]'s module doc comment for how
     /// this is derived from the default sink's `channelVolumes`.
@@ -215,7 +220,7 @@ pub struct AudioState {
 /// Analog Stereo"`), not the `node.name` the metadata keys route by
 /// (`"alsa_output.pci-0000_00_1f.3.analog-stereo"`). Both exist on every device this machine
 /// advertises, and only one is meant for a person.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct AudioDevice {
     /// PipeWire registry id, which is what `audio:set_default_sink(id)` takes.
     pub id: u32,
@@ -267,9 +272,14 @@ pub(super) struct SinkRoute {
 
 /// Builds one of § 2.4's device arrays. Ordered by registry id so two publishes of the same
 /// registry produce the same list, for the reason `AudioApps::snapshot` already sorts.
-fn device_list<'a>(devices: impl Iterator<Item = (u32, &'a DeviceNames)> + Clone, default_name: Option<&str>) -> Vec<AudioDevice> {
-    let active = master::resolve_default_device(default_name, devices.clone().map(|(id, names)| (id, names.node_name.as_str())));
-    let mut list: Vec<AudioDevice> = devices.map(|(id, names)| AudioDevice { id, name: names.display(), active: active == Some(id) }).collect();
+fn device_list<'a>(
+    devices: impl Iterator<Item = (u32, &'a DeviceNames)> + Clone,
+    default_name: Option<&str>,
+) -> Vec<AudioDevice> {
+    let active =
+        master::resolve_default_device(default_name, devices.clone().map(|(id, names)| (id, names.node_name.as_str())));
+    let mut list: Vec<AudioDevice> =
+        devices.map(|(id, names)| AudioDevice { id, name: names.display(), active: active == Some(id) }).collect();
     list.sort_by_key(|device| device.id);
     list
 }
@@ -292,7 +302,7 @@ pub(super) fn device_display_name(props: &impl PropsLookup) -> Option<String> {
 /// `process_name` field (unlike [`AppStream`]) -- `oblisk.privacy`'s own `/proc/{pid}/comm`
 /// fallback already covers that case for pids PipeWire doesn't see at all, so resolving it here
 /// too would be redundant work this capability never reads.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct VideoSourceApp {
     pub node_id: u32,
     pub pid: i32,
@@ -312,7 +322,12 @@ fn parse_video_source_props(node_id: u32, props: &impl PropsLookup) -> Option<Vi
 
 /// Applies one bound `Video/Source` node's `info` event -- mirrors [`apply_info_event`]'s
 /// props-change gating exactly (the same PipeWire event-ordering quirks, not specific to audio).
-pub(super) fn apply_video_info_event(sources: &mut VideoSourceApps, node_id: u32, has_props_change: bool, props: Option<&impl PropsLookup>) {
+pub(super) fn apply_video_info_event(
+    sources: &mut VideoSourceApps,
+    node_id: u32,
+    has_props_change: bool,
+    props: Option<&impl PropsLookup>,
+) {
     if !has_props_change {
         return;
     }
@@ -449,8 +464,14 @@ impl MixerState {
         let state = AudioState {
             volume: master.volume,
             muted: master.muted,
-            sinks: device_list(self.sinks.iter().map(|(&id, sink)| (id, &sink.names)), self.default_sink_name.as_deref()),
-            sources: device_list(self.sources.iter().map(|(&id, names)| (id, names)), self.default_source_name.as_deref()),
+            sinks: device_list(
+                self.sinks.iter().map(|(&id, sink)| (id, &sink.names)),
+                self.default_sink_name.as_deref(),
+            ),
+            sources: device_list(
+                self.sources.iter().map(|(&id, names)| (id, names)),
+                self.default_source_name.as_deref(),
+            ),
             apps,
         };
         let _ = self.updates.send(state);
@@ -757,7 +778,8 @@ mod tests {
     fn app_stream_serializes_with_the_spec_field_spelling() {
         // docs/adr/0053 decision 3: node_id -> id, app_name -> name; pid/process_name kept
         // (docs/adr/0016).
-        let stream = AppStream { id: 7, pid: 999, name: Some("Zen".to_string()), process_name: None, volume: 1.0, muted: false };
+        let stream =
+            AppStream { id: 7, pid: 999, name: Some("Zen".to_string()), process_name: None, volume: 1.0, muted: false };
         let json = serde_json::to_value(&stream).unwrap();
         assert_eq!(
             json,
@@ -808,20 +830,29 @@ mod tests {
 
     /// One tracked sink, from the three things a test ever cares to vary about it.
     fn sink_at(node_name: &str, description: Option<&str>, props: Option<master::RawSinkProps>) -> SinkEntry {
-        SinkEntry { names: DeviceNames { node_name: node_name.to_string(), description: description.map(str::to_string) }, props, route: None }
+        SinkEntry {
+            names: DeviceNames { node_name: node_name.to_string(), description: description.map(str::to_string) },
+            props,
+            route: None,
+        }
     }
 
     /// `id -> DeviceNames` the way `MixerState` holds it, from pairs a test can read at a glance.
     fn tracked(entries: &[(u32, &str, Option<&str>)]) -> HashMap<u32, DeviceNames> {
         entries
             .iter()
-            .map(|(id, node_name, description)| (*id, DeviceNames { node_name: node_name.to_string(), description: description.map(str::to_string) }))
+            .map(|(id, node_name, description)| {
+                (*id, DeviceNames { node_name: node_name.to_string(), description: description.map(str::to_string) })
+            })
             .collect()
     }
 
     #[test]
     fn device_list_marks_the_metadata_named_device_active_and_orders_by_id() {
-        let names = tracked(&[(70, "bluez_output.headset", Some("WH-1000XM4")), (59, "alsa_output.analog", Some("Built-in Audio Analog Stereo"))]);
+        let names = tracked(&[
+            (70, "bluez_output.headset", Some("WH-1000XM4")),
+            (59, "alsa_output.analog", Some("Built-in Audio Analog Stereo")),
+        ]);
 
         let devices = device_list(names.iter().map(|(&id, names)| (id, names)), Some("bluez_output.headset"));
 
@@ -888,13 +919,19 @@ mod tests {
     /// One device's raw `Props` at a given linear volume, so a test says the number it means
     /// rather than its cube.
     fn props_at(linear: f32, muted: bool) -> master::RawSinkProps {
-        master::RawSinkProps { mute: muted, channel_volumes: master::cubed_channel_volumes(linear, 2).expect("two channels is not zero") }
+        master::RawSinkProps {
+            mute: muted,
+            channel_volumes: master::cubed_channel_volumes(linear, 2).expect("two channels is not zero"),
+        }
     }
 
     /// Everything `publish_audio` reads, with every PipeWire proxy map left empty. A helper
     /// rather than repeated per test: only a handful of fields is ever the subject of a given
     /// test, and the rest is noise.
-    fn mixer_state(updates: UnboundedSender<AudioState>, video_updates: UnboundedSender<Vec<VideoSourceApp>>) -> MixerState {
+    fn mixer_state(
+        updates: UnboundedSender<AudioState>,
+        video_updates: UnboundedSender<Vec<VideoSourceApp>>,
+    ) -> MixerState {
         MixerState {
             apps: AudioApps::new(),
             video_sources: VideoSourceApps::new(),
@@ -919,7 +956,8 @@ mod tests {
         let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (video_updates, _video_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut state = mixer_state(updates, video_updates);
-        state.sinks = HashMap::from([(59, sink_at("alsa_output.pci-...analog-stereo", None, Some(props_at(0.3, false))))]);
+        state.sinks =
+            HashMap::from([(59, sink_at("alsa_output.pci-...analog-stereo", None, Some(props_at(0.3, false))))]);
         state.default_sink_name = Some("alsa_output.pci-...analog-stereo".to_string());
         state.apps.upsert(sample_stream(1));
 
@@ -997,6 +1035,9 @@ mod tests {
         let published = rx.try_recv().expect("publish_audio should have sent a snapshot");
         assert_eq!(published.sinks.iter().map(|sink| sink.active).collect::<Vec<_>>(), [false, true]);
         assert_eq!(published.sinks[1].name, "WH-1000XM4");
-        assert_eq!(published.sources, vec![AudioDevice { id: 60, name: "Built-in Microphone".to_string(), active: true }]);
+        assert_eq!(
+            published.sources,
+            vec![AudioDevice { id: 60, name: "Built-in Microphone".to_string(), active: true }]
+        );
     }
 }

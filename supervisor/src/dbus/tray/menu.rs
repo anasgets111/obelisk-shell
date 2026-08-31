@@ -9,7 +9,7 @@ use super::proxies::{DBusMenuProxy, raw_menu_layout_to_value};
 
 /// One node of a DBusMenu layout tree, already resolved into what `tray.items[].menu` needs
 /// (docs/oblisk-idl-api-specs.md §2.14).
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct MenuItem {
     pub id: i32,
     pub menu_type: String,
@@ -115,7 +115,9 @@ pub(super) fn parse_menu_node(value: &Value<'_>, depth: u32) -> Option<MenuItem>
     let toggle_state = toggle_type.as_ref().map(|_| toggle_state_raw.unwrap_or(-1));
 
     let children = if depth >= MAX_MENU_DEPTH {
-        eprintln!("tray: GetLayout reply exceeded the maximum menu depth ({MAX_MENU_DEPTH}) at node id {id}; truncating its children");
+        eprintln!(
+            "tray: GetLayout reply exceeded the maximum menu depth ({MAX_MENU_DEPTH}) at node id {id}; truncating its children"
+        );
         Vec::new()
     } else {
         match unwrap_variant(children_field) {
@@ -133,7 +135,6 @@ pub(super) async fn fetch_menu_via(menu: &DBusMenuProxy<'static>) -> zbus::Resul
     Ok(parse_menu_node(&root_value, 0).map(|root| root.children).unwrap_or_default())
 }
 
-
 #[cfg(test)]
 mod tests {
     use zbus::zvariant::{Array, Dict, Signature, Str, StructureBuilder};
@@ -145,19 +146,33 @@ mod tests {
     fn menu_node_value<'a>(id: i32, properties: Vec<(&'a str, Value<'a>)>, children: Vec<Value<'a>>) -> Value<'a> {
         let mut dict = Dict::new(&Signature::Str, &Signature::Variant);
         for (key, value) in properties {
-            dict.append(Value::Str(Str::from(key)), Value::Value(Box::new(value))).expect("dict insert must succeed in this test");
+            dict.append(Value::Str(Str::from(key)), Value::Value(Box::new(value)))
+                .expect("dict insert must succeed in this test");
         }
         let mut array = Array::new(&Signature::Variant);
         for child in children {
             array.append(Value::Value(Box::new(child))).expect("array insert must succeed in this test");
         }
-        let structure = StructureBuilder::new().add_field(id).append_field(Value::Dict(dict)).append_field(Value::Array(array)).build().expect("well-formed test structure");
+        let structure = StructureBuilder::new()
+            .add_field(id)
+            .append_field(Value::Dict(dict))
+            .append_field(Value::Array(array))
+            .build()
+            .expect("well-formed test structure");
         Value::Structure(structure)
     }
 
     #[test]
     fn parse_menu_node_parses_a_leaf_standard_item() {
-        let value = menu_node_value(7, vec![("type", Value::Str(Str::from("standard"))), ("label", Value::Str(Str::from("Quit"))), ("enabled", Value::Bool(true))], vec![]);
+        let value = menu_node_value(
+            7,
+            vec![
+                ("type", Value::Str(Str::from("standard"))),
+                ("label", Value::Str(Str::from("Quit"))),
+                ("enabled", Value::Bool(true)),
+            ],
+            vec![],
+        );
 
         let item = parse_menu_node(&value, 0).expect("must parse a well-formed node");
         assert_eq!(item.id, 7);
@@ -195,7 +210,11 @@ mod tests {
 
     #[test]
     fn parse_menu_node_parses_toggle_type_and_state() {
-        let value = menu_node_value(4, vec![("toggle-type", Value::Str(Str::from("checkmark"))), ("toggle-state", Value::I32(1))], vec![]);
+        let value = menu_node_value(
+            4,
+            vec![("toggle-type", Value::Str(Str::from("checkmark"))), ("toggle-state", Value::I32(1))],
+            vec![],
+        );
         let item = parse_menu_node(&value, 0).expect("must parse a well-formed node");
         assert_eq!(item.toggle_type, Some("checkmark".to_string()));
         assert_eq!(item.toggle_state, Some(1));
@@ -271,7 +290,9 @@ mod tests {
             current = &current.children[0];
             depth += 1;
         }
-        assert_eq!(depth, MAX_MENU_DEPTH, "parsing must truncate children exactly at the depth cap, not keep recursing into the deeper levels the raw tree actually has");
+        assert_eq!(
+            depth, MAX_MENU_DEPTH,
+            "parsing must truncate children exactly at the depth cap, not keep recursing into the deeper levels the raw tree actually has"
+        );
     }
-
 }

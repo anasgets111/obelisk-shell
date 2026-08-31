@@ -11,7 +11,7 @@ use super::metadata::clamp_seek_target;
 use super::player::PlayerState;
 use super::watcher::{service_name_for_id, spawn_discovery};
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct MprisState {
     pub players: Vec<PlayerState>,
 }
@@ -160,7 +160,10 @@ impl MprisController {
             Some(trackid) => match zbus::zvariant::ObjectPath::try_from(trackid.as_str()) {
                 Ok(path) => context.player.set_position(path, target).await,
                 Err(err) => {
-                    eprintln!("mpris: cached trackid {trackid:?} for {} isn't a valid object path, falling back to relative Seek: {err}", context.bus_name);
+                    eprintln!(
+                        "mpris: cached trackid {trackid:?} for {} isn't a valid object path, falling back to relative Seek: {err}",
+                        context.bus_name
+                    );
                     context.player.seek(target - self.live_position(id).await.unwrap_or(0)).await
                 }
             },
@@ -188,7 +191,12 @@ impl MprisController {
         let bus_name = service_name_for_id(id);
         let guard = self.registry.lock().unwrap();
         let entry = guard.get(&bus_name)?;
-        Some(SeekContext { bus_name: bus_name.clone(), player: entry.player.clone(), trackid: entry.cached_trackid.clone(), length: entry.last_known.length })
+        Some(SeekContext {
+            bus_name: bus_name.clone(),
+            player: entry.player.clone(),
+            trackid: entry.cached_trackid.clone(),
+            length: entry.last_known.length,
+        })
     }
 }
 

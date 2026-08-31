@@ -12,7 +12,7 @@ use crate::hardware::keyboard::layout::{CompositorKind, detect_compositor};
 /// `oblisk.workspaces`'s full payload (§ 2.9). Field names are the JSON keys verbatim.
 /// `active_client` is `Option` (§ 2.9: "or `nil` if none focused"), omitted rather than
 /// serialized as `null`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct WorkspacesState {
     pub outputs: Vec<OutputWorkspaces>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21,7 +21,7 @@ pub struct WorkspacesState {
 
 /// One output's workspace state. `workspaces` is docs/adr/0056 decision 3's addition to
 /// § 2.9.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct OutputWorkspaces {
     pub name: String,
     pub active_workspace: u64,
@@ -35,7 +35,7 @@ pub struct OutputWorkspaces {
 /// `id` is niri's stable, monitor-independent identity: what `active_workspace`/
 /// `focused_workspace` refer to and what `workspaces:focus(id)` takes. `idx` is the 1-based
 /// position on that output (what a keybind/button label means), not stable across a reorder.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct WorkspaceEntry {
     pub id: u64,
     pub idx: u8,
@@ -46,7 +46,7 @@ pub struct WorkspaceEntry {
 /// § 2.9's `active_client`, minus `is_fullscreen` (docs/adr/0056 decision 5: niri-ipc 26.4.0's
 /// `Window` has no such field, and a fabricated `false` would be wrong for fullscreen windows).
 /// `class` is niri's `app_id`: X11's `WM_CLASS` has no Wayland equivalent.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct ActiveClient {
     pub title: String,
     pub class: String,
@@ -63,7 +63,10 @@ pub enum WorkspacesSignal {
 /// is unit tested without a compositor. Outputs are ordered by connector name and each
 /// output's workspaces by `idx` -- `HashMap` iteration order is not an order. An output with
 /// no active workspace is omitted rather than given a fabricated id (should be unreachable).
-pub fn derive_state(workspaces: &HashMap<u64, niri_ipc::Workspace>, windows: &HashMap<u64, niri_ipc::Window>) -> WorkspacesState {
+pub fn derive_state(
+    workspaces: &HashMap<u64, niri_ipc::Workspace>,
+    windows: &HashMap<u64, niri_ipc::Window>,
+) -> WorkspacesState {
     let mut by_output: HashMap<&str, Vec<&niri_ipc::Workspace>> = HashMap::new();
     for workspace in workspaces.values() {
         let Some(output) = workspace.output.as_deref() else { continue };
@@ -118,9 +121,13 @@ impl WorkspacesController {
         match compositor {
             Some(CompositorKind::Niri) => spawn_niri_reader(Arc::clone(&state), events),
             Some(CompositorKind::Hyprland) => {
-                eprintln!("workspaces: this session is Hyprland, which has no implementor yet (docs/adr/0056 decision 1); workspace reporting disabled for this run");
+                eprintln!(
+                    "workspaces: this session is Hyprland, which has no implementor yet (docs/adr/0056 decision 1); workspace reporting disabled for this run"
+                );
             }
-            None => eprintln!("workspaces: no supported compositor detected; workspace reporting disabled for this run"),
+            None => {
+                eprintln!("workspaces: no supported compositor detected; workspace reporting disabled for this run")
+            }
         }
         Self { state, compositor }
     }
@@ -146,7 +153,9 @@ impl WorkspacesController {
                     return;
                 }
             };
-            let request = niri_ipc::Request::Action(niri_ipc::Action::FocusWorkspace { reference: niri_ipc::WorkspaceReferenceArg::Id(id) });
+            let request = niri_ipc::Request::Action(niri_ipc::Action::FocusWorkspace {
+                reference: niri_ipc::WorkspaceReferenceArg::Id(id),
+            });
             if let Err(err) = socket.send(request) {
                 eprintln!("workspaces: niri FocusWorkspace({id}) request failed: {err}");
             }
@@ -171,14 +180,18 @@ fn spawn_niri_reader(state: Arc<Mutex<WorkspacesState>>, events: UnboundedSender
     let mut socket = match niri_ipc::socket::Socket::connect() {
         Ok(socket) => socket,
         Err(err) => {
-            eprintln!("workspaces: failed to connect to the niri IPC socket; workspace reporting disabled for this run: {err}");
+            eprintln!(
+                "workspaces: failed to connect to the niri IPC socket; workspace reporting disabled for this run: {err}"
+            );
             return;
         }
     };
     match socket.send(niri_ipc::Request::EventStream) {
         Ok(Ok(niri_ipc::Response::Handled)) => {}
         Ok(Ok(_)) => {
-            eprintln!("workspaces: unexpected reply to the niri EventStream request; workspace reporting disabled for this run");
+            eprintln!(
+                "workspaces: unexpected reply to the niri EventStream request; workspace reporting disabled for this run"
+            );
             return;
         }
         Ok(Err(msg)) => {
@@ -299,7 +312,8 @@ mod tests {
 
     #[test]
     fn derive_state_omits_an_output_with_no_active_workspace_rather_than_inventing_one() {
-        let workspaces = map(vec![(1, workspace(1, 1, "eDP-1", false, false)), (2, workspace(2, 1, "DP-2", true, false))]);
+        let workspaces =
+            map(vec![(1, workspace(1, 1, "eDP-1", false, false)), (2, workspace(2, 1, "DP-2", true, false))]);
 
         let state = derive_state(&workspaces, &HashMap::new());
 
@@ -311,7 +325,8 @@ mod tests {
 
     #[test]
     fn derive_state_puts_focused_workspace_only_on_the_output_that_holds_focus() {
-        let workspaces = map(vec![(1, workspace(1, 1, "eDP-1", true, false)), (2, workspace(2, 1, "DP-2", true, true))]);
+        let workspaces =
+            map(vec![(1, workspace(1, 1, "eDP-1", true, false)), (2, workspace(2, 1, "DP-2", true, true))]);
 
         let state = derive_state(&workspaces, &HashMap::new());
 
@@ -328,7 +343,10 @@ mod tests {
         let json = serde_json::to_value(derive_state(&workspaces, &HashMap::new())).unwrap();
 
         let output = &json["outputs"][0];
-        assert!(output.get("focused_workspace").is_none(), "an absent key reads as nil in Lua; a `null` would too, but only an absent key matches every other optional field here");
+        assert!(
+            output.get("focused_workspace").is_none(),
+            "an absent key reads as nil in Lua; a `null` would too, but only an absent key matches every other optional field here"
+        );
         assert_eq!(output["active_workspace"], 1);
     }
 
@@ -341,7 +359,9 @@ mod tests {
             (14, window(14, "Sign in | Slack", "slack", false, false)),
         ]);
 
-        let client = derive_state(&HashMap::new(), &windows).active_client.expect("a focused window must produce an active_client");
+        let client = derive_state(&HashMap::new(), &windows)
+            .active_client
+            .expect("a focused window must produce an active_client");
 
         assert_eq!(client.title, "src/main.rs - Neovim");
         assert_eq!(client.class, "kitty", "§ 2.9's `class` is niri's `app_id`; a Wayland toplevel has no WM_CLASS");

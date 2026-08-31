@@ -16,7 +16,7 @@ use super::scan::{AppSummary, LaunchTarget, scan};
 /// have to be a Lua array index, and Lua counts from one while the JSON array this serializes to
 /// counts from zero, so every config reading it would carry an off-by-one nobody can see in the
 /// payload. Repeating three small fields for a few hundred entries costs less than that trap.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct ApplicationsState {
     pub entries: Vec<AppSummary>,
     pub by_app_id: BTreeMap<String, AppSummary>,
@@ -162,7 +162,10 @@ mod tests {
         }
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let controller = ApplicationsController::new(vec![dir.path().to_path_buf()], tx);
-        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.expect("the opening scan must signal").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the opening scan must signal")
+            .unwrap();
         (controller, dir)
     }
 
@@ -188,7 +191,8 @@ mod tests {
         let marker = tempfile::tempdir().unwrap();
         let touched = marker.path().join("ran");
         let (controller, _dir) =
-            controller_over(&[("t.desktop", &runnable("Toucher", &format!("/usr/bin/touch {}", touched.display())))]).await;
+            controller_over(&[("t.desktop", &runnable("Toucher", &format!("/usr/bin/touch {}", touched.display())))])
+                .await;
 
         controller.launch("t").expect("launching a known entry must succeed");
 
@@ -218,12 +222,17 @@ mod tests {
     #[test]
     fn a_terminal_entry_is_refused_when_the_environment_names_no_terminal() {
         assert_eq!(command_line(None, console_program()), Err(LaunchError::NoTerminal));
-        assert_eq!(command_line(Some(String::new()), console_program()), Err(LaunchError::NoTerminal), "an empty $TERMINAL is unset");
+        assert_eq!(
+            command_line(Some(String::new()), console_program()),
+            Err(LaunchError::NoTerminal),
+            "an empty $TERMINAL is unset"
+        );
     }
 
     #[test]
     fn a_terminal_entry_is_wrapped_in_the_emulator_the_environment_names() {
-        let (command, args) = command_line(Some("foot".to_string()), console_program()).expect("a named terminal must be accepted");
+        let (command, args) =
+            command_line(Some("foot".to_string()), console_program()).expect("a named terminal must be accepted");
 
         assert_eq!(command, "foot");
         assert_eq!(args, vec!["-e".to_string(), "/usr/bin/top".to_string(), "-u".to_string()]);
@@ -231,9 +240,11 @@ mod tests {
 
     #[test]
     fn an_ordinary_entry_is_spawned_directly_whatever_the_environment_says() {
-        let target = LaunchTarget { command: "firefox".to_string(), args: vec!["--new-tab".to_string()], terminal: false };
+        let target =
+            LaunchTarget { command: "firefox".to_string(), args: vec!["--new-tab".to_string()], terminal: false };
 
-        let (command, args) = command_line(Some("foot".to_string()), target).expect("a graphical entry needs no terminal");
+        let (command, args) =
+            command_line(Some("foot".to_string()), target).expect("a graphical entry needs no terminal");
 
         assert_eq!(command, "firefox", "$TERMINAL must not wrap an entry that never asked for it");
         assert_eq!(args, vec!["--new-tab".to_string()]);
@@ -247,7 +258,10 @@ mod tests {
         std::fs::write(dir.path().join("a.desktop"), runnable("A", "/bin/true")).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let controller = ApplicationsController::new(vec![dir.path().to_path_buf()], tx);
-        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.expect("the opening scan signals").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the opening scan signals")
+            .unwrap();
 
         controller.refresh();
 
@@ -261,12 +275,18 @@ mod tests {
         std::fs::write(dir.path().join("a.desktop"), runnable("A", "/bin/true")).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let controller = ApplicationsController::new(vec![dir.path().to_path_buf()], tx);
-        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.expect("the opening scan signals").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the opening scan signals")
+            .unwrap();
 
         std::fs::write(dir.path().join("b.desktop"), runnable("B", "/bin/true")).unwrap();
         controller.refresh();
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.expect("a changed scan must push").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a changed scan must push")
+            .unwrap();
         assert_eq!(controller.snapshot().entries.len(), 2);
     }
 }

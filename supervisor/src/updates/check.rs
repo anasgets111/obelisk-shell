@@ -11,7 +11,7 @@ use std::path::Path;
 use super::pacman_conf::RepoServers;
 
 /// One installed package with a newer version in some sync repo.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct UpdateCandidate {
     pub name: String,
     pub old_version: String,
@@ -25,7 +25,11 @@ pub struct UpdateCandidate {
 /// (`force: true`, matching `checkupdates`'s own always-fresh-sync behavior -- no `fakeroot`
 /// requirement found against a user-owned temp dir), then diffs every package in `root`'s
 /// installed set against its matching sync-repo entry via `alpm`'s own `sync_new_version`.
-pub fn check_for_updates(root: &Path, db_path: &Path, repos: &[RepoServers]) -> Result<Vec<UpdateCandidate>, alpm::Error> {
+pub fn check_for_updates(
+    root: &Path,
+    db_path: &Path,
+    repos: &[RepoServers],
+) -> Result<Vec<UpdateCandidate>, alpm::Error> {
     let mut handle = alpm::Alpm::new(root.to_string_lossy().into_owned(), db_path.to_string_lossy().into_owned())?;
 
     for repo in repos {
@@ -56,4 +60,3 @@ pub fn check_for_updates(root: &Path, db_path: &Path, repos: &[RepoServers]) -> 
 
     Ok(candidates)
 }
-

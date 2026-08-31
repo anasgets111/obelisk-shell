@@ -16,7 +16,7 @@ const MAX_DEPTH: usize = 4;
 /// the argv never crosses into Lua, because `applications:launch(id)` is what runs it and a
 /// config that could rewrite a command line before it ran would be a config that could be made
 /// to run something else.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct AppSummary {
     /// The desktop file id (`org.telegram.desktop`), and `launch`'s one argument.
     pub id: String,
@@ -223,7 +223,11 @@ mod tests {
 
     #[test]
     fn application_dirs_puts_the_users_own_directory_first_so_an_override_wins() {
-        let dirs = application_dirs(Some(PathBuf::from("/custom/data")), Some("/a:/b".to_string()), Path::new("/home/someone"));
+        let dirs = application_dirs(
+            Some(PathBuf::from("/custom/data")),
+            Some("/a:/b".to_string()),
+            Path::new("/home/someone"),
+        );
         assert_eq!(
             dirs,
             vec![
@@ -237,7 +241,10 @@ mod tests {
     #[test]
     fn application_dirs_treats_an_empty_data_dirs_as_unset_rather_than_as_no_directories() {
         let dirs = application_dirs(None, Some(String::new()), Path::new("/home/someone"));
-        assert!(dirs.contains(&PathBuf::from("/usr/share/applications")), "an empty XDG_DATA_DIRS must fall back to the default");
+        assert!(
+            dirs.contains(&PathBuf::from("/usr/share/applications")),
+            "an empty XDG_DATA_DIRS must fall back to the default"
+        );
     }
 
     /// The user's own copy of an entry replaces the system one entirely, which is how a user
@@ -285,7 +292,11 @@ mod tests {
     #[test]
     fn scan_keeps_the_parsed_argv_out_of_the_entry_a_config_can_read() {
         let dir = tempfile::tempdir().unwrap();
-        write_entry(dir.path(), "browser.desktop", "[Desktop Entry]\nType=Application\nName=Browser\nExec=firefox --new-tab %u\n");
+        write_entry(
+            dir.path(),
+            "browser.desktop",
+            "[Desktop Entry]\nType=Application\nName=Browser\nExec=firefox --new-tab %u\n",
+        );
 
         let result = scan(&[dir.path().to_path_buf()]);
 
@@ -293,7 +304,10 @@ mod tests {
         assert_eq!(target.command, "firefox");
         assert_eq!(target.args, vec!["--new-tab".to_string()], "the field code must not reach argv");
         let serialized = serde_json::to_value(&result.entries[0]).unwrap();
-        assert!(serialized.get("exec").is_none() && serialized.get("command").is_none(), "no argv may appear in the Lua-visible payload");
+        assert!(
+            serialized.get("exec").is_none() && serialized.get("command").is_none(),
+            "no argv may appear in the Lua-visible payload"
+        );
     }
 
     #[test]
@@ -340,8 +354,16 @@ mod tests {
 
         let map = scan(&[dir.path().to_path_buf()]).by_app_id;
 
-        assert_eq!(map.get("zed").map(|e| e.name.as_str()), Some("Zed Editor"), "an exact desktop file id outranks a lowercased WM class");
-        assert_eq!(map.get("Zed").map(|e| e.name.as_str()), Some("Impostor"), "the exact WM class still resolves to the entry declaring it");
+        assert_eq!(
+            map.get("zed").map(|e| e.name.as_str()),
+            Some("Zed Editor"),
+            "an exact desktop file id outranks a lowercased WM class"
+        );
+        assert_eq!(
+            map.get("Zed").map(|e| e.name.as_str()),
+            Some("Impostor"),
+            "the exact WM class still resolves to the entry declaring it"
+        );
     }
 
     #[test]
@@ -351,7 +373,11 @@ mod tests {
 
         let result = scan(&[PathBuf::from("/nonexistent/applications"), dir.path().to_path_buf()]);
 
-        assert_eq!(result.entries.len(), 1, "most systems have no /usr/local/share/applications and that is not an error");
+        assert_eq!(
+            result.entries.len(),
+            1,
+            "most systems have no /usr/local/share/applications and that is not an error"
+        );
     }
 
     #[test]

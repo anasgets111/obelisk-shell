@@ -21,7 +21,9 @@ pub fn dispatch(controller: &UpdatesController, envelope: &shared::CommandEnvelo
         },
         "install" => {
             let controller = controller.clone();
-            tokio::spawn(async move { controller.install().await; });
+            tokio::spawn(async move {
+                controller.install().await;
+            });
         }
         _ => crate::log_unknown_action(params),
     }

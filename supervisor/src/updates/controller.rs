@@ -17,7 +17,7 @@ use crate::process;
 /// `oblisk.updates`'s combined payload. `check_error`/`install_error` are `None` when
 /// nothing's gone wrong, not a fabricated empty string. `install_total_steps == 0` while
 /// `installing` is true means the transaction size isn't known yet (pacman hasn't printed it).
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct UpdatesState {
     pub count: u32,
     pub packages: Vec<UpdateCandidate>,
@@ -113,11 +113,15 @@ impl UpdatesController {
 /// Known limitation: no coordination against a concurrently running real install mutating
 /// this same `local/` directory. An overlapping check can surface a spurious, transient
 /// `check_error` or copy an inconsistent snapshot -- self-heals on the next scheduled check.
-fn check_against_a_throwaway_copy(pacman_conf_path: &Path, pacman_db_root: &Path) -> Result<Vec<UpdateCandidate>, String> {
+fn check_against_a_throwaway_copy(
+    pacman_conf_path: &Path,
+    pacman_db_root: &Path,
+) -> Result<Vec<UpdateCandidate>, String> {
     let throwaway = tempfile::tempdir().map_err(|err| format!("failed to create a throwaway temp dir: {err}"))?;
     let local_src = pacman_db_root.join("local");
     let local_dst = throwaway.path().join("local");
-    copy_dir_recursive(&local_src, &local_dst).map_err(|err| format!("failed to copy {} to a throwaway dir: {err}", local_src.display()))?;
+    copy_dir_recursive(&local_src, &local_dst)
+        .map_err(|err| format!("failed to copy {} to a throwaway dir: {err}", local_src.display()))?;
 
     let repos = resolve_repo_servers(pacman_conf_path);
     if repos.is_empty() {
@@ -143,7 +147,13 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
 /// Runs until every `UpdatesController` (and its `Clone`s) drops. `alpm`'s types aren't
 /// `Send` and the sync is genuinely blocking network I/O, so each check runs inside
 /// `tokio::task::spawn_blocking`, never awaited inline.
-async fn run_check_task(pacman_conf_path: PathBuf, pacman_db_root: PathBuf, mut interval_rx: watch::Receiver<Duration>, state: Arc<Mutex<UpdatesState>>, events: UnboundedSender<UpdatesSignal>) {
+async fn run_check_task(
+    pacman_conf_path: PathBuf,
+    pacman_db_root: PathBuf,
+    mut interval_rx: watch::Receiver<Duration>,
+    state: Arc<Mutex<UpdatesState>>,
+    events: UnboundedSender<UpdatesSignal>,
+) {
     loop {
         let interval = *interval_rx.borrow_and_update();
         match poll_mode(interval) {
@@ -202,7 +212,11 @@ fn now_unix() -> i64 {
 /// Lua never sees raw subprocess output (ADR-0034). Assumes `state.installing` and its
 /// progress fields are already set by [`UpdatesController::install`]'s atomic check-and-set.
 async fn run_install(state: Arc<Mutex<UpdatesState>>, events: UnboundedSender<UpdatesSignal>) {
-    let child = match process::spawn_group_leader_piped("pkexec", &["pacman".to_string(), "-Syu".to_string(), "--noconfirm".to_string()], &[]) {
+    let child = match process::spawn_group_leader_piped(
+        "pkexec",
+        &["pacman".to_string(), "-Syu".to_string(), "--noconfirm".to_string()],
+        &[],
+    ) {
         Ok(child) => child,
         Err(err) => {
             let mut guard = state.lock().unwrap();
@@ -219,7 +233,11 @@ async fn run_install(state: Arc<Mutex<UpdatesState>>, events: UnboundedSender<Up
 /// Split from [`run_install`] so the stdout-driven progress loop can be tested against a stub
 /// child process, without a real `pkexec`/`pacman`. Sends `UpdatesSignal::Changed` on every
 /// parsed progress line (ADR-0034), not just at the end.
-async fn run_install_with_child(state: Arc<Mutex<UpdatesState>>, events: UnboundedSender<UpdatesSignal>, mut child: tokio::process::Child) {
+async fn run_install_with_child(
+    state: Arc<Mutex<UpdatesState>>,
+    events: UnboundedSender<UpdatesSignal>,
+    mut child: tokio::process::Child,
+) {
     // Drained concurrently on its own task, not left unread: a real `pacman -Syu` upgrade can
     // write enough stderr warnings to fill the pipe's ~64KiB kernel buffer, which blocks
     // pacman's single-threaded process and wedges `installing` at `true` forever. Logged, not discarded.
@@ -330,7 +348,8 @@ mod tests {
     #[tokio::test]
     async fn run_install_with_child_reports_a_nonzero_exit_as_an_install_error() {
         let state = Arc::new(Mutex::new(UpdatesState::default()));
-        let child = process::spawn_group_leader_piped("sh", &["-c".to_string(), "exit 1".to_string()], &[]).expect("spawn a failing stub");
+        let child = process::spawn_group_leader_piped("sh", &["-c".to_string(), "exit 1".to_string()], &[])
+            .expect("spawn a failing stub");
 
         let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
         run_install_with_child(Arc::clone(&state), events_tx, child).await;
@@ -343,7 +362,12 @@ mod tests {
     #[tokio::test]
     async fn run_install_with_child_flags_reboot_required_when_a_kernel_package_was_installed() {
         let state = Arc::new(Mutex::new(UpdatesState::default()));
-        let child = process::spawn_group_leader_piped("sh", &["-c".to_string(), "echo '(1/1) upgrading linux'; exit 0".to_string()], &[]).expect("spawn a stub install script");
+        let child = process::spawn_group_leader_piped(
+            "sh",
+            &["-c".to_string(), "echo '(1/1) upgrading linux'; exit 0".to_string()],
+            &[],
+        )
+        .expect("spawn a stub install script");
 
         let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
         run_install_with_child(Arc::clone(&state), events_tx, child).await;
@@ -355,16 +379,29 @@ mod tests {
     async fn reboot_required_stays_true_across_a_later_install_that_did_not_touch_the_kernel() {
         let state = Arc::new(Mutex::new(UpdatesState::default()));
 
-        let kernel_child = process::spawn_group_leader_piped("sh", &["-c".to_string(), "echo '(1/1) upgrading linux'; exit 0".to_string()], &[]).expect("spawn a stub install script");
+        let kernel_child = process::spawn_group_leader_piped(
+            "sh",
+            &["-c".to_string(), "echo '(1/1) upgrading linux'; exit 0".to_string()],
+            &[],
+        )
+        .expect("spawn a stub install script");
         let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
         run_install_with_child(Arc::clone(&state), events_tx, kernel_child).await;
         assert!(state.lock().unwrap().reboot_required, "first install touched the kernel");
 
-        let unrelated_child = process::spawn_group_leader_piped("sh", &["-c".to_string(), "echo '(1/1) upgrading nss'; exit 0".to_string()], &[]).expect("spawn a stub install script");
+        let unrelated_child = process::spawn_group_leader_piped(
+            "sh",
+            &["-c".to_string(), "echo '(1/1) upgrading nss'; exit 0".to_string()],
+            &[],
+        )
+        .expect("spawn a stub install script");
         let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
         run_install_with_child(Arc::clone(&state), events_tx, unrelated_child).await;
 
-        assert!(state.lock().unwrap().reboot_required, "a later install with no kernel package must not clear a still-pending reboot");
+        assert!(
+            state.lock().unwrap().reboot_required,
+            "a later install with no kernel package must not clear a still-pending reboot"
+        );
     }
 
     // ---- copy_dir_recursive ----

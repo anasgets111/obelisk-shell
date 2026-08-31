@@ -51,5 +51,9 @@ mod registry;
 mod state;
 mod write;
 
-pub use registry::{command_channel, run, AudioCommandSender};
+pub use registry::{AudioCommandSender, command_channel, run};
 pub use state::{AudioCommand, VideoSourceApp};
+// `main.rs` only ever gets this type by inference, through `run`'s channel, so nothing outside
+// needed to name it until `stubs.rs` had to ask it for its schema.
+#[cfg(test)]
+pub use state::AudioState;

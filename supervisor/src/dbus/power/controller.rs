@@ -12,7 +12,7 @@ use zbus::zvariant::OwnedValue;
 /// `oblisk.power`'s full payload (§ 2.13). Every field is `Option`, omitted from the JSON
 /// rather than serialized as `null`, so a config reads `nil` for anything this host cannot
 /// answer. See `power/mod.rs` for why this is four optional fields, not one on/off capability.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct PowerState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_profile: Option<String>,
@@ -33,7 +33,11 @@ pub enum PowerSignal {
 /// `OnBattery` is on the manager object, not on any device: it is the system-wide answer
 /// across every power supply UPower knows about. A laptop in a dock with two mains adapters
 /// is the case that separates system-wide from per-device, and UPower aggregates it for free.
-#[zbus::proxy(interface = "org.freedesktop.UPower", default_service = "org.freedesktop.UPower", default_path = "/org/freedesktop/UPower")]
+#[zbus::proxy(
+    interface = "org.freedesktop.UPower",
+    default_service = "org.freedesktop.UPower",
+    default_path = "/org/freedesktop/UPower"
+)]
 trait UPower {
     #[zbus(property)]
     fn on_battery(&self) -> zbus::Result<bool>;
@@ -71,7 +75,11 @@ trait PowerProfiles {
 /// `org.freedesktop.UPower.PowerProfiles` in 0.20 and kept the old name working, so both are
 /// tried, newest first.
 const POWER_PROFILES_ENDPOINTS: [(&str, &str, &str); 2] = [
-    ("org.freedesktop.UPower.PowerProfiles", "/org/freedesktop/UPower/PowerProfiles", "org.freedesktop.UPower.PowerProfiles"),
+    (
+        "org.freedesktop.UPower.PowerProfiles",
+        "/org/freedesktop/UPower/PowerProfiles",
+        "org.freedesktop.UPower.PowerProfiles",
+    ),
     ("net.hadess.PowerProfiles", "/net/hadess/PowerProfiles", "net.hadess.PowerProfiles"),
 ];
 
@@ -134,7 +142,15 @@ impl PowerController {
 /// to build one), so the probe is `active_profile()`.
 async fn connect_power_profiles(system_bus: &zbus::Connection) -> Option<PowerProfilesProxy<'static>> {
     for (service, path, interface) in POWER_PROFILES_ENDPOINTS {
-        let built = PowerProfilesProxy::builder(system_bus).destination(service).ok()?.path(path).ok()?.interface(interface).ok()?.build().await;
+        let built = PowerProfilesProxy::builder(system_bus)
+            .destination(service)
+            .ok()?
+            .path(path)
+            .ok()?
+            .interface(interface)
+            .ok()?
+            .build()
+            .await;
         match built {
             Ok(proxy) => {
                 if proxy.active_profile().await.is_ok() {
@@ -151,7 +167,11 @@ async fn connect_power_profiles(system_bus: &zbus::Connection) -> Option<PowerPr
 /// rather than keeping the last known value: a daemon that stopped answering is a fact worth
 /// showing, and a stale number that looks live is the failure mode this codebase has now been
 /// bitten by three times.
-async fn read_state(upower: Option<&UPowerProxy<'static>>, device: Option<&DisplayDeviceProxy<'static>>, profiles: Option<&PowerProfilesProxy<'static>>) -> PowerState {
+async fn read_state(
+    upower: Option<&UPowerProxy<'static>>,
+    device: Option<&DisplayDeviceProxy<'static>>,
+    profiles: Option<&PowerProfilesProxy<'static>>,
+) -> PowerState {
     let mut state = PowerState::default();
     if let Some(upower) = upower {
         state.on_battery = upower.on_battery().await.ok();
@@ -180,7 +200,11 @@ async fn next_change<S: Stream + Unpin>(stream: &mut Option<S>) -> Option<S::Ite
 ///
 /// A host with neither UPower nor power-profiles-daemon never sends a signal, so `oblisk.power`
 /// stays `nil` (ADR-0037), and the task exits instead of parking on a stream that never fires.
-async fn run_power_task(system_bus: zbus::Connection, state: Arc<Mutex<PowerState>>, events: UnboundedSender<PowerSignal>) {
+async fn run_power_task(
+    system_bus: zbus::Connection,
+    state: Arc<Mutex<PowerState>>,
+    events: UnboundedSender<PowerSignal>,
+) {
     let upower = match UPowerProxy::new(&system_bus).await {
         Ok(proxy) => Some(proxy),
         Err(err) => {
@@ -197,10 +221,14 @@ async fn run_power_task(system_bus: zbus::Connection, state: Arc<Mutex<PowerStat
     };
     let profiles = connect_power_profiles(&system_bus).await;
     if profiles.is_none() {
-        eprintln!("power: no power-profiles-daemon reachable; active_profile and profiles will not be reported this run");
+        eprintln!(
+            "power: no power-profiles-daemon reachable; active_profile and profiles will not be reported this run"
+        );
     }
     if upower.is_none() && device.is_none() && profiles.is_none() {
-        eprintln!("power: nothing on this host can answer any of § 2.13's fields; power reporting disabled for this run");
+        eprintln!(
+            "power: nothing on this host can answer any of § 2.13's fields; power reporting disabled for this run"
+        );
         return;
     }
 

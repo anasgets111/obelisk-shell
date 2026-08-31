@@ -30,7 +30,9 @@ pub fn dispatch(controller: &ApplicationsController, envelope: &shared::CommandE
                     let reason = match err {
                         LaunchError::Unknown => format!("no application entry with id {id:?}"),
                         LaunchError::NoTerminal => {
-                            format!("{id:?} declares Terminal=true and $TERMINAL is unset, so there is no emulator to run it in")
+                            format!(
+                                "{id:?} declares Terminal=true and $TERMINAL is unset, so there is no emulator to run it in"
+                            )
                         }
                         LaunchError::Spawn(message) => format!("spawning {id:?} failed: {message}"),
                     };

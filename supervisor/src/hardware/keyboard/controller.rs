@@ -19,7 +19,7 @@ use super::locks::{read_led_on, resolve_lock_leds};
 /// `bool`) -- they default `false` and stay there, logged once, if neither evdev nor sysfs
 /// resolves. `active_layout` defaults to an empty string (IDL declares it non-nullable,
 /// ADR-0034), `active_layout_index`/`layout_count` default `0`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct KeyboardState {
     pub backlight_pct: i32,
     pub caps_lock: bool,
@@ -32,7 +32,15 @@ pub struct KeyboardState {
 
 impl Default for KeyboardState {
     fn default() -> Self {
-        Self { backlight_pct: -1, caps_lock: false, num_lock: false, scroll_lock: false, active_layout: String::new(), active_layout_index: 0, layout_count: 0 }
+        Self {
+            backlight_pct: -1,
+            caps_lock: false,
+            num_lock: false,
+            scroll_lock: false,
+            active_layout: String::new(),
+            active_layout_index: 0,
+            layout_count: 0,
+        }
     }
 }
 
@@ -77,18 +85,26 @@ impl KeyboardController {
     /// construction. `leds_root` (real default `/sys/class/leds`) is the lock-state sysfs
     /// fallback's root, injected for testability. Layout picks one [`CompositorLink`] via
     /// [`detect_compositor`]'s env-var probe -- `None` if neither compositor is detected.
-    pub async fn new(system_bus: zbus::Connection, leds_root: &Path, events_tx: UnboundedSender<KeyboardSignal>) -> Self {
+    pub async fn new(
+        system_bus: zbus::Connection,
+        leds_root: &Path,
+        events_tx: UnboundedSender<KeyboardSignal>,
+    ) -> Self {
         let state = Arc::new(Mutex::new(KeyboardState::default()));
         let backlight = resolve_backlight(&system_bus, &state, events_tx.clone()).await;
         resolve_locks(leds_root, &state, events_tx.clone()).await;
         let layout: Option<Box<dyn CompositorLink>> = match detect_compositor() {
             Some(CompositorKind::Hyprland) => {
-                let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").expect("detect_compositor already confirmed this env var is set");
+                let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
+                    .expect("detect_compositor already confirmed this env var is set");
                 Some(Box::new(HyprlandLink::new(signature, Arc::clone(&state), events_tx.clone())))
             }
-            Some(CompositorKind::Niri) => NiriLink::new(Arc::clone(&state), events_tx.clone()).map(|link| Box::new(link) as Box<dyn CompositorLink>),
+            Some(CompositorKind::Niri) => NiriLink::new(Arc::clone(&state), events_tx.clone())
+                .map(|link| Box::new(link) as Box<dyn CompositorLink>),
             None => {
-                eprintln!("keyboard: neither HYPRLAND_INSTANCE_SIGNATURE nor NIRI_SOCKET is set; layout reporting disabled for this run");
+                eprintln!(
+                    "keyboard: neither HYPRLAND_INSTANCE_SIGNATURE nor NIRI_SOCKET is set; layout reporting disabled for this run"
+                );
                 None
             }
         };
@@ -134,7 +150,11 @@ impl KeyboardController {
 /// -- a `BrightnessChanged` emitted in that gap would otherwise be silently and permanently
 /// missed. A failed initial read is best-effort only: `backlight_pct` stays at its `-1` default
 /// until the first `BrightnessChanged` arrives, rather than degrading the whole capability.
-async fn resolve_backlight(system_bus: &zbus::Connection, state: &Arc<Mutex<KeyboardState>>, events: UnboundedSender<KeyboardSignal>) -> Backlight {
+async fn resolve_backlight(
+    system_bus: &zbus::Connection,
+    state: &Arc<Mutex<KeyboardState>>,
+    events: UnboundedSender<KeyboardSignal>,
+) -> Backlight {
     let proxy = match KbdBacklightProxy::new(system_bus).await {
         Ok(proxy) => proxy,
         Err(err) => {
@@ -145,21 +165,27 @@ async fn resolve_backlight(system_bus: &zbus::Connection, state: &Arc<Mutex<Keyb
     let max = match proxy.get_max_brightness().await {
         Ok(max) if max > 0 => max,
         Ok(_) | Err(_) => {
-            eprintln!("keyboard: no usable KbdBacklight found on this system bus; backlight reporting disabled for this run");
+            eprintln!(
+                "keyboard: no usable KbdBacklight found on this system bus; backlight reporting disabled for this run"
+            );
             return Backlight::Unavailable;
         }
     };
     let mut changed = match proxy.receive_brightness_changed().await {
         Ok(changed) => changed,
         Err(err) => {
-            eprintln!("keyboard: failed to subscribe to BrightnessChanged; backlight reporting disabled for this run: {err}");
+            eprintln!(
+                "keyboard: failed to subscribe to BrightnessChanged; backlight reporting disabled for this run: {err}"
+            );
             return Backlight::Unavailable;
         }
     };
 
     match proxy.get_brightness().await {
         Ok(brightness) => state.lock().unwrap().backlight_pct = percent_from_raw(brightness, max),
-        Err(err) => eprintln!("keyboard: failed to read initial KbdBacklight brightness; will pick up from the next BrightnessChanged: {err}"),
+        Err(err) => eprintln!(
+            "keyboard: failed to read initial KbdBacklight brightness; will pick up from the next BrightnessChanged: {err}"
+        ),
     }
 
     let forward_state = Arc::clone(state);
@@ -181,7 +207,9 @@ async fn resolve_backlight(system_bus: &zbus::Connection, state: &Arc<Mutex<Keyb
 /// against fake data: `evdev::enumerate()` scans real `/dev/input` device nodes, verified only
 /// by live testing on this dev machine (docs/adr/0034).
 fn find_keyboard_led_device() -> Option<evdev::Device> {
-    evdev::enumerate().find(|(_, device)| device.supported_leds().is_some_and(|leds| leds.contains(evdev::LedCode::LED_CAPSL))).map(|(_, device)| device)
+    evdev::enumerate()
+        .find(|(_, device)| device.supported_leds().is_some_and(|leds| leds.contains(evdev::LedCode::LED_CAPSL)))
+        .map(|(_, device)| device)
 }
 
 /// Resolves lock-state reporting and writes the initial value into `state`. evdev is primary
@@ -199,7 +227,9 @@ async fn resolve_locks(leds_root: &Path, state: &Arc<Mutex<KeyboardState>>, even
                 guard.num_lock = led_state.contains(evdev::LedCode::LED_NUML);
                 guard.scroll_lock = led_state.contains(evdev::LedCode::LED_SCROLLL);
             }
-            Err(err) => eprintln!("keyboard: failed to read initial evdev LED state; will pick up from the first EV_LED event: {err}"),
+            Err(err) => eprintln!(
+                "keyboard: failed to read initial evdev LED state; will pick up from the first EV_LED event: {err}"
+            ),
         }
         match device.into_event_stream() {
             Ok(mut stream) => {
@@ -209,7 +239,9 @@ async fn resolve_locks(leds_root: &Path, state: &Arc<Mutex<KeyboardState>>, even
                         let event = match stream.next_event().await {
                             Ok(event) => event,
                             Err(err) => {
-                                eprintln!("keyboard: evdev event stream ended; lock-state will no longer update: {err}");
+                                eprintln!(
+                                    "keyboard: evdev event stream ended; lock-state will no longer update: {err}"
+                                );
                                 break;
                             }
                         };
@@ -235,15 +267,21 @@ async fn resolve_locks(leds_root: &Path, state: &Arc<Mutex<KeyboardState>>, even
             Err(err) => {
                 // A device that's merely un-streamable still counts as "evdev can't be opened"
                 // -- fall through to the sysfs branch instead of leaving lock state at `false` forever.
-                eprintln!("keyboard: failed to open an EV_LED event stream; falling back to a one-time sysfs LED read for lock state: {err}");
+                eprintln!(
+                    "keyboard: failed to open an EV_LED event stream; falling back to a one-time sysfs LED read for lock state: {err}"
+                );
             }
         }
     } else {
-        eprintln!("keyboard: no accessible evdev device with LED_CAPSL capability; falling back to a one-time sysfs LED read for lock state");
+        eprintln!(
+            "keyboard: no accessible evdev device with LED_CAPSL capability; falling back to a one-time sysfs LED read for lock state"
+        );
     }
 
     let Some(leds) = resolve_lock_leds(leds_root) else {
-        eprintln!("keyboard: no lock-state source available (neither evdev nor sysfs LED nodes); caps/num/scroll_lock will stay false");
+        eprintln!(
+            "keyboard: no lock-state source available (neither evdev nor sysfs LED nodes); caps/num/scroll_lock will stay false"
+        );
         return;
     };
     let mut guard = state.lock().unwrap();
@@ -282,7 +320,15 @@ mod tests {
     fn keyboard_state_default_is_the_unavailable_sentinel() {
         assert_eq!(
             KeyboardState::default(),
-            KeyboardState { backlight_pct: -1, caps_lock: false, num_lock: false, scroll_lock: false, active_layout: String::new(), active_layout_index: 0, layout_count: 0 }
+            KeyboardState {
+                backlight_pct: -1,
+                caps_lock: false,
+                num_lock: false,
+                scroll_lock: false,
+                active_layout: String::new(),
+                active_layout_index: 0,
+                layout_count: 0
+            }
         );
     }
 

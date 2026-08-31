@@ -30,7 +30,7 @@ use pipewire::spa::sys as spa_sys;
 use serde::Serialize;
 
 /// Master output volume/mute, as § 2.4 specifies (`audio.volume`, `audio.muted`).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct MasterVolume {
     pub volume: f32,
     pub muted: bool,
@@ -78,7 +78,9 @@ pub fn extract_sink_props(value: &Value) -> Option<RawSinkProps> {
     for property in &object.properties {
         match (property.key, &property.value) {
             (key, Value::Bool(value)) if key == spa_sys::SPA_PROP_mute => mute = *value,
-            (key, Value::ValueArray(pipewire::spa::pod::ValueArray::Float(values))) if key == spa_sys::SPA_PROP_channelVolumes => {
+            (key, Value::ValueArray(pipewire::spa::pod::ValueArray::Float(values)))
+                if key == spa_sys::SPA_PROP_channelVolumes =>
+            {
                 channel_volumes = Some(values.clone());
             }
             _ => {}
@@ -124,7 +126,10 @@ pub fn parse_default_device_name(json: &str) -> Option<String> {
 /// wrong device's volume. Both windows are brief and bounded by an event PipeWire sends
 /// promptly, so this is left as is. Upgrade path if either window proves too wide: hold the
 /// previous resolved master id across an unresolved query instead of guessing by id.
-pub fn resolve_default_device<'a>(default_name: Option<&str>, names: impl Iterator<Item = (u32, &'a str)>) -> Option<u32> {
+pub fn resolve_default_device<'a>(
+    default_name: Option<&str>,
+    names: impl Iterator<Item = (u32, &'a str)>,
+) -> Option<u32> {
     let mut matched: Option<u32> = None;
     let mut lowest: Option<u32> = None;
     for (id, name) in names {
@@ -145,8 +150,15 @@ pub fn resolve_default_device<'a>(default_name: Option<&str>, names: impl Iterat
 ///
 /// `mixer.rs` keeps the whole [`RawSinkProps`], not the derived [`MasterVolume`]: the write path
 /// needs the channel count, and the only honest source for it is the array last reported.
-pub fn compute_master<'a>(default_name: Option<&str>, names: impl Iterator<Item = (u32, &'a str)>, props: impl Fn(u32) -> Option<RawSinkProps>) -> MasterVolume {
-    resolve_default_device(default_name, names).and_then(props).map(|raw| master_volume_from_props(&raw)).unwrap_or_default()
+pub fn compute_master<'a>(
+    default_name: Option<&str>,
+    names: impl Iterator<Item = (u32, &'a str)>,
+    props: impl Fn(u32) -> Option<RawSinkProps>,
+) -> MasterVolume {
+    resolve_default_device(default_name, names)
+        .and_then(props)
+        .map(|raw| master_volume_from_props(&raw))
+        .unwrap_or_default()
 }
 
 /// The inverse of [`master_volume_from_props`]'s cube root, spread across `channels` channels.
@@ -193,7 +205,10 @@ fn props_object_with_id(id: u32, channel_volumes: Option<Vec<f32>>, muted: Optio
         properties.push(Property::new(spa_sys::SPA_PROP_mute, Value::Bool(muted)));
     }
     if let Some(channel_volumes) = channel_volumes {
-        properties.push(Property::new(spa_sys::SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(channel_volumes))));
+        properties.push(Property::new(
+            spa_sys::SPA_PROP_channelVolumes,
+            Value::ValueArray(ValueArray::Float(channel_volumes)),
+        ));
     }
     Value::Object(Object { type_: spa_sys::SPA_TYPE_OBJECT_Props, id, properties })
 }
@@ -222,7 +237,10 @@ pub fn route_object(index: i32, profile_device: i32, channel_volumes: Option<Vec
         properties: vec![
             Property::new(spa_sys::SPA_PARAM_ROUTE_index, Value::Int(index)),
             Property::new(spa_sys::SPA_PARAM_ROUTE_device, Value::Int(profile_device)),
-            Property::new(spa_sys::SPA_PARAM_ROUTE_props, props_object_with_id(spa_sys::SPA_PARAM_Route, channel_volumes, muted)),
+            Property::new(
+                spa_sys::SPA_PARAM_ROUTE_props,
+                props_object_with_id(spa_sys::SPA_PARAM_Route, channel_volumes, muted),
+            ),
             Property::new(spa_sys::SPA_PARAM_ROUTE_save, Value::Bool(true)),
         ],
     })
@@ -392,13 +410,19 @@ mod tests {
 
     #[test]
     fn resolve_default_device_matches_by_name() {
-        let sinks = HashMap::from([(59, "alsa_output.pci-...analog-stereo".to_string()), (70, "bluez_output.headset".to_string())]);
+        let sinks = HashMap::from([
+            (59, "alsa_output.pci-...analog-stereo".to_string()),
+            (70, "bluez_output.headset".to_string()),
+        ]);
         assert_eq!(resolve_default_device(Some("bluez_output.headset"), names(&sinks)), Some(70));
     }
 
     #[test]
     fn resolve_default_device_falls_back_to_lowest_id_with_no_default_name() {
-        let sinks = HashMap::from([(70, "bluez_output.headset".to_string()), (59, "alsa_output.pci-...analog-stereo".to_string())]);
+        let sinks = HashMap::from([
+            (70, "bluez_output.headset".to_string()),
+            (59, "alsa_output.pci-...analog-stereo".to_string()),
+        ]);
         assert_eq!(resolve_default_device(None, names(&sinks)), Some(59));
     }
 
@@ -449,19 +473,29 @@ mod tests {
     #[test]
     fn a_props_object_carries_only_the_field_the_caller_is_changing() {
         // Sending both would lose a write -- see props_object's own doc comment.
-        let Value::Object(volume_only) = props_object(Some(vec![0.5]), None) else { panic!("props_object must build an object") };
+        let Value::Object(volume_only) = props_object(Some(vec![0.5]), None) else {
+            panic!("props_object must build an object")
+        };
         assert_eq!(volume_only.properties.len(), 1);
         assert_eq!(volume_only.properties[0].key, spa_sys::SPA_PROP_channelVolumes);
 
-        let Value::Object(mute_only) = props_object(None, Some(true)) else { panic!("props_object must build an object") };
+        let Value::Object(mute_only) = props_object(None, Some(true)) else {
+            panic!("props_object must build an object")
+        };
         assert_eq!(mute_only.properties.len(), 1);
         assert_eq!(mute_only.properties[0].key, spa_sys::SPA_PROP_mute);
     }
 
     #[test]
     fn a_route_object_carries_the_volume_in_a_nested_props_object() {
-        let Value::Object(route) = route_object(2, 7, Some(vec![0.125, 0.125]), Some(true)) else { panic!("route_object must build an object") };
-        let nested = route.properties.iter().find(|property| property.key == spa_sys::SPA_PARAM_ROUTE_props).expect("a Route must carry props");
+        let Value::Object(route) = route_object(2, 7, Some(vec![0.125, 0.125]), Some(true)) else {
+            panic!("route_object must build an object")
+        };
+        let nested = route
+            .properties
+            .iter()
+            .find(|property| property.key == spa_sys::SPA_PARAM_ROUTE_props)
+            .expect("a Route must carry props");
         let extracted = extract_sink_props(&nested.value).expect("the nested object must parse as sink props");
         assert!(extracted.mute);
         assert_eq!(extracted.channel_volumes, vec![0.125, 0.125]);
@@ -469,8 +503,14 @@ mod tests {
 
     #[test]
     fn a_route_object_asks_for_the_setting_to_be_saved() {
-        let Value::Object(route) = route_object(2, 7, Some(vec![0.5]), None) else { panic!("route_object must build an object") };
-        let save = route.properties.iter().find(|property| property.key == spa_sys::SPA_PARAM_ROUTE_save).expect("a Route must carry save");
+        let Value::Object(route) = route_object(2, 7, Some(vec![0.5]), None) else {
+            panic!("route_object must build an object")
+        };
+        let save = route
+            .properties
+            .iter()
+            .find(|property| property.key == spa_sys::SPA_PARAM_ROUTE_save)
+            .expect("a Route must carry save");
         assert_eq!(save.value, Value::Bool(true));
     }
 
@@ -491,8 +531,10 @@ mod tests {
     fn a_serialized_props_object_reads_back_as_the_same_values() {
         // The write path hands these bytes to C through Pod::from_bytes. A serializer/
         // deserializer disagreement means a write accepted and silently ignored.
-        let bytes = serialize_props(&props_object(Some(vec![0.027, 0.027]), Some(true))).expect("a Props object must serialize");
-        let (_, value) = pipewire::spa::pod::deserialize::PodDeserializer::deserialize_from::<Value>(&bytes).expect("the bytes must read back as a pod");
+        let bytes = serialize_props(&props_object(Some(vec![0.027, 0.027]), Some(true)))
+            .expect("a Props object must serialize");
+        let (_, value) = pipewire::spa::pod::deserialize::PodDeserializer::deserialize_from::<Value>(&bytes)
+            .expect("the bytes must read back as a pod");
         let extracted = extract_sink_props(&value).expect("the round trip must still parse as sink props");
         assert!(extracted.mute);
         assert_eq!(extracted.channel_volumes, vec![0.027, 0.027]);
@@ -504,7 +546,8 @@ mod tests {
     fn compute_master_combines_resolution_and_lookup() {
         let sinks = HashMap::from([(59, "alsa_output.pci-...analog-stereo".to_string())]);
         let props = HashMap::from([(59, RawSinkProps { mute: false, channel_volumes: vec![0.027, 0.027] })]);
-        let master = compute_master(Some("alsa_output.pci-...analog-stereo"), names(&sinks), |id| props.get(&id).cloned());
+        let master =
+            compute_master(Some("alsa_output.pci-...analog-stereo"), names(&sinks), |id| props.get(&id).cloned());
         assert!((master.volume - 0.3).abs() < 1e-6, "expected ~0.3, got {}", master.volume);
         assert!(!master.muted);
     }
@@ -512,7 +555,10 @@ mod tests {
     #[test]
     fn compute_master_defaults_when_the_resolved_sink_has_no_props_yet() {
         let sinks = HashMap::from([(59, "alsa_output.pci-...analog-stereo".to_string())]);
-        assert_eq!(compute_master(Some("alsa_output.pci-...analog-stereo"), names(&sinks), |_| None), MasterVolume::default());
+        assert_eq!(
+            compute_master(Some("alsa_output.pci-...analog-stereo"), names(&sinks), |_| None),
+            MasterVolume::default()
+        );
     }
 
     #[test]

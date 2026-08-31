@@ -22,24 +22,28 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use rusty_network_manager::dbus_interface_types::NMDeviceType;
-use rusty_network_manager::{AccessPointProxy, DeviceProxy, NetworkManagerProxy, SettingsConnectionProxy, SettingsProxy, WirelessProxy};
+use rusty_network_manager::{
+    AccessPointProxy, DeviceProxy, NetworkManagerProxy, SettingsConnectionProxy, SettingsProxy, WirelessProxy,
+};
 use serde::Serialize;
 use shared::Zeroize;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::StreamExt;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath};
 
-
 pub mod connection;
 
-use connection::{access_point_is_secure, build_connection_dict, connection_intent, connection_wants_autoconnect, dedup_and_top20, resolve_band, settings_match_ssid};
 use connection::ConnectError;
+use connection::{
+    access_point_is_secure, build_connection_dict, connection_intent, connection_wants_autoconnect, dedup_and_top20,
+    resolve_band, settings_match_ssid,
+};
 pub use connection::{parse_bool_arg, parse_connect_args, parse_ssid_arg};
 
 /// One scanned access point, already resolved to what `network.available_networks` needs
 /// (docs/oblisk-idl-api-specs.md §2.5). `Serialize`: this is what ends up in a `StateSnapshot`'s
 /// `payload`, same convention as `audio::mixer::AppStream`.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AccessPointInfo {
     pub ssid: String,
     pub strength: u8,
@@ -51,7 +55,7 @@ pub struct AccessPointInfo {
 /// `oblisk.network`'s live push state (docs/adr/0029). Scoped to exactly what §4.2 asks for --
 /// scanning status and the deduplicated AP list -- not the full §2.5 read schema
 /// (`connected`/`ssid`/`wifi_enabled`/etc.), which §4 doesn't ask this controller to track.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct NetworkState {
     pub scanning: bool,
     pub available_networks: Vec<AccessPointInfo>,
@@ -81,7 +85,6 @@ pub enum NetworkSignal {
     ScanStarted,
 }
 
-
 fn root_object_path() -> ObjectPath<'static> {
     ObjectPath::try_from("/").expect("\"/\" is always a valid D-Bus object path")
 }
@@ -101,11 +104,17 @@ async fn bind_wireless(connection: &zbus::Connection, path: OwnedObjectPath) -> 
     WirelessProxy::builder(connection).path(path)?.build().await
 }
 
-async fn bind_access_point(connection: &zbus::Connection, path: OwnedObjectPath) -> zbus::Result<AccessPointProxy<'static>> {
+async fn bind_access_point(
+    connection: &zbus::Connection,
+    path: OwnedObjectPath,
+) -> zbus::Result<AccessPointProxy<'static>> {
     AccessPointProxy::builder(connection).path(path)?.build().await
 }
 
-async fn bind_settings_connection(connection: &zbus::Connection, path: OwnedObjectPath) -> zbus::Result<SettingsConnectionProxy<'static>> {
+async fn bind_settings_connection(
+    connection: &zbus::Connection,
+    path: OwnedObjectPath,
+) -> zbus::Result<SettingsConnectionProxy<'static>> {
     SettingsConnectionProxy::builder(connection).path(path)?.build().await
 }
 
@@ -296,14 +305,18 @@ impl NetworkController {
             let conn = match bind_settings_connection(&self.connection, conn_path.clone()).await {
                 Ok(conn) => conn,
                 Err(err) => {
-                    eprintln!("network: failed to bind connection {conn_path} while searching for an autoconnect profile: {err}");
+                    eprintln!(
+                        "network: failed to bind connection {conn_path} while searching for an autoconnect profile: {err}"
+                    );
                     continue;
                 }
             };
             let settings = match conn.get_settings().await {
                 Ok(settings) => settings,
                 Err(err) => {
-                    eprintln!("network: failed to read settings for {conn_path} while searching for an autoconnect profile: {err}");
+                    eprintln!(
+                        "network: failed to read settings for {conn_path} while searching for an autoconnect profile: {err}"
+                    );
                     continue;
                 }
             };
@@ -351,7 +364,11 @@ impl NetworkController {
         dedup_and_top20(aps)
     }
 
-    async fn read_access_point(&self, path: &OwnedObjectPath, active_path: Option<&OwnedObjectPath>) -> Option<AccessPointInfo> {
+    async fn read_access_point(
+        &self,
+        path: &OwnedObjectPath,
+        active_path: Option<&OwnedObjectPath>,
+    ) -> Option<AccessPointInfo> {
         let ap = bind_access_point(&self.connection, path.clone()).await.ok()?;
         let ssid_bytes = ap.ssid().await.ok()?;
         if ssid_bytes.is_empty() {
@@ -391,7 +408,8 @@ impl NetworkController {
         let wifi = self.wifi.as_ref().ok_or(ConnectError::NoWifiDevice)?;
         let mut intent = connection_intent(&pending.ssid, pending.hidden, secret)?;
         let dict = build_connection_dict(&intent);
-        let result = self.nm.add_and_activate_connection2(dict, &wifi.device_path, &root_object_path(), HashMap::new()).await;
+        let result =
+            self.nm.add_and_activate_connection2(dict, &wifi.device_path, &root_object_path(), HashMap::new()).await;
         // intent.psk is build_connection_dict's own plaintext-password copy, zeroized explicitly
         // here on every exit path rather than left to Drop alone (ADR-0005/ADR-0014). dict
         // borrows from intent and is fully consumed by the call above, so this is the first
@@ -446,28 +464,36 @@ pub fn dispatch(controller: &NetworkController, envelope: &shared::CommandEnvelo
         "set_networking_enabled" => match parse_bool_arg(&params.arguments) {
             Some(enabled) => {
                 let controller = controller.clone();
-                tokio::spawn(async move { controller.set_networking_enabled(enabled).await; });
+                tokio::spawn(async move {
+                    controller.set_networking_enabled(enabled).await;
+                });
             }
             None => crate::log_malformed_command(params),
         },
         "set_wifi_enabled" => match parse_bool_arg(&params.arguments) {
             Some(enabled) => {
                 let controller = controller.clone();
-                tokio::spawn(async move { controller.set_wifi_enabled(enabled).await; });
+                tokio::spawn(async move {
+                    controller.set_wifi_enabled(enabled).await;
+                });
             }
             None => crate::log_malformed_command(params),
         },
         "set_ethernet_enabled" => match parse_bool_arg(&params.arguments) {
             Some(enabled) => {
                 let controller = controller.clone();
-                tokio::spawn(async move { controller.set_ethernet_enabled(enabled).await; });
+                tokio::spawn(async move {
+                    controller.set_ethernet_enabled(enabled).await;
+                });
             }
             None => crate::log_malformed_command(params),
         },
         "scan" => {
             controller.mark_scanning();
             let controller = controller.clone();
-            tokio::spawn(async move { controller.scan().await; });
+            tokio::spawn(async move {
+                controller.scan().await;
+            });
         }
         "connect" => match parse_connect_args(&params.arguments) {
             Some((ssid, hidden)) => controller.stash_connect_intent(PendingNetworkConnect { ssid, hidden }),
@@ -476,7 +502,9 @@ pub fn dispatch(controller: &NetworkController, envelope: &shared::CommandEnvelo
         "forget" => match parse_ssid_arg(&params.arguments) {
             Some(ssid) => {
                 let controller = controller.clone();
-                tokio::spawn(async move { controller.forget(&ssid).await; });
+                tokio::spawn(async move {
+                    controller.forget(&ssid).await;
+                });
             }
             None => crate::log_malformed_command(params),
         },

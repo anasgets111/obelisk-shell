@@ -47,7 +47,7 @@ pub use controller::BluetoothController;
 // State shape pushed as `oblisk.bluetooth`'s StateSnapshot (docs/oblisk-idl-api-specs.md §2.6).
 // ---------------------------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct ConnectedDevice {
     pub mac: String,
     pub name: String,
@@ -60,7 +60,7 @@ pub struct ConnectedDevice {
     pub category: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct DiscoveredDevice {
     pub mac: String,
     pub name: String,
@@ -69,7 +69,7 @@ pub struct DiscoveredDevice {
     pub paired: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct BluetoothState {
     pub enabled: bool,
     pub discovering: bool,
@@ -158,51 +158,64 @@ pub fn dispatch(controller: &BluetoothController, envelope: &shared::CommandEnve
         "set_enabled" => match parse_bool_arg(&params.arguments) {
             Some(enabled) => {
                 let controller = controller.clone();
-                tokio::spawn(async move { controller.set_enabled(enabled).await; });
+                tokio::spawn(async move {
+                    controller.set_enabled(enabled).await;
+                });
             }
             None => crate::log_malformed_command(params),
         },
         "start_discovery" => {
             controller.clear_discovered();
             let controller = controller.clone();
-            tokio::spawn(async move { controller.start_discovery().await; });
+            tokio::spawn(async move {
+                controller.start_discovery().await;
+            });
         }
         "stop_discovery" => {
             let controller = controller.clone();
-            tokio::spawn(async move { controller.stop_discovery().await; });
+            tokio::spawn(async move {
+                controller.stop_discovery().await;
+            });
         }
         "pair" => match parse_mac_arg(&params.arguments) {
             Some(mac) => {
                 let controller = controller.clone();
-                tokio::spawn(async move { controller.pair(&mac).await; });
+                tokio::spawn(async move {
+                    controller.pair(&mac).await;
+                });
             }
             None => crate::log_malformed_command(params),
         },
         "connect" => match parse_mac_arg(&params.arguments) {
             Some(mac) => {
                 let controller = controller.clone();
-                tokio::spawn(async move { controller.connect(&mac).await; });
+                tokio::spawn(async move {
+                    controller.connect(&mac).await;
+                });
             }
             None => crate::log_malformed_command(params),
         },
         "disconnect" => match parse_mac_arg(&params.arguments) {
             Some(mac) => {
                 let controller = controller.clone();
-                tokio::spawn(async move { controller.disconnect(&mac).await; });
+                tokio::spawn(async move {
+                    controller.disconnect(&mac).await;
+                });
             }
             None => crate::log_malformed_command(params),
         },
         "forget" => match parse_mac_arg(&params.arguments) {
             Some(mac) => {
                 let controller = controller.clone();
-                tokio::spawn(async move { controller.forget(&mac).await; });
+                tokio::spawn(async move {
+                    controller.forget(&mac).await;
+                });
             }
             None => crate::log_malformed_command(params),
         },
         _ => crate::log_unknown_action(params),
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -294,5 +307,4 @@ mod tests {
         assert_eq!(parse_mac_arg(&[]), None);
         assert_eq!(parse_mac_arg(&[serde_json::json!(42)]), None);
     }
-
 }

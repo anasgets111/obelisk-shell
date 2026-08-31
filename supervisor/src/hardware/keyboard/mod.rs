@@ -16,7 +16,9 @@ pub fn dispatch(controller: &KeyboardController, envelope: &shared::CommandEnvel
         "set_backlight" => match parse_set_backlight_args(&params.arguments) {
             Some(pct) => {
                 let controller = controller.clone();
-                tokio::spawn(async move { controller.set_backlight(pct).await; });
+                tokio::spawn(async move {
+                    controller.set_backlight(pct).await;
+                });
             }
             None => crate::log_malformed_command(params),
         },

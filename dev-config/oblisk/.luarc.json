@@ -10,6 +10,6 @@
     "jit": "disable",
     "ffi": "disable"
   },
-  "workspace.library": ["../lua-meta"],
+  "workspace.library": ["../../lua-meta"],
   "workspace.checkThirdParty": false
 }

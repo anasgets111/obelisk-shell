@@ -6,7 +6,7 @@ use std::time::Duration;
 /// `oblisk.sysinfo`'s five Lua-visible fields (docs/oblisk-idl-api-specs.md §2.12). Field
 /// names are the `StateSnapshot` payload's JSON keys verbatim -- the Renderer routes them
 /// straight into the Lua signal table by name, unchanged.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct SysinfoState {
     pub cpu_percent: u8,
     pub ram_percent: u8,
@@ -88,7 +88,11 @@ impl SysinfoController {
     /// calls `configure`). `signal_tx` is shared by all three; each sends [`SysinfoSignal::Changed`]
     /// only after actually updating `state` on a real tick. The temp chip(s) are resolved here,
     /// once, before the temp task is spawned -- `hwmon_root` itself is never threaded into the task.
-    pub fn new(proc_root: std::path::PathBuf, hwmon_root: std::path::PathBuf, signal_tx: tokio::sync::mpsc::UnboundedSender<SysinfoSignal>) -> Self {
+    pub fn new(
+        proc_root: std::path::PathBuf,
+        hwmon_root: std::path::PathBuf,
+        signal_tx: tokio::sync::mpsc::UnboundedSender<SysinfoSignal>,
+    ) -> Self {
         let state = std::sync::Arc::new(std::sync::Mutex::new(SysinfoState::default()));
 
         let (cpu_interval, cpu_rx) = tokio::sync::watch::channel(Duration::ZERO);
@@ -299,7 +303,8 @@ mod tests {
 
     #[test]
     fn parse_configure_args_leaves_absent_keys_as_none() {
-        let cfg = super::parse_configure_args(&[serde_json::json!({ "temp_interval": 0 })]).expect("a partial table must still parse");
+        let cfg = super::parse_configure_args(&[serde_json::json!({ "temp_interval": 0 })])
+            .expect("a partial table must still parse");
         assert_eq!(cfg.cpu_interval, None);
         assert_eq!(cfg.ram_interval, None);
         assert_eq!(cfg.temp_interval, Some(0));
@@ -317,13 +322,19 @@ mod tests {
 
     #[test]
     fn parse_configure_args_drops_the_whole_call_on_one_wrong_typed_present_key() {
-        assert_eq!(super::parse_configure_args(&[serde_json::json!({ "cpu_interval": "fast", "ram_interval": 5 })]), None);
+        assert_eq!(
+            super::parse_configure_args(&[serde_json::json!({ "cpu_interval": "fast", "ram_interval": 5 })]),
+            None
+        );
     }
 
     #[test]
     fn poll_mode_is_dormant_at_zero_and_ticking_otherwise() {
         assert_eq!(super::poll_mode(std::time::Duration::ZERO), super::PollMode::Dormant);
-        assert_eq!(super::poll_mode(std::time::Duration::from_secs(5)), super::PollMode::Ticking(std::time::Duration::from_secs(5)));
+        assert_eq!(
+            super::poll_mode(std::time::Duration::from_secs(5)),
+            super::PollMode::Ticking(std::time::Duration::from_secs(5))
+        );
     }
 
     #[test]

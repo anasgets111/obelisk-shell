@@ -120,9 +120,9 @@ pub async fn reap_process_group(child: &mut Child, grace: Duration) -> io::Resul
     signal_group_best_effort(pgid, Signal::SIGKILL)?;
     match wait_or_classify(child, grace).await? {
         TimeoutRace::ActuallyExited(status) => Ok(ReapOutcome::Escalated(status)),
-        TimeoutRace::StillRunning => Err(io::Error::other(
-            "process group did not exit even after SIGKILL (likely stuck in uninterruptible I/O)",
-        )),
+        TimeoutRace::StillRunning => {
+            Err(io::Error::other("process group did not exit even after SIGKILL (likely stuck in uninterruptible I/O)"))
+        }
     }
 }
 
@@ -164,7 +164,11 @@ mod tests {
 
         let race = wait_or_classify(&mut child, Duration::from_millis(20)).await.expect("wait_or_classify failed");
 
-        assert_eq!(race, TimeoutRace::StillRunning, "a still-running child within a short grace must not be misreported as exited");
+        assert_eq!(
+            race,
+            TimeoutRace::StillRunning,
+            "a still-running child within a short grace must not be misreported as exited"
+        );
 
         // No signal was sent above, so clean up directly rather than leaking the sleep.
         child.kill().await.expect("cleanup kill failed");
@@ -287,8 +291,8 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_group_leader_piped_pipes_stdout_and_stderr_separately_with_the_real_exit_code() {
-        let mut child =
-            spawn_group_leader_piped("sh", &sh_args("echo line1; echo line2 >&2; exit 3"), &[]).expect("failed to spawn");
+        let mut child = spawn_group_leader_piped("sh", &sh_args("echo line1; echo line2 >&2; exit 3"), &[])
+            .expect("failed to spawn");
 
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");

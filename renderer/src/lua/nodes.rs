@@ -23,8 +23,21 @@ use mlua::{Lua, Table, Value};
 /// declaration is *written*, which docs/adr/0049 already separated from when the Wayland object
 /// exists. `window` and `popup` own no `xdg_toplevel`/`xdg_popup` until `visible` says so; `lock`
 /// is the same shape with the compositor's `locked` event as its trigger instead of a signal.
-const NODE_KINDS: [&str; 13] =
-    ["rect", "row", "column", "text", "icon", "image", "button", "list", "textfield", "panel", "window", "popup", "lock"];
+const NODE_KINDS: [&str; 13] = [
+    "rect",
+    "row",
+    "column",
+    "text",
+    "icon",
+    "image",
+    "button",
+    "list",
+    "textfield",
+    "panel",
+    "window",
+    "popup",
+    "lock",
+];
 
 /// A Lua node table, tagged with its constructor's `kind` and carrying every other prop
 /// untouched. Not the final in-memory scene node -- see the module doc comment.
@@ -100,10 +113,8 @@ mod tests {
     #[test]
     fn a_node_constructor_tags_the_props_table_with_its_kind() {
         let lua = lua_with_constructors();
-        let table: Table = lua
-            .load(r##"return rect { background = "#11111B", width = "Fill", height = 32 }"##)
-            .eval()
-            .unwrap();
+        let table: Table =
+            lua.load(r##"return rect { background = "#11111B", width = "Fill", height = 32 }"##).eval().unwrap();
         assert_eq!(table.get::<String>("kind").unwrap(), "rect");
         assert_eq!(table.get::<String>("background").unwrap(), "#11111B");
     }
@@ -187,34 +198,35 @@ mod tests {
     }
 }
 
-/// The lua-language-server stubs in `dev-config/lua-meta/` are hand-written, so they drift the
-/// first time someone adds a node kind or a capability and forgets them. Nothing else notices: a
-/// stale stub compiles, passes clippy, and only shows up as a missing completion months later.
+/// `lua-meta/nodes.lua` and `lua-meta/surfaces.lua` are hand-written and always will be. There is
+/// no type to generate them from: a node's schema is 29 scattered `properties.get("...")` calls
+/// across `layout/node/`, each validating one key inline, so the schema is control flow rather
+/// than data. `lua-meta/oblisk.lua` is the opposite case and is generated
+/// (`supervisor/src/stubs.rs`), because the capability payloads are real `Serialize` structs.
 ///
-/// These two tests are the cheap guard. They check the *roster*, not the fields, which is the
-/// drift that actually happens. Field-level accuracy stays a human's job until a generator earns
-/// its keep, and the upgrade path is emitting LuaCATS from the supervisor's `Serialize` structs,
-/// which are what actually cross the socket.
+/// So this guard covers the hand-written half. It checks the roster, not the fields, which is the
+/// drift that actually happens: someone adds a node kind and forgets the stub. The capability
+/// check stays here too, because a config reaches `oblisk.<name>` through the same file and this
+/// crate is the one that owns `shared::CAPABILITIES`'s Lua-side spelling.
 #[cfg(test)]
 mod meta_stub_tests {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
     fn meta(file: &str) -> String {
-        let path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/lua-meta").join(file);
-        std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{} is missing or unreadable: {err}", path.display()))
+        let path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lua-meta").join(file);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("{} is missing or unreadable: {err}", path.display()))
     }
 
     /// Every name a config can call as a node constructor, declared exactly once.
     #[test]
     fn the_stubs_declare_every_node_kind_and_no_others() {
         let source = meta("nodes.lua") + &meta("surfaces.lua");
-        let declared: BTreeSet<&str> = source
-            .lines()
-            .filter_map(|line| line.strip_prefix("function ")?.split('(').next())
-            .collect();
+        let declared: BTreeSet<&str> =
+            source.lines().filter_map(|line| line.strip_prefix("function ")?.split('(').next()).collect();
         let expected: BTreeSet<&str> = super::NODE_KINDS.iter().copied().collect();
-        assert_eq!(declared, expected, "dev-config/lua-meta is out of step with NODE_KINDS");
+        assert_eq!(declared, expected, "lua-meta is out of step with NODE_KINDS");
     }
 
     /// Every `shared::CAPABILITIES` name, as a field on the `Oblisk` class.
@@ -232,6 +244,6 @@ mod meta_stub_tests {
             .filter(|name| !renderer_sourced.contains(name))
             .collect();
         let expected: BTreeSet<&str> = shared::CAPABILITIES.iter().copied().collect();
-        assert_eq!(declared, expected, "dev-config/lua-meta/oblisk.lua is out of step with shared::CAPABILITIES");
+        assert_eq!(declared, expected, "lua-meta/oblisk.lua is out of step with shared::CAPABILITIES");
     }
 }

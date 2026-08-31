@@ -14,7 +14,7 @@ use super::super::read_attr;
 /// `oblisk.battery`'s full payload (§ 2.2). Field names are the `StateSnapshot` JSON keys
 /// verbatim -- may not be renamed. `Default` (`false`, `0`, `false`) is itself the correct
 /// "no battery hardware" answer for a desktop, not a placeholder needing a sentinel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, schemars::JsonSchema)]
 pub struct BatteryState {
     pub present: bool,
     pub percent: u8,
@@ -41,7 +41,8 @@ fn is_system_battery(entry_dir: &Path) -> bool {
 /// `read_dir`'s unspecified order) for a deterministic choice across boots on a two-battery
 /// laptop. `None` if nothing qualifies.
 fn select_system_battery(power_supply_root: &Path) -> Option<PathBuf> {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(power_supply_root).ok()?.flatten().map(|entry| entry.path()).collect();
+    let mut entries: Vec<PathBuf> =
+        std::fs::read_dir(power_supply_root).ok()?.flatten().map(|entry| entry.path()).collect();
     entries.sort();
     entries.into_iter().find(|entry| is_system_battery(entry))
 }
@@ -104,7 +105,11 @@ impl BatteryController {
 /// Reads the initial state, sends it, then hands off to [`run_battery_watch_loop`]. Falls
 /// back to [`run_battery_poll_loop`] only if [`build_power_supply_watch`] fails to stand up --
 /// a broken udev socket must not leave a working battery unreported.
-async fn run_battery_task(power_supply_root: PathBuf, state: Arc<Mutex<BatteryState>>, events: UnboundedSender<BatterySignal>) {
+async fn run_battery_task(
+    power_supply_root: PathBuf,
+    state: Arc<Mutex<BatteryState>>,
+    events: UnboundedSender<BatterySignal>,
+) {
     let initial = read_battery_state(&power_supply_root);
     *state.lock().expect("battery state mutex poisoned") = initial;
     if events.send(BatterySignal::Changed).is_err() {
@@ -114,7 +119,9 @@ async fn run_battery_task(power_supply_root: PathBuf, state: Arc<Mutex<BatterySt
     match build_power_supply_watch() {
         Ok(watch) => run_battery_watch_loop(watch, power_supply_root, initial, state, events).await,
         Err(err) => {
-            eprintln!("battery: failed to set up the udev power_supply watch ({err}); falling back to a {POLL_INTERVAL:?} poll");
+            eprintln!(
+                "battery: failed to set up the udev power_supply watch ({err}); falling back to a {POLL_INTERVAL:?} poll"
+            );
             run_battery_poll_loop(power_supply_root, initial, state, events).await;
         }
     }
@@ -148,7 +155,9 @@ async fn run_battery_watch_loop(
         let mut guard = match watch.readable_mut().await {
             Ok(guard) => guard,
             Err(err) => {
-                eprintln!("battery: the udev power_supply watch's fd errored ({err}); falling back to a {POLL_INTERVAL:?} poll for the rest of this run");
+                eprintln!(
+                    "battery: the udev power_supply watch's fd errored ({err}); falling back to a {POLL_INTERVAL:?} poll for the rest of this run"
+                );
                 return run_battery_poll_loop(power_supply_root, previous, state, events).await;
             }
         };
@@ -168,7 +177,12 @@ async fn run_battery_watch_loop(
 
 /// The fallback path: re-reads on a fixed timer instead of a real event, same push-on-change
 /// filter as the primary path.
-async fn run_battery_poll_loop(power_supply_root: PathBuf, mut previous: BatteryState, state: Arc<Mutex<BatteryState>>, events: UnboundedSender<BatterySignal>) {
+async fn run_battery_poll_loop(
+    power_supply_root: PathBuf,
+    mut previous: BatteryState,
+    state: Arc<Mutex<BatteryState>>,
+    events: UnboundedSender<BatterySignal>,
+) {
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     ticker.tick().await; // tokio::time::interval's first tick fires immediately; the caller's initial (or pre-fallback) read already covers it
 
@@ -275,7 +289,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         write_entry(root.path(), "AC0", &[("type", "Mains")]);
         write_entry(root.path(), "BAT0", &[("type", "Battery"), ("capacity", "59"), ("status", "Not charging")]);
-        write_entry(root.path(), "ucsi-source-psy-USBC000:001", &[("type", "USB"), ("scope", "System"), ("status", "Not charging")]);
+        write_entry(
+            root.path(),
+            "ucsi-source-psy-USBC000:001",
+            &[("type", "USB"), ("scope", "System"), ("status", "Not charging")],
+        );
 
         assert_eq!(read_battery_state(root.path()), BatteryState { present: true, percent: 59, charging: false });
     }
@@ -283,7 +301,11 @@ mod tests {
     #[test]
     fn read_battery_state_excludes_a_device_scoped_peripheral_battery() {
         let root = tempfile::tempdir().unwrap();
-        write_entry(root.path(), "hid-aa-bb-battery", &[("type", "Battery"), ("scope", "Device"), ("capacity", "80"), ("status", "Discharging")]);
+        write_entry(
+            root.path(),
+            "hid-aa-bb-battery",
+            &[("type", "Battery"), ("scope", "Device"), ("capacity", "80"), ("status", "Discharging")],
+        );
 
         assert_eq!(read_battery_state(root.path()), BatteryState::default());
     }
@@ -350,7 +372,11 @@ mod tests {
         let controller = BatteryController::new(root.path().to_path_buf(), events_tx);
 
         let signal = tokio::time::timeout(std::time::Duration::from_secs(2), events_rx.recv()).await;
-        assert_eq!(signal, Ok(Some(BatterySignal::Changed)), "must announce the initial state without waiting for the first poll tick");
+        assert_eq!(
+            signal,
+            Ok(Some(BatterySignal::Changed)),
+            "must announce the initial state without waiting for the first poll tick"
+        );
         assert_eq!(controller.snapshot(), BatteryState { present: true, percent: 59, charging: false });
     }
 

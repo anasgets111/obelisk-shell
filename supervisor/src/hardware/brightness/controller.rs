@@ -16,7 +16,7 @@ use super::super::scale::{percent_from_raw, raw_from_percent};
 /// Renderer routes it into the Lua `oblisk.brightness` signal table by name, unchanged.
 /// `Default` (`0`) is a placeholder before the first real read; never observed if no device
 /// was found, since no signal is sent in that case (see `brightness/mod.rs`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, schemars::JsonSchema)]
 pub struct BrightnessState {
     pub percent: u8,
 }
@@ -58,7 +58,9 @@ fn select_backlight_device(backlight_root: &Path) -> Option<(PathBuf, i32)> {
             (max > 0).then_some((dir, max))
         })
         .collect();
-    entries.sort_by(|(dir_a, _), (dir_b, _)| device_type_rank(dir_a).cmp(&device_type_rank(dir_b)).then_with(|| dir_a.cmp(dir_b)));
+    entries.sort_by(|(dir_a, _), (dir_b, _)| {
+        device_type_rank(dir_a).cmp(&device_type_rank(dir_b)).then_with(|| dir_a.cmp(dir_b))
+    });
     entries.into_iter().next()
 }
 
@@ -129,7 +131,11 @@ impl BrightnessController {
     /// Returns immediately. No usable device under `backlight_root` leaves `device` at
     /// `None` and never spawns the read task -- no signal is ever sent in that case either
     /// (see `brightness/mod.rs`).
-    pub fn new(backlight_root: PathBuf, system_bus: zbus::Connection, events: UnboundedSender<BrightnessSignal>) -> Self {
+    pub fn new(
+        backlight_root: PathBuf,
+        system_bus: zbus::Connection,
+        events: UnboundedSender<BrightnessSignal>,
+    ) -> Self {
         let state = Arc::new(Mutex::new(BrightnessState::default()));
         let selected = select_backlight_device(&backlight_root);
         let device = selected.map(|(dir, max)| {
@@ -140,7 +146,9 @@ impl BrightnessController {
             Some(device) => {
                 tokio::spawn(run_brightness_task(device.dir.clone(), device.max, Arc::clone(&state), events));
             }
-            None => eprintln!("brightness: no usable backlight device found under {backlight_root:?}; brightness reporting disabled for this run"),
+            None => eprintln!(
+                "brightness: no usable backlight device found under {backlight_root:?}; brightness reporting disabled for this run"
+            ),
         }
         Self { state, device: Arc::new(device), system_bus }
     }
@@ -178,7 +186,12 @@ impl BrightnessController {
 /// Falls back to [`run_brightness_poll_loop`] only if [`build_backlight_watch`] fails to
 /// stand up. This task only spawns once [`select_backlight_device`] already found a usable
 /// device, so there's no "stay at default forever" branch to reach here.
-async fn run_brightness_task(device_dir: PathBuf, max: i32, state: Arc<Mutex<BrightnessState>>, events: UnboundedSender<BrightnessSignal>) {
+async fn run_brightness_task(
+    device_dir: PathBuf,
+    max: i32,
+    state: Arc<Mutex<BrightnessState>>,
+    events: UnboundedSender<BrightnessSignal>,
+) {
     let initial = read_percent(&device_dir, max);
     state.lock().expect("brightness state mutex poisoned").percent = initial;
     if events.send(BrightnessSignal::Changed).is_err() {
@@ -188,7 +201,9 @@ async fn run_brightness_task(device_dir: PathBuf, max: i32, state: Arc<Mutex<Bri
     match build_backlight_watch() {
         Ok(watch) => run_brightness_watch_loop(watch, device_dir, max, initial, state, events).await,
         Err(err) => {
-            eprintln!("brightness: failed to set up the udev backlight watch ({err}); falling back to a {POLL_INTERVAL:?} poll");
+            eprintln!(
+                "brightness: failed to set up the udev backlight watch ({err}); falling back to a {POLL_INTERVAL:?} poll"
+            );
             run_brightness_poll_loop(device_dir, max, initial, state, events).await;
         }
     }
@@ -220,7 +235,9 @@ async fn run_brightness_watch_loop(
         let mut guard = match watch.readable_mut().await {
             Ok(guard) => guard,
             Err(err) => {
-                eprintln!("brightness: the udev backlight watch's fd errored ({err}); falling back to a {POLL_INTERVAL:?} poll for the rest of this run");
+                eprintln!(
+                    "brightness: the udev backlight watch's fd errored ({err}); falling back to a {POLL_INTERVAL:?} poll for the rest of this run"
+                );
                 return run_brightness_poll_loop(device_dir, max, previous, state, events).await;
             }
         };
@@ -240,7 +257,13 @@ async fn run_brightness_watch_loop(
 
 /// The fallback path: re-reads on a fixed timer instead of a real event, same push-on-change
 /// filter as the primary path.
-async fn run_brightness_poll_loop(device_dir: PathBuf, max: i32, mut previous: u8, state: Arc<Mutex<BrightnessState>>, events: UnboundedSender<BrightnessSignal>) {
+async fn run_brightness_poll_loop(
+    device_dir: PathBuf,
+    max: i32,
+    mut previous: u8,
+    state: Arc<Mutex<BrightnessState>>,
+    events: UnboundedSender<BrightnessSignal>,
+) {
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     ticker.tick().await; // tokio::time::interval's first tick fires immediately; the caller's initial (or pre-fallback) read already covers it
 
@@ -366,7 +389,8 @@ mod tests {
     async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {
         let (a, b) = tokio::net::UnixStream::pair().expect("failed to create a unix socket pair");
         let guid = zbus::Guid::generate();
-        let server_builder = zbus::connection::Builder::unix_stream(a).server(guid).expect("p2p server builder setup").p2p();
+        let server_builder =
+            zbus::connection::Builder::unix_stream(a).server(guid).expect("p2p server builder setup").p2p();
         let client_builder = zbus::connection::Builder::unix_stream(b).p2p();
         tokio::try_join!(server_builder.build(), client_builder.build()).expect("p2p handshake")
     }
@@ -374,14 +398,22 @@ mod tests {
     #[tokio::test]
     async fn brightness_controller_pushes_the_initial_state_before_the_first_poll_tick() {
         let root = tempfile::tempdir().unwrap();
-        write_entry(root.path(), "intel_backlight", &[("type", "raw"), ("max_brightness", "19200"), ("brightness", "9600")]);
+        write_entry(
+            root.path(),
+            "intel_backlight",
+            &[("type", "raw"), ("max_brightness", "19200"), ("brightness", "9600")],
+        );
         let (_service_side, caller_side) = p2p_pair().await;
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let controller = BrightnessController::new(root.path().to_path_buf(), caller_side, events_tx);
 
         let signal = tokio::time::timeout(std::time::Duration::from_secs(2), events_rx.recv()).await;
-        assert_eq!(signal, Ok(Some(BrightnessSignal::Changed)), "must announce the initial state without waiting for the first poll tick");
+        assert_eq!(
+            signal,
+            Ok(Some(BrightnessSignal::Changed)),
+            "must announce the initial state without waiting for the first poll tick"
+        );
         assert_eq!(controller.snapshot(), BrightnessState { percent: 50 });
     }
 

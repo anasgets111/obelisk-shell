@@ -31,20 +31,26 @@ pub fn dispatch(controller: &IdleController, envelope: &shared::CommandEnvelope)
         "register" => match parse_register_args(&params.arguments) {
             Some(sec) => {
                 let controller = controller.clone();
-                tokio::spawn(async move { controller.register_threshold(generation_id, sec).await; });
+                tokio::spawn(async move {
+                    controller.register_threshold(generation_id, sec).await;
+                });
             }
             None => crate::log_malformed_command(params),
         },
         "inhibit" => match parse_inhibit_args(&params.arguments) {
             Some(reason) => {
                 let controller = controller.clone();
-                tokio::spawn(async move { controller.inhibit(generation_id, &reason).await; });
+                tokio::spawn(async move {
+                    controller.inhibit(generation_id, &reason).await;
+                });
             }
             None => crate::log_malformed_command(params),
         },
         "release_inhibit" => {
             let controller = controller.clone();
-            tokio::spawn(async move { controller.release_inhibit(generation_id).await; });
+            tokio::spawn(async move {
+                controller.release_inhibit(generation_id).await;
+            });
         }
         _ => crate::log_unknown_action(params),
     }

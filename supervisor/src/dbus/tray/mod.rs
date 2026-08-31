@@ -53,7 +53,7 @@ pub mod watcher;
 
 pub use controller::TrayController;
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct TrayState {
     pub items: Vec<TrayItem>,
 }
@@ -122,28 +122,33 @@ pub fn dispatch(controller: &TrayController, envelope: &shared::CommandEnvelope)
         "activate" => match parse_activate_args(&params.arguments) {
             Some((id, x, y)) => {
                 let controller = controller.clone();
-                tokio::spawn(async move { controller.activate(&id, x, y).await; });
+                tokio::spawn(async move {
+                    controller.activate(&id, x, y).await;
+                });
             }
             None => crate::log_malformed_command(params),
         },
         "activate_menu_item" => match parse_activate_menu_item_args(&params.arguments) {
             Some((id, menu_item_id)) => {
                 let controller = controller.clone();
-                tokio::spawn(async move { controller.activate_menu_item(&id, menu_item_id).await; });
+                tokio::spawn(async move {
+                    controller.activate_menu_item(&id, menu_item_id).await;
+                });
             }
             None => crate::log_malformed_command(params),
         },
         "menu_will_show" => match parse_menu_will_show_args(&params.arguments) {
             Some((id, submenu_id)) => {
                 let controller = controller.clone();
-                tokio::spawn(async move { controller.menu_will_show(&id, submenu_id).await; });
+                tokio::spawn(async move {
+                    controller.menu_will_show(&id, submenu_id).await;
+                });
             }
             None => crate::log_malformed_command(params),
         },
         _ => crate::log_unknown_action(params),
     }
 }
-
 
 /// Shared by every submodule's own `#[cfg(test)]` -- see [`p2p_pair`] for why this lives here
 /// instead of being copied into each one.
@@ -159,13 +164,15 @@ mod test_support {
     pub(super) async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {
         let (a, b) = UnixStream::pair().expect("failed to create a unix socket pair");
         let guid = zbus::Guid::generate();
-        let server_builder =
-            zbus::connection::Builder::unix_stream(a).server(guid).expect("p2p server builder setup").p2p().method_timeout(std::time::Duration::from_millis(200));
+        let server_builder = zbus::connection::Builder::unix_stream(a)
+            .server(guid)
+            .expect("p2p server builder setup")
+            .p2p()
+            .method_timeout(std::time::Duration::from_millis(200));
         let client_builder = zbus::connection::Builder::unix_stream(b).p2p();
         tokio::try_join!(server_builder.build(), client_builder.build()).expect("p2p handshake")
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -183,24 +190,37 @@ mod tests {
         assert!(!should_call_activate(true));
     }
 
-
     // ---- arg parsers ----
 
     #[test]
     fn parse_activate_args_reads_id_x_y() {
-        assert_eq!(parse_activate_args(&[serde_json::json!("1.42"), serde_json::json!(10), serde_json::json!(20)]), Some(("1.42".to_string(), 10, 20)));
+        assert_eq!(
+            parse_activate_args(&[serde_json::json!("1.42"), serde_json::json!(10), serde_json::json!(20)]),
+            Some(("1.42".to_string(), 10, 20))
+        );
     }
 
     #[test]
     fn parse_activate_args_rejects_a_malformed_shape() {
         assert_eq!(parse_activate_args(&[]), None, "missing every element");
-        assert_eq!(parse_activate_args(&[serde_json::json!(1), serde_json::json!(10), serde_json::json!(20)]), None, "id is not a string");
-        assert_eq!(parse_activate_args(&[serde_json::json!("1.42"), serde_json::json!("x"), serde_json::json!(20)]), None, "x is not a number");
+        assert_eq!(
+            parse_activate_args(&[serde_json::json!(1), serde_json::json!(10), serde_json::json!(20)]),
+            None,
+            "id is not a string"
+        );
+        assert_eq!(
+            parse_activate_args(&[serde_json::json!("1.42"), serde_json::json!("x"), serde_json::json!(20)]),
+            None,
+            "x is not a number"
+        );
     }
 
     #[test]
     fn parse_activate_menu_item_args_reads_id_and_menu_item_id() {
-        assert_eq!(parse_activate_menu_item_args(&[serde_json::json!("1.42"), serde_json::json!(7)]), Some(("1.42".to_string(), 7)));
+        assert_eq!(
+            parse_activate_menu_item_args(&[serde_json::json!("1.42"), serde_json::json!(7)]),
+            Some(("1.42".to_string(), 7))
+        );
     }
 
     #[test]
@@ -211,7 +231,9 @@ mod tests {
 
     #[test]
     fn parse_menu_will_show_args_reads_id_and_submenu_id() {
-        assert_eq!(parse_menu_will_show_args(&[serde_json::json!("1.42"), serde_json::json!(3)]), Some(("1.42".to_string(), 3)));
+        assert_eq!(
+            parse_menu_will_show_args(&[serde_json::json!("1.42"), serde_json::json!(3)]),
+            Some(("1.42".to_string(), 3))
+        );
     }
-
 }

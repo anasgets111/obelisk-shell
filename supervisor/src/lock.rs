@@ -15,7 +15,7 @@ use tokio::sync::mpsc::UnboundedSender;
 /// layout time (docs/adr/0044), not evented, so two identical consecutive failures are one
 /// unchanged `error` string. `error`'s "nothing went wrong" value is the empty string, the same
 /// convention `keyboard`'s `active_layout` uses.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct LockState {
     pub active: bool,
     pub authenticating: bool,
@@ -204,14 +204,20 @@ impl SessionLockedFlag {
         match change {
             SessionLock::Taken => {
                 if let Err(err) = std::fs::File::create(&self.path) {
-                    eprintln!("lock: could not write {} ; a Supervisor restart will not know the session is locked: {err}", self.path.display());
+                    eprintln!(
+                        "lock: could not write {} ; a Supervisor restart will not know the session is locked: {err}",
+                        self.path.display()
+                    );
                 }
             }
             SessionLock::Released => {
                 if let Err(err) = std::fs::remove_file(&self.path)
                     && err.kind() != std::io::ErrorKind::NotFound
                 {
-                    eprintln!("lock: could not remove {} ; the next Supervisor start will lock the screen: {err}", self.path.display());
+                    eprintln!(
+                        "lock: could not remove {} ; the next Supervisor start will lock the screen: {err}",
+                        self.path.display()
+                    );
                 }
             }
             SessionLock::Unchanged => {}
@@ -390,7 +396,10 @@ mod tests {
         assert_eq!(compositor_lock_change(&shared::LockOutcome::Locked), SessionLock::Taken);
         assert_eq!(compositor_lock_change(&shared::LockOutcome::Unlocked), SessionLock::Released);
         assert_eq!(compositor_lock_change(&shared::LockOutcome::Finished), SessionLock::Released);
-        assert_eq!(compositor_lock_change(&shared::LockOutcome::Refused("no lock node".into())), SessionLock::Unchanged);
+        assert_eq!(
+            compositor_lock_change(&shared::LockOutcome::Refused("no lock node".into())),
+            SessionLock::Unchanged
+        );
     }
 
     #[test]
@@ -457,7 +466,14 @@ mod tests {
     /// `attempts`/`error` is visible against the default. `acquisition` is non-zero for the same
     /// reason: a transition that renumbered the lock would otherwise look like one that didn't.
     fn locked_with_one_failure() -> LockState {
-        LockState { active: true, authenticating: true, attempts: 1, error: "authentication failed".to_string(), requested: false, acquisition: 4 }
+        LockState {
+            active: true,
+            authenticating: true,
+            attempts: 1,
+            error: "authentication failed".to_string(),
+            requested: false,
+            acquisition: 4,
+        }
     }
 
     #[test]
@@ -533,7 +549,11 @@ mod tests {
     fn every_way_a_lock_request_resolves_reopens_the_swap_gate() {
         // A resolution that forgot to clear `requested` would defer reloads for the rest of the
         // session.
-        for outcome in [shared::LockOutcome::Refused("no lock node is declared".to_string()), shared::LockOutcome::Finished, shared::LockOutcome::Unlocked] {
+        for outcome in [
+            shared::LockOutcome::Refused("no lock node is declared".to_string()),
+            shared::LockOutcome::Finished,
+            shared::LockOutcome::Unlocked,
+        ] {
             let mut state = LockState::default();
             apply(&mut state, LockEvent::LockRequested);
             apply(&mut state, LockEvent::Reported(outcome.clone()));
@@ -544,7 +564,10 @@ mod tests {
         let mut state = LockState::default();
         apply(&mut state, LockEvent::LockRequested);
         apply(&mut state, LockEvent::Reported(shared::LockOutcome::Locked));
-        assert!(defers_swap(&state) && state.active && !state.requested, "a confirmed lock hands the gate over to `active`");
+        assert!(
+            defers_swap(&state) && state.active && !state.requested,
+            "a confirmed lock hands the gate over to `active`"
+        );
 
         apply(&mut state, LockEvent::Reported(shared::LockOutcome::Unlocked));
         assert!(!defers_swap(&state));
@@ -552,8 +575,14 @@ mod tests {
 
     #[test]
     fn authentication_needs_a_held_lock_and_no_attempt_already_in_flight() {
-        assert!(!may_authenticate(&LockState::default()), "an unlocked session must not be a PAM oracle any config can drive from a bar textfield");
-        assert!(!may_authenticate(&LockState { requested: true, ..LockState::default() }), "an unconfirmed request is not a lock screen on the glass yet");
+        assert!(
+            !may_authenticate(&LockState::default()),
+            "an unlocked session must not be a PAM oracle any config can drive from a bar textfield"
+        );
+        assert!(
+            !may_authenticate(&LockState { requested: true, ..LockState::default() }),
+            "an unconfirmed request is not a lock screen on the glass yet"
+        );
         assert!(may_authenticate(&LockState { active: true, ..LockState::default() }));
         assert!(
             !may_authenticate(&LockState { active: true, authenticating: true, ..LockState::default() }),
@@ -565,28 +594,68 @@ mod tests {
     fn locked_marks_the_session_active_and_resets_the_attempt_counter() {
         let mut state = LockState { attempts: 3, error: "authentication failed".to_string(), ..LockState::default() };
         apply(&mut state, LockEvent::Reported(shared::LockOutcome::Locked));
-        assert_eq!(state, LockState { active: true, authenticating: false, attempts: 0, error: String::new(), requested: false, acquisition: 1 });
+        assert_eq!(
+            state,
+            LockState {
+                active: true,
+                authenticating: false,
+                attempts: 0,
+                error: String::new(),
+                requested: false,
+                acquisition: 1
+            }
+        );
     }
 
     #[test]
     fn refused_records_the_reason_and_leaves_the_session_unlocked() {
         let mut state = LockState::default();
         apply(&mut state, LockEvent::Reported(shared::LockOutcome::Refused("no lock node is declared".to_string())));
-        assert_eq!(state, LockState { active: false, authenticating: false, attempts: 0, error: "no lock node is declared".to_string(), requested: false, acquisition: 0 });
+        assert_eq!(
+            state,
+            LockState {
+                active: false,
+                authenticating: false,
+                attempts: 0,
+                error: "no lock node is declared".to_string(),
+                requested: false,
+                acquisition: 0
+            }
+        );
     }
 
     #[test]
     fn authentication_started_sets_authenticating() {
         let mut state = LockState { active: true, ..LockState::default() };
         apply(&mut state, LockEvent::AuthenticationStarted);
-        assert_eq!(state, LockState { active: true, authenticating: true, attempts: 0, error: String::new(), requested: false, acquisition: 0 });
+        assert_eq!(
+            state,
+            LockState {
+                active: true,
+                authenticating: true,
+                attempts: 0,
+                error: String::new(),
+                requested: false,
+                acquisition: 0
+            }
+        );
     }
 
     #[test]
     fn a_failed_authentication_counts_an_attempt_and_keeps_the_session_locked() {
         let mut state = LockState { active: true, authenticating: true, ..LockState::default() };
         apply(&mut state, LockEvent::Authenticated(shared::PamOutcome::AuthFailed));
-        assert_eq!(state, LockState { active: true, authenticating: false, attempts: 1, error: "authentication failed".to_string(), requested: false, acquisition: 0 });
+        assert_eq!(
+            state,
+            LockState {
+                active: true,
+                authenticating: false,
+                attempts: 1,
+                error: "authentication failed".to_string(),
+                requested: false,
+                acquisition: 0
+            }
+        );
 
         // Two identical consecutive failures are one unchanged error string -- the counter is the
         // only thing that tells the config the second one happened.
@@ -598,7 +667,18 @@ mod tests {
     fn a_successful_authentication_stops_authenticating_but_does_not_itself_unlock() {
         let mut state = locked_with_one_failure();
         apply(&mut state, LockEvent::Authenticated(shared::PamOutcome::Success));
-        assert_eq!(state, LockState { active: true, authenticating: false, attempts: 1, error: String::new(), requested: false, acquisition: 4 }, "active clears only when the Renderer reports Unlocked -- the lock is on the glass until unlock_and_destroy actually runs");
+        assert_eq!(
+            state,
+            LockState {
+                active: true,
+                authenticating: false,
+                attempts: 1,
+                error: String::new(),
+                requested: false,
+                acquisition: 4
+            },
+            "active clears only when the Renderer reports Unlocked -- the lock is on the glass until unlock_and_destroy actually runs"
+        );
     }
 
     #[test]
@@ -606,7 +686,18 @@ mod tests {
         for outcome in [shared::LockOutcome::Unlocked, shared::LockOutcome::Finished] {
             let mut state = locked_with_one_failure();
             apply(&mut state, LockEvent::Reported(outcome.clone()));
-            assert_eq!(state, LockState { active: false, authenticating: false, attempts: 1, error: String::new(), requested: false, acquisition: 4 }, "{outcome:?}");
+            assert_eq!(
+                state,
+                LockState {
+                    active: false,
+                    authenticating: false,
+                    attempts: 1,
+                    error: String::new(),
+                    requested: false,
+                    acquisition: 4
+                },
+                "{outcome:?}"
+            );
         }
     }
 
@@ -626,7 +717,10 @@ mod tests {
         // main.rs's PAM-outcome arm is this method's only caller.
         controller.unlock();
         assert_eq!(rx.try_recv().ok(), Some(shared::SetSessionLock { locked: false }));
-        assert!(controller.snapshot().active, "active clears on the Renderer's Unlocked report, not on the order going out");
+        assert!(
+            controller.snapshot().active,
+            "active clears on the Renderer's Unlocked report, not on the order going out"
+        );
     }
 
     #[test]
@@ -634,11 +728,17 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let controller = LockController::new(tx);
 
-        assert!(controller.try_begin_authentication().is_none(), "no lock is held, so there is nothing to authenticate against");
+        assert!(
+            controller.try_begin_authentication().is_none(),
+            "no lock is held, so there is nothing to authenticate against"
+        );
         controller.record(LockEvent::Reported(shared::LockOutcome::Locked));
         let acquisition = controller.try_begin_authentication().expect("a held lock admits the first attempt");
         assert!(controller.snapshot().authenticating);
-        assert!(controller.try_begin_authentication().is_none(), "the second submission must find the first still in flight");
+        assert!(
+            controller.try_begin_authentication().is_none(),
+            "the second submission must find the first still in flight"
+        );
 
         assert!(controller.record_authentication(acquisition, shared::PamOutcome::AuthFailed));
         assert!(controller.try_begin_authentication().is_some(), "the worker's answer released it");
@@ -655,10 +755,16 @@ mod tests {
         apply(&mut state, LockEvent::Reported(shared::LockOutcome::Locked));
         apply(&mut state, LockEvent::AuthenticationStarted);
         let acquisition = state.acquisition;
-        assert!(accepts_outcome(&state, acquisition), "the ordinary case: the answer is about the lock still on the glass");
+        assert!(
+            accepts_outcome(&state, acquisition),
+            "the ordinary case: the answer is about the lock still on the glass"
+        );
 
         apply(&mut state, LockEvent::Reported(shared::LockOutcome::Finished));
-        assert!(!accepts_outcome(&state, acquisition), "the lock the password was typed against is gone; the answer is about nothing");
+        assert!(
+            !accepts_outcome(&state, acquisition),
+            "the lock the password was typed against is gone; the answer is about nothing"
+        );
 
         apply(&mut state, LockEvent::LockRequested);
         apply(&mut state, LockEvent::Reported(shared::LockOutcome::Locked));
@@ -680,7 +786,10 @@ mod tests {
         controller.record(LockEvent::Reported(shared::LockOutcome::Finished));
         controller.record(LockEvent::Reported(shared::LockOutcome::Locked));
 
-        assert!(!controller.record_authentication(stale, shared::PamOutcome::AuthFailed), "the refusal is reported so main.rs can log it");
+        assert!(
+            !controller.record_authentication(stale, shared::PamOutcome::AuthFailed),
+            "the refusal is reported so main.rs can log it"
+        );
 
         let state = controller.snapshot();
         assert_eq!(state.attempts, 0, "the new lock has seen no attempts");
@@ -700,7 +809,10 @@ mod tests {
 
         assert_eq!(rx.try_recv().ok(), Some(shared::SetSessionLock { locked: true }));
         assert!(rx.try_recv().is_err(), "the second lock() cannot change anything, so it is not sent either");
-        assert!(!controller.snapshot().requested, "and above all it does not shut the swap gate on an event that is never coming");
+        assert!(
+            !controller.snapshot().requested,
+            "and above all it does not shut the swap gate on an event that is never coming"
+        );
     }
 
     #[test]

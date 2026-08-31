@@ -42,14 +42,18 @@ pub fn dispatch(controller: &NotificationsController, envelope: &shared::Command
         "dismiss" => match parse_dismiss_args(&params.arguments) {
             Some(id) => {
                 let controller = controller.clone();
-                tokio::spawn(async move { controller.dismiss(id).await; });
+                tokio::spawn(async move {
+                    controller.dismiss(id).await;
+                });
             }
             None => crate::log_malformed_command(params),
         },
         "reply" => match parse_reply_args(&params.arguments) {
             Some((id, text)) => {
                 let controller = controller.clone();
-                tokio::spawn(async move { controller.reply(id, text).await; });
+                tokio::spawn(async move {
+                    controller.reply(id, text).await;
+                });
             }
             None => crate::log_malformed_command(params),
         },
@@ -113,7 +117,7 @@ const NOTIFICATIONS_CAPABILITIES: [&str; 10] = [
 /// carries its own styling and, for a `<a href>`, the link target; an image run carries only a
 /// spooled/validated path -- `alt` text is parsed for grammar completeness but not carried
 /// forward, since nothing in this round's scope reads it.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(tag = "kind")]
 pub enum NotificationSpan {
     #[serde(rename = "text")]
@@ -124,7 +128,7 @@ pub enum NotificationSpan {
 
 /// The `low`/`normal`/`critical` tier (CONTEXT.md's "Notification urgency"). `Hash`/`Eq` so it can
 /// key the sound registry directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, schemars::JsonSchema)]
 pub enum Urgency {
     #[serde(rename = "low")]
     Low,
@@ -159,7 +163,7 @@ fn parse_urgency_str(value: &str) -> Option<Urgency> {
 /// §2.7, ADR-0033's corrections: `body` is a span array not a flat string, `urgency`/`has_reply`
 /// are new fields). Trimmed to what the feed shape and write commands need -- the raw `actions`
 /// array is never stored, only the `has_reply` bool it collapses into.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct Notification {
     pub id: u32,
     pub app_name: String,
@@ -176,7 +180,7 @@ pub struct Notification {
 }
 
 /// `notifications.feed`/`notifications.dnd`'s `StateSnapshot` payload shape (ADR-0033).
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct NotificationsState {
     pub feed: Vec<Notification>,
     pub dnd: bool,
@@ -206,7 +210,6 @@ fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> String {
     input[..end].to_string()
 }
 
-
 /// Shared by every submodule's own `#[cfg(test)]`.
 #[cfg(test)]
 mod test_support {
@@ -219,11 +222,10 @@ mod test_support {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::test_support::text;
+    use super::*;
 
     // ---- truncate_utf8_bytes (TDD seam 1) ----
 
@@ -290,7 +292,10 @@ mod tests {
     fn notification_span_text_serializes_with_a_kind_tag() {
         let span = text("hi", true, false, false, Some("url"));
         let json = serde_json::to_value(&span).unwrap();
-        assert_eq!(json, serde_json::json!({ "kind": "text", "text": "hi", "bold": true, "italic": false, "underline": false, "href": "url" }));
+        assert_eq!(
+            json,
+            serde_json::json!({ "kind": "text", "text": "hi", "bold": true, "italic": false, "underline": false, "href": "url" })
+        );
     }
 
     #[test]

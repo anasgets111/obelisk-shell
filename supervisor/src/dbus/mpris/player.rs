@@ -15,7 +15,7 @@ use super::proxies::{MprisPlayerProxy, MprisRootProxy, bind_player, bind_root};
 use super::watcher::player_id;
 use tokio::sync::mpsc::UnboundedSender;
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct PlayerState {
     pub id: String,
     pub identity: String,
@@ -51,7 +51,9 @@ pub(super) type PlayerRegistry = Arc<Mutex<HashMap<String, PlayerEntry>>>;
 /// Known open gap (ADR-0036's Consequences): `system.time` (§2.11, unbuilt) is a 1Hz
 /// whole-second epoch, not comparable to this at microsecond resolution.
 pub(super) fn monotonic_micros() -> i64 {
-    let now: std::time::Duration = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC).map(std::time::Duration::from).unwrap_or_default();
+    let now: std::time::Duration = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)
+        .map(std::time::Duration::from)
+        .unwrap_or_default();
     i64::try_from(now.as_micros()).unwrap_or(i64::MAX)
 }
 
@@ -74,11 +76,18 @@ struct Previous<'a> {
     trackid: &'a Option<String>,
 }
 
-async fn resync(bus_name: &str, player: &MprisPlayerProxy<'static>, root: &MprisRootProxy<'static>, previous: Option<Previous<'_>>) -> Resynced {
+async fn resync(
+    bus_name: &str,
+    player: &MprisPlayerProxy<'static>,
+    root: &MprisRootProxy<'static>,
+    previous: Option<Previous<'_>>,
+) -> Resynced {
     let play_state = match player.playback_status().await {
         Ok(status) => status,
         Err(err) => {
-            eprintln!("mpris: PlaybackStatus read failed for {bus_name}; keeping the last known value this round: {err}");
+            eprintln!(
+                "mpris: PlaybackStatus read failed for {bus_name}; keeping the last known value this round: {err}"
+            );
             previous.as_ref().map(|p| p.state.play_state.clone()).unwrap_or_default()
         }
     };
@@ -93,7 +102,9 @@ async fn resync(bus_name: &str, player: &MprisPlayerProxy<'static>, root: &Mpris
     // its previous value rather than resetting to empty, which would register as a spurious
     // track change.
     let Ok(metadata) = player.metadata().await else {
-        eprintln!("mpris: Metadata read failed for {bus_name}; keeping the last known title/artist/art/length/trackid this round");
+        eprintln!(
+            "mpris: Metadata read failed for {bus_name}; keeping the last known title/artist/art/length/trackid this round"
+        );
         let state = PlayerState {
             id: player_id(bus_name).to_string(),
             identity: player_identity,
@@ -151,7 +162,12 @@ async fn resync(bus_name: &str, player: &MprisPlayerProxy<'static>, root: &Mpris
 /// its write-back would then find nothing and `break`, permanently freezing the player at
 /// its initial snapshot. Confirmed live: consistently hit on the first player registered in
 /// a fresh session.
-pub(super) async fn register_player(connection: &zbus::Connection, registry: &PlayerRegistry, events: &UnboundedSender<MprisSignal>, bus_name: String) {
+pub(super) async fn register_player(
+    connection: &zbus::Connection,
+    registry: &PlayerRegistry,
+    events: &UnboundedSender<MprisSignal>,
+    bus_name: String,
+) {
     let player = match bind_player(connection, &bus_name).await {
         Ok(player) => player,
         Err(err) => {
@@ -177,7 +193,13 @@ pub(super) async fn register_player(connection: &zbus::Connection, registry: &Pl
 
     let Resynced { state, identity, trackid } = resync(&bus_name, &player, &root, None).await;
 
-    let entry = PlayerEntry { player: player.clone(), last_known: state, track_identity: identity, cached_trackid: trackid, forwarder: None };
+    let entry = PlayerEntry {
+        player: player.clone(),
+        last_known: state,
+        track_identity: identity,
+        cached_trackid: trackid,
+        forwarder: None,
+    };
     let previous = registry.lock().unwrap().insert(bus_name.clone(), entry);
     if let Some(previous) = previous
         && let Some(handle) = previous.forwarder
@@ -202,7 +224,13 @@ pub(super) async fn register_player(connection: &zbus::Connection, registry: &Pl
 /// has no `receive_position_changed` trigger: the real freedesktop spec excludes it from
 /// `PropertiesChanged` (too high-frequency), so `Seeked` is the only live signal for a
 /// position change on its own.
-fn spawn_player_forwarder(bus_name: String, player: MprisPlayerProxy<'static>, root: MprisRootProxy<'static>, registry: PlayerRegistry, events: UnboundedSender<MprisSignal>) -> JoinHandle<()> {
+fn spawn_player_forwarder(
+    bus_name: String,
+    player: MprisPlayerProxy<'static>,
+    root: MprisRootProxy<'static>,
+    registry: PlayerRegistry,
+    events: UnboundedSender<MprisSignal>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut playback_status = player.receive_playback_status_changed().await;
         let mut metadata = player.receive_metadata_changed().await;
@@ -219,8 +247,14 @@ fn spawn_player_forwarder(bus_name: String, player: MprisPlayerProxy<'static>, r
                 break;
             }
 
-            let previous = { registry.lock().unwrap().get(&bus_name).map(|entry| (entry.last_known.clone(), entry.track_identity.clone(), entry.cached_trackid.clone())) };
-            let previous_ctx = previous.as_ref().map(|(state, identity, trackid)| Previous { state, identity, trackid });
+            let previous =
+                {
+                    registry.lock().unwrap().get(&bus_name).map(|entry| {
+                        (entry.last_known.clone(), entry.track_identity.clone(), entry.cached_trackid.clone())
+                    })
+                };
+            let previous_ctx =
+                previous.as_ref().map(|(state, identity, trackid)| Previous { state, identity, trackid });
             let Resynced { state, identity, trackid } = resync(&bus_name, &player, &root, previous_ctx).await;
 
             let mut guard = registry.lock().unwrap();

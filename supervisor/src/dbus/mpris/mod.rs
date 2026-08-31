@@ -33,21 +33,27 @@ pub fn dispatch(controller: &MprisController, envelope: &shared::CommandEnvelope
         "control" => match parse_control_args(&params.arguments) {
             Some((id, cmd)) => {
                 let controller = controller.clone();
-                tokio::spawn(async move { controller.control(&id, &cmd).await; });
+                tokio::spawn(async move {
+                    controller.control(&id, &cmd).await;
+                });
             }
             None => crate::log_malformed_command(params),
         },
         "seek" => match parse_seek_args(&params.arguments) {
             Some((id, pos_us)) => {
                 let controller = controller.clone();
-                tokio::spawn(async move { controller.seek(&id, pos_us).await; });
+                tokio::spawn(async move {
+                    controller.seek(&id, pos_us).await;
+                });
             }
             None => crate::log_malformed_command(params),
         },
         "seek_relative" => match parse_seek_relative_args(&params.arguments) {
             Some((id, off)) => {
                 let controller = controller.clone();
-                tokio::spawn(async move { controller.seek_relative(&id, off).await; });
+                tokio::spawn(async move {
+                    controller.seek_relative(&id, off).await;
+                });
             }
             None => crate::log_malformed_command(params),
         },

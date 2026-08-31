@@ -28,8 +28,12 @@ pub fn dispatch(commands: &AudioCommandSender, envelope: &shared::CommandEnvelop
         "toggle_mute" => Some(AudioCommand::ToggleMasterMute),
         "set_default_sink" => parse_id_arg(&params.arguments).map(AudioCommand::SetDefaultSink),
         "set_default_source" => parse_id_arg(&params.arguments).map(AudioCommand::SetDefaultSource),
-        "set_app_volume" => parse_id_and_volume_args(&params.arguments).map(|(id, volume)| AudioCommand::SetAppVolume { id, volume }),
-        "set_app_muted" => parse_id_and_bool_args(&params.arguments).map(|(id, muted)| AudioCommand::SetAppMuted { id, muted }),
+        "set_app_volume" => {
+            parse_id_and_volume_args(&params.arguments).map(|(id, volume)| AudioCommand::SetAppVolume { id, volume })
+        }
+        "set_app_muted" => {
+            parse_id_and_bool_args(&params.arguments).map(|(id, muted)| AudioCommand::SetAppMuted { id, muted })
+        }
         _ => return crate::log_unknown_action(params),
     };
     let Some(command) = command else {

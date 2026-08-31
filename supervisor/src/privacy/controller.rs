@@ -14,12 +14,12 @@ use super::video::{find_device_openers, read_comm};
 
 /// One active camera user (ADR-0034: `privacy.camera_users: table`, array of `{app_name}`,
 /// empty = inactive).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct CameraUser {
     pub app_name: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct PrivacyState {
     pub camera_users: Vec<CameraUser>,
 }
@@ -35,7 +35,8 @@ pub enum PrivacySignal {
 /// when a pid matches a tracked video-source node, else `/proc/{pid}/comm`, else a `pid {n}`
 /// placeholder so a real opener is never silently dropped. Pure and unit-testable.
 fn resolve_camera_users(proc_root: &Path, devices: &[PathBuf], pipewire: &[VideoSourceApp]) -> Vec<CameraUser> {
-    let mut pids: Vec<u32> = devices.iter().flat_map(|device| find_device_openers(proc_root, &device.to_string_lossy())).collect();
+    let mut pids: Vec<u32> =
+        devices.iter().flat_map(|device| find_device_openers(proc_root, &device.to_string_lossy())).collect();
     pids.sort_unstable();
     pids.dedup();
 
@@ -60,7 +61,12 @@ impl PrivacyController {
     /// `proc_root`/`video4linux_root` (real defaults `/proc`/`/sys/class/video4linux`) follow
     /// this codebase's sysfs/procfs root-injection convention. `video_sources` is one PipeWire
     /// connection shared with `oblisk.audio` (ADR-0034). Returns immediately.
-    pub fn new(proc_root: PathBuf, video4linux_root: &Path, video_sources: UnboundedReceiver<Vec<VideoSourceApp>>, events: UnboundedSender<PrivacySignal>) -> Self {
+    pub fn new(
+        proc_root: PathBuf,
+        video4linux_root: &Path,
+        video_sources: UnboundedReceiver<Vec<VideoSourceApp>>,
+        events: UnboundedSender<PrivacySignal>,
+    ) -> Self {
         let state = Arc::new(Mutex::new(PrivacyState::default()));
         let devices = super::video::enumerate_video_devices(video4linux_root);
         tokio::spawn(run_camera_task(proc_root, devices, Arc::clone(&state), video_sources, events));
@@ -79,7 +85,13 @@ impl PrivacyController {
 /// Logs and returns without ever updating `state` if inotify can't be initialized or no video
 /// devices exist. Still sends one `PrivacySignal::Changed` before returning on each of these
 /// paths: without it, a newly-connecting generation never gets even the empty state seeded.
-async fn run_camera_task(proc_root: PathBuf, devices: Vec<PathBuf>, state: Arc<Mutex<PrivacyState>>, mut video_sources: UnboundedReceiver<Vec<VideoSourceApp>>, events: UnboundedSender<PrivacySignal>) {
+async fn run_camera_task(
+    proc_root: PathBuf,
+    devices: Vec<PathBuf>,
+    state: Arc<Mutex<PrivacyState>>,
+    mut video_sources: UnboundedReceiver<Vec<VideoSourceApp>>,
+    events: UnboundedSender<PrivacySignal>,
+) {
     if devices.is_empty() {
         eprintln!("privacy: no /dev/videoN devices found; camera_users will stay empty");
         let _ = events.send(PrivacySignal::Changed);
@@ -102,7 +114,9 @@ async fn run_camera_task(proc_root: PathBuf, devices: Vec<PathBuf>, state: Arc<M
     let mut inotify_stream = match inotify.into_event_stream(vec![0u8; 4096]) {
         Ok(stream) => stream,
         Err(err) => {
-            eprintln!("privacy: failed to start the inotify event stream; camera detection disabled for this run: {err}");
+            eprintln!(
+                "privacy: failed to start the inotify event stream; camera detection disabled for this run: {err}"
+            );
             let _ = events.send(PrivacySignal::Changed);
             return;
         }
@@ -165,7 +179,8 @@ mod tests {
         std::os::unix::fs::symlink("/dev/video0", fd_dir.join("5")).unwrap();
         std::fs::write(root.path().join("1234").join("comm"), "raw-binary-name\n").unwrap();
 
-        let users = resolve_camera_users(root.path(), &[PathBuf::from("/dev/video0")], &[video_source(1234, "Firefox")]);
+        let users =
+            resolve_camera_users(root.path(), &[PathBuf::from("/dev/video0")], &[video_source(1234, "Firefox")]);
 
         assert_eq!(users, vec![CameraUser { app_name: "Firefox".to_string() }]);
     }
@@ -205,7 +220,8 @@ mod tests {
         std::os::unix::fs::symlink("/dev/video1", fd_dir.join("6")).unwrap();
         std::fs::write(root.path().join("1234").join("comm"), "mpv\n").unwrap();
 
-        let users = resolve_camera_users(root.path(), &[PathBuf::from("/dev/video0"), PathBuf::from("/dev/video1")], &[]);
+        let users =
+            resolve_camera_users(root.path(), &[PathBuf::from("/dev/video0"), PathBuf::from("/dev/video1")], &[]);
 
         assert_eq!(users, vec![CameraUser { app_name: "mpv".to_string() }]);
     }
@@ -221,10 +237,15 @@ mod tests {
         let (_video_tx, video_sources) = tokio::sync::mpsc::unbounded_channel();
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let controller = PrivacyController::new(PathBuf::from("/proc"), video4linux_root.path(), video_sources, events_tx);
+        let controller =
+            PrivacyController::new(PathBuf::from("/proc"), video4linux_root.path(), video_sources, events_tx);
 
         let signal = tokio::time::timeout(std::time::Duration::from_secs(2), events_rx.recv()).await;
-        assert_eq!(signal, Ok(Some(PrivacySignal::Changed)), "must still announce an empty state when no camera hardware exists");
+        assert_eq!(
+            signal,
+            Ok(Some(PrivacySignal::Changed)),
+            "must still announce an empty state when no camera hardware exists"
+        );
         assert!(controller.snapshot().camera_users.is_empty());
     }
 }

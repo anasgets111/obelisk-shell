@@ -12,6 +12,9 @@ mod reload;
 mod reload_link;
 mod snapshot;
 mod socket;
+// The LuaCATS stub generator, a development tool with no place in the shipped binary.
+#[cfg(test)]
+mod stubs;
 mod system;
 mod updates;
 mod watcher;

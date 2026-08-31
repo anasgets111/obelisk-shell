@@ -15,7 +15,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 /// `oblisk.system`'s two Lua-visible fields (docs/oblisk-idl-api-specs.md §2.11). Field names
 /// are the `StateSnapshot` payload's JSON keys verbatim.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct SystemState {
     /// Unix epoch seconds, not milliseconds -- §2.11 calls it "system time epoch" with no unit
     /// stated. `os.date` wants seconds, so a millis reading would be silently wrong by 1000x.
@@ -96,7 +96,11 @@ impl SystemController {
 /// ([`time_until_next_second`]), then ticks a plain steady one-second `tokio::time::interval`
 /// forever. `last_emitted` starts at the second `SystemController::new` already seeded, so the
 /// first real tick doesn't double-push for a second construction already reported.
-async fn run_clock_task(state: Arc<Mutex<SystemState>>, signal_tx: UnboundedSender<SystemSignal>, mut last_emitted: i64) {
+async fn run_clock_task(
+    state: Arc<Mutex<SystemState>>,
+    signal_tx: UnboundedSender<SystemSignal>,
+    mut last_emitted: i64,
+) {
     let delay = time_until_next_second(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default());
     let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + delay, Duration::from_secs(1));
 
@@ -170,7 +174,10 @@ mod tests {
 
         assert_eq!(snapshot.state, serde_json::json!({"theme": "dark"}));
         let now = epoch_seconds(SystemTime::now());
-        assert!((now - 2..=now).contains(&snapshot.time), "seeded time must be the real current second, not a stale zero");
+        assert!(
+            (now - 2..=now).contains(&snapshot.time),
+            "seeded time must be the real current second, not a stale zero"
+        );
     }
 
     #[tokio::test]
