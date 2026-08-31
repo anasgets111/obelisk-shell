@@ -63,10 +63,26 @@ pub(super) fn access_point_is_secure(flags: u32, wpa_flags: u32, rsn_flags: u32)
 /// Merges duplicate SSIDs keeping the highest signal strength, then serializes the top 20 (§4.2).
 /// Ties within the same SSID keep whichever entry was seen first -- a tie only happens between
 /// two distinct BSSIDs broadcasting the same SSID, and picking either is equally correct.
+///
+/// `active` is merged rather than carried by the winner, and that distinction is the whole of a bug
+/// this had: NetworkManager exposed two AP objects for one SSID at *the same BSSID*, strengths 62
+/// and 58, with `ActiveAccessPoint` naming the weaker one. Keeping the stronger entry wholesale
+/// dropped the flag with the object it came on, and a connected machine's bar read "offline".
+///
+/// Strength is a property of an AP object; `active` is a property of the SSID the radio is
+/// associated with. So the strongest sighting wins the numbers and any sighting wins the flag.
 pub(super) fn dedup_and_top20(aps: Vec<AccessPointInfo>) -> Vec<AccessPointInfo> {
     let mut best: HashMap<String, AccessPointInfo> = HashMap::new();
     for ap in aps {
-        best.entry(ap.ssid.clone()).and_modify(|existing| if ap.strength > existing.strength { *existing = ap.clone() }).or_insert(ap);
+        best.entry(ap.ssid.clone())
+            .and_modify(|existing| {
+                let active = existing.active || ap.active;
+                if ap.strength > existing.strength {
+                    *existing = ap.clone();
+                }
+                existing.active = active;
+            })
+            .or_insert(ap);
     }
     let mut deduped: Vec<AccessPointInfo> = best.into_values().collect();
     deduped.sort_by_key(|ap| std::cmp::Reverse(ap.strength));
@@ -231,6 +247,42 @@ mod tests {
     fn dedup_and_top20_keeps_the_highest_strength_entry_per_ssid() {
         let result = dedup_and_top20(vec![ap("home", 40), ap("home", 90), ap("home", 60)]);
         assert_eq!(result, vec![ap("home", 90)]);
+    }
+
+    #[test]
+    fn dedup_and_top20_keeps_active_even_when_a_stronger_duplicate_is_not_the_connected_one() {
+        // Measured on a real session, not imagined: NetworkManager exposed two AP objects for one
+        // SSID at the same BSSID, strengths 62 and 58, and `ActiveAccessPoint` named the 58. The
+        // merge kept the 62 and dropped the flag with the object, so a connected machine's bar read
+        // "offline". `active` is a property of the SSID the radio is associated with, not of the AP
+        // object that happens to be advertising it loudest.
+        let mut connected = ap("home", 58);
+        connected.active = true;
+        let merged = dedup_and_top20(vec![ap("home", 62), connected]);
+
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].active, "the connected SSID must stay marked connected");
+        assert_eq!(merged[0].strength, 62, "and still report the strongest signal seen for it");
+    }
+
+    #[test]
+    fn dedup_and_top20_keeps_active_regardless_of_which_duplicate_arrives_first() {
+        let mut connected = ap("home", 58);
+        connected.active = true;
+        let merged = dedup_and_top20(vec![connected, ap("home", 62)]);
+
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].active);
+        assert_eq!(merged[0].strength, 62);
+    }
+
+    #[test]
+    fn dedup_and_top20_leaves_an_unconnected_ssid_unconnected() {
+        // The flag is merged, not invented: two sightings of an SSID nothing is associated with
+        // stay inactive.
+        let merged = dedup_and_top20(vec![ap("home", 62), ap("home", 58)]);
+        assert_eq!(merged.len(), 1);
+        assert!(!merged[0].active);
     }
 
     #[test]
