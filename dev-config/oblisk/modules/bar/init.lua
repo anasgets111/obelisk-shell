@@ -6,9 +6,11 @@ local center = require("modules.bar.center_side")
 local right = require("modules.bar.right_side")
 
 -- Three zones at 46/13/41. Each is a fixed-width row distributing its own spare space by its own
--- `align_h`, which is the only way to centre anything here: a `Fill` child takes the parent's whole
--- budget rather than the remainder (`resolve_non_content` in scene.rs), so the flexbox trick of two
--- `Fill` spacers does not work, they both take the full width.
+-- `align_h`. That was once the only way to centre anything here, because a `Fill` child took the
+-- parent's whole budget rather than the remainder, so the flexbox trick of two `Fill` spacers
+-- failed: both spacers took the full width and the middle zone was pushed off the end. `scene.rs`
+-- now sizes a `Fill` child from what its siblings leave, so the trick works and the percentages
+-- below are a workaround kept past its cause. See the note further down before rewriting them.
 
 -- The sides are equal because that is what makes the middle a centre. A 30/40/30 split with the
 -- modules this bar carries put the right zone over its 576px and ran the battery off the edge of a
@@ -39,10 +41,13 @@ local right = require("modules.bar.right_side")
 -- is the cheapest thing available to give up, and it is also the clearest signal yet that three
 -- fixed percentages is the wrong model for this bar.
 --
--- Worth naming rather than fixing again by shaving characters: a zone cannot borrow from its
--- neighbour, so every module added from here costs another module its place until this engine has a
--- real space-between -- `resolve_non_content` gives a `Fill` child the parent's whole budget rather
--- than the remainder, which is the gap underneath all of this.
+-- The gap underneath all of this is closed. A `Fill` child is now sized from the remainder its
+-- siblings leave, so a zone can borrow from its neighbour: two `Fill` spacers around a content-sized
+-- centre zone centre it exactly, at any module width, and the arithmetic above stops mattering.
+--
+-- Left standing anyway, for now. Every number in this comment was measured against real module
+-- widths on a real output, and swapping three fixed percentages for two spacers moves every module
+-- on the bar at once. That wants a live session to look at, not a passing edit.
 return panel {
     id = "bar",
     layer = "Top",

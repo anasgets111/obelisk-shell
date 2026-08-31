@@ -1333,9 +1333,15 @@ mod tests {
     #[test]
     fn the_shipped_dev_configs_bar_zones_hold_their_modules_without_overflowing() {
         // The failure this catches has happened twice and is invisible until a screenshot: a zone
-        // is a fixed percentage of the bar, `row` has no space-between and no shrink, so a zone
-        // one module too full silently paints the last one past its own right edge and off the
-        // bar. Resolved against a 1920x1080 output, which is what `test_outputs` gives.
+        // is a fixed percentage of the bar and `row` does not shrink a child to make its siblings
+        // fit, so a zone one module too full silently paints the last one past its own right edge
+        // and off the bar. Resolved against a 1920x1080 output, which is what `test_outputs` gives.
+        //
+        // The zones are a fixed percentage by the config's choice now, not by the engine's limit. A
+        // `Fill` child is sized from the remainder its siblings leave, so two `Fill` spacers around
+        // a content-sized centre zone would centre it at any module width and retire this whole
+        // failure mode. `dev-config/oblisk/modules/bar/init.lua` says why that rewrite is not done
+        // yet. Until it is, this test is what stands between a full zone and a clipped module.
         //
         // A loaded bar, not the boot one. Left to itself every capability reads nil and each
         // module draws its shortest placeholder, so an empty bar would pass this and a real

@@ -2012,6 +2012,27 @@ the IDL-only entries fell between the two documents.
 > whole budget rather than the remainder, so two `Fill` spacers both take the full width instead of
 > splitting it. The bar uses three fixed percentage zones each distributing its own spare space by
 > its own `align_h`. There is no space-between in this engine, and nothing said so before now.
+>
+> **Amended: this was a bug, not a missing feature, and it is fixed.** The paragraph above reads as
+> a limit to design around. It is not. `Fill` resolved against the parent's *whole* content extent
+> per child, with no knowledge of siblings, so in a 600px row a `Fill` child took 600 and its fixed
+> sibling was positioned at x=600, outside the row containing it. Two `Fill` children each took 600
+> and overlapped. `column` did the same on its height. Measured, not inferred: the numbers are in
+> `layout::scene`'s tests.
+>
+> `resolve_and_reconcile`'s child loop now runs in two rounds. Every child whose main-axis size does
+> not depend on a sibling resolves first; the `Fill` children then split what is left, counted the
+> way `position_children` counts it (visible children only, `spacing` once between each pair), with
+> the remainder clamped at zero so fixed children that already overflow collapse a `Fill` sibling
+> rather than handing it a negative budget. Property resolution stays in one loop in declaration
+> order, so every Lua getter still fires exactly once in the order the config wrote it (Phase 19
+> item 5); only recursion order moves, which nothing can observe.
+>
+> Deliberately unchanged, each pinned by a test: a row's cross axis still hands every child the
+> row's full height, `Fill` under a stacking `rect` still means the whole box (ADR-0023 item 4), a
+> percentage still resolves against the parent rather than the remainder as a CSS percentage does,
+> and a `Fill` child of a `Content`-sized row still resolves to 0 because there is no remainder to
+> divide. No ADR: the tree is still one recursive pass and every node still resolves once.
 
 > **Built (item 2).** `brightness` reads `/sys/class/backlight`, picking one device by the `type`
 > attribute the kernel's own `Documentation/ABI/stable/sysfs-class-backlight` exposes for exactly
@@ -2122,6 +2143,13 @@ the IDL-only entries fell between the two documents.
 > zone. Neither side can grow: the sides are equal because that is what makes the middle a centre,
 > and the 20% centre's slack cannot be borrowed by a 40% side. From here every module added costs
 > another module its place, until this engine has a real space-between.
+>
+> **Amended.** A zone can borrow from its neighbour now: two `Fill` spacers around a content-sized
+> centre zone centre it exactly at any module width, which is the arrangement this whole comment was
+> written to work around. The percentages in `dev-config/oblisk/modules/bar/init.lua` are a
+> workaround kept past its cause. Left standing on purpose: every number here was measured against
+> real module widths on a real output, and swapping three fixed percentages for two spacers moves
+> every module on the bar at once, which wants a live session rather than a passing edit.
 
 > **Built (item 5).** § 2.4 is now reported in full. The prediction in the item above
 > was right about both halves and wrong about how much each cost.

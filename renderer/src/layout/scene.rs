@@ -660,6 +660,102 @@ fn pair_children_by_id_then_position(
     Ok(matched)
 }
 
+/// The axis a parent lays its children out along. Absent for a stacking parent (`rect`, `button`
+/// and the four surface roles), whose children each get the whole content box on both axes and so
+/// have no remainder to share -- measured, and correct as it stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainAxis {
+    Horizontal,
+    Vertical,
+}
+
+/// Which axis `kind` flows along, reading a `list`'s `direction` through [`flow_kind`] so a
+/// horizontal `list` shares a row's rules rather than a column's.
+fn main_axis_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Option<MainAxis>, LayoutError> {
+    Ok(match flow_kind(kind, properties)? {
+        "row" => Some(MainAxis::Horizontal),
+        "column" => Some(MainAxis::Vertical),
+        _ => None,
+    })
+}
+
+/// One child resolved but not yet recursed into, held between the two phases of
+/// [`resolve_and_reconcile`]'s child loop.
+struct PendingChild {
+    reusable: Option<RetainedNode>,
+    properties: HashMap<String, Value>,
+    margin: EdgeInsets,
+    budget: LogicalSize,
+    /// Whether this child asked to fill its parent's *main* axis, and so has to wait for round two.
+    /// Always `false` under a stacking parent, where `Fill` already means the whole box.
+    fills_main: bool,
+    visible: bool,
+}
+
+/// This child's extent along `axis` including its margin -- the same number
+/// [`position_children`] calls a footprint and advances its cursor by.
+///
+/// The margin is passed in rather than re-parsed off `child.properties`, because the remainder this
+/// feeds has to be built from the same margin the child was budgeted with. Re-reading it here would
+/// run a `margin` table's `__index` metamethod a second time and could get a different answer, which
+/// is the class of bug `resolve_properties`' own doc comment exists to describe.
+fn main_axis_footprint(child: &RetainedNode, margin: &EdgeInsets, axis: MainAxis) -> f32 {
+    let extent = match axis {
+        MainAxis::Horizontal => child.rect.width,
+        MainAxis::Vertical => child.rect.height,
+    };
+    extent + main_axis_margin(margin, axis)
+}
+
+/// The margin a footprint carries on `axis`, so a forced size can have it subtracted back out.
+fn main_axis_margin(margin: &EdgeInsets, axis: MainAxis) -> f32 {
+    match axis {
+        MainAxis::Horizontal => margin.left + margin.right,
+        MainAxis::Vertical => margin.top + margin.bottom,
+    }
+}
+
+/// Recurses into one child that phase one already resolved.
+///
+/// `forced_main` is the main-axis size a `Fill` child was handed out of its parent's remainder, and
+/// `None` for every other child, which sizes itself from `budget` exactly as it always has. It is
+/// merged with, not layered over, [`stretch_forced_size`]'s answer: that function only ever forces
+/// the *cross* axis, so the two never name the same axis and the `or` below cannot mask it.
+#[allow(clippy::too_many_arguments)]
+fn resolve_pending_child(
+    scene: &mut Scene,
+    child: PendingChild,
+    kind: &str,
+    parent_kind: &str,
+    main_axis: Option<MainAxis>,
+    forced_main: Option<f32>,
+    own_width_known: Option<f32>,
+    own_height_known: Option<f32>,
+    shaping: &ShapingHandle,
+    lua: &Lua,
+    depth: u32,
+) -> Result<RetainedNode, LayoutError> {
+    let (stretch_width, stretch_height) =
+        stretch_forced_size(parent_kind, &child.properties, own_width_known, own_height_known, child.budget)?;
+    let (forced_width, forced_height) = match main_axis {
+        Some(MainAxis::Horizontal) => (forced_main.or(stretch_width), stretch_height),
+        Some(MainAxis::Vertical) => (stretch_width, forced_main.or(stretch_height)),
+        None => (stretch_width, stretch_height),
+    };
+    resolve_and_reconcile(
+        scene,
+        child.reusable,
+        kind,
+        child.properties,
+        child.budget,
+        shaping,
+        forced_width,
+        forced_height,
+        lua,
+        depth,
+    )
+}
+
 /// The single recursive walk: constraint pass on entry, size pass from the recursive children's
 /// results, position pass once this node's own size is known. Reconciles as it goes: `retained`
 /// is `Some` only when the caller already matched `fresh`'s kind at this position (§ 4).
@@ -730,6 +826,13 @@ fn resolve_and_reconcile(
     // 10). Correct for the Content-sized-parent case; wrong only for a child that specifically
     // wants to fill a Content-sized ancestor in that same axis, which no fixture here needs. A
     // second pass over just that axis is the upgrade path if this ever matters.
+    //
+    // The `Fill` rounds below are not that second pass and do not weaken this. Every node still
+    // resolves exactly once and the tree is still walked once; the rounds only order *siblings*
+    // within one parent, so that a child asking for the remainder is sized after the siblings whose
+    // sizes the remainder is made of. What stays unsolved is the case above, where the parent
+    // itself has no size yet -- and there the remainder is zero, which is why a `Fill` child of a
+    // Content-sized row still resolves to 0.
     let child_budget = LogicalSize {
         width: own_width_known.map_or(0.0, |w| (w - padding.left - padding.right).max(0.0)),
         height: own_height_known.map_or(0.0, |h| (h - padding.top - padding.bottom).max(0.0)),
@@ -737,8 +840,18 @@ fn resolve_and_reconcile(
 
     let fresh_children = children_of(kind, &properties)?;
     let matched_candidates = pair_children_by_id_then_position(scene, &fresh_children, old_children)?;
+    let main_axis = main_axis_of(kind, &properties)?;
 
-    let mut new_children = Vec::with_capacity(fresh_children.len());
+    // Phase one: resolve every child's own property map, in declaration order, and nothing else.
+    //
+    // Split out from the recursion below because a `Fill` child's main-axis size is the remainder
+    // its siblings leave, and a `Content`-sized sibling's size is only known by recursing into it.
+    // Declaration order is what this loop protects: `resolve_properties` is where a child's Lua
+    // getters run, so leaving them here keeps each one firing exactly once, in the order the config
+    // wrote it (build-steps.md Phase 19 item 5), while only the *recursion* order moves. A getter
+    // cannot observe which subtree the walk descends into next; it can observe being called out of
+    // order.
+    let mut pending = Vec::with_capacity(fresh_children.len());
     for (fresh_child, candidate) in fresh_children.iter().zip(matched_candidates) {
         // Before this child's own getters run, not after: resolving its property map calls back
         // into Lua, and a child the walk is about to refuse must not get to execute anything on the
@@ -770,22 +883,113 @@ fn resolve_and_reconcile(
             width: (child_budget.width - child_margin.left - child_margin.right).max(0.0),
             height: (child_budget.height - child_margin.top - child_margin.bottom).max(0.0),
         };
-        let (child_forced_width, child_forced_height) =
-            stretch_forced_size(kind, &child_properties, own_width_known, own_height_known, margined_budget)?;
-
-        new_children.push(resolve_and_reconcile(
-            scene,
+        let fills_main = match main_axis {
+            Some(MainAxis::Horizontal) => matches!(node::parse_size_mode(&child_properties, "width")?, SizeMode::Fill),
+            Some(MainAxis::Vertical) => matches!(node::parse_size_mode(&child_properties, "height")?, SizeMode::Fill),
+            None => false,
+        };
+        // Read before the map moves into the struct. Needed here rather than off the resolved
+        // child, because round two's remainder counts visible siblings and a `Fill` child has not
+        // been recursed into yet when that count is taken.
+        let child_visible = node::parse_visible(&child_properties)?;
+        pending.push(PendingChild {
             reusable,
-            &fresh_child.kind,
-            child_properties,
-            margined_budget,
+            properties: child_properties,
+            margin: child_margin,
+            budget: margined_budget,
+            fills_main,
+            visible: child_visible,
+        });
+    }
+
+    // Phase two, round one: every child whose main-axis size does not depend on a sibling.
+    // Copied out before the slots are drained: round one consumes each `PendingChild`, and round
+    // two still needs the margin of the siblings it is measuring the remainder against.
+    let child_margins: Vec<EdgeInsets> = pending.iter().map(|child| child.margin).collect();
+    let mut slots: Vec<Option<PendingChild>> = pending.into_iter().map(Some).collect();
+    let mut resolved: Vec<Option<RetainedNode>> = (0..slots.len()).map(|_| None).collect();
+    for i in 0..slots.len() {
+        if slots[i].as_ref().is_some_and(|child| child.fills_main) {
+            continue;
+        }
+        let child = slots[i].take().expect("phase one filled every slot and round one takes each at most once");
+        resolved[i] = Some(resolve_pending_child(
+            scene,
+            child,
+            &fresh_children[i].kind,
+            kind,
+            main_axis,
+            None,
+            own_width_known,
+            own_height_known,
             shaping,
-            child_forced_width,
-            child_forced_height,
             lua,
             depth + 1,
         )?);
     }
+
+    // Phase two, round two: the `Fill` children split what round one left.
+    //
+    // Counted exactly the way `position_children` counts it -- visible children only, `spacing`
+    // once between each adjacent pair -- because a remainder computed on any other basis sizes
+    // children to a box the positioning pass does not then put them in.
+    if let Some(axis) = main_axis
+        && slots.iter().any(Option::is_some)
+    {
+        let spacing = node::parse_spacing(&properties)?;
+        let content_main = match axis {
+            MainAxis::Horizontal => child_budget.width,
+            MainAxis::Vertical => child_budget.height,
+        };
+        let visible: Vec<bool> = (0..slots.len())
+            .map(|i| slots[i].as_ref().map_or_else(|| resolved[i].as_ref().is_some_and(|c| c.visible), |c| c.visible))
+            .collect();
+        let taken: f32 = resolved
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| visible[*i])
+            .filter_map(|(i, child)| Some((i, child.as_ref()?)))
+            .map(|(i, child)| main_axis_footprint(child, &child_margins[i], axis))
+            .sum();
+        let gaps = spacing * visible.iter().filter(|v| **v).count().saturating_sub(1) as f32;
+        // Clamped, so fixed children that already overflow their parent collapse the `Fill`
+        // children to nothing rather than handing them a negative budget. Matches every other
+        // budget in this function, and matches flexbox without `flex-shrink`: the overflow stays
+        // visible instead of being silently absorbed.
+        let remainder = (content_main - taken - gaps).max(0.0);
+        // Divided among the *visible* `Fill` children, since an invisible one takes no space in
+        // `position_children` and must not shrink the sibling that does. An invisible one still
+        // gets the same share: it is never placed, and sizing its subtree to nothing would be a
+        // second surprise on the day it becomes visible.
+        let fill_share = remainder / (0..slots.len()).filter(|&i| slots[i].is_some() && visible[i]).count().max(1) as f32;
+        for i in 0..slots.len() {
+            let Some(child) = slots[i].take() else {
+                continue;
+            };
+            // The share is a footprint, and a footprint includes margin -- so the size forced on
+            // the child is the share less its own margins, leaving `share` once the positioning
+            // pass adds them back.
+            let forced_main = (fill_share - main_axis_margin(&child.margin, axis)).max(0.0);
+            resolved[i] = Some(resolve_pending_child(
+                scene,
+                child,
+                &fresh_children[i].kind,
+                kind,
+                main_axis,
+                Some(forced_main),
+                own_width_known,
+                own_height_known,
+                shaping,
+                lua,
+                depth + 1,
+            )?);
+        }
+    }
+
+    let mut new_children: Vec<RetainedNode> = resolved
+        .into_iter()
+        .map(|child| child.expect("every slot resolves in round one or round two, and `main_axis` is `None` when round two is skipped"))
+        .collect();
 
     // Padding is added here rather than inside `intrinsic_content_size`, and only on an axis whose
     // size the config did not state. `intrinsic_content_size` answers "how much room do the
@@ -1477,6 +1681,227 @@ mod tests {
             row.children[1].rect.x, 0.0,
             "the visible child packs at the start as if the hidden one weren't there"
         );
+    }
+
+    /// The measured defect this pass fixes. `width = "Fill"` used to resolve against the parent's
+    /// whole content width, per child, with no knowledge of siblings: in a 600px row a `Fill` child
+    /// took 600 and its fixed sibling was then placed at x=600, outside the row it belonged to.
+    #[test]
+    fn a_fill_child_takes_only_the_room_its_siblings_leave() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"panel { id = "bar", child = row { width = 600, height = 40, children = {
+                rect { width = "Fill", height = 10 },
+                rect { width = 100, height = 10 },
+            } } }"#,
+        );
+        apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!(row.children[0].rect.width, 500.0, "the fill child takes 600 less its sibling's 100");
+        assert_eq!(row.children[1].rect.x, 500.0, "and its sibling lands inside the row, not past its edge");
+    }
+
+    #[test]
+    fn two_fill_siblings_split_the_remainder_equally() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"panel { id = "bar", child = row { width = 600, height = 40, children = {
+                rect { width = "Fill", height = 10 },
+                rect { width = "Fill", height = 10 },
+            } } }"#,
+        );
+        apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!((row.children[0].rect.width, row.children[1].rect.width), (300.0, 300.0));
+        assert_eq!(row.children[1].rect.x, 300.0);
+    }
+
+    /// A share is a footprint, and `position_children` advances its cursor by a footprint including
+    /// margin. Forcing the share as the child's *size* instead would push every later sibling out
+    /// by exactly the margin.
+    #[test]
+    fn a_fill_childs_margin_comes_out_of_its_own_share() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"panel { id = "bar", child = row { width = 600, height = 40, children = {
+                rect { width = "Fill", height = 10, margin = 25 },
+                rect { width = 100, height = 10 },
+            } } }"#,
+        );
+        apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!(row.children[0].rect.width, 450.0, "500 of footprint less 25 of margin on each side");
+        assert_eq!(row.children[1].rect.x, 500.0, "so the sibling still starts one footprint in");
+    }
+
+    /// The mirror of `a_fill_childs_margin_comes_out_of_its_own_share`, and the case that test
+    /// missed: the margin on the *sibling* rather than on the `Fill` child. `position_children`
+    /// advances its cursor by a footprint that includes margin, so a remainder that counts only the
+    /// sibling's box hands the `Fill` child exactly that margin too much and pushes it off the end.
+    #[test]
+    fn a_fixed_siblings_margin_is_counted_against_the_remainder() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"panel { id = "bar", child = row { width = 600, height = 40, children = {
+                rect { width = 100, height = 10, margin = 20 },
+                rect { width = "Fill", height = 10 },
+            } } }"#,
+        );
+        apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        let fill = &row.children[1];
+        assert_eq!(fill.rect.width, 460.0, "600 less the sibling's 100 box and its 40 of margin");
+        assert_eq!(
+            fill.rect.x + fill.rect.width,
+            row.rect.width,
+            "and the fill child ends exactly at the row's edge, not past it"
+        );
+    }
+
+    #[test]
+    fn spacing_is_reserved_before_a_fill_child_is_sized() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"panel { id = "bar", child = row { width = 600, height = 40, spacing = 20, children = {
+                rect { width = "Fill", height = 10 },
+                rect { width = 100, height = 10 },
+            } } }"#,
+        );
+        apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!(row.children[0].rect.width, 480.0, "600 less the sibling's 100 and the one 20px gap");
+        assert_eq!(row.children[1].rect.x, 500.0);
+    }
+
+    #[test]
+    fn a_column_fills_its_main_axis_the_same_way_a_row_does() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"panel { id = "bar", child = column { width = 200, height = 600, children = {
+                rect { height = "Fill", width = 10 },
+                rect { height = 100, width = 10 },
+            } } }"#,
+        );
+        apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
+        let column = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!(column.children[0].rect.height, 500.0);
+        assert_eq!(column.children[1].rect.y, 500.0);
+    }
+
+    /// Clamped rather than negative, and the overflow stays visible. This is flexbox without
+    /// `flex-shrink`: the engine will not silently shrink a size the config stated in pixels to
+    /// make a `Fill` sibling fit.
+    #[test]
+    fn fixed_children_that_already_overflow_collapse_a_fill_sibling_to_nothing() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"panel { id = "bar", child = row { width = 100, height = 40, children = {
+                rect { width = "Fill", height = 10 },
+                rect { width = 300, height = 10 },
+            } } }"#,
+        );
+        apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!(row.children[0].rect.width, 0.0);
+        assert_eq!(row.children[1].rect.width, 300.0, "the stated size is kept, not shrunk to fit");
+    }
+
+    /// An invisible sibling takes no space in `position_children`, so it must reserve none here
+    /// either -- otherwise hiding a node would shrink the one beside it.
+    #[test]
+    fn an_invisible_sibling_reserves_nothing_from_a_fill_childs_share() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        for hidden in [r#"rect { width = 100, height = 10, visible = false }"#, r#"rect { width = "Fill", height = 10, visible = false }"#] {
+            let mut scene_for_case = std::mem::replace(&mut scene, Scene::new());
+            let (_lua, surface) = surface_from(&format!(
+                r#"panel {{ id = "bar", child = row {{ width = 600, height = 40, children = {{
+                    rect {{ width = "Fill", height = 10 }}, {hidden},
+                }} }} }}"#
+            ));
+            apply_at(&mut scene_for_case, &[surface], full(), &shaping, &_lua).unwrap();
+            let row = &scene_for_case.surface("bar@TEST").unwrap().children[0];
+            assert_eq!(row.children[0].rect.width, 600.0, "the visible fill child takes the whole row");
+        }
+    }
+
+    /// Correct before this pass and pinned so it stays that way: a row's *cross* axis hands every
+    /// child the row's full height, because on that axis there is nothing to share.
+    #[test]
+    fn fill_on_a_rows_cross_axis_is_still_the_whole_row() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"panel { id = "bar", child = row { width = 600, height = 200, children = {
+                rect { width = 100, height = "Fill" },
+                rect { width = 100, height = 50 },
+            } } }"#,
+        );
+        apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!(row.children[0].rect.height, 200.0);
+    }
+
+    /// Also correct before this pass and pinned: a stacking parent has no main axis, its children
+    /// may overlap by design (docs/adr/0023 item 4), and `Fill` there means the whole box.
+    #[test]
+    fn fill_under_a_stacking_parent_is_still_the_whole_box() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"panel { id = "bar", child = rect { width = 600, height = 200, children = {
+                rect { width = "Fill", height = 10 },
+                rect { width = "Fill", height = 10 },
+            } } }"#,
+        );
+        apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
+        let stack = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!((stack.children[0].rect.width, stack.children[1].rect.width), (600.0, 600.0));
+        assert_eq!(stack.children[1].rect.x, 0.0, "stacked, not flowed");
+    }
+
+    /// A percentage still resolves against the parent, not against the remainder, which is what a
+    /// CSS percentage width does. Deliberately left alone by this pass: changing it would be a
+    /// second behaviour change riding along inside a bug fix.
+    #[test]
+    fn a_percentage_sibling_still_resolves_against_the_parent() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"panel { id = "bar", child = row { width = 600, height = 40, children = {
+                rect { width = "Fill", height = 10 },
+                rect { width = "50%", height = 10 },
+            } } }"#,
+        );
+        apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!(row.children[1].rect.width, 300.0, "half of the parent, not half of what is left");
+        assert_eq!(row.children[0].rect.width, 300.0, "and the fill child takes what that leaves");
+    }
+
+    /// Unchanged, and deliberate: a row that states no width has no remainder to divide, so a
+    /// `Fill` child of it resolves to zero. See `resolve_and_reconcile`'s `child_budget` ponytail
+    /// for the one-pass reasoning behind it and the upgrade path.
+    #[test]
+    fn a_fill_child_of_a_content_sized_row_still_resolves_to_zero() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"panel { id = "bar", child = row { height = 40, children = {
+                rect { width = "Fill", height = 10 },
+                rect { width = 100, height = 10 },
+            } } }"#,
+        );
+        apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!(row.children[0].rect.width, 0.0);
     }
 
     /// Found live against `dev-config`: a content-sized `column` with 8px of padding reported the
@@ -2396,6 +2821,53 @@ mod tests {
             1,
             "one Scene::apply must read a property's Signal exactly once"
         );
+    }
+
+    /// The guarantee the two-round child loop had to preserve, and the one most likely to be lost
+    /// by a later edit: rounds order *recursion*, never property resolution.
+    ///
+    /// The `Fill` child is declared first and recursed into last, so if resolution had been folded
+    /// into the rounds this reads `b,a` instead of `a,b`. Each getter still firing exactly once is
+    /// build-steps.md Phase 19 item 5, which an impure closure like this one can observe.
+    #[test]
+    fn a_fill_child_resolves_its_properties_in_declaration_order_despite_being_recursed_into_last() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua
+            .load(
+                r#"
+                order = ""
+                local function mark(name, value)
+                    return computed({}, function() order = order .. name; return value end)
+                end
+                return panel { id = "bar", child = row { width = 600, height = 40, children = {
+                    rect { width = "Fill", height = 10, margin = mark("a", 0),
+                        children = { rect { width = 1, height = 1, margin = mark("A", 0) } } },
+                    rect { width = 100, height = 10, margin = mark("b", 0),
+                        children = { rect { width = 1, height = 1, margin = mark("B", 0) } } },
+                } } }
+                "#,
+            )
+            .eval()
+            .unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+
+        apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap();
+
+        // `a` before `b` is the guarantee. `B` before `A` is the proof it is a real one: the
+        // grandchildren resolve during recursion, so the fixed child's subtree is walked before the
+        // `Fill` child's even though the `Fill` child was declared first. Fold resolution into the
+        // rounds and this reads `bBaA`.
+        assert_eq!(
+            lua.globals().get::<String>("order").unwrap(),
+            "abBA",
+            "siblings resolve in declaration order, and each getter fires exactly once"
+        );
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!(row.children[0].rect.width, 500.0, "and the fill child was still sized from the remainder");
     }
 
     #[test]

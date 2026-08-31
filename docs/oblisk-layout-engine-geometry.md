@@ -76,7 +76,17 @@ These bounds are clamped by the child's explicit properties:
 *   `Pixels(f32)`: Sets explicit, non-flexible dimensions.
 *   `Percent(f32)`: Multiplies available parent bounds by a fractional scale `[0.0, 1.0]`.
 *   `Content`: Shrink-wraps the boundaries tightly around child dimensions.
-*   `Fill`: Commands the child to stretch and occupy maximum available parent space.
+*   `Fill`: Takes the space the child's siblings leave, which depends on the axis. On a parent's
+    **main** axis (a `row`'s width, a `column`'s height) that is the remainder after every sized
+    sibling and every spacing gap, split equally among the `Fill` children and clamped at zero, so
+    siblings that already overflow collapse a `Fill` child rather than giving it a negative box. On
+    a **cross** axis, and under a stacking parent whose children may overlap, there are no siblings
+    to share with and `Fill` is the whole content box.
+
+    This bullet used to read "occupy maximum available parent space", and the engine implemented
+    exactly that: a `Fill` child took the parent's whole extent on every axis, so one of them in a
+    600px row took 600 and its sibling was positioned at x=600, outside the row. The sentence was
+    the defect, not just a description of it.
 
 ### 3.2 Step 2: Size Resolution Pass (Bottom-Up)
 Leaf nodes compute their intrinsic size bounds.

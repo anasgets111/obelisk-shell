@@ -1,7 +1,7 @@
 -- A label next to a `components/toggle.lua`, the settings-row shape `modules/bar/panels/settings.lua`
 -- wants for `bluetooth.enabled` and every boolean capability after it. Content-sized rather than
--- `width = "Fill"` with the toggle pinned to the far edge, for the same reason
--- `components/panel_header.lua` gives up on that: this `row`'s main axis has no space-between.
+-- `width = "Fill"` with the toggle pinned to the far edge, which was a `row` bug this engine no
+-- longer has -- see `components/panel_header.lua` for the same note and the same one-property fix.
 local theme = require("config.theme")
 local cell = require("components.cell")
 local toggle = require("components.toggle")
