@@ -352,6 +352,42 @@ pub fn parse_list_direction(properties: &HashMap<String, Value>) -> Result<&'sta
     }
 }
 
+/// `opacity` (`oblisk-idl-api-specs.md` § 5.1): how much of this node and everything under it
+/// reaches the screen, 0 for invisible and 1 for solid. Absent defaults to 1.
+///
+/// § 5.1 and not § 5.2, because this belongs to every kind rather than to the ones that draw a box.
+/// A `list` paints nothing itself and still has to fade what is inside it, which is also why the
+/// value lives on `ResolvedNode` rather than inside `PaintStyle`.
+///
+/// **Inherited, and multiplied.** The value parsed here is one node's own contribution;
+/// `layout::paint::build_node` multiplies it into whatever its ancestors already applied, the same
+/// way it intersects a clip rather than replacing one. That is what makes fading a whole panel one
+/// property instead of a walk over its children.
+///
+/// **Not `visible = false`.** A fully transparent node still lays out, still occupies space in its
+/// parent's flow, and still hit-tests, because `layout::hit` gates descent on `visible` alone. That
+/// is what lets a fade run without the layout jumping under it, and it matches what the reference
+/// config expects from the property it uses in 32 files.
+///
+/// Refused rather than clamped outside `[0, 1]`, matching every other paint property since
+/// docs/adr/0068: a config that writes `opacity = 50` meaning percent should hear about it while
+/// applying, not stare at an invisible panel.
+pub fn parse_opacity(properties: &HashMap<String, Value>) -> Result<f32, LayoutError> {
+    let Some(value) = properties.get("opacity") else {
+        return Ok(1.0);
+    };
+    let Some(n) = value_as_f32("opacity", value)? else {
+        return Err(invalid("opacity", format!("must be a number, got {}", preview_for_error(value))));
+    };
+    // `NaN` and the infinities never reach this: `value_as_f32` goes through `marshal::check_number`
+    // first, which refuses a non-finite before any range test would have to decide what
+    // `(0.0..=1.0).contains(&NaN)` ought to mean.
+    if !(0.0..=1.0).contains(&n) {
+        return Err(invalid("opacity", format!("must be within [0, 1], got {n}")));
+    }
+    Ok(n)
+}
+
 pub fn parse_visible(properties: &HashMap<String, Value>) -> Result<bool, LayoutError> {
     let Some(value) = properties.get("visible") else {
         return Ok(true);

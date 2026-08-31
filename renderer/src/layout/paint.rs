@@ -56,8 +56,11 @@ pub enum Draw {
     /// lookup. Keeping the filesystem hit out of [`build`] is what lets the build run on every
     /// re-resolve without touching the icon theme, and the name plus the size is what decides the
     /// pixels either way.
-    Icon { name: String, px: u32 },
-    Image { source: String, fit: Fit, px: u32 },
+    /// `alpha` rather than a tinted colour, because an icon is blitted rather than filled:
+    /// `femtovg`'s `Paint::image` takes the alpha as its last argument, where a `Box` or a `Text`
+    /// can carry the same information inside the `Rgba` it already had.
+    Icon { name: String, px: u32, alpha: f32 },
+    Image { source: String, fit: Fit, px: u32, alpha: f32 },
 }
 
 /// One drawable node: what, where, and the clip it draws under.
@@ -134,7 +137,7 @@ pub struct SecureField<'a> {
 /// could say "these two trees paint the same" at all.
 pub fn build(root: &ResolvedNode, scale: f32, focus: Option<&SecureField>) -> DisplayList {
     let mut commands = Vec::new();
-    build_node(root, 0.0, 0.0, scale, UNCLIPPED, focus, &mut commands);
+    build_node(root, 0.0, 0.0, scale, UNCLIPPED, 1.0, focus, &mut commands);
     DisplayList { commands }
 }
 
@@ -142,12 +145,17 @@ pub fn build(root: &ResolvedNode, scale: f32, focus: Option<&SecureField>) -> Di
 /// is the absolute position of this node's parent's content box -- added to `node.rect.x`/`.y`
 /// (parent-relative) to get this node's absolute rect, which is in turn what the next recursion
 /// level's origin becomes.
+// Eight parameters, and the same answer `resolve_and_reconcile` gives: three of them (`origin`,
+// `clip`, `inherited_opacity`) are what this recursion accumulates and the rest are invariants it
+// carries, so a struct would be a bag holding the same eight fields through the same one caller.
+#[allow(clippy::too_many_arguments)]
 fn build_node(
     node: &ResolvedNode,
     origin_x: f32,
     origin_y: f32,
     scale: f32,
     clip: PhysicalRect,
+    inherited_opacity: f32,
     focus: Option<&SecureField>,
     out: &mut Vec<DrawCmd>,
 ) {
@@ -200,12 +208,18 @@ fn build_node(
     // draws nothing, which stays deliberate -- on a lock surface that silence is a transparent
     // buffer over a locked session, the black screen docs/adr/0052 decision 3 refuses a lock to
     // avoid, reached by another route.
-    if let Some(draw) = node.paint.as_ref().and_then(|style| draw_for(style, rect, scale, focus)) {
+    // Multiplied down the tree the same way `clip` is intersected down it, and for the same
+    // reason: a child can only ever be fainter than its parent, never solid inside a faded panel.
+    // Baked into the draw here rather than applied when `execute` runs, because ADR-0063 skips a
+    // repaint when the new display list equals the last one -- a fade that lived outside the list
+    // would be a change the surface never noticed.
+    let opacity = inherited_opacity * node.opacity;
+    if let Some(draw) = node.paint.as_ref().and_then(|style| draw_for(style, rect, scale, opacity, focus)) {
         out.push(DrawCmd { rect, clip, draw });
     }
 
     for child in &node.children {
-        build_node(child, x, y, scale, clip, focus, out);
+        build_node(child, x, y, scale, clip, opacity, focus, out);
     }
 }
 
@@ -257,15 +271,15 @@ pub fn execute(painter: &mut TextPainter, images: &mut ImageCache, list: &Displa
                 paint_border(painter.canvas_mut(), rect, *radius, *colors, *widths, scale);
             }
             Draw::Text { content, font_size, color } => painter.draw_line(content, rect, *font_size, scale, *color),
-            Draw::Icon { name, px } => {
+            Draw::Icon { name, px, alpha } => {
                 // `u16` is `freedesktop-icons`'s own size type, and a theme has no directory above
                 // 512 anyway.
                 if let Some(path) = image::icons::resolve(name, (*px).min(512) as u16) {
-                    draw_file(painter.canvas_mut(), images, &path, Fit::Contain, rect, *px);
+                    draw_file(painter.canvas_mut(), images, &path, Fit::Contain, rect, *px, *alpha);
                 }
             }
-            Draw::Image { source, fit, px } => {
-                draw_file(painter.canvas_mut(), images, std::path::Path::new(source), *fit, rect, *px)
+            Draw::Image { source, fit, px, alpha } => {
+                draw_file(painter.canvas_mut(), images, std::path::Path::new(source), *fit, rect, *px, *alpha)
             }
         }
     }
@@ -283,14 +297,33 @@ pub fn execute(painter: &mut TextPainter, images: &mut ImageCache, list: &Displa
 /// Nothing here can fail. A malformed paint property never reaches this function: `Scene::apply`
 /// refused the tree that carried it (see `node::paint_style`'s module doc comment), which is what
 /// replaced the per-frame log-and-default this function used to be five of.
-fn draw_for(style: &PaintStyle, rect: LogicalRect, scale: f32, focus: Option<&SecureField>) -> Option<Draw> {
+/// One colour at `opacity`, multiplied into the alpha it already carries.
+///
+/// Multiplied rather than replaced: a half-transparent colour inside a half-faded panel is a
+/// quarter, and a config that wrote both meant both.
+fn fade(color: Rgba, opacity: f32) -> Rgba {
+    Rgba { a: color.a * opacity, ..color }
+}
+
+/// Every edge of a border at `opacity`. `None` stays `None`: an edge with no colour draws nothing,
+/// and fading nothing is still nothing.
+fn fade_border(colors: BorderColor, opacity: f32) -> BorderColor {
+    BorderColor {
+        top: colors.top.map(|c| fade(c, opacity)),
+        right: colors.right.map(|c| fade(c, opacity)),
+        bottom: colors.bottom.map(|c| fade(c, opacity)),
+        left: colors.left.map(|c| fade(c, opacity)),
+    }
+}
+
+fn draw_for(style: &PaintStyle, rect: LogicalRect, scale: f32, opacity: f32, focus: Option<&SecureField>) -> Option<Draw> {
     match style {
         // The shared paint of `rect`/`row`/`column`/`button` and all four surface roles: background
         // fill, then borders (`oblisk-idl-api-specs.md` § 5.2 item 1).
         PaintStyle::Box { background, radius, colors, widths } => Some(Draw::Box {
-            background: *background,
+            background: background.map(|color| fade(color, opacity)),
             radius: *radius,
-            colors: *colors,
+            colors: fade_border(*colors, opacity),
             widths: *widths,
         }),
 
@@ -312,7 +345,7 @@ fn draw_for(style: &PaintStyle, rect: LogicalRect, scale: f32, focus: Option<&Se
         PaintStyle::Text { content, font_size, color } => Some(Draw::Text {
             content: content.clone(),
             font_size: *font_size,
-            color: *color,
+            color: fade(*color, opacity),
         }),
 
         // `icon` (§ 5.2 item 5): the theme name, resolved to a file by [`execute`]
@@ -325,6 +358,7 @@ fn draw_for(style: &PaintStyle, rect: LogicalRect, scale: f32, focus: Option<&Se
         PaintStyle::Icon { name } => Some(Draw::Icon {
             name: name.clone(),
             px: physical_edge(rect.width.min(rect.height), scale),
+            alpha: opacity,
         }),
 
         // `image` (docs/adr/0054 decision 3): the file at `source`, fitted by `fit`. An empty
@@ -338,6 +372,7 @@ fn draw_for(style: &PaintStyle, rect: LogicalRect, scale: f32, focus: Option<&Se
             source: source.clone(),
             fit: *fit,
             px: physical_edge(rect.width.max(rect.height), scale),
+            alpha: opacity,
         }),
 
         // `textfield` (§ 5.2 item 8): the placeholder while empty, one `mask_character` per typed
@@ -361,7 +396,7 @@ fn draw_for(style: &PaintStyle, rect: LogicalRect, scale: f32, focus: Option<&Se
             (!content.is_empty()).then_some(Draw::Text {
                 content,
                 font_size: *font_size,
-                color: *color,
+                color: fade(*color, opacity),
             })
         }
     }
@@ -374,7 +409,15 @@ fn draw_for(style: &PaintStyle, rect: LogicalRect, scale: f32, focus: Option<&Se
 /// paint's extent unless `REPEAT_X`/`REPEAT_Y` are set, so filling the whole box with a `Contain`
 /// paint would smear the image's outermost pixel row across the letterbox. `Cover`'s fitted rect is
 /// larger than the box instead, and `paint_node`'s scissor is what crops it.
-fn draw_file(canvas: &mut Canvas<OpenGl>, images: &mut ImageCache, file: &std::path::Path, fit: Fit, rect: LogicalRect, px: u32) {
+fn draw_file(
+    canvas: &mut Canvas<OpenGl>,
+    images: &mut ImageCache,
+    file: &std::path::Path,
+    fit: Fit,
+    rect: LogicalRect,
+    px: u32,
+    alpha: f32,
+) {
     let Some(id) = images.image(canvas, file, px) else {
         return;
     };
@@ -386,7 +429,7 @@ fn draw_file(canvas: &mut Canvas<OpenGl>, images: &mut ImageCache, file: &std::p
     path.rect(fitted.x, fitted.y, fitted.width, fitted.height);
     canvas.fill_path(
         &path,
-        &Paint::image(id, fitted.x, fitted.y, fitted.width, fitted.height, 0.0, 1.0),
+        &Paint::image(id, fitted.x, fitted.y, fitted.width, fitted.height, 0.0, alpha),
     );
 }
 
@@ -645,6 +688,113 @@ mod tests {
     }
 
     // ---- display list (`build`), the seam that needs no EGL context ----
+
+    fn box_alpha(cmd: &DrawCmd) -> f32 {
+        match &cmd.draw {
+            Draw::Box { background: Some(color), .. } => color.a,
+            other => panic!("expected a filled box, got {other:?}"),
+        }
+    }
+
+    /// The whole point of the property: one `opacity` on a container fades everything under it,
+    /// rather than each descendant needing its own.
+    #[test]
+    fn a_parents_opacity_reaches_every_descendant() {
+        let lua = Lua::new();
+        let src = r##"return panel { id = "bar", width = 200, height = 40, opacity = 0.5,
+            child = rect { width = 100, height = 20, background = "#ffffffff" } }"##;
+        let tree = resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 });
+        let list = build(&tree, 1.0, None);
+        assert_eq!(box_alpha(&list.commands[1]), 0.5, "the child fades with the panel it sits in");
+    }
+
+    /// Multiplied down the chain rather than replaced, so nothing inside a faded panel can come
+    /// back solid.
+    #[test]
+    fn a_nested_opacity_multiplies_with_its_ancestors_rather_than_replacing_them() {
+        let lua = Lua::new();
+        let src = r##"return panel { id = "bar", width = 200, height = 40, opacity = 0.5,
+            child = rect { width = 100, height = 20, opacity = 0.5, background = "#ffffffff" } }"##;
+        let tree = resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 });
+        let list = build(&tree, 1.0, None);
+        assert_eq!(box_alpha(&list.commands[1]), 0.25, "half of a half");
+    }
+
+    /// A colour that was already translucent keeps its own alpha as a factor: a config writing
+    /// both meant both.
+    #[test]
+    fn an_opacity_multiplies_the_alpha_a_colour_already_carried() {
+        let lua = Lua::new();
+        let src = r##"return panel { id = "bar", width = 200, height = 40, opacity = 0.5,
+            background = "#ffffff80" }"##;
+        let tree = resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 });
+        let list = build(&tree, 1.0, None);
+        let expected = (0x80 as f32 / 255.0) * 0.5;
+        assert!((box_alpha(&list.commands[0]) - expected).abs() < 1e-6);
+    }
+
+    /// ADR-0063 skips a repaint when the new list equals the last one, so a fade that did not
+    /// change the list would be a change the surface never painted.
+    #[test]
+    fn changing_only_the_opacity_changes_the_display_list() {
+        let solid = Lua::new();
+        let faded = Lua::new();
+        let src = |opacity: &str| {
+            format!(
+                r##"return panel {{ id = "bar", width = 200, height = 40, opacity = {opacity},
+                    child = text {{ content = "12:00", foreground = "#ffffffff" }} }}"##
+            )
+        };
+        let size = LogicalSize { width: 200.0, height: 40.0 };
+        let a = build(&resolved_surface(&solid, &src("1.0"), size), 1.0, None);
+        let b = build(&resolved_surface(&faded, &src("0.4"), size), 1.0, None);
+        assert_ne!(a, b, "the alpha is in the list, not applied on the way to the canvas");
+    }
+
+    /// Blitted draws carry the alpha separately, because `Paint::image` takes it as an argument
+    /// where a fill can bake it into the colour.
+    #[test]
+    fn an_icon_carries_the_faded_alpha_rather_than_a_tinted_colour() {
+        let lua = Lua::new();
+        let src = r##"return panel { id = "bar", width = 200, height = 40, opacity = 0.25,
+            child = icon { name = "network-wireless", size = 16 } }"##;
+        let tree = resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 });
+        let list = build(&tree, 1.0, None);
+        let icon = list.commands.iter().find_map(|cmd| match &cmd.draw {
+            Draw::Icon { alpha, .. } => Some(*alpha),
+            _ => None,
+        });
+        assert_eq!(icon, Some(0.25));
+    }
+
+    /// Every border edge fades, and an edge with no colour stays absent rather than becoming a
+    /// transparent one.
+    #[test]
+    fn a_border_fades_edge_by_edge_and_an_absent_edge_stays_absent() {
+        let lua = Lua::new();
+        let src = r##"return panel { id = "bar", width = 200, height = 40, opacity = 0.5,
+            border_color = { top = "#ff0000ff" }, border_width = { top = 2 } }"##;
+        let tree = resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 });
+        let list = build(&tree, 1.0, None);
+        let Draw::Box { colors, .. } = &list.commands[0].draw else {
+            panic!("expected a box");
+        };
+        assert_eq!(colors.top.unwrap().a, 0.5);
+        assert!(colors.bottom.is_none(), "an edge the config never coloured is not faded into existence");
+    }
+
+    /// `opacity = 0` and `visible = false` are different, deliberately: a transparent node still
+    /// lays out and still takes pointer events, which is what lets a fade run without the layout
+    /// jumping. So it still produces a draw, at zero alpha.
+    #[test]
+    fn a_fully_transparent_node_still_draws_rather_than_vanishing_from_the_list() {
+        let lua = Lua::new();
+        let src = r##"return panel { id = "bar", width = 200, height = 40, opacity = 0,
+            background = "#ffffffff" }"##;
+        let tree = resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 });
+        let list = build(&tree, 1.0, None);
+        assert_eq!(box_alpha(&list.commands[0]), 0.0);
+    }
 
     /// The property this whole optimisation rests on: same tree in, same list out. If this can
     /// ever fail for an unchanged scene, `paint_surface`'s skip repaints every frame anyway and

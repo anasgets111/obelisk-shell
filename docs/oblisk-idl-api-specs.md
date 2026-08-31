@@ -358,6 +358,7 @@ Any property in this table or in § 5.2 accepts a `Signal` handle in place of a 
 | `align_h` | `string` | `"Start"`, `"Center"`, `"End"`, `"Stretch"` | Horizontal alignment distribution. |
 | `align_v` | `string` | `"Start"`, `"Center"`, `"End"`, `"Stretch"` | Vertical alignment distribution. |
 | `visible` | `boolean` / `Signal` | `true`, `false`, or binary signal | Determines if the node enters constraint and paint passes. |
+| `opacity` | `number` / `Signal` | `[0, 1]`, defaults to `1` | How much of this node and its subtree reaches the screen. Inherited multiplicatively: a child inside a node at `0.5` can be fainter but never more solid, so fading a whole panel is one property. Refused outside the range rather than clamped, so `opacity = 50` meaning percent fails the apply. Distinct from `visible = false`: a node at `0` still lays out, still occupies space in its parent's flow, and still takes pointer events. |
 | `id` | `string` | Unique among siblings | Optional reconciliation hint. Matches this node to its previous self across a re-resolve, so leases and named state follow the right node when siblings are inserted or removed. Scoped to the parent, so a reusable module may carry the same ids in every instantiation. Not addressable from Lua and has no effect on layout or paint (ADR-0045). |
 
 ### 5.2 Specific Geometric Node Schemas
@@ -409,7 +410,7 @@ Receives input focus and pointer events.
 
 > A handler declaring one parameter still works untouched, because Lua drops arguments a function does not declare. It does now run on a right or middle click as well as a left one, where before those events did nothing. `if button ~= "left" then return end` restores the old behavior for a handler that wants it.
 
-> **This row is most of the pointer model, and it now reads five `wl_pointer` events of six.** The frame handler in `renderer/src/wayland/input.rs` matches `Press`, `Release` and `Leave` for clicks, and `Enter`/`Motion`/`Leave` for hover (`hover` below). Only `Axis` is still dropped, so a wheel drives neither a value nor a viewport; that one needs a design decision before a spec row, and the decision is what a scrollable container *is* rather than what the callback looks like. `build-steps.md` section 6 ranks it next.
+> **This row is most of the pointer model, and the model is now complete.** The frame handler in `renderer/src/wayland/input.rs` matches `Press`, `Release` and `Leave` for clicks, `Enter`/`Motion`/`Leave` for hover (`hover` below), and `Axis` for the wheel (`scroll` below). Nothing is dropped: the match over `PointerEventKind` is exhaustive and the `_ => {}` arm that used to swallow the rest is gone. The design decision this paragraph asked for, what a scrollable container *is*, is docs/adr/0069.
 
 #### Hover (`hover`, `hover(name)`, `hover_rect(name)`)
 A **hover slot** is engine-written reactive state naming one region of one surface: whether the pointer is inside it, and where it is. Declared on any node, read from anywhere (docs/adr/0062).
@@ -420,6 +421,19 @@ A **hover slot** is engine-written reactive state naming one region of one surfa
 *   `hover_rect(name)` -> `Signal` (Global. The region's absolute rect, `{ x, y, width, height }`, in its surface's logical coordinates -- the same shape and space `on_click` hands a handler. Bind it to a `popup`'s `anchor_rect` to put a tooltip over the node. Keeps the last rect it was given when the pointer leaves, so `anchor_rect` stays non-zero while the popup closes)
 
 > **A node and every ancestor of it are hovered.** Hover uses `on_click`'s own hit path (ADR-0050 decision 1), so a `pill` that is a `row` wrapping a `button` wrapping a `text` reports all three, and a config binds the outermost. Two overlapping siblings resolve the way paint does: the one drawn last is the hovered one.
+
+#### Scroll (`scroll`, `scroll(name)`)
+A **scroll offset** is engine-written reactive state naming how far one container has been scrolled along its main axis, in logical pixels. Declared on any container that flows, read from anywhere (docs/adr/0069).
+
+*   `scroll`: `Signal` (A node property on `row`, `column` and `list`. Takes the signal `scroll(name)` returns and makes that node a viewport its children move inside. Structural, like `hover`: the handle is what is stored, because the layout pass both reads the offset and writes back the one it used)
+*   `scroll(name)` -> `Signal` (Global. A number, `0` at the top or left. Read-only to Lua: `signal:set()` refuses it, because the engine is the writer)
+    *   `name`: `string` (The slot's identity, the way `hover(name)`'s and `state(name, initial)`'s are. An in-place reload finds the offset the user left, so an open panel does not jump back to the top when the config is edited)
+
+> **The wheel writes and the layout pass clamps.** A wheel event adds a distance to the offset without bounding it; `position_children` then clamps against the content extent it has just measured and writes back what it used, because that extent is a number no config can see. So the signal always reads where the container actually is, not what the last wheel asked for.
+
+> **A container with nothing to scroll is a no-op, not an error.** A `Content`-sized column grows to fit its children, so its content and its viewport are the same number and the offset clamps to `0`. Same answer `"Fill"` gives in a `Content` parent, and for the same reason: there is no remainder.
+
+> **There is no `on_scroll` and no content extent.** Nothing yet wants the wheel as an event rather than a value, and nothing draws a scrollbar; the first config that needs either is where the shape of it gets decided.
 
 > **A tooltip is a `popup` with `grab = false`.** There is no tooltip role. A grabbing popup would take the pointer off the node whose hover opened it, and `grab = false` is also what lets a hover open one at all, since there is no click to carry the input serial § 6.3 otherwise requires.
 

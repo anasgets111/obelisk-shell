@@ -105,6 +105,7 @@ mod tests {
             kind: kind.to_string(),
             rect: LogicalRect { x, y, width, height },
             visible: true,
+            opacity: 1.0,
             properties: HashMap::new(),
             paint: None,
             children,

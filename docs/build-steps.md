@@ -2740,6 +2740,23 @@ By modules unblocked per unit of work, which is not the same as by size.
    with it. Nothing in `process.run` cancels a request the config has moved on from, so every
    subprocess-backed module needs that guard, and a demo without one would teach the wrong shape.
 3. **Gradient and shadow on `rect`.** Already in the dependency. Parsers and § 5.2 rows only.
+
+   > **Amended twice.** Gradient came off this line: the reference config has no `gradient`,
+   > `GradientStop`, `LinearGradient` or `RadialGradient` in any of its 129 QML files, so it was
+   > never on the path. Shadow stands on its own evidence, 16 uses across 7 files.
+   >
+   > **`opacity` was the item missing from this list, and it is built.** 32 of those 129 files set
+   > it, more than any paint property here except colour, and the engine accepted it and silently
+   > ignored it. Inherited and multiplied down the tree the way the clip is intersected down it, so
+   > fading a panel is one property rather than a walk over its children; baked into the display
+   > list rather than applied at the canvas, because ADR-0063 skips a repaint when the list compares
+   > equal and a fade outside the list is a change the surface never notices; and refused outside
+   > `[0, 1]` under ADR-0068's rule, so `opacity = 50` meaning percent fails the apply instead of
+   > painting nothing.
+   >
+   > `opacity = 0` and `visible = false` stay different. A transparent node still lays out, still
+   > occupies space, and still hit-tests, which is what will let a fade animate without the layout
+   > jumping under it.
 4. **`on_hover`.** ~~Two tooltips, a hover-to-open panel, a hover highlight, and every
    expand-on-hover affordance.~~ **Built (docs/adr/0062).** The engine may emit a signal, and this
    is the first one it emits.

@@ -92,6 +92,10 @@ pub struct ResolvedNode {
     pub kind: String,
     pub rect: LogicalRect,
     pub visible: bool,
+    /// This node's own `opacity`, before any ancestor's is applied. `layout::paint::build_node`
+    /// multiplies the chain together as it descends, the same way it intersects a clip, so a panel
+    /// fades with everything in it from one property. 1.0 is the default and contributes nothing.
+    pub opacity: f32,
     pub properties: HashMap<String, Value>,
     /// This node's paint properties, parsed here rather than by `layout::paint` on every frame
     /// (`node::paint_style`'s module doc comment says why). `None` for a kind that draws nothing.
@@ -111,6 +115,7 @@ struct RetainedNode {
     kind: String,
     rect: LogicalRect,
     visible: bool,
+    opacity: f32,
     properties: HashMap<String, Value>,
     paint: Option<PaintStyle>,
     children: Vec<RetainedNode>,
@@ -122,6 +127,7 @@ impl RetainedNode {
             kind: self.kind.clone(),
             rect: self.rect,
             visible: self.visible,
+            opacity: self.opacity,
             properties: self.properties.clone(),
             paint: self.paint.clone(),
             children: self
@@ -399,6 +405,7 @@ impl Scene {
             kind,
             rect,
             visible,
+            opacity,
             properties,
             paint,
             children,
@@ -413,6 +420,7 @@ impl Scene {
                 kind,
                 rect,
                 visible,
+                opacity,
                 properties,
                 paint,
                 children: Vec::new(),
@@ -804,6 +812,7 @@ fn resolve_and_reconcile(
 
     let padding = node::parse_edge_insets(&properties, "padding")?;
     let visible = node::parse_visible(&properties)?;
+    let opacity = node::parse_opacity(&properties)?;
     let width_mode = node::parse_size_mode(&properties, "width")?;
     let height_mode = node::parse_size_mode(&properties, "height")?;
     // Before `intrinsic_content_size`, which sizes a `text` from the `content` and `font_size`
@@ -1021,6 +1030,7 @@ fn resolve_and_reconcile(
             height: size.height,
         },
         visible,
+        opacity,
         properties,
         paint,
         children: new_children,
@@ -2210,6 +2220,31 @@ mod tests {
     /// The coverage docs/adr/0068 widened, pinned so it stays deliberate. `layout::paint::build_node`
     /// returned before any parser on an invisible node, so this config used to boot fine and fail
     /// only once something made the node visible.
+    /// ADR-0068's rule applied to the new property: a bad value fails the apply rather than being
+    /// clamped or defaulted, so `opacity = 50` meaning percent is heard about immediately.
+    #[test]
+    fn an_opacity_outside_zero_to_one_fails_the_pass() {
+        let shaping = ShapingHandle::spawn();
+        for bad in ["50", "-0.5", "1.5", r#""half""#] {
+            let mut scene = Scene::new();
+            let (_lua, surface) = surface_from(&format!(r#"panel {{ id = "bar", child = rect {{ opacity = {bad} }} }}"#));
+            let err = apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap_err();
+            assert!(
+                matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "opacity"),
+                "`opacity = {bad}` must be refused by name, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_opacity_is_fully_opaque() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(r#"panel { id = "bar", child = rect { width = 10, height = 10 } }"#);
+        apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
+        assert_eq!(scene.surface("bar@TEST").unwrap().children[0].opacity, 1.0);
+    }
+
     #[test]
     fn a_malformed_paint_property_on_an_invisible_node_still_fails_the_pass() {
         let mut scene = Scene::new();
@@ -3164,6 +3199,7 @@ mod tests {
                 height: 10.0,
             },
             visible: true,
+            opacity: 1.0,
             properties: HashMap::new(),
             paint: None,
             children: Vec::new(),
@@ -3177,6 +3213,7 @@ mod tests {
                 height: 10.0,
             },
             visible: false,
+            opacity: 1.0,
             properties: HashMap::new(),
             paint: None,
             children: Vec::new(),
@@ -3190,6 +3227,7 @@ mod tests {
                 height: 100.0,
             },
             visible: true,
+            opacity: 1.0,
             properties: HashMap::new(),
             paint: None,
             children: vec![visible_child, hidden_child],
@@ -3214,6 +3252,7 @@ mod tests {
             kind: "rect".to_string(),
             rect: LogicalRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 },
             visible: false,
+            opacity: 1.0,
             properties: HashMap::new(),
             paint: None,
             children: Vec::new(),
@@ -3222,6 +3261,7 @@ mod tests {
             kind: "panel".to_string(),
             rect: LogicalRect { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0 },
             visible: true,
+            opacity: 1.0,
             properties: HashMap::new(),
             paint: None,
             children: vec![hidden_child],
@@ -3238,12 +3278,14 @@ mod tests {
             kind: "panel".to_string(),
             rect: LogicalRect { x: 0.0, y: 0.0, width: 1920.0, height: 32.0 },
             visible: true,
+            opacity: 1.0,
             properties: HashMap::new(),
             paint: None,
             children: vec![ResolvedNode {
                 kind: "row".to_string(),
                 rect: LogicalRect { x: 0.0, y: 0.0, width: 1920.0, height: 32.0 },
                 visible: true,
+                opacity: 1.0,
                 properties: HashMap::new(),
                 paint: None,
                 children: Vec::new(),

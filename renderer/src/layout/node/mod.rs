@@ -49,8 +49,8 @@ pub use spec::{
 #[cfg(test)]
 pub use spec::LockSpec;
 pub use style::{
-    BorderColor, parse_align, parse_edge_insets, parse_size_mode,
-    parse_list_direction, parse_spacing, parse_visible,
+    BorderColor, parse_align, parse_edge_insets, parse_list_direction, parse_opacity, parse_size_mode, parse_spacing,
+    parse_visible,
 };
 pub use surface::{Anchor, KeyboardInteractivity, LayerKind, PanelSpec, SurfaceTopology, panel_spec};
 pub use toplevel::{ConstraintAdjustment, PopupAnchor, PopupSpec, SizeHint, WindowSpec, popup_spec, window_spec};

@@ -1055,6 +1055,7 @@ mod tests {
             paint: node::paint_style(kind, &properties).unwrap(),
             rect: LogicalRect { x, y, width, height },
             visible: true,
+            opacity: 1.0,
             properties,
             children: Vec::new(),
         }
