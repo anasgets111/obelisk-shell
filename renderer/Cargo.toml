@@ -1,7 +1,7 @@
 [package]
 name = "renderer"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 
 # The installed name. The crate stays `renderer`, which is what `-p renderer` and every module
 # path in the tree already say; this is only what lands in `$PREFIX/lib/oblisk`.

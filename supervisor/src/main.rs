@@ -14,7 +14,8 @@ mod reload_link;
 mod setup;
 mod snapshot;
 mod socket;
-// The LuaCATS stub generator, a development tool with no place in the shipped binary.
+// The LuaCATS stub generator, a development tool with no place in the shipped binary. The reader
+// that tells a user their stubs are stale lives in `setup`, which is the thing that acts on it.
 #[cfg(test)]
 mod stubs;
 mod system;
