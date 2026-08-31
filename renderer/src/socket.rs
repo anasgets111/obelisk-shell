@@ -1194,6 +1194,428 @@ mod tests {
         assert_eq!(output.surfaces[0].properties.get("active").unwrap().as_integer(), Some(2));
     }
 
+    /// Every bar-backing capability at or past the width its module can draw, for
+    /// [`the_shipped_dev_configs_bar_zones_hold_their_modules_without_overflowing`]. The strings
+    /// run past each module's own `util.truncate` limit deliberately: the module clamps them, and
+    /// a test feeding short ones would be measuring the clamp rather than the layout.
+    fn widest_bar_snapshots() -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            ("audio", serde_json::json!({ "volume": 1.0, "muted": false, "apps": [] })),
+            ("brightness", serde_json::json!({ "percent": 100 })),
+            ("battery", serde_json::json!({ "present": true, "percent": 100, "charging": true })),
+            ("power", serde_json::json!({ "on_battery": true, "energy_rate": 22.5, "active_profile": "performance" })),
+            ("updates", serde_json::json!({ "count": 0, "installing": true, "install_current_step": 128, "install_total_steps": 512 })),
+            ("keyboard", serde_json::json!({ "active_layout": "English (US, intl.)", "caps_lock": true })),
+            ("privacy", serde_json::json!({ "camera_users": [{ "app_name": "A Video Conferencing Application" }] })),
+            ("network", serde_json::json!({ "scanning": false, "available_networks": [{ "ssid": "a-long-access-point-name", "strength": 100, "active": true }] })),
+            (
+                "bluetooth",
+                serde_json::json!({ "enabled": true, "connected_devices": [{ "name": "A Long Bluetooth Device Name", "battery": 100 }] }),
+            ),
+            (
+                "mpris",
+                serde_json::json!({ "players": [{ "title": "A Rather Long Track Title", "artist": "A Rather Long Artist Name", "play_state": "Playing" }] }),
+            ),
+            (
+                "workspaces",
+                serde_json::json!({
+                    "active_client": { "class": "org.example.LongClass", "title": "A window title long enough to be truncated" },
+                    "outputs": [{
+                        "name": "TEST",
+                        "active_workspace": 1,
+                        "focused_workspace": 1,
+                        "workspaces": (1..=12).map(|n| serde_json::json!({ "id": n, "idx": n })).collect::<Vec<_>>(),
+                    }],
+                }),
+            ),
+            (
+                "tray",
+                serde_json::json!({
+                    "items": (0..6)
+                        .map(|n| serde_json::json!({ "id": format!("item-{n}"), "name": format!("Tray Item {n}"), "icon_name": "application-x-executable" }))
+                        .collect::<Vec<_>>(),
+                }),
+            ),
+            ("system", serde_json::json!({ "time": 1_700_000_000 })),
+        ]
+    }
+
+    #[test]
+    fn a_hover_bound_by_a_config_survives_resolution_and_drives_what_it_is_bound_to() {
+        // The half of docs/adr/0062 no unit test on either side reaches: that a `hover` handle a
+        // config wrote into a node property is still a handle by the time the pointer handler sees
+        // the resolved tree (decision 3), and that writing it moves what a second node bound it to.
+        // `pointer_frame` itself needs a real compositor, so this drives `layout::hover` against a
+        // genuinely resolved tree instead -- everything between the config and the write.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(
+            dir.path(),
+            r#"
+            local hovered = hover("pill")
+            return { panel {
+                id = "bar", layer = "Top", width = "Fill", height = 40,
+                child = row {
+                    width = 100, height = 20, hover = hovered,
+                    children = { rect { id = "tip", width = 10, height = 10, visible = hovered } },
+                },
+            } }
+            "#,
+        );
+        let (mut client, _outbound_rx) = test_client(&path);
+        assert!(run_startup(&mut client), "the config must resolve");
+
+        let hover_row = |client: &RendererClient| client.scene.surface("bar@TEST").expect("the bar resolves").children[0].clone();
+        assert!(!hover_row(&client).children[0].visible, "nothing is hovered before the pointer arrives");
+
+        // The pointer lands inside the row. `hover_writes` is what `App::sync_hover` calls, given
+        // the same tree it would be given.
+        let tree = client.scene.surface("bar@TEST").unwrap();
+        let writes = layout::hover::hover_writes(&tree, Some(layout::hit::LogicalPoint { x: 50.0, y: 10.0 }));
+        assert_eq!(writes.len(), 1, "one node declared a hover, so there is one write");
+        assert!(writes[0].hovered, "the pointer is inside the row that declared it");
+        assert!(writes[0].rect.is_some(), "and it reports where it is, for a tooltip to anchor to");
+
+        for write in &writes {
+            write
+                .signal
+                .hover_handle()
+                .expect("a config-authored hover is writable by the engine")
+                .set_changed(mlua::Value::Boolean(write.hovered));
+        }
+        assert!(client.re_resolve_if_dirty(), "a hover that changed has to re-resolve the scene");
+        assert!(hover_row(&client).children[0].visible, "the node bound to the hover is showing now");
+
+        // And back off, which is the edge a callback-shaped design drops when a re-resolve replaces
+        // the node between the two events (docs/adr/0062 decision 1).
+        let tree = client.scene.surface("bar@TEST").unwrap();
+        for write in layout::hover::hover_writes(&tree, None) {
+            write.signal.hover_handle().unwrap().set_changed(mlua::Value::Boolean(write.hovered));
+        }
+        assert!(client.re_resolve_if_dirty());
+        assert!(!hover_row(&client).children[0].visible, "the pointer left, so it is hidden again");
+    }
+
+    #[test]
+    fn the_shipped_dev_config_evaluates_and_declares_every_surface_it_ships() {
+        // Against `dev-config/oblisk/shell.lua` itself, not a fixture. That config is this repo's
+        // worked example and its live-session fixture, and it is split across thirty-odd files
+        // that reach each other through `require`, so a rename or a moved module breaks it in a
+        // way no unit test over `components/` can see. Evaluated exactly as `run_startup_
+        // evaluation` would: capabilities seeded and reading nil, which is also the state a real
+        // boot evaluates in before the first snapshot lands.
+        let shell_lua = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/shell.lua");
+        let (client, _outbound_rx) = test_client(&shell_lua);
+
+        let (_output, specs) = evaluate_and_specs(&client.loader, &shell_lua)
+            .unwrap_or_else(|err| panic!("the shipped dev config must evaluate: {err}"));
+
+        // By id and role rather than by count, so this says which surface went missing.
+        let declared: Vec<(&str, &str)> = specs
+            .iter()
+            .map(|spec| {
+                let role = match spec {
+                    SurfaceSpec::Panel(_) => "panel",
+                    SurfaceSpec::Window(_) => "window",
+                    SurfaceSpec::Popup(_) => "popup",
+                    SurfaceSpec::Lock(_) => "lock",
+                };
+                (spec.declared_id(), role)
+            })
+            .collect();
+        assert_eq!(
+            declared,
+            vec![
+                ("wallpaper", "panel"),
+                ("bar", "panel"),
+                ("notification_area", "panel"),
+                ("osd", "panel"),
+                ("settings", "window"),
+                ("panel_host", "popup"),
+                ("battery_tooltip", "popup"),
+                ("clock_tooltip", "popup"),
+                ("launcher_tooltip", "popup"),
+                ("launcher", "window"),
+                ("lock_screen", "lock"),
+            ]
+        );
+    }
+
+    /// The absolute centre of every node in `node` declaring a `hover` property, accumulating the
+    /// parent-relative origins on the way down the way `layout::hit` does.
+    fn hover_region_centres(node: &crate::layout::ResolvedNode, x: f32, y: f32, out: &mut Vec<layout::hit::LogicalPoint>) {
+        let (x, y) = (x + node.rect.x, y + node.rect.y);
+        if node.properties.contains_key("hover") {
+            out.push(layout::hit::LogicalPoint { x: x + node.rect.width / 2.0, y: y + node.rect.height / 2.0 });
+        }
+        for child in &node.children {
+            hover_region_centres(child, x, y, out);
+        }
+    }
+
+    /// The one region centre this test's assertions are written against, and a panic naming the
+    /// count if the bar ever grows a second before it.
+    fn centre_of_the_hover_region(node: &crate::layout::ResolvedNode, x: f32, y: f32) -> Option<layout::hit::LogicalPoint> {
+        let mut centres = Vec::new();
+        hover_region_centres(node, x, y, &mut centres);
+        centres.first().copied()
+    }
+
+    #[test]
+    fn every_hover_region_the_shipped_bar_declares_lights_exactly_one_slot() {
+        // The wiring check the per-module tooltips need and no unit test reaches: each region names
+        // a slot by string, and a typo is a region that lights nothing and a tooltip that never
+        // opens. Silent in every other gate, because both halves parse and both resolve.
+        let shell_lua = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/shell.lua");
+        let (mut client, _outbound_rx) = test_client(&shell_lua);
+        for (capability, payload) in widest_bar_snapshots() {
+            client.apply_state_snapshot(StateSnapshot { capability: capability.to_string(), revision: 1, payload }).unwrap();
+        }
+        assert!(run_startup(&mut client), "the shipped dev config must resolve into a scene");
+
+        let bar = client.scene.surface("bar@TEST").unwrap();
+        let mut centres = Vec::new();
+        hover_region_centres(&bar, 0.0, 0.0, &mut centres);
+        assert!(centres.len() >= 2, "the bar declares more than one hover region, got {}", centres.len());
+
+        for centre in &centres {
+            let writes = layout::hover::hover_writes(&bar, Some(*centre));
+            let lit: Vec<bool> = writes.iter().map(|write| write.hovered).collect();
+            assert_eq!(
+                lit.iter().filter(|hovered| **hovered).count(),
+                1,
+                "a point inside one region must light that region and no other, at {centre:?} got {lit:?}"
+            );
+        }
+
+        // Distinct slots, not one signal shared by every region. A slot name copy-pasted between
+        // two modules reads as a tooltip opening over the wrong one live, and passes every other
+        // check here: both regions parse, both resolve, and each lights exactly one *write*.
+        let writes = layout::hover::hover_writes(&bar, Some(centres[0]));
+        let first = writes.first().expect("the walk found regions above");
+        first.signal.hover_handle().unwrap().set_changed(mlua::Value::Boolean(true));
+        let lit_after: Vec<bool> = writes
+            .iter()
+            .map(|write| write.signal.get_value(client.lua()).unwrap() == mlua::Value::Boolean(true))
+            .collect();
+        assert_eq!(
+            lit_after.iter().filter(|lit| **lit).count(),
+            1,
+            "writing one region's signal must light one region, got {lit_after:?}"
+        );
+    }
+
+    #[test]
+    fn the_shipped_dev_configs_battery_tooltip_opens_when_its_pill_is_hovered() {
+        // docs/adr/0062 against the config this repo ships, which is the only place the whole chain
+        // exists at once: `hover(name)` in `battery.lua`, the `hover` property on the pill,
+        // `hover_rect(name)` on the tooltip's `anchor_rect`, and the popup's `visible`.
+        //
+        // Found by walking for the `hover` property rather than by indexing into the left zone, so
+        // reordering the bar does not silently turn this into a test of the wrong module.
+        let shell_lua = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/shell.lua");
+        let (mut client, _outbound_rx) = test_client(&shell_lua);
+        for (capability, payload) in widest_bar_snapshots() {
+            client.apply_state_snapshot(StateSnapshot { capability: capability.to_string(), revision: 1, payload }).unwrap();
+        }
+        assert!(run_startup(&mut client), "the shipped dev config must resolve into a scene");
+
+        let tooltip_is_up = |client: &RendererClient| client.scene.surface("battery_tooltip").expect("the tooltip resolves").visible;
+        assert!(!tooltip_is_up(&client), "a tooltip is not up before the pointer has been anywhere");
+
+        // Both of this slice's live bugs were in the state *before* anything is hovered, which the
+        // rest of this test walks straight past, so they are pinned here.
+        //
+        // `grab` is § 6.3's default `true` unless a popup says otherwise, and a grabbing popup
+        // needs an armed input serial that a hover cannot produce -- the tooltip resolved
+        // `visible = true` on a real pointer and the compositor refused it on every re-resolve.
+        // `anchor_rect` is required and non-zero, and the rect signal started nil, which reads as
+        // the property being absent rather than as a rect.
+        let (_output, specs) = evaluate_and_specs(&client.loader, &shell_lua).expect("the shipped config evaluates");
+        let tooltip = specs
+            .iter()
+            .find_map(|spec| match spec {
+                SurfaceSpec::Popup(popup) if popup.id == "battery_tooltip" => Some(popup),
+                _ => None,
+            })
+            .expect("the shipped config declares a battery tooltip");
+        assert!(!tooltip.grab, "a hover-opened popup must not ask for a grab; there is no click to arm its serial");
+        assert!(
+            tooltip.anchor_rect.width > 0.0 && tooltip.anchor_rect.height > 0.0,
+            "anchor_rect has to be a real non-zero rect before anything has been hovered, got {:?}",
+            tooltip.anchor_rect
+        );
+
+        let bar = client.scene.surface("bar@TEST").unwrap();
+        let centre = centre_of_the_hover_region(&bar, 0.0, 0.0).expect("the dev config declares a hover region");
+        let writes = layout::hover::hover_writes(&bar, Some(centre));
+        // The bar declares several regions now, and a point inside one is outside the rest. Every
+        // write is applied the way `App::sync_hover` applies them, because turning the others *off*
+        // is half of what the walk is for.
+        assert_eq!(writes.iter().filter(|write| write.hovered).count(), 1, "a point is inside exactly one region");
+        for write in writes {
+            write.signal.hover_handle().unwrap().set_changed(mlua::Value::Boolean(write.hovered));
+            let Some(rect) = write.rect else {
+                continue;
+            };
+            // Built here rather than reached for through `crate::wayland::input`, which is private:
+            // the shape is § 6.3's `anchor_rect`, and a wrong one fails the re-resolve asserted
+            // just below rather than passing quietly.
+            let table = client.lua().create_table().unwrap();
+            table.set("x", rect.x).unwrap();
+            table.set("y", rect.y).unwrap();
+            table.set("width", rect.width).unwrap();
+            table.set("height", rect.height).unwrap();
+            write.signal.hover_rect_handle().unwrap().set_changed(mlua::Value::Table(table));
+        }
+        assert!(client.re_resolve_if_dirty(), "a hover that changed re-resolves the scene");
+        assert!(tooltip_is_up(&client), "hovering the battery pill opens its tooltip");
+
+        // And closes again. `anchor_rect` keeps the rect it was last given rather than clearing,
+        // which is what stops § 6.3's non-zero rule failing the evaluation on the way out.
+        let bar = client.scene.surface("bar@TEST").unwrap();
+        for write in layout::hover::hover_writes(&bar, None) {
+            write.signal.hover_handle().unwrap().set_changed(mlua::Value::Boolean(false));
+        }
+        assert!(client.re_resolve_if_dirty());
+        assert!(!tooltip_is_up(&client), "the pointer left the bar, so the tooltip closed");
+    }
+
+    #[test]
+    fn the_shipped_dev_configs_notification_card_is_up_only_while_something_is_in_the_feed() {
+        // The bug this is here for was on screen for the whole slice: the surface had no `visible`
+        // binding at all, so a card reading "no notifications" sat in the corner permanently. An
+        // empty state is what a *panel* shows; a popup that is always up is not a notification.
+        let shell_lua = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/shell.lua");
+        let (mut client, _outbound_rx) = test_client(&shell_lua);
+        assert!(run_startup(&mut client), "the shipped dev config must resolve into a scene");
+
+        let card_is_up =
+            |client: &RendererClient| client.scene.surface("notification_area@TEST").expect("the card resolves").visible;
+        assert!(!card_is_up(&client), "nothing has been received, so there is nothing to show");
+
+        client
+            .apply_state_snapshot(StateSnapshot {
+                capability: "notifications".to_string(),
+                revision: 1,
+                payload: serde_json::json!({ "feed": [{ "id": 7, "app_name": "Zen", "summary": "a thing happened" }] }),
+            })
+            .unwrap();
+        assert!(client.re_resolve_if_dirty());
+        assert!(card_is_up(&client), "a notification in the feed puts the card up");
+
+        // And back down when the Supervisor expires it out of the feed (docs/adr/0033), which is
+        // the whole of this config's auto-hide: no timer here, just an empty list.
+        client
+            .apply_state_snapshot(StateSnapshot {
+                capability: "notifications".to_string(),
+                revision: 2,
+                payload: serde_json::json!({ "feed": [] }),
+            })
+            .unwrap();
+        assert!(client.re_resolve_if_dirty());
+        assert!(!card_is_up(&client), "an expired feed takes the card with it");
+    }
+
+    #[test]
+    fn the_shipped_dev_configs_lock_screen_draws_one_mask_glyph_per_typed_character() {
+        // The lock screen is the one surface where drawing nothing is a lockout risk rather than a
+        // cosmetic gap: typing blind makes a typo invisible, `pam_unix` answers a wrong password
+        // with a two second delay, and `pam_faillock` locks the account after three. Asserted
+        // against the shipped `lock.lua` rather than a fixture, because what has to hold is that
+        // *this* config's field is the one that fills.
+        let shell_lua = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/shell.lua");
+        let (mut client, _outbound_rx) = test_client(&shell_lua);
+        assert!(run_startup(&mut client), "the shipped dev config must resolve into a scene");
+
+        let lock = client.scene.surface("lock_screen@TEST").expect("the lock screen resolves");
+        let masked = |focus: Option<&layout::paint::SecureField>| -> Vec<String> {
+            layout::paint::build(&lock, 1.0, focus)
+                .commands
+                .iter()
+                .filter_map(|command| match &command.draw {
+                    layout::paint::Draw::Text { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let unfocused = masked(None);
+        assert!(unfocused.iter().any(|drawn| drawn == "password"), "an untouched field shows its placeholder: {unfocused:?}");
+
+        // The pair `lock.lua` declares, and the pair the Supervisor's unlock path answers.
+        let target = layout::node::SecureSubmitTarget { capability: "lock".to_string(), action: "authenticate".to_string() };
+        let typed = masked(Some(&layout::paint::SecureField { target: &target, filled: 5 }));
+        assert!(
+            typed.iter().any(|drawn| drawn == "*****"),
+            "five keystrokes must draw five of this config's `mask_character`: {typed:?}"
+        );
+        assert!(!typed.iter().any(|drawn| drawn == "password"), "the placeholder gives way once something is typed: {typed:?}");
+    }
+
+    #[test]
+    fn the_shipped_dev_configs_bar_zones_hold_their_modules_without_overflowing() {
+        // The failure this catches has happened twice and is invisible until a screenshot: a zone
+        // is a fixed percentage of the bar, `row` has no space-between and no shrink, so a zone
+        // one module too full silently paints the last one past its own right edge and off the
+        // bar. Resolved against a 1920x1080 output, which is what `test_outputs` gives.
+        //
+        // A loaded bar, not the boot one. Left to itself every capability reads nil and each
+        // module draws its shortest placeholder, so an empty bar would pass this and a real
+        // session would still clip. The snapshots below are each module at or near its widest:
+        // every string that gets truncated is fed past its truncation limit, the tray carries
+        // items, and the privacy pill -- normally hidden -- is forced visible with a camera user.
+        let shell_lua = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/shell.lua");
+        let (mut client, _outbound_rx) = test_client(&shell_lua);
+        for (capability, payload) in widest_bar_snapshots() {
+            client
+                .apply_state_snapshot(StateSnapshot { capability: capability.to_string(), revision: 1, payload })
+                .unwrap_or_else(|err| panic!("{capability} snapshot must apply: {err}"));
+        }
+        assert!(run_startup(&mut client), "the shipped dev config must resolve into a scene");
+
+        let bar = client.scene.surface("bar@TEST").expect("the bar instance must resolve");
+        // bar -> the padded row -> the three zones.
+        let zones = &bar.children[0].children;
+        assert_eq!(zones.len(), 3, "the bar is three zones (`modules/bar/init.lua`)");
+
+        // Every zone reported before any assertion, so one overflow does not hide the next.
+        let overflowing: Vec<String> = zones
+            .iter()
+            .enumerate()
+            .filter_map(|(index, zone)| {
+                let shown: Vec<&crate::layout::ResolvedNode> = zone.children.iter().filter(|child| child.visible).collect();
+                let content: f32 = shown.iter().map(|child| child.rect.width).sum::<f32>() + 6.0 * shown.len().saturating_sub(1) as f32;
+                let widths: Vec<String> = shown.iter().map(|child| format!("{:.0}", child.rect.width)).collect();
+                (content > zone.rect.width).then(|| {
+                    format!("zone {index}: {:.0}px of modules ({}) in {:.0}px", content, widths.join("+"), zone.rect.width)
+                })
+            })
+            .collect();
+        assert!(overflowing.is_empty(), "a bar zone will paint past its own edge -- {}", overflowing.join("; "));
+
+        // The popup has the same problem in the other axis and no percentage to hide it: § 6.3
+        // makes `width`/`height` literal and gives a popup no `Fill`, so a panel body taller than
+        // the surface it was declared for is simply cut off. Each panel is measured on its own,
+        // because only one is visible at a time.
+        let host = client.scene.surface("panel_host").expect("the panel host must resolve");
+        let card = &host.children[0];
+        let tallest = card.children.iter().map(|section| section.rect.height).fold(0.0_f32, f32::max);
+        let widest = card.children.iter().map(|section| section.rect.width).fold(0.0_f32, f32::max);
+        // `panel_card`'s defaults: 10px top and bottom, 12px left and right.
+        assert!(
+            tallest + 20.0 <= host.rect.height,
+            "the tallest bar panel is {:.0}px in a {:.0}px popup; its last rows will be cut off",
+            tallest + 20.0,
+            host.rect.height
+        );
+        assert!(
+            widest + 24.0 <= host.rect.width,
+            "the widest bar panel is {:.0}px in a {:.0}px popup; it will paint past the edge",
+            widest + 24.0,
+            host.rect.width
+        );
+    }
+
     #[test]
     fn every_rostered_capability_is_on_the_oblisk_table_and_reads_nil_before_its_first_snapshot() {
         // ADR-0037's uniform contract: a shell.lua reading any rostered capability at boot gets a

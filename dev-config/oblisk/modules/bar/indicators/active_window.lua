@@ -1,3 +1,5 @@
+-- Mirrors ActiveWindow.qml.
+--
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
@@ -57,7 +59,27 @@ local function refresh_window_title()
     end)
 end
 
+-- The focused window's own icon, and the second `oblisk.applications` consumer (docs/adr/0061).
+-- Its source is `oblisk.workspaces.active_client.class`, not the `process.run` above: that is a
+-- toplevel's `app_id` (ADR-0056 decision 5), which is exactly the spelling `util.app_entry` maps
+-- onto a `.desktop` entry. Before the capability existed there was nowhere for an `app_id` to
+-- become an icon at all, which is the caller ADR-0054 decision 5 said would arrive one day.
+--
+-- So the icon tracks focus live while the title beside it waits for a click, and that split is
+-- deliberate rather than an oversight: the title is this file's `process.run`/`json.decode`
+-- demonstration (ADR-0057) and stays click-driven, while an icon that only updated when clicked
+-- would sit there showing the wrong application.
+local focused_icon = icon {
+    name = computed({ oblisk.applications, oblisk.workspaces }, function(applications, workspaces)
+        local client = workspaces and workspaces.active_client
+        local entry = util.app_entry(applications, client and client.class)
+        return (entry and entry.icon) or ""
+    end),
+    size = 14,
+}
+
 local window_title_module = pill({
+    focused_icon,
     button {
         width = 210,
         height = 24,

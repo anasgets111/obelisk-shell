@@ -1,3 +1,5 @@
+-- Mirrors Global/LockScreen.qml.
+--
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
@@ -14,9 +16,12 @@ local cell = require("components.cell")
 -- keyboard focus, so this is typable with no click. A second such field would put the lock screen
 -- back to needing a mouse, because with two destinations the engine refuses to guess.
 --
--- Measured, so it is not mistaken for breakage on a live lock: a `textfield` paints nothing today
--- (`paint.rs` skips the kind), so this reserves 28px and swallows keystrokes while showing no
--- masked characters at all. `lock_status` below is what shows that typing is landing.
+-- `mask_character` is drawn, one glyph per keystroke, so typing is visible. It was not always:
+-- this field reserved 28px and swallowed keystrokes showing nothing, and typing a password blind
+-- is worse than it sounds. `pam_unix` answers a wrong password with a two second delay and
+-- `pam_faillock` locks the account after three, so an invisible typo looked exactly like a slow
+-- unlock and three of them cost ten minutes. `lock_status` below still reports what the
+-- capability says; this reports what you typed.
 local password_field = textfield {
     width = "Fill",
     height = 28,

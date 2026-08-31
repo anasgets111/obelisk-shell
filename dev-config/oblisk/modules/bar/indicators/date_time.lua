@@ -7,6 +7,7 @@
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
+local tooltip = require("components.tooltip")
 
 local clock = cell(util.label(oblisk.system, function(s)
     return os.date("%H:%M:%S", s.time)
@@ -16,4 +17,24 @@ local date = cell(util.label(oblisk.system, function(s)
     return os.date("%a %d %b", s.time)
 end), theme.DIM, 11)
 
-return { clock = clock, date = date }
+-- Quickshell's DateTimeDisplay opens a mini calendar and a weather panel on hover. There is no
+-- calendar node and no weather capability, so this is the part of that tooltip the data supports:
+-- the full date `%a %d %b` had to truncate, and the seconds the pill does not show.
+local SLOT = "clock"
+
+local clock_tooltip = tooltip({
+    id = "clock_tooltip",
+    slot = SLOT,
+    width = 200,
+    height = 60,
+    children = {
+        cell(util.label(oblisk.system, function(s)
+            return os.date("%A %d %B %Y", s.time)
+        end), theme.FG, 12),
+        cell(util.label(oblisk.system, function(s)
+            return os.date("%H:%M:%S %Z", s.time)
+        end), theme.DIM, 11),
+    },
+})
+
+return { clock = clock, date = date, slot = SLOT, tooltip = clock_tooltip }

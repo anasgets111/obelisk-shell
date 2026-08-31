@@ -15,6 +15,9 @@ return row {
     end),
     children = { pill({ cell(util.label(oblisk.privacy, function(p)
         local users = p.camera_users or {}
-        return "cam: " .. ((users[1] or {}).app_name or "?")
+        -- Truncated like every other readout here. An app name arrives from whichever process
+        -- opened the camera and has no length this config controls, and the pill is only ever up
+        -- while a camera is live, which is the worst moment for the bar to reflow.
+        return "cam: " .. util.truncate((users[1] or {}).app_name or "?", 10)
     end), theme.RED) }, "#45253aff") },
 }

@@ -12,22 +12,9 @@ local util = require("lib.util")
 local cell = require("components.cell")
 local pill = require("components.pill")
 local meter = require("components.meter")
+local ui_state = require("lib.ui_state")
 
-local volume_icon = oblisk.audio:map(function(a)
-    if a == nil then
-        return ""
-    end
-    if a.muted then
-        return "audio-volume-muted"
-    end
-    local percent = (a.volume or 0) * 100
-    if percent < 34 then
-        return "audio-volume-low"
-    elseif percent < 67 then
-        return "audio-volume-medium"
-    end
-    return "audio-volume-high"
-end)
+local volume_icon = oblisk.audio:map(util.volume_icon_name)
 
 -- The icon and the readout are one `button`: clicking mutes, clicking again unmutes. This is the
 -- § 3.2 audio write path's live proof, and `toggle_mute` is the one action of the seven that takes
@@ -40,7 +27,7 @@ end)
 local volume_module = pill({
     icon { name = volume_icon, size = 14 },
     -- The readout is the button and the icon beside it is not, which is the shape
-    -- `brightness_module` already uses: a `button` is a stacking container (`scene.rs` positions
+    -- every pill here uses: a `button` is a stacking container (`scene.rs` positions
     -- its children independently rather than in a line), so it holds one child. Wrapping a `row`
     -- in it to get both drew the icon's box and none of its pixels.
     button {
@@ -48,6 +35,7 @@ local volume_module = pill({
         align_v = "Center",
         on_click = function()
             oblisk.audio:invoke("toggle_mute")
+            ui_state.arm_osd("volume")
         end,
         children = { cell(util.label(oblisk.audio, function(a)
             if a.muted then

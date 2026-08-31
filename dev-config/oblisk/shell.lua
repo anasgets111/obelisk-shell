@@ -3,18 +3,22 @@
 -- target/debug/supervisor`), and it is the worked example of what a config for this shell looks
 -- like. Where those conflict the fixture wins, and the comment says so.
 --
--- Laid out like a bar people actually run: three zones, modules grouped into pills, the clock
--- centred. That shape is not decoration. It is what found docs/adr/0053: writing it required a
--- clock, a battery and a volume readout, and none of the three had a data source until that ADR.
+-- Laid out like a bar people actually run, because it is copied from one: the zones and the order
+-- of the modules in them are `~/.config/quickshell`'s, down to the clock sitting last on the right
+-- rather than centred. That shape is not decoration. It is what found docs/adr/0053: writing it
+-- required a clock, a battery and a volume readout, and none of the three had a data source until
+-- that ADR.
 --
 -- Editing this file while the stack runs drives a reload. Changing `id`/`layer`/`anchor`/`monitor`/
 -- `namespace` on a surface is a topology change and drives a full PBA generation swap (§ 15.2);
 -- anything else reloads in place on the same Lua VM.
 
--- What this file imports, and where each thing lives. The layout mirrors the Quickshell config
--- this shell is written to replace: `config/` holds design tokens, `components/` holds dumb
--- reusable widgets, `lib/` holds functions with no node in them, and `modules/` holds feature
--- assemblies grouped by the surface they appear on.
+-- What this file imports, and where each thing lives. The tree mirrors the Quickshell config this
+-- shell is written to replace, directory for directory: `config/` holds design tokens,
+-- `components/` holds dumb reusable widgets, `lib/` holds functions with no node in them, and
+-- `modules/` holds feature assemblies -- `bar/` with its `indicators/` and `panels/`, `global/`
+-- for the surfaces that are not the bar, `notification/`, `osd/`, and `shell/` for the one host
+-- that puts a panel on screen.
 --
 -- There is no `services/` directory, and that is the one place the mirror deliberately breaks.
 -- Quickshell needs 25 singleton `*Service.qml` files because each one has to own its own D-Bus
@@ -28,14 +32,34 @@
 -- Bound to locals first, and that is load-bearing rather than style. Lua 5.4's `require` returns
 -- *two* values, the module and the loader data (the file path), where 5.3 returned one. A call in
 -- the last position of a table constructor expands to all of its values, so the obvious
--- `return { require(...), require(...) }` puts a seventh element in this list that is the string
--- "/path/to/lock.lua", and the engine then reports `error converting Lua string to table` with no
--- clue which of the six is wrong. `local x = require(...)` takes the first value and nothing else.
+-- `return { require(...), require(...) }` puts one more element in this list than it has surfaces,
+-- a string like "/path/to/lock.lua", and the engine then reports `error converting Lua string to
+-- table` with no clue which entry is wrong. `local x = require(...)` takes the first value and nothing else.
 local wallpaper = require("modules.global.wallpaper")
 local bar = require("modules.bar")
 local notifications = require("modules.notification.popup")
+local osd = require("modules.osd.popup")
 local settings = require("modules.bar.panels.settings")
-local menu = require("modules.bar.panels.menu")
+local panel_host = require("modules.shell.panel_host")
+local launcher = require("modules.global.launcher")
+-- A tooltip is a surface of its own, so each is listed here rather than nested in the bar: a
+-- `popup` is an `xdg_popup` rooted under the bar, not a node inside it (§ 6.3, docs/adr/0062).
+-- They cost nothing until hovered -- a popup with `visible = false` creates no Wayland object.
+local battery_tooltip = require("modules.bar.indicators.battery").tooltip
+local clock_tooltip = require("modules.bar.indicators.date_time").tooltip
+local launcher_tooltip = require("modules.bar.indicators.launcher_button").tooltip
 local lock_screen = require("modules.global.lock")
 
-return { wallpaper, bar, notifications, settings, menu.surface, lock_screen }
+return {
+    wallpaper,
+    bar,
+    notifications,
+    osd,
+    settings,
+    panel_host,
+    battery_tooltip,
+    clock_tooltip,
+    launcher_tooltip,
+    launcher,
+    lock_screen,
+}
