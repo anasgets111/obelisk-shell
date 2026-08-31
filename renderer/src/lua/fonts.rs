@@ -6,6 +6,11 @@
 //! the same shape as `state`, `hover` and `scroll`: a registry in `Lua::app_data`, written while
 //! the config evaluates and read afterwards.
 //!
+//! Its own module rather than a fourth registry inside `lua::signal`, where those three live. They
+//! are there because they are signals and share `SignalKind`, its write gating and the dirty flag.
+//! This is a plain list read once with no reactivity at all, so putting it beside them would file it
+//! under the one thing it is not.
+//!
 //! **Process-wide, not per node.** One chain, ordered, and `femtovg` and `cosmic-text` both fall
 //! back across it per glyph. That is what makes a Nerd Font's private-use glyphs work beside a sans
 //! face for body text without any node saying which it wants: the codepoint decides. A per-node

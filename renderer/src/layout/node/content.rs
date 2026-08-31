@@ -98,6 +98,11 @@ fn parse_optional_string(properties: &HashMap<String, Value>, property: &str) ->
 /// Only visible when the box is wider than the text, so it does nothing on a `Content`-sized node
 /// whose box came from measuring that same string. An explicit `width`, a `"Fill"`, or a
 /// `Stretch`ed cross axis is what makes room for it to matter.
+///
+/// Its own type rather than a reuse of [`Align`](super::Align), whose match arms look the same. That
+/// one carries `Stretch`, which forces a child's size during layout; a run of glyphs has no size to
+/// force, so a shared type would give this property a fourth value with no meaning and every reader
+/// of it a case to invent an answer for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TextAlign {
     #[default]

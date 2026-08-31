@@ -27,6 +27,22 @@ pub struct TextPainter {
     fonts: Vec<FontId>,
 }
 
+/// Which femtovg alignment to set, and what x to hand `fill_text` under it.
+///
+/// `set_text_align` decides what the x it is given *means*, so the anchor moves with the alignment:
+/// the near edge, the centre, or the far edge of the snapped box.
+///
+/// Its own function because everything around it needs a live GL context and this is arithmetic.
+fn text_anchor(align: TextAlign, x0: i32, x1: i32) -> (Align, f32) {
+    match align {
+        TextAlign::Start => (Align::Left, x0 as f32),
+        // Averaged in `f32` rather than `(x0 + x1) / 2` in `i32`, which would truncate an odd-width
+        // box half a pixel to the left of its own centre.
+        TextAlign::Center => (Align::Center, (x0 as f32 + x1 as f32) / 2.0),
+        TextAlign::End => (Align::Right, x1 as f32),
+    }
+}
+
 impl TextPainter {
     /// `load_fn` must resolve GL function pointers against a context that's already current on
     /// this thread -- FemtoVG doesn't make any context current itself.
@@ -103,14 +119,41 @@ impl TextPainter {
         // its far edge. Measuring the run here to compute a left offset would be a second
         // measurement, against femtovg's metrics rather than the cosmic-text ones the box was sized
         // with, which is exactly the disagreement `text::shaping`'s module doc records.
-        let (femto_align, anchor_x) = match align {
-            TextAlign::Start => (Align::Left, physical.x0 as f32),
-            TextAlign::Center => (Align::Center, (physical.x0 + physical.x1) as f32 / 2.0),
-            TextAlign::End => (Align::Right, physical.x1 as f32),
-        };
+        let (femto_align, anchor_x) = text_anchor(align, physical.x0, physical.x1);
         paint.set_text_align(femto_align);
         let ascender = self.canvas.measure_font(&paint).map(|m| m.ascender()).unwrap_or(font_size);
         let baseline_y = physical.y0 as f32 + ascender;
         let _ = self.canvas.fill_text(anchor_x, baseline_y, text, &paint);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The anchor has to move with the alignment, because `set_text_align` changes what the x
+    /// means rather than shifting the run under a fixed one.
+    #[test]
+    fn the_anchor_is_the_edge_the_alignment_measures_from() {
+        assert_eq!(text_anchor(TextAlign::Start, 10, 90), (Align::Left, 10.0));
+        assert_eq!(text_anchor(TextAlign::Center, 10, 90), (Align::Center, 50.0));
+        assert_eq!(text_anchor(TextAlign::End, 10, 90), (Align::Right, 90.0));
+    }
+
+    /// An odd-width box centres on a half pixel. Averaging in `i32` first would truncate it left,
+    /// which is a half-pixel drift that only shows on some box widths and not others.
+    #[test]
+    fn an_odd_width_box_centres_on_its_true_middle() {
+        assert_eq!(text_anchor(TextAlign::Center, 0, 15).1, 7.5);
+    }
+
+    /// A zero-width box is degenerate but reachable (a `Content`-sized node holding an empty
+    /// string), and all three alignments have to agree on it rather than one of them drifting.
+    #[test]
+    fn a_zero_width_box_anchors_every_alignment_at_the_same_point() {
+        let x = 42;
+        assert_eq!(text_anchor(TextAlign::Start, x, x).1, 42.0);
+        assert_eq!(text_anchor(TextAlign::Center, x, x).1, 42.0);
+        assert_eq!(text_anchor(TextAlign::End, x, x).1, 42.0);
     }
 }

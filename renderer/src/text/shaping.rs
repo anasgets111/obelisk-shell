@@ -424,6 +424,25 @@ mod tests {
         assert_eq!(after, wanted, "the worker measures against what the config asked for");
     }
 
+    /// The half the primary-family test does not reach, and the one that matters most here.
+    /// `font_chain_data` is what `TextPainter::new` loads into femtovg, so a `set_chain` that moved
+    /// the measuring side and not this one would reproduce the exact defect this module's doc
+    /// records: text measured against one font and painted with another.
+    #[test]
+    fn a_declared_chain_reaches_the_faces_femtovg_paints_with_too() {
+        let handle = ShapingHandle::spawn();
+        let before: Vec<usize> = handle.font_chain_data().iter().map(|data| data.as_ref().len()).collect();
+        handle.set_chain(&["CaskaydiaCove Nerd Font Propo".to_string()]);
+        let after: Vec<usize> = handle.font_chain_data().iter().map(|data| data.as_ref().len()).collect();
+        if handle.resolved_primary_family() != "CaskaydiaCove Nerd Font Propo" {
+            eprintln!("skip: the family is not installed, so nothing could change");
+            return;
+        }
+        assert_eq!(after.len(), 1, "a one-family chain loads one file");
+        assert_ne!(after, before, "the bytes femtovg would load must be the new font's, not the old chain's");
+        assert!(after[0] > 0, "and they are real bytes, not an empty mapping");
+    }
+
     #[test]
     fn an_empty_declaration_leaves_the_default_chain_standing() {
         let handle = ShapingHandle::spawn();
