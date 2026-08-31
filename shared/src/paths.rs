@@ -32,15 +32,42 @@ pub fn session_locked_flag_path() -> io::Result<PathBuf> {
 #[cfg(debug_assertions)]
 const DEV_CONFIG_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../dev-config/oblisk");
 
-/// `~/.config/oblisk/`, resolved via `$XDG_CONFIG_HOME` falling back to `$HOME/.config` (XDG
-/// Base Directory order). Both `supervisor` (watches this directory) and `renderer` (reads
-/// `shell.lua` from it) resolve it identically.
+/// The environment variable `oblisk -c <dir>` sets, and the highest-precedence answer below.
 ///
-/// A debug build looks in the workspace's `dev-config/oblisk/` first, so `cargo run -p
-/// supervisor` boots against the tracked dev config with no environment set up. `$XDG_CONFIG_HOME`
-/// still wins in both builds, so the dev branch is not a second source of truth. Release builds
-/// never see it at all: `debug_assertions` is off, so `DEV_CONFIG_DIR` isn't compiled in.
+/// It is public rather than an implementation detail of the spawn path, because running two
+/// configs side by side is the reason `-c` exists and hiding the variable buys nothing.
+pub const CONFIG_DIR_ENV: &str = "OBLISK_CONFIG_DIR";
+
+/// The generation id the Supervisor stamps on every Renderer it spawns.
+///
+/// Here rather than in either binary because both read it and its absence means something to both:
+/// the Renderer treats it as "nobody spawned me" and refuses to start, and the Supervisor sets it
+/// on the boot spawn and on every generation swap.
+pub const GENERATION_ID_ENV: &str = "OBLISK_GENERATION_ID";
+
+/// Set on the Renderer when `oblisk check` re-execs it to evaluate a config without a display.
+pub const CHECK_ENV: &str = "OBLISK_CHECK";
+
+/// `~/.config/oblisk/`, in precedence order: `$OBLISK_CONFIG_DIR`, then `$XDG_CONFIG_HOME/oblisk`,
+/// then the dev config in a debug build, then `$HOME/.config/oblisk`.
+///
+/// Both binaries call this and neither tells the other what it got. They agree because they share
+/// an environment, which is exactly why `-c` sets [`CONFIG_DIR_ENV`] in the Supervisor's own
+/// process rather than passing a path down: every Renderer the Supervisor spawns inherits it, and
+/// so does every Renderer a generation swap spawns later. A path passed through the handshake
+/// instead would have to be re-passed on every swap, and a swap that forgot would silently read a
+/// different config than the one being watched.
+///
+/// A debug build looks in the workspace's `dev-config/oblisk/` before `$HOME`, so a binary run out
+/// of `target/debug` boots against the tracked dev config with nothing set up. Both variables win
+/// over it, so it is not a second source of truth, and a release build never compiles it in.
 pub fn config_dir() -> io::Result<PathBuf> {
+    // Taken as the directory itself, not joined with `oblisk`: `-c` names the config, where
+    // `$XDG_CONFIG_HOME` names the directory configs live in.
+    if let Some(explicit) = std::env::var_os(CONFIG_DIR_ENV) {
+        return Ok(PathBuf::from(explicit));
+    }
+
     if let Some(xdg_config_home) = std::env::var_os("XDG_CONFIG_HOME") {
         return Ok(PathBuf::from(xdg_config_home).join("oblisk"));
     }
@@ -118,5 +145,31 @@ mod tests {
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
         }
         assert_eq!(resolved, PathBuf::from("/tmp/oblisk-config-dir-test/oblisk"));
+    }
+
+    /// `-c` has to beat `$XDG_CONFIG_HOME`, or a user with the variable set could not point the
+    /// shell at a second config at all.
+    #[test]
+    fn the_explicit_config_dir_wins_over_xdg_config_home() {
+        let _guard = env_lock();
+        let previous_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let previous_explicit = std::env::var_os(CONFIG_DIR_ENV);
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", "/tmp/oblisk-xdg");
+            std::env::set_var(CONFIG_DIR_ENV, "/tmp/oblisk-explicit");
+        }
+        let resolved = config_dir().unwrap();
+        unsafe {
+            match previous_xdg {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match previous_explicit {
+                Some(value) => std::env::set_var(CONFIG_DIR_ENV, value),
+                None => std::env::remove_var(CONFIG_DIR_ENV),
+            }
+        }
+        // Taken whole, not joined with `oblisk`: this names the config directory itself.
+        assert_eq!(resolved, PathBuf::from("/tmp/oblisk-explicit"));
     }
 }

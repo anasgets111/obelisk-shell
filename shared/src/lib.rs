@@ -4,7 +4,10 @@ use zeroize::ZeroizeOnDrop;
 pub mod framing;
 mod paths;
 mod secure_buffer;
-pub use paths::{config_dir, control_socket_path, session_locked_flag_path, shell_lua_path};
+pub use paths::{
+    CHECK_ENV, CONFIG_DIR_ENV, GENERATION_ID_ENV, config_dir, control_socket_path, session_locked_flag_path,
+    shell_lua_path,
+};
 pub use secure_buffer::SecureBuffer;
 pub use zeroize::{Zeroize, Zeroizing};
 
@@ -20,8 +23,23 @@ pub use zeroize::{Zeroize, Zeroizing};
 /// loudly in development rather than as an index-into-nil error in a user's `shell.lua`. `idle`
 /// is deliberately absent: it's event-shaped, not snapshot state (ADR-0032).
 pub const CAPABILITIES: &[&str] = &[
-    "audio", "network", "bluetooth", "tray", "notifications", "mpris", "sysinfo", "keyboard", "privacy", "updates", "lock", "battery", "system",
-    "brightness", "workspaces", "power", "applications",
+    "audio",
+    "network",
+    "bluetooth",
+    "tray",
+    "notifications",
+    "mpris",
+    "sysinfo",
+    "keyboard",
+    "privacy",
+    "updates",
+    "lock",
+    "battery",
+    "system",
+    "brightness",
+    "workspaces",
+    "power",
+    "applications",
 ];
 
 /// Guarded JSON-RPC 2.0 envelope wrapping a Lua write action.
@@ -75,12 +93,19 @@ pub struct ReevaluateRequest {
 /// branch, not to run the reload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ReevaluateReport {
-    Unchanged { sequence: u64 },
-    TopologyChanged { sequence: u64 },
+    Unchanged {
+        sequence: u64,
+    },
+    TopologyChanged {
+        sequence: u64,
+    },
     /// `shell.lua` failed to evaluate. The Renderer has already kept its prior applied scene
     /// untouched and entered rescue state locally -- `error` is for the Supervisor's own
     /// logging only.
-    Failed { sequence: u64, error: String },
+    Failed {
+        sequence: u64,
+        error: String,
+    },
 }
 
 /// Supervisor -> Renderer: apply the pending evaluation from the [`ReevaluateRequest`] carrying
@@ -457,7 +482,10 @@ mod tests {
     fn supervisor_frame_promote_generation_is_adjacently_tagged() {
         let frame = SupervisorFrame::PromoteGeneration(PromoteGeneration { surface_id: "overlay_canvas".to_string() });
         let wire = serde_json::to_value(&frame).unwrap();
-        assert_eq!(wire, serde_json::json!({ "kind": "PromoteGeneration", "data": { "surface_id": "overlay_canvas" } }));
+        assert_eq!(
+            wire,
+            serde_json::json!({ "kind": "PromoteGeneration", "data": { "surface_id": "overlay_canvas" } })
+        );
 
         let parsed: SupervisorFrame = serde_json::from_value(wire).unwrap();
         assert_eq!(parsed, frame);
@@ -465,9 +493,14 @@ mod tests {
 
     #[test]
     fn renderer_frame_ready_signal_is_adjacently_tagged() {
-        let frame = RendererFrame::ReadySignal(ReadySignal { surfaces: vec!["main_bar".to_string(), "overlay_canvas".to_string()] });
+        let frame = RendererFrame::ReadySignal(ReadySignal {
+            surfaces: vec!["main_bar".to_string(), "overlay_canvas".to_string()],
+        });
         let wire = serde_json::to_value(&frame).unwrap();
-        assert_eq!(wire, serde_json::json!({ "kind": "ReadySignal", "data": { "surfaces": ["main_bar", "overlay_canvas"] } }));
+        assert_eq!(
+            wire,
+            serde_json::json!({ "kind": "ReadySignal", "data": { "surfaces": ["main_bar", "overlay_canvas"] } })
+        );
 
         let parsed: RendererFrame = serde_json::from_value(wire).unwrap();
         assert_eq!(parsed, frame);
@@ -475,9 +508,15 @@ mod tests {
 
     #[test]
     fn renderer_frame_presentation_evidence_is_adjacently_tagged() {
-        let frame = RendererFrame::PresentationEvidence(PresentationEvidence { nonce: 7, surface_id: "wallpaper_layer@DP-1".to_string() });
+        let frame = RendererFrame::PresentationEvidence(PresentationEvidence {
+            nonce: 7,
+            surface_id: "wallpaper_layer@DP-1".to_string(),
+        });
         let wire = serde_json::to_value(&frame).unwrap();
-        assert_eq!(wire, serde_json::json!({ "kind": "PresentationEvidence", "data": { "nonce": 7, "surface_id": "wallpaper_layer@DP-1" } }));
+        assert_eq!(
+            wire,
+            serde_json::json!({ "kind": "PresentationEvidence", "data": { "nonce": 7, "surface_id": "wallpaper_layer@DP-1" } })
+        );
 
         let parsed: RendererFrame = serde_json::from_value(wire).unwrap();
         assert_eq!(parsed, frame);
@@ -519,8 +558,12 @@ mod tests {
     /// type must scrub its own `secret` on zeroize/drop.
     #[test]
     fn zeroizing_a_secure_submit_clears_its_secret() {
-        let mut submit =
-            SecureSubmit { generation_id: 4, capability: "polkit".to_string(), action: "authenticate".to_string(), secret: b"hunter2".to_vec() };
+        let mut submit = SecureSubmit {
+            generation_id: 4,
+            capability: "polkit".to_string(),
+            action: "authenticate".to_string(),
+            secret: b"hunter2".to_vec(),
+        };
 
         submit.zeroize();
 
@@ -529,9 +572,16 @@ mod tests {
 
     #[test]
     fn supervisor_frame_process_output_is_adjacently_tagged() {
-        let frame = SupervisorFrame::ProcessOutput(ProcessOutputLine { id: 3, stream: ProcessStream::Stdout, line: "hello".to_string() });
+        let frame = SupervisorFrame::ProcessOutput(ProcessOutputLine {
+            id: 3,
+            stream: ProcessStream::Stdout,
+            line: "hello".to_string(),
+        });
         let wire = serde_json::to_value(&frame).unwrap();
-        assert_eq!(wire, serde_json::json!({ "kind": "ProcessOutput", "data": { "id": 3, "stream": "Stdout", "line": "hello" } }));
+        assert_eq!(
+            wire,
+            serde_json::json!({ "kind": "ProcessOutput", "data": { "id": 3, "stream": "Stdout", "line": "hello" } })
+        );
 
         let parsed: SupervisorFrame = serde_json::from_value(wire).unwrap();
         assert_eq!(parsed, frame);
@@ -572,5 +622,4 @@ mod tests {
             assert_eq!(parsed, outcome);
         }
     }
-
 }
