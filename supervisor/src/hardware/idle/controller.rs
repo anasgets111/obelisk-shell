@@ -6,12 +6,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::RwLock;
+use tokio::sync::mpsc::UnboundedSender;
 
-use super::inhibit::{INHIBIT_MODE, INHIBIT_WHAT, INHIBIT_WHO, InhibitState, LiveInhibit, Login1ManagerProxy, apply_inhibit, apply_release_inhibit, cleanup_generation_inhibit};
-use super::notify::{NotifyState, cleanup_generation_thresholds, connect_wayland_idle, register_threshold_entry, spawn_idle_event_forwarder};
-
+use super::inhibit::{
+    INHIBIT_MODE, INHIBIT_WHAT, INHIBIT_WHO, InhibitState, LiveInhibit, Login1ManagerProxy, apply_inhibit,
+    apply_release_inhibit, cleanup_generation_inhibit,
+};
+use super::notify::{
+    NotifyState, cleanup_generation_thresholds, connect_wayland_idle, register_threshold_entry,
+    spawn_idle_event_forwarder,
+};
 
 /// `idle:register_threshold(sec, on_idle, on_resume)`'s `arguments: [sec]`
 /// (docs/oblisk-supervisor-services-dbus.md §7.1; ADR-0032). The callbacks themselves stay
@@ -24,8 +29,6 @@ pub fn parse_register_args(arguments: &[serde_json::Value]) -> Option<u64> {
 pub fn parse_inhibit_args(arguments: &[serde_json::Value]) -> Option<String> {
     arguments.first()?.as_str().map(str::to_string)
 }
-
-
 
 /// Bound on [`connect_wayland_idle`]'s background `spawn_blocking` task (see
 /// [`IdleController::new`]). A local Wayland roundtrip completes well under a second against
@@ -55,18 +58,26 @@ impl IdleController {
 
         let notify_for_task = notify.clone();
         tokio::spawn(async move {
-            let outcome = tokio::time::timeout(IDLE_NOTIFY_SETUP_TIMEOUT, tokio::task::spawn_blocking(connect_wayland_idle)).await;
+            let outcome =
+                tokio::time::timeout(IDLE_NOTIFY_SETUP_TIMEOUT, tokio::task::spawn_blocking(connect_wayland_idle))
+                    .await;
             match outcome {
                 Ok(Ok(Ok((live, raw_events_rx)))) => {
                     spawn_idle_event_forwarder(live.registry.clone(), raw_events_rx, events_tx);
                     *notify_for_task.write().await = NotifyState::Live(live);
-                    eprintln!("idle: dedicated Wayland connection for ext_idle_notifier_v1 established; notify live for this run");
+                    eprintln!(
+                        "idle: dedicated Wayland connection for ext_idle_notifier_v1 established; notify live for this run"
+                    );
                 }
                 Ok(Ok(Err(err))) => {
-                    eprintln!("idle: dedicated Wayland connection for ext_idle_notifier_v1 unavailable; notify disabled for this run: {err}");
+                    eprintln!(
+                        "idle: dedicated Wayland connection for ext_idle_notifier_v1 unavailable; notify disabled for this run: {err}"
+                    );
                 }
                 Ok(Err(join_err)) => {
-                    eprintln!("idle: the dedicated Wayland connection setup task panicked; notify disabled for this run: {join_err}");
+                    eprintln!(
+                        "idle: the dedicated Wayland connection setup task panicked; notify disabled for this run: {join_err}"
+                    );
                 }
                 Err(_) => {
                     eprintln!(
@@ -93,7 +104,9 @@ impl IdleController {
     pub async fn register_threshold(&self, generation_id: u32, sec: u64) {
         let notify = self.notify.read().await;
         let NotifyState::Live(live) = &*notify else {
-            eprintln!("idle: register_threshold(generation {generation_id}, {sec}s) ignored: notify is inert for this run");
+            eprintln!(
+                "idle: register_threshold(generation {generation_id}, {sec}s) ignored: notify is inert for this run"
+            );
             return;
         };
 
@@ -105,7 +118,8 @@ impl IdleController {
         if created_new_listener {
             let duration = Duration::from_secs(sec);
             let timeout_ms = u32::try_from(duration.as_millis()).unwrap_or(u32::MAX);
-            let notification = live.notifier.get_idle_notification(timeout_ms, &live.seat, &live.queue_handle, duration);
+            let notification =
+                live.notifier.get_idle_notification(timeout_ms, &live.seat, &live.queue_handle, duration);
             live.registry.lock().unwrap().listeners.insert(duration, notification);
             if let Err(err) = live.connection.flush() {
                 eprintln!("idle: failed to flush the get_idle_notification request for {sec}s: {err}");
@@ -133,7 +147,9 @@ impl IdleController {
         let proxy = match Login1ManagerProxy::new(&self.inhibit.system_bus).await {
             Ok(proxy) => proxy,
             Err(err) => {
-                eprintln!("idle: inhibit(generation {generation_id}, {reason:?}) failed to build the login1 Manager proxy: {err}");
+                eprintln!(
+                    "idle: inhibit(generation {generation_id}, {reason:?}) failed to build the login1 Manager proxy: {err}"
+                );
                 if let Some(count) = state.counts.get_mut(&generation_id) {
                     *count = count.saturating_sub(1);
                 }
@@ -146,7 +162,9 @@ impl IdleController {
                 state.fd = Some(fd);
             }
             Err(err) => {
-                eprintln!("idle: Inhibit({INHIBIT_WHAT:?}, {INHIBIT_WHO:?}, {reason:?}, {INHIBIT_MODE:?}) failed: {err}");
+                eprintln!(
+                    "idle: Inhibit({INHIBIT_WHAT:?}, {INHIBIT_WHO:?}, {reason:?}, {INHIBIT_MODE:?}) failed: {err}"
+                );
                 if let Some(count) = state.counts.get_mut(&generation_id) {
                     *count = count.saturating_sub(1);
                 }
@@ -185,7 +203,6 @@ impl IdleController {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +230,4 @@ mod tests {
         assert_eq!(parse_inhibit_args(&[]), None);
         assert_eq!(parse_inhibit_args(&[serde_json::json!(42)]), None);
     }
-
 }

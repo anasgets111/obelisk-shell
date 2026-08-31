@@ -85,19 +85,30 @@ pub(super) trait AgentManager1 {
 
 /// Small convenience wrappers around each proxy's own macro-generated `builder()`, purely to
 /// keep every per-path `.path(path)?.build().await` call site one line instead of three.
-pub(super) async fn bind_adapter(connection: &zbus::Connection, path: OwnedObjectPath) -> zbus::Result<Adapter1Proxy<'static>> {
+pub(super) async fn bind_adapter(
+    connection: &zbus::Connection,
+    path: OwnedObjectPath,
+) -> zbus::Result<Adapter1Proxy<'static>> {
     Adapter1Proxy::builder(connection).path(path)?.build().await
 }
 
-pub(super) async fn bind_device(connection: &zbus::Connection, path: OwnedObjectPath) -> zbus::Result<Device1Proxy<'static>> {
+pub(super) async fn bind_device(
+    connection: &zbus::Connection,
+    path: OwnedObjectPath,
+) -> zbus::Result<Device1Proxy<'static>> {
     Device1Proxy::builder(connection).path(path)?.build().await
 }
 
-pub(super) async fn bind_battery(connection: &zbus::Connection, path: OwnedObjectPath) -> zbus::Result<Battery1Proxy<'static>> {
+pub(super) async fn bind_battery(
+    connection: &zbus::Connection,
+    path: OwnedObjectPath,
+) -> zbus::Result<Battery1Proxy<'static>> {
     Battery1Proxy::builder(connection).path(path)?.build().await
 }
 
-pub(super) async fn bind_object_manager(connection: &zbus::Connection) -> zbus::Result<zbus::fdo::ObjectManagerProxy<'static>> {
+pub(super) async fn bind_object_manager(
+    connection: &zbus::Connection,
+) -> zbus::Result<zbus::fdo::ObjectManagerProxy<'static>> {
     zbus::fdo::ObjectManagerProxy::builder(connection).destination("org.bluez")?.path("/")?.build().await
 }
 
@@ -115,4 +126,3 @@ pub(super) async fn subscribe_object_manager(
 pub(super) async fn bind_agent_manager(connection: &zbus::Connection) -> zbus::Result<AgentManager1Proxy<'static>> {
     AgentManager1Proxy::new(connection).await
 }
-

@@ -33,7 +33,6 @@ pub(super) fn resolve_expiry(urgency: Urgency, expire_timeout: i32) -> ExpiryPol
     }
 }
 
-
 // -------------------------------------------------------------------------------------------
 // DND sound-gating logic (TDD seam 6).
 // -------------------------------------------------------------------------------------------
@@ -57,13 +56,16 @@ pub(super) fn should_play_sound(dnd: bool, urgency: Urgency, sound_registered: b
 /// validated through the same path-trust boundary as `image-path`) plays instead of the tier
 /// default; else `tier_default` plays; else nothing. `hints["sound-name"]` never reaches this
 /// function -- it isn't honored.
-pub(super) fn resolve_sound_path(suppress: bool, client_sound_file: Option<PathBuf>, tier_default: Option<PathBuf>) -> Option<PathBuf> {
+pub(super) fn resolve_sound_path(
+    suppress: bool,
+    client_sound_file: Option<PathBuf>,
+    tier_default: Option<PathBuf>,
+) -> Option<PathBuf> {
     if suppress {
         return None;
     }
     client_sound_file.or(tier_default)
 }
-
 
 // -------------------------------------------------------------------------------------------
 // Queue mutation (TDD seam 7): FIFO eviction and replace/icon lifecycle, pure `VecDeque`
@@ -127,7 +129,10 @@ fn push_new(queue: &mut VecDeque<Notification>, notification: Notification) -> O
 /// `icon_path` and marks the old file for deletion, "rather than leaving a stale image attached to
 /// new text" (ADR-0033). A fresh image that differs from the old path also marks the old file for
 /// deletion; the same path reused (rare, but not impossible) deletes nothing.
-fn resolve_replacement_icon(previous_icon_path: Option<String>, fresh_icon_path: Option<String>) -> (Option<String>, Option<String>) {
+fn resolve_replacement_icon(
+    previous_icon_path: Option<String>,
+    fresh_icon_path: Option<String>,
+) -> (Option<String>, Option<String>) {
     match (&previous_icon_path, &fresh_icon_path) {
         (Some(old), Some(new)) if old != new => (fresh_icon_path, previous_icon_path),
         (Some(_), Some(_)) => (fresh_icon_path, None),
@@ -143,7 +148,10 @@ fn resolve_replacement_icon(previous_icon_path: Option<String>, fresh_icon_path:
 /// needs to clean up ([`QueueCleanup`]) -- either the replaced entry's own old icon
 /// ([`resolve_replacement_icon`], never a signal) or, on the fallback path, whatever [`push_new`]
 /// itself evicted (icon deletion *and* a `NotificationClosed` signal).
-pub(super) fn replace_or_push(queue: &mut VecDeque<Notification>, mut notification: Notification) -> Option<QueueCleanup> {
+pub(super) fn replace_or_push(
+    queue: &mut VecDeque<Notification>,
+    mut notification: Notification,
+) -> Option<QueueCleanup> {
     let target_id = notification.id;
     if let Some(existing) = queue.iter_mut().find(|entry| entry.id == target_id) {
         let previous_icon = existing.icon_path.clone();
@@ -180,11 +188,10 @@ pub(super) fn feed_view(queue: &VecDeque<Notification>) -> Vec<Notification> {
     queue.iter().rev().take(NOTIFICATION_FEED_VIEW).cloned().collect()
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_support::text;
+    use super::*;
 
     // ---- resolve_expiry (TDD seam 5) ----
 
@@ -243,7 +250,11 @@ mod tests {
     fn resolve_sound_path_suppress_always_wins_to_none() {
         let client = Some(PathBuf::from("/usr/share/sounds/client.wav"));
         let tier = Some(PathBuf::from("/usr/share/sounds/tier.wav"));
-        assert_eq!(resolve_sound_path(true, client.clone(), tier.clone()), None, "suppress-sound must force silence even with both a client file and a tier default present");
+        assert_eq!(
+            resolve_sound_path(true, client.clone(), tier.clone()),
+            None,
+            "suppress-sound must force silence even with both a client file and a tier default present"
+        );
         assert_eq!(resolve_sound_path(true, client, None), None);
         assert_eq!(resolve_sound_path(true, None, tier), None);
         assert_eq!(resolve_sound_path(true, None, None), None);
@@ -350,14 +361,16 @@ mod tests {
 
     #[test]
     fn resolve_replacement_icon_deletes_the_old_icon_when_a_different_fresh_image_is_supplied() {
-        let (resolved, to_delete) = resolve_replacement_icon(Some("/tmp/old.png".to_string()), Some("/tmp/new.png".to_string()));
+        let (resolved, to_delete) =
+            resolve_replacement_icon(Some("/tmp/old.png".to_string()), Some("/tmp/new.png".to_string()));
         assert_eq!(resolved, Some("/tmp/new.png".to_string()));
         assert_eq!(to_delete, Some("/tmp/old.png".to_string()));
     }
 
     #[test]
     fn resolve_replacement_icon_deletes_nothing_when_the_same_path_is_reused() {
-        let (resolved, to_delete) = resolve_replacement_icon(Some("/tmp/same.png".to_string()), Some("/tmp/same.png".to_string()));
+        let (resolved, to_delete) =
+            resolve_replacement_icon(Some("/tmp/same.png".to_string()), Some("/tmp/same.png".to_string()));
         assert_eq!(resolved, Some("/tmp/same.png".to_string()));
         assert_eq!(to_delete, None);
     }
@@ -379,7 +392,11 @@ mod tests {
         replacement.summary = "updated".to_string();
         let cleanup = replace_or_push(&mut queue, replacement);
 
-        assert_eq!(cleanup, Some(QueueCleanup::ReplacedIcon("/tmp/old.png".to_string())), "a same-id replace must never report an Evicted cleanup");
+        assert_eq!(
+            cleanup,
+            Some(QueueCleanup::ReplacedIcon("/tmp/old.png".to_string())),
+            "a same-id replace must never report an Evicted cleanup"
+        );
         assert_eq!(queue.len(), 2, "a replace must not grow the queue");
         assert_eq!(queue[0].summary, "updated");
         assert_eq!(queue[0].icon_path, None);
@@ -503,8 +520,16 @@ mod tests {
         queue[0] = replacement;
 
         // Timer A (captured incarnation 1 at spawn time) must find nothing: superseded.
-        assert_eq!(find_expiring_entry(&queue, 7, 1), None, "a stale timer for the pre-replace incarnation must be a no-op");
+        assert_eq!(
+            find_expiring_entry(&queue, 7, 1),
+            None,
+            "a stale timer for the pre-replace incarnation must be a no-op"
+        );
         // Timer B (captured incarnation 2, the replacement's own) must find the real entry.
-        assert_eq!(find_expiring_entry(&queue, 7, 2), Some(0), "the current timer for the post-replace incarnation must still fire normally");
+        assert_eq!(
+            find_expiring_entry(&queue, 7, 2),
+            Some(0),
+            "the current timer for the post-replace incarnation must still fire normally"
+        );
     }
 }

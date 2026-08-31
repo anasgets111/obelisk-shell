@@ -10,8 +10,8 @@ use std::rc::Rc;
 use pipewire as pw;
 use pw::keys;
 use pw::registry::GlobalObject;
-use pw::spa::pod::deserialize::PodDeserializer;
 use pw::spa::pod::Value;
+use pw::spa::pod::deserialize::PodDeserializer;
 use pw::spa::utils::dict::DictRef;
 use pw::types::ObjectType;
 use tokio::sync::mpsc::UnboundedSender;
@@ -19,9 +19,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::audio::master;
 
 use super::state::{
-    apply_info_event, apply_video_info_event, classify, device_display_name, AudioApps, AudioCommand, AudioState, DefaultDevice,
-    DeviceNames, MixerState, NodeKind, PropsLookup, SinkEntry, SinkRoute, VideoSourceApp, VideoSourceApps, DEFAULT_AUDIO_SINK_KEY,
-    DEFAULT_AUDIO_SOURCE_KEY,
+    AudioApps, AudioCommand, AudioState, DEFAULT_AUDIO_SINK_KEY, DEFAULT_AUDIO_SOURCE_KEY, DefaultDevice, DeviceNames,
+    MixerState, NodeKind, PropsLookup, SinkEntry, SinkRoute, VideoSourceApp, VideoSourceApps, apply_info_event,
+    apply_video_info_event, classify, device_display_name,
 };
 use super::write::apply_command;
 
@@ -45,7 +45,11 @@ use super::write::apply_command;
 /// Logs and returns if PipeWire can't be reached at all (no daemon running) rather than
 /// panicking: audio/video-source tracking is one optional subsystem, not a reason to take the
 /// whole supervisor down.
-pub fn run(updates: UnboundedSender<AudioState>, video_updates: UnboundedSender<Vec<VideoSourceApp>>, commands: AudioCommandReceiver) {
+pub fn run(
+    updates: UnboundedSender<AudioState>,
+    video_updates: UnboundedSender<Vec<VideoSourceApp>>,
+    commands: AudioCommandReceiver,
+) {
     if let Err(err) = run_inner(updates, video_updates, commands) {
         eprintln!("pipewire registry listener stopped: {err}");
     }
@@ -63,7 +67,11 @@ pub fn command_channel() -> (AudioCommandSender, AudioCommandReceiver) {
     pw::channel::channel()
 }
 
-fn run_inner(updates: UnboundedSender<AudioState>, video_updates: UnboundedSender<Vec<VideoSourceApp>>, commands: AudioCommandReceiver) -> Result<(), pw::Error> {
+fn run_inner(
+    updates: UnboundedSender<AudioState>,
+    video_updates: UnboundedSender<Vec<VideoSourceApp>>,
+    commands: AudioCommandReceiver,
+) -> Result<(), pw::Error> {
     pw::init();
 
     let main_loop = pw::main_loop::MainLoopRc::new(None)?;
@@ -140,7 +148,8 @@ fn run_inner(updates: UnboundedSender<AudioState>, video_updates: UnboundedSende
     // Held for the loop's lifetime: dropping the AttachedReceiver detaches the eventfd source
     // and every later command is silently discarded.
     let state_for_command = Rc::clone(&state);
-    let _attached_commands = commands.attach(main_loop.loop_(), move |command| apply_command(&state_for_command, command));
+    let _attached_commands =
+        commands.attach(main_loop.loop_(), move |command| apply_command(&state_for_command, command));
 
     main_loop.run();
     Ok(())
@@ -365,7 +374,9 @@ fn track_source(state: &Rc<RefCell<MixerState>>, obj: &GlobalObject<&DictRef>) {
     let Some(props) = obj.props else { return };
     let Some(node_name) = props.get_prop(*keys::NODE_NAME) else { return };
     let mut state_mut = state.borrow_mut();
-    state_mut.sources.insert(obj.id, DeviceNames { node_name: node_name.to_string(), description: device_display_name(props) });
+    state_mut
+        .sources
+        .insert(obj.id, DeviceNames { node_name: node_name.to_string(), description: device_display_name(props) });
     state_mut.publish_audio();
 }
 
@@ -374,7 +385,11 @@ fn track_source(state: &Rc<RefCell<MixerState>>, obj: &GlobalObject<&DictRef>) {
 /// capability doesn't need. A machine advertises multiple `Metadata` objects (`settings`,
 /// `filters`, `route-settings`, confirmed live via `pw-mon`); every non-matching one is left
 /// unbound.
-fn bind_default_metadata(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryRc, obj: &GlobalObject<&DictRef>) {
+fn bind_default_metadata(
+    state: &Rc<RefCell<MixerState>>,
+    registry: &pw::registry::RegistryRc,
+    obj: &GlobalObject<&DictRef>,
+) {
     if obj.props.and_then(|props| props.get_prop(METADATA_NAME)) != Some("default") {
         return;
     }

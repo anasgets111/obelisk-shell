@@ -50,13 +50,9 @@ pub fn init(wl_display_ptr: *mut c_void) -> Result<EglState, String> {
     let display = unsafe { instance.get_display(wl_display_ptr) }
         .ok_or("eglGetDisplay returned no display for the Wayland connection")?;
 
-    instance
-        .initialize(display)
-        .map_err(|e| format!("eglInitialize failed: {e}"))?;
+    instance.initialize(display).map_err(|e| format!("eglInitialize failed: {e}"))?;
 
-    instance
-        .bind_api(egl::OPENGL_ES_API)
-        .map_err(|e| format!("eglBindAPI(EGL_OPENGL_ES_API) failed: {e}"))?;
+    instance.bind_api(egl::OPENGL_ES_API).map_err(|e| format!("eglBindAPI(EGL_OPENGL_ES_API) failed: {e}"))?;
 
     let query_attribs = [
         egl::SURFACE_TYPE,
@@ -95,12 +91,7 @@ pub fn init(wl_display_ptr: *mut c_void) -> Result<EglState, String> {
         .create_context(display, config, None, &context_attribs)
         .map_err(|e| format!("eglCreateContext (GLES3) failed: {e}"))?;
 
-    Ok(EglState {
-        instance,
-        display,
-        config,
-        context,
-    })
+    Ok(EglState { instance, display, config, context })
 }
 
 fn query_config_attribs(

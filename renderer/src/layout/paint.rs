@@ -36,7 +36,7 @@ use crate::image::{self, Fit, ImageCache};
 use crate::layout::node::{self, BorderColor, EdgeInsets, PaintStyle, Rgba, TextAlign};
 use crate::layout::scene::ResolvedNode;
 use crate::text::atlas::TextPainter;
-use crate::text::snap::{snap_border_band, snap_to_physical, LogicalRect, PhysicalRect};
+use crate::text::snap::{LogicalRect, PhysicalRect, snap_border_band, snap_to_physical};
 
 /// What one node actually draws, with every paint property already parsed. The variants are the
 /// four kind arms that draw anything; a `textfield` or an unrecognised kind contributes no
@@ -50,8 +50,18 @@ use crate::text::snap::{snap_border_band, snap_to_physical, LogicalRect, Physica
 #[derive(Debug, Clone, PartialEq)]
 pub enum Draw {
     /// `rect`/`row`/`column`/`button` and all four surface roles: the fill, then the border.
-    Box { background: Option<Rgba>, radius: f32, colors: BorderColor, widths: EdgeInsets },
-    Text { content: String, font_size: f32, color: Rgba, align: TextAlign },
+    Box {
+        background: Option<Rgba>,
+        radius: f32,
+        colors: BorderColor,
+        widths: EdgeInsets,
+    },
+    Text {
+        content: String,
+        font_size: f32,
+        color: Rgba,
+        align: TextAlign,
+    },
     /// The theme *name*, not the resolved path: [`execute`] does the `image::icons::resolve`
     /// lookup. Keeping the filesystem hit out of [`build`] is what lets the build run on every
     /// re-resolve without touching the icon theme, and the name plus the size is what decides the
@@ -59,8 +69,17 @@ pub enum Draw {
     /// `alpha` rather than a tinted colour, because an icon is blitted rather than filled:
     /// `femtovg`'s `Paint::image` takes the alpha as its last argument, where a `Box` or a `Text`
     /// can carry the same information inside the `Rgba` it already had.
-    Icon { name: String, px: u32, alpha: f32 },
-    Image { source: String, fit: Fit, px: u32, alpha: f32 },
+    Icon {
+        name: String,
+        px: u32,
+        alpha: f32,
+    },
+    Image {
+        source: String,
+        fit: Fit,
+        px: u32,
+        alpha: f32,
+    },
 }
 
 /// One drawable node: what, where, and the clip it draws under.
@@ -270,7 +289,9 @@ pub fn execute(painter: &mut TextPainter, images: &mut ImageCache, list: &Displa
                 }
                 paint_border(painter.canvas_mut(), rect, *radius, *colors, *widths, scale);
             }
-            Draw::Text { content, font_size, color, align } => painter.draw_line(content, rect, *font_size, scale, *color, *align),
+            Draw::Text { content, font_size, color, align } => {
+                painter.draw_line(content, rect, *font_size, scale, *color, *align)
+            }
             Draw::Icon { name, px, alpha } => {
                 // `u16` is `freedesktop-icons`'s own size type, and a theme has no directory above
                 // 512 anyway.
@@ -286,7 +307,6 @@ pub fn execute(painter: &mut TextPainter, images: &mut ImageCache, list: &Displa
     painter.canvas_mut().reset_scissor();
     painter.canvas_mut().flush();
 }
-
 
 /// One node's parsed paint properties as the draw they produce, or `None` when they produce none.
 ///
@@ -316,7 +336,13 @@ fn fade_border(colors: BorderColor, opacity: f32) -> BorderColor {
     }
 }
 
-fn draw_for(style: &PaintStyle, rect: LogicalRect, scale: f32, opacity: f32, focus: Option<&SecureField>) -> Option<Draw> {
+fn draw_for(
+    style: &PaintStyle,
+    rect: LogicalRect,
+    scale: f32,
+    opacity: f32,
+    focus: Option<&SecureField>,
+) -> Option<Draw> {
     match style {
         // The shared paint of `rect`/`row`/`column`/`button` and all four surface roles: background
         // fill, then borders (`oblisk-idl-api-specs.md` § 5.2 item 1).
@@ -432,10 +458,7 @@ fn draw_file(
     let fitted = image::fitted_rect(rect, width as f32, height as f32, fit);
     let mut path = Path::new();
     path.rect(fitted.x, fitted.y, fitted.width, fitted.height);
-    canvas.fill_path(
-        &path,
-        &Paint::image(id, fitted.x, fitted.y, fitted.width, fitted.height, 0.0, alpha),
-    );
+    canvas.fill_path(&path, &Paint::image(id, fitted.x, fitted.y, fitted.width, fitted.height, 0.0, alpha));
 }
 
 /// One logical edge in whole physical pixels, floored at 1. `ImageCache` keys on this, so it has
@@ -472,7 +495,14 @@ fn fill_rect(canvas: &mut Canvas<OpenGl>, rect: LogicalRect, radius: f32, color:
 /// on without duplicating its internal `rounded_rect_varying` construction; the upgrade path is
 /// exactly that -- four independent corner arcs plus four edge segments, mitred at each join --
 /// once a real config needs a rounded per-edge border rather than this approximation.
-fn paint_border(canvas: &mut Canvas<OpenGl>, rect: LogicalRect, radius: f32, colors: BorderColor, widths: EdgeInsets, scale: f32) {
+fn paint_border(
+    canvas: &mut Canvas<OpenGl>,
+    rect: LogicalRect,
+    radius: f32,
+    colors: BorderColor,
+    widths: EdgeInsets,
+    scale: f32,
+) {
     let uniform_width = widths.top == widths.right && widths.right == widths.bottom && widths.bottom == widths.left;
     let uniform_color = matches!(
         (colors.top, colors.right, colors.bottom, colors.left),
@@ -493,7 +523,13 @@ fn paint_border(canvas: &mut Canvas<OpenGl>, rect: LogicalRect, radius: f32, col
         let (_, width) = snap_border_band(rect.x, widths.top, scale);
         let inset = width / 2.0;
         let mut path = Path::new();
-        path.rounded_rect(box_x + inset, box_y + inset, (box_width - width).max(0.0), (box_height - width).max(0.0), radius);
+        path.rounded_rect(
+            box_x + inset,
+            box_y + inset,
+            (box_width - width).max(0.0),
+            (box_height - width).max(0.0),
+            radius,
+        );
         let mut paint = Paint::color(Color::rgbaf(color.r, color.g, color.b, color.a));
         paint.set_line_width(width);
         canvas.stroke_path(&path, &paint);
@@ -503,7 +539,14 @@ fn paint_border(canvas: &mut Canvas<OpenGl>, rect: LogicalRect, radius: f32, col
     // Corners overlap here rather than mitre -- each edge is its own filled rect spanning the
     // node's full width or height, so two adjacent non-zero edges both cover the corner they
     // share.
-    paint_border_edge(canvas, colors.top, widths.top, LogicalRect { x: rect.x, y: rect.y, width: rect.width, height: widths.top }, EdgeAxis::Horizontal, scale);
+    paint_border_edge(
+        canvas,
+        colors.top,
+        widths.top,
+        LogicalRect { x: rect.x, y: rect.y, width: rect.width, height: widths.top },
+        EdgeAxis::Horizontal,
+        scale,
+    );
     paint_border_edge(
         canvas,
         colors.bottom,
@@ -512,7 +555,14 @@ fn paint_border(canvas: &mut Canvas<OpenGl>, rect: LogicalRect, radius: f32, col
         EdgeAxis::Horizontal,
         scale,
     );
-    paint_border_edge(canvas, colors.left, widths.left, LogicalRect { x: rect.x, y: rect.y, width: widths.left, height: rect.height }, EdgeAxis::Vertical, scale);
+    paint_border_edge(
+        canvas,
+        colors.left,
+        widths.left,
+        LogicalRect { x: rect.x, y: rect.y, width: widths.left, height: rect.height },
+        EdgeAxis::Vertical,
+        scale,
+    );
     paint_border_edge(
         canvas,
         colors.right,
@@ -538,7 +588,14 @@ enum EdgeAxis {
 /// `snap_border_band` before building the path, so a filled-edge border gets the same
 /// whole-physical-pixel treatment as the uniform-radius stroke above -- the long axis is left
 /// alone, since only the thin axis can straddle a pixel boundary and blur.
-fn paint_border_edge(canvas: &mut Canvas<OpenGl>, color: Option<Rgba>, width: f32, edge_rect: LogicalRect, axis: EdgeAxis, scale: f32) {
+fn paint_border_edge(
+    canvas: &mut Canvas<OpenGl>,
+    color: Option<Rgba>,
+    width: f32,
+    edge_rect: LogicalRect,
+    axis: EdgeAxis,
+    scale: f32,
+) {
     let Some(color) = color else { return };
     if width <= 0.0 {
         return;
@@ -567,10 +624,10 @@ mod tests {
     use khronos_egl as egl;
     use mlua::Lua;
 
-    use crate::lua::nodes::{deserialize_lua_table, register_node_constructors};
-    use crate::lua::signal;
     use crate::layout::instance::SurfaceInstance;
     use crate::layout::scene::{LogicalSize, Scene};
+    use crate::lua::nodes::{deserialize_lua_table, register_node_constructors};
+    use crate::lua::signal;
     use crate::text::shaping::{ShapeRequest, ShapingHandle};
 
     const PLATFORM_SURFACELESS_MESA: egl::Enum = 0x31DD;
@@ -586,7 +643,9 @@ mod tests {
     fn init_headless_egl(width: i32, height: i32) -> Option<egl::Instance<egl::Static>> {
         let instance = egl::Instance::new(egl::Static);
 
-        let display = match unsafe { instance.get_platform_display(PLATFORM_SURFACELESS_MESA, egl::DEFAULT_DISPLAY, &[egl::ATTRIB_NONE]) } {
+        let display = match unsafe {
+            instance.get_platform_display(PLATFORM_SURFACELESS_MESA, egl::DEFAULT_DISPLAY, &[egl::ATTRIB_NONE])
+        } {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("EGL init failed, skip: eglGetPlatformDisplay(SURFACELESS_MESA): {e}");
@@ -660,7 +719,12 @@ mod tests {
     /// Builds a `TextPainter` against `instance`'s already-current context -- same
     /// `font_chain_data` source `paint_surface` uses, so this harness draws with the exact
     /// declared font chain cosmic-text shaped against (docs/adr/0043 decision 2).
-    fn text_painter(instance: &egl::Instance<egl::Static>, shaping: &ShapingHandle, width: u32, height: u32) -> Option<TextPainter> {
+    fn text_painter(
+        instance: &egl::Instance<egl::Static>,
+        shaping: &ShapingHandle,
+        width: u32,
+        height: u32,
+    ) -> Option<TextPainter> {
         let font_chain = shaping.font_chain_data();
         TextPainter::new(
             |s| instance.get_proc_address(s).map_or(std::ptr::null(), |f| f as *const c_void),
@@ -715,7 +779,9 @@ mod tests {
 
     #[test]
     fn a_declared_text_align_reaches_the_display_list() {
-        for (declared, expected) in [("Center", TextAlign::Center), ("End", TextAlign::End), ("Start", TextAlign::Start)] {
+        for (declared, expected) in
+            [("Center", TextAlign::Center), ("End", TextAlign::End), ("Start", TextAlign::Start)]
+        {
             let lua = Lua::new();
             let src = format!(
                 r##"return panel {{ id = "bar", width = 200, height = 40,
@@ -880,8 +946,10 @@ mod tests {
     fn changing_only_a_texts_content_changes_the_list() {
         let lua = Lua::new();
         let panel = |content: &str| {
-            format!(r##"return panel {{ id = "bar", width = 200, height = 40,
-                child = text {{ content = "{content}", foreground = "#ffffffff" }} }}"##)
+            format!(
+                r##"return panel {{ id = "bar", width = 200, height = 40,
+                child = text {{ content = "{content}", foreground = "#ffffffff" }} }}"##
+            )
         };
         let size = LogicalSize { width: 200.0, height: 40.0 };
         let before = build(&resolved_surface(&lua, &panel("12:00:00"), size), 1.0, None);
@@ -929,7 +997,11 @@ mod tests {
             0x33,
             "the panel root's own background must be listed first, got {backgrounds:?}"
         );
-        assert_eq!((backgrounds[1].b * 255.0).round() as u8, 0x66, "the child must be listed after the parent it paints over");
+        assert_eq!(
+            (backgrounds[1].b * 255.0).round() as u8,
+            0x66,
+            "the child must be listed after the parent it paints over"
+        );
     }
 
     /// A child's clip is its own box intersected with its parent's, never wider. This is the
@@ -1025,7 +1097,11 @@ mod tests {
         let lua = Lua::new();
         let elsewhere = node::SecureSubmitTarget { capability: "network".to_string(), action: "connect".to_string() };
         let list = build(&password_surface(&lua), 1.0, Some(&SecureField { target: &elsewhere, filled: 9 }));
-        assert_eq!(drawn_text(&list), vec!["password".to_string()], "a PSK's length must not leak onto the lock screen's field");
+        assert_eq!(
+            drawn_text(&list),
+            vec!["password".to_string()],
+            "a PSK's length must not leak onto the lock screen's field"
+        );
     }
 
     /// The count is all paint ever gets (see [`SecureField`]), so there is no path by which a
@@ -1086,7 +1162,9 @@ mod tests {
     ) -> Option<(egl::Instance<egl::Static>, egl::Display, egl::Context, egl::Surface, egl::Surface)> {
         let instance = egl::Instance::new(egl::Static);
 
-        let display = match unsafe { instance.get_platform_display(PLATFORM_SURFACELESS_MESA, egl::DEFAULT_DISPLAY, &[egl::ATTRIB_NONE]) } {
+        let display = match unsafe {
+            instance.get_platform_display(PLATFORM_SURFACELESS_MESA, egl::DEFAULT_DISPLAY, &[egl::ATTRIB_NONE])
+        } {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("EGL init failed, skip: eglGetPlatformDisplay(SURFACELESS_MESA): {e}");
@@ -1102,9 +1180,18 @@ mod tests {
             return None;
         }
         let attribs = [
-            egl::SURFACE_TYPE, egl::PBUFFER_BIT,
-            egl::RENDERABLE_TYPE, egl::OPENGL_ES3_BIT,
-            egl::RED_SIZE, 8, egl::GREEN_SIZE, 8, egl::BLUE_SIZE, 8, egl::ALPHA_SIZE, 8,
+            egl::SURFACE_TYPE,
+            egl::PBUFFER_BIT,
+            egl::RENDERABLE_TYPE,
+            egl::OPENGL_ES3_BIT,
+            egl::RED_SIZE,
+            8,
+            egl::GREEN_SIZE,
+            8,
+            egl::BLUE_SIZE,
+            8,
+            egl::ALPHA_SIZE,
+            8,
             egl::NONE,
         ];
         let config = match instance.choose_first_config(display, &attribs) {
@@ -1206,7 +1293,9 @@ mod tests {
         let shaping = ShapingHandle::spawn();
         let Some(mut painter) = text_painter(&instance, &shaping, 64, 64) else { return };
 
-        for (kind, colour, expected) in [("window", "#FF0000FF", (255, 0, 0, 255)), ("popup", "#0000FFFF", (0, 0, 255, 255))] {
+        for (kind, colour, expected) in
+            [("window", "#FF0000FF", (255, 0, 0, 255)), ("popup", "#0000FFFF", (0, 0, 255, 255))]
+        {
             let lua = Lua::new();
             let root = resolved_surface(
                 &lua,
@@ -1214,7 +1303,11 @@ mod tests {
                 LogicalSize { width: 64.0, height: 64.0 },
             );
             paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
-            assert_eq!(pixel_at(painter.canvas_mut(), 32, 32), expected, "a `{kind}` root must paint its own box like a `panel` root");
+            assert_eq!(
+                pixel_at(painter.canvas_mut(), 32, 32),
+                expected,
+                "a `{kind}` root must paint its own box like a `panel` root"
+            );
         }
     }
 
@@ -1232,7 +1325,11 @@ mod tests {
         );
         paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
         assert_eq!(pixel_at(painter.canvas_mut(), 32, 32), (0, 255, 0, 255));
-        assert_eq!(pixel_at(painter.canvas_mut(), 1, 1), (0, 255, 0, 255), "the fill reaches the corner of the output the surface covers");
+        assert_eq!(
+            pixel_at(painter.canvas_mut(), 1, 1),
+            (0, 255, 0, 255),
+            "the fill reaches the corner of the output the surface covers"
+        );
     }
 
     #[test]
@@ -1329,7 +1426,10 @@ mod tests {
                 );
             }
         }
-        assert!(lit_pixels > 0, "text with a foreground colour must paint at least one non-background pixel inside its rect");
+        assert!(
+            lit_pixels > 0,
+            "text with a foreground colour must paint at least one non-background pixel inside its rect"
+        );
     }
 
     /// The uniform-border-with-radius branch of [`paint_border`] had no test at all: the per-edge
@@ -1394,12 +1494,20 @@ mod tests {
         const TEXT: &str = "Oblisk Shell Renderer";
         const FONT_SIZE: f32 = 24.0;
 
-        let shaped = shaping.shape(ShapeRequest { text: TEXT.into(), font_size: FONT_SIZE, line_height: FONT_SIZE * 1.2, max_width: None });
+        let shaped = shaping.shape(ShapeRequest {
+            text: TEXT.into(),
+            font_size: FONT_SIZE,
+            line_height: FONT_SIZE * 1.2,
+            max_width: None,
+        });
 
         let mut paint = Paint::color(Color::black());
         paint.set_font(painter.fonts());
         paint.set_font_size(FONT_SIZE);
-        let metrics = painter.canvas_mut().measure_text(0.0, 0.0, TEXT, &paint).expect("measure_text should succeed with the chain fonts loaded");
+        let metrics = painter
+            .canvas_mut()
+            .measure_text(0.0, 0.0, TEXT, &paint)
+            .expect("measure_text should succeed with the chain fonts loaded");
         let femtovg_width = metrics.width();
 
         let tolerance = shaped.width.max(femtovg_width) * 0.02;
@@ -1555,11 +1663,19 @@ mod tests {
         );
         paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
 
-        assert_eq!(pixel_at(painter.canvas_mut(), 9, 30), (255, 0, 0, 255), "column 9 should be the surface's red, outside the border");
+        assert_eq!(
+            pixel_at(painter.canvas_mut(), 9, 30),
+            (255, 0, 0, 255),
+            "column 9 should be the surface's red, outside the border"
+        );
         for x in 10..14usize {
             assert_eq!(pixel_at(painter.canvas_mut(), x, 30), (255, 255, 255, 255), "column {x} is not fully white");
         }
-        assert_eq!(pixel_at(painter.canvas_mut(), 14, 30), (0, 0, 0, 255), "column 14 should be the rect's own black fill, past the border");
+        assert_eq!(
+            pixel_at(painter.canvas_mut(), 14, 30),
+            (0, 0, 0, 255),
+            "column 14 should be the rect's own black fill, past the border"
+        );
     }
 
     /// A `row`/`column`/`rect` container clips its children just as much as a `text` node clips

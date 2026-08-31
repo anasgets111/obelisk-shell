@@ -26,20 +26,27 @@ impl StatusNotifierWatcher {
         #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         let sender = header.sender().map(|s| s.to_string());
-        let (unique_name, object_path) = resolve_registration(&self.connection, &service, sender.as_deref())
-            .await
-            .map_err(|err| zbus::fdo::Error::Failed(format!("RegisterStatusNotifierItem({service:?}) could not be resolved: {err}")))?;
+        let (unique_name, object_path) =
+            resolve_registration(&self.connection, &service, sender.as_deref()).await.map_err(|err| {
+                zbus::fdo::Error::Failed(format!(
+                    "RegisterStatusNotifierItem({service:?}) could not be resolved: {err}"
+                ))
+            })?;
 
-        register_item(&self.connection, &self.registry, &self.events, unique_name.clone(), object_path)
-            .await
-            .map_err(|err| zbus::fdo::Error::Failed(format!("RegisterStatusNotifierItem({service:?}) failed: {err}")))?;
+        register_item(&self.connection, &self.registry, &self.events, unique_name.clone(), object_path).await.map_err(
+            |err| zbus::fdo::Error::Failed(format!("RegisterStatusNotifierItem({service:?}) failed: {err}")),
+        )?;
 
         let _ = emitter.status_notifier_item_registered(unique_name.as_str()).await;
         Ok(())
     }
 
     #[zbus(name = "RegisterStatusNotifierHost")]
-    async fn register_status_notifier_host(&self, _service: String, #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>) {
+    async fn register_status_notifier_host(
+        &self,
+        _service: String,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+    ) {
         // Accepted trivially (ADR-0031): Oblisk is the only host that matters here; this
         // exists for spec completeness (we may register ourselves as our own host too, see
         // TrayController::new).
@@ -70,15 +77,24 @@ impl StatusNotifierWatcher {
     }
 
     #[zbus(signal)]
-    async fn status_notifier_item_registered(signal_emitter: &zbus::object_server::SignalEmitter<'_>, service: &str) -> zbus::Result<()>;
+    async fn status_notifier_item_registered(
+        signal_emitter: &zbus::object_server::SignalEmitter<'_>,
+        service: &str,
+    ) -> zbus::Result<()>;
     #[zbus(signal)]
-    async fn status_notifier_item_unregistered(signal_emitter: &zbus::object_server::SignalEmitter<'_>, service: &str) -> zbus::Result<()>;
+    async fn status_notifier_item_unregistered(
+        signal_emitter: &zbus::object_server::SignalEmitter<'_>,
+        service: &str,
+    ) -> zbus::Result<()>;
     #[zbus(signal)]
-    async fn status_notifier_host_registered(signal_emitter: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
+    async fn status_notifier_host_registered(
+        signal_emitter: &zbus::object_server::SignalEmitter<'_>,
+    ) -> zbus::Result<()>;
     #[zbus(signal)]
-    async fn status_notifier_host_unregistered(signal_emitter: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
+    async fn status_notifier_host_unregistered(
+        signal_emitter: &zbus::object_server::SignalEmitter<'_>,
+    ) -> zbus::Result<()>;
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -86,9 +102,9 @@ mod tests {
 
     use zbus::zvariant::OwnedObjectPath;
 
-    use super::*;
-    use super::super::{DEFAULT_ITEM_OBJECT_PATH, RawIconPixmap, RawToolTip, WATCHER_OBJECT_PATH};
     use super::super::test_support::p2p_pair;
+    use super::super::{DEFAULT_ITEM_OBJECT_PATH, RawIconPixmap, RawToolTip, WATCHER_OBJECT_PATH};
+    use super::*;
 
     // ---- resolve_registration / register_status_notifier_item: a fabricated unique name
     //      must be rejected, since a connection can only ever truthfully claim its own real
@@ -173,12 +189,19 @@ mod tests {
     #[tokio::test]
     async fn register_status_notifier_item_accepts_a_unique_name_matching_the_real_sender() {
         let (connection, peer) = p2p_pair().await;
-        peer.object_server().at(DEFAULT_ITEM_OBJECT_PATH, StubStatusNotifierItem).await.expect("failed to export the stub StatusNotifierItem");
-        peer.object_server().at("/org/freedesktop/DBus", StubDBusDaemon).await.expect("failed to export the stub org.freedesktop.DBus");
+        peer.object_server()
+            .at(DEFAULT_ITEM_OBJECT_PATH, StubStatusNotifierItem)
+            .await
+            .expect("failed to export the stub StatusNotifierItem");
+        peer.object_server()
+            .at("/org/freedesktop/DBus", StubDBusDaemon)
+            .await
+            .expect("failed to export the stub org.freedesktop.DBus");
 
         let registry: ItemRegistry = Arc::new(Mutex::new(HashMap::new()));
         let watcher = test_watcher(connection.clone(), registry.clone());
-        let emitter = zbus::object_server::SignalEmitter::new(&connection, WATCHER_OBJECT_PATH).expect("valid signal emitter");
+        let emitter =
+            zbus::object_server::SignalEmitter::new(&connection, WATCHER_OBJECT_PATH).expect("valid signal emitter");
 
         let message = register_call_message(":1.5");
         let result = watcher.register_status_notifier_item(":1.5".to_string(), message.header(), emitter).await;
@@ -192,7 +215,8 @@ mod tests {
         let (connection, _peer) = p2p_pair().await;
         let registry: ItemRegistry = Arc::new(Mutex::new(HashMap::new()));
         let watcher = test_watcher(connection.clone(), registry.clone());
-        let emitter = zbus::object_server::SignalEmitter::new(&connection, WATCHER_OBJECT_PATH).expect("valid signal emitter");
+        let emitter =
+            zbus::object_server::SignalEmitter::new(&connection, WATCHER_OBJECT_PATH).expect("valid signal emitter");
 
         // The real sender is :1.5; the call claims to be the fabricated, never-connected :999.1.
         let message = register_call_message(":1.5");

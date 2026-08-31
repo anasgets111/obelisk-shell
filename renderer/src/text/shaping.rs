@@ -156,7 +156,8 @@ impl ShapingHandle {
                             // faces and every measurement taken so far, and the caller has already
                             // cleared the cache for the same reason this rebuild exists.
                             let borrowed: Vec<&str> = chain.iter().map(String::as_str).collect();
-                            let ResolvedFonts { db: mut new_db, primary_family: new_primary } = fonts::resolve_chain(&borrowed);
+                            let ResolvedFonts { db: mut new_db, primary_family: new_primary } =
+                                fonts::resolve_chain(&borrowed);
                             chain_data = font_chain_data(&mut new_db);
                             font_system = FontSystem::new_with_locale_and_db(detect_locale(), new_db);
                             primary_family = new_primary;
@@ -219,9 +220,7 @@ impl ShapingHandle {
                 reply_tx,
             ))
             .expect("oblisk-text-shaping worker thread died");
-        let result = reply_rx
-            .recv()
-            .expect("oblisk-text-shaping worker thread died before replying");
+        let result = reply_rx.recv().expect("oblisk-text-shaping worker thread died before replying");
 
         let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
         // Cleared wholesale rather than evicted one entry at a time. An LRU needs a recency order
@@ -262,7 +261,9 @@ impl ShapingHandle {
         }
         self.cache.lock().unwrap_or_else(PoisonError::into_inner).clear();
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.requests.send(Request::SetChain(chain.to_vec(), reply_tx)).expect("oblisk-text-shaping worker thread died");
+        self.requests
+            .send(Request::SetChain(chain.to_vec(), reply_tx))
+            .expect("oblisk-text-shaping worker thread died");
         let _ = reply_rx.recv();
     }
 
@@ -283,12 +284,8 @@ impl ShapingHandle {
     /// file per call the way the `Vec<Vec<u8>>` it replaces did.
     pub fn font_chain_data(&self) -> Vec<FontData> {
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.requests
-            .send(Request::FontChainData(reply_tx))
-            .expect("oblisk-text-shaping worker thread died");
-        reply_rx
-            .recv()
-            .expect("oblisk-text-shaping worker thread died before replying")
+        self.requests.send(Request::FontChainData(reply_tx)).expect("oblisk-text-shaping worker thread died");
+        reply_rx.recv().expect("oblisk-text-shaping worker thread died before replying")
     }
 
     /// Returns the font chain's resolved primary family: the same name `shape()` asks
@@ -296,12 +293,8 @@ impl ShapingHandle {
     #[cfg(test)]
     pub fn resolved_primary_family(&self) -> String {
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.requests
-            .send(Request::ResolvedPrimaryFamily(reply_tx))
-            .expect("oblisk-text-shaping worker thread died");
-        reply_rx
-            .recv()
-            .expect("oblisk-text-shaping worker thread died before replying")
+        self.requests.send(Request::ResolvedPrimaryFamily(reply_tx)).expect("oblisk-text-shaping worker thread died");
+        reply_rx.recv().expect("oblisk-text-shaping worker thread died before replying")
     }
 }
 
@@ -483,7 +476,10 @@ mod tests {
             ("text", ShapeRequest { text: "abd".into(), font_size: 13.0, line_height: 15.6, max_width: None }),
             ("font_size", ShapeRequest { text: "abc".into(), font_size: 26.0, line_height: 15.6, max_width: None }),
             ("line_height", ShapeRequest { text: "abc".into(), font_size: 13.0, line_height: 40.0, max_width: None }),
-            ("max_width", ShapeRequest { text: "abc".into(), font_size: 13.0, line_height: 15.6, max_width: Some(10.0) }),
+            (
+                "max_width",
+                ShapeRequest { text: "abc".into(), font_size: 13.0, line_height: 15.6, max_width: Some(10.0) },
+            ),
         ] {
             let before = handle.cached_len();
             handle.shape(request);
@@ -510,7 +506,11 @@ mod tests {
         let clone = handle.clone();
         handle.shape(req("shared", 13.0));
         clone.shape(req("shared", 13.0));
-        assert_eq!(clone.cached_len(), 1, "`wayland::App` and the client it owns must not measure the same string twice");
+        assert_eq!(
+            clone.cached_len(),
+            1,
+            "`wayland::App` and the client it owns must not measure the same string twice"
+        );
     }
 
     /// Cheap to hold and worth pinning: a cached answer has to be the answer the worker gave, not
@@ -528,12 +528,8 @@ mod tests {
     #[test]
     fn shapes_nonempty_text_to_a_nonzero_box() {
         let handle = ShapingHandle::spawn();
-        let result = handle.shape(ShapeRequest {
-            text: "Oblisk".into(),
-            font_size: 14.0,
-            line_height: 18.0,
-            max_width: None,
-        });
+        let result =
+            handle.shape(ShapeRequest { text: "Oblisk".into(), font_size: 14.0, line_height: 18.0, max_width: None });
         assert!(result.width > 0.0, "expected nonzero width, got {}", result.width);
         assert_eq!(result.height, 18.0);
     }
@@ -541,24 +537,16 @@ mod tests {
     #[test]
     fn empty_text_measures_to_zero_width() {
         let handle = ShapingHandle::spawn();
-        let result = handle.shape(ShapeRequest {
-            text: String::new(),
-            font_size: 14.0,
-            line_height: 18.0,
-            max_width: None,
-        });
+        let result =
+            handle.shape(ShapeRequest { text: String::new(), font_size: 14.0, line_height: 18.0, max_width: None });
         assert_eq!(result.width, 0.0);
     }
 
     #[test]
     fn longer_text_measures_wider_than_shorter_text() {
         let handle = ShapingHandle::spawn();
-        let short = handle.shape(ShapeRequest {
-            text: "O".into(),
-            font_size: 14.0,
-            line_height: 18.0,
-            max_width: None,
-        });
+        let short =
+            handle.shape(ShapeRequest { text: "O".into(), font_size: 14.0, line_height: 18.0, max_width: None });
         let long = handle.shape(ShapeRequest {
             text: "Oblisk Shell".into(),
             font_size: 14.0,
@@ -589,7 +577,11 @@ mod tests {
         assert!(!first.is_empty(), "the default chain must resolve to at least one loaded face");
         assert_eq!(first.len(), second.len());
         for (a, b) in first.iter().zip(second.iter()) {
-            assert_eq!(a.as_ref().as_ptr(), b.as_ref().as_ptr(), "each ask should share one mapping, not copy the file");
+            assert_eq!(
+                a.as_ref().as_ptr(),
+                b.as_ref().as_ptr(),
+                "each ask should share one mapping, not copy the file"
+            );
         }
     }
 
@@ -609,7 +601,10 @@ mod tests {
         }
 
         let query = fontdb::Query { families: &[fontdb::Family::Name(&primary_family)], ..Default::default() };
-        assert!(db.query(&query).is_some(), "primary_family {primary_family:?} is not findable in the loaded font chain");
+        assert!(
+            db.query(&query).is_some(),
+            "primary_family {primary_family:?} is not findable in the loaded font chain"
+        );
     }
 
     #[test]
@@ -631,7 +626,8 @@ mod tests {
         let ResolvedFonts { db, .. } = fonts::resolve_chain(&["Noto Sans", "Noto Sans Mono"]);
         let mut font_system = FontSystem::new_with_locale_and_db(detect_locale(), db);
 
-        let request = ShapeRequest { text: "Oblisk Shell Renderer".into(), font_size: 24.0, line_height: 28.8, max_width: None };
+        let request =
+            ShapeRequest { text: "Oblisk Shell Renderer".into(), font_size: 24.0, line_height: 28.8, max_width: None };
         let proportional = shape(&mut font_system, "Noto Sans", &request);
         let monospace = shape(&mut font_system, "Noto Sans Mono", &request);
 
@@ -663,13 +659,7 @@ mod tests {
             line_height: 18.0,
             max_width: Some(unconstrained.width / 2.0),
         });
-        assert!(
-            wrapped.height > unconstrained.height,
-            "wrapping onto more lines must grow the measured height"
-        );
-        assert!(
-            wrapped.width <= unconstrained.width,
-            "a wrapped line can't be wider than the unconstrained text"
-        );
+        assert!(wrapped.height > unconstrained.height, "wrapping onto more lines must grow the measured height");
+        assert!(wrapped.width <= unconstrained.width, "a wrapped line can't be wider than the unconstrained text");
     }
 }

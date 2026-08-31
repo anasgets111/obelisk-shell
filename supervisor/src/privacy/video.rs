@@ -40,7 +40,9 @@ pub fn find_device_openers(proc_root: &Path, device_path: &str) -> Vec<u32> {
     for proc_entry in proc_entries.flatten() {
         let Ok(pid) = proc_entry.file_name().to_string_lossy().parse::<u32>() else { continue };
         let Ok(fd_entries) = std::fs::read_dir(proc_entry.path().join("fd")) else { continue };
-        let has_device_open = fd_entries.flatten().any(|fd_entry| std::fs::read_link(fd_entry.path()).is_ok_and(|target| target == Path::new(device_path)));
+        let has_device_open = fd_entries
+            .flatten()
+            .any(|fd_entry| std::fs::read_link(fd_entry.path()).is_ok_and(|target| target == Path::new(device_path)));
         if has_device_open {
             pids.push(pid);
         }
@@ -73,7 +75,10 @@ mod tests {
         write_video_device_dir(root.path(), "video0");
         write_video_device_dir(root.path(), "video1");
 
-        assert_eq!(enumerate_video_devices(root.path()), vec![PathBuf::from("/dev/video0"), PathBuf::from("/dev/video1")]);
+        assert_eq!(
+            enumerate_video_devices(root.path()),
+            vec![PathBuf::from("/dev/video0"), PathBuf::from("/dev/video1")]
+        );
     }
 
     #[test]

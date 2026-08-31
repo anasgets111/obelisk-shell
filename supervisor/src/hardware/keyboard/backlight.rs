@@ -30,7 +30,8 @@ mod tests {
     async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {
         let (a, b) = UnixStream::pair().expect("failed to create a unix socket pair");
         let guid = zbus::Guid::generate();
-        let server_builder = zbus::connection::Builder::unix_stream(a).server(guid).expect("p2p server builder setup").p2p();
+        let server_builder =
+            zbus::connection::Builder::unix_stream(a).server(guid).expect("p2p server builder setup").p2p();
         let client_builder = zbus::connection::Builder::unix_stream(b).p2p();
         tokio::try_join!(server_builder.build(), client_builder.build()).expect("p2p handshake")
     }
@@ -78,7 +79,10 @@ mod tests {
         let brightness = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(1));
         service_side
             .object_server()
-            .at("/org/freedesktop/UPower/KbdBacklight", StubKbdBacklight { brightness: brightness.clone(), max: 3, set_calls: set_tx })
+            .at(
+                "/org/freedesktop/UPower/KbdBacklight",
+                StubKbdBacklight { brightness: brightness.clone(), max: 3, set_calls: set_tx },
+            )
             .await
             .expect("failed to export the stub KbdBacklight");
 

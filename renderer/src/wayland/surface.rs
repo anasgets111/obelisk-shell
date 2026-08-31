@@ -253,10 +253,7 @@ fn resolved_surface_spec(
 /// An empty result is legal, not a degenerate case: `drive_handshake`'s collection loop exits
 /// immediately on an empty expected set.
 fn presenting_surface_ids<'a>(surfaces: impl Iterator<Item = (&'a str, MapState)>) -> Vec<String> {
-    surfaces
-        .filter(|(_, state)| state.presents())
-        .map(|(id, _)| id.to_string())
-        .collect()
+    surfaces.filter(|(_, state)| state.presents()).map(|(id, _)| id.to_string()).collect()
 }
 /// Whether every tracked surface has staged everything a PBA Candidate owes it, which is
 /// [`App::maybe_send_ready_signal`]'s gate (§ 15.2 points 2-3). Takes `(null_buffered, exists)` per
@@ -302,7 +299,12 @@ impl App {
     ///
     /// Called with the whole instance set at startup and with only the added instances on a monitor
     /// hotplug (see [`App::handle_output_change`]) -- the same function either way.
-    pub(super) fn create_surfaces(&mut self, qh: &QueueHandle<App>, specs: &[SurfaceSpec], instances: &[SurfaceInstance]) {
+    pub(super) fn create_surfaces(
+        &mut self,
+        qh: &QueueHandle<App>,
+        specs: &[SurfaceSpec],
+        instances: &[SurfaceInstance],
+    ) {
         // Re-read per call rather than snapshotted once at startup: this now also runs from an
         // output event, where the whole point is that the output list has just changed.
         let outputs: HashMap<String, wl_output::WlOutput> = self
@@ -317,7 +319,10 @@ impl App {
 
         for instance in instances {
             let Some(roster) = specs.iter().find(|spec| spec.declared_id() == instance.declared_id) else {
-                eprintln!("[oblisk-renderer] instance {:?} has no matching declaration; skipping", instance.instance_id);
+                eprintln!(
+                    "[oblisk-renderer] instance {:?} has no matching declaration; skipping",
+                    instance.instance_id
+                );
                 continue;
             };
             // `Scene::surface` hands back an owned `ResolvedNode`, so nothing borrows `self` past
@@ -754,8 +759,7 @@ impl App {
             spec.margin.left as i32,
         );
         layer.wl_surface().commit();
-        self.surfaces[index].map_state =
-            if was_mapped { MapState::AwaitingConfigure } else { MapState::Mapped };
+        self.surfaces[index].map_state = if was_mapped { MapState::AwaitingConfigure } else { MapState::Mapped };
         eprintln!("[oblisk-renderer] {} mapping: visible = true", self.surfaces[index].surface_id);
     }
 
@@ -824,10 +828,7 @@ impl App {
         // loop, with no other context switch between the two.
         self.gl.get_or_insert_with(|| unsafe {
             glow::Context::from_loader_function(|s| {
-                self.egl
-                    .instance
-                    .get_proc_address(s)
-                    .map_or(std::ptr::null(), |f| f as *const c_void)
+                self.egl.instance.get_proc_address(s).map_or(std::ptr::null(), |f| f as *const c_void)
             })
         });
 
@@ -897,8 +898,7 @@ impl App {
             let focus = self.secure_field_for(&surface_id);
             tree.as_ref().map(|tree| layout::paint::build(tree, 1.0, focus.as_ref())).unwrap_or_default()
         };
-        if self
-            .surfaces[index]
+        if self.surfaces[index]
             .last_painted
             .as_ref()
             .is_some_and(|(painted_size, painted)| *painted_size == (width, height) && *painted == list)
@@ -1004,9 +1004,8 @@ impl App {
     /// until each has been dealt with, but the payload is only the surfaces that will present a frame
     /// -- see [`presenting_surface_ids`] for what each direction of a mismatch costs.
     pub(super) fn maybe_send_ready_signal(&mut self) {
-        let staged = candidate_has_staged(
-            self.surfaces.iter().map(|s| (s.null_buffered, s.role.wl_surface().is_some())),
-        );
+        let staged =
+            candidate_has_staged(self.surfaces.iter().map(|s| (s.null_buffered, s.role.wl_surface().is_some())));
         if self.ready_signal_sent || !staged {
             return;
         }
@@ -1146,8 +1145,13 @@ mod tests {
         // docs/adr/0049 decision 1 creates no `xdg_toplevel` for it, so no configure is coming and
         // `null_buffered` would stay false forever -- a `ready_timeout` hang under a plain gate, on
         // any config declaring a hidden window (the dev config does).
-        assert!(candidate_has_staged([("bar", true, true), ("settings", false, false)].into_iter().map(|(_, n, e)| (n, e))));
-        assert!(candidate_has_staged([(false, false)].into_iter()), "a surface with no object at all is complete by construction");
+        assert!(candidate_has_staged(
+            [("bar", true, true), ("settings", false, false)].into_iter().map(|(_, n, e)| (n, e))
+        ));
+        assert!(
+            candidate_has_staged([(false, false)].into_iter()),
+            "a surface with no object at all is complete by construction"
+        );
     }
 
     #[test]
@@ -1224,7 +1228,10 @@ mod tests {
             SurfaceSpec::Lock(lock_spec_fixture()),
         ] {
             assert!(starting_visible(Some(true), &roster));
-            assert!(!starting_visible(Some(false), &roster), "a declared-closed surface stays closed whatever its role");
+            assert!(
+                !starting_visible(Some(false), &roster),
+                "a declared-closed surface stays closed whatever its role"
+            );
         }
     }
 
@@ -1247,7 +1254,9 @@ mod tests {
 
         let (role, spec) = resolved_surface_spec(&SurfaceSpec::Popup(placeholder), &properties);
         assert_eq!(role, "popup");
-        let SurfaceSpec::Popup(spec) = spec.unwrap() else { panic!("the role comes from the roster, not from the properties") };
+        let SurfaceSpec::Popup(spec) = spec.unwrap() else {
+            panic!("the role comes from the roster, not from the properties")
+        };
         assert_eq!(spec.anchor_rect, LogicalRect { x: 40.0, y: 4.0, width: 86.0, height: 24.0 });
     }
 

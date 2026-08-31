@@ -30,7 +30,9 @@ impl std::fmt::Display for SoundDecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Wav(err) => write!(f, "{err}"),
-            Self::UnsupportedFormat { format, bits } => write!(f, "unsupported WAV sample format {format:?} at {bits} bits per sample"),
+            Self::UnsupportedFormat { format, bits } => {
+                write!(f, "unsupported WAV sample format {format:?} at {bits} bits per sample")
+            }
         }
     }
 }
@@ -54,9 +56,10 @@ fn decode_wav_samples(path: &Path) -> Result<DecodedWav, SoundDecodeError> {
     let spec = reader.spec();
     let samples: Vec<i16> = match (spec.sample_format, spec.bits_per_sample) {
         (hound::SampleFormat::Int, 16) => reader.samples::<i16>().collect::<Result<_, _>>()?,
-        (hound::SampleFormat::Float, 32) => {
-            reader.samples::<f32>().map(|sample| sample.map(|value| (value.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)).collect::<Result<_, _>>()?
-        }
+        (hound::SampleFormat::Float, 32) => reader
+            .samples::<f32>()
+            .map(|sample| sample.map(|value| (value.clamp(-1.0, 1.0) * i16::MAX as f32) as i16))
+            .collect::<Result<_, _>>()?,
         (format, bits) => return Err(SoundDecodeError::UnsupportedFormat { format, bits }),
     };
     Ok(DecodedWav { channels: u32::from(spec.channels), sample_rate: spec.sample_rate, samples })
@@ -114,7 +117,12 @@ fn play_one_wav(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    let playback = PlaybackState { samples: decoded.samples, position: 0, channels: decoded.channels, main_loop: main_loop.clone() };
+    let playback = PlaybackState {
+        samples: decoded.samples,
+        position: 0,
+        channels: decoded.channels,
+        main_loop: main_loop.clone(),
+    };
 
     let _listener = stream
         .add_local_listener_with_user_data(playback)
@@ -125,7 +133,8 @@ fn play_one_wav(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 let stride = CHAN_SIZE * state.channels.max(1) as usize;
                 let data = &mut datas[0];
                 let n_frames = if let Some(slice) = data.data() {
-                    let remaining_frames = state.samples.len().saturating_sub(state.position) / state.channels.max(1) as usize;
+                    let remaining_frames =
+                        state.samples.len().saturating_sub(state.position) / state.channels.max(1) as usize;
                     let capacity_frames = slice.len() / stride;
                     let n_frames = remaining_frames.min(capacity_frames);
                     for i in 0..n_frames {
@@ -168,7 +177,11 @@ fn play_one_wav(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     let values = pw::spa::pod::serialize::PodSerializer::serialize(
         std::io::Cursor::new(Vec::new()),
-        &pw::spa::pod::Value::Object(pw::spa::pod::Object { type_: pw::spa::sys::SPA_TYPE_OBJECT_Format, id: pw::spa::sys::SPA_PARAM_EnumFormat, properties: audio_info.into() }),
+        &pw::spa::pod::Value::Object(pw::spa::pod::Object {
+            type_: pw::spa::sys::SPA_TYPE_OBJECT_Format,
+            id: pw::spa::sys::SPA_PARAM_EnumFormat,
+            properties: audio_info.into(),
+        }),
     )?
     .0
     .into_inner();
@@ -177,14 +190,15 @@ fn play_one_wav(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     stream.connect(
         pw::spa::utils::Direction::Output,
         None,
-        pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::RT_PROCESS,
+        pw::stream::StreamFlags::AUTOCONNECT
+            | pw::stream::StreamFlags::MAP_BUFFERS
+            | pw::stream::StreamFlags::RT_PROCESS,
         &mut params,
     )?;
 
     main_loop.run();
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -204,7 +218,12 @@ mod tests {
     fn decode_wav_samples_round_trips_16_bit_int_pcm() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sound.wav");
-        let spec = hound::WavSpec { channels: 2, sample_rate: 44100, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 44100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
         let samples = [100i16, -100, 200, -200];
         write_test_wav(&path, spec, &samples);
 
@@ -218,7 +237,12 @@ mod tests {
     fn decode_wav_samples_decodes_32_bit_float_pcm() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sound.wav");
-        let spec = hound::WavSpec { channels: 1, sample_rate: 22050, bits_per_sample: 32, sample_format: hound::SampleFormat::Float };
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 22050,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
         let mut writer = hound::WavWriter::create(&path, spec).unwrap();
         writer.write_sample(0.5f32).unwrap();
         writer.write_sample(-0.5f32).unwrap();
@@ -227,14 +251,23 @@ mod tests {
         let decoded = decode_wav_samples(&path).expect("must decode a real 32-bit float WAV file");
         assert_eq!(decoded.channels, 1);
         assert_eq!(decoded.samples.len(), 2);
-        assert!(decoded.samples[0] > 16000 && decoded.samples[0] < 17000, "0.5 should map close to i16::MAX/2, got {}", decoded.samples[0]);
+        assert!(
+            decoded.samples[0] > 16000 && decoded.samples[0] < 17000,
+            "0.5 should map close to i16::MAX/2, got {}",
+            decoded.samples[0]
+        );
     }
 
     #[test]
     fn decode_wav_samples_rejects_an_unsupported_bit_depth() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sound.wav");
-        let spec = hound::WavSpec { channels: 1, sample_rate: 8000, bits_per_sample: 8, sample_format: hound::SampleFormat::Int };
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 8000,
+            bits_per_sample: 8,
+            sample_format: hound::SampleFormat::Int,
+        };
         write_test_wav(&path, spec, &[]);
 
         assert!(decode_wav_samples(&path).is_err());

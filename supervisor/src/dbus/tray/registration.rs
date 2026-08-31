@@ -39,13 +39,18 @@ pub(super) enum RegistrationError {
     /// sender of this call: a connection can only ever truthfully claim its own unique name
     /// (bus-daemon-filled, unspoofable), so any mismatch means the caller fabricated a name
     /// it doesn't own.
-    UniqueNameMismatch { claimed: String, sender: String },
+    UniqueNameMismatch {
+        claimed: String,
+        sender: String,
+    },
 }
 
 impl std::fmt::Display for RegistrationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoSender => write!(f, "an object-path service argument requires a message sender, but none was present"),
+            Self::NoSender => {
+                write!(f, "an object-path service argument requires a message sender, but none was present")
+            }
             Self::InvalidName(err) => write!(f, "invalid D-Bus name: {err}"),
             Self::Dbus(err) => write!(f, "{err}"),
             Self::UniqueNameMismatch { claimed, sender } => {
@@ -61,12 +66,18 @@ impl std::error::Error for RegistrationError {}
 /// sender into `(unique_name, object_path)` -- the registry key this controller actually uses
 /// (ADR-0031). The well-known-name branch is the only one that performs I/O (`GetNameOwner`);
 /// the other two are resolved synchronously.
-pub(super) async fn resolve_registration(connection: &zbus::Connection, service: &str, sender: Option<&str>) -> Result<(OwnedUniqueName, OwnedObjectPath), RegistrationError> {
+pub(super) async fn resolve_registration(
+    connection: &zbus::Connection,
+    service: &str,
+    sender: Option<&str>,
+) -> Result<(OwnedUniqueName, OwnedObjectPath), RegistrationError> {
     match classify_service_arg(service) {
         RegistrationTarget::ObjectPathFromSender { object_path } => {
             let sender = sender.ok_or(RegistrationError::NoSender)?;
-            let unique_name = OwnedUniqueName::try_from(sender).map_err(|err| RegistrationError::InvalidName(err.to_string()))?;
-            let object_path = OwnedObjectPath::try_from(object_path).map_err(|err| RegistrationError::InvalidName(err.to_string()))?;
+            let unique_name =
+                OwnedUniqueName::try_from(sender).map_err(|err| RegistrationError::InvalidName(err.to_string()))?;
+            let object_path = OwnedObjectPath::try_from(object_path)
+                .map_err(|err| RegistrationError::InvalidName(err.to_string()))?;
             Ok((unique_name, object_path))
         }
         RegistrationTarget::UniqueName { unique_name } => {
@@ -80,20 +91,27 @@ pub(super) async fn resolve_registration(connection: &zbus::Connection, service:
             if unique_name != sender {
                 return Err(RegistrationError::UniqueNameMismatch { claimed: unique_name, sender: sender.to_string() });
             }
-            let unique_name = OwnedUniqueName::try_from(unique_name).map_err(|err| RegistrationError::InvalidName(err.to_string()))?;
+            let unique_name = OwnedUniqueName::try_from(unique_name)
+                .map_err(|err| RegistrationError::InvalidName(err.to_string()))?;
             Ok((unique_name, default_item_object_path()))
         }
         RegistrationTarget::WellKnownName { well_known_name } => {
-            let dbus_proxy = zbus::fdo::DBusProxy::new(connection).await.map_err(|err| RegistrationError::Dbus(err.to_string()))?;
-            let well_known = WellKnownName::try_from(well_known_name).map_err(|err| RegistrationError::InvalidName(err.to_string()))?;
-            let owner = dbus_proxy.get_name_owner(BusName::WellKnown(well_known)).await.map_err(|err| RegistrationError::Dbus(err.to_string()))?;
+            let dbus_proxy =
+                zbus::fdo::DBusProxy::new(connection).await.map_err(|err| RegistrationError::Dbus(err.to_string()))?;
+            let well_known = WellKnownName::try_from(well_known_name)
+                .map_err(|err| RegistrationError::InvalidName(err.to_string()))?;
+            let owner = dbus_proxy
+                .get_name_owner(BusName::WellKnown(well_known))
+                .await
+                .map_err(|err| RegistrationError::Dbus(err.to_string()))?;
             Ok((owner, default_item_object_path()))
         }
     }
 }
 
 fn default_item_object_path() -> OwnedObjectPath {
-    OwnedObjectPath::try_from(DEFAULT_ITEM_OBJECT_PATH).expect("DEFAULT_ITEM_OBJECT_PATH is a valid object path literal")
+    OwnedObjectPath::try_from(DEFAULT_ITEM_OBJECT_PATH)
+        .expect("DEFAULT_ITEM_OBJECT_PATH is a valid object path literal")
 }
 
 /// The leading `:` stripped from a `:N.M` unique name -- both the internal Lua-facing `id` and
@@ -102,7 +120,6 @@ fn default_item_object_path() -> OwnedObjectPath {
 pub(super) fn sanitize_unique_name(unique_name: &str) -> String {
     unique_name.trim_start_matches(':').to_string()
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -131,7 +148,6 @@ mod tests {
         );
     }
 
-
     // ---- sanitize_unique_name ----
 
     #[test]
@@ -143,7 +159,6 @@ mod tests {
     fn sanitize_unique_name_is_a_no_op_without_a_leading_colon() {
         assert_eq!(sanitize_unique_name("1.234"), "1.234");
     }
-
 
     // ---- resolve_registration / register_status_notifier_item: a fabricated unique name
     //      must be rejected, since a connection can only ever truthfully claim its own real
@@ -173,7 +188,9 @@ mod tests {
                 assert_eq!(claimed, ":999.1");
                 assert_eq!(sender, ":1.5");
             }
-            other => panic!("a fabricated unique name not matching the real sender must be rejected as UniqueNameMismatch, got {other:?}"),
+            other => panic!(
+                "a fabricated unique name not matching the real sender must be rejected as UniqueNameMismatch, got {other:?}"
+            ),
         }
     }
 

@@ -80,7 +80,10 @@ pub(crate) fn surface_specs(output: &LoadOutput) -> Result<Vec<SurfaceSpec>, Loa
 // thread it runs on, with no configure handling and no way to set `app.exit` until it returns --
 // `while true do end` in `shell.lua` wedges the whole process. Upgrade path: extend ADR-0021's
 // hook to cover `Loader::evaluate_file` itself, not just the closures it registers.
-pub(crate) fn evaluate_and_specs(loader: &Loader, shell_lua_path: &Path) -> Result<(LoadOutput, Vec<SurfaceSpec>), LoaderError> {
+pub(crate) fn evaluate_and_specs(
+    loader: &Loader,
+    shell_lua_path: &Path,
+) -> Result<(LoadOutput, Vec<SurfaceSpec>), LoaderError> {
     let output = loader.evaluate_file(shell_lua_path)?;
     let specs = surface_specs(&output)?;
     Ok((output, specs))

@@ -29,7 +29,9 @@ impl std::fmt::Display for SocketLinkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SocketLinkError::Send(err) => write!(f, "{err}"),
-            SocketLinkError::ConnectionClosed => write!(f, "the inbound control-socket channel closed while waiting for a response"),
+            SocketLinkError::ConnectionClosed => {
+                write!(f, "the inbound control-socket channel closed while waiting for a response")
+            }
         }
     }
 }
@@ -51,9 +53,14 @@ impl SocketCandidateLink<'_> {
     /// `extract`, logging and dropping everything else. `ConnectionClosed` if the channel ends
     /// first. `extract`'s `Err` carries the rejected frame boxed: `RendererFrame` is large
     /// enough that clippy's `result_large_err` flags an unboxed `Result` closure return.
-    async fn recv_matching<T>(&mut self, what: &str, mut extract: impl FnMut(RendererFrame) -> Result<T, Box<RendererFrame>>) -> Result<T, SocketLinkError> {
+    async fn recv_matching<T>(
+        &mut self,
+        what: &str,
+        mut extract: impl FnMut(RendererFrame) -> Result<T, Box<RendererFrame>>,
+    ) -> Result<T, SocketLinkError> {
         loop {
-            let InboundFrame { generation_id, frame } = self.inbound.recv().await.ok_or(SocketLinkError::ConnectionClosed)?;
+            let InboundFrame { generation_id, frame } =
+                self.inbound.recv().await.ok_or(SocketLinkError::ConnectionClosed)?;
             if generation_id != self.candidate_generation_id {
                 eprintln!(
                     "SocketCandidateLink({what}): frame from generation {generation_id} dropped during an in-flight swap handshake for \
@@ -114,7 +121,9 @@ impl CandidateLink for SocketCandidateLink<'_> {
     }
 
     async fn send_activate_draw(&mut self, nonce: u64) -> Result<(), Self::Error> {
-        self.registry.send_frame(self.candidate_generation_id, &SupervisorFrame::ActivateDraw(ActivateDraw { nonce })).map_err(SocketLinkError::Send)
+        self.registry
+            .send_frame(self.candidate_generation_id, &SupervisorFrame::ActivateDraw(ActivateDraw { nonce }))
+            .map_err(SocketLinkError::Send)
     }
 
     async fn recv_presentation_evidence(&mut self, nonce: u64) -> Result<String, Self::Error> {
@@ -183,7 +192,8 @@ mod tests {
     async fn push_state_snapshot_retries_until_the_candidate_connection_registers() {
         let registry = GenerationRegistry::default();
         let (_inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
-        let mut link = SocketCandidateLink { registry: registry.clone(), candidate_generation_id: 9, inbound: &mut inbound_rx };
+        let mut link =
+            SocketCandidateLink { registry: registry.clone(), candidate_generation_id: 9, inbound: &mut inbound_rx };
 
         let late_registry = registry.clone();
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -222,7 +232,10 @@ mod tests {
         let mut link = SocketCandidateLink { registry, candidate_generation_id: 9, inbound: &mut inbound_rx };
 
         inbound_tx
-            .send(InboundFrame { generation_id: 9, frame: RendererFrame::ReadySignal(ReadySignal { surfaces: vec!["main_bar".to_string()] }) })
+            .send(InboundFrame {
+                generation_id: 9,
+                frame: RendererFrame::ReadySignal(ReadySignal { surfaces: vec!["main_bar".to_string()] }),
+            })
             .unwrap();
 
         let surfaces = link.recv_ready_signal().await.expect("ready signal must resolve");
@@ -245,10 +258,14 @@ mod tests {
         // Right generation, wrong frame type.
         inbound_tx.send(InboundFrame { generation_id: 9, frame: command_frame() }).unwrap();
         inbound_tx
-            .send(InboundFrame { generation_id: 9, frame: RendererFrame::ReadySignal(ReadySignal { surfaces: vec!["overlay_canvas".to_string()] }) })
+            .send(InboundFrame {
+                generation_id: 9,
+                frame: RendererFrame::ReadySignal(ReadySignal { surfaces: vec!["overlay_canvas".to_string()] }),
+            })
             .unwrap();
 
-        let surfaces = link.recv_ready_signal().await.expect("ready signal must resolve despite irrelevant frames first");
+        let surfaces =
+            link.recv_ready_signal().await.expect("ready signal must resolve despite irrelevant frames first");
         assert_eq!(surfaces, vec!["overlay_canvas".to_string()]);
     }
 
@@ -261,13 +278,19 @@ mod tests {
         inbound_tx
             .send(InboundFrame {
                 generation_id: 9,
-                frame: RendererFrame::PresentationEvidence(PresentationEvidence { nonce: 1, surface_id: "stale".to_string() }),
+                frame: RendererFrame::PresentationEvidence(PresentationEvidence {
+                    nonce: 1,
+                    surface_id: "stale".to_string(),
+                }),
             })
             .unwrap();
         inbound_tx
             .send(InboundFrame {
                 generation_id: 9,
-                frame: RendererFrame::PresentationEvidence(PresentationEvidence { nonce: 2, surface_id: "main_bar".to_string() }),
+                frame: RendererFrame::PresentationEvidence(PresentationEvidence {
+                    nonce: 2,
+                    surface_id: "main_bar".to_string(),
+                }),
             })
             .unwrap();
 

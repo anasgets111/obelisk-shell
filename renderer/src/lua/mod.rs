@@ -5,10 +5,10 @@
 //! [`Loader::evaluate_file`] reads the real `~/.config/oblisk/shell.lua` (`shared::shell_lua_path`)
 //! and is `renderer/src/socket.rs`'s real entry point: both the Renderer's own startup evaluation
 //! and every Supervisor-triggered `Reevaluate` round trip call it.
-pub mod fonts;
 pub mod capability;
-pub mod marshal;
+pub mod fonts;
 pub mod json;
+pub mod marshal;
 pub mod namespace;
 pub mod nodes;
 pub mod process;
@@ -28,7 +28,13 @@ use mlua::{Lua, Table, Value};
 /// `IO` is absent outright. `OS` is loaded here only so [`restrict_os`] can lift the four calls
 /// worth keeping out of it; nothing else in that library survives the next line of `Loader::new`.
 fn config_stdlib() -> mlua::StdLib {
-    mlua::StdLib::COROUTINE | mlua::StdLib::TABLE | mlua::StdLib::STRING | mlua::StdLib::UTF8 | mlua::StdLib::MATH | mlua::StdLib::PACKAGE | mlua::StdLib::OS
+    mlua::StdLib::COROUTINE
+        | mlua::StdLib::TABLE
+        | mlua::StdLib::STRING
+        | mlua::StdLib::UTF8
+        | mlua::StdLib::MATH
+        | mlua::StdLib::PACKAGE
+        | mlua::StdLib::OS
 }
 
 /// The four `os` calls ADR-0048 keeps, each of which reads process-local state and returns without
@@ -296,7 +302,9 @@ fn collect_surfaces(value: Value) -> Result<Vec<VirtualNode>, LoaderError> {
         surfaces.push(node);
     }
     if surfaces.is_empty() {
-        return Err(LoaderError::InvalidTopLevelReturn("the returned table has no `kind` field and no array elements".to_string()));
+        return Err(LoaderError::InvalidTopLevelReturn(
+            "the returned table has no `kind` field and no array elements".to_string(),
+        ));
     }
     Ok(surfaces)
 }
@@ -313,7 +321,9 @@ fn collect_surfaces(value: Value) -> Result<Vec<VirtualNode>, LoaderError> {
 fn require_surface(node: &VirtualNode) -> Result<(), LoaderError> {
     match node.kind.as_str() {
         "panel" | "window" | "popup" | "lock" => Ok(()),
-        other => Err(LoaderError::InvalidTopLevelReturn(format!("top-level node must be `panel`, `window`, `popup` or `lock`, got `{other}`"))),
+        other => Err(LoaderError::InvalidTopLevelReturn(format!(
+            "top-level node must be `panel`, `window`, `popup` or `lock`, got `{other}`"
+        ))),
     }
 }
 
@@ -379,7 +389,11 @@ mod tests {
 
         std::fs::write(&module, r#"return { accent = "second" }"#).unwrap();
         let second = loader.evaluate(source).unwrap();
-        assert_eq!(accent(&second), "second", "the re-evaluation ran against the cached module, so the edit did nothing");
+        assert_eq!(
+            accent(&second),
+            "second",
+            "the re-evaluation ran against the cached module, so the edit did nothing"
+        );
     }
 
     /// The other half: clearing has to stop at the config's own modules, or `require "string"`
@@ -412,11 +426,15 @@ mod tests {
         let loader = Loader::new(signal::DirtyFlag::new(), &dir).unwrap();
 
         let accent: String = loader.lua().load(r#"return require("config.theme").ACCENT"#).eval().unwrap();
-        assert!(accent.starts_with('#') && accent.len() == 9, "the palette entry has to be a #rrggbbaa string, got `{accent}`");
+        assert!(
+            accent.starts_with('#') && accent.len() == 9,
+            "the palette entry has to be a #rrggbbaa string, got `{accent}`"
+        );
 
         // Also proves a module can `require` a module of its own: `components.pill` reads
         // `config.theme` before it returns.
-        let is_builder: bool = loader.lua().load(r#"return type(require("components.pill")) == "function""#).eval().unwrap();
+        let is_builder: bool =
+            loader.lua().load(r#"return type(require("components.pill")) == "function""#).eval().unwrap();
         assert!(is_builder, "a component has to come back as the builder it returns");
     }
 
@@ -539,7 +557,10 @@ mod tests {
         assert_eq!(track.get::<String>("kind").unwrap(), "button");
         let theme = theme_of(&loader);
         assert_eq!(track.get::<i64>("height").unwrap(), theme_number(&theme, "control", "xs"));
-        assert!(track.get::<i64>("width").unwrap() > track.get::<i64>("height").unwrap(), "a switch is wider than it is tall");
+        assert!(
+            track.get::<i64>("width").unwrap() > track.get::<i64>("height").unwrap(),
+            "a switch is wider than it is tall"
+        );
 
         let on_click: Function = track.get("on_click").unwrap();
         let rect = loader.lua().create_table().unwrap();
@@ -610,7 +631,10 @@ mod tests {
         loader.evaluate(r#"package = nil return panel { id = "bar", layer = "Top" }"#).unwrap();
 
         let second = loader.evaluate(r#"return panel { id = "bar", layer = "Top" }"#);
-        assert!(matches!(second, Err(LoaderError::Eval(_))), "the next reload has to report, not quietly skip the cache clear: {second:?}");
+        assert!(
+            matches!(second, Err(LoaderError::Eval(_))),
+            "the next reload has to report, not quietly skip the cache clear: {second:?}"
+        );
     }
 
     /// The contract every split config rests on: a required module runs in the same VM as
@@ -631,7 +655,10 @@ mod tests {
             .unwrap();
         assert_eq!(output.surfaces[0].properties.get("has_state").unwrap(), &Value::Boolean(true));
         assert_eq!(output.surfaces[0].properties.get("has_json").unwrap(), &Value::Boolean(true));
-        assert!(output.surfaces[0].properties.contains_key("child"), "a node built in a required module has to survive into the tree");
+        assert!(
+            output.surfaces[0].properties.contains_key("child"),
+            "a node built in a required module has to survive into the tree"
+        );
     }
 
     /// Found by running the shipped config: the surface list held a seventh element that was a
@@ -645,10 +672,15 @@ mod tests {
     fn a_non_node_in_the_surface_list_names_which_element_and_what_it_was() {
         let loader = test_loader();
         let err = loader
-            .evaluate(r#"return { panel { id = "bar", layer = "Top" }, "/home/me/.config/oblisk/modules/global/lock.lua" }"#)
+            .evaluate(
+                r#"return { panel { id = "bar", layer = "Top" }, "/home/me/.config/oblisk/modules/global/lock.lua" }"#,
+            )
             .unwrap_err();
 
-        assert!(matches!(err, LoaderError::InvalidTopLevelReturn(_)), "a bad element is a bad return, not an evaluation failure: {err:?}");
+        assert!(
+            matches!(err, LoaderError::InvalidTopLevelReturn(_)),
+            "a bad element is a bad return, not an evaluation failure: {err:?}"
+        );
         let message = err.to_string();
         assert!(message.contains("surface 2"), "the message has to say which element: {message}");
         assert!(message.contains("string"), "the message has to say what it got: {message}");
@@ -667,7 +699,10 @@ mod tests {
         let loader = test_loader();
         assert!(absent(&loader, "io"), "the whole of `io` goes, io.open and io.popen included");
         for call in ["os.execute", "os.exit", "os.remove", "os.rename", "os.tmpname", "os.setlocale"] {
-            assert!(absent(&loader, call), "`{call}` blocks or kills the render thread and has no business in a config");
+            assert!(
+                absent(&loader, call),
+                "`{call}` blocks or kills the render thread and has no business in a config"
+            );
         }
     }
 
@@ -746,7 +781,8 @@ mod tests {
         // docs/adr/0052 decision 2: the compositor still decides when the lock surface exists;
         // this function only ever decided where the declaration may be written.
         let loader = test_loader();
-        let output = loader.evaluate(r##"return lock { id = "screen", child = rect { background = "#000000FF" } }"##).unwrap();
+        let output =
+            loader.evaluate(r##"return lock { id = "screen", child = rect { background = "#000000FF" } }"##).unwrap();
         assert_eq!(output.surfaces.len(), 1);
         assert_eq!(output.surfaces[0].kind, "lock");
     }
@@ -786,7 +822,9 @@ mod tests {
         let value = loader.to_lua_value(&json).unwrap();
         loader.set_global("state", value).unwrap();
 
-        let output = loader.evaluate(r#"return panel { id = "bar", layer = "Top", volume = state.volume, muted = state.muted }"#).unwrap();
+        let output = loader
+            .evaluate(r#"return panel { id = "bar", layer = "Top", volume = state.volume, muted = state.muted }"#)
+            .unwrap();
         assert_eq!(output.surfaces[0].properties.get("volume").unwrap().as_f64().unwrap(), 0.5);
         assert_eq!(output.surfaces[0].properties.get("muted").unwrap(), &Value::Boolean(false));
     }
@@ -834,11 +872,8 @@ mod tests {
         let value = loader.to_lua_value(&json).unwrap();
         loader.set_global("payload", value).unwrap();
 
-        let result: String = loader
-            .lua()
-            .load(r#"if payload.icon_path then return "truthy" else return "falsy" end"#)
-            .eval()
-            .unwrap();
+        let result: String =
+            loader.lua().load(r#"if payload.icon_path then return "truthy" else return "falsy" end"#).eval().unwrap();
         assert_eq!(result, "falsy");
     }
 
@@ -878,7 +913,8 @@ mod tests {
         let value = loader.to_lua_value(&json).unwrap();
         loader.set_global("state", value).unwrap();
 
-        let ipairs_count: i64 = loader.lua().load("local n = 0 for _ in ipairs(state.xs) do n = n + 1 end return n").eval().unwrap();
+        let ipairs_count: i64 =
+            loader.lua().load("local n = 0 for _ in ipairs(state.xs) do n = n + 1 end return n").eval().unwrap();
         assert_eq!(ipairs_count, 1, "ipairs must stop at the hole the nil leaves");
         // Reachable past the hole by index: a hole, not a truncation.
         let third: i64 = loader.lua().load("return state.xs[3]").eval().unwrap();
@@ -909,10 +945,7 @@ mod tests {
             .unwrap();
         assert_eq!(output.surfaces[0].properties.get("volume").unwrap().as_f64().unwrap(), 0.5);
         assert_eq!(output.surfaces[0].properties.get("muted").unwrap(), &Value::Boolean(false));
-        assert_eq!(
-            output.surfaces[0].properties.get("label").unwrap().as_string().unwrap().to_string_lossy(),
-            "media"
-        );
+        assert_eq!(output.surfaces[0].properties.get("label").unwrap().as_string().unwrap().to_string_lossy(), "media");
         assert_eq!(
             output.surfaces[0].properties.get("second_tag").unwrap().as_string().unwrap().to_string_lossy(),
             "b"

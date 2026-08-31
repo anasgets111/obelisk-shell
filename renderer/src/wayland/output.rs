@@ -114,7 +114,11 @@ impl App {
             let facts = OutputFacts {
                 name: info.name.clone(),
                 logical_size: info.logical_size,
-                current_mode: info.modes.iter().find(|mode| mode.current).map(|mode| (mode.dimensions, mode.refresh_rate)),
+                current_mode: info
+                    .modes
+                    .iter()
+                    .find(|mode| mode.current)
+                    .map(|mode| (mode.dimensions, mode.refresh_rate)),
                 scale_factor: info.scale_factor,
             };
             match screen_entry(index, &facts) {
@@ -161,7 +165,10 @@ impl App {
             // point (see `App::startup_complete`) -- but nothing below it applies yet.
             return;
         }
-        eprintln!("[oblisk-renderer] outputs changed: {:?}", screens.iter().map(|s| s.name.as_str()).collect::<Vec<_>>());
+        eprintln!(
+            "[oblisk-renderer] outputs changed: {:?}",
+            screens.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+        );
 
         let specs = self.client.applied_surface_specs();
         let fresh = expand_instances(&specs, &geometries_from(&screens));
@@ -217,7 +224,9 @@ impl PresentationTimeHandler for App {
             eprintln!("[oblisk-renderer] presented event for an untracked surface; dropping");
             return;
         };
-        if let Err(e) = self.outbound_tx.send(RendererFrame::PresentationEvidence(PresentationEvidence { nonce, surface_id })) {
+        if let Err(e) =
+            self.outbound_tx.send(RendererFrame::PresentationEvidence(PresentationEvidence { nonce, surface_id }))
+        {
             eprintln!("[oblisk-renderer] failed to queue PresentationEvidence for the socket thread: {e}");
         }
     }
@@ -256,14 +265,7 @@ impl CompositorHandler for App {
     ) {
     }
 
-    fn frame(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _time: u32,
-    ) {
-    }
+    fn frame(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _surface: &wl_surface::WlSurface, _time: u32) {}
 
     fn surface_enter(
         &mut self,
@@ -391,10 +393,7 @@ mod tests {
 
     #[test]
     fn the_screens_payload_is_the_array_of_field_tables_a_config_loops_over() {
-        let screens = [
-            screen_entry(0, &facts(Some("eDP-1"))).unwrap(),
-            screen_entry(1, &facts(Some("DP-1"))).unwrap(),
-        ];
+        let screens = [screen_entry(0, &facts(Some("eDP-1"))).unwrap(), screen_entry(1, &facts(Some("DP-1"))).unwrap()];
 
         assert_eq!(
             screens_payload(&screens),

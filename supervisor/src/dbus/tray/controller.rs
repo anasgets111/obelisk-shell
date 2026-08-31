@@ -9,13 +9,16 @@ use tokio::sync::mpsc::UnboundedSender;
 use zbus::fdo::RequestNameFlags;
 use zbus::zvariant::Value;
 
-use super::{TrayActionError, TrayState, TraySignal, WATCHER_BUS_NAME, WATCHER_OBJECT_PATH, should_call_activate, unix_timestamp_u32};
 use super::item::TrayItem;
 use super::menu::fetch_menu_via;
 use super::proxies::{DBusMenuProxy, StatusNotifierItemProxy, StatusNotifierWatcherClientProxy};
 use super::registration::sanitize_unique_name;
 use super::registry::{ItemKey, ItemRegistry, spawn_name_owner_changed_forwarder};
 use super::watcher::StatusNotifierWatcher;
+use super::{
+    TrayActionError, TraySignal, TrayState, WATCHER_BUS_NAME, WATCHER_OBJECT_PATH, should_call_activate,
+    unix_timestamp_u32,
+};
 
 #[derive(Clone)]
 pub struct TrayController {
@@ -42,7 +45,12 @@ impl TrayController {
 
         let registry: ItemRegistry = Arc::new(Mutex::new(HashMap::new()));
         let host_registered = Arc::new(Mutex::new(false));
-        let watcher = StatusNotifierWatcher { connection: connection.clone(), registry: registry.clone(), host_registered, events: events.clone() };
+        let watcher = StatusNotifierWatcher {
+            connection: connection.clone(),
+            registry: registry.clone(),
+            host_registered,
+            events: events.clone(),
+        };
         // Logged-and-continue, not `?`-propagated: an export failure here must not abort the
         // whole Supervisor -- this controller still constructs either way.
         if let Err(err) = connection.object_server().at(WATCHER_OBJECT_PATH, watcher).await {
@@ -56,7 +64,9 @@ impl TrayController {
                     eprintln!("tray: RegisterStatusNotifierHost failed: {err}");
                 }
             }
-            Err(err) => eprintln!("tray: failed to bind the StatusNotifierWatcher client proxy for RegisterStatusNotifierHost: {err}"),
+            Err(err) => eprintln!(
+                "tray: failed to bind the StatusNotifierWatcher client proxy for RegisterStatusNotifierHost: {err}"
+            ),
         }
 
         match zbus::fdo::DBusProxy::new(&connection).await {
@@ -86,7 +96,10 @@ impl TrayController {
 
     fn find_item_id(&self, id: &str) -> Option<(ItemKey, TrayItem)> {
         let guard = self.registry.lock().unwrap();
-        guard.iter().find(|(key, _)| sanitize_unique_name(key.0.as_str()) == id).map(|(key, entry)| (key.clone(), entry.last_known.clone()))
+        guard
+            .iter()
+            .find(|(key, _)| sanitize_unique_name(key.0.as_str()) == id)
+            .map(|(key, entry)| (key.clone(), entry.last_known.clone()))
     }
 
     fn find_item_proxy(&self, key: &ItemKey) -> Option<StatusNotifierItemProxy<'static>> {
@@ -163,4 +176,3 @@ impl TrayController {
         }
     }
 }
-

@@ -162,18 +162,10 @@ pub fn parse_text_align(properties: &HashMap<String, Value>) -> Result<TextAlign
 
 pub fn parse_foreground(properties: &HashMap<String, Value>) -> Result<Rgba, LayoutError> {
     let Some(value) = properties.get("foreground") else {
-        return Ok(Rgba {
-            r: 1.0,
-            g: 1.0,
-            b: 1.0,
-            a: 1.0,
-        });
+        return Ok(Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 });
     };
     let Value::String(s) = value else {
-        return Err(invalid(
-            "foreground",
-            format!("expected a string, got {}", preview_for_error(value)),
-        ));
+        return Err(invalid("foreground", format!("expected a string, got {}", preview_for_error(value))));
     };
     let s = checked_string("foreground", s)?;
     parse_hex_color("foreground", &s)
@@ -206,7 +198,11 @@ pub fn parse_icon_size(properties: &HashMap<String, Value>) -> Result<f32, Layou
 /// Shared shape behind [`parse_surface_id`]/`surface::parse_layer`/`surface::parse_monitor`: fetch `property`,
 /// reject a `Signal`, require it to be a string. `default` supplies the value when the property
 /// is absent; `None` makes it required, erroring instead (Standards review, docs/adr/0024).
-pub(super) fn parse_string_property(properties: &HashMap<String, Value>, property: &str, default: Option<&str>) -> Result<String, LayoutError> {
+pub(super) fn parse_string_property(
+    properties: &HashMap<String, Value>,
+    property: &str,
+    default: Option<&str>,
+) -> Result<String, LayoutError> {
     let value = match properties.get(property) {
         Some(value) => value,
         None => match default {
@@ -256,10 +252,9 @@ pub fn parse_node_id(properties: &HashMap<String, Value>) -> Result<Option<Strin
     };
     reject_signal_in_structural_field("id", value)?;
     match value {
-        Value::String(s) => s
-            .to_str()
-            .map(|s| Some(s.to_string()))
-            .map_err(|_| invalid("id", "must be valid UTF-8 -- an id is compared for equality, so it cannot be converted lossily")),
+        Value::String(s) => s.to_str().map(|s| Some(s.to_string())).map_err(|_| {
+            invalid("id", "must be valid UTF-8 -- an id is compared for equality, so it cannot be converted lossily")
+        }),
         other => Err(invalid("id", format!("expected a string, got {}", preview_for_error(other)))),
     }
 }
@@ -269,203 +264,196 @@ mod tests {
     use super::*;
     use crate::lua::nodes::deserialize_lua_table;
 
-        fn lua() -> mlua::Lua {
-            mlua::Lua::new()
-        }
+    fn lua() -> mlua::Lua {
+        mlua::Lua::new()
+    }
 
-        fn props_from_table(table: &mlua::Table) -> HashMap<String, Value> {
-            deserialize_lua_table(table).unwrap().properties
-        }
+    fn props_from_table(table: &mlua::Table) -> HashMap<String, Value> {
+        deserialize_lua_table(table).unwrap().properties
+    }
 
-        #[test]
-        fn text_content_absent_defaults_to_the_empty_string() {
-            let props = HashMap::new();
-            assert_eq!(parse_content(&props).unwrap(), "");
-        }
+    #[test]
+    fn text_content_absent_defaults_to_the_empty_string() {
+        let props = HashMap::new();
+        assert_eq!(parse_content(&props).unwrap(), "");
+    }
 
-        #[test]
-        fn a_signal_resolving_to_a_string_satisfies_content() {
-            let lua = lua();
-            crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
-            let hello = lua.create_string("hello").unwrap();
-            let signal = crate::lua::signal::Signal::new_live(Value::String(hello), crate::lua::signal::DirtyFlag::new()).0;
-            let table = lua.create_table().unwrap();
-            table.set("kind", "text").unwrap();
-            table.set("content", signal).unwrap();
-            let node = deserialize_lua_table(&table).unwrap();
-            assert_eq!(parse_content(&resolve_properties(&node.properties, "text", &lua).unwrap()).unwrap(), "hello");
-        }
+    #[test]
+    fn a_signal_resolving_to_a_string_satisfies_content() {
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let hello = lua.create_string("hello").unwrap();
+        let signal = crate::lua::signal::Signal::new_live(Value::String(hello), crate::lua::signal::DirtyFlag::new()).0;
+        let table = lua.create_table().unwrap();
+        table.set("kind", "text").unwrap();
+        table.set("content", signal).unwrap();
+        let node = deserialize_lua_table(&table).unwrap();
+        assert_eq!(parse_content(&resolve_properties(&node.properties, "text", &lua).unwrap()).unwrap(), "hello");
+    }
 
-        #[test]
-        fn a_signal_resolving_to_a_table_reports_the_same_error_a_literal_table_would() {
-            let lua = lua();
-            crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+    #[test]
+    fn a_signal_resolving_to_a_table_reports_the_same_error_a_literal_table_would() {
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
 
-            let literal_table: mlua::Table = lua.load(r#"return { kind = "text", content = {} }"#).eval().unwrap();
-            let literal_props = props_from_table(&literal_table);
-            let literal_err = parse_content(&resolve_properties(&literal_props, "text", &lua).unwrap()).unwrap_err();
+        let literal_table: mlua::Table = lua.load(r#"return { kind = "text", content = {} }"#).eval().unwrap();
+        let literal_props = props_from_table(&literal_table);
+        let literal_err = parse_content(&resolve_properties(&literal_props, "text", &lua).unwrap()).unwrap_err();
 
-            let signal = crate::lua::signal::Signal::new_live(Value::Table(lua.create_table().unwrap()), crate::lua::signal::DirtyFlag::new()).0;
-            let table = lua.create_table().unwrap();
-            table.set("kind", "text").unwrap();
-            table.set("content", signal).unwrap();
-            let node = deserialize_lua_table(&table).unwrap();
-            let signal_err = parse_content(&resolve_properties(&node.properties, "text", &lua).unwrap()).unwrap_err();
+        let signal = crate::lua::signal::Signal::new_live(
+            Value::Table(lua.create_table().unwrap()),
+            crate::lua::signal::DirtyFlag::new(),
+        )
+        .0;
+        let table = lua.create_table().unwrap();
+        table.set("kind", "text").unwrap();
+        table.set("content", signal).unwrap();
+        let node = deserialize_lua_table(&table).unwrap();
+        let signal_err = parse_content(&resolve_properties(&node.properties, "text", &lua).unwrap()).unwrap_err();
 
-            for err in [&literal_err, &signal_err] {
-                assert!(matches!(
-                    err,
-                    LayoutError::InvalidProperty { property, detail }
-                        if property == "content" && detail.starts_with("expected a string")
-                ));
-            }
-        }
-
-        #[test]
-        fn fit_rejects_a_mode_that_does_not_exist_rather_than_covering_silently() {
-            let lua = lua();
-            let table: mlua::Table = lua.load(r#"return { kind = "image", fit = "fill" }"#).eval().unwrap();
-            let err = parse_fit(&props_from_table(&table)).unwrap_err();
-            assert!(format!("{err}").contains("cover"), "the error should name the modes that do exist, got {err}");
-
-            let table: mlua::Table = lua.load(r#"return { kind = "image", fit = 3 }"#).eval().unwrap();
-            assert!(parse_fit(&props_from_table(&table)).is_err());
-        }
-
-        #[test]
-        fn an_image_source_that_is_not_a_string_is_rejected() {
-            let lua = lua();
-            let table: mlua::Table = lua.load(r#"return { kind = "image", source = 5 }"#).eval().unwrap();
-            assert!(parse_image_source(&props_from_table(&table)).is_err());
-            let table: mlua::Table = lua.load(r#"return { kind = "image", source = "/tmp/w.png" }"#).eval().unwrap();
-            assert_eq!(parse_image_source(&props_from_table(&table)).unwrap(), "/tmp/w.png");
-        }
-
-        #[test]
-        fn font_size_of_1e300_is_rejected_instead_of_overflowing_to_inf() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(r#"return { kind = "text", font_size = 1e300 }"#)
-                .eval()
-                .unwrap();
-            let props = props_from_table(&table);
+        for err in [&literal_err, &signal_err] {
             assert!(matches!(
-                parse_font_size(&props).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "font_size"
+                err,
+                LayoutError::InvalidProperty { property, detail }
+                    if property == "content" && detail.starts_with("expected a string")
             ));
         }
+    }
 
-        #[test]
-        fn font_size_absent_defaults_to_twelve() {
-            let props = HashMap::new();
-            assert_eq!(parse_font_size(&props).unwrap(), 12.0);
-        }
+    #[test]
+    fn fit_rejects_a_mode_that_does_not_exist_rather_than_covering_silently() {
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "image", fit = "fill" }"#).eval().unwrap();
+        let err = parse_fit(&props_from_table(&table)).unwrap_err();
+        assert!(format!("{err}").contains("cover"), "the error should name the modes that do exist, got {err}");
 
-        #[test]
-        fn a_signal_resolving_to_a_number_satisfies_font_size_through_marshals_check_number() {
-            let lua = lua();
-            crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
-            let signal = crate::lua::signal::Signal::new_live(Value::Number(18.0), crate::lua::signal::DirtyFlag::new()).0;
-            let table = lua.create_table().unwrap();
-            table.set("kind", "text").unwrap();
-            table.set("font_size", signal).unwrap();
-            let node = deserialize_lua_table(&table).unwrap();
-            assert_eq!(parse_font_size(&resolve_properties(&node.properties, "text", &lua).unwrap()).unwrap(), 18.0);
-        }
+        let table: mlua::Table = lua.load(r#"return { kind = "image", fit = 3 }"#).eval().unwrap();
+        assert!(parse_fit(&props_from_table(&table)).is_err());
+    }
 
-        #[test]
-        fn icon_size_absent_defaults_to_twelve() {
-            let props = HashMap::new();
-            assert_eq!(parse_icon_size(&props).unwrap(), 12.0);
-        }
+    #[test]
+    fn an_image_source_that_is_not_a_string_is_rejected() {
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "image", source = 5 }"#).eval().unwrap();
+        assert!(parse_image_source(&props_from_table(&table)).is_err());
+        let table: mlua::Table = lua.load(r#"return { kind = "image", source = "/tmp/w.png" }"#).eval().unwrap();
+        assert_eq!(parse_image_source(&props_from_table(&table)).unwrap(), "/tmp/w.png");
+    }
 
-        #[test]
-        fn node_id_absent_is_none() {
-            let props = HashMap::new();
-            assert_eq!(parse_node_id(&props).unwrap(), None);
-        }
+    #[test]
+    fn font_size_of_1e300_is_rejected_instead_of_overflowing_to_inf() {
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "text", font_size = 1e300 }"#).eval().unwrap();
+        let props = props_from_table(&table);
+        assert!(matches!(
+            parse_font_size(&props).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "font_size"
+        ));
+    }
 
-        #[test]
-        fn node_id_reads_the_string() {
-            let lua = lua();
-            let table: mlua::Table = lua.load(r#"return { kind = "rect", id = "handle" }"#).eval().unwrap();
-            let props = props_from_table(&table);
-            assert_eq!(parse_node_id(&props).unwrap(), Some("handle".to_string()));
-        }
+    #[test]
+    fn font_size_absent_defaults_to_twelve() {
+        let props = HashMap::new();
+        assert_eq!(parse_font_size(&props).unwrap(), 12.0);
+    }
 
-        #[test]
-        fn a_signal_userdata_in_node_id_is_rejected() {
-            let lua = lua();
-            crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
-            let signal = crate::lua::signal::Signal::new_live(Value::Boolean(true), crate::lua::signal::DirtyFlag::new()).0;
+    #[test]
+    fn a_signal_resolving_to_a_number_satisfies_font_size_through_marshals_check_number() {
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let signal = crate::lua::signal::Signal::new_live(Value::Number(18.0), crate::lua::signal::DirtyFlag::new()).0;
+        let table = lua.create_table().unwrap();
+        table.set("kind", "text").unwrap();
+        table.set("font_size", signal).unwrap();
+        let node = deserialize_lua_table(&table).unwrap();
+        assert_eq!(parse_font_size(&resolve_properties(&node.properties, "text", &lua).unwrap()).unwrap(), 18.0);
+    }
+
+    #[test]
+    fn icon_size_absent_defaults_to_twelve() {
+        let props = HashMap::new();
+        assert_eq!(parse_icon_size(&props).unwrap(), 12.0);
+    }
+
+    #[test]
+    fn node_id_absent_is_none() {
+        let props = HashMap::new();
+        assert_eq!(parse_node_id(&props).unwrap(), None);
+    }
+
+    #[test]
+    fn node_id_reads_the_string() {
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "rect", id = "handle" }"#).eval().unwrap();
+        let props = props_from_table(&table);
+        assert_eq!(parse_node_id(&props).unwrap(), Some("handle".to_string()));
+    }
+
+    #[test]
+    fn a_signal_userdata_in_node_id_is_rejected() {
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let signal = crate::lua::signal::Signal::new_live(Value::Boolean(true), crate::lua::signal::DirtyFlag::new()).0;
+        let table = lua.create_table().unwrap();
+        table.set("kind", "rect").unwrap();
+        table.set("id", signal).unwrap();
+        let node = deserialize_lua_table(&table).unwrap();
+        assert!(
+            matches!(parse_node_id(&node.properties).unwrap_err(), LayoutError::UnsupportedSignalProperty(p) if p == "id")
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_node_id_is_rejected_rather_than_lossily_converted() {
+        let lua = lua();
+        let table = lua.create_table().unwrap();
+        table.set("kind", "rect").unwrap();
+        table.set("id", lua.create_string(b"\xff").unwrap()).unwrap();
+        let props = props_from_table(&table);
+        let err = parse_node_id(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "id"),
+            "a non-UTF-8 id must be a LayoutError naming the property: {err:?}"
+        );
+    }
+
+    #[test]
+    fn two_distinct_non_utf8_ids_do_not_collapse_onto_one_replacement_character() {
+        let lua = lua();
+        for byte in [b"\xff".as_slice(), b"\xfe".as_slice()] {
             let table = lua.create_table().unwrap();
             table.set("kind", "rect").unwrap();
-            table.set("id", signal).unwrap();
-            let node = deserialize_lua_table(&table).unwrap();
-            assert!(matches!(parse_node_id(&node.properties).unwrap_err(), LayoutError::UnsupportedSignalProperty(p) if p == "id"));
-        }
-
-        #[test]
-        fn a_non_utf8_node_id_is_rejected_rather_than_lossily_converted() {
-            let lua = lua();
-            let table = lua.create_table().unwrap();
-            table.set("kind", "rect").unwrap();
-            table.set("id", lua.create_string(b"\xff").unwrap()).unwrap();
+            table.set("id", lua.create_string(byte).unwrap()).unwrap();
             let props = props_from_table(&table);
-            let err = parse_node_id(&props).unwrap_err();
             assert!(
-                matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "id"),
-                "a non-UTF-8 id must be a LayoutError naming the property: {err:?}"
+                matches!(parse_node_id(&props), Err(LayoutError::InvalidProperty { ref property, .. }) if property == "id")
             );
         }
+    }
 
-        #[test]
-        fn two_distinct_non_utf8_ids_do_not_collapse_onto_one_replacement_character() {
-            let lua = lua();
-            for byte in [b"\xff".as_slice(), b"\xfe".as_slice()] {
-                let table = lua.create_table().unwrap();
-                table.set("kind", "rect").unwrap();
-                table.set("id", lua.create_string(byte).unwrap()).unwrap();
-                let props = props_from_table(&table);
-                assert!(matches!(parse_node_id(&props), Err(LayoutError::InvalidProperty { ref property, .. }) if property == "id"));
-            }
-        }
+    #[test]
+    fn foreground_absent_defaults_to_white() {
+        let props = HashMap::new();
+        assert_eq!(parse_foreground(&props).unwrap(), Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 });
+    }
 
-        #[test]
-        fn foreground_absent_defaults_to_white() {
-            let props = HashMap::new();
-            assert_eq!(
-                parse_foreground(&props).unwrap(),
-                Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
-            );
-        }
+    #[test]
+    fn foreground_reads_a_hex_colour() {
+        let lua = lua();
+        let table: mlua::Table = lua.load(r##"return { kind = "text", foreground = "#00ff0080" }"##).eval().unwrap();
+        let props = props_from_table(&table);
+        assert_eq!(parse_foreground(&props).unwrap(), Rgba { r: 0.0, g: 1.0, b: 0.0, a: 0x80 as f32 / 255.0 });
+    }
 
-        #[test]
-        fn foreground_reads_a_hex_colour() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(r##"return { kind = "text", foreground = "#00ff0080" }"##)
-                .eval()
-                .unwrap();
-            let props = props_from_table(&table);
-            assert_eq!(
-                parse_foreground(&props).unwrap(),
-                Rgba { r: 0.0, g: 1.0, b: 0.0, a: 0x80 as f32 / 255.0 }
-            );
-        }
-
-        #[test]
-        fn foreground_wrong_type_is_rejected() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(r#"return { kind = "text", foreground = 5 }"#)
-                .eval()
-                .unwrap();
-            let props = props_from_table(&table);
-            let err = parse_foreground(&props).unwrap_err();
-            assert!(
-                matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "foreground" && detail.contains("expected a string")),
-                "{err}"
-            );
-        }
+    #[test]
+    fn foreground_wrong_type_is_rejected() {
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "text", foreground = 5 }"#).eval().unwrap();
+        let props = props_from_table(&table);
+        let err = parse_foreground(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "foreground" && detail.contains("expected a string")),
+            "{err}"
+        );
+    }
 }

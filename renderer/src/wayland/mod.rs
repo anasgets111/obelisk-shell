@@ -4,41 +4,47 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::c_void;
 
+use khronos_egl::Surface as EglSurface;
+use mlua::{Function, Lua, Table, Value};
+use shared::{
+    LockOutcome, LockReport, PresentationEvidence, ReadySignal, RendererFrame, SecureSubmit, SupervisorFrame, Zeroize,
+};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::presentation_time::{PresentTime, PresentationTimeHandler, PresentationTimeState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::seat::keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers};
-use smithay_client_toolkit::seat::pointer::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, PointerEvent, PointerEventKind, PointerHandler};
+use smithay_client_toolkit::seat::pointer::{
+    BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, PointerEvent, PointerEventKind, PointerHandler,
+};
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::session_lock::{
     SessionLock, SessionLockHandler, SessionLockState, SessionLockSurface, SessionLockSurfaceConfigure,
 };
+use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::wlr_layer::{
-    Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
-    LayerSurfaceConfigure,
+    Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure,
+};
+use smithay_client_toolkit::shell::xdg::popup::{Popup, PopupConfigure, PopupHandler};
+use smithay_client_toolkit::shell::xdg::window::{
+    DecorationMode, Window, WindowConfigure, WindowDecorations, WindowHandler,
 };
 use smithay_client_toolkit::shell::xdg::{XdgPositioner, XdgShell, XdgSurface};
-use smithay_client_toolkit::shell::xdg::popup::{Popup, PopupConfigure, PopupHandler};
-use smithay_client_toolkit::shell::xdg::window::{DecorationMode, Window, WindowConfigure, WindowDecorations, WindowHandler};
-use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::{delegate_registry, registry_handlers};
-use khronos_egl::Surface as EglSurface;
-use mlua::{Function, Lua, Table, Value};
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface};
 use wayland_client::{Connection, Proxy, QueueHandle, WEnum};
 use wayland_egl::WlEglSurface;
 use wayland_protocols::wp::presentation_time::client::wp_presentation_feedback;
 use wayland_protocols::xdg::shell::client::{xdg_positioner, xdg_surface};
-use shared::{LockOutcome, LockReport, PresentationEvidence, ReadySignal, RendererFrame, SecureSubmit, SupervisorFrame, Zeroize};
 
+use crate::image::ImageCache;
 use crate::layout;
 use crate::layout::instance::{OutputGeometry, SurfaceInstance, expand_instances, is_instance_of, reconcile_instances};
 use crate::layout::node::{
-    self, ConstraintAdjustment, LayerKind, PanelSpec, PopupAnchor, PopupSpec, SizeHint, SizeMode, SurfaceSpec, WindowSpec,
+    self, ConstraintAdjustment, LayerKind, PanelSpec, PopupAnchor, PopupSpec, SizeHint, SizeMode, SurfaceSpec,
+    WindowSpec,
 };
-use crate::image::ImageCache;
 use crate::socket::{FrameOutcome, RendererClient};
 use crate::text::atlas::TextPainter;
 use crate::text::shaping::ShapingHandle;
@@ -195,9 +201,8 @@ pub fn run(
     // Optional, unlike layer-shell's: a compositor with no `xdg_wm_base` is legal, and a
     // panel-only config works fine there. `create_surfaces` is what says which `window` went
     // unbuilt, since only it knows there was one.
-    let xdg_shell = XdgShell::bind(&globals, &qh)
-        .inspect_err(|err| log_bind_failure("<xdg-shell>", "xdg_wm_base::bind", err))
-        .ok();
+    let xdg_shell =
+        XdgShell::bind(&globals, &qh).inspect_err(|err| log_bind_failure("<xdg-shell>", "xdg_wm_base::bind", err)).ok();
     let output_state = OutputState::new(&globals, &qh);
     let seat_state = SeatState::new(&globals, &qh);
     // Not `?`, not logged: `SessionLockState::new` cannot fail. It stores a `GlobalProxy`, so a
@@ -314,7 +319,9 @@ pub fn run(
     // Both failure modes (evaluation, apply) already logged their own error and set
     // `oblisk.rescue` inside `RendererClient`; this line only adds the consequence.
     if !app.client.apply_instances() {
-        eprintln!("[oblisk-renderer] no scene was applied at startup; surfaces still bind, and paint nothing until a reload or a push produces one");
+        eprintln!(
+            "[oblisk-renderer] no scene was applied at startup; surfaces still bind, and paint nothing until a reload or a push produces one"
+        );
     }
 
     app.create_surfaces(&qh, &specs, &instances);
@@ -385,7 +392,9 @@ pub fn run(
                     // `ext_session_lock_v1.destroy`: that lives in SCTK's `Drop`, which
                     // `std::process::exit` skips, keeping the exit clean of `invalid_destroy`.
                     if let Err(err) = event_queue.flush() {
-                        eprintln!("[oblisk-renderer] the last flush before exiting failed ({err}); a session lock requested in this same turn may never have reached the compositor");
+                        eprintln!(
+                            "[oblisk-renderer] the last flush before exiting failed ({err}); a session lock requested in this same turn may never have reached the compositor"
+                        );
                     }
                     eprintln!("[oblisk-renderer] {}", supervisor_gone_report(app.session_lock.is_some()));
                     std::process::exit(EXIT_SUPERVISOR_GONE);

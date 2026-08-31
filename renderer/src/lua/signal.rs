@@ -117,7 +117,10 @@ enum SignalKind {
     // no production caller yet either -- exercised by tests only.
     #[allow(dead_code)]
     Direct(Value),
-    Computed { deps: Vec<Signal>, func: Function },
+    Computed {
+        deps: Vec<Signal>,
+        func: Function,
+    },
     /// A value Rust can overwrite after construction (`Signal::new_live`/`LiveSignalHandle`).
     /// `Rc<RefCell<_>>`, not `Arc<Mutex<_>>`: the `Loader` this lives on stays confined to one
     /// dedicated OS thread (the Wayland dispatch thread, docs/adr/0039).
@@ -134,7 +137,11 @@ enum SignalKind {
     /// a reference to the rect cell `hover_rect(name)` reads, so the pointer handler can write both
     /// from the one handle a node's `hover` property gave it. `None` on the rect signal itself,
     /// which is a hover signal in every other respect and is not a trigger for anything.
-    Hover { cell: Rc<RefCell<Value>>, paired_rect: Option<Rc<RefCell<Value>>>, dirty: DirtyFlag },
+    Hover {
+        cell: Rc<RefCell<Value>>,
+        paired_rect: Option<Rc<RefCell<Value>>>,
+        dirty: DirtyFlag,
+    },
     /// How far a scrollable container has been scrolled along its main axis, in logical pixels
     /// (docs/adr/0069). Written by `crate::wayland`'s pointer handler on a wheel and by
     /// `layout::scene`'s positioning pass when it clamps; read by a config that wants to know.
@@ -143,7 +150,10 @@ enum SignalKind {
     /// who may write, so `Signal::scroll_handle` hands out a write end for this kind alone and a
     /// config naming `scroll = oblisk.network` gets no writer instead of a wheel that overwrites a
     /// capability snapshot.
-    Scroll { cell: Rc<RefCell<Value>>, dirty: DirtyFlag },
+    Scroll {
+        cell: Rc<RefCell<Value>>,
+        dirty: DirtyFlag,
+    },
     /// Lua-authored state (ADR-0044 decision 5): the one signal kind `Signal::set` accepts, built
     /// by the `state(name, initial)` global and written from a config's own `on_click`.
     ///
@@ -156,7 +166,10 @@ enum SignalKind {
     /// Carries its own `DirtyFlag` clone rather than reaching for one at write time: `set` is a
     /// `UserData` method with no `RendererClient` in reach, and every signal in a generation
     /// shares the one flag decision 2 specifies anyway.
-    State { cell: Rc<RefCell<Value>>, dirty: DirtyFlag },
+    State {
+        cell: Rc<RefCell<Value>>,
+        dirty: DirtyFlag,
+    },
 }
 
 impl SignalKind {
@@ -310,7 +323,11 @@ impl Signal {
         let over = Rc::new(RefCell::new(Value::Boolean(false)));
         let rect = Rc::new(RefCell::new(initial_rect));
         (
-            Signal(SignalKind::Hover { cell: Rc::clone(&over), paired_rect: Some(Rc::clone(&rect)), dirty: dirty.clone() }),
+            Signal(SignalKind::Hover {
+                cell: Rc::clone(&over),
+                paired_rect: Some(Rc::clone(&rect)),
+                dirty: dirty.clone(),
+            }),
             Signal(SignalKind::Hover { cell: rect, paired_rect: None, dirty }),
         )
     }
@@ -368,7 +385,9 @@ impl Signal {
     /// no node's `hover` property should be naming.
     pub(crate) fn hover_rect_handle(&self) -> Option<LiveSignalHandle> {
         match &self.0 {
-            SignalKind::Hover { paired_rect: Some(rect), dirty, .. } => Some(LiveSignalHandle(Rc::clone(rect), dirty.clone())),
+            SignalKind::Hover { paired_rect: Some(rect), dirty, .. } => {
+                Some(LiveSignalHandle(Rc::clone(rect), dirty.clone()))
+            }
             _ => None,
         }
     }
@@ -658,7 +677,9 @@ impl<'lua> CpuBudget<'lua> {
                 },
             )?;
         }
-        lua.app_data_mut::<Vec<Deadline>>().expect("just ensured the deadline stack exists").push(Deadline::starting_now());
+        lua.app_data_mut::<Vec<Deadline>>()
+            .expect("just ensured the deadline stack exists")
+            .push(Deadline::starting_now());
         Ok(Self { lua })
     }
 
@@ -707,7 +728,9 @@ impl Drop for CpuBudget<'_> {
 /// `last()`: see [`CpuBudget`]'s doc comment for why. An empty stack (no evaluation in flight) is
 /// never expired, which is what lets [`CpuBudget::enter`] install the hook before its first push.
 fn governing_deadline_expired(lua: &Lua) -> bool {
-    lua.app_data_ref::<Vec<Deadline>>().and_then(|stack| stack.first().copied()).is_some_and(|deadline| deadline.expired())
+    lua.app_data_ref::<Vec<Deadline>>()
+        .and_then(|stack| stack.first().copied())
+        .is_some_and(|deadline| deadline.expired())
 }
 
 /// The one answer to "does this Lua userdata resolve like a signal?", and the `Signal` to
@@ -766,8 +789,12 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
             if lua.app_data_ref::<StateRegistry>().is_none() {
                 lua.set_app_data(StateRegistry::default());
             }
-            let existing =
-                lua.app_data_ref::<StateRegistry>().expect("just ensured the state registry exists").0.get(&name).cloned();
+            let existing = lua
+                .app_data_ref::<StateRegistry>()
+                .expect("just ensured the state registry exists")
+                .0
+                .get(&name)
+                .cloned();
             if let Some((signal, seeded)) = existing {
                 // Decision 5: a name already in the map wins, which is what makes an in-place
                 // reload keep the value instead of resetting it.
@@ -790,7 +817,9 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
                 return Ok(signal);
             }
             let signal = Signal::new_state(initial.clone(), dirty.clone()).map_err(|err| {
-                mlua::Error::runtime(format!("state(\"{name}\", ...) refused its initial value at the marshalling boundary: {err}"))
+                mlua::Error::runtime(format!(
+                    "state(\"{name}\", ...) refused its initial value at the marshalling boundary: {err}"
+                ))
             })?;
             lua.app_data_mut::<StateRegistry>()
                 .expect("just ensured the state registry exists")
@@ -808,22 +837,28 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
             Ok(hover_slot(lua, &hover_dirty, name)?.0)
         })?,
     )?;
-    lua.globals().set(
-        "hover_rect",
-        lua.create_function(move |lua, name: String| Ok(hover_slot(lua, &rect_dirty, name)?.1))?,
-    )?;
+    lua.globals()
+        .set("hover_rect", lua.create_function(move |lua, name: String| Ok(hover_slot(lua, &rect_dirty, name)?.1))?)?;
     lua.globals().set(
         "scroll",
         lua.create_function(move |lua, name: String| {
             if lua.app_data_ref::<ScrollRegistry>().is_none() {
                 lua.set_app_data(ScrollRegistry::default());
             }
-            let existing = lua.app_data_ref::<ScrollRegistry>().expect("just ensured the scroll registry exists").0.get(&name).cloned();
+            let existing = lua
+                .app_data_ref::<ScrollRegistry>()
+                .expect("just ensured the scroll registry exists")
+                .0
+                .get(&name)
+                .cloned();
             if let Some(signal) = existing {
                 return Ok(signal);
             }
             let signal = Signal::new_scroll(scroll_dirty.clone());
-            lua.app_data_mut::<ScrollRegistry>().expect("just ensured the scroll registry exists").0.insert(name, signal.clone());
+            lua.app_data_mut::<ScrollRegistry>()
+                .expect("just ensured the scroll registry exists")
+                .0
+                .insert(name, signal.clone());
             Ok(signal)
         })?,
     )
@@ -843,7 +878,8 @@ fn hover_slot(lua: &Lua, dirty: &DirtyFlag, name: String) -> mlua::Result<(Signa
     if lua.app_data_ref::<HoverRegistry>().is_none() {
         lua.set_app_data(HoverRegistry::default());
     }
-    let existing = lua.app_data_ref::<HoverRegistry>().expect("just ensured the hover registry exists").0.get(&name).cloned();
+    let existing =
+        lua.app_data_ref::<HoverRegistry>().expect("just ensured the hover registry exists").0.get(&name).cloned();
     if let Some(slot) = existing {
         return Ok(slot);
     }
@@ -1242,10 +1278,7 @@ mod tests {
         lua.globals().set("a", Signal::try_new_direct(Value::Integer(3)).unwrap()).unwrap();
         lua.globals().set("b", Signal::try_new_direct(Value::Integer(4)).unwrap()).unwrap();
 
-        let result: i64 = lua
-            .load("return computed({a, b}, function(x, y) return x + y end):get()")
-            .eval()
-            .unwrap();
+        let result: i64 = lua.load("return computed({a, b}, function(x, y) return x + y end):get()").eval().unwrap();
         assert_eq!(result, 7);
     }
 
@@ -1274,9 +1307,8 @@ mod tests {
         lua.globals().set("a", Signal::try_new_direct(Value::Integer(1)).unwrap()).unwrap();
 
         let start = Instant::now();
-        let result: mlua::Result<i64> = lua
-            .load("return computed({a}, function(x) while true do end end):get()")
-            .eval();
+        let result: mlua::Result<i64> =
+            lua.load("return computed({a}, function(x) while true do end end):get()").eval();
         let elapsed = start.elapsed();
 
         assert!(result.is_err(), "a busy-loop computed must error, not return a value");
@@ -1293,9 +1325,8 @@ mod tests {
         lua.globals().set("other", Signal::try_new_direct(Value::Integer(2)).unwrap()).unwrap();
 
         let start = Instant::now();
-        let result: mlua::Result<i64> = lua
-            .load("return computed({a}, function(x) local y = other:get(); while true do end end):get()")
-            .eval();
+        let result: mlua::Result<i64> =
+            lua.load("return computed({a}, function(x) local y = other:get(); while true do end end):get()").eval();
         let elapsed = start.elapsed();
 
         assert!(result.is_err(), "the outer computed must still abort even though its body read a second Signal");
@@ -1521,8 +1552,7 @@ mod tests {
         let lua = Lua::new();
         register(&lua, DirtyFlag::new()).unwrap();
         lua.globals().set("a", Signal::try_new_direct(Value::Integer(1)).unwrap()).unwrap();
-        let _: mlua::Result<i64> =
-            lua.load("return computed({a}, function(x) while true do end end):get()").eval();
+        let _: mlua::Result<i64> = lua.load("return computed({a}, function(x) while true do end end):get()").eval();
 
         // An unrelated, slower-than-5ms-but-legitimate top-level script must not be clipped by a
         // hook left over from the aborted computed above.
@@ -1591,6 +1621,9 @@ mod tests {
 
         lua.globals().set("handle", lua.create_any_userdata(7u32).unwrap()).unwrap();
         let err = lua.load("return computed({handle}, function(n) return n end)").exec().unwrap_err().to_string();
-        assert!(err.contains("must be Signals or `oblisk` capabilities"), "the error must say what was expected: {err}");
+        assert!(
+            err.contains("must be Signals or `oblisk` capabilities"),
+            "the error must say what was expected: {err}"
+        );
     }
 }

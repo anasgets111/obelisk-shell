@@ -36,11 +36,7 @@ pub fn check_integer(value: i64) -> Result<i64, MarshalError> {
 }
 
 pub fn check_string(value: &str) -> Result<&str, MarshalError> {
-    if value.len() <= MAX_STRING_BYTES {
-        Ok(value)
-    } else {
-        Err(MarshalError::StringTooLong { len: value.len() })
-    }
+    if value.len() <= MAX_STRING_BYTES { Ok(value) } else { Err(MarshalError::StringTooLong { len: value.len() }) }
 }
 
 #[cfg(test)]

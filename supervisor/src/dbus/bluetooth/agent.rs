@@ -3,8 +3,8 @@
 
 use zbus::zvariant::{ObjectPath, OwnedObjectPath};
 
-use super::proxies::bind_agent_manager;
 use super::AGENT_OBJECT_PATH;
+use super::proxies::bind_agent_manager;
 
 /// `org.bluez.Error.Rejected` as a properly-named D-Bus error reply -- `zbus::fdo::Error::Failed`
 /// would carry the wrong error name (`org.freedesktop.DBus.Error.Failed`).
@@ -104,7 +104,8 @@ mod tests {
     async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {
         let (a, b) = UnixStream::pair().expect("failed to create a unix socket pair");
         let guid = zbus::Guid::generate();
-        let server_builder = zbus::connection::Builder::unix_stream(a).server(guid).expect("p2p server builder setup").p2p();
+        let server_builder =
+            zbus::connection::Builder::unix_stream(a).server(guid).expect("p2p server builder setup").p2p();
         let client_builder = zbus::connection::Builder::unix_stream(b).p2p();
         tokio::try_join!(server_builder.build(), client_builder.build()).expect("p2p handshake")
     }
@@ -129,7 +130,11 @@ mod tests {
     #[tokio::test]
     async fn request_pin_code_returns_a_properly_named_rejected_error() {
         let (agent_side, caller_side) = p2p_pair().await;
-        agent_side.object_server().at(AGENT_OBJECT_PATH, BluetoothAgent).await.expect("failed to export BluetoothAgent");
+        agent_side
+            .object_server()
+            .at(AGENT_OBJECT_PATH, BluetoothAgent)
+            .await
+            .expect("failed to export BluetoothAgent");
 
         let proxy = agent1_proxy(&caller_side).await;
         let result: zbus::Result<String> = proxy.call("RequestPinCode", &(dummy_device_path(),)).await;
@@ -143,7 +148,11 @@ mod tests {
     #[tokio::test]
     async fn request_passkey_returns_a_properly_named_rejected_error() {
         let (agent_side, caller_side) = p2p_pair().await;
-        agent_side.object_server().at(AGENT_OBJECT_PATH, BluetoothAgent).await.expect("failed to export BluetoothAgent");
+        agent_side
+            .object_server()
+            .at(AGENT_OBJECT_PATH, BluetoothAgent)
+            .await
+            .expect("failed to export BluetoothAgent");
 
         let proxy = agent1_proxy(&caller_side).await;
         let result: zbus::Result<u32> = proxy.call("RequestPasskey", &(dummy_device_path(),)).await;
@@ -157,25 +166,43 @@ mod tests {
     #[tokio::test]
     async fn request_confirmation_auto_accepts() {
         let (agent_side, caller_side) = p2p_pair().await;
-        agent_side.object_server().at(AGENT_OBJECT_PATH, BluetoothAgent).await.expect("failed to export BluetoothAgent");
+        agent_side
+            .object_server()
+            .at(AGENT_OBJECT_PATH, BluetoothAgent)
+            .await
+            .expect("failed to export BluetoothAgent");
 
         let proxy = agent1_proxy(&caller_side).await;
-        proxy.call::<_, _, ()>("RequestConfirmation", &(dummy_device_path(), 123456u32)).await.expect("RequestConfirmation must auto-accept");
+        proxy
+            .call::<_, _, ()>("RequestConfirmation", &(dummy_device_path(), 123456u32))
+            .await
+            .expect("RequestConfirmation must auto-accept");
     }
 
     #[tokio::test]
     async fn request_authorization_auto_accepts() {
         let (agent_side, caller_side) = p2p_pair().await;
-        agent_side.object_server().at(AGENT_OBJECT_PATH, BluetoothAgent).await.expect("failed to export BluetoothAgent");
+        agent_side
+            .object_server()
+            .at(AGENT_OBJECT_PATH, BluetoothAgent)
+            .await
+            .expect("failed to export BluetoothAgent");
 
         let proxy = agent1_proxy(&caller_side).await;
-        proxy.call::<_, _, ()>("RequestAuthorization", &(dummy_device_path(),)).await.expect("RequestAuthorization must auto-accept");
+        proxy
+            .call::<_, _, ()>("RequestAuthorization", &(dummy_device_path(),))
+            .await
+            .expect("RequestAuthorization must auto-accept");
     }
 
     #[tokio::test]
     async fn authorize_service_auto_accepts() {
         let (agent_side, caller_side) = p2p_pair().await;
-        agent_side.object_server().at(AGENT_OBJECT_PATH, BluetoothAgent).await.expect("failed to export BluetoothAgent");
+        agent_side
+            .object_server()
+            .at(AGENT_OBJECT_PATH, BluetoothAgent)
+            .await
+            .expect("failed to export BluetoothAgent");
 
         let proxy = agent1_proxy(&caller_side).await;
         proxy
@@ -187,7 +214,11 @@ mod tests {
     #[tokio::test]
     async fn cancel_and_release_are_no_ops() {
         let (agent_side, caller_side) = p2p_pair().await;
-        agent_side.object_server().at(AGENT_OBJECT_PATH, BluetoothAgent).await.expect("failed to export BluetoothAgent");
+        agent_side
+            .object_server()
+            .at(AGENT_OBJECT_PATH, BluetoothAgent)
+            .await
+            .expect("failed to export BluetoothAgent");
 
         let proxy = agent1_proxy(&caller_side).await;
         proxy.call::<_, _, ()>("Cancel", &()).await.expect("Cancel must succeed");

@@ -122,12 +122,8 @@ fn spec_update(applied: &PanelSpec, fresh: &PanelSpec, output: layout::LogicalSi
     // Compared as the pixel pair that actually goes on the wire, not as the two `SizeMode`s: a
     // percent and an equivalent pixel count are the same request, and `Fill` and `Content` are
     // both the protocol's `0`.
-    let extent = |spec: &PanelSpec| {
-        (
-            layer_extent_for(spec.width, output.width),
-            layer_extent_for(spec.height, output.height),
-        )
-    };
+    let extent =
+        |spec: &PanelSpec| (layer_extent_for(spec.width, output.width), layer_extent_for(spec.height, output.height));
     SpecUpdate {
         margin: (fresh.margin != applied.margin).then_some(fresh.margin),
         keyboard_interactivity: (fresh.keyboard_interactivity != applied.keyboard_interactivity)
@@ -188,7 +184,10 @@ impl App {
         visible: bool,
     ) {
         let Some(output) = outputs.get(&instance.output) else {
-            eprintln!("[oblisk-renderer] instance {:?} names an output that has since gone; skipping", instance.instance_id);
+            eprintln!(
+                "[oblisk-renderer] instance {:?} names an output that has since gone; skipping",
+                instance.instance_id
+            );
             return;
         };
         let size = (
@@ -271,12 +270,7 @@ impl App {
         let update = spec_update(applied, &fresh, *output_size);
 
         if let Some(margin) = update.margin {
-            layer.set_margin(
-                margin.top as i32,
-                margin.right as i32,
-                margin.bottom as i32,
-                margin.left as i32,
-            );
+            layer.set_margin(margin.top as i32, margin.right as i32, margin.bottom as i32, margin.left as i32);
         }
         if let Some(mode) = update.keyboard_interactivity {
             layer.set_keyboard_interactivity(keyboard_interactivity_for(mode));
@@ -383,13 +377,24 @@ mod tests {
     fn every_keyboard_interactivity_maps_to_its_protocol_mode() {
         assert_eq!(keyboard_interactivity_for(node::KeyboardInteractivity::None), KeyboardInteractivity::None);
         assert_eq!(keyboard_interactivity_for(node::KeyboardInteractivity::OnDemand), KeyboardInteractivity::OnDemand);
-        assert_eq!(keyboard_interactivity_for(node::KeyboardInteractivity::Exclusive), KeyboardInteractivity::Exclusive);
+        assert_eq!(
+            keyboard_interactivity_for(node::KeyboardInteractivity::Exclusive),
+            KeyboardInteractivity::Exclusive
+        );
     }
 
     #[test]
     fn layer_extent_maps_fill_and_content_to_the_protocols_zero_and_resolves_a_percent() {
-        assert_eq!(layer_extent_for(SizeMode::Fill, 1920.0), 0, "`Fill` means the anchors decide, which the protocol spells 0");
-        assert_eq!(layer_extent_for(SizeMode::Content, 1920.0), 0, "an omitted width has no measured content at creation time either");
+        assert_eq!(
+            layer_extent_for(SizeMode::Fill, 1920.0),
+            0,
+            "`Fill` means the anchors decide, which the protocol spells 0"
+        );
+        assert_eq!(
+            layer_extent_for(SizeMode::Content, 1920.0),
+            0,
+            "an omitted width has no measured content at creation time either"
+        );
         assert_eq!(layer_extent_for(SizeMode::Pixels(32.0), 1920.0), 32);
         assert_eq!(layer_extent_for(SizeMode::Percent(0.5), 1920.0), 960);
     }
@@ -400,14 +405,22 @@ mod tests {
         // config that trips it must be refused per surface instead.
         let bar = node::Anchor { top: true, right: true, bottom: false, left: true };
         assert_eq!(ambiguous_zero_axis((0, 32), bar), None, "width 0 is fine: left and right are both anchored");
-        assert_eq!(ambiguous_zero_axis((0, 0), bar), Some("height"), "height 0 with only the top edge anchored is the protocol error");
+        assert_eq!(
+            ambiguous_zero_axis((0, 0), bar),
+            Some("height"),
+            "height 0 with only the top edge anchored is the protocol error"
+        );
 
         let corner = node::Anchor { top: true, right: true, bottom: false, left: false };
         assert_eq!(ambiguous_zero_axis((0, 40), corner), Some("width"));
         assert_eq!(ambiguous_zero_axis((380, 40), corner), None, "an explicit size on both axes is always legal");
 
         let full = node::Anchor { top: true, right: true, bottom: true, left: true };
-        assert_eq!(ambiguous_zero_axis((0, 0), full), None, "a fullscreen surface may leave both axes to the compositor");
+        assert_eq!(
+            ambiguous_zero_axis((0, 0), full),
+            None,
+            "a fullscreen surface may leave both axes to the compositor"
+        );
     }
 
     #[test]

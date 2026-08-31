@@ -50,7 +50,10 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>,
 }
 
 /// Serializes `value` as JSON and writes it as one frame.
-pub async fn write_json_frame<W: AsyncWrite + Unpin, T: Serialize>(writer: &mut W, value: &T) -> Result<(), FramingError> {
+pub async fn write_json_frame<W: AsyncWrite + Unpin, T: Serialize>(
+    writer: &mut W,
+    value: &T,
+) -> Result<(), FramingError> {
     let payload = serde_json::to_vec(value)?;
     write_frame(writer, &payload).await
 }

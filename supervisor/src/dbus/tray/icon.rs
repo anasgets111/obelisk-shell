@@ -17,13 +17,19 @@ pub(super) struct IconPixmap {
 /// non-empty, capped at [`MAX_PIXMAP_DIMENSION`], and its byte length matches `width * height *
 /// 4` (ARGB32, 4 bytes/pixel) exactly.
 fn pixmap_is_valid(width: i32, height: i32, byte_len: usize) -> bool {
-    width > 0 && width == height && width <= MAX_PIXMAP_DIMENSION && (width as usize) * (height as usize) * 4 == byte_len
+    width > 0
+        && width == height
+        && width <= MAX_PIXMAP_DIMENSION
+        && (width as usize) * (height as usize) * 4 == byte_len
 }
 
 /// The single largest pixmap that passes [`pixmap_is_valid`] (ADR-0031: "no target-size guess,
 /// largest capped at 128" -- downscaling a large source always beats upscaling a small one).
 pub(super) fn largest_valid_pixmap(pixmaps: &[IconPixmap]) -> Option<&IconPixmap> {
-    pixmaps.iter().filter(|pixmap| pixmap_is_valid(pixmap.width, pixmap.height, pixmap.bytes.len())).max_by_key(|pixmap| pixmap.width)
+    pixmaps
+        .iter()
+        .filter(|pixmap| pixmap_is_valid(pixmap.width, pixmap.height, pixmap.bytes.len()))
+        .max_by_key(|pixmap| pixmap.width)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,10 +85,10 @@ fn encode_argb32_to_png(width: u32, height: u32, argb: &[u8]) -> Result<Vec<u8>,
 /// directory tree if missing. Same path overwritten in place on every call -- no cache-busting
 /// (ADR-0031).
 pub(super) fn write_icon_png(sanitized_unique_name: &str, pixmap: &IconPixmap) -> std::io::Result<String> {
-    let png_bytes = encode_argb32_to_png(pixmap.width as u32, pixmap.height as u32, &pixmap.bytes).map_err(std::io::Error::other)?;
+    let png_bytes = encode_argb32_to_png(pixmap.width as u32, pixmap.height as u32, &pixmap.bytes)
+        .map_err(std::io::Error::other)?;
     shm_icons::write_png("tray", &format!("{sanitized_unique_name}.png"), &png_bytes)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -117,7 +123,6 @@ mod tests {
         assert!(!pixmap_is_valid(-1, -1, 4));
     }
 
-
     // ---- largest_valid_pixmap ----
 
     fn pixmap(size: i32) -> IconPixmap {
@@ -150,7 +155,6 @@ mod tests {
         assert_eq!(largest_valid_pixmap(&[]), None);
     }
 
-
     // ---- resolve_icon_source ----
 
     #[test]
@@ -172,7 +176,6 @@ mod tests {
         assert_eq!(resolve_icon_source("", &invalid), IconSource::None);
     }
 
-
     // ---- encode_argb32_to_png (round trip through the real png crate, both encode and decode) ----
 
     #[test]
@@ -190,5 +193,4 @@ mod tests {
         // R, G, B, A -- the encoder must reorder from the source's A, R, G, B.
         assert_eq!(rgba, &[0x22, 0x33, 0x44, 0x11]);
     }
-
 }

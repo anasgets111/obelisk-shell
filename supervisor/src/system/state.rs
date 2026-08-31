@@ -65,7 +65,11 @@ mod tests {
         for (name, contents) in [("array.json", "[1, 2, 3]"), ("scalar.json", "42")] {
             let path = dir.path().join(name);
             std::fs::write(&path, contents).unwrap();
-            assert_eq!(load_state(&path), empty_object(), "{name}: §2.11 promises a dictionary, not an array or a scalar");
+            assert_eq!(
+                load_state(&path),
+                empty_object(),
+                "{name}: §2.11 promises a dictionary, not an array or a scalar"
+            );
         }
     }
 }

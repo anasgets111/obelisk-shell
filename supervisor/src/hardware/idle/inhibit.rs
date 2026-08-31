@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 
-
 /// What one refcount transition means for the shared inhibit fd: open it (0->1) or close it
 /// (->0), never both -- [`apply_inhibit`] only reports `should_open_fd`, the others only `should_close_fd`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,8 +48,6 @@ pub fn cleanup_generation_inhibit(counts: &mut HashMap<u32, u32>, generation_id:
     InhibitTransition { should_open_fd: false, should_close_fd: total_before > 0 && total_after == 0 }
 }
 
-
-
 #[zbus::proxy(
     interface = "org.freedesktop.login1.Manager",
     default_service = "org.freedesktop.login1",
@@ -67,8 +64,6 @@ pub(crate) const INHIBIT_WHAT: &str = "idle";
 pub(crate) const INHIBIT_WHO: &str = "oblisk";
 pub(crate) const INHIBIT_MODE: &str = "block";
 
-
-
 pub(crate) struct InhibitState {
     pub(crate) counts: HashMap<u32, u32>,
     pub(crate) fd: Option<zbus::zvariant::OwnedFd>,
@@ -82,7 +77,6 @@ pub(crate) struct LiveInhibit {
     /// write run as one critical section with the lock held across an `.await`, which `std::sync::Mutex` can't do.
     pub(crate) state: tokio::sync::Mutex<InhibitState>,
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -125,7 +119,11 @@ mod tests {
 
         let transition = apply_release_inhibit(&mut counts, 1);
 
-        assert_eq!(transition, InhibitTransition { should_open_fd: false, should_close_fd: false }, "generation 2 still holds an inhibit");
+        assert_eq!(
+            transition,
+            InhibitTransition { should_open_fd: false, should_close_fd: false },
+            "generation 2 still holds an inhibit"
+        );
         assert_eq!(counts.get(&1), Some(&0));
         assert_eq!(counts.get(&2), Some(&1));
     }
@@ -195,7 +193,8 @@ mod tests {
     async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {
         let (a, b) = UnixStream::pair().expect("failed to create a unix socket pair");
         let guid = zbus::Guid::generate();
-        let server_builder = zbus::connection::Builder::unix_stream(a).server(guid).expect("p2p server builder setup").p2p();
+        let server_builder =
+            zbus::connection::Builder::unix_stream(a).server(guid).expect("p2p server builder setup").p2p();
         let client_builder = zbus::connection::Builder::unix_stream(b).p2p();
         tokio::try_join!(server_builder.build(), client_builder.build()).expect("p2p handshake")
     }
@@ -238,7 +237,8 @@ mod tests {
             .await
             .expect("failed to build a p2p Login1ManagerProxy");
 
-        let fd = proxy.inhibit("idle", "oblisk", "playing a video", "block").await.expect("Inhibit call should succeed");
+        let fd =
+            proxy.inhibit("idle", "oblisk", "playing a video", "block").await.expect("Inhibit call should succeed");
         // OwnedFd's own Drop closing it cleanly (no panic) is itself part of this assertion.
         drop(fd);
 

@@ -129,7 +129,10 @@ mod tests {
         map.insert("xesam:artist".to_string(), owned(Value::Array(artists)));
         map.insert("mpris:artUrl".to_string(), owned(Value::Str(Str::from("file:///home/anas/art.png"))));
         map.insert("mpris:length".to_string(), owned(Value::I64(1_302_000_000)));
-        map.insert("mpris:trackid".to_string(), owned(Value::ObjectPath(ObjectPath::try_from("/org/mpris/MediaPlayer2/firefox").unwrap())));
+        map.insert(
+            "mpris:trackid".to_string(),
+            owned(Value::ObjectPath(ObjectPath::try_from("/org/mpris/MediaPlayer2/firefox").unwrap())),
+        );
         map.insert("xesam:url".to_string(), owned(Value::Str(Str::from("https://example.com/watch"))));
         map
     }
@@ -171,28 +174,48 @@ mod tests {
 
     #[test]
     fn track_identity_differs_when_only_trackid_changes() {
-        let a = ParsedMetadata { trackid: Some("/1".into()), url: Some("u".into()), title: "t".into(), ..Default::default() };
+        let a = ParsedMetadata {
+            trackid: Some("/1".into()),
+            url: Some("u".into()),
+            title: "t".into(),
+            ..Default::default()
+        };
         let b = ParsedMetadata { trackid: Some("/2".into()), ..a.clone() };
         assert_ne!(a.track_identity(), b.track_identity());
     }
 
     #[test]
     fn track_identity_differs_when_only_url_changes() {
-        let a = ParsedMetadata { trackid: Some("/1".into()), url: Some("u1".into()), title: "t".into(), ..Default::default() };
+        let a = ParsedMetadata {
+            trackid: Some("/1".into()),
+            url: Some("u1".into()),
+            title: "t".into(),
+            ..Default::default()
+        };
         let b = ParsedMetadata { url: Some("u2".into()), ..a.clone() };
         assert_ne!(a.track_identity(), b.track_identity());
     }
 
     #[test]
     fn track_identity_differs_when_only_title_changes() {
-        let a = ParsedMetadata { trackid: Some("/1".into()), url: Some("u".into()), title: "t1".into(), ..Default::default() };
+        let a = ParsedMetadata {
+            trackid: Some("/1".into()),
+            url: Some("u".into()),
+            title: "t1".into(),
+            ..Default::default()
+        };
         let b = ParsedMetadata { title: "t2".into(), ..a.clone() };
         assert_ne!(a.track_identity(), b.track_identity());
     }
 
     #[test]
     fn track_identity_is_equal_when_nothing_changed() {
-        let a = ParsedMetadata { trackid: Some("/1".into()), url: Some("u".into()), title: "t".into(), ..Default::default() };
+        let a = ParsedMetadata {
+            trackid: Some("/1".into()),
+            url: Some("u".into()),
+            title: "t".into(),
+            ..Default::default()
+        };
         assert_eq!(a.track_identity(), a.clone().track_identity());
     }
 

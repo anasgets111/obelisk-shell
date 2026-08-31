@@ -331,7 +331,8 @@ mod tests {
 
     #[test]
     fn settings_match_ssid_compares_the_wireless_sections_ssid_bytes() {
-        let settings = settings_with("802-11-wireless", "ssid", OwnedValue::try_from(Value::from(b"HomeWifi".to_vec())).unwrap());
+        let settings =
+            settings_with("802-11-wireless", "ssid", OwnedValue::try_from(Value::from(b"HomeWifi".to_vec())).unwrap());
         assert!(settings_match_ssid(&settings, "HomeWifi"));
         assert!(!settings_match_ssid(&settings, "OfficeWifi"));
     }
@@ -406,14 +407,21 @@ mod tests {
 
     #[test]
     fn parse_connect_args_parses_ssid_and_hidden() {
-        assert_eq!(parse_connect_args(&[serde_json::json!("HomeWifi"), serde_json::json!(true)]), Some(("HomeWifi".to_string(), true)));
+        assert_eq!(
+            parse_connect_args(&[serde_json::json!("HomeWifi"), serde_json::json!(true)]),
+            Some(("HomeWifi".to_string(), true))
+        );
     }
 
     #[test]
     fn parse_connect_args_rejects_a_malformed_shape() {
         assert_eq!(parse_connect_args(&[]), None, "missing both elements");
         assert_eq!(parse_connect_args(&[serde_json::json!(1), serde_json::json!(true)]), None, "ssid is not a string");
-        assert_eq!(parse_connect_args(&[serde_json::json!("HomeWifi"), serde_json::json!("nope")]), None, "hidden is not a boolean");
+        assert_eq!(
+            parse_connect_args(&[serde_json::json!("HomeWifi"), serde_json::json!("nope")]),
+            None,
+            "hidden is not a boolean"
+        );
     }
 
     #[test]

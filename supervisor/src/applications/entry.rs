@@ -192,7 +192,11 @@ Exec=firefox --new-window
 ";
         let group = parse_group(contents).expect("the file has a [Desktop Entry] group");
         assert_eq!(group.get("Name").map(String::as_str), Some("Firefox"));
-        assert_eq!(group.get("Exec").map(String::as_str), Some("firefox %u"), "the action's Exec must not overwrite the application's");
+        assert_eq!(
+            group.get("Exec").map(String::as_str),
+            Some("firefox %u"),
+            "the action's Exec must not overwrite the application's"
+        );
     }
 
     #[test]
@@ -224,7 +228,10 @@ Exec=firefox --new-window
 
     #[test]
     fn tokenize_exec_splits_on_whitespace() {
-        assert_eq!(tokenize_exec("kitty --single-instance"), Some(("kitty".to_string(), vec!["--single-instance".to_string()])));
+        assert_eq!(
+            tokenize_exec("kitty --single-instance"),
+            Some(("kitty".to_string(), vec!["--single-instance".to_string()]))
+        );
     }
 
     /// A `.desktop` file quotes with double quotes only. Treating single quotes as quoting, the
@@ -272,12 +279,21 @@ Exec=firefox --new-window
     #[test]
     fn desktop_file_id_turns_a_subdirectory_into_a_dash() {
         let base = Path::new("/usr/share/applications");
-        assert_eq!(desktop_file_id(Path::new("/usr/share/applications/kde4/konsole.desktop"), base), Some("kde4-konsole".to_string()));
-        assert_eq!(desktop_file_id(Path::new("/usr/share/applications/firefox.desktop"), base), Some("firefox".to_string()));
+        assert_eq!(
+            desktop_file_id(Path::new("/usr/share/applications/kde4/konsole.desktop"), base),
+            Some("kde4-konsole".to_string())
+        );
+        assert_eq!(
+            desktop_file_id(Path::new("/usr/share/applications/firefox.desktop"), base),
+            Some("firefox".to_string())
+        );
     }
 
     #[test]
     fn desktop_file_id_rejects_a_file_that_is_not_a_desktop_entry() {
-        assert_eq!(desktop_file_id(Path::new("/usr/share/applications/mimeinfo.cache"), Path::new("/usr/share/applications")), None);
+        assert_eq!(
+            desktop_file_id(Path::new("/usr/share/applications/mimeinfo.cache"), Path::new("/usr/share/applications")),
+            None
+        );
     }
 }

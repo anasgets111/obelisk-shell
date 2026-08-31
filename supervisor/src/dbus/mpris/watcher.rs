@@ -39,7 +39,12 @@ pub(super) fn service_name_for_id(id: &str) -> String {
 
 /// `ListNames` scanned once, filtered by [`is_trackable_player`], each match handed to
 /// [`register_player`].
-async fn discover_existing(connection: &zbus::Connection, dbus_proxy: &zbus::fdo::DBusProxy<'static>, registry: &PlayerRegistry, events: &UnboundedSender<MprisSignal>) {
+async fn discover_existing(
+    connection: &zbus::Connection,
+    dbus_proxy: &zbus::fdo::DBusProxy<'static>,
+    registry: &PlayerRegistry,
+    events: &UnboundedSender<MprisSignal>,
+) {
     let names = match dbus_proxy.list_names().await {
         Ok(names) => names,
         Err(err) => {
@@ -66,7 +71,11 @@ async fn discover_existing(connection: &zbus::Connection, dbus_proxy: &zbus::fdo
 /// subscription before `discover_existing`'s own scan reaches that name is a harmless
 /// double-registration, already handled by `register_player`'s insert-returns-previous-abort
 /// logic.
-pub(super) async fn spawn_discovery(connection: zbus::Connection, registry: PlayerRegistry, events: UnboundedSender<MprisSignal>) {
+pub(super) async fn spawn_discovery(
+    connection: zbus::Connection,
+    registry: PlayerRegistry,
+    events: UnboundedSender<MprisSignal>,
+) {
     let dbus_proxy = match zbus::fdo::DBusProxy::new(&connection).await {
         Ok(proxy) => proxy,
         Err(err) => {

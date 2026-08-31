@@ -54,11 +54,7 @@ const FALLBACK_SERVICE: &str = "login";
 /// Supervisor holding a stale "no oblisk stack" from boot is exactly the case where a restart is
 /// least convenient, since the session may be locked at the time.
 fn pam_service_in(pam_config_dir: &std::path::Path) -> &'static str {
-    if pam_config_dir.join(OBLISK_SERVICE).exists() {
-        OBLISK_SERVICE
-    } else {
-        FALLBACK_SERVICE
-    }
+    if pam_config_dir.join(OBLISK_SERVICE).exists() { OBLISK_SERVICE } else { FALLBACK_SERVICE }
 }
 
 fn pam_service() -> &'static str {
@@ -125,7 +121,9 @@ fn outcome_for_error(err: nonstick::ErrorCode) -> shared::PamOutcome {
     use nonstick::ErrorCode::*;
     match err {
         MaxTries => shared::PamOutcome::MaxTries,
-        AuthenticationError | PermissionDenied | UserUnknown | CredentialsInsufficient | CredentialsExpired => shared::PamOutcome::AuthFailed,
+        AuthenticationError | PermissionDenied | UserUnknown | CredentialsInsufficient | CredentialsExpired => {
+            shared::PamOutcome::AuthFailed
+        }
         other => shared::PamOutcome::PamError(format!("{other:?}")),
     }
 }
@@ -235,7 +233,8 @@ pub async fn drive_pam_and_respond(
         shared::PamOutcome::Success => {
             let identity_details: std::collections::HashMap<&str, zbus::zvariant::Value> =
                 std::collections::HashMap::from([("uid", zbus::zvariant::Value::from(uid))]);
-            let identity = zbus_polkit::policykit1::Identity { identity_kind: "unix-user", identity_details: &identity_details };
+            let identity =
+                zbus_polkit::policykit1::Identity { identity_kind: "unix-user", identity_details: &identity_details };
             if let Err(err) = authority.authentication_agent_response2(uid, &challenge.cookie, &identity).await {
                 eprintln!("authentication_agent_response2 failed for cookie {:?}: {err}", challenge.cookie);
             }
@@ -365,7 +364,8 @@ impl Drop for ReportOnDrop {
             // and clear authenticating -- the exact variant doesn't matter, since there's no real
             // PAM answer to report. PamError also gives the lock screen's error string something
             // to say.
-            let outcome = shared::PamOutcome::PamError("pam authentication task ended without reporting an outcome".to_string());
+            let outcome =
+                shared::PamOutcome::PamError("pam authentication task ended without reporting an outcome".to_string());
             let _ = tx.send((self.acquisition, outcome));
         }
     }
@@ -379,7 +379,10 @@ async fn spawn_worker_and_exchange(username: &str, secret: &[u8]) -> std::io::Re
     let child = crate::process::spawn_group_leader_stdio_piped(
         &exe.to_string_lossy(),
         &[],
-        &[("OBLISK_PAM_WORKER".to_string(), "1".to_string()), ("OBLISK_PAM_USERNAME".to_string(), username.to_string())],
+        &[
+            ("OBLISK_PAM_WORKER".to_string(), "1".to_string()),
+            ("OBLISK_PAM_USERNAME".to_string(), username.to_string()),
+        ],
     )?;
     exchange_over(child, secret, PAM_EXCHANGE_TIMEOUT).await
 }
@@ -397,10 +400,16 @@ async fn spawn_worker_and_exchange(username: &str, secret: &[u8]) -> std::io::Re
 /// `select!` -- that would stall the entire Supervisor. Taken as a parameter, matching
 /// `reap_process_group`'s `grace`, so tests can use a short one instead of
 /// [`PAM_EXCHANGE_TIMEOUT`]'s real 30 seconds.
-async fn exchange_over(mut child: tokio::process::Child, secret: &[u8], timeout: Duration) -> std::io::Result<shared::PamOutcome> {
+async fn exchange_over(
+    mut child: tokio::process::Child,
+    secret: &[u8],
+    timeout: Duration,
+) -> std::io::Result<shared::PamOutcome> {
     let outcome_result = match tokio::time::timeout(timeout, write_secret_then_read_outcome(&mut child, secret)).await {
         Ok(result) => result,
-        Err(_elapsed) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "pam worker did not respond within the timeout")),
+        Err(_elapsed) => {
+            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "pam worker did not respond within the timeout"))
+        }
     };
 
     if let Err(err) = crate::process::reap_process_group(&mut child, crate::process::DEFAULT_REAP_GRACE).await {
@@ -415,7 +424,10 @@ async fn exchange_over(mut child: tokio::process::Child, secret: &[u8], timeout:
 /// `exchange_over` can still reach afterward to reap it whether this future completed or was
 /// cancelled -- a cancelled future drops everything it owns (child.stdin's taken handle), which
 /// still closes that pipe end cleanly even mid-write.
-async fn write_secret_then_read_outcome(child: &mut tokio::process::Child, secret: &[u8]) -> std::io::Result<shared::PamOutcome> {
+async fn write_secret_then_read_outcome(
+    child: &mut tokio::process::Child,
+    secret: &[u8],
+) -> std::io::Result<shared::PamOutcome> {
     let mut stdin = child.stdin.take().expect("spawn_group_leader_stdio_piped always pipes stdin");
     tokio::io::AsyncWriteExt::write_all(&mut stdin, secret).await?;
     drop(stdin); // closes the write half so the worker's stdin read hits EOF
@@ -459,12 +471,10 @@ mod tests {
     /// `account` line fails the second one after the password was already accepted.
     #[test]
     fn the_shipped_pam_stack_declares_both_chains_the_worker_drives() {
-        let shipped = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../packaging/pam.d/oblisk")).unwrap();
-        let directives: Vec<&str> = shipped
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .collect();
+        let shipped =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../packaging/pam.d/oblisk")).unwrap();
+        let directives: Vec<&str> =
+            shipped.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')).collect();
         assert!(directives.iter().any(|line| line.starts_with("auth")), "no auth chain in {directives:?}");
         assert!(directives.iter().any(|line| line.starts_with("account")), "no account chain in {directives:?}");
         assert!(
@@ -490,7 +500,10 @@ mod tests {
 
     #[test]
     fn outcome_for_error_maps_an_arbitrary_other_variant_to_pam_error() {
-        assert_eq!(outcome_for_error(nonstick::ErrorCode::SystemError), shared::PamOutcome::PamError("SystemError".to_string()));
+        assert_eq!(
+            outcome_for_error(nonstick::ErrorCode::SystemError),
+            shared::PamOutcome::PamError("SystemError".to_string())
+        );
     }
 
     // drive_pam_and_respond / spawn_worker_and_exchange call real libpam via a real subprocess
@@ -530,7 +543,10 @@ mod tests {
             }
         })
         .await;
-        assert!(gone.is_ok(), "the worker (pid {pid}) should be reaped even though exchange_over returned an error, not left sleeping");
+        assert!(
+            gone.is_ok(),
+            "the worker (pid {pid}) should be reaped even though exchange_over returned an error, not left sleeping"
+        );
     }
 
     #[tokio::test]
@@ -543,7 +559,11 @@ mod tests {
 
         let outcome = exchange_over(child, b"the-password", TEST_TIMEOUT).await.expect("exchange_over failed");
 
-        assert_eq!(outcome, shared::PamOutcome::PamError("got 12".to_string()), "the fake worker must have seen all 12 bytes of the secret");
+        assert_eq!(
+            outcome,
+            shared::PamOutcome::PamError("got 12".to_string()),
+            "the fake worker must have seen all 12 bytes of the secret"
+        );
     }
 
     #[tokio::test]
@@ -569,7 +589,10 @@ mod tests {
             }
         })
         .await;
-        assert!(gone.is_ok(), "the worker (pid {pid}) should be reaped even after a timeout, not left sleeping for the full 30s");
+        assert!(
+            gone.is_ok(),
+            "the worker (pid {pid}) should be reaped even after a timeout, not left sleeping for the full 30s"
+        );
     }
 
     #[test]
@@ -614,20 +637,35 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         drop(ReportOnDrop { acquisition: 7, outcome_tx: Some(tx) });
 
-        let (acquisition, outcome) = rx.try_recv().expect("a fallback outcome must be sent when the guard is dropped before reporting");
-        assert!(matches!(outcome, shared::PamOutcome::PamError(_)), "the fallback must be a PamOutcome so main.rs's pam_outcomes arm can still clear `authenticating`");
-        assert_eq!(acquisition, 7, "and it must be tagged with the lock it was started for, or lock::accepts_outcome cannot place it");
+        let (acquisition, outcome) =
+            rx.try_recv().expect("a fallback outcome must be sent when the guard is dropped before reporting");
+        assert!(
+            matches!(outcome, shared::PamOutcome::PamError(_)),
+            "the fallback must be a PamOutcome so main.rs's pam_outcomes arm can still clear `authenticating`"
+        );
+        assert_eq!(
+            acquisition, 7,
+            "and it must be tagged with the lock it was started for, or lock::accepts_outcome cannot place it"
+        );
     }
 
     #[test]
     fn report_on_drop_does_not_double_send_once_the_real_outcome_already_went_out() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut guard = ReportOnDrop { acquisition: 7, outcome_tx: Some(tx) };
-        guard.outcome_tx.take().expect("freshly built guard holds a sender").send((7, shared::PamOutcome::Success)).expect("send failed");
+        guard
+            .outcome_tx
+            .take()
+            .expect("freshly built guard holds a sender")
+            .send((7, shared::PamOutcome::Success))
+            .expect("send failed");
         drop(guard);
 
         assert_eq!(rx.try_recv(), Ok((7, shared::PamOutcome::Success)));
-        assert!(rx.try_recv().is_err(), "the drop guard must not also send its fallback once the real outcome already went out");
+        assert!(
+            rx.try_recv().is_err(),
+            "the drop guard must not also send its fallback once the real outcome already went out"
+        );
     }
 
     #[tokio::test]
@@ -641,9 +679,14 @@ mod tests {
             panic!("simulated panic before the task's own explicit send");
         });
         let join_result = handle.await;
-        assert!(join_result.is_err(), "the task did panic -- that part of the simulation, not the fix, is what's asserted here");
+        assert!(
+            join_result.is_err(),
+            "the task did panic -- that part of the simulation, not the fix, is what's asserted here"
+        );
 
-        let (_acquisition, outcome) = rx.try_recv().expect("the drop guard must still report a fallback outcome even though the task panicked first");
+        let (_acquisition, outcome) = rx
+            .try_recv()
+            .expect("the drop guard must still report a fallback outcome even though the task panicked first");
         assert!(matches!(outcome, shared::PamOutcome::PamError(_)));
     }
 }

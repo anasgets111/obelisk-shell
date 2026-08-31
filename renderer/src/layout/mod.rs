@@ -29,6 +29,6 @@ pub mod secure_submit;
 // exercised through `Scene`'s own API.
 #[allow(unused_imports)]
 pub use node::{Align, EdgeInsets, LayoutError, SizeMode};
-pub use scene::{LogicalSize, ResolvedNode, Scene, overlay_input_regions};
 #[allow(unused_imports)]
 pub use scene::NodeId;
+pub use scene::{LogicalSize, ResolvedNode, Scene, overlay_input_regions};

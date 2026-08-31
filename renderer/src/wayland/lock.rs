@@ -15,8 +15,7 @@ use crate::wayland::surface::TrackedRole;
 /// `lock` node cannot be locked: acquiring anyway paints nothing, the compositor never unlocks on
 /// client death (docs/adr/0042), and the only way out is a VT switch. Locking a user out over a
 /// config omission is not fail-secure, it is a denial of service spelled the same way.
-const NO_LOCK_DECLARED: &str =
-    "this config declares no `lock` surface (§ 6.4), so locking the session would leave a black screen with no password field and no way back \
+const NO_LOCK_DECLARED: &str = "this config declares no `lock` surface (§ 6.4), so locking the session would leave a black screen with no password field and no way back \
      in short of a VT switch; the lock was refused (docs/adr/0052 decision 3)";
 /// The second half of docs/adr/0052 decision 3's refusal, and the one the guard was missing.
 ///
@@ -30,27 +29,23 @@ const NO_LOCK_DECLARED: &str =
 ///
 /// A separate sentence from [`NO_LOCK_DECLARED`]: one config is missing a `lock` node, the other
 /// is missing a `textfield` inside the one it has.
-const LOCK_CANNOT_AUTHENTICATE: &str =
-    "this config's `lock` surface (§ 6.4) does not hold exactly one `textfield` with `secure_submit = { capability = \"lock\", action = \"authenticate\" }` \
+const LOCK_CANNOT_AUTHENTICATE: &str = "this config's `lock` surface (§ 6.4) does not hold exactly one `textfield` with `secure_submit = { capability = \"lock\", action = \"authenticate\" }` \
      and nothing else, so the compositor handing it keyboard focus would arm no field, nothing on it could ever authenticate, and the only way back in \
      would be a VT switch; the lock was refused (docs/adr/0052 decision 3)";
 /// A `SetSessionLock { locked: false }` that reached a lock object the compositor never answered
 /// with `locked`. See [`App::release_session_lock`]: nothing was released, because there was
 /// nothing up to release.
-const LOCK_NEVER_GRANTED: &str =
-    "the session lock was given up before the compositor ever granted it (no `ext_session_lock_v1::locked` arrived), so nothing was unlocked";
+const LOCK_NEVER_GRANTED: &str = "the session lock was given up before the compositor ever granted it (no `ext_session_lock_v1::locked` arrived), so nothing was unlocked";
 /// The other half of `finished`: the compositor answered the `lock` request with an immediate
 /// refusal instead of `locked`. Almost always another lock client already holds the session,
 /// but it is compositor policy that this side of the wire cannot narrow down further, so the
 /// message says what is known and does not guess.
-const LOCK_DENIED: &str =
-    "the compositor denied the session lock; another lock client most likely holds it already (`ext_session_lock_v1::finished` arrived in place \
+const LOCK_DENIED: &str = "the compositor denied the session lock; another lock client most likely holds it already (`ext_session_lock_v1::finished` arrived in place \
      of `locked`)";
 /// What `oblisk.rescue` says when the compositor tore down a lock that really was up. Not a
 /// failure of anything this process did: docs/adr/0052 decision 4 routes it here, not to
 /// `oblisk.lock`'s `error`, because there is no lock screen left on the glass to read a message on.
-const LOCK_TORN_DOWN: &str =
-    "the compositor ended the session lock through its own mechanism; the session is unlocked and the lock screen is gone \
+const LOCK_TORN_DOWN: &str = "the compositor ended the session lock through its own mechanism; the session is unlocked and the lock screen is gone \
      (`ext_session_lock_v1::finished` after `locked`)";
 /// The exit code this process uses when the Supervisor's control socket is gone (docs/adr/0059
 /// decision 1). Nobody is left to read it -- the process that classifies exit codes just died --
@@ -167,7 +162,10 @@ impl App {
     /// gives: `get_lock_surface` takes the proxy, and this is the one place it is already in hand.
     pub(super) fn create_lock(&mut self, instance: &SurfaceInstance, outputs: &HashMap<String, wl_output::WlOutput>) {
         let Some(output) = outputs.get(&instance.output) else {
-            eprintln!("[oblisk-renderer] instance {:?} names an output that has since gone; skipping", instance.instance_id);
+            eprintln!(
+                "[oblisk-renderer] instance {:?} names an output that has since gone; skipping",
+                instance.instance_id
+            );
             return;
         };
         self.surfaces.push(TrackedSurface {
@@ -220,7 +218,10 @@ impl App {
                 *surface = Some(lock_surface);
             }
             self.surfaces[index].map_state = MapState::AwaitingConfigure;
-            eprintln!("[oblisk-renderer] {}: lock surface created, awaiting its configure", self.surfaces[index].surface_id);
+            eprintln!(
+                "[oblisk-renderer] {}: lock surface created, awaiting its configure",
+                self.surfaces[index].surface_id
+            );
         }
     }
 
@@ -280,7 +281,10 @@ impl App {
             .filter(|tracked| matches!(tracked.role, TrackedRole::Lock { .. }))
             .map(|tracked| tracked.surface_id.clone())
             .collect();
-        let can_authenticate = lock_instances.iter().filter_map(|id| self.client.scene().surface(id)).any(|tree| tree_can_authenticate(&tree));
+        let can_authenticate = lock_instances
+            .iter()
+            .filter_map(|id| self.client.scene().surface(id))
+            .any(|tree| tree_can_authenticate(&tree));
         match lock_command(locked, !lock_instances.is_empty(), can_authenticate, self.session_lock.is_some()) {
             LockCommand::Nothing => {}
             LockCommand::Refuse(reason) => self.refuse_lock(reason),
@@ -295,7 +299,9 @@ impl App {
                     // existed *now*, and a monitor hotplug retires and replaces them.
                     self.client.set_session_locked(true);
                     self.ensure_lock_surfaces(qh);
-                    eprintln!("[oblisk-renderer] session lock requested; waiting for the compositor's `locked` or `finished`");
+                    eprintln!(
+                        "[oblisk-renderer] session lock requested; waiting for the compositor's `locked` or `finished`"
+                    );
                 }
                 // The compositor advertises no `ext_session_lock_manager_v1`. Carried as the
                 // error's own words rather than a constant beside the other two, because this is
@@ -409,7 +415,11 @@ impl SessionLockHandler for App {
     fn locked(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, session_lock: SessionLock) {
         self.session_lock = Some(session_lock);
         self.ensure_lock_surfaces(qh);
-        let surfaces = self.surfaces.iter().filter(|tracked| matches!(tracked.role, TrackedRole::Lock { surface: Some(_), .. })).count();
+        let surfaces = self
+            .surfaces
+            .iter()
+            .filter(|tracked| matches!(tracked.role, TrackedRole::Lock { surface: Some(_), .. }))
+            .count();
         eprintln!("[oblisk-renderer] the session is locked; {surfaces} lock surface(s) up");
         self.report_lock(LockOutcome::Locked);
     }

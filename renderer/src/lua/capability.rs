@@ -88,7 +88,9 @@ impl CommandSender {
             id,
         };
         if self.outbound_tx.send(RendererFrame::Command(envelope)).is_err() {
-            eprintln!("oblisk.{capability}:invoke(\"{action}\"): failed to queue the command, the control-socket writer is gone");
+            eprintln!(
+                "oblisk.{capability}:invoke(\"{action}\"): failed to queue the command, the control-socket writer is gone"
+            );
         }
     }
 }

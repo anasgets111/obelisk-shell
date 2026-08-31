@@ -47,7 +47,13 @@ fn process_command(generation_id: u32, action: &str, arguments: Vec<serde_json::
     CommandEnvelope {
         jsonrpc: "2.0".to_string(),
         method: "ExecuteCommand".to_string(),
-        params: CommandParams { generation_id, capability: "process".to_string(), action: action.to_string(), arguments, expected_revision: 0 },
+        params: CommandParams {
+            generation_id,
+            capability: "process".to_string(),
+            action: action.to_string(),
+            arguments,
+            expected_revision: 0,
+        },
         id,
     }
 }
@@ -57,7 +63,12 @@ impl ProcessRegistry {
     /// into every outbound `CommandEnvelope`. `outbound_tx` is the Renderer's one outbound frame
     /// channel, drained by the socket thread's `pump`.
     pub fn new(generation_id: u32, outbound_tx: UnboundedSender<RendererFrame>) -> Self {
-        ProcessRegistry(Rc::new(RefCell::new(Inner { generation_id, next_id: 0, pending: HashMap::new(), outbound_tx })))
+        ProcessRegistry(Rc::new(RefCell::new(Inner {
+            generation_id,
+            next_id: 0,
+            pending: HashMap::new(),
+            outbound_tx,
+        })))
     }
 
     fn allocate_id(&self) -> u64 {
@@ -198,7 +209,9 @@ mod tests {
     fn process_handle_kill_queues_a_kill_command_with_no_arguments_carrying_the_same_id() {
         let (lua, _registry, mut rx) = lua_with_process(4);
 
-        lua.load(r#"handle = process.run("sleep", {"5"}, function() end, function() end); handle:kill()"#).exec().unwrap();
+        lua.load(r#"handle = process.run("sleep", {"5"}, function() end, function() end); handle:kill()"#)
+            .exec()
+            .unwrap();
 
         let run_envelope = queued_command(&mut rx).unwrap();
         let kill_envelope = queued_command(&mut rx).expect("a kill command must have been queued");
@@ -259,7 +272,9 @@ mod tests {
     #[test]
     fn dispatch_exit_invokes_the_registered_exit_cb_with_the_code_then_forgets_the_id() {
         let (lua, registry, _rx) = lua_with_process(0);
-        lua.load(r#"process.run("cmd", {}, function() end, function(code) probe = { code = code } end)"#).exec().unwrap();
+        lua.load(r#"process.run("cmd", {}, function() end, function(code) probe = { code = code } end)"#)
+            .exec()
+            .unwrap();
 
         registry.dispatch_exit(0, Some(3));
         let probe = probe_table(&lua);
@@ -274,7 +289,9 @@ mod tests {
     #[test]
     fn dispatch_exit_passes_nil_for_an_absent_code() {
         let (lua, registry, _rx) = lua_with_process(0);
-        lua.load(r#"process.run("cmd", {}, function() end, function(code) probe = { is_nil = code == nil } end)"#).exec().unwrap();
+        lua.load(r#"process.run("cmd", {}, function() end, function(code) probe = { is_nil = code == nil } end)"#)
+            .exec()
+            .unwrap();
 
         registry.dispatch_exit(0, None);
         let probe = probe_table(&lua);

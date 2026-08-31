@@ -11,14 +11,19 @@ use zbus::fdo::RequestNameFlags;
 use zbus::zvariant::Value;
 
 use super::icon::{
-    IconInput, RawImageData, decode_raw_image_data, default_trusted_icon_roots, delete_icon_file, encode_image_data_to_png, image_data_is_valid,
-    resolve_icon_input, sanitize_body, strip_file_uri, validate_trusted_path, value_as_bool, value_as_str, value_as_u8, write_icon_png,
+    IconInput, RawImageData, decode_raw_image_data, default_trusted_icon_roots, delete_icon_file,
+    encode_image_data_to_png, image_data_is_valid, resolve_icon_input, sanitize_body, strip_file_uri,
+    validate_trusted_path, value_as_bool, value_as_str, value_as_u8, write_icon_png,
 };
-use super::queue::{ExpiryPolicy, QueueCleanup, feed_view, find_expiring_entry, next_incarnation, remove_by_id, replace_or_push, resolve_expiry, resolve_notification_id, resolve_sound_path, should_play_sound};
+use super::queue::{
+    ExpiryPolicy, QueueCleanup, feed_view, find_expiring_entry, next_incarnation, remove_by_id, replace_or_push,
+    resolve_expiry, resolve_notification_id, resolve_sound_path, should_play_sound,
+};
 use super::sound::SoundSender;
 use super::{
-    MAX_APP_NAME_BYTES, MAX_SUMMARY_BYTES, NOTIFICATIONS_BUS_NAME, NOTIFICATIONS_CAPABILITIES, NOTIFICATIONS_OBJECT_PATH, Notification, NotificationsSignal, NotificationsState,
-    Urgency, truncate_utf8_bytes, urgency_from_hint_byte, parse_urgency_str,
+    MAX_APP_NAME_BYTES, MAX_SUMMARY_BYTES, NOTIFICATIONS_BUS_NAME, NOTIFICATIONS_CAPABILITIES,
+    NOTIFICATIONS_OBJECT_PATH, Notification, NotificationsSignal, NotificationsState, Urgency, parse_urgency_str,
+    truncate_utf8_bytes, urgency_from_hint_byte,
 };
 
 // -------------------------------------------------------------------------------------------
@@ -36,7 +41,6 @@ fn format_reply_action_key(text: &str) -> String {
 fn actions_have_reply(actions: &[String]) -> bool {
     actions.chunks(2).any(|pair| pair.first().is_some_and(|key| key == "inline-reply"))
 }
-
 
 // -------------------------------------------------------------------------------------------
 // D-Bus interface + controller. `NotificationsController` is both the exported
@@ -91,11 +95,18 @@ impl NotificationsController {
     /// Requests `org.freedesktop.Notifications` with `DoNotQueue` set: a real desktop might
     /// already have `mako`/`dunst` running and owning this name, a genuine "someone else already
     /// provides this" outcome to degrade to inert for, not a race to queue behind (ADR-0033).
-    pub async fn new(connection: zbus::Connection, events: UnboundedSender<NotificationsSignal>, sound_tx: SoundSender) -> Self {
+    pub async fn new(
+        connection: zbus::Connection,
+        events: UnboundedSender<NotificationsSignal>,
+        sound_tx: SoundSender,
+    ) -> Self {
         let state = Arc::new(Mutex::new(NotificationsQueueState::new()));
         let trusted_roots = Arc::new(default_trusted_icon_roots());
 
-        let live_connection = match connection.request_name_with_flags(NOTIFICATIONS_BUS_NAME, RequestNameFlags::DoNotQueue.into()).await {
+        let live_connection = match connection
+            .request_name_with_flags(NOTIFICATIONS_BUS_NAME, RequestNameFlags::DoNotQueue.into())
+            .await
+        {
             Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => Some(connection.clone()),
             Ok(other) => {
                 eprintln!(
@@ -105,7 +116,9 @@ impl NotificationsController {
                 None
             }
             Err(err) => {
-                eprintln!("notifications: RequestName({NOTIFICATIONS_BUS_NAME}) failed: {err}; disabling the D-Bus server for this run");
+                eprintln!(
+                    "notifications: RequestName({NOTIFICATIONS_BUS_NAME}) failed: {err}; disabling the D-Bus server for this run"
+                );
                 None
             }
         };
@@ -115,7 +128,9 @@ impl NotificationsController {
         if let Some(live_connection) = &live_connection
             && let Err(err) = live_connection.object_server().at(NOTIFICATIONS_OBJECT_PATH, controller.clone()).await
         {
-            eprintln!("notifications: failed to export org.freedesktop.Notifications at {NOTIFICATIONS_OBJECT_PATH}: {err}");
+            eprintln!(
+                "notifications: failed to export org.freedesktop.Notifications at {NOTIFICATIONS_OBJECT_PATH}: {err}"
+            );
         }
 
         controller
@@ -125,7 +140,13 @@ impl NotificationsController {
     /// state -- used when the session bus itself couldn't be reached at all. Every write command
     /// still behaves sensibly; only signal emission and `Notify` arriving over D-Bus never happen.
     pub fn inert(events: UnboundedSender<NotificationsSignal>, sound_tx: SoundSender) -> Self {
-        Self { connection: None, state: Arc::new(Mutex::new(NotificationsQueueState::new())), events, sound_tx, trusted_roots: Arc::new(default_trusted_icon_roots()) }
+        Self {
+            connection: None,
+            state: Arc::new(Mutex::new(NotificationsQueueState::new())),
+            events,
+            sound_tx,
+            trusted_roots: Arc::new(default_trusted_icon_roots()),
+        }
     }
 
     async fn emit_notification_closed(&self, id: u32, reason: CloseReason) {
@@ -134,7 +155,9 @@ impl NotificationsController {
             Ok(emitter) => {
                 let _ = Self::notification_closed(&emitter, id, reason.into()).await;
             }
-            Err(err) => eprintln!("notifications: failed to build a signal emitter for NotificationClosed({id}, {reason:?}): {err}"),
+            Err(err) => eprintln!(
+                "notifications: failed to build a signal emitter for NotificationClosed({id}, {reason:?}): {err}"
+            ),
         }
     }
 
@@ -144,7 +167,9 @@ impl NotificationsController {
             Ok(emitter) => {
                 let _ = Self::action_invoked(&emitter, id, action_key).await;
             }
-            Err(err) => eprintln!("notifications: failed to build a signal emitter for ActionInvoked({id}, {action_key:?}): {err}"),
+            Err(err) => eprintln!(
+                "notifications: failed to build a signal emitter for ActionInvoked({id}, {action_key:?}): {err}"
+            ),
         }
     }
 
@@ -152,10 +177,20 @@ impl NotificationsController {
     /// validated `icon_path`. `image-data`/`icon_data` get bounds-checked and PNG-encoded/spooled
     /// to SHM; `image-path`/`app_icon` run through the same [`validate_trusted_path`] boundary
     /// body-markup images use.
-    async fn resolve_and_spool_icon(&self, id: u32, image_data: Option<RawImageData>, image_path: Option<String>, app_icon: Option<String>, icon_data: Option<RawImageData>) -> Option<String> {
+    async fn resolve_and_spool_icon(
+        &self,
+        id: u32,
+        image_data: Option<RawImageData>,
+        image_path: Option<String>,
+        app_icon: Option<String>,
+        icon_data: Option<RawImageData>,
+    ) -> Option<String> {
         match resolve_icon_input(image_data, image_path, app_icon, icon_data) {
             IconInput::ImageData(raw) | IconInput::IconData(raw) => spool_raw_image(id, &raw),
-            IconInput::ImagePath(path) | IconInput::AppIcon(path) => validate_trusted_path(strip_file_uri(&path), &self.trusted_roots).map(|p| p.to_string_lossy().into_owned()),
+            IconInput::ImagePath(path) | IconInput::AppIcon(path) => {
+                validate_trusted_path(strip_file_uri(&path), &self.trusted_roots)
+                    .map(|p| p.to_string_lossy().into_owned())
+            }
             IconInput::None => None,
         }
     }
@@ -209,11 +244,15 @@ impl NotificationsController {
             match state.queue.iter().position(|n| n.id == id) {
                 Some(index) if state.queue[index].has_reply => remove_by_id(&mut state.queue, id),
                 Some(_) => {
-                    eprintln!("notifications: reply({id}, ...) ignored: that notification does not accept an inline reply");
+                    eprintln!(
+                        "notifications: reply({id}, ...) ignored: that notification does not accept an inline reply"
+                    );
                     None
                 }
                 None => {
-                    eprintln!("notifications: reply({id}, ...) ignored: no notification with that id is currently queued");
+                    eprintln!(
+                        "notifications: reply({id}, ...) ignored: no notification with that id is currently queued"
+                    );
                     None
                 }
             }
@@ -234,7 +273,9 @@ impl NotificationsController {
             Some(validated) => {
                 self.state.lock().unwrap().sound_registry.insert(urgency, validated);
             }
-            None => eprintln!("notifications: set_sound({urgency:?}, {path:?}) ignored: not a trusted, existing sound file path"),
+            None => eprintln!(
+                "notifications: set_sound({urgency:?}, {path:?}) ignored: not a trusted, existing sound file path"
+            ),
         }
     }
 
@@ -295,7 +336,8 @@ impl NotificationsController {
         let has_reply = actions_have_reply(&actions);
 
         let image_data = hints.get("image-data").or_else(|| hints.get("image_data")).and_then(decode_raw_image_data);
-        let image_path = hints.get("image-path").or_else(|| hints.get("image_path")).and_then(value_as_str).map(str::to_string);
+        let image_path =
+            hints.get("image-path").or_else(|| hints.get("image_path")).and_then(value_as_str).map(str::to_string);
         let app_icon = (!app_icon.is_empty()).then_some(app_icon);
         let icon_data = hints.get("icon_data").and_then(decode_raw_image_data);
         let suppress_sound = hints.get("suppress-sound").and_then(value_as_bool).unwrap_or(false);
@@ -309,7 +351,8 @@ impl NotificationsController {
         };
         let icon_path = self.resolve_and_spool_icon(id, image_data, image_path, app_icon, icon_data).await;
 
-        let notification = Notification { id, app_name, summary, body: body_spans, icon_path, urgency, has_reply, incarnation };
+        let notification =
+            Notification { id, app_name, summary, body: body_spans, icon_path, urgency, has_reply, incarnation };
 
         let cleanup = {
             let mut state = self.state.lock().unwrap();
@@ -341,7 +384,8 @@ impl NotificationsController {
             let state = self.state.lock().unwrap();
             (state.dnd, state.sound_registry.get(&urgency).cloned())
         };
-        let client_sound_file = sound_file.and_then(|path| validate_trusted_path(strip_file_uri(&path), &self.trusted_roots));
+        let client_sound_file =
+            sound_file.and_then(|path| validate_trusted_path(strip_file_uri(&path), &self.trusted_roots));
         let sound_path = resolve_sound_path(suppress_sound, client_sound_file, tier_default_sound);
         if should_play_sound(dnd, urgency, sound_path.is_some())
             && let Some(sound_path) = sound_path
@@ -386,10 +430,18 @@ impl NotificationsController {
     /// 4 = FIFO eviction -- a base-spec "undefined/reserved" value repurposed for Oblisk's hard
     /// 100-cap (ADR-0033).
     #[zbus(signal, name = "NotificationClosed")]
-    async fn notification_closed(signal_emitter: &zbus::object_server::SignalEmitter<'_>, id: u32, reason: u32) -> zbus::Result<()>;
+    async fn notification_closed(
+        signal_emitter: &zbus::object_server::SignalEmitter<'_>,
+        id: u32,
+        reason: u32,
+    ) -> zbus::Result<()>;
 
     #[zbus(signal, name = "ActionInvoked")]
-    async fn action_invoked(signal_emitter: &zbus::object_server::SignalEmitter<'_>, id: u32, action_key: String) -> zbus::Result<()>;
+    async fn action_invoked(
+        signal_emitter: &zbus::object_server::SignalEmitter<'_>,
+        id: u32,
+        action_key: String,
+    ) -> zbus::Result<()>;
 }
 
 // -------------------------------------------------------------------------------------------
@@ -415,7 +467,6 @@ pub fn parse_set_sound_args(arguments: &[serde_json::Value]) -> Option<(Urgency,
     let path = arguments.get(1)?.as_str()?.to_string();
     Some((urgency, path))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -464,7 +515,10 @@ mod tests {
 
     #[test]
     fn parse_reply_args_reads_id_and_text() {
-        assert_eq!(parse_reply_args(&[serde_json::json!(7), serde_json::json!("sounds good")]), Some((7, "sounds good".to_string())));
+        assert_eq!(
+            parse_reply_args(&[serde_json::json!(7), serde_json::json!("sounds good")]),
+            Some((7, "sounds good".to_string()))
+        );
     }
 
     #[test]
@@ -485,5 +539,4 @@ mod tests {
     fn parse_set_sound_args_rejects_an_invalid_urgency_string() {
         assert_eq!(parse_set_sound_args(&[serde_json::json!("urgent"), serde_json::json!("/path")]), None);
     }
-
 }

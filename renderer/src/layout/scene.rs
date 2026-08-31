@@ -56,7 +56,6 @@ pub struct LogicalSize {
 /// the cheaper lever, at 2.85x fewer bytes per level.
 const MAX_TREE_DEPTH: u32 = 64;
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(u64);
 
@@ -130,11 +129,7 @@ impl RetainedNode {
             opacity: self.opacity,
             properties: self.properties.clone(),
             paint: self.paint.clone(),
-            children: self
-                .children
-                .iter()
-                .map(RetainedNode::to_resolved)
-                .collect(),
+            children: self.children.iter().map(RetainedNode::to_resolved).collect(),
         }
     }
 }
@@ -333,8 +328,18 @@ impl Scene {
         } else {
             (None, None)
         };
-        let reconciled =
-            resolve_and_reconcile(self, existing, &fresh.kind, properties, available, shaping, forced.0, forced.1, lua, 0)?;
+        let reconciled = resolve_and_reconcile(
+            self,
+            existing,
+            &fresh.kind,
+            properties,
+            available,
+            shaping,
+            forced.0,
+            forced.1,
+            lua,
+            0,
+        )?;
         self.surfaces.insert(key, reconciled);
         Ok(())
     }
@@ -400,32 +405,12 @@ impl Scene {
     /// (`CONTEXT.md`, Lease: "tears down removed subtrees child-first so a parent never frees a
     /// resource a child still holds").
     fn retire_child_first(&mut self, node: RetainedNode) {
-        let RetainedNode {
-            id,
-            kind,
-            rect,
-            visible,
-            opacity,
-            properties,
-            paint,
-            children,
-        } = node;
+        let RetainedNode { id, kind, rect, visible, opacity, properties, paint, children } = node;
         for child in children {
             self.retire_child_first(child);
         }
-        self.retiring.push((
-            id,
-            RetainedNode {
-                id,
-                kind,
-                rect,
-                visible,
-                opacity,
-                properties,
-                paint,
-                children: Vec::new(),
-            },
-        ));
+        self.retiring
+            .push((id, RetainedNode { id, kind, rect, visible, opacity, properties, paint, children: Vec::new() }));
     }
 }
 
@@ -436,7 +421,8 @@ impl Scene {
 /// has to be walked whether or not the compositor has handed out a surface to paint it into.
 fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
     match kind {
-        "panel" | "window" | "popup" | "lock" | "rect" | "row" | "column" | "text" | "icon" | "image" | "button" | "list" | "textfield" => Ok(()),
+        "panel" | "window" | "popup" | "lock" | "rect" | "row" | "column" | "text" | "icon" | "image" | "button"
+        | "list" | "textfield" => Ok(()),
         other => Err(LayoutError::UnsupportedNodeKind(other.to_string())),
     }
 }
@@ -471,11 +457,7 @@ fn ensure_node_admissible(kind: &str, depth: u32) -> Result<(), LayoutError> {
     // what "maximum depth" means. The reported `depth` is 1-based (the level being refused) so
     // "maximum depth of 64 levels ... got at least 65" reads as the truth.
     if depth >= MAX_TREE_DEPTH {
-        return Err(LayoutError::TreeTooDeep {
-            kind: kind.to_string(),
-            depth: depth + 1,
-            max: MAX_TREE_DEPTH,
-        });
+        return Err(LayoutError::TreeTooDeep { kind: kind.to_string(), depth: depth + 1, max: MAX_TREE_DEPTH });
     }
     Ok(())
 }
@@ -498,9 +480,9 @@ fn ensure_node_admissible(kind: &str, depth: u32) -> Result<(), LayoutError> {
 /// on `App`, because docs/adr/0005 says a masked field's bytes never become an `mlua::Value`.
 fn children_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Vec<VirtualNode>, LayoutError> {
     match kind {
-        "panel" | "window" | "popup" | "lock" => Ok(node::parse_single_child(properties, "child")?
-            .into_iter()
-            .collect()),
+        "panel" | "window" | "popup" | "lock" => {
+            Ok(node::parse_single_child(properties, "child")?.into_iter().collect())
+        }
         "rect" | "row" | "column" | "button" => node::parse_children(properties),
         // ADR-0045 decision 3, build-steps.md Phase 19 item 12: a `list`'s children don't exist
         // as a literal Lua table -- they're generated from `source`, one per element, which is
@@ -598,10 +580,8 @@ fn pair_children_by_id_then_position(
     fresh_children: &[VirtualNode],
     old_children: Vec<RetainedNode>,
 ) -> Result<Vec<Option<RetainedNode>>, LayoutError> {
-    let fresh_ids: Vec<Option<String>> = fresh_children
-        .iter()
-        .map(|c| node::parse_node_id(&c.properties))
-        .collect::<Result<_, _>>()?;
+    let fresh_ids: Vec<Option<String>> =
+        fresh_children.iter().map(|c| node::parse_node_id(&c.properties)).collect::<Result<_, _>>()?;
 
     // Decision 1: a duplicate id among siblings is a LayoutError, not silent last-one-wins.
     // Checked before touching `old_children` at all, so a bad config never partially retires
@@ -620,10 +600,8 @@ fn pair_children_by_id_then_position(
     // child's id can't hold a Signal or duplicate a sibling's -- both were rejected in the pass
     // that first made this node retained -- so `.ok().flatten()` collapsing "no id" and "already
     // validated" together is safe here.
-    let old_ids: Vec<Option<String>> = old_children
-        .iter()
-        .map(|c| node::parse_node_id(&c.properties).ok().flatten())
-        .collect();
+    let old_ids: Vec<Option<String>> =
+        old_children.iter().map(|c| node::parse_node_id(&c.properties).ok().flatten()).collect();
     let mut old_slots: Vec<Option<RetainedNode>> = old_children.into_iter().map(Some).collect();
 
     let mut retained_by_id: HashMap<&str, usize> = HashMap::with_capacity(old_ids.len());
@@ -970,7 +948,8 @@ fn resolve_and_reconcile(
         // `position_children` and must not shrink the sibling that does. An invisible one still
         // gets the same share: it is never placed, and sizing its subtree to nothing would be a
         // second surprise on the day it becomes visible.
-        let fill_share = remainder / (0..slots.len()).filter(|&i| slots[i].is_some() && visible[i]).count().max(1) as f32;
+        let fill_share =
+            remainder / (0..slots.len()).filter(|&i| slots[i].is_some() && visible[i]).count().max(1) as f32;
         for i in 0..slots.len() {
             let Some(child) = slots[i].take() else {
                 continue;
@@ -997,7 +976,11 @@ fn resolve_and_reconcile(
 
     let mut new_children: Vec<RetainedNode> = resolved
         .into_iter()
-        .map(|child| child.expect("every slot resolves in round one or round two, and `main_axis` is `None` when round two is skipped"))
+        .map(|child| {
+            child.expect(
+                "every slot resolves in round one or round two, and `main_axis` is `None` when round two is skipped",
+            )
+        })
         .collect();
 
     // Padding is added here rather than inside `intrinsic_content_size`, and only on an axis whose
@@ -1013,10 +996,7 @@ fn resolve_and_reconcile(
     let intrinsic = intrinsic_content_size(kind, &properties, paint.as_ref(), &new_children, text_wrap_width, shaping)?;
     let own_width = own_width_known.unwrap_or(intrinsic.width + padding.horizontal());
     let own_height = own_height_known.unwrap_or(intrinsic.height + padding.vertical());
-    let size = LogicalSize {
-        width: own_width,
-        height: own_height,
-    };
+    let size = LogicalSize { width: own_width, height: own_height };
 
     position_children(kind, &properties, &mut new_children, size, padding, own_width_known, own_height_known)?;
 
@@ -1027,12 +1007,7 @@ fn resolve_and_reconcile(
     Ok(RetainedNode {
         id,
         kind: kind.to_string(),
-        rect: LogicalRect {
-            x: 0.0,
-            y: 0.0,
-            width: size.width,
-            height: size.height,
-        },
+        rect: LogicalRect { x: 0.0, y: 0.0, width: size.width, height: size.height },
         visible,
         opacity,
         properties,
@@ -1088,23 +1063,13 @@ fn intrinsic_content_size(
             // just above, the `String` `node::paint_style` builds per node per pass, and hashing
             // the text once per lookup. Interning a node's string across passes is the next move
             // if this ever matters; it did not before the cache landed, because shaping hid it.
-            let shaped = shaping.shape(ShapeRequest {
-                text: content,
-                font_size,
-                line_height: font_size * 1.2,
-                max_width,
-            });
-            Ok(LogicalSize {
-                width: shaped.width,
-                height: shaped.height,
-            })
+            let shaped =
+                shaping.shape(ShapeRequest { text: content, font_size, line_height: font_size * 1.2, max_width });
+            Ok(LogicalSize { width: shaped.width, height: shaped.height })
         }
         "icon" => {
             let size = node::parse_icon_size(properties)?;
-            Ok(LogicalSize {
-                width: size,
-                height: size,
-            })
+            Ok(LogicalSize { width: size, height: size })
         }
         // `image` has no intrinsic size, unlike `icon`: knowing a file's own dimensions means
         // decoding it, and this pass has no canvas to decode against and runs on every
@@ -1247,14 +1212,15 @@ fn scroll_offset(properties: &HashMap<String, Value>, content_main: f32, total_m
     };
     let limit = (total_main - content_main).max(0.0);
     let used = asked.clamp(0.0, limit);
-    if used != asked && let Some(handle) = signal.scroll_handle() {
+    if used != asked
+        && let Some(handle) = signal.scroll_handle()
+    {
         // Quiet: this number is derived from the geometry of the pass that is running, so marking
         // the scene dirty would schedule another pass to observe what this one already used.
         handle.set_quiet(Value::Number(f64::from(used)));
     }
     used
 }
-
 
 /// Rewrites an over-wide `text` to the longest prefix that fits, finished with an ellipsis.
 ///
@@ -1283,7 +1249,12 @@ fn elide_to_fit(paint: &mut Option<PaintStyle>, content_width: f32, shaping: &Sh
     }
     let measure = |text: &str| {
         shaping
-            .shape(ShapeRequest { text: text.to_string(), font_size: *font_size, line_height: *font_size * 1.2, max_width: None })
+            .shape(ShapeRequest {
+                text: text.to_string(),
+                font_size: *font_size,
+                line_height: *font_size * 1.2,
+                max_width: None,
+            })
             .width
     };
     if measure(content) <= content_width {
@@ -1310,7 +1281,6 @@ fn elide_to_fit(paint: &mut Option<PaintStyle>, content_width: f32, shaping: &Sh
     *content = format!("{}\u{2026}", &content[..cuts[low]]);
 }
 
-
 /// § 3.3's top-down position/stretch pass, per kind. `own_width_known`/`own_height_known` are the
 /// same values `resolve_and_reconcile` already resolved for this node: `Some` means a `Stretch`
 /// child in that axis was already forced to its final size before it resolved (see
@@ -1334,26 +1304,19 @@ fn position_children(
     let content_width = (size.width - padding.left - padding.right).max(0.0);
     let content_height = (size.height - padding.top - padding.bottom).max(0.0);
 
-    let margins: Vec<EdgeInsets> = children
-        .iter()
-        .map(|c| node::parse_edge_insets(&c.properties, "margin"))
-        .collect::<Result<_, _>>()?;
+    let margins: Vec<EdgeInsets> =
+        children.iter().map(|c| node::parse_edge_insets(&c.properties, "margin")).collect::<Result<_, _>>()?;
 
     match flow_kind(kind, properties)? {
         "row" => {
             let spacing = node::parse_spacing(properties)?;
             let main_align = node::parse_align(properties, "align_h")?;
-            let visible_indices: Vec<usize> = children
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.visible)
-                .map(|(i, _)| i)
-                .collect();
+            let visible_indices: Vec<usize> =
+                children.iter().enumerate().filter(|(_, c)| c.visible).map(|(i, _)| i).collect();
             // § 3.1: a child's margin travels with it on the main axis, so a margined child pushes
             // its neighbors apart instead of overlapping them.
-            let footprints: Vec<f32> = (0..children.len())
-                .map(|i| children[i].rect.width + margins[i].left + margins[i].right)
-                .collect();
+            let footprints: Vec<f32> =
+                (0..children.len()).map(|i| children[i].rect.width + margins[i].left + margins[i].right).collect();
             let total_main = visible_indices.iter().map(|&i| footprints[i]).sum::<f32>()
                 + spacing * visible_indices.len().saturating_sub(1) as f32;
             let spare = (content_width - total_main).max(0.0);
@@ -1385,15 +1348,10 @@ fn position_children(
         "column" => {
             let spacing = node::parse_spacing(properties)?;
             let main_align = node::parse_align(properties, "align_v")?;
-            let visible_indices: Vec<usize> = children
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.visible)
-                .map(|(i, _)| i)
-                .collect();
-            let footprints: Vec<f32> = (0..children.len())
-                .map(|i| children[i].rect.height + margins[i].top + margins[i].bottom)
-                .collect();
+            let visible_indices: Vec<usize> =
+                children.iter().enumerate().filter(|(_, c)| c.visible).map(|(i, _)| i).collect();
+            let footprints: Vec<f32> =
+                (0..children.len()).map(|i| children[i].rect.height + margins[i].top + margins[i].bottom).collect();
             let total_main = visible_indices.iter().map(|&i| footprints[i]).sum::<f32>()
                 + spacing * visible_indices.len().saturating_sub(1) as f32;
             let spare = (content_height - total_main).max(0.0);
@@ -1533,10 +1491,7 @@ mod tests {
     }
 
     fn full() -> LogicalSize {
-        LogicalSize {
-            width: 1000.0,
-            height: 500.0,
-        }
+        LogicalSize { width: 1000.0, height: 500.0 }
     }
 
     /// The single-output shorthand every fixture below uses: one instance per declared surface,
@@ -1576,10 +1531,8 @@ mod tests {
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::Integer(40), crate::lua::signal::DirtyFlag::new()).0;
         lua.globals().set("w", signal).unwrap();
-        let table: mlua::Table = lua
-            .load(r#"return panel { id = "bar", child = rect { width = w, height = 20 } }"#)
-            .eval()
-            .unwrap();
+        let table: mlua::Table =
+            lua.load(r#"return panel { id = "bar", child = rect { width = w, height = 20 } }"#).eval().unwrap();
         let surface = deserialize_lua_table(&table).unwrap();
 
         apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap();
@@ -1617,8 +1570,7 @@ mod tests {
     fn a_pixels_sized_rect_resolves_to_its_explicit_size() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        let (_lua, surface) =
-            surface_from(r#"panel { id = "bar", child = rect { width = 40, height = 20 } }"#);
+        let (_lua, surface) = surface_from(r#"panel { id = "bar", child = rect { width = 40, height = 20 } }"#);
         apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
         let root = scene.surface("bar@TEST").unwrap();
         let child = &root.children[0];
@@ -1654,9 +1606,8 @@ mod tests {
     fn a_percent_child_scales_against_its_parents_available_bounds() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        let (_lua, surface) = surface_from(
-            r#"panel { id = "bar", width = 1000, height = 500, child = rect { width = "50%" } }"#,
-        );
+        let (_lua, surface) =
+            surface_from(r#"panel { id = "bar", width = 1000, height = 500, child = rect { width = "50%" } }"#);
         apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
         let child = &scene.surface("bar@TEST").unwrap().children[0];
         assert_eq!(child.rect.width, 500.0);
@@ -1713,10 +1664,7 @@ mod tests {
         );
         apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
         let row = &scene.surface("bar@TEST").unwrap().children[0];
-        assert_eq!(
-            row.children[1].rect.x, 15.0,
-            "10 (first child) + 5 (its margin.right) = 15, not overlapping at 10"
-        );
+        assert_eq!(row.children[1].rect.x, 15.0, "10 (first child) + 5 (its margin.right) = 15, not overlapping at 10");
     }
 
     #[test]
@@ -1808,10 +1756,7 @@ mod tests {
         );
         apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
         let row = &scene.surface("bar@TEST").unwrap().children[0];
-        assert_eq!(
-            row.rect.width, 10.0,
-            "the invisible child must not widen the row or add a spacing gap"
-        );
+        assert_eq!(row.rect.width, 10.0, "the invisible child must not widen the row or add a spacing gap");
         assert_eq!(
             row.children[1].rect.x, 0.0,
             "the visible child packs at the start as if the hidden one weren't there"
@@ -1954,7 +1899,10 @@ mod tests {
     fn an_invisible_sibling_reserves_nothing_from_a_fill_childs_share() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        for hidden in [r#"rect { width = 100, height = 10, visible = false }"#, r#"rect { width = "Fill", height = 10, visible = false }"#] {
+        for hidden in [
+            r#"rect { width = 100, height = 10, visible = false }"#,
+            r#"rect { width = "Fill", height = 10, visible = false }"#,
+        ] {
             let mut scene_for_case = std::mem::replace(&mut scene, Scene::new());
             let (_lua, surface) = surface_from(&format!(
                 r#"panel {{ id = "bar", child = row {{ width = 600, height = 40, children = {{
@@ -2245,16 +2193,11 @@ mod tests {
     fn text_content_size_comes_from_a_real_shaping_round_trip() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        let (_lua, surface) =
-            surface_from(r#"panel { id = "bar", child = text { content = "Oblisk" } }"#);
+        let (_lua, surface) = surface_from(r#"panel { id = "bar", child = text { content = "Oblisk" } }"#);
         apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
         let text = &scene.surface("bar@TEST").unwrap().children[0];
         assert!(text.rect.width > 0.0);
-        assert_eq!(
-            text.rect.height,
-            12.0 * 1.2,
-            "default font_size 12 * the 1.2 line-height multiplier"
-        );
+        assert_eq!(text.rect.height, 12.0 * 1.2, "default font_size 12 * the 1.2 line-height multiplier");
     }
 
     #[test]
@@ -2345,7 +2288,9 @@ mod tests {
     /// sliced into invalid UTF-8. Panics inside the search if this ever regresses.
     #[test]
     fn a_multibyte_string_is_cut_at_character_boundaries() {
-        let drawn = elided(r#"panel { id = "bar", child = text { width = 40, content = "ααααααααααααααααααααααααα", elide = "End" } }"#);
+        let drawn = elided(
+            r#"panel { id = "bar", child = text { width = 40, content = "ααααααααααααααααααααααααα", elide = "End" } }"#,
+        );
         assert!(drawn.ends_with('\u{2026}'));
         assert!(drawn.trim_end_matches('\u{2026}').chars().all(|c| c == 'α'), "no partial codepoints: {drawn:?}");
     }
@@ -2354,7 +2299,8 @@ mod tests {
     fn an_unknown_elide_fails_the_pass_naming_the_property() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        let (_lua, surface) = surface_from(r#"panel { id = "bar", child = text { content = "hi", elide = "Middle" } }"#);
+        let (_lua, surface) =
+            surface_from(r#"panel { id = "bar", child = text { content = "hi", elide = "Middle" } }"#);
         let err = apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap_err();
         assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "elide"), "got {err:?}");
     }
@@ -2364,7 +2310,8 @@ mod tests {
         let shaping = ShapingHandle::spawn();
         for bad in ["50", "-0.5", "1.5", r#""half""#] {
             let mut scene = Scene::new();
-            let (_lua, surface) = surface_from(&format!(r#"panel {{ id = "bar", child = rect {{ opacity = {bad} }} }}"#));
+            let (_lua, surface) =
+                surface_from(&format!(r#"panel {{ id = "bar", child = rect {{ opacity = {bad} }} }}"#));
             let err = apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap_err();
             assert!(
                 matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "opacity"),
@@ -2386,8 +2333,7 @@ mod tests {
     fn a_malformed_paint_property_on_an_invisible_node_still_fails_the_pass() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        let (_lua, surface) =
-            surface_from(r#"panel { id = "bar", child = rect { visible = false, background = 5 } }"#);
+        let (_lua, surface) = surface_from(r#"panel { id = "bar", child = rect { visible = false, background = 5 } }"#);
         let err = apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap_err();
         assert!(matches!(err, LayoutError::InvalidProperty { property, .. } if property == "background"));
     }
@@ -2421,7 +2367,11 @@ mod tests {
         apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
 
         let image = &scene.surface("bar@TEST").unwrap().children[0];
-        assert!(image.rect.width > 0.0 && image.rect.height > 0.0, "a Fill image should take the panel, got {:?}", image.rect);
+        assert!(
+            image.rect.width > 0.0 && image.rect.height > 0.0,
+            "a Fill image should take the panel, got {:?}",
+            image.rect
+        );
     }
 
     #[test]
@@ -2436,10 +2386,7 @@ mod tests {
         let field = &scene.surface("bar@TEST").unwrap().children[0].children[0];
         assert_eq!(field.kind, "textfield");
         assert!(field.children.is_empty(), "textfield is a leaf, never a container");
-        assert_eq!(
-            field.properties.get("mask_character").unwrap().as_string().unwrap().to_string_lossy(),
-            "*"
-        );
+        assert_eq!(field.properties.get("mask_character").unwrap().as_string().unwrap().to_string_lossy(), "*");
     }
 
     #[test]
@@ -2477,7 +2424,10 @@ mod tests {
 
         scene.apply(&[surface], &[], &shaping, &_lua).unwrap();
 
-        assert!(scene.surface("bar@TEST").is_none(), "no instance means no output to resolve against, which is not an error");
+        assert!(
+            scene.surface("bar@TEST").is_none(),
+            "no instance means no output to resolve against, which is not an error"
+        );
     }
 
     #[test]
@@ -2514,11 +2464,17 @@ mod tests {
             available: full(),
         }];
         let err = scene
-            .apply_admitting(&[v2], &instances, &shaping, &_lua2, |_| Err(node::invalid("child", "the finished scene is not admissible")))
+            .apply_admitting(&[v2], &instances, &shaping, &_lua2, |_| {
+                Err(node::invalid("child", "the finished scene is not admissible"))
+            })
             .unwrap_err();
 
         assert!(err.to_string().contains("not admissible"), "the veto's own message must reach the caller: {err}");
-        assert_eq!(scene.surface("bar@TEST").unwrap().rect.width, 10.0, "a vetoed apply must leave the prior tree on screen");
+        assert_eq!(
+            scene.surface("bar@TEST").unwrap().rect.width,
+            10.0,
+            "a vetoed apply must leave the prior tree on screen"
+        );
         assert_eq!(scene.next_id, next_id_before, "and must not leak the ids the vetoed walk allocated");
     }
 
@@ -2575,23 +2531,18 @@ mod tests {
     fn reapplying_the_same_shape_at_the_same_index_reuses_the_node_id() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        let (_lua1, surface_v1) =
-            surface_from(r#"panel { id = "bar", child = rect { width = 10, height = 10 } }"#);
+        let (_lua1, surface_v1) = surface_from(r#"panel { id = "bar", child = rect { width = 10, height = 10 } }"#);
         apply_at(&mut scene, &[surface_v1], full(), &shaping, &_lua1).unwrap();
         let first_id = {
             let key = "bar@TEST";
             scene.surfaces.get(key).unwrap().children[0].id
         };
 
-        let (_lua2, surface_v2) =
-            surface_from(r#"panel { id = "bar", child = rect { width = 99, height = 99 } }"#);
+        let (_lua2, surface_v2) = surface_from(r#"panel { id = "bar", child = rect { width = 99, height = 99 } }"#);
         apply_at(&mut scene, &[surface_v2], full(), &shaping, &_lua2).unwrap();
         let second_id = scene.surfaces.get("bar@TEST").unwrap().children[0].id;
 
-        assert_eq!(
-            first_id, second_id,
-            "same kind at the same position must reuse the retained node's identity"
-        );
+        assert_eq!(first_id, second_id, "same kind at the same position must reuse the retained node's identity");
         assert_eq!(
             scene.surface("bar@TEST").unwrap().children[0].rect.width,
             99.0,
@@ -2603,21 +2554,15 @@ mod tests {
     fn a_kind_change_at_the_same_index_replaces_and_retires_the_old_node() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        let (_lua1, surface_v1) =
-            surface_from(r#"panel { id = "bar", child = rect { width = 10, height = 10 } }"#);
+        let (_lua1, surface_v1) = surface_from(r#"panel { id = "bar", child = rect { width = 10, height = 10 } }"#);
         apply_at(&mut scene, &[surface_v1], full(), &shaping, &_lua1).unwrap();
         assert!(scene.retiring_ids().is_empty());
 
-        let (_lua2, surface_v2) =
-            surface_from(r#"panel { id = "bar", child = text { content = "hi" } }"#);
+        let (_lua2, surface_v2) = surface_from(r#"panel { id = "bar", child = text { content = "hi" } }"#);
         apply_at(&mut scene, &[surface_v2], full(), &shaping, &_lua2).unwrap();
 
         assert_eq!(scene.surface("bar@TEST").unwrap().children[0].kind, "text");
-        assert_eq!(
-            scene.retiring_ids().len(),
-            1,
-            "the replaced rect must be retired, not dropped"
-        );
+        assert_eq!(scene.retiring_ids().len(), 1, "the replaced rect must be retired, not dropped");
     }
 
     #[test]
@@ -2629,9 +2574,8 @@ mod tests {
         );
         apply_at(&mut scene, &[surface_v1], full(), &shaping, &_lua1).unwrap();
 
-        let (_lua2, surface_v2) = surface_from(
-            r#"panel { id = "bar", child = row { children = { rect { width = 1, height = 1 } } } }"#,
-        );
+        let (_lua2, surface_v2) =
+            surface_from(r#"panel { id = "bar", child = row { children = { rect { width = 1, height = 1 } } } }"#);
         apply_at(&mut scene, &[surface_v2], full(), &shaping, &_lua2).unwrap();
 
         assert_eq!(scene.surface("bar@TEST").unwrap().children[0].children.len(), 1);
@@ -2649,41 +2593,29 @@ mod tests {
         let outer_id = scene.surfaces.get("bar@TEST").unwrap().children[0].children[0].id;
         let inner_id = scene.surfaces.get("bar@TEST").unwrap().children[0].children[0].children[0].id;
 
-        let (_lua2, surface_v2) =
-            surface_from(r#"panel { id = "bar", child = row { children = {} } }"#);
+        let (_lua2, surface_v2) = surface_from(r#"panel { id = "bar", child = row { children = {} } }"#);
         apply_at(&mut scene, &[surface_v2], full(), &shaping, &_lua2).unwrap();
 
         let order = scene.retiring_ids();
         let inner_pos = order.iter().position(|id| *id == inner_id).unwrap();
         let outer_pos = order.iter().position(|id| *id == outer_id).unwrap();
-        assert!(
-            inner_pos < outer_pos,
-            "the child must be retired before its parent"
-        );
+        assert!(inner_pos < outer_pos, "the child must be retired before its parent");
     }
 
     #[test]
     fn release_removes_exactly_one_retiring_entry_and_is_false_on_an_unknown_id() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        let (_lua1, surface_v1) =
-            surface_from(r#"panel { id = "bar", child = rect { width = 1, height = 1 } }"#);
+        let (_lua1, surface_v1) = surface_from(r#"panel { id = "bar", child = rect { width = 1, height = 1 } }"#);
         apply_at(&mut scene, &[surface_v1], full(), &shaping, &_lua1).unwrap();
-        let (_lua2, surface_v2) =
-            surface_from(r#"panel { id = "bar", child = text { content = "x" } }"#);
+        let (_lua2, surface_v2) = surface_from(r#"panel { id = "bar", child = text { content = "x" } }"#);
         apply_at(&mut scene, &[surface_v2], full(), &shaping, &_lua2).unwrap();
 
         let id = scene.retiring_ids()[0];
         assert!(scene.release(id));
         assert!(scene.retiring_ids().is_empty());
-        assert!(
-            !scene.release(id),
-            "releasing an already-released id must return false"
-        );
-        assert!(
-            !scene.release(NodeId(9999)),
-            "releasing an id that never existed must return false"
-        );
+        assert!(!scene.release(id), "releasing an already-released id must return false");
+        assert!(!scene.release(NodeId(9999)), "releasing an id that never existed must return false");
     }
 
     #[test]
@@ -2850,7 +2782,10 @@ mod tests {
         apply_at(&mut scene, &[surface_v2], full(), &shaping, &_lua2).unwrap();
         let row = &scene.surfaces.get("bar@TEST").unwrap().children[0];
 
-        assert_eq!(row.children[0].id, original_id, "position 0 still reuses the retained identity, since matching stays positional");
+        assert_eq!(
+            row.children[0].id, original_id,
+            "position 0 still reuses the retained identity, since matching stays positional"
+        );
         assert_ne!(
             row.children[1].id, original_id,
             "position 1 is a fresh allocation, not a reused identity -- matching today's rule with no ids present"
@@ -2925,7 +2860,11 @@ mod tests {
         );
         apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
         let row = &scene.surface("bar@TEST").unwrap().children[0];
-        assert_eq!(row.children.len(), 2, "two columns, each with its own 'inner' child, must not collide across parents");
+        assert_eq!(
+            row.children.len(),
+            2,
+            "two columns, each with its own 'inner' child, must not collide across parents"
+        );
         assert_eq!(row.children[0].children[0].rect.width, 1.0);
         assert_eq!(row.children[1].children[0].rect.width, 2.0);
     }
@@ -3065,8 +3004,9 @@ mod tests {
     fn removing_an_id_retires_the_old_node_and_allocates_a_new_one() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        let (_lua1, surface_v1) =
-            surface_from(r#"panel { id = "bar", child = row { children = { rect { id = "x", width = 1, height = 1 } } } }"#);
+        let (_lua1, surface_v1) = surface_from(
+            r#"panel { id = "bar", child = row { children = { rect { id = "x", width = 1, height = 1 } } } }"#,
+        );
         apply_at(&mut scene, &[surface_v1], full(), &shaping, &_lua1).unwrap();
         let x_id = scene.surfaces.get("bar@TEST").unwrap().children[0].children[0].id;
 
@@ -3108,7 +3048,8 @@ mod tests {
 
         assert!(row[0].id != outer_id, "`other` is a new id, so it must not adopt `gone`'s retained node");
         let order = scene.retiring_ids();
-        let inner_pos = order.iter().position(|id| *id == inner_id).expect("the vanished subtree's child must be retired");
+        let inner_pos =
+            order.iter().position(|id| *id == inner_id).expect("the vanished subtree's child must be retired");
         let outer_pos = order.iter().position(|id| *id == outer_id).expect("the vanished node must be retired");
         assert!(inner_pos < outer_pos, "retirement stays child-first even with a same-length fresh list");
     }
@@ -3126,7 +3067,8 @@ mod tests {
         let (_lua1, surface_v1) =
             surface_from(&format!("panel {{ id = \"bar\", child = row {{ children = {{ {v1_children} }} }} }}"));
         apply_at(&mut scene, &[surface_v1], full(), &shaping, &_lua1).unwrap();
-        let before: Vec<NodeId> = scene.surfaces.get("bar@TEST").unwrap().children[0].children.iter().map(|c| c.id).collect();
+        let before: Vec<NodeId> =
+            scene.surfaces.get("bar@TEST").unwrap().children[0].children.iter().map(|c| c.id).collect();
 
         let mut v2_children = String::new();
         v2_children.push_str("rect { id = \"fresh\", width = 1, height = 1 },\n");
@@ -3136,7 +3078,8 @@ mod tests {
         let (_lua2, surface_v2) =
             surface_from(&format!("panel {{ id = \"bar\", child = row {{ children = {{ {v2_children} }} }} }}"));
         apply_at(&mut scene, &[surface_v2], full(), &shaping, &_lua2).unwrap();
-        let after: Vec<NodeId> = scene.surfaces.get("bar@TEST").unwrap().children[0].children.iter().map(|c| c.id).collect();
+        let after: Vec<NodeId> =
+            scene.surfaces.get("bar@TEST").unwrap().children[0].children.iter().map(|c| c.id).collect();
 
         assert_eq!(after.len(), N);
         for (slot, i) in (1..N).rev().enumerate() {
@@ -3319,22 +3262,14 @@ mod tests {
             matches!(&err, LayoutError::UnsupportedNodeKind(kind) if kind == "banana"),
             "the error must be unchanged by moving the check earlier: {err:?}"
         );
-        assert!(
-            !lua.globals().get::<bool>("ran").unwrap(),
-            "a rejected child's property getters must not run"
-        );
+        assert!(!lua.globals().get::<bool>("ran").unwrap(), "a rejected child's property getters must not run");
     }
 
     #[test]
     fn overlay_input_regions_includes_only_visible_direct_children() {
         let visible_child = ResolvedNode {
             kind: "rect".to_string(),
-            rect: LogicalRect {
-                x: 0.0,
-                y: 0.0,
-                width: 10.0,
-                height: 10.0,
-            },
+            rect: LogicalRect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 },
             visible: true,
             opacity: 1.0,
             properties: HashMap::new(),
@@ -3343,12 +3278,7 @@ mod tests {
         };
         let hidden_child = ResolvedNode {
             kind: "rect".to_string(),
-            rect: LogicalRect {
-                x: 20.0,
-                y: 20.0,
-                width: 10.0,
-                height: 10.0,
-            },
+            rect: LogicalRect { x: 20.0, y: 20.0, width: 10.0, height: 10.0 },
             visible: false,
             opacity: 1.0,
             properties: HashMap::new(),
@@ -3357,12 +3287,7 @@ mod tests {
         };
         let root = ResolvedNode {
             kind: "panel".to_string(),
-            rect: LogicalRect {
-                x: 0.0,
-                y: 0.0,
-                width: 100.0,
-                height: 100.0,
-            },
+            rect: LogicalRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 },
             visible: true,
             opacity: 1.0,
             properties: HashMap::new(),
@@ -3372,15 +3297,7 @@ mod tests {
 
         let regions = overlay_input_regions(&root, 1.0);
         assert_eq!(regions.len(), 1);
-        assert_eq!(
-            regions[0],
-            PhysicalRect {
-                x0: 0,
-                y0: 0,
-                x1: 10,
-                y1: 10
-            }
-        );
+        assert_eq!(regions[0], PhysicalRect { x0: 0, y0: 0, x1: 10, y1: 10 });
     }
 
     #[test]
@@ -3494,9 +3411,8 @@ mod tests {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let itemfn = r#"function(item) return rect { width = item, height = 1 } end"#;
-        let (_lua1, surface_v1) = surface_from(&format!(
-            r#"panel {{ id = "bar", child = list {{ source = {{ 1 }}, itemfn = {itemfn} }} }}"#
-        ));
+        let (_lua1, surface_v1) =
+            surface_from(&format!(r#"panel {{ id = "bar", child = list {{ source = {{ 1 }}, itemfn = {itemfn} }} }}"#));
         apply_at(&mut scene, &[surface_v1], full(), &shaping, &_lua1).unwrap();
         let x_id = scene.surfaces.get("bar@TEST").unwrap().children[0].children[0].id;
 
@@ -3539,9 +3455,8 @@ mod tests {
     fn a_list_with_no_source_is_a_layout_error_naming_source() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        let (_lua, surface) = surface_from(
-            r#"panel { id = "bar", child = list { itemfn = function(item) return rect {} end } }"#,
-        );
+        let (_lua, surface) =
+            surface_from(r#"panel { id = "bar", child = list { itemfn = function(item) return rect {} end } }"#);
         let err = apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap_err();
         assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "source"), "{err:?}");
     }
@@ -3570,8 +3485,7 @@ mod tests {
     fn a_list_itemfn_that_is_not_a_function_is_a_layout_error_naming_itemfn() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        let (_lua, surface) =
-            surface_from(r#"panel { id = "bar", child = list { source = { 1 }, itemfn = "nope" } }"#);
+        let (_lua, surface) = surface_from(r#"panel { id = "bar", child = list { source = { 1 }, itemfn = "nope" } }"#);
         let err = apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap_err();
         assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "itemfn"), "{err:?}");
     }
@@ -3708,11 +3622,17 @@ mod tests {
     fn a_window_root_that_does_write_a_size_still_gets_the_size_it_wrote() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        let (lua, surface) = surface_from(r#"{ kind = "window", id = "settings", width = 400, child = rect { width = "Fill", height = "Fill" } }"#);
+        let (lua, surface) = surface_from(
+            r#"{ kind = "window", id = "settings", width = 400, child = rect { width = "Fill", height = "Fill" } }"#,
+        );
         apply_at(&mut scene, &[surface], LogicalSize { width: 1920.0, height: 1168.0 }, &shaping, &lua).unwrap();
 
         let root = scene.surface("settings@TEST").unwrap();
-        assert_eq!((root.rect.width, root.rect.height), (400.0, 1168.0), "the written width stands; the unwritten height fills");
+        assert_eq!(
+            (root.rect.width, root.rect.height),
+            (400.0, 1168.0),
+            "the written width stands; the unwritten height fills"
+        );
     }
 
     #[test]
@@ -3751,9 +3671,8 @@ mod tests {
     fn an_unsized_lock_root_is_its_output_so_a_fill_child_covers_the_locked_screen() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        let (lua, surface) = surface_from(
-            r#"{ kind = "lock", id = "screen-lock", child = rect { width = "Fill", height = "Fill" } }"#,
-        );
+        let (lua, surface) =
+            surface_from(r#"{ kind = "lock", id = "screen-lock", child = rect { width = "Fill", height = "Fill" } }"#);
         apply_at(&mut scene, &[surface], LogicalSize { width: 2560.0, height: 1440.0 }, &shaping, &lua).unwrap();
 
         let root = scene.surface("screen-lock@TEST").unwrap();

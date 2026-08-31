@@ -22,8 +22,10 @@ static TAG_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Extracts `key="value"` attribute pairs from a tag's own inner text (double-quoted only).
-static ATTR_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"([a-zA-Z_:][a-zA-Z0-9_:-]*)\s*=\s*"([^"]*)""#).expect("ATTR_PATTERN is a valid, hand-checked regex literal"));
+static ATTR_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"([a-zA-Z_:][a-zA-Z0-9_:-]*)\s*=\s*"([^"]*)""#)
+        .expect("ATTR_PATTERN is a valid, hand-checked regex literal")
+});
 
 /// One recognized (or explicitly rejected) tag construct -- [`classify_tag`]'s output.
 #[derive(Debug, Clone, PartialEq)]
@@ -51,7 +53,9 @@ enum ClassifiedTag {
 }
 
 fn extract_attr(attrs: &str, key: &str) -> Option<String> {
-    ATTR_PATTERN.captures_iter(attrs).find_map(|caps| if caps[1].eq_ignore_ascii_case(key) { Some(caps[2].to_string()) } else { None })
+    ATTR_PATTERN
+        .captures_iter(attrs)
+        .find_map(|caps| if caps[1].eq_ignore_ascii_case(key) { Some(caps[2].to_string()) } else { None })
 }
 
 /// Classifies one `TAG_PATTERN` match (including its surrounding `<`/`>`) into a
@@ -97,11 +101,24 @@ fn is_closing_tag_named(raw: &str, opaque_name: &str) -> bool {
 /// Flushes `current` into a new [`NotificationSpan::Text`] carrying the currently-active style,
 /// if non-empty. A no-op otherwise -- callers flush unconditionally on every style change and at
 /// end-of-input, so most calls see an already-empty `current`.
-fn flush_text(spans: &mut Vec<NotificationSpan>, current: &mut String, bold: u32, italic: u32, underline: u32, href: Option<String>) {
+fn flush_text(
+    spans: &mut Vec<NotificationSpan>,
+    current: &mut String,
+    bold: u32,
+    italic: u32,
+    underline: u32,
+    href: Option<String>,
+) {
     if current.is_empty() {
         return;
     }
-    spans.push(NotificationSpan::Text { text: std::mem::take(current), bold: bold > 0, italic: italic > 0, underline: underline > 0, href });
+    spans.push(NotificationSpan::Text {
+        text: std::mem::take(current),
+        bold: bold > 0,
+        italic: italic > 0,
+        underline: underline > 0,
+        href,
+    });
 }
 
 /// Parses `input` into [`NotificationSpan`]s, accepting exactly `<b>`, `<i>`, `<u>`,
@@ -194,11 +211,10 @@ pub(super) fn parse_markup(input: &str) -> Vec<NotificationSpan> {
     spans
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_support::text;
+    use super::*;
 
     // ---- parse_markup (TDD seam 2) ----
 

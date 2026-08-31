@@ -178,7 +178,9 @@ async fn drive_handshake<L: CandidateLink>(
         }
         Ok(())
     };
-    timeout(evidence_timeout, collect).await.map_err(|_elapsed| PbaFailure::Timeout { stage: Stage::EvidenceVerification })??;
+    timeout(evidence_timeout, collect)
+        .await
+        .map_err(|_elapsed| PbaFailure::Timeout { stage: Stage::EvidenceVerification })??;
 
     Ok(expected)
 }
@@ -228,7 +230,8 @@ pub async fn run_pba<L: CandidateLink>(
     nonce: u64,
     timings: PbaTimings,
 ) -> Result<PbaOutcome, PbaFailure<L::Error>> {
-    let mut candidate = process::spawn_group_leader(candidate_cmd, candidate_args, candidate_envs).map_err(PbaFailure::SpawnFailed)?;
+    let mut candidate =
+        process::spawn_group_leader(candidate_cmd, candidate_args, candidate_envs).map_err(PbaFailure::SpawnFailed)?;
 
     match drive_handshake(link, snapshots, nonce, timings.ready_timeout, timings.evidence_timeout).await {
         Ok(promoted_surfaces) => Ok(PbaOutcome { candidate, promoted_surfaces }),
@@ -243,13 +246,25 @@ pub async fn run_pba<L: CandidateLink>(
 /// two sends are indistinguishable from each other to anything observable: a `send_frame_logged`
 /// to a generation with no connection logs and drops, so a test driving the real function proves
 /// nothing about which frame went first.
-fn swap_frames(superseded_generation_id: u32, candidate_generation_id: u32, promoted_surfaces: &[String]) -> Vec<(u32, shared::SupervisorFrame)> {
+fn swap_frames(
+    superseded_generation_id: u32,
+    candidate_generation_id: u32,
+    promoted_surfaces: &[String],
+) -> Vec<(u32, shared::SupervisorFrame)> {
     promoted_surfaces
         .iter()
         .flat_map(|surface_id| {
             [
-                (superseded_generation_id, shared::SupervisorFrame::DeselectInput(shared::DeselectInput { surface_id: surface_id.clone() })),
-                (candidate_generation_id, shared::SupervisorFrame::PromoteGeneration(shared::PromoteGeneration { surface_id: surface_id.clone() })),
+                (
+                    superseded_generation_id,
+                    shared::SupervisorFrame::DeselectInput(shared::DeselectInput { surface_id: surface_id.clone() }),
+                ),
+                (
+                    candidate_generation_id,
+                    shared::SupervisorFrame::PromoteGeneration(shared::PromoteGeneration {
+                        surface_id: surface_id.clone(),
+                    }),
+                ),
             ]
         })
         .collect()
@@ -283,7 +298,9 @@ pub(crate) async fn swap_and_reap(
     candidate_generation_id: u32,
     outcome: PbaOutcome,
 ) {
-    for (generation_id, frame) in swap_frames(authoritative.generation_id, candidate_generation_id, &outcome.promoted_surfaces) {
+    for (generation_id, frame) in
+        swap_frames(authoritative.generation_id, candidate_generation_id, &outcome.promoted_surfaces)
+    {
         send_frame_logged(registry, generation_id, &frame);
     }
     reap_generations_processes(processes, authoritative.generation_id).await;
@@ -346,7 +363,11 @@ mod tests {
                 _ => unreachable!(),
             })
             .collect();
-        assert_eq!(named, vec!["bar@DP-1", "bar@DP-1", "bar@HDMI-A-1", "bar@HDMI-A-1"], "each surface hands over completely before the next starts");
+        assert_eq!(
+            named,
+            vec!["bar@DP-1", "bar@DP-1", "bar@HDMI-A-1", "bar@HDMI-A-1"],
+            "each surface hands over completely before the next starts"
+        );
     }
 
     #[test]
@@ -377,8 +398,14 @@ mod tests {
         swap_and_reap(&registry, &mut processes, &mut authoritative, 2, outcome).await;
 
         assert_eq!(authoritative.generation_id, 2, "the candidate is authoritative once the swap returns");
-        assert!(!processes.contains_key(&(1, 7)), "the superseded generation's `process.run` entry must be gone from the registry");
-        for (pid, what) in [(child_pid, "the superseded generation's `process.run` child"), (superseded_pid, "the superseded Renderer")] {
+        assert!(
+            !processes.contains_key(&(1, 7)),
+            "the superseded generation's `process.run` entry must be gone from the registry"
+        );
+        for (pid, what) in [
+            (child_pid, "the superseded generation's `process.run` child"),
+            (superseded_pid, "the superseded Renderer"),
+        ] {
             let gone = tokio::time::timeout(Duration::from_millis(500), async {
                 while std::path::Path::new(&format!("/proc/{pid}")).exists() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -455,7 +482,13 @@ mod tests {
         /// The common case: one expected surface ("main_bar"), hydration/activate always
         /// succeed, `ready` and the one evidence call are configured explicitly.
         fn new(ready: StepBehavior, evidence: EvidenceOutcome) -> Self {
-            Self::with_steps(StepBehavior::Succeed, ready, vec!["main_bar".to_string()], StepBehavior::Succeed, VecDeque::from([evidence]))
+            Self::with_steps(
+                StepBehavior::Succeed,
+                ready,
+                vec!["main_bar".to_string()],
+                StepBehavior::Succeed,
+                VecDeque::from([evidence]),
+            )
         }
 
         /// Full control over every step, for tests exercising a hang/failure on hydration or
@@ -467,7 +500,14 @@ mod tests {
             activate: StepBehavior,
             evidence: VecDeque<EvidenceOutcome>,
         ) -> Self {
-            Self { hydration, ready, ready_surfaces, activate, evidence: Mutex::new(evidence), calls: Mutex::new(Vec::new()) }
+            Self {
+                hydration,
+                ready,
+                ready_surfaces,
+                activate,
+                evidence: Mutex::new(evidence),
+                calls: Mutex::new(Vec::new()),
+            }
         }
 
         fn record(&self, call: &'static str) {
@@ -559,7 +599,13 @@ mod tests {
             EvidenceOutcome::Return("wallpaper_layer@DP-1".to_string()),
             EvidenceOutcome::Return("main_bar".to_string()),
         ]);
-        let mut link = FakeCandidateLink::with_steps(StepBehavior::Succeed, StepBehavior::Succeed, expected.clone(), StepBehavior::Succeed, arrival_order);
+        let mut link = FakeCandidateLink::with_steps(
+            StepBehavior::Succeed,
+            StepBehavior::Succeed,
+            expected.clone(),
+            StepBehavior::Succeed,
+            arrival_order,
+        );
 
         let mut outcome = run_pba(
             "sh",
@@ -688,7 +734,8 @@ mod tests {
     /// parallel and several spawn near-identical commands, so a name-based check would
     /// false-positive on a sibling test's own live child.
     fn unique_pidfile() -> std::path::PathBuf {
-        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("system clock").as_nanos();
+        let unique =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("system clock").as_nanos();
         std::env::temp_dir().join(format!("oblisk-reload-test-{}-{unique}.pid", std::process::id()))
     }
 
@@ -727,7 +774,13 @@ mod tests {
             EvidenceOutcome::Return("main_bar".to_string()),
             EvidenceOutcome::Return("overlay_canvas".to_string()),
         ]);
-        let mut link = FakeCandidateLink::with_steps(StepBehavior::Succeed, StepBehavior::Succeed, expected, StepBehavior::Succeed, evidence);
+        let mut link = FakeCandidateLink::with_steps(
+            StepBehavior::Succeed,
+            StepBehavior::Succeed,
+            expected,
+            StepBehavior::Succeed,
+            evidence,
+        );
         let pidfile = unique_pidfile();
 
         let failure = run_pba(
@@ -750,12 +803,16 @@ mod tests {
         let _ = std::fs::remove_file(&pidfile);
 
         let gone = wait_until(Duration::from_millis(500), || !proc_exists(candidate_pid)).await;
-        assert!(gone, "the aborted candidate (pid {candidate_pid}) must have been reaped even though 2 of 3 surfaces 'succeeded'");
+        assert!(
+            gone,
+            "the aborted candidate (pid {candidate_pid}) must have been reaped even though 2 of 3 surfaces 'succeeded'"
+        );
     }
 
     #[tokio::test]
     async fn run_pba_fails_with_unexpected_evidence_for_a_surface_id_never_announced() {
-        let mut link = FakeCandidateLink::new(StepBehavior::Succeed, EvidenceOutcome::Return("never_announced".to_string()));
+        let mut link =
+            FakeCandidateLink::new(StepBehavior::Succeed, EvidenceOutcome::Return("never_announced".to_string()));
 
         let failure = run_pba(
             "sh",
@@ -780,8 +837,17 @@ mod tests {
     #[tokio::test]
     async fn run_pba_fails_with_unexpected_evidence_when_the_same_surface_id_is_reported_twice() {
         let expected = vec!["main_bar".to_string(), "overlay_canvas".to_string()];
-        let evidence = VecDeque::from([EvidenceOutcome::Return("main_bar".to_string()), EvidenceOutcome::Return("main_bar".to_string())]);
-        let mut link = FakeCandidateLink::with_steps(StepBehavior::Succeed, StepBehavior::Succeed, expected, StepBehavior::Succeed, evidence);
+        let evidence = VecDeque::from([
+            EvidenceOutcome::Return("main_bar".to_string()),
+            EvidenceOutcome::Return("main_bar".to_string()),
+        ]);
+        let mut link = FakeCandidateLink::with_steps(
+            StepBehavior::Succeed,
+            StepBehavior::Succeed,
+            expected,
+            StepBehavior::Succeed,
+            evidence,
+        );
 
         let failure = run_pba(
             "sh",

@@ -10,8 +10,8 @@ use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use zbus::zvariant::OwnedObjectPath;
 
-use super::proxies::{Adapter1Proxy, Battery1Proxy, Device1Proxy, bind_battery, bind_device};
 use super::BluetoothSignal;
+use super::proxies::{Adapter1Proxy, Battery1Proxy, Device1Proxy, bind_battery, bind_device};
 
 /// One tracked `Device1` object. `mac` is cached at registration time rather than re-read
 /// live: resolving `pair`/`connect`/`disconnect`/`forget`'s `mac` argument to an object path
@@ -29,7 +29,13 @@ pub(super) type DeviceRegistry = Arc<Mutex<HashMap<OwnedObjectPath, DeviceEntry>
 /// Binds `path` as a `Device1`, caches its `Address`, optionally binds `Battery1` (only if
 /// `has_battery`), spawns this device's own signal forwarder, and inserts the entry into
 /// `devices`. Logs and skips (never registers a half-built entry) on any D-Bus failure.
-pub(super) async fn register_device(connection: &zbus::Connection, devices: &DeviceRegistry, path: OwnedObjectPath, has_battery: bool, events: UnboundedSender<BluetoothSignal>) {
+pub(super) async fn register_device(
+    connection: &zbus::Connection,
+    devices: &DeviceRegistry,
+    path: OwnedObjectPath,
+    has_battery: bool,
+    events: UnboundedSender<BluetoothSignal>,
+) {
     let device = match bind_device(connection, path.clone()).await {
         Ok(device) => device,
         Err(err) => {
@@ -75,7 +81,11 @@ pub(super) async fn register_device(connection: &zbus::Connection, devices: &Dev
 /// this function returns exactly one `JoinHandle` -- the registry entry has room for only
 /// one. `battery`'s absence is modeled as `std::future::pending()` rather than an
 /// `Option<Stream>` guard: simpler than unifying two different stream types behind one.
-fn spawn_device_signal_forwarder(device: Device1Proxy<'static>, battery: Option<Battery1Proxy<'static>>, events: UnboundedSender<BluetoothSignal>) -> JoinHandle<()> {
+fn spawn_device_signal_forwarder(
+    device: Device1Proxy<'static>,
+    battery: Option<Battery1Proxy<'static>>,
+    events: UnboundedSender<BluetoothSignal>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut connected_changed = device.receive_connected_changed().await;
         let mut paired_changed = device.receive_paired_changed().await;
@@ -120,8 +130,13 @@ fn spawn_device_signal_forwarder(device: Device1Proxy<'static>, battery: Option<
 /// `ObjectManagerProxy`: the subscription must complete before `GetManagedObjects()`'s own
 /// hydration call runs, not after this task gets scheduled, or a device added/removed in
 /// that window would be silently and permanently missed.
-pub(super) fn spawn_object_manager_forwarder<A, R>(connection: zbus::Connection, mut added: A, mut removed: R, devices: DeviceRegistry, events: UnboundedSender<BluetoothSignal>)
-where
+pub(super) fn spawn_object_manager_forwarder<A, R>(
+    connection: zbus::Connection,
+    mut added: A,
+    mut removed: R,
+    devices: DeviceRegistry,
+    events: UnboundedSender<BluetoothSignal>,
+) where
     A: tokio_stream::Stream<Item = zbus::fdo::InterfacesAdded> + Unpin + Send + 'static,
     R: tokio_stream::Stream<Item = zbus::fdo::InterfacesRemoved> + Unpin + Send + 'static,
 {
@@ -173,7 +188,10 @@ where
 /// Runs until `adapter`'s connection drops, forwarding `Powered`/`Discovering` property
 /// changes as [`BluetoothSignal::AdapterChanged`] -- keeps `bluetooth.enabled`/`discovering`
 /// correct after any change BlueZ makes on its own, not just this controller's own writes.
-pub(super) fn spawn_adapter_signal_forwarder(adapter: Adapter1Proxy<'static>, events: UnboundedSender<BluetoothSignal>) {
+pub(super) fn spawn_adapter_signal_forwarder(
+    adapter: Adapter1Proxy<'static>,
+    events: UnboundedSender<BluetoothSignal>,
+) {
     tokio::spawn(async move {
         let mut powered_changed = adapter.receive_powered_changed().await;
         let mut discovering_changed = adapter.receive_discovering_changed().await;
@@ -190,4 +208,3 @@ pub(super) fn spawn_adapter_signal_forwarder(adapter: Adapter1Proxy<'static>, ev
         }
     });
 }
-

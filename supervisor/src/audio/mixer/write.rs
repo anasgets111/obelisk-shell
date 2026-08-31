@@ -10,7 +10,9 @@ use pipewire as pw;
 
 use crate::audio::master;
 
-use super::state::{AudioCommand, DefaultDevice, MixerState, SinkRoute, DEFAULT_AUDIO_SINK_KEY, DEFAULT_AUDIO_SOURCE_KEY};
+use super::state::{
+    AudioCommand, DEFAULT_AUDIO_SINK_KEY, DEFAULT_AUDIO_SOURCE_KEY, DefaultDevice, MixerState, SinkRoute,
+};
 
 /// The `type_` a `default.audio.*` metadata value carries. Read straight off `pw-metadata`'s own
 /// dump (`type:'Spa:String:JSON'`) rather than inferred from the value looking like JSON.
@@ -78,7 +80,10 @@ pub(super) fn apply_command(state: &Rc<RefCell<MixerState>>, command: AudioComma
 /// `RefCell`, not held across the write, because the write borrows the same state again.
 fn resolve_master(state: &Rc<RefCell<MixerState>>) -> Option<(u32, master::RawSinkProps)> {
     let state = state.borrow();
-    let node_id = master::resolve_default_device(state.default_sink_name.as_deref(), state.sinks.iter().map(|(&id, sink)| (id, sink.names.node_name.as_str())))?;
+    let node_id = master::resolve_default_device(
+        state.default_sink_name.as_deref(),
+        state.sinks.iter().map(|(&id, sink)| (id, sink.names.node_name.as_str())),
+    )?;
     let current = state.sinks.get(&node_id)?.props.clone()?;
     Some((node_id, current))
 }
@@ -110,12 +115,23 @@ fn write_master(state: &Rc<RefCell<MixerState>>, node_id: u32, channel_volumes: 
 /// The route `index` is not guessable: a card publishes several routes and only its own `Route`
 /// param says which one is active for a given `card.profile.device`. Without that index the
 /// write goes to the wrong route or to none.
-fn write_device_route(state: &Rc<RefCell<MixerState>>, node_id: u32, route: SinkRoute, channel_volumes: Option<Vec<f32>>, muted: Option<bool>) {
+fn write_device_route(
+    state: &Rc<RefCell<MixerState>>,
+    node_id: u32,
+    route: SinkRoute,
+    channel_volumes: Option<Vec<f32>>,
+    muted: Option<bool>,
+) {
     let Some(index) = state.borrow().device_routes.get(&(route.device_id, route.profile_device)).copied() else {
-        eprintln!("audio: sink {node_id} routes through device {} port {}, whose active Route index has not been seen; ignored", route.device_id, route.profile_device);
+        eprintln!(
+            "audio: sink {node_id} routes through device {} port {}, whose active Route index has not been seen; ignored",
+            route.device_id, route.profile_device
+        );
         return;
     };
-    let Some(bytes) = master::serialize_props(&master::route_object(index, route.profile_device, channel_volumes, muted)) else {
+    let Some(bytes) =
+        master::serialize_props(&master::route_object(index, route.profile_device, channel_volumes, muted))
+    else {
         eprintln!("audio: failed to serialize a Route object for device {}; ignored", route.device_id);
         return;
     };
@@ -137,7 +153,12 @@ fn write_device_route(state: &Rc<RefCell<MixerState>>, node_id: u32, route: Sink
 /// The serialized bytes are held in a local for the whole call: `Pod::from_bytes` borrows them,
 /// and `set_param` reads through that borrow into C, so letting the `Vec` drop early would hand
 /// PipeWire a dangling pointer.
-fn write_node_props(state: &Rc<RefCell<MixerState>>, node_id: u32, channel_volumes: Option<Vec<f32>>, muted: Option<bool>) {
+fn write_node_props(
+    state: &Rc<RefCell<MixerState>>,
+    node_id: u32,
+    channel_volumes: Option<Vec<f32>>,
+    muted: Option<bool>,
+) {
     let Some(bytes) = master::serialize_props(&master::props_object(channel_volumes, muted)) else {
         eprintln!("audio: failed to serialize a Props object for node {node_id}; ignored");
         return;

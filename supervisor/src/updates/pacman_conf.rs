@@ -119,7 +119,10 @@ mod tests {
         // This dev machine's real `[omarchy]` section -- confirmed, not hypothetical.
         let text = "[omarchy]\nSigLevel = Required DatabaseOptional\nServer = https://pkgs.omarchy.org/edge/$arch\n";
         let repos = parse_pacman_conf(text);
-        assert_eq!(repos, vec![("omarchy".to_string(), vec![], vec!["https://pkgs.omarchy.org/edge/$arch".to_string()])]);
+        assert_eq!(
+            repos,
+            vec![("omarchy".to_string(), vec![], vec!["https://pkgs.omarchy.org/edge/$arch".to_string()])]
+        );
     }
 
     #[test]
@@ -140,14 +143,20 @@ mod tests {
     #[test]
     fn parse_mirrorlist_extracts_every_uncommented_server_line() {
         let text = "# comment\nServer = https://one.example/$repo/os/$arch\n#Server = https://commented.example/$repo/os/$arch\nServer = https://two.example/$repo/os/$arch\n";
-        assert_eq!(parse_mirrorlist(text), vec!["https://one.example/$repo/os/$arch".to_string(), "https://two.example/$repo/os/$arch".to_string()]);
+        assert_eq!(
+            parse_mirrorlist(text),
+            vec!["https://one.example/$repo/os/$arch".to_string(), "https://two.example/$repo/os/$arch".to_string()]
+        );
     }
 
     // ---- substitute ----
 
     #[test]
     fn substitute_replaces_repo_and_arch_placeholders() {
-        assert_eq!(substitute("https://example/$repo/os/$arch", "core"), format!("https://example/core/os/{}", std::env::consts::ARCH));
+        assert_eq!(
+            substitute("https://example/$repo/os/$arch", "core"),
+            format!("https://example/core/os/{}", std::env::consts::ARCH)
+        );
     }
 
     // ---- resolve_repo_servers (real fs I/O against a tempdir -- docs/oblisk-tdd-test-harness.md's convention) ----
@@ -162,7 +171,13 @@ mod tests {
         std::fs::write(&conf_path, format!("[options]\n[core]\nInclude = {}\n", mirrorlist_path.display())).unwrap();
 
         let repos = resolve_repo_servers(&conf_path);
-        assert_eq!(repos, vec![RepoServers { name: "core".to_string(), servers: vec![format!("https://example.test/core/os/{}", std::env::consts::ARCH)] }]);
+        assert_eq!(
+            repos,
+            vec![RepoServers {
+                name: "core".to_string(),
+                servers: vec![format!("https://example.test/core/os/{}", std::env::consts::ARCH)]
+            }]
+        );
     }
 
     #[test]
@@ -172,7 +187,13 @@ mod tests {
         std::fs::write(&conf_path, "[omarchy]\nServer = https://pkgs.example/$arch\n").unwrap();
 
         let repos = resolve_repo_servers(&conf_path);
-        assert_eq!(repos, vec![RepoServers { name: "omarchy".to_string(), servers: vec![format!("https://pkgs.example/{}", std::env::consts::ARCH)] }]);
+        assert_eq!(
+            repos,
+            vec![RepoServers {
+                name: "omarchy".to_string(),
+                servers: vec![format!("https://pkgs.example/{}", std::env::consts::ARCH)]
+            }]
+        );
     }
 
     #[test]
@@ -185,7 +206,8 @@ mod tests {
     fn resolve_repo_servers_gives_a_repo_zero_servers_when_its_include_file_is_missing() {
         let dir = tempfile::tempdir().unwrap();
         let conf_path = dir.path().join("pacman.conf");
-        std::fs::write(&conf_path, format!("[core]\nInclude = {}\n", dir.path().join("does-not-exist").display())).unwrap();
+        std::fs::write(&conf_path, format!("[core]\nInclude = {}\n", dir.path().join("does-not-exist").display()))
+            .unwrap();
 
         let repos = resolve_repo_servers(&conf_path);
         assert_eq!(repos, vec![RepoServers { name: "core".to_string(), servers: vec![] }]);

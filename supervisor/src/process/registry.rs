@@ -21,7 +21,8 @@ pub(crate) type LiveProcesses = HashMap<(u32, u64), Child>;
 /// shape mismatch (a protocol desync, not a spawn failure) -- logged by the caller.
 pub(crate) fn process_run_args(arguments: &[serde_json::Value]) -> Option<(String, Vec<String>)> {
     let cmd = arguments.first()?.as_str()?.to_string();
-    let args = arguments.get(1)?.as_array()?.iter().map(|v| v.as_str().map(str::to_string)).collect::<Option<Vec<_>>>()?;
+    let args =
+        arguments.get(1)?.as_array()?.iter().map(|v| v.as_str().map(str::to_string)).collect::<Option<Vec<_>>>()?;
     Some((cmd, args))
 }
 
@@ -48,14 +49,25 @@ pub(crate) async fn dispatch(
                     });
                 }
                 None => {
-                    send_frame_logged(registry, generation_id, &SupervisorFrame::ProcessExited(ProcessExited { id, code: None }));
+                    send_frame_logged(
+                        registry,
+                        generation_id,
+                        &SupervisorFrame::ProcessExited(ProcessExited { id, code: None }),
+                    );
                 }
             },
             None => {
-                eprintln!("malformed process.run command from generation {generation_id}: {:?}", envelope.params.arguments);
+                eprintln!(
+                    "malformed process.run command from generation {generation_id}: {:?}",
+                    envelope.params.arguments
+                );
                 // Lua's ProcessHandle is already waiting on `id`'s exit_cb; with no process
                 // ever spawned, this is what stops it leaking the callback pair forever.
-                send_frame_logged(registry, generation_id, &SupervisorFrame::ProcessExited(ProcessExited { id, code: None }));
+                send_frame_logged(
+                    registry,
+                    generation_id,
+                    &SupervisorFrame::ProcessExited(ProcessExited { id, code: None }),
+                );
             }
         },
         "kill" => match kill_registered_process(processes, generation_id, id).await {
@@ -65,7 +77,11 @@ pub(crate) async fn dispatch(
             KillOutcome::ReapFailed => {
                 // The registry entry is already removed and the reap failure already logged;
                 // this stops `id`'s exit_cb from leaking. `None` is honest, not synthesized.
-                send_frame_logged(registry, generation_id, &SupervisorFrame::ProcessExited(ProcessExited { id, code: None }));
+                send_frame_logged(
+                    registry,
+                    generation_id,
+                    &SupervisorFrame::ProcessExited(ProcessExited { id, code: None }),
+                );
             }
             KillOutcome::NotRegistered => {}
         },
@@ -136,7 +152,11 @@ fn report_process_output_line(
 ) -> bool {
     match line {
         Ok(Some(line)) => {
-            send_frame_logged(registry, generation_id, &SupervisorFrame::ProcessOutput(ProcessOutputLine { id, stream, line }));
+            send_frame_logged(
+                registry,
+                generation_id,
+                &SupervisorFrame::ProcessOutput(ProcessOutputLine { id, stream, line }),
+            );
             false
         }
         Ok(None) => true,
@@ -168,7 +188,9 @@ pub(crate) async fn kill_registered_process(processes: &mut LiveProcesses, gener
         return KillOutcome::NotRegistered;
     };
     match super::reap_process_group(&mut child, super::DEFAULT_REAP_GRACE).await {
-        Ok(super::ReapOutcome::ExitedCleanly(status) | super::ReapOutcome::Escalated(status)) => KillOutcome::Reaped(status.code()),
+        Ok(super::ReapOutcome::ExitedCleanly(status) | super::ReapOutcome::Escalated(status)) => {
+            KillOutcome::Reaped(status.code())
+        }
         Err(err) => {
             eprintln!("failed to reap process {id} (generation {generation_id}) on kill: {err}");
             KillOutcome::ReapFailed
@@ -187,9 +209,18 @@ pub(crate) fn take_exited_process(processes: &mut LiveProcesses, generation_id: 
 /// Always run as a detached `tokio::spawn`ed task, never awaited inline in `main()`'s
 /// `select!` -- both piped streams closing only means the process stopped writing to them, not
 /// that it exited (a daemonizing child can redirect them onto `/dev/null` and keep running).
-pub(crate) async fn wait_and_report_exit(registry: socket::GenerationRegistry, generation_id: u32, id: u64, mut child: Child) {
+pub(crate) async fn wait_and_report_exit(
+    registry: socket::GenerationRegistry,
+    generation_id: u32,
+    id: u64,
+    mut child: Child,
+) {
     match child.wait().await {
-        Ok(status) => send_frame_logged(&registry, generation_id, &SupervisorFrame::ProcessExited(ProcessExited { id, code: status.code() })),
+        Ok(status) => send_frame_logged(
+            &registry,
+            generation_id,
+            &SupervisorFrame::ProcessExited(ProcessExited { id, code: status.code() }),
+        ),
         Err(err) => eprintln!("failed to wait on exited process {id} (generation {generation_id}): {err}"),
     }
 }
@@ -198,7 +229,8 @@ pub(crate) async fn wait_and_report_exit(registry: socket::GenerationRegistry, g
 /// Lua spawned -- not just its own Renderer process (`CONTEXT.md`'s Generation swap). No
 /// `ProcessExited` is sent: the superseded generation's own connection is torn down in the same swap.
 pub(crate) async fn reap_generations_processes(processes: &mut LiveProcesses, generation_id: u32) {
-    let stale_ids: Vec<(u32, u64)> = processes.keys().filter(|(entry_generation_id, _)| *entry_generation_id == generation_id).copied().collect();
+    let stale_ids: Vec<(u32, u64)> =
+        processes.keys().filter(|(entry_generation_id, _)| *entry_generation_id == generation_id).copied().collect();
     for key in stale_ids {
         if let Some(mut child) = processes.remove(&key)
             && let Err(err) = super::reap_process_group(&mut child, super::DEFAULT_REAP_GRACE).await
@@ -233,18 +265,31 @@ mod tests {
     #[test]
     fn process_run_args_parses_cmd_and_args_from_arguments() {
         let arguments = vec![serde_json::json!("echo"), serde_json::json!(["hello", "world"])];
-        assert_eq!(process_run_args(&arguments), Some(("echo".to_string(), vec!["hello".to_string(), "world".to_string()])));
+        assert_eq!(
+            process_run_args(&arguments),
+            Some(("echo".to_string(), vec!["hello".to_string(), "world".to_string()]))
+        );
     }
 
     #[test]
     fn process_run_args_rejects_a_malformed_shape() {
         assert_eq!(process_run_args(&[]), None, "missing both elements");
         assert_eq!(process_run_args(&[serde_json::json!(1), serde_json::json!([])]), None, "cmd is not a string");
-        assert_eq!(process_run_args(&[serde_json::json!("echo"), serde_json::json!("not-an-array")]), None, "args is not an array");
-        assert_eq!(process_run_args(&[serde_json::json!("echo"), serde_json::json!([1, 2])]), None, "args contains non-strings");
+        assert_eq!(
+            process_run_args(&[serde_json::json!("echo"), serde_json::json!("not-an-array")]),
+            None,
+            "args is not an array"
+        );
+        assert_eq!(
+            process_run_args(&[serde_json::json!("echo"), serde_json::json!([1, 2])]),
+            None,
+            "args contains non-strings"
+        );
     }
 
-    fn registry_with_connection(generation_id: u32) -> (socket::GenerationRegistry, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+    fn registry_with_connection(
+        generation_id: u32,
+    ) -> (socket::GenerationRegistry, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
         let registry = socket::GenerationRegistry::default();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         registry.register(generation_id, tx);
@@ -275,7 +320,8 @@ mod tests {
     async fn stream_process_output_forwards_both_streams_then_the_real_exit_code_arrives_via_wait() {
         let mut processes: LiveProcesses = HashMap::new();
         let (stdout, stderr) =
-            spawn_and_register_process(&mut processes, 1, 9, "sh", &sh_args("echo out1; echo err1 >&2; exit 3")).unwrap();
+            spawn_and_register_process(&mut processes, 1, 9, "sh", &sh_args("echo out1; echo err1 >&2; exit 3"))
+                .unwrap();
         let (registry, mut rx) = registry_with_connection(1);
 
         stream_process_output(&registry, 1, 9, stdout, stderr).await;
@@ -369,7 +415,10 @@ mod tests {
             }
         })
         .await;
-        assert!(gone.is_ok(), "process {pid} should be gone after the supersede-time reap, not just removed from the registry");
+        assert!(
+            gone.is_ok(),
+            "process {pid} should be gone after the supersede-time reap, not just removed from the registry"
+        );
     }
 
     #[tokio::test]
@@ -388,7 +437,8 @@ mod tests {
         let mut processes: LiveProcesses = HashMap::new();
         spawn_and_register_process(&mut processes, 1, 1, "sh", &sh_args("sleep 5"));
         spawn_and_register_process(&mut processes, 2, 1, "sh", &sh_args("sleep 5"));
-        let pids: Vec<u32> = processes.values().map(|child| child.id().expect("freshly spawned child has a pid")).collect();
+        let pids: Vec<u32> =
+            processes.values().map(|child| child.id().expect("freshly spawned child has a pid")).collect();
 
         reap_all_processes(&mut processes).await;
 
@@ -398,6 +448,9 @@ mod tests {
             }
         })
         .await;
-        assert!(gone.is_ok(), "every reaped process should actually be gone from /proc, not just removed from the registry");
+        assert!(
+            gone.is_ok(),
+            "every reaped process should actually be gone from /proc, not just removed from the registry"
+        );
     }
 }

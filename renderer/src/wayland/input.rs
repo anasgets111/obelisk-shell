@@ -202,7 +202,11 @@ pub(super) struct FocusedField {
 ///
 /// A free function, not a `&mut self` method, so the property is testable without a live Wayland
 /// connection -- the same reason [`secure_submit_frame`] is one.
-fn retarget_secure_submit(focused: &mut Option<FocusedField>, buffer: &mut shared::SecureBuffer, next: Option<FocusedField>) {
+fn retarget_secure_submit(
+    focused: &mut Option<FocusedField>,
+    buffer: &mut shared::SecureBuffer,
+    next: Option<FocusedField>,
+) {
     if *focused != next {
         buffer.zeroize();
     }
@@ -224,9 +228,15 @@ fn retarget_secure_submit(focused: &mut Option<FocusedField>, buffer: &mut share
 /// pick, and the compositor's `enter` commonly follows that press, so discarding it would make a
 /// multi-field surface untypable by clicking. Requiring the tree to still declare that destination
 /// keeps a reload from pointing at a field the config has since deleted.
-fn focus_on_enter(surface_id: Option<&str>, tree: Option<&layout::ResolvedNode>, current: Option<&FocusedField>) -> Option<FocusedField> {
+fn focus_on_enter(
+    surface_id: Option<&str>,
+    tree: Option<&layout::ResolvedNode>,
+    current: Option<&FocusedField>,
+) -> Option<FocusedField> {
     let (id, tree) = (surface_id?, tree?);
-    if let Some(current) = current.filter(|field| field.surface_id == id && secure_submit_targets(tree).contains(&field.target)) {
+    if let Some(current) =
+        current.filter(|field| field.surface_id == id && secure_submit_targets(tree).contains(&field.target))
+    {
         return Some(current.clone());
     }
     Some(FocusedField { surface_id: id.to_string(), target: sole_secure_submit(tree)? })
@@ -357,7 +367,12 @@ fn release_ends_press(armed: Option<&ArmedClick>, button: u32) -> bool {
 /// armed rect but on something no longer a handled button (a re-resolve put a plain `rect` there)
 /// is not the click the press started. `released_on` is [`clickable_button`]'s answer for the
 /// release, not the raw pointer position.
-fn release_completes_click(armed: Option<&ArmedClick>, instance_id: &str, released_on: Option<LogicalRect>, button: u32) -> bool {
+fn release_completes_click(
+    armed: Option<&ArmedClick>,
+    instance_id: &str,
+    released_on: Option<LogicalRect>,
+    button: u32,
+) -> bool {
     match (armed, released_on) {
         (Some(armed), Some(rect)) => armed.instance_id == instance_id && armed.rect == rect && armed.button == button,
         _ => false,
@@ -372,7 +387,12 @@ fn release_completes_click(armed: Option<&ArmedClick>, instance_id: &str, releas
 /// declaring `anchor_rect = menu_anchor`. `Err` names the step as well as the error: a rect table
 /// this engine could not build is the engine's bug, a handler that raised is the config's, and
 /// merging them would send a config author looking at their own Lua for a fault that isn't there.
-fn call_on_click(lua: &Lua, on_click: &Function, rect: LogicalRect, button: &str) -> Result<(), (&'static str, mlua::Error)> {
+fn call_on_click(
+    lua: &Lua,
+    on_click: &Function,
+    rect: LogicalRect,
+    button: &str,
+) -> Result<(), (&'static str, mlua::Error)> {
     let argument = rect_table(lua, rect).map_err(|e| ("could not build on_click's rect argument", e))?;
     on_click.call::<()>((argument, button)).map_err(|e| ("on_click raised, ignoring it", e))
 }
@@ -397,7 +417,12 @@ pub(super) fn rect_table(lua: &Lua, rect: LogicalRect) -> mlua::Result<Table> {
 /// A free function, not a `&mut self` method, for [`retarget_secure_submit`]'s reason: it makes the
 /// whole read/zeroize contract directly unit-testable, which nothing involving a live `wl_surface`
 /// is.
-fn secure_submit_frame(generation_id: u32, capability: &str, action: &str, buffer: &mut shared::SecureBuffer) -> RendererFrame {
+fn secure_submit_frame(
+    generation_id: u32,
+    capability: &str,
+    action: &str,
+    buffer: &mut shared::SecureBuffer,
+) -> RendererFrame {
     let frame = RendererFrame::SecureSubmit(SecureSubmit {
         generation_id,
         capability: capability.to_string(),
@@ -437,12 +462,13 @@ impl App {
     /// advisory: nothing can reach `secure_buffer` through a focus that has gone stale, whatever
     /// took the surface away and whether or not a `leave` ever followed.
     fn prune_secure_focus(&mut self) {
-        let armed = self
-            .focused_secure_submit
-            .as_ref()
-            .is_some_and(|field| focus_is_still_armed(field, self.keyboard_focus.as_deref(), self.surface_is_live(&field.surface_id)));
+        let armed = self.focused_secure_submit.as_ref().is_some_and(|field| {
+            focus_is_still_armed(field, self.keyboard_focus.as_deref(), self.surface_is_live(&field.surface_id))
+        });
         if self.focused_secure_submit.is_some() && !armed {
-            eprintln!("[oblisk-renderer] the focused secure_submit field is no longer the one receiving keys; dropping it and scrubbing its buffer");
+            eprintln!(
+                "[oblisk-renderer] the focused secure_submit field is no longer the one receiving keys; dropping it and scrubbing its buffer"
+            );
             self.focus_secure_submit(None);
         }
     }
@@ -479,7 +505,9 @@ impl App {
     pub(super) fn drop_secure_focus_if_its_surface_is_gone(&mut self) {
         let gone = self.focused_secure_submit.as_ref().is_some_and(|field| !self.surface_is_live(&field.surface_id));
         if gone {
-            eprintln!("[oblisk-renderer] the surface holding the focused secure_submit field is gone; dropping it and scrubbing its buffer");
+            eprintln!(
+                "[oblisk-renderer] the surface holding the focused secure_submit field is gone; dropping it and scrubbing its buffer"
+            );
             self.focus_secure_submit(None);
         }
     }
@@ -699,7 +727,10 @@ impl App {
                     // The engine's own failure, not the config's, and not worth taking a shell down
                     // for: the boolean already landed, so a tooltip opens where it last was rather
                     // than not opening.
-                    Err(err) => eprintln!("[oblisk-renderer] {}: could not build a hover rect: {err}", self.surfaces[index].surface_id),
+                    Err(err) => eprintln!(
+                        "[oblisk-renderer] {}: could not build a hover rect: {err}",
+                        self.surfaces[index].surface_id
+                    ),
                 }
             }
         }
@@ -737,13 +768,21 @@ impl SeatHandler for App {
     /// re-announces its pointer, and SCTK turns each announcement into this call. A second
     /// `wl_pointer` would deliver duplicate events into one `armed` slot, and a second
     /// `wl_keyboard` two `enter`/`leave` streams into one `keyboard_focus`.
-    fn new_capability(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, capability: Capability) {
+    fn new_capability(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
         match capability {
             Capability::Pointer if self.pointer.is_none() => match self.seat_state.get_pointer(qh, &seat) {
                 Ok(pointer) => self.pointer = Some(pointer),
                 // Not fatal: a shell with no pointer still paints, still reloads, and still takes
                 // `wp-text-input-v3` input. Only `on_click` stops working, which is what this says.
-                Err(e) => eprintln!("[oblisk-renderer] wl_seat::get_pointer failed; no button's on_click will ever fire: {e}"),
+                Err(e) => {
+                    eprintln!("[oblisk-renderer] wl_seat::get_pointer failed; no button's on_click will ever fire: {e}")
+                }
             },
             // `None` rmlvo: take the compositor's own keymap. This shell never interprets a keysym
             // (there is no `on_key` in § 5.2), so imposing a layout of its own would be policy
@@ -752,13 +791,21 @@ impl SeatHandler for App {
                 Ok(keyboard) => self.keyboard = Some(keyboard),
                 // Also not fatal, and narrower than it looks: losing this loses the `enter`/`leave`
                 // that clear a focused `textfield`, so a stale focus can outlive the user moving on.
-                Err(e) => eprintln!("[oblisk-renderer] wl_seat::get_keyboard failed; keyboard focus will never be tracked: {e}"),
+                Err(e) => eprintln!(
+                    "[oblisk-renderer] wl_seat::get_keyboard failed; keyboard focus will never be tracked: {e}"
+                ),
             },
             _ => {}
         }
     }
 
-    fn remove_capability(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat, capability: Capability) {
+    fn remove_capability(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
         match capability {
             Capability::Pointer => {
                 // A pointer that is gone will never send the `release` this press was waiting for,
@@ -797,7 +844,13 @@ impl SeatHandler for App {
 /// Pointer input to `on_click` (docs/adr/0050). See `delegate_dispatch2!(App)` at the bottom of
 /// this file for why no `delegate_pointer!` call accompanies this.
 impl PointerHandler for App {
-    fn pointer_frame(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _pointer: &wl_pointer::WlPointer, events: &[PointerEvent]) {
+    fn pointer_frame(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _pointer: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
         for event in events {
             // A surface this process does not own: a `wl_pointer` is per seat, not per surface,
             // and nothing stops the compositor from having delivered an event for a surface that
@@ -848,7 +901,12 @@ impl PointerHandler for App {
                     // Focus is untouched here. The press already decided it, and a release that
                     // drags off a `textfield` must not un-focus the field the user is typing into.
                     let hit = self.hit_under(index, event.position).button;
-                    let fires = release_completes_click(self.armed.as_ref(), &instance_id, hit.as_ref().map(|(rect, _)| *rect), button);
+                    let fires = release_completes_click(
+                        self.armed.as_ref(),
+                        &instance_id,
+                        hit.as_ref().map(|(rect, _)| *rect),
+                        button,
+                    );
                     // Before the call, so a handler that re-enters here cannot find its own press
                     // still armed. See [`release_ends_press`] for why this is not unconditional.
                     if release_ends_press(self.armed.as_ref(), button) {
@@ -876,7 +934,14 @@ impl PointerHandler for App {
                 // The wheel (docs/adr/0069). `Enter`/`Motion`/`Leave` above have already kept
                 // `sync_hover` fed, so the position this needs is the event's own.
                 PointerEventKind::Axis { horizontal, vertical, .. } => {
-                    self.scroll_at(index, event.position, horizontal.absolute, horizontal.value120, vertical.absolute, vertical.value120);
+                    self.scroll_at(
+                        index,
+                        event.position,
+                        horizontal.absolute,
+                        horizontal.value120,
+                        vertical.absolute,
+                        vertical.value120,
+                    );
                 }
             }
         }
@@ -919,7 +984,9 @@ impl KeyboardHandler for App {
                 "[oblisk-renderer] {id}: keyboard focus takes its `secure_submit` field ({}/{})",
                 field.target.capability, field.target.action
             ),
-            (Some(id), None) => eprintln!("[oblisk-renderer] keyboard focus entered {id}, which declares no sole `secure_submit` field"),
+            (Some(id), None) => {
+                eprintln!("[oblisk-renderer] keyboard focus entered {id}, which declares no sole `secure_submit` field")
+            }
         }
         // Unconditional, and that is defect 2. Both "nothing to arm" cases used to be early returns
         // that moved `keyboard_focus` on and left the previous surface's field armed with its
@@ -956,18 +1023,40 @@ impl KeyboardHandler for App {
     // pushes bytes into a native `shared::SecureBuffer` and out to the Supervisor without a Lua
     // value ever existing, adding no IDL surface. See [`secure_key_action`] for why this is the
     // keyboard and not text-input.
-    fn press_key(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _keyboard: &wl_keyboard::WlKeyboard, _serial: u32, event: KeyEvent) {
+    fn press_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        event: KeyEvent,
+    ) {
         self.apply_secure_key(&event, false);
     }
 
-    fn repeat_key(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _keyboard: &wl_keyboard::WlKeyboard, _serial: u32, event: KeyEvent) {
+    fn repeat_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        event: KeyEvent,
+    ) {
         self.apply_secure_key(&event, true);
     }
 
     // Genuinely empty, and the two below with it: a release carries no `utf8` at all (SCTK's own
     // `KeyEvent` doc says so), and neither a modifier latch nor a layout change edits a buffer.
     // They exist because `KeyboardHandler` has no default bodies for them.
-    fn release_key(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _keyboard: &wl_keyboard::WlKeyboard, _serial: u32, _event: KeyEvent) {}
+    fn release_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        _event: KeyEvent,
+    ) {
+    }
 
     fn update_modifiers(
         &mut self,
@@ -1045,7 +1134,12 @@ mod tests {
         assert!(buffer.is_empty(), "the source SecureBuffer must be zeroized as soon as it has been read");
     }
 
-    fn hit_node(lua: &Lua, kind: &str, (x, y, width, height): (f32, f32, f32, f32), on_click: bool) -> layout::ResolvedNode {
+    fn hit_node(
+        lua: &Lua,
+        kind: &str,
+        (x, y, width, height): (f32, f32, f32, f32),
+        on_click: bool,
+    ) -> layout::ResolvedNode {
         let mut properties = HashMap::new();
         if on_click {
             properties.insert("on_click".to_string(), Value::Function(lua.create_function(|_, ()| Ok(())).unwrap()));
@@ -1327,8 +1421,16 @@ mod tests {
         let lua = Lua::new();
         let untypable = tree_with(&lua, vec![textfield(&lua, None)]);
         let armed = field("screen@TEST", "lock", "authenticate");
-        assert_eq!(focus_on_enter(None, None, Some(&armed)), None, "an `enter` on a surface this process already destroyed");
-        assert_eq!(focus_on_enter(Some("bar@TEST"), Some(&untypable), Some(&armed)), None, "a surface whose tree names no destination");
+        assert_eq!(
+            focus_on_enter(None, None, Some(&armed)),
+            None,
+            "an `enter` on a surface this process already destroyed"
+        );
+        assert_eq!(
+            focus_on_enter(Some("bar@TEST"), Some(&untypable), Some(&armed)),
+            None,
+            "a surface whose tree names no destination"
+        );
 
         let typable = tree_with(&lua, vec![textfield(&lua, Some(secure_submit_table(&lua, "lock", "authenticate")))]);
         assert_eq!(focus_on_enter(Some("screen@TEST"), Some(&typable), None), Some(armed.clone()));
@@ -1361,7 +1463,10 @@ mod tests {
         // the plaintext used to stay live in `App::secure_buffer`.
         let armed = field("screen@TEST", "lock", "authenticate");
         assert!(focus_is_still_armed(&armed, Some("screen@TEST"), true));
-        assert!(!focus_is_still_armed(&armed, Some("screen@TEST"), false), "its `wl_surface` is gone, whether or not a `leave` ever came");
+        assert!(
+            !focus_is_still_armed(&armed, Some("screen@TEST"), false),
+            "its `wl_surface` is gone, whether or not a `leave` ever came"
+        );
         assert!(!focus_is_still_armed(&armed, Some("bar@TEST"), true), "another surface is the one receiving keys");
         assert!(!focus_is_still_armed(&armed, None, true), "the keyboard is on a surface this process does not own");
     }
@@ -1430,7 +1535,8 @@ mod tests {
         assert_eq!(sole_secure_submit(&two_fields), None);
 
         // One field, but pointed somewhere the Supervisor does not route an unlock through.
-        let wrong_destination = tree_with(&lua, vec![textfield(&lua, Some(secure_submit_table(&lua, "polkit", "authenticate")))]);
+        let wrong_destination =
+            tree_with(&lua, vec![textfield(&lua, Some(secure_submit_table(&lua, "polkit", "authenticate")))]);
         assert!(!tree_can_authenticate(&wrong_destination));
     }
 

@@ -198,8 +198,13 @@ pub(crate) fn interval_from_env(value: Option<&str>) -> Option<Duration> {
 /// [`fold_drm_clients`] deduped rather than summed: a count of 1 next to a plausible number is
 /// the difference between a measurement and a coincidence.
 pub(crate) fn report_line(label: &str, sample: &Sample) -> String {
-    let total_pss: u64 = sample.supervisor.rollup.pss + sample.renderers.iter().map(|(_, memory)| memory.rollup.pss).sum::<u64>();
-    let mut line = format!("[oblisk-memory] {label}: total pss {:.1} MiB; supervisor pss {:.1} MiB", mib(total_pss), mib(sample.supervisor.rollup.pss));
+    let total_pss: u64 =
+        sample.supervisor.rollup.pss + sample.renderers.iter().map(|(_, memory)| memory.rollup.pss).sum::<u64>();
+    let mut line = format!(
+        "[oblisk-memory] {label}: total pss {:.1} MiB; supervisor pss {:.1} MiB",
+        mib(total_pss),
+        mib(sample.supervisor.rollup.pss)
+    );
     for (generation_id, memory) in &sample.renderers {
         line.push_str(&format!(
             "; generation {generation_id} pss {:.1} MiB uss {:.1} MiB gpu {:.1} MiB ({:.1} MiB shared, {} drm client(s))",
@@ -222,8 +227,9 @@ fn mib(kib: u64) -> f64 {
 /// a process with no DRM fds is not an error, it's a correctly zeroed [`Gpu`].
 fn read_process_memory(who: &str) -> io::Result<ProcessMemory> {
     let rollup_text = std::fs::read_to_string(format!("/proc/{who}/smaps_rollup"))?;
-    let rollup = parse_rollup(&rollup_text)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("/proc/{who}/smaps_rollup has no Pss: line")))?;
+    let rollup = parse_rollup(&rollup_text).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("/proc/{who}/smaps_rollup has no Pss: line"))
+    })?;
     Ok(ProcessMemory { rollup, gpu: read_gpu(who) })
 }
 
@@ -232,8 +238,12 @@ fn read_process_memory(who: &str) -> io::Result<ProcessMemory> {
 /// close constantly; that race is normal) both fold to "no DRM memory found" rather than
 /// propagating -- a raced-away fd is indistinguishable from one that was never a DRM fd.
 fn read_gpu(who: &str) -> Gpu {
-    let Ok(entries) = std::fs::read_dir(format!("/proc/{who}/fdinfo")) else { return fold_drm_clients(std::iter::empty()) };
-    let clients = entries.flatten().filter_map(|entry| std::fs::read_to_string(entry.path()).ok().and_then(|text| parse_drm_client(&text)));
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{who}/fdinfo")) else {
+        return fold_drm_clients(std::iter::empty());
+    };
+    let clients = entries
+        .flatten()
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok().and_then(|text| parse_drm_client(&text)));
     fold_drm_clients(clients)
 }
 
@@ -252,7 +262,9 @@ pub(crate) fn sample(renderer_pids: &[(u32, u32)]) -> io::Result<Sample> {
     for &(generation_id, pid) in renderer_pids {
         match read_process(pid) {
             Ok(memory) => renderers.push((generation_id, memory)),
-            Err(err) => eprintln!("[oblisk-memory] generation {generation_id} (pid {pid}) could not be sampled, skipping: {err}"),
+            Err(err) => eprintln!(
+                "[oblisk-memory] generation {generation_id} (pid {pid}) could not be sampled, skipping: {err}"
+            ),
         }
     }
     Ok(Sample { supervisor, renderers })
@@ -282,7 +294,8 @@ pub(crate) fn sampler_from_env() -> Option<tokio::time::Interval> {
 /// A `Child` whose `id()` is `None` has already been reaped, so it's dropped from the sample
 /// rather than reported as zero. A read failure is logged and the loop continues.
 pub(crate) fn log_sample(label: &str, renderers: &[(u32, &tokio::process::Child)]) {
-    let pids: Vec<(u32, u32)> = renderers.iter().filter_map(|(generation_id, child)| child.id().map(|pid| (*generation_id, pid))).collect();
+    let pids: Vec<(u32, u32)> =
+        renderers.iter().filter_map(|(generation_id, child)| child.id().map(|pid| (*generation_id, pid))).collect();
     match sample(&pids) {
         Ok(sample) => eprintln!("{}", report_line(label, &sample)),
         Err(err) => eprintln!("[oblisk-memory] {label} sample failed: {err}"),
@@ -348,7 +361,11 @@ Locked:                0 kB
 
     #[test]
     fn parse_rollup_is_none_without_a_pss_line() {
-        assert_eq!(parse_rollup("Rss:                3932 kB\n"), None, "a truncated rollup must not be reported as a zero-byte process");
+        assert_eq!(
+            parse_rollup("Rss:                3932 kB\n"),
+            None,
+            "a truncated rollup must not be reported as a zero-byte process"
+        );
     }
 
     // ---- parse_drm_client ----
@@ -391,19 +408,29 @@ drm-engine-video-enhance:\t0 ns\n";
     #[test]
     fn parse_drm_client_is_none_without_a_drm_driver_line() {
         let text = "pos:\t0\nflags:\t02\nmnt_id:\t9\nino:\t123\n";
-        assert_eq!(parse_drm_client(text), None, "most fds are not DRM fds and must not be reported as zero-byte GPU clients");
+        assert_eq!(
+            parse_drm_client(text),
+            None,
+            "most fds are not DRM fds and must not be reported as zero-byte GPU clients"
+        );
     }
 
     #[test]
     fn parse_drm_client_ignores_drm_total_and_only_sums_resident_and_shared() {
         let text = "drm-driver:\tamdgpu\ndrm-pdev:\t0000:03:00.0\ndrm-client-id:\t9\ndrm-total-system0:\t500000 KiB\ndrm-resident-system0:\t100000 KiB\ndrm-shared-system0:\t20000 KiB\n";
-        assert_eq!(parse_drm_client(text), Some(DrmClient { pdev: "0000:03:00.0".to_string(), client_id: 9, resident: 100000, shared: 20000 }));
+        assert_eq!(
+            parse_drm_client(text),
+            Some(DrmClient { pdev: "0000:03:00.0".to_string(), client_id: 9, resident: 100000, shared: 20000 })
+        );
     }
 
     #[test]
     fn parse_drm_client_falls_back_to_the_older_drm_memory_naming_when_no_resident_field_exists() {
         let text = "drm-driver:\tamdgpu\ndrm-pdev:\t0000:03:00.0\ndrm-client-id:\t7\ndrm-memory-vram:\t102400 KiB\ndrm-memory-gtt:\t51200 KiB\n";
-        assert_eq!(parse_drm_client(text), Some(DrmClient { pdev: "0000:03:00.0".to_string(), client_id: 7, resident: 153600, shared: 0 }));
+        assert_eq!(
+            parse_drm_client(text),
+            Some(DrmClient { pdev: "0000:03:00.0".to_string(), client_id: 7, resident: 153600, shared: 0 })
+        );
     }
 
     #[test]
@@ -411,14 +438,20 @@ drm-engine-video-enhance:\t0 ns\n";
         // A driver could report both naming styles in the same file; resident, when present,
         // wins outright rather than being added to the fallback.
         let text = "drm-driver:\ti915\ndrm-pdev:\t0000:00:02.0\ndrm-client-id:\t4\ndrm-resident-system0:\t1000 KiB\ndrm-memory-system0:\t9999 KiB\n";
-        assert_eq!(parse_drm_client(text), Some(DrmClient { pdev: "0000:00:02.0".to_string(), client_id: 4, resident: 1000, shared: 0 }));
+        assert_eq!(
+            parse_drm_client(text),
+            Some(DrmClient { pdev: "0000:00:02.0".to_string(), client_id: 4, resident: 1000, shared: 0 })
+        );
     }
 
     #[test]
     fn parse_drm_client_treats_a_bare_zero_resident_value_as_present_not_missing() {
         // If a bare "0" failed to parse, this would fall back to drm-memory-system0's 99999.
         let text = "drm-driver:\ti915\ndrm-pdev:\t0000:00:02.0\ndrm-client-id:\t4\ndrm-resident-system0:\t0\ndrm-memory-system0:\t99999 KiB\n";
-        assert_eq!(parse_drm_client(text), Some(DrmClient { pdev: "0000:00:02.0".to_string(), client_id: 4, resident: 0, shared: 0 }));
+        assert_eq!(
+            parse_drm_client(text),
+            Some(DrmClient { pdev: "0000:00:02.0".to_string(), client_id: 4, resident: 0, shared: 0 })
+        );
     }
 
     /// The fallback is selected by the modern key being absent, never by its value failing to
@@ -426,14 +459,20 @@ drm-engine-video-enhance:\t0 ns\n";
     #[test]
     fn an_unparseable_resident_value_does_not_fall_back_to_the_legacy_field() {
         let text = "drm-driver:\ti915\ndrm-pdev:\t0000:00:02.0\ndrm-client-id:\t4\ndrm-resident-system0:\t50 MiB\ndrm-memory-system0:\t99999 KiB\n";
-        assert_eq!(parse_drm_client(text), Some(DrmClient { pdev: "0000:00:02.0".to_string(), client_id: 4, resident: 0, shared: 0 }));
+        assert_eq!(
+            parse_drm_client(text),
+            Some(DrmClient { pdev: "0000:00:02.0".to_string(), client_id: 4, resident: 0, shared: 0 })
+        );
     }
 
     #[test]
     fn parse_drm_client_ignores_a_field_reported_in_a_unit_other_than_kib() {
         // Misreading "50 MiB" as 50 KiB would under-report by 1024x; dropped instead.
         let text = "drm-driver:\ti915\ndrm-pdev:\t0000:00:02.0\ndrm-client-id:\t4\ndrm-resident-system0:\t50 MiB\ndrm-resident-other:\t1000 KiB\n";
-        assert_eq!(parse_drm_client(text), Some(DrmClient { pdev: "0000:00:02.0".to_string(), client_id: 4, resident: 1000, shared: 0 }));
+        assert_eq!(
+            parse_drm_client(text),
+            Some(DrmClient { pdev: "0000:00:02.0".to_string(), client_id: 4, resident: 1000, shared: 0 })
+        );
     }
 
     // ---- fold_drm_clients ----
@@ -468,7 +507,11 @@ drm-engine-video-enhance:\t0 ns\n";
 
     #[test]
     fn interval_from_env_is_none_for_zero() {
-        assert_eq!(interval_from_env(Some("0")), None, "0 means the periodic sampler is off, not an interval of zero seconds");
+        assert_eq!(
+            interval_from_env(Some("0")),
+            None,
+            "0 means the periodic sampler is off, not an interval of zero seconds"
+        );
     }
 
     #[test]
@@ -486,7 +529,10 @@ drm-engine-video-enhance:\t0 ns\n";
     #[test]
     fn report_line_formats_total_supervisor_and_one_clause_per_renderer_in_order() {
         let sample = Sample {
-            supervisor: ProcessMemory { rollup: Rollup { pss: 8192, uss: 0 }, gpu: Gpu { resident: 0, shared: 0, clients: 0 } },
+            supervisor: ProcessMemory {
+                rollup: Rollup { pss: 8192, uss: 0 },
+                gpu: Gpu { resident: 0, shared: 0, clients: 0 },
+            },
             renderers: vec![
                 (
                     0,
@@ -518,8 +564,17 @@ drm-engine-video-enhance:\t0 ns\n";
         // docs/adr/0043 decision 1: total pss is a PSS sum, not a PSS+USS sum -- USS is reported
         // per renderer only.
         let sample = Sample {
-            supervisor: ProcessMemory { rollup: Rollup { pss: 1024, uss: 999_999 }, gpu: Gpu { resident: 999_999, shared: 999_999, clients: 1 } },
-            renderers: vec![(0, ProcessMemory { rollup: Rollup { pss: 1024, uss: 999_999 }, gpu: Gpu { resident: 999_999, shared: 999_999, clients: 1 } })],
+            supervisor: ProcessMemory {
+                rollup: Rollup { pss: 1024, uss: 999_999 },
+                gpu: Gpu { resident: 999_999, shared: 999_999, clients: 1 },
+            },
+            renderers: vec![(
+                0,
+                ProcessMemory {
+                    rollup: Rollup { pss: 1024, uss: 999_999 },
+                    gpu: Gpu { resident: 999_999, shared: 999_999, clients: 1 },
+                },
+            )],
         };
         assert!(report_line("check", &sample).starts_with("[oblisk-memory] check: total pss 2.0 MiB;"));
     }

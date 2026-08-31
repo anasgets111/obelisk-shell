@@ -144,8 +144,7 @@ pub fn expand_instances(specs: &[SurfaceSpec], outputs: &[OutputGeometry]) -> Ve
 /// `SurfaceInstance`'s own `declared_id` on `crate::wayland::TrackedSurface` instead of re-deriving
 /// it here. That is a wider change than this one caller justifies.
 pub fn is_instance_of(instance_id: &str, declared_id: &str) -> bool {
-    instance_id == declared_id
-        || instance_id.strip_prefix(declared_id).is_some_and(|rest| rest.starts_with('@'))
+    instance_id == declared_id || instance_id.strip_prefix(declared_id).is_some_and(|rest| rest.starts_with('@'))
 }
 
 /// What one output change does to a live generation's surface instances (docs/adr/0038 decision 3:
@@ -198,7 +197,9 @@ pub fn reconcile_instances(current: &[SurfaceInstance], fresh: &[SurfaceInstance
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::node::{Anchor, KeyboardInteractivity, LayerKind, PanelSpec, SizeMode, SurfaceTopology, WindowSpec};
+    use crate::layout::node::{
+        Anchor, KeyboardInteractivity, LayerKind, PanelSpec, SizeMode, SurfaceTopology, WindowSpec,
+    };
 
     fn spec(id: &str, monitor: &str) -> SurfaceSpec {
         SurfaceSpec::Panel(PanelSpec {
@@ -236,10 +237,7 @@ mod tests {
         let outputs = [output("eDP-1", 1920.0, 1080.0), output("DP-1", 3840.0, 2160.0)];
         let instances = expand_instances(&[spec("bar", "All")], &outputs);
 
-        assert_eq!(
-            instances.iter().map(|i| i.instance_id.as_str()).collect::<Vec<_>>(),
-            ["bar@eDP-1", "bar@DP-1"]
-        );
+        assert_eq!(instances.iter().map(|i| i.instance_id.as_str()).collect::<Vec<_>>(), ["bar@eDP-1", "bar@DP-1"]);
         assert_eq!(instances[0].available, LogicalSize { width: 1920.0, height: 1080.0 });
         assert_eq!(instances[1].available, LogicalSize { width: 3840.0, height: 2160.0 });
         assert_eq!(instances[0].declared_id, "bar");
@@ -273,7 +271,10 @@ mod tests {
         let instances = expand_instances(&[window("settings")], &outputs);
 
         assert_eq!(instances.len(), 1);
-        assert_eq!(instances[0].instance_id, "settings", "no `@output` suffix: there is no output in the declaration to name");
+        assert_eq!(
+            instances[0].instance_id, "settings",
+            "no `@output` suffix: there is no output in the declaration to name"
+        );
         assert_eq!(instances[0].declared_id, "settings");
         assert!(instances[0].output.is_empty());
         assert_eq!(instances[0].available, LogicalSize { width: 1920.0, height: 1080.0 });
@@ -320,7 +321,10 @@ mod tests {
 
     #[test]
     fn a_popup_gets_one_instance_on_its_bare_id_however_many_monitors_are_connected() {
-        let instances = expand_instances(&[popup("menu", "bar")], &[output("eDP-1", 1920.0, 1080.0), output("DP-1", 3840.0, 2160.0)]);
+        let instances = expand_instances(
+            &[popup("menu", "bar")],
+            &[output("eDP-1", 1920.0, 1080.0), output("DP-1", 3840.0, 2160.0)],
+        );
 
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].instance_id, "menu");
@@ -390,13 +394,17 @@ mod tests {
     #[test]
     fn a_plugged_in_monitor_adds_one_instance_and_leaves_the_existing_one_alone() {
         let current = [configured("bar@eDP-1", "bar", "eDP-1", 1920.0, 32.0)];
-        let fresh = expand_instances(&[spec("bar", "All")], &[output("eDP-1", 1920.0, 1080.0), output("DP-1", 3840.0, 2160.0)]);
+        let fresh =
+            expand_instances(&[spec("bar", "All")], &[output("eDP-1", 1920.0, 1080.0), output("DP-1", 3840.0, 2160.0)]);
 
         let reconcile = reconcile_instances(&current, &fresh);
 
         assert_eq!(reconcile.added.iter().map(|i| i.instance_id.as_str()).collect::<Vec<_>>(), ["bar@DP-1"]);
         assert!(reconcile.removed.is_empty());
-        assert_eq!(reconcile.instances.iter().map(|i| i.instance_id.as_str()).collect::<Vec<_>>(), ["bar@eDP-1", "bar@DP-1"]);
+        assert_eq!(
+            reconcile.instances.iter().map(|i| i.instance_id.as_str()).collect::<Vec<_>>(),
+            ["bar@eDP-1", "bar@DP-1"]
+        );
     }
 
     #[test]

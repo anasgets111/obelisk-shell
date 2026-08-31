@@ -14,7 +14,8 @@ fn round_milli_c(milli_c: i64) -> i64 {
 /// `preference`, trying `preference` in order (docs/adr/0035) -- preference-list order wins
 /// over directory iteration order.
 pub fn resolve_chip(hwmon_root: &Path, preference: &[&str]) -> Option<PathBuf> {
-    let entries: Vec<PathBuf> = std::fs::read_dir(hwmon_root).ok()?.filter_map(|entry| entry.ok().map(|entry| entry.path())).collect();
+    let entries: Vec<PathBuf> =
+        std::fs::read_dir(hwmon_root).ok()?.filter_map(|entry| entry.ok().map(|entry| entry.path())).collect();
     for wanted in preference {
         for dir in &entries {
             if let Ok(name) = std::fs::read_to_string(dir.join("name"))
@@ -60,7 +61,9 @@ fn read_primary_sensor(chip_dir: &Path) -> Option<i64> {
     let entries = std::fs::read_dir(chip_dir).ok()?;
     let lowest = entries
         .filter_map(|e| e.ok())
-        .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix("_input")?.strip_prefix("temp")?.parse::<u32>().ok()))
+        .filter_map(|e| {
+            e.file_name().to_str().and_then(|n| n.strip_suffix("_input")?.strip_prefix("temp")?.parse::<u32>().ok())
+        })
         .min()?;
     let value = std::fs::read_to_string(chip_dir.join(format!("temp{lowest}_input"))).ok()?;
     value.trim().parse::<i64>().ok().map(round_milli_c)

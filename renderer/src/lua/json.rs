@@ -136,17 +136,15 @@ mod tests {
         let lua = lua_with_json();
         // With three arguments `table.insert` reads the second as a position, so a decoder that
         // always returned a trailing nil would raise here rather than insert.
-        let count: i64 = lua
-            .load(r#"local t = {} table.insert(t, json.decode('{"a":1}')) return #t"#)
-            .eval()
-            .unwrap();
+        let count: i64 = lua.load(r#"local t = {} table.insert(t, json.decode('{"a":1}')) return #t"#).eval().unwrap();
         assert_eq!(count, 1);
     }
 
     #[test]
     fn decode_reads_a_json_array_as_a_one_based_lua_array() {
         let lua = lua_with_json();
-        let (len, second): (i64, String) = lua.load(r#"local t = json.decode('["a","b"]') return #t, t[1]"#).eval().unwrap();
+        let (len, second): (i64, String) =
+            lua.load(r#"local t = json.decode('["a","b"]') return #t, t[1]"#).eval().unwrap();
         assert_eq!((len, second.as_str()), (2, "a"));
     }
 
@@ -155,7 +153,11 @@ mod tests {
         let lua = lua_with_json();
         lua.globals().set("raw", lua.create_string(b"{\"name\":\"\xff\xfe\"}").unwrap()).unwrap();
         let (value, message): (Value, Option<String>) = lua.load("return json.decode(raw)").eval().unwrap();
-        assert_eq!(value, Value::Nil, "a subprocess emitting a non-utf8 byte must not raise past the config's error check");
+        assert_eq!(
+            value,
+            Value::Nil,
+            "a subprocess emitting a non-utf8 byte must not raise past the config's error check"
+        );
         assert!(message.is_some());
     }
 
@@ -164,7 +166,10 @@ mod tests {
         let lua = lua_with_json();
         let (value, message): (Value, Option<String>) = lua.load(r#"return json.decode('null')"#).eval().unwrap();
         assert_eq!(value, Value::Nil);
-        assert_eq!(message, None, "it succeeded, so there is no message -- but `if t then` cannot tell that apart from a parse error");
+        assert_eq!(
+            message, None,
+            "it succeeded, so there is no message -- but `if t then` cannot tell that apart from a parse error"
+        );
     }
 
     /// A real captured `niri msg -j focused-window` line, worth pinning over a synthetic fixture
@@ -187,7 +192,10 @@ mod tests {
             )
             .eval()
             .unwrap();
-        assert_eq!(title, "\u{25d0} Docs/build-steps.md next step", "a \\uXXXX escape has to come back out as the character it names");
+        assert_eq!(
+            title, "\u{25d0} Docs/build-steps.md next step",
+            "a \\uXXXX escape has to come back out as the character it names"
+        );
         assert!(scrolling_absent, "a null two levels down has to erase its key like a top-level one");
         assert_eq!(width, 1536, "an integer array element stays an integer, not a float");
     }

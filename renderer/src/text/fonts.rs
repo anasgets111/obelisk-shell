@@ -98,8 +98,12 @@ fn system_fallback(chain: &[&str]) -> ResolvedFonts {
     let mut db = Database::new();
     db.load_system_fonts();
     let query = Query { families: &[Family::SansSerif], ..Default::default() };
-    let id = db.query(&query).or_else(|| db.faces().next().map(|face| face.id)).expect("fontdb has no loaded faces at all, system fallback exhausted");
-    let primary_family = db.face(id).expect("queried id must be in the database that produced it").families[0].0.clone();
+    let id = db
+        .query(&query)
+        .or_else(|| db.faces().next().map(|face| face.id))
+        .expect("fontdb has no loaded faces at all, system fallback exhausted");
+    let primary_family =
+        db.face(id).expect("queried id must be in the database that produced it").families[0].0.clone();
     ResolvedFonts { db, primary_family }
 }
 

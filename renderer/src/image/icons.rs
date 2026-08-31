@@ -41,9 +41,7 @@ pub fn resolve(name: &str, size: u16) -> Option<PathBuf> {
     if Path::new(name).is_absolute() {
         return Some(PathBuf::from(name));
     }
-    memoized(name, size, || {
-        freedesktop_icons::lookup(name).with_theme(theme()).with_size(size).with_cache().find()
-    })
+    memoized(name, size, || freedesktop_icons::lookup(name).with_theme(theme()).with_size(size).with_cache().find())
 }
 
 /// [`resolve`]'s memo, with the filesystem walk passed in so a test can count how often it runs.
@@ -56,12 +54,7 @@ fn memoized(name: &str, size: u16, lookup: impl FnOnce() -> Option<PathBuf>) -> 
     let found = lookup();
     // Re-locked rather than held across `lookup`: it walks the filesystem, and holding the map for
     // that would serialize every other caller behind the slowest possible path.
-    memo()
-        .lock()
-        .expect("icon memo poisoned")
-        .entry(size)
-        .or_default()
-        .insert(name.to_string(), found.clone());
+    memo().lock().expect("icon memo poisoned").entry(size).or_default().insert(name.to_string(), found.clone());
     found
 }
 
@@ -178,10 +171,7 @@ mod tests {
     fn the_resolved_theme_is_a_directory_under_an_icon_search_path() {
         let theme = theme();
         assert!(!theme.is_empty());
-        assert!(
-            !theme.contains('/'),
-            "the theme is a directory name, not a path, got {theme:?}"
-        );
+        assert!(!theme.contains('/'), "the theme is a directory name, not a path, got {theme:?}");
     }
 
     #[test]
@@ -203,10 +193,22 @@ mod tests {
     fn the_memo_keys_on_both_name_and_size() {
         // A collision here draws the *wrong* icon rather than none, which is the harder failure to
         // notice: a bar full of plausible-looking icons that are not the ones asked for.
-        assert_eq!(memoized("oblisk-test-beta", 16, || Some(PathBuf::from("/memo/beta-16"))), Some(PathBuf::from("/memo/beta-16")));
-        assert_eq!(memoized("oblisk-test-beta", 32, || Some(PathBuf::from("/memo/beta-32"))), Some(PathBuf::from("/memo/beta-32")));
-        assert_eq!(memoized("oblisk-test-gamma", 16, || Some(PathBuf::from("/memo/gamma-16"))), Some(PathBuf::from("/memo/gamma-16")));
-        assert_eq!(memoized("oblisk-test-beta", 16, || panic!("a remembered name must not be looked up again")), Some(PathBuf::from("/memo/beta-16")));
+        assert_eq!(
+            memoized("oblisk-test-beta", 16, || Some(PathBuf::from("/memo/beta-16"))),
+            Some(PathBuf::from("/memo/beta-16"))
+        );
+        assert_eq!(
+            memoized("oblisk-test-beta", 32, || Some(PathBuf::from("/memo/beta-32"))),
+            Some(PathBuf::from("/memo/beta-32"))
+        );
+        assert_eq!(
+            memoized("oblisk-test-gamma", 16, || Some(PathBuf::from("/memo/gamma-16"))),
+            Some(PathBuf::from("/memo/gamma-16"))
+        );
+        assert_eq!(
+            memoized("oblisk-test-beta", 16, || panic!("a remembered name must not be looked up again")),
+            Some(PathBuf::from("/memo/beta-16"))
+        );
     }
 
     #[test]

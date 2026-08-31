@@ -18,7 +18,7 @@ use femtovg::{Align, Canvas, Color, FontId, Paint, TextContext};
 use crate::layout::node::{Rgba, TextAlign};
 use crate::text::shaping::FontData;
 
-use super::snap::{snap_to_physical, LogicalRect};
+use super::snap::{LogicalRect, snap_to_physical};
 
 /// A FemtoVG canvas bound to the calling thread's current EGL/GL context, with the declared
 /// font chain loaded and ready to draw with.
@@ -102,7 +102,15 @@ impl TextPainter {
     /// Phase 4, point 3) in `color`. Does not flush or swap buffers -- `layout::paint`'s tree
     /// walk draws a whole surface's worth of nodes onto this same canvas and flushes once at
     /// the end (build-steps.md Phase 19 item 6).
-    pub fn draw_line(&mut self, text: &str, rect: LogicalRect, font_size: f32, scale: f32, color: Rgba, align: TextAlign) {
+    pub fn draw_line(
+        &mut self,
+        text: &str,
+        rect: LogicalRect,
+        font_size: f32,
+        scale: f32,
+        color: Rgba,
+        align: TextAlign,
+    ) {
         let physical = snap_to_physical(rect, scale);
         // `Rgba`'s four `f32` fields exist so `Color::rgbaf` takes them with no conversion.
         let mut paint = Paint::color(Color::rgbaf(color.r, color.g, color.b, color.a));

@@ -75,6 +75,9 @@ pub(super) async fn bind_root(connection: &zbus::Connection, bus_name: &str) -> 
     MprisRootProxy::builder(connection).destination(bus_name.to_string())?.build().await
 }
 
-pub(super) async fn bind_player(connection: &zbus::Connection, bus_name: &str) -> zbus::Result<MprisPlayerProxy<'static>> {
+pub(super) async fn bind_player(
+    connection: &zbus::Connection,
+    bus_name: &str,
+) -> zbus::Result<MprisPlayerProxy<'static>> {
     MprisPlayerProxy::builder(connection).destination(bus_name.to_string())?.build().await
 }

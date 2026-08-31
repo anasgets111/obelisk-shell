@@ -61,14 +61,18 @@ impl NiriLink {
         let mut socket = match niri_ipc::socket::Socket::connect() {
             Ok(socket) => socket,
             Err(err) => {
-                eprintln!("keyboard: failed to connect to the niri IPC socket; layout reporting disabled for this run: {err}");
+                eprintln!(
+                    "keyboard: failed to connect to the niri IPC socket; layout reporting disabled for this run: {err}"
+                );
                 return None;
             }
         };
         match socket.send(niri_ipc::Request::EventStream) {
             Ok(Ok(niri_ipc::Response::Handled)) => {}
             Ok(Ok(_)) => {
-                eprintln!("keyboard: unexpected reply to niri EventStream request; layout reporting disabled for this run");
+                eprintln!(
+                    "keyboard: unexpected reply to niri EventStream request; layout reporting disabled for this run"
+                );
                 return None;
             }
             Ok(Err(msg)) => {
@@ -136,7 +140,9 @@ impl CompositorLink for NiriLink {
                     return;
                 }
             };
-            let request = niri_ipc::Request::Action(niri_ipc::Action::SwitchLayout { layout: niri_ipc::LayoutSwitchTarget::Index(index) });
+            let request = niri_ipc::Request::Action(niri_ipc::Action::SwitchLayout {
+                layout: niri_ipc::LayoutSwitchTarget::Index(index),
+            });
             if let Err(err) = socket.send(request) {
                 eprintln!("keyboard: niri SwitchLayout request failed: {err}");
             }
@@ -175,11 +181,16 @@ struct HyprlandKeyboard {
 fn parse_hyprland_devices(json: &str) -> Option<HyprlandKeyboard> {
     let root: serde_json::Value = serde_json::from_str(json).ok()?;
     let keyboards = root.get("keyboards")?.as_array()?;
-    let parsed: Vec<HyprlandKeyboard> = keyboards.iter().filter_map(|k| serde_json::from_value(k.clone()).ok()).collect();
+    let parsed: Vec<HyprlandKeyboard> =
+        keyboards.iter().filter_map(|k| serde_json::from_value(k.clone()).ok()).collect();
     parsed.iter().find(|k| k.main).cloned().or_else(|| parsed.into_iter().next())
 }
 
-fn apply_hyprland_layout(state: &Arc<Mutex<KeyboardState>>, device_name: &Arc<Mutex<Option<String>>>, keyboard: &HyprlandKeyboard) {
+fn apply_hyprland_layout(
+    state: &Arc<Mutex<KeyboardState>>,
+    device_name: &Arc<Mutex<Option<String>>>,
+    keyboard: &HyprlandKeyboard,
+) {
     let mut guard = state.lock().unwrap();
     guard.active_layout = keyboard.active_keymap.clone();
     guard.layout_count = keyboard.layout.split(',').filter(|s| !s.is_empty()).count() as u32;
@@ -221,7 +232,11 @@ impl ResyncSequence {
     }
 }
 
-async fn resync_hyprland_layout(state: &Arc<Mutex<KeyboardState>>, device_name: &Arc<Mutex<Option<String>>>, sequence: &ResyncSequence) {
+async fn resync_hyprland_layout(
+    state: &Arc<Mutex<KeyboardState>>,
+    device_name: &Arc<Mutex<Option<String>>>,
+    sequence: &ResyncSequence,
+) {
     let ticket = sequence.ticket();
     let output = match tokio::process::Command::new("hyprctl").args(["-j", "devices"]).output().await {
         Ok(output) if output.status.success() => output,
@@ -243,10 +258,14 @@ async fn resync_hyprland_layout(state: &Arc<Mutex<KeyboardState>>, device_name: 
             if sequence.claim(ticket) {
                 apply_hyprland_layout(state, device_name, &keyboard);
             } else {
-                eprintln!("keyboard: dropping a stale hyprctl -j devices result (a more recent layout query already applied)");
+                eprintln!(
+                    "keyboard: dropping a stale hyprctl -j devices result (a more recent layout query already applied)"
+                );
             }
         }
-        None => eprintln!("keyboard: hyprctl -j devices output didn't contain a usable keyboard entry; layout not updated this round"),
+        None => eprintln!(
+            "keyboard: hyprctl -j devices output didn't contain a usable keyboard entry; layout not updated this round"
+        ),
     }
 }
 
@@ -276,7 +295,10 @@ impl HyprlandLink {
             let stream = match UnixStream::connect(&socket_path) {
                 Ok(stream) => stream,
                 Err(err) => {
-                    eprintln!("keyboard: failed to connect to Hyprland's event socket at {}: {err}", socket_path.display());
+                    eprintln!(
+                        "keyboard: failed to connect to Hyprland's event socket at {}: {err}",
+                        socket_path.display()
+                    );
                     return;
                 }
             };
@@ -316,7 +338,9 @@ impl CompositorLink for HyprlandLink {
 
     fn switch_layout(&self, index: usize) {
         let Some(device) = self.device_name.lock().unwrap().clone() else {
-            eprintln!("keyboard: switch_layout called before Hyprland's primary keyboard device name is known; ignored");
+            eprintln!(
+                "keyboard: switch_layout called before Hyprland's primary keyboard device name is known; ignored"
+            );
             return;
         };
         let socket_path = hyprland_socket_path(&self.signature, "socket.sock");
@@ -324,7 +348,10 @@ impl CompositorLink for HyprlandLink {
             let mut stream = match tokio::net::UnixStream::connect(&socket_path).await {
                 Ok(stream) => stream,
                 Err(err) => {
-                    eprintln!("keyboard: failed to connect to Hyprland's command socket at {}: {err}", socket_path.display());
+                    eprintln!(
+                        "keyboard: failed to connect to Hyprland's command socket at {}: {err}",
+                        socket_path.display()
+                    );
                     return;
                 }
             };
@@ -407,6 +434,9 @@ mod tests {
         // SAFETY: single-threaded test, no other test in this process reads XDG_RUNTIME_DIR
         // concurrently.
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000") };
-        assert_eq!(hyprland_socket_path("abc123", "socket2.sock"), PathBuf::from("/run/user/1000/hypr/abc123/socket2.sock"));
+        assert_eq!(
+            hyprland_socket_path("abc123", "socket2.sock"),
+            PathBuf::from("/run/user/1000/hypr/abc123/socket2.sock")
+        );
     }
 }

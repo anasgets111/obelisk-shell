@@ -35,7 +35,12 @@ pub(crate) struct Namespace {
 /// **One table, so a typo is a Lua error rather than silence.** § 6.4's `lock` node constructor
 /// owns the global `lock`, and a bare `lock` signal used to silently overwrite it and break every
 /// `lock { ... }` declaration (docs/adr/0052 decision 1).
-pub(crate) fn build(loader: &Loader, dirty: &DirtyFlag, commands: &CommandSender, shell_lua_path: &Path) -> mlua::Result<Namespace> {
+pub(crate) fn build(
+    loader: &Loader,
+    dirty: &DirtyFlag,
+    commands: &CommandSender,
+    shell_lua_path: &Path,
+) -> mlua::Result<Namespace> {
     let table = loader.create_table()?;
     let mut capabilities = HashMap::new();
     for capability in shared::CAPABILITIES {
@@ -54,10 +59,8 @@ pub(crate) fn build(loader: &Loader, dirty: &DirtyFlag, commands: &CommandSender
     // A string beside `version` rather than a capability: static process information, not something
     // that pushes. The parent of `shell.lua` rather than a second call to `shared::config_dir()`,
     // so this cannot disagree with the file actually loaded.
-    table.set(
-        "config_dir",
-        shell_lua_path.parent().map(|dir| dir.to_string_lossy().into_owned()).unwrap_or_default(),
-    )?;
+    table
+        .set("config_dir", shell_lua_path.parent().map(|dir| dir.to_string_lossy().into_owned()).unwrap_or_default())?;
     loader.set_global("oblisk", table.clone())?;
     Ok(Namespace { table, capabilities, rescue, screens, screens_payload })
 }
@@ -120,8 +123,9 @@ fn version_table(loader: &Loader) -> mlua::Result<mlua::Table> {
 /// `socket::tests::oblisk_version_is_three_integers_a_config_can_compare`, which reaches this
 /// through [`build`] and so fails on the panic as well as on a wrong number.
 fn version_parts() -> [u32; 3] {
-    [env!("CARGO_PKG_VERSION_MAJOR"), env!("CARGO_PKG_VERSION_MINOR"), env!("CARGO_PKG_VERSION_PATCH")]
-        .map(|part| part.parse().expect("Cargo's CARGO_PKG_VERSION_* are the numeric components of an already-parsed semver"))
+    [env!("CARGO_PKG_VERSION_MAJOR"), env!("CARGO_PKG_VERSION_MINOR"), env!("CARGO_PKG_VERSION_PATCH")].map(|part| {
+        part.parse().expect("Cargo's CARGO_PKG_VERSION_* are the numeric components of an already-parsed semver")
+    })
 }
 
 /// `oblisk.rescue`'s `{ is_rescue, error_log }` table. `pub(crate)` for `RendererClient::set_rescue_state`,

@@ -57,7 +57,9 @@ impl std::fmt::Display for SendFrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SendFrameError::Serialize(err) => write!(f, "failed to serialize frame: {err}"),
-            SendFrameError::NoConnection { generation_id } => write!(f, "no connection registered for generation {generation_id}"),
+            SendFrameError::NoConnection { generation_id } => {
+                write!(f, "no connection registered for generation {generation_id}")
+            }
         }
     }
 }
@@ -80,11 +82,7 @@ impl GenerationRegistry {
     /// `SupervisorFrame` send goes through.
     pub fn send_frame(&self, generation_id: u32, frame: &SupervisorFrame) -> Result<(), SendFrameError> {
         let payload = serde_json::to_vec(frame).map_err(SendFrameError::Serialize)?;
-        if self.send_to(generation_id, payload) {
-            Ok(())
-        } else {
-            Err(SendFrameError::NoConnection { generation_id })
-        }
+        if self.send_to(generation_id, payload) { Ok(()) } else { Err(SendFrameError::NoConnection { generation_id }) }
     }
 
     /// Registers `tx` for `generation_id`, replacing any prior connection registered under the
@@ -127,7 +125,9 @@ fn bind(path: &Path) -> Result<UnixListener, io::Error> {
 /// sender's generation, and a channel reporting each `generation_id` the instant its
 /// connection finishes registering -- so `main.rs` can replay a capability's already-known
 /// `StateSnapshot`s the moment a generation connects, rather than dropping a push mid-hydration.
-pub fn spawn_listener(path: &Path) -> Result<(GenerationRegistry, mpsc::UnboundedReceiver<InboundFrame>, mpsc::UnboundedReceiver<u32>), io::Error> {
+pub fn spawn_listener(
+    path: &Path,
+) -> Result<(GenerationRegistry, mpsc::UnboundedReceiver<InboundFrame>, mpsc::UnboundedReceiver<u32>), io::Error> {
     let listener = bind(path)?;
     let registry = GenerationRegistry::default();
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
@@ -196,7 +196,9 @@ async fn handle_connection(
             }
             Err(FramingError::Decode(err)) => {
                 // A malformed frame doesn't kill the connection -- only a transport failure does.
-                eprintln!("control-socket frame from generation {generation_id} failed to decode as RendererFrame: {err}");
+                eprintln!(
+                    "control-socket frame from generation {generation_id} failed to decode as RendererFrame: {err}"
+                );
             }
             Err(_) => break,
         }

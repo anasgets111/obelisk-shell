@@ -119,7 +119,8 @@ fn forget_subtree(
     hashes: &mut HashMap<PathBuf, u64>,
     dir: &Path,
 ) -> bool {
-    let doomed: Vec<WatchDescriptor> = wd_to_dir.iter().filter(|(_, watched)| watched.starts_with(dir)).map(|(wd, _)| wd.clone()).collect();
+    let doomed: Vec<WatchDescriptor> =
+        wd_to_dir.iter().filter(|(_, watched)| watched.starts_with(dir)).map(|(wd, _)| wd.clone()).collect();
     for wd in doomed {
         // A failure means the kernel already invalidated this watch (deleted, not moved).
         // Nothing left to remove either way.
@@ -267,7 +268,10 @@ mod tests {
         // ISDIR arm's ponytail names, testing that race instead of the hash map.
         tokio::time::sleep(Duration::from_millis(150)).await;
         std::fs::write(dir.path().join("widgets/clock.lua"), "return 1").unwrap();
-        assert!(recv_within(&mut rx, WAIT).await.is_some(), "a file recreated under a rebuilt directory has to reload, whatever its bytes");
+        assert!(
+            recv_within(&mut rx, WAIT).await.is_some(),
+            "a file recreated under a rebuilt directory has to reload, whatever its bytes"
+        );
     }
 
     /// The layout a dotfiles repository produces -- see walk's own doc comment for why
@@ -282,7 +286,10 @@ mod tests {
         let mut rx = spawn_watcher(dir.path(), SHORT_DEBOUNCE).unwrap();
         std::fs::write(outside.path().join("clock.lua"), "return { changed = true }").unwrap();
 
-        assert!(recv_within(&mut rx, WAIT).await.is_some(), "an edit through a symlinked config subdirectory has to reload");
+        assert!(
+            recv_within(&mut rx, WAIT).await.is_some(),
+            "an edit through a symlinked config subdirectory has to reload"
+        );
     }
 
     /// A symlink pointing at an ancestor is a cycle, and following symlinks without a guard walks
@@ -336,7 +343,10 @@ mod tests {
         std::fs::write(dir.path().join("shell.lua"), "return {}").unwrap();
 
         assert!(recv_within(&mut rx, WAIT).await.is_some(), "a write to shell.lua must fire a trigger");
-        assert!(recv_within(&mut rx, SHORT_DEBOUNCE * 3).await.is_none(), "must not fire a second trigger for the same settled write");
+        assert!(
+            recv_within(&mut rx, SHORT_DEBOUNCE * 3).await.is_none(),
+            "must not fire a second trigger for the same settled write"
+        );
     }
 
     #[tokio::test]
@@ -350,7 +360,10 @@ mod tests {
         std::fs::write(&path, "return { id = 2 }").unwrap();
 
         assert!(recv_within(&mut rx, WAIT).await.is_some(), "the burst must fire a trigger");
-        assert!(recv_within(&mut rx, SHORT_DEBOUNCE * 3).await.is_none(), "a rapid burst must coalesce into exactly one trigger, not two");
+        assert!(
+            recv_within(&mut rx, SHORT_DEBOUNCE * 3).await.is_none(),
+            "a rapid burst must coalesce into exactly one trigger, not two"
+        );
     }
 
     #[tokio::test]
@@ -394,7 +407,10 @@ mod tests {
 
         std::fs::write(dir.path().join("colors.lua"), "return {}").unwrap();
 
-        assert!(recv_within(&mut rx, WAIT).await.is_some(), "any .lua file at the top level must trigger a reload, not just shell.lua");
+        assert!(
+            recv_within(&mut rx, WAIT).await.is_some(),
+            "any .lua file at the top level must trigger a reload, not just shell.lua"
+        );
     }
 
     #[tokio::test]
@@ -405,7 +421,10 @@ mod tests {
 
         std::fs::write(dir.path().join("widgets/clock.lua"), "return {}").unwrap();
 
-        assert!(recv_within(&mut rx, WAIT).await.is_some(), "a .lua file inside a subdirectory that existed at startup must trigger a reload");
+        assert!(
+            recv_within(&mut rx, WAIT).await.is_some(),
+            "a .lua file inside a subdirectory that existed at startup must trigger a reload"
+        );
     }
 
     #[tokio::test]
@@ -422,7 +441,10 @@ mod tests {
         tokio::time::sleep(SHORT_DEBOUNCE).await;
         std::fs::write(dir.path().join("widgets/clock.lua"), "return {}").unwrap();
 
-        assert!(recv_within(&mut rx, WAIT).await.is_some(), "a .lua file inside a directory created after startup must trigger a reload");
+        assert!(
+            recv_within(&mut rx, WAIT).await.is_some(),
+            "a .lua file inside a directory created after startup must trigger a reload"
+        );
     }
 
     #[tokio::test]
@@ -439,7 +461,10 @@ mod tests {
         // MODIFY/CLOSE_WRITE pair, must not count as a change.
         std::fs::write(&path, "return {}").unwrap();
 
-        assert!(recv_within(&mut rx, WAIT).await.is_none(), "rewriting identical contents must not fire a second trigger");
+        assert!(
+            recv_within(&mut rx, WAIT).await.is_none(),
+            "rewriting identical contents must not fire a second trigger"
+        );
     }
 
     #[tokio::test]

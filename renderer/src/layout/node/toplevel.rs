@@ -85,11 +85,18 @@ fn parse_size_hint(properties: &HashMap<String, Value>, property: &str) -> Resul
         return Ok(None);
     };
     let Value::Table(table) = value else {
-        return Err(invalid(property, format!("expected a `{{ width, height }}` table, got {}", preview_for_error(value))));
+        return Err(invalid(
+            property,
+            format!("expected a `{{ width, height }}` table, got {}", preview_for_error(value)),
+        ));
     };
     let axis = |key: &str| -> Result<f32, LayoutError> {
-        let n = table_number(property, table, key)?
-            .ok_or_else(|| invalid(property, format!("`{key}` is required -- a size hint names both axes, or use 0 for an unconstrained one")))?;
+        let n = table_number(property, table, key)?.ok_or_else(|| {
+            invalid(
+                property,
+                format!("`{key}` is required -- a size hint names both axes, or use 0 for an unconstrained one"),
+            )
+        })?;
         // Negative is the one value the requests refuse outright ("Using strictly negative values
         // for width or height will result in an invalid_size error"); the upper end is § 5.1's own
         // `[0, 8192]`, already enforced by `parse_size_mode` for the same quantity on the same node.
@@ -117,7 +124,9 @@ fn check_max_size_above_min(min: Option<SizeHint>, max: Option<SizeHint>) -> Res
         if max_n > 0.0 && max_n < min_n {
             return Err(invalid(
                 "max_size",
-                format!("`{axis}` is {max_n}, below `min_size`'s {min_n} -- a maximum under the minimum raises xdg_toplevel's invalid_size"),
+                format!(
+                    "`{axis}` is {max_n}, below `min_size`'s {min_n} -- a maximum under the minimum raises xdg_toplevel's invalid_size"
+                ),
             ));
         }
     }
@@ -160,13 +169,7 @@ pub fn window_spec(properties: &HashMap<String, Value>) -> Result<WindowSpec, La
     let min_size = parse_size_hint(properties, "min_size")?;
     let max_size = parse_size_hint(properties, "max_size")?;
     check_max_size_above_min(min_size, max_size)?;
-    Ok(WindowSpec {
-        id,
-        title: parse_title(properties)?,
-        app_id,
-        min_size,
-        max_size,
-    })
+    Ok(WindowSpec { id, title: parse_title(properties)?, app_id, min_size, max_size })
 }
 
 /// § 6.3's `anchor` and `gravity`, which share one value set. `layout`'s own enum rather than
@@ -255,14 +258,8 @@ impl ConstraintAdjustment {
     /// The protocol's own default: never move the popup, even when it falls off-screen. What an
     /// explicitly empty array parses to, and the base [`parse_constraint_adjustment`] accumulates
     /// named entries onto.
-    pub const NONE: Self = Self {
-        slide_x: false,
-        slide_y: false,
-        flip_x: false,
-        flip_y: false,
-        resize_x: false,
-        resize_y: false,
-    };
+    pub const NONE: Self =
+        Self { slide_x: false, slide_y: false, flip_x: false, flip_y: false, resize_x: false, resize_y: false };
 }
 
 impl Default for ConstraintAdjustment {
@@ -383,7 +380,8 @@ pub fn parse_anchor_rect(properties: &HashMap<String, Value>) -> Result<LogicalR
             format!("expected an `{{ x, y, width, height }}` table, got {}", preview_for_error(value)),
         ));
     };
-    let origin = |key: &str| -> Result<f32, LayoutError> { Ok(table_number("anchor_rect", table, key)?.unwrap_or(0.0)) };
+    let origin =
+        |key: &str| -> Result<f32, LayoutError> { Ok(table_number("anchor_rect", table, key)?.unwrap_or(0.0)) };
     let extent = |key: &str| -> Result<f32, LayoutError> {
         let n = table_number("anchor_rect", table, key)?.ok_or_else(|| {
             invalid("anchor_rect", format!("`{key}` is required and must be greater than 0 -- a zero-size anchor rectangle raises invalid_positioner"))
@@ -391,17 +389,14 @@ pub fn parse_anchor_rect(properties: &HashMap<String, Value>) -> Result<LogicalR
         if !(n > 0.0 && n <= 8192.0) {
             return Err(invalid(
                 "anchor_rect",
-                format!("`{key}` must be within (0, 8192], got {n} -- a zero or negative anchor rectangle size is a protocol error"),
+                format!(
+                    "`{key}` must be within (0, 8192], got {n} -- a zero or negative anchor rectangle size is a protocol error"
+                ),
             ));
         }
         Ok(n)
     };
-    Ok(LogicalRect {
-        x: origin("x")?,
-        y: origin("y")?,
-        width: extent("width")?,
-        height: extent("height")?,
-    })
+    Ok(LogicalRect { x: origin("x")?, y: origin("y")?, width: extent("width")?, height: extent("height")? })
 }
 
 /// § 6.3's `width`/`height`. **Not** [`parse_size_mode`], and that is the whole reason this is a
@@ -422,10 +417,14 @@ fn parse_popup_extent(properties: &HashMap<String, Value>, property: &str) -> Re
     let value = properties.get(property).ok_or_else(|| {
         invalid(property, "required for `popup`, got nothing -- a popup has no \"Fill\", and set_size raises invalid_input on a zero size")
     })?;
-    let n = value_as_f32(property, value)?
-        .ok_or_else(|| invalid(property, format!("expected a number, got {} -- a popup has no \"Fill\"", preview_for_error(value))))?;
+    let n = value_as_f32(property, value)?.ok_or_else(|| {
+        invalid(property, format!("expected a number, got {} -- a popup has no \"Fill\"", preview_for_error(value)))
+    })?;
     if !(n > 0.0 && n <= 8192.0) {
-        return Err(invalid(property, format!("must be within (0, 8192], got {n} -- set_size raises invalid_input on a zero or negative size")));
+        return Err(invalid(
+            property,
+            format!("must be within (0, 8192], got {n} -- set_size raises invalid_input on a zero or negative size"),
+        ));
     }
     Ok(n)
 }
@@ -515,582 +514,593 @@ mod tests {
     use super::*;
     use crate::lua::nodes::deserialize_lua_table;
 
-        fn lua() -> mlua::Lua {
-            mlua::Lua::new()
-        }
+    fn lua() -> mlua::Lua {
+        mlua::Lua::new()
+    }
 
-        fn props_from_table(table: &mlua::Table) -> HashMap<String, Value> {
-            deserialize_lua_table(table).unwrap().properties
-        }
+    fn props_from_table(table: &mlua::Table) -> HashMap<String, Value> {
+        deserialize_lua_table(table).unwrap().properties
+    }
 
-        #[test]
-        fn window_spec_reads_every_toplevel_field_in_one_pass() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(
-                    r#"return { kind = "window", id = "settings", title = "Oblisk Settings", app_id = "oblisk.settings",
+    #[test]
+    fn window_spec_reads_every_toplevel_field_in_one_pass() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(
+                r#"return { kind = "window", id = "settings", title = "Oblisk Settings", app_id = "oblisk.settings",
                                 min_size = { width = 320, height = 240 }, max_size = { width = 1280, height = 960 } }"#,
-                )
-                .eval()
-                .unwrap();
-            let spec = window_spec(&props_from_table(&table)).unwrap();
-            assert_eq!(
-                spec,
-                WindowSpec {
-                    id: "settings".to_string(),
-                    title: "Oblisk Settings".to_string(),
-                    app_id: "oblisk.settings".to_string(),
-                    min_size: Some(SizeHint { width: 320.0, height: 240.0 }),
-                    max_size: Some(SizeHint { width: 1280.0, height: 960.0 }),
-                }
-            );
-        }
+            )
+            .eval()
+            .unwrap();
+        let spec = window_spec(&props_from_table(&table)).unwrap();
+        assert_eq!(
+            spec,
+            WindowSpec {
+                id: "settings".to_string(),
+                title: "Oblisk Settings".to_string(),
+                app_id: "oblisk.settings".to_string(),
+                min_size: Some(SizeHint { width: 320.0, height: 240.0 }),
+                max_size: Some(SizeHint { width: 1280.0, height: 960.0 }),
+            }
+        );
+    }
 
-        #[test]
-        fn a_window_without_an_id_is_rejected_the_same_way_a_panel_is() {
-            let lua = lua();
-            let table: mlua::Table = lua.load(r#"return { kind = "window", title = "x" }"#).eval().unwrap();
-            assert!(matches!(
-                window_spec(&props_from_table(&table)).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "id"
-            ));
-        }
+    #[test]
+    fn a_window_without_an_id_is_rejected_the_same_way_a_panel_is() {
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "window", title = "x" }"#).eval().unwrap();
+        assert!(matches!(
+            window_spec(&props_from_table(&table)).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "id"
+        ));
+    }
 
-        #[test]
-        fn window_title_absent_defaults_to_the_empty_string_rather_than_the_id() {
-            let lua = lua();
-            let table: mlua::Table = lua.load(r#"return { kind = "window", id = "settings" }"#).eval().unwrap();
-            assert_eq!(window_spec(&props_from_table(&table)).unwrap().title, "");
-        }
+    #[test]
+    fn window_title_absent_defaults_to_the_empty_string_rather_than_the_id() {
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "window", id = "settings" }"#).eval().unwrap();
+        assert_eq!(window_spec(&props_from_table(&table)).unwrap().title, "");
+    }
 
-        #[test]
-        fn window_app_id_absent_defaults_to_oblisk_dash_id() {
-            let lua = lua();
-            let table: mlua::Table = lua.load(r#"return { kind = "window", id = "settings" }"#).eval().unwrap();
-            assert_eq!(window_spec(&props_from_table(&table)).unwrap().app_id, "oblisk-settings");
-        }
+    #[test]
+    fn window_app_id_absent_defaults_to_oblisk_dash_id() {
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "window", id = "settings" }"#).eval().unwrap();
+        assert_eq!(window_spec(&props_from_table(&table)).unwrap().app_id, "oblisk-settings");
+    }
 
-        #[test]
-        fn window_min_size_and_max_size_are_absent_when_undeclared() {
-            let lua = lua();
-            let table: mlua::Table = lua.load(r#"return { kind = "window", id = "settings" }"#).eval().unwrap();
-            let spec = window_spec(&props_from_table(&table)).unwrap();
-            assert_eq!(spec.min_size, None);
-            assert_eq!(spec.max_size, None);
-        }
+    #[test]
+    fn window_min_size_and_max_size_are_absent_when_undeclared() {
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "window", id = "settings" }"#).eval().unwrap();
+        let spec = window_spec(&props_from_table(&table)).unwrap();
+        assert_eq!(spec.min_size, None);
+        assert_eq!(spec.max_size, None);
+    }
 
-        #[test]
-        fn a_negative_window_min_size_axis_is_a_layout_error_rather_than_invalid_size() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(r#"return { kind = "window", id = "settings", min_size = { width = -1, height = 240 } }"#)
-                .eval()
-                .unwrap();
-            assert!(matches!(
-                window_spec(&props_from_table(&table)).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "min_size"
-            ));
-        }
+    #[test]
+    fn a_negative_window_min_size_axis_is_a_layout_error_rather_than_invalid_size() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "window", id = "settings", min_size = { width = -1, height = 240 } }"#)
+            .eval()
+            .unwrap();
+        assert!(matches!(
+            window_spec(&props_from_table(&table)).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "min_size"
+        ));
+    }
 
-        #[test]
-        fn a_max_size_below_min_size_is_a_layout_error_rather_than_invalid_size() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(
-                    r#"return { kind = "window", id = "settings", min_size = { width = 800, height = 600 },
+    #[test]
+    fn a_max_size_below_min_size_is_a_layout_error_rather_than_invalid_size() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(
+                r#"return { kind = "window", id = "settings", min_size = { width = 800, height = 600 },
                                 max_size = { width = 400, height = 600 } }"#,
-                )
-                .eval()
-                .unwrap();
-            assert!(matches!(
-                window_spec(&props_from_table(&table)).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "max_size"
-            ));
-        }
+            )
+            .eval()
+            .unwrap();
+        assert!(matches!(
+            window_spec(&props_from_table(&table)).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "max_size"
+        ));
+    }
 
-        #[test]
-        fn a_zero_max_size_axis_means_unset_and_does_not_collide_with_min_size() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(
-                    r#"return { kind = "window", id = "settings", min_size = { width = 800, height = 600 },
+    #[test]
+    fn a_zero_max_size_axis_means_unset_and_does_not_collide_with_min_size() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(
+                r#"return { kind = "window", id = "settings", min_size = { width = 800, height = 600 },
                                 max_size = { width = 0, height = 0 } }"#,
-                )
-                .eval()
-                .unwrap();
-            assert_eq!(
-                window_spec(&props_from_table(&table)).unwrap().max_size,
-                Some(SizeHint { width: 0.0, height: 0.0 })
-            );
-        }
-
-        #[test]
-        fn a_window_size_hint_missing_an_axis_is_rejected_naming_the_axis() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(r#"return { kind = "window", id = "settings", min_size = { width = 320 } }"#)
-                .eval()
-                .unwrap();
-            assert!(matches!(
-                window_spec(&props_from_table(&table)).unwrap_err(),
-                LayoutError::InvalidProperty { property, detail } if property == "min_size" && detail.contains("height")
-            ));
-        }
-
-        #[test]
-        fn a_window_size_hint_that_is_not_a_table_is_rejected() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(r#"return { kind = "window", id = "settings", max_size = 800 }"#)
-                .eval()
-                .unwrap();
-            assert!(matches!(
-                window_spec(&props_from_table(&table)).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "max_size"
-            ));
-        }
-
-        #[test]
-        fn a_signal_in_a_window_title_resolves_because_set_title_is_valid_on_a_live_toplevel() {
-            let lua = lua();
-            crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
-            let signal = crate::lua::signal::Signal::new_live(
-                Value::String(lua.create_string("Now Playing").unwrap()),
-                crate::lua::signal::DirtyFlag::new(),
             )
-            .0;
-            lua.globals().set("t", signal).unwrap();
-            let table: mlua::Table = lua.load(r#"return { kind = "window", id = "w", title = t }"#).eval().unwrap();
-            let resolved = resolve_properties(&props_from_table(&table), "window", &lua).unwrap();
-            assert_eq!(window_spec(&resolved).unwrap().title, "Now Playing");
-        }
+            .eval()
+            .unwrap();
+        assert_eq!(
+            window_spec(&props_from_table(&table)).unwrap().max_size,
+            Some(SizeHint { width: 0.0, height: 0.0 })
+        );
+    }
 
-        #[test]
-        fn a_signal_in_a_window_app_id_resolves_because_set_app_id_is_valid_on_a_live_toplevel() {
-            let lua = lua();
-            crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
-            let signal = crate::lua::signal::Signal::new_live(
-                Value::String(lua.create_string("oblisk.later").unwrap()),
-                crate::lua::signal::DirtyFlag::new(),
-            )
-            .0;
-            lua.globals().set("a", signal).unwrap();
-            let table: mlua::Table = lua.load(r#"return { kind = "window", id = "w", app_id = a }"#).eval().unwrap();
-            let resolved = resolve_properties(&props_from_table(&table), "window", &lua).unwrap();
-            assert_eq!(window_spec(&resolved).unwrap().app_id, "oblisk.later");
-        }
+    #[test]
+    fn a_window_size_hint_missing_an_axis_is_rejected_naming_the_axis() {
+        let lua = lua();
+        let table: mlua::Table =
+            lua.load(r#"return { kind = "window", id = "settings", min_size = { width = 320 } }"#).eval().unwrap();
+        assert!(matches!(
+            window_spec(&props_from_table(&table)).unwrap_err(),
+            LayoutError::InvalidProperty { property, detail } if property == "min_size" && detail.contains("height")
+        ));
+    }
 
-        #[test]
-        fn a_signal_in_a_window_id_is_still_rejected_because_id_is_every_kinds_reconcile_identity() {
-            let lua = lua();
-            crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
-            let signal = crate::lua::signal::Signal::new_live(
-                Value::String(lua.create_string("w").unwrap()),
-                crate::lua::signal::DirtyFlag::new(),
-            )
-            .0;
-            lua.globals().set("i", signal).unwrap();
-            let table: mlua::Table = lua.load(r#"return { kind = "window", id = i }"#).eval().unwrap();
-            let resolved = resolve_properties(&props_from_table(&table), "window", &lua).unwrap();
-            assert!(matches!(
-                window_spec(&resolved).unwrap_err(),
-                LayoutError::UnsupportedSignalProperty(p) if p == "id"
-            ));
-        }
+    #[test]
+    fn a_window_size_hint_that_is_not_a_table_is_rejected() {
+        let lua = lua();
+        let table: mlua::Table =
+            lua.load(r#"return { kind = "window", id = "settings", max_size = 800 }"#).eval().unwrap();
+        assert!(matches!(
+            window_spec(&props_from_table(&table)).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "max_size"
+        ));
+    }
 
-        /// Every popup fixture needs the four required properties, so only the property under test
-        /// varies. `extra` is spliced in as further table entries, and a key it repeats *overrides* the
-        /// default above it -- a Lua table constructor performs its assignments in order, so
-        /// `{ width = 200, width = 0 }` is a table with `width == 0`. That is how a test declares one
-        /// bad value without restating the other three good ones.
-        fn popup_props(lua: &mlua::Lua, extra: &str) -> HashMap<String, Value> {
-            let table: mlua::Table = lua
-                .load(format!(
-                    r#"return {{ kind = "popup", id = "menu", parent = "bar",
+    #[test]
+    fn a_signal_in_a_window_title_resolves_because_set_title_is_valid_on_a_live_toplevel() {
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let signal = crate::lua::signal::Signal::new_live(
+            Value::String(lua.create_string("Now Playing").unwrap()),
+            crate::lua::signal::DirtyFlag::new(),
+        )
+        .0;
+        lua.globals().set("t", signal).unwrap();
+        let table: mlua::Table = lua.load(r#"return { kind = "window", id = "w", title = t }"#).eval().unwrap();
+        let resolved = resolve_properties(&props_from_table(&table), "window", &lua).unwrap();
+        assert_eq!(window_spec(&resolved).unwrap().title, "Now Playing");
+    }
+
+    #[test]
+    fn a_signal_in_a_window_app_id_resolves_because_set_app_id_is_valid_on_a_live_toplevel() {
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let signal = crate::lua::signal::Signal::new_live(
+            Value::String(lua.create_string("oblisk.later").unwrap()),
+            crate::lua::signal::DirtyFlag::new(),
+        )
+        .0;
+        lua.globals().set("a", signal).unwrap();
+        let table: mlua::Table = lua.load(r#"return { kind = "window", id = "w", app_id = a }"#).eval().unwrap();
+        let resolved = resolve_properties(&props_from_table(&table), "window", &lua).unwrap();
+        assert_eq!(window_spec(&resolved).unwrap().app_id, "oblisk.later");
+    }
+
+    #[test]
+    fn a_signal_in_a_window_id_is_still_rejected_because_id_is_every_kinds_reconcile_identity() {
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let signal = crate::lua::signal::Signal::new_live(
+            Value::String(lua.create_string("w").unwrap()),
+            crate::lua::signal::DirtyFlag::new(),
+        )
+        .0;
+        lua.globals().set("i", signal).unwrap();
+        let table: mlua::Table = lua.load(r#"return { kind = "window", id = i }"#).eval().unwrap();
+        let resolved = resolve_properties(&props_from_table(&table), "window", &lua).unwrap();
+        assert!(matches!(
+            window_spec(&resolved).unwrap_err(),
+            LayoutError::UnsupportedSignalProperty(p) if p == "id"
+        ));
+    }
+
+    /// Every popup fixture needs the four required properties, so only the property under test
+    /// varies. `extra` is spliced in as further table entries, and a key it repeats *overrides* the
+    /// default above it -- a Lua table constructor performs its assignments in order, so
+    /// `{ width = 200, width = 0 }` is a table with `width == 0`. That is how a test declares one
+    /// bad value without restating the other three good ones.
+    fn popup_props(lua: &mlua::Lua, extra: &str) -> HashMap<String, Value> {
+        let table: mlua::Table = lua
+            .load(format!(
+                r#"return {{ kind = "popup", id = "menu", parent = "bar",
                                  anchor_rect = {{ x = 10, y = 0, width = 24, height = 24 }},
                                  width = 200, height = 300 {extra} }}"#
-                ))
-                .eval()
-                .unwrap();
-            props_from_table(&table)
-        }
+            ))
+            .eval()
+            .unwrap();
+        props_from_table(&table)
+    }
 
-        #[test]
-        fn popup_spec_reads_every_positioner_field_in_one_pass() {
-            let lua = lua();
-            let props = popup_props(
-                &lua,
-                r#", anchor = "BottomLeft", gravity = "BottomRight",
+    #[test]
+    fn popup_spec_reads_every_positioner_field_in_one_pass() {
+        let lua = lua();
+        let props = popup_props(
+            &lua,
+            r#", anchor = "BottomLeft", gravity = "BottomRight",
                     constraint_adjustment = { "SlideY", "ResizeX" }, offset = { x = -4, y = 2 }, grab = false"#,
-            );
-            let spec = popup_spec(&props).unwrap();
-            assert_eq!(
-                spec,
-                PopupSpec {
-                    id: "menu".to_string(),
-                    parent: "bar".to_string(),
-                    anchor_rect: LogicalRect { x: 10.0, y: 0.0, width: 24.0, height: 24.0 },
-                    width: 200.0,
-                    height: 300.0,
-                    anchor: PopupAnchor::BottomLeft,
-                    gravity: PopupAnchor::BottomRight,
-                    constraint_adjustment: ConstraintAdjustment { slide_y: true, resize_x: true, ..ConstraintAdjustment::NONE },
-                    offset: PopupOffset { x: -4.0, y: 2.0 },
-                    grab: false,
-                }
-            );
-        }
+        );
+        let spec = popup_spec(&props).unwrap();
+        assert_eq!(
+            spec,
+            PopupSpec {
+                id: "menu".to_string(),
+                parent: "bar".to_string(),
+                anchor_rect: LogicalRect { x: 10.0, y: 0.0, width: 24.0, height: 24.0 },
+                width: 200.0,
+                height: 300.0,
+                anchor: PopupAnchor::BottomLeft,
+                gravity: PopupAnchor::BottomRight,
+                constraint_adjustment: ConstraintAdjustment {
+                    slide_y: true,
+                    resize_x: true,
+                    ..ConstraintAdjustment::NONE
+                },
+                offset: PopupOffset { x: -4.0, y: 2.0 },
+                grab: false,
+            }
+        );
+    }
 
-        #[test]
-        fn a_popup_without_a_parent_is_rejected() {
-            let lua = lua();
-            let table: mlua::Table = lua
+    #[test]
+    fn a_popup_without_a_parent_is_rejected() {
+        let lua = lua();
+        let table: mlua::Table = lua
                 .load(r#"return { kind = "popup", id = "menu", anchor_rect = { width = 1, height = 1 }, width = 8, height = 8 }"#)
                 .eval()
                 .unwrap();
-            assert!(matches!(
-                popup_spec(&props_from_table(&table)).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "parent"
-            ));
-        }
+        assert!(matches!(
+            popup_spec(&props_from_table(&table)).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "parent"
+        ));
+    }
 
-        #[test]
-        fn a_popup_with_an_empty_parent_is_rejected() {
-            let lua = lua();
-            let props = popup_props(&lua, r#", parent = """#);
-            assert!(matches!(
-                popup_spec(&props).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "parent"
-            ));
-        }
+    #[test]
+    fn a_popup_with_an_empty_parent_is_rejected() {
+        let lua = lua();
+        let props = popup_props(&lua, r#", parent = """#);
+        assert!(matches!(
+            popup_spec(&props).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "parent"
+        ));
+    }
 
-        #[test]
-        fn a_popup_without_an_anchor_rect_is_a_layout_error_rather_than_invalid_positioner() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(r#"return { kind = "popup", id = "menu", parent = "bar", width = 8, height = 8 }"#)
-                .eval()
-                .unwrap();
-            assert!(matches!(
-                popup_spec(&props_from_table(&table)).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "anchor_rect"
-            ));
-        }
+    #[test]
+    fn a_popup_without_an_anchor_rect_is_a_layout_error_rather_than_invalid_positioner() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "popup", id = "menu", parent = "bar", width = 8, height = 8 }"#)
+            .eval()
+            .unwrap();
+        assert!(matches!(
+            popup_spec(&props_from_table(&table)).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "anchor_rect"
+        ));
+    }
 
-        #[test]
-        fn a_zero_size_anchor_rect_is_a_layout_error_rather_than_invalid_positioner() {
-            let lua = lua();
-            for axis in ["width", "height"] {
-                let props = popup_props(&lua, &format!(r#", anchor_rect = {{ x = 0, y = 0, width = 24, height = 24, {axis} = 0 }}"#));
-                assert!(
-                    matches!(popup_spec(&props).unwrap_err(), LayoutError::InvalidProperty { property, .. } if property == "anchor_rect"),
-                    "a zero anchor_rect {axis} must be a LayoutError"
-                );
-            }
-        }
-
-        #[test]
-        fn a_negative_anchor_rect_size_is_a_layout_error_rather_than_invalid_input() {
-            let lua = lua();
-            let props = popup_props(&lua, r#", anchor_rect = { x = 0, y = 0, width = -24, height = 24 }"#);
-            assert!(matches!(
-                popup_spec(&props).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "anchor_rect"
-            ));
-        }
-
-        #[test]
-        fn an_anchor_rect_omitting_x_and_y_defaults_them_to_zero() {
-            let lua = lua();
-            let props = popup_props(&lua, r#", anchor_rect = { width = 24, height = 24 }"#);
-            let rect = popup_spec(&props).unwrap().anchor_rect;
-            assert_eq!(rect, LogicalRect { x: 0.0, y: 0.0, width: 24.0, height: 24.0 });
-        }
-
-        #[test]
-        fn an_anchor_rect_that_is_not_a_table_is_rejected() {
-            let lua = lua();
-            let props = popup_props(&lua, r#", anchor_rect = 24"#);
-            assert!(matches!(
-                popup_spec(&props).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "anchor_rect"
-            ));
-        }
-
-        #[test]
-        fn a_popup_missing_its_width_or_height_is_a_layout_error_rather_than_invalid_positioner() {
-            let lua = lua();
-            for (present, missing) in [("width", "height"), ("height", "width")] {
-                let table: mlua::Table = lua
-                    .load(format!(
-                        r#"return {{ kind = "popup", id = "menu", parent = "bar",
-                                     anchor_rect = {{ width = 24, height = 24 }}, {present} = 200 }}"#
-                    ))
-                    .eval()
-                    .unwrap();
-                let err = popup_spec(&props_from_table(&table)).unwrap_err();
-                assert!(
-                    matches!(&err, LayoutError::InvalidProperty { property, .. } if property == missing),
-                    "an omitted `{missing}` must be a LayoutError naming it: {err:?}"
-                );
-            }
-        }
-
-        #[test]
-        fn a_zero_popup_width_or_height_is_a_layout_error_rather_than_invalid_input() {
-            let lua = lua();
-            for axis in ["width", "height"] {
-                let props = popup_props(&lua, &format!(r#", {axis} = 0"#));
-                assert!(
-                    matches!(popup_spec(&props).unwrap_err(), LayoutError::InvalidProperty { property, .. } if property == axis),
-                    "a zero popup {axis} must be a LayoutError naming it"
-                );
-            }
-        }
-
-        #[test]
-        fn a_fill_popup_width_is_rejected_because_a_popup_has_no_fill() {
-            let lua = lua();
-            let props = popup_props(&lua, r#", width = "Fill""#);
-            assert!(matches!(
-                popup_spec(&props).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "width"
-            ));
-        }
-
-        #[test]
-        fn popup_anchor_and_gravity_read_the_same_nine_value_set() {
-            let lua = lua();
-            for (text, expected) in [
-                ("Top", PopupAnchor::Top),
-                ("Bottom", PopupAnchor::Bottom),
-                ("Left", PopupAnchor::Left),
-                ("Right", PopupAnchor::Right),
-                ("TopLeft", PopupAnchor::TopLeft),
-                ("TopRight", PopupAnchor::TopRight),
-                ("BottomLeft", PopupAnchor::BottomLeft),
-                ("BottomRight", PopupAnchor::BottomRight),
-                ("Center", PopupAnchor::Center),
-            ] {
-                let props = popup_props(&lua, &format!(r#", anchor = "{text}", gravity = "{text}""#));
-                let spec = popup_spec(&props).unwrap();
-                assert_eq!(spec.anchor, expected);
-                assert_eq!(spec.gravity, expected);
-            }
-        }
-
-        #[test]
-        fn popup_anchor_and_gravity_absent_default_to_center() {
-            let lua = lua();
-            let spec = popup_spec(&popup_props(&lua, "")).unwrap();
-            assert_eq!(spec.anchor, PopupAnchor::Center);
-            assert_eq!(spec.gravity, PopupAnchor::Center);
-        }
-
-        #[test]
-        fn an_unknown_popup_anchor_is_rejected_naming_the_property() {
-            let lua = lua();
-            let props = popup_props(&lua, r#", anchor = "Middle""#);
-            assert!(matches!(
-                popup_spec(&props).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "anchor"
-            ));
-        }
-
-        #[test]
-        fn an_unknown_popup_gravity_is_rejected_naming_the_property() {
-            let lua = lua();
-            let props = popup_props(&lua, r#", gravity = "Downward""#);
-            assert!(matches!(
-                popup_spec(&props).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "gravity"
-            ));
-        }
-
-        #[test]
-        fn constraint_adjustment_absent_defaults_to_flip_y_and_slide_x() {
-            let lua = lua();
-            assert_eq!(
-                popup_spec(&popup_props(&lua, "")).unwrap().constraint_adjustment,
-                ConstraintAdjustment { flip_y: true, slide_x: true, ..ConstraintAdjustment::NONE }
-            );
-        }
-
-        #[test]
-        fn constraint_adjustment_reads_every_named_adjustment() {
-            let lua = lua();
+    #[test]
+    fn a_zero_size_anchor_rect_is_a_layout_error_rather_than_invalid_positioner() {
+        let lua = lua();
+        for axis in ["width", "height"] {
             let props = popup_props(
                 &lua,
-                r#", constraint_adjustment = { "SlideX", "SlideY", "FlipX", "FlipY", "ResizeX", "ResizeY" }"#,
+                &format!(r#", anchor_rect = {{ x = 0, y = 0, width = 24, height = 24, {axis} = 0 }}"#),
             );
-            assert_eq!(
-                popup_spec(&props).unwrap().constraint_adjustment,
-                ConstraintAdjustment { slide_x: true, slide_y: true, flip_x: true, flip_y: true, resize_x: true, resize_y: true }
-            );
-        }
-
-        #[test]
-        fn constraint_adjustment_is_a_set_so_order_and_repetition_do_not_change_it() {
-            let lua = lua();
-            let ordered = popup_spec(&popup_props(&lua, r#", constraint_adjustment = { "FlipY", "SlideX" }"#)).unwrap();
-            let reversed = popup_spec(&popup_props(&lua, r#", constraint_adjustment = { "SlideX", "FlipY", "SlideX" }"#)).unwrap();
-            assert_eq!(ordered.constraint_adjustment, reversed.constraint_adjustment);
-        }
-
-        #[test]
-        fn an_explicitly_empty_constraint_adjustment_is_the_protocols_own_no_adjustment() {
-            let lua = lua();
-            assert_eq!(
-                popup_spec(&popup_props(&lua, r#", constraint_adjustment = {}"#)).unwrap().constraint_adjustment,
-                ConstraintAdjustment::NONE
+            assert!(
+                matches!(popup_spec(&props).unwrap_err(), LayoutError::InvalidProperty { property, .. } if property == "anchor_rect"),
+                "a zero anchor_rect {axis} must be a LayoutError"
             );
         }
+    }
 
-        #[test]
-        fn an_unknown_constraint_adjustment_entry_is_rejected() {
-            let lua = lua();
-            let props = popup_props(&lua, r#", constraint_adjustment = { "FlipY", "SlideZ" }"#);
-            assert!(matches!(
-                popup_spec(&props).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "constraint_adjustment"
-            ));
-        }
+    #[test]
+    fn a_negative_anchor_rect_size_is_a_layout_error_rather_than_invalid_input() {
+        let lua = lua();
+        let props = popup_props(&lua, r#", anchor_rect = { x = 0, y = 0, width = -24, height = 24 }"#);
+        assert!(matches!(
+            popup_spec(&props).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "anchor_rect"
+        ));
+    }
 
-        #[test]
-        fn a_constraint_adjustment_that_is_not_an_array_table_is_rejected() {
-            let lua = lua();
-            let props = popup_props(&lua, r#", constraint_adjustment = "FlipY""#);
-            assert!(matches!(
-                popup_spec(&props).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "constraint_adjustment"
-            ));
-        }
+    #[test]
+    fn an_anchor_rect_omitting_x_and_y_defaults_them_to_zero() {
+        let lua = lua();
+        let props = popup_props(&lua, r#", anchor_rect = { width = 24, height = 24 }"#);
+        let rect = popup_spec(&props).unwrap().anchor_rect;
+        assert_eq!(rect, LogicalRect { x: 0.0, y: 0.0, width: 24.0, height: 24.0 });
+    }
 
-        #[test]
-        fn popup_offset_absent_defaults_to_zero() {
-            let lua = lua();
-            assert_eq!(popup_spec(&popup_props(&lua, "")).unwrap().offset, PopupOffset { x: 0.0, y: 0.0 });
-        }
+    #[test]
+    fn an_anchor_rect_that_is_not_a_table_is_rejected() {
+        let lua = lua();
+        let props = popup_props(&lua, r#", anchor_rect = 24"#);
+        assert!(matches!(
+            popup_spec(&props).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "anchor_rect"
+        ));
+    }
 
-        #[test]
-        fn popup_offset_may_be_negative_on_either_axis() {
-            let lua = lua();
-            let props = popup_props(&lua, r#", offset = { x = -8, y = -2 }"#);
-            assert_eq!(popup_spec(&props).unwrap().offset, PopupOffset { x: -8.0, y: -2.0 });
-        }
-
-        #[test]
-        fn a_popup_offset_that_is_not_a_table_is_rejected() {
-            let lua = lua();
-            let props = popup_props(&lua, r#", offset = 4"#);
-            assert!(matches!(
-                popup_spec(&props).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "offset"
-            ));
-        }
-
-        #[test]
-        fn popup_grab_absent_defaults_to_true() {
-            let lua = lua();
-            assert!(popup_spec(&popup_props(&lua, "")).unwrap().grab);
-        }
-
-        #[test]
-        fn popup_grab_reads_the_boolean_and_rejects_anything_else() {
-            let lua = lua();
-            assert!(!popup_spec(&popup_props(&lua, ", grab = false")).unwrap().grab);
-            assert!(matches!(
-                popup_spec(&popup_props(&lua, ", grab = 1")).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "grab"
-            ));
-        }
-
-        #[test]
-        fn a_signal_in_a_popup_anchor_rect_resolves_because_the_positioner_is_rebuilt_on_every_open() {
-            let lua = lua();
-            crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
-            let table: mlua::Table = lua
-                .load(
-                    r#"return { kind = "popup", id = "menu", parent = "bar", width = 200, height = 300,
-                                anchor_rect = state("menu_anchor", { x = 4, y = 8, width = 16, height = 24 }) }"#,
-                )
-                .eval()
-                .unwrap();
-            let resolved = resolve_properties(&props_from_table(&table), "popup", &lua).unwrap();
-            assert_eq!(
-                popup_spec(&resolved).unwrap().anchor_rect,
-                LogicalRect { x: 4.0, y: 8.0, width: 16.0, height: 24.0 }
-            );
-        }
-
-        /// The same fixture as [`popup_props`] but with every property under test bound to a live
-        /// signal instead of a literal, and *not* run through [`resolve_properties`] -- which is
-        /// exactly the map `crate::socket`'s `surface_specs` parses.
-        fn unresolved_popup_props(lua: &mlua::Lua, extra: &str) -> HashMap<String, Value> {
-            crate::lua::signal::register(lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+    #[test]
+    fn a_popup_missing_its_width_or_height_is_a_layout_error_rather_than_invalid_positioner() {
+        let lua = lua();
+        for (present, missing) in [("width", "height"), ("height", "width")] {
             let table: mlua::Table = lua
                 .load(format!(
                     r#"return {{ kind = "popup", id = "menu", parent = "bar",
-                                 anchor_rect = state("a", {{ x = 4, y = 8, width = 16, height = 24 }}),
-                                 width = 200, height = 300 {extra} }}"#
+                                     anchor_rect = {{ width = 24, height = 24 }}, {present} = 200 }}"#
                 ))
                 .eval()
                 .unwrap();
-            props_from_table(&table)
+            let err = popup_spec(&props_from_table(&table)).unwrap_err();
+            assert!(
+                matches!(&err, LayoutError::InvalidProperty { property, .. } if property == missing),
+                "an omitted `{missing}` must be a LayoutError naming it: {err:?}"
+            );
         }
+    }
 
-        #[test]
-        fn a_signal_bound_popup_property_is_deferred_rather_than_rejected_before_it_resolves() {
-            let lua = lua();
-            let spec = popup_spec(&unresolved_popup_props(
-                &lua,
-                r#", width = state("w", 200), height = state("h", 300), anchor = state("an", "Top"),
+    #[test]
+    fn a_zero_popup_width_or_height_is_a_layout_error_rather_than_invalid_input() {
+        let lua = lua();
+        for axis in ["width", "height"] {
+            let props = popup_props(&lua, &format!(r#", {axis} = 0"#));
+            assert!(
+                matches!(popup_spec(&props).unwrap_err(), LayoutError::InvalidProperty { property, .. } if property == axis),
+                "a zero popup {axis} must be a LayoutError naming it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fill_popup_width_is_rejected_because_a_popup_has_no_fill() {
+        let lua = lua();
+        let props = popup_props(&lua, r#", width = "Fill""#);
+        assert!(matches!(
+            popup_spec(&props).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "width"
+        ));
+    }
+
+    #[test]
+    fn popup_anchor_and_gravity_read_the_same_nine_value_set() {
+        let lua = lua();
+        for (text, expected) in [
+            ("Top", PopupAnchor::Top),
+            ("Bottom", PopupAnchor::Bottom),
+            ("Left", PopupAnchor::Left),
+            ("Right", PopupAnchor::Right),
+            ("TopLeft", PopupAnchor::TopLeft),
+            ("TopRight", PopupAnchor::TopRight),
+            ("BottomLeft", PopupAnchor::BottomLeft),
+            ("BottomRight", PopupAnchor::BottomRight),
+            ("Center", PopupAnchor::Center),
+        ] {
+            let props = popup_props(&lua, &format!(r#", anchor = "{text}", gravity = "{text}""#));
+            let spec = popup_spec(&props).unwrap();
+            assert_eq!(spec.anchor, expected);
+            assert_eq!(spec.gravity, expected);
+        }
+    }
+
+    #[test]
+    fn popup_anchor_and_gravity_absent_default_to_center() {
+        let lua = lua();
+        let spec = popup_spec(&popup_props(&lua, "")).unwrap();
+        assert_eq!(spec.anchor, PopupAnchor::Center);
+        assert_eq!(spec.gravity, PopupAnchor::Center);
+    }
+
+    #[test]
+    fn an_unknown_popup_anchor_is_rejected_naming_the_property() {
+        let lua = lua();
+        let props = popup_props(&lua, r#", anchor = "Middle""#);
+        assert!(matches!(
+            popup_spec(&props).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "anchor"
+        ));
+    }
+
+    #[test]
+    fn an_unknown_popup_gravity_is_rejected_naming_the_property() {
+        let lua = lua();
+        let props = popup_props(&lua, r#", gravity = "Downward""#);
+        assert!(matches!(
+            popup_spec(&props).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "gravity"
+        ));
+    }
+
+    #[test]
+    fn constraint_adjustment_absent_defaults_to_flip_y_and_slide_x() {
+        let lua = lua();
+        assert_eq!(
+            popup_spec(&popup_props(&lua, "")).unwrap().constraint_adjustment,
+            ConstraintAdjustment { flip_y: true, slide_x: true, ..ConstraintAdjustment::NONE }
+        );
+    }
+
+    #[test]
+    fn constraint_adjustment_reads_every_named_adjustment() {
+        let lua = lua();
+        let props = popup_props(
+            &lua,
+            r#", constraint_adjustment = { "SlideX", "SlideY", "FlipX", "FlipY", "ResizeX", "ResizeY" }"#,
+        );
+        assert_eq!(
+            popup_spec(&props).unwrap().constraint_adjustment,
+            ConstraintAdjustment {
+                slide_x: true,
+                slide_y: true,
+                flip_x: true,
+                flip_y: true,
+                resize_x: true,
+                resize_y: true
+            }
+        );
+    }
+
+    #[test]
+    fn constraint_adjustment_is_a_set_so_order_and_repetition_do_not_change_it() {
+        let lua = lua();
+        let ordered = popup_spec(&popup_props(&lua, r#", constraint_adjustment = { "FlipY", "SlideX" }"#)).unwrap();
+        let reversed =
+            popup_spec(&popup_props(&lua, r#", constraint_adjustment = { "SlideX", "FlipY", "SlideX" }"#)).unwrap();
+        assert_eq!(ordered.constraint_adjustment, reversed.constraint_adjustment);
+    }
+
+    #[test]
+    fn an_explicitly_empty_constraint_adjustment_is_the_protocols_own_no_adjustment() {
+        let lua = lua();
+        assert_eq!(
+            popup_spec(&popup_props(&lua, r#", constraint_adjustment = {}"#)).unwrap().constraint_adjustment,
+            ConstraintAdjustment::NONE
+        );
+    }
+
+    #[test]
+    fn an_unknown_constraint_adjustment_entry_is_rejected() {
+        let lua = lua();
+        let props = popup_props(&lua, r#", constraint_adjustment = { "FlipY", "SlideZ" }"#);
+        assert!(matches!(
+            popup_spec(&props).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "constraint_adjustment"
+        ));
+    }
+
+    #[test]
+    fn a_constraint_adjustment_that_is_not_an_array_table_is_rejected() {
+        let lua = lua();
+        let props = popup_props(&lua, r#", constraint_adjustment = "FlipY""#);
+        assert!(matches!(
+            popup_spec(&props).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "constraint_adjustment"
+        ));
+    }
+
+    #[test]
+    fn popup_offset_absent_defaults_to_zero() {
+        let lua = lua();
+        assert_eq!(popup_spec(&popup_props(&lua, "")).unwrap().offset, PopupOffset { x: 0.0, y: 0.0 });
+    }
+
+    #[test]
+    fn popup_offset_may_be_negative_on_either_axis() {
+        let lua = lua();
+        let props = popup_props(&lua, r#", offset = { x = -8, y = -2 }"#);
+        assert_eq!(popup_spec(&props).unwrap().offset, PopupOffset { x: -8.0, y: -2.0 });
+    }
+
+    #[test]
+    fn a_popup_offset_that_is_not_a_table_is_rejected() {
+        let lua = lua();
+        let props = popup_props(&lua, r#", offset = 4"#);
+        assert!(matches!(
+            popup_spec(&props).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "offset"
+        ));
+    }
+
+    #[test]
+    fn popup_grab_absent_defaults_to_true() {
+        let lua = lua();
+        assert!(popup_spec(&popup_props(&lua, "")).unwrap().grab);
+    }
+
+    #[test]
+    fn popup_grab_reads_the_boolean_and_rejects_anything_else() {
+        let lua = lua();
+        assert!(!popup_spec(&popup_props(&lua, ", grab = false")).unwrap().grab);
+        assert!(matches!(
+            popup_spec(&popup_props(&lua, ", grab = 1")).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "grab"
+        ));
+    }
+
+    #[test]
+    fn a_signal_in_a_popup_anchor_rect_resolves_because_the_positioner_is_rebuilt_on_every_open() {
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua
+            .load(
+                r#"return { kind = "popup", id = "menu", parent = "bar", width = 200, height = 300,
+                                anchor_rect = state("menu_anchor", { x = 4, y = 8, width = 16, height = 24 }) }"#,
+            )
+            .eval()
+            .unwrap();
+        let resolved = resolve_properties(&props_from_table(&table), "popup", &lua).unwrap();
+        assert_eq!(
+            popup_spec(&resolved).unwrap().anchor_rect,
+            LogicalRect { x: 4.0, y: 8.0, width: 16.0, height: 24.0 }
+        );
+    }
+
+    /// The same fixture as [`popup_props`] but with every property under test bound to a live
+    /// signal instead of a literal, and *not* run through [`resolve_properties`] -- which is
+    /// exactly the map `crate::socket`'s `surface_specs` parses.
+    fn unresolved_popup_props(lua: &mlua::Lua, extra: &str) -> HashMap<String, Value> {
+        crate::lua::signal::register(lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua
+            .load(format!(
+                r#"return {{ kind = "popup", id = "menu", parent = "bar",
+                                 anchor_rect = state("a", {{ x = 4, y = 8, width = 16, height = 24 }}),
+                                 width = 200, height = 300 {extra} }}"#
+            ))
+            .eval()
+            .unwrap();
+        props_from_table(&table)
+    }
+
+    #[test]
+    fn a_signal_bound_popup_property_is_deferred_rather_than_rejected_before_it_resolves() {
+        let lua = lua();
+        let spec = popup_spec(&unresolved_popup_props(
+            &lua,
+            r#", width = state("w", 200), height = state("h", 300), anchor = state("an", "Top"),
                     gravity = state("g", "Bottom"), constraint_adjustment = state("c", {}),
                     offset = state("o", { x = 3, y = 3 }), grab = state("gr", false)"#,
-            ))
-            .unwrap();
-            assert_eq!(spec.anchor_rect, LogicalRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 });
-            assert_eq!((spec.width, spec.height), (1.0, 1.0));
-            assert_eq!((spec.anchor, spec.gravity), (PopupAnchor::Center, PopupAnchor::Center));
-            assert_eq!(spec.constraint_adjustment, ConstraintAdjustment::default());
-            assert_eq!(spec.offset, PopupOffset::default());
-            assert!(spec.grab, "a deferred `grab` takes § 6.3's default, not the signal's current value");
-        }
+        ))
+        .unwrap();
+        assert_eq!(spec.anchor_rect, LogicalRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 });
+        assert_eq!((spec.width, spec.height), (1.0, 1.0));
+        assert_eq!((spec.anchor, spec.gravity), (PopupAnchor::Center, PopupAnchor::Center));
+        assert_eq!(spec.constraint_adjustment, ConstraintAdjustment::default());
+        assert_eq!(spec.offset, PopupOffset::default());
+        assert!(spec.grab, "a deferred `grab` takes § 6.3's default, not the signal's current value");
+    }
 
-        #[test]
-        fn a_literal_typo_beside_a_deferred_signal_still_fails_on_the_evaluation_pass() {
-            let lua = lua();
-            assert!(matches!(
-                popup_spec(&unresolved_popup_props(&lua, r#", anchor = "Middle""#)).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "anchor"
-            ));
-        }
+    #[test]
+    fn a_literal_typo_beside_a_deferred_signal_still_fails_on_the_evaluation_pass() {
+        let lua = lua();
+        assert!(matches!(
+            popup_spec(&unresolved_popup_props(&lua, r#", anchor = "Middle""#)).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "anchor"
+        ));
+    }
 
-        #[test]
-        fn a_signal_in_a_popup_parent_is_still_rejected_on_the_evaluation_pass() {
-            let lua = lua();
-            assert!(matches!(
-                popup_spec(&unresolved_popup_props(&lua, r#", parent = state("p", "bar")"#)).unwrap_err(),
-                LayoutError::UnsupportedSignalProperty(p) if p == "parent"
-            ));
-        }
+    #[test]
+    fn a_signal_in_a_popup_parent_is_still_rejected_on_the_evaluation_pass() {
+        let lua = lua();
+        assert!(matches!(
+            popup_spec(&unresolved_popup_props(&lua, r#", parent = state("p", "bar")"#)).unwrap_err(),
+            LayoutError::UnsupportedSignalProperty(p) if p == "parent"
+        ));
+    }
 
-        #[test]
-        fn a_signal_in_a_window_title_app_id_or_size_hint_is_deferred_on_the_evaluation_pass_too() {
-            let lua = lua();
-            crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
-            let table: mlua::Table = lua
-                .load(
-                    r#"return { kind = "window", id = "w", title = state("t", "Now Playing"),
+    #[test]
+    fn a_signal_in_a_window_title_app_id_or_size_hint_is_deferred_on_the_evaluation_pass_too() {
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua
+            .load(
+                r#"return { kind = "window", id = "w", title = state("t", "Now Playing"),
                                 app_id = state("a", "oblisk.later"),
                                 min_size = state("mn", { width = 320, height = 240 }),
                                 max_size = state("mx", { width = 1280, height = 800 }) }"#,
-                )
-                .eval()
-                .unwrap();
-            let spec = window_spec(&props_from_table(&table)).unwrap();
-            assert_eq!(spec.title, "", "the placeholder is what a toplevel that never sends set_title has");
-            assert_eq!(spec.app_id, "oblisk-w", "the same default an absent `app_id` takes");
-            assert_eq!((spec.min_size, spec.max_size), (None, None), "absent means the request is simply not sent");
-        }
+            )
+            .eval()
+            .unwrap();
+        let spec = window_spec(&props_from_table(&table)).unwrap();
+        assert_eq!(spec.title, "", "the placeholder is what a toplevel that never sends set_title has");
+        assert_eq!(spec.app_id, "oblisk-w", "the same default an absent `app_id` takes");
+        assert_eq!((spec.min_size, spec.max_size), (None, None), "absent means the request is simply not sent");
+    }
 }

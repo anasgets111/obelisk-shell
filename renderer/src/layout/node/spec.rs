@@ -156,10 +156,7 @@ pub fn parse_single_child(
         return Ok(None);
     };
     let Value::Table(table) = value else {
-        return Err(invalid(
-            property,
-            format!("expected a node table, got {}", preview_for_error(value)),
-        ));
+        return Err(invalid(property, format!("expected a node table, got {}", preview_for_error(value))));
     };
     let node = deserialize_lua_table(table).map_err(|e| invalid(property, e.to_string()))?;
     Ok(Some(node))
@@ -171,10 +168,7 @@ pub fn parse_children(properties: &HashMap<String, Value>) -> Result<Vec<Virtual
         return Ok(Vec::new());
     };
     let Value::Table(table) = value else {
-        return Err(invalid(
-            "children",
-            format!("expected an array table, got {}", preview_for_error(value)),
-        ));
+        return Err(invalid("children", format!("expected an array table, got {}", preview_for_error(value))));
     };
     let mut children = Vec::new();
     for entry in table.sequence_values::<mlua::Table>() {
@@ -222,14 +216,9 @@ pub fn parse_children(properties: &HashMap<String, Value>) -> Result<Vec<Virtual
 /// the two other `children_of` arms with it. Worth doing when a real config drives a list from a
 /// capability that pushes often, not before.
 pub fn parse_list_children(properties: &HashMap<String, Value>) -> Result<Vec<VirtualNode>, LayoutError> {
-    let source_value = properties
-        .get("source")
-        .ok_or_else(|| invalid("source", "required for `list`, got nothing"))?;
+    let source_value = properties.get("source").ok_or_else(|| invalid("source", "required for `list`, got nothing"))?;
     let Value::Table(source) = source_value else {
-        return Err(invalid(
-            "source",
-            format!("expected an array table, got {}", preview_for_error(source_value)),
-        ));
+        return Err(invalid("source", format!("expected an array table, got {}", preview_for_error(source_value))));
     };
 
     let itemfn = match properties.get("itemfn") {
@@ -249,14 +238,9 @@ pub fn parse_list_children(properties: &HashMap<String, Value>) -> Result<Vec<Vi
     for element in source.sequence_values::<Value>() {
         let element = element.map_err(|e| invalid("source", e.to_string()))?;
 
-        let built = itemfn
-            .call::<Value>(element.clone())
-            .map_err(|e| invalid("itemfn", e.to_string()))?;
+        let built = itemfn.call::<Value>(element.clone()).map_err(|e| invalid("itemfn", e.to_string()))?;
         let Value::Table(built_table) = built else {
-            return Err(invalid(
-                "itemfn",
-                format!("expected a node table, got {}", preview_for_error(&built)),
-            ));
+            return Err(invalid("itemfn", format!("expected a node table, got {}", preview_for_error(&built))));
         };
         let mut node = deserialize_lua_table(&built_table).map_err(|e| invalid("itemfn", e.to_string()))?;
 
@@ -312,22 +296,15 @@ pub struct SecureSubmitTarget {
 /// [`parse_node_id`] makes for the same reason: this pair addresses a secret to a Supervisor
 /// capability, so a lossy conversion could collapse two distinct byte strings onto the same name
 /// and route a password to a capability nobody registered.
-pub fn parse_secure_submit(
-    properties: &HashMap<String, Value>,
-) -> Result<Option<SecureSubmitTarget>, LayoutError> {
+pub fn parse_secure_submit(properties: &HashMap<String, Value>) -> Result<Option<SecureSubmitTarget>, LayoutError> {
     let Some(value) = properties.get("secure_submit") else {
         return Ok(None);
     };
     let Value::Table(table) = value else {
-        return Err(invalid(
-            "secure_submit",
-            format!("expected a table, got {}", preview_for_error(value)),
-        ));
+        return Err(invalid("secure_submit", format!("expected a table, got {}", preview_for_error(value))));
     };
     let field = |key: &str| -> Result<String, LayoutError> {
-        let v: Value = table
-            .get(key)
-            .map_err(|e| invalid("secure_submit", e.to_string()))?;
+        let v: Value = table.get(key).map_err(|e| invalid("secure_submit", e.to_string()))?;
         let s = match v {
             Value::Nil => return Err(invalid("secure_submit", format!("`{key}` is required"))),
             Value::String(s) => s,
@@ -351,256 +328,227 @@ pub fn parse_secure_submit(
         }
         Ok(s)
     };
-    Ok(Some(SecureSubmitTarget {
-        capability: field("capability")?,
-        action: field("action")?,
-    }))
+    Ok(Some(SecureSubmitTarget { capability: field("capability")?, action: field("action")? }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-        fn lua() -> mlua::Lua {
-            mlua::Lua::new()
-        }
+    fn lua() -> mlua::Lua {
+        mlua::Lua::new()
+    }
 
-        fn props_from_table(table: &mlua::Table) -> HashMap<String, Value> {
-            deserialize_lua_table(table).unwrap().properties
-        }
+    fn props_from_table(table: &mlua::Table) -> HashMap<String, Value> {
+        deserialize_lua_table(table).unwrap().properties
+    }
 
-        #[test]
-        fn parse_children_walks_nested_node_tables() {
-            let lua = lua();
-            let table: mlua::Table = lua
+    #[test]
+    fn parse_children_walks_nested_node_tables() {
+        let lua = lua();
+        let table: mlua::Table = lua
                 .load(r#"return { kind = "row", children = { { kind = "text", content = "a" }, { kind = "text", content = "b" } } }"#)
                 .eval()
                 .unwrap();
-            let props = props_from_table(&table);
-            let children = parse_children(&props).unwrap();
-            assert_eq!(children.len(), 2);
-            assert_eq!(children[0].kind, "text");
-            assert_eq!(
-                children[1]
-                    .properties
-                    .get("content")
-                    .unwrap()
-                    .as_string()
-                    .unwrap()
-                    .to_string_lossy(),
-                "b"
-            );
-        }
+        let props = props_from_table(&table);
+        let children = parse_children(&props).unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].kind, "text");
+        assert_eq!(children[1].properties.get("content").unwrap().as_string().unwrap().to_string_lossy(), "b");
+    }
 
-        #[test]
-        fn parse_single_child_converts_the_child_table() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(r#"return { kind = "panel", child = { kind = "rect" } }"#)
-                .eval()
-                .unwrap();
-            let props = props_from_table(&table);
-            let child = parse_single_child(&props, "child").unwrap();
-            assert_eq!(child.unwrap().kind, "rect");
-        }
+    #[test]
+    fn parse_single_child_converts_the_child_table() {
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "panel", child = { kind = "rect" } }"#).eval().unwrap();
+        let props = props_from_table(&table);
+        let child = parse_single_child(&props, "child").unwrap();
+        assert_eq!(child.unwrap().kind, "rect");
+    }
 
-        #[test]
-        fn parse_single_child_absent_is_none() {
-            let props = HashMap::new();
-            assert!(parse_single_child(&props, "child").unwrap().is_none());
-        }
+    #[test]
+    fn parse_single_child_absent_is_none() {
+        let props = HashMap::new();
+        assert!(parse_single_child(&props, "child").unwrap().is_none());
+    }
 
-        #[test]
-        fn secure_submit_absent_is_none() {
-            let props = HashMap::new();
-            assert_eq!(parse_secure_submit(&props).unwrap(), None);
-        }
+    #[test]
+    fn secure_submit_absent_is_none() {
+        let props = HashMap::new();
+        assert_eq!(parse_secure_submit(&props).unwrap(), None);
+    }
 
-        #[test]
-        fn secure_submit_well_formed_table_parses_capability_and_action() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(r#"return { kind = "textfield", secure_submit = { capability = "network", action = "connect" } }"#)
-                .eval()
-                .unwrap();
-            let props = props_from_table(&table);
-            assert_eq!(
-                parse_secure_submit(&props).unwrap(),
-                Some(SecureSubmitTarget {
-                    capability: "network".to_string(),
-                    action: "connect".to_string(),
-                })
-            );
-        }
+    #[test]
+    fn secure_submit_well_formed_table_parses_capability_and_action() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "textfield", secure_submit = { capability = "network", action = "connect" } }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        assert_eq!(
+            parse_secure_submit(&props).unwrap(),
+            Some(SecureSubmitTarget { capability: "network".to_string(), action: "connect".to_string() })
+        );
+    }
 
-        #[test]
-        fn secure_submit_missing_capability_is_invalid_property_naming_the_field() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(r#"return { kind = "textfield", secure_submit = { action = "connect" } }"#)
-                .eval()
-                .unwrap();
-            let props = props_from_table(&table);
-            let err = parse_secure_submit(&props).unwrap_err();
+    #[test]
+    fn secure_submit_missing_capability_is_invalid_property_naming_the_field() {
+        let lua = lua();
+        let table: mlua::Table =
+            lua.load(r#"return { kind = "textfield", secure_submit = { action = "connect" } }"#).eval().unwrap();
+        let props = props_from_table(&table);
+        let err = parse_secure_submit(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "secure_submit" && detail.contains("capability")),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn secure_submit_missing_action_is_invalid_property_naming_the_field() {
+        let lua = lua();
+        let table: mlua::Table =
+            lua.load(r#"return { kind = "textfield", secure_submit = { capability = "network" } }"#).eval().unwrap();
+        let props = props_from_table(&table);
+        let err = parse_secure_submit(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "secure_submit" && detail.contains("action")),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn secure_submit_empty_capability_is_invalid_property() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "textfield", secure_submit = { capability = "", action = "connect" } }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_secure_submit(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "secure_submit" && detail.contains("capability")),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn secure_submit_empty_action_is_invalid_property() {
+        let lua = lua();
+        let table: mlua::Table = lua
+            .load(r#"return { kind = "textfield", secure_submit = { capability = "network", action = "" } }"#)
+            .eval()
+            .unwrap();
+        let props = props_from_table(&table);
+        let err = parse_secure_submit(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "secure_submit" && detail.contains("action")),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn secure_submit_non_table_value_is_invalid_property() {
+        let lua = lua();
+        let table: mlua::Table =
+            lua.load(r#"return { kind = "textfield", secure_submit = "network.connect" }"#).eval().unwrap();
+        let props = props_from_table(&table);
+        assert!(matches!(
+            parse_secure_submit(&props).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "secure_submit"
+        ));
+    }
+
+    #[test]
+    fn secure_submit_non_utf8_capability_is_rejected_rather_than_lossily_converted() {
+        let lua = lua();
+        let table = lua.create_table().unwrap();
+        table.set("kind", "textfield").unwrap();
+        let inner = lua.create_table().unwrap();
+        inner.set("capability", lua.create_string(b"\xff").unwrap()).unwrap();
+        inner.set("action", "connect").unwrap();
+        table.set("secure_submit", inner).unwrap();
+        let props = props_from_table(&table);
+        let err = parse_secure_submit(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "secure_submit"),
+            "a non-UTF-8 secure_submit field must be a LayoutError naming the property: {err:?}"
+        );
+    }
+
+    #[test]
+    fn lock_spec_reads_the_id_and_that_is_the_whole_of_section_6_4() {
+        let lua = lua();
+        let table: mlua::Table =
+            lua.load(r#"return { kind = "lock", id = "screen-lock", child = { kind = "rect" } }"#).eval().unwrap();
+        assert_eq!(lock_spec(&props_from_table(&table)).unwrap(), LockSpec { id: "screen-lock".to_string() });
+    }
+
+    #[test]
+    fn a_lock_without_an_id_is_rejected_the_same_way_every_other_role_is() {
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "lock" }"#).eval().unwrap();
+        assert!(matches!(
+            lock_spec(&props_from_table(&table)).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "id"
+        ));
+    }
+
+    #[test]
+    fn every_property_section_6_4_denies_a_lock_is_refused_by_name_rather_than_ignored() {
+        let lua = lua();
+        for property in ["visible", "monitor", "anchor", "width", "height"] {
+            let table: mlua::Table =
+                lua.load(format!(r#"return {{ kind = "lock", id = "screen-lock", {property} = 1 }}"#)).eval().unwrap();
+            let err = lock_spec(&props_from_table(&table)).unwrap_err();
             assert!(
-                matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "secure_submit" && detail.contains("capability")),
-                "got {err}"
+                matches!(&err, LayoutError::InvalidProperty { property: p, .. } if p == property),
+                "`{property}` must be refused by name, got {err:?}"
             );
         }
+    }
 
-        #[test]
-        fn secure_submit_missing_action_is_invalid_property_naming_the_field() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(r#"return { kind = "textfield", secure_submit = { capability = "network" } }"#)
-                .eval()
-                .unwrap();
-            let props = props_from_table(&table);
-            let err = parse_secure_submit(&props).unwrap_err();
-            assert!(
-                matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "secure_submit" && detail.contains("action")),
-                "got {err}"
-            );
-        }
+    #[test]
+    fn a_refused_lock_property_wins_over_a_missing_id_because_it_is_the_error_that_teaches() {
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "lock", visible = false }"#).eval().unwrap();
+        assert!(matches!(
+            lock_spec(&props_from_table(&table)).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "visible"
+        ));
+    }
 
-        #[test]
-        fn secure_submit_empty_capability_is_invalid_property() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(r#"return { kind = "textfield", secure_submit = { capability = "", action = "connect" } }"#)
-                .eval()
-                .unwrap();
-            let props = props_from_table(&table);
-            let err = parse_secure_submit(&props).unwrap_err();
-            assert!(
-                matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "secure_submit" && detail.contains("capability")),
-                "got {err}"
-            );
-        }
+    #[test]
+    fn a_signal_bound_lock_property_is_refused_on_the_evaluation_pass_like_a_literal_one() {
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table =
+            lua.load(r#"return { kind = "lock", id = "screen-lock", visible = state("v", true) }"#).eval().unwrap();
+        assert!(matches!(
+            lock_spec(&props_from_table(&table)).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "visible"
+        ));
+    }
 
-        #[test]
-        fn secure_submit_empty_action_is_invalid_property() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(r#"return { kind = "textfield", secure_submit = { capability = "network", action = "" } }"#)
-                .eval()
-                .unwrap();
-            let props = props_from_table(&table);
-            let err = parse_secure_submit(&props).unwrap_err();
-            assert!(
-                matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "secure_submit" && detail.contains("action")),
-                "got {err}"
-            );
-        }
+    #[test]
+    fn a_signal_in_a_lock_id_is_rejected_by_the_universal_structural_arm_with_no_new_carve_out() {
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table =
+            lua.load(r#"return { kind = "lock", id = state("i", "screen-lock") }"#).eval().unwrap();
+        let resolved = resolve_properties(&props_from_table(&table), "lock", &lua).unwrap();
+        assert!(matches!(
+            lock_spec(&resolved).unwrap_err(),
+            LayoutError::UnsupportedSignalProperty(p) if p == "id"
+        ));
+    }
 
-        #[test]
-        fn secure_submit_non_table_value_is_invalid_property() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(r#"return { kind = "textfield", secure_submit = "network.connect" }"#)
-                .eval()
-                .unwrap();
-            let props = props_from_table(&table);
-            assert!(matches!(
-                parse_secure_submit(&props).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "secure_submit"
-            ));
-        }
-
-        #[test]
-        fn secure_submit_non_utf8_capability_is_rejected_rather_than_lossily_converted() {
-            let lua = lua();
-            let table = lua.create_table().unwrap();
-            table.set("kind", "textfield").unwrap();
-            let inner = lua.create_table().unwrap();
-            inner.set("capability", lua.create_string(b"\xff").unwrap()).unwrap();
-            inner.set("action", "connect").unwrap();
-            table.set("secure_submit", inner).unwrap();
-            let props = props_from_table(&table);
-            let err = parse_secure_submit(&props).unwrap_err();
-            assert!(
-                matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "secure_submit"),
-                "a non-UTF-8 secure_submit field must be a LayoutError naming the property: {err:?}"
-            );
-        }
-
-        #[test]
-        fn lock_spec_reads_the_id_and_that_is_the_whole_of_section_6_4() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(r#"return { kind = "lock", id = "screen-lock", child = { kind = "rect" } }"#)
-                .eval()
-                .unwrap();
-            assert_eq!(lock_spec(&props_from_table(&table)).unwrap(), LockSpec { id: "screen-lock".to_string() });
-        }
-
-        #[test]
-        fn a_lock_without_an_id_is_rejected_the_same_way_every_other_role_is() {
-            let lua = lua();
-            let table: mlua::Table = lua.load(r#"return { kind = "lock" }"#).eval().unwrap();
-            assert!(matches!(
-                lock_spec(&props_from_table(&table)).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "id"
-            ));
-        }
-
-        #[test]
-        fn every_property_section_6_4_denies_a_lock_is_refused_by_name_rather_than_ignored() {
-            let lua = lua();
-            for property in ["visible", "monitor", "anchor", "width", "height"] {
-                let table: mlua::Table = lua
-                    .load(format!(r#"return {{ kind = "lock", id = "screen-lock", {property} = 1 }}"#))
-                    .eval()
-                    .unwrap();
-                let err = lock_spec(&props_from_table(&table)).unwrap_err();
-                assert!(
-                    matches!(&err, LayoutError::InvalidProperty { property: p, .. } if p == property),
-                    "`{property}` must be refused by name, got {err:?}"
-                );
-            }
-        }
-
-        #[test]
-        fn a_refused_lock_property_wins_over_a_missing_id_because_it_is_the_error_that_teaches() {
-            let lua = lua();
-            let table: mlua::Table = lua.load(r#"return { kind = "lock", visible = false }"#).eval().unwrap();
-            assert!(matches!(
-                lock_spec(&props_from_table(&table)).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "visible"
-            ));
-        }
-
-        #[test]
-        fn a_signal_bound_lock_property_is_refused_on_the_evaluation_pass_like_a_literal_one() {
-            let lua = lua();
-            crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
-            let table: mlua::Table = lua
-                .load(r#"return { kind = "lock", id = "screen-lock", visible = state("v", true) }"#)
-                .eval()
-                .unwrap();
-            assert!(matches!(
-                lock_spec(&props_from_table(&table)).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "visible"
-            ));
-        }
-
-        #[test]
-        fn a_signal_in_a_lock_id_is_rejected_by_the_universal_structural_arm_with_no_new_carve_out() {
-            let lua = lua();
-            crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
-            let table: mlua::Table = lua.load(r#"return { kind = "lock", id = state("i", "screen-lock") }"#).eval().unwrap();
-            let resolved = resolve_properties(&props_from_table(&table), "lock", &lua).unwrap();
-            assert!(matches!(
-                lock_spec(&resolved).unwrap_err(),
-                LayoutError::UnsupportedSignalProperty(p) if p == "id"
-            ));
-        }
-
-        #[test]
-        fn a_lock_fingerprints_on_its_id_alone_so_only_its_existence_is_a_topology_change() {
-            let spec = SurfaceSpec::Lock(LockSpec { id: "screen-lock".to_string() });
-            assert_eq!(spec.declared_id(), "screen-lock");
-            assert_eq!(spec.fingerprint(), SurfaceFingerprint::Lock("screen-lock".to_string()));
-            assert_ne!(spec.fingerprint(), SurfaceFingerprint::Window("screen-lock".to_string()));
-        }
+    #[test]
+    fn a_lock_fingerprints_on_its_id_alone_so_only_its_existence_is_a_topology_change() {
+        let spec = SurfaceSpec::Lock(LockSpec { id: "screen-lock".to_string() });
+        assert_eq!(spec.declared_id(), "screen-lock");
+        assert_eq!(spec.fingerprint(), SurfaceFingerprint::Lock("screen-lock".to_string()));
+        assert_ne!(spec.fingerprint(), SurfaceFingerprint::Window("screen-lock".to_string()));
+    }
 }

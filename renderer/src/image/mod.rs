@@ -119,11 +119,7 @@ impl Default for ImageCache {
 
 impl ImageCache {
     pub fn new() -> Self {
-        ImageCache {
-            entries: HashMap::new(),
-            order: VecDeque::new(),
-            evicted: Vec::new(),
-        }
+        ImageCache { entries: HashMap::new(), order: VecDeque::new(), evicted: Vec::new() }
     }
 
     /// Frees the textures evicted during the previous frame. `layout::paint::paint_tree` calls this
@@ -269,7 +265,8 @@ fn rasterize_svg(path: &Path, box_px: u32) -> Result<(Vec<u8>, u32, u32), String
     let scale = box_px as f32 / longest;
     let width = ((size.width() * scale).round() as u32).max(1);
     let height = ((size.height() * scale).round() as u32).max(1);
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height).ok_or_else(|| format!("no pixmap for {width}x{height}"))?;
+    let mut pixmap =
+        resvg::tiny_skia::Pixmap::new(width, height).ok_or_else(|| format!("no pixmap for {width}x{height}"))?;
     resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
     Ok((pixmap.take(), width, height))
 }
@@ -307,12 +304,7 @@ mod tests {
     use super::*;
 
     fn box_rect() -> LogicalRect {
-        LogicalRect {
-            x: 10.0,
-            y: 20.0,
-            width: 100.0,
-            height: 50.0,
-        }
+        LogicalRect { x: 10.0, y: 20.0, width: 100.0, height: 50.0 }
     }
 
     #[test]
@@ -395,10 +387,7 @@ mod tests {
         assert_eq!((width, height), (2, 2));
         // Straight alpha, in the order Pillow was handed them: the half-transparent green stays
         // 0x00ff00 rather than arriving premultiplied to 0x008000.
-        assert_eq!(
-            pixels,
-            vec![255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 255, 0, 0, 0, 0]
-        );
+        assert_eq!(pixels, vec![255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 255, 0, 0, 0, 0]);
     }
 
     #[test]
@@ -425,11 +414,7 @@ mod tests {
     }
 
     fn key(path: &str, px: u32, version: FileVersion) -> CacheKey {
-        CacheKey {
-            path: PathBuf::from(path),
-            raster_px: if is_vector(Path::new(path)) { px } else { 0 },
-            version,
-        }
+        CacheKey { path: PathBuf::from(path), raster_px: if is_vector(Path::new(path)) { px } else { 0 }, version }
     }
 
     #[test]

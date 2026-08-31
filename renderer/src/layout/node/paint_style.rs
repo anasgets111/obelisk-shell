@@ -47,18 +47,41 @@ use super::*;
 #[derive(Debug, Clone, PartialEq)]
 pub enum PaintStyle {
     /// `rect`/`row`/`column`/`button` and all four surface roles: the fill, then the border.
-    Box { background: Option<Rgba>, radius: f32, colors: BorderColor, widths: EdgeInsets },
-    Text { content: String, font_size: f32, color: Rgba, align: TextAlign, elide: Elide },
+    Box {
+        background: Option<Rgba>,
+        radius: f32,
+        colors: BorderColor,
+        widths: EdgeInsets,
+    },
+    Text {
+        content: String,
+        font_size: f32,
+        color: Rgba,
+        align: TextAlign,
+        elide: Elide,
+    },
     /// The theme *name*, not the resolved path: `layout::paint::execute` does the
     /// `image::icons::resolve` lookup, so neither this pass nor the display-list build touches the
     /// icon theme.
-    Icon { name: String },
-    Image { source: String, fit: Fit },
+    Icon {
+        name: String,
+    },
+    Image {
+        source: String,
+        fit: Fit,
+    },
     /// `target` is `None` when the field declares no `secure_submit` at all. A malformed one is an
     /// error now, unlike before: `layout::secure_submit::secure_submit_targets` used to skip it
     /// silently on the grounds that the press path would log it, and the press path was the only
     /// other reader.
-    TextField { target: Option<SecureSubmitTarget>, placeholder: String, mask: String, font_size: f32, color: Rgba, align: TextAlign },
+    TextField {
+        target: Option<SecureSubmitTarget>,
+        placeholder: String,
+        mask: String,
+        font_size: f32,
+        color: Rgba,
+        align: TextAlign,
+    },
 }
 
 /// Parses `kind`'s paint properties out of an already-resolved property map.
@@ -84,13 +107,8 @@ pub fn paint_style(kind: &str, properties: &HashMap<String, Value>) -> Result<Op
             align: parse_text_align(properties)?,
             elide: parse_elide(properties)?,
         },
-        "icon" => PaintStyle::Icon {
-            name: parse_icon_name(properties)?,
-        },
-        "image" => PaintStyle::Image {
-            source: parse_image_source(properties)?,
-            fit: parse_fit(properties)?,
-        },
+        "icon" => PaintStyle::Icon { name: parse_icon_name(properties)? },
+        "image" => PaintStyle::Image { source: parse_image_source(properties)?, fit: parse_fit(properties)? },
         "textfield" => PaintStyle::TextField {
             target: parse_secure_submit(properties)?,
             placeholder: parse_placeholder(properties)?,

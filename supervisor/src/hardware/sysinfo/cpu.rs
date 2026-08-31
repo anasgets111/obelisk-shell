@@ -45,7 +45,8 @@ pub fn delta_percent(prev: &CpuSample, current: &CpuSample) -> u8 {
 pub fn read_sample(proc_root: &std::path::Path) -> std::io::Result<CpuSample> {
     let content = std::fs::read_to_string(proc_root.join("stat"))?;
     let line = content.lines().next().unwrap_or("");
-    parse_stat_line(line).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed /proc/stat aggregate cpu line"))
+    parse_stat_line(line)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed /proc/stat aggregate cpu line"))
 }
 
 #[cfg(test)]

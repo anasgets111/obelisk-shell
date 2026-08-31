@@ -67,7 +67,11 @@ pub struct BeginAuthenticationCall {
 /// choice meaningful; see this ADR's upgrade path (docs/adr/0028) for where that UI would need
 /// to attach.
 pub fn first_unix_user_uid(identities: &[(String, HashMap<String, OwnedValue>)]) -> Option<u32> {
-    identities.iter().find(|(kind, _)| kind == "unix-user").and_then(|(_, details)| details.get("uid")).and_then(|v| u32::try_from(v.clone()).ok())
+    identities
+        .iter()
+        .find(|(kind, _)| kind == "unix-user")
+        .and_then(|(_, details)| details.get("uid"))
+        .and_then(|v| u32::try_from(v.clone()).ok())
 }
 
 /// `org.freedesktop.PolicyKit1.AuthenticationAgent`, the interface polkitd calls back into
@@ -101,7 +105,14 @@ impl AuthenticationAgent {
         identities: Vec<(String, HashMap<String, OwnedValue>)>,
     ) {
         // A dropped receiver just means nobody is listening (e.g. mid-shutdown); not a reason to fail the D-Bus call.
-        let _ = self.challenges.send(BeginAuthenticationCall { action_id, message, icon_name, details, cookie, identities });
+        let _ = self.challenges.send(BeginAuthenticationCall {
+            action_id,
+            message,
+            icon_name,
+            details,
+            cookie,
+            identities,
+        });
     }
 
     async fn cancel_authentication(&self, _cookie: String) {
@@ -227,14 +238,22 @@ mod tests {
             .await
             .expect("failed to build a p2p proxy to the agent");
 
-        let details: HashMap<String, String> = HashMap::from([("polkit.gettext_domain".to_string(), "polkit".to_string())]);
+        let details: HashMap<String, String> =
+            HashMap::from([("polkit.gettext_domain".to_string(), "polkit".to_string())]);
         let identity_details: HashMap<String, OwnedValue> =
             HashMap::from([("uid".to_string(), OwnedValue::try_from(Value::from(1000u32)).unwrap())]);
         let identities: Vec<(String, HashMap<String, OwnedValue>)> = vec![("unix-user".to_string(), identity_details)];
         proxy
             .call_method(
                 "BeginAuthentication",
-                &("org.oblisk.test.action", "Authenticate to do the thing", "dialog-password", details, "cookie-123", identities),
+                &(
+                    "org.oblisk.test.action",
+                    "Authenticate to do the thing",
+                    "dialog-password",
+                    details,
+                    "cookie-123",
+                    identities,
+                ),
             )
             .await
             .expect("BeginAuthentication call should succeed");
@@ -245,7 +264,11 @@ mod tests {
         assert_eq!(received.icon_name, "dialog-password");
         assert_eq!(received.cookie, "cookie-123");
         assert_eq!(received.details.get("polkit.gettext_domain").map(String::as_str), Some("polkit"));
-        assert_eq!(first_unix_user_uid(&received.identities), Some(1000), "identities must be forwarded, not discarded");
+        assert_eq!(
+            first_unix_user_uid(&received.identities),
+            Some(1000),
+            "identities must be forwarded, not discarded"
+        );
     }
 
     #[tokio::test]
@@ -286,7 +309,10 @@ mod tests {
 
     #[test]
     fn first_unix_user_uid_is_none_when_only_a_unix_group_is_present() {
-        let group = ("unix-group".to_string(), HashMap::from([("gid".to_string(), OwnedValue::try_from(Value::from(100u32)).unwrap())]));
+        let group = (
+            "unix-group".to_string(),
+            HashMap::from([("gid".to_string(), OwnedValue::try_from(Value::from(100u32)).unwrap())]),
+        );
         assert_eq!(first_unix_user_uid(&[group]), None);
     }
 

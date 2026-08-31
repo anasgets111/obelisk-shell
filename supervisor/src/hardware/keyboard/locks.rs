@@ -28,7 +28,11 @@ fn find_led(leds_root: &Path, suffix: &str) -> Option<PathBuf> {
 }
 
 pub fn resolve_lock_leds(leds_root: &Path) -> Option<LockLeds> {
-    Some(LockLeds { caps: find_led(leds_root, "capslock")?, num: find_led(leds_root, "numlock")?, scroll: find_led(leds_root, "scrolllock")? })
+    Some(LockLeds {
+        caps: find_led(leds_root, "capslock")?,
+        num: find_led(leds_root, "numlock")?,
+        scroll: find_led(leds_root, "scrolllock")?,
+    })
 }
 
 /// Reads one LED's `brightness` file. Kernel LED-class brightness is `0` = off, nonzero = on

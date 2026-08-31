@@ -47,7 +47,8 @@ pub fn compute_percentages(info: &MemInfo) -> (u8, u8) {
 /// `/proc` (docs/oblisk-tdd-test-harness.md's mandate).
 pub fn read_meminfo(proc_root: &std::path::Path) -> std::io::Result<MemInfo> {
     let content = std::fs::read_to_string(proc_root.join("meminfo"))?;
-    parse_meminfo(&content).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed /proc/meminfo"))
+    parse_meminfo(&content)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed /proc/meminfo"))
 }
 
 #[cfg(test)]
@@ -84,14 +85,16 @@ mod tests {
     #[test]
     fn parse_meminfo_skips_a_blank_or_colon_less_line_instead_of_aborting_the_whole_parse() {
         // A blank line partway through must not discard the fields already seen around it.
-        let info = super::parse_meminfo("MemTotal: 1000 kB\n\nMemAvailable: 400 kB\n").expect("a stray blank line must not abort the whole parse");
+        let info = super::parse_meminfo("MemTotal: 1000 kB\n\nMemAvailable: 400 kB\n")
+            .expect("a stray blank line must not abort the whole parse");
         assert_eq!(info.mem_total, 1000);
         assert_eq!(info.mem_available, 400);
     }
 
     #[test]
     fn parse_meminfo_defaults_swap_fields_to_zero_when_absent() {
-        let info = super::parse_meminfo("MemTotal: 1000 kB\nMemAvailable: 400 kB\n").expect("should still parse without swap fields");
+        let info = super::parse_meminfo("MemTotal: 1000 kB\nMemAvailable: 400 kB\n")
+            .expect("should still parse without swap fields");
         assert_eq!(info.swap_total, 0);
         assert_eq!(info.swap_free, 0);
     }

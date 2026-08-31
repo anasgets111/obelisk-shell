@@ -64,7 +64,11 @@ fn popup_visibility_action(visible: bool, exists: bool, dismissed_at: Option<u64
 /// whichever output `expand_instances` listed first. There is no better answer available: nothing
 /// in § 6.3 lets such a popup say which monitor it means. The upgrade path is a `monitor` property
 /// on `popup`, at which point this takes a third argument and the fallback becomes a real choice.
-fn parent_instance_index<'a>(instance_ids: impl Iterator<Item = &'a str>, parent: &str, armed: Option<&str>) -> Option<usize> {
+fn parent_instance_index<'a>(
+    instance_ids: impl Iterator<Item = &'a str>,
+    parent: &str,
+    armed: Option<&str>,
+) -> Option<usize> {
     let mut first = None;
     for (index, instance_id) in instance_ids.enumerate() {
         if !is_instance_of(instance_id, parent) {
@@ -200,7 +204,10 @@ const UNCONFIGURED_WINDOW_SIZE: (f32, f32) = (640.0, 480.0);
 /// maximum size in the given dimension", the same reading [`node::window_spec`]'s parser applies.
 ///
 /// At least 1 on both axes: a `wl_egl_window` of 0 is invalid.
-fn toplevel_size_for(new_size: (Option<std::num::NonZeroU32>, Option<std::num::NonZeroU32>), spec: &WindowSpec) -> (u32, u32) {
+fn toplevel_size_for(
+    new_size: (Option<std::num::NonZeroU32>, Option<std::num::NonZeroU32>),
+    spec: &WindowSpec,
+) -> (u32, u32) {
     let axis = |configured: Option<std::num::NonZeroU32>, fallback: f32, min: f32, max: f32| -> u32 {
         if let Some(configured) = configured {
             return configured.get();
@@ -261,7 +268,13 @@ impl App {
     /// The entry exists either way because it is what makes the window reachable at all: the poll
     /// loop's [`App::apply_resolved_surface_state`] walks `self.surfaces`, and a window with no
     /// entry would never have its `visible` looked at, so it could never open.
-    pub(super) fn create_window(&mut self, qh: &QueueHandle<App>, spec: &WindowSpec, instance: &SurfaceInstance, visible: bool) {
+    pub(super) fn create_window(
+        &mut self,
+        qh: &QueueHandle<App>,
+        spec: &WindowSpec,
+        instance: &SurfaceInstance,
+        visible: bool,
+    ) {
         self.surfaces.push(TrackedSurface {
             role: TrackedRole::Window { window: None, spec: spec.clone() },
             bound: None,
@@ -288,7 +301,13 @@ impl App {
     /// [`App::show_popup`] and says so once, which is correct, not a startup failure: nothing has been
     /// clicked, so there is no serial, and a dropdown that cannot be dismissed by clicking outside it
     /// is worse than one that did not open (docs/adr/0049's amendment).
-    pub(super) fn create_popup(&mut self, qh: &QueueHandle<App>, spec: &PopupSpec, instance: &SurfaceInstance, visible: bool) {
+    pub(super) fn create_popup(
+        &mut self,
+        qh: &QueueHandle<App>,
+        spec: &PopupSpec,
+        instance: &SurfaceInstance,
+        visible: bool,
+    ) {
         self.surfaces.push(TrackedSurface {
             role: TrackedRole::Popup { popup: None, spec: spec.clone(), dismissed_at: None, refusal_logged: None },
             bound: None,
@@ -481,7 +500,9 @@ impl App {
     fn show_popup(&mut self, qh: &QueueHandle<App>, index: usize) {
         let surface_id = self.surfaces[index].surface_id.clone();
         let Some(xdg_shell) = self.xdg_shell.as_ref() else {
-            eprintln!("[oblisk-renderer] {surface_id}: this compositor advertises no xdg_wm_base, so no popup can be created for it");
+            eprintln!(
+                "[oblisk-renderer] {surface_id}: this compositor advertises no xdg_wm_base, so no popup can be created for it"
+            );
             return;
         };
         let TrackedRole::Popup { spec, .. } = &self.surfaces[index].role else {
@@ -504,7 +525,9 @@ impl App {
             };
             let Some(seat) = self.seat_state.seats().next() else {
                 if self.refusal_is_new(index, PopupRefusal::Seatless) {
-                    eprintln!("[oblisk-renderer] {surface_id}: `grab = true` and this compositor advertises no seat, so it is not opened");
+                    eprintln!(
+                        "[oblisk-renderer] {surface_id}: `grab = true` and this compositor advertises no seat, so it is not opened"
+                    );
                 }
                 return;
             };
@@ -716,11 +739,8 @@ impl WindowHandler for App {
             return;
         };
         let surface_id = self.surfaces[index].surface_id.clone();
-        let on_close = self
-            .client
-            .scene()
-            .surface(&surface_id)
-            .and_then(|tree| match tree.properties.get("on_close") {
+        let on_close =
+            self.client.scene().surface(&surface_id).and_then(|tree| match tree.properties.get("on_close") {
                 // § 6.2 leaves the key opaque to `layout::node` exactly as § 5.2 leaves `on_click`,
                 // so this is the only place its type is ever checked. Anything that is not a
                 // function simply is not a close handler.
@@ -728,7 +748,9 @@ impl WindowHandler for App {
                 _ => None,
             });
         let Some(on_close) = on_close else {
-            eprintln!("[oblisk-renderer] {surface_id}: the compositor asked it to close and no `on_close` declined or accepted; staying open");
+            eprintln!(
+                "[oblisk-renderer] {surface_id}: the compositor asked it to close and no `on_close` declined or accepted; staying open"
+            );
             return;
         };
         if let Err(e) = on_close.call::<()>(()) {
@@ -764,7 +786,9 @@ impl WindowHandler for App {
             return;
         };
         let surface_id = self.surfaces[index].surface_id.clone();
-        if configure.decoration_mode == DecorationMode::Client && self.surfaces[index].map_state == MapState::AwaitingConfigure {
+        if configure.decoration_mode == DecorationMode::Client
+            && self.surfaces[index].map_state == MapState::AwaitingConfigure
+        {
             eprintln!(
                 "[oblisk-renderer] {surface_id}: the compositor granted client-side decorations; carrying on undecorated, since this shell draws no titlebar of its own"
             );
@@ -835,11 +859,8 @@ impl PopupHandler for App {
         self.hide_popup(index);
         self.latch_popup(index);
 
-        let on_dismiss = self
-            .client
-            .scene()
-            .surface(&surface_id)
-            .and_then(|tree| match tree.properties.get("on_dismiss") {
+        let on_dismiss =
+            self.client.scene().surface(&surface_id).and_then(|tree| match tree.properties.get("on_dismiss") {
                 // § 6.3 leaves the key opaque to `layout::node` exactly as § 5.2 leaves `on_click`
                 // and § 6.2 leaves `on_close`, so this is the only place its type is ever checked.
                 Some(Value::Function(on_dismiss)) => Some(on_dismiss.clone()),
@@ -881,7 +902,11 @@ mod tests {
         let mut spec = settings_window();
         spec.min_size = Some(SizeHint { width: 320.0, height: 240.0 });
         spec.max_size = Some(SizeHint { width: 1280.0, height: 800.0 });
-        assert_eq!(toplevel_size_for((nz(1920), nz(1168)), &spec), (1920, 1168), "the hints never override a configure");
+        assert_eq!(
+            toplevel_size_for((nz(1920), nz(1168)), &spec),
+            (1920, 1168),
+            "the hints never override a configure"
+        );
     }
 
     #[test]

@@ -106,7 +106,12 @@ pub(super) fn raw_menu_layout_to_value(raw: RawMenuLayout) -> Value<'static> {
 #[zbus::proxy(interface = "com.canonical.dbusmenu")]
 pub(super) trait DBusMenu {
     #[zbus(name = "GetLayout")]
-    fn get_layout(&self, parent_id: i32, recursion_depth: i32, property_names: &[&str]) -> zbus::Result<(u32, RawMenuLayout)>;
+    fn get_layout(
+        &self,
+        parent_id: i32,
+        recursion_depth: i32,
+        property_names: &[&str],
+    ) -> zbus::Result<(u32, RawMenuLayout)>;
 
     #[zbus(name = "Event")]
     fn event(&self, id: i32, event_id: &str, data: &Value<'_>, timestamp: u32) -> zbus::Result<()>;
@@ -132,19 +137,26 @@ pub(super) trait StatusNotifierWatcherClient {
     fn register_status_notifier_host(&self, service: &str) -> zbus::Result<()>;
 }
 
-pub(super) async fn bind_item(connection: &zbus::Connection, unique_name: &OwnedUniqueName, path: &OwnedObjectPath) -> zbus::Result<StatusNotifierItemProxy<'static>> {
+pub(super) async fn bind_item(
+    connection: &zbus::Connection,
+    unique_name: &OwnedUniqueName,
+    path: &OwnedObjectPath,
+) -> zbus::Result<StatusNotifierItemProxy<'static>> {
     StatusNotifierItemProxy::builder(connection).destination(unique_name.clone())?.path(path.clone())?.build().await
 }
 
-pub(super) async fn bind_dbusmenu(connection: &zbus::Connection, unique_name: &OwnedUniqueName, path: &OwnedObjectPath) -> zbus::Result<DBusMenuProxy<'static>> {
+pub(super) async fn bind_dbusmenu(
+    connection: &zbus::Connection,
+    unique_name: &OwnedUniqueName,
+    path: &OwnedObjectPath,
+) -> zbus::Result<DBusMenuProxy<'static>> {
     DBusMenuProxy::builder(connection).destination(unique_name.clone())?.path(path.clone())?.build().await
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::menu::parse_menu_node;
+    use super::*;
 
     // ---- RawMenuLayout / raw_menu_layout_to_value ----
 
@@ -175,5 +187,4 @@ mod tests {
         assert_eq!(item.children.len(), 1);
         assert_eq!(item.children[0].id, 11);
     }
-
 }

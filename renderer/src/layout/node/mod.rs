@@ -35,14 +35,18 @@ mod toplevel;
 // ran them itself on every node on every frame; [`paint_style`] is their only caller now
 // (docs/adr/0068), so the way to ask what a node paints is to ask for its `PaintStyle`. `super::*`
 // is what carries them into `paint_style.rs`.
-use content::{parse_elide, parse_fit, parse_font_size, parse_foreground, parse_icon_name, parse_image_source, parse_mask_character, parse_placeholder, parse_text_align};
+use content::{
+    parse_elide, parse_fit, parse_font_size, parse_foreground, parse_icon_name, parse_image_source,
+    parse_mask_character, parse_placeholder, parse_text_align,
+};
 use spec::parse_secure_submit;
 use style::{parse_background, parse_border_color, parse_border_width, parse_radius};
 
 pub use content::{Elide, TextAlign, parse_content, parse_icon_size, parse_node_id, parse_surface_id};
 pub use paint_style::{PaintStyle, paint_style};
 pub use spec::{
-    SecureSubmitTarget, SurfaceFingerprint, SurfaceSpec, lock_spec, parse_children, parse_list_children, parse_single_child,
+    SecureSubmitTarget, SurfaceFingerprint, SurfaceSpec, lock_spec, parse_children, parse_list_children,
+    parse_single_child,
 };
 // `wayland::tests`' and `instance::tests`' fixtures name it as `node::LockSpec`, but nothing in
 // this crate's non-test reachable set does.
@@ -119,9 +123,7 @@ pub enum LayoutError {
     UnsupportedNodeKind(String),
     #[error("invalid value for `{property}`: {detail}")]
     InvalidProperty { property: String, detail: String },
-    #[error(
-        "`{0}` is a Signal handle, not a plain value -- read it via :get() before returning it from shell.lua"
-    )]
+    #[error("`{0}` is a Signal handle, not a plain value -- read it via :get() before returning it from shell.lua")]
     UnsupportedSignalProperty(String),
     /// build-steps.md Phase 19 item 3: `resolve_and_reconcile`'s recursion, bounded at
     /// `layout::scene::MAX_TREE_DEPTH`. Covers both a literal cyclic tree (`r.children = { r }`)
@@ -141,10 +143,7 @@ pub enum LayoutError {
 /// `Scene::apply_one_instance` raises an `id`-scoped error for an instance naming an undeclared
 /// surface, and every other `InvalidProperty` in this crate is built here rather than by hand.
 pub(crate) fn invalid(property: &str, detail: impl Into<String>) -> LayoutError {
-    LayoutError::InvalidProperty {
-        property: property.to_string(),
-        detail: detail.into(),
-    }
+    LayoutError::InvalidProperty { property: property.to_string(), detail: detail.into() }
 }
 
 /// Longest prefix of a rejected value's `Debug` form this file will ever put in an error message.
@@ -251,10 +250,7 @@ fn checked_string(property: &str, s: &mlua::LuaString) -> Result<String, LayoutE
 /// specifies none of them.
 fn parse_hex_color(property: &str, s: &str) -> Result<Rgba, LayoutError> {
     let Some(digits) = s.strip_prefix('#') else {
-        return Err(invalid(
-            property,
-            format!("hex colour must start with `#`, got `{s}`"),
-        ));
+        return Err(invalid(property, format!("hex colour must start with `#`, got `{s}`")));
     };
     // Digit check before length check, and in that order deliberately: every byte of a multi-byte
     // UTF-8 sequence is >= 0x80 and so fails `is_ascii_hexdigit`, so non-ASCII input (`"#日本語"`)
@@ -262,30 +258,19 @@ fn parse_hex_color(property: &str, s: &str) -> Result<Rgba, LayoutError> {
     // string is known to be pure ASCII, where `.len()` is the character count -- reporting a byte
     // count for `"#日本語"` (9 bytes, 3 characters) would name the wrong number entirely.
     if !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(invalid(
-            property,
-            format!("hex colour must contain only hex digits, got `{s}`"),
-        ));
+        return Err(invalid(property, format!("hex colour must contain only hex digits, got `{s}`")));
     }
     if digits.len() != 6 && digits.len() != 8 {
         return Err(invalid(
             property,
-            format!(
-                "hex colour must have 6 or 8 hex digits after `#`, got {} in `{s}`",
-                digits.len()
-            ),
+            format!("hex colour must have 6 or 8 hex digits after `#`, got {} in `{s}`", digits.len()),
         ));
     }
     let channel = |range: std::ops::Range<usize>| -> f32 {
         u8::from_str_radix(&digits[range], 16).expect("digits validated as hex above") as f32 / 255.0
     };
     let a = if digits.len() == 8 { channel(6..8) } else { 1.0 };
-    Ok(Rgba {
-        r: channel(0..2),
-        g: channel(2..4),
-        b: channel(4..6),
-        a,
-    })
+    Ok(Rgba { r: channel(0..2), g: channel(2..4), b: channel(4..6), a })
 }
 
 /// Whether `property` is one [`resolve_properties`] copies through untouched on a node of this
@@ -425,9 +410,7 @@ pub fn resolve_properties(
             resolved.insert(property.clone(), value.clone());
             continue;
         };
-        let value = signal
-            .get_value(lua)
-            .map_err(|e| invalid(property, format!("Signal getter failed: {e}")))?;
+        let value = signal.get_value(lua).map_err(|e| invalid(property, format!("Signal getter failed: {e}")))?;
         match value {
             Value::UserData(_) => {
                 return Err(invalid(
@@ -505,182 +488,176 @@ mod tests {
     use crate::image::Fit;
     use crate::lua::nodes::deserialize_lua_table;
 
-        fn lua() -> mlua::Lua {
-            mlua::Lua::new()
-        }
+    fn lua() -> mlua::Lua {
+        mlua::Lua::new()
+    }
 
-        fn props_from_table(table: &mlua::Table) -> HashMap<String, Value> {
-            deserialize_lua_table(table).unwrap().properties
-        }
+    fn props_from_table(table: &mlua::Table) -> HashMap<String, Value> {
+        deserialize_lua_table(table).unwrap().properties
+    }
 
-        #[test]
-        fn a_signal_resolving_to_another_signal_is_an_error() {
-            let lua = lua();
-            crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
-            let inner = crate::lua::signal::Signal::new_live(Value::Integer(5), crate::lua::signal::DirtyFlag::new()).0;
-            let inner_userdata = lua.create_userdata(inner).unwrap();
-            let outer = crate::lua::signal::Signal::new_live(Value::UserData(inner_userdata), crate::lua::signal::DirtyFlag::new()).0;
-            let table = lua.create_table().unwrap();
-            table.set("kind", "text").unwrap();
-            table.set("font_size", outer).unwrap();
-            let node = deserialize_lua_table(&table).unwrap();
-            assert!(matches!(
-                resolve_properties(&node.properties, "text", &lua).unwrap_err(),
-                LayoutError::InvalidProperty { property, .. } if property == "font_size"
-            ));
-        }
+    #[test]
+    fn a_signal_resolving_to_another_signal_is_an_error() {
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let inner = crate::lua::signal::Signal::new_live(Value::Integer(5), crate::lua::signal::DirtyFlag::new()).0;
+        let inner_userdata = lua.create_userdata(inner).unwrap();
+        let outer =
+            crate::lua::signal::Signal::new_live(Value::UserData(inner_userdata), crate::lua::signal::DirtyFlag::new())
+                .0;
+        let table = lua.create_table().unwrap();
+        table.set("kind", "text").unwrap();
+        table.set("font_size", outer).unwrap();
+        let node = deserialize_lua_table(&table).unwrap();
+        assert!(matches!(
+            resolve_properties(&node.properties, "text", &lua).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "font_size"
+        ));
+    }
 
-        /// A *resolved* property bag whose `property` slot held a live signal currently reading `nil`
-        /// -- exactly the state every rostered capability's global is in before its first
-        /// `StateSnapshot` (`renderer/src/socket.rs`'s `RendererClient::new` seeds all of
-        /// `shared::CAPABILITIES` at `Value::Nil`), which is what a config binding a bare capability
-        /// signal resolves at startup. Routed through [`resolve_properties`] because that is where the
-        /// nil rule now lives: the key is omitted from the resolved map rather than each parser
-        /// checking for a `Value::Nil` of its own (build-steps.md Phase 19 item 5).
-        fn props_with_nil_signal(lua: &mlua::Lua, kind: &str, property: &str) -> HashMap<String, Value> {
-            crate::lua::signal::register(lua, crate::lua::signal::DirtyFlag::new()).unwrap();
-            let signal = crate::lua::signal::Signal::new_live(Value::Nil, crate::lua::signal::DirtyFlag::new()).0;
-            let table = lua.create_table().unwrap();
-            table.set("kind", kind).unwrap();
-            table.set(property, signal).unwrap();
-            resolve_properties(&props_from_table(&table), kind, lua).unwrap()
-        }
+    /// A *resolved* property bag whose `property` slot held a live signal currently reading `nil`
+    /// -- exactly the state every rostered capability's global is in before its first
+    /// `StateSnapshot` (`renderer/src/socket.rs`'s `RendererClient::new` seeds all of
+    /// `shared::CAPABILITIES` at `Value::Nil`), which is what a config binding a bare capability
+    /// signal resolves at startup. Routed through [`resolve_properties`] because that is where the
+    /// nil rule now lives: the key is omitted from the resolved map rather than each parser
+    /// checking for a `Value::Nil` of its own (build-steps.md Phase 19 item 5).
+    fn props_with_nil_signal(lua: &mlua::Lua, kind: &str, property: &str) -> HashMap<String, Value> {
+        crate::lua::signal::register(lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let signal = crate::lua::signal::Signal::new_live(Value::Nil, crate::lua::signal::DirtyFlag::new()).0;
+        let table = lua.create_table().unwrap();
+        table.set("kind", kind).unwrap();
+        table.set(property, signal).unwrap();
+        resolve_properties(&props_from_table(&table), kind, lua).unwrap()
+    }
 
-        #[test]
-        fn a_signal_resolving_to_nil_takes_each_parsers_absent_property_default() {
-            let lua = lua();
-            assert!(
-                !props_with_nil_signal(&lua, "rect", "width").contains_key("width"),
-                "the rule is one omitted key, not a Nil each parser re-checks"
-            );
-            assert_eq!(parse_size_mode(&props_with_nil_signal(&lua, "rect", "width"), "width").unwrap(), SizeMode::Content);
-            assert_eq!(
-                parse_edge_insets(&props_with_nil_signal(&lua, "rect", "padding"), "padding").unwrap(),
-                EdgeInsets::default()
-            );
-            assert_eq!(parse_align(&props_with_nil_signal(&lua, "rect", "align_h"), "align_h").unwrap(), Align::Start);
-            assert!(parse_visible(&props_with_nil_signal(&lua, "rect", "visible")).unwrap());
-            assert_eq!(parse_spacing(&props_with_nil_signal(&lua, "row", "spacing")).unwrap(), 0.0);
-            assert_eq!(parse_font_size(&props_with_nil_signal(&lua, "text", "font_size")).unwrap(), 12.0);
-            assert!(parse_single_child(&props_with_nil_signal(&lua, "panel", "child"), "child").unwrap().is_none());
-            assert!(parse_children(&props_with_nil_signal(&lua, "row", "children")).unwrap().is_empty());
-            assert_eq!(parse_content(&props_with_nil_signal(&lua, "text", "content")).unwrap(), "");
-            assert_eq!(parse_icon_size(&props_with_nil_signal(&lua, "icon", "size")).unwrap(), 12.0);
-            assert_eq!(parse_icon_name(&props_with_nil_signal(&lua, "icon", "name")).unwrap(), "");
-            assert_eq!(parse_image_source(&props_with_nil_signal(&lua, "image", "source")).unwrap(), "");
-            assert_eq!(parse_fit(&props_with_nil_signal(&lua, "image", "fit")).unwrap(), Fit::Cover);
-        }
+    #[test]
+    fn a_signal_resolving_to_nil_takes_each_parsers_absent_property_default() {
+        let lua = lua();
+        assert!(
+            !props_with_nil_signal(&lua, "rect", "width").contains_key("width"),
+            "the rule is one omitted key, not a Nil each parser re-checks"
+        );
+        assert_eq!(parse_size_mode(&props_with_nil_signal(&lua, "rect", "width"), "width").unwrap(), SizeMode::Content);
+        assert_eq!(
+            parse_edge_insets(&props_with_nil_signal(&lua, "rect", "padding"), "padding").unwrap(),
+            EdgeInsets::default()
+        );
+        assert_eq!(parse_align(&props_with_nil_signal(&lua, "rect", "align_h"), "align_h").unwrap(), Align::Start);
+        assert!(parse_visible(&props_with_nil_signal(&lua, "rect", "visible")).unwrap());
+        assert_eq!(parse_spacing(&props_with_nil_signal(&lua, "row", "spacing")).unwrap(), 0.0);
+        assert_eq!(parse_font_size(&props_with_nil_signal(&lua, "text", "font_size")).unwrap(), 12.0);
+        assert!(parse_single_child(&props_with_nil_signal(&lua, "panel", "child"), "child").unwrap().is_none());
+        assert!(parse_children(&props_with_nil_signal(&lua, "row", "children")).unwrap().is_empty());
+        assert_eq!(parse_content(&props_with_nil_signal(&lua, "text", "content")).unwrap(), "");
+        assert_eq!(parse_icon_size(&props_with_nil_signal(&lua, "icon", "size")).unwrap(), 12.0);
+        assert_eq!(parse_icon_name(&props_with_nil_signal(&lua, "icon", "name")).unwrap(), "");
+        assert_eq!(parse_image_source(&props_with_nil_signal(&lua, "image", "source")).unwrap(), "");
+        assert_eq!(parse_fit(&props_with_nil_signal(&lua, "image", "fit")).unwrap(), Fit::Cover);
+    }
 
-        #[test]
-        fn resolve_properties_copies_a_structural_field_through_raw_so_it_can_still_be_rejected() {
-            let lua = lua();
-            crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
-            let signal = crate::lua::signal::Signal::new_live(Value::Boolean(true), crate::lua::signal::DirtyFlag::new()).0;
-            let table = lua.create_table().unwrap();
-            table.set("kind", "rect").unwrap();
-            table.set("id", signal).unwrap();
-            let node = deserialize_lua_table(&table).unwrap();
+    #[test]
+    fn resolve_properties_copies_a_structural_field_through_raw_so_it_can_still_be_rejected() {
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let signal = crate::lua::signal::Signal::new_live(Value::Boolean(true), crate::lua::signal::DirtyFlag::new()).0;
+        let table = lua.create_table().unwrap();
+        table.set("kind", "rect").unwrap();
+        table.set("id", signal).unwrap();
+        let node = deserialize_lua_table(&table).unwrap();
 
-            let resolved = resolve_properties(&node.properties, "rect", &lua).unwrap();
+        let resolved = resolve_properties(&node.properties, "rect", &lua).unwrap();
 
-            assert!(matches!(resolved.get("id"), Some(Value::UserData(_))), "id must survive the resolve step unresolved");
-            assert!(matches!(parse_node_id(&resolved).unwrap_err(), LayoutError::UnsupportedSignalProperty(p) if p == "id"));
-        }
+        assert!(matches!(resolved.get("id"), Some(Value::UserData(_))), "id must survive the resolve step unresolved");
+        assert!(
+            matches!(parse_node_id(&resolved).unwrap_err(), LayoutError::UnsupportedSignalProperty(p) if p == "id")
+        );
+    }
 
-        #[test]
-        fn two_failing_properties_always_report_the_same_one() {
-            let lua = lua();
-            crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
-            let table: mlua::Table = lua
-                .load(
-                    r#"
+    #[test]
+    fn two_failing_properties_always_report_the_same_one() {
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua
+            .load(
+                r#"
                     return {
                         kind = "rect",
                         alpha = computed({}, function() error("alpha boom") end),
                         beta = computed({}, function() error("beta boom") end),
                     }
                     "#,
-                )
-                .eval()
-                .unwrap();
-            for _ in 0..8 {
-                let props = props_from_table(&table);
-                let err = resolve_properties(&props, "rect", &lua).unwrap_err();
-                assert!(
-                    matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "alpha"),
-                    "the same broken config must always name the same property, got: {err}"
-                );
-            }
-        }
-
-        #[test]
-        fn oversized_string_property_error_message_is_bounded() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(r#"return { kind = "rect", radius = string.rep("Q", 20 * 1024 * 1024) }"#)
-                .eval()
-                .unwrap();
+            )
+            .eval()
+            .unwrap();
+        for _ in 0..8 {
             let props = props_from_table(&table);
-            let err = parse_radius(&props).unwrap_err();
-            let LayoutError::InvalidProperty { property, detail } = &err else {
-                panic!("expected InvalidProperty, got {err}");
-            };
-            assert_eq!(property, "radius");
+            let err = resolve_properties(&props, "rect", &lua).unwrap_err();
             assert!(
-                detail.len() < 1024,
-                "a 20 MB input must not produce a multi-megabyte error message, got {} bytes",
-                detail.len()
+                matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "alpha"),
+                "the same broken config must always name the same property, got: {err}"
             );
         }
+    }
 
-        #[test]
-        fn oversized_string_property_error_still_names_type_and_shows_a_recognizable_prefix() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(r#"return { kind = "rect", radius = string.rep("Q", 20 * 1024 * 1024) }"#)
-                .eval()
-                .unwrap();
-            let props = props_from_table(&table);
-            let err = parse_radius(&props).unwrap_err();
-            let LayoutError::InvalidProperty { detail, .. } = &err else {
-                panic!("expected InvalidProperty, got {err}");
-            };
-            assert!(detail.contains("expected a number"), "{detail}");
-            assert!(detail.contains("String("), "must still name the rejected type: {detail}");
-            assert!(detail.contains("QQQ"), "must show a recognizable prefix of the value: {detail}");
-            assert!(
-                detail.contains(&(20 * 1024 * 1024).to_string()),
-                "must state the real length, or a truncated preview reads as the whole value: {detail}"
-            );
-        }
+    #[test]
+    fn oversized_string_property_error_message_is_bounded() {
+        let lua = lua();
+        let table: mlua::Table =
+            lua.load(r#"return { kind = "rect", radius = string.rep("Q", 20 * 1024 * 1024) }"#).eval().unwrap();
+        let props = props_from_table(&table);
+        let err = parse_radius(&props).unwrap_err();
+        let LayoutError::InvalidProperty { property, detail } = &err else {
+            panic!("expected InvalidProperty, got {err}");
+        };
+        assert_eq!(property, "radius");
+        assert!(
+            detail.len() < 1024,
+            "a 20 MB input must not produce a multi-megabyte error message, got {} bytes",
+            detail.len()
+        );
+    }
 
-        #[test]
-        fn short_string_property_error_message_is_unchanged() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(r#"return { kind = "rect", radius = "banana" }"#)
-                .eval()
-                .unwrap();
-            let props = props_from_table(&table);
-            let err = parse_radius(&props).unwrap_err();
-            let LayoutError::InvalidProperty { detail, .. } = &err else {
-                panic!("expected InvalidProperty, got {err}");
-            };
-            assert_eq!(detail, "expected a number, got String(\"banana\")");
-        }
+    #[test]
+    fn oversized_string_property_error_still_names_type_and_shows_a_recognizable_prefix() {
+        let lua = lua();
+        let table: mlua::Table =
+            lua.load(r#"return { kind = "rect", radius = string.rep("Q", 20 * 1024 * 1024) }"#).eval().unwrap();
+        let props = props_from_table(&table);
+        let err = parse_radius(&props).unwrap_err();
+        let LayoutError::InvalidProperty { detail, .. } = &err else {
+            panic!("expected InvalidProperty, got {err}");
+        };
+        assert!(detail.contains("expected a number"), "{detail}");
+        assert!(detail.contains("String("), "must still name the rejected type: {detail}");
+        assert!(detail.contains("QQQ"), "must show a recognizable prefix of the value: {detail}");
+        assert!(
+            detail.contains(&(20 * 1024 * 1024).to_string()),
+            "must state the real length, or a truncated preview reads as the whole value: {detail}"
+        );
+    }
 
-        #[test]
-        fn non_string_variant_error_message_is_unchanged() {
-            let lua = lua();
-            let table: mlua::Table = lua
-                .load(r#"return { kind = "rect", radius = true }"#)
-                .eval()
-                .unwrap();
-            let props = props_from_table(&table);
-            let err = parse_radius(&props).unwrap_err();
-            let LayoutError::InvalidProperty { detail, .. } = &err else {
-                panic!("expected InvalidProperty, got {err}");
-            };
-            assert_eq!(detail, "expected a number, got Boolean(true)");
-        }
+    #[test]
+    fn short_string_property_error_message_is_unchanged() {
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "rect", radius = "banana" }"#).eval().unwrap();
+        let props = props_from_table(&table);
+        let err = parse_radius(&props).unwrap_err();
+        let LayoutError::InvalidProperty { detail, .. } = &err else {
+            panic!("expected InvalidProperty, got {err}");
+        };
+        assert_eq!(detail, "expected a number, got String(\"banana\")");
+    }
+
+    #[test]
+    fn non_string_variant_error_message_is_unchanged() {
+        let lua = lua();
+        let table: mlua::Table = lua.load(r#"return { kind = "rect", radius = true }"#).eval().unwrap();
+        let props = props_from_table(&table);
+        let err = parse_radius(&props).unwrap_err();
+        let LayoutError::InvalidProperty { detail, .. } = &err else {
+            panic!("expected InvalidProperty, got {err}");
+        };
+        assert_eq!(detail, "expected a number, got Boolean(true)");
+    }
 }

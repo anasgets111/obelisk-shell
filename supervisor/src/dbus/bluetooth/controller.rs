@@ -8,9 +8,15 @@ use tokio::sync::mpsc::UnboundedSender;
 use zbus::zvariant::OwnedObjectPath;
 
 use super::agent::register_agent_best_effort;
-use super::proxies::{Adapter1Proxy, Battery1Proxy, Device1Proxy, bind_adapter, bind_object_manager, subscribe_object_manager};
-use super::registry::{DeviceRegistry, register_device, spawn_adapter_signal_forwarder, spawn_object_manager_forwarder};
-use super::{BluetoothActionError, BluetoothSignal, BluetoothState, ConnectedDevice, DiscoveredDevice, class_to_category};
+use super::proxies::{
+    Adapter1Proxy, Battery1Proxy, Device1Proxy, bind_adapter, bind_object_manager, subscribe_object_manager,
+};
+use super::registry::{
+    DeviceRegistry, register_device, spawn_adapter_signal_forwarder, spawn_object_manager_forwarder,
+};
+use super::{
+    BluetoothActionError, BluetoothSignal, BluetoothState, ConnectedDevice, DiscoveredDevice, class_to_category,
+};
 
 /// Holds every proxy `oblisk.bluetooth`'s write actions and state rebuilds need. `Clone`:
 /// every field is a cheap `zbus` proxy/`Arc` handle, so a clone can be moved into a
@@ -72,7 +78,14 @@ impl BluetoothController {
                             }
                         }
                         if has("org.bluez.Device1") {
-                            register_device(&connection, &devices, path.clone(), has("org.bluez.Battery1"), events.clone()).await;
+                            register_device(
+                                &connection,
+                                &devices,
+                                path.clone(),
+                                has("org.bluez.Battery1"),
+                                events.clone(),
+                            )
+                            .await;
                         }
                     }
                 }
@@ -169,7 +182,13 @@ impl BluetoothController {
                     Some(battery) => battery.percentage().await.map(i32::from).unwrap_or(-1),
                     None => -1,
                 };
-                connected.push(ConnectedDevice { mac, name, battery: battery_percent, codec: None, category: class_to_category(class).to_string() });
+                connected.push(ConnectedDevice {
+                    mac,
+                    name,
+                    battery: battery_percent,
+                    codec: None,
+                    category: class_to_category(class).to_string(),
+                });
             } else if !paired {
                 discovered.push(DiscoveredDevice { mac, name, paired: false });
             }
@@ -277,4 +296,3 @@ impl BluetoothController {
         }
     }
 }
-

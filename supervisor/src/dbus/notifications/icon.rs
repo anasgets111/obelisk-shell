@@ -47,7 +47,8 @@ pub(super) fn validate_trusted_path(path: &str, trusted_roots: &[PathBuf]) -> Op
     if !canonical.is_file() {
         return None;
     }
-    let is_trusted = trusted_roots.iter().any(|root| root.canonicalize().map(|root| canonical.starts_with(&root)).unwrap_or(false));
+    let is_trusted =
+        trusted_roots.iter().any(|root| root.canonicalize().map(|root| canonical.starts_with(&root)).unwrap_or(false));
     is_trusted.then_some(canonical)
 }
 
@@ -67,14 +68,12 @@ pub(super) fn sanitize_body(raw_body: &str, trusted_roots: &[PathBuf]) -> Vec<No
     parse_markup(&truncated)
         .into_iter()
         .filter_map(|span| match span {
-            NotificationSpan::Image { image_path } => {
-                validate_trusted_path(&image_path, trusted_roots).map(|validated| NotificationSpan::Image { image_path: validated.to_string_lossy().into_owned() })
-            }
+            NotificationSpan::Image { image_path } => validate_trusted_path(&image_path, trusted_roots)
+                .map(|validated| NotificationSpan::Image { image_path: validated.to_string_lossy().into_owned() }),
             text_span => Some(text_span),
         })
         .collect()
 }
-
 
 // -------------------------------------------------------------------------------------------
 // Image hint decoding: the real freedesktop `image-data`/`icon_data` struct shape
@@ -125,7 +124,9 @@ pub(super) fn value_as_str<'a>(value: &'a Value<'_>) -> Option<&'a str> {
 
 fn value_as_bytes(value: &Value<'_>) -> Option<Vec<u8>> {
     match value {
-        Value::Array(array) => Some(array.iter().filter_map(|v| if let Value::U8(b) = v { Some(*b) } else { None }).collect()),
+        Value::Array(array) => {
+            Some(array.iter().filter_map(|v| if let Value::U8(b) = v { Some(*b) } else { None }).collect())
+        }
         _ => None,
     }
 }
@@ -235,7 +236,12 @@ pub(super) enum IconInput {
     None,
 }
 
-pub(super) fn resolve_icon_input(image_data: Option<RawImageData>, image_path: Option<String>, app_icon: Option<String>, icon_data: Option<RawImageData>) -> IconInput {
+pub(super) fn resolve_icon_input(
+    image_data: Option<RawImageData>,
+    image_path: Option<String>,
+    app_icon: Option<String>,
+    icon_data: Option<RawImageData>,
+) -> IconInput {
     if let Some(data) = image_data {
         return IconInput::ImageData(data);
     }
@@ -250,7 +256,6 @@ pub(super) fn resolve_icon_input(image_data: Option<RawImageData>, image_path: O
     }
     IconInput::None
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -306,7 +311,8 @@ mod tests {
         // temp dirs share a parent -- construct the traversal against the trusted dir's own parent
         // directly instead of assuming that, so this test is robust to however the OS lays out
         // temp directories.
-        let escape_path = trusted_dir.path().join("..").join(outside_dir.path().file_name().unwrap()).join("secret.png");
+        let escape_path =
+            trusted_dir.path().join("..").join(outside_dir.path().file_name().unwrap()).join("secret.png");
         assert_eq!(validate_trusted_path(escape_path.to_str().unwrap(), &[trusted_dir.path().to_path_buf()]), None);
     }
 
@@ -388,7 +394,15 @@ mod tests {
     fn valid_rgba_image(width: i32, height: i32) -> RawImageData {
         let channels = 4;
         let rowstride = width * channels;
-        RawImageData { width, height, rowstride, has_alpha: true, bits_per_sample: 8, channels, data: vec![0u8; (rowstride * height) as usize] }
+        RawImageData {
+            width,
+            height,
+            rowstride,
+            has_alpha: true,
+            bits_per_sample: 8,
+            channels,
+            data: vec![0u8; (rowstride * height) as usize],
+        }
     }
 
     #[test]
@@ -440,7 +454,15 @@ mod tests {
     fn encode_image_data_to_png_round_trips_a_known_pixel() {
         // One 1x1 RGBA pixel: R=0x11, G=0x22, B=0x33, A=0x44 (already RGBA row-major, unlike
         // tray's ARGB network-byte-order pixmaps -- no reordering needed).
-        let image = RawImageData { width: 1, height: 1, rowstride: 4, has_alpha: true, bits_per_sample: 8, channels: 4, data: vec![0x11, 0x22, 0x33, 0x44] };
+        let image = RawImageData {
+            width: 1,
+            height: 1,
+            rowstride: 4,
+            has_alpha: true,
+            bits_per_sample: 8,
+            channels: 4,
+            data: vec![0x11, 0x22, 0x33, 0x44],
+        };
         let png_bytes = encode_image_data_to_png(&image).expect("encoding must succeed");
 
         let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes.as_slice()));
@@ -465,10 +487,21 @@ mod tests {
         for byte in &data {
             array.append(Value::U8(*byte)).unwrap();
         }
-        let value = structure_value(vec![Value::I32(2), Value::I32(1), Value::I32(8), Value::Bool(true), Value::I32(8), Value::I32(4), Value::Array(array)]);
+        let value = structure_value(vec![
+            Value::I32(2),
+            Value::I32(1),
+            Value::I32(8),
+            Value::Bool(true),
+            Value::I32(8),
+            Value::I32(4),
+            Value::Array(array),
+        ]);
 
         let decoded = decode_raw_image_data(&value).expect("must decode a well-formed image-data structure");
-        assert_eq!(decoded, RawImageData { width: 2, height: 1, rowstride: 8, has_alpha: true, bits_per_sample: 8, channels: 4, data });
+        assert_eq!(
+            decoded,
+            RawImageData { width: 2, height: 1, rowstride: 8, has_alpha: true, bits_per_sample: 8, channels: 4, data }
+        );
     }
 
     #[test]
@@ -490,13 +523,19 @@ mod tests {
 
     #[test]
     fn resolve_icon_input_prefers_image_data_over_everything() {
-        let resolved = resolve_icon_input(Some(tiny_image()), Some("/path".to_string()), Some("app-icon".to_string()), Some(tiny_image()));
+        let resolved = resolve_icon_input(
+            Some(tiny_image()),
+            Some("/path".to_string()),
+            Some("app-icon".to_string()),
+            Some(tiny_image()),
+        );
         assert_eq!(resolved, IconInput::ImageData(tiny_image()));
     }
 
     #[test]
     fn resolve_icon_input_prefers_image_path_over_app_icon_and_icon_data() {
-        let resolved = resolve_icon_input(None, Some("/path".to_string()), Some("app-icon".to_string()), Some(tiny_image()));
+        let resolved =
+            resolve_icon_input(None, Some("/path".to_string()), Some("app-icon".to_string()), Some(tiny_image()));
         assert_eq!(resolved, IconInput::ImagePath("/path".to_string()));
     }
 

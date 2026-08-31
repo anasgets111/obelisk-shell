@@ -29,7 +29,10 @@ pub fn parse_install_step(line: &str) -> Option<InstallStep> {
     let current: u32 = current.trim().parse().ok()?;
     let total: u32 = total.trim().parse().ok()?;
     let rest = rest.trim();
-    let rest = rest.strip_prefix("installing ").or_else(|| rest.strip_prefix("upgrading ")).or_else(|| rest.strip_prefix("reinstalling "))?;
+    let rest = rest
+        .strip_prefix("installing ")
+        .or_else(|| rest.strip_prefix("upgrading "))
+        .or_else(|| rest.strip_prefix("reinstalling "))?;
     let package = rest.split_whitespace().next()?.to_string();
     Some(InstallStep { current, total, package })
 }

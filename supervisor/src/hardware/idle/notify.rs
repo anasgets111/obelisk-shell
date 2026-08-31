@@ -9,13 +9,12 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
-use wayland_client::globals::{registry_queue_init, GlobalListContents};
+use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_registry;
 use wayland_client::protocol::wl_seat::{self, WlSeat};
 use wayland_client::{Connection, Dispatch, QueueHandle};
 use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notification_v1::{self, ExtIdleNotificationV1};
 use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notifier_v1::ExtIdleNotifierV1;
-
 
 /// Registers `generation_id` against `sec`'s duration in `fanout`; returns whether a new
 /// `ext_idle_notification_v1` listener is needed for that duration (docs/adr/0032: one listener
@@ -36,8 +35,6 @@ pub fn cleanup_generation_thresholds(fanout: &mut HashMap<Duration, Vec<u32>>, g
         entries.retain(|&id| id != generation_id);
     }
 }
-
-
 
 /// Dispatch target for the Supervisor's own, separate Wayland connection (ADR-0010, survives a
 /// Renderer crash or reload). Holds only the raw-event forwarding channel -- other state
@@ -64,7 +61,15 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandThreadStat
 /// `wl_seat` is bound only so `get_idle_notification` has an object to name -- this feature
 /// never creates a pointer/keyboard/touch object from it, so every seat event is dropped.
 impl Dispatch<WlSeat, ()> for WaylandThreadState {
-    fn event(_state: &mut Self, _proxy: &WlSeat, _event: wl_seat::Event, _data: &(), _conn: &Connection, _qhandle: &QueueHandle<Self>) {}
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlSeat,
+        _event: wl_seat::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
 }
 
 /// `ext_idle_notifier_v1` has no `<event>` in its protocol XML -- this can never actually fire;
@@ -144,7 +149,8 @@ pub(crate) type RawIdleEventReceiver = UnboundedReceiver<(Duration, shared::Idle
 /// [`IdleController::new`] runs it inside `tokio::task::spawn_blocking`, bounded by
 /// [`IDLE_NOTIFY_SETUP_TIMEOUT`]. The error type is `Send + Sync` so the `Result` can cross
 /// that boundary.
-pub(crate) fn connect_wayland_idle() -> Result<(LiveNotify, RawIdleEventReceiver), Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) fn connect_wayland_idle()
+-> Result<(LiveNotify, RawIdleEventReceiver), Box<dyn std::error::Error + Send + Sync>> {
     let connection = Connection::connect_to_env()?;
     let (globals, mut event_queue) = registry_queue_init::<WaylandThreadState>(&connection)?;
     let qh = event_queue.handle();
@@ -181,7 +187,11 @@ pub(crate) fn connect_wayland_idle() -> Result<(LiveNotify, RawIdleEventReceiver
 /// Drains `raw_events_rx`, expanding each raw `(Duration, IdleState)` event into one
 /// [`shared::IdleEvent`] per `generation_id` registered against that duration (ADR-0032's
 /// fan-out), forwarding each to `events_tx` (drained by `main.rs`'s `select!` loop).
-pub(crate) fn spawn_idle_event_forwarder(registry: Arc<Mutex<NotifyRegistry>>, mut raw_events_rx: RawIdleEventReceiver, events_tx: UnboundedSender<shared::IdleEvent>) -> JoinHandle<()> {
+pub(crate) fn spawn_idle_event_forwarder(
+    registry: Arc<Mutex<NotifyRegistry>>,
+    mut raw_events_rx: RawIdleEventReceiver,
+    events_tx: UnboundedSender<shared::IdleEvent>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some((duration, state)) = raw_events_rx.recv().await {
             let generation_ids = registry.lock().unwrap().fanout.get(&duration).cloned().unwrap_or_default();
@@ -194,7 +204,6 @@ pub(crate) fn spawn_idle_event_forwarder(registry: Arc<Mutex<NotifyRegistry>>, m
         }
     })
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -218,7 +227,11 @@ mod tests {
 
         assert!(first_created);
         assert!(!second_created, "the second registration at the same duration must not need a new listener");
-        assert_eq!(fanout.get(&Duration::from_secs(30)), Some(&vec![1, 2]), "both generations must appear in the same duration's fan-out list");
+        assert_eq!(
+            fanout.get(&Duration::from_secs(30)),
+            Some(&vec![1, 2]),
+            "both generations must appear in the same duration's fan-out list"
+        );
     }
 
     #[test]
@@ -240,7 +253,11 @@ mod tests {
 
         assert!(first_created);
         assert!(!second_created);
-        assert_eq!(fanout.get(&Duration::from_secs(30)), Some(&vec![1, 1]), "a generation's own repeated registration must append, not dedupe");
+        assert_eq!(
+            fanout.get(&Duration::from_secs(30)),
+            Some(&vec![1, 1]),
+            "a generation's own repeated registration must append, not dedupe"
+        );
     }
 
     // ---- cleanup_generation_thresholds (TDD seam 5, notify half) ----
@@ -255,7 +272,11 @@ mod tests {
         cleanup_generation_thresholds(&mut fanout, 1);
 
         assert_eq!(fanout.get(&Duration::from_secs(30)), Some(&vec![2]), "generation 2's entry at 30s must survive");
-        assert_eq!(fanout.get(&Duration::from_secs(60)), Some(&vec![]), "generation 1's only entry at 60s must be dropped");
+        assert_eq!(
+            fanout.get(&Duration::from_secs(60)),
+            Some(&vec![]),
+            "generation 1's only entry at 60s must be dropped"
+        );
     }
 
     #[test]
@@ -267,5 +288,4 @@ mod tests {
 
         assert_eq!(fanout.get(&Duration::from_secs(30)), Some(&vec![1]));
     }
-
 }
