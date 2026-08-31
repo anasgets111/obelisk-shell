@@ -1,0 +1,25 @@
+-- The background-plus-padding-plus-radius block every dropdown and panel body turns out to be.
+-- `modules/shell/panel_host.lua`'s popup child and `modules/bar/panels/settings.lua`'s window
+-- child were the same six properties before this existed, which is exactly `components/pill.lua`'s
+-- own reason for being: two call sites in agreement is a component, not a coincidence.
+--
+-- `opts` overrides rather than replaces: a card called with no options at all is the popup shape
+-- (10px radius, 6px spacing), since that is the more common of the two. The settings window wants
+-- `radius = 0` (an opaque toplevel has no edge to round against) and its own padding, and passes
+-- both explicitly.
+local theme = require("config.theme")
+
+return function(children, opts)
+    opts = opts or {}
+    return column {
+        width = opts.width,
+        height = opts.height,
+        padding = opts.padding or { top = 10, right = 12, bottom = 10, left = 12 },
+        spacing = opts.spacing or 6,
+        background = opts.background or theme.BG,
+        radius = opts.radius or 10,
+        border_width = opts.border_width,
+        border_color = opts.border_color,
+        children = children,
+    }
+end

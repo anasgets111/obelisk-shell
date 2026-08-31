@@ -13,6 +13,9 @@
 return {
     BG      = "#1e1e2eff",
     SURFACE = "#313244ff",
+    -- Catppuccin surface1, one step up from SURFACE. The hover shade: a module that highlights
+    -- under the pointer reads this rather than inventing its own lighter blue (docs/adr/0062).
+    HOVER   = "#45475aff",
     FG      = "#cdd6f4ff",
     DIM     = "#6c7086ff",
     ACCENT  = "#89b4faff",

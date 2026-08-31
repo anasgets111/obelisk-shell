@@ -416,6 +416,183 @@ mod tests {
         assert!(is_builder, "a component has to come back as the builder it returns");
     }
 
+    /// A dev-config loader that can `require` the shipped `components/`, for the component tests
+    /// below. Distinct from `test_loader()`: those never `require` anything, and a bare temp
+    /// directory has no `components/panel_card.lua` to find.
+    fn dev_config_loader() -> Loader {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk");
+        Loader::new(signal::DirtyFlag::new(), &dir).unwrap()
+    }
+
+    fn child_table(output: &LoadOutput) -> Table {
+        let Value::Table(child) = output.surfaces[0].properties.get("child").unwrap() else {
+            panic!("surface's `child` did not come back as a table");
+        };
+        child.clone()
+    }
+
+    #[test]
+    fn panel_card_wraps_its_children_in_a_column_with_the_popup_shapes_defaults() {
+        let loader = dev_config_loader();
+        let output = loader
+            .evaluate(r#"local panel_card = require("components.panel_card") return panel { id = "p", child = panel_card({ text { content = "x" } }) }"#)
+            .unwrap();
+        let card = child_table(&output);
+        assert_eq!(card.get::<String>("kind").unwrap(), "column");
+        assert_eq!(card.get::<i64>("radius").unwrap(), 10);
+        assert_eq!(card.get::<i64>("spacing").unwrap(), 6);
+        let children: Table = card.get("children").unwrap();
+        assert_eq!(children.raw_len(), 1);
+    }
+
+    /// `modules/bar/panels/settings.lua`'s own reason for `panel_card`: its window body wants
+    /// `radius = 0` and its own padding, not the popup defaults above.
+    #[test]
+    fn panel_card_lets_a_caller_override_every_default() {
+        let loader = dev_config_loader();
+        let output = loader
+            .evaluate(
+                r##"local panel_card = require("components.panel_card")
+                   return panel { id = "p", child = panel_card({}, { radius = 0, spacing = 2, background = "#000000ff" }) }"##,
+            )
+            .unwrap();
+        let card = child_table(&output);
+        assert_eq!(card.get::<i64>("radius").unwrap(), 0);
+        assert_eq!(card.get::<i64>("spacing").unwrap(), 2);
+        assert_eq!(card.get::<String>("background").unwrap(), "#000000ff");
+    }
+
+    /// `on_click` fires for right and middle clicks too (§ 5.2 item 6), so a close button has to
+    /// filter to a left click itself the same way `modules/bar/indicators/session.lua`'s lock
+    /// button does -- a right click landing on a settings window's close button must not close it.
+    #[test]
+    fn panel_header_calls_on_close_for_a_left_click_and_nothing_else() {
+        use mlua::Function;
+        let loader = dev_config_loader();
+        let output = loader
+            .evaluate(
+                r#"local panel_header = require("components.panel_header")
+                   closed = false
+                   return panel { id = "p", child = panel_header("hi", function() closed = true end) }"#,
+            )
+            .unwrap();
+        let header = child_table(&output);
+        assert_eq!(header.get::<String>("kind").unwrap(), "row");
+        let children: Table = header.get("children").unwrap();
+        let title: Table = children.get(1).unwrap();
+        assert_eq!(title.get::<String>("kind").unwrap(), "text");
+        assert_eq!(title.get::<String>("content").unwrap(), "hi");
+        let close_button: Table = children.get(2).unwrap();
+        assert_eq!(close_button.get::<String>("kind").unwrap(), "button");
+
+        let on_click: Function = close_button.get("on_click").unwrap();
+        let rect = loader.lua().create_table().unwrap();
+        on_click.call::<()>((rect.clone(), "right")).unwrap();
+        let closed: bool = loader.lua().globals().get("closed").unwrap();
+        assert!(!closed, "a right click on the close button must not call on_close");
+
+        on_click.call::<()>((rect, "left")).unwrap();
+        let closed: bool = loader.lua().globals().get("closed").unwrap();
+        assert!(closed, "a left click on the close button has to call on_close");
+    }
+
+    /// The behavioral half of `components/toggle.lua`: a click reads the signal's current value
+    /// through `read`, flips it, and hands the flip to `on_change` -- never the signal directly,
+    /// so a capability-backed toggle (`oblisk.bluetooth`) and a `state()`-backed one both work.
+    #[test]
+    fn toggle_reads_the_current_value_through_read_and_flips_it_into_on_change() {
+        use mlua::Function;
+        let loader = dev_config_loader();
+        let output = loader
+            .evaluate(
+                r#"local toggle = require("components.toggle")
+                   local on = state("on", false)
+                   last_change = nil
+                   return panel { id = "p", child = toggle(on, function(v) return v end, function(new_value)
+                       last_change = new_value
+                       on:set(new_value)
+                   end) }"#,
+            )
+            .unwrap();
+        let track = child_table(&output);
+        assert_eq!(track.get::<String>("kind").unwrap(), "button");
+        assert_eq!(track.get::<i64>("width").unwrap(), 34);
+        assert_eq!(track.get::<i64>("height").unwrap(), 18);
+
+        let on_click: Function = track.get("on_click").unwrap();
+        let rect = loader.lua().create_table().unwrap();
+        on_click.call::<()>((rect.clone(), "left")).unwrap();
+        let after_first: bool = loader.lua().globals().get("last_change").unwrap();
+        assert!(after_first, "a click on an off toggle has to flip on_change to true");
+
+        on_click.call::<()>((rect, "left")).unwrap();
+        let after_second: bool = loader.lua().globals().get("last_change").unwrap();
+        assert!(!after_second, "the next click has to read the new value back, not the one it started with");
+    }
+
+    #[test]
+    fn toggle_ignores_a_right_or_middle_click() {
+        use mlua::Function;
+        let loader = dev_config_loader();
+        let output = loader
+            .evaluate(
+                r#"local toggle = require("components.toggle")
+                   local on = state("on", false)
+                   changes = 0
+                   return panel { id = "p", child = toggle(on, function(v) return v end, function(new_value)
+                       changes = changes + 1
+                       on:set(new_value)
+                   end) }"#,
+            )
+            .unwrap();
+        let track = child_table(&output);
+        let on_click: Function = track.get("on_click").unwrap();
+        let rect = loader.lua().create_table().unwrap();
+        on_click.call::<()>((rect.clone(), "right")).unwrap();
+        on_click.call::<()>((rect, "middle")).unwrap();
+        let changes: i64 = loader.lua().globals().get("changes").unwrap();
+        assert_eq!(changes, 0, "only a left click may flip a toggle");
+    }
+
+    /// `modules/bar/panels/settings.lua`'s `bluetooth.enabled` row: a label beside a
+    /// `components/toggle.lua`, both driven by the same signal/read/on_change triple.
+    #[test]
+    fn panel_toggle_card_pairs_a_label_with_a_toggle_bound_to_the_same_signal() {
+        let loader = dev_config_loader();
+        let output = loader
+            .evaluate(
+                r#"local card = require("components.panel_toggle_card")
+                   local on = state("on", true)
+                   return panel { id = "p", child = card("enabled", on, function(v) return v end, function(new_value)
+                       on:set(new_value)
+                   end) }"#,
+            )
+            .unwrap();
+        let row = child_table(&output);
+        assert_eq!(row.get::<String>("kind").unwrap(), "row");
+        let children: Table = row.get("children").unwrap();
+        let label: Table = children.get(1).unwrap();
+        assert_eq!(label.get::<String>("kind").unwrap(), "text");
+        assert_eq!(label.get::<String>("content").unwrap(), "enabled");
+        let toggle_node: Table = children.get(2).unwrap();
+        assert_eq!(toggle_node.get::<String>("kind").unwrap(), "button");
+    }
+
+    /// `modules/bar/indicators/sys_tray.lua`'s tray count: a badge is a filled `row` around
+    /// whatever `content` (a literal string or a `Signal`) its caller hands it.
+    #[test]
+    fn badge_wraps_content_in_a_small_filled_row() {
+        let loader = dev_config_loader();
+        let output = loader.evaluate(r#"local badge = require("components.badge") return panel { id = "p", child = badge("3") }"#).unwrap();
+        let row = child_table(&output);
+        assert_eq!(row.get::<String>("kind").unwrap(), "row");
+        assert_eq!(row.get::<i64>("height").unwrap(), 16);
+        let children: Table = row.get("children").unwrap();
+        let text_node: Table = children.get(1).unwrap();
+        assert_eq!(text_node.get::<String>("kind").unwrap(), "text");
+        assert_eq!(text_node.get::<String>("content").unwrap(), "3");
+    }
+
     /// `forget_config_modules` runs before every evaluation and reads `package.loaded`, so a
     /// config that removes `package` reaches into the *next* reload rather than only its own. The
     /// answer must be a reported error, not a silent no-op.

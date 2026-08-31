@@ -24,6 +24,46 @@ function util.count(list)
     return list and #list or 0
 end
 
+-- An `app_id` to its `.desktop` entry, through `oblisk.applications`'s own `by_app_id` map
+-- (docs/adr/0061). Three callers want this and each holds a differently-spelled id:
+-- `modules/global/launcher.lua` has a real desktop file id, `modules/bar/indicators/active_window.lua`
+-- has whatever the compositor reports as a toplevel's `app_id`, and
+-- `modules/bar/indicators/sys_tray.lua` has a StatusNotifierItem's self-declared `Id`.
+--
+-- The lowercase retry is here rather than in the capability because the map already carries a
+-- case-folded key for every entry: this only has to fold the *caller's* spelling to reach it, and
+-- doing that in Rust would mean the capability guessing which of its keys a caller meant.
+function util.app_entry(applications, app_id)
+    if applications == nil or app_id == nil or app_id == "" then
+        return nil
+    end
+    local by_app_id = applications.by_app_id
+    if by_app_id == nil then
+        return nil
+    end
+    return by_app_id[app_id] or by_app_id[string.lower(app_id)]
+end
+
+-- The icon-name mapping `modules/bar/indicators/volume.lua` and `modules/osd/popup.lua` both need:
+-- pulled out once a second real call site made it a duplicate rather than a one-off
+-- (`components/pill.lua`'s own bar for a shared file). Takes the raw `oblisk.audio` payload, not a
+-- signal, so a caller decides for itself whether `nil` gets its own branch or an empty icon name.
+function util.volume_icon_name(a)
+    if a == nil then
+        return ""
+    end
+    if a.muted then
+        return "audio-volume-muted"
+    end
+    local percent = (a.volume or 0) * 100
+    if percent < 34 then
+        return "audio-volume-low"
+    elseif percent < 67 then
+        return "audio-volume-medium"
+    end
+    return "audio-volume-high"
+end
+
 -- A module that has nothing to say should not be a pill containing "--". `visible` is an ordinary
 -- base property (§ 5.1) and takes a signal like any other, so a module can hide itself on the same
 -- pass that resolves its text, and a hidden child is skipped by the row's own positioning rather
