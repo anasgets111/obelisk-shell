@@ -15,7 +15,7 @@ glow = "0.18.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 khronos-egl = { version = "6.0.0", features = ["static"] }
 mlua = { version = "0.12.0", features = ["lua54", "vendored", "serde"] }
-nix = { version = "0.31.3", features = ["poll"] }
+nix = { version = "0.31.3", features = ["poll", "time"] }
 resvg = { version = "0.48.1", default-features = false }
 serde_json = "1.0.151"
 shared = { version = "0.1.0", path = "../shared" }

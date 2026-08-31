@@ -26,6 +26,59 @@ use crate::lua::marshal;
 /// § 1.2: "CPU runtime is capped at 5ms per evaluation."
 const CPU_CAP: Duration = Duration::from_millis(5);
 
+/// One live evaluation's allowance, on both clocks.
+///
+/// `cpu` is the one § 1.2 specifies and the only one that decides. `wall` is a pre-filter and
+/// nothing else: a thread's CPU time advances at most as fast as the clock, so an unexpired wall
+/// deadline *proves* an unexpired CPU one and [`Deadline::expired`] can answer "keep going"
+/// without a syscall. Measured on an Intel laptop, `Instant::now()` is 23.6ns against
+/// `CLOCK_THREAD_CPUTIME_ID`'s 170.4ns, and the hook fires every
+/// [`CHECK_EVERY_N_INSTRUCTIONS`] instructions, so the common path pays the cheap clock.
+///
+/// This was wall clock alone, which made the constant's name and § 1.2 both wrong: a descheduled
+/// evaluation was charged for time it did not run. On a 12-thread machine running the whole test
+/// suite that fired on configs a quiet machine evaluates in microseconds, 5 times in 53 full
+/// runs, a different test each time.
+///
+/// Nothing is lost by not counting the wait. A thread parked in a syscall executes no
+/// instructions, so the hook never fired during one anyway; ADR-0048 says so and answers it the
+/// only way that works, by removing every call that can block: `io` is absent from
+/// `lua::config_stdlib`, and `lua::restrict_os` keeps only four `os` calls, all of which return
+/// without waiting.
+#[derive(Clone, Copy)]
+struct Deadline {
+    wall: Instant,
+    /// `None` when the clock could not be read, which leaves `wall` authoritative on its own.
+    cpu: Option<Duration>,
+}
+
+impl Deadline {
+    /// [`CPU_CAP`] from now, on both clocks.
+    fn starting_now() -> Self {
+        Self { wall: Instant::now() + CPU_CAP, cpu: thread_cpu_time().map(|used| used + CPU_CAP) }
+    }
+
+    fn expired(&self) -> bool {
+        if Instant::now() <= self.wall {
+            return false;
+        }
+        // Past the wall pre-filter, so the CPU clock decides. An unreadable clock expires: a cap
+        // that cannot measure must fire rather than quietly stop existing, and falling back to
+        // the wall deadline is exactly the behaviour this replaced.
+        self.cpu.is_none_or(|deadline| thread_cpu_time().is_none_or(|used| used > deadline))
+    }
+}
+
+/// How much CPU the calling thread has burned, which is what § 1.2's cap is written against.
+///
+/// Per *thread*, not per process: one evaluation runs start to finish on the thread that entered
+/// it, and the Lua VM is single-threaded by construction (docs/adr/0039 puts it on the Wayland
+/// thread). A process-wide clock would charge a config for the shaping worker.
+fn thread_cpu_time() -> Option<Duration> {
+    let spent = nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID).ok()?;
+    Some(Duration::new(spent.tv_sec().try_into().ok()?, spent.tv_nsec().try_into().ok()?))
+}
+
 /// How many VM instructions run between budget checks. `mlua`'s `HookTriggers` docs warn a low
 /// value "can incur a very high overhead"; 1000 keeps the check cheap while still catching a
 /// runaway closure within roughly one instruction-batch of the 5ms mark, not after it's spun for
@@ -428,11 +481,12 @@ struct HoverRegistry(HashMap<String, (Signal, Signal)>);
 /// evaluation as a whole, not a per-level allowance that resets on every recursive `:get()`.
 ///
 /// `stack[0]` is also, specifically, the *minimum*, so this is `first()` and not `iter().min()`:
-/// every deadline is `Instant::now() + CPU_CAP`, and entries are pushed and popped strictly LIFO,
-/// so the vector is non-decreasing and its first element is its minimum. That matters because the
-/// hook runs every [`CHECK_EVERY_N_INSTRUCTIONS`] instructions: `first()` is O(1) where `min()`
-/// walked up to [`MAX_SIGNAL_NESTING_DEPTH`] `Instant`s per fire. Do not "fix" it to `last()`
-/// either -- that is the per-level reset this design exists to avoid.
+/// every entry is [`Deadline::starting_now`], and entries are pushed and popped strictly LIFO, so
+/// the vector is non-decreasing and its first element is its minimum. Both clocks are monotonic,
+/// so that holds on each of the pair independently and the argument survived them becoming two.
+/// It matters because the hook runs every [`CHECK_EVERY_N_INSTRUCTIONS`] instructions: `first()`
+/// is O(1) where `min()` walked up to [`MAX_SIGNAL_NESTING_DEPTH`] entries per fire. Do not "fix"
+/// it to `last()` either -- that is the per-level reset this design exists to avoid.
 struct CpuBudget<'lua> {
     lua: &'lua Lua,
 }
@@ -446,10 +500,10 @@ impl<'lua> CpuBudget<'lua> {
     /// disabling the cap for the rest of the VM's life. No Lua runs between the install and the
     /// push, and the hook tolerates an empty stack.
     fn enter(lua: &'lua Lua) -> mlua::Result<Self> {
-        if lua.app_data_ref::<Vec<Instant>>().is_none() {
-            lua.set_app_data(Vec::<Instant>::new());
+        if lua.app_data_ref::<Vec<Deadline>>().is_none() {
+            lua.set_app_data(Vec::<Deadline>::new());
         }
-        let depth = lua.app_data_ref::<Vec<Instant>>().expect("just ensured the deadline stack exists").len();
+        let depth = lua.app_data_ref::<Vec<Deadline>>().expect("just ensured the deadline stack exists").len();
         if depth >= MAX_SIGNAL_NESTING_DEPTH {
             return Err(mlua::Error::runtime(format!(
                 "signal nesting exceeded its maximum depth of {MAX_SIGNAL_NESTING_DEPTH} levels -- a computed/map chain recursing into itself, or a dependency chain that long?"
@@ -476,9 +530,7 @@ impl<'lua> CpuBudget<'lua> {
                 },
             )?;
         }
-        lua.app_data_mut::<Vec<Instant>>()
-            .expect("just ensured the deadline stack exists")
-            .push(Instant::now() + CPU_CAP);
+        lua.app_data_mut::<Vec<Deadline>>().expect("just ensured the deadline stack exists").push(Deadline::starting_now());
         Ok(Self { lua })
     }
 
@@ -508,7 +560,7 @@ impl Drop for CpuBudget<'_> {
     fn drop(&mut self) {
         let remaining = {
             let mut stack =
-                self.lua.app_data_mut::<Vec<Instant>>().expect("CpuBudget::enter always runs before its Drop");
+                self.lua.app_data_mut::<Vec<Deadline>>().expect("CpuBudget::enter always runs before its Drop");
             stack.pop();
             stack.len()
         };
@@ -527,9 +579,7 @@ impl Drop for CpuBudget<'_> {
 /// `last()`: see [`CpuBudget`]'s doc comment for why. An empty stack (no evaluation in flight) is
 /// never expired, which is what lets [`CpuBudget::enter`] install the hook before its first push.
 fn governing_deadline_expired(lua: &Lua) -> bool {
-    lua.app_data_ref::<Vec<Instant>>()
-        .and_then(|stack| stack.first().copied())
-        .is_some_and(|deadline| Instant::now() > deadline)
+    lua.app_data_ref::<Vec<Deadline>>().and_then(|stack| stack.first().copied()).is_some_and(|deadline| deadline.expired())
 }
 
 /// The one answer to "does this Lua userdata resolve like a signal?", and the `Signal` to
@@ -1093,10 +1143,10 @@ mod tests {
     fn a_map_chain_at_the_nesting_cap_is_accepted_and_one_link_past_it_is_rejected() {
         // Both caps mean the same thing: at most N levels are admitted, the N+1th is rejected.
         //
-        // The assertions are about which *gate* fired, not about the value, because the 5ms
-        // budget is wall clock and not CPU time: on a loaded machine a chain this long can be
-        // descheduled past its deadline, and the whole suite running in parallel is exactly that
-        // machine. A CPU-cap error at the limit is the budget doing its job; what must never
+        // The assertions are about which *gate* fired, not about the value. The budget counts
+        // this thread's CPU time now (see `Deadline`), so a descheduled chain is no longer
+        // charged for the wait, but a chain this long can still genuinely spend 5ms of CPU on a
+        // busy machine. A CPU-cap error at the limit is the budget doing its job; what must never
         // happen is the *nesting* cap refusing a depth it claims to admit.
         let lua = lua_with_signal("a", Value::Integer(7));
         match lua.load(map_chain_source(MAX_SIGNAL_NESTING_DEPTH)).eval::<i64>() {
@@ -1134,6 +1184,35 @@ mod tests {
 
         assert!(result.is_err(), "an exponential diamond graph must be cut off, not returned: {result:?}");
         assert!(elapsed < Duration::from_millis(100), "the shared 5ms budget must cut it off early, took {elapsed:?}");
+    }
+
+    #[test]
+    fn a_computed_descheduled_past_its_deadline_is_not_charged_for_time_it_did_not_run() {
+        // The suite's own flakiness is what this is for. Measured before the fix: 5 failures in 53
+        // full renderer-suite runs, a different test each time, every one of them
+        // `computed/map exceeded its 5ms CPU budget` raised by a config a quiet machine evaluates
+        // in microseconds. 630 tests across 12 threads deschedule one, and a wall-clock deadline
+        // charges it for the wait.
+        //
+        // `park` burns no CPU, so a cap meaning what § 1.2 says -- "CPU runtime is capped at 5ms"
+        // -- must not fire here. The loop after it is what makes this cover both gates rather than
+        // one: it runs enough instructions for the hook to fire mid-call, and returning then puts
+        // `CpuBudget::check_not_exceeded` past the wall deadline too.
+        let lua = lua_with_signal("a", Value::Integer(7));
+        let park = lua
+            .create_function(|_, ()| {
+                std::thread::sleep(Duration::from_millis(40));
+                Ok(())
+            })
+            .unwrap();
+        lua.globals().set("park", park).unwrap();
+
+        let value: i64 = lua
+            .load("return a:map(function(v) park() local n = 0 for i = 1, 5000 do n = n + i end return v end):get()")
+            .eval()
+            .unwrap();
+
+        assert_eq!(value, 7);
     }
 
     #[test]
