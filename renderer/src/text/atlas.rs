@@ -13,9 +13,9 @@ use std::error::Error;
 use std::ffi::c_void;
 
 use femtovg::renderer::OpenGl;
-use femtovg::{Canvas, Color, FontId, Paint, TextContext};
+use femtovg::{Align, Canvas, Color, FontId, Paint, TextContext};
 
-use crate::layout::node::Rgba;
+use crate::layout::node::{Rgba, TextAlign};
 use crate::text::shaping::FontData;
 
 use super::snap::{snap_to_physical, LogicalRect};
@@ -86,7 +86,7 @@ impl TextPainter {
     /// Phase 4, point 3) in `color`. Does not flush or swap buffers -- `layout::paint`'s tree
     /// walk draws a whole surface's worth of nodes onto this same canvas and flushes once at
     /// the end (build-steps.md Phase 19 item 6).
-    pub fn draw_line(&mut self, text: &str, rect: LogicalRect, font_size: f32, scale: f32, color: Rgba) {
+    pub fn draw_line(&mut self, text: &str, rect: LogicalRect, font_size: f32, scale: f32, color: Rgba, align: TextAlign) {
         let physical = snap_to_physical(rect, scale);
         // `Rgba`'s four `f32` fields exist so `Color::rgbaf` takes them with no conversion.
         let mut paint = Paint::color(Color::rgbaf(color.r, color.g, color.b, color.a));
@@ -98,8 +98,19 @@ impl TextPainter {
         // fill_text's y is the text baseline, not the box top, so it belongs at the snapped top
         // edge plus the font's ascender -- not the snapped bottom edge, which would cut
         // descenders off outside the box.
+        // femtovg's own alignment rather than a measured offset: `set_text_align` decides what the
+        // x it is handed *means*, so a centred run needs the box's centre and a right-aligned one
+        // its far edge. Measuring the run here to compute a left offset would be a second
+        // measurement, against femtovg's metrics rather than the cosmic-text ones the box was sized
+        // with, which is exactly the disagreement `text::shaping`'s module doc records.
+        let (femto_align, anchor_x) = match align {
+            TextAlign::Start => (Align::Left, physical.x0 as f32),
+            TextAlign::Center => (Align::Center, (physical.x0 + physical.x1) as f32 / 2.0),
+            TextAlign::End => (Align::Right, physical.x1 as f32),
+        };
+        paint.set_text_align(femto_align);
         let ascender = self.canvas.measure_font(&paint).map(|m| m.ascender()).unwrap_or(font_size);
         let baseline_y = physical.y0 as f32 + ascender;
-        let _ = self.canvas.fill_text(physical.x0 as f32, baseline_y, text, &paint);
+        let _ = self.canvas.fill_text(anchor_x, baseline_y, text, &paint);
     }
 }

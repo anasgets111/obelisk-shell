@@ -92,6 +92,40 @@ fn parse_optional_string(properties: &HashMap<String, Value>, property: &str) ->
 /// `text.foreground` (§ 5.2 item 4). Absent defaults to white -- `layout::paint`'s `paint_text`
 /// falls back to the same white whenever this parser errors on a present-but-malformed value, so
 /// the rendered result agrees whether the key was omitted or rejected.
+/// Where a run of glyphs sits inside the box the node was given, as distinct from where the node
+/// sits inside its parent (`align_h`).
+///
+/// Only visible when the box is wider than the text, so it does nothing on a `Content`-sized node
+/// whose box came from measuring that same string. An explicit `width`, a `"Fill"`, or a
+/// `Stretch`ed cross axis is what makes room for it to matter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextAlign {
+    #[default]
+    Start,
+    Center,
+    End,
+}
+
+/// `text_align` (`oblisk-idl-api-specs.md` § 5.2 item 4). Absent is `Start`.
+///
+/// Strings rather than an enum-like table, matching what `fit`, `layer`, `align_h` and `on_click`'s
+/// button name already do at this boundary. `Start`/`End` rather than `Left`/`Right` for the same
+/// reason `align_h` uses them: they are the names the rest of § 5.2 uses for the same axis.
+pub fn parse_text_align(properties: &HashMap<String, Value>) -> Result<TextAlign, LayoutError> {
+    let Some(value) = properties.get("text_align") else {
+        return Ok(TextAlign::Start);
+    };
+    let Value::String(s) = value else {
+        return Err(invalid("text_align", format!("must be a string, got {}", preview_for_error(value))));
+    };
+    match checked_string("text_align", s)?.as_str() {
+        "Start" => Ok(TextAlign::Start),
+        "Center" => Ok(TextAlign::Center),
+        "End" => Ok(TextAlign::End),
+        other => Err(invalid("text_align", format!("must be \"Start\", \"Center\" or \"End\", got {other:?}"))),
+    }
+}
+
 pub fn parse_foreground(properties: &HashMap<String, Value>) -> Result<Rgba, LayoutError> {
     let Some(value) = properties.get("foreground") else {
         return Ok(Rgba {

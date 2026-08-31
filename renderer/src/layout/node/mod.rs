@@ -35,11 +35,11 @@ mod toplevel;
 // ran them itself on every node on every frame; [`paint_style`] is their only caller now
 // (docs/adr/0068), so the way to ask what a node paints is to ask for its `PaintStyle`. `super::*`
 // is what carries them into `paint_style.rs`.
-use content::{parse_fit, parse_font_size, parse_foreground, parse_icon_name, parse_image_source, parse_mask_character, parse_placeholder};
+use content::{parse_fit, parse_font_size, parse_foreground, parse_icon_name, parse_image_source, parse_mask_character, parse_placeholder, parse_text_align};
 use spec::parse_secure_submit;
 use style::{parse_background, parse_border_color, parse_border_width, parse_radius};
 
-pub use content::{parse_content, parse_icon_size, parse_node_id, parse_surface_id};
+pub use content::{parse_content, parse_icon_size, parse_node_id, parse_surface_id, TextAlign};
 pub use paint_style::{PaintStyle, paint_style};
 pub use spec::{
     SecureSubmitTarget, SurfaceFingerprint, SurfaceSpec, lock_spec, parse_children, parse_list_children, parse_single_child,

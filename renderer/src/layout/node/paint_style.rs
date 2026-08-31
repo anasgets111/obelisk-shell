@@ -48,7 +48,7 @@ use super::*;
 pub enum PaintStyle {
     /// `rect`/`row`/`column`/`button` and all four surface roles: the fill, then the border.
     Box { background: Option<Rgba>, radius: f32, colors: BorderColor, widths: EdgeInsets },
-    Text { content: String, font_size: f32, color: Rgba },
+    Text { content: String, font_size: f32, color: Rgba, align: TextAlign },
     /// The theme *name*, not the resolved path: `layout::paint::execute` does the
     /// `image::icons::resolve` lookup, so neither this pass nor the display-list build touches the
     /// icon theme.
@@ -58,7 +58,7 @@ pub enum PaintStyle {
     /// error now, unlike before: `layout::secure_submit::secure_submit_targets` used to skip it
     /// silently on the grounds that the press path would log it, and the press path was the only
     /// other reader.
-    TextField { target: Option<SecureSubmitTarget>, placeholder: String, mask: String, font_size: f32, color: Rgba },
+    TextField { target: Option<SecureSubmitTarget>, placeholder: String, mask: String, font_size: f32, color: Rgba, align: TextAlign },
 }
 
 /// Parses `kind`'s paint properties out of an already-resolved property map.
@@ -81,6 +81,7 @@ pub fn paint_style(kind: &str, properties: &HashMap<String, Value>) -> Result<Op
             content: parse_content(properties)?,
             font_size: parse_font_size(properties)?,
             color: parse_foreground(properties)?,
+            align: parse_text_align(properties)?,
         },
         "icon" => PaintStyle::Icon {
             name: parse_icon_name(properties)?,
@@ -95,6 +96,7 @@ pub fn paint_style(kind: &str, properties: &HashMap<String, Value>) -> Result<Op
             mask: parse_mask_character(properties)?,
             font_size: parse_font_size(properties)?,
             color: parse_foreground(properties)?,
+            align: parse_text_align(properties)?,
         },
         _ => return Ok(None),
     };
@@ -116,6 +118,18 @@ mod tests {
         let table: mlua::Table = lua.load(lua_src).eval().unwrap();
         let node = deserialize_lua_table(&table).unwrap();
         paint_style(&node.kind, &node.properties)
+    }
+
+    #[test]
+    fn an_unknown_text_align_fails_the_pass_naming_the_property() {
+        let lua = Lua::new();
+        let err = style(&lua, r#"return { kind = "text", content = "hi", text_align = "Middle" }"#).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "text_align"),
+            "got {err:?}"
+        );
+        let err = style(&lua, r#"return { kind = "text", content = "hi", text_align = 1 }"#).unwrap_err();
+        assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "text_align"));
     }
 
     #[test]

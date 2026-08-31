@@ -33,7 +33,7 @@ use femtovg::renderer::OpenGl;
 use femtovg::{Canvas, Color, Paint, Path};
 
 use crate::image::{self, Fit, ImageCache};
-use crate::layout::node::{self, BorderColor, EdgeInsets, PaintStyle, Rgba};
+use crate::layout::node::{self, BorderColor, EdgeInsets, PaintStyle, Rgba, TextAlign};
 use crate::layout::scene::ResolvedNode;
 use crate::text::atlas::TextPainter;
 use crate::text::snap::{snap_border_band, snap_to_physical, LogicalRect, PhysicalRect};
@@ -51,7 +51,7 @@ use crate::text::snap::{snap_border_band, snap_to_physical, LogicalRect, Physica
 pub enum Draw {
     /// `rect`/`row`/`column`/`button` and all four surface roles: the fill, then the border.
     Box { background: Option<Rgba>, radius: f32, colors: BorderColor, widths: EdgeInsets },
-    Text { content: String, font_size: f32, color: Rgba },
+    Text { content: String, font_size: f32, color: Rgba, align: TextAlign },
     /// The theme *name*, not the resolved path: [`execute`] does the `image::icons::resolve`
     /// lookup. Keeping the filesystem hit out of [`build`] is what lets the build run on every
     /// re-resolve without touching the icon theme, and the name plus the size is what decides the
@@ -270,7 +270,7 @@ pub fn execute(painter: &mut TextPainter, images: &mut ImageCache, list: &Displa
                 }
                 paint_border(painter.canvas_mut(), rect, *radius, *colors, *widths, scale);
             }
-            Draw::Text { content, font_size, color } => painter.draw_line(content, rect, *font_size, scale, *color),
+            Draw::Text { content, font_size, color, align } => painter.draw_line(content, rect, *font_size, scale, *color, *align),
             Draw::Icon { name, px, alpha } => {
                 // `u16` is `freedesktop-icons`'s own size type, and a theme has no directory above
                 // 512 anyway.
@@ -342,10 +342,11 @@ fn draw_for(style: &PaintStyle, rect: LogicalRect, scale: f32, opacity: f32, foc
         // not past it. No shaving observed on this chain. It is still the correct outcome if a
         // future font or fallback face renders wider than it measures: the alternative is the
         // overrun landing on whatever sits to the right, which is the exact bug this fixes.
-        PaintStyle::Text { content, font_size, color } => Some(Draw::Text {
+        PaintStyle::Text { content, font_size, color, align } => Some(Draw::Text {
             content: content.clone(),
             font_size: *font_size,
             color: fade(*color, opacity),
+            align: *align,
         }),
 
         // `icon` (§ 5.2 item 5): the theme name, resolved to a file by [`execute`]
@@ -388,7 +389,7 @@ fn draw_for(style: &PaintStyle, rect: LogicalRect, scale: f32, opacity: f32, foc
         // Only the focused field fills. An unfocused one shows its placeholder, which is also the
         // honest thing to draw: `input::retarget_secure_submit` zeroizes the buffer whenever focus
         // moves, so there is no typed state left anywhere else to represent.
-        PaintStyle::TextField { target, placeholder, mask, font_size, color } => {
+        PaintStyle::TextField { target, placeholder, mask, font_size, color, align } => {
             let filled = focus
                 .filter(|focus| target.as_ref().is_some_and(|declared| declared == focus.target))
                 .map_or(0, |focus| focus.filled);
@@ -397,6 +398,7 @@ fn draw_for(style: &PaintStyle, rect: LogicalRect, scale: f32, opacity: f32, foc
                 content,
                 font_size: *font_size,
                 color: fade(*color, opacity),
+                align: *align,
             })
         }
     }
@@ -688,6 +690,65 @@ mod tests {
     }
 
     // ---- display list (`build`), the seam that needs no EGL context ----
+
+    fn text_align_of(list: &DisplayList) -> TextAlign {
+        list.commands
+            .iter()
+            .find_map(|cmd| match &cmd.draw {
+                Draw::Text { align, .. } => Some(*align),
+                _ => None,
+            })
+            .expect("expected a text draw")
+    }
+
+    #[test]
+    fn a_text_run_is_left_aligned_in_its_box_unless_it_says_otherwise() {
+        let lua = Lua::new();
+        let src = r##"return panel { id = "bar", width = 200, height = 40,
+            child = text { content = "hi", foreground = "#ffffffff" } }"##;
+        let tree = resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 });
+        assert_eq!(text_align_of(&build(&tree, 1.0, None)), TextAlign::Start);
+    }
+
+    #[test]
+    fn a_declared_text_align_reaches_the_display_list() {
+        for (declared, expected) in [("Center", TextAlign::Center), ("End", TextAlign::End), ("Start", TextAlign::Start)] {
+            let lua = Lua::new();
+            let src = format!(
+                r##"return panel {{ id = "bar", width = 200, height = 40,
+                    child = text {{ content = "hi", foreground = "#ffffffff", text_align = "{declared}" }} }}"##
+            );
+            let tree = resolved_surface(&lua, &src, LogicalSize { width: 200.0, height: 40.0 });
+            assert_eq!(text_align_of(&build(&tree, 1.0, None)), expected, "text_align = {declared:?}");
+        }
+    }
+
+    /// A masked field aligns the same way a `text` does, because both produce a `Draw::Text` and a
+    /// password prompt that centres its dots is a normal thing to want.
+    #[test]
+    fn a_textfield_carries_its_own_alignment_too() {
+        let lua = Lua::new();
+        let src = r##"return panel { id = "bar", width = 200, height = 40,
+            child = textfield { width = 180, height = 24, placeholder = "password", foreground = "#ffffffff", text_align = "Center" } }"##;
+        let tree = resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 });
+        assert_eq!(text_align_of(&build(&tree, 1.0, None)), TextAlign::Center);
+    }
+
+    /// The alignment is in the list, so switching it repaints. Same argument as the opacity case:
+    /// ADR-0063 skips a repaint when the list compares equal.
+    #[test]
+    fn changing_only_the_text_alignment_changes_the_display_list() {
+        let size = LogicalSize { width: 200.0, height: 40.0 };
+        let src = |align: &str| {
+            format!(
+                r##"return panel {{ id = "bar", width = 200, height = 40,
+                    child = text {{ content = "hi", foreground = "#ffffffff", text_align = "{align}" }} }}"##
+            )
+        };
+        let a = build(&resolved_surface(&Lua::new(), &src("Start"), size), 1.0, None);
+        let b = build(&resolved_surface(&Lua::new(), &src("Center"), size), 1.0, None);
+        assert_ne!(a, b);
+    }
 
     fn box_alpha(cmd: &DrawCmd) -> f32 {
         match &cmd.draw {

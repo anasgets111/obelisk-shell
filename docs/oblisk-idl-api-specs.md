@@ -385,6 +385,7 @@ Arranges children vertically.
 
 #### 4. `text`
 Draws shaped unicode glyph text via `cosmic-text`.
+*   `text_align`: `string` (`"Start"`, `"Center"` or `"End"`. Where the run of glyphs sits inside the box this node was given, which is a different question from `align_h`, where the node sits inside its parent. Defaults to `"Start"`. Only visible when the box is wider than the text, so it does nothing on a `Content`-sized node whose box came from measuring that same string)
 *   `content`: `string` / `Signal` (The string text to display. Defaults to `""`, so a `text` bound to a capability signal renders empty until that signal's first push rather than rejecting the tree at boot, ADR-0044)
 *   `font_size`: `integer` (Defaults to `12`)
 *   `foreground`: `string` (Hex-color code, same strict `#RRGGBB` / `#RRGGBBAA` form as `rect.background`. Defaults to opaque white)
