@@ -48,7 +48,7 @@ use super::*;
 pub enum PaintStyle {
     /// `rect`/`row`/`column`/`button` and all four surface roles: the fill, then the border.
     Box { background: Option<Rgba>, radius: f32, colors: BorderColor, widths: EdgeInsets },
-    Text { content: String, font_size: f32, color: Rgba, align: TextAlign },
+    Text { content: String, font_size: f32, color: Rgba, align: TextAlign, elide: Elide },
     /// The theme *name*, not the resolved path: `layout::paint::execute` does the
     /// `image::icons::resolve` lookup, so neither this pass nor the display-list build touches the
     /// icon theme.
@@ -82,6 +82,7 @@ pub fn paint_style(kind: &str, properties: &HashMap<String, Value>) -> Result<Op
             font_size: parse_font_size(properties)?,
             color: parse_foreground(properties)?,
             align: parse_text_align(properties)?,
+            elide: parse_elide(properties)?,
         },
         "icon" => PaintStyle::Icon {
             name: parse_icon_name(properties)?,

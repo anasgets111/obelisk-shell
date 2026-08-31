@@ -2466,6 +2466,8 @@ bar.
 | Paint vocabulary | four operations | fill, radius, per-edge border, blit |
 | Animation | absent | Lua has no clock faster than 1 Hz |
 | Text and layout | sufficient | shaping, clipping, alignment and keyed reconciliation are built |
+| Text metrics | partly built | `text_align` and `elide` land; wrap and `max_lines` need line breaks the shaper does not return |
+| Fonts | declared | `fonts { ... }` picks the chain; no per-node family, and none is needed while fallback is per glyph |
 
 The data layer is fine. That was the surprise. Input and paint are where this falls over.
 

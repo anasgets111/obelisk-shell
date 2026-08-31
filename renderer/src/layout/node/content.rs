@@ -106,6 +106,35 @@ pub enum TextAlign {
     End,
 }
 
+/// What to do with a run of text too wide for the box it was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Elide {
+    /// Let the clip cut it off mid-glyph, which is what every `text` did before this existed.
+    #[default]
+    None,
+    /// Drop trailing characters and finish with a single-character ellipsis.
+    End,
+}
+
+/// `elide` (`oblisk-idl-api-specs.md` § 5.2 item 4). Absent is `None`.
+///
+/// Only `"End"` is offered. QML also has head and middle elision; the reference config uses neither,
+/// and a middle elide has to decide how to split a grapheme budget across two runs, which is real
+/// work for nothing that has asked.
+pub fn parse_elide(properties: &HashMap<String, Value>) -> Result<Elide, LayoutError> {
+    let Some(value) = properties.get("elide") else {
+        return Ok(Elide::None);
+    };
+    let Value::String(s) = value else {
+        return Err(invalid("elide", format!("must be a string, got {}", preview_for_error(value))));
+    };
+    match checked_string("elide", s)?.as_str() {
+        "None" => Ok(Elide::None),
+        "End" => Ok(Elide::End),
+        other => Err(invalid("elide", format!("must be \"None\" or \"End\", got {other:?}"))),
+    }
+}
+
 /// `text_align` (`oblisk-idl-api-specs.md` § 5.2 item 4). Absent is `Start`.
 ///
 /// Strings rather than an enum-like table, matching what `fit`, `layer`, `align_h` and `on_click`'s

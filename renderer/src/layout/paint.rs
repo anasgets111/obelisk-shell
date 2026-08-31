@@ -342,7 +342,10 @@ fn draw_for(style: &PaintStyle, rect: LogicalRect, scale: f32, opacity: f32, foc
         // not past it. No shaving observed on this chain. It is still the correct outcome if a
         // future font or fallback face renders wider than it measures: the alternative is the
         // overrun landing on whatever sits to the right, which is the exact bug this fixes.
-        PaintStyle::Text { content, font_size, color, align } => Some(Draw::Text {
+        // `elide` is absent here on purpose: `Scene::apply` has already rewritten `content` to the
+        // string that fits, because that is the only place the box width and the shaping worker are
+        // both in reach. By the time a draw is built there is nothing left to decide.
+        PaintStyle::Text { content, font_size, color, align, elide: _ } => Some(Draw::Text {
             content: content.clone(),
             font_size: *font_size,
             color: fade(*color, opacity),

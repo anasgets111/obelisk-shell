@@ -817,7 +817,7 @@ fn resolve_and_reconcile(
     let height_mode = node::parse_size_mode(&properties, "height")?;
     // Before `intrinsic_content_size`, which sizes a `text` from the `content` and `font_size`
     // parsed here rather than parsing them a second time.
-    let paint = node::paint_style(kind, &properties)?;
+    let mut paint = node::paint_style(kind, &properties)?;
 
     let own_width_known = forced_width.or_else(|| resolve_non_content(width_mode, available.width));
     let own_height_known = forced_height.or_else(|| resolve_non_content(height_mode, available.height));
@@ -1019,6 +1019,10 @@ fn resolve_and_reconcile(
     };
 
     position_children(kind, &properties, &mut new_children, size, padding, own_width_known, own_height_known)?;
+
+    // After sizing, because the width it fits into is this node's own, and before the node is
+    // built, because what it rewrites is the string the display list will carry.
+    elide_to_fit(&mut paint, (size.width - padding.horizontal()).max(0.0), shaping);
 
     Ok(RetainedNode {
         id,
@@ -1249,6 +1253,61 @@ fn scroll_offset(properties: &HashMap<String, Value>, content_main: f32, total_m
         handle.set_quiet(Value::Number(f64::from(used)));
     }
     used
+}
+
+
+/// Rewrites an over-wide `text` to the longest prefix that fits, finished with an ellipsis.
+///
+/// Runs here rather than in `layout::paint` because this is the only place both halves are in
+/// reach: the box width is not known until this node has been sized, and the shaping worker is not
+/// reachable from a display-list build, which is pure by design.
+///
+/// Does nothing when the text already fits, and nothing on a `Content`-sized node, whose box came
+/// from measuring this same string and therefore always fits it.
+///
+/// ponytail: a binary search over character prefixes, so roughly ten `ShapingHandle::shape` calls
+/// the first time a given string elides in a given box. Every one of them is a cache key
+/// (`text::shaping`'s memo), so a string that elided last pass costs nothing this pass, and the
+/// search only reruns when the string or the box changes. Before that cache existed this would have
+/// been ten blocking round trips per elided node per frame, which is why it is written this way now
+/// and would not have been then. Cutting at a character boundary rather than a grapheme cluster is
+/// the real ceiling: an emoji with a skin-tone modifier can lose the modifier and change what it
+/// draws. Nothing in this shell's own strings does that, and window titles arriving from outside it
+/// eventually will, so a `unicode-segmentation` pass over grapheme boundaries is the upgrade path.
+fn elide_to_fit(paint: &mut Option<PaintStyle>, content_width: f32, shaping: &ShapingHandle) {
+    let Some(PaintStyle::Text { content, font_size, elide: node::Elide::End, .. }) = paint.as_mut() else {
+        return;
+    };
+    if content.is_empty() || content_width <= 0.0 {
+        return;
+    }
+    let measure = |text: &str| {
+        shaping
+            .shape(ShapeRequest { text: text.to_string(), font_size: *font_size, line_height: *font_size * 1.2, max_width: None })
+            .width
+    };
+    if measure(content) <= content_width {
+        return;
+    }
+
+    // Byte offsets a prefix may be cut at, so the search never lands inside a codepoint. The last
+    // entry is the start of the final character, which is the longest prefix worth trying: the whole
+    // string is already known not to fit.
+    let cuts: Vec<usize> = content.char_indices().map(|(index, _)| index).collect();
+    // Largest index into `cuts` whose prefix plus an ellipsis still fits. Zero is always admissible
+    // and means the ellipsis alone, the honest answer for a box too narrow for even one character.
+    let (mut low, mut high) = (0usize, cuts.len() - 1);
+    while low < high {
+        // Rounded up, so `mid` is always above `low` and the loop cannot stall; `high` is only ever
+        // assigned `mid - 1`, and `mid` is at least 1 whenever this body runs.
+        let mid = low + (high - low).div_ceil(2);
+        if measure(&format!("{}\u{2026}", &content[..cuts[mid]])) <= content_width {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    *content = format!("{}\u{2026}", &content[..cuts[low]]);
 }
 
 
@@ -2222,6 +2281,84 @@ mod tests {
     /// only once something made the node visible.
     /// ADR-0068's rule applied to the new property: a bad value fails the apply rather than being
     /// clamped or defaulted, so `opacity = 50` meaning percent is heard about immediately.
+    fn drawn_text(scene: &Scene) -> String {
+        fn find(node: &ResolvedNode) -> Option<String> {
+            if let Some(PaintStyle::Text { content, .. }) = &node.paint {
+                return Some(content.clone());
+            }
+            node.children.iter().find_map(find)
+        }
+        find(&scene.surface("bar@TEST").unwrap()).expect("expected a text node")
+    }
+
+    fn elided(lua_src: &str) -> String {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(lua_src);
+        apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
+        drawn_text(&scene)
+    }
+
+    const LONG: &str = "a window title far too long for the box it was given";
+
+    #[test]
+    fn a_text_too_wide_for_its_box_is_cut_short_and_finished_with_an_ellipsis() {
+        let drawn = elided(&format!(
+            r#"panel {{ id = "bar", child = text {{ width = 80, content = "{LONG}", elide = "End" }} }}"#
+        ));
+        assert!(drawn.ends_with('\u{2026}'), "must end with an ellipsis: {drawn:?}");
+        assert!(drawn.chars().count() < LONG.chars().count(), "must be shorter than the original: {drawn:?}");
+        assert!(LONG.starts_with(drawn.trim_end_matches('\u{2026}')), "must be a prefix of the original: {drawn:?}");
+    }
+
+    #[test]
+    fn a_text_that_already_fits_is_left_exactly_as_written() {
+        let drawn = elided(r#"panel { id = "bar", child = text { width = 600, content = "short", elide = "End" } }"#);
+        assert_eq!(drawn, "short", "an ellipsis on a string that fits would be a lie about the content");
+    }
+
+    /// The default. Without it the clip cuts mid-glyph, which is what every `text` did before this.
+    #[test]
+    fn a_text_that_does_not_ask_to_elide_keeps_its_whole_string() {
+        let drawn = elided(&format!(r#"panel {{ id = "bar", child = text {{ width = 80, content = "{LONG}" }} }}"#));
+        assert_eq!(drawn, LONG);
+    }
+
+    /// A `Content`-sized box came from measuring this same string, so it fits by construction.
+    #[test]
+    fn a_content_sized_text_never_elides_itself() {
+        let drawn = elided(&format!(r#"panel {{ id = "bar", child = text {{ content = "{LONG}", elide = "End" }} }}"#));
+        assert_eq!(drawn, LONG);
+    }
+
+    /// The degenerate end of the search: a box too narrow for even one character leaves the
+    /// ellipsis alone rather than panicking on an empty prefix or returning the whole string.
+    #[test]
+    fn a_box_too_narrow_for_one_character_draws_only_the_ellipsis() {
+        let drawn = elided(&format!(
+            r#"panel {{ id = "bar", child = text {{ width = 1, content = "{LONG}", elide = "End" }} }}"#
+        ));
+        assert_eq!(drawn, "\u{2026}");
+    }
+
+    /// Cut at character boundaries, so a multi-byte codepoint is kept or dropped whole rather than
+    /// sliced into invalid UTF-8. Panics inside the search if this ever regresses.
+    #[test]
+    fn a_multibyte_string_is_cut_at_character_boundaries() {
+        let drawn = elided(r#"panel { id = "bar", child = text { width = 40, content = "ααααααααααααααααααααααααα", elide = "End" } }"#);
+        assert!(drawn.ends_with('\u{2026}'));
+        assert!(drawn.trim_end_matches('\u{2026}').chars().all(|c| c == 'α'), "no partial codepoints: {drawn:?}");
+    }
+
+    #[test]
+    fn an_unknown_elide_fails_the_pass_naming_the_property() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(r#"panel { id = "bar", child = text { content = "hi", elide = "Middle" } }"#);
+        let err = apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap_err();
+        assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "elide"), "got {err:?}");
+    }
+
     #[test]
     fn an_opacity_outside_zero_to_one_fails_the_pass() {
         let shaping = ShapingHandle::spawn();

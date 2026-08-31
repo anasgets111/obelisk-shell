@@ -385,6 +385,7 @@ Arranges children vertically.
 
 #### 4. `text`
 Draws shaped unicode glyph text via `cosmic-text`.
+*   `elide`: `string` (`"None"` or `"End"`. `"End"` drops trailing characters until the run plus a single-character ellipsis fits the box, and is a no-op when it already fits or when the box is `Content`-sized, since that box came from measuring this same string. Defaults to `"None"`, which leaves the clip to cut the run off mid-glyph. Only `"End"` exists: QML also elides at the head and the middle, the reference config uses neither, and a middle elide has to split a character budget across two runs)
 *   `text_align`: `string` (`"Start"`, `"Center"` or `"End"`. Where the run of glyphs sits inside the box this node was given, which is a different question from `align_h`, where the node sits inside its parent. Defaults to `"Start"`. Only visible when the box is wider than the text, so it does nothing on a `Content`-sized node whose box came from measuring that same string)
 *   `content`: `string` / `Signal` (The string text to display. Defaults to `""`, so a `text` bound to a capability signal renders empty until that signal's first push rather than rejecting the tree at boot, ADR-0044)
 *   `font_size`: `integer` (Defaults to `12`)
