@@ -1,80 +1,41 @@
--- Mirrors ActiveWindow.qml.
+-- Mirrors ActiveWindow.qml: the focused window's icon and title, side by side in the centre zone.
 --
+-- Both halves read one push, `oblisk.workspaces.active_client`, so the caption tracks focus with
+-- nothing asking it to. It used to be a click: the title lived in a `state` signal that a
+-- `process.run("niri", {"msg", "-j", "focused-window"})` filled in, and until you clicked it the bar
+-- read "click for the focused window". That was there to demonstrate `process.run` feeding
+-- `json.decode` (docs/adr/0057), and it was the wrong module to demonstrate it in. ADR-0056 keeps
+-- window *lists* out of `workspaces`, which is true and is not this: the focused window alone has
+-- been in every snapshot since that ADR, as `active_client`, which is where the icon was already
+-- getting `class`. Shelling out to niri for a string the supervisor had already pushed bought a
+-- worse answer, a subprocess per click, and a request counter to throw away the replies that landed
+-- out of order.
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
 
--- The first `process.run` in this config, and the reason `json.decode` exists (docs/adr/0057,
--- build-steps.md section 6 item 2). `niri msg -j focused-window` reports something no capability
--- carries: ADR-0056 keeps window lists out of `workspaces`, so before the decoder this data was
--- unreachable from Lua no matter how many subprocesses a config spawned.
---
--- The accumulate-then-decode shape is the one every JSON-emitting subprocess needs, not a
--- flourish. `out_cb` fires once per line with the newline stripped, because the Supervisor reads
--- the child through `BufReader::lines()`, so a pretty-printed document arrives in pieces and only
--- `exit_cb` knows the buffer is whole.
-local window_title = state("window_title", "click for the focused window")
-
 -- The same budget `modules/bar/indicators/media.lua` uses, because the two share the centre zone
 -- one at a time and a title that changed width when the player stopped would move the whole bar.
+--
+-- A character budget rather than the bounded box `components/cell.lua` argues for, and the argument
+-- there is right in general: "WWWW" and "iiii" are the same four characters at twice the width.
+-- This node has to stay content-sized anyway, because the centre zone's midpoint is its content's
+-- midpoint, and a box wide enough to elide against is a box that fixes the zone's width.
 local TITLE_LIMIT = 44
 
--- Every answer arrives after the click that asked for it, and nothing cancels a request the config
--- has moved on from: `exit_cb` fires whenever the child exits, however stale its question has
--- become. Without this counter a second click, or the reset below, is silently overwritten when the
--- first click's reply lands late, and a rapid double click shows whichever answer the scheduler
--- happened to finish last rather than the newer one. Every subprocess-backed module has this
--- problem, so the demo carries the guard rather than pretending it does not.
-local title_request = 0
-
--- Bumping the counter is what cancels the outstanding request, so the fetch and the reset both go
--- through here instead of each remembering to do it.
-local function claim_title_request()
-    title_request = title_request + 1
-    return title_request
+-- `nil` until the first snapshot, and `nil` again whenever nothing holds focus, which the
+-- supervisor sends as an absent key rather than a null (`workspaces/controller.rs`).
+local function focused(workspaces)
+    return workspaces and workspaces.active_client
 end
 
-local function refresh_window_title()
-    local request = claim_title_request()
-    local buffer = {}
-    process.run("niri", { "msg", "-j", "focused-window" }, function(line, stream)
-        if stream == "stdout" then
-            table.insert(buffer, line)
-        end
-    end, function(code)
-        if request ~= title_request then
-            return
-        end
-        if code ~= 0 then
-            window_title:set(string.format("niri msg exited %s", tostring(code)))
-            return
-        end
-        local window, err = json.decode(table.concat(buffer))
-        if not window then
-            -- The ambiguous case `json.decode`'s doc comment names, met in the first config to
-            -- call it: a bare top-level `null` decodes cleanly to `nil`, so `if not window` cannot
-            -- tell success from a parse error. `err` is the only thing that can, which is why it is
-            -- read rather than dropped.
-            window_title:set(err and "undecodable" or "nothing focused")
-            return
-        end
-        window_title:set(window.title or "untitled")
-    end)
-end
-
--- The focused window's own icon, and the second `oblisk.applications` consumer (docs/adr/0061).
--- Its source is `oblisk.workspaces.active_client.class`, not the `process.run` above: that is a
--- toplevel's `app_id` (ADR-0056 decision 5), which is exactly the spelling `util.app_entry` maps
--- onto a `.desktop` entry. Before the capability existed there was nowhere for an `app_id` to
--- become an icon at all, which is the caller ADR-0054 decision 5 said would arrive one day.
---
--- So the icon tracks focus live while the title beside it waits for a click, and that split is
--- deliberate rather than an oversight: the title is this file's `process.run`/`json.decode`
--- demonstration (ADR-0057) and stays click-driven, while an icon that only updated when clicked
--- would sit there showing the wrong application.
+-- The second `oblisk.applications` consumer (docs/adr/0061). `active_client.class` is a toplevel's
+-- `app_id` (ADR-0056 decision 5), which is the spelling `util.app_entry` maps onto a `.desktop`
+-- entry. Before that capability existed there was nowhere for an `app_id` to become an icon, which
+-- is the caller ADR-0054 decision 5 said would arrive one day.
 local focused_icon = icon {
     name = computed({ oblisk.applications, oblisk.workspaces }, function(applications, workspaces)
-        local client = workspaces and workspaces.active_client
+        local client = focused(workspaces)
         local entry = util.app_entry(applications, client and client.class)
         return (entry and entry.icon) or ""
     end),
@@ -82,39 +43,25 @@ local focused_icon = icon {
     align_v = "Center",
 }
 
--- No pill. `ActiveWindow.qml` puts the icon and the title straight on the bar with no ground behind
--- them, which is what makes the centre read as a caption rather than as one more control. The
--- button is still the click target and still has no background of its own.
-local window_title_module = row {
+-- No pill and no button. `ActiveWindow.qml` puts the icon and the title straight on the bar with no
+-- ground behind them, which is what makes the centre read as a caption rather than one more
+-- control. The button that used to wrap the title was the click target for the fetch above and had
+-- nothing to do once the title stopped needing one.
+return row {
     height = theme.item_height,
     align_v = "Center",
     spacing = theme.spacing.sm,
+    -- Nothing focused means nothing to caption. Hiding the row rather than drawing an empty one
+    -- also gives the zone its width back, since an invisible child costs its parent no space and no
+    -- spacing (`layout::scene`'s row arm).
+    visible = oblisk.workspaces:map(function(workspaces)
+        return focused(workspaces) ~= nil
+    end),
     children = {
         focused_icon,
-        button {
-            -- Content-sized, so the centre zone is its own content's width and lands on the bar's
-            -- midpoint. It was a fixed 216px box with the title centred inside it, which centres
-            -- nothing: the icon sat at the box's left edge and the title in its middle.
-            height = theme.item_height,
-            align_v = "Center",
-            on_click = function(_, button)
-                if button == "left" then
-                    refresh_window_title()
-                else
-                    claim_title_request()
-                    window_title:set("click for the focused window")
-                end
-            end,
-            -- `text.content` takes a signal directly (ADR-0044), so this needs no `label` wrapper:
-            -- the signal already holds a string on every path above, including both failure paths.
-            -- Capped at a codepoint budget rather than elided into a box, for the reason
-            -- `lib/util.lua`'s `truncate` gives: a window title is unbounded and this node has to
-            -- stay its own width for the zone around it to centre.
-            children = { cell(window_title:map(function(title)
-                return util.truncate(title, TITLE_LIMIT)
-            end), theme.FG, theme.font.sm, { align_v = "Center" }) },
-        },
+        cell(oblisk.workspaces:map(function(workspaces)
+            local client = focused(workspaces)
+            return util.truncate(client and client.title or "", TITLE_LIMIT)
+        end), theme.FG, theme.font.sm, { align_v = "Center" }),
     },
 }
-
-return window_title_module

@@ -302,7 +302,7 @@ The `process.run` function yields an opaque `ProcessHandle` object to Lua:
 
 `json.decode(text)` returns the decoded value, or `nil` plus a message string. See ADR-0057 for the return convention, and `json.decode`'s doc comment in `renderer/src/lua/json.rs` for what `null` maps to. There is deliberately no `json.encode`.
 
-`out_cb` fires once per line with the newline stripped, so a pretty-printed document arrives in pieces: accumulate in `out_cb` and decode in `exit_cb`. `dev-config/oblisk/shell.lua`'s `refresh_window_title` is that shape end to end.
+`out_cb` fires once per line with the newline stripped, so a pretty-printed document arrives in pieces: accumulate in `out_cb` and decode in `exit_cb`. The config's worked example of that shape was `refresh_window_title`, retired once it turned out to be fetching a string `oblisk.workspaces.active_client` already carried; nothing in the shipped config decodes JSON today.
 
 ---
 

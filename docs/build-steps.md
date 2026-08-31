@@ -2730,9 +2730,17 @@ By modules unblocked per unit of work, which is not the same as by size.
    line with its nested `null`s and its non-ASCII title, plus a `luac -p` syntax check on the config
    below. Not live-verified: no test drives the full path, which is `on_click` to `process.run` to
    `out_cb` per line to `json.decode` to `state:set` to a repaint, because the middle of it needs the
-   Supervisor to spawn a real child. `dev-config/oblisk/shell.lua`'s `refresh_window_title` is that
-   path written out, reporting the focused window title, which is data no capability carries because
-   ADR-0056 keeps window lists out of `workspaces`. Clicking it is the check.
+   Supervisor to spawn a real child. `dev-config/oblisk/shell.lua`'s `refresh_window_title` was that
+   path written out, reporting the focused window title by clicking it.
+
+   **That example is gone, and its premise was wrong.** It claimed the focused window title is "data
+   no capability carries because ADR-0056 keeps window lists out of `workspaces`". ADR-0056 keeps
+   window *lists* out; the focused window alone has been in every snapshot since, as `active_client`,
+   which the icon beside that title was already reading for its `class`. So the demo shelled out to
+   niri for a string the Supervisor had already pushed, and the bar read "click for the focused
+   window" until you clicked it. `modules/bar/indicators/active_window.lua` now binds the capability.
+   `json.decode` has no caller in the config as a result; the weather indicator in section 6 is the
+   next one, and it needs a subprocess honestly, because no capability carries a forecast.
 
    That config carries a request counter, and it is not decoration. A review traced the failure: left
    click, then a reset, then the first click's reply landing late and overwriting the reset, with a
