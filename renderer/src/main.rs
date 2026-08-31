@@ -1,3 +1,4 @@
+mod check;
 mod image;
 mod layout;
 mod lua;
@@ -18,6 +19,38 @@ mod wayland;
 ///   `UnboundedSender::send` is synchronous and non-blocking, so the Wayland thread can call it
 ///   directly without bridging.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `oblisk check` re-execs this binary rather than duplicating the loader in the Supervisor,
+    // which has no `mlua`. Before any Wayland connection, because the point is that it needs none.
+    if std::env::var_os(shared::CHECK_ENV).is_some() {
+        let config_dir = shared::config_dir()?;
+        return match check::run(&config_dir) {
+            Ok(report) => {
+                print!("{report}");
+                Ok(())
+            }
+            Err(message) => {
+                eprintln!("{message}");
+                std::process::exit(1);
+            }
+        };
+    }
+
+    // Not a command. Without the Supervisor this process has no control socket to connect to, no
+    // generation id, no capability pushes and nobody to reap it, so it would map a bar that never
+    // updates and never exits. Refusing here turns that into one line instead of a socket error
+    // from a thread the user cannot see.
+    //
+    // The env var rather than the socket, because the check has to happen before the connection is
+    // attempted, and `OBLISK_GENERATION_ID` is what `process::spawn_group_leader` sets on every
+    // Renderer the Supervisor starts, boot and generation swap alike.
+    if std::env::var_os(shared::GENERATION_ID_ENV).is_none() {
+        eprintln!(
+            "oblisk-renderer is not a command. The Supervisor starts it, one process per renderer \
+             generation, and reaps it.\n\nRun `oblisk` instead. `oblisk --help` lists what it takes."
+        );
+        std::process::exit(2);
+    }
+
     let (inbound_tx, inbound_rx) = std::sync::mpsc::channel::<shared::SupervisorFrame>();
     let (outbound_tx, outbound_rx) = tokio::sync::mpsc::unbounded_channel::<shared::RendererFrame>();
 

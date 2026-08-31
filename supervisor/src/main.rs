@@ -1,5 +1,6 @@
 mod applications;
 mod audio;
+mod cli;
 mod dbus;
 mod generation;
 mod hardware;
@@ -10,6 +11,7 @@ mod privacy;
 mod process;
 mod reload;
 mod reload_link;
+mod setup;
 mod snapshot;
 mod socket;
 // The LuaCATS stub generator, a development tool with no place in the shipped binary.
@@ -32,7 +34,10 @@ use dbus::notifications::{self, NotificationsController, NotificationsSignal};
 use dbus::polkit::{AGENT_OBJECT_PATH, AuthenticationAgent, current_session_subject, register_agent};
 use dbus::power::{self, PowerController, PowerSignal};
 use dbus::tray::{self, TrayController, TraySignal};
-use generation::{Authoritative, RendererDeparture, RestartBrake, RESTART_LIMIT, RESTART_WINDOW, classify_departure, departure_report, renderer_binary_path};
+use generation::{
+    Authoritative, RESTART_LIMIT, RESTART_WINDOW, RendererDeparture, RestartBrake, classify_departure,
+    departure_report, renderer_binary_path,
+};
 use hardware::battery::{BatteryController, BatterySignal};
 use hardware::brightness::{self, BrightnessController, BrightnessSignal};
 use hardware::idle::{self, IdleController};
@@ -40,16 +45,14 @@ use hardware::keyboard::{self, KeyboardController, KeyboardSignal};
 use hardware::sysinfo::{self, SysinfoController, SysinfoSignal};
 use lock::LockController;
 use privacy::{PrivacyController, PrivacySignal};
+use process::registry::{LiveProcesses, reap_all_processes, take_exited_process, wait_and_report_exit};
+use reload_link::SocketCandidateLink;
+use shared::{ApplyPendingReload, ReevaluateReport, ReevaluateRequest, RendererFrame, SupervisorFrame, Zeroize};
+use snapshot::push_snapshot;
+use socket::send_frame_logged;
 use system::{SystemController, SystemSignal};
 use updates::{UpdatesController, UpdatesSignal};
 use workspaces::{WorkspacesController, WorkspacesSignal};
-use process::registry::{LiveProcesses, reap_all_processes, take_exited_process, wait_and_report_exit};
-use reload_link::SocketCandidateLink;
-use socket::send_frame_logged;
-use shared::{
-    ApplyPendingReload, RendererFrame, ReevaluateReport, ReevaluateRequest, SupervisorFrame, Zeroize,
-};
-use snapshot::push_snapshot;
 
 /// How long the Watcher waits after the last relevant `shell.lua` change before dispatching a
 /// reload -- coalesces a multi-event save into one round trip. Fixed (docs/adr/0024 item 6).
@@ -59,8 +62,11 @@ const RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 /// up from `reload.rs`'s own test constants for a real Candidate that has to bind Wayland/EGL.
 /// Generous enough a healthy Candidate never trips them, tight enough a wedged one doesn't hang a
 /// config edit.
-const PBA_TIMINGS: reload::PbaTimings =
-    reload::PbaTimings { ready_timeout: Duration::from_secs(2), evidence_timeout: Duration::from_secs(3), reap_grace: process::DEFAULT_REAP_GRACE };
+const PBA_TIMINGS: reload::PbaTimings = reload::PbaTimings {
+    ready_timeout: Duration::from_secs(2),
+    evidence_timeout: Duration::from_secs(3),
+    reap_grace: process::DEFAULT_REAP_GRACE,
+};
 
 /// Whether an `Unchanged` report's `sequence` still names the most recently sent `Reevaluate`.
 /// A mismatch means a newer `Reevaluate` already went out for this generation, so the go-ahead
@@ -75,9 +81,12 @@ fn is_current_reload(report_sequence: u64, next_sequence: u64) -> bool {
 /// so `is_current_reload` rejects a stale report from either trigger.
 fn begin_reload(registry: &socket::GenerationRegistry, generation_id: u32, next_sequence: &mut u64) {
     *next_sequence += 1;
-    send_frame_logged(registry, generation_id, &SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: *next_sequence }));
+    send_frame_logged(
+        registry,
+        generation_id,
+        &SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: *next_sequence }),
+    );
 }
-
 
 /// The malformed-arguments log line every capability's `dispatch` adapter shares (ADR-0037).
 pub(crate) fn log_malformed_command(params: &shared::CommandParams) {
@@ -153,11 +162,52 @@ fn main() -> Result<(), Box<dyn Error>> {
     if std::env::var_os("OBLISK_PAM_WORKER").is_some() {
         return pam_worker::run_worker();
     }
-    // std::process::exit, not return: the exit code is the point of `Shutdown`, and `main`'s
-    // `Result` can only produce 0 or 1 (docs/adr/0059 decision 3). Every teardown
-    // `run_supervisor` owns has already run by the time it returns.
-    let shutdown = tokio::runtime::Runtime::new()?.block_on(run_supervisor())?;
-    std::process::exit(shutdown.exit_code());
+
+    let args = match cli::parse(std::env::args()) {
+        Ok(args) => args,
+        Err(message) => {
+            eprintln!("oblisk: {message}\n\n{}", cli::HELP);
+            std::process::exit(2);
+        }
+    };
+
+    // Set before anything resolves a path, and set in this process rather than passed down.
+    // `shared::config_dir` reads it, and so does every Renderer spawned from here, including the
+    // ones a later generation swap spawns (see that function's own note).
+    if let Some(dir) = &args.config_dir {
+        // SAFETY: single-threaded. No tokio runtime exists yet and no thread has been spawned;
+        // the PAM worker re-exec above is the only earlier branch and it returns.
+        unsafe { std::env::set_var(shared::CONFIG_DIR_ENV, dir) };
+    }
+
+    match args.command {
+        cli::Command::Help => {
+            print!("{}", cli::HELP);
+            Ok(())
+        }
+        cli::Command::Version => {
+            println!("oblisk {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        cli::Command::Init { force } => setup::run(&shared::config_dir()?, force),
+        cli::Command::Check => match setup::check(&shared::config_dir()?) {
+            Ok(report) => {
+                print!("{report}");
+                Ok(())
+            }
+            Err(message) => {
+                eprintln!("{message}");
+                std::process::exit(1);
+            }
+        },
+        cli::Command::Run => {
+            // std::process::exit, not return: the exit code is the point of `Shutdown`, and
+            // `main`'s `Result` can only produce 0 or 1 (docs/adr/0059 decision 3). Every teardown
+            // `run_supervisor` owns has already run by the time it returns.
+            let shutdown = tokio::runtime::Runtime::new()?.block_on(run_supervisor())?;
+            std::process::exit(shutdown.exit_code());
+        }
+    }
 }
 
 async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
@@ -204,11 +254,16 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     // own org.freedesktop.Notifications, degrading to inert via RequestName's DoNotQueue.
     let (sound_tx, sound_rx) = std::sync::mpsc::channel::<PathBuf>();
     std::thread::spawn(move || notifications::run_sound_player(sound_rx));
-    let (notifications_signal_tx, mut notifications_signals) = tokio::sync::mpsc::unbounded_channel::<NotificationsSignal>();
+    let (notifications_signal_tx, mut notifications_signals) =
+        tokio::sync::mpsc::unbounded_channel::<NotificationsSignal>();
     let notifications = match zbus::Connection::session().await {
-        Ok(notifications_connection) => NotificationsController::new(notifications_connection, notifications_signal_tx, sound_tx.clone()).await,
+        Ok(notifications_connection) => {
+            NotificationsController::new(notifications_connection, notifications_signal_tx, sound_tx.clone()).await
+        }
         Err(err) => {
-            eprintln!("notifications: failed to connect to the session bus; notifications server disabled for this run: {err}");
+            eprintln!(
+                "notifications: failed to connect to the session bus; notifications server disabled for this run: {err}"
+            );
             NotificationsController::inert(notifications_signal_tx, sound_tx.clone())
         }
     };
@@ -242,17 +297,24 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     // keyboard capability (docs/adr/0034): a missing KbdBacklight degrades in place to
     // backlight_pct: -1, a missing lock source to false.
     let (keyboard_signal_tx, mut keyboard_signals) = tokio::sync::mpsc::unbounded_channel::<KeyboardSignal>();
-    let keyboard = KeyboardController::new(connection.clone(), &PathBuf::from("/sys/class/leds"), keyboard_signal_tx).await;
+    let keyboard =
+        KeyboardController::new(connection.clone(), &PathBuf::from("/sys/class/leds"), keyboard_signal_tx).await;
 
     // privacy capability (docs/adr/0034): kernel-level /dev/videoN open/close via inotify plus a
     // /proc fd-scan, enriched by video_sources from the mixer thread above.
     let (privacy_signal_tx, mut privacy_signals) = tokio::sync::mpsc::unbounded_channel::<PrivacySignal>();
-    let privacy = PrivacyController::new(PathBuf::from("/proc"), &PathBuf::from("/sys/class/video4linux"), video_sources, privacy_signal_tx);
+    let privacy = PrivacyController::new(
+        PathBuf::from("/proc"),
+        &PathBuf::from("/sys/class/video4linux"),
+        video_sources,
+        privacy_signal_tx,
+    );
 
     // updates capability (docs/adr/0034): alpm-based Arch update checking, separate from
     // sysinfo's own scheduler.
     let (updates_signal_tx, mut updates_signals) = tokio::sync::mpsc::unbounded_channel::<UpdatesSignal>();
-    let updates = UpdatesController::new(PathBuf::from("/etc/pacman.conf"), PathBuf::from("/var/lib/pacman"), updates_signal_tx);
+    let updates =
+        UpdatesController::new(PathBuf::from("/etc/pacman.conf"), PathBuf::from("/var/lib/pacman"), updates_signal_tx);
 
     // battery capability (docs/adr/0053, § 2.2). The root is a parameter, not a constant, so
     // device selection is testable against a fixture directory.
@@ -262,7 +324,8 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     // brightness capability (docs/adr/0053, § 2.3): ranked firmware over platform over raw. No
     // device found means it never pushes -- see hardware::brightness's module doc.
     let (brightness_signal_tx, mut brightness_signals) = tokio::sync::mpsc::unbounded_channel::<BrightnessSignal>();
-    let brightness = BrightnessController::new(PathBuf::from("/sys/class/backlight"), connection.clone(), brightness_signal_tx);
+    let brightness =
+        BrightnessController::new(PathBuf::from("/sys/class/backlight"), connection.clone(), brightness_signal_tx);
 
     // workspaces capability (docs/adr/0056, § 2.9): niri's IPC stream via $NIRI_SOCKET. A
     // non-niri session never pushes.
@@ -284,7 +347,8 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
 
     // applications capability (docs/adr/0061): the installed `.desktop` entries. Scans in the
     // background from construction, so this returns before the first surface is up.
-    let (applications_signal_tx, mut applications_signals) = tokio::sync::mpsc::unbounded_channel::<ApplicationsSignal>();
+    let (applications_signal_tx, mut applications_signals) =
+        tokio::sync::mpsc::unbounded_channel::<ApplicationsSignal>();
     let applications = ApplicationsController::new(
         applications::application_dirs(
             std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
@@ -311,8 +375,11 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     // shell without it, so a spawn failure here is fatal to main.
     let renderer_path = renderer_binary_path()?;
     let renderer_path_str = renderer_path.to_string_lossy().into_owned();
-    let boot_child =
-        process::spawn_group_leader(&renderer_path_str, &[], &[("OBLISK_GENERATION_ID".to_string(), "0".to_string())])?;
+    let boot_child = process::spawn_group_leader(
+        &renderer_path_str,
+        &[],
+        &[(shared::GENERATION_ID_ENV.to_string(), "0".to_string())],
+    )?;
     let mut authoritative = Authoritative { generation_id: 0, child: boot_child };
     let mut next_generation_id: u32 = 1;
     let mut restart_brake = RestartBrake::new(RESTART_LIMIT, RESTART_WINDOW);
@@ -400,7 +467,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                 match process::spawn_group_leader(
                     &renderer_path_str,
                     &[],
-                    &[("OBLISK_GENERATION_ID".to_string(), replacement_generation_id.to_string())],
+                    &[(shared::GENERATION_ID_ENV.to_string(), replacement_generation_id.to_string())],
                 ) {
                     Ok(child) => {
                         authoritative = Authoritative { generation_id: replacement_generation_id, child };
@@ -689,7 +756,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     let candidate_generation_id = next_generation_id;
                     next_generation_id += 1;
                     let candidate_envs = vec![
-                        ("OBLISK_GENERATION_ID".to_string(), candidate_generation_id.to_string()),
+                        (shared::GENERATION_ID_ENV.to_string(), candidate_generation_id.to_string()),
                         ("OBLISK_PBA_CANDIDATE".to_string(), "1".to_string()),
                     ];
                     // Every capability's latest snapshot hydrates the fresh Candidate's first
@@ -832,7 +899,10 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     if !renderer_departed
         && let Err(err) = process::reap_process_group(&mut authoritative.child, process::DEFAULT_REAP_GRACE).await
     {
-        eprintln!("failed to reap authoritative generation {}'s renderer on shutdown: {err}", authoritative.generation_id);
+        eprintln!(
+            "failed to reap authoritative generation {}'s renderer on shutdown: {err}",
+            authoritative.generation_id
+        );
     }
     reap_all_processes(&mut processes).await;
     // Best-effort: socket::bind's own stale-file removal covers a missed unlink on the next boot.
@@ -878,8 +948,9 @@ mod tests {
         begin_reload(&registry, 7, &mut next_sequence);
 
         assert_eq!(next_sequence, 2);
-        let sent: Vec<SupervisorFrame> =
-            std::iter::from_fn(|| rx.try_recv().ok()).map(|payload| serde_json::from_slice(&payload).unwrap()).collect();
+        let sent: Vec<SupervisorFrame> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|payload| serde_json::from_slice(&payload).unwrap())
+            .collect();
         assert_eq!(
             sent,
             vec![

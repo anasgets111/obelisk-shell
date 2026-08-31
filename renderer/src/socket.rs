@@ -33,8 +33,9 @@ use std::path::{Path, PathBuf};
 
 use shared::framing::{self, write_json_frame};
 use shared::{
-    ApplyPendingReload, ConnectionHandshake, DeselectInput, IdleEvent, ProcessExited, ProcessOutputLine, PromoteGeneration, ReevaluateReport,
-    ReevaluateRequest, RendererFrame, SetSessionLock, StateSnapshot, SupervisorFrame, Zeroize,
+    ApplyPendingReload, ConnectionHandshake, DeselectInput, IdleEvent, ProcessExited, ProcessOutputLine,
+    PromoteGeneration, ReevaluateReport, ReevaluateRequest, RendererFrame, SetSessionLock, StateSnapshot,
+    SupervisorFrame, Zeroize,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
@@ -55,12 +56,15 @@ use crate::text::shaping::ShapingHandle;
 /// `main`, then handed to both threads: the socket thread stamps it into the handshake, the
 /// Wayland thread stamps it into every outbound `CommandEnvelope` and `SecureSubmit`.
 pub fn generation_id_from_env() -> u32 {
-    std::env::var("OBLISK_GENERATION_ID").ok().and_then(|value| value.parse().ok()).unwrap_or(0)
+    std::env::var(shared::GENERATION_ID_ENV).ok().and_then(|value| value.parse().ok()).unwrap_or(0)
 }
 
 /// Connects to `path` and sends the handshake identifying `generation_id`, returning the
 /// live stream on success.
-async fn connect_and_handshake(path: &Path, generation_id: u32) -> Result<UnixStream, Box<dyn std::error::Error + Send + Sync>> {
+async fn connect_and_handshake(
+    path: &Path,
+    generation_id: u32,
+) -> Result<UnixStream, Box<dyn std::error::Error + Send + Sync>> {
     let mut stream = UnixStream::connect(path).await?;
     write_json_frame(&mut stream, &ConnectionHandshake { generation_id }).await?;
     Ok(stream)
@@ -71,7 +75,11 @@ async fn connect_and_handshake(path: &Path, generation_id: u32) -> Result<UnixSt
 /// Wayland thread reads as `Disconnected` and exits on (docs/adr/0059 decision 1). No startup
 /// race to tolerate: `supervisor/src/main.rs` binds the control socket before spawning the first
 /// Renderer.
-pub fn spawn_client(generation_id: u32, inbound_tx: std::sync::mpsc::Sender<SupervisorFrame>, outbound_rx: mpsc::UnboundedReceiver<RendererFrame>) {
+pub fn spawn_client(
+    generation_id: u32,
+    inbound_tx: std::sync::mpsc::Sender<SupervisorFrame>,
+    outbound_rx: mpsc::UnboundedReceiver<RendererFrame>,
+) {
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread().enable_io().build() {
             Ok(runtime) => runtime,
@@ -222,7 +230,8 @@ impl RendererClient {
         outbound_tx: mpsc::UnboundedSender<RendererFrame>,
         generation_id: u32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let shell_lua_path = shared::shell_lua_path().map_err(|err| format!("failed to resolve shell.lua's path: {err}"))?;
+        let shell_lua_path =
+            shared::shell_lua_path().map_err(|err| format!("failed to resolve shell.lua's path: {err}"))?;
         // One flag for this whole generation (ADR-0044 decision 2), created before anything that
         // hands out a `LiveSignalHandle` so the rescue signal shares it too.
         let dirty = DirtyFlag::new();
@@ -230,9 +239,12 @@ impl RendererClient {
         // and nowhere else (ADR-0047 decision 1). Taken from the resolved path rather than by
         // asking `shared::config_dir()` a second time, so the two can never disagree.
         let config_dir = shell_lua_path.parent().ok_or("shell.lua's path has no parent directory")?.to_path_buf();
-        let loader = Loader::new(dirty.clone(), &config_dir).map_err(|err| format!("failed to start the Lua loader: {err}"))?;
+        let loader =
+            Loader::new(dirty.clone(), &config_dir).map_err(|err| format!("failed to start the Lua loader: {err}"))?;
         let process_registry = ProcessRegistry::new(generation_id, outbound_tx.clone());
-        loader.register_process(process_registry.clone()).map_err(|err| format!("failed to register the process global: {err}"))?;
+        loader
+            .register_process(process_registry.clone())
+            .map_err(|err| format!("failed to register the process global: {err}"))?;
         // The one write path § 3.2's commands all take, stamped with the same generation id
         // `ProcessRegistry` above stamps, from the same source: § 7.3's guard rule drops a packet
         // whose generation is stale, so a second source for it would be a second way to be
@@ -498,9 +510,10 @@ impl RendererClient {
             return false;
         };
         let (instances, locked) = (&self.instances, self.holds_session_lock);
-        let applied = self.scene.apply_admitting(&output.surfaces, instances, &self.shaping, self.loader.lua(), |scene| {
-            lock_stays_authenticatable(scene, instances, locked)
-        });
+        let applied =
+            self.scene.apply_admitting(&output.surfaces, instances, &self.shaping, self.loader.lua(), |scene| {
+                lock_stays_authenticatable(scene, instances, locked)
+            });
         match applied {
             Ok(()) => {
                 log_applied_surfaces(&self.scene, &self.instances);
@@ -565,7 +578,9 @@ impl RendererClient {
             SupervisorFrame::DeselectInput(DeselectInput { surface_id }) => {
                 // No per-surface input-region/focus machinery exists yet to hand this to
                 // (docs/adr/0025 item 4).
-                eprintln!("control-socket client: DeselectInput({surface_id}) received (no real input-region wiring yet)");
+                eprintln!(
+                    "control-socket client: DeselectInput({surface_id}) received (no real input-region wiring yet)"
+                );
             }
             SupervisorFrame::PromoteGeneration(PromoteGeneration { surface_id }) => {
                 eprintln!("control-socket client: PromoteGeneration({surface_id}) received (no real focus wiring yet)");
@@ -638,7 +653,10 @@ impl RendererClient {
     /// ignored, not fatal.
     fn handle_apply_pending(&mut self, apply: ApplyPendingReload) {
         if !matches!(&self.state.pending, Some((sequence, _, _)) if *sequence == apply.sequence) {
-            eprintln!("control-socket client: ApplyPendingReload({}) doesn't match the currently pending reload; ignoring", apply.sequence);
+            eprintln!(
+                "control-socket client: ApplyPendingReload({}) doesn't match the currently pending reload; ignoring",
+                apply.sequence
+            );
             return;
         }
         let (_, output, topology) = self.state.pending.take().expect("just confirmed Some above");
@@ -661,7 +679,9 @@ impl RendererClient {
                 // right trade against a second "something changed" signal beside this one flag.
                 self.dirty.mark();
             }
-            Err(err) => eprintln!("control-socket client: ApplyPendingReload's stored evaluation failed to apply: {err}"),
+            Err(err) => {
+                eprintln!("control-socket client: ApplyPendingReload's stored evaluation failed to apply: {err}")
+            }
         }
     }
 
@@ -694,9 +714,10 @@ impl RendererClient {
             return false;
         }
         let (instances, locked) = (&self.instances, self.holds_session_lock);
-        let applied = self.scene.apply_admitting(&output.surfaces, instances, &self.shaping, self.loader.lua(), |scene| {
-            lock_stays_authenticatable(scene, instances, locked)
-        });
+        let applied =
+            self.scene.apply_admitting(&output.surfaces, instances, &self.shaping, self.loader.lua(), |scene| {
+                lock_stays_authenticatable(scene, instances, locked)
+            });
         if let Err(err) = applied {
             // `Scene::apply` rolls back to its exact pre-call state on error, so the prior good
             // scene is still applied and still on screen. Deliberately not routed to
@@ -720,7 +741,11 @@ impl RendererClient {
     }
 }
 
-async fn run(generation_id: u32, inbound_tx: std::sync::mpsc::Sender<SupervisorFrame>, mut outbound_rx: mpsc::UnboundedReceiver<RendererFrame>) {
+async fn run(
+    generation_id: u32,
+    inbound_tx: std::sync::mpsc::Sender<SupervisorFrame>,
+    mut outbound_rx: mpsc::UnboundedReceiver<RendererFrame>,
+) {
     let path = match shared::control_socket_path() {
         Ok(path) => path,
         Err(err) => {
@@ -843,7 +868,9 @@ fn log_applied_surfaces(scene: &Scene, instances: &[SurfaceInstance]) {
                 r.children.len(),
                 r.properties.len()
             ),
-            None => eprintln!("layout resolved but surface {:?} is absent from the applied scene", instance.instance_id),
+            None => {
+                eprintln!("layout resolved but surface {:?} is absent from the applied scene", instance.instance_id)
+            }
         }
     }
 }
@@ -904,8 +931,15 @@ mod tests {
         let process_registry = ProcessRegistry::new(0, outbound_tx.clone());
         loader.register_process(process_registry.clone()).unwrap();
         let commands = CommandSender::new(0, outbound_tx);
-        let client =
-            RendererClient::new(loader, shell_lua_path.to_path_buf(), ShapingHandle::spawn(), commands, process_registry, dirty).unwrap();
+        let client = RendererClient::new(
+            loader,
+            shell_lua_path.to_path_buf(),
+            ShapingHandle::spawn(),
+            commands,
+            process_registry,
+            dirty,
+        )
+        .unwrap();
         (client, outbound_rx)
     }
 
@@ -949,10 +983,17 @@ mod tests {
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let (client, _outbound_rx) = test_client(&missing);
 
-        let snapshot = StateSnapshot { capability: "audio".to_string(), revision: 1, payload: serde_json::json!({ "app_name": "Zen" }) };
+        let snapshot = StateSnapshot {
+            capability: "audio".to_string(),
+            revision: 1,
+            payload: serde_json::json!({ "app_name": "Zen" }),
+        };
         client.apply_state_snapshot(snapshot).unwrap();
 
-        let output = client.loader.evaluate(r#"return panel { id = "bar", layer = "Top", app_name = oblisk.audio:get().app_name }"#).unwrap();
+        let output = client
+            .loader
+            .evaluate(r#"return panel { id = "bar", layer = "Top", app_name = oblisk.audio:get().app_name }"#)
+            .unwrap();
         let app_name = output.surfaces[0].properties.get("app_name").unwrap().as_string().unwrap().to_string_lossy();
         assert_eq!(app_name, "Zen");
     }
@@ -965,10 +1006,17 @@ mod tests {
         let (client, _outbound_rx) = test_client(&missing);
         assert!(!shared::CAPABILITIES.contains(&"workspace"), "this test needs a genuinely unrostered name");
 
-        let snapshot = StateSnapshot { capability: "workspace".to_string(), revision: 1, payload: serde_json::json!({ "active": 2 }) };
+        let snapshot = StateSnapshot {
+            capability: "workspace".to_string(),
+            revision: 1,
+            payload: serde_json::json!({ "active": 2 }),
+        };
         client.apply_state_snapshot(snapshot).unwrap();
 
-        let output = client.loader.evaluate(r#"return panel { id = "bar", layer = "Top", active = oblisk.workspace:get().active }"#).unwrap();
+        let output = client
+            .loader
+            .evaluate(r#"return panel { id = "bar", layer = "Top", active = oblisk.workspace:get().active }"#)
+            .unwrap();
         assert_eq!(output.surfaces[0].properties.get("active").unwrap().as_integer(), Some(2));
     }
 
@@ -982,10 +1030,16 @@ mod tests {
             ("brightness", serde_json::json!({ "percent": 100 })),
             ("battery", serde_json::json!({ "present": true, "percent": 100, "charging": true })),
             ("power", serde_json::json!({ "on_battery": true, "energy_rate": 22.5, "active_profile": "performance" })),
-            ("updates", serde_json::json!({ "count": 0, "installing": true, "install_current_step": 128, "install_total_steps": 512 })),
+            (
+                "updates",
+                serde_json::json!({ "count": 0, "installing": true, "install_current_step": 128, "install_total_steps": 512 }),
+            ),
             ("keyboard", serde_json::json!({ "active_layout": "English (US, intl.)", "caps_lock": true })),
             ("privacy", serde_json::json!({ "camera_users": [{ "app_name": "A Video Conferencing Application" }] })),
-            ("network", serde_json::json!({ "scanning": false, "available_networks": [{ "ssid": "a-long-access-point-name", "strength": 100, "active": true }] })),
+            (
+                "network",
+                serde_json::json!({ "scanning": false, "available_networks": [{ "ssid": "a-long-access-point-name", "strength": 100, "active": true }] }),
+            ),
             (
                 "bluetooth",
                 serde_json::json!({ "enabled": true, "connected_devices": [{ "name": "A Long Bluetooth Device Name", "battery": 100 }] }),
@@ -1042,7 +1096,8 @@ mod tests {
         let (mut client, _outbound_rx) = test_client(&path);
         assert!(run_startup(&mut client), "the config must resolve");
 
-        let hover_row = |client: &RendererClient| client.scene.surface("bar@TEST").expect("the bar resolves").children[0].clone();
+        let hover_row =
+            |client: &RendererClient| client.scene.surface("bar@TEST").expect("the bar resolves").children[0].clone();
         assert!(!hover_row(&client).children[0].visible, "nothing is hovered before the pointer arrives");
 
         // The pointer lands inside the row. `hover_writes` is what `App::sync_hover` calls, given
@@ -1122,7 +1177,12 @@ mod tests {
 
     /// The absolute centre of every node in `node` declaring a `hover` property, accumulating the
     /// parent-relative origins on the way down the way `layout::hit` does.
-    fn hover_region_centres(node: &crate::layout::ResolvedNode, x: f32, y: f32, out: &mut Vec<layout::hit::LogicalPoint>) {
+    fn hover_region_centres(
+        node: &crate::layout::ResolvedNode,
+        x: f32,
+        y: f32,
+        out: &mut Vec<layout::hit::LogicalPoint>,
+    ) {
         let (x, y) = (x + node.rect.x, y + node.rect.y);
         if node.properties.contains_key("hover") {
             out.push(layout::hit::LogicalPoint { x: x + node.rect.width / 2.0, y: y + node.rect.height / 2.0 });
@@ -1140,7 +1200,9 @@ mod tests {
         let shell_lua = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/shell.lua");
         let (mut client, _outbound_rx) = test_client(&shell_lua);
         for (capability, payload) in widest_bar_snapshots() {
-            client.apply_state_snapshot(StateSnapshot { capability: capability.to_string(), revision: 1, payload }).unwrap();
+            client
+                .apply_state_snapshot(StateSnapshot { capability: capability.to_string(), revision: 1, payload })
+                .unwrap();
         }
         assert!(run_startup(&mut client), "the shipped dev config must resolve into a scene");
 
@@ -1187,11 +1249,14 @@ mod tests {
         let shell_lua = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/shell.lua");
         let (mut client, _outbound_rx) = test_client(&shell_lua);
         for (capability, payload) in widest_bar_snapshots() {
-            client.apply_state_snapshot(StateSnapshot { capability: capability.to_string(), revision: 1, payload }).unwrap();
+            client
+                .apply_state_snapshot(StateSnapshot { capability: capability.to_string(), revision: 1, payload })
+                .unwrap();
         }
         assert!(run_startup(&mut client), "the shipped dev config must resolve into a scene");
 
-        let tooltip_is_up = |client: &RendererClient| client.scene.surface("battery_tooltip").expect("the tooltip resolves").visible;
+        let tooltip_is_up =
+            |client: &RendererClient| client.scene.surface("battery_tooltip").expect("the tooltip resolves").visible;
         assert!(!tooltip_is_up(&client), "a tooltip is not up before the pointer has been anywhere");
 
         // Both of this slice's live bugs were in the state *before* anything is hovered, which the
@@ -1279,8 +1344,9 @@ mod tests {
         let (mut client, _outbound_rx) = test_client(&shell_lua);
         assert!(run_startup(&mut client), "the shipped dev config must resolve into a scene");
 
-        let card_is_up =
-            |client: &RendererClient| client.scene.surface("notification_area@TEST").expect("the card resolves").visible;
+        let card_is_up = |client: &RendererClient| {
+            client.scene.surface("notification_area@TEST").expect("the card resolves").visible
+        };
         assert!(!card_is_up(&client), "nothing has been received, so there is nothing to show");
 
         client
@@ -1330,16 +1396,23 @@ mod tests {
         };
 
         let unfocused = masked(None);
-        assert!(unfocused.iter().any(|drawn| drawn == "password"), "an untouched field shows its placeholder: {unfocused:?}");
+        assert!(
+            unfocused.iter().any(|drawn| drawn == "password"),
+            "an untouched field shows its placeholder: {unfocused:?}"
+        );
 
         // The pair `lock.lua` declares, and the pair the Supervisor's unlock path answers.
-        let target = layout::node::SecureSubmitTarget { capability: "lock".to_string(), action: "authenticate".to_string() };
+        let target =
+            layout::node::SecureSubmitTarget { capability: "lock".to_string(), action: "authenticate".to_string() };
         let typed = masked(Some(&layout::paint::SecureField { target: &target, filled: 5 }));
         assert!(
             typed.iter().any(|drawn| drawn == "*****"),
             "five keystrokes must draw five of this config's `mask_character`: {typed:?}"
         );
-        assert!(!typed.iter().any(|drawn| drawn == "password"), "the placeholder gives way once something is typed: {typed:?}");
+        assert!(
+            !typed.iter().any(|drawn| drawn == "password"),
+            "the placeholder gives way once something is typed: {typed:?}"
+        );
     }
 
     #[test]
@@ -1379,11 +1452,18 @@ mod tests {
             .iter()
             .enumerate()
             .filter_map(|(index, zone)| {
-                let shown: Vec<&crate::layout::ResolvedNode> = zone.children.iter().filter(|child| child.visible).collect();
-                let content: f32 = shown.iter().map(|child| child.rect.width).sum::<f32>() + 6.0 * shown.len().saturating_sub(1) as f32;
+                let shown: Vec<&crate::layout::ResolvedNode> =
+                    zone.children.iter().filter(|child| child.visible).collect();
+                let content: f32 = shown.iter().map(|child| child.rect.width).sum::<f32>()
+                    + 6.0 * shown.len().saturating_sub(1) as f32;
                 let widths: Vec<String> = shown.iter().map(|child| format!("{:.0}", child.rect.width)).collect();
                 (content > zone.rect.width).then(|| {
-                    format!("zone {index}: {:.0}px of modules ({}) in {:.0}px", content, widths.join("+"), zone.rect.width)
+                    format!(
+                        "zone {index}: {:.0}px of modules ({}) in {:.0}px",
+                        content,
+                        widths.join("+"),
+                        zone.rect.width
+                    )
                 })
             })
             .collect();
@@ -1431,8 +1511,12 @@ mod tests {
         let (client, _outbound_rx) = test_client(&missing);
 
         for capability in shared::CAPABILITIES {
-            let probe = format!(r#"return panel {{ id = "bar", layer = "Top", is_nil = oblisk.{capability}:get() == nil }}"#);
-            let output = client.loader.evaluate(&probe).unwrap_or_else(|err| panic!("rostered capability {capability:?} is not on `oblisk`: {err}"));
+            let probe =
+                format!(r#"return panel {{ id = "bar", layer = "Top", is_nil = oblisk.{capability}:get() == nil }}"#);
+            let output = client
+                .loader
+                .evaluate(&probe)
+                .unwrap_or_else(|err| panic!("rostered capability {capability:?} is not on `oblisk`: {err}"));
             assert_eq!(
                 output.surfaces[0].properties.get("is_nil").unwrap().as_boolean(),
                 Some(true),
@@ -1520,10 +1604,7 @@ mod tests {
         // `lua::namespace::version_parts`'s `expect`, which is why that function carries no
         // narrower test of its own.
         let field = |name: &str| props.get(name).unwrap().as_integer().unwrap();
-        assert_eq!(
-            format!("{}.{}.{}", field("major"), field("minor"), field("patch")),
-            env!("CARGO_PKG_VERSION")
-        );
+        assert_eq!(format!("{}.{}.{}", field("major"), field("minor"), field("patch")), env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
@@ -1570,19 +1651,30 @@ mod tests {
         assert!(run_startup(&mut client), "a config declaring a lock screen must build a scene");
 
         // The constructor survived: a `lock { ... }` at the root still produced a § 6.4 surface.
-        let probe = client.loader.evaluate(
-            r##"return panel {
+        let probe = client
+            .loader
+            .evaluate(
+                r##"return panel {
                 id = "_probe", layer = "Top",
                 lock_kind = lock { id = "screen" }.kind,
                 capability_type = type(oblisk.lock),
                 attempts = oblisk.lock:get().attempts,
             }"##,
-        ).unwrap();
+            )
+            .unwrap();
         let props = &probe.surfaces[0].properties;
-        assert_eq!(props.get("lock_kind").unwrap().as_string().unwrap().to_string_lossy(), "lock", "the global `lock` must still be § 6.4's node constructor");
+        assert_eq!(
+            props.get("lock_kind").unwrap().as_string().unwrap().to_string_lossy(),
+            "lock",
+            "the global `lock` must still be § 6.4's node constructor"
+        );
         // The capability is reachable, hydrated, under the name § 2 gives it.
         assert_eq!(props.get("capability_type").unwrap().as_string().unwrap().to_string_lossy(), "userdata");
-        assert_eq!(props.get("attempts").unwrap().as_integer(), Some(2), "the `lock` StateSnapshot must reach `oblisk.lock`, not a bare global nothing registered");
+        assert_eq!(
+            props.get("attempts").unwrap().as_integer(),
+            Some(2),
+            "the `lock` StateSnapshot must reach `oblisk.lock`, not a bare global nothing registered"
+        );
     }
 
     /// The write half of the same object: a config's own `on_click` calling the lock action puts
@@ -1607,13 +1699,24 @@ mod tests {
         let (client, _outbound_rx) = test_client(&missing);
 
         client
-            .apply_state_snapshot(StateSnapshot { capability: "network".to_string(), revision: 1, payload: serde_json::json!({ "scanning": true }) })
+            .apply_state_snapshot(StateSnapshot {
+                capability: "network".to_string(),
+                revision: 1,
+                payload: serde_json::json!({ "scanning": true }),
+            })
             .unwrap();
         client
-            .apply_state_snapshot(StateSnapshot { capability: "network".to_string(), revision: 2, payload: serde_json::json!({ "scanning": false }) })
+            .apply_state_snapshot(StateSnapshot {
+                capability: "network".to_string(),
+                revision: 2,
+                payload: serde_json::json!({ "scanning": false }),
+            })
             .unwrap();
 
-        let output = client.loader.evaluate(r#"return panel { id = "bar", layer = "Top", scanning = oblisk.network:get().scanning }"#).unwrap();
+        let output = client
+            .loader
+            .evaluate(r#"return panel { id = "bar", layer = "Top", scanning = oblisk.network:get().scanning }"#)
+            .unwrap();
         assert_eq!(
             output.surfaces[0].properties.get("scanning").unwrap().as_boolean(),
             Some(false),
@@ -1667,13 +1770,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
-        client.state.applied_topology =
-            Some(surface_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap().iter().map(SurfaceSpec::fingerprint).collect());
+        client.state.applied_topology = Some(
+            surface_specs(&client.loader.evaluate_file(&path).unwrap())
+                .unwrap()
+                .iter()
+                .map(SurfaceSpec::fingerprint)
+                .collect(),
+        );
 
         write_shell_lua(dir.path(), three_roles_config());
         client.handle_reevaluate(ReevaluateRequest { sequence: 9 });
 
-        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence: 9 }));
+        assert_eq!(
+            queued_frame(&mut outbound_rx),
+            RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence: 9 })
+        );
         assert!(client.state.pending.is_none());
     }
 
@@ -1705,7 +1816,10 @@ mod tests {
         // A restyle: same surfaces, same field, different colour.
         write_shell_lua(dir.path(), &lock_config("#204080FF"));
         client.handle_reevaluate(ReevaluateRequest { sequence: 20 });
-        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 20 }));
+        assert_eq!(
+            queued_frame(&mut outbound_rx),
+            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 20 })
+        );
         client.handle_apply_pending(ApplyPendingReload { sequence: 20 });
         let restyled = client.scene.surface("screen@TEST").expect("the lock instance is still resolved");
         assert_eq!(
@@ -1715,12 +1829,18 @@ mod tests {
         );
 
         // The edit that must not land: same lock, no `textfield` under it.
-        write_shell_lua(dir.path(), r##"return {
+        write_shell_lua(
+            dir.path(),
+            r##"return {
             panel { id = "bar", layer = "Top" },
             lock { id = "screen", child = column { background = "#204080FF", children = {} } },
-        }"##);
+        }"##,
+        );
         client.handle_reevaluate(ReevaluateRequest { sequence: 21 });
-        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 21 }));
+        assert_eq!(
+            queued_frame(&mut outbound_rx),
+            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 21 })
+        );
         client.handle_apply_pending(ApplyPendingReload { sequence: 21 });
 
         let still_up = client.scene.surface("screen@TEST").expect("a refused apply leaves the prior scene standing");
@@ -1741,15 +1861,24 @@ mod tests {
         let (mut client, mut outbound_rx) = test_client(&path);
         assert!(run_startup(&mut client));
 
-        write_shell_lua(dir.path(), r##"return {
+        write_shell_lua(
+            dir.path(),
+            r##"return {
             panel { id = "bar", layer = "Top" },
             lock { id = "screen", child = column { background = "#101010FF", children = {} } },
-        }"##);
+        }"##,
+        );
         client.handle_reevaluate(ReevaluateRequest { sequence: 22 });
-        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 22 }));
+        assert_eq!(
+            queued_frame(&mut outbound_rx),
+            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 22 })
+        );
         client.handle_apply_pending(ApplyPendingReload { sequence: 22 });
 
-        assert!(client.scene.surface("screen@TEST").unwrap().children[0].children.is_empty(), "an unlocked session's lock screen is ordinary");
+        assert!(
+            client.scene.surface("screen@TEST").unwrap().children[0].children.is_empty(),
+            "an unlocked session's lock screen is ordinary"
+        );
     }
 
     #[test]
@@ -1768,20 +1897,34 @@ mod tests {
         client.set_session_locked(true);
 
         let specs = client.applied_surface_specs();
-        let docked = vec![OutputGeometry { name: "DP-1".to_string(), size: layout::LogicalSize { width: 2560.0, height: 1440.0 } }];
+        let docked = vec![OutputGeometry {
+            name: "DP-1".to_string(),
+            size: layout::LogicalSize { width: 2560.0, height: 1440.0 },
+        }];
         client.set_instances(expand_instances(&specs, &docked));
         assert!(client.apply_instances(), "the freshly plugged output resolves its own lock surface");
 
-        write_shell_lua(dir.path(), r##"return {
+        write_shell_lua(
+            dir.path(),
+            r##"return {
             panel { id = "bar", layer = "Top" },
             lock { id = "screen", child = column { background = "#101010FF", children = {} } },
-        }"##);
+        }"##,
+        );
         client.handle_reevaluate(ReevaluateRequest { sequence: 30 });
-        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 30 }));
+        assert_eq!(
+            queued_frame(&mut outbound_rx),
+            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 30 })
+        );
         client.handle_apply_pending(ApplyPendingReload { sequence: 30 });
 
-        let live = client.scene.surface("screen@DP-1").expect("the lock instance on the output that is actually plugged in");
-        assert_eq!(live.children[0].children.len(), 1, "the veto must ask what is on the glass now, not what was there when the lock was taken");
+        let live =
+            client.scene.surface("screen@DP-1").expect("the lock instance on the output that is actually plugged in");
+        assert_eq!(
+            live.children[0].children.len(),
+            1,
+            "the veto must ask what is on the glass now, not what was there when the lock was taken"
+        );
     }
 
     #[test]
@@ -1802,16 +1945,27 @@ mod tests {
         assert!(!run_startup(&mut client), "a config with two `lock` surfaces must not produce a generation");
         let (is_rescue, error_log) = rescue_state(&client.loader);
         assert!(is_rescue, "the refusal has to be visible somewhere, and rescue is where an evaluation failure goes");
-        assert!(error_log.contains("§ 6.4"), "the message must name the section that says one lock surface per output: {error_log}");
+        assert!(
+            error_log.contains("§ 6.4"),
+            "the message must name the section that says one lock surface per output: {error_log}"
+        );
 
         write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
-        client.state.applied_topology =
-            Some(surface_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap().iter().map(SurfaceSpec::fingerprint).collect());
+        client.state.applied_topology = Some(
+            surface_specs(&client.loader.evaluate_file(&path).unwrap())
+                .unwrap()
+                .iter()
+                .map(SurfaceSpec::fingerprint)
+                .collect(),
+        );
         write_shell_lua(dir.path(), two_locks);
         client.handle_reevaluate(ReevaluateRequest { sequence: 11 });
 
         assert!(
-            matches!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::Failed { sequence: 11, .. })),
+            matches!(
+                queued_frame(&mut outbound_rx),
+                RendererFrame::ReevaluateReport(ReevaluateReport::Failed { sequence: 11, .. })
+            ),
             "an edit that adds a second lock must fail the reevaluation rather than be staged"
         );
         assert!(client.state.pending.is_none());
@@ -1824,13 +1978,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return window { id = "settings", title = "Settings" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
-        client.state.applied_topology =
-            Some(surface_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap().iter().map(SurfaceSpec::fingerprint).collect());
+        client.state.applied_topology = Some(
+            surface_specs(&client.loader.evaluate_file(&path).unwrap())
+                .unwrap()
+                .iter()
+                .map(SurfaceSpec::fingerprint)
+                .collect(),
+        );
 
-        write_shell_lua(dir.path(), r#"return window { id = "settings", title = "Oblisk settings", app_id = "oblisk.settings" }"#);
+        write_shell_lua(
+            dir.path(),
+            r#"return window { id = "settings", title = "Oblisk settings", app_id = "oblisk.settings" }"#,
+        );
         client.handle_reevaluate(ReevaluateRequest { sequence: 10 });
 
-        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 10 }));
+        assert_eq!(
+            queued_frame(&mut outbound_rx),
+            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 10 })
+        );
         assert!(client.state.pending.is_some());
     }
 
@@ -1855,7 +2020,10 @@ mod tests {
 
         let (is_rescue, error_log) = rescue_state(&client.loader);
         assert!(is_rescue);
-        assert!(error_log.contains("anchor_rect"), "the human reading rescue's error_log needs the property named: {error_log}");
+        assert!(
+            error_log.contains("anchor_rect"),
+            "the human reading rescue's error_log needs the property named: {error_log}"
+        );
     }
 
     #[test]
@@ -1917,12 +2085,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
-        client.state.applied_topology =
-            Some(surface_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap().iter().map(SurfaceSpec::fingerprint).collect());
+        client.state.applied_topology = Some(
+            surface_specs(&client.loader.evaluate_file(&path).unwrap())
+                .unwrap()
+                .iter()
+                .map(SurfaceSpec::fingerprint)
+                .collect(),
+        );
 
         client.handle_reevaluate(ReevaluateRequest { sequence: 5 });
 
-        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 5 }));
+        assert_eq!(
+            queued_frame(&mut outbound_rx),
+            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 5 })
+        );
         assert!(matches!(&client.state.pending, Some((sequence, _, _)) if *sequence == 5));
     }
 
@@ -1932,12 +2108,20 @@ mod tests {
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
         // Seed a *different* applied topology so the fresh evaluation reads as changed.
-        client.state.applied_topology =
-            Some(vec![SurfaceFingerprint::Panel(layout::node::SurfaceTopology { id: "other".to_string(), layer: LayerKind::Top, anchor: Default::default(), monitor: "All".to_string(), namespace: "oblisk-other".to_string() })]);
+        client.state.applied_topology = Some(vec![SurfaceFingerprint::Panel(layout::node::SurfaceTopology {
+            id: "other".to_string(),
+            layer: LayerKind::Top,
+            anchor: Default::default(),
+            monitor: "All".to_string(),
+            namespace: "oblisk-other".to_string(),
+        })]);
 
         client.handle_reevaluate(ReevaluateRequest { sequence: 1 });
 
-        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence: 1 }));
+        assert_eq!(
+            queued_frame(&mut outbound_rx),
+            RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence: 1 })
+        );
         assert!(client.state.pending.is_none(), "a topology-changed generation must not stage a pending apply");
     }
 
@@ -1953,8 +2137,13 @@ mod tests {
             r#"return panel { id = "bar", layer = "Top", margin = { left = 4 }, keyboard_interactivity = "None", exclusive = false, height = 32 }"#,
         );
         let (mut client, mut outbound_rx) = test_client(&path);
-        client.state.applied_topology =
-            Some(surface_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap().iter().map(SurfaceSpec::fingerprint).collect());
+        client.state.applied_topology = Some(
+            surface_specs(&client.loader.evaluate_file(&path).unwrap())
+                .unwrap()
+                .iter()
+                .map(SurfaceSpec::fingerprint)
+                .collect(),
+        );
 
         // Every in-place field changed at once; every topology field left alone.
         write_shell_lua(
@@ -1968,7 +2157,10 @@ mod tests {
             RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 7 }),
             "margin/keyboard_interactivity/exclusive/size are in-place fields and must not trigger a generation swap"
         );
-        assert!(client.state.pending.is_some(), "an Unchanged verdict must stage the fresh evaluation for ApplyPendingReload");
+        assert!(
+            client.state.pending.is_some(),
+            "an Unchanged verdict must stage the fresh evaluation for ApplyPendingReload"
+        );
     }
 
     #[test]
@@ -1978,13 +2170,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
-        client.state.applied_topology =
-            Some(surface_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap().iter().map(SurfaceSpec::fingerprint).collect());
+        client.state.applied_topology = Some(
+            surface_specs(&client.loader.evaluate_file(&path).unwrap())
+                .unwrap()
+                .iter()
+                .map(SurfaceSpec::fingerprint)
+                .collect(),
+        );
 
         write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", namespace = "my-bar" }"#);
         client.handle_reevaluate(ReevaluateRequest { sequence: 8 });
 
-        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence: 8 }));
+        assert_eq!(
+            queued_frame(&mut outbound_rx),
+            RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence: 8 })
+        );
         assert!(client.state.pending.is_none());
     }
 
@@ -1993,11 +2193,18 @@ mod tests {
         // A `configure` reuses ADR-0044 decision 2's one dirty flag rather than adding a second
         // "something changed" mechanism next to it.
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", width = "Fill", height = "Fill" }"#);
+        let path = write_shell_lua(
+            dir.path(),
+            r#"return panel { id = "bar", layer = "Top", width = "Fill", height = "Fill" }"#,
+        );
         let (mut client, _outbound_rx) = test_client(&path);
         assert!(run_startup(&mut client), "startup must have applied");
         assert!(!client.dirty.take(), "a clean startup leaves the flag clear");
-        assert_eq!(client.scene.surface("bar@TEST").unwrap().rect.height, 1080.0, "the first resolve uses the output's own size");
+        assert_eq!(
+            client.scene.surface("bar@TEST").unwrap().rect.height,
+            1080.0,
+            "the first resolve uses the output's own size"
+        );
 
         client.set_instance_size("bar@TEST", layout::LogicalSize { width: 1920.0, height: 32.0 });
 
@@ -2012,12 +2219,18 @@ mod tests {
     #[test]
     fn set_instance_size_repeating_the_current_size_does_not_mark_the_scene_dirty() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", width = "Fill", height = "Fill" }"#);
+        let path = write_shell_lua(
+            dir.path(),
+            r#"return panel { id = "bar", layer = "Top", width = "Fill", height = "Fill" }"#,
+        );
         let (mut client, _outbound_rx) = test_client(&path);
         assert!(run_startup(&mut client));
 
         client.set_instance_size("bar@TEST", layout::LogicalSize { width: 1920.0, height: 1080.0 });
-        assert!(!client.dirty.take(), "a duplicate configure carrying the size already resolved against changes nothing");
+        assert!(
+            !client.dirty.take(),
+            "a duplicate configure carrying the size already resolved against changes nothing"
+        );
 
         client.set_instance_size("no-such-surface@TEST", layout::LogicalSize { width: 10.0, height: 10.0 });
         assert!(!client.dirty.take(), "a configure for a surface no instance names must not dirty the whole scene");
@@ -2028,7 +2241,10 @@ mod tests {
         // `monitor = "All"` across a laptop panel and a 4K external is two configured sizes, and
         // one tree per declared surface could only ever serve one of them.
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", width = "Fill", height = "Fill" }"#);
+        let path = write_shell_lua(
+            dir.path(),
+            r#"return panel { id = "bar", layer = "Top", width = "Fill", height = "Fill" }"#,
+        );
         let (mut client, _outbound_rx) = test_client(&path);
 
         let specs = client.run_startup_evaluation().expect("the fixture evaluates");
@@ -2049,7 +2265,10 @@ mod tests {
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", monitor = "HDMI-A-9" }"#);
         let (mut client, _outbound_rx) = test_client(&path);
 
-        assert!(run_startup(&mut client), "an unmatched monitor is not an apply failure -- there is simply nothing to resolve");
+        assert!(
+            run_startup(&mut client),
+            "an unmatched monitor is not an apply failure -- there is simply nothing to resolve"
+        );
         assert!(client.scene.surface("bar@TEST").is_none());
         assert!(client.instances.is_empty());
     }
@@ -2080,7 +2299,8 @@ mod tests {
         // A topology-field type error (e.g. `anchor.top` not a boolean) used to be folded into
         // `InvalidTopLevelReturn`'s fixed "must be a `panel` node or an array of them" message.
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", anchor = { top = "yes" } }"#);
+        let path =
+            write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", anchor = { top = "yes" } }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
 
         client.handle_reevaluate(ReevaluateRequest { sequence: 1 });
@@ -2088,7 +2308,10 @@ mod tests {
         match queued_frame(&mut outbound_rx) {
             RendererFrame::ReevaluateReport(ReevaluateReport::Failed { error, .. }) => {
                 assert!(error.contains("topology"), "expected a topology-specific message, got: {error}");
-                assert!(!error.contains("top-level return"), "must not reuse the unrelated top-level-return message, got: {error}");
+                assert!(
+                    !error.contains("top-level return"),
+                    "must not reuse the unrelated top-level-return message, got: {error}"
+                );
             }
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -2140,7 +2363,11 @@ mod tests {
         let (client, _outbound_rx) = test_client(&missing);
         assert!(!client.dirty.take(), "a fresh client must not start dirty");
 
-        let snapshot = StateSnapshot { capability: "audio".to_string(), revision: 1, payload: serde_json::json!({ "app_name": "Zen" }) };
+        let snapshot = StateSnapshot {
+            capability: "audio".to_string(),
+            revision: 1,
+            payload: serde_json::json!({ "app_name": "Zen" }),
+        };
         client.apply_state_snapshot(snapshot).unwrap();
 
         assert!(client.dirty.take(), "LiveSignalHandle::set must mark the shared scene-dirty flag");
@@ -2149,20 +2376,32 @@ mod tests {
     #[test]
     fn re_resolve_if_dirty_applies_a_pushed_value_without_reading_shell_lua_again() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", visible = oblisk.workspace }"#);
+        let path =
+            write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", visible = oblisk.workspace }"#);
         let (mut client, _outbound_rx) = test_client(&path);
         client
-            .apply_state_snapshot(StateSnapshot { capability: "workspace".to_string(), revision: 1, payload: serde_json::json!(true) })
+            .apply_state_snapshot(StateSnapshot {
+                capability: "workspace".to_string(),
+                revision: 1,
+                payload: serde_json::json!(true),
+            })
             .unwrap();
         run_startup(&mut client);
-        assert!(client.scene.surface("bar@TEST").unwrap().visible, "startup must have applied the pushed initial value");
+        assert!(
+            client.scene.surface("bar@TEST").unwrap().visible,
+            "startup must have applied the pushed initial value"
+        );
 
         // Break the file so a real re-evaluation would fail: the re-resolve below must read the
         // pushed value off the retained tree's live signal, never touching this file again.
         std::fs::write(&path, "this is not lua").unwrap();
 
         client
-            .apply_state_snapshot(StateSnapshot { capability: "workspace".to_string(), revision: 2, payload: serde_json::json!(false) })
+            .apply_state_snapshot(StateSnapshot {
+                capability: "workspace".to_string(),
+                revision: 2,
+                payload: serde_json::json!(false),
+            })
             .unwrap();
         client.re_resolve_if_dirty();
 
@@ -2177,14 +2416,23 @@ mod tests {
     #[test]
     fn re_resolve_if_dirty_clears_the_flag_and_a_second_call_does_no_work() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", visible = oblisk.workspace }"#);
+        let path =
+            write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", visible = oblisk.workspace }"#);
         let (mut client, _outbound_rx) = test_client(&path);
         client
-            .apply_state_snapshot(StateSnapshot { capability: "workspace".to_string(), revision: 1, payload: serde_json::json!(true) })
+            .apply_state_snapshot(StateSnapshot {
+                capability: "workspace".to_string(),
+                revision: 1,
+                payload: serde_json::json!(true),
+            })
             .unwrap();
         run_startup(&mut client);
         client
-            .apply_state_snapshot(StateSnapshot { capability: "workspace".to_string(), revision: 2, payload: serde_json::json!(false) })
+            .apply_state_snapshot(StateSnapshot {
+                capability: "workspace".to_string(),
+                revision: 2,
+                payload: serde_json::json!(false),
+            })
             .unwrap();
 
         client.re_resolve_if_dirty();
@@ -2194,7 +2442,8 @@ mod tests {
         // Replace `applied_output` directly (bypassing the push path, which would re-mark dirty)
         // with an evaluation that resolves `visible` to `true`. A true no-op leaves the scene
         // exactly as the first resolve left it.
-        let poisoned_path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", visible = true }"#);
+        let poisoned_path =
+            write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", visible = true }"#);
         let (poisoned_output, _) = evaluate_and_specs(&client.loader, &poisoned_path).unwrap();
         client.state.applied_output = Some(poisoned_output);
 
@@ -2214,21 +2463,33 @@ mod tests {
 
         for revision in 1..=5 {
             client
-                .apply_state_snapshot(StateSnapshot { capability: "audio".to_string(), revision, payload: serde_json::json!({ "n": revision }) })
+                .apply_state_snapshot(StateSnapshot {
+                    capability: "audio".to_string(),
+                    revision,
+                    payload: serde_json::json!({ "n": revision }),
+                })
                 .unwrap();
         }
 
         assert!(client.dirty.take(), "a burst of five pushes must have marked the flag");
-        assert!(!client.dirty.take(), "the flag records only whether a push happened since the last check, not how many, so the burst coalesces into one turn's work");
+        assert!(
+            !client.dirty.take(),
+            "the flag records only whether a push happened since the last check, not how many, so the burst coalesces into one turn's work"
+        );
     }
 
     #[test]
     fn a_push_that_makes_a_property_invalid_keeps_the_prior_scene_and_does_not_enter_rescue() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", visible = oblisk.workspace }"#);
+        let path =
+            write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", visible = oblisk.workspace }"#);
         let (mut client, _outbound_rx) = test_client(&path);
         client
-            .apply_state_snapshot(StateSnapshot { capability: "workspace".to_string(), revision: 1, payload: serde_json::json!(true) })
+            .apply_state_snapshot(StateSnapshot {
+                capability: "workspace".to_string(),
+                revision: 1,
+                payload: serde_json::json!(true),
+            })
             .unwrap();
         run_startup(&mut client);
         assert!(client.scene.surface("bar@TEST").unwrap().visible);
@@ -2272,8 +2533,15 @@ mod tests {
 
         let bar = client.scene.surface("bar@TEST").expect("a bare rostered signal must not stop the config applying");
         assert!(bar.visible, "`visible = audio` with audio still nil must take parse_visible's default");
-        assert!(bar.children[0].children.is_empty(), "`children = tray` with tray still nil must take parse_children's default");
-        assert_eq!(rescue_state(&client.loader), (false, String::new()), "a startup that applies must not be in rescue");
+        assert!(
+            bar.children[0].children.is_empty(),
+            "`children = tray` with tray still nil must take parse_children's default"
+        );
+        assert_eq!(
+            rescue_state(&client.loader),
+            (false, String::new()),
+            "a startup that applies must not be in rescue"
+        );
     }
 
     #[test]
@@ -2281,18 +2549,28 @@ mod tests {
         // ADR-0044's headline example: `text { content = oblisk.mpris.title }` must apply at boot
         // even though `title` still reads `nil`, the same rule as `visible`/`children` above.
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", child = text { content = oblisk.audio } }"#);
+        let path = write_shell_lua(
+            dir.path(),
+            r#"return panel { id = "bar", layer = "Top", child = text { content = oblisk.audio } }"#,
+        );
         let (mut client, _outbound_rx) = test_client(&path);
 
         run_startup(&mut client);
 
-        let bar = client.scene.surface("bar@TEST").expect("a bare rostered signal on `content` must not stop the config applying");
+        let bar = client
+            .scene
+            .surface("bar@TEST")
+            .expect("a bare rostered signal on `content` must not stop the config applying");
         assert_eq!(
             layout::node::parse_content(&bar.children[0].properties).unwrap(),
             "",
             "`content = audio` with audio still nil must take parse_content's default"
         );
-        assert_eq!(rescue_state(&client.loader), (false, String::new()), "a startup that applies must not be in rescue");
+        assert_eq!(
+            rescue_state(&client.loader),
+            (false, String::new()),
+            "a startup that applies must not be in rescue"
+        );
     }
 
     #[test]
@@ -2305,11 +2583,18 @@ mod tests {
         assert!(client.state.applied_output.is_none(), "startup must have failed (no file)");
 
         client
-            .apply_state_snapshot(StateSnapshot { capability: "audio".to_string(), revision: 1, payload: serde_json::json!({ "app_name": "Zen" }) })
+            .apply_state_snapshot(StateSnapshot {
+                capability: "audio".to_string(),
+                revision: 1,
+                payload: serde_json::json!({ "app_name": "Zen" }),
+            })
             .unwrap();
         client.re_resolve_if_dirty();
 
-        assert!(client.dirty.take(), "the push must still be pending for whatever applies next, not consumed by the early return");
+        assert!(
+            client.dirty.take(),
+            "the push must still be pending for whatever applies next, not consumed by the early return"
+        );
     }
 
     #[test]
@@ -2337,12 +2622,20 @@ mod tests {
         for revision in 1..=20 {
             let count = if revision % 2 == 0 { 1 } else { 3 };
             client
-                .apply_state_snapshot(StateSnapshot { capability: "audio".to_string(), revision, payload: serde_json::json!(count) })
+                .apply_state_snapshot(StateSnapshot {
+                    capability: "audio".to_string(),
+                    revision,
+                    payload: serde_json::json!(count),
+                })
                 .unwrap();
             client.re_resolve_if_dirty();
         }
 
-        assert_eq!(client.scene.surface("bar@TEST").unwrap().children[0].children.len(), 1, "the last push shrank the row back to one child");
+        assert_eq!(
+            client.scene.surface("bar@TEST").unwrap().children[0].children.len(),
+            1,
+            "the last push shrank the row back to one child"
+        );
         assert!(
             client.scene.retiring_ids().is_empty(),
             "a successful apply must drain the lease bag, since nothing holds a lease today; got {} entries after 20 re-resolves",
@@ -2356,13 +2649,19 @@ mod tests {
         // a successful startup used to mark the scene dirty by clearing rescue that was already
         // clear, costing a whole redundant `Scene::apply` on the first poll turn.
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", child = text { content = "hi" } }"#);
+        let path = write_shell_lua(
+            dir.path(),
+            r#"return panel { id = "bar", layer = "Top", child = text { content = "hi" } }"#,
+        );
         let (mut client, _outbound_rx) = test_client(&path);
 
         run_startup(&mut client);
 
         assert!(client.scene.surface("bar@TEST").is_some(), "startup must have applied");
-        assert!(!client.dirty.take(), "an apply that succeeded resolved every signal at its current value, so nothing is stale");
+        assert!(
+            !client.dirty.take(),
+            "an apply that succeeded resolved every signal at its current value, so nothing is stale"
+        );
     }
 
     /// `screens_payload`'s shape, hand-written here so these tests do not depend on
@@ -2413,7 +2712,10 @@ mod tests {
 
         assert!(run_startup(&mut client), "an unseeded `screens` must not fail the evaluation");
         let tree = client.scene.surface("bar@TEST").unwrap();
-        assert_eq!(tree.children[0].properties.get("content").unwrap().as_string().unwrap().to_string_lossy(), "screens: 0");
+        assert_eq!(
+            tree.children[0].properties.get("content").unwrap().as_string().unwrap().to_string_lossy(),
+            "screens: 0"
+        );
     }
 
     #[test]
@@ -2441,7 +2743,13 @@ mod tests {
         client.set_screens(screens_json(&["eDP-1"]));
         run_startup(&mut client);
         let content = |client: &RendererClient| {
-            client.scene.surface("bar@TEST").unwrap().children[0].properties.get("content").unwrap().as_string().unwrap().to_string_lossy()
+            client.scene.surface("bar@TEST").unwrap().children[0]
+                .properties
+                .get("content")
+                .unwrap()
+                .as_string()
+                .unwrap()
+                .to_string_lossy()
         };
         assert_eq!(content(&client), "n=1");
 
@@ -2456,7 +2764,10 @@ mod tests {
         // follows resolved against that very value, so entering the poll loop dirty would buy one
         // redundant `Scene::apply` before anything is drawn.
         let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", child = text { content = "hi" } }"#);
+        let path = write_shell_lua(
+            dir.path(),
+            r#"return panel { id = "bar", layer = "Top", child = text { content = "hi" } }"#,
+        );
         let (mut client, _outbound_rx) = test_client(&path);
 
         assert!(client.set_screens(screens_json(&["eDP-1"])));
@@ -2477,7 +2788,9 @@ mod tests {
 
         let specs = client.applied_surface_specs();
         assert_eq!(specs.len(), 1);
-        assert!(matches!(&specs[0], SurfaceSpec::Panel(panel) if panel.topology.id == "bar" && panel.topology.monitor == "All"));
+        assert!(
+            matches!(&specs[0], SurfaceSpec::Panel(panel) if panel.topology.id == "bar" && panel.topology.monitor == "All")
+        );
     }
 
     #[test]
@@ -2505,13 +2818,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
-        client.state.applied_topology =
-            Some(vec![SurfaceFingerprint::Panel(layout::node::SurfaceTopology { id: "other".to_string(), layer: LayerKind::Top, anchor: Default::default(), monitor: "All".to_string(), namespace: "oblisk-other".to_string() })]);
+        client.state.applied_topology = Some(vec![SurfaceFingerprint::Panel(layout::node::SurfaceTopology {
+            id: "other".to_string(),
+            layer: LayerKind::Top,
+            anchor: Default::default(),
+            monitor: "All".to_string(),
+            namespace: "oblisk-other".to_string(),
+        })]);
 
         client.handle_reevaluate(ReevaluateRequest { sequence: 1 });
 
-        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence: 1 }));
-        assert!(!client.dirty.take(), "a topology-changed generation must not have its scene marked dirty by the verdict itself");
+        assert_eq!(
+            queued_frame(&mut outbound_rx),
+            RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence: 1 })
+        );
+        assert!(
+            !client.dirty.take(),
+            "a topology-changed generation must not have its scene marked dirty by the verdict itself"
+        );
     }
 
     #[test]
@@ -2521,12 +2845,23 @@ mod tests {
         let (mut client, mut outbound_rx) = test_client(&path);
         // A different applied topology so the fresh evaluation reads as changed -- proves the
         // dispatch/queue path, not `handle_reevaluate`'s own classification logic.
-        client.state.applied_topology =
-            Some(vec![SurfaceFingerprint::Panel(layout::node::SurfaceTopology { id: "other".to_string(), layer: LayerKind::Top, anchor: Default::default(), monitor: "All".to_string(), namespace: "oblisk-other".to_string() })]);
+        client.state.applied_topology = Some(vec![SurfaceFingerprint::Panel(layout::node::SurfaceTopology {
+            id: "other".to_string(),
+            layer: LayerKind::Top,
+            anchor: Default::default(),
+            monitor: "All".to_string(),
+            namespace: "oblisk-other".to_string(),
+        })]);
 
-        assert_eq!(client.handle_frame(SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: 1 })), FrameOutcome::Handled);
+        assert_eq!(
+            client.handle_frame(SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: 1 })),
+            FrameOutcome::Handled
+        );
 
-        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence: 1 }));
+        assert_eq!(
+            queued_frame(&mut outbound_rx),
+            RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence: 1 })
+        );
     }
 
     #[test]
@@ -2537,7 +2872,10 @@ mod tests {
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, _outbound_rx) = test_client(&path);
 
-        assert_eq!(client.handle_frame(SupervisorFrame::ActivateDraw(ActivateDraw { nonce: 42 })), FrameOutcome::ActivateDraw(42));
+        assert_eq!(
+            client.handle_frame(SupervisorFrame::ActivateDraw(ActivateDraw { nonce: 42 })),
+            FrameOutcome::ActivateDraw(42)
+        );
     }
 
     #[test]
@@ -2549,8 +2887,14 @@ mod tests {
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, _outbound_rx) = test_client(&path);
 
-        assert_eq!(client.handle_frame(SupervisorFrame::SetSessionLock(SetSessionLock { locked: true })), FrameOutcome::SetSessionLock(true));
-        assert_eq!(client.handle_frame(SupervisorFrame::SetSessionLock(SetSessionLock { locked: false })), FrameOutcome::SetSessionLock(false));
+        assert_eq!(
+            client.handle_frame(SupervisorFrame::SetSessionLock(SetSessionLock { locked: true })),
+            FrameOutcome::SetSessionLock(true)
+        );
+        assert_eq!(
+            client.handle_frame(SupervisorFrame::SetSessionLock(SetSessionLock { locked: false })),
+            FrameOutcome::SetSessionLock(false)
+        );
     }
 
     #[test]
@@ -2559,13 +2903,27 @@ mod tests {
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
 
-        assert_eq!(client.handle_frame(SupervisorFrame::DeselectInput(DeselectInput { surface_id: "main_bar".to_string() })), FrameOutcome::Handled);
-        assert_eq!(client.handle_frame(SupervisorFrame::PromoteGeneration(PromoteGeneration { surface_id: "main_bar".to_string() })), FrameOutcome::Handled);
+        assert_eq!(
+            client.handle_frame(SupervisorFrame::DeselectInput(DeselectInput { surface_id: "main_bar".to_string() })),
+            FrameOutcome::Handled
+        );
+        assert_eq!(
+            client.handle_frame(SupervisorFrame::PromoteGeneration(PromoteGeneration {
+                surface_id: "main_bar".to_string()
+            })),
+            FrameOutcome::Handled
+        );
         // A third, recognized frame to prove dispatch kept working after the two inert ones above
         // -- the report's exact verdict isn't the point, only that a real response arrives at all.
-        assert_eq!(client.handle_frame(SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: 9 })), FrameOutcome::Handled);
+        assert_eq!(
+            client.handle_frame(SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: 9 })),
+            FrameOutcome::Handled
+        );
 
-        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 9 }));
+        assert_eq!(
+            queued_frame(&mut outbound_rx),
+            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 9 })
+        );
     }
 
     #[test]
@@ -2585,9 +2943,16 @@ mod tests {
             )
             .unwrap();
 
-        let output_frame = SupervisorFrame::ProcessOutput(ProcessOutputLine { id: 0, stream: shared::ProcessStream::Stdout, line: "hello".to_string() });
+        let output_frame = SupervisorFrame::ProcessOutput(ProcessOutputLine {
+            id: 0,
+            stream: shared::ProcessStream::Stdout,
+            line: "hello".to_string(),
+        });
         assert_eq!(client.handle_frame(output_frame), FrameOutcome::Handled);
-        assert_eq!(client.handle_frame(SupervisorFrame::ProcessExited(ProcessExited { id: 0, code: Some(3) })), FrameOutcome::Handled);
+        assert_eq!(
+            client.handle_frame(SupervisorFrame::ProcessExited(ProcessExited { id: 0, code: Some(3) })),
+            FrameOutcome::Handled
+        );
 
         let output = client
             .loader
@@ -2747,7 +3112,9 @@ mod tests {
 
             // Queue an outbound frame while the inbound read is stalled mid-frame -- exactly the
             // race the old per-iteration `select!` lost.
-            outbound_tx.send(RendererFrame::ReadySignal(ReadySignal { surfaces: vec!["main_bar".to_string()] })).unwrap();
+            outbound_tx
+                .send(RendererFrame::ReadySignal(ReadySignal { surfaces: vec!["main_bar".to_string()] }))
+                .unwrap();
             let_pump_advance(pumping.as_mut(), 20).await;
 
             // The write direction must not be starved by the stuck read.

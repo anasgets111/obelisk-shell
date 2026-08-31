@@ -16,12 +16,22 @@ use std::time::Duration;
 pub(super) const RESTART_LIMIT: usize = 3;
 pub(super) const RESTART_WINDOW: Duration = Duration::from_secs(60);
 
-/// Resolves the Renderer binary as a sibling of the running Supervisor binary (the standard
-/// same-workspace cargo layout). No packaging or install-path configuration exists yet
-/// (docs/adr/0025) -- this is the only assumption available until one does.
-pub(super) fn renderer_binary_path() -> io::Result<PathBuf> {
+/// The Renderer's installed filename. Not `renderer`, which is too generic to put anywhere a
+/// user's `$PATH` might reach, and `cargo install` puts every binary in one directory.
+pub(crate) const RENDERER_BINARY: &str = "oblisk-renderer";
+
+/// Resolves the Renderer binary as a sibling of the running Supervisor binary.
+///
+/// This is what keeps the Renderer off `$PATH` in an install with no code behind it. On Linux
+/// `current_exe` reads `/proc/self/exe`, which is already symlink-resolved, so
+/// `$PREFIX/bin/oblisk -> ../lib/oblisk/oblisk` still finds `$PREFIX/lib/oblisk/oblisk-renderer`.
+/// A user gets one command on their path and the pair stays together.
+///
+/// The sibling rule is also what makes `cargo run` a trap worth naming: it rebuilds one half of
+/// the stack and launches whatever the other half already was. `just run` builds both.
+pub(crate) fn renderer_binary_path() -> io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
-    Ok(exe.with_file_name("renderer"))
+    Ok(exe.with_file_name(RENDERER_BINARY))
 }
 
 /// One generation's identity and process handle while it's authoritative. Reassigned wholesale
@@ -206,7 +216,10 @@ mod tests {
 
         // One crash per window, forever: a bug to chase in the log, not a loop to stop restarting.
         for attempt in 0..10 {
-            assert!(brake.allow(start + Duration::from_secs(attempt * 61)), "crash {attempt} stands alone in its window");
+            assert!(
+                brake.allow(start + Duration::from_secs(attempt * 61)),
+                "crash {attempt} stands alone in its window"
+            );
         }
     }
 }
