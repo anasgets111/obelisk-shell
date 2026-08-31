@@ -1,6 +1,6 @@
 //! Real PAM conversation (build-steps.md Phase 15 item 3, closing docs/adr/0015 item 1).
 //! Both halves of docs/adr/0028's design live here: they share the wire protocol
-//! (`shared::PamOutcome` over `shared::framing`) and the PAM service name.
+//! (`shared::PamOutcome` over `shared::framing`) and the PAM service name ([`pam_service`]).
 //!
 //! docs/adr/0028: PAM runs in a re-exec'd worker process, not inline, because `nonstick`'s FFI is
 //! blocking and this codebase's rule is no blocking call inline in the async Supervisor.
@@ -27,9 +27,43 @@ use std::time::Duration;
 use nonstick::{ConversationAdapter, Transaction};
 use tokio::sync::mpsc::UnboundedSender;
 
-/// The PAM service this worker authenticates against. This system has no `/etc/pam.d/polkit-1`
-/// -- `"login"` is the disclosed fallback (ADR-0028). Not configurable: no spec asks for that.
-const PAM_SERVICE: &str = "login";
+/// Where PAM keeps its per-service stacks. A constant so [`pam_service_in`] can be pointed at a
+/// temporary directory by its tests without a real `/etc` to install into.
+const PAM_CONFIG_DIR: &str = "/etc/pam.d";
+
+/// The service Oblisk's own stack is installed as (`packaging/pam.d/oblisk`).
+const OBLISK_SERVICE: &str = "oblisk";
+
+/// What [`run_conversation`] authenticates against when `packaging/pam.d/oblisk` has not been
+/// installed. This system has no `/etc/pam.d/polkit-1`, so `"login"` is the disclosed fallback
+/// (ADR-0028).
+const FALLBACK_SERVICE: &str = "login";
+
+/// The PAM service this worker authenticates against: Oblisk's own stack when the admin has
+/// installed one, the console-login stack otherwise.
+///
+/// Chosen by probing rather than hardcoded, and the fallback is the whole reason. PAM answers a
+/// missing service file out of `/etc/pam.d/other`, which on a stock Arch install is `pam_deny`,
+/// so naming `oblisk` unconditionally would turn "the packager did not copy one file" into "the
+/// lock screen refuses every correct password". A screen locker is the one program where failing
+/// closed locks the user out of their own machine, so this fails back to the stack that has been
+/// working instead.
+///
+/// The probe is a `stat` per authentication, which is once per typed password. Deliberately not
+/// cached: an admin who installs the file should not have to restart the shell -- and the
+/// Supervisor holding a stale "no oblisk stack" from boot is exactly the case where a restart is
+/// least convenient, since the session may be locked at the time.
+fn pam_service_in(pam_config_dir: &std::path::Path) -> &'static str {
+    if pam_config_dir.join(OBLISK_SERVICE).exists() {
+        OBLISK_SERVICE
+    } else {
+        FALLBACK_SERVICE
+    }
+}
+
+fn pam_service() -> &'static str {
+    pam_service_in(std::path::Path::new(PAM_CONFIG_DIR))
+}
 
 /// Ceiling on the whole write-password/read-outcome exchange with the worker (`exchange_over`),
 /// not any single PAM call inside it. Generous relative to `reload::PbaTimings`' 2-3 second
@@ -102,7 +136,7 @@ fn outcome_for_error(err: nonstick::ErrorCode) -> shared::PamOutcome {
 fn run_conversation(username: &str, password: &[u8]) -> shared::PamOutcome {
     let password = Rc::new(RefCell::new(password.to_vec()));
     let conversation = PasswordConversation { password: Rc::clone(&password) };
-    let outcome = match nonstick::TransactionBuilder::new_with_service(PAM_SERVICE)
+    let outcome = match nonstick::TransactionBuilder::new_with_service(pam_service())
         .username(username)
         .build(conversation.into_conversation())
     {
@@ -393,6 +427,51 @@ async fn write_secret_then_read_outcome(child: &mut tokio::process::Child, secre
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- pam_service_in ----
+
+    /// The safe direction, and the one that matters: with no stack installed the worker keeps
+    /// using the console-login service that has been authenticating all along. Naming `oblisk`
+    /// here instead would send PAM to `/etc/pam.d/other`, which is `pam_deny` on a stock Arch
+    /// install -- a lock screen that refuses the correct password.
+    #[test]
+    fn without_an_installed_stack_the_service_falls_back_to_login() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(pam_service_in(dir.path()), "login");
+    }
+
+    #[test]
+    fn an_installed_stack_is_preferred_over_the_console_login_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("oblisk"), "auth include system-auth\n").unwrap();
+        assert_eq!(pam_service_in(dir.path()), "oblisk");
+    }
+
+    /// A directory PAM could not read at all is the same case as "not installed", not a panic:
+    /// this runs inside the worker on the path to an unlock.
+    #[test]
+    fn a_missing_pam_config_directory_falls_back_rather_than_failing() {
+        assert_eq!(pam_service_in(std::path::Path::new("/no/such/pam.d")), "login");
+    }
+
+    /// The file this repo ships is what the probe looks for, and it has to carry both chains --
+    /// `run_conversation` calls `authenticate` and then `account_management`, and a stack with no
+    /// `account` line fails the second one after the password was already accepted.
+    #[test]
+    fn the_shipped_pam_stack_declares_both_chains_the_worker_drives() {
+        let shipped = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../packaging/pam.d/oblisk")).unwrap();
+        let directives: Vec<&str> = shipped
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        assert!(directives.iter().any(|line| line.starts_with("auth")), "no auth chain in {directives:?}");
+        assert!(directives.iter().any(|line| line.starts_with("account")), "no account chain in {directives:?}");
+        assert!(
+            directives.iter().all(|line| line.starts_with("auth") || line.starts_with("account")),
+            "the worker opens no session and changes no password, so anything else is dead config: {directives:?}"
+        );
+    }
 
     /// A generous timeout for tests exercising the ordinary (non-timeout) paths -- short enough
     /// to keep a hung test from stalling the suite, long enough it never fires against these
