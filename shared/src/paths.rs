@@ -66,8 +66,24 @@ pub fn shell_lua_path() -> io::Result<PathBuf> {
 mod tests {
     use super::*;
 
+    /// Serializes every test that reads or writes `$XDG_CONFIG_HOME`.
+    ///
+    /// `config_dir` resolves through a process-global environment variable, and one test here has
+    /// to set it to prove it still wins. Without this lock that write lands in the middle of
+    /// another test's two reads, and the two disagree: the first read sees the injected value and
+    /// the second sees the dev-config fallback. That failed about a third of the time, in a test
+    /// whose subject is a `join` -- so the noise pointed at the wrong function entirely.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Kept even when a previous holder panicked: the guarded state is the environment, which the
+    /// holder restores itself, so a poisoned lock carries no broken invariant worth failing on.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn shell_lua_path_is_config_dir_joined_with_shell_lua() {
+        let _guard = env_lock();
         let path = shell_lua_path().unwrap();
         assert_eq!(path, config_dir().unwrap().join("shell.lua"));
         assert!(path.ends_with("oblisk/shell.lua"));
@@ -93,6 +109,7 @@ mod tests {
     /// touches the environment.
     #[test]
     fn xdg_config_home_still_wins_over_the_dev_config_directory() {
+        let _guard = env_lock();
         let previous = std::env::var_os("XDG_CONFIG_HOME");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", "/tmp/oblisk-config-dir-test") };
         let resolved = config_dir().unwrap();
