@@ -2466,16 +2466,16 @@ last row is not a bar module; it is the only thing in the reference shell that n
 | Module | What it needs | What it gets |
 | :--- | :--- | :--- |
 | Volume | hover-expand, drag slider, wheel, middle-click mute, right-click panel | one click |
-| SysTray | left activate, right menu, scroll forwarded to the item | one click |
+| SysTray | left activate, right menu, scroll forwarded to the item | one click; lays out horizontally now |
 | ScreenRecorder | left region record, middle focused-output record, right options | one click |
 | PowerMenu | click arms a countdown, right-click cancels it | no cancel |
 | ArchChecker | left polls, right opens the panel | one of the two |
 | IdleInhibitor | left toggles, right opens settings | one of the two |
 | WallpaperButton | left opens the picker, right randomizes every monitor | one of the two |
-| BatteryIndicator | hover tooltip: power source, platform profile, CPU governor | no tooltip |
-| DateTimeDisplay | hover tooltip: mini calendar and weather detail | no tooltip |
-| MediaIndicator | hover opens the media panel | no hover |
-| WorkspaceStrip | hover highlights the slot under the pointer | no hover |
+| BatteryIndicator | hover tooltip: power source, platform profile, CPU governor | built, minus the governor |
+| DateTimeDisplay | hover tooltip: mini calendar and weather detail | unblocked |
+| MediaIndicator | hover opens the media panel | unblocked |
+| WorkspaceStrip | hover highlights the slot under the pointer | unblocked |
 | DisplaySettings | drag monitors on a canvas, snapping to neighbouring edges | no drag |
 
 Three things are missing. They cost very different amounts, so keep them apart.
@@ -2483,12 +2483,18 @@ Three things are missing. They cost very different amounts, so keep them apart.
 1. **A button index on `on_click`.** The cheapest item in this ledger. `wl_pointer::button` already
    carries the code, and `fire_on_click` already builds a table argument for the rect, which can
    carry a second field. One § 5.2 row, nothing else. Right-click alone repairs six modules.
-2. **`on_hover`.** `Enter`, `Motion` and `Leave` already arrive at the drop site, and `hit_under`
-   already resolves a position to a node path. Reading the event is not the work. The work is
-   deciding what a hover *is* in a retained tree that re-resolves on every signal push. Two shapes
-   fit: a callback firing with a boolean, or a `hovered` signal the config binds to `visible`. The
-   signal makes a tooltip declarative instead of a state machine. It also makes the engine a source
-   of signals rather than only a consumer, which is why it needs an ADR.
+2. **`on_hover`.** **Built, as a signal rather than a callback (docs/adr/0062).** `hover(name)` is a
+   boolean the engine writes from `Enter`/`Motion`/`Leave`, `hover_rect(name)` is where the node
+   was, and a node claims the region with a `hover` property. A tooltip is a `popup` with
+   `grab = false` binding `visible` and `anchor_rect` to the pair, which is two lines and no state
+   machine. The four rows above that wanted hover are unblocked; `dev-config` uses it for the
+   battery tooltip, which is also where the power detail moved out of the pill.
+
+   The design question the ranking named -- what a hover *is* in a tree that re-resolves on every
+   push -- is answered by the condition/event split in decision 1, and the answer to "may the engine
+   emit a signal" is yes, which is the direction that ADR sets. Verified by unit test at two seams
+   and against the shipped config, not on a live session: `pointer_frame` still needs a compositor,
+   the same gap item 1 records.
 3. **`on_scroll`.** `Axis` arrives at the same drop site. The open question is what a scrollable
    container means, not what the callback looks like. Clipping already exists: `paint_tree` pushes an
    `intersect_scissor` per node, so a subtree is already cut to its parent's box. The missing half is
@@ -2638,12 +2644,14 @@ By modules unblocked per unit of work, which is not the same as by size.
    with it. Nothing in `process.run` cancels a request the config has moved on from, so every
    subprocess-backed module needs that guard, and a demo without one would teach the wrong shape.
 3. **Gradient and shadow on `rect`.** Already in the dependency. Parsers and § 5.2 rows only.
-4. **`on_hover`.** Two tooltips, a hover-to-open panel, a hover highlight, and every expand-on-hover
-   affordance. Needs an ADR on whether the engine may emit a signal rather than only consume one.
+4. **`on_hover`.** ~~Two tooltips, a hover-to-open panel, a hover highlight, and every
+   expand-on-hover affordance.~~ **Built (docs/adr/0062).** The engine may emit a signal, and this
+   is the first one it emits.
 5. **`on_scroll` plus a scroll offset.** Clipping is built, so this is layout and spec work, not
    paint work. Blocks every list-bearing panel until it lands.
-6. **The animation model.** Largest item, scoped in section 5, and gated behind items 4 and 5 in
-   practice. An expanding pill needs the hover before it needs the easing.
+6. **The animation model.** Largest item, scoped in section 5, and gated behind item 5 in practice;
+   item 4 is no longer in front of it. An expanding pill has its hover now and snaps without the
+   easing.
 7. **Backdrop blur.** One ADR, two bad options, and only the client-side one works on niri.
 8. **A `shape` node taking a path.** Closes the notch, the arcs and circular progress together, and
    costs far less than exposing shaders.
