@@ -19,15 +19,20 @@
 //! Failure semantics, chosen as the reading consistent with PBA's whole point (never a black
 //! frame, never an unverified swap): any failure before every expected surface_id's evidence is
 //! verified aborts the Candidate and leaves Generation `N` untouched. `run_pba` never touches `N`
-//! (see [`PbaOutcome`]) -- reaping it is the caller's job, after sending the Swap messages. All
+//! (see [`PbaOutcome`]) -- [`swap_and_reap`] does that, after sending the Swap messages. All
 //! four [`CandidateLink`] steps are deadline-gated: `ready_timeout` bounds `push_state_snapshot`
 //! and `recv_ready_signal`, `evidence_timeout` bounds `send_activate_draw` and the whole
 //! evidence-collection loop -- see [`PbaTimings`] and [`drive_handshake`].
 
+use std::fmt;
 use std::io;
 use std::time::Duration;
 
 use tokio::process::Child;
+
+use crate::generation::Authoritative;
+use crate::process::registry::{LiveProcesses, reap_generations_processes};
+use crate::socket::{GenerationRegistry, send_frame_logged};
 use tokio::time::timeout;
 
 use crate::process;
@@ -96,14 +101,33 @@ pub enum PbaFailure<E> {
     AbortReapFailed { original: Box<PbaFailure<E>>, reap_error: io::Error },
 }
 
+/// The sentence a failed swap is logged as. Here rather than as a match at the call site so the
+/// wording lives beside the variants it describes, and so `AbortReapFailed` renders its nested
+/// `original` as the same sentence rather than as a `Debug` struct dump.
+impl<E: fmt::Display> fmt::Display for PbaFailure<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PbaFailure::SpawnFailed(err) => write!(f, "could not spawn the candidate: {err}"),
+            PbaFailure::Link { stage, source } => write!(f, "{stage:?} failed: {source}"),
+            PbaFailure::Timeout { stage } => write!(f, "{stage:?} timed out"),
+            PbaFailure::UnexpectedEvidence { stage, surface_id } => {
+                write!(f, "{stage:?} got unexpected evidence for surface_id {surface_id:?}")
+            }
+            PbaFailure::AbortReapFailed { original, reap_error } => {
+                write!(f, "{original}, and the candidate's abort-reap also failed: {reap_error}")
+            }
+        }
+    }
+}
+
 /// A completed PBA reload: Generation `N+1` (`candidate`) is confirmed presented on every
 /// expected surface. `promoted_surfaces` is every surface_id that completed evidence
 /// verification, in `ReadySignal`'s order. `run_pba` does not reap Generation `N`
 /// (`superseded`), and doesn't even take it as a parameter: § 15.4's ordering is Input
 /// Deselection -> Candidate Promotion -> Reap, and the Swap messages
 /// (`DeselectInput`/`PromoteGeneration`) go to two different connections while `CandidateLink`
-/// is scoped to only the candidate's. The caller sends those Swap messages, then reaps
-/// `superseded` itself via `process::reap_process_group` (see `main.rs`'s `TopologyChanged`).
+/// is scoped to only the candidate's. [`swap_and_reap`] sends those Swap messages, then reaps
+/// `superseded` itself via [`process::reap_process_group`].
 #[derive(Debug)]
 pub struct PbaOutcome {
     pub candidate: Child,
@@ -212,15 +236,159 @@ pub async fn run_pba<L: CandidateLink>(
     }
 }
 
+/// § 15.4's Swap messages, in the order they go on the wire: for each promoted surface, the
+/// superseded generation is told to stop taking input before the candidate is told to start.
+///
+/// Its own function so that order is a value a test can assert on. Inside [`swap_and_reap`] the
+/// two sends are indistinguishable from each other to anything observable: a `send_frame_logged`
+/// to a generation with no connection logs and drops, so a test driving the real function proves
+/// nothing about which frame went first.
+fn swap_frames(superseded_generation_id: u32, candidate_generation_id: u32, promoted_surfaces: &[String]) -> Vec<(u32, shared::SupervisorFrame)> {
+    promoted_surfaces
+        .iter()
+        .flat_map(|surface_id| {
+            [
+                (superseded_generation_id, shared::SupervisorFrame::DeselectInput(shared::DeselectInput { surface_id: surface_id.clone() })),
+                (candidate_generation_id, shared::SupervisorFrame::PromoteGeneration(shared::PromoteGeneration { surface_id: surface_id.clone() })),
+            ]
+        })
+        .collect()
+}
+
+/// § 15.4's Swap & Reap, the sixth step of the sequence this module's doc comment names and the
+/// one it did not hold: [`run_pba`] stops at verified evidence, and everything after it lived in
+/// `main.rs`'s `TopologyChanged` arm.
+///
+/// Two rules, only one of which the code makes obvious:
+///
+/// 1. **Input deselection before promotion**, per surface (§ 15.4). The superseded generation
+///    stops taking input before the candidate starts, so no surface is live on two generations at
+///    once. [`swap_frames`] holds that order, so it is checkable without a live connection.
+/// 2. **The reassignment last**, which is the one a reader has to be told. `PromoteGeneration`
+///    carries `candidate_generation_id` and is unaffected, but the `DeselectInput` frames and both
+///    reaps read `authoritative.generation_id`, so promoting first would deselect input on the
+///    candidate and sweep the candidate's own `process.run` children while the superseded
+///    generation kept both.
+///
+/// The two reaps are not ordered against each other. The generation's `process.run` children are
+/// their own process group leaders (§ 12, docs/adr/0026), so the Renderer's group reap never
+/// reaches them and `reap_generations_processes` collects them whichever side of it runs.
+///
+/// Takes the whole [`PbaOutcome`] by value because promoting it consumes it: `candidate` becomes
+/// the new authoritative child, so nothing may hold it afterwards.
+pub(crate) async fn swap_and_reap(
+    registry: &GenerationRegistry,
+    processes: &mut LiveProcesses,
+    authoritative: &mut Authoritative,
+    candidate_generation_id: u32,
+    outcome: PbaOutcome,
+) {
+    for (generation_id, frame) in swap_frames(authoritative.generation_id, candidate_generation_id, &outcome.promoted_surfaces) {
+        send_frame_logged(registry, generation_id, &frame);
+    }
+    reap_generations_processes(processes, authoritative.generation_id).await;
+    match process::reap_process_group(&mut authoritative.child, process::DEFAULT_REAP_GRACE).await {
+        Ok(process::ReapOutcome::ExitedCleanly(status)) => {
+            eprintln!("superseded generation {} exited cleanly: {status}", authoritative.generation_id);
+        }
+        Ok(process::ReapOutcome::Escalated(status)) => {
+            eprintln!("superseded generation {} had to be escalated to SIGKILL: {status}", authoritative.generation_id);
+        }
+        Err(err) => {
+            eprintln!("failed to reap superseded generation {}: {err}", authoritative.generation_id);
+        }
+    }
+    *authoritative = Authoritative { generation_id: candidate_generation_id, child: outcome.candidate };
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
     use super::*;
+    use crate::process::registry::spawn_and_register_process;
 
     fn sh_args(script: &str) -> Vec<String> {
         vec!["-c".to_string(), script.to_string()]
+    }
+
+    /// § 15.4's rule 1, the one the process reaps cannot show: on every surface the superseded
+    /// generation is deselected before the candidate is promoted, so no surface is live on two
+    /// generations at once. Both frames per surface, in that order, addressed to opposite
+    /// generations.
+    #[test]
+    fn every_surface_is_deselected_on_the_superseded_generation_before_the_candidate_is_promoted() {
+        let surfaces = vec!["bar@DP-1".to_string(), "bar@HDMI-A-1".to_string()];
+
+        let frames = swap_frames(1, 2, &surfaces);
+
+        let addressed: Vec<(u32, &str)> = frames
+            .iter()
+            .map(|(generation_id, frame)| {
+                (
+                    *generation_id,
+                    match frame {
+                        shared::SupervisorFrame::DeselectInput(_) => "deselect",
+                        shared::SupervisorFrame::PromoteGeneration(_) => "promote",
+                        other => panic!("a swap sends only DeselectInput and PromoteGeneration, not {other:?}"),
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(addressed, vec![(1, "deselect"), (2, "promote"), (1, "deselect"), (2, "promote")]);
+
+        let named: Vec<&str> = frames
+            .iter()
+            .map(|(_, frame)| match frame {
+                shared::SupervisorFrame::DeselectInput(f) => f.surface_id.as_str(),
+                shared::SupervisorFrame::PromoteGeneration(f) => f.surface_id.as_str(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(named, vec!["bar@DP-1", "bar@DP-1", "bar@HDMI-A-1", "bar@HDMI-A-1"], "each surface hands over completely before the next starts");
+    }
+
+    #[test]
+    fn a_swap_with_no_promoted_surfaces_sends_nothing() {
+        assert!(swap_frames(1, 2, &[]).is_empty());
+    }
+
+    /// § 15.4's step 6, end to end: after a swap nothing of the superseded generation is left
+    /// running, and `authoritative` names the candidate.
+    ///
+    /// The rule it actually pins is the reassignment coming last. Promoting first makes
+    /// `reap_generations_processes` sweep generation 2's children instead of generation 1's, so
+    /// the registered `sleep` outlives the reload with nothing left owning it. Verified by
+    /// mutation: hoisting the reassignment above the reaps fails this test.
+    #[tokio::test]
+    async fn a_swap_leaves_nothing_of_the_superseded_generation_running() {
+        let registry = GenerationRegistry::default();
+        let mut processes: LiveProcesses = std::collections::HashMap::new();
+        spawn_and_register_process(&mut processes, 1, 7, "sh", &sh_args("sleep 5"));
+        let child_pid = processes.get(&(1, 7)).unwrap().id().expect("a freshly spawned child has a pid");
+
+        let superseded = process::spawn_group_leader("sh", &sh_args("sleep 5"), &[]).unwrap();
+        let superseded_pid = superseded.id().expect("a freshly spawned child has a pid");
+        let mut authoritative = Authoritative { generation_id: 1, child: superseded };
+        let candidate = process::spawn_group_leader("sh", &sh_args("sleep 5"), &[]).unwrap();
+        let outcome = PbaOutcome { candidate, promoted_surfaces: vec!["bar@DP-1".to_string()] };
+
+        swap_and_reap(&registry, &mut processes, &mut authoritative, 2, outcome).await;
+
+        assert_eq!(authoritative.generation_id, 2, "the candidate is authoritative once the swap returns");
+        assert!(!processes.contains_key(&(1, 7)), "the superseded generation's `process.run` entry must be gone from the registry");
+        for (pid, what) in [(child_pid, "the superseded generation's `process.run` child"), (superseded_pid, "the superseded Renderer")] {
+            let gone = tokio::time::timeout(Duration::from_millis(500), async {
+                while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(gone.is_ok(), "{what} (pid {pid}) is still running after the swap");
+        }
+
+        let _ = process::reap_process_group(&mut authoritative.child, process::DEFAULT_REAP_GRACE).await;
     }
 
     fn sample_snapshot() -> shared::StateSnapshot {

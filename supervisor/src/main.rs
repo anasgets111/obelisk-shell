@@ -40,10 +40,11 @@ use privacy::{PrivacyController, PrivacySignal};
 use system::{SystemController, SystemSignal};
 use updates::{UpdatesController, UpdatesSignal};
 use workspaces::{WorkspacesController, WorkspacesSignal};
-use process::registry::{LiveProcesses, reap_all_processes, reap_generations_processes, take_exited_process, wait_and_report_exit};
+use process::registry::{LiveProcesses, reap_all_processes, take_exited_process, wait_and_report_exit};
 use reload_link::SocketCandidateLink;
+use socket::send_frame_logged;
 use shared::{
-    ApplyPendingReload, DeselectInput, PromoteGeneration, RendererFrame, ReevaluateReport, ReevaluateRequest, SupervisorFrame, Zeroize,
+    ApplyPendingReload, RendererFrame, ReevaluateReport, ReevaluateRequest, SupervisorFrame, Zeroize,
 };
 use snapshot::push_snapshot;
 
@@ -74,28 +75,6 @@ fn begin_reload(registry: &socket::GenerationRegistry, generation_id: u32, next_
     send_frame_logged(registry, generation_id, &SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: *next_sequence }));
 }
 
-/// Sends `frame` to `generation_id`, logging (not propagating) a failure -- the one place every
-/// `SupervisorFrame` send in the main loop goes through. A `NoConnection` failure is logged and
-/// dropped: `network`/`bluetooth` can start pushing before the boot Renderer's connection exists,
-/// but the `connected.recv()` arm below replays `last_snapshots` once it registers, so nothing
-/// pushed before that point is lost.
-fn send_frame_logged(registry: &socket::GenerationRegistry, generation_id: u32, frame: &SupervisorFrame) {
-    let Err(err) = registry.send_frame(generation_id, frame) else {
-        return;
-    };
-    // A snapshot that misses the boot window is the one failure here that is routine, and it was
-    // being reported like the ones that are not: thirteen `failed to push` lines, each carrying a
-    // whole serialized payload, before the Renderer had even drawn a frame. That is how a
-    // `failed to push` line that does mean something stops being read.
-    if let (SupervisorFrame::StateSnapshot(snapshot), socket::SendFrameError::NoConnection { .. }) = (frame, &err) {
-        eprintln!(
-            "generation {generation_id} has not connected yet, so {} revision {} waits for the replay",
-            snapshot.capability, snapshot.revision
-        );
-        return;
-    }
-    eprintln!("failed to push {frame:?} to generation {generation_id}: {err}");
-}
 
 /// The malformed-arguments log line every capability's `dispatch` adapter shares (ADR-0037).
 pub(crate) fn log_malformed_command(params: &shared::CommandParams) {
@@ -720,51 +699,13 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                             // docs/adr/0043 decision 1 item 3: the widest point of the handoff --
                             // the Candidate has presented (run_pba returned Ok) and the superseded
                             // generation still owns every buffer, so both are fully resident.
+                            // Sampled here rather than inside the swap, which reaps one of the two
+                            // processes it would be measuring.
                             memory::log_sample("pba handoff", &[(authoritative.generation_id, &authoritative.child), (candidate_generation_id, &outcome.candidate)]);
-                            for surface_id in &outcome.promoted_surfaces {
-                                send_frame_logged(&registry, authoritative.generation_id, &SupervisorFrame::DeselectInput(DeselectInput { surface_id: surface_id.clone() }));
-                                send_frame_logged(&registry, candidate_generation_id, &SupervisorFrame::PromoteGeneration(PromoteGeneration { surface_id: surface_id.clone() }));
-                            }
-                            // § 12's group reap applies to every process the superseded
-                            // generation's Lua spawned, not just its own Renderer (docs/adr/0026).
-                            reap_generations_processes(&mut processes, authoritative.generation_id).await;
-                            // run_pba never reaps superseded any more (docs/adr/0025 item 3) --
-                            // this caller's job, done only now the Swap messages have gone out.
-                            match process::reap_process_group(&mut authoritative.child, process::DEFAULT_REAP_GRACE).await {
-                                Ok(process::ReapOutcome::ExitedCleanly(status)) => {
-                                    eprintln!("superseded generation {} exited cleanly: {status}", authoritative.generation_id);
-                                }
-                                Ok(process::ReapOutcome::Escalated(status)) => {
-                                    eprintln!("superseded generation {} had to be escalated to SIGKILL: {status}", authoritative.generation_id);
-                                }
-                                Err(err) => {
-                                    eprintln!("failed to reap superseded generation {}: {err}", authoritative.generation_id);
-                                }
-                            }
-                            authoritative = Authoritative { generation_id: candidate_generation_id, child: outcome.candidate };
+                            reload::swap_and_reap(&registry, &mut processes, &mut authoritative, candidate_generation_id, outcome).await;
                         }
                         Err(failure) => {
-                            match failure {
-                                reload::PbaFailure::SpawnFailed(err) => {
-                                    eprintln!("generation swap for sequence {sequence} failed: could not spawn the candidate: {err}");
-                                }
-                                reload::PbaFailure::Link { stage, source } => {
-                                    eprintln!("generation swap for sequence {sequence} failed during {stage:?}: {source}");
-                                }
-                                reload::PbaFailure::Timeout { stage } => {
-                                    eprintln!("generation swap for sequence {sequence} failed: {stage:?} timed out");
-                                }
-                                reload::PbaFailure::UnexpectedEvidence { stage, surface_id } => {
-                                    eprintln!(
-                                        "generation swap for sequence {sequence} failed during {stage:?}: unexpected evidence for surface_id {surface_id:?}"
-                                    );
-                                }
-                                reload::PbaFailure::AbortReapFailed { original, reap_error } => {
-                                    eprintln!(
-                                        "generation swap for sequence {sequence} failed ({original:?}) and the candidate's abort-reap also failed: {reap_error}"
-                                    );
-                                }
-                            }
+                            eprintln!("generation swap for sequence {sequence} failed: {failure}");
                             eprintln!("{} stays authoritative", authoritative.generation_id);
                         }
                     }
