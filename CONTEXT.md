@@ -113,7 +113,7 @@ What makes a freshly evaluated node the same node as the one already in the reta
 _Avoid_: node id (the property, not the concept), key (a `list`'s spelling of this, not the general term), handle
 
 **Named state**:
-Config-authored reactive state, created by `state(name, initial)` and writable from Lua, unlike every other signal. The name is what survives: a generation keeps one `name -> Signal` map that outlives any single evaluation, so re-running the config on an in-place reload finds the same signal holding the same value and an open dropdown stays open. Dies on a generation swap, since the map lives in the process being reaped (ADR-0044).
+Config-authored reactive state, created by `state(name, initial)` and writable from Lua, unlike every other signal. The name is what survives: a generation keeps one map that outlives any single evaluation, so re-running the config on an in-place reload finds the same signal holding the same value and an open dropdown stays open. What survives is a name whose `initial` the config author left alone. Editing that literal re-seeds the signal, because the edit is a later write than the `:set()` it lands on. Dies on a generation swap, since the map lives in the process being reaped (ADR-0044 decision 5 and its amendment).
 _Avoid_: persistent state (implies it survives a swap or a restart, which it does not), local state, property
 
 **Signal resolution**:

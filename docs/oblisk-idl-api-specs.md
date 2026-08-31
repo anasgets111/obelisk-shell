@@ -43,7 +43,7 @@ text { content = oblisk.mpris.title }         -- live: re-reads whenever the val
 text { content = oblisk.mpris.title:get() }   -- frozen: the value at evaluation time, forever
 ```
 
-A handle left in a property resolves at layout time on every pass, so the node follows the signal. A `:get()` result is a plain string the engine cannot distinguish from a literal, and nothing updates it until the next config edit. Signals are read-only to Lua: a config cannot construct one or write to one, and the only writable state is what the Supervisor pushes (ADR-0044).
+A handle left in a property resolves at layout time on every pass, so the node follows the signal. A `:get()` result is a plain string the engine cannot distinguish from a literal, and nothing updates it until the next config edit. Every signal the Supervisor pushes is read-only to Lua, and `signal:set()` names the kind it refused. `state(name, initial)` below is the one writable kind, and the only one a config constructs (ADR-0044).
 
 **A signal resolving to `nil` means the property is absent**, so the property's documented default applies instead of the resolution failing. Every capability signal reads `nil` until its first `StateSnapshot` arrives, which is a state a config sees on every boot, so `content = oblisk.mpris.title` renders the `content` default until the first push rather than rejecting the tree. This also keeps the two spellings consistent: a Lua table cannot store a `nil` value, so `content = nil` is already indistinguishable from omitting `content`.
 
@@ -425,6 +425,21 @@ The font chain this shell measures and paints with, in fallback order (docs/adr/
 > **Declaring nothing keeps the default**, which is `sans-serif`, `Noto Sans CJK JP`, `Noto Color Emoji`. None of those carries Nerd Font private-use glyphs, so a shell drawing its chrome that way has to declare a chain or draw tofu.
 
 > **Read once, at startup.** Editing the declaration re-evaluates like any other edit and changes nothing until the shell restarts. A chain change invalidates every measurement in the shell, which is closer to a topology change than to the in-place restyle a reload is for.
+
+#### Named state (`state(name, initial)`)
+The one signal a config writes. Reactive state the config owns, keyed by a name that outlives any single evaluation, so an in-place reload hands back the signal the last one built (docs/adr/0044 decision 5).
+
+*   `state(name, initial)` -> `Signal` (Global. Writable: `signal:set(value)` stores a new value and marks the scene dirty, so the next pass re-resolves every node reading it)
+    *   `name`: `string` (The identity. Two calls with one name are one signal, so the button that writes it and the surface that reads it need not be the same file)
+    *   `initial`: `any` (The value on the first evaluation that names it. Marshal-checked at § 1.1's boundary, the same check `:set()` applies)
+
+> **An edit to `initial` wins; a reload alone does not.** A re-declaration whose `initial` differs from the one this name was seeded from re-seeds the signal, because editing the config file is a later write than the `:set()` it lands on. One whose `initial` is unchanged keeps the live value, which is what leaves a dropdown open across an unrelated save. Without the first half, a `state` default is the one value in a config that editing cannot change (ADR-0044 decision 5's amendment).
+
+> **A table `initial` is never an edit.** Tables compare by identity and every evaluation builds a fresh one, so comparing them would call every reload an edit. Numbers compare across integer and float the way Lua's `==` does; two scalars of different types are an edit.
+
+> **Write a constant.** The re-seed rule reads the author's intent off a value, so `state("t", os.time())` re-seeds on every reload and no `:set()` to it survives one. Nothing detects this.
+
+> **Dies on a generation swap**, since the map lives in the process being reaped. A swap means the config's structure changed, so a closed dropdown is not a surprise.
 
 #### Hover (`hover`, `hover(name)`, `hover_rect(name)`)
 A **hover slot** is engine-written reactive state naming one region of one surface: whether the pointer is inside it, and where it is. Declared on any node, read from anywhere (docs/adr/0062).

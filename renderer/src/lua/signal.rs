@@ -196,6 +196,31 @@ fn check_lua_authored(value: &Value) -> Result<(), marshal::MarshalError> {
     Ok(())
 }
 
+/// Whether a `state` literal is one this can compare across two evaluations.
+///
+/// Tables, functions and userdata are not, because `mlua` compares them by pointer and every
+/// evaluation builds fresh ones, so one would always look edited.
+fn is_comparable_literal(value: &Value) -> bool {
+    matches!(value, Value::Nil | Value::Boolean(_) | Value::Integer(_) | Value::Number(_) | Value::String(_))
+}
+
+/// Did the config author edit this `state` call's literal since the evaluation that seeded it?
+/// `None` means the question cannot be answered, which ADR-0044's amendment reads as "no".
+///
+/// The `false` answer for a table is the load-bearing one. `lib/ui_state.lua`'s `popup_anchor`
+/// default is a table, so a pointer comparison would call every reload an edit and snap an open
+/// popup back to the corner. Numbers compare across `Integer`/`Number` the way Lua's own `==`
+/// does, so rewriting `0` as `0.0` is not an edit; two scalars of different types are.
+fn literal_was_edited(current: &Value, seeded: &Value) -> Option<bool> {
+    if !is_comparable_literal(current) || !is_comparable_literal(seeded) {
+        return None;
+    }
+    Some(match (current, seeded) {
+        (Value::Integer(i), Value::Number(n)) | (Value::Number(n), Value::Integer(i)) => (*i as f64) != *n,
+        _ => current != seeded,
+    })
+}
+
 /// A read-only reactive value. Wraps either a plain value (`Direct`, Rust-pushed) or a Lua
 /// closure recomputed against its dependencies' current values on every `get()` (`Computed`).
 #[derive(Clone)]
@@ -224,6 +249,27 @@ impl Signal {
     pub fn new_state(initial: Value, dirty: DirtyFlag) -> Result<Self, marshal::MarshalError> {
         check_lua_authored(&initial)?;
         Ok(Signal(SignalKind::State { cell: Rc::new(RefCell::new(initial)), dirty }))
+    }
+
+    /// Overwrites a `state` signal's value with a new `initial`, for ADR-0044's amendment: the
+    /// config author changed the literal, so the file is the later write and beats whatever
+    /// `signal:set()` last left here.
+    ///
+    /// Marks dirty through the same flag `set` does. An in-place reload re-applies the scene
+    /// anyway, but a re-seed that marked nothing would be a write no other path guarantees to
+    /// pick up, and the amendment is about a value the author expects to see on screen.
+    ///
+    /// Only [`SignalKind::State`] can be re-seeded, which is the only kind the state registry
+    /// holds; every other kind reaching here is a caller bug rather than a config error.
+    pub fn reseed(&self, value: Value) -> Result<(), marshal::MarshalError> {
+        check_lua_authored(&value)?;
+        let SignalKind::State { cell, dirty } = &self.0 else {
+            debug_assert!(false, "reseed on {} signal, which the state registry cannot hold", self.0.describe());
+            return Ok(());
+        };
+        *cell.borrow_mut() = value;
+        dirty.mark();
+        Ok(())
     }
 
     /// A signal Rust can push new values into after construction via the paired
@@ -508,16 +554,23 @@ pub fn any_scroll_registered(lua: &Lua) -> bool {
     lua.app_data_ref::<ScrollRegistry>().is_some_and(|registry| !registry.0.is_empty())
 }
 
-/// The `name -> Signal` map ADR-0044 decision 5 hangs `state` off: the *name* is the identity, so
-/// re-running the config on an in-place reload finds the signal it built last time still holding
-/// whatever the user's last click left in it, and an open dropdown stays open across a config edit.
+/// The `name -> (Signal, literal)` map ADR-0044 decision 5 hangs `state` off: the *name* is the
+/// identity, so re-running the config on an in-place reload finds the signal it built last time
+/// still holding whatever the user's last click left in it, and an open dropdown stays open across
+/// a config edit.
+///
+/// The second half is decision 5's amendment. It is the `initial` this name was last seeded from,
+/// kept so the next evaluation can ask whether the config author edited the literal. If they did,
+/// the file is the later write and wins; if they did not, the live value stands. Without it a
+/// `state` default is the one value in a config that editing cannot change, which is how the
+/// wallpaper path found this.
 ///
 /// Lives in `Lua::set_app_data`, the same per-`Lua` storage [`CpuBudget::enter`] keeps its
 /// deadline stack in, so it needs no explicit lifetime management: decision 4 keeps the VM alive
 /// across an in-place reload, and a generation swap is a new process with a new VM, which is
 /// decision 5's "named state dies on a generation swap" falling out for free.
 #[derive(Default)]
-struct StateRegistry(HashMap<String, Signal>);
+struct StateRegistry(HashMap<String, (Signal, Value)>);
 
 /// `state`'s registry, for `hover(name)` (docs/adr/0062 decision 2). Separate map, same rule and
 /// the same lifetime: the name is the identity, so an in-place reload finds the signal it built
@@ -715,18 +768,34 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
             }
             let existing =
                 lua.app_data_ref::<StateRegistry>().expect("just ensured the state registry exists").0.get(&name).cloned();
-            if let Some(signal) = existing {
-                // Decision 5: a name already in the map wins and `initial` is ignored, which is
-                // what makes an in-place reload keep the value instead of resetting it.
+            if let Some((signal, seeded)) = existing {
+                // Decision 5: a name already in the map wins, which is what makes an in-place
+                // reload keep the value instead of resetting it.
+                //
+                // Its amendment narrows that to a literal the author left alone. An `initial` that
+                // differs from the one this name was seeded from is an edit to the config file,
+                // and an edit is a later write than the `:set()` it overwrites. Without this a
+                // `state` default is the one value editing the config cannot change.
+                if literal_was_edited(&initial, &seeded) == Some(true) {
+                    signal.reseed(initial.clone()).map_err(|err| {
+                        mlua::Error::runtime(format!(
+                            "state(\"{name}\", ...) refused its new initial value at the marshalling boundary: {err}"
+                        ))
+                    })?;
+                    lua.app_data_mut::<StateRegistry>()
+                        .expect("just ensured the state registry exists")
+                        .0
+                        .insert(name, (signal.clone(), initial));
+                }
                 return Ok(signal);
             }
-            let signal = Signal::new_state(initial, dirty.clone()).map_err(|err| {
+            let signal = Signal::new_state(initial.clone(), dirty.clone()).map_err(|err| {
                 mlua::Error::runtime(format!("state(\"{name}\", ...) refused its initial value at the marshalling boundary: {err}"))
             })?;
             lua.app_data_mut::<StateRegistry>()
                 .expect("just ensured the state registry exists")
                 .0
-                .insert(name, signal.clone());
+                .insert(name, (signal.clone(), initial));
             Ok(signal)
         })?,
     )?;
@@ -975,10 +1044,27 @@ mod tests {
     }
 
     #[test]
-    fn the_same_state_name_returns_the_same_signal_and_ignores_the_second_initial() {
+    fn the_same_state_name_and_the_same_initial_keeps_the_value_written_since() {
         // ADR-0044 decision 5's whole point: an in-place reload must hand back the signal holding
         // the user's last click, not reset it to what the config literal says.
         let (lua, _dirty) = lua_with_state();
+        let result: i64 = lua
+            .load(
+                r#"
+                state("open", 0):set(5)
+                return state("open", 0):get()
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(result, 5, "an unedited literal must keep the current value, not reset to the initial");
+    }
+
+    #[test]
+    fn a_changed_initial_re_seeds_the_signal_and_marks_dirty() {
+        // Decision 5's amendment. The literal changed, so the config author edited the file, and
+        // the edit is a later write than the `:set()` it lands on. This is the wallpaper path.
+        let (lua, dirty) = lua_with_state();
         let result: i64 = lua
             .load(
                 r#"
@@ -988,7 +1074,77 @@ mod tests {
             )
             .eval()
             .unwrap();
-        assert_eq!(result, 5, "a re-declared name must keep its current value and ignore the new initial");
+        assert_eq!(result, 99, "an edited literal must win over the value `:set()` left behind");
+        assert!(dirty.take(), "a re-seed must mark the scene dirty, or nothing repaints from it");
+    }
+
+    #[test]
+    fn re_seeding_twice_from_the_same_edited_literal_only_happens_once() {
+        // The registry has to remember the *new* literal, not the one it was built with, or every
+        // later evaluation would re-seed against a stale comparison and clobber `:set()` forever.
+        let (lua, _dirty) = lua_with_state();
+        let result: i64 = lua
+            .load(
+                r#"
+                state("open", 0)
+                state("open", 99)
+                state("open", 99):set(7)
+                return state("open", 99):get()
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(result, 7, "the second evaluation of an already-adopted literal is not another edit");
+    }
+
+    #[test]
+    fn a_table_initial_never_counts_as_edited() {
+        // `lib/ui_state.lua`'s `popup_anchor`. mlua compares tables by pointer and every
+        // evaluation builds a fresh one, so comparing them would call every reload an edit and
+        // snap an open popup back to the corner.
+        let (lua, _dirty) = lua_with_state();
+        let result: i64 = lua
+            .load(
+                r#"
+                state("anchor", { x = 0 }):set(5)
+                return state("anchor", { x = 0 }):get()
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(result, 5, "a table literal must keep the live value, since it cannot be compared");
+    }
+
+    #[test]
+    fn rewriting_an_integer_literal_as_a_float_is_not_an_edit() {
+        // Lua's own `==` says `0 == 0.0`, and a config author who reformats a number did not
+        // change the value they wrote.
+        let (lua, _dirty) = lua_with_state();
+        let result: i64 = lua
+            .load(
+                r#"
+                state("count", 0):set(5)
+                return state("count", 0.0):get()
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(result, 5, "0 and 0.0 are the same literal");
+    }
+
+    #[test]
+    fn changing_a_literals_type_is_an_edit() {
+        let (lua, _dirty) = lua_with_state();
+        let result: String = lua
+            .load(
+                r#"
+                state("kind", false):set("clicked")
+                return state("kind", "waiting"):get()
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(result, "waiting", "two scalars of different types are a different literal");
     }
 
     #[test]
@@ -998,7 +1154,7 @@ mod tests {
             .load(
                 r#"
                 state("a", 1):set(10)
-                return state("a", 0):get(), state("b", 2):get()
+                return state("a", 1):get(), state("b", 2):get()
                 "#,
             )
             .eval()

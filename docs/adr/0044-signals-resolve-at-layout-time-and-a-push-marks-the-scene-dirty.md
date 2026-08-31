@@ -54,6 +54,10 @@
 > from a dead state panics, since `ValueRef::to_pointer` locks the state and `LoadOutput`'s derived
 > `Debug` reaches it. That makes struct field order load-bearing, because Rust drops fields in
 > declaration order and the `Loader` must be declared after anything holding values from it.
+>
+> Decision 5's "a name already in the map wins and `initial` is ignored" is too broad, and the
+> wallpaper found it. A literal the config author changed re-seeds the signal; one they did not
+> touch keeps the live value. See the amendment at the end.
 
 Nothing connects a capability's state to the screen. Three facts, each defensible alone, combine
 into a shell that cannot react to anything:
@@ -193,3 +197,50 @@ did and which decision 4 rules out. Two entries are added: **Dirty scene** for t
 `list` stays deferred. A `Signal` in `source` resolves to a table under decision 1, but expanding
 that table through `itemfn` is Lua execution during a resolve rather than during an evaluation, and
 `children_of` does not handle `list` at all yet. ADR-0023 item 1 still owns it.
+
+## Amendment: a changed literal re-seeds named state, a runtime write does not
+
+Decision 5 is right about the case it was written for and wrong about the other half of the
+population that calls `state`. The wallpaper found it. `dev-config`'s `modules/global/wallpaper.lua`
+keeps the path in `state("wallpaper", path)`, so editing that path and saving does nothing: the name
+is already in the map, `initial` is discarded, and the shell keeps painting the file the last restart
+seeded it with. Editing a value in the config file and watching the config file lose is the failure
+an in-place reload exists to prevent.
+
+Both behaviours are correct, for different values. The ten `state` calls in the dev config split
+cleanly. Seven are runtime UI state (`panel_open`, `osd_visible`, `launcher_open`, `panel_kind` and
+the rest) whose literals are `false` and `""` and mean "closed at boot". Nobody edits those, and
+decision 5 is what keeps a dropdown open across a save. Two are values the config file is the source
+of truth for: the wallpaper path, and `indicators/active_window.lua`'s placeholder title. The author
+edits the literal and means it.
+
+What separates them is which write came last. A runtime `:set()` is a write; editing the literal and
+saving is a later one. So the registry stores the literal it last seeded from alongside the signal,
+and a re-evaluation compares against it. A new `initial` that differs means the author edited the
+file: adopt it, writing through the same path `:set()` takes so the dirty flag is marked, and
+remember the new literal. One that matches means keep whatever the signal holds, which may be a
+runtime write, and that is decision 5 unchanged. A `:set()` between two reloads is lost only when
+the same save also changed that signal's literal, which is the author saying so.
+
+**Scalars only.** `mlua` compares tables by pointer, and every evaluation builds a fresh one, so a
+table literal always compares unequal. `lib/ui_state.lua`'s `popup_anchor` default is a table, and
+under a naive comparison every reload would snap an open popup back to the corner. A non-scalar
+`initial` keeps decision 5's behaviour exactly.
+
+`ponytail:` the ceiling is a config that wants a table default re-seeded on edit, and the upgrade
+path is a structural compare. It needs a depth bound, because it runs inside ADR-0021's 5ms
+evaluation budget and the config author picks the depth.
+
+**The literal has to be stable across evaluations.** This rule reads authorial intent off a value,
+so `state("t", os.time())` re-seeds on every reload and no runtime write to it ever survives one.
+That is a config bug this cannot detect, and the answer is to write a constant. Same class as a
+`computed` body with a side effect in it.
+
+A generation swap is unchanged. The map dies with the process it lived in, so the new generation
+seeds from whatever the literal now says, which is what the author just edited it to.
+
+Two documents follow this rather than lead it. `CONTEXT.md`'s **Named state** entry claims "the name
+is what survives"; what survives is a name whose literal did not change, which is the narrower and
+true claim. `oblisk-idl-api-specs.md` § 1.2 still says a config "cannot construct [a signal] or write
+to one", which decision 5 made false the day it shipped and which this amendment is a reason to fix
+rather than the cause of.
