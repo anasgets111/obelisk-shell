@@ -592,6 +592,78 @@ impl App {
         }
     }
 
+    /// Writes every `hover` signal in one surface against the pointer's position, or turns them all
+    /// off when `position` is `None` (docs/adr/0062).
+    ///
+    /// Two phases, and the split is forced: `layout::hover::hover_writes` borrows the resolved tree
+    /// out of `self.client`, and `LiveSignalHandle::set_changed` runs while that borrow is still
+    /// alive only if the writes are collected first. Cloning the `Signal`s is what ends the borrow;
+    /// a `Signal` is an `Rc` handle, so the clone is a refcount bump rather than a copy of anything.
+    ///
+    /// Nothing marks the scene dirty here directly. `set_changed` marks it, and only when the value
+    /// actually moved (decision 4) -- a pointer sitting still inside one button re-resolves nothing,
+    /// which matters because `wl_pointer` reports motion at device rate and one mark re-resolves
+    /// every surface in the generation (ADR-0044 decision 2).
+    ///
+    /// ponytail: `Scene::surface` deep-clones the retained subtree into a `ResolvedNode`, property
+    /// maps and all, and this asks for it on every motion event rather than on every click. For the
+    /// dev bar that is a few hundred small `HashMap` clones per event while the pointer is moving
+    /// across a shell surface, on the Wayland dispatch thread. The guard above is what keeps it off
+    /// every config that does not use hover, which is why it is a guard and not an assertion. The
+    /// real fix is a borrowing accessor -- `Scene` handing out `&RetainedNode`, or running this
+    /// walk against the retained tree behind a closure -- and it is not built here because
+    /// `layout::hit` and `layout::hover` are both written against `ResolvedNode` and changing that
+    /// is a wider edit than this slice. Do it when a profile names this, or when the second
+    /// per-motion consumer arrives.
+    fn sync_hover(&mut self, index: usize, position: Option<(f64, f64)>) {
+        // Before the tree is touched, because the tree is the expensive part: a config that never
+        // called `hover(name)` has nothing to write and skips all of it.
+        if !crate::lua::signal::any_hover_registered(self.client.lua()) {
+            return;
+        }
+        let surface_id = &self.surfaces[index].surface_id;
+        let Some(tree) = self.client.scene().surface(surface_id) else {
+            return;
+        };
+        let point = position.map(|(x, y)| layout::hit::LogicalPoint { x: x as f32, y: y as f32 });
+        let writes = layout::hover::hover_writes(&tree, point);
+        let lua = self.client.lua();
+        for write in writes {
+            // `None` for anything that is not a hover signal, which is how a config binding
+            // `hover = oblisk.network` fails to make the pointer overwrite a capability snapshot
+            // (docs/adr/0062 decision 2).
+            let Some(handle) = write.signal.hover_handle() else {
+                continue;
+            };
+            // The boolean decides whether anything happens at all, and it is checked first because
+            // its answer is what gates the rect below.
+            let crossed = handle.set_changed(mlua::Value::Boolean(write.hovered));
+            // Only on the edge into the node, and the guard is not an optimisation. `set_changed`
+            // compares with `PartialEq`, and two `mlua` tables holding identical numbers are not
+            // equal -- table equality is identity -- so a freshly built rect table always counts as
+            // a change. Writing it per motion event would mark the scene dirty on every one of
+            // them and undo exactly what decision 4 is for. Writing it once per entry is also all
+            // that is wanted: the node does not move while the pointer sits inside it, and if a
+            // re-resolve does move it, that re-resolve happened for its own reasons anyway.
+            //
+            // Order does not matter to a reader. Both land before the poll loop's single
+            // `re_resolve_if_dirty` for this turn, so nothing ever resolves against one and not
+            // the other.
+            if crossed
+                && let Some(rect) = write.rect
+                && let Some(rect_handle) = write.signal.hover_rect_handle()
+            {
+                match rect_table(lua, rect) {
+                    Ok(table) => rect_handle.set(mlua::Value::Table(table)),
+                    // The engine's own failure, not the config's, and not worth taking a shell down
+                    // for: the boolean already landed, so a tooltip opens where it last was rather
+                    // than not opening.
+                    Err(err) => eprintln!("[oblisk-renderer] {}: could not build a hover rect: {err}", self.surfaces[index].surface_id),
+                }
+            }
+        }
+    }
+
     /// Calls one `button`'s `on_click` with its rect (docs/adr/0050 decision 3).
     ///
     /// A raise is logged against the surface it happened on and swallowed. A broken `on_click` is
@@ -755,12 +827,22 @@ impl PointerHandler for App {
                     }
                 }
                 // The pointer left the surface, so the release (if it ever comes) lands somewhere
-                // else. This is the drag-off-and-cancel decision 2 is built around.
-                PointerEventKind::Leave { .. } => self.armed = None,
-                // `Enter`/`Motion`/`Axis`: nothing in § 5.2 reads hover or scroll yet
-                // (build-steps.md section 6 ranks both), and a motion that leaves the armed rect
-                // deliberately does *not* disarm -- dragging back onto the button and releasing
-                // still clicks it, which is what every toolkit does.
+                // else. This is the drag-off-and-cancel decision 2 is built around. The `None`
+                // position turns every hover in this surface off (docs/adr/0062): no `Motion` will
+                // arrive to say the pointer has gone, so a tooltip left open here stays open.
+                PointerEventKind::Leave { .. } => {
+                    self.armed = None;
+                    self.sync_hover(index, None);
+                }
+                // A motion that leaves the armed rect deliberately does *not* disarm -- dragging
+                // back onto the button and releasing still clicks it, which is what every toolkit
+                // does. Both kinds carry a position and both update hover, because an `Enter` is
+                // the only event a pointer that appears already inside a surface sends.
+                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                    self.sync_hover(index, Some(event.position));
+                }
+                // `Axis`: nothing in § 5.2 reads scroll yet (build-steps.md section 6 ranks it
+                // next, and the open question there is what a scrollable container is).
                 _ => {}
             }
         }

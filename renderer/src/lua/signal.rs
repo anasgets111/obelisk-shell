@@ -69,6 +69,19 @@ enum SignalKind {
     /// `Rc<RefCell<_>>`, not `Arc<Mutex<_>>`: the `Loader` this lives on stays confined to one
     /// dedicated OS thread (the Wayland dispatch thread, docs/adr/0039).
     Live(Rc<RefCell<Value>>),
+    /// The engine's own reactive state: a boolean `crate::wayland`'s pointer handler writes and a
+    /// config only reads, built by the `hover(name)` global (docs/adr/0062).
+    ///
+    /// Structurally identical to [`SignalKind::Live`] and deliberately not it. The two differ in
+    /// who may write them, which is the whole point of the split: `Signal::hover_handle` hands out
+    /// a write end for this variant only, so a config binding `hover = oblisk.network` gets no
+    /// writer rather than a pointer that overwrites a capability snapshot.
+    ///
+    /// `paired_rect` is the other half of one hover slot: the boolean `hover(name)` returns carries
+    /// a reference to the rect cell `hover_rect(name)` reads, so the pointer handler can write both
+    /// from the one handle a node's `hover` property gave it. `None` on the rect signal itself,
+    /// which is a hover signal in every other respect and is not a trigger for anything.
+    Hover { cell: Rc<RefCell<Value>>, paired_rect: Option<Rc<RefCell<Value>>>, dirty: DirtyFlag },
     /// Lua-authored state (ADR-0044 decision 5): the one signal kind `Signal::set` accepts, built
     /// by the `state(name, initial)` global and written from a config's own `on_click`.
     ///
@@ -91,6 +104,7 @@ impl SignalKind {
             SignalKind::Direct(_) => "a direct",
             SignalKind::Computed { .. } => "a computed",
             SignalKind::Live(_) => "a capability",
+            SignalKind::Hover { .. } => "a hover",
             SignalKind::State { .. } => "a state",
         }
     }
@@ -163,6 +177,57 @@ impl Signal {
         (Signal(SignalKind::Live(Rc::clone(&cell))), LiveSignalHandle(cell, dirty))
     }
 
+    /// The signal `hover(name)` builds: a boolean the *engine* writes from `wl_pointer`, read-only
+    /// to Lua (docs/adr/0062 decision 2).
+    ///
+    /// Its own kind rather than a second [`Self::new_live`] caller, and the variant earns its place
+    /// at both ends. `signal:set()` refuses it by name, so a config is told it is holding a hover
+    /// slot rather than a capability; and [`Self::hover_handle`] answers `None` for every other
+    /// kind, so a config writing `hover = oblisk.network` cannot get the pointer to overwrite a
+    /// capability's snapshot.
+    ///
+    /// Starts `false`, not nil: a config binds this straight to `visible`, and a signal resolving
+    /// to nil means the property is *absent* (ADR-0044 decision 1's amendment), which is not what
+    /// "the pointer is not here" should mean.
+    ///
+    /// `initial_rect` is that same rule applied to the other half, and it is not optional. A
+    /// tooltip binds `anchor_rect` to the rect signal, § 6.3 makes `anchor_rect` required and
+    /// non-zero, and the popup resolves from the first frame -- long before any pointer has been
+    /// near it. A nil here reads as "no `anchor_rect` at all" and the popup is refused on every
+    /// re-resolve until something hovers, which is what a live run reported before this argument
+    /// existed. The caller passes a real 1x1 rect; this constructor takes it rather than building
+    /// it because a `Value::Table` needs a `Lua` and this does not have one.
+    pub fn new_hover(dirty: DirtyFlag, initial_rect: Value) -> (Self, Self) {
+        let over = Rc::new(RefCell::new(Value::Boolean(false)));
+        let rect = Rc::new(RefCell::new(initial_rect));
+        (
+            Signal(SignalKind::Hover { cell: Rc::clone(&over), paired_rect: Some(Rc::clone(&rect)), dirty: dirty.clone() }),
+            Signal(SignalKind::Hover { cell: rect, paired_rect: None, dirty }),
+        )
+    }
+
+    /// The write end of a hover signal, for `crate::wayland`'s pointer handler. `None` for every
+    /// other kind -- see [`Self::new_hover`] for why that refusal is the point rather than a
+    /// missing case.
+    pub(crate) fn hover_handle(&self) -> Option<LiveSignalHandle> {
+        match &self.0 {
+            SignalKind::Hover { cell, dirty, .. } => Some(LiveSignalHandle(Rc::clone(cell), dirty.clone())),
+            _ => None,
+        }
+    }
+
+    /// The write end of the rect half of this hover slot: where the node carrying it last was, in
+    /// its surface's logical coordinates, which is what a tooltip `popup` binds `anchor_rect` to.
+    ///
+    /// `None` for every kind but the boolean half of a hover slot -- including the rect half, which
+    /// no node's `hover` property should be naming.
+    pub(crate) fn hover_rect_handle(&self) -> Option<LiveSignalHandle> {
+        match &self.0 {
+            SignalKind::Hover { paired_rect: Some(rect), dirty, .. } => Some(LiveSignalHandle(Rc::clone(rect), dirty.clone())),
+            _ => None,
+        }
+    }
+
     /// The signal `map(f)` builds: a `Computed` with this one as its only dependency, recomputed
     /// on every read like any other (ADR-0044 decision 3, no memoization).
     ///
@@ -183,6 +248,7 @@ impl Signal {
         match &self.0 {
             SignalKind::Direct(value) => Ok(value.clone()),
             SignalKind::Live(cell) => Ok(cell.borrow().clone()),
+            SignalKind::Hover { cell, .. } => Ok(cell.borrow().clone()),
             SignalKind::State { cell, .. } => Ok(cell.borrow().clone()),
             SignalKind::Computed { deps, func } => {
                 // Entered *before* dependency resolution, not around `func.call` alone: this
@@ -226,6 +292,23 @@ impl LiveSignalHandle {
     pub fn set(&self, value: Value) {
         *self.0.borrow_mut() = value;
         self.1.mark();
+    }
+
+    /// [`Self::set`], except that storing the value already there does nothing at all: no write,
+    /// no dirty mark, and it answers `false`.
+    ///
+    /// docs/adr/0062 decision 4. The pointer handler calls this on every `wl_pointer` motion
+    /// event, which arrives at device rate, and one mark re-resolves every surface in the
+    /// generation (ADR-0044 decision 2). Comparing first turns that into one re-resolve per
+    /// hover boundary crossed rather than one per motion event.
+    pub fn set_changed(&self, value: Value) -> bool {
+        let unchanged = *self.0.borrow() == value;
+        if unchanged {
+            return false;
+        }
+        *self.0.borrow_mut() = value;
+        self.1.mark();
+        true
     }
 }
 
@@ -294,6 +377,15 @@ impl UserData for Signal {
     }
 }
 
+/// Whether this VM's config ever called `hover(name)`.
+///
+/// `crate::wayland`'s pointer handler asks before doing any hover work at all, so a config with no
+/// tooltip and no expand-on-hover pays nothing for the feature existing: no tree clone, no walk,
+/// no signal writes, on an event that arrives at pointer-report rate.
+pub fn any_hover_registered(lua: &Lua) -> bool {
+    lua.app_data_ref::<HoverRegistry>().is_some_and(|registry| !registry.0.is_empty())
+}
+
 /// The `name -> Signal` map ADR-0044 decision 5 hangs `state` off: the *name* is the identity, so
 /// re-running the config on an in-place reload finds the signal it built last time still holding
 /// whatever the user's last click left in it, and an open dropdown stays open across a config edit.
@@ -304,6 +396,16 @@ impl UserData for Signal {
 /// decision 5's "named state dies on a generation swap" falling out for free.
 #[derive(Default)]
 struct StateRegistry(HashMap<String, Signal>);
+
+/// `state`'s registry, for `hover(name)` (docs/adr/0062 decision 2). Separate map, same rule and
+/// the same lifetime: the name is the identity, so an in-place reload finds the signal it built
+/// last time and a tooltip open across a `config/theme.lua` edit stays open.
+///
+/// Not shared with [`StateRegistry`]: one name space would let `state("volume", 0)` and
+/// `hover("volume")` collide, and the collision would surface as `signal:set()` refusing a name
+/// the config thought it owned.
+#[derive(Default)]
+struct HoverRegistry(HashMap<String, (Signal, Signal)>);
 
 /// An RAII claim on the 5ms evaluation budget, held for one `Computed` [`Signal::get_value`] --
 /// dependency resolution *and* the closure call, not the closure call alone. Entering pushes a
@@ -461,6 +563,8 @@ pub fn is_signal(ud: &mlua::AnyUserData) -> bool {
 /// call is worse than threading one argument through. It must be the same flag `Signal::new_live`
 /// hands out and `RendererClient` drains, or a `:set()` would mark a flag nothing reads.
 pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
+    let hover_dirty = dirty.clone();
+    let rect_dirty = dirty.clone();
     lua.globals().set(
         "computed",
         lua.create_function(|_, (deps, func): (Table, Function)| {
@@ -499,7 +603,59 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
                 .insert(name, signal.clone());
             Ok(signal)
         })?,
+    )?;
+    lua.globals().set(
+        "hover",
+        lua.create_function(move |lua, name: String| {
+            if lua.app_data_ref::<HoverRegistry>().is_none() {
+                lua.set_app_data(HoverRegistry::default());
+            }
+            Ok(hover_slot(lua, &hover_dirty, name)?.0)
+        })?,
+    )?;
+    lua.globals().set(
+        "hover_rect",
+        lua.create_function(move |lua, name: String| Ok(hover_slot(lua, &rect_dirty, name)?.1))?,
     )
+}
+
+/// One hover slot by name, built on first ask: the boolean `hover(name)` returns and the rect
+/// `hover_rect(name)` returns, in that order (docs/adr/0062 decision 2).
+///
+/// The name is the identity, exactly as `state(name, initial)` does it (ADR-0044 decision 5), which
+/// is what carries a hover across an in-place reload and what lets two files reach one slot. Both
+/// globals build the pair, so naming the rect first is not a different slot from naming the boolean
+/// first.
+///
+/// No marshalling check on either initial: the only values these ever hold are the booleans and the
+/// rect table the pointer handler writes, none of them hand-authored in Lua.
+fn hover_slot(lua: &Lua, dirty: &DirtyFlag, name: String) -> mlua::Result<(Signal, Signal)> {
+    if lua.app_data_ref::<HoverRegistry>().is_none() {
+        lua.set_app_data(HoverRegistry::default());
+    }
+    let existing = lua.app_data_ref::<HoverRegistry>().expect("just ensured the hover registry exists").0.get(&name).cloned();
+    if let Some(slot) = existing {
+        return Ok(slot);
+    }
+    let slot = Signal::new_hover(dirty.clone(), Value::Table(unhovered_rect(lua)?));
+    lua.app_data_mut::<HoverRegistry>().expect("just ensured the hover registry exists").0.insert(name, slot.clone());
+    Ok(slot)
+}
+
+/// What `hover_rect(name)` reads before the pointer has ever been on its node: a 1x1 rect at the
+/// origin.
+///
+/// Non-zero on both axes because § 6.3 refuses a zero `anchor_rect`, and a real table rather than
+/// nil because a nil property is an *absent* one. A tooltip bound to this resolves from the first
+/// frame and simply sits at the origin, which nothing ever sees: it is `visible = hover(name)`, and
+/// that is false until the same event that replaces this with the node's real rect.
+fn unhovered_rect(lua: &Lua) -> mlua::Result<mlua::Table> {
+    let rect = lua.create_table()?;
+    rect.set("x", 0.0)?;
+    rect.set("y", 0.0)?;
+    rect.set("width", 1.0)?;
+    rect.set("height", 1.0)?;
+    Ok(rect)
 }
 
 #[cfg(test)]
@@ -521,6 +677,122 @@ mod tests {
         let dirty = DirtyFlag::new();
         register(&lua, dirty.clone()).unwrap();
         (lua, dirty)
+    }
+
+    #[test]
+    fn hover_returns_a_read_only_boolean_signal_that_starts_false() {
+        // docs/adr/0062 decision 2: the engine writes this one, so a config that reads it before
+        // the pointer has ever been over the node must get `false`, not nil -- `visible` binds to
+        // it directly and a nil there would mean "absent" (ADR-0044 decision 1's amendment).
+        let (lua, _dirty) = lua_with_state();
+        let started: bool = lua.load(r#"return hover("volume"):get()"#).eval().unwrap();
+        assert!(!started);
+    }
+
+    #[test]
+    fn hover_hands_the_same_name_the_same_signal_so_an_in_place_reload_keeps_it_open() {
+        // The `state(name, initial)` rule of ADR-0044 decision 5, applied to hover by
+        // docs/adr/0062 decision 2: the name is the identity, so re-running the config finds the
+        // signal it built last time rather than a fresh false.
+        //
+        // Asserted through the storage rather than with `==`, which on two userdata handles is
+        // object identity and answers false for `state(...)` too. What has to hold is that a write
+        // to the slot one call named is read by the other.
+        let (lua, _dirty) = lua_with_state();
+        lua.load(r#"first = hover("volume") second = hover("volume") other = hover("battery")"#).exec().unwrap();
+
+        let first: mlua::AnyUserData = lua.globals().get("first").unwrap();
+        from_userdata(&first).unwrap().hover_handle().unwrap().set(Value::Boolean(true));
+
+        assert!(lua.load("return second:get()").eval::<bool>().unwrap(), "one name is one slot");
+        assert!(!lua.load("return other:get()").eval::<bool>().unwrap(), "a different name is a different slot");
+    }
+
+    #[test]
+    fn hover_rect_reads_a_real_non_zero_rect_before_anything_has_been_hovered() {
+        // Found on a live session, not here: the rect half started nil, a signal resolving to nil
+        // means the property is *absent* (ADR-0044 decision 1's amendment), and a tooltip's
+        // `anchor_rect` is required and non-zero (§ 6.3). So every re-resolve refused the popup
+        // until something hovered -- once per capability push, from the first frame.
+        let (lua, _dirty) = lua_with_state();
+        let rect: mlua::Table = lua.load(r#"return hover_rect("volume"):get()"#).eval().unwrap();
+
+        assert!(rect.get::<f32>("width").unwrap() > 0.0, "a zero-width anchor_rect is refused by the protocol");
+        assert!(rect.get::<f32>("height").unwrap() > 0.0, "and so is a zero-height one");
+        assert_eq!(rect.get::<f32>("x").unwrap(), 0.0);
+        assert_eq!(rect.get::<f32>("y").unwrap(), 0.0);
+    }
+
+    #[test]
+    fn a_config_cannot_write_a_hover_signal_and_the_refusal_names_it_a_hover() {
+        // Its own `SignalKind`, not the capability one, so this message does not tell a config it
+        // is holding a capability (docs/adr/0062 decision 2).
+        let (lua, dirty) = lua_with_state();
+        let err = lua.load(r#"hover("volume"):set(true)"#).exec().unwrap_err().to_string();
+        assert!(err.contains("state(name, initial)"), "the refusal points at the one writable kind: {err}");
+        assert!(err.contains("a hover signal"), "the refusal has to name what it is holding: {err}");
+        assert!(!dirty.take(), "a refused write marks nothing");
+    }
+
+    #[test]
+    fn the_engine_writes_a_hover_signal_through_its_handle_and_only_a_hover_signal() {
+        // The other half of decision 2: the writer takes a hover signal and nothing else, so a
+        // config binding `hover = oblisk.network` cannot get the pointer to overwrite a
+        // capability's snapshot.
+        let dirty = DirtyFlag::new();
+        let (hovered, hovered_rect) = Signal::new_hover(dirty.clone(), Value::Nil);
+        let (capability, _capability_handle) = Signal::new_live(Value::Boolean(false), dirty.clone());
+
+        assert!(hovered.hover_handle().is_some(), "a hover signal has a write end");
+        assert!(hovered.hover_rect_handle().is_some(), "and a write end for where the node was");
+        assert!(capability.hover_handle().is_none(), "a capability signal must not be writable as a hover");
+        assert!(
+            hovered_rect.hover_rect_handle().is_none(),
+            "the rect half is not itself a trigger, so it hands out no second rect"
+        );
+    }
+
+    #[test]
+    fn writing_the_value_already_stored_marks_nothing() {
+        // docs/adr/0062 decision 4. The pointer pushes this on every `wl_pointer` motion event and
+        // one mark re-resolves every surface in the generation (ADR-0044 decision 2), so a pointer
+        // sitting still inside one button must cost no re-resolves at all.
+        let dirty = DirtyFlag::new();
+        let (hovered, _rect) = Signal::new_hover(dirty.clone(), Value::Nil);
+        let handle = hovered.hover_handle().unwrap();
+
+        assert!(handle.set_changed(Value::Boolean(true)), "the first crossing is a real change");
+        assert!(dirty.take());
+
+        assert!(!handle.set_changed(Value::Boolean(true)), "the same value again is not a change");
+        assert!(!dirty.take(), "an unchanged hover must not re-resolve the scene");
+
+        assert!(handle.set_changed(Value::Boolean(false)), "leaving is a change again");
+        assert!(dirty.take());
+    }
+
+    #[test]
+    fn set_changed_cannot_dedupe_a_table_because_table_equality_is_identity() {
+        // Not a wish, a warning. `crate::wayland::input`'s hover writer builds a fresh rect table
+        // per event, and `PartialEq` on two `mlua` tables compares identity rather than contents,
+        // so this can never answer "unchanged" for one. That is why the rect is written on the
+        // entry edge only and not on every motion event (docs/adr/0062 decision 4) -- a caller
+        // that leans on `set_changed` to dedupe a table marks the scene dirty every time.
+        let lua = Lua::new();
+        let dirty = DirtyFlag::new();
+        let (_over, rect) = Signal::new_hover(dirty.clone(), Value::Nil);
+        let handle = rect.hover_handle().unwrap();
+
+        let build = || {
+            let table = lua.create_table().unwrap();
+            table.set("x", 1.0).unwrap();
+            table.set("y", 2.0).unwrap();
+            Value::Table(table)
+        };
+        assert!(handle.set_changed(build()));
+        assert!(dirty.take());
+        assert!(handle.set_changed(build()), "an identical table is still a different table");
+        assert!(dirty.take(), "which is exactly the per-motion dirty mark the writer must avoid");
     }
 
     #[test]

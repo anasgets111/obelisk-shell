@@ -12,6 +12,7 @@
 //! resource to guard yet.
 
 pub mod hit;
+pub mod hover;
 pub mod instance;
 pub mod node;
 pub mod paint;

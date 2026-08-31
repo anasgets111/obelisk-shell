@@ -306,8 +306,15 @@ fn parse_hex_color(property: &str, s: &str) -> Result<Rgba, LayoutError> {
 /// carry a `Signal`; a `lock`'s § 6.4 property list is only `id` and `child`. All three roles' `id`
 /// is already covered by the universal arm, since it is a reconcile identity rather than a protocol
 /// field.
+///
+/// `hover` joins `id` in the universal arm for the same reason and on any kind (docs/adr/0062
+/// decision 3): it names the signal the pointer handler writes, and a resolved `hover` would arrive
+/// there as the boolean `false`, saying nothing about *which* signal that is. Structural properties
+/// are identities, and identities do not resolve.
 fn is_structural_property(kind: &str, property: &str) -> bool {
-    property == "id" || (kind == "panel" && matches!(property, "layer" | "anchor" | "monitor" | "namespace"))
+    property == "id"
+        || property == "hover"
+        || (kind == "panel" && matches!(property, "layer" | "anchor" | "monitor" | "namespace"))
 }
 
 /// One node's raw property map with every `Signal` replaced by its current value (ADR-0044
