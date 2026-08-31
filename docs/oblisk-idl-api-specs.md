@@ -418,7 +418,7 @@ Receives input focus and pointer events.
 The font chain this shell measures and paints with, in fallback order (docs/adr/0043 decision 2).
 
 *   `fonts(chain)` (Global, called at the top level of `shell.lua`. Takes an array of family-name strings. Refused if any entry is not a string, naming which one, because Lua would otherwise coerce a number into a family nobody can find)
-    *   `chain`: `table` (Family names as fontconfig resolves them, e.g. `"CaskaydiaCove Nerd Font Propo"`. An entry no font on the system matches is skipped with a diagnostic rather than substituted, so a typo costs that entry and not the chain)
+    *   `chain`: `table` (A dense array of family names as fontconfig resolves them, e.g. `"CaskaydiaCove Nerd Font Propo"`. Refused if it has a hole or a named key, because a sparse table would otherwise lose its tail silently: `sequence_values` stops at the first `nil` and Lua's `#` is undefined on one. An entry no font on the system matches is skipped with a diagnostic rather than substituted, so a typo costs that entry and not the chain)
 
 > **One chain, and the codepoint picks the face.** Both readers fall back per glyph across the whole chain in order: a Nerd Font first and a sans face second gives glyph chrome and body text from one declaration, with no node saying which it wants. There is no per-node `font_family`.
 

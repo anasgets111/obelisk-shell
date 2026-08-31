@@ -33,21 +33,41 @@ pub fn register(lua: &Lua) -> mlua::Result<()> {
     lua.globals().set(
         "fonts",
         lua.create_function(|lua, chain: mlua::Table| {
-            let mut families = Vec::new();
-            for (index, entry) in chain.sequence_values::<mlua::Value>().enumerate() {
+            // Every key is collected and then checked to be exactly `1..=n`, rather than trusting
+            // either `sequence_values` or `raw_len`. Both are wrong here in the same direction:
+            // `sequence_values` stops at the first `nil` and returns what it had, and Lua's `#` is
+            // undefined on a sparse table and answers 1 for `{ [1] = "A", [3] = "C" }`. Either way a
+            // chain with a hole loses its tail silently, and the shell runs on a shorter fallback
+            // than the config wrote with nothing said about it.
+            let mut indexed: Vec<(i64, String)> = Vec::new();
+            for pair in chain.pairs::<mlua::Value, mlua::Value>() {
+                let (key, value) = pair?;
+                let mlua::Value::Integer(index) = key else {
+                    return Err(mlua::Error::runtime(
+                        "fonts() takes an array of family-name strings, not a table with named keys",
+                    ));
+                };
                 // Checked rather than left to mlua's `FromLua`, which coerces a number to a string
                 // the way Lua itself does. `fonts { 12 }` would otherwise record a family named
                 // "12", and the only symptom would be `resolve_chain` logging that it could not
-                // find it -- a miss that reads like the font is not installed rather than like the
-                // config is wrong.
-                let mlua::Value::String(family) = entry? else {
+                // find it, which reads like a missing font rather than a wrong config.
+                let mlua::Value::String(family) = value else {
                     return Err(mlua::Error::runtime(format!(
-                        "fonts() takes an array of family-name strings; entry {} is not a string",
-                        index + 1
+                        "fonts() takes an array of family-name strings; entry {index} is not a string"
                     )));
                 };
-                families.push(family.to_string_lossy());
+                indexed.push((index, family.to_string_lossy()));
             }
+            indexed.sort_by_key(|(index, _)| *index);
+            for (position, (index, _)) in indexed.iter().enumerate() {
+                let expected = position as i64 + 1;
+                if *index != expected {
+                    return Err(mlua::Error::runtime(format!(
+                        "fonts() takes a dense array of family-name strings; entry {expected} is missing"
+                    )));
+                }
+            }
+            let families: Vec<String> = indexed.into_iter().map(|(_, family)| family).collect();
             lua.set_app_data(FontRegistry(families));
             Ok(())
         })?,
@@ -96,6 +116,26 @@ mod tests {
             vec!["CaskaydiaCove Nerd Font Propo", "Noto Sans", "Noto Color Emoji"],
             "order is the fallback order, so it has to survive the round trip"
         );
+    }
+
+    /// Found by review. `sequence_values` stops at the first `nil` and returns what it had, so a
+    /// sparse table lost its tail with no error at all: `{ [1] = "A", [3] = "C" }` recorded `["A"]`
+    /// and the shell quietly ran on a shorter fallback chain than the config wrote.
+    #[test]
+    fn a_hole_in_the_chain_is_refused_rather_than_truncating_it() {
+        let lua = lua_with_fonts();
+        let err = lua.load(r#"local t = {} t[1] = "A" t[3] = "C" fonts(t)"#).exec().unwrap_err().to_string();
+        assert!(err.contains("entry 2"), "the message must name the gap: {err}");
+        assert!(declared_chain(&lua).is_empty(), "a refused call records nothing");
+    }
+
+    /// The typo the key walk also catches: a named key is not an array entry, and taking it
+    /// silently would drop the family the config thought it had declared.
+    #[test]
+    fn a_table_with_named_keys_is_not_a_chain() {
+        let lua = lua_with_fonts();
+        assert!(lua.load(r#"fonts { family = "Noto Sans" }"#).exec().is_err());
+        assert!(declared_chain(&lua).is_empty());
     }
 
     #[test]
