@@ -1,7 +1,7 @@
 //! Decodes a file into a GPU texture, caches it, and fits it into a box (docs/adr/0054,
 //! build-steps.md Phase 29 items 1 and 2).
 //!
-//! PNG and JPEG decode through femtovg's `Canvas::load_image_file`. SVG decodes through `resvg`,
+//! PNG and JPEG decode through the `image` crate ([`decode_raster`]). SVG decodes through `resvg`,
 //! needed because Adwaita ships scalable SVG icons.
 //!
 //! The cache key is the path, and for SVG only, the rasterized pixel size: a raster file has one
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use femtovg::renderer::OpenGl;
 use femtovg::rgb::FromSlice;
-use femtovg::{Canvas, ImageFlags, ImageId, ImageSource};
+use femtovg::{Canvas, ErrorKind, ImageFlags, ImageId, ImageSource};
 
 use crate::text::snap::LogicalRect;
 
@@ -208,14 +208,42 @@ fn is_vector(path: &Path) -> bool {
 
 fn load(canvas: &mut Canvas<OpenGl>, path: &Path, raster_px: u32) -> Result<ImageId, String> {
     if raster_px == 0 {
-        return canvas.load_image_file(path, ImageFlags::empty()).map_err(|err| err.to_string());
+        let (pixels, width, height) = decode_raster(path)?;
+        // Straight alpha, which is what the `image` crate produces, so no flag: `PREMULTIPLIED`
+        // below is the SVG path's answer to tiny-skia, not a house default.
+        let source = ImageSource::from(femtovg::imgref::Img::new(pixels.as_rgba(), width as usize, height as usize));
+        return canvas.create_image(source, ImageFlags::empty()).map_err(femtovg_error);
     }
     let (pixels, width, height) = rasterize_svg(path, raster_px)?;
     // `PREMULTIPLIED` because tiny-skia's `Pixmap` is premultiplied RGBA8 and femtovg samples a
     // texture without this flag as straight alpha -- getting it wrong shows as a dark halo around
     // every anti-aliased icon edge rather than as an outright failure.
     let source = ImageSource::from(femtovg::imgref::Img::new(pixels.as_rgba(), width as usize, height as usize));
-    canvas.create_image(source, ImageFlags::PREMULTIPLIED).map_err(|err| err.to_string())
+    canvas.create_image(source, ImageFlags::PREMULTIPLIED).map_err(femtovg_error)
+}
+
+/// femtovg's `ErrorKind` writes the literal string `"canvas error"` for every one of its
+/// sixteen variants, so `Debug` is the only thing that names which failure happened.
+fn femtovg_error(err: ErrorKind) -> String {
+    format!("{err:?}")
+}
+
+/// Decodes a PNG or JPEG to straight-alpha RGBA8, and the reason `image` is a direct dependency
+/// (`renderer/Cargo.toml`).
+///
+/// femtovg's `Canvas::load_image_file` would be the obvious call and cannot decode anything: the
+/// crate declares `image` with `default-features = false` and enables no format, so every PNG
+/// comes back `Unsupported(Exact(Png))`. That took the tray's and the notification daemon's
+/// spooled pixmaps (docs/adr/0031) with it, since both spool PNG.
+///
+/// `into_rgba8` also covers the grayscale-plus-alpha and 16-bit variants femtovg's own
+/// `ImageSource` conversion refuses outright, and costs nothing when the file already decoded to
+/// RGBA8, which every icon in a theme does.
+fn decode_raster(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
+    let decoded = ::image::open(path).map_err(|err| err.to_string())?;
+    let rgba = decoded.into_rgba8();
+    let (width, height) = rgba.dimensions();
+    Ok((rgba.into_raw(), width, height))
 }
 
 /// Rasterizes at `box_px` on the longest edge, preserving the aspect ratio; [`fitted_rect`] does
@@ -341,6 +369,44 @@ mod tests {
         let distinct: std::collections::HashSet<[u8; 3]> =
             pixels.as_chunks::<4>().0.iter().map(|px| [px[0], px[1], px[2]]).collect();
         assert!(distinct.len() > 16, "expected a gradient, got {} colours", distinct.len());
+    }
+
+    /// A 2x2 RGBA PNG encoded by Pillow, byte for byte. An independent encoder is the point: a
+    /// fixture this crate wrote itself could not tell a working decoder from a round trip through
+    /// a broken one.
+    const PIL_2X2_RGBA_PNG: [u8; 80] = [
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00,
+        0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x06, 0x00, 0x00, 0x00, 0x72, 0xb6, 0x0d, 0x24, 0x00, 0x00, 0x00,
+        0x17, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x05, 0xc1, 0x01, 0x01, 0x00, 0x00, 0x00, 0x82, 0x20, 0xa6, 0xf7,
+        0xdc, 0x40, 0x24, 0x43, 0xc1, 0x01, 0x3a, 0xdc, 0x05, 0x7c, 0xf2, 0x4a, 0x44, 0x5b, 0x00, 0x00, 0x00, 0x00,
+        0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    #[test]
+    fn a_png_decodes_to_the_pixels_it_was_written_with() {
+        // The regression this exists for is not a wrong pixel, it is no decoder at all: femtovg
+        // pulls `image` with every format feature off, so before `decode_raster` this file, every
+        // themed PNG icon and every tray pixmap (docs/adr/0031) failed with `Unsupported(Png)`.
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("fixture.png");
+        std::fs::write(&png, PIL_2X2_RGBA_PNG).unwrap();
+
+        let (pixels, width, height) = decode_raster(&png).expect("a PNG decoder must be compiled in");
+        assert_eq!((width, height), (2, 2));
+        // Straight alpha, in the order Pillow was handed them: the half-transparent green stays
+        // 0x00ff00 rather than arriving premultiplied to 0x008000.
+        assert_eq!(
+            pixels,
+            vec![255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 255, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_an_image_reports_why_instead_of_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("not-really.png");
+        std::fs::write(&fake, b"<svg/>").unwrap();
+        assert!(decode_raster(&fake).is_err());
     }
 
     #[test]
