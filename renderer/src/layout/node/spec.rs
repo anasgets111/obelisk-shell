@@ -498,7 +498,11 @@ mod tests {
     #[test]
     fn every_property_section_6_4_denies_a_lock_is_refused_by_name_rather_than_ignored() {
         let lua = lua();
-        for property in ["visible", "monitor", "anchor", "width", "height"] {
+        // `monitor` and `anchor` never reach `lock_spec` from a config any more: they are not on
+        // `lock`'s row in `nodes::NODE_PROPERTIES`, so `deserialize_lua_table` refuses them first
+        // (`a_lock_property_that_is_not_even_on_the_kind_is_refused_before_lock_spec_sees_it`).
+        // The three left here are ones a lock legitimately has a row for and refuses anyway.
+        for property in ["visible", "width", "height"] {
             let table: mlua::Table =
                 lua.load(format!(r#"return {{ kind = "lock", id = "screen-lock", {property} = 1 }}"#)).eval().unwrap();
             let err = lock_spec(&props_from_table(&table)).unwrap_err();
@@ -506,6 +510,19 @@ mod tests {
                 matches!(&err, LayoutError::InvalidProperty { property: p, .. } if p == property),
                 "`{property}` must be refused by name, got {err:?}"
             );
+        }
+    }
+
+    /// The other half of the § 6.4 denial, one layer up. A name a `lock` has no row for cannot
+    /// reach `lock_spec` at all, so the refusal a config author sees is the property gate's.
+    #[test]
+    fn a_lock_property_that_is_not_even_on_the_kind_is_refused_before_lock_spec_sees_it() {
+        let lua = lua();
+        for property in ["monitor", "anchor"] {
+            let table: mlua::Table =
+                lua.load(format!(r#"return {{ kind = "lock", id = "screen-lock", {property} = 1 }}"#)).eval().unwrap();
+            let err = crate::lua::nodes::deserialize_lua_table(&table).unwrap_err();
+            assert!(err.to_string().contains(property), "`{property}` must be refused by name, got {err}");
         }
     }
 

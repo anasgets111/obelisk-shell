@@ -530,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn a_signal_in_layer_on_a_non_panel_node_resolves_instead_of_surviving_as_a_handle() {
+    fn a_surface_topology_field_on_a_non_panel_node_is_refused_rather_than_carried() {
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         for property in ["layer", "anchor", "monitor"] {
@@ -539,14 +539,12 @@ mod tests {
             let table = lua.create_table().unwrap();
             table.set("kind", "rect").unwrap();
             table.set(property, signal).unwrap();
-            let node = deserialize_lua_table(&table).unwrap();
 
-            let resolved = resolve_properties(&node.properties, "rect", &lua).unwrap();
+            let err = deserialize_lua_table(&table).unwrap_err();
 
             assert!(
-                matches!(resolved.get(property), Some(Value::Boolean(true))),
-                "`{property}` on a rect must resolve to the signal's value, got {:?}",
-                resolved.get(property)
+                err.to_string().contains(property),
+                "`{property}` is § 6.1 topology and a rect has no row for it, so it must be refused by name: {err}"
             );
         }
     }

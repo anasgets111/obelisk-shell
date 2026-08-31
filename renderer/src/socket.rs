@@ -910,17 +910,22 @@ mod tests {
         path
     }
 
+    /// Evaluates `setup` above a minimal `panel` and reads one of the globals it left behind.
+    ///
+    /// A global rather than a value smuggled onto the returned node: a node refuses a key no
+    /// parser of its kind reads (`lua::nodes::NODE_PROPERTIES`), and a probe name is exactly
+    /// such a key.
+    fn probe<T: mlua::FromLua>(loader: &Loader, setup: &str, name: &str) -> T {
+        loader.evaluate(&format!("{setup}\nreturn panel {{ id = \"_probe\", layer = \"Top\" }}")).unwrap();
+        loader.lua().globals().get(name).unwrap()
+    }
+
     /// Reads `rescue:get()`'s current fields back out by evaluating a tiny probe script --
     /// `LiveSignalHandle` only exposes `set`, so this is the only way to observe what a prior
     /// `set_rescue_state` call actually stored.
     fn rescue_state(loader: &Loader) -> (bool, String) {
-        let output = loader
-            .evaluate(r#"return panel { id = "_rescue_probe", layer = "Top", is_rescue = oblisk.rescue:get().is_rescue, error_log = oblisk.rescue:get().error_log }"#)
-            .unwrap();
-        let props = &output.surfaces[0].properties;
-        let is_rescue = props.get("is_rescue").unwrap().as_boolean().unwrap();
-        let error_log = props.get("error_log").unwrap().as_string().unwrap().to_string_lossy();
-        (is_rescue, error_log)
+        let setup = "is_rescue, error_log = oblisk.rescue:get().is_rescue, oblisk.rescue:get().error_log";
+        (probe(loader, setup, "is_rescue"), probe(loader, setup, "error_log"))
     }
 
     /// A client wired to a real outbound channel, whose receiver is handed back so a test can
@@ -991,12 +996,7 @@ mod tests {
         };
         client.apply_state_snapshot(snapshot).unwrap();
 
-        let output = client
-            .loader
-            .evaluate(r#"return panel { id = "bar", layer = "Top", app_name = oblisk.audio:get().app_name }"#)
-            .unwrap();
-        let app_name = output.surfaces[0].properties.get("app_name").unwrap().as_string().unwrap().to_string_lossy();
-        assert_eq!(app_name, "Zen");
+        assert_eq!(probe::<String>(&client.loader, "app_name = oblisk.audio:get().app_name", "app_name"), "Zen");
     }
 
     #[test]
@@ -1014,11 +1014,7 @@ mod tests {
         };
         client.apply_state_snapshot(snapshot).unwrap();
 
-        let output = client
-            .loader
-            .evaluate(r#"return panel { id = "bar", layer = "Top", active = oblisk.workspace:get().active }"#)
-            .unwrap();
-        assert_eq!(output.surfaces[0].properties.get("active").unwrap().as_integer(), Some(2));
+        assert_eq!(probe::<i64>(&client.loader, "active = oblisk.workspace:get().active", "active"), 2);
     }
 
     /// Every bar-backing capability at or past the width its module can draw, for
@@ -1512,15 +1508,9 @@ mod tests {
         let (client, _outbound_rx) = test_client(&missing);
 
         for capability in shared::CAPABILITIES {
-            let probe =
-                format!(r#"return panel {{ id = "bar", layer = "Top", is_nil = oblisk.{capability}:get() == nil }}"#);
-            let output = client
-                .loader
-                .evaluate(&probe)
-                .unwrap_or_else(|err| panic!("rostered capability {capability:?} is not on `oblisk`: {err}"));
-            assert_eq!(
-                output.surfaces[0].properties.get("is_nil").unwrap().as_boolean(),
-                Some(true),
+            let setup = format!("is_nil = oblisk.{capability}:get() == nil");
+            assert!(
+                probe::<bool>(&client.loader, &setup, "is_nil"),
                 "oblisk.{capability} should read nil before its first snapshot"
             );
         }
@@ -1539,11 +1529,9 @@ mod tests {
             if *capability == "lock" {
                 continue;
             }
-            let probe = format!(r#"return panel {{ id = "bar", layer = "Top", is_nil = {capability} == nil }}"#);
-            let output = client.loader.evaluate(&probe).unwrap();
-            assert_eq!(
-                output.surfaces[0].properties.get("is_nil").unwrap().as_boolean(),
-                Some(true),
+            let setup = format!("is_nil = {capability} == nil");
+            assert!(
+                probe::<bool>(&client.loader, &setup, "is_nil"),
                 "{capability} is still a bare global; § 2 names it oblisk.{capability}"
             );
         }
@@ -1562,11 +1550,7 @@ mod tests {
         assert!(err.contains("already something else"), "the refusal must say why: {err}");
 
         // The real `rescue` still reads its own table, not an empty capability.
-        let output = client
-            .loader
-            .evaluate(r#"return panel { id = "bar", layer = "Top", intact = oblisk.rescue:get().is_rescue == false }"#)
-            .unwrap();
-        assert_eq!(output.surfaces[0].properties.get("intact").unwrap().as_boolean(), Some(true));
+        assert!(probe::<bool>(&client.loader, "intact = oblisk.rescue:get().is_rescue == false", "intact"));
     }
 
     #[test]
@@ -1575,17 +1559,16 @@ mod tests {
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let (client, _outbound_rx) = test_client(&missing);
 
-        let probe = r#"return panel { id = "bar", layer = "Top",
-            rescued = oblisk.rescue:get().is_rescue,
-            screen_count = #oblisk.screens:get(),
-            bare_rescue_gone = rescue == nil,
-            bare_screens_gone = screens == nil }"#;
-        let output = client.loader.evaluate(probe).unwrap();
-        let props = &output.surfaces[0].properties;
-        assert_eq!(props.get("rescued").unwrap().as_boolean(), Some(false));
-        assert_eq!(props.get("screen_count").unwrap().as_integer(), Some(0));
-        assert_eq!(props.get("bare_rescue_gone").unwrap().as_boolean(), Some(true));
-        assert_eq!(props.get("bare_screens_gone").unwrap().as_boolean(), Some(true));
+        let setup = r#"
+            rescued = oblisk.rescue:get().is_rescue
+            screen_count = #oblisk.screens:get()
+            bare_rescue_gone = rescue == nil
+            bare_screens_gone = screens == nil
+        "#;
+        assert!(!probe::<bool>(&client.loader, setup, "rescued"));
+        assert_eq!(probe::<i64>(&client.loader, setup, "screen_count"), 0);
+        assert!(probe::<bool>(&client.loader, setup, "bare_rescue_gone"));
+        assert!(probe::<bool>(&client.loader, setup, "bare_screens_gone"));
     }
 
     #[test]
@@ -1595,16 +1578,13 @@ mod tests {
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let (client, _outbound_rx) = test_client(&missing);
 
-        let probe = r#"return panel { id = "bar", layer = "Top",
-            major = oblisk.version.major, minor = oblisk.version.minor, patch = oblisk.version.patch }"#;
-        let output = client.loader.evaluate(probe).unwrap();
-        let props = &output.surfaces[0].properties;
+        let setup = "major, minor, patch = oblisk.version.major, oblisk.version.minor, oblisk.version.patch";
         // Read back through Lua and compared against Cargo's own string, rather than against a
         // second call to the function that built the table: this asserts the number a config
         // actually sees, not that one function agrees with itself. It also reaches
         // `lua::namespace::version_parts`'s `expect`, which is why that function carries no
         // narrower test of its own.
-        let field = |name: &str| props.get(name).unwrap().as_integer().unwrap();
+        let field = |name: &str| probe::<i64>(&client.loader, setup, name);
         assert_eq!(format!("{}.{}.{}", field("major"), field("minor"), field("patch")), env!("CARGO_PKG_VERSION"));
     }
 
@@ -1613,10 +1593,8 @@ mod tests {
         // Derived from the loaded path rather than re-resolved, so a Renderer started with an
         // explicit `shell.lua` cannot report a directory it is not reading from.
         let (client, _outbound_rx) = test_client(std::path::Path::new("/opt/oblisk-config/shell.lua"));
-        let probe = r#"return panel { id = "bar", layer = "Top", dir = oblisk.config_dir }"#;
-        let output = client.loader.evaluate(probe).unwrap();
-        let dir = output.surfaces[0].properties.get("dir").unwrap().as_string().unwrap();
-        assert_eq!(dir.to_string_lossy(), "/opt/oblisk-config");
+        let dir = probe::<String>(&client.loader, "dir = oblisk.config_dir", "dir");
+        assert_eq!(dir, "/opt/oblisk-config");
     }
 
     /// `RendererClient::new` seeds the roster *after* `Loader::new` registered § 6.4's node
@@ -1652,28 +1630,21 @@ mod tests {
         assert!(run_startup(&mut client), "a config declaring a lock screen must build a scene");
 
         // The constructor survived: a `lock { ... }` at the root still produced a § 6.4 surface.
-        let probe = client
-            .loader
-            .evaluate(
-                r##"return panel {
-                id = "_probe", layer = "Top",
-                lock_kind = lock { id = "screen" }.kind,
-                capability_type = type(oblisk.lock),
-                attempts = oblisk.lock:get().attempts,
-            }"##,
-            )
-            .unwrap();
-        let props = &probe.surfaces[0].properties;
+        let setup = r#"
+            lock_kind = lock { id = "screen" }.kind
+            capability_type = type(oblisk.lock)
+            attempts = oblisk.lock:get().attempts
+        "#;
         assert_eq!(
-            props.get("lock_kind").unwrap().as_string().unwrap().to_string_lossy(),
+            probe::<String>(&client.loader, setup, "lock_kind"),
             "lock",
             "the global `lock` must still be § 6.4's node constructor"
         );
         // The capability is reachable, hydrated, under the name § 2 gives it.
-        assert_eq!(props.get("capability_type").unwrap().as_string().unwrap().to_string_lossy(), "userdata");
+        assert_eq!(probe::<String>(&client.loader, setup, "capability_type"), "userdata");
         assert_eq!(
-            props.get("attempts").unwrap().as_integer(),
-            Some(2),
+            probe::<i64>(&client.loader, setup, "attempts"),
+            2,
             "the `lock` StateSnapshot must reach `oblisk.lock`, not a bare global nothing registered"
         );
     }
@@ -1714,13 +1685,8 @@ mod tests {
             })
             .unwrap();
 
-        let output = client
-            .loader
-            .evaluate(r#"return panel { id = "bar", layer = "Top", scanning = oblisk.network:get().scanning }"#)
-            .unwrap();
-        assert_eq!(
-            output.surfaces[0].properties.get("scanning").unwrap().as_boolean(),
-            Some(false),
+        assert!(
+            !probe::<bool>(&client.loader, "scanning = oblisk.network:get().scanning", "scanning"),
             "the second push must update the same registered global, not fail or create a second one"
         );
     }
@@ -2955,14 +2921,10 @@ mod tests {
             FrameOutcome::Handled
         );
 
-        let output = client
-            .loader
-            .evaluate(r#"return panel { id = "bar", layer = "Top", line = probe_line, stream = probe_stream, code = probe_code }"#)
-            .unwrap();
-        let props = &output.surfaces[0].properties;
-        assert_eq!(props.get("line").unwrap().as_string().unwrap().to_string_lossy(), "hello");
-        assert_eq!(props.get("stream").unwrap().as_string().unwrap().to_string_lossy(), "stdout");
-        assert_eq!(props.get("code").unwrap().as_integer().unwrap(), 3);
+        let lua = client.loader.lua().globals();
+        assert_eq!(lua.get::<String>("probe_line").unwrap(), "hello");
+        assert_eq!(lua.get::<String>("probe_stream").unwrap(), "stdout");
+        assert_eq!(lua.get::<i64>("probe_code").unwrap(), 3);
     }
 
     /// Queues `frame` for the socket thread and returns what [`pump`] actually wrote to the wire

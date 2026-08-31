@@ -352,6 +352,15 @@ mod tests {
 
     /// A loader for the tests that never `require` anything, where the config directory only has
     /// to be a path rather than a populated tree.
+    /// Evaluates `setup` above a minimal `panel` and hands back the globals it left behind.
+    ///
+    /// A global rather than a value smuggled onto the returned node: a node rejects a key no
+    /// parser of its kind reads (`nodes::NODE_PROPERTIES`), and a probe name is exactly that.
+    fn probe<T: mlua::FromLua>(loader: &Loader, setup: &str, name: &str) -> T {
+        loader.evaluate(&format!("{setup}\nreturn panel {{ id = \"bar\", layer = \"Top\" }}")).unwrap();
+        loader.lua().globals().get(name).unwrap()
+    }
+
     fn test_loader() -> Loader {
         Loader::new(signal::DirtyFlag::new(), &std::env::temp_dir()).unwrap()
     }
@@ -698,10 +707,14 @@ mod tests {
         let loader = Loader::new(signal::DirtyFlag::new(), dir.path()).unwrap();
 
         let output = loader
-            .evaluate(r#"local w = require("widget") return panel { id = "bar", layer = "Top", has_state = w.has_state, has_json = w.has_json, child = w.node }"#)
+            .evaluate(
+                r#"local w = require("widget")
+                   has_state, has_json = w.has_state, w.has_json
+                   return panel { id = "bar", layer = "Top", child = w.node }"#,
+            )
             .unwrap();
-        assert_eq!(output.surfaces[0].properties.get("has_state").unwrap(), &Value::Boolean(true));
-        assert_eq!(output.surfaces[0].properties.get("has_json").unwrap(), &Value::Boolean(true));
+        assert!(loader.lua().globals().get::<bool>("has_state").unwrap());
+        assert!(loader.lua().globals().get::<bool>("has_json").unwrap());
         assert!(
             output.surfaces[0].properties.contains_key("child"),
             "a node built in a required module has to survive into the tree"
@@ -854,12 +867,10 @@ mod tests {
         let (signal, handle) = signal::Signal::new_live(Value::Integer(7), signal::DirtyFlag::new());
         loader.set_global("audio", signal).unwrap();
 
-        let output = loader.evaluate(r#"return panel { id = "bar", layer = "Top", reading = audio:get() }"#).unwrap();
-        assert_eq!(output.surfaces[0].properties.get("reading").unwrap().as_integer().unwrap(), 7);
+        assert_eq!(probe::<i64>(&loader, "reading = audio:get()", "reading"), 7);
 
         handle.set(Value::Integer(9));
-        let output = loader.evaluate(r#"return panel { id = "bar", layer = "Top", reading = audio:get() }"#).unwrap();
-        assert_eq!(output.surfaces[0].properties.get("reading").unwrap().as_integer().unwrap(), 9);
+        assert_eq!(probe::<i64>(&loader, "reading = audio:get()", "reading"), 9);
     }
 
     #[test]
@@ -869,11 +880,8 @@ mod tests {
         let value = loader.to_lua_value(&json).unwrap();
         loader.set_global("state", value).unwrap();
 
-        let output = loader
-            .evaluate(r#"return panel { id = "bar", layer = "Top", volume = state.volume, muted = state.muted }"#)
-            .unwrap();
-        assert_eq!(output.surfaces[0].properties.get("volume").unwrap().as_f64().unwrap(), 0.5);
-        assert_eq!(output.surfaces[0].properties.get("muted").unwrap(), &Value::Boolean(false));
+        assert_eq!(probe::<f64>(&loader, "volume = state.volume", "volume"), 0.5);
+        assert!(!probe::<bool>(&loader, "muted = state.muted", "muted"));
     }
 
     /// A JSON `null` must reach Lua as `nil`, erasing the key rather than leaving a
@@ -890,21 +898,13 @@ mod tests {
         let value = loader.to_lua_value(&json).unwrap();
         loader.set_global("item", value).unwrap();
 
-        let output = loader
-            .evaluate(
-                r#"
-                local key_count = 0
-                for _ in pairs(item) do key_count = key_count + 1 end
-                return panel {
-                    id = "bar", layer = "Top",
-                    key_count = key_count,
-                    path_is_nil = item.icon_path == nil,
-                }
-                "#,
-            )
-            .unwrap();
-        assert_eq!(output.surfaces[0].properties.get("key_count").unwrap().as_integer().unwrap(), 1);
-        assert_eq!(output.surfaces[0].properties.get("path_is_nil").unwrap(), &Value::Boolean(true));
+        let setup = r#"
+            key_count = 0
+            for _ in pairs(item) do key_count = key_count + 1 end
+            path_is_nil = item.icon_path == nil
+        "#;
+        assert_eq!(probe::<i64>(&loader, setup, "key_count"), 1);
+        assert!(probe::<bool>(&loader, setup, "path_is_nil"));
     }
 
     /// The actual bug: mlua's default `serialize_none_to_null` maps JSON `null` to a
@@ -982,21 +982,11 @@ mod tests {
         let value = loader.to_lua_value(&json).unwrap();
         loader.set_global("state", value).unwrap();
 
-        let output = loader
-            .evaluate(
-                r#"return panel {
-                    id = "bar", layer = "Top",
-                    volume = state.volume, muted = state.muted, label = state.label, second_tag = state.tags[2],
-                }"#,
-            )
-            .unwrap();
-        assert_eq!(output.surfaces[0].properties.get("volume").unwrap().as_f64().unwrap(), 0.5);
-        assert_eq!(output.surfaces[0].properties.get("muted").unwrap(), &Value::Boolean(false));
-        assert_eq!(output.surfaces[0].properties.get("label").unwrap().as_string().unwrap().to_string_lossy(), "media");
-        assert_eq!(
-            output.surfaces[0].properties.get("second_tag").unwrap().as_string().unwrap().to_string_lossy(),
-            "b"
-        );
+        let setup = "volume, muted, label, second_tag = state.volume, state.muted, state.label, state.tags[2]";
+        assert_eq!(probe::<f64>(&loader, setup, "volume"), 0.5);
+        assert!(!probe::<bool>(&loader, setup, "muted"));
+        assert_eq!(probe::<String>(&loader, setup, "label"), "media");
+        assert_eq!(probe::<String>(&loader, setup, "second_tag"), "b");
     }
 
     #[test]

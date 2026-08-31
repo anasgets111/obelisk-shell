@@ -583,8 +583,8 @@ mod tests {
                 r#"
                     return {
                         kind = "rect",
-                        alpha = computed({}, function() error("alpha boom") end),
-                        beta = computed({}, function() error("beta boom") end),
+                        background = computed({}, function() error("background boom") end),
+                        radius = computed({}, function() error("radius boom") end),
                     }
                     "#,
             )
@@ -594,7 +594,7 @@ mod tests {
             let props = props_from_table(&table);
             let err = resolve_properties(&props, "rect", &lua).unwrap_err();
             assert!(
-                matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "alpha"),
+                matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "background"),
                 "the same broken config must always name the same property, got: {err}"
             );
         }

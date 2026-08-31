@@ -39,6 +39,107 @@ const NODE_KINDS: [&str; 13] = [
     "lock",
 ];
 
+/// The § 5.1 properties every kind takes, surface roles included: geometry, identity and the two
+/// flags. `layout::scene` reads these off any node it resolves without asking what kind it is.
+const COMMON_PROPERTIES: &[&str] =
+    &["align_h", "align_v", "height", "hover", "id", "margin", "opacity", "padding", "visible", "width"];
+
+/// What every kind that paints as a box takes on top of [`COMMON_PROPERTIES`]: the fill, then the
+/// border. The set is `node::paint_style`'s own first match arm -- `row`, `column` and `button`
+/// have no paint properties beyond a `rect`'s, and all four § 6 surface roles paint exactly like
+/// one.
+const BOX_PROPERTIES: &[&str] = &["background", "border_color", "border_width", "radius"];
+
+/// Which kinds that arm covers.
+const BOX_KINDS: [&str; 8] = ["rect", "row", "column", "button", "panel", "window", "popup", "lock"];
+
+/// What each `kind` accepts beyond the two lists above, and the reason [`deserialize_lua_table`]
+/// can reject an unknown key at all.
+///
+/// Until this existed, an unrecognized key was copied into `properties` and then read by nothing:
+/// `aling_v = "Center"` in a config was silent, and the node just did not centre. Every parser
+/// only ever asks for the keys it knows, so nothing was in a position to notice.
+///
+/// ponytail: hand-written, and it has to be. A node's schema is not a type -- it is roughly 60
+/// `properties.get("...")` calls spread across `layout/node/`, `layout/scene.rs` and `wayland/`,
+/// each with its own defaulting and coercion rules, so there is nothing to derive it from the way
+/// `supervisor/src/stubs.rs` derives a capability payload. Two guards hold it in place:
+/// `every_property_a_parser_reads_is_accepted` greps those calls out of the source, and
+/// `the_stubs_declare_the_same_properties` compares it against `lua-meta`. The upgrade path is a
+/// per-kind props struct the parsers read fields off, which is a rewrite of the parse layer rather
+/// than a derive.
+///
+/// A name here that no parser reads yet is allowed and deliberate: `textfield`'s `on_change` and
+/// `on_submit` are typed to ADR-0027's settled shape while `zwp_text_input_v3` is unwired, and
+/// rejecting them would make a config written against the documented API fail to load.
+const NODE_PROPERTIES: &[(&str, &[&str])] = &[
+    ("rect", &["children"]),
+    ("row", &["children", "scroll", "spacing"]),
+    ("column", &["children", "scroll", "spacing"]),
+    ("text", &["content", "elide", "font_size", "foreground", "text_align"]),
+    ("icon", &["name", "size"]),
+    ("image", &["fit", "source"]),
+    ("button", &["children", "on_click"]),
+    ("list", &["direction", "itemfn", "key", "scroll", "source", "spacing"]),
+    // `font_size`, `foreground` and `text_align` are the text half `node::paint_style` reads off a
+    // `textfield` too: it draws either its placeholder or its masked content.
+    (
+        "textfield",
+        &[
+            "font_size",
+            "foreground",
+            "mask_character",
+            "on_change",
+            "on_submit",
+            "placeholder",
+            "secure_submit",
+            "text_align",
+        ],
+    ),
+    ("panel", &["anchor", "child", "exclusive", "keyboard_interactivity", "layer", "monitor", "namespace"]),
+    ("window", &["app_id", "child", "max_size", "min_size", "on_close", "title"]),
+    (
+        "popup",
+        &[
+            "anchor",
+            "anchor_rect",
+            "child",
+            "constraint_adjustment",
+            "grab",
+            "gravity",
+            "offset",
+            "on_dismiss",
+            "parent",
+        ],
+    ),
+    ("lock", &["child"]),
+];
+
+/// Whether `kind` accepts `property`. An unknown `kind` accepts everything:
+/// `register_node_constructors` is the only thing that tags a table with one, so a kind missing
+/// from [`NODE_PROPERTIES`] is a new constructor whose row has not been written, and refusing
+/// every property of it would be a worse failure than the silence this replaces.
+fn accepts(kind: &str, property: &str) -> bool {
+    let Some((_, own)) = NODE_PROPERTIES.iter().find(|(name, _)| *name == kind) else {
+        return true;
+    };
+    own.contains(&property)
+        || COMMON_PROPERTIES.contains(&property)
+        || (BOX_KINDS.contains(&kind) && BOX_PROPERTIES.contains(&property))
+}
+
+/// Every property `kind` accepts, sorted, for the error message.
+fn accepted_properties(kind: &str) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> =
+        NODE_PROPERTIES.iter().find(|(name, _)| *name == kind).map_or_else(Vec::new, |(_, own)| own.to_vec());
+    names.extend_from_slice(COMMON_PROPERTIES);
+    if BOX_KINDS.contains(&kind) {
+        names.extend_from_slice(BOX_PROPERTIES);
+    }
+    names.sort_unstable();
+    names
+}
+
 /// A Lua node table, tagged with its constructor's `kind` and carrying every other prop
 /// untouched. Not the final in-memory scene node -- see the module doc comment.
 #[derive(Debug, Clone)]
@@ -55,6 +156,10 @@ pub enum DeserializeError {
     MissingKind,
     #[error("node table's `kind` field is not a string")]
     KindNotAString,
+    /// A key no parser of this `kind` reads. Rejected rather than copied through: see
+    /// [`NODE_PROPERTIES`].
+    #[error("`{kind}` has no property `{property}`; it accepts {accepted}")]
+    UnknownProperty { kind: String, property: String, accepted: String },
 }
 
 /// Registers every [`NODE_KINDS`] entry as Lua-callable sugar: each takes the props table Lua
@@ -94,6 +199,13 @@ pub fn deserialize_lua_table(table: &Table) -> Result<VirtualNode, DeserializeEr
             Value::String(s) => s.to_string_lossy(),
             other => other.to_string()?,
         };
+        if !accepts(&kind, &key) {
+            return Err(DeserializeError::UnknownProperty {
+                kind: kind.clone(),
+                property: key,
+                accepted: accepted_properties(&kind).join(", "),
+            });
+        }
         properties.insert(key, value);
     }
 
@@ -117,6 +229,39 @@ mod tests {
             lua.load(r##"return rect { background = "#11111B", width = "Fill", height = 32 }"##).eval().unwrap();
         assert_eq!(table.get::<String>("kind").unwrap(), "rect");
         assert_eq!(table.get::<String>("background").unwrap(), "#11111B");
+    }
+
+    /// The silence this replaces: `aling_v` was copied into `properties`, read by nothing, and
+    /// the node just did not centre.
+    #[test]
+    fn a_misspelled_property_is_refused_and_the_message_names_what_the_kind_takes() {
+        let lua = lua_with_constructors();
+        let table: mlua::Table = lua.load(r#"return row { aling_v = "Center" }"#).eval().unwrap();
+
+        let err = deserialize_lua_table(&table).unwrap_err().to_string();
+
+        assert!(err.contains("aling_v"), "the message must name the key that was refused: {err}");
+        assert!(err.contains("align_v"), "and the ones it accepts, so the typo is visible: {err}");
+    }
+
+    /// The per-kind half. `layer` is real § 6.1 topology, and meaningless on a `rect`.
+    #[test]
+    fn a_property_of_another_kind_is_refused_too() {
+        let lua = lua_with_constructors();
+        let table: mlua::Table = lua.load(r#"return rect { layer = "Top" }"#).eval().unwrap();
+        assert!(deserialize_lua_table(&table).unwrap_err().to_string().contains("layer"));
+    }
+
+    /// A surface root takes the § 5.1 base properties and paints like a rect, so neither half is
+    /// refused on one.
+    #[test]
+    fn a_surface_root_takes_the_base_properties_and_the_box_ones() {
+        let lua = lua_with_constructors();
+        let table: mlua::Table = lua
+            .load(r##"return panel { id = "bar", layer = "Top", padding = { top = 4 }, radius = 8, opacity = 0.5 }"##)
+            .eval()
+            .unwrap();
+        assert!(deserialize_lua_table(&table).is_ok());
     }
 
     #[test]
@@ -227,6 +372,131 @@ mod meta_stub_tests {
             source.lines().filter_map(|line| line.strip_prefix("function ")?.split('(').next()).collect();
         let expected: BTreeSet<&str> = super::NODE_KINDS.iter().copied().collect();
         assert_eq!(declared, expected, "lua-meta is out of step with NODE_KINDS");
+    }
+
+    /// Every kind's `---@field` set, inherited classes folded in, against [`super::accepted_properties`].
+    ///
+    /// The stubs are what a config author sees in an editor, so a name here that the engine
+    /// refuses is worse than a missing one: the completion offers it and the config fails to
+    /// load. This ran red the day it was written -- `RowProps` declared no `background` while
+    /// `node::paint_style` has painted one since ADR-0068, and all four surface classes were
+    /// missing the `NodeBase` half they have always taken.
+    #[test]
+    fn the_stubs_declare_the_same_properties_the_engine_accepts() {
+        let source = meta("nodes.lua") + &meta("surfaces.lua");
+        let classes = parse_classes(&source);
+        for kind in super::NODE_KINDS {
+            let class = format!("{}Props", capitalize(kind));
+            let declared = fields_of(&classes, &class);
+            let expected: BTreeSet<String> = super::accepted_properties(kind).into_iter().map(str::to_string).collect();
+            assert_eq!(declared, expected, "lua-meta's {class} is out of step with NODE_PROPERTIES for `{kind}`");
+        }
+    }
+
+    /// Every property name the parsers actually read has to be accepted by some kind, or that
+    /// parser is dead code reading a key `deserialize_lua_table` already refused.
+    ///
+    /// One-directional on purpose: a name in the table that no parser reads yet is fine and
+    /// deliberate (`textfield`'s `on_change`/`on_submit`, typed while `zwp_text_input_v3` is
+    /// unwired). A source grep, like `supervisor/src/stubs.rs`'s used to be, because a property
+    /// name lives in a string literal and not in a type.
+    #[test]
+    fn every_property_a_parser_reads_is_accepted_by_some_kind() {
+        let accepted: BTreeSet<String> =
+            super::NODE_KINDS.iter().flat_map(|kind| super::accepted_properties(kind)).map(str::to_string).collect();
+        let mut read = BTreeSet::new();
+        for source in rust_sources(Path::new(env!("CARGO_MANIFEST_DIR")).join("src")) {
+            let text = std::fs::read_to_string(&source).expect("a source file this build compiled is readable");
+            // Below `#[cfg(test)]`, a fixture is free to name anything.
+            let production = text.split_once("\n#[cfg(test)]").map_or(text.as_str(), |(before, _)| before);
+            read.extend(property_literals(production));
+        }
+        let unreachable: Vec<&String> = read.difference(&accepted).collect();
+        assert!(
+            unreachable.is_empty(),
+            "these parsers read a property no kind accepts, so `deserialize_lua_table` refuses it first: {unreachable:?}"
+        );
+    }
+
+    /// `rect` -> `Rect`.
+    fn capitalize(name: &str) -> String {
+        let mut chars = name.chars();
+        chars.next().map(|first| first.to_ascii_uppercase().to_string() + chars.as_str()).unwrap_or_default()
+    }
+
+    /// Each `---@class Name: Parent, Parent` and its own `---@field` names.
+    fn parse_classes(source: &str) -> Vec<(String, Vec<String>, BTreeSet<String>)> {
+        let mut classes: Vec<(String, Vec<String>, BTreeSet<String>)> = Vec::new();
+        for line in source.lines() {
+            if let Some(rest) = line.strip_prefix("---@class ") {
+                let (name, parents) = match rest.split_once(':') {
+                    Some((name, parents)) => (name.trim(), parents.split(',').map(|p| p.trim().to_string()).collect()),
+                    None => (rest.trim(), Vec::new()),
+                };
+                classes.push((name.to_string(), parents, BTreeSet::new()));
+            } else if let Some(rest) = line.strip_prefix("---@field ")
+                && let Some((name, _)) = rest.split_once(char::is_whitespace)
+                && let Some(current) = classes.last_mut()
+            {
+                current.2.insert(name.trim_end_matches('?').to_string());
+            }
+        }
+        classes
+    }
+
+    /// One class's fields plus every parent's, which is what completion offers on it.
+    fn fields_of(classes: &[(String, Vec<String>, BTreeSet<String>)], name: &str) -> BTreeSet<String> {
+        let Some((_, parents, own)) = classes.iter().find(|(class, ..)| class == name) else {
+            panic!("lua-meta declares no `{name}` class");
+        };
+        let mut fields = own.clone();
+        for parent in parents {
+            fields.extend(fields_of(classes, parent));
+        }
+        fields
+    }
+
+    fn rust_sources(root: PathBuf) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    /// The two shapes a property name is written in: `properties.get("x")`, and the `"x"` a
+    /// parser taking a property name is called with (`parse_align(properties, "align_v")`).
+    fn property_literals(text: &str) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        for (index, _) in text.match_indices("properties") {
+            let rest = &text[index + "properties".len()..];
+            let head: String = rest.chars().take(40).collect();
+            let opener = match head.trim_start().chars().next() {
+                // `properties.get("x")` and its `remove`/`contains_key` siblings.
+                Some('.') => head.find('"'),
+                // `(properties, "x")`, the trailing argument of a name-taking parser.
+                Some(',') => head.find('"'),
+                _ => None,
+            };
+            let Some(quote) = opener else { continue };
+            let Some(end) = head[quote + 1..].find('"') else { continue };
+            let name = &head[quote + 1..quote + 1 + end];
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                names.insert(name.to_string());
+            }
+        }
+        names
     }
 
     /// Every `shared::CAPABILITIES` name, as a field on the `Oblisk` class.

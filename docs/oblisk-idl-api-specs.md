@@ -349,6 +349,8 @@ The Rust scene-graph engine parses layout trees built from sugar constructors. T
 
 Every node schema contains the following base layout properties.
 
+A node takes the properties its kind has a row for, and no others. A name none of them names is refused when the node is read, saying what that kind does accept: `aling_v = "Center"` used to be copied through and read by nothing, so the node silently did not centre. The same rule puts § 6.1's `layer` out of reach of a `rect`. The four § 6 surface roles take every § 5.1 base property and paint like a `rect`, so they accept `background`, `radius`, `border_color` and `border_width` too.
+
 Any property in this table or in § 5.2 accepts a `Signal` handle in place of a literal, whether or not its row spells the union out. The engine resolves the handle at layout time and then applies that property's normal rules to the result, so a `Signal` returning `"Fill"` is a valid `width` and one returning a table is the same error a literal table would be (ADR-0044). The rows that name `Signal` explicitly are the ones a config reaches for most, not the only ones allowed.
 
 | Property Name | Type | Valid Range / Options | Layout Engine Interpretation |

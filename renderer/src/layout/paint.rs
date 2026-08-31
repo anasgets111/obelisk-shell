@@ -965,7 +965,7 @@ mod tests {
         let lua = Lua::new();
         let src = r##"return panel { id = "bar", width = 200, height = 40, background = "#112233ff",
             child = rect { visible = false, background = "#ff0000ff", width = 50, height = 20,
-                   child = text { content = "hidden", foreground = "#ffffffff" } } }"##;
+                   children = { text { content = "hidden", foreground = "#ffffffff" } } } }"##;
         let list = build(&resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 }), 1.0, None);
         assert!(
             !list.commands.iter().any(|c| matches!(&c.draw, Draw::Text { content, .. } if content == "hidden")),
@@ -1012,7 +1012,7 @@ mod tests {
         let lua = Lua::new();
         let src = r##"return panel { id = "bar", width = 200, height = 40,
             child = rect { background = "#445566ff", width = 40, height = 10,
-                child = rect { background = "#778899ff", width = 500, height = 500 } } }"##;
+                children = { rect { background = "#778899ff", width = 500, height = 500 } } } }"##;
         let list = build(&resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 }), 1.0, None);
         let clips: Vec<_> = list.commands.iter().map(|c| c.clip).collect();
         for pair in clips.windows(2) {
@@ -1032,7 +1032,7 @@ mod tests {
         let lua = Lua::new();
         let src = r##"return panel { id = "bar", width = 200, height = 40,
             child = rect { background = "#445566ff", width = 0, height = 0,
-                child = text { content = "offscreen", foreground = "#ffffffff" } } }"##;
+                children = { text { content = "offscreen", foreground = "#ffffffff" } } } }"##;
         let list = build(&resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 }), 1.0, None);
         assert!(
             !list.commands.iter().any(|c| matches!(&c.draw, Draw::Text { content, .. } if content == "offscreen")),

@@ -25,19 +25,24 @@
 ---@field id? string Reconciliation hint, unique among siblings. Not addressable from Lua and has no effect on layout or paint (ADR-0045).
 ---@field hover? Signal The signal `hover(name)` returned. Marks this node's box as that slot's region.
 
----@class RectProps: NodeBase
+---The fill and the border, taken by every kind that paints as a box: `rect`, `row`, `column`,
+---`button`, and all four surface roles. `row` and `column` have no paint properties of their own
+---beyond a `rect`'s, and a surface root paints exactly like one.
+---@class BoxBase
 ---@field background? Color|Signal Omitted means no fill at all, which differs from `#00000000`: the first draws nothing, the second draws a transparent rectangle.
 ---@field radius? integer Corner rounding, default `0`.
 ---@field border_color? Color|Edges A bare string applies to all four edges. No default: an edge paints only where both a colour and a non-zero width say so.
 ---@field border_width? integer|Edges A bare number applies to all four edges. Default `0`.
+
+---@class RectProps: NodeBase, BoxBase
 ---@field children? Node[]
 
----@class RowProps: NodeBase
+---@class RowProps: NodeBase, BoxBase
 ---@field spacing? integer Pixels between siblings. A hidden child costs nothing, including its gap.
 ---@field children? Node[]
 ---@field scroll? Signal The signal `scroll(name)` returned. Makes this a viewport its children move inside.
 
----@class ColumnProps: NodeBase
+---@class ColumnProps: NodeBase, BoxBase
 ---@field spacing? integer
 ---@field children? Node[]
 ---@field scroll? Signal
@@ -57,10 +62,8 @@
 ---@field source? string|Signal An absolute path. Never a theme name; that is `icon`'s job.
 ---@field fit? "cover"|"contain"|"stretch" Default `"cover"`. An image has no intrinsic size and takes the box `width`/`height` give it.
 
----@class ButtonProps: NodeBase
+---@class ButtonProps: NodeBase, BoxBase
 ---@field children? Node[]
----@field background? Color|Signal
----@field radius? integer
 ---@field on_click? fun(rect: Rect, button: "left"|"right"|"middle") Fires on the release, and only when the release lands on the same node and the same button the press armed. A handler declaring one parameter still works.
 
 ---@class ListProps: NodeBase
@@ -80,6 +83,9 @@
 ---@field secure_submit? { capability: string, action: string } Only meaningful alongside `mask_character`; without it a masked field's value is unreadable from Lua entirely (ADR-0005, ADR-0027).
 ---@field on_change? fun(text: string) Per committed edit batch from `wp-text-input-v3`, not per keystroke.
 ---@field on_submit? fun(text?: string) Takes the committed text, except when both `mask_character` and `secure_submit` are set, when it fires with no argument.
+---@field font_size? integer Default `12`. Applies to the placeholder and to the masked content alike.
+---@field foreground? Color|Signal Default opaque white.
+---@field text_align? "Start"|"Center"|"End" Where the run sits inside the field's own box.
 
 ---@param props RectProps
 ---@return Node
