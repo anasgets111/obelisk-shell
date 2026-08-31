@@ -43,7 +43,7 @@ pub use spec::{
 pub use spec::LockSpec;
 pub use style::{
     BorderColor, parse_align, parse_background, parse_border_color, parse_border_width, parse_edge_insets, parse_radius, parse_size_mode,
-    parse_spacing, parse_visible,
+    parse_list_direction, parse_spacing, parse_visible,
 };
 pub use surface::{Anchor, KeyboardInteractivity, LayerKind, PanelSpec, SurfaceTopology, panel_spec};
 pub use toplevel::{ConstraintAdjustment, PopupAnchor, PopupSpec, SizeHint, WindowSpec, popup_spec, window_spec};

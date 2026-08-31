@@ -811,6 +811,17 @@ fn resolve_and_reconcile(
 /// § 3.2's bottom-up size resolution, per kind. An invisible child contributes nothing here (see
 /// `resolve_and_reconcile`'s doc comment on the collapse-vs-reserve-space choice) -- filtered out
 /// before the row/column sum and the stacking union.
+/// The kind whose layout `kind` actually uses. Every kind is itself except `list`, which borrows a
+/// `row`'s or a `column`'s arm depending on its `direction` (§ 5.2 item 7).
+///
+/// A `list` is a repeater, not a third layout: it reconciles children by key and then stacks them,
+/// and "stacks them" is a `column` or a `row` and nothing else. Routing to the existing arms is what
+/// keeps a horizontal list identical to a hand-built `row` in spacing, margins, alignment and
+/// stretch, rather than a second implementation that agrees with it until it does not.
+fn flow_kind<'a>(kind: &'a str, properties: &HashMap<String, Value>) -> Result<&'a str, LayoutError> {
+    if kind == "list" { node::parse_list_direction(properties) } else { Ok(kind) }
+}
+
 fn intrinsic_content_size(
     kind: &str,
     properties: &HashMap<String, Value>,
@@ -818,7 +829,7 @@ fn intrinsic_content_size(
     text_wrap_width: f32,
     shaping: &ShapingHandle,
 ) -> Result<LogicalSize, LayoutError> {
-    match kind {
+    match flow_kind(kind, properties)? {
         "text" => {
             let content = node::parse_content(properties)?;
             let font_size = node::parse_font_size(properties)?;
@@ -884,18 +895,17 @@ fn intrinsic_content_size(
         // about a list's geometry, only its reconciliation, so this is this slice's own
         // interpretation, the same way ADR-0023 item 4 labels the stacking model as one.
         //
-        // ponytail: no horizontal list. A repeated tray (icons flowing left to right) can't be
-        // expressed today, and neither upgrade path is built because both cost more than this
-        // slice needs. It has a second consumer now, `oblisk.workspaces` (docs/adr/0056),
-        // whose workspace strip is the same shape and draws as one `text` cell in `dev-config`
-        // for the same reason the tray draws one item. A `direction` property on `list` would invent API § 5.2 doesn't have --
-        // `list`'s own spec entry lists only `source`/`itemfn`/`key`. Splicing a list's generated
-        // children into its *parent's* child list -- a true repeater, which would inherit
-        // whichever direction that parent already lays out in -- conflicts with ADR-0045's "a
-        // node is identified by its position in one parent's child list": a spliced list has no
-        // single parent's child list to hold a position in, so that ADR would need amending
-        // first, not just this code.
-        "column" | "list" => {
+        // The no-horizontal-list ponytail that used to sit here is gone: `list` takes a
+        // `direction` and `flow_kind` routes it to the `row` arm above or to this one. The
+        // alternative it weighed against -- splicing a list's generated children into its
+        // *parent's* child list, so it inherits whichever direction that parent lays out in --
+        // stays rejected, and for the reason recorded then rather than for effort: ADR-0045
+        // identifies a node by its position in one parent's child list, and a spliced list has no
+        // single such list to hold a position in. `direction` needed a § 5.2 row, which it now
+        // has, and nothing else.
+        //
+        // A `list` reaches here too, when its `direction` is `Vertical`.
+        "column" => {
             let spacing = node::parse_spacing(properties)?;
             let visible: Vec<&RetainedNode> = children.iter().filter(|c| c.visible).collect();
             let height = visible
@@ -975,7 +985,7 @@ fn position_children(
         .map(|c| node::parse_edge_insets(&c.properties, "margin"))
         .collect::<Result<_, _>>()?;
 
-    match kind {
+    match flow_kind(kind, properties)? {
         "row" => {
             let spacing = node::parse_spacing(properties)?;
             let main_align = node::parse_align(properties, "align_h")?;
@@ -1011,10 +1021,9 @@ fn position_children(
                 cursor += footprints[i] + spacing;
             }
         }
-        // `list` positions exactly like `column` -- see `intrinsic_content_size`'s matching arm
-        // for why this is a labeled interpretation rather than a spec requirement, and for the
-        // no-horizontal-list ponytail.
-        "column" | "list" => {
+        // A `list` reaches here too, when its `direction` is `Vertical` -- `flow_kind` above has
+        // already turned it into one of these two names.
+        "column" => {
             let spacing = node::parse_spacing(properties)?;
             let main_align = node::parse_align(properties, "align_v")?;
             let visible_indices: Vec<usize> = children
@@ -1100,6 +1109,50 @@ pub fn overlay_input_regions(surface_root: &ResolvedNode, scale: f32) -> Vec<Phy
         .filter(|child| child.visible)
         .map(|child| snap_to_physical(child.rect, scale))
         .collect()
+}
+
+#[cfg(test)]
+mod flow_kind_tests {
+    use super::*;
+
+    fn props(lua: &mlua::Lua, direction: Option<&str>) -> HashMap<String, Value> {
+        let mut properties = HashMap::new();
+        if let Some(direction) = direction {
+            properties.insert("direction".to_string(), Value::String(lua.create_string(direction).unwrap()));
+        }
+        properties
+    }
+
+    #[test]
+    fn a_list_lays_out_as_a_column_unless_it_says_otherwise() {
+        // The default is what every config written before `direction` existed relies on.
+        let lua = mlua::Lua::new();
+        assert_eq!(flow_kind("list", &props(&lua, None)).unwrap(), "column");
+        assert_eq!(flow_kind("list", &props(&lua, Some("Vertical"))).unwrap(), "column");
+    }
+
+    #[test]
+    fn a_horizontal_list_lays_out_as_a_row() {
+        let lua = mlua::Lua::new();
+        assert_eq!(flow_kind("list", &props(&lua, Some("Horizontal"))).unwrap(), "row");
+    }
+
+    #[test]
+    fn direction_on_anything_that_is_not_a_list_is_ignored_rather_than_obeyed() {
+        // `row` and `column` already say which way they go in their own name, so a `direction` on
+        // one is a config confusing itself, not a second way to spell the kind.
+        let lua = mlua::Lua::new();
+        assert_eq!(flow_kind("column", &props(&lua, Some("Horizontal"))).unwrap(), "column");
+        assert_eq!(flow_kind("row", &props(&lua, Some("Vertical"))).unwrap(), "row");
+    }
+
+    #[test]
+    fn an_unknown_direction_is_refused_by_name() {
+        let lua = mlua::Lua::new();
+        let err = flow_kind("list", &props(&lua, Some("sideways"))).unwrap_err().to_string();
+        assert!(err.contains("sideways"), "the message has to name what was written: {err}");
+        assert!(err.contains("Horizontal"), "and what was expected: {err}");
+    }
 }
 
 #[cfg(test)]

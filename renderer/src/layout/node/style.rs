@@ -332,6 +332,26 @@ pub fn parse_align(
     }
 }
 
+/// `list.direction` (§ 5.2 item 7): `"Vertical"` (the default) or `"Horizontal"`.
+///
+/// Returns the kind whose layout a `list` borrows, because that is all the property does --
+/// `layout::scene` has one `row` arm and one `column` arm, and a `list` is routed to whichever the
+/// direction names rather than growing a third. `"Vertical"` is the default because it was the only
+/// behaviour before this existed, so no config that predates it changes shape.
+pub fn parse_list_direction(properties: &HashMap<String, Value>) -> Result<&'static str, LayoutError> {
+    let Some(value) = properties.get("direction") else {
+        return Ok("column");
+    };
+    let Value::String(s) = value else {
+        return Err(invalid("direction", format!("expected a string, got {}", preview_for_error(value))));
+    };
+    match checked_string("direction", s)?.as_str() {
+        "Vertical" => Ok("column"),
+        "Horizontal" => Ok("row"),
+        other => Err(invalid("direction", format!("unknown direction `{other}`, expected `Vertical` or `Horizontal`"))),
+    }
+}
+
 pub fn parse_visible(properties: &HashMap<String, Value>) -> Result<bool, LayoutError> {
     let Some(value) = properties.get("visible") else {
         return Ok(true);
