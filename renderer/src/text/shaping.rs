@@ -40,9 +40,29 @@ pub struct ShapeResult {
     pub height: f32,
 }
 
+/// One font file's bytes, held once and shared by every reader.
+///
+/// The inner `Arc` is `fontdb`'s: `Database::make_shared_face_data` maps the file and rewrites
+/// every face that came from it to point at the mapping, so cosmic-text (which owns the
+/// `Database`) and femtovg (which is handed this) read the same pages rather than each holding a
+/// copy. That is the whole point of the type. The bytes are `Shared_Clean` and page-cache backed,
+/// so a second process using the same font pays nothing for it, and the kernel can evict them.
+///
+/// The newtype is what femtovg's `add_shared_font_with_index` needs: it takes
+/// `T: AsRef<[u8]> + 'static` by value, and `Arc<dyn AsRef<[u8]>>` does not itself implement
+/// `AsRef<[u8]>`.
+#[derive(Clone)]
+pub struct FontData(std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>);
+
+impl AsRef<[u8]> for FontData {
+    fn as_ref(&self) -> &[u8] {
+        (*self.0).as_ref()
+    }
+}
+
 enum Request {
     Shape(ShapeRequest, mpsc::Sender<ShapeResult>),
-    FontChainBytes(mpsc::Sender<Vec<Vec<u8>>>),
+    FontChainData(mpsc::Sender<Vec<FontData>>),
     // Test-only, `#[cfg(test)]` rather than `#[allow(dead_code)]`: nothing outside a test binary
     // sends this. The production diagnostic for the resolved chain is `fonts::resolve_chain`'s
     // own `eprintln!`.
@@ -69,10 +89,12 @@ impl ShapingHandle {
         thread::Builder::new()
             .name("oblisk-text-shaping".into())
             .spawn(move || {
-                let ResolvedFonts { db, primary_family } = fonts::resolve_chain(fonts::DEFAULT_CHAIN);
-                // Read once: neither the chain nor its load order changes again for this
-                // FontSystem's lifetime.
-                let chain_bytes = font_chain_bytes(&db);
+                let ResolvedFonts { mut db, primary_family } = fonts::resolve_chain(fonts::DEFAULT_CHAIN);
+                // Mapped once, before the `Database` is handed to cosmic-text: neither the chain
+                // nor its load order changes again for this `FontSystem`'s lifetime, and doing it
+                // here is what leaves the shared mappings *in* the database for cosmic-text to
+                // find rather than mapping the same files a second time.
+                let chain_data = font_chain_data(&mut db);
                 let mut font_system = FontSystem::new_with_locale_and_db(detect_locale(), db);
                 while let Ok(request) = rx.recv() {
                     match request {
@@ -80,8 +102,8 @@ impl ShapingHandle {
                             // A dropped receiver just means the result is discarded.
                             let _ = reply.send(shape(&mut font_system, &primary_family, &req));
                         }
-                        Request::FontChainBytes(reply) => {
-                            let _ = reply.send(chain_bytes.clone());
+                        Request::FontChainData(reply) => {
+                            let _ = reply.send(chain_data.clone());
                         }
                         #[cfg(test)]
                         Request::ResolvedPrimaryFamily(reply) => {
@@ -106,13 +128,17 @@ impl ShapingHandle {
             .expect("oblisk-text-shaping worker thread died before replying")
     }
 
-    /// Returns the loaded font chain's raw bytes, in chain order -- what femtovg (no system font
-    /// discovery of its own) loads via `add_font_mem` so paint rasterizes with the same chain,
-    /// same order, that cosmic-text shaped against (`text::atlas::TextPainter::new`).
-    pub fn font_chain_bytes(&self) -> Vec<Vec<u8>> {
+    /// Returns the loaded font chain's shared bytes, in chain order -- what femtovg (no system
+    /// font discovery of its own) loads via `add_shared_font_with_index` so paint rasterizes with
+    /// the exact chain, in the exact order, that cosmic-text shaped against
+    /// (`text::atlas::TextPainter::new`).
+    ///
+    /// Cheap and repeatable: cloning `FontData` clones an `Arc`, so this no longer copies a font
+    /// file per call the way the `Vec<Vec<u8>>` it replaces did.
+    pub fn font_chain_data(&self) -> Vec<FontData> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.requests
-            .send(Request::FontChainBytes(reply_tx))
+            .send(Request::FontChainData(reply_tx))
             .expect("oblisk-text-shaping worker thread died");
         reply_rx
             .recv()
@@ -155,33 +181,56 @@ fn shape(font_system: &mut FontSystem, primary_family: &str, request: &ShapeRequ
 /// not one per face.
 ///
 /// `db.faces()` yields one `FaceInfo` per face, and a `.ttc` collection can hold many (Inter's
-/// own `Inter.ttc` on this machine has 36). `with_face_data` hands back the *whole file*'s bytes
-/// regardless of which face's `id` asked for them, so without deduping by source path, a
-/// collection entry would return the same multi-megabyte buffer once per face inside it -- 36
-/// identical copies for Inter.
+/// own `Inter.ttc` on this machine has 36). A shared mapping covers the *whole file* regardless
+/// of which face's `id` asked for it, so without deduping by source path a collection entry
+/// would appear once per face inside it -- 36 identical entries for Inter.
 ///
-/// ponytail: `femtovg::add_font_mem` takes no face index and always loads face 0 of whatever
-/// it's given (confirmed by reading femtovg's own `add_font_mem_with_index(data, 0)`), so a
-/// `.ttc`'s other 35 faces, and any weight or style declared only inside them, are unreachable
-/// through this path regardless of deduping. That's already where this codebase sits: nothing
-/// selects a weight or style anywhere today, so it costs nothing now. Reaching a face other
-/// than 0 needs `add_shared_font_with_index`, which is a real API femtovg already has -- the
-/// fix if a declared weight/style ever needs to come from inside a collection file.
-fn font_chain_bytes(db: &fontdb::Database) -> Vec<Vec<u8>> {
+/// Maps rather than reads, which is the entire memory story here. `Noto Color Emoji` is an 11MB
+/// CBDT bitmap font, and the `data.to_vec()` this replaces held it three times over: once in the
+/// worker's own `Vec<Vec<u8>>`, once again in femtovg's `add_font_mem` copy, and once more in
+/// cosmic-text's independent mapping. Measured on an idle eleven-surface session, dropping that
+/// one font from the chain cut the Renderer's private-dirty memory from 49.7MB to 22.7MB, which
+/// is what those copies cost. `make_shared_face_data` rewrites every face sharing the path to
+/// `Source::SharedFile`, so the mapping this returns is also the one cosmic-text goes on to use.
+///
+/// SAFETY: `make_shared_face_data` is `unsafe` because a font file rewritten on disk changes
+/// under the mapping, which can fault or produce nonsense glyphs. That is the same bargain
+/// cosmic-text already makes internally for every font it renders, and the alternative is paying
+/// a private copy per font per process to defend against someone editing a system font in place.
+///
+/// A face whose mapping cannot be established is skipped rather than fatal: `resolve_chain`
+/// already treats a chain entry it cannot honor as a skip, and losing the emoji font is a
+/// missing glyph, not a dead shell. Chain order survives, so `fonts[0]` is still the primary.
+///
+/// ponytail: femtovg is handed face index 0 of every file, so a `.ttc`'s other faces, and any
+/// weight or style declared only inside them, stay unreachable. Nothing selects a weight or
+/// style anywhere today, so it costs nothing now; `add_shared_font_with_index` already takes the
+/// index this would need.
+fn font_chain_data(db: &mut fontdb::Database) -> Vec<FontData> {
+    // Collected first: `make_shared_face_data` needs `&mut db`, so nothing may be borrowing it.
+    let faces: Vec<(fontdb::ID, Option<std::path::PathBuf>)> = db
+        .faces()
+        .map(|face| {
+            let path = match &face.source {
+                fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => Some(path.clone()),
+                fontdb::Source::Binary(_) => None,
+            };
+            (face.id, path)
+        })
+        .collect();
+
     let mut seen_paths = std::collections::HashSet::new();
-    let mut bytes = Vec::new();
-    for face in db.faces() {
-        // `fonts::resolve_chain` only loads through `Database::load_font_file`, which always
-        // produces `Source::File`.
-        let fontdb::Source::File(path) = &face.source else {
-            bytes.push(db.with_face_data(face.id, |data, _face_index| data.to_vec()).expect("a face just enumerated by db.faces() must have its own source data"));
+    let mut data = Vec::new();
+    for (id, path) in faces {
+        if path.is_some_and(|path| !seen_paths.insert(path)) {
             continue;
-        };
-        if seen_paths.insert(path.clone()) {
-            bytes.push(db.with_face_data(face.id, |data, _face_index| data.to_vec()).expect("a face just enumerated by db.faces() must have its own source data"));
+        }
+        match unsafe { db.make_shared_face_data(id) } {
+            Some((bytes, _face_index)) => data.push(FontData(bytes)),
+            None => eprintln!("font chain: face {id:?} could not be mapped, skipped"),
         }
     }
-    bytes
+    data
 }
 
 /// The process locale, read the way glibc's own env-var chain does: `LC_ALL`, then `LC_CTYPE`,
@@ -252,18 +301,33 @@ mod tests {
     }
 
     #[test]
-    fn font_chain_bytes_are_all_loadable_fonts() {
+    fn font_chain_data_is_all_loadable_fonts() {
         let handle = ShapingHandle::spawn();
-        let chain = handle.font_chain_bytes();
+        let chain = handle.font_chain_data();
         assert!(!chain.is_empty(), "the default chain must resolve to at least one loaded face");
-        for bytes in &chain {
-            ttf_parser::Face::parse(bytes, 0).expect("every chain entry's bytes should parse as a font face");
+        for data in &chain {
+            ttf_parser::Face::parse(data.as_ref(), 0).expect("every chain entry's bytes should parse as a font face");
+        }
+    }
+
+    /// The point of `FontData`: two calls hand back the same mapping rather than two copies of
+    /// the file. Compares the pointers the slices start at, since that is what "same pages" means
+    /// -- equal *contents* would pass just as well for the copying implementation this replaced.
+    #[test]
+    fn two_asks_for_the_font_chain_share_one_mapping() {
+        let handle = ShapingHandle::spawn();
+        let first = handle.font_chain_data();
+        let second = handle.font_chain_data();
+        assert!(!first.is_empty(), "the default chain must resolve to at least one loaded face");
+        assert_eq!(first.len(), second.len());
+        for (a, b) in first.iter().zip(second.iter()) {
+            assert_eq!(a.as_ref().as_ptr(), b.as_ref().as_ptr(), "each ask should share one mapping, not copy the file");
         }
     }
 
     #[test]
     fn the_resolved_primary_family_is_findable_among_the_loaded_chain_fonts() {
-        // Reconstructs a database from `font_chain_bytes()` -- the exact bytes
+        // Reconstructs a database from `font_chain_data()` -- the exact bytes
         // `text::atlas::TextPainter` loads into femtovg -- and queries it the way `shape()`
         // queries cosmic-text's. Comparing name records instead would pass for the wrong reason:
         // a font's `fontdb`-visible family and its raw TTF `FAMILY` record are different sources
@@ -272,8 +336,8 @@ mod tests {
         let primary_family = handle.resolved_primary_family();
 
         let mut db = fontdb::Database::new();
-        for bytes in handle.font_chain_bytes() {
-            db.load_font_data(bytes);
+        for data in handle.font_chain_data() {
+            db.load_font_data(data.as_ref().to_vec());
         }
 
         let query = fontdb::Query { families: &[fontdb::Family::Name(&primary_family)], ..Default::default() };

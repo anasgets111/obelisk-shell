@@ -13,9 +13,10 @@ use std::error::Error;
 use std::ffi::c_void;
 
 use femtovg::renderer::OpenGl;
-use femtovg::{Canvas, Color, FontId, Paint};
+use femtovg::{Canvas, Color, FontId, Paint, TextContext};
 
 use crate::layout::node::Rgba;
+use crate::text::shaping::FontData;
 
 use super::snap::{snap_to_physical, LogicalRect};
 
@@ -30,24 +31,33 @@ impl TextPainter {
     /// `load_fn` must resolve GL function pointers against a context that's already current on
     /// this thread -- FemtoVG doesn't make any context current itself.
     ///
-    /// `font_chain_bytes` is `ShapingHandle::font_chain_bytes()`'s own output, in the same chain
-    /// order cosmic-text shaped against, so measurement and paint resolve the one declared chain
-    /// rather than two independently-discovered fonts that can disagree (docs/adr/0043 decision
-    /// 2). Errors if the slice is empty -- `draw_line` cannot fall back to a font it was never
-    /// given.
+    /// `font_chain` is `ShapingHandle::font_chain_data()`'s own output, in the same chain order
+    /// cosmic-text shaped against, so measurement and paint resolve the one declared chain rather
+    /// than two independently-discovered fonts that can disagree (docs/adr/0043 decision 2).
+    /// Errors if the slice is empty -- `draw_line` cannot fall back to a font it was never given.
+    ///
+    /// Registers through a `TextContext` and `add_shared_font_with_index` rather than
+    /// `Canvas::add_font_mem`, because `add_font_mem` is `data.to_owned()` inside femtovg: it
+    /// would give the canvas a private copy of every font file and undo the sharing `FontData`
+    /// exists for. `Canvas::add_font_mem` is the only route femtovg exposes on the canvas itself,
+    /// so reaching the shared API means building the context first and handing it over.
     pub fn new(
         load_fn: impl FnMut(&str) -> *const c_void,
         width: u32,
         height: u32,
-        font_chain_bytes: &[Vec<u8>],
+        font_chain: &[FontData],
     ) -> Result<Self, Box<dyn Error>> {
-        if font_chain_bytes.is_empty() {
+        if font_chain.is_empty() {
             return Err("TextPainter::new requires at least one loaded font".into());
         }
         let renderer = unsafe { OpenGl::new_from_function(load_fn)? };
-        let mut canvas = Canvas::new(renderer)?;
+        let text_context = TextContext::default();
+        let mut canvas = Canvas::new_with_text_context(renderer, text_context.clone())?;
         canvas.set_size(width, height, 1.0);
-        let fonts = font_chain_bytes.iter().map(|bytes| canvas.add_font_mem(bytes)).collect::<Result<Vec<_>, _>>()?;
+        let fonts = font_chain
+            .iter()
+            .map(|data| text_context.add_shared_font_with_index(data.clone(), 0))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { canvas, fonts })
     }
 

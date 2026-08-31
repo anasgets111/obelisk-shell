@@ -932,12 +932,12 @@ impl App {
         }
 
         if self.text_painter.is_none() {
-            let font_chain_bytes = self.shaping.font_chain_bytes();
+            let font_chain = self.shaping.font_chain_data();
             match TextPainter::new(
                 |s| self.egl.instance.get_proc_address(s).map_or(std::ptr::null(), |f| f as *const c_void),
                 width,
                 height,
-                &font_chain_bytes,
+                &font_chain,
             ) {
                 Ok(painter) => self.text_painter = Some(painter),
                 Err(e) => {

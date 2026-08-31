@@ -731,15 +731,15 @@ mod tests {
     }
 
     /// Builds a `TextPainter` against `instance`'s already-current context -- same
-    /// `font_chain_bytes` source `paint_surface` uses, so this harness draws with the exact
+    /// `font_chain_data` source `paint_surface` uses, so this harness draws with the exact
     /// declared font chain cosmic-text shaped against (docs/adr/0043 decision 2).
     fn text_painter(instance: &egl::Instance<egl::Static>, shaping: &ShapingHandle, width: u32, height: u32) -> Option<TextPainter> {
-        let font_chain_bytes = shaping.font_chain_bytes();
+        let font_chain = shaping.font_chain_data();
         TextPainter::new(
             |s| instance.get_proc_address(s).map_or(std::ptr::null(), |f| f as *const c_void),
             width,
             height,
-            &font_chain_bytes,
+            &font_chain,
         )
         .map_err(|e| eprintln!("EGL init failed, skip: FemtoVG init: {e}"))
         .ok()
@@ -1275,14 +1275,14 @@ mod tests {
     /// roughly 30% narrower than the glyphs drawn into it.
     ///
     /// Both sides now measure/paint the exact same declared chain
-    /// (`ShapingHandle::font_chain_bytes`), so this compares cosmic-text's `shape()` against
+    /// (`ShapingHandle::font_chain_data`), so this compares cosmic-text's `shape()` against
     /// femtovg's own `measure_text` for the identical string at the identical size and asserts
     /// they land within 2% -- not exact equality, since the two shapers round glyph advances
     /// slightly differently even reading the same font file.
     ///
     /// What this actually covers, stated plainly rather than implied: it catches paint and
     /// measurement loading two *different font sets* -- confirmed real by temporarily having
-    /// `TextPainter` load `font_chain_bytes()[1..]` (dropping the chain's first entry) instead
+    /// `TextPainter` load `font_chain_data()[1..]` (dropping the chain's first entry) instead
     /// of the full chain, which produced a 61.6% divergence and failed here as expected. It does
     /// *not* catch `shape()` asking for the wrong family while both sides still load the *same*
     /// set: today's default chain resolves to exactly one Latin-covering face (`Noto Sans CJK
