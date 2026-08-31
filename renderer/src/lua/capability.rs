@@ -72,7 +72,13 @@ impl CommandSender {
     /// `1`), so it means "never hydrated in this Renderer": honest for a write before the first
     /// snapshot, and permanently correct for a capability with no state to be stale about, which
     /// is why `lock` (ADR-0052 decision 1) and `process.rs` both send it forever.
-    fn send(&self, capability: &str, action: &str, arguments: Vec<serde_json::Value>, expected_revision: u32) {
+    pub(crate) fn send(
+        &self,
+        capability: &str,
+        action: &str,
+        arguments: Vec<serde_json::Value>,
+        expected_revision: u32,
+    ) {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
         let envelope = CommandEnvelope {

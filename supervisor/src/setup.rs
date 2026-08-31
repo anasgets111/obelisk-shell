@@ -199,8 +199,10 @@ pub fn run(config_dir: &Path, force: bool) -> Result<(), Box<dyn std::error::Err
 mod tests {
     use super::*;
 
-    /// Serializes the tests that set `$XDG_DATA_HOME`, which is process-global: without this one
-    /// test's write lands between another's two reads and the failure points at the wrong thing.
+    /// Serializes every test that touches `$XDG_DATA_HOME`, which is process-global. That is not
+    /// only the tests that set it: `run` resolves its stub directory through it, so a test that
+    /// merely calls `run` reads whatever another test had set at that instant, writes the stubs
+    /// into a `tempdir` about to be deleted, and fails on a missing file it never named.
     static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -300,6 +302,7 @@ mod tests {
 
     #[test]
     fn init_writes_a_luarc_and_a_shell_lua_and_keeps_an_existing_one() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("oblisk");
         std::fs::create_dir_all(&config).unwrap();
@@ -317,6 +320,7 @@ mod tests {
 
     #[test]
     fn force_overwrites_the_starter_config() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().to_path_buf();
         std::fs::write(config.join("shell.lua"), "-- mine\n").unwrap();
@@ -328,6 +332,7 @@ mod tests {
     /// config directory and finds nothing, with no error anywhere.
     #[test]
     fn the_generated_luarc_points_at_an_absolute_stub_directory() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         run(dir.path(), false).unwrap();
         let luarc: serde_json::Value =

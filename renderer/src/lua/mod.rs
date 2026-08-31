@@ -7,6 +7,7 @@
 //! and every Supervisor-triggered `Reevaluate` round trip call it.
 pub mod capability;
 pub mod fonts;
+pub mod idle;
 pub mod json;
 pub mod marshal;
 pub mod namespace;
@@ -16,6 +17,7 @@ pub mod signal;
 pub mod surfaces;
 
 pub use nodes::VirtualNode;
+use std::cell::RefCell;
 
 use mlua::{Lua, Table, Value};
 
@@ -93,6 +95,11 @@ fn point_package_path_at(lua: &Lua, config_dir: &std::path::Path) -> mlua::Resul
 /// -- each call is a fresh evaluation of its `source` argument, not an incremental re-run.
 pub struct Loader {
     lua: Lua,
+    /// `oblisk.idle`'s threshold registrations, cleared before every evaluation. `Option` because
+    /// `Loader::new` runs before `lua::namespace::build`, which is what creates the registry, and
+    /// `RefCell` because registering it is the one thing that happens to a `Loader` after
+    /// construction. A `Loader` with none is a test fixture that never built a namespace.
+    idle: RefCell<Option<idle::IdleRegistry>>,
     /// The `package.loaded` keys the standard library occupies, captured before any config has
     /// run -- the allowlist [`Loader::forget_config_modules`] subtracts from. Captured rather than
     /// hardcoded so a change to [`config_stdlib`] cannot leave a name behind to be evicted as if a
@@ -151,7 +158,7 @@ impl Loader {
         fonts::register(&lua)?;
         signal::register(&lua, dirty)?;
         let standard_modules = loaded_module_names(&lua)?;
-        Ok(Loader { lua, standard_modules })
+        Ok(Loader { lua, standard_modules, idle: RefCell::new(None) })
     }
 
     /// Evaluates `source` directly, under a generic `shell.lua` chunk name. Test-only: production
@@ -180,6 +187,10 @@ impl Loader {
     /// right where the filename would be.
     fn evaluate_named(&self, source: &str, name: &str) -> Result<LoadOutput, LoaderError> {
         self.forget_config_modules()?;
+        // The callbacks belong to the tree this evaluation replaces (`lua::idle`'s module doc).
+        if let Some(idle) = self.idle.borrow().as_ref() {
+            idle.forget_thresholds();
+        }
         let value: Value = self.lua.load(source).set_name(format!("@{name}")).eval()?;
         Ok(LoadOutput { surfaces: collect_surfaces(value)? })
     }
@@ -209,6 +220,14 @@ impl Loader {
     /// through [`Self::set_global`]/[`Self::create_table`] alone.
     pub fn register_process(&self, registry: process::ProcessRegistry) -> mlua::Result<()> {
         process::register(&self.lua, registry)
+    }
+
+    /// Hands this `Loader` the `oblisk.idle` registry `lua::namespace::build` just created, so
+    /// [`Self::evaluate_file`] can drop its threshold callbacks before re-running `shell.lua`.
+    /// Registering the Lua-side member is the namespace's job, not this one's: `oblisk.idle` is a
+    /// field on that table, unlike `process`, which is a global.
+    pub(crate) fn register_idle(&self, registry: idle::IdleRegistry) {
+        *self.idle.borrow_mut() = Some(registry);
     }
 
     /// Converts a JSON value into the equivalent Lua value, on this `Loader`'s own `Lua` state (a
@@ -393,6 +412,34 @@ mod tests {
             accent(&second),
             "second",
             "the re-evaluation ran against the cached module, so the edit did nothing"
+        );
+    }
+
+    /// The idle half of the same rule. The callbacks belong to the tree the evaluation replaces,
+    /// so an in-place reload that kept them would run the previous config's `on_idle` too, once
+    /// more per reload, forever (`lua::idle`).
+    #[test]
+    fn a_re_evaluation_drops_the_idle_thresholds_the_previous_one_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = Loader::new(signal::DirtyFlag::new(), dir.path()).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let registry = idle::IdleRegistry::new(capability::CommandSender::new(0, tx));
+        loader.set_global("idle", registry.member()).unwrap();
+        loader.register_idle(registry.clone());
+        let source = r#"
+            runs = (runs or 0)
+            idle:register_threshold(30, function() runs = runs + 1 end, function() end)
+            return panel { id = "bar", layer = "Top" }
+        "#;
+
+        loader.evaluate(source).unwrap();
+        loader.evaluate(source).unwrap();
+        registry.dispatch_event(30, shared::IdleState::Idled);
+
+        assert_eq!(
+            loader.lua().load("return runs").eval::<i64>().unwrap(),
+            1,
+            "the second evaluation stacked a second copy of the callback on the same threshold"
         );
     }
 

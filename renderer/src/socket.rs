@@ -202,6 +202,9 @@ pub struct RendererClient {
     /// [`Self::set_rescue_state`] can tell a real change from a no-op rewrite.
     rescue_state: (bool, String),
     process_registry: ProcessRegistry,
+    /// `oblisk.idle`'s threshold callbacks (docs/adr/0032). Renderer-sourced like
+    /// `screens_handle`, so deliberately not in `capabilities` -- see `lua::idle`.
+    idle_registry: crate::lua::idle::IdleRegistry,
     /// The scene-dirty flag (ADR-0044 decision 2). Cloned into every `LiveSignalHandle` this
     /// client hands out, so a `set` on any of them marks this same flag.
     dirty: DirtyFlag,
@@ -284,6 +287,7 @@ impl RendererClient {
             // Matches the table `lua::namespace::build` already put in the `rescue` signal.
             rescue_state: (false, String::new()),
             process_registry,
+            idle_registry: namespace.idle,
             dirty,
             state: ReloadState { applied_topology: None, applied_output: None, pending: None },
             outbound_tx,
@@ -596,14 +600,11 @@ impl RendererClient {
             // down again -- lives on `crate::wayland::App` (docs/adr/0042, docs/adr/0052
             // decision 1), which also owns the tracked surface set this decision needs.
             SupervisorFrame::SetSessionLock(SetSessionLock { locked }) => return FrameOutcome::SetSessionLock(locked),
-            SupervisorFrame::IdleEvent(IdleEvent { generation_id, threshold_sec, state }) => {
-                // No Lua-side `register_threshold` callback registry exists yet to dispatch this
-                // to -- ADR-0032's Supervisor-side controller and wire types are that slice's
-                // scope; the Renderer-side callback lookup is a later phase.
-                eprintln!(
-                    "control-socket client: IdleEvent(generation={generation_id}, threshold_sec={threshold_sec}, state={state:?}) \
-                     received (no Lua callback registry wired yet)"
-                );
+            // `generation_id` is not checked: the Supervisor fans an event out to the generations
+            // that registered the threshold and writes it down this generation's own socket, so a
+            // frame arriving here is already addressed to this process (docs/adr/0032).
+            SupervisorFrame::IdleEvent(IdleEvent { generation_id: _, threshold_sec, state }) => {
+                self.idle_registry.dispatch_event(threshold_sec, state);
             }
         }
         FrameOutcome::Handled

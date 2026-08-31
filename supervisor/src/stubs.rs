@@ -361,9 +361,30 @@ function Capability:invoke(command, ...) end
 "#;
 
 const RENDERER_SOURCED: &str = r#"
---- Renderer-sourced members ---------------------------------------------------------------------
--- Not capabilities and not in `shared::CAPABILITIES`: these come from the renderer's own state, so
--- they carry no commands and are written by hand rather than derived from a payload struct.
+--- Off-roster members ---------------------------------------------------------------------------
+-- Not capabilities and not in `shared::CAPABILITIES`, so they have no payload struct to derive
+-- from and are written by hand. `Screen` and `RescueState` come from the renderer's own state.
+-- `Idle` is the other direction: a supervisor service that pushes no state at all, because an idle
+-- threshold crossing is an event, not something to read (ADR-0032).
+
+---@class Idle
+local Idle = {}
+
+---Runs `on_idle` after `seconds` without input on the seat, and `on_resume` when input returns.
+---Registrations do not survive a config reload, which re-runs `shell.lua` and drops them, so
+---register at the top level rather than inside a callback that fires more than once.
+---@param seconds integer
+---@param on_idle fun()
+---@param on_resume fun()
+function Idle:register_threshold(seconds, on_idle, on_resume) end
+
+---Holds off idle actions system-wide (logind `Inhibit`, `what="idle"`) until a matching
+---`release_inhibit`. Counted, so two holders need two releases and neither cancels the other.
+---@param reason string Shown by `loginctl list-inhibitors`.
+function Idle:inhibit(reason) end
+
+---Releases one `inhibit` hold.
+function Idle:release_inhibit() end
 
 ---@class Screen
 ---@field name string Matches a surface's `monitor`.
@@ -382,7 +403,8 @@ const RENDERER_SOURCED: &str = r#"
 ---@field patch integer
 "#;
 
-const OBLISK_TAIL: &str = r#"---@field screens Signal A `Screen[]`. Renderer-sourced, seeded to an empty list, and the one signal with a value at first evaluation (ADR-0041).
+const OBLISK_TAIL: &str = r#"---@field idle Idle Idle thresholds and the inhibit pair. Methods only, no state to read (ADR-0032).
+---@field screens Signal A `Screen[]`. Renderer-sourced, seeded to an empty list, and the one signal with a value at first evaluation (ADR-0041).
 ---@field rescue Signal A `RescueState`. Renderer-sourced, no commands (ADR-0046).
 ---@field version ObliskVersion Three integers a config can compare. Not a signal.
 ---@field config_dir string The directory `shell.lua` was loaded from, so a config can name a file it ships beside itself. Not a signal.

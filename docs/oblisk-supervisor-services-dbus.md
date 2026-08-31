@@ -137,6 +137,14 @@ To provide complete design freedom to the user, Oblisk rejects hardcoded inactiv
     *   The Renderer looks up the registered callback and executes `on_idle()` instantly.
     *   When user input is resumed on the seat, `resumed` triggers and executes `on_resume()`.
 *   This architecture allows Lua to register unlimited custom thresholds (e.g. dim backlight after 30s, lock screen after 5m, DPMS sleep after 10m) with zero active timers or polling loops.
+*   Registrations do not outlive an evaluation. Re-running `shell.lua` drops every callback the previous one registered, because they belong to the tree being replaced; the Supervisor keeps its listener, and re-registering the same duration is a no-op there.
+*   Two registrations for the same duration are one Wayland listener and two callbacks. The Supervisor allocates per distinct duration and fans out; the event names the threshold, not the registration.
+
+### 7.2 Idle Inhibit
+*   `idle:inhibit(reason)` and `idle:release_inhibit()` hold off auto-suspend-on-idle through `org.freedesktop.login1.Manager.Inhibit(what="idle", mode="block")`, on the system bus the Supervisor already has (ADR-0032). Not the Wayland `idle-inhibit-unstable-v1` protocol, which inhibits per surface and would need the Renderer to own it.
+*   The hold is a counted, per-generation reference on one logind fd: the fd opens on the 0-to-1 transition and closes on 1-to-0, so a media player and a presentation mode can both hold it without either release killing the other.
+*   logind closes the fd if the holding process dies, so a Supervisor crash cannot leak a stuck inhibit.
+*   Notify degrading to inert (no `ext_idle_notifier_v1`, a failed dedicated connection, a setup timeout) does not disable inhibit. The two halves share a controller, not a transport.
 
 ---
 

@@ -236,12 +236,14 @@ mod meta_stub_tests {
         // The `---@field` block under `---@class Oblisk`, which is the namespace a config sees.
         // Split on the trailing newline too, or this matches `---@class ObliskVersion` first.
         let class = source.split("---@class Oblisk\n").nth(1).expect("oblisk.lua declares an Oblisk class");
-        let renderer_sourced = ["screens", "rescue", "version", "config_dir"];
+        // The `oblisk` table's off-roster members, which have no `StateSnapshot` behind them and
+        // so no roster entry: see `lua::namespace::build` and `lua::idle`.
+        let off_roster = ["idle", "screens", "rescue", "version", "config_dir"];
         let declared: BTreeSet<&str> = class
             .lines()
             .take_while(|line| line.starts_with("---@field"))
             .filter_map(|line| line.split_whitespace().nth(1))
-            .filter(|name| !renderer_sourced.contains(name))
+            .filter(|name| !off_roster.contains(name))
             .collect();
         let expected: BTreeSet<&str> = shared::CAPABILITIES.iter().copied().collect();
         assert_eq!(declared, expected, "lua-meta/oblisk.lua is out of step with shared::CAPABILITIES");

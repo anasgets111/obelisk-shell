@@ -10,6 +10,7 @@ use std::path::Path;
 
 use crate::lua::Loader;
 use crate::lua::capability::{Capability, CapabilityHandle, CommandSender};
+use crate::lua::idle::IdleRegistry;
 use crate::lua::signal::{DirtyFlag, LiveSignalHandle};
 
 /// One generation's built `oblisk` table, plus the handles its owner needs to keep writing to
@@ -19,13 +20,16 @@ pub(crate) struct Namespace {
     /// One handle per `shared::CAPABILITIES` name, for `StateSnapshot` pushes to hydrate.
     pub(crate) capabilities: HashMap<String, CapabilityHandle>,
     pub(crate) rescue: LiveSignalHandle,
+    /// `oblisk.idle`'s registry, kept so an inbound `SupervisorFrame::IdleEvent` can find the
+    /// callbacks the config registered for that threshold.
+    pub(crate) idle: IdleRegistry,
     pub(crate) screens: LiveSignalHandle,
     /// The value `screens` currently holds, so a later output change can diff against it.
     pub(crate) screens_payload: serde_json::Value,
 }
 
 /// Builds the whole `oblisk` namespace: every `shared::CAPABILITIES` roster name, the two
-/// Renderer-sourced signals `rescue` and `screens`, `version`, and `config_dir`.
+/// Renderer-sourced signals `rescue` and `screens`, `idle`, `version`, and `config_dir`.
 ///
 /// **Every roster name is pre-seeded here**, not left to a lazy path, so a `shell.lua` reading any
 /// rostered capability before its first push gets a live signal reading `nil` instead of an
@@ -48,6 +52,12 @@ pub(crate) fn build(
         table.set(*capability, member)?;
         capabilities.insert((*capability).to_string(), handle);
     }
+    // Off-roster like `rescue` and `screens`, but for the opposite reason: those are Renderer
+    // state the Supervisor never pushes, and idle is a Supervisor service that pushes nothing --
+    // its events are threshold crossings, not state. See `lua::idle`.
+    let idle = IdleRegistry::new(commands.clone());
+    table.set("idle", idle.member())?;
+    loader.register_idle(idle.clone());
     let rescue = register_rescue_signal(loader, &table, dirty.clone())?;
     // Seeded to an empty list (not `nil`) so a config looping over `oblisk.screens` iterates zero
     // times rather than erroring, and set through `new_live`'s initial value rather than a `set` so
@@ -62,7 +72,7 @@ pub(crate) fn build(
     table
         .set("config_dir", shell_lua_path.parent().map(|dir| dir.to_string_lossy().into_owned()).unwrap_or_default())?;
     loader.set_global("oblisk", table.clone())?;
-    Ok(Namespace { table, capabilities, rescue, screens, screens_payload })
+    Ok(Namespace { table, capabilities, rescue, idle, screens, screens_payload })
 }
 
 /// `oblisk.rescue` (§ 2.10). Returns the handle so later evaluations can update it.
