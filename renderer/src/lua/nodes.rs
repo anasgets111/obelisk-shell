@@ -186,3 +186,52 @@ mod tests {
         assert_eq!(table.get::<String>("id").unwrap(), "screen-lock");
     }
 }
+
+/// The lua-language-server stubs in `dev-config/lua-meta/` are hand-written, so they drift the
+/// first time someone adds a node kind or a capability and forgets them. Nothing else notices: a
+/// stale stub compiles, passes clippy, and only shows up as a missing completion months later.
+///
+/// These two tests are the cheap guard. They check the *roster*, not the fields, which is the
+/// drift that actually happens. Field-level accuracy stays a human's job until a generator earns
+/// its keep, and the upgrade path is emitting LuaCATS from the supervisor's `Serialize` structs,
+/// which are what actually cross the socket.
+#[cfg(test)]
+mod meta_stub_tests {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    fn meta(file: &str) -> String {
+        let path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/lua-meta").join(file);
+        std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{} is missing or unreadable: {err}", path.display()))
+    }
+
+    /// Every name a config can call as a node constructor, declared exactly once.
+    #[test]
+    fn the_stubs_declare_every_node_kind_and_no_others() {
+        let source = meta("nodes.lua") + &meta("surfaces.lua");
+        let declared: BTreeSet<&str> = source
+            .lines()
+            .filter_map(|line| line.strip_prefix("function ")?.split('(').next())
+            .collect();
+        let expected: BTreeSet<&str> = super::NODE_KINDS.iter().copied().collect();
+        assert_eq!(declared, expected, "dev-config/lua-meta is out of step with NODE_KINDS");
+    }
+
+    /// Every `shared::CAPABILITIES` name, as a field on the `Oblisk` class.
+    #[test]
+    fn the_stubs_declare_every_capability_and_no_others() {
+        let source = meta("oblisk.lua");
+        // The `---@field` block under `---@class Oblisk`, which is the namespace a config sees.
+        // Split on the trailing newline too, or this matches `---@class ObliskVersion` first.
+        let class = source.split("---@class Oblisk\n").nth(1).expect("oblisk.lua declares an Oblisk class");
+        let renderer_sourced = ["screens", "rescue", "version", "config_dir"];
+        let declared: BTreeSet<&str> = class
+            .lines()
+            .take_while(|line| line.starts_with("---@field"))
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .filter(|name| !renderer_sourced.contains(name))
+            .collect();
+        let expected: BTreeSet<&str> = shared::CAPABILITIES.iter().copied().collect();
+        assert_eq!(declared, expected, "dev-config/lua-meta/oblisk.lua is out of step with shared::CAPABILITIES");
+    }
+}

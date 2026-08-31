@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/LuaLS/vscode-lua/master/setting/schema.json",
+  "runtime.version": "Lua 5.4",
+  "runtime.path": ["dev-config/oblisk/?.lua", "dev-config/oblisk/?/init.lua"],
+  "runtime.pathStrict": true,
+  "runtime.builtin": {
+    "io": "disable",
+    "debug": "disable",
+    "os": "disable",
+    "jit": "disable",
+    "ffi": "disable"
+  },
+  "workspace.library": ["dev-config/lua-meta"],
+  "workspace.checkThirdParty": false
+}
