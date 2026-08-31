@@ -21,7 +21,7 @@ pub use zeroize::{Zeroize, Zeroizing};
 /// is deliberately absent: it's event-shaped, not snapshot state (ADR-0032).
 pub const CAPABILITIES: &[&str] = &[
     "audio", "network", "bluetooth", "tray", "notifications", "mpris", "sysinfo", "keyboard", "privacy", "updates", "lock", "battery", "system",
-    "brightness", "workspaces", "power",
+    "brightness", "workspaces", "power", "applications",
 ];
 
 /// Guarded JSON-RPC 2.0 envelope wrapping a Lua write action.

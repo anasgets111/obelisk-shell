@@ -1,3 +1,4 @@
+mod applications;
 mod audio;
 mod dbus;
 mod generation;
@@ -18,9 +19,10 @@ mod workspaces;
 
 use std::collections::HashMap;
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use applications::{ApplicationsController, ApplicationsSignal};
 use dbus::bluetooth::{self, BluetoothController, BluetoothSignal};
 use dbus::network::{self, NetworkController, NetworkSignal};
 use dbus::notifications::{self, NotificationsController, NotificationsSignal};
@@ -286,6 +288,18 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
         system_signal_tx,
     );
 
+    // applications capability (docs/adr/0061): the installed `.desktop` entries. Scans in the
+    // background from construction, so this returns before the first surface is up.
+    let (applications_signal_tx, mut applications_signals) = tokio::sync::mpsc::unbounded_channel::<ApplicationsSignal>();
+    let applications = ApplicationsController::new(
+        applications::application_dirs(
+            std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+            std::env::var("XDG_DATA_DIRS").ok(),
+            Path::new(&std::env::var_os("HOME").unwrap_or_else(|| std::ffi::OsString::from("/"))),
+        ),
+        applications_signal_tx,
+    );
+
     // lock capability (docs/adr/0042, docs/adr/0052): the Renderer holds ext_session_lock_v1 and
     // paints it; this side owns the decision to take it. The channel exists because the
     // controller must not cache the authoritative generation id -- a swap reassigns it.
@@ -515,6 +529,10 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                 let state = power.snapshot();
                 push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "power", &state);
             }
+            Some(ApplicationsSignal::Changed) = applications_signals.recv() => {
+                let state = applications.snapshot();
+                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "applications", &state);
+            }
             Some(SystemSignal::Changed) = system_signals.recv() => {
                 // The only capability pushing on a timer, once per wall-clock second (docs/adr/
                 // 0053 decision 2) -- emitted only when the epoch second actually changed.
@@ -633,6 +651,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     "updates" => updates::dispatch(&updates, &envelope),
                     "notifications" => notifications::dispatch(&notifications, &envelope),
                     "lock" => lock::dispatch(&lock, &envelope),
+                    "applications" => applications::dispatch(&applications, &envelope),
                     _ => eprintln!("inbound command from generation {}: {:?}", inbound.generation_id, envelope),
                 },
                 RendererFrame::ReadySignal(_) | RendererFrame::PresentationEvidence(_) => {
