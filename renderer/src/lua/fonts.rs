@@ -1,5 +1,5 @@
 //! The `fonts { ... }` declaration: which font families this shell measures and paints with
-//! (docs/adr/0043 decision 2).
+//! (ADR-0043 decision 2).
 //!
 //! A global that records rather than a value the config returns, because `shell.lua` returns an
 //! array of surfaces and there is no slot in it for something that is not one. That puts this in

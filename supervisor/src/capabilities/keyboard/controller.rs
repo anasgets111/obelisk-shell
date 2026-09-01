@@ -217,7 +217,7 @@ async fn resolve_backlight(
 /// Picks the keyboard-like evdev device (the first one, in `evdev::enumerate()`'s order,
 /// whose LED capability set includes `LED_CAPSL`) and returns it still open. Not unit-tested
 /// against fake data: `evdev::enumerate()` scans real `/dev/input` device nodes, verified only
-/// by live testing on this dev machine (docs/adr/0034).
+/// by live testing on this dev machine (ADR-0034).
 fn find_keyboard_led_device() -> Option<evdev::Device> {
     evdev::enumerate()
         .find(|(_, device)| device.supported_leds().is_some_and(|leds| leds.contains(evdev::LedCode::LED_CAPSL)))

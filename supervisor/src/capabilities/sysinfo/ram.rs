@@ -1,7 +1,7 @@
-//! `ram_percent`/`swap_percent` sourcing: `/proc/meminfo` (docs/adr/0035).
+//! `ram_percent`/`swap_percent` sourcing: `/proc/meminfo` (ADR-0035).
 
 /// The four `/proc/meminfo` fields `ram_percent`/`swap_percent` need. `mem_available` is used
-/// as-is (docs/adr/0035: the kernel's own considered-free estimate, not reinvented from `Buffers`/`Cached`).
+/// as-is (ADR-0035: the kernel's own considered-free estimate, not reinvented from `Buffers`/`Cached`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemInfo {
     pub mem_total: u64,

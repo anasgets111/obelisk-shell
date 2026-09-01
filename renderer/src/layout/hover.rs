@@ -1,4 +1,4 @@
-//! Which `hover` signals a pointer position turns on, and which it turns off (docs/adr/0062).
+//! Which `hover` signals a pointer position turns on, and which it turns off (ADR-0062).
 //!
 //! Pure, and a module rather than three functions inside `crate::wayland` for [`super::hit`]'s
 //! reason: everything else on the pointer path needs a live `wl_pointer` and a live `wl_surface`,
@@ -36,7 +36,7 @@ pub struct HoverWrite {
 /// tooltip has to close. Invisible nodes are walked for the same reason: a node that went invisible
 /// while the pointer was inside it still owns a signal reading true.
 ///
-/// **On the path, not the innermost node** (docs/adr/0062 decision 5). [`hit::hit_path`] already
+/// **On the path, not the innermost node** (ADR-0062 decision 5). [`hit::hit_path`] already
 /// applies the three rules that matter -- containment gates descent, the topmost child wins, a node
 /// that is not visible is not entered -- so a `pill` wrapping a `button` wrapping a `text` reports
 /// all three as hovered, which is what a config binding the pill's own signal needs.
@@ -75,7 +75,7 @@ fn collect(node: &ResolvedNode, path: &[&ResolvedNode], writes: &mut Vec<HoverWr
 /// The `Signal` behind a node's `hover` property, or `None` if it has none.
 ///
 /// The property arrives unresolved because `layout::node::is_structural_property` says so
-/// (docs/adr/0062 decision 3), so what is in the slot is the handle itself. Anything else in it --
+/// (ADR-0062 decision 3), so what is in the slot is the handle itself. Anything else in it --
 /// a string, a bare boolean, a `state()` signal -- yields `None` here and is silently inert rather
 /// than an error: `crate::wayland`'s writer is the wrong place to fail a config, and
 /// `Signal::hover_handle` refuses the kinds this must not write anyway.
@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn an_ancestor_of_the_node_under_the_pointer_is_hovered_too() {
-        // docs/adr/0062 decision 5, and the case every module in `dev-config` is: a `pill` is a
+        // ADR-0062 decision 5, and the case every module in `dev-config` is: a `pill` is a
         // `row` wrapping a `button` wrapping a `text`, and the signal a config binds hangs off the
         // outermost of the three. Innermost-only hover would report false for all of them.
         let lua = Lua::new();

@@ -1,5 +1,5 @@
 //! Notifications capability (`oblisk.notifications`, docs/oblisk-supervisor-services-dbus.md §1;
-//! docs/oblisk-idl-api-specs.md §2.7/§3.2; docs/adr/0033). Hosts `org.freedesktop.Notifications`
+//! docs/oblisk-idl-api-specs.md §2.7/§3.2; ADR-0033). Hosts `org.freedesktop.Notifications`
 //! on its own session-bus connection, backed by a 100-item FIFO queue (`notifications.feed` is a
 //! most-recent-20 view over it), a Supervisor-global do-not-disturb toggle, and a Lua-configured
 //! per-urgency sound registry played back through a dedicated PipeWire playback thread. A

@@ -66,7 +66,7 @@ pub fn parse_seek_relative_args(arguments: &[serde_json::Value]) -> Option<(Stri
     Some((id, off))
 }
 
-/// No `events` field, unlike `TrayController` (docs/adr/0031): every write action here
+/// No `events` field, unlike `TrayController` (ADR-0031): every write action here
 /// (`control`/`seek`/`seek_relative`) issues its real D-Bus call and returns without ever
 /// self-sending a signal (ADR-0036's "state flows through the signal, not the write call")
 /// -- the next real player event is what triggers the next push.

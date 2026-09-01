@@ -66,7 +66,7 @@ pub(crate) fn secure_submit_targets(tree: &ResolvedNode) -> Vec<SecureSubmitTarg
 ///
 /// Exactly one, deliberately: with two `secure_submit` fields there is no non-arbitrary answer to
 /// "whose password is this?", the guess `wayland::input`'s `submit_frame_for` already refuses to
-/// make (docs/adr/0050 decision 4). Zero is the same answer. Both cases leave focus alone for a
+/// make (ADR-0050 decision 4). Zero is the same answer. Both cases leave focus alone for a
 /// press to decide, which buys the single-field case: every lock screen and password prompt.
 pub(crate) fn sole_secure_submit(tree: &ResolvedNode) -> Option<SecureSubmitTarget> {
     let mut targets = secure_submit_targets(tree);
@@ -86,7 +86,7 @@ pub(crate) fn sole_secure_submit(tree: &ResolvedNode) -> Option<SecureSubmitTarg
 /// Sole-and-unlocking is the right rule, not merely the stricter one: `any` is not implementable
 /// as a focus rule at all, since with two destinations there is no non-arbitrary answer to "whose
 /// password is this?" (the guess `wayland::input`'s `submit_frame_for` already refuses to make,
-/// docs/adr/0050 decision 4). So the focus rule stays, and admission moves to meet it.
+/// ADR-0050 decision 4). So the focus rule stays, and admission moves to meet it.
 pub(crate) fn tree_can_authenticate(tree: &ResolvedNode) -> bool {
     sole_secure_submit(tree).as_ref().is_some_and(unlocks_the_session)
 }
@@ -111,7 +111,7 @@ pub(crate) fn tree_can_authenticate(tree: &ResolvedNode) -> bool {
 /// empty set fails.
 ///
 /// **Restyling a live lock screen must keep working**, which is why the veto asks the narrowest
-/// possible question rather than freezing the tree (docs/adr/0052 decision 2).
+/// possible question rather than freezing the tree (ADR-0052 decision 2).
 ///
 /// The predicate is [`tree_can_authenticate`], not a copy of it: a second opinion about what makes
 /// a lock screen usable is how a lock gets granted against a rule the keyboard does not follow.
@@ -140,7 +140,7 @@ pub(crate) fn lock_stays_authenticatable(
         format!(
             "this evaluation leaves the locked session's `lock` surfaces {locks:?} with no single `textfield` carrying \
              `secure_submit = {{ capability = \"lock\", action = \"authenticate\" }}`, so the locked session would have no way back in \
-             but a VT switch; the reload was refused and the lock screen that is on screen still stands (§ 6.4, docs/adr/0052 decision 3)"
+             but a VT switch; the reload was refused and the lock screen that is on screen still stands (§ 6.4, ADR-0052 decision 3)"
         ),
     ))
 }

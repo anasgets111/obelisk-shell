@@ -18,10 +18,10 @@ use crate::lua::{LoadOutput, Loader, LoaderError};
 /// § 6.2/6.3's properties become requests that raise protocol errors -- a zero `anchor_rect`
 /// answers `invalid_positioner`, a `max_size` under a `min_size` answers `invalid_size` -- and a
 /// protocol error kills the whole connection. A config typo must be a `layout::node::LayoutError`
-/// at evaluation instead, landing in `rescue`'s `error_log` (§ 2.10, docs/adr/0046).
+/// at evaluation instead, landing in `rescue`'s `error_log` (§ 2.10, ADR-0046).
 ///
 /// **This is an evaluation-time, literal-only fast-fail, not the authoritative spec** for the two
-/// roles whose properties are meant to move (docs/adr/0049's second amendment): a `Signal` in a
+/// roles whose properties are meant to move (ADR-0049's second amendment): a `Signal` in a
 /// `window`'s `title` or a `popup`'s `anchor_rect` is **skipped** rather than rejected
 /// (`layout::node::is_deferred_signal`), carrying that parser's placeholder in its place; a
 /// *literal* is validated here in full. `crate::wayland::App::apply_resolved_state` builds the
@@ -32,7 +32,7 @@ use crate::lua::{LoadOutput, Loader, LoaderError};
 ///
 /// What *is* authoritative here is the roster and the fingerprint: which surfaces were declared,
 /// in what order, with what role. **§ 6.4's `lock` is authoritative here in full, and it is the
-/// only role that is** (docs/adr/0052 decision 2): `id` is structural and `child` is the scene's
+/// only role that is** (ADR-0052 decision 2): `id` is structural and `child` is the scene's
 /// to walk, so [`lock_spec`](layout::node::lock_spec) consults `is_deferred_signal` nowhere.
 pub(crate) fn surface_specs(output: &LoadOutput) -> Result<Vec<SurfaceSpec>, LoaderError> {
     let invalid = |err: layout::node::LayoutError| LoaderError::InvalidTopology(err.to_string());
@@ -76,7 +76,7 @@ pub(crate) fn surface_specs(output: &LoadOutput) -> Result<Vec<SurfaceSpec>, Loa
 }
 
 // ponytail: this top-level evaluation is uncapped, unlike a `computed`/`map` closure's 5ms hook
-// (docs/adr/0021). docs/adr/0039 accepts this: a slow evaluation blocks the Wayland dispatch
+// (ADR-0021). ADR-0039 accepts this: a slow evaluation blocks the Wayland dispatch
 // thread it runs on, with no configure handling and no way to set `app.exit` until it returns --
 // `while true do end` in `shell.lua` wedges the whole process. Upgrade path: extend ADR-0021's
 // hook to cover `Loader::evaluate_file` itself, not just the closures it registers.

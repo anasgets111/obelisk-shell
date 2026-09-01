@@ -164,7 +164,7 @@ pub fn compute_master<'a>(
 /// The inverse of [`master_volume_from_props`]'s cube root, spread across `channels` channels.
 /// PipeWire stores `channelVolumes` cubed, so a linear `0.3` a config asks for is written as
 /// `0.027`; skipping this writes 30% as 67%, the same conversion the read direction already got
-/// wrong once (docs/adr/0053).
+/// wrong once (ADR-0053).
 ///
 /// `linear` is clamped to `[0.0, 1.0]` here, not at the parse: § 3.2 states the range and this is
 /// the one function whose output leaves the process.

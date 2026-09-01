@@ -38,7 +38,7 @@ pub(super) fn largest_valid_pixmap(pixmaps: &[IconPixmap]) -> Option<&IconPixmap
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum IconSource {
-    /// `IconName` named a file inside the item's own `IconThemePath` (docs/adr/0074). Wins over
+    /// `IconName` named a file inside the item's own `IconThemePath` (ADR-0074). Wins over
     /// [`Self::Name`], because a name that resolved to a concrete file has no business being looked
     /// up again in a session theme that has never heard of it.
     ThemePathFile(String),
@@ -52,7 +52,7 @@ pub(super) enum IconSource {
 }
 
 /// The file `icon_name` names inside the item's own `IconThemePath`, or `None` when the item
-/// declares no such directory or holds no such file (docs/adr/0074).
+/// declares no such directory or holds no such file (ADR-0074).
 ///
 /// Three spellings tried, because the spec says only "a directory of icons" and leaves the layout
 /// to the application: the bare name for a name that already carries its extension, then `.png` and
@@ -120,7 +120,7 @@ fn encode_argb32_to_png(width: u32, height: u32, argb: &[u8]) -> Result<Vec<u8>,
 ///
 /// `filename_stem` is the item's sanitized unique name for its base icon and that plus a variant
 /// suffix for the other two, so an item's attention and overlay pixmaps do not overwrite each other
-/// or the icon they sit beside (docs/adr/0074).
+/// or the icon they sit beside (ADR-0074).
 pub(super) fn write_icon_png(filename_stem: &str, pixmap: &IconPixmap) -> std::io::Result<String> {
     let png_bytes = encode_argb32_to_png(pixmap.width as u32, pixmap.height as u32, &pixmap.bytes)
         .map_err(std::io::Error::other)?;
@@ -131,7 +131,7 @@ pub(super) fn write_icon_png(filename_stem: &str, pixmap: &IconPixmap) -> std::i
 mod tests {
     use super::*;
 
-    // ---- theme_path_file / IconThemePath (docs/adr/0074) ----
+    // ---- theme_path_file / IconThemePath (ADR-0074) ----
 
     #[test]
     fn an_items_own_theme_path_beats_the_session_theme() {

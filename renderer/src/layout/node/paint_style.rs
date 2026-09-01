@@ -7,7 +7,7 @@
 //! ## Why not at paint time, where it was
 //!
 //! `layout::paint::build` runs for every mapped surface on every dirty turn, because comparing the
-//! display list is *how* a surface declines a repaint (docs/adr/0063 decision 1). So the parse was
+//! display list is *how* a surface declines a repaint (ADR-0063 decision 1). So the parse was
 //! the price of finding out that nothing had changed, at ADR-0044 decision 2's cadence rather than
 //! the once-per-config-edit one it was written for.
 //!
@@ -41,7 +41,7 @@ use super::*;
 /// same set `layout::paint::build_node`'s match arm bounds: a kind added to
 /// `layout::scene::ensure_supported_kind` without a decision here draws nothing, on purpose.
 ///
-/// Holds no Lua value, for docs/adr/0063 decision 2's reason. That ADR is about `Draw`, but the
+/// Holds no Lua value, for ADR-0063 decision 2's reason. That ADR is about `Draw`, but the
 /// trap is the same one: mlua compares tables by identity, so a property whose signal resolves to
 /// a table would compare unequal every pass and repaint forever.
 #[derive(Debug, Clone, PartialEq)]
@@ -71,7 +71,7 @@ pub enum PaintStyle {
     Icon {
         name: String,
         /// § 5.1's `foreground`, which for an icon means what CSS `color` means: the value a
-        /// `currentColor` fill resolves to (docs/adr/0072). `None` leaves the file's own colours
+        /// `currentColor` fill resolves to (ADR-0072). `None` leaves the file's own colours
         /// alone, which is every full-colour app icon.
         color: Option<Rgba>,
     },

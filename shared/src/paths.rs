@@ -16,10 +16,10 @@ pub fn control_socket_path() -> io::Result<PathBuf> {
     Ok(PathBuf::from(runtime_dir).join("oblisk-shell.sock"))
 }
 
-/// Where the "the compositor is locked and nothing of ours holds it" marker lives (docs/adr/0060).
+/// Where the "the compositor is locked and nothing of ours holds it" marker lives (ADR-0060).
 /// Beside the control socket deliberately: both are per-login runtime state bounded by
 /// `$XDG_RUNTIME_DIR` going away with the session. Only `supervisor` reads or writes it -- the
-/// Renderer holds the protocol object but never the decision (docs/adr/0042).
+/// Renderer holds the protocol object but never the decision (ADR-0042).
 pub fn session_locked_flag_path() -> io::Result<PathBuf> {
     let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;

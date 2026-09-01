@@ -32,7 +32,7 @@ use socket::send_frame_logged;
 use supervisor::Supervisor;
 
 /// How long the Watcher waits after the last relevant `shell.lua` change before dispatching a
-/// reload -- coalesces a multi-event save into one round trip. Fixed (docs/adr/0024 item 6).
+/// reload -- coalesces a multi-event save into one round trip. Fixed (ADR-0024 item 6).
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// § 15.2/15.3's ready-signal and evidence-verification deadlines (`reload::PbaTimings`), scaled
@@ -47,13 +47,13 @@ const PBA_TIMINGS: reload::PbaTimings = reload::PbaTimings {
 
 /// Whether an `Unchanged` report's `sequence` still names the most recently sent `Reevaluate`.
 /// A mismatch means a newer `Reevaluate` already went out for this generation, so the go-ahead
-/// must not fire for a superseded evaluation (docs/adr/0024 item 2).
+/// must not fire for a superseded evaluation (ADR-0024 item 2).
 fn is_current_reload(report_sequence: u64, next_sequence: u64) -> bool {
     report_sequence == next_sequence
 }
 
-/// Starts one reload cycle: bumps the sequence and sends the `Reevaluate` carrying it (docs/adr/
-/// 0024, docs/adr/0041 decision 4). Reached by the watcher's debounced file change and by a
+/// Starts one reload cycle: bumps the sequence and sends the `Reevaluate` carrying it
+/// (ADR-0024, ADR-0041 decision 4). Reached by the watcher's debounced file change and by a
 /// Renderer's `RequestReload` after a `wl_output` change -- both funnel through the same counter
 /// so `is_current_reload` rejects a stale report from either trigger.
 fn begin_reload(registry: &socket::GenerationRegistry, generation_id: u32, next_sequence: &mut u64) {
@@ -78,7 +78,7 @@ pub(crate) fn log_unknown_action(params: &shared::CommandParams) {
     eprintln!("{}: unknown action {:?} from generation {}", params.capability, params.action, params.generation_id);
 }
 
-/// Logs a command for a capability whose controller was never built (docs/adr/0070).
+/// Logs a command for a capability whose controller was never built (ADR-0070).
 ///
 /// Not reachable from a config: reading `oblisk.<name>` is what hands out the object an `invoke`
 /// is a method on, and that read sends the start on the same socket, in order, ahead of the
@@ -108,7 +108,7 @@ pub(crate) fn parse_action<A: serde::de::DeserializeOwned>(params: &shared::Comm
     }
 }
 
-/// Why `run_supervisor` returned, and the process exit code it becomes (docs/adr/0059 decision 3).
+/// Why `run_supervisor` returned, and the process exit code it becomes (ADR-0059 decision 3).
 /// `packaging/oblisk-shell.service` restarts this process on every exit but one, so that exit
 /// needs a code of its own to be named in `RestartPreventExitStatus`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,7 +178,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
         cli::Command::Run => {
             // std::process::exit, not return: the exit code is the point of `Shutdown`, and
-            // `main`'s `Result` can only produce 0 or 1 (docs/adr/0059 decision 3). Every teardown
+            // `main`'s `Result` can only produce 0 or 1 (ADR-0059 decision 3). Every teardown
             // `run_supervisor` owns has already run by the time it returns.
             let shutdown = tokio::runtime::Runtime::new()?.block_on(run_supervisor())?;
             std::process::exit(shutdown.exit_code());
@@ -191,7 +191,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     let (tx, mut challenges) = tokio::sync::mpsc::unbounded_channel();
     let mut polkit_agent = PolkitAgent::new(tx);
     // Long-lived proxy for the polkit reply once a challenge's PAM conversation finishes
-    // (docs/adr/0028) -- built once here, not per-challenge. Kept out of `Session` with
+    // (ADR-0028) -- built once here, not per-challenge. Kept out of `Session` with
     // `pending_challenge` below: the polkit agent answers a D-Bus caller and touches no
     // generation state, so it is the one path through this loop that needs none of it.
     let authority = match zbus_polkit::policykit1::AuthorityProxy::new(&connection).await {
@@ -212,12 +212,12 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     // Idle capability (ADR-0032): notify rides its own Wayland connection (idle authority must
     // survive a Renderer crash or reload, ADR-0010); inhibit rides the shared connection. Built
     // when the config first calls a method on `oblisk.idle` like every other capability
-    // (docs/adr/0070) -- off the roster, so its own methods send the start rather than an
+    // (ADR-0070) -- off the roster, so its own methods send the start rather than an
     // `__index` (`renderer/src/lua/idle.rs`). Its events are not snapshots, so its receiver stays
     // here rather than joining `Signals`.
     let (idle_signal_tx, mut idle_signals) = tokio::sync::mpsc::unbounded_channel::<shared::IdleEvent>();
 
-    // Every capability's channel and controller (docs/adr/0076). `capabilities` owns what is
+    // Every capability's channel and controller (ADR-0076). `capabilities` owns what is
     // running and every sender; `signals` is the receiving half this loop awaits. A capability the
     // config never reads keeps a sender nobody sends on, so it simply never wakes the loop.
     let (capabilities, mut signals) = Capabilities::new(connection.clone(), sound_tx, idle_signal_tx);
@@ -225,7 +225,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     let socket_path = shared::control_socket_path()?;
     let (registry, mut inbound_frames, mut connected) = socket::spawn_listener(&socket_path)?;
 
-    // lock capability (docs/adr/0042, docs/adr/0052): the Renderer holds ext_session_lock_v1 and
+    // lock capability (ADR-0042, ADR-0052): the Renderer holds ext_session_lock_v1 and
     // paints it; this side owns the decision to take it. The channel exists because the
     // controller must not cache the authoritative generation id -- a swap reassigns it.
     let (lock_command_tx, mut lock_commands) = tokio::sync::mpsc::unbounded_channel::<shared::SetSessionLock>();
@@ -236,7 +236,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     let config_dir = shared::config_dir()?;
     let mut reload_events = watcher::spawn_watcher(&config_dir, RELOAD_DEBOUNCE)?;
 
-    // Generation 0 is boot-spawned by the Supervisor itself (docs/adr/0025 item 7) -- there is no
+    // Generation 0 is boot-spawned by the Supervisor itself (ADR-0025 item 7) -- there is no
     // shell without it, so a spawn failure here is fatal to main.
     let renderer_path = renderer_binary_path()?;
     let renderer_path_str = renderer_path.to_string_lossy().into_owned();
@@ -262,7 +262,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut memory_sampler = memory::sampler_from_env();
     // Every break below leaves this alone except the brake's, the one exit a service manager must
-    // not restart into (docs/adr/0059 decision 3).
+    // not restart into (ADR-0059 decision 3).
     let mut shutdown = Shutdown::Requested;
 
     loop {
@@ -275,7 +275,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                 eprintln!("SIGTERM received, shutting down");
                 break;
             }
-            // docs/adr/0058 decision 1: a dead Renderer sends no frames, and a healthy idle one
+            // ADR-0058 decision 1: a dead Renderer sends no frames, and a healthy idle one
             // sends none either -- without this arm the difference never reaches select! at all.
             status = supervisor.authoritative.child.wait() => {
                 if let Some(reason) = supervisor.replace_departed_renderer(status) {
@@ -291,7 +291,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                 pending_challenge = Some(challenge);
             }
             Some(generation_id) = connected.recv() => supervisor.hydrate(generation_id),
-            // One arm for every snapshot capability (docs/adr/0076). `Signals::next` is the
+            // One arm for every snapshot capability (ADR-0076). `Signals::next` is the
             // cancel-safe half -- bare `recv()`s -- and `Capabilities::push` runs here in the
             // winning arm's body, which `select!` never cancels, so the two capabilities that
             // `await` while building their state cannot lose a signal to a busier branch.
@@ -305,7 +305,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
             }
             Some(command) = lock_commands.recv() => supervisor.send_lock_command(command),
             // The other half of the secure_submit(lock, authenticate) arm below -- the one place a
-            // Success becomes an unlock order (docs/adr/0042).
+            // Success becomes an unlock order (ADR-0042).
             Some((acquisition, outcome)) = pam_outcomes.recv() => supervisor.record_pam_outcome(acquisition, outcome),
             Some(()) = reload_events.recv() => supervisor.begin_reload(),
             Some((generation_id, id)) = process_done.recv() => supervisor.reap_exited_process(generation_id, id),
@@ -336,13 +336,13 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                 },
                 RendererFrame::ReadySignal(_) | RendererFrame::PresentationEvidence(_) => {
                     // Both only matter mid-handshake, where SocketCandidateLink reads them
-                    // directly off inbound_frames (see TopologyChanged below, docs/adr/0025).
+                    // directly off inbound_frames (see TopologyChanged below, ADR-0025).
                     // Reaching here means it arrived outside any in-flight handshake -- stale, or
                     // a wire-protocol desync.
                     eprintln!("generation {}'s handshake frame arrived outside any in-flight PBA handshake; dropping: {:?}", inbound.generation_id, inbound.frame);
                 }
                 RendererFrame::StartCapability { capability } => {
-                    // docs/adr/0070: the config read `oblisk.<capability>` (or declared a
+                    // ADR-0070: the config read `oblisk.<capability>` (or declared a
                     // `secure_submit` naming it), and this is the first time anything in this
                     // process has. Awaited inline rather than spawned -- decision 4 says why.
                     // Re-entrant: decision 3 has every generation re-send every name it read, and
@@ -359,13 +359,13 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                         ),
                     }
                 }
-                // docs/adr/0041 decision 4: a wl_output appeared or disappeared.
+                // ADR-0041 decision 4: a wl_output appeared or disappeared.
                 RendererFrame::RequestReload => supervisor.begin_reload(),
                 RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence }) => {
                     supervisor.answer_unchanged_report(inbound.generation_id, sequence).await;
                 }
                 RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence }) if supervisor.lock.defers_swap() => {
-                    // docs/adr/0042: candidate N+1 cannot acquire the lock generation N holds, so
+                    // ADR-0042: candidate N+1 cannot acquire the lock generation N holds, so
                     // PBA's handoff waits until the lock clears. In-place reloads (Unchanged
                     // above) are not gated. Checked as defers_swap, not is_active: a lock order
                     // that's out but not yet reported is just as unswappable, and that window can
@@ -379,7 +379,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     eprintln!("generation {}'s shell.lua re-evaluation (sequence {sequence}) failed: {error}", inbound.generation_id);
                 }
                 RendererFrame::SecureSubmit(mut submit) if submit.capability == "polkit" && submit.action == "authenticate" => {
-                    // docs/adr/0028: the polkit-routed case. Must come before the catch-all
+                    // ADR-0028: the polkit-routed case. Must come before the catch-all
                     // SecureSubmit arm below -- match arms are tried in order.
                     match pending_challenge.take().zip(authority.as_ref()) {
                         Some((challenge, authority)) => {
@@ -431,7 +431,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     // authoritative generation paints the lock screen a password can have been
                     // typed into. Unlike polkit/network, which take any generation's submission
                     // (they answer a challenge the Supervisor itself holds), a lock belongs to
-                    // exactly one generation (docs/adr/0042).
+                    // exactly one generation (ADR-0042).
                     eprintln!(
                         "generation {}'s secure_submit(lock, authenticate) is stale -- {} is authoritative; dropping",
                         submit.generation_id, supervisor.authoritative.generation_id
@@ -439,7 +439,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     submit.secret.zeroize();
                 }
                 RendererFrame::SecureSubmit(mut submit) if submit.capability == "lock" && submit.action == "authenticate" => {
-                    // docs/adr/0042, docs/adr/0052: this arm and the pam_outcomes arm above are
+                    // ADR-0042, ADR-0052: this arm and the pam_outcomes arm above are
                     // the only path to an unlock, making "never unlock_and_destroy except on a
                     // successful authentication" a property of one call site. Must come before the
                     // catch-all arm below. No pending-intent lookup, unlike polkit/network: the
@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn a_tripped_restart_brake_exits_with_a_code_a_service_manager_will_not_restart() {
-        // docs/adr/0059 decision 3: systemd's default start limit (5 in 10s) is too fast to catch
+        // ADR-0059 decision 3: systemd's default start limit (5 in 10s) is too fast to catch
         // this brake's give-up (three deaths over 60s). The code is what carries the difference.
         assert_ne!(Shutdown::RestartBrakeTripped.exit_code(), Shutdown::Requested.exit_code());
         assert_ne!(Shutdown::RestartBrakeTripped.exit_code(), 0, "a give-up is not a clean exit");
@@ -529,7 +529,7 @@ mod tests {
         registry.register(7, tx);
         let mut next_sequence = 0;
 
-        // Both triggers (the watcher's file change and RequestReload, docs/adr/0041 decision 4)
+        // Both triggers (the watcher's file change and RequestReload, ADR-0041 decision 4)
         // reach this same call, so two of them must produce two distinct, increasing sequences.
         begin_reload(&registry, 7, &mut next_sequence);
         begin_reload(&registry, 7, &mut next_sequence);

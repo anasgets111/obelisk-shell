@@ -1,4 +1,4 @@
-//! `oblisk.keyboard` capability: backlight (UPower), lock state, and layout (docs/adr/0034),
+//! `oblisk.keyboard` capability: backlight (UPower), lock state, and layout (ADR-0034),
 //! all wired in, sharing one `Arc<Mutex<KeyboardState>>` and one shared signal channel.
 
 pub mod backlight;
@@ -18,7 +18,7 @@ pub enum KeyboardAction {
 }
 
 /// `oblisk.keyboard`'s action dispatch (ADR-0037): `set_backlight` is a D-Bus write, so it gets
-/// `tokio::spawn`ed (ADR-0029); `switch_layout` is synchronous, forwarding through the compositor link's own channel (docs/adr/0034).
+/// `tokio::spawn`ed (ADR-0029); `switch_layout` is synchronous, forwarding through the compositor link's own channel (ADR-0034).
 pub fn dispatch(controller: &KeyboardController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     let Some(action) = crate::parse_action::<KeyboardAction>(params) else { return };

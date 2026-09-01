@@ -1,4 +1,4 @@
-//! The session lock: `ext_session_lock_v1` (docs/adr/0042, docs/adr/0052), including the
+//! The session lock: `ext_session_lock_v1` (ADR-0042, ADR-0052), including the
 //! acquire/refuse/release decision tables and the rescue messages `oblisk.rescue` shows once no
 //! lock screen is left on the glass to read one on.
 //!
@@ -11,13 +11,13 @@ use crate::layout::secure_submit::tree_can_authenticate;
 use crate::wayland::surface::MapState;
 use crate::wayland::surface::TrackedRole;
 
-/// docs/adr/0052 decision 3's refusal, as the sentence the user reads. A config that declares no
+/// ADR-0052 decision 3's refusal, as the sentence the user reads. A config that declares no
 /// `lock` node cannot be locked: acquiring anyway paints nothing, the compositor never unlocks on
-/// client death (docs/adr/0042), and the only way out is a VT switch. Locking a user out over a
+/// client death (ADR-0042), and the only way out is a VT switch. Locking a user out over a
 /// config omission is not fail-secure, it is a denial of service spelled the same way.
 const NO_LOCK_DECLARED: &str = "this config declares no `lock` surface (§ 6.4), so locking the session would leave a black screen with no password field and no way back \
-     in short of a VT switch; the lock was refused (docs/adr/0052 decision 3)";
-/// The second half of docs/adr/0052 decision 3's refusal, and the one the guard was missing.
+     in short of a VT switch; the lock was refused (ADR-0052 decision 3)";
+/// The second half of ADR-0052 decision 3's refusal, and the one the guard was missing.
 ///
 /// `node::lock_spec` requires only an `id` -- `child` is optional -- so `lock { id = "x" }` is a
 /// legal declaration that resolves to a surface with no password field, an empty input region and
@@ -31,7 +31,7 @@ const NO_LOCK_DECLARED: &str = "this config declares no `lock` surface (§ 6.4),
 /// is missing a `textfield` inside the one it has.
 const LOCK_CANNOT_AUTHENTICATE: &str = "this config's `lock` surface (§ 6.4) does not hold exactly one `textfield` with `secure_submit = { capability = \"lock\", action = \"authenticate\" }` \
      and nothing else, so the compositor handing it keyboard focus would arm no field, nothing on it could ever authenticate, and the only way back in \
-     would be a VT switch; the lock was refused (docs/adr/0052 decision 3)";
+     would be a VT switch; the lock was refused (ADR-0052 decision 3)";
 /// A `SetSessionLock { locked: false }` that reached a lock object the compositor never answered
 /// with `locked`. See [`App::release_session_lock`]: nothing was released, because there was
 /// nothing up to release.
@@ -43,35 +43,35 @@ const LOCK_NEVER_GRANTED: &str = "the session lock was given up before the compo
 const LOCK_DENIED: &str = "the compositor denied the session lock; another lock client most likely holds it already (`ext_session_lock_v1::finished` arrived in place \
      of `locked`)";
 /// What `oblisk.rescue` says when the compositor tore down a lock that really was up. Not a
-/// failure of anything this process did: docs/adr/0052 decision 4 routes it here, not to
+/// failure of anything this process did: ADR-0052 decision 4 routes it here, not to
 /// `oblisk.lock`'s `error`, because there is no lock screen left on the glass to read a message on.
 const LOCK_TORN_DOWN: &str = "the compositor ended the session lock through its own mechanism; the session is unlocked and the lock screen is gone \
      (`ext_session_lock_v1::finished` after `locked`)";
-/// The exit code this process uses when the Supervisor's control socket is gone (docs/adr/0059
+/// The exit code this process uses when the Supervisor's control socket is gone (ADR-0059
 /// decision 1). Nobody is left to read it -- the process that classifies exit codes just died --
 /// so this is for a journal and `$status`, not a handshake. Distinct from `0` (not a clean exit)
 /// and from `1` (not a failure of anything this process was asked to do).
 pub(super) const EXIT_SUPERVISOR_GONE: i32 = 70;
 /// What this process says on its way out when the Supervisor's control socket is gone, split on
-/// whether it holds `ext_session_lock_v1` at that moment (docs/adr/0059 decisions 1 and 2).
+/// whether it holds `ext_session_lock_v1` at that moment (ADR-0059 decisions 1 and 2).
 ///
 /// Pure and split out because the locked half can mislead into an unrecoverable state:
-/// docs/adr/0058 decision 4 already caught the neighbouring mistake, where a refusal ending "the
+/// ADR-0058 decision 4 already caught the neighbouring mistake, where a refusal ending "the
 /// lock screen that is on screen still stands" is true of a vetoed reload and false of a process
 /// that is exiting.
 pub(super) fn supervisor_gone_report(holds_session_lock: bool) -> &'static str {
     if holds_session_lock {
-        "the Supervisor's control socket is gone while this Renderer holds the session lock. PAM runs in the Supervisor (docs/adr/0028), so this \
+        "the Supervisor's control socket is gone while this Renderer holds the session lock. PAM runs in the Supervisor (ADR-0028), so this \
          lock screen can no longer authenticate anyone, and exiting without unlocking is what keeps a `kill` from being a way past a lock screen. \
          The session stays locked behind whatever the compositor puts up for a lock client that died, and the way back in is a VT switch \
-         (docs/adr/0059 decision 2)"
+         (ADR-0059 decision 2)"
     } else {
         "the Supervisor's control socket is gone, so this Renderer has no capability data, no `process.run` and no PAM left to serve. Exiting \
-         rather than painting a shell that still takes clicks and answers none of them (docs/adr/0059 decision 1)"
+         rather than painting a shell that still takes clicks and answers none of them (ADR-0059 decision 1)"
     }
 }
 /// What one `SetSessionLock` asks this process to do, decided before any Wayland object is touched
-/// (docs/adr/0042, docs/adr/0052 decisions 3 and 4).
+/// (ADR-0042, ADR-0052 decisions 3 and 4).
 ///
 /// Pure and separate because the two interesting answers are refusals, and a refusal that only
 /// exists inside a `&mut self` method that also talks to the compositor is untestable. See
@@ -90,7 +90,7 @@ enum LockCommand {
 /// One `SetSessionLock`, resolved against what this process is already holding.
 ///
 /// `locked = true` has four answers and only one is "take the lock". Two of the other three are
-/// refusals, and docs/adr/0052 decision 3 is both: the lock must be refused here, before
+/// refusals, and ADR-0052 decision 3 is both: the lock must be refused here, before
 /// `SessionLockState::lock` is called, because a lock granted and then found unusable is exactly
 /// the black screen the decision exists to prevent.
 ///
@@ -118,7 +118,7 @@ fn lock_command(locked: bool, declares_lock: bool, can_authenticate: bool, lock_
     }
 }
 /// What one ordered release actually did, given whether `ext_session_lock_v1::locked` had been
-/// dispatched on the lock object being given up (docs/adr/0052 decision 4).
+/// dispatched on the lock object being given up (ADR-0052 decision 4).
 ///
 /// `Unlocked` is a state transition the Supervisor's `lock::apply` moves its `active` flag on, so
 /// reporting one for a lock never granted would tell the Supervisor the session went from locked
@@ -127,7 +127,7 @@ fn lock_command(locked: bool, declares_lock: bool, can_authenticate: bool, lock_
 fn release_outcome(was_locked: bool) -> LockOutcome {
     if was_locked { LockOutcome::Unlocked } else { LockOutcome::Refused(LOCK_NEVER_GRANTED.to_string()) }
 }
-/// Which of `ext_session_lock_v1::finished`'s two events this one is (docs/adr/0042), decided by
+/// Which of `ext_session_lock_v1::finished`'s two events this one is (ADR-0042), decided by
 /// the fact that separates them: whether `locked` was ever sent on this lock object.
 ///
 /// The protocol puts both on one event. "The finished event should be sent immediately on
@@ -148,11 +148,11 @@ fn finished_outcome(was_locked: bool) -> LockOutcome {
 
 impl App {
     /// [`App::create_surfaces`]'s `lock` arm: the tracking entry always, the
-    /// `ext_session_lock_surface_v1` never from here (docs/adr/0052 decision 2).
+    /// `ext_session_lock_surface_v1` never from here (ADR-0052 decision 2).
     ///
     /// The entry is what makes the retained scene resolve this instance's tree at all, letting an
     /// in-place reload restyle a live lock screen, and it is the only record that this config
-    /// declares a lock screen -- the fact docs/adr/0052 decision 3 refuses a lock on the absence of.
+    /// declares a lock screen -- the fact ADR-0052 decision 3 refuses a lock on the absence of.
     /// [`App::set_session_lock`] asks that question by looking for these entries.
     ///
     /// No `visible` is consulted and there is none to consult: `layout::node::lock_spec` refuses the
@@ -185,7 +185,7 @@ impl App {
     /// Idempotent per output, a protocol requirement, not tidiness: a second lock surface on one
     /// output is a `duplicate_output` error, killing the connection with the session still locked.
     /// `expand_instances` produces one `lock` instance per output per declared lock spec
-    /// (docs/adr/0052 decision 2), so "this instance already has a surface" and "this output already
+    /// (ADR-0052 decision 2), so "this instance already has a surface" and "this output already
     /// has one" agree only while a config declares at most one `lock` -- which `crate::socket`'s
     /// `surface_specs` now refuses to let through. The `surface: None` pattern below is the
     /// per-instance half of that invariant; the refusal is the other half.
@@ -256,7 +256,7 @@ impl App {
         }
     }
 
-    /// One `SetSessionLock` from the Supervisor (docs/adr/0042, docs/adr/0052 decision 1). The
+    /// One `SetSessionLock` from the Supervisor (ADR-0042, ADR-0052 decision 1). The
     /// decision is [`lock_command`], which is pure and tested; this is the protocol traffic it does
     /// not do.
     ///
@@ -273,7 +273,7 @@ impl App {
     ///
     /// A `lock` that fails at the protocol level is a refusal, not a crash, the same tolerance
     /// [`App::show_window`] applies to a missing `xdg_wm_base`: the shell keeps painting, and the one
-    /// thing that did not happen says so through the channel docs/adr/0052 decision 4 named for it.
+    /// thing that did not happen says so through the channel ADR-0052 decision 4 named for it.
     pub(super) fn set_session_lock(&mut self, qh: &QueueHandle<App>, locked: bool) {
         let lock_instances: Vec<String> = self
             .surfaces
@@ -308,7 +308,7 @@ impl App {
                 // the one refusal whose cause is outside both this shell and its config, and
                 // `GlobalError` already says which global is missing.
                 Err(err) => {
-                    let reason = format!("this compositor cannot lock the session: {err} (docs/adr/0042)");
+                    let reason = format!("this compositor cannot lock the session: {err} (ADR-0042)");
                     self.refuse_lock(&reason);
                 }
             },
@@ -316,8 +316,8 @@ impl App {
         }
     }
 
-    /// `unlock_and_destroy`, and the only path in this process that performs one (docs/adr/0042,
-    /// docs/adr/0052's consequences).
+    /// `unlock_and_destroy`, and the only path in this process that performs one (ADR-0042,
+    /// ADR-0052's consequences).
     ///
     /// Reachable from exactly one place: a `SetSessionLock { locked: false }`, which the Supervisor
     /// sends only from the `pam_outcomes` arm of its `select!` loop, on a `PamOutcome::Success`.
@@ -363,7 +363,7 @@ impl App {
     }
 
     /// A lock that was asked for and did not happen: logged, pushed to `oblisk.rescue`, and reported
-    /// (docs/adr/0052 decision 4).
+    /// (ADR-0052 decision 4).
     ///
     /// `rescue` is the right channel: a refused lock leaves the ordinary scene on the glass, so there
     /// is no lock screen for the message to appear on, and `rescue` is rendered by the config's own
@@ -391,7 +391,7 @@ impl App {
     }
 }
 
-/// `ext_session_lock_v1` for the session lock (docs/adr/0042, docs/adr/0052). See
+/// `ext_session_lock_v1` for the session lock (ADR-0042, ADR-0052). See
 /// `delegate_dispatch2!(App)` at the bottom of this file for why no `delegate_session_lock!` call
 /// accompanies this.
 ///
@@ -401,7 +401,7 @@ impl App {
 impl SessionLockHandler for App {
     /// The compositor granted the lock: the session is now locked, every other client's content is
     /// hidden, and this process is responsible for what is on screen until it unlocks
-    /// (docs/adr/0042).
+    /// (ADR-0042).
     ///
     /// The surface creation here is normally a no-op, deliberately: [`App::set_session_lock`]
     /// already created one per output the moment `lock` succeeded, since the protocol asks clients
@@ -428,7 +428,7 @@ impl SessionLockHandler for App {
     /// before any `locked`, the compositor denied the request. Arriving after one, it ended a lock
     /// that was really up, through its own secure mechanism.
     ///
-    /// Both set `rescue` (docs/adr/0052 decision 4), and the test is not severity but whether there
+    /// Both set `rescue` (ADR-0052 decision 4), and the test is not severity but whether there
     /// is a lock screen left to read a message on. There is not: a denial never put one up, and a
     /// teardown took the one that was up away, so in both cases the ordinary scene is what the user
     /// is looking at and `rescue` is what it renders.
@@ -442,7 +442,7 @@ impl SessionLockHandler for App {
     /// time, and losing the connection here is the worst outcome available: the session ends up
     /// unlocked and the shell is dead, with the `rescue` message set below never reaching a surface.
     ///
-    /// This is not the convenience path docs/adr/0042 forbids: that rule is about initiating an
+    /// This is not the convenience path ADR-0042 forbids: that rule is about initiating an
     /// unlock, and the compositor initiated this one through its own secure mechanism --
     /// `finished` is documented as "the compositor has decided that the session lock should be
     /// destroyed". The one path that ends a live lock is still [`App::release_session_lock`],
@@ -515,8 +515,8 @@ mod tests {
 
     #[test]
     fn a_supervisor_that_vanished_while_the_lock_was_up_reports_a_locked_session_and_not_a_lock_screen() {
-        // docs/adr/0059 decision 2: this process is about to exit, so the message must send the
-        // reader to a VT, not to a password field that no longer exists (docs/adr/0058 decision 4's
+        // ADR-0059 decision 2: this process is about to exit, so the message must send the
+        // reader to a VT, not to a password field that no longer exists (ADR-0058 decision 4's
         // "still stands" trap).
         let report = supervisor_gone_report(true);
         assert!(report.contains("VT"), "the locked report must name the only way back in: {report}");
@@ -536,7 +536,7 @@ mod tests {
 
     #[test]
     fn a_lock_is_refused_when_the_config_declares_no_lock_surface() {
-        // docs/adr/0052 decision 3: the refusal must happen before `SessionLockState::lock` is
+        // ADR-0052 decision 3: the refusal must happen before `SessionLockState::lock` is
         // called, since a lock granted and then painted nothing is a black screen with no way out
         // but a VT switch.
         assert_eq!(lock_command(true, false, false, false), LockCommand::Refuse(NO_LOCK_DECLARED));
@@ -546,7 +546,7 @@ mod tests {
     #[test]
     fn a_lock_screen_with_no_password_field_is_refused_as_loudly_as_no_lock_screen_at_all() {
         // `lock { id = "x" }` is a legal declaration that resolves to an empty tree, reaching
-        // docs/adr/0052 decision 3's black screen through the guard instead of around it, so the
+        // ADR-0052 decision 3's black screen through the guard instead of around it, so the
         // tracked-surface test alone is not enough.
         assert_eq!(lock_command(true, true, false, false), LockCommand::Refuse(LOCK_CANNOT_AUTHENTICATE));
         // The two refusals stay distinct: different edits to make to a config.
@@ -566,7 +566,7 @@ mod tests {
     #[test]
     fn only_a_locked_false_command_against_a_held_lock_releases() {
         // The single `Release` in the table: `unlock_and_destroy` has exactly one reachable caller
-        // in this process, reached only on a `PamOutcome::Success` (docs/adr/0042).
+        // in this process, reached only on a `PamOutcome::Success` (ADR-0042).
         assert_eq!(lock_command(false, true, true, true), LockCommand::Release);
         assert_eq!(lock_command(false, false, false, true), LockCommand::Release);
     }

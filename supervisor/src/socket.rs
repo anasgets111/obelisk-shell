@@ -5,9 +5,9 @@
 //! one live connection at once: during a generation swap, Generation `N` and Candidate `N+1`
 //! are both connected simultaneously, each registered by `generation_id`.
 //!
-//! Deliberately deferred (docs/adr/0020): the command-dispatch routing table
+//! Deliberately deferred (ADR-0020): the command-dispatch routing table
 //! (`oblisk-idl-api-specs.md` § 3.2's ~30 write commands). Inbound frames are decoded as
-//! `shared::RendererFrame` (docs/adr/0024) and forwarded to the caller as-is.
+//! `shared::RendererFrame` (ADR-0024) and forwarded to the caller as-is.
 
 use std::collections::HashMap;
 use std::io;
@@ -29,7 +29,7 @@ pub struct InboundFrame {
 
 /// A registry entry paired with a monotonic token identifying which connection registered it.
 /// Needed because two connections can legitimately claim the same `generation_id` in sequence
-/// (a reconnect, or duplicate `OBLISK_GENERATION_ID=0` defaults, docs/adr/0020 item 5):
+/// (a reconnect, or duplicate `OBLISK_GENERATION_ID=0` defaults, ADR-0020 item 5):
 /// without the token, the old connection's cleanup would unregister the new one's live entry.
 struct Entry {
     token: u64,
@@ -69,7 +69,7 @@ impl std::error::Error for SendFrameError {}
 impl GenerationRegistry {
     /// Queues `payload` for delivery to `generation_id`'s connection. Returns `false` if no
     /// connection is registered for that generation. The one place raw bytes cross into a
-    /// connection's outbound channel (docs/adr/0022); [`Self::send_frame`] builds on this.
+    /// connection's outbound channel (ADR-0022); [`Self::send_frame`] builds on this.
     pub fn send_to(&self, generation_id: u32, payload: Vec<u8>) -> bool {
         let connections = self.connections.lock().unwrap();
         match connections.get(&generation_id) {

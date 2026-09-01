@@ -39,14 +39,14 @@ const CPU_CAP: Duration = Duration::from_millis(5);
 /// - debug, same load: 550ms and 1.10s.
 ///
 /// 2 seconds is roughly 2x the worst of those and 7x the release figure, and around 300x
-/// docs/adr/0069's 6.14ms for a 500-row list, which is the shape a real config has. A tighter cap
+/// ADR-0069's 6.14ms for a 500-row list, which is the shape a real config has. A tighter cap
 /// looked defensible until those numbers existed: 250ms fired on that 2000-sibling test in both
 /// profiles, which is a legitimate config being refused.
 ///
 /// It is a bound on damage, not a performance target, and it is deliberately far too loose to be
 /// mistaken for one. What it exists to stop is the shape item 5 measured: a `margin` table whose
 /// `__index` spins made one `Scene::apply` run 26.10 seconds and return `Ok(())`, on the thread
-/// that also answers `configure` and runs the VM (docs/adr/0039). Under this the same config gets
+/// that also answers `configure` and runs the VM (ADR-0039). Under this the same config gets
 /// one 2 second stall and a `LayoutError` that `oblisk.rescue` can report, instead of a desktop
 /// that never comes back. Turning "forever" into "twice" is the whole of what it buys.
 ///
@@ -101,7 +101,7 @@ impl Deadline {
 /// How much CPU the calling thread has burned, which is what § 1.2's cap is written against.
 ///
 /// Per *thread*, not per process: one evaluation runs start to finish on the thread that entered
-/// it, and the Lua VM is single-threaded by construction (docs/adr/0039 puts it on the Wayland
+/// it, and the Lua VM is single-threaded by construction (ADR-0039 puts it on the Wayland
 /// thread). A process-wide clock would charge a config for the shaping worker.
 fn thread_cpu_time() -> Option<Duration> {
     let spent = nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID).ok()?;
@@ -157,10 +157,10 @@ enum SignalKind {
     },
     /// A value Rust can overwrite after construction (`Signal::new_live`/`LiveSignalHandle`).
     /// `Rc<RefCell<_>>`, not `Arc<Mutex<_>>`: the `Loader` this lives on stays confined to one
-    /// dedicated OS thread (the Wayland dispatch thread, docs/adr/0039).
+    /// dedicated OS thread (the Wayland dispatch thread, ADR-0039).
     Live(Rc<RefCell<Value>>),
     /// The engine's own reactive state: a boolean `crate::wayland`'s pointer handler writes and a
-    /// config only reads, built by the `hover(name)` global (docs/adr/0062).
+    /// config only reads, built by the `hover(name)` global (ADR-0062).
     ///
     /// Structurally identical to [`SignalKind::Live`] and deliberately not it. The two differ in
     /// who may write them, which is the whole point of the split: `Signal::hover_handle` hands out
@@ -177,7 +177,7 @@ enum SignalKind {
         dirty: DirtyFlag,
     },
     /// How far a scrollable container has been scrolled along its main axis, in logical pixels
-    /// (docs/adr/0069). Written by `crate::wayland`'s pointer handler on a wheel and by
+    /// (ADR-0069). Written by `crate::wayland`'s pointer handler on a wheel and by
     /// `layout::scene`'s positioning pass when it clamps; read by a config that wants to know.
     ///
     /// A fifth variant for [`SignalKind::Hover`]'s reason and not a reuse of it: the split is about
@@ -334,7 +334,7 @@ impl Signal {
     }
 
     /// The signal `hover(name)` builds: a boolean the *engine* writes from `wl_pointer`, read-only
-    /// to Lua (docs/adr/0062 decision 2).
+    /// to Lua (ADR-0062 decision 2).
     ///
     /// Its own kind rather than a second [`Self::new_live`] caller, and the variant earns its place
     /// at both ends. `signal:set()` refuses it by name, so a config is told it is holding a hover
@@ -366,7 +366,7 @@ impl Signal {
         )
     }
 
-    /// A scroll offset, starting at the top (docs/adr/0069 decision 2).
+    /// A scroll offset, starting at the top (ADR-0069 decision 2).
     ///
     /// A plain number rather than a pair like [`Self::new_hover`]'s: the content extent a scrollbar
     /// would also want is deliberately not published, because nothing draws one yet and the first
@@ -496,7 +496,7 @@ impl LiveSignalHandle {
     /// [`Self::set`], except that storing the value already there does nothing at all: no write,
     /// no dirty mark, and it answers `false`.
     ///
-    /// docs/adr/0062 decision 4. The pointer handler calls this on every `wl_pointer` motion
+    /// ADR-0062 decision 4. The pointer handler calls this on every `wl_pointer` motion
     /// event, which arrives at device rate, and one mark re-resolves every surface in the
     /// generation (ADR-0044 decision 2). Comparing first turns that into one re-resolve per
     /// hover boundary crossed rather than one per motion event.
@@ -530,7 +530,7 @@ impl LiveSignalHandle {
 /// The one scene-dirty flag ADR-0044 decision 2 specifies: a single `bool`, shared by every
 /// [`LiveSignalHandle`] in a generation and by the `RendererClient` that reads and clears it, not
 /// a per-signal or per-surface set. `Rc<Cell<bool>>`, not `Arc<AtomicBool>`: this lives entirely
-/// on the Wayland dispatch thread (docs/adr/0039).
+/// on the Wayland dispatch thread (ADR-0039).
 ///
 /// `ponytail:` one flag for the whole scene means any push re-resolves every surface, including
 /// one that reads nothing from the capability that changed. The upgrade path is a per-surface
@@ -576,7 +576,7 @@ impl UserData for Signal {
         methods.add_method("set", |_, this, value: Value| {
             let SignalKind::State { cell, dirty } = &this.0 else {
                 return Err(mlua::Error::runtime(format!(
-                    "signal:set() is only valid on a state(name, initial) signal, and this is {} signal: every other signal kind is read-only to Lua (docs/adr/0044 decision 5)",
+                    "signal:set() is only valid on a state(name, initial) signal, and this is {} signal: every other signal kind is read-only to Lua (ADR-0044 decision 5)",
                     this.0.describe()
                 )));
             };
@@ -625,7 +625,7 @@ pub fn any_scroll_registered(lua: &Lua) -> bool {
 #[derive(Default)]
 struct StateRegistry(HashMap<String, (Signal, Value)>);
 
-/// `state`'s registry, for `hover(name)` (docs/adr/0062 decision 2). Separate map, same rule and
+/// `state`'s registry, for `hover(name)` (ADR-0062 decision 2). Separate map, same rule and
 /// the same lifetime: the name is the identity, so an in-place reload finds the signal it built
 /// last time and a tooltip open across a `config/theme.lua` edit stays open.
 ///
@@ -637,7 +637,7 @@ struct HoverRegistry(HashMap<String, (Signal, Signal)>);
 
 /// The `name -> Signal` map behind `scroll(name)`, keyed the way [`HoverRegistry`] and the `state`
 /// registry are: the name is the identity, so an in-place reload finds the offset the user left and
-/// an open panel does not jump back to the top when the config is edited (docs/adr/0069 decision 2).
+/// an open panel does not jump back to the top when the config is edited (ADR-0069 decision 2).
 #[derive(Default)]
 struct ScrollRegistry(HashMap<String, Signal>);
 
@@ -814,7 +814,7 @@ impl<'lua> CpuBudget<'lua> {
     /// error and never returns (`while true do pcall(f) end`) still spins until a hook fire
     /// happens to land on an instruction outside the `pcall`, eventually but not promptly.
     /// Bounding that properly needs preemption this VM cannot offer from inside itself; the
-    /// upgrade path is the generation-swap process boundary (docs/adr/0039), which can kill a
+    /// upgrade path is the generation-swap process boundary (ADR-0039), which can kill a
     /// wedged renderer outright.
     fn check_not_exceeded(&self) -> mlua::Result<()> {
         match expired_budget(self.lua) {
@@ -980,7 +980,7 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
 }
 
 /// One hover slot by name, built on first ask: the boolean `hover(name)` returns and the rect
-/// `hover_rect(name)` returns, in that order (docs/adr/0062 decision 2).
+/// `hover_rect(name)` returns, in that order (ADR-0062 decision 2).
 ///
 /// The name is the identity, exactly as `state(name, initial)` does it (ADR-0044 decision 5), which
 /// is what carries a hover across an in-place reload and what lets two files reach one slot. Both
@@ -1042,7 +1042,7 @@ mod tests {
 
     #[test]
     fn hover_returns_a_read_only_boolean_signal_that_starts_false() {
-        // docs/adr/0062 decision 2: the engine writes this one, so a config that reads it before
+        // ADR-0062 decision 2: the engine writes this one, so a config that reads it before
         // the pointer has ever been over the node must get `false`, not nil -- `visible` binds to
         // it directly and a nil there would mean "absent" (ADR-0044 decision 1's amendment).
         let (lua, _dirty) = lua_with_state();
@@ -1053,7 +1053,7 @@ mod tests {
     #[test]
     fn hover_hands_the_same_name_the_same_signal_so_an_in_place_reload_keeps_it_open() {
         // The `state(name, initial)` rule of ADR-0044 decision 5, applied to hover by
-        // docs/adr/0062 decision 2: the name is the identity, so re-running the config finds the
+        // ADR-0062 decision 2: the name is the identity, so re-running the config finds the
         // signal it built last time rather than a fresh false.
         //
         // Asserted through the storage rather than with `==`, which on two userdata handles is
@@ -1087,7 +1087,7 @@ mod tests {
     #[test]
     fn a_config_cannot_write_a_hover_signal_and_the_refusal_names_it_a_hover() {
         // Its own `SignalKind`, not the capability one, so this message does not tell a config it
-        // is holding a capability (docs/adr/0062 decision 2).
+        // is holding a capability (ADR-0062 decision 2).
         let (lua, dirty) = lua_with_state();
         let err = lua.load(r#"hover("volume"):set(true)"#).exec().unwrap_err().to_string();
         assert!(err.contains("state(name, initial)"), "the refusal points at the one writable kind: {err}");
@@ -1115,7 +1115,7 @@ mod tests {
 
     #[test]
     fn writing_the_value_already_stored_marks_nothing() {
-        // docs/adr/0062 decision 4. The pointer pushes this on every `wl_pointer` motion event and
+        // ADR-0062 decision 4. The pointer pushes this on every `wl_pointer` motion event and
         // one mark re-resolves every surface in the generation (ADR-0044 decision 2), so a pointer
         // sitting still inside one button must cost no re-resolves at all.
         let dirty = DirtyFlag::new();
@@ -1137,7 +1137,7 @@ mod tests {
         // Not a wish, a warning. `crate::wayland::input`'s hover writer builds a fresh rect table
         // per event, and `PartialEq` on two `mlua` tables compares identity rather than contents,
         // so this can never answer "unchanged" for one. That is why the rect is written on the
-        // entry edge only and not on every motion event (docs/adr/0062 decision 4) -- a caller
+        // entry edge only and not on every motion event (ADR-0062 decision 4) -- a caller
         // that leans on `set_changed` to dedupe a table marks the scene dirty every time.
         let lua = Lua::new();
         let dirty = DirtyFlag::new();

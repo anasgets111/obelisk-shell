@@ -19,7 +19,7 @@
 //! fell about a third with it, since a full-surface commit made the compositor recomposite the
 //! screen behind it.
 //!
-//! Draws in tree order, parent then children: that is what makes the stacking model docs/adr/0023
+//! Draws in tree order, parent then children: that is what makes the stacking model ADR-0023
 //! item 4 already implements resolve overlaps the same way layout resolved them -- a later sibling
 //! or a child paints over what an earlier one already put down. An invisible node (`visible ==
 //! false`) and its whole subtree draw nothing, the same collapse
@@ -75,7 +75,7 @@ pub enum Draw {
         name: String,
         px: u32,
         alpha: f32,
-        /// What a `currentColor` fill in the resolved SVG resolves to (docs/adr/0072). Part of the
+        /// What a `currentColor` fill in the resolved SVG resolves to (ADR-0072). Part of the
         /// command and not just of the draw call because `ImageCache` keys on it: the same file
         /// tinted two ways is two textures.
         color: Option<Rgba>,
@@ -244,7 +244,7 @@ fn build_node(
     // `node.kind` is not consulted at all: `node::paint_style` already made that decision, once,
     // while `Scene::apply` resolved this node. A kind it does not recognise carries no style and
     // draws nothing, which stays deliberate -- on a lock surface that silence is a transparent
-    // buffer over a locked session, the black screen docs/adr/0052 decision 3 refuses a lock to
+    // buffer over a locked session, the black screen ADR-0052 decision 3 refuses a lock to
     // avoid, reached by another route.
     // Multiplied down the tree the same way `clip` is intersected down it, and for the same
     // reason: a child can only ever be fainter than its parent, never solid inside a faded panel.
@@ -327,7 +327,7 @@ fn split_fill_and_border(draw: Option<Draw>) -> (Option<Draw>, Option<Draw>) {
 ///
 /// `crate::wayland::App::paint_surface` is the production caller, since build-steps.md Phase 20
 /// item 4: `socket.rs`'s `RendererClient` keys a `Scene` by the `id` a config writes, and
-/// `wayland::App` keys a `wl_surface` the same way since docs/adr/0038 decision 1 deleted the
+/// `wayland::App` keys a `wl_surface` the same way since ADR-0038 decision 1 deleted the
 /// fixed Rust-owned role enum that used to keep the two id spaces from overlapping.
 /// Test-only since the skip landed: production paints through [`build`] and [`execute`]
 /// separately, because `wayland::App::paint_surface` has to compare the list between the two.
@@ -564,7 +564,7 @@ fn draw_for(
         }),
 
         // `icon` (§ 5.2 item 5): the theme name, resolved to a file by [`execute`]
-        // (build-steps.md Phase 29 item 3, docs/adr/0054).
+        // (build-steps.md Phase 29 item 3, ADR-0054).
         //
         // `Contain` rather than `Cover`, and the *shorter* edge as the resolved size: `size` is
         // § 5.2's "bounding box diameter", so an icon in a box that is not square should sit inside
@@ -577,7 +577,7 @@ fn draw_for(
             color: *color,
         }),
 
-        // `image` (docs/adr/0054 decision 3): the file at `source`, fitted by `fit`. An empty
+        // `image` (ADR-0054 decision 3): the file at `source`, fitted by `fit`. An empty
         // `source` is the absent-key default, so it draws nothing rather than reaching the cache
         // with a path of "".
         //
@@ -983,7 +983,7 @@ mod tests {
 
     /// Builds a `TextPainter` against `instance`'s already-current context -- same
     /// `font_chain_data` source `paint_surface` uses, so this harness draws with the exact
-    /// declared font chain cosmic-text shaped against (docs/adr/0043 decision 2).
+    /// declared font chain cosmic-text shaped against (ADR-0043 decision 2).
     fn text_painter(
         instance: &egl::Instance<egl::Static>,
         shaping: &ShapingHandle,
@@ -1238,7 +1238,7 @@ mod tests {
         );
     }
 
-    /// Draw order is tree order, which is what makes docs/adr/0023 item 4's stacking model come
+    /// Draw order is tree order, which is what makes ADR-0023 item 4's stacking model come
     /// out right: a child is painted after the parent it covers.
     #[test]
     fn a_parents_box_is_listed_before_its_childs() {
@@ -1842,7 +1842,7 @@ mod tests {
         assert_eq!(pixel_at(painter.canvas_mut(), 9, 30), (255, 0, 0, 255));
     }
 
-    /// The regression test for docs/build-steps.md Phase 19 item 10 / docs/adr/0043 decision 2:
+    /// The regression test for docs/build-steps.md Phase 19 item 10 / ADR-0043 decision 2:
     /// measurement (`ShapingHandle::shape`, cosmic-text) and paint (`TextPainter`, femtovg) must
     /// resolve the same font, or a `text` node's laid-out box and its painted glyphs disagree.
     /// Measured live on the dev machine before this fix: cosmic-text measured under

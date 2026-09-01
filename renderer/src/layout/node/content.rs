@@ -15,7 +15,7 @@ use crate::image::Fit;
 use super::*;
 
 /// Absent `content` defaults to the empty string. It used to be required, but decision 1's nil
-/// rule (docs/adr/0044) means a `text` bound to a bare, not-yet-pushed capability signal resolves
+/// rule (ADR-0044) means a `text` bound to a bare, not-yet-pushed capability signal resolves
 /// `content` to absent at boot, since every rostered signal reads `nil` until its first
 /// `StateSnapshot` and `run_startup_evaluation` runs before the poll loop drains one. Rejecting
 /// that would reject the whole tree and boot a blank shell.
@@ -28,14 +28,14 @@ pub fn parse_content(properties: &HashMap<String, Value>) -> Result<String, Layo
 }
 
 /// `icon.name` (§ 5.2 item 5): a theme name, or an absolute path, which `image::icons::resolve`
-/// tells apart. Defaults to `""` for the same boot reason `content` does (docs/adr/0044): a `name`
+/// tells apart. Defaults to `""` for the same boot reason `content` does (ADR-0044): a `name`
 /// bound to a capability signal is `nil` until that capability's first push, and rejecting the
 /// tree over it would fail every config that binds one.
 pub fn parse_icon_name(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     parse_optional_string(properties, "name")
 }
 
-/// `image.source` (docs/adr/0054 decision 3): an absolute path, never a theme name. The split from
+/// `image.source` (ADR-0054 decision 3): an absolute path, never a theme name. The split from
 /// [`parse_icon_name`] is the whole difference between the two node kinds, so they do not share a
 /// property spelling either.
 /// `textfield.placeholder` (§ 5.2 item 8): what an empty field shows. Defaults to `""`, the same
@@ -63,7 +63,7 @@ pub fn parse_image_source(properties: &HashMap<String, Value>) -> Result<String,
     parse_optional_string(properties, "source")
 }
 
-/// `image.fit` (docs/adr/0055 decision 3). Absent is `cover`; a string that is not one of the three
+/// `image.fit` (ADR-0055 decision 3). Absent is `cover`; a string that is not one of the three
 /// modes is an error rather than a silent fallback, because `fit = "fill"` is a config author
 /// reaching for a mode that does not exist and a silently-covered image would hide that.
 pub fn parse_fit(properties: &HashMap<String, Value>) -> Result<Fit, LayoutError> {
@@ -165,7 +165,7 @@ pub fn parse_text_align(properties: &HashMap<String, Value>) -> Result<TextAlign
 /// Separate from [`parse_foreground`] because an `icon`'s default is not white: an icon with no
 /// `foreground` must rasterize exactly as its file says, and a themed default would repaint every
 /// full-colour app icon. Only a `currentColor` icon has anything to take a colour from
-/// (docs/adr/0072).
+/// (ADR-0072).
 pub fn parse_optional_foreground(properties: &HashMap<String, Value>) -> Result<Option<Rgba>, LayoutError> {
     if !properties.contains_key("foreground") {
         return Ok(None);
@@ -192,7 +192,7 @@ pub fn parse_font_size(properties: &HashMap<String, Value>) -> Result<f32, Layou
         .ok_or_else(|| invalid("font_size", format!("expected a number, got {}", preview_for_error(value))))
 }
 
-/// Absent `size` defaults to 12.0, the same nil-rule rationale as [`parse_content`] (docs/adr/0044's
+/// Absent `size` defaults to 12.0, the same nil-rule rationale as [`parse_content`] (ADR-0044's
 /// amendment banner): `icon` was the second property the amendment names as still failing after
 /// decision 1's nil rule alone. Same accepted cost: `icon { sizee = 24 }` now renders a
 /// 12.0-sized icon instead of being rejected.
@@ -210,7 +210,7 @@ pub fn parse_icon_size(properties: &HashMap<String, Value>) -> Result<f32, Layou
 
 /// Shared shape behind [`parse_surface_id`]/`surface::parse_layer`/`surface::parse_monitor`: fetch `property`,
 /// reject a `Signal`, require it to be a string. `default` supplies the value when the property
-/// is absent; `None` makes it required, erroring instead (Standards review, docs/adr/0024).
+/// is absent; `None` makes it required, erroring instead (Standards review, ADR-0024).
 pub(super) fn parse_string_property(
     properties: &HashMap<String, Value>,
     property: &str,
@@ -231,7 +231,7 @@ pub(super) fn parse_string_property(
 }
 
 /// A top-level surface's `id`: required, unique among the surfaces in one config, and keys
-/// `Scene::apply`'s `HashMap` (`docs/oblisk-layout-engine-geometry.md` § 4). Since docs/adr/0045,
+/// `Scene::apply`'s `HashMap` (`docs/oblisk-layout-engine-geometry.md` § 4). Since ADR-0045,
 /// this same property is also the surface's *reconcile* identity: the root of a tree is the one
 /// node whose retained counterpart is found by key lookup rather than by [`parse_node_id`]'s
 /// per-parent pairing, because a surface has no parent to be scoped within -- decision 5 is
@@ -241,7 +241,7 @@ pub fn parse_surface_id(properties: &HashMap<String, Value>) -> Result<String, L
 }
 
 /// The optional `id` base property on every node kind, one level below a surface's root
-/// (docs/adr/0045 decisions 1-2). `None` means "no id" and is not an error --
+/// (ADR-0045 decisions 1-2). `None` means "no id" and is not an error --
 /// `pair_children_by_id_then_position` pairs a child that carries none positionally against the
 /// other id-less children (ADR-0023's original rule applied to that subsequence). Adding or
 /// dropping an `id` is a change of identity, not a cosmetic edit: the retained counterpart is

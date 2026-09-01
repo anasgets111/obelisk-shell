@@ -1,9 +1,9 @@
-//! Real [`reload::CandidateLink`] implementation over the control socket (docs/adr/0019 item
+//! Real [`reload::CandidateLink`] implementation over the control socket (ADR-0019 item
 //! 1/6): [`SocketCandidateLink`] is the production implementation `main.rs` drives
 //! `reload::run_pba`'s handshake with.
 //!
 //! Borrows the Supervisor's shared `inbound_frames` channel for the duration of one in-flight
-//! handshake, rather than a dedicated per-candidate channel (docs/adr/0025). A frame here that
+//! handshake, rather than a dedicated per-candidate channel (ADR-0025). A frame here that
 //! isn't relevant to this handshake is logged and dropped, not routed anywhere else.
 
 use std::time::Duration;
@@ -94,7 +94,7 @@ impl CandidateLink for SocketCandidateLink<'_> {
     /// `timeout(ready_timeout, ..)`. Found live (a real spawned process racing a real socket
     /// connect), not in review -- the fakes in this module's tests register instantly.
     ///
-    /// Sends one `StateSnapshot` frame per entry in `snapshots` (docs/adr/0029: every known
+    /// Sends one `StateSnapshot` frame per entry in `snapshots` (ADR-0029: every known
     /// capability), not just the first -- the retry loop only matters for the first frame.
     async fn push_state_snapshot(&mut self, snapshots: &[StateSnapshot]) -> Result<(), Self::Error> {
         for snapshot in snapshots {

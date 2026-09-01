@@ -1,4 +1,4 @@
-//! Pointer hit-testing: the chain of nodes under one point (docs/adr/0050 decision 1).
+//! Pointer hit-testing: the chain of nodes under one point (ADR-0050 decision 1).
 //!
 //! Pure, and that is the whole reason it is a module rather than three functions inside
 //! `crate::wayland`: everything else on the pointer path needs a live `wl_pointer` and a live
@@ -19,7 +19,7 @@ pub struct LogicalPoint {
 ///
 /// A path, not a topmost node: the only tree anyone writes is a `button` whose child is a `text`,
 /// and the deepest node under the pointer has no `on_click`, so returning it alone would mean no
-/// button ever fires (docs/adr/0050 decision 1). Each caller scans the result from the deep end
+/// button ever fires (ADR-0050 decision 1). Each caller scans the result from the deep end
 /// for the kind it wants.
 ///
 /// Three rules, all load-bearing:

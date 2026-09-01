@@ -4,7 +4,7 @@
 //! `RegisterAuthenticationAgent(subject: (sa{sv}), locale: s, object_path: s) -> ()`, not
 //! `RegisterAgent` as build-steps.md names it. The call-out uses `zbus_polkit`'s `Authority`
 //! proxy and `Subject` type directly rather than hand-deriving matching zvariant types
-//! (docs/adr/0013).
+//! (ADR-0013).
 //!
 //! The agent side, `org.freedesktop.PolicyKit1.AuthenticationAgent`, has no maintained crate,
 //! so `AuthenticationAgent` below is hand-written against the verified signature:
@@ -71,7 +71,7 @@ pub struct BeginAuthenticationCall {
 /// picking one to authenticate as is normally a user-facing choice (an identity picker), which
 /// doesn't exist here: this codebase's only `secure_submit` UI is a single password field with
 /// no picker. First-match is the simplest correct behavior until a picker exists to make the
-/// choice meaningful; see this ADR's upgrade path (docs/adr/0028) for where that UI would need
+/// choice meaningful; see this ADR's upgrade path (ADR-0028) for where that UI would need
 /// to attach.
 pub fn first_unix_user_uid(identities: &[(String, HashMap<String, OwnedValue>)]) -> Option<u32> {
     identities
@@ -88,7 +88,7 @@ pub fn first_unix_user_uid(identities: &[(String, HashMap<String, OwnedValue>)])
 /// does not drive a PAM conversation or push the challenge to the Renderer over IPC. Neither
 /// exists yet in this dependency tree (no PAM crate) or codebase (no IPC socket server, no
 /// `textfield` scene node) to hand the challenge to. See
-/// docs/adr/0015-polkit-pam-conversation-and-textfield-wiring-deferred.md for the real flow
+/// ADR-0015-polkit-pam-conversation-and-textfield-wiring-deferred.md for the real flow
 /// this stands in for and what unblocks it.
 pub struct AuthenticationAgent {
     challenges: UnboundedSender<BeginAuthenticationCall>,
@@ -129,7 +129,7 @@ impl AuthenticationAgent {
 }
 
 /// The authentication agent, held unregistered until a config declares a `secure_submit` that
-/// names polkit (docs/adr/0070 decisions 5 and 6).
+/// names polkit (ADR-0070 decisions 5 and 6).
 ///
 /// Registration used to be the fourth statement of `run_supervisor` and propagated with `?`, which
 /// meant "An authentication agent already exists for the given subject" -- the normal answer on a

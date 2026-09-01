@@ -3,7 +3,7 @@
 //!
 //! The worker builds its `FontSystem` from `text::fonts::resolve_chain`'s declared chain rather
 //! than `FontSystem::new()`, which walks the whole system font database (up to ~1s per
-//! cosmic-text's own docs -- docs/adr/0043 decision 2, Phase 19 item 10). A plain `std::thread`
+//! cosmic-text's own docs -- ADR-0043 decision 2, Phase 19 item 10). A plain `std::thread`
 //! plus `mpsc`, not tokio's multi-thread runtime: this is one dedicated CPU-bound worker, and
 //! renderer's Cargo.toml only carries tokio's `rt`/`net`/`macros` features.
 //!
@@ -65,7 +65,7 @@ enum Request {
     Shape(ShapeRequest, mpsc::Sender<ShapeResult>),
     FontChainData(mpsc::Sender<Vec<FontData>>),
     /// Replace the chain this worker measures against, once, after the config has said what it
-    /// wants (docs/adr/0043 decision 2). Replies when the new `FontSystem` is live, so the caller
+    /// wants (ADR-0043 decision 2). Replies when the new `FontSystem` is live, so the caller
     /// knows the next `font_chain_data` will answer with the new faces rather than the old.
     SetChain(Vec<String>, mpsc::Sender<()>),
     // Test-only, `#[cfg(test)]` rather than `#[allow(dead_code)]`: nothing outside a test binary
@@ -86,7 +86,7 @@ enum Request {
 /// roughly hourly instead and costs one cold pass, a few milliseconds, once.
 ///
 /// Full, the map holds on the order of 400KB: 4096 entries of a short `String` plus four integers
-/// and two floats, with `HashMap`'s own overhead. That is under one percent of docs/adr/0043's
+/// and two floats, with `HashMap`'s own overhead. That is under one percent of ADR-0043's
 /// 50MB-per-monitor budget, which is what makes a cap this generous the cheap choice.
 const SHAPE_CACHE_CAPACITY: usize = 4096;
 
@@ -114,8 +114,8 @@ struct ShapeKey {
 ///
 /// `Clone` clones the request `Sender` alone, so every clone still addresses the one worker
 /// thread and `FontSystem` -- what lets `wayland::App` and the `RendererClient` it owns share a
-/// warm font cache instead of each paying `FontSystem::new()`'s ~1s startup (docs/adr/0023 item
-/// 8, closed by docs/adr/0039 decision 3).
+/// warm font cache instead of each paying `FontSystem::new()`'s ~1s startup (ADR-0023 item
+/// 8, closed by ADR-0039 decision 3).
 ///
 /// The measurement cache is `Arc`-shared for the same reason and hangs on this side of the
 /// channel rather than inside the worker, which is the whole point of it: a worker-side cache

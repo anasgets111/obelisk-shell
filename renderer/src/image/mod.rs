@@ -1,4 +1,4 @@
-//! Decodes a file into a GPU texture, caches it, and fits it into a box (docs/adr/0054,
+//! Decodes a file into a GPU texture, caches it, and fits it into a box (ADR-0054,
 //! build-steps.md Phase 29 items 1 and 2).
 //!
 //! PNG and JPEG decode through the `image` crate ([`decode_raster`]). SVG decodes through `resvg`,
@@ -7,7 +7,7 @@
 //! The cache key is the path, and for SVG only, the rasterized pixel size: a raster file has one
 //! decode regardless of the box it lands in, but a vector rasterized for a 12px box would be
 //! served blurry to a 24px box under a path-only key. The key also carries the file's mtime and
-//! length (docs/adr/0031), so a producer that overwrites a path in place -- the tray does -- gets
+//! length (ADR-0031), so a producer that overwrites a path in place -- the tray does -- gets
 //! a fresh texture rather than the one it wrote last time.
 //!
 //! Failures are cached too, as `None`, so an unreadable file or `.svgz` (see [`rasterize_svg`])
@@ -32,7 +32,7 @@ use crate::text::snap::LogicalRect;
 /// § 9.2 asks for, so a wallpaper loaded once at startup is evicted before a tray icon loaded
 /// forty times. FIFO is a `VecDeque` and a counter; LRU needs a touch on every hit and either a
 /// dependency or an intrusive list. The eviction that actually matters is by bytes rather than by
-/// count (docs/adr/0043's budget: one 4K wallpaper is 32 MB and 127 tray icons are not), and
+/// count (ADR-0043's budget: one 4K wallpaper is 32 MB and 127 tray icons are not), and
 /// neither is worth building before there is a cache to measure.
 const CACHE_CAPACITY: usize = 128;
 
@@ -44,13 +44,13 @@ struct CacheKey {
     raster_px: u32,
     version: FileVersion,
     /// The `currentColor` value this texture was rasterized with, packed `0x00RRGGBB`
-    /// (docs/adr/0072). `None` for a raster file and for an untinted SVG. Part of the key because
+    /// (ADR-0072). `None` for a raster file and for an untinted SVG. Part of the key because
     /// one theme file drawn white on the bar and dim in a popup is two textures, and without it the
     /// first tint would win for the life of the process.
     tint: Option<u32>,
 }
 
-/// What tells one revision of a file from the next, at a path that keeps its name (docs/adr/0031's
+/// What tells one revision of a file from the next, at a path that keeps its name (ADR-0031's
 /// deferred item: the tray spools every icon update over the same
 /// `/dev/shm/oblisk-$UID/tray/{name}.png`, no revision suffix).
 ///
@@ -80,7 +80,7 @@ impl FileVersion {
     }
 }
 
-/// How an image fills the box layout gave it (docs/adr/0055 decision 3).
+/// How an image fills the box layout gave it (ADR-0055 decision 3).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Fit {
     /// Scales to cover the box and crops the overflow. The default because it is the only one of
@@ -109,7 +109,7 @@ impl Fit {
 /// Path-and-size to uploaded texture, for one generation (`CONTEXT.md`, **Image cache**).
 ///
 /// Not shared with the Supervisor and not persisted: the Renderer is swapped as an OS process on
-/// every reload, so this is cold again after each config edit (docs/adr/0054).
+/// every reload, so this is cold again after each config edit (ADR-0054).
 pub struct ImageCache {
     entries: HashMap<CacheKey, Option<ImageId>>,
     order: VecDeque<CacheKey>,
@@ -146,7 +146,7 @@ impl ImageCache {
     /// rasterizes against; a raster file ignores it.
     ///
     /// `None` for anything that did not decode, logged once rather than once per frame. The canvas
-    /// must be current on the calling thread, which since docs/adr/0039 is the only thread that
+    /// must be current on the calling thread, which since ADR-0039 is the only thread that
     /// paints.
     ///
     /// Stats the file on every call, including a hit, because the key carries the file's revision
@@ -155,13 +155,13 @@ impl ImageCache {
     /// to asking whether the bytes changed is re-reading them to find out.
     ///
     /// ponytail: a miss reads the file, and for an SVG rasterizes it, inside the frame. That thread
-    /// is also the Wayland dispatch thread and the one the config VM runs on (docs/adr/0039), so a
+    /// is also the Wayland dispatch thread and the one the config VM runs on (ADR-0039), so a
     /// cold `list` of thirty tray icons on a cold page cache is thirty `open`/`read` pairs plus
     /// thirty resvg renders before the first `swap_buffers`. Steady state after that is one hash
     /// lookup per node per frame, which is why this is a startup and reload cost rather than a
     /// per-frame one. The upgrade path is the shape `text::shaping` already has: hand the path and
     /// the size to a worker, return `None` for this frame, and mark the scene dirty when the upload
-    /// is ready (docs/adr/0044 decision 2). That is also
+    /// is ready (ADR-0044 decision 2). That is also
     /// `oblisk-supervisor-services-dbus.md` § 9.2's "off-thread", met on this side of the process
     /// boundary. Not built now because nothing has measured a dropped frame from it.
     pub fn image(
@@ -246,7 +246,7 @@ fn femtovg_error(err: ErrorKind) -> String {
 /// femtovg's `Canvas::load_image_file` would be the obvious call and cannot decode anything: the
 /// crate declares `image` with `default-features = false` and enables no format, so every PNG
 /// comes back `Unsupported(Exact(Png))`. That took the tray's and the notification daemon's
-/// spooled pixmaps (docs/adr/0031) with it, since both spool PNG.
+/// spooled pixmaps (ADR-0031) with it, since both spool PNG.
 ///
 /// `into_rgba8` also covers the grayscale-plus-alpha and 16-bit variants femtovg's own
 /// `ImageSource` conversion refuses outright, and costs nothing when the file already decoded to
@@ -305,7 +305,7 @@ fn hex_rgb(color: Rgba) -> String {
 }
 
 /// `data` with every `currentColor` made to resolve to `tint`, or `data` untouched when it holds no
-/// `currentColor` at all (docs/adr/0072).
+/// `currentColor` at all (ADR-0072).
 ///
 /// Two rewrites, because symbolic icons come in two shapes and a theme mixes them freely.
 ///
@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn the_shipped_wallpaper_rasterizes_to_opaque_pixels_at_the_size_asked_for() {
-        // Exercises resvg end to end against the file `dev-config` actually ships (docs/adr/0055):
+        // Exercises resvg end to end against the file `dev-config` actually ships (ADR-0055):
         // a tree that parses to nothing renders a fully transparent pixmap rather than an error.
         let svg = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/wallpaper.svg");
         let (pixels, width, height) = rasterize_svg(&svg, 128, None).expect("the shipped wallpaper should parse");
@@ -556,7 +556,7 @@ mod tests {
     fn a_png_decodes_to_the_pixels_it_was_written_with() {
         // The regression this exists for is not a wrong pixel, it is no decoder at all: femtovg
         // pulls `image` with every format feature off, so before `decode_raster` this file, every
-        // themed PNG icon and every tray pixmap (docs/adr/0031) failed with `Unsupported(Png)`.
+        // themed PNG icon and every tray pixmap (ADR-0031) failed with `Unsupported(Png)`.
         let dir = tempfile::tempdir().unwrap();
         let png = dir.path().join("fixture.png");
         std::fs::write(&png, PIL_2X2_RGBA_PNG).unwrap();

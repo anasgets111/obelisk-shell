@@ -44,7 +44,7 @@ impl TrayController {
         }
 
         // Before anything can spool: a fresh Supervisor owns nothing in there, so whatever is left
-        // is a previous run's and nothing will ever delete it otherwise (docs/adr/0074).
+        // is a previous run's and nothing will ever delete it otherwise (ADR-0074).
         crate::capabilities::shm_icons::sweep(super::icon::SPOOL_SUBDIR);
 
         let registry: ItemRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -135,7 +135,7 @@ impl TrayController {
         }
     }
 
-    /// `tray:secondary_activate(id, x, y)`: § 2.5's middle-click (docs/adr/0074).
+    /// `tray:secondary_activate(id, x, y)`: § 2.5's middle-click (ADR-0074).
     ///
     /// No `should_call_activate` gate, unlike [`Self::activate`]: `ItemIsMenu` says a *primary*
     /// click must open the menu instead of activating, and says nothing about the secondary one.
@@ -154,7 +154,7 @@ impl TrayController {
         }
     }
 
-    /// `tray:scroll(id, delta, orientation)`: § 2.5's scroll over the icon (docs/adr/0074).
+    /// `tray:scroll(id, delta, orientation)`: § 2.5's scroll over the icon (ADR-0074).
     ///
     /// `orientation` reaches the application verbatim. The spec names `"vertical"` and
     /// `"horizontal"` and this does not police it, because the string is the application's to
@@ -222,7 +222,7 @@ impl TrayController {
 
 /// Whether `name` is an item's own well-known bus name, the
 /// `org.{kde,freedesktop}.StatusNotifierItem-PID-N` an application claims before it calls
-/// `RegisterStatusNotifierItem` (docs/adr/0073).
+/// `RegisterStatusNotifierItem` (ADR-0073).
 ///
 /// Both spellings, because both are in the wild: KDE's is the de-facto one and Chromium claims the
 /// `org.freedesktop` one. The trailing `-` is what keeps this off `org.kde.StatusNotifierWatcher`
@@ -231,7 +231,7 @@ fn is_item_bus_name(name: &str) -> bool {
     ["org.kde.StatusNotifierItem-", "org.freedesktop.StatusNotifierItem-"].iter().any(|prefix| name.starts_with(prefix))
 }
 
-/// Registers every tray item already on the bus when this host starts (docs/adr/0073).
+/// Registers every tray item already on the bus when this host starts (ADR-0073).
 ///
 /// The spec's answer to a host starting late is `StatusNotifierHostRegistered`, which this watcher
 /// emits and which an application is meant to re-register on. Slack does not, so restarting the

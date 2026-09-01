@@ -49,7 +49,7 @@ fn read_max_brightness(entry_dir: &Path) -> i32 {
 }
 
 /// Picks one backlight device under `backlight_root`: entries with `max_brightness > 0`
-/// (docs/adr/0053 decision 6), ranked by [`device_type_rank`], ties broken by sorted
+/// (ADR-0053 decision 6), ranked by [`device_type_rank`], ties broken by sorted
 /// directory name for a deterministic choice across boots. `None` if nothing qualifies.
 fn select_backlight_device(backlight_root: &Path) -> Option<(PathBuf, i32)> {
     let mut entries: Vec<(PathBuf, i32)> = std::fs::read_dir(backlight_root)

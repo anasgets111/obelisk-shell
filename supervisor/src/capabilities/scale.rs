@@ -1,6 +1,6 @@
 //! Raw-brightness/percent conversion shared by every `hardware` capability that scales a
 //! `[0, max]` device reading against a `[0, 100]` percent: `keyboard`'s UPower backlight
-//! (docs/adr/0034) and `brightness`'s sysfs backlight (docs/adr/0053) both call these.
+//! (ADR-0034) and `brightness`'s sysfs backlight (ADR-0053) both call these.
 
 /// Converts a raw `[0, max]` brightness reading into a `[0, 100]` percent, round-half-away-
 /// from-zero. `max <= 0` returns the IDL's `-1` unavailable sentinel rather than dividing by

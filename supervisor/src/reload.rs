@@ -10,7 +10,7 @@
 //! - [`CandidateLink`]: an operation-level trait over the control socket. `socket::
 //!   SocketCandidateLink` is the real implementation; a fake drives this module's own tests.
 //!
-//! Not built here (docs/adr/0025): true independent per-output timing (ADR-0003's model, where
+//! Not built here (ADR-0025): true independent per-output timing (ADR-0003's model, where
 //! each output transfers the moment its own evidence lands with no barrier on siblings -- this
 //! module gates the Swap on all expected surface_ids within one shared `evidence_timeout`
 //! instead, a deliberate safety-motivated simplification) and a partial-candidate-abort
@@ -46,13 +46,13 @@ pub trait CandidateLink {
 
     /// § 15.2 point 1 / step 2 ("State Hydration"): push every pre-cached per-capability state
     /// snapshot down to the Candidate so it can hydrate its signals without querying the system
-    /// itself (docs/adr/0029).
+    /// itself (ADR-0029).
     async fn push_state_snapshot(&mut self, snapshots: &[shared::StateSnapshot]) -> Result<(), Self::Error>;
 
     /// § 15.2 points 2-3 / step 3 ("Null-Buffer Staging"): block until the Candidate signals it
     /// has completed its Wayland layer-shell handshake and committed its null buffers, i.e. it's
     /// ready for `ActivateDraw`. Returns the surface_ids it staged null buffers for; `run_pba`
-    /// uses this as the expected set for evidence collection (docs/adr/0025 item 2).
+    /// uses this as the expected set for evidence collection (ADR-0025 item 2).
     async fn recv_ready_signal(&mut self) -> Result<Vec<String>, Self::Error>;
 
     /// § 15.2 point 3 / step 4 ("Activate Draw"): write the unique, nonce-bound `ActivateDraw`
@@ -141,7 +141,7 @@ pub struct PbaOutcome {
 ///
 /// Evidence collection loops over every surface_id `recv_ready_signal` returned, wrapped in one
 /// `timeout(evidence_timeout, ...)` for the whole loop, not one per surface: § 15.4's promotion
-/// gate is all expected surface_ids within one shared deadline (docs/adr/0025 item 3). Returns
+/// gate is all expected surface_ids within one shared deadline (ADR-0025 item 3). Returns
 /// the confirmed surface_ids in `expected`'s order once every one has reported.
 async fn drive_handshake<L: CandidateLink>(
     link: &mut L,
@@ -286,7 +286,7 @@ fn swap_frames(
 ///    generation kept both.
 ///
 /// The two reaps are not ordered against each other. The generation's `process.run` children are
-/// their own process group leaders (§ 12, docs/adr/0026), so the Renderer's group reap never
+/// their own process group leaders (§ 12, ADR-0026), so the Renderer's group reap never
 /// reaches them and `reap_generations_processes` collects them whichever side of it runs.
 ///
 /// Takes the whole [`PbaOutcome`] by value because promoting it consumes it: `candidate` becomes

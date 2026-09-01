@@ -1,6 +1,6 @@
 //! `oblisk.brightness` capability: display backlight percent (docs/oblisk-idl-api-specs.md
 //! § 2.3), sysfs-read via a udev `backlight` subsystem watch, written through logind
-//! (docs/adr/0053). Sibling to `battery` under `hardware`, shaped the same way but with a
+//! (ADR-0053). Sibling to `battery` under `hardware`, shaped the same way but with a
 //! `dispatch` function for the write side (`brightness:set(pct)`, § 3.2).
 //!
 //! No backlight device at startup means the controller never emits

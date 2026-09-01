@@ -1,5 +1,5 @@
 //! `oblisk.applications` capability: the installed `.desktop` entries, enumerated
-//! (docs/adr/0061). Top-level, sibling to `system`/`updates`/`privacy` -- plain filesystem
+//! (ADR-0061). Top-level, sibling to `system`/`updates`/`privacy` -- plain filesystem
 //! reads, no D-Bus proxy and no hardware thread.
 //!
 //! This is the capability ADR-0054 decision 5 said would arrive "the day something needs an icon

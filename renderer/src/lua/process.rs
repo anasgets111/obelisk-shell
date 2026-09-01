@@ -1,17 +1,17 @@
 //! `process` global table and `ProcessHandle` userdata (`oblisk-idl-api-specs.md` § 3.2/3.3,
-//! `docs/oblisk-supervisor-services-dbus.md` § 12, build-steps.md Phase 15 item 1, docs/adr/0026).
+//! `docs/oblisk-supervisor-services-dbus.md` § 12, build-steps.md Phase 15 item 1, ADR-0026).
 //!
 //! `process.run(cmd, args, out_cb, exit_cb)` executes on the Wayland dispatch thread, inside a Lua
 //! evaluation, with no socket in scope -- so it can't write the outbound `"process"`/`"run"`
 //! `CommandEnvelope` directly. [`ProcessRegistry`] instead queues it onto the same
 //! `mpsc::UnboundedSender<RendererFrame>` every other outbound frame goes to, which the socket
-//! thread's `pump` drains and writes (docs/adr/0039).
+//! thread's `pump` drains and writes (ADR-0039).
 //!
 //! `Rc<RefCell<_>>`, not `Arc<Mutex<_>>`: [`ProcessRegistry`] is confined to the one Wayland
 //! dispatch thread, alongside the Lua VM whose closures drive it.
 //!
 //! Callback calling convention (not pinned down by the spec docs, decided here -- see
-//! docs/adr/0026): `out_cb(line, stream)` with `stream` the Lua string `"stdout"`/`"stderr"` (the
+//! ADR-0026): `out_cb(line, stream)` with `stream` the Lua string `"stdout"`/`"stderr"` (the
 //! wire type stays a real `shared::ProcessStream` enum; Lua has no enums). `exit_cb(code)` with
 //! `code` an integer or `nil`, `Option<i32>`'s own natural `IntoLua` mapping.
 
@@ -31,7 +31,7 @@ struct PendingProcess {
 }
 
 /// Registers `process.run`'s pending callbacks, assigns each call's `CommandEnvelope.id`
-/// (docs/adr/0026: the Renderer assigns it, not the Supervisor, so `process.run` can return a
+/// (ADR-0026: the Renderer assigns it, not the Supervisor, so `process.run` can return a
 /// `ProcessHandle` synchronously), and queues outbound `"process"` commands.
 #[derive(Clone)]
 pub struct ProcessRegistry(Rc<RefCell<Inner>>);
@@ -111,7 +111,7 @@ impl ProcessRegistry {
     }
 
     /// `SupervisorFrame::ProcessExited` dispatch: invokes `id`'s registered `exit_cb` and forgets
-    /// the id, the callback pair's last use (docs/adr/0026).
+    /// the id, the callback pair's last use (ADR-0026).
     pub fn dispatch_exit(&self, id: u64, code: Option<i32>) {
         let exit_cb = self.0.borrow_mut().pending.remove(&id).map(|p| p.exit_cb);
         let Some(exit_cb) = exit_cb else { return };

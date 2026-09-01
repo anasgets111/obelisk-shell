@@ -1,4 +1,4 @@
-//! `oblisk.idle`: idle-notify thresholds and the logind inhibit pair (docs/adr/0032,
+//! `oblisk.idle`: idle-notify thresholds and the logind inhibit pair (ADR-0032,
 //! docs/oblisk-supervisor-services-dbus.md § 7).
 //!
 //! **Not a capability**, and deliberately outside `shared::Capability::ALL` for the same reason
@@ -15,7 +15,7 @@
 //!
 //! There is no unregister. `Loader::evaluate_file` drops every threshold before it re-runs
 //! `shell.lua`, because the callbacks belong to the tree being replaced -- without that an
-//! in-place reload (docs/adr/0047) stacks a second copy of every callback on the same VM, and the
+//! in-place reload (ADR-0047) stacks a second copy of every callback on the same VM, and the
 //! tenth reload of a config that dims the screen dims it ten times. The Supervisor keeps its
 //! listener; re-registering the same duration is a no-op there.
 
@@ -53,7 +53,7 @@ impl IdleRegistry {
 
     /// `idle:register_threshold(sec, on_idle, on_resume)` (§ 7.1). Sends the start ahead of the
     /// command, because `idle` is off the roster and so has no `oblisk` member for
-    /// `lua::namespace`'s `__index` to catch (docs/adr/0070 decision 1). Both are deduplicated by
+    /// `lua::namespace`'s `__index` to catch (ADR-0070 decision 1). Both are deduplicated by
     /// `CommandSender`, so the second call sends only the command.
     ///
     /// The registration is local and
@@ -162,7 +162,7 @@ mod tests {
     }
 
     /// The next queued command, stepping over the `idle` start that every method sends ahead of
-    /// its first command (docs/adr/0070). `every_idle_method_starts_the_capability_first` is what
+    /// its first command (ADR-0070). `every_idle_method_starts_the_capability_first` is what
     /// asserts on those.
     fn queued_command(rx: &mut mpsc::UnboundedReceiver<RendererFrame>) -> Option<CommandEnvelope> {
         loop {
@@ -174,7 +174,7 @@ mod tests {
         }
     }
 
-    /// docs/adr/0070 decision 1: `idle` is off the roster, so nothing indexes `oblisk` to reach
+    /// ADR-0070 decision 1: `idle` is off the roster, so nothing indexes `oblisk` to reach
     /// it and the methods have to send the start themselves. Without this the Supervisor never
     /// builds `IdleController` and a `register` command lands on nothing.
     #[test]

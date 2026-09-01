@@ -18,13 +18,13 @@ pub use zeroize::{Zeroize, Zeroizing};
 /// cannot write to something else.
 ///
 /// The Renderer hands a rostered name out on first read of `oblisk.<name>`, and that read is what
-/// starts the capability's controller on the Supervisor (docs/adr/0070). Until its first
+/// starts the capability's controller on the Supervisor (ADR-0070). Until its first
 /// `StateSnapshot` the member reads `nil`, which is also what a name the config never reads costs:
 /// nothing runs behind it. `idle` is deliberately absent: it's event-shaped, not snapshot state
 /// (ADR-0032), and neither is `polkit`, which is reached from a `secure_submit` rather than a read
-/// (docs/adr/0070 decision 5) -- the Supervisor's own `Startable` covers both.
+/// (ADR-0070 decision 5) -- the Supervisor's own `Startable` covers both.
 ///
-/// An enum rather than the `&[&str]` this replaces (docs/adr/0076). The roster is matched on in
+/// An enum rather than the `&[&str]` this replaces (ADR-0076). The roster is matched on in
 /// two places that decide whether a capability starts and whether its commands are dispatched, and
 /// as strings both of them accepted a name nothing implemented, silently: the capability's Lua
 /// member existed and stayed `nil` forever. Exhaustive matches make adding a variant a build
@@ -124,7 +124,7 @@ pub struct CommandParams {
 
 /// Emitted by the Supervisor on system changes to hydrate active Lua signals. `capability`
 /// names which live Lua signal this hydrates; `renderer/src/socket.rs`'s `apply_state_snapshot`
-/// routes by this field (docs/adr/0029). `revision` is that capability's own state-version
+/// routes by this field (ADR-0029). `revision` is that capability's own state-version
 /// counter (ADR-0004).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StateSnapshot {
@@ -177,7 +177,7 @@ pub struct ApplyPendingReload {
 }
 
 /// § 15.2 point 3 ("Activate Draw"). Not a `CommandEnvelope` -- wrong direction/shape
-/// (docs/adr/0019).
+/// (ADR-0019).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActivateDraw {
     pub nonce: u64,
@@ -185,14 +185,14 @@ pub struct ActivateDraw {
 
 /// § 15.2 points 2-3 ("Null-Buffer Staging"): the Candidate's one-time report that every tracked
 /// Wayland surface has committed its null buffer and is staged, waiting for `ActivateDraw`.
-/// `surfaces` is a surface_id list, not a monitor id list (docs/adr/0025 item 2).
+/// `surfaces` is a surface_id list, not a monitor id list (ADR-0025 item 2).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReadySignal {
     pub surfaces: Vec<String>,
 }
 
 /// § 15.3 point 4 ("Evidence Verification"): one message per surface_id that received its
-/// `wp_presentation_feedback` `presented` event (docs/adr/0019 item 5).
+/// `wp_presentation_feedback` `presented` event (ADR-0019 item 5).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PresentationEvidence {
     pub nonce: u64,
@@ -201,7 +201,7 @@ pub struct PresentationEvidence {
 
 /// § 15.4 point 1 ("Input Deselection"): tells the superseded generation to stop treating
 /// `surface_id` as authoritative. No per-surface input-region/focus wiring exists yet to hand
-/// this to (docs/adr/0025 item 4).
+/// this to (ADR-0025 item 4).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeselectInput {
     pub surface_id: String,
@@ -222,7 +222,7 @@ pub enum ProcessStream {
 }
 
 /// Supervisor -> Renderer: `"idled"` or `"resumed"`, one `ext_idle_notification_v1` event
-/// (docs/adr/0032). `#[serde(rename)]` on each variant, not the derived `Idled`/`Resumed`:
+/// (ADR-0032). `#[serde(rename)]` on each variant, not the derived `Idled`/`Resumed`:
 /// ADR-0032 pins the wire value to the protocol's own lowercase event names, not Rust's
 /// PascalCase spelling.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -234,7 +234,7 @@ pub enum IdleState {
 }
 
 /// Supervisor -> Renderer: one `ext_idle_notification_v1` `idled`/`resumed` event, fanned out to
-/// `generation_id` (docs/adr/0032). `threshold_sec` is the duration this event's listener was
+/// `generation_id` (ADR-0032). `threshold_sec` is the duration this event's listener was
 /// created for -- the Renderer looks up its own registered callback by this value, not through
 /// the `StateSnapshot`/`revision` path: idle is event-shaped, not pollable state.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -246,7 +246,7 @@ pub struct IdleEvent {
 
 /// Supervisor -> Renderer: one line of a `process.run`-spawned child's stdout/stderr. `id` is
 /// the same value the Renderer assigned in the `"process"`/`"run"` `CommandEnvelope.id` that
-/// spawned it -- assigned client-side rather than handed back by the Supervisor (docs/adr/0026).
+/// spawned it -- assigned client-side rather than handed back by the Supervisor (ADR-0026).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProcessOutputLine {
     pub id: u64,
@@ -351,7 +351,7 @@ pub enum RendererFrame {
     SecureSubmit(SecureSubmit),
     LockReport(LockReport),
     /// Asks the Supervisor to *start* a reload cycle for this generation: bump the sequence it
-    /// owns and send the [`ReevaluateRequest`] carrying it (docs/adr/0041 decision 4).
+    /// owns and send the [`ReevaluateRequest`] carrying it (ADR-0041 decision 4).
     ///
     /// Carries no sequence: the Supervisor is the only holder of `next_sequence`, and
     /// `supervisor/src/main.rs`'s `is_current_reload` drops any report whose sequence isn't the
@@ -359,7 +359,7 @@ pub enum RendererFrame {
     /// `ReevaluateReport` discarded as stale.
     RequestReload,
     /// Asks the Supervisor to construct `capability`'s controller, sent the first time this
-    /// generation's config reads `oblisk.<capability>` (docs/adr/0070 decision 1) or applies a
+    /// generation's config reads `oblisk.<capability>` (ADR-0070 decision 1) or applies a
     /// scene whose `secure_submit` names it (decision 5).
     ///
     /// Carries no generation id in the payload for the same reason [`Self::RequestReload`] carries

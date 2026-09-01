@@ -73,9 +73,9 @@ pub struct App {
     /// and a declared `window` says so once instead of taking the process down.
     xdg_shell: Option<XdgShell>,
     /// `ext_session_lock_manager_v1`, or the knowledge that the compositor advertises none
-    /// (docs/adr/0042). Not an `Option` like `xdg_shell`: SCTK wraps the global in a
+    /// (ADR-0042). Not an `Option` like `xdg_shell`: SCTK wraps the global in a
     /// `GlobalProxy`, so the absent case surfaces as `GlobalError::MissingGlobal` from `lock`
-    /// itself, a refusal of a lock command rather than a startup bind failure (docs/adr/0052
+    /// itself, a refusal of a lock command rather than a startup bind failure (ADR-0052
     /// decision 4). Not in `registry_handlers![OutputState, SeatState]`: `SessionLockState` is
     /// not a `RegistryHandler`; it binds once from the `GlobalList` in [`run`].
     session_lock_state: SessionLockState,
@@ -83,16 +83,16 @@ pub struct App {
     /// unlock the Supervisor ordered, a denial, or a compositor teardown.
     ///
     /// `Some` with `is_locked()` still false is the in-flight window between request and answer,
-    /// which is why `finished` is two different events (docs/adr/0042) -- see
+    /// which is why `finished` is two different events (ADR-0042) -- see
     /// `lock::finished_outcome`.
     session_lock: Option<SessionLock>,
     /// The shared EGL display, config and GLES3 context, or `None` until a surface needs one.
     ///
     /// Lazy because `eglInitialize` is what makes Mesa load its driver, which on this machine is
     /// `libgallium` plus the LLVM it links: 125 MB of mapped pages and 13-35 ms, for a process
-    /// that may never draw. A config declaring no surfaces (docs/adr/0070 decision 7) never pays
+    /// that may never draw. A config declaring no surfaces (ADR-0070 decision 7) never pays
     /// either, and a PBA Candidate pays after `ActivateDraw` rather than inside its ready window,
-    /// since `activate_draw_one` is its only bind (docs/adr/0071).
+    /// since `activate_draw_one` is its only bind (ADR-0071).
     egl: Option<egl::EglState>,
     gl: Option<glow::Context>,
     /// Kept for the `wl_display` pointer [`App::ensure_egl`] needs, and kept as the whole
@@ -100,14 +100,14 @@ pub struct App {
     /// SAFETY precondition: the display outlives the EGL state built against it.
     conn: Connection,
     /// The one `ShapingHandle` for the process; `client` holds a clone, so content-sizing and
-    /// painting share one worker thread and one `FontSystem` (docs/adr/0039 decision 3).
+    /// painting share one worker thread and one `FontSystem` (ADR-0039 decision 3).
     shaping: ShapingHandle,
     text_painter: Option<TextPainter>,
     /// One image cache for the process, keyed by file path and pixel size, so an icon drawn on
     /// the bar and the same icon in a popup are one upload, not one per surface (`CONTEXT.md`,
     /// **Image cache**).
     image_cache: ImageCache,
-    /// The Lua VM, `Loader`, retained `Scene`, live signals and reload bookkeeping (docs/adr/0039).
+    /// The Lua VM, `Loader`, retained `Scene`, live signals and reload bookkeeping (ADR-0039).
     /// `mlua::Lua` is `!Send`, so `App` is too -- fine, since `wayland-client` puts no `Send`
     /// bound on the dispatch state.
     client: RendererClient,
@@ -120,7 +120,7 @@ pub struct App {
     ready_signal_sent: bool,
     /// Set once [`run`]'s startup sequence has evaluated the config and built its surfaces. The
     /// initial `wl_output` burst dispatches inside `run`'s own two roundtrips, before the
-    /// evaluation that seeds `screens` from it (docs/adr/0041 decision 2), so
+    /// evaluation that seeds `screens` from it (ADR-0041 decision 2), so
     /// [`App::handle_output_change`] must not run its full job that early: there is no
     /// evaluation to expand yet.
     startup_complete: bool,
@@ -149,27 +149,27 @@ pub struct App {
     /// alone, the only way a client learns which surface `keyboard_interactivity` actually won
     /// focus for.
     keyboard: Option<wl_keyboard::WlKeyboard>,
-    /// The instance id of the surface holding keyboard focus, if any (docs/adr/0050's
+    /// The instance id of the surface holding keyboard focus, if any (ADR-0050's
     /// consequences). `input::focus_is_still_armed` reads it on every keystroke: a `secure_submit`
     /// field is armed only while the surface that declared it is the one this names.
     ///
     /// ponytail: nothing *else* consumes it, because § 5.2 has no `on_key` for a keysym to route to
-    /// and docs/adr/0050 explicitly declines to invent one. Upgrade path: an IDL key-handler
+    /// and ADR-0050 explicitly declines to invent one. Upgrade path: an IDL key-handler
     /// property, at which point this is the surface whose tree the keysym gets dispatched into.
     keyboard_focus: Option<String>,
-    /// The press waiting for its release, if any (docs/adr/0050 decision 2, [`ArmedClick`]).
+    /// The press waiting for its release, if any (ADR-0050 decision 2, [`ArmedClick`]).
     armed: Option<ArmedClick>,
-    /// The serial `xdg_popup.grab` needs, for the length of one poll turn (docs/adr/0049's
+    /// The serial `xdg_popup.grab` needs, for the length of one poll turn (ADR-0049's
     /// amendment, [`ArmedSerial`]).
     input_serial: Option<ArmedSerial>,
-    /// Every `BTN_LEFT` press and release this process has seen, counted (docs/adr/0051's first
+    /// Every `BTN_LEFT` press and release this process has seen, counted (ADR-0051's first
     /// amendment). Monotonic and never reset. Makes the dismissal latch clearable: `input_serial`
     /// is cleared at the end of each poll turn, so a later turn has nothing to compare "has the
     /// user asked again" against. Counting both press and release, not just press, means the
     /// reopen works whatever order the compositor batches a dismissal in relative to `popup_done`.
     pointer_input_count: u64,
     /// The focused `secure_submit` field and the surface it lives on, set by the press that focused
-    /// a `textfield` (docs/adr/0050 decision 4, `input::focused_target`) or by keyboard focus landing on
+    /// a `textfield` (ADR-0050 decision 4, `input::focused_target`) or by keyboard focus landing on
     /// a surface with a sole one (`input::sole_secure_submit`). `None` means no frame at all -- see
     /// `input::submit_frame_for`. Written only through [`App::focus_secure_submit`].
     focused_secure_submit: Option<FocusedField>,
@@ -195,7 +195,7 @@ pub struct App {
     secure_input_changed: bool,
 }
 
-/// The Renderer's main thread: Wayland dispatch, EGL, and (since docs/adr/0039) the Lua VM, the
+/// The Renderer's main thread: Wayland dispatch, EGL, and (since ADR-0039) the Lua VM, the
 /// retained `Scene`, and the live signals. `inbound_rx` carries `SupervisorFrame`s decoded by the
 /// socket thread; `outbound_tx` carries every frame this thread sends back.
 pub fn run(
@@ -218,7 +218,7 @@ pub fn run(
     let seat_state = SeatState::new(&globals, &qh);
     // Not `?`, not logged: `SessionLockState::new` cannot fail. It stores a `GlobalProxy`, so a
     // missing `ext_session_lock_manager_v1` surfaces only when something asks for a lock
-    // (docs/adr/0052 decision 4).
+    // (ADR-0052 decision 4).
     let session_lock_state = SessionLockState::new(&globals, &qh);
     let registry_state = RegistryState::new(&globals);
     // Stable protocol. `PresentationTimeState::bind` tolerates a compositor that doesn't
@@ -228,7 +228,7 @@ pub fn run(
     let is_pba_candidate = std::env::var("OBLISK_PBA_CANDIDATE").is_ok();
 
     // One `ShapingHandle` for the process: `App` keeps this one, `RendererClient` gets a clone
-    // (docs/adr/0039 decision 3). `Loader::new()` runs on this thread because `mlua::Lua` is
+    // (ADR-0039 decision 3). `Loader::new()` runs on this thread because `mlua::Lua` is
     // `!Send`.
     let shaping = ShapingHandle::spawn();
     let client = RendererClient::start(shaping.clone(), outbound_tx.clone(), generation_id)?;
@@ -279,7 +279,7 @@ pub fn run(
 
     // `oblisk-supervisor-services-dbus.md` § 15.2's Candidate order made literal, which on one
     // thread is just the order of these statements: evaluate shell.lua, bind the layer-shell
-    // surfaces the evaluation declared (docs/adr/0038 decision 1), commit null buffers (in
+    // surfaces the evaluation declared (ADR-0038 decision 1), commit null buffers (in
     // `bind_and_clear`'s candidate branch), signal ready (`maybe_send_ready_signal`).
     //
     // ponytail: this runs inside the PBA ready window -- no layer surface exists until it
@@ -289,7 +289,7 @@ pub fn run(
     // eating into that budget -- accepted cost, not a fix, since § 15.2 requires evaluate-before-
     // bind ordering.
     //
-    // `screens` is seeded before the evaluation, not after (docs/adr/0041 decision 2): a config's
+    // `screens` is seeded before the evaluation, not after (ADR-0041 decision 2): a config's
     // top-level `for _, screen in ipairs(screens:get())` loop runs during this evaluation, so a
     // list seeded afterwards would declare no per-monitor panels on the first pass.
     let screens = app.screens(None);
@@ -338,7 +338,7 @@ pub fn run(
     if app.is_pba_candidate {
         // `bind_and_clear`'s configure-driven check misses a generation whose every surface is a
         // `window` with `visible = false`: no `xdg_toplevel` exists to be configured
-        // (docs/adr/0049 decision 1), so without this call such a Candidate never announces
+        // (ADR-0049 decision 1), so without this call such a Candidate never announces
         // itself and dies on `ready_timeout`. A no-op otherwise, since the gate refuses this early.
         app.maybe_send_ready_signal();
     }
@@ -357,10 +357,10 @@ pub fn run(
             break;
         }
         // Drain, not one-per-pass: every `SupervisorFrame` reaches this thread through this
-        // channel (docs/adr/0039), so a burst of `StateSnapshot` pushes must not be spread one
+        // channel (ADR-0039), so a burst of `StateSnapshot` pushes must not be spread one
         // per 15ms poll tick.
         //
-        // `Disconnected` is a separate answer from `Empty` here (docs/adr/0059 decision 1). It
+        // `Disconnected` is a separate answer from `Empty` here (ADR-0059 decision 1). It
         // used to be one: `while let Ok(frame)` treated a dead socket thread the same as an idle
         // one, so killing the Supervisor left this process spinning its 15ms poll forever at
         // 17.8% of a core, painting a shell with no capability data and no way to reach one.
@@ -379,7 +379,7 @@ pub fn run(
                 // `std::process::exit`, not `app.exit = true`: breaking the loop returns from `run`
                 // and drops `App`, and SCTK's `SessionLockInner::Drop` sends a bare
                 // `ext_session_lock_v1.destroy`, which is `invalid_destroy` once `locked` has been
-                // sent -- the one error docs/adr/0052 exists to avoid. Skipping the destructor
+                // sent -- the one error ADR-0052 exists to avoid. Skipping the destructor
                 // closes the connection instead, which the compositor treats as the same lock
                 // client death and logs as nothing.
                 //
@@ -416,7 +416,7 @@ pub fn run(
                 // Serviced here, not collected like a draw nonce: a draw must land after the
                 // re-resolve below or it paints the pre-push layout, but a lock reads nothing a
                 // re-resolve produces -- whether this config declares a `lock` surface is a fact
-                // about the tracked surface set (docs/adr/0052 decision 3) that no capability push
+                // about the tracked surface set (ADR-0052 decision 3) that no capability push
                 // changes. Deferring would cost a poll turn on the one command whose whole point is
                 // that the screen goes secure now.
                 FrameOutcome::SetSessionLock(locked) => {
@@ -426,7 +426,7 @@ pub fn run(
                     // so `locked` may already be on the wire but undispatched. `unlock()` would then
                     // be a silent no-op and the `Drop` right after would send the plain `destroy`
                     // the protocol XML forbids once `locked` was sent -- `invalid_destroy`, which
-                    // kills the connection with the session still locked, the state docs/adr/0052
+                    // kills the connection with the session still locked, the state ADR-0052
                     // exists to prevent. `roundtrip` closes it: a `wl_callback` cannot arrive before
                     // everything sent earlier.
                     //
@@ -467,7 +467,7 @@ pub fn run(
         // reach the screen at all rather than stopping at a resolved tree in memory.
         // Two statements, the two halves of one commit. The first stages everything the
         // re-resolve changed about each surface -- layer-shell fields permitted to change in
-        // place, the input region, whether it is mapped (docs/adr/0038 decision 2). All of that
+        // place, the input region, whether it is mapped (ADR-0038 decision 2). All of that
         // is double-buffered `wl_surface` state, so none of it takes effect until the second
         // statement's `swap_buffers` commits it. Committing per field would show the compositor a
         // half-updated surface between requests.
@@ -482,7 +482,7 @@ pub fn run(
         if re_resolved || typed {
             app.repaint_mapped_surfaces();
         }
-        // The disarm half of docs/adr/0049's amendment, and it must be here, not inside the `if`
+        // The disarm half of ADR-0049's amendment, and it must be here, not inside the `if`
         // above. `dispatch_pending` armed `input_serial` if a `BTN_LEFT` press or release arrived
         // this turn; `apply_resolved_surface_state` above is the only reader, since it is the only
         // thing that creates a popup. Clearing unconditionally makes "a popup may only open in

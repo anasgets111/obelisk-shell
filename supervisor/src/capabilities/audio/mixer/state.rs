@@ -19,7 +19,7 @@ use crate::capabilities::audio::master;
 /// see the module doc comment.
 const STREAM_OUTPUT_AUDIO: &str = "Stream/Output/Audio";
 
-/// `media.class` value a camera-capture PipeWire node carries (docs/adr/0034). Tracked here,
+/// `media.class` value a camera-capture PipeWire node carries (ADR-0034). Tracked here,
 /// not a second PipeWire connection, purely as a name-enrichment source for `oblisk.privacy`'s
 /// camera detection -- PipeWire only sees the portal-routed subset of camera users, so this is
 /// supplementary to that capability's own kernel-level detection, never primary.
@@ -30,8 +30,8 @@ const VIDEO_SOURCE: &str = "Video/Source";
 ///
 /// `Serialize`: this is what `main.rs` puts in a `StateSnapshot`'s `payload`, pushed to the
 /// Renderer over the control socket as-is. Field names match § 2.4's spelling (`id`, `name`,
-/// docs/adr/0053 decision 3). `pid`/`process_name` are kept even though § 2.4 doesn't list them
-/// -- docs/adr/0016 exists because finding the owning process was genuinely hard, and discarding
+/// ADR-0053 decision 3). `pid`/`process_name` are kept even though § 2.4 doesn't list them
+/// -- ADR-0016 exists because finding the owning process was genuinely hard, and discarding
 /// that answer would throw away the one part of this payload that took real work.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AppStream {
@@ -198,7 +198,7 @@ impl AudioApps {
     }
 }
 
-/// The full `oblisk.audio` payload (§ 2.4, docs/adr/0053 decision 3): master output
+/// The full `oblisk.audio` payload (§ 2.4, ADR-0053 decision 3): master output
 /// volume/mute plus the per-app stream list.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AudioState {
@@ -303,7 +303,7 @@ pub(super) fn device_display_name(props: &impl PropsLookup) -> Option<String> {
 }
 
 /// One `Video/Source` node PipeWire has advertised, resolved just enough for `oblisk.privacy`'s
-/// name-enrichment (docs/adr/0034): `pid` is what a kernel-detected `/dev/videoN` opener's own
+/// name-enrichment (ADR-0034): `pid` is what a kernel-detected `/dev/videoN` opener's own
 /// pid gets matched against; `app_name` is the nicer name PipeWire supplies for the match. No
 /// `process_name` field (unlike [`AppStream`]) -- `oblisk.privacy`'s own `/proc/{pid}/comm`
 /// fallback already covers that case for pids PipeWire doesn't see at all, so resolving it here
@@ -405,7 +405,7 @@ pub enum AudioCommand {
 /// comment for what a graceful shutdown would need that doesn't exist yet.
 ///
 /// The `sink_*`/`metadata*`/`default_sink_name` fields are § 2.4's master-volume tracking
-/// (docs/adr/0053 decision 3) -- see [`master`]. `sink_nodes` is separate from `nodes` (which
+/// (ADR-0053 decision 3) -- see [`master`]. `sink_nodes` is separate from `nodes` (which
 /// only holds stream/video-source proxies) because a sink's proxy outlives its own,
 /// differently-shaped `param` listener rather than the `info` listener `nodes` entries carry.
 pub(super) struct MixerState {
@@ -782,8 +782,8 @@ mod tests {
 
     #[test]
     fn app_stream_serializes_with_the_spec_field_spelling() {
-        // docs/adr/0053 decision 3: node_id -> id, app_name -> name; pid/process_name kept
-        // (docs/adr/0016).
+        // ADR-0053 decision 3: node_id -> id, app_name -> name; pid/process_name kept
+        // (ADR-0016).
         let stream =
             AppStream { id: 7, pid: 999, name: Some("Zen".to_string()), process_name: None, volume: 1.0, muted: false };
         let json = serde_json::to_value(&stream).unwrap();

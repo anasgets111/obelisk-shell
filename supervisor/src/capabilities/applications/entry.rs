@@ -1,4 +1,4 @@
-//! One `.desktop` file, parsed (docs/adr/0061). The desktop entry specification's file format
+//! One `.desktop` file, parsed (ADR-0061). The desktop entry specification's file format
 //! and its `Exec` quoting rules, hand-written rather than pulled from a crate: the whole of what
 //! this needs is one group header, seven keys and one tokenizer, and owning the semantics is
 //! worth more here than a dependency's opinion about them.

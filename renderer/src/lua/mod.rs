@@ -21,10 +21,10 @@ use std::cell::RefCell;
 
 use mlua::{Lua, Table, Value};
 
-/// What a config's VM loads, spelled out rather than mlua's `StdLib::ALL_SAFE` (docs/adr/0048):
-/// `ALL_SAFE` leaves `io` and `os` whole, and the Lua VM runs on the Wayland thread (docs/adr/0039),
+/// What a config's VM loads, spelled out rather than mlua's `StdLib::ALL_SAFE` (ADR-0048):
+/// `ALL_SAFE` leaves `io` and `os` whole, and the Lua VM runs on the Wayland thread (ADR-0039),
 /// so `io.read` or `os.execute` in a `computed` freezes every surface on every monitor until it
-/// returns -- the 5ms CPU cap (docs/adr/0021) cannot catch it, since it's an instruction-count hook
+/// returns -- the 5ms CPU cap (ADR-0021) cannot catch it, since it's an instruction-count hook
 /// and a thread parked in a syscall executes no instructions.
 ///
 /// `IO` is absent outright. `OS` is loaded here only so [`restrict_os`] can lift the four calls
@@ -66,7 +66,7 @@ fn restrict_os(lua: &Lua) -> mlua::Result<()> {
     lua.globals().get::<Table>("package")?.get::<Table>("loaded")?.set("os", &kept)
 }
 
-/// Points `require` at the config directory and nothing else (docs/adr/0047 decision 1).
+/// Points `require` at the config directory and nothing else (ADR-0047 decision 1).
 ///
 /// Replaces Lua's compiled-in default (`/usr/local/share/lua/5.4/?.lua;...;./?.lua;./?/init.lua`)
 /// rather than prepending to it. The system entries let a same-named module installed system
@@ -114,7 +114,7 @@ pub enum LoaderError {
     Eval(#[from] mlua::Error),
     /// The script evaluated cleanly, but its top-level return wasn't a surface node or an array of
     /// them (§ 6.1). An *empty* array is fine, and so is no return at all: a config may declare no
-    /// surfaces (docs/adr/0070 decision 7).
+    /// surfaces (ADR-0070 decision 7).
     #[error("shell.lua's top-level return must be a `panel` node or an array of them: {0}")]
     InvalidTopLevelReturn(String),
     /// [`Loader::evaluate_file`] couldn't read `shell.lua` off disk (missing file, permissions).
@@ -242,7 +242,7 @@ impl Loader {
     }
 
     /// Drops every module a config's own `require` put in `package.loaded`, leaving the standard
-    /// library alone (docs/adr/0047 decision 2).
+    /// library alone (ADR-0047 decision 2).
     ///
     /// ADR-0044 decision 4 keeps one VM per generation and does not reset it on an in-place
     /// reload; `require` caches by module name. Together they mean an edited `widgets/clock.lua`
@@ -291,7 +291,7 @@ call in last position expands to both: bind it to a local first";
 fn collect_surfaces(value: Value) -> Result<Vec<VirtualNode>, LoaderError> {
     let table = match value {
         Value::Table(t) => t,
-        // A config that declares nothing, which is legal (docs/adr/0070 decision 7) and is the
+        // A config that declares nothing, which is legal (ADR-0070 decision 7) and is the
         // shape an empty `shell.lua` returns: Lua's own `nil` for a chunk with no `return`.
         Value::Nil => return Ok(Vec::new()),
         other => {
@@ -324,17 +324,17 @@ fn collect_surfaces(value: Value) -> Result<Vec<VirtualNode>, LoaderError> {
         require_surface(&node)?;
         surfaces.push(node);
     }
-    // `return {}` is a config that declares no surfaces, not a mistake (docs/adr/0070 decision 7).
+    // `return {}` is a config that declares no surfaces, not a mistake (ADR-0070 decision 7).
     // It used to be refused, which made "run nothing" a state this engine did not have -- and that
     // is the only state in which a config gates every capability off.
     Ok(surfaces)
 }
 
-/// § 6's roles, at the root where § 6 puts them -- all four (docs/adr/0040 decision 1).
+/// § 6's roles, at the root where § 6 puts them -- all four (ADR-0040 decision 1).
 ///
 /// `lock` is admitted here even though its Wayland object's lifetime is the lock's, not the
-/// config's: docs/adr/0052 decision 2 treats "where the declaration lives" and "when the Wayland
-/// object exists" as separate questions, the same split docs/adr/0049 already made for `window`
+/// config's: ADR-0052 decision 2 treats "where the declaration lives" and "when the Wayland
+/// object exists" as separate questions, the same split ADR-0049 already made for `window`
 /// (admitted here, owns no `xdg_toplevel` until `visible` resolves true) and `popup`. A `lock`
 /// owns no `ext_session_lock_surface_v1` until the compositor sends `locked`; refusing it at the
 /// root would leave § 6.4's `child` -- the whole authored lock screen -- with no legal place to
@@ -367,7 +367,7 @@ mod tests {
         Loader::new(signal::DirtyFlag::new(), &std::env::temp_dir()).unwrap()
     }
 
-    /// docs/adr/0047 decision 1.
+    /// ADR-0047 decision 1.
     #[test]
     fn require_resolves_a_module_inside_the_config_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -403,7 +403,7 @@ mod tests {
         }
     }
 
-    /// docs/adr/0047 decision 2, the one place ADR-0044 and ADR-0047 interact: without a module
+    /// ADR-0047 decision 2, the one place ADR-0044 and ADR-0047 interact: without a module
     /// cache clear, an edit to a required module would re-run `shell.lua` against the stale
     /// cached copy, a reload that silently does nothing.
     #[test]
@@ -754,7 +754,7 @@ mod tests {
         loader.lua().load(format!("return ({expr}) == nil")).eval().unwrap()
     }
 
-    /// docs/adr/0048: each of these blocks the Wayland dispatch thread, and the 5ms CPU cap can't
+    /// ADR-0048: each of these blocks the Wayland dispatch thread, and the 5ms CPU cap can't
     /// catch it since a thread parked in a syscall executes no instructions.
     #[test]
     fn the_config_vm_has_no_blocking_stdlib_call_left_to_stall_wayland_dispatch() {
@@ -813,7 +813,7 @@ mod tests {
         assert!(matches!(err, LoaderError::InvalidTopLevelReturn(_)));
     }
 
-    /// docs/adr/0070 decision 7. "Run nothing" is the only state in which a config gates every
+    /// ADR-0070 decision 7. "Run nothing" is the only state in which a config gates every
     /// capability off, so it has to be a state this engine has.
     #[test]
     fn a_config_may_declare_no_surfaces_at_all() {
@@ -848,7 +848,7 @@ mod tests {
 
     #[test]
     fn evaluate_accepts_a_window_and_a_popup_at_the_top_level_beside_a_panel() {
-        // docs/adr/0040 decision 1: all four § 6 roles are a config's to declare at the root.
+        // ADR-0040 decision 1: all four § 6 roles are a config's to declare at the root.
         let loader = test_loader();
         let output = loader
             .evaluate(
@@ -865,7 +865,7 @@ mod tests {
 
     #[test]
     fn evaluate_accepts_a_top_level_lock_because_declaring_one_is_not_the_same_as_locking() {
-        // docs/adr/0052 decision 2: the compositor still decides when the lock surface exists;
+        // ADR-0052 decision 2: the compositor still decides when the lock surface exists;
         // this function only ever decided where the declaration may be written.
         let loader = test_loader();
         let output =

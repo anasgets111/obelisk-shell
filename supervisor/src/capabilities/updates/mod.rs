@@ -19,7 +19,7 @@ pub enum UpdatesAction {
 }
 
 /// `oblisk.updates`'s action dispatch (ADR-0037): `configure` is synchronous (it only rewrites
-/// the interval under its lock and nudges the scheduler's watch channel -- docs/adr/0034);
+/// the interval under its lock and nudges the scheduler's watch channel -- ADR-0034);
 /// `install` runs a real `pacman` child and gets `tokio::spawn`ed.
 pub fn dispatch(controller: &UpdatesController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;

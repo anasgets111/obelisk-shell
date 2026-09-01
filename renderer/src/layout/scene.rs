@@ -3,13 +3,13 @@
 //!
 //! A pass is three steps. [`prepare`] walks the fresh tree in declaration order, resolving each
 //! node's properties once, parsing them once, matching it to the retained node it continues
-//! (`pair_children_by_id_then_position`, § 4 as amended by docs/adr/0045: children carrying an
+//! (`pair_children_by_id_then_position`, § 4 as amended by ADR-0045: children carrying an
 //! `id` pair by that `id` alone, scoped to their parent, and the id-less ones pair by position
 //! among themselves -- ADR-0023's original rule on a smaller set), retiring removed subtrees
 //! child-first (`CONTEXT.md`, Lease), and building a taffy node for it. [`solve`] runs § 3's three
 //! passes over that tree. [`finish`] reads the geometry back out.
 //!
-//! The § 3 math itself is taffy's since docs/adr/0077, which supersedes ADR-0023's one-pass
+//! The § 3 math itself is taffy's since ADR-0077, which supersedes ADR-0023's one-pass
 //! stacking model. What is still this module's own is everything a solver has no opinion about:
 //! node identity, the lease, the depth cap, the once-per-pass resolution guarantee, the scroll
 //! writeback, and text elision. [`taffy_style`] is the seam between the two, and it is the only
@@ -60,7 +60,7 @@ pub struct LogicalSize {
 /// The nest costs about 450 KiB once rather than per level, because it is popped before the walk
 /// descends to the next node. So 64 levels peak at roughly half of a 2 MiB stack, a 1.97x margin.
 ///
-/// 64 rather than fewer, and unchanged by the solver swap (docs/adr/0077), because that swap
+/// 64 rather than fewer, and unchanged by the solver swap (ADR-0077), because that swap
 /// *lowered* this: the hand-written pass needed about 1,400 KiB for the same worst case, a 1.44x
 /// margin, so the cap is on firmer ground now than it was when it was written. A real `shell.lua`
 /// is 10 to 15 levels deep, which leaves 4x headroom above anything a config has asked for.
@@ -82,7 +82,7 @@ pub struct NodeId(u64);
 /// independent answers to one question. Measured before this existed: 16 `__index` invocations for
 /// one child's margin in one apply, and a row that measured itself 18 wide then placed its 10-wide
 /// child spanning 16..26, eight pixels outside the parent it had just been sized to fit. No
-/// `Signal` involved. The solver reads this struct once too (docs/adr/0077): [`taffy_style`] is the
+/// `Signal` involved. The solver reads this struct once too (ADR-0077): [`taffy_style`] is the
 /// only thing that touches it, and it runs once per node per pass.
 ///
 /// Parsed by the *parent*, in its child loop, for the same reason the property resolve is: a
@@ -93,7 +93,7 @@ pub struct NodeId(u64);
 ///
 /// Every field is parsed for every kind, including the ones that kind ignores: `spacing` on a
 /// `text`, `align_h` on a `row`'s child where only `align_v` was ever read. That widens what fails
-/// the pass, deliberately and in the direction docs/adr/0068 already chose -- a malformed geometry
+/// the pass, deliberately and in the direction ADR-0068 already chose -- a malformed geometry
 /// property is now heard about while applying rather than on the day a config changes the node's
 /// kind and the property starts being read. It is the same trade item 5 made knowingly for
 /// resolution ("a getter that raises fails the apply even for a property nothing currently
@@ -223,7 +223,7 @@ impl RetainedNode {
 /// per output and each is configured to a different size. One tree per declared surface cannot
 /// serve both -- whichever output resolved last would decide the geometry the other one painted.
 ///
-/// This *refines* docs/adr/0045 decision 5 rather than replacing it. The surface `id` is still the
+/// This *refines* ADR-0045 decision 5 rather than replacing it. The surface `id` is still the
 /// reconcile identity: `apply` finds a fresh `VirtualNode` by `node::parse_surface_id` exactly as
 /// before. What the key adds is the output half, stable for an instance's whole life -- an
 /// instance is created for one output and dies with it -- so the pair is as much an identity as
@@ -232,12 +232,12 @@ impl RetainedNode {
 /// Everything below a surface's root reconciles through `pair_children_by_id_then_position`: an
 /// optional, per-parent-scoped `id` pairs only against the same `id`, and the children carrying
 /// none fall back to ADR-0023's original positional rule among themselves (§ 4 as amended by
-/// docs/adr/0045).
+/// ADR-0045).
 #[derive(Default)]
 pub struct Scene {
     surfaces: HashMap<String, RetainedNode>,
     /// Removed subtrees, held alive child-first order until [`Scene::release`] finalizes the
-    /// drop (`CONTEXT.md`, Lease). Nothing calls `release` in production yet -- see docs/adr/0023
+    /// drop (`CONTEXT.md`, Lease). Nothing calls `release` in production yet -- see ADR-0023
     /// item 7. `Vec`, not a `HashMap`, specifically so insertion order (child-first) is
     /// observable, both for a future consumer and for this module's own tests.
     retiring: Vec<(NodeId, RetainedNode)>,
@@ -375,7 +375,7 @@ impl Scene {
         shaping: &ShapingHandle,
         lua: &Lua,
     ) -> Result<(), LayoutError> {
-        // Matched by the declared `id`, keyed by the instance id: docs/adr/0045 decision 5's
+        // Matched by the declared `id`, keyed by the instance id: ADR-0045 decision 5's
         // reconcile identity, resolved per output (see this type's doc comment).
         let mut fresh = None;
         for candidate in fresh_surfaces {
@@ -421,7 +421,7 @@ impl Scene {
         // § 6.4's `lock` is the same case and a worse failure: it has no `width` or `height` at all
         // (`layout::node::lock_spec` refuses both), so it can only ever fall to `Content`, and the
         // surface it fills is the whole output. A zero-sized lock root paints a transparent buffer
-        // over a locked session, the black screen with no password field docs/adr/0052 decision 3
+        // over a locked session, the black screen with no password field ADR-0052 decision 3
         // refuses the lock to avoid.
         //
         // Only the `Content` default is overridden, per axis. A `window` that does write a `width`
@@ -472,7 +472,7 @@ impl Scene {
     /// One surface instance's resolved tree, by its `"{id}@{output}"` instance id
     /// (`layout::instance::SurfaceInstance::instance_id`) -- not by the declared `id` a config
     /// writes. `crate::wayland::App::paint_surface` looks a tree up with exactly the id its
-    /// `TrackedSurface` carries, which is what makes the two id spaces one (docs/adr/0038).
+    /// `TrackedSurface` carries, which is what makes the two id spaces one (ADR-0038).
     pub fn surface(&self, instance_id: &str) -> Option<ResolvedNode> {
         self.surfaces.get(instance_id).map(RetainedNode::to_resolved)
     }
@@ -483,7 +483,7 @@ impl Scene {
     /// ponytail: no production caller yet -- nothing in this codebase owns a per-node GPU
     /// resource to guard, so nothing needs to signal "done consuming this retired subtree." The
     /// mechanism is built ahead of that consumer per build-steps.md Phase 12's own instruction
-    /// (docs/adr/0023 item 7), matching `supervisor/src/socket.rs`'s `GenerationRegistry::send_to`
+    /// (ADR-0023 item 7), matching `supervisor/src/socket.rs`'s `GenerationRegistry::send_to`
     /// precedent from Phase 9. Exercised by this module's own tests only.
     #[allow(dead_code)]
     pub fn release(&mut self, id: NodeId) -> bool {
@@ -504,7 +504,7 @@ impl Scene {
     /// as well as Rust memory in a process meant to live for a whole session.
     ///
     /// Unconditional, and only correct because it is: nothing in this codebase holds a lease
-    /// today, so nothing can be mid-teardown when this runs (docs/adr/0023 item 7, the same fact
+    /// today, so nothing can be mid-teardown when this runs (ADR-0023 item 7, the same fact
     /// [`Self::release`]'s own ponytail records).
     ///
     /// ponytail: this is the wrong shape the moment a real lease holder exists. Once a paint stage
@@ -538,10 +538,10 @@ impl Scene {
     }
 }
 
-/// All four § 6 roles are here per docs/adr/0040 decision 1. Every one is a surface container: a
+/// All four § 6 roles are here per ADR-0040 decision 1. Every one is a surface container: a
 /// role for a `wl_surface`, a `child` tree inside it, and no layout model of their own beyond the
-/// stacking one docs/adr/0023 item 4 already gives `panel`. `lock` is admitted the same way
-/// (docs/adr/0052 decision 2): this admits a *node kind* into the walk, and a lock screen's tree
+/// stacking one ADR-0023 item 4 already gives `panel`. `lock` is admitted the same way
+/// (ADR-0052 decision 2): this admits a *node kind* into the walk, and a lock screen's tree
 /// has to be walked whether or not the compositor has handed out a surface to paint it into.
 fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
     match kind {
@@ -601,7 +601,7 @@ fn ensure_node_admissible(kind: &str, depth: u32) -> Result<(), LayoutError> {
 /// `on_submit`) ride along unvalidated in `RetainedNode.properties`, same as `button`'s `on_click`.
 /// What *does* read `secure_submit` out of the resolved tree is `renderer/src/wayland/mod.rs`'s
 /// keyboard path, off the scene graph rather than through it: the buffer and the focus target live
-/// on `App`, because docs/adr/0005 says a masked field's bytes never become an `mlua::Value`.
+/// on `App`, because ADR-0005 says a masked field's bytes never become an `mlua::Value`.
 fn children_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Vec<VirtualNode>, LayoutError> {
     match kind {
         "panel" | "window" | "popup" | "lock" => {
@@ -631,7 +631,7 @@ fn resolve_non_content(mode: SizeMode, available: f32) -> Option<f32> {
 }
 
 /// Pairs `fresh_children` against `old_children` (`docs/oblisk-layout-engine-geometry.md` § 4,
-/// docs/adr/0045 decisions 1-2) by partitioning both sides into identified and unidentified
+/// ADR-0045 decisions 1-2) by partitioning both sides into identified and unidentified
 /// subsequences, because an `id` means "this is the same node, and *only* the same node", in both
 /// directions:
 ///
@@ -817,7 +817,7 @@ fn main_align(align: Align) -> taffy::JustifyContent {
 /// shaped.
 ///
 /// `parent_axis` is the axis this node's parent flows along, `None` when the parent stacks
-/// (docs/adr/0023 item 4) or when this is a surface root. It is what decides which of this node's
+/// (ADR-0023 item 4) or when this is a surface root. It is what decides which of this node's
 /// two `Fill`s is a share of a remainder and which is the whole slot: filling a row's main axis
 /// means splitting what the siblings leave, and filling anything else means taking all of it.
 fn taffy_style(
@@ -879,7 +879,7 @@ fn taffy_style(
             // on both axes because a single flex line only ever spends the one it flows along.
             out.gap = taffy::Size { width: length(style.spacing), height: length(style.spacing) };
         }
-        // The stacking model (docs/adr/0023 item 4) is a grid of exactly one cell holding every
+        // The stacking model (ADR-0023 item 4) is a grid of exactly one cell holding every
         // child: they overlap, each is aligned independently on both axes within the full content
         // box, and the container's own `Content` size is their bounding union. That is what a
         // single auto-sized grid track does, which is why this is a `Display::Grid` rather than an
@@ -1097,7 +1097,7 @@ fn finish(
     let mut children: Vec<RetainedNode> =
         children.into_iter().map(|child| finish(tree, child, shaping)).collect::<Result<_, _>>()?;
 
-    // docs/adr/0069 decision 4. Subtracted from every child's main coordinate, so a scrolled child
+    // ADR-0069 decision 4. Subtracted from every child's main coordinate, so a scrolled child
     // sits before the content box and the clip `layout::paint` computes per node cuts it. The
     // extent is summed here rather than read off taffy's `scrollable_overflow_rect` because the
     // two disagree by a margin: CSS scrollable overflow is the union of the children's border
@@ -1234,7 +1234,7 @@ fn flow_kind<'a>(kind: &'a str, properties: &HashMap<String, Value>) -> Result<&
 /// The `Signal` behind a node's `scroll` property, or `None` if it declares none.
 ///
 /// Unresolved in the slot because `layout::node::is_structural_property` says so, the same way
-/// `hover` arrives (docs/adr/0062 decision 3, docs/adr/0069 decision 4). Anything else there -- a
+/// `hover` arrives (ADR-0062 decision 3, ADR-0069 decision 4). Anything else there -- a
 /// number, a `state()` signal, a capability -- is silently inert rather than an error, matching
 /// `layout::hover::hover_signal`: `Signal::scroll_handle` refuses every kind this must not write,
 /// so a config naming the wrong thing gets no scrolling instead of a wheel writing somewhere it
@@ -1260,7 +1260,7 @@ fn scroll_signal(properties: &HashMap<String, Value>) -> Option<crate::lua::sign
 }
 
 /// How far this container is scrolled along its main axis, clamped to what there is to scroll, and
-/// written back so the signal holds the offset actually used (docs/adr/0069 decision 4).
+/// written back so the signal holds the offset actually used (ADR-0069 decision 4).
 ///
 /// `content_main` is the viewport and `total_main` the content, both already computed by the caller
 /// for its own alignment arithmetic, which is why this needed no new parameter threaded through the
@@ -1352,7 +1352,7 @@ fn elide_to_fit(paint: &mut Option<PaintStyle>, content_width: f32, shaping: &Sh
 /// `crate::wayland::App::apply_input_region`, which is the only place a Wayland object exists to
 /// push it to.
 ///
-/// Per surface since docs/adr/0038 decision 5. Applies to any surface whose visible content is
+/// Per surface since ADR-0038 decision 5. Applies to any surface whose visible content is
 /// smaller than the surface itself -- load-bearing for a fullscreen transparent panel, an empty
 /// region (so clicks pass straight through) for one with nothing visible in it, and a no-op for a
 /// tightly-sized bar whose child fills it.
@@ -1634,7 +1634,7 @@ pub(super) mod tests {
         );
     }
 
-    /// docs/adr/0023 item 11, closed by the solver rather than by anything written here.
+    /// ADR-0023 item 11, closed by the solver rather than by anything written here.
     ///
     /// Same shape as the test above, minus the row's `height = "Fill"`, which is the whole
     /// difference: the row is now `Content`-sized, so its own height is not known until after its
@@ -1663,7 +1663,7 @@ pub(super) mod tests {
         assert_eq!(
             stretched.children[0].rect.y,
             (50.0 - 6.0) / 2.0,
-            "centered against the stretched height, which is docs/adr/0023 item 11 no longer holding"
+            "centered against the stretched height, which is ADR-0023 item 11 no longer holding"
         );
     }
 
@@ -1942,7 +1942,7 @@ pub(super) mod tests {
     }
 
     /// Also correct before this pass and pinned: a stacking parent has no main axis, its children
-    /// may overlap by design (docs/adr/0023 item 4), and `Fill` there means the whole box.
+    /// may overlap by design (ADR-0023 item 4), and `Fill` there means the whole box.
     #[test]
     fn fill_under_a_stacking_parent_is_still_the_whole_box() {
         let mut scene = Scene::new();
@@ -1979,7 +1979,7 @@ pub(super) mod tests {
     }
 
     /// Unchanged, and deliberate: a row that states no width has no remainder to divide, so a
-    /// `Fill` child of it resolves to zero. See docs/adr/0077's own note on item 10
+    /// `Fill` child of it resolves to zero. See ADR-0077's own note on item 10
     /// for the one-pass reasoning behind it and the upgrade path.
     #[test]
     fn a_fill_child_of_a_content_sized_row_still_resolves_to_zero() {
@@ -1996,7 +1996,7 @@ pub(super) mod tests {
         assert_eq!(row.children[0].rect.width, 0.0);
     }
 
-    /// docs/adr/0069. Scrolling moves children within a viewport the clip already cuts them to.
+    /// ADR-0069. Scrolling moves children within a viewport the clip already cuts them to.
     fn scrolled(lua_src: &str, offset: f32) -> (mlua::Lua, Vec<f32>, f32) {
         let lua = mlua::Lua::new();
         register_node_constructors(&lua).unwrap();
@@ -2228,7 +2228,7 @@ pub(super) mod tests {
         assert!(matches!(err, LayoutError::UnsupportedNodeKind(k) if k == "banana"));
     }
 
-    /// The coverage docs/adr/0068 widened, pinned so it stays deliberate. `layout::paint::build_node`
+    /// The coverage ADR-0068 widened, pinned so it stays deliberate. `layout::paint::build_node`
     /// returned before any parser on an invisible node, so this config used to boot fine and fail
     /// only once something made the node visible.
     /// ADR-0068's rule applied to the new property: a bad value fails the apply rather than being

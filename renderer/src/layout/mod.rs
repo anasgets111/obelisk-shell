@@ -7,7 +7,7 @@
 //! passes and owns the `Scene`: the persistent node tree each generation's `Loader::evaluate`
 //! output reconciles into on `apply`, rather than being rebuilt from scratch.
 //!
-//! Scope ceilings from docs/adr/0023: `rect`/`button`/`panel` containers use a stacking
+//! Scope ceilings from ADR-0023: `rect`/`button`/`panel` containers use a stacking
 //! positioning model with no formula in § 3.2; the lease/retiring mechanism has no real GPU
 //! resource to guard yet.
 

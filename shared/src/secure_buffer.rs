@@ -49,7 +49,7 @@ impl SecureBuffer {
     /// A `Vec::truncate` alone would leave the deleted byte live in the backing allocation for
     /// as long as the user keeps typing -- the explicit `.zeroize()` that ends a submit is far
     /// too late, since a lock screen holds this buffer across a whole password entry, corrections
-    /// included (docs/adr/0005).
+    /// included (ADR-0005).
     ///
     /// **A whole scalar, not a byte.** `expose_secret` sends the bytes straight into an IPC
     /// envelope with no second UTF-8 decode to catch a split character, so removing one byte of
@@ -185,7 +185,7 @@ mod tests {
     }
 
     /// A multi-byte character is one Backspace, not one byte of one: `expose_secret` serializes
-    /// straight onto the wire with no second decode to catch a split scalar (docs/adr/0005).
+    /// straight onto the wire with no second decode to catch a split scalar (ADR-0005).
     #[test]
     fn pop_char_removes_a_whole_utf8_scalar_and_reports_an_empty_buffer() {
         let mut buf = SecureBuffer::new();

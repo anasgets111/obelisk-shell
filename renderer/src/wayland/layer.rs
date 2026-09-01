@@ -30,7 +30,7 @@ pub(super) fn anchor_for(anchor: node::Anchor) -> Anchor {
     flags.set(Anchor::RIGHT, anchor.right);
     flags
 }
-/// § 6.1's `keyboard_interactivity` to the protocol's own field. Before docs/adr/0038 every
+/// § 6.1's `keyboard_interactivity` to the protocol's own field. Before ADR-0038 every
 /// surface took a hardcoded mode per Rust-owned role, so a launcher wanting `Exclusive` and an
 /// OSD wanting `None` could not coexist.
 pub(super) fn keyboard_interactivity_for(mode: node::KeyboardInteractivity) -> KeyboardInteractivity {
@@ -96,7 +96,7 @@ fn exclusive_zone_for(anchor: node::Anchor, configured_size: (u32, u32)) -> i32 
 }
 /// The layer-shell requests one live surface needs after a re-resolve changed its `panel`
 /// properties -- `margin`, `keyboard_interactivity`, size, and the `exclusive` flag the zone is
-/// derived from (docs/adr/0038 decision 2, § 6.1). `None` per field means "unchanged, send
+/// derived from (ADR-0038 decision 2, § 6.1). `None` per field means "unchanged, send
 /// nothing": these are all double-buffered, so resending an unchanged value is just wire noise.
 ///
 /// [`SurfaceTopology`](node::SurfaceTopology)'s five fields -- `id`, `layer`, `anchor`, `monitor`,
@@ -139,7 +139,7 @@ struct LayerSpec<'a> {
     /// The compositor-visible namespace (§ 6.1's `namespace`, defaulting to `"oblisk-{id}"`),
     /// which is what a `layerrule` matches on.
     namespace: &'a str,
-    /// Always `Some` since docs/adr/0038 decision 3: one surface is created per
+    /// Always `Some` since ADR-0038 decision 3: one surface is created per
     /// `(surface, output)` pair, so the output is never the compositor's to pick.
     output: &'a wl_output::WlOutput,
     anchor: Anchor,
@@ -216,7 +216,7 @@ impl App {
         );
         layer.commit();
 
-        // § 6.1's `visible`. A panel declared `visible = false` is still created (docs/adr/0038
+        // § 6.1's `visible`. A panel declared `visible = false` is still created (ADR-0038
         // decision 2: `visible` maps and unmaps, it does not create and destroy). It still performs
         // the initial commit above, required by `get_layer_surface` before any configure arrives;
         // what makes it invisible is that no buffer is ever attached, and `MapState::Unmapped` is
@@ -240,7 +240,7 @@ impl App {
     ///
     /// The explicit `0` matters: this used to leave a non-exclusive surface alone entirely, on the
     /// reasoning that the protocol's default zone is already 0 -- true only while `exclusive` could
-    /// never change. It is a `Signal`-bindable property (docs/adr/0038 decision 2), so a dock
+    /// never change. It is a `Signal`-bindable property (ADR-0038 decision 2), so a dock
     /// turning `exclusive = false` has to take back the zone it previously reserved, and the
     /// default is no help once a real value has been sent. `-1` makes that argument twice over:
     /// a surface leaving `Ignore` has to be told, and nothing else would tell it.
@@ -317,7 +317,7 @@ impl App {
 
 impl LayerShellHandler for App {
     /// `zwlr_layer_surface_v1::closed` means this surface is gone and must be destroyed -- the
-    /// compositor sends it when the output the surface was on is destroyed, docs/adr/0038
+    /// compositor sends it when the output the surface was on is destroyed, ADR-0038
     /// decision 3's removal half arriving by the layer-shell route instead of the `wl_output` one.
     /// It is not a shutdown signal.
     ///

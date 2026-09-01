@@ -32,7 +32,7 @@ pub enum SystemSignal {
 }
 
 /// Whether a freshly-sampled epoch second is worth pushing. This filter is mandatory
-/// (docs/adr/0044): every `StateSnapshot` marks the Renderer's scene dirty and drives a full
+/// (ADR-0044): every `StateSnapshot` marks the Renderer's scene dirty and drives a full
 /// re-resolve and repaint, so an unconditional push would repaint the whole scene every tick
 /// even when nothing changed. Pure over the last-emitted and current second, so it's testable
 /// without a real clock. `last_emitted` is `None` only before the first tick.

@@ -1,6 +1,6 @@
-//! Theme name to file path, in the Renderer (docs/adr/0054, build-steps.md Phase 29 item 3).
+//! Theme name to file path, in the Renderer (ADR-0054, build-steps.md Phase 29 item 3).
 //!
-//! docs/adr/0054 settles the resolver here rather than in the Supervisor (`oblisk-supervisor-
+//! ADR-0054 settles the resolver here rather than in the Supervisor (`oblisk-supervisor-
 //! services-dbus.md` § 9.2's original plan): § 3.2 calls `system:find_icon` a synchronous lookup
 //! returning a path, and the control socket has no request/response shape to make that true over
 //! -- only one-way commands and one-way `StateSnapshot`s.
@@ -63,7 +63,7 @@ fn memoized(name: &str, size: u16, lookup: impl FnOnce() -> Option<PathBuf>) -> 
 ///
 /// Process lifetime is the right scope because [`theme`] already has it: the active theme is read
 /// once, so what this maps cannot change without the reload that replaces the whole Renderer
-/// process (docs/adr/0054). A `Mutex` rather than a `thread_local!` because nothing about the
+/// process (ADR-0054). A `Mutex` rather than a `thread_local!` because nothing about the
 /// function says render thread, and an uncontended lock is nanoseconds against a lookup that
 /// measured 1.6 *milli*seconds.
 ///
@@ -90,7 +90,7 @@ fn theme() -> &'static str {
 
 /// `freedesktop-icons` ships `default_theme_gtk()` for this and it cannot be used: it shells out
 /// to `gsettings get org.gnome.desktop.interface icon-theme` (a process spawn per call, from the
-/// render thread, which since docs/adr/0039 is also the Wayland dispatch thread), and it does not
+/// render thread, which since ADR-0039 is also the Wayland dispatch thread), and it does not
 /// return what `with_theme` takes -- it maps the setting through the theme's `index.theme` and
 /// returns the `Name=` field (`"Tela circle dracula"`), while `with_theme` is keyed by directory
 /// name (`"Tela-circle-dracula"`). The mismatch fails silently: every lookup returns `None`.
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn an_empty_name_resolves_to_nothing() {
         // `icon` with no `name` defaults to `""`, and a `name` bound to an unhydrated capability
-        // signal is `nil` until its first push (docs/adr/0037). Both land here.
+        // signal is `nil` until its first push (ADR-0037). Both land here.
         assert_eq!(resolve("", 16), None);
     }
 

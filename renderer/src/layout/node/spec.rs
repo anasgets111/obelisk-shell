@@ -16,7 +16,7 @@ use crate::lua::nodes::{VirtualNode, deserialize_lua_table};
 use super::*;
 
 /// § 6.4's `lock`, whose whole property list is `id` and `child` (build-steps.md Phase 23,
-/// docs/adr/0052 decision 2). `child` is not a field here for the same reason it is not one on the
+/// ADR-0052 decision 2). `child` is not a field here for the same reason it is not one on the
 /// other three roles: `layout::scene::children_of` walks it into the retained tree, and a spec
 /// carries what the Wayland side has to be told, not what the layout engine reads.
 ///
@@ -40,17 +40,17 @@ pub struct LockSpec {
 /// **Refusing rather than ignoring is this parser's one real decision.** `visible = false` on a
 /// lock screen implies the config decides when the lock is up, and it does not: the compositor
 /// creates lock surfaces after `locked` and destroys them at `unlock_and_destroy`, and obeying the
-/// property mid-session would destroy a surface the compositor is still showing -- docs/adr/0042
+/// property mid-session would destroy a surface the compositor is still showing -- ADR-0042
 /// records that as what makes the compositor "fall back to rendering a solid color". Ignoring it
 /// silently would leave the wrong mental model in place until the author meets it from the other
 /// side, locked out by a screen that did not do what they wrote. An error lands in `rescue`'s
-/// `error_log` (§ 2.10, docs/adr/0046) at evaluation time, where a human is reading and the session
+/// `error_log` (§ 2.10, ADR-0046) at evaluation time, where a human is reading and the session
 /// is not locked -- the cheapest place the correction can happen.
 ///
 /// `monitor`, `anchor`, `width` and `height` get the same treatment for a weaker reason: each is
 /// inert rather than dangerous (a lock surface's geometry is entirely the compositor's configure,
 /// and it expands per output because the protocol says so, not because a `monitor` asked --
-/// docs/adr/0052 decision 2), and a property that quietly does nothing is worse unreported than
+/// ADR-0052 decision 2), and a property that quietly does nothing is worse unreported than
 /// reported.
 ///
 /// The refusals run *before* `id` is read, deliberately: `lock { visible = false }` with no `id`
@@ -59,7 +59,7 @@ pub struct LockSpec {
 ///
 /// Nothing here consults [`is_deferred_signal`]: a refusal tests for the *key*, so a `Signal` under
 /// it is refused exactly as a literal is, and § 6.4 leaves a `lock` no movable property for the
-/// two-pass split docs/adr/0049's second amendment set up for `window` and `popup` to apply to.
+/// two-pass split ADR-0049's second amendment set up for `window` and `popup` to apply to.
 pub fn lock_spec(properties: &HashMap<String, Value>) -> Result<LockSpec, LayoutError> {
     for property in ["visible", "monitor", "anchor", "width", "height"] {
         if properties.contains_key(property) {
@@ -67,7 +67,7 @@ pub fn lock_spec(properties: &HashMap<String, Value>) -> Result<LockSpec, Layout
                 property,
                 format!(
                     "§ 6.4 gives a `lock` no `{property}`: a lock surface covers every connected output, for exactly as long as the compositor holds \
-                     the session locked, and none of that is the config's to set (docs/adr/0042, docs/adr/0052 decision 2)"
+                     the session locked, and none of that is the config's to set (ADR-0042, ADR-0052 decision 2)"
                 ),
             ));
         }
@@ -75,7 +75,7 @@ pub fn lock_spec(properties: &HashMap<String, Value>) -> Result<LockSpec, Layout
     Ok(LockSpec { id: parse_surface_id(properties)? })
 }
 
-/// One declared top-level surface, parsed by whichever § 6 role its `kind` names (docs/adr/0040
+/// One declared top-level surface, parsed by whichever § 6 role its `kind` names (ADR-0040
 /// decision 1). `crate::socket`'s `surface_specs` builds one per node the evaluation returned, and
 /// this is the roster every later stage reads: `layout::instance::expand_instances` turns it into
 /// surface instances and `crate::wayland::App::create_surfaces` binds them.
@@ -116,7 +116,7 @@ impl SurfaceSpec {
 }
 
 /// One declared surface's share of the topology `crate::socket`'s `handle_reevaluate` diffs to
-/// choose a generation swap over an in-place reload (docs/adr/0001, `CONTEXT.md`'s Topology
+/// choose a generation swap over an in-place reload (ADR-0001, `CONTEXT.md`'s Topology
 /// change). Order-sensitive equality on `Vec<SurfaceFingerprint>` is that diff.
 ///
 /// The four roles contribute different amounts, and the protocol decides how much rather than a
@@ -124,16 +124,16 @@ impl SurfaceSpec {
 /// `get_layer_surface` fixes every one of them at creation. A `window`, a `popup` and a `lock`
 /// carry their `id` alone: everything else they hold is either a request on a live object
 /// (`set_title`, `set_app_id`, the two size hints -- see [`WindowSpec`]'s own "no `WindowTopology`"
-/// note) or rebuilt per open (the whole `xdg_positioner`, docs/adr/0049 decision 1), so none of it
+/// note) or rebuilt per open (the whole `xdg_positioner`, ADR-0049 decision 1), so none of it
 /// can strand a live object the way a changed `namespace` would. A `lock` reaches the same
 /// one-field answer from the other end: § 6.4 gives it `id` and `child` alone, so the only
 /// question a topology diff can ask about it is whether it is still there.
 ///
-/// What the three `id` arms *do* catch is the case docs/adr/0049 decision 3 names: adding or
+/// What the three `id` arms *do* catch is the case ADR-0049 decision 3 names: adding or
 /// removing a declaration is a topology change for every role, including the three whose Wayland
 /// object comes and goes inside one generation. Deleting a `lock` mid-session is the sharpest case:
-/// it is a topology change, so it is a swap, so docs/adr/0042's rule queues it until unlock and a
-/// live lock screen cannot lose its tree underneath it (docs/adr/0052, Consequences).
+/// it is a topology change, so it is a swap, so ADR-0042's rule queues it until unlock and a
+/// live lock screen cannot lose its tree underneath it (ADR-0052, Consequences).
 ///
 /// The role itself is part of the fingerprint by construction: rewriting `panel { id = "x" }` as
 /// `window { id = "x" }` changes the variant, which is a different Wayland object entirely and so a
@@ -179,7 +179,7 @@ pub fn parse_children(properties: &HashMap<String, Value>) -> Result<Vec<Virtual
     Ok(children)
 }
 
-/// A `list` node's children (`oblisk-idl-api-specs.md` § 5.2 item 7, docs/adr/0045 decision 3,
+/// A `list` node's children (`oblisk-idl-api-specs.md` § 5.2 item 7, ADR-0045 decision 3,
 /// build-steps.md Phase 19 item 12). Parallels [`parse_children`]'s role for
 /// `rect`/`row`/`column`/`button`, but a `list`'s children are never a literal Lua table: they are
 /// generated here, once per element of `source`, by calling `itemfn(element)` and deserializing the
@@ -273,11 +273,11 @@ pub fn parse_list_children(properties: &HashMap<String, Value>) -> Result<Vec<Vi
 
 /// `textfield.secure_submit` (§ 5.2 item 8): the `{ capability, action }` pair a masked field's
 /// committed buffer is addressed to once the focused field submits, instead of the value ever
-/// reaching Lua (docs/adr/0005, docs/adr/0027). The submit is Enter on `wl_keyboard`, read natively
+/// reaching Lua (ADR-0005, ADR-0027). The submit is Enter on `wl_keyboard`, read natively
 /// in `renderer/src/wayland/mod.rs` -- ADR-0027's `zwp_text_input_v3` bridge was the original
 /// transport and no longer carries this path at all; see that file's `secure_key_action` for why a
 /// password must not travel through an input method. This pair becomes the routing key on a
-/// `RendererFrame::SecureSubmit` envelope (docs/adr/0050 decision 4), which is why both fields are
+/// `RendererFrame::SecureSubmit` envelope (ADR-0050 decision 4), which is why both fields are
 /// required rather than falling back to some default capability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecureSubmitTarget {

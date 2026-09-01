@@ -33,7 +33,7 @@ pub(crate) struct Namespace {
 ///
 /// **No roster name is on the table itself.** Every one is built here and parked in a side table
 /// that `oblisk`'s `__index` moves across on first read, which is what tells the Supervisor to
-/// construct that capability's controller (docs/adr/0070 decision 1). A config still reads a live
+/// construct that capability's controller (ADR-0070 decision 1). A config still reads a live
 /// signal holding `nil` before the first push rather than indexing into nil (ADR-0037); the
 /// difference is that a name the config never reads costs a `nil` and nothing else, where it used
 /// to cost a D-Bus subscription. The unrostered lazy path in `crate::socket` is unrelated: it is
@@ -41,7 +41,7 @@ pub(crate) struct Namespace {
 ///
 /// **One table, so a typo is a Lua error rather than silence.** § 6.4's `lock` node constructor
 /// owns the global `lock`, and a bare `lock` signal used to silently overwrite it and break every
-/// `lock { ... }` declaration (docs/adr/0052 decision 1).
+/// `lock { ... }` declaration (ADR-0052 decision 1).
 pub(crate) fn build(
     loader: &Loader,
     dirty: &DirtyFlag,
@@ -82,7 +82,7 @@ pub(crate) fn build(
 }
 
 /// Puts `pending`'s members behind `oblisk`'s `__index`, so reading one both hands it over and
-/// starts its controller (docs/adr/0070 decision 1).
+/// starts its controller (ADR-0070 decision 1).
 ///
 /// The member is `raw_set` onto `oblisk` on the way out, so the metamethod fires exactly once per
 /// name and the second read is an ordinary table lookup. That matters more than it looks: a
@@ -127,7 +127,7 @@ fn register_rescue_signal(loader: &Loader, oblisk: &mlua::Table, dirty: DirtyFla
     Ok(handle)
 }
 
-/// Registers the reactive `oblisk.screens` signal (docs/adr/0041 decision 2), seeded with
+/// Registers the reactive `oblisk.screens` signal (ADR-0041 decision 2), seeded with
 /// `initial`.
 ///
 /// Deliberately outside `shared::Capability::ALL` and outside the capability map, an exception to the

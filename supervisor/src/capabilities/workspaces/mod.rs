@@ -1,10 +1,10 @@
 //! `oblisk.workspaces` capability: per-output workspace state and the focused window
-//! (`docs/oblisk-idl-api-specs.md` § 2.9), read off niri's IPC event stream (docs/adr/0056).
+//! (`docs/oblisk-idl-api-specs.md` § 2.9), read off niri's IPC event stream (ADR-0056).
 //!
 //! A top-level module rather than a tenant of `hardware/` or `dbus/`: it is one compositor's
 //! Unix socket, not a device or a D-Bus interface.
 //!
-//! One compositor, no trait (docs/adr/0056 decision 1): a trait with one implementor is
+//! One compositor, no trait (ADR-0056 decision 1): a trait with one implementor is
 //! speculative generality. A session that is not niri never pushes, so `oblisk.workspaces`
 //! stays `nil` -- § 2.9 has no absence sentinel, and an empty `outputs` array would read as
 //! "no workspaces" rather than "nobody asked".

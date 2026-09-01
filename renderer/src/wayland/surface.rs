@@ -21,12 +21,12 @@ pub(super) struct BoundSurface {
     native_window: WlEglSurface,
 }
 /// Logs an EGL/Wayland bind-time failure for `bind_and_clear`'s fallible steps. `surface_id`
-/// is `"{id}@{output}"` (docs/adr/0038), naming both the config's surface and the monitor it
+/// is `"{id}@{output}"` (ADR-0038), naming both the config's surface and the monitor it
 /// failed on.
 pub(super) fn log_bind_failure(surface_id: &str, stage: &str, err: impl std::fmt::Display) {
     eprintln!("[oblisk-renderer] {surface_id}: {stage} failed: {err}");
 }
-/// § 6.1's `visible`, as the compositor currently sees it (docs/adr/0038 decision 2: within a
+/// § 6.1's `visible`, as the compositor currently sees it (ADR-0038 decision 2: within a
 /// live generation, `visible` maps and unmaps a surface without destroying it).
 ///
 /// Three states, not two: `zwlr_layer_surface_v1` requires a re-map to commit with no buffer
@@ -52,17 +52,17 @@ impl MapState {
     }
 }
 /// The protocol object a tracked surface's `wl_surface` has been given a role by, plus the spec
-/// its state was last set from (§ 6, docs/adr/0040 decision 1). One enum, not a `Vec` per role,
+/// its state was last set from (§ 6, ADR-0040 decision 1). One enum, not a `Vec` per role,
 /// because the EGL binding, paint pass, input routing and PBA staging are identical across roles
 /// and all index one `App::surfaces`.
 ///
-/// Variants differ in how long the Wayland object lives (docs/adr/0049 decision 1): a `panel`'s
+/// Variants differ in how long the Wayland object lives (ADR-0049 decision 1): a `panel`'s
 /// lives for the generation, a `window`'s or `popup`'s only while shown, hence `Option`.
 pub(super) enum TrackedRole {
     Panel {
         layer: LayerSurface,
         /// The diff baseline `layer::spec_update` compares a fresh resolve against, so only fields
-        /// that actually moved are pushed (docs/adr/0038 decision 2). Also the standing
+        /// that actually moved are pushed (ADR-0038 decision 2). Also the standing
         /// anchor/exclusive answer [`App::apply_exclusive_zone`] needs once `configure` reports
         /// a size.
         spec: PanelSpec,
@@ -76,7 +76,7 @@ pub(super) enum TrackedRole {
     },
     Window {
         /// `None` when `visible` is false: the `xdg_toplevel`, `xdg_surface` and `wl_surface`
-        /// do not exist at all (docs/adr/0049 decision 1). A declared-but-never-shown window
+        /// do not exist at all (ADR-0049 decision 1). A declared-but-never-shown window
         /// costs one retained node and zero Wayland objects.
         window: Option<Window>,
         /// This toplevel's state's diff baseline for `xdg_shell::window_update`. Maintained even while
@@ -85,25 +85,25 @@ pub(super) enum TrackedRole {
     },
     Popup {
         /// `None` when not shown. `xdg_positioner` is consumed by `get_popup`, so a popup
-        /// anchored once cannot be re-anchored (docs/adr/0049); every open builds a fresh
+        /// anchored once cannot be re-anchored (ADR-0049); every open builds a fresh
         /// positioner, `wl_surface` and `xdg_popup`.
         popup: Option<Popup>,
         /// The spec the next open builds from -- not a diff baseline like a panel's or window's:
         /// every field is an `xdg_positioner` request consumed at creation, so this is a plain
         /// store, re-read whole at the next [`App::show_popup`].
         spec: PopupSpec,
-        /// docs/adr/0051 decision 2's latch: [`App::pointer_input_count`] when the compositor
+        /// ADR-0051 decision 2's latch: [`App::pointer_input_count`] when the compositor
         /// dismissed this popup, or `None` if not dismissed. No replacement is created while
         /// the counter is unmoved -- without the latch, a click-outside livelocks: `popup_done`
         /// destroys the object but leaves `visible = true`, so the next re-resolve reopens it
         /// for the same click-outside, forever.
         ///
-        /// A count, not the bool decision 2 first specified (docs/adr/0051's first amendment):
+        /// A count, not the bool decision 2 first specified (ADR-0051's first amendment):
         /// the `visible = false` edge meant to clear it is unobservable in this case, so a bool
         /// latches permanently. See `xdg_shell::popup_visibility_action`, which reads this.
         dismissed_at: Option<u64>,
         /// Which of [`App::show_popup`]'s refusals was last logged for this `visible = true`
-        /// run, or `None` if none has been -- docs/adr/0049's amendment: log a refusal once,
+        /// run, or `None` if none has been -- ADR-0049's amendment: log a refusal once,
         /// not once per re-resolve. Not a second latch: it does not stop retries, only repeated
         /// logging. Cleared on a successful create or `visible = false`.
         refusal_logged: Option<PopupRefusal>,
@@ -112,7 +112,7 @@ pub(super) enum TrackedRole {
         /// The output this lock surface covers, held from instance expansion rather than
         /// looked up when the lock is taken: § 6.4 gives a `lock` no `monitor` to name one with.
         output: wl_output::WlOutput,
-        /// `None` until this process holds the lock (docs/adr/0052 decision 2). Dropping this
+        /// `None` until this process holds the lock (ADR-0052 decision 2). Dropping this
         /// handle is the teardown and nothing else is: `SessionLockSurfaceInner::Drop` sends
         /// `ext_session_lock_surface_v1.destroy`, which makes the compositor fall back to a
         /// solid color on outputs still present. Cleared only by an output removal
@@ -132,7 +132,7 @@ impl TrackedRole {
     }
 
     /// This surface as something an `xdg_popup` can be rooted under, or `None` if it cannot be one
-    /// (§ 6.3's `parent`, docs/adr/0051 decision 1). A `window`/`popup` not currently shown answers
+    /// (§ 6.3's `parent`, ADR-0051 decision 1). A `window`/`popup` not currently shown answers
     /// `None`, so the popup asking is not created either.
     pub(super) fn as_popup_parent(&self) -> Option<PopupParent> {
         match self {
@@ -141,16 +141,16 @@ impl TrackedRole {
             TrackedRole::Popup { popup, .. } => popup.as_ref().map(|p| PopupParent::Xdg(p.xdg_surface().clone())),
             // `ext_session_lock_surface_v1` is neither an `xdg_surface` nor a `zwlr_layer_surface_v1`,
             // the only two `get_popup` accepts, so no request can root a popup here. That matches the
-            // protocol anyway: while locked the compositor shows lock surfaces only (docs/adr/0042).
+            // protocol anyway: while locked the compositor shows lock surfaces only (ADR-0042).
             TrackedRole::Lock { .. } => None,
         }
     }
 }
 /// Why [`App::show_popup`] declined to open a popup, remembered so the line is not repeated on
-/// the next re-resolve while the same refusal still holds (docs/adr/0049's amendment).
+/// the next re-resolve while the same refusal still holds (ADR-0049's amendment).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PopupRefusal {
-    /// `grab = true` and no input event armed a serial this turn (docs/adr/0051 decision 3).
+    /// `grab = true` and no input event armed a serial this turn (ADR-0051 decision 3).
     Unarmed,
     /// `grab = true` and the compositor advertises no seat to take the grab on.
     Seatless,
@@ -202,11 +202,11 @@ pub(super) struct TrackedSurface {
 /// what its resolved tree says (`None` when it has none) and which role was declared.
 ///
 /// Role-aware fallback: an absent tree means the startup apply failed and rolled back
-/// (`Scene::apply` restores its pre-call state on error), so a `panel` (docs/adr/0038 decision 2)
+/// (`Scene::apply` restores its pre-call state on error), so a `panel` (ADR-0038 decision 2)
 /// treats it as visible -- "keep the shell up", painting nothing until the next re-resolve.
-/// `window`/`popup` have create-and-destroy semantics (docs/adr/0049 decision 1), so an absent
+/// `window`/`popup` have create-and-destroy semantics (ADR-0049 decision 1), so an absent
 /// tree is not a declaration of `visible = true`. A `lock` has no `visible` property at all
-/// (§ 6.4, docs/adr/0042); `false` is the answer that stays correct if a future caller reads it.
+/// (§ 6.4, ADR-0042); `false` is the answer that stays correct if a future caller reads it.
 fn starting_visible(resolved: Option<bool>, roster: &SurfaceSpec) -> bool {
     resolved.unwrap_or(match roster {
         SurfaceSpec::Panel(_) => true,
@@ -214,7 +214,7 @@ fn starting_visible(resolved: Option<bool>, roster: &SurfaceSpec) -> bool {
     })
 }
 /// One surface's [`SurfaceSpec`] re-derived from its resolved properties, and the § 6 role word
-/// for the log line if it fails (docs/adr/0049's second amendment).
+/// for the log line if it fails (ADR-0049's second amendment).
 ///
 /// `roster` contributes only the role; everything else comes from `properties`, already read
 /// once this pass (ADR-0044 decision 1). The role cannot come from properties instead: `kind` is
@@ -243,9 +243,9 @@ fn resolved_surface_spec(
 /// `evidence_timeout`. Drawing one that was not announced trips `!expected.contains(&surface_id)`
 /// and aborts the Candidate as `PbaFailure::UnexpectedEvidence`.
 ///
-/// A panel declared `visible = false` forces the filter: docs/adr/0038 decision 2 still creates
+/// A panel declared `visible = false` forces the filter: ADR-0038 decision 2 still creates
 /// it, so it stages like every other surface but never presents a frame. `window`/`popup` declared
-/// `visible = false` reach the same answer by a shorter route (docs/adr/0049 decision 1 does not
+/// `visible = false` reach the same answer by a shorter route (ADR-0049 decision 1 does not
 /// create their role object at all). A `popup` is strongest: a Candidate freezes
 /// [`App::apply_visibility`] and has no armed serial to grab with, so it never presents during a
 /// handshake whatever `visible` says.
@@ -264,7 +264,7 @@ fn presenting_surface_ids<'a>(surfaces: impl Iterator<Item = (&'a str, MapState)
 /// buffer on its first configure the same way. What does not generalize is the assumption
 /// underneath a plain `all(null_buffered)` -- that every tracked surface gets a configure. A
 /// `panel` always does, since it is created and committed at startup even when `visible` is false.
-/// A `window` declared `visible = false` has no `xdg_toplevel` at all (docs/adr/0049 decision 1),
+/// A `window` declared `visible = false` has no `xdg_toplevel` at all (ADR-0049 decision 1),
 /// so no configure ever arrives, `null_buffered` stays false forever, and the Candidate would
 /// never send `ReadySignal` -- a `ready_timeout` hang on any config declaring a hidden window,
 /// which the dev config already does. A `popup` widens that further: a Candidate freezes `visible`
@@ -279,7 +279,7 @@ fn candidate_has_staged(surfaces: impl Iterator<Item = (bool, bool)>) -> bool {
 
 impl App {
     /// One tracked surface per surface instance, built from the evaluation that declared it
-    /// (docs/adr/0038 decision 1, docs/adr/0049 decision 1).
+    /// (ADR-0038 decision 1, ADR-0049 decision 1).
     ///
     /// The roles diverge in what "create" means, and only there. A `panel` gets its
     /// `zwlr_layer_surface_v1` here whatever its `visible` says, because that object lives as long
@@ -295,7 +295,7 @@ impl App {
     /// [`starting_visible`]): it is parsed from the evaluation's unresolved properties, so every
     /// signal-bound field in it is still at its parser placeholder. What it is right for is which
     /// declarations exist and what role each is, neither of which a re-resolve can change
-    /// (docs/adr/0049 decision 3).
+    /// (ADR-0049 decision 3).
     ///
     /// Called with the whole instance set at startup and with only the added instances on a monitor
     /// hotplug (see [`App::handle_output_change`]) -- the same function either way.
@@ -330,7 +330,7 @@ impl App {
             let tree = self.client.scene().surface(&instance.instance_id);
             let visible = starting_visible(tree.as_ref().map(|tree| tree.visible), roster);
             // Built from the resolved properties, as `apply_resolved_state` builds it on every
-            // later pass (docs/adr/0049's second amendment). `run` parses `specs` from the raw,
+            // later pass (ADR-0049's second amendment). `run` parses `specs` from the raw,
             // pre-resolve properties, so a signal-bound field is still at its parser placeholder --
             // and for a popup that is permanent damage, not one stale frame: every `PopupSpec`
             // field is an `xdg_positioner` request the positioner consumes at `get_popup`, and
@@ -359,7 +359,7 @@ impl App {
             }
         }
         // The "and any new outputs as they are advertised" half of `ext-session-lock-v1`'s own
-        // expectation (docs/adr/0042). A no-op unless a lock is held right now; on a monitor
+        // expectation (ADR-0042). A no-op unless a lock is held right now; on a monitor
         // hotplug it gives the freshly advertised output its lock surface instead of leaving the
         // compositor to paint a solid color there.
         self.ensure_lock_surfaces(qh);
@@ -371,7 +371,7 @@ impl App {
     ///
     /// Two callers, and they differ in what they do with the role object rather than in how they
     /// free this half: `destroy_surface_by_id` drops it, and [`App::hide_window`] drops only the
-    /// `xdg_toplevel` and keeps the tracking entry (docs/adr/0049 decision 1).
+    /// `xdg_toplevel` and keeps the tracking entry (ADR-0049 decision 1).
     pub(super) fn release_bound(&mut self, index: usize) {
         let Some(bound) = self.surfaces[index].bound.take() else {
             return;
@@ -394,7 +394,7 @@ impl App {
     }
 
     /// Destroys one surface instance: its role object, its `wl_surface`, its `wl_egl_window`, and
-    /// its EGL surface (docs/adr/0038 decision 3's removal half). A no-op for an id this process has
+    /// its EGL surface (ADR-0038 decision 3's removal half). A no-op for an id this process has
     /// no surface for, the normal case for the second of the two events an unplugged monitor
     /// produces -- `zwlr_layer_surface_v1::closed` and `OutputHandler::output_destroyed` both arrive,
     /// in either order, and whichever comes first does the work.
@@ -508,7 +508,7 @@ impl App {
         // neighbour) has to move the `wl_egl_window` too, or the surface keeps rendering into a
         // buffer sized at its first configure. This is `wayland-egl`'s own resize request, not a
         // rebind: the `WlEglSurface` and the EGL surface built from it both stay valid. It went
-        // unnoticed before docs/adr/0038 because the one surface that drew anything drew a fixed
+        // unnoticed before ADR-0038 because the one surface that drew anything drew a fixed
         // proof string; the resized frame is real content now.
         if let Some(bound) = self.surfaces[index].bound.as_ref() {
             bound.native_window.resize(width.max(1) as i32, height.max(1) as i32, 0, 0);
@@ -528,10 +528,10 @@ impl App {
 
     /// Pushes one surface's freshly resolved root back to the compositor: the protocol fields its
     /// role permits changing on a live object, the input region, and whether the surface is shown
-    /// at all (docs/adr/0038 decision 2, docs/adr/0049 decisions 1-2).
+    /// at all (ADR-0038 decision 2, ADR-0049 decisions 1-2).
     ///
     /// This is where a `window`'s authoritative [`WindowSpec`] is derived, and "resolved" is the
-    /// whole point (docs/adr/0049's second amendment). `crate::socket::surface_specs` parses the
+    /// whole point (ADR-0049's second amendment). `crate::socket::surface_specs` parses the
     /// unresolved properties, which is right for a `panel`'s topology fields -- they reject a
     /// `Signal` on purpose, since `get_layer_surface` fixes them at creation. A `window`'s `title`
     /// is the opposite case: § 6.2 spells it as `string`/`Signal` precisely so it can move, and
@@ -577,7 +577,7 @@ impl App {
                 // A store, not a diff: every field on a `PopupSpec` is an `xdg_positioner` request
                 // consumed by `get_popup`, and `xdg_popup.reposition` is not built. So there is
                 // nothing to send at a live popup -- what this push buys is that the next
-                // `show_popup` builds its positioner from this pass's `anchor_rect` (docs/adr/0049's
+                // `show_popup` builds its positioner from this pass's `anchor_rect` (ADR-0049's
                 // second amendment). The click that opens a dropdown writes the button's rect to a
                 // `state` signal on the same turn this reads it.
                 Ok(fresh) => {
@@ -604,7 +604,7 @@ impl App {
         self.apply_visibility(index, tree.visible);
     }
 
-    /// `wl_surface::set_input_region` from this surface's own resolved tree (§ 5.1, docs/adr/0038
+    /// `wl_surface::set_input_region` from this surface's own resolved tree (§ 5.1, ADR-0038
     /// decision 5).
     ///
     /// Per surface, not for one overlay. Three cases fall out of the same code rather than needing
@@ -647,7 +647,7 @@ impl App {
     }
 
     /// Applies § 5.1's `visible` to a live surface, by whichever mechanism the role's lifetime rule
-    /// calls for (docs/adr/0038 decision 2, docs/adr/0049 decisions 1-2).
+    /// calls for (ADR-0038 decision 2, ADR-0049 decisions 1-2).
     ///
     /// The same Lua-facing property, two different mechanics underneath, and this is the one
     /// function where that divergence lives. A `panel`'s Wayland object outlives every flip, so
@@ -684,14 +684,14 @@ impl App {
                 _ => {}
             },
             // Its own function, not a third `map_state` arm: a popup answers on two inputs, not
-            // one -- docs/adr/0051 decision 2's latch is the second, and a dismissed popup sits in
+            // one -- ADR-0051 decision 2's latch is the second, and a dismissed popup sits in
             // `MapState::Unmapped` with `visible` still true, a state the other two roles never reach.
             TrackedRole::Popup { .. } => self.apply_popup_visibility(index, visible),
             // The one role where `visible` is not a property at all: `layout::node::lock_spec`
             // refuses the key, so the `true` this is called with is `parse_visible`'s default. A
             // lock surface's lifetime is the compositor's end to end -- created once `locked`
             // arrives, destroyed at `unlock_and_destroy` -- so acting on `visible` here could only
-            // destroy a surface the compositor is still showing (docs/adr/0042, docs/adr/0052
+            // destroy a surface the compositor is still showing (ADR-0042, ADR-0052
             // decision 2).
             TrackedRole::Lock { .. } => {}
         }
@@ -699,7 +699,7 @@ impl App {
 
     /// `zwlr_layer_surface_v1`'s own unmap procedure, taken literally: "Attaching a null buffer to
     /// a layer surface unmaps it." One commit, no destroyed protocol objects, the whole point of
-    /// docs/adr/0038 decision 2 -- toggling a launcher costs this instead of a process spawn.
+    /// ADR-0038 decision 2 -- toggling a launcher costs this instead of a process spawn.
     ///
     /// This is the only commit an unmapped surface ever gets. Nothing else in this file may commit
     /// one, because the same description says "the client can re-map the surface by performing a
@@ -772,13 +772,13 @@ impl App {
     /// whether [`App::egl`] is `Some` afterwards.
     ///
     /// Called from [`App::ensure_bound`] and nowhere else, which is what makes the whole Mesa load
-    /// conditional on a surface existing to draw into (docs/adr/0071). `surface_id` only names the
+    /// conditional on a surface existing to draw into (ADR-0071). `surface_id` only names the
     /// surface unlucky enough to be first in the log line; the state it builds is shared.
     ///
     /// A failure is fatal, matching every other bind failure in [`App::ensure_bound`]. That is a
     /// later death than the `?` this replaced: a PBA Candidate now signals ready before it has
     /// proven it can build a context, so an EGL that breaks between two generations of one session
-    /// takes the shell down rather than rolling back (docs/adr/0071 decision 3).
+    /// takes the shell down rather than rolling back (ADR-0071 decision 3).
     fn ensure_egl(&mut self, surface_id: &str) -> bool {
         if self.egl.is_some() {
             return true;
@@ -818,7 +818,7 @@ impl App {
             return false;
         };
 
-        // The first surface to get this far is the one that pays for Mesa (docs/adr/0071). After
+        // The first surface to get this far is the one that pays for Mesa (ADR-0071). After
         // the two cheap bails above, so a `window` that went invisible mid-bind still costs
         // nothing.
         if !self.ensure_egl(&surface_id) {
@@ -898,7 +898,7 @@ impl App {
     /// a physical grid the framebuffer does not have.
     fn paint_surface(&mut self, index: usize) {
         // An unmapped surface has no buffer, and one still waiting for the configure that follows
-        // its (re-)map commit may not attach one yet (docs/adr/0038 decision 2; see [`MapState`]).
+        // its (re-)map commit may not attach one yet (ADR-0038 decision 2; see [`MapState`]).
         // `swap_buffers` at the bottom of this function is that attach *and* the commit carrying
         // it, so this guard is what keeps `visible = false` from quietly re-mapping the surface it
         // just hid.
@@ -1104,7 +1104,7 @@ impl App {
             && let Err(e) = self.presentation_time.feedback(&surface, &self.queue_handle)
         {
             // Not fatal to the whole candidate -- the Supervisor's evidence_timeout is what
-            // catches a surface that never presents (docs/adr/0025 item 6); don't invent a
+            // catches a surface that never presents (ADR-0025 item 6); don't invent a
             // second failure-reporting path here.
             log_bind_failure(&self.surfaces[index].surface_id.clone(), "wp_presentation::feedback", e);
         }
@@ -1127,7 +1127,7 @@ impl App {
     /// `None` is routine, not exceptional, on every one of those paths: a `wl_pointer`, a
     /// `wl_keyboard` and a feedback object are all per seat or per commit, not per surface, so any of
     /// them can name a surface this process has since destroyed -- an output change, or a `visible`
-    /// flip that took a `window`'s toplevel away (docs/adr/0049 decision 1).
+    /// flip that took a `window`'s toplevel away (ADR-0049 decision 1).
     pub(super) fn index_of_surface(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
         self.surfaces.iter().position(|s| s.role.wl_surface() == Some(surface))
     }
@@ -1180,7 +1180,7 @@ mod tests {
 
     #[test]
     fn a_window_declared_invisible_has_nothing_to_stage_and_must_not_hold_the_ready_signal() {
-        // docs/adr/0049 decision 1 creates no `xdg_toplevel` for it, so no configure is coming and
+        // ADR-0049 decision 1 creates no `xdg_toplevel` for it, so no configure is coming and
         // `null_buffered` would stay false forever -- a `ready_timeout` hang under a plain gate, on
         // any config declaring a hidden window (the dev config does).
         assert!(candidate_has_staged(
@@ -1275,7 +1275,7 @@ mod tests {
 
     #[test]
     fn a_new_surfaces_spec_comes_from_the_resolved_tree_not_the_evaluations_roster() {
-        // docs/adr/0049's second amendment: the roster's `anchor_rect` is `DEFERRED_POPUP_EXTENT`'s
+        // ADR-0049's second amendment: the roster's `anchor_rect` is `DEFERRED_POPUP_EXTENT`'s
         // 1x1 placeholder whenever the config signal-bound it, and a popup shown from that keeps it
         // for its whole life since the positioner is consumed by `get_popup`.
         let lua = Lua::new();

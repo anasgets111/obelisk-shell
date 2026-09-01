@@ -1,5 +1,5 @@
 //! `temp_cores`/`temp_gpu` sourcing: `/sys/class/hwmon/` chip resolution by name preference
-//! (docs/adr/0035).
+//! (ADR-0035).
 
 use std::path::{Path, PathBuf};
 
@@ -11,7 +11,7 @@ fn round_milli_c(milli_c: i64) -> i64 {
 }
 
 /// Resolves the first chip directory under `hwmon_root` whose `name` file matches an entry in
-/// `preference`, trying `preference` in order (docs/adr/0035) -- preference-list order wins
+/// `preference`, trying `preference` in order (ADR-0035) -- preference-list order wins
 /// over directory iteration order.
 pub fn resolve_chip(hwmon_root: &Path, preference: &[&str]) -> Option<PathBuf> {
     let entries: Vec<PathBuf> =
@@ -69,15 +69,15 @@ fn read_primary_sensor(chip_dir: &Path) -> Option<i64> {
     value.trim().parse::<i64>().ok().map(round_milli_c)
 }
 
-/// Preference list resolved once at controller construction for `temp_cores` (docs/adr/0035).
+/// Preference list resolved once at controller construction for `temp_cores` (ADR-0035).
 const CPU_TEMP_PREFERENCE: &[&str] = &["k10temp", "coretemp"];
 /// Generic ACPI thermal-zone fallback when neither `k10temp` nor `coretemp` exists --
 /// every machine has this, and its one sensor becomes a one-element array.
 const GENERIC_TEMP_FALLBACK: &str = "acpitz";
-/// Preference list resolved once at controller construction for `temp_gpu` (docs/adr/0035).
+/// Preference list resolved once at controller construction for `temp_gpu` (ADR-0035).
 const GPU_TEMP_PREFERENCE: &[&str] = &["amdgpu", "nouveau", "nvidia"];
 
-/// Where `temp_cores` reads from, resolved once (docs/adr/0035: chip resolution happens at
+/// Where `temp_cores` reads from, resolved once (ADR-0035: chip resolution happens at
 /// controller construction, never re-scanned per tick -- see [`resolve_temp_cores_source`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreTempSource {
@@ -90,7 +90,7 @@ pub enum CoreTempSource {
 }
 
 /// Resolves `temp_cores`'s source: the CPU chip preference list first, then the `acpitz`
-/// fallback, then unavailable (docs/adr/0035). Call once, at construction -- chips don't
+/// fallback, then unavailable (ADR-0035). Call once, at construction -- chips don't
 /// hotplug for onboard sensors, so re-scanning every tick would be pure waste.
 pub fn resolve_temp_cores_source(hwmon_root: &Path) -> CoreTempSource {
     if let Some(chip_dir) = resolve_chip(hwmon_root, CPU_TEMP_PREFERENCE) {
@@ -103,7 +103,7 @@ pub fn resolve_temp_cores_source(hwmon_root: &Path) -> CoreTempSource {
 }
 
 /// `temp_cores`, read from an already-resolved [`CoreTempSource`] -- the per-tick half of the
-/// resolve-once/read-per-tick split (docs/adr/0035); no directory scan happens here.
+/// resolve-once/read-per-tick split (ADR-0035); no directory scan happens here.
 pub fn read_temp_cores_from(source: &CoreTempSource) -> Vec<i64> {
     match source {
         CoreTempSource::PerCore(chip_dir) => read_cores(chip_dir),
@@ -112,14 +112,14 @@ pub fn read_temp_cores_from(source: &CoreTempSource) -> Vec<i64> {
     }
 }
 
-/// Resolves `temp_gpu`'s chip (docs/adr/0035). Call once, at controller construction --
+/// Resolves `temp_gpu`'s chip (ADR-0035). Call once, at controller construction --
 /// same "chips don't hotplug" reasoning as [`resolve_temp_cores_source`].
 pub fn resolve_gpu_chip(hwmon_root: &Path) -> Option<PathBuf> {
     resolve_chip(hwmon_root, GPU_TEMP_PREFERENCE)
 }
 
 /// `temp_gpu`, read from an already-resolved chip, or the IDL's own `-1` sentinel if none
-/// resolved (docs/adr/0035) -- the per-tick half of the resolve-once/read-per-tick split.
+/// resolved (ADR-0035) -- the per-tick half of the resolve-once/read-per-tick split.
 pub fn read_temp_gpu_from(gpu_chip: Option<&Path>) -> i64 {
     gpu_chip.and_then(read_primary_sensor).unwrap_or(-1)
 }

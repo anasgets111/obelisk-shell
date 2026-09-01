@@ -2,7 +2,7 @@
 //!
 //! build-steps.md cites `docs/oblisk-layout-engine-geometry.md § 5` for this, but that section
 //! is "Overlay Input Region Bounding Box Calculations" (Phase 3's click-through region) -- a
-//! stale cross-reference (see docs/adr/0012). The real technique: floor the top-left corner,
+//! stale cross-reference (see ADR-0012). The real technique: floor the top-left corner,
 //! ceil the bottom-right, so the physical box always fully contains the logical one.
 //!
 //! Borders round differently, and the two must not be conflated. [`snap_to_physical`] grows a

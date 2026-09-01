@@ -1,5 +1,5 @@
 //! System tray host (`oblisk.tray`, docs/oblisk-supervisor-services-dbus.md §2;
-//! docs/oblisk-idl-api-specs.md §2.14; docs/adr/0031).
+//! docs/oblisk-idl-api-specs.md §2.14; ADR-0031).
 //!
 //! Hosts `org.kde.StatusNotifierWatcher` at `/StatusNotifierWatcher` and client-handles every
 //! registered `org.kde.StatusNotifierItem` (plus its optional `com.canonical.dbusmenu` menu).
@@ -15,7 +15,7 @@
 //! [`registry::spawn_name_owner_changed_forwarder`]).
 //!
 //! ponytail: `TrayController::new` never fails outright, same reasoning as
-//! `BluetoothController::new` (docs/adr/0030) -- a session with no other tray host running (the
+//! `BluetoothController::new` (ADR-0030) -- a session with no other tray host running (the
 //! overwhelmingly common case for niri/sway) is not an error, and `RequestName` losing the race to
 //! an already-running DE tray (Plasma/GNOME) is an expected, handled outcome (ADR-0031's "dual-role
 //! dance"), not a startup failure either.
@@ -106,7 +106,7 @@ pub fn parse_activate_args(arguments: &[serde_json::Value]) -> Option<(String, i
     Some((id, x, y))
 }
 
-/// `tray:scroll(id, delta, orientation)`'s `arguments: [id, delta, orientation]` (docs/adr/0074).
+/// `tray:scroll(id, delta, orientation)`'s `arguments: [id, delta, orientation]` (ADR-0074).
 ///
 /// Its own parser rather than a reuse of [`parse_activate_args`]: the shapes look alike, but the
 /// third argument is a string here and reusing the coordinate parser would silently drop every
@@ -160,7 +160,7 @@ pub fn dispatch(controller: &TrayController, envelope: &shared::CommandEnvelope)
             }
             None => crate::log_malformed_command(params),
         },
-        // Same `[id, x, y]` shape as `Activate`, so the same parser (docs/adr/0074).
+        // Same `[id, x, y]` shape as `Activate`, so the same parser (ADR-0074).
         TrayAction::SecondaryActivate => match parse_activate_args(&params.arguments) {
             Some((id, x, y)) => {
                 let controller = controller.clone();
@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn every_tray_action_the_idl_names_parses() {
-        // `secondary_activate` and `scroll` are new (docs/adr/0074); serde owns the mapping, so a
+        // `secondary_activate` and `scroll` are new (ADR-0074); serde owns the mapping, so a
         // rename that misses the stub fails here rather than at a config author's keyboard.
         for name in ["activate", "secondary_activate", "scroll", "activate_menu_item", "menu_will_show"] {
             let action: Result<TrayAction, _> = serde_json::from_value(serde_json::json!(name));

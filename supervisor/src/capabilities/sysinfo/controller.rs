@@ -1,5 +1,5 @@
 //! `SysinfoController`: three independently-configurable, watch-driven poll tasks (cpu; ram+
-//! swap; temp_cores+temp_gpu) feeding one shared `SysinfoState` (docs/adr/0035).
+//! swap; temp_cores+temp_gpu) feeding one shared `SysinfoState` (ADR-0035).
 
 use std::time::Duration;
 
@@ -25,7 +25,7 @@ pub struct SysinfoState {
 }
 
 impl Default for SysinfoState {
-    /// Pre-first-sample sentinels (docs/adr/0035): `0` for the three percent fields (no
+    /// Pre-first-sample sentinels (ADR-0035): `0` for the three percent fields (no
     /// second sentinel convention needed alongside `temp_gpu`'s own IDL-mandated `-1`).
     fn default() -> Self {
         Self { cpu_percent: 0, ram_percent: 0, swap_percent: 0, temp_cores: Vec::new(), temp_gpu: -1 }
@@ -33,7 +33,7 @@ impl Default for SysinfoState {
 }
 
 /// Whether a metric task should arm a real ticking timer or park itself with zero wakeups
-/// (docs/adr/0035's suspend-at-zero mechanism). The pure decision a task's loop branches on
+/// (ADR-0035's suspend-at-zero mechanism). The pure decision a task's loop branches on
 /// every time its `watch::Receiver` reports a changed interval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollMode {
@@ -55,7 +55,7 @@ pub enum SysinfoSignal {
 }
 
 /// `sysinfo:configure({cpu_interval, ram_interval, temp_interval})`'s parsed argument
-/// (docs/adr/0035). A present key overrides that task's interval; an absent key leaves it
+/// (ADR-0035). A present key overrides that task's interval; an absent key leaves it
 /// unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SysinfoConfigure {
@@ -201,7 +201,7 @@ async fn run_cpu_task(
 }
 
 /// `ram_percent`/`swap_percent`'s task -- both computed from one `/proc/meminfo` read on
-/// every tick (docs/adr/0035: `swap_percent` rides `ram_interval`, no separate interval).
+/// every tick (ADR-0035: `swap_percent` rides `ram_interval`, no separate interval).
 async fn run_ram_task(
     proc_root: std::path::PathBuf,
     mut interval_rx: tokio::sync::watch::Receiver<Duration>,

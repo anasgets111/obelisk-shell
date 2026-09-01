@@ -3,14 +3,14 @@
 //! classified and reported (`classify_departure`, `departure_report`). `RestartBrake` is the
 //! crash-loop stop condition `main.rs`'s exit-handling arm consults before spawning a
 //! replacement. The promote/retire transition itself -- reassigning which generation is
-//! authoritative -- stays in `main.rs`'s `select!` loop (docs/adr/0037): it is one arm among many
+//! authoritative -- stays in `main.rs`'s `select!` loop (ADR-0037): it is one arm among many
 //! sharing that loop's own state, not a step this module could run on its own.
 
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// docs/adr/0058 decision 3: three deaths inside a minute is enough that a transient crash (an
+/// ADR-0058 decision 3: three deaths inside a minute is enough that a transient crash (an
 /// OOM that has since passed, a GPU reset) recovers without a human, and few enough that a config
 /// that kills every Renderer stops after three rather than flickering the lock screen forever.
 pub(super) const RESTART_LIMIT: usize = 3;
@@ -41,7 +41,7 @@ pub(super) struct Authoritative {
     pub(super) child: tokio::process::Child,
 }
 
-/// How the authoritative Renderer's process ended (docs/adr/0058 decision 2). `Clean` is not a
+/// How the authoritative Renderer's process ended (ADR-0058 decision 2). `Clean` is not a
 /// crash: `main`'s own shutdown reap must never be reported as one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RendererDeparture {
@@ -68,7 +68,7 @@ pub(super) fn classify_departure(status: std::process::ExitStatus) -> RendererDe
     }
 }
 
-/// docs/adr/0058 decision 3's stop condition: at most `limit` restarts inside any `window`. An
+/// ADR-0058 decision 3's stop condition: at most `limit` restarts inside any `window`. An
 /// unbraked loop turns one dead bar into a lock screen that flickers every few hundred
 /// milliseconds, harder to escape than the dead shell it was meant to fix.
 ///
@@ -103,7 +103,7 @@ impl RestartBrake {
 }
 
 /// The line a human reads when the Renderer goes away, carrying whether a lock was live
-/// (docs/adr/0058 decision 2). The compositor does not unlock when a lock client dies, so a
+/// (ADR-0058 decision 2). The compositor does not unlock when a lock client dies, so a
 /// Renderer that dies holding `ext_session_lock_v1` costs the session now, not just a bar.
 pub(super) fn departure_report(departure: RendererDeparture, generation_id: u32, lock_active: bool) -> String {
     let what = match departure {
@@ -113,7 +113,7 @@ pub(super) fn departure_report(departure: RendererDeparture, generation_id: u32,
     };
     let lock = if lock_active {
         ", and it held the session lock: the compositor does not unlock when a lock client dies, so the session stays \
-         locked until a replacement takes the lock over (docs/adr/0058)"
+         locked until a replacement takes the lock over (ADR-0058)"
     } else {
         ""
     };

@@ -13,7 +13,7 @@ use super::*;
 
 /// `"NN%"` (`^\d+(\.\d+)?%$`) as `SizeMode::Percent`. Not a confirmed spec syntax -- § 5.1's base
 /// property table only documents integer/`"Fill"` for width/height even though § 3.1 names
-/// `Percent(f32)` as a size class without giving it a literal Lua form. See docs/adr/0023.
+/// `Percent(f32)` as a size class without giving it a literal Lua form. See ADR-0023.
 fn parse_percent(s: &str) -> Option<f32> {
     let digits = s.strip_suffix('%')?;
     let mut parts = digits.splitn(2, '.');
@@ -38,7 +38,7 @@ fn parse_percent(s: &str) -> Option<f32> {
 /// them takes a `&Lua` or handles a `Value::Nil` of its own.
 pub fn parse_size_mode(properties: &HashMap<String, Value>, property: &str) -> Result<SizeMode, LayoutError> {
     // Deferred on the evaluation-time pass ([`is_deferred_signal`]): § 6.1's `width`/`height` are a
-    // layer-shell `set_size`, which docs/adr/0038 decision 2 lists among the requests that are valid
+    // layer-shell `set_size`, which ADR-0038 decision 2 lists among the requests that are valid
     // on a live surface, so `crate::wayland::App::apply_spec_change` re-derives both from the
     // resolved tree on every pass. Same placeholder an absent property gets. The guard cannot fire
     // below a surface root, where this parser is also used: `resolve_properties` has already
@@ -113,7 +113,7 @@ pub(super) fn table_number(property: &str, table: &mlua::Table, key: &str) -> Re
 /// dropped it on return, so the only Lua a budget ever covered was a signal getter's own body.
 /// A `margin` table whose `__index` spins 200 million iterations made one `Scene::apply` take
 /// 26.10 seconds and return `Ok(())`, reachable from a config using no `Signal` at all, on the
-/// thread that also answers `configure` and runs the VM (docs/adr/0039). `lua::signal`'s
+/// thread that also answers `configure` and runs the VM (ADR-0039). `lua::signal`'s
 /// `LayoutPassBudget` now holds the hook for the whole pass, so the same config is refused in
 /// 2 seconds with a `LayoutError::PassBudgetExceeded`.
 ///
@@ -124,7 +124,7 @@ pub(super) fn table_number(property: &str, table: &mlua::Table, key: &str) -> Re
 pub fn parse_edge_insets(properties: &HashMap<String, Value>, property: &str) -> Result<EdgeInsets, LayoutError> {
     // Deferred on the evaluation-time pass, for [`parse_size_mode`]'s reason: on a `panel` root
     // `margin` is the layer-shell anchor offset, which `set_margin` changes on a live surface
-    // (docs/adr/0038 decision 2). Zero insets are the placeholder an absent `margin` already takes,
+    // (ADR-0038 decision 2). Zero insets are the placeholder an absent `margin` already takes,
     // and the same "cannot fire below a root" note applies.
     if is_deferred_signal(properties, property) {
         return Ok(EdgeInsets::default());
@@ -260,7 +260,7 @@ pub fn parse_border_color(properties: &HashMap<String, Value>) -> Result<BorderC
         return Err(invalid("border_color", format!("expected a string or a table, got {}", preview_for_error(value))));
     };
     // `table.get` is metamethod-aware here too. Unlike margin/padding this was never read twice --
-    // docs/adr/0068 already had `paint_style` parse it once per node -- so all it needed was a
+    // ADR-0068 already had `paint_style` parse it once per node -- so all it needed was a
     // budget to run under, which `lua::signal`'s `LayoutPassBudget` now provides for the whole
     // pass. See [`parse_edge_insets`] for the measurements.
     let edge = |key: &str| -> Result<Option<Rgba>, LayoutError> {
@@ -362,7 +362,7 @@ pub fn parse_list_direction(properties: &HashMap<String, Value>) -> Result<&'sta
 /// config expects from the property it uses in 32 files.
 ///
 /// Refused rather than clamped outside `[0, 1]`, matching every other paint property since
-/// docs/adr/0068: a config that writes `opacity = 50` meaning percent should hear about it while
+/// ADR-0068: a config that writes `opacity = 50` meaning percent should hear about it while
 /// applying, not stare at an invisible panel.
 pub fn parse_opacity(properties: &HashMap<String, Value>) -> Result<f32, LayoutError> {
     let Some(value) = properties.get("opacity") else {

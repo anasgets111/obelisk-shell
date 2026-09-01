@@ -17,7 +17,7 @@ use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notification_v1::{
 use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notifier_v1::ExtIdleNotifierV1;
 
 /// Registers `generation_id` against `sec`'s duration in `fanout`; returns whether a new
-/// `ext_idle_notification_v1` listener is needed for that duration (docs/adr/0032: one listener
+/// `ext_idle_notification_v1` listener is needed for that duration (ADR-0032: one listener
 /// per distinct duration). No dedup: the same `sec` registered twice appends twice -- each
 /// registration is its own Lua-side callback pairing, so `fanout`'s lists are multisets.
 pub fn register_threshold_entry(fanout: &mut HashMap<Duration, Vec<u32>>, generation_id: u32, sec: u64) -> bool {

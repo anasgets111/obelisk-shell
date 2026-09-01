@@ -78,7 +78,7 @@ pub(super) async fn fetch_tray_item_base(
     let item_is_menu = item.item_is_menu().await.unwrap_or(false);
     let tooltip = item.tool_tip().await.ok();
     // Read once and used by all three icon resolutions below: the directory is the item's, not any
-    // one icon's (docs/adr/0074).
+    // one icon's (ADR-0074).
     let theme_path = item.icon_theme_path().await.unwrap_or_default();
 
     let sanitized = sanitize_unique_name(unique_name.as_str());
@@ -125,7 +125,7 @@ pub(super) async fn fetch_tray_item_base(
 
 /// One icon triple (`{X}IconName`, `{X}IconPixmap`, the item's `IconThemePath`) resolved to the
 /// `(name, path)` pair a config reads, for whichever of the three variants § 2.5 defines
-/// (docs/adr/0074).
+/// (ADR-0074).
 ///
 /// `spool_suffix` distinguishes the spooled PNGs, since an item's three pixmaps would otherwise all
 /// land on `{unique_name}.png` and the last write would win.

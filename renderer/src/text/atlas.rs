@@ -1,7 +1,7 @@
 //! Glyph rasterization and GPU texture atlas management, via FemtoVG (build-steps.md
 //! Phase 4, point 2).
 //!
-//! FemtoVG owns its glyph atlas entirely internally (see docs/adr/0012): rasterized glyphs pack
+//! FemtoVG owns its glyph atlas entirely internally (see ADR-0012): rasterized glyphs pack
 //! into private atlas pages that start at a fixed size and grow by adding further pages, not by
 //! expanding one large texture -- there is no public API to configure a single fixed-size page
 //! the way build-steps.md's "2048x2048" literally describes, and no public API to feed it glyphs
@@ -49,7 +49,7 @@ impl TextPainter {
     ///
     /// `font_chain` is `ShapingHandle::font_chain_data()`'s own output, in the same chain order
     /// cosmic-text shaped against, so measurement and paint resolve the one declared chain rather
-    /// than two independently-discovered fonts that can disagree (docs/adr/0043 decision 2).
+    /// than two independently-discovered fonts that can disagree (ADR-0043 decision 2).
     /// Errors if the slice is empty -- `draw_line` cannot fall back to a font it was never given.
     ///
     /// Registers through a `TextContext` and `add_shared_font_with_index` rather than
@@ -88,7 +88,7 @@ impl TextPainter {
     }
 
     /// The same canvas `draw_line` fills text onto, exposed so `layout::paint`'s tree walk can
-    /// draw a node's background/border on it too (build-steps.md Phase 19 item 6, docs/adr/0023)
+    /// draw a node's background/border on it too (build-steps.md Phase 19 item 6, ADR-0023)
     /// -- one canvas per surface, shared by every paint operation, not one per property kind.
     pub fn canvas_mut(&mut self) -> &mut Canvas<OpenGl> {
         &mut self.canvas

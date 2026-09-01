@@ -13,7 +13,7 @@ use crate::send_frame_logged;
 use crate::socket;
 
 /// Every `process.run`-spawned child still tracked, keyed by the generation that spawned it
-/// and the `CommandEnvelope.id` the Renderer assigned it (docs/adr/0026). A plain local,
+/// and the `CommandEnvelope.id` the Renderer assigned it (ADR-0026). A plain local,
 /// mutated only from inside `main()`'s own `select!` arms -- not behind a mutex.
 pub(crate) type LiveProcesses = HashMap<(u32, u64), Child>;
 

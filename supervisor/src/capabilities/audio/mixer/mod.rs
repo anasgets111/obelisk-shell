@@ -4,7 +4,7 @@
 //! set on the stream node's own properties -- not `sec.pid`/`node.client-id` (not real
 //! `pipewire-rs` keys) and not `pipewire.sec.pid` (set on the Client object, but for a stream
 //! routed through `pipewire-pulse` that's `pipewire-pulse`'s own pid, not the application's).
-//! Matches `/proc/{pid}/comm` for the real app in every case checked. See docs/adr/0016.
+//! Matches `/proc/{pid}/comm` for the real app in every case checked. See ADR-0016.
 //!
 //! `media.class == "Stream/Output/Audio"` identifies a playback stream, verified against real
 //! `pw-dump` output.
@@ -40,7 +40,7 @@
 //! true, the fix is binding every `ObjectType::Node` unconditionally and filtering inside the
 //! `info` callback instead.
 //!
-//! Master output volume/mute (§ 2.4, docs/adr/0053 decision 3) is a second, mostly independent
+//! Master output volume/mute (§ 2.4, ADR-0053 decision 3) is a second, mostly independent
 //! tracking job on the same registry listener: `Audio/Sink` nodes' `SPA_PARAM_Props` param (via
 //! `param` events, not `info`) and the `default` `Metadata` object's `default.audio.sink` key
 //! (which names the master sink by `node.name`). This file only wires the PipeWire event
@@ -54,6 +54,6 @@ mod write;
 pub use registry::{AudioCommandSender, command_channel, run};
 pub use state::{AudioCommand, VideoSourceApp};
 // `main.rs` names this on `ensure_mixer_thread`'s sender parameter, which is what the lazy start
-// (docs/adr/0070) cost: the channel outlives the thread's construction, so its item type can no
+// (ADR-0070) cost: the channel outlives the thread's construction, so its item type can no
 // longer be inferred from `run`'s own signature at the one call site.
 pub use state::AudioState;

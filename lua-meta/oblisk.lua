@@ -44,7 +44,7 @@ function Capability:invoke(command, ...) end
 ---@field strength integer Signal strength, `0` to `100`.
 
 ---@class ActiveClient
----§ 2.9's `active_client`, minus `is_fullscreen` (docs/adr/0056 decision 5: niri-ipc 26.4.0's
+---§ 2.9's `active_client`, minus `is_fullscreen` (ADR-0056 decision 5: niri-ipc 26.4.0's
 ---`Window` has no such field, and a fabricated `false` would be wrong for fullscreen windows).
 ---`class` is Wayland's `app_id`: X11's `WM_CLASS` has no Wayland equivalent.
 ---@field class string The Wayland `app_id`, e.g. `"firefox"`. Named `class` for the X11 habit, but a Wayland toplevel has no `WM_CLASS`. The key `applications.by_app_id` is built to be looked up by.
@@ -57,8 +57,8 @@ function Capability:invoke(command, ...) end
 ---
 ---`Serialize`: this is what `main.rs` puts in a `StateSnapshot`'s `payload`, pushed to the
 ---Renderer over the control socket as-is. Field names match § 2.4's spelling (`id`, `name`,
----docs/adr/0053 decision 3). `pid`/`process_name` are kept even though § 2.4 doesn't list them
------ docs/adr/0016 exists because finding the owning process was genuinely hard, and discarding
+---ADR-0053 decision 3). `pid`/`process_name` are kept even though § 2.4 doesn't list them
+----- ADR-0016 exists because finding the owning process was genuinely hard, and discarding
 ---that answer would throw away the one part of this payload that took real work.
 ---@field id integer PipeWire registry id of the stream node -- the key [`AudioApps`] tracks entries by.
 ---@field muted boolean § 2.4's per-app mute, from the same `Props` param as `volume`.
@@ -68,7 +68,7 @@ function Capability:invoke(command, ...) end
 ---@field volume number § 2.4's per-app volume, range `[0.0, 1.0]`. Read from this stream node's own `SPA_PARAM_Props` through the same cube-root conversion the master sink uses (see [`master`]): a stream stores `channelVolumes` cubed exactly as a sink does, confirmed with `pw-cli enum-params <id> Props` against a live playback stream. `1.0` until that param arrives, PipeWire's own untouched value for a stream never adjusted.
 
 ---@class AppSummary
----One application as the config sees it (docs/adr/0061). Deliberately the display half only:
+---One application as the config sees it (ADR-0061). Deliberately the display half only:
 ---the argv never crosses into Lua, because `applications:launch(id)` is what runs it and a
 ---config that could rewrite a command line before it ran would be a config that could be made
 ---to run something else.
@@ -166,10 +166,10 @@ function Capability:invoke(command, ...) end
 ---@field underline? boolean The run sat inside `<u>`.
 
 ---@class OutputWorkspaces
----One output's workspace state. `workspaces` is docs/adr/0056 decision 3's addition to
+---One output's workspace state. `workspaces` is ADR-0056 decision 3's addition to
 ---§ 2.9.
 ---@field active_workspace integer The [`WorkspaceEntry::id`] of the workspace visible on this output. Every output has one, focused or not.
----@field focused_workspace? integer docs/adr/0056 decision 4: present only on the output that actually holds focus, so `out.focused_workspace ~= nil` is the "is this the focused monitor" test.
+---@field focused_workspace? integer ADR-0056 decision 4: present only on the output that actually holds focus, so `out.focused_workspace ~= nil` is the "is this the focused monitor" test.
 ---@field name string The connector name, e.g. `"eDP-1"`. Matches an `oblisk.screens` entry's `name` and a surface's `monitor`.
 ---@field workspaces WorkspaceEntry[] The workspaces on this output, ordered by [`WorkspaceEntry::idx`]. What a strip draws: the two ids above are opaque on their own and name nothing a user would recognise.
 
@@ -219,7 +219,7 @@ function Capability:invoke(command, ...) end
 ---@field name? string The compositor's own name for the workspace, or `nil` when it has none. Most do not.
 
 ---@class ApplicationsState
----`oblisk.applications`'s payload (docs/adr/0061 decision 2).
+---`oblisk.applications`'s payload (ADR-0061 decision 2).
 ---
 ---`by_app_id` repeats the summaries in `entries` rather than indexing into it. An index would
 ---have to be a Lua array index, and Lua counts from one while the JSON array this serializes to
@@ -229,7 +229,7 @@ function Capability:invoke(command, ...) end
 ---@field entries AppSummary[] Every installed desktop entry that is visible and launchable, sorted by name. Rebuilt on `applications:refresh()`; nothing watches the directories, so an app installed mid-session does not appear until something asks.
 
 ---@class AudioState
----The full `oblisk.audio` payload (§ 2.4, docs/adr/0053 decision 3): master output
+---The full `oblisk.audio` payload (§ 2.4, ADR-0053 decision 3): master output
 ---volume/mute plus the per-app stream list.
 ---@field apps AppStream[] One entry per application playing audio right now. Empty when nothing is, which is the normal state and not an error.
 ---@field muted boolean Master output mute.
@@ -275,9 +275,9 @@ function Capability:invoke(command, ...) end
 ---@field scroll_lock boolean Scroll Lock is on.
 
 ---@class LockState
----`oblisk.lock`'s payload (docs/adr/0052 decision 4). `attempts` counts failed authentications
+---`oblisk.lock`'s payload (ADR-0052 decision 4). `attempts` counts failed authentications
 ---since acquisition, and exists because Lua can't rebuild it: capability state is sampled at
----layout time (docs/adr/0044), not evented, so two identical consecutive failures are one
+---layout time (ADR-0044), not evented, so two identical consecutive failures are one
 ---unchanged `error` string. `error`'s "nothing went wrong" value is the empty string, the same
 ---convention `keyboard`'s `active_layout` uses.
 ---@field active boolean The session is locked and the Renderer has confirmed it. Never optimistic: a lock that has been asked for but not yet confirmed still reads `false`, so a config cannot draw an unlocked screen over a locked session or the reverse.
@@ -289,7 +289,7 @@ function Capability:invoke(command, ...) end
 ---@field players PlayerState[] Every MPRIS player on the bus, longest-running first. A player that appears appends, and one pushing position updates does not move, so `players[1]` keeps meaning the same player. Empty when nothing is running, which is not an error.
 
 ---@class NetworkState
----`oblisk.network`'s live push state (docs/adr/0029). Scoped to exactly what §4.2 asks for --
+---`oblisk.network`'s live push state (ADR-0029). Scoped to exactly what §4.2 asks for --
 ---scanning status and the deduplicated AP list -- not the full §2.5 read schema
 ---(`connected`/`ssid`/`wifi_enabled`/etc.), which §4 doesn't ask this controller to track.
 ---@field available_networks AccessPointInfo[] The access points from the last completed scan: deduplicated by SSID keeping the strongest radio of each, sorted strongest first, and cut to 20. Keeps the previous list while [`NetworkState::scanning`] is true, so a panel does not blank out mid-scan.

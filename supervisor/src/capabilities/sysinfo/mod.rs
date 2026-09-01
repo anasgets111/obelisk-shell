@@ -1,5 +1,5 @@
 //! `oblisk.sysinfo` capability: CPU/RAM/swap/temperature telemetry, three independently
-//! Lua-configurable poll intervals (docs/adr/0035).
+//! Lua-configurable poll intervals (ADR-0035).
 
 pub mod controller;
 pub mod cpu;
@@ -17,7 +17,7 @@ pub enum SysinfoAction {
 }
 
 /// `oblisk.sysinfo`'s action dispatch (ADR-0037): `configure` is synchronous, so nothing here
-/// spawns -- it only rewrites the shared config under its lock and nudges the watch channels (docs/adr/0035).
+/// spawns -- it only rewrites the shared config under its lock and nudges the watch channels (ADR-0035).
 pub fn dispatch(controller: &SysinfoController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     let Some(action) = crate::parse_action::<SysinfoAction>(params) else { return };

@@ -1,4 +1,4 @@
-//! Memory measurement harness (docs/adr/0043 decision 1). Reads `/proc/[pid]/smaps_rollup` for
+//! Memory measurement harness (ADR-0043 decision 1). Reads `/proc/[pid]/smaps_rollup` for
 //! PSS/USS and `/proc/[pid]/fdinfo/*` for DRM (GPU) residency, and formats one log line per
 //! sample. This has no dependency on the paint pass and exists purely to answer "where is the
 //! memory", per the ADR's closing paragraph -- it decides nothing and evicts nothing itself.
@@ -68,7 +68,7 @@ pub(crate) struct Sample {
 /// The key is matched exactly against the trimmed text before the first `:`, not by prefix:
 /// `smaps_rollup` also carries `Pss_Dirty:`, `Pss_Anon:`, `Pss_File:`, `Pss_Shmem:` and
 /// `SwapPss:`, all starting with "Pss", which a prefix match would pick up and give a smaller,
-/// wrong number (docs/adr/0043 decision 1 item 1).
+/// wrong number (ADR-0043 decision 1 item 1).
 ///
 /// USS is `Private_Clean + Private_Dirty` (decision 1 item 2): the pages nothing else maps,
 /// independent of what's amortized across the supervisor and every renderer sharing a binary.
@@ -190,7 +190,7 @@ pub(crate) fn interval_from_env(value: Option<&str>) -> Option<Duration> {
 }
 
 /// The one log line a sample produces. `total pss` is the supervisor's PSS plus every renderer's
-/// PSS (docs/adr/0043 decision 1 item 1, compared against the 50 MiB-per-monitor budget); GPU
+/// PSS (ADR-0043 decision 1 item 1, compared against the 50 MiB-per-monitor budget); GPU
 /// residency is reported per renderer but never added in, since it's not in any `smaps` number
 /// under a real driver. One `; generation N ...` clause per renderer, in `sample`'s order.
 ///
@@ -271,7 +271,7 @@ pub(crate) fn sample(renderer_pids: &[(u32, u32)]) -> io::Result<Sample> {
 }
 
 /// Builds the steady-state sampler from the environment, or `None` to leave it off
-/// (docs/adr/0043's sampling amendment). Opt-in: anyone can read the same `smaps_rollup` from
+/// (ADR-0043's sampling amendment). Opt-in: anyone can read the same `smaps_rollup` from
 /// outside a running shell any time, so an always-on timer would add a periodic log line and
 /// nothing else. The handoff sample is unconditional for the opposite reason: nobody outside the
 /// process can catch a window that exists only during a swap.
@@ -287,7 +287,7 @@ pub(crate) fn sampler_from_env() -> Option<tokio::time::Interval> {
 }
 
 /// Reads and logs one memory sample across the Supervisor and the Renderers named by
-/// `renderers` (docs/adr/0043 decision 1). Two callers in `main.rs`: the steady-state timer,
+/// `renderers` (ADR-0043 decision 1). Two callers in `main.rs`: the steady-state timer,
 /// which passes the single authoritative generation, and the PBA arm, which passes both
 /// generations during the one window where two Renderers are alive.
 ///
@@ -561,7 +561,7 @@ drm-engine-video-enhance:\t0 ns\n";
 
     #[test]
     fn report_line_total_pss_excludes_gpu_and_uss() {
-        // docs/adr/0043 decision 1: total pss is a PSS sum, not a PSS+USS sum -- USS is reported
+        // ADR-0043 decision 1: total pss is a PSS sum, not a PSS+USS sum -- USS is reported
         // per renderer only.
         let sample = Sample {
             supervisor: ProcessMemory {

@@ -264,7 +264,7 @@ pub(super) fn spawn_name_owner_changed_forwarder(
                     handle.abort();
                 }
                 // The item's own spooled pixmaps, gone with it. All three variants, since each
-                // spools to its own filename (docs/adr/0074). `/dev/shm` outlives this process, so
+                // spools to its own filename (ADR-0074). `/dev/shm` outlives this process, so
                 // without this every application restart leaves more PNGs resident until reboot:
                 // the filename is built from the connection's unique name, and a reconnecting
                 // application never gets the same one back.

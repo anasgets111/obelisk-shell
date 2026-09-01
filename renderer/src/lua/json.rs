@@ -1,4 +1,4 @@
-//! `json` global table (`oblisk-idl-api-specs.md` § 3.3, docs/adr/0057, build-steps.md section 6
+//! `json` global table (`oblisk-idl-api-specs.md` § 3.3, ADR-0057, build-steps.md section 6
 //! item 2) -- the config's only reader for structured subprocess output.
 //!
 //! `process.run`'s `out_cb` fires once per line, newline stripped, so a config polling

@@ -1,5 +1,5 @@
 //! The `oblisk` namespace's capability objects: one capability's read signal, its revision, and
-//! § 3.2's write path on the same handle (build-steps.md Phase 25 items 1 and 2, docs/adr/0052
+//! § 3.2's write path on the same handle (build-steps.md Phase 25 items 1 and 2, ADR-0052
 //! decision 1).
 //!
 //! [`CommandSender::send`] builds an envelope from `{capability, action, arguments}` and knows
@@ -10,7 +10,7 @@
 //!
 //! A Lua call on the Wayland dispatch thread has no socket in scope, so it queues a
 //! `RendererFrame::Command` onto the one outbound channel the socket thread's `pump` drains
-//! (docs/adr/0039). `Rc`, not `Arc`: everything here is confined to that one thread.
+//! (ADR-0039). `Rc`, not `Arc`: everything here is confined to that one thread.
 //!
 //! One userdata rather than a signal beside a writer: § 3.2 writes every command as a method on
 //! the capability itself, and ADR-0052 decision 4 reads a lock screen's state off the same name
@@ -49,7 +49,7 @@ pub struct CommandSender {
     /// Every capability this generation has already asked the Supervisor to start, so the second
     /// reader of `oblisk.audio` costs nothing. Shared across every clone of this sender because
     /// `lua::namespace`'s `__index` and `socket`'s `secure_submit` sweep are two callers of the
-    /// same question (docs/adr/0070 decisions 1 and 5).
+    /// same question (ADR-0070 decisions 1 and 5).
     started: Rc<RefCell<HashSet<String>>>,
     outbound_tx: UnboundedSender<RendererFrame>,
 }

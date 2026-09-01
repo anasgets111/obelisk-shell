@@ -151,7 +151,7 @@ pub(super) trait StatusNotifierWatcherClient {
 }
 
 /// `destination` rather than the item's unique name: a Chromium tray item answers only the
-/// well-known name it registered under (docs/adr/0072).
+/// well-known name it registered under (ADR-0072).
 pub(super) async fn bind_item(
     connection: &zbus::Connection,
     destination: &OwnedBusName,

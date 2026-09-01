@@ -1,5 +1,5 @@
 //! Every lazily-started capability: what is running, how each one starts, where each one's signal
-//! arrives, and which command goes to which (ADR-0037, docs/adr/0070, docs/adr/0076).
+//! arrives, and which command goes to which (ADR-0037, ADR-0070, ADR-0076).
 //!
 //! This exists because `run_supervisor` was the only scope where sixteen controllers and their
 //! twenty channels coexisted, which made every one of them five locals in an 800-line function
@@ -22,7 +22,7 @@
 //! `power` in different trees for no reason a config author could see. The two helpers that
 //! grouping genuinely shared, [`read_attr`] and [`parse_bool_arg`], are here instead; `polkit` was
 //! never a capability and moved out to `crate::polkit`; `shm_icons` is shared by exactly two
-//! capabilities and sits beside them (docs/adr/0076).
+//! capabilities and sits beside them (ADR-0076).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -96,7 +96,7 @@ pub enum Startable {
     /// config read still starts it, and it still takes commands.
     Idle,
     /// The one name that arrives from a `secure_submit` declaring it rather than from a
-    /// capability read (docs/adr/0070 decision 5). Start only; it has no commands.
+    /// capability read (ADR-0070 decision 5). Start only; it has no commands.
     Polkit,
 }
 
@@ -252,9 +252,9 @@ capability_channels! {
     }
     // `lock` is the one roster entry with no signal channel, and it is deliberate rather than
     // missing. Its controller is built at boot in `main.rs`, not here, because the Supervisor's own
-    // relock path commands it before any config has read anything (docs/adr/0060); it reports
+    // relock path commands it before any config has read anything (ADR-0060); it reports
     // through the `LockOutcome` frames `main.rs` already handles, not through a `StateSnapshot`
-    // this module pushes (docs/adr/0052 decision 4).
+    // this module pushes (ADR-0052 decision 4).
     without_channel { Lock }
 }
 
@@ -262,7 +262,7 @@ capability_channels! {
 ///
 /// `audio` has no controller: starting it spawns the PipeWire mixer thread and keeps the command
 /// channel that thread reads, so it is an `Option` of that channel. `lock` has one, but it is
-/// built at boot in `main.rs` rather than here -- the Supervisor's own relock path (docs/adr/0060)
+/// built at boot in `main.rs` rather than here -- the Supervisor's own relock path (ADR-0060)
 /// commands it before any config has read anything -- so [`Capabilities::dispatch`] is handed it.
 pub struct Capabilities {
     network: Option<NetworkController>,
@@ -293,7 +293,7 @@ pub struct Capabilities {
     /// session-bus capabilities open their own.
     connection: zbus::Connection,
     sound_tx: std::sync::mpsc::Sender<PathBuf>,
-    /// The mixer thread's video half (docs/adr/0034), in `Option`s because starting either `audio`
+    /// The mixer thread's video half (ADR-0034), in `Option`s because starting either `audio`
     /// or `privacy` moves one end: the mixer thread owns the sender, `privacy` the receiver.
     video_tx: Option<UnboundedSender<Vec<VideoSourceApp>>>,
     video_sources: Option<UnboundedReceiver<Vec<VideoSourceApp>>>,
@@ -301,7 +301,7 @@ pub struct Capabilities {
 
 impl Capabilities {
     /// Builds every channel and returns the two halves. Nothing is constructed here: a controller
-    /// exists only once the config reads its `oblisk` member (docs/adr/0070 decision 1).
+    /// exists only once the config reads its `oblisk` member (ADR-0070 decision 1).
     pub fn new(
         connection: zbus::Connection,
         sound_tx: std::sync::mpsc::Sender<PathBuf>,
@@ -352,7 +352,7 @@ impl Capabilities {
         self.network.as_ref()
     }
 
-    /// docs/adr/0070: the config read `oblisk.<capability>` and this is the first time anything in
+    /// ADR-0070: the config read `oblisk.<capability>` and this is the first time anything in
     /// this process has. Awaited by the caller inline rather than spawned -- decision 4 says why.
     ///
     /// Re-entrant by design: every generation sends its own starts, so a swap re-sends every name
@@ -425,7 +425,7 @@ impl Capabilities {
                 }
             }
             // Three independently-configurable poll tasks, still dormant after this until Lua
-            // calls sysinfo:configure (docs/adr/0035).
+            // calls sysinfo:configure (ADR-0035).
             Capability::Sysinfo => {
                 if self.sysinfo.is_none() {
                     self.sysinfo = Some(SysinfoController::new(
@@ -436,7 +436,7 @@ impl Capabilities {
                 }
             }
             // A missing KbdBacklight degrades in place to `backlight_pct: -1`, a missing lock
-            // source to `false` (docs/adr/0034).
+            // source to `false` (ADR-0034).
             Capability::Keyboard => {
                 if self.keyboard.is_none() {
                     self.keyboard = Some(
@@ -450,7 +450,7 @@ impl Capabilities {
                 }
             }
             // Kernel-level /dev/videoN open/close via inotify plus a /proc fd-scan, enriched by
-            // the mixer thread's video_sources (docs/adr/0034).
+            // the mixer thread's video_sources (ADR-0034).
             Capability::Privacy => {
                 if self.privacy.is_none() {
                     self.ensure_mixer_thread();
@@ -465,7 +465,7 @@ impl Capabilities {
                 }
             }
             // alpm-based Arch update checking, separate from sysinfo's own scheduler and equally
-            // dormant until Lua sets an interval (docs/adr/0034).
+            // dormant until Lua sets an interval (ADR-0034).
             Capability::Updates => {
                 if self.updates.is_none() {
                     self.updates = Some(UpdatesController::new(
@@ -476,7 +476,7 @@ impl Capabilities {
                 }
             }
             // UPower's DisplayDevice, the composite across every battery on the machine. A host
-            // with no UPower never pushes (docs/adr/0080, § 2.2).
+            // with no UPower never pushes (ADR-0080, § 2.2).
             Capability::Battery => {
                 if self.battery.is_none() {
                     self.battery = Some(BatteryController::new(self.connection.clone(), self.senders.battery.clone()));
@@ -500,13 +500,13 @@ impl Capabilities {
                 }
             }
             // UPower for on_battery/energy_rate, power-profiles-daemon for active_profile/
-            // profiles. Either can be missing (§ 2.13, docs/adr/0053).
+            // profiles. Either can be missing (§ 2.13, ADR-0053).
             Capability::Power => {
                 if self.power.is_none() {
                     self.power = Some(PowerController::new(self.connection.clone(), self.senders.power.clone()));
                 }
             }
-            // The 1 Hz clock plus persisted state.json (docs/adr/0053, § 2.11).
+            // The 1 Hz clock plus persisted state.json (ADR-0053, § 2.11).
             Capability::System => {
                 if self.system.is_none() {
                     self.system = Some(SystemController::new(
@@ -532,7 +532,7 @@ impl Capabilities {
             }
             Capability::Audio => self.ensure_mixer_thread(),
             // Not a controller this owns: `LockController` is a state holder built at boot in
-            // `main.rs` (docs/adr/0060), so its read costs nothing here.
+            // `main.rs` (ADR-0060), so its read costs nothing here.
             Capability::Lock => {}
         }
     }
@@ -588,7 +588,7 @@ impl Capabilities {
                     push!(Capability::Bluetooth, &bluetooth.handle_signal(signal).await);
                 }
             }
-            // No debounce (docs/adr/0031): `build_state` is a synchronous snapshot of already-live
+            // No debounce (ADR-0031): `build_state` is a synchronous snapshot of already-live
             // data the forwarder task recomputed before sending.
             Signal::Tray => {
                 if let Some(tray) = &self.tray {
@@ -609,7 +609,7 @@ impl Capabilities {
                 }
             }
             // No debounce: whichever of the three poll tasks fired already wrote its field(s)
-            // under its own lock (docs/adr/0035); this just clones and pushes.
+            // under its own lock (ADR-0035); this just clones and pushes.
             Signal::Sysinfo => {
                 if let Some(sysinfo) = &self.sysinfo {
                     push!(Capability::Sysinfo, &sysinfo.snapshot());
@@ -625,7 +625,7 @@ impl Capabilities {
                     push!(Capability::Battery, &battery.snapshot());
                 }
             }
-            // Fires only when a backlight device was found (docs/adr/0053).
+            // Fires only when a backlight device was found (ADR-0053).
             Signal::Brightness => {
                 if let Some(brightness) = &self.brightness {
                     push!(Capability::Brightness, &brightness.snapshot());
@@ -649,7 +649,7 @@ impl Capabilities {
                     push!(Capability::Applications, &applications.snapshot());
                 }
             }
-            // The only capability pushing on a timer, once per wall-clock second (docs/adr/0053
+            // The only capability pushing on a timer, once per wall-clock second (ADR-0053
             // decision 2) -- emitted only when the epoch second actually changed.
             Signal::System => {
                 if let Some(system) = &self.system {
@@ -674,7 +674,7 @@ impl Capabilities {
     /// match, argument parse, and write-action spawn).
     ///
     /// Every arm but `lock` reads an `Option`, because a controller exists only once the config
-    /// has read its member (docs/adr/0070) -- see `log_unstarted`. `lock` is passed in because it
+    /// has read its member (ADR-0070) -- see `log_unstarted`. `lock` is passed in because it
     /// is built at boot rather than started; `battery`, `system` and `privacy` are read-only and
     /// have no `dispatch` at all.
     pub async fn dispatch(&mut self, capability: Capability, envelope: &CommandEnvelope, lock: &LockController) {
@@ -733,7 +733,7 @@ mod tests {
         assert_eq!(
             Startable::from_name("polkit"),
             Some(Startable::Polkit),
-            "arrives from a secure_submit, not a read (docs/adr/0070 decision 5)"
+            "arrives from a secure_submit, not a read (ADR-0070 decision 5)"
         );
     }
 

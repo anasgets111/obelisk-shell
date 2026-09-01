@@ -1,5 +1,5 @@
 //! BlueZ Bluetooth D-Bus controller (`oblisk.bluetooth`, build-steps.md; docs/oblisk-supervisor-
-//! services-dbus.md §5; docs/oblisk-idl-api-specs.md §2.6; docs/adr/0030).
+//! services-dbus.md §5; docs/oblisk-idl-api-specs.md §2.6; ADR-0030).
 //!
 //! Every proxy here is hand-written against BlueZ's own D-Bus API docs (ADR-0030's "no
 //! maintained zbus proxy crate" decision) -- `org.freedesktop.DBus.ObjectManager` is the one
@@ -102,7 +102,7 @@ pub enum BluetoothSignal {
     DeviceRegistryChanged,
     /// Sent by [`BluetoothController::clear_discovered`], not a forwarder: a
     /// `bluetooth:start_discovery()` was just dispatched and `discovered_devices` must clear
-    /// immediately, before `StartDiscovery`'s D-Bus round trip completes (docs/adr/0030). A
+    /// immediately, before `StartDiscovery`'s D-Bus round trip completes (ADR-0030). A
     /// distinct variant, not [`DeviceRegistryChanged`](Self::DeviceRegistryChanged): a full
     /// registry re-derivation here would instantly undo the clear it exists to perform.
     DiscoveryCleared,
@@ -128,7 +128,7 @@ impl std::fmt::Display for BluetoothActionError {
 impl std::error::Error for BluetoothActionError {}
 
 /// Bits 8-12 (Major Device Class) and 2-7 (Minor Device Class) of a BlueZ `Class` property
-/// (docs/adr/0030's exact bit layout). Parses `Class` ourselves rather than trusting BlueZ's own
+/// (ADR-0030's exact bit layout). Parses `Class` ourselves rather than trusting BlueZ's own
 /// `Icon` property, which comes back empty whenever `Class == 0` (common for BLE peripherals
 /// before GAP data is read).
 fn class_to_category(class: u32) -> &'static str {

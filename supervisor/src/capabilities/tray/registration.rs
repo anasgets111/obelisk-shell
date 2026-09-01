@@ -66,7 +66,7 @@ impl std::error::Error for RegistrationError {}
 /// where its messages are actually addressed.
 ///
 /// Two names rather than one because they answer different questions and a Chromium tray item
-/// answers only one of them (docs/adr/0072). `unique_name` is the identity: it is what
+/// answers only one of them (ADR-0072). `unique_name` is the identity: it is what
 /// `NameOwnerChanged` reports on, what the registry keys by, and what the spool filename is built
 /// from. `destination` is the address every `Get` and `GetLayout` carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,7 +85,7 @@ pub(super) struct ResolvedRegistration {
 /// invisible: its Chromium D-Bus code answers a property `Get` addressed to
 /// `org.freedesktop.StatusNotifierItem-PID-1` and fails the identical `Get` addressed to the
 /// unique name that owns it. The lookup still happens, because the identity half of the answer
-/// needs it (docs/adr/0072).
+/// needs it (ADR-0072).
 pub(super) async fn resolve_registration(
     connection: &zbus::Connection,
     service: &str,
@@ -135,7 +135,7 @@ pub(super) async fn resolve_registration(
 /// part that broke Slack is testable without a bus.
 ///
 /// `destination` is the well-known name and not `owner`. Substituting the owner is the textbook
-/// resolution and it is what made Slack's item unreadable (docs/adr/0072): its Chromium D-Bus code
+/// resolution and it is what made Slack's item unreadable (ADR-0072): its Chromium D-Bus code
 /// dispatches property reads on the message's destination field, answering
 /// `org.freedesktop.StatusNotifierItem-PID-1` and failing the same read sent to `:1.N`, which owns
 /// it. `owner` is still what comes back as `unique_name`, because identity is the other half of

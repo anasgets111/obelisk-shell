@@ -173,7 +173,7 @@ async fn read_state(device: &DisplayDeviceProxy<'static>) -> BatteryState {
 /// batches a device's changes into a single signal, and a percentage that moves while the state
 /// flips arrives as one message. This is Quickshell's `DBusPropertyGroup` shape.
 ///
-/// **No timer, and that is the point of docs/adr/0080.** The sysfs reader this replaced could not
+/// **No timer, and that is the point of ADR-0080.** The sysfs reader this replaced could not
 /// see a change the kernel did not announce, and measured on this machine the kernel announced a
 /// plug and nothing else: `capacity` fell 69 to 65 with zero `power_supply` uevents delivered.
 /// UPower polls the hardware itself and emits on every refresh, so the polling moves to the one

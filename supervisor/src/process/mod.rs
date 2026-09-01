@@ -1,6 +1,6 @@
 //! Subprocess process-group lifecycle primitives: spawn a child as leader of its own new
 //! process group, then reap the whole group (`SIGTERM`, grace period, escalate to `SIGKILL`).
-//! See docs/adr/0018, docs/adr/0026 (`process.run`, on top in [`registry`]), docs/adr/0025
+//! See ADR-0018, ADR-0026 (`process.run`, on top in [`registry`]), ADR-0025
 //! (`reload::run_pba` is the reap primitive's caller).
 //!
 //! Uses `tokio::process::Command::process_group(0)` rather than hand-rolling `setpgid`.
@@ -64,7 +64,7 @@ pub fn spawn_group_leader(cmd: &str, args: &[String], envs: &[(String, String)])
 }
 
 /// Identical to [`spawn_group_leader`] except stdout/stderr are piped instead of inherited --
-/// `process.run` (docs/adr/0026) needs to forward the child's output as
+/// `process.run` (ADR-0026) needs to forward the child's output as
 /// `SupervisorFrame::ProcessOutput`. Stdin stays inherited.
 pub fn spawn_group_leader_piped(cmd: &str, args: &[String], envs: &[(String, String)]) -> io::Result<Child> {
     Command::new(cmd)

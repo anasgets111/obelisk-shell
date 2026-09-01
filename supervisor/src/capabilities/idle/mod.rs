@@ -1,4 +1,4 @@
-//! Idle capability (`oblisk.idle`, docs/oblisk-supervisor-services-dbus.md §7; docs/adr/0032).
+//! Idle capability (`oblisk.idle`, docs/oblisk-supervisor-services-dbus.md §7; ADR-0032).
 //! Splits transport -- `ext_idle_notifier_v1` on the Supervisor's own dedicated Wayland
 //! connection for notify, `org.freedesktop.login1.Manager.Inhibit` on the existing system-bus
 //! connection for inhibit -- but shares one controller and one generation-scoped cleanup hook.

@@ -1,5 +1,5 @@
 //! NetworkManager D-Bus controller (`oblisk.network`, build-steps.md Phase 16;
-//! docs/oblisk-supervisor-services-dbus.md §4; docs/adr/0029).
+//! docs/oblisk-supervisor-services-dbus.md §4; ADR-0029).
 //!
 //! Mirrors `dbus::polkit`'s structure (a controller holding proxies, exposing async methods per
 //! IDL write action) rather than `audio::mixer`'s dedicated-thread pattern: NetworkManager's API
@@ -58,7 +58,7 @@ pub struct AccessPointInfo {
     pub active: bool,
 }
 
-/// `oblisk.network`'s live push state (docs/adr/0029). Scoped to exactly what §4.2 asks for --
+/// `oblisk.network`'s live push state (ADR-0029). Scoped to exactly what §4.2 asks for --
 /// scanning status and the deduplicated AP list -- not the full §2.5 read schema
 /// (`connected`/`ssid`/`wifi_enabled`/etc.), which §4 doesn't ask this controller to track.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
@@ -214,7 +214,7 @@ impl NetworkController {
     }
 
     /// Applies one [`NetworkSignal`] to the controller-owned [`NetworkState`] and returns the
-    /// updated state to push (docs/adr/0029: no debounce -- every relevant event fully
+    /// updated state to push (ADR-0029: no debounce -- every relevant event fully
     /// re-derives the AP list from scratch).
     pub async fn handle_signal(&self, signal: NetworkSignal) -> NetworkState {
         match signal {
@@ -351,7 +351,7 @@ impl NetworkController {
     }
 
     /// § 4.2: fully re-queries the Wi-Fi device's current AP list and returns it deduplicated
-    /// and capped at the top 20 by strength (docs/adr/0029: no debounce). Empty, not an error,
+    /// and capped at the top 20 by strength (ADR-0029: no debounce). Empty, not an error,
     /// when there's no Wi-Fi device.
     pub async fn build_available_networks(&self) -> Vec<AccessPointInfo> {
         let Some(wifi) = &self.wifi else {

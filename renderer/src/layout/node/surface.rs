@@ -29,7 +29,7 @@ pub enum LayerKind {
 /// [`parse_surface_id`].
 ///
 /// Validates rather than passing the raw string through: `crate::wayland::App::create_panel`
-/// creates one layer surface per instance straight from this value (docs/adr/0038 decision 1), so
+/// creates one layer surface per instance straight from this value (ADR-0038 decision 1), so
 /// an unrecognized string is a config error the author must see rather than a silent fall to some
 /// default layer -- a typo'd `layer = "Toop"` that quietly stacked a bar on `Background` would be a
 /// far worse failure than a rejected config, because nothing on screen would say why.
@@ -111,7 +111,7 @@ pub enum KeyboardInteractivity {
 /// in-place field, deliberately outside [`SurfaceTopology`] and outside
 /// [`is_structural_property`]'s carve-out: `zwlr_layer_surface_v1::set_keyboard_interactivity` is
 /// valid on a live surface, so a `Signal` here resolves like any other property
-/// (docs/adr/0044 decision 1) and an edit to it is a value change, not a swap.
+/// (ADR-0044 decision 1) and an edit to it is a value change, not a swap.
 pub fn parse_keyboard_interactivity(properties: &HashMap<String, Value>) -> Result<KeyboardInteractivity, LayoutError> {
     // Deferred on the evaluation-time pass ([`is_deferred_signal`]), same split as [`parse_title`]'s:
     // this doc comment's own argument is what makes it a deferral rather than a rejection, since a
@@ -209,7 +209,7 @@ pub fn parse_exclusive(properties: &HashMap<String, Value>) -> Result<Exclusive,
 /// This is the whole of the swap fingerprint, and [`PanelSpec`]'s other fields are deliberately
 /// not in it: `margin`, `keyboard_interactivity`, `exclusive`, `width` and `height` are all
 /// requests layer-shell accepts on a live surface, so changing one reloads in place
-/// (docs/adr/0038 decision 2).
+/// (ADR-0038 decision 2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurfaceTopology {
     pub id: String,

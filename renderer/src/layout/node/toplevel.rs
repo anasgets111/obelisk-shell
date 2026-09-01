@@ -23,7 +23,7 @@ use super::*;
 ///
 /// In-place, deliberately outside [`is_structural_property`]'s carve-out: `xdg_toplevel::set_title`
 /// is a request on a live toplevel, so a `Signal` here resolves like any other property
-/// (docs/adr/0044 decision 1, and § 6.2 spells the `string`/`Signal` union out) and the next pass
+/// (ADR-0044 decision 1, and § 6.2 spells the `string`/`Signal` union out) and the next pass
 /// simply sends the new title.
 pub fn parse_title(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     // Deferred rather than rejected on the evaluation-time pass ([`is_deferred_signal`]): § 6.2
@@ -47,7 +47,7 @@ pub fn parse_title(properties: &HashMap<String, Value>) -> Result<String, Layout
 /// to update the property" -- it changes on a live object, the test `keyboard_interactivity` passes
 /// and `namespace` fails (`get_layer_surface` fixes a namespace at creation; `set_app_id` fixes
 /// nothing). A `window`'s `id` is a carve-out on every kind regardless: it is the reconcile
-/// identity, not a protocol field (docs/adr/0045 decision 1).
+/// identity, not a protocol field (ADR-0045 decision 1).
 pub fn parse_app_id(properties: &HashMap<String, Value>, id: &str) -> Result<String, LayoutError> {
     let default = format!("oblisk-{id}");
     // Deferred on the evaluation-time pass for [`parse_title`]'s reason: `set_app_id` is a request
@@ -137,21 +137,21 @@ fn check_max_size_above_min(min: Option<SizeHint>, max: Option<SizeHint>) -> Res
 /// build-steps.md Phase 22), the way [`PanelSpec`] does for a layer surface.
 ///
 /// A `window` is a **top-level** node returned from `shell.lua`, a sibling of `panel`, not
-/// something nested inside a panel's child tree (docs/adr/0040 decision 1).
+/// something nested inside a panel's child tree (ADR-0040 decision 1).
 ///
 /// **No `WindowTopology`.** [`PanelSpec`] carries one because five of a panel's fields are fixed at
 /// `get_layer_surface` time. A toplevel's are not: `set_title`, `set_app_id`, `set_min_size` and
 /// `set_max_size` are all requests on a live toplevel, and `visible` creates and destroys the
-/// object rather than swapping the generation (docs/adr/0049 decisions 1-3). What is left is `id`,
-/// and an `id` changing is adding one declaration and removing another, which docs/adr/0001 and
-/// docs/adr/0049 decision 3 already route to a swap on the *declared set*.
+/// object rather than swapping the generation (ADR-0049 decisions 1-3). What is left is `id`,
+/// and an `id` changing is adding one declaration and removing another, which ADR-0001 and
+/// ADR-0049 decision 3 already route to a swap on the *declared set*.
 ///
 /// § 6.2 gives a `window` no `monitor`: the compositor places a toplevel, so unlike a `panel` one
-/// declaration is one Wayland object, never one per output (docs/adr/0038 decision 3).
+/// declaration is one Wayland object, never one per output (ADR-0038 decision 3).
 ///
 /// `on_close` and `visible` are absent here for the same reasons [`PanelSpec`] omits their
 /// equivalents. A callback rides along untouched in `layout::scene::RetainedNode::properties`,
-/// exactly as `button`'s `on_click` does and where docs/adr/0050's input path reads it; `visible`
+/// exactly as `button`'s `on_click` does and where ADR-0050's input path reads it; `visible`
 /// is § 5.1 base state on every node, parsed by [`parse_visible`] in the reconcile walk.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowSpec {
@@ -242,7 +242,7 @@ pub fn parse_popup_anchor(properties: &HashMap<String, Value>, property: &str) -
 /// discards and invite a reader to think the config chose the precedence.
 ///
 /// [`Default`] is § 6.3's `{ "FlipY", "SlideX" }` -- dropdown behaviour, and deliberately **not**
-/// the protocol's own default of no adjustment at all (docs/adr/0040 decision 3). An explicitly
+/// the protocol's own default of no adjustment at all (ADR-0040 decision 3). An explicitly
 /// empty array is how a config asks for [`ConstraintAdjustment::NONE`] back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConstraintAdjustment {
@@ -337,7 +337,7 @@ pub fn parse_popup_offset(properties: &HashMap<String, Value>) -> Result<PopupOf
 
 /// § 6.3's `anchor_rect`, in the parent surface's logical coordinates. [`LogicalRect`] rather than
 /// a type of its own: `crate::wayland`'s `rect_table` builds `on_click`'s single argument out of a
-/// `LogicalRect` (docs/adr/0050 decision 3), and § 6.3 says this property is "normally passed
+/// `LogicalRect` (ADR-0050 decision 3), and § 6.3 says this property is "normally passed
 /// straight from the rect `button`'s `on_click` hands back", so the same rect round-trips through
 /// the config and lands back in the type it left as.
 ///
@@ -356,7 +356,7 @@ pub fn parse_popup_offset(properties: &HashMap<String, Value>) -> Result<PopupOf
 /// anchor rectangle incomplete, and a placeholder that would itself be a protocol error is not a
 /// placeholder.
 ///
-/// It never reaches a compositor: docs/adr/0049's second amendment re-derives the authoritative
+/// It never reaches a compositor: ADR-0049's second amendment re-derives the authoritative
 /// spec from the resolved tree in `App::apply_resolved_state`, before `apply_visibility` can create
 /// anything from it. The one place it is observable is `expand_instances`, which seeds a popup
 /// instance's `available` from the declared `width`/`height` -- a popup that signal-binds a size
@@ -430,13 +430,13 @@ fn parse_popup_extent(properties: &HashMap<String, Value>, property: &str) -> Re
 }
 
 /// § 6.3's `grab`, defaulting to `true`. A dropdown that cannot be dismissed by clicking outside it
-/// is the whole reason docs/adr/0040 decision 2 reached for a real `xdg_popup` instead of a second
+/// is the whole reason ADR-0040 decision 2 reached for a real `xdg_popup` instead of a second
 /// `panel`, so the default is the behaviour a config author expects rather than the protocol's
 /// "only if you ask".
 ///
 /// Whether the grab can actually be taken is not decided here: it needs a serial from a real input
-/// event, which only exists for the length of one poll turn (docs/adr/0049's amendment), and a
-/// compositor may deny it anyway, which docs/adr/0040 decision 2 records as a normal outcome.
+/// event, which only exists for the length of one poll turn (ADR-0049's amendment), and a
+/// compositor may deny it anyway, which ADR-0040 decision 2 records as a normal outcome.
 pub fn parse_grab(properties: &HashMap<String, Value>) -> Result<bool, LayoutError> {
     if is_deferred_signal(properties, "grab") {
         return Ok(true);
@@ -460,11 +460,11 @@ pub fn parse_grab(properties: &HashMap<String, Value>) -> Result<bool, LayoutErr
 /// layer-shell parent), and that parent is a *surface*, not a node.
 ///
 /// **No `PopupTopology`, for a stronger reason than [`WindowSpec`] has.** A popup's Wayland object
-/// exists only while it is shown (docs/adr/0049 decision 1) and its `xdg_positioner` is consumed by
+/// exists only while it is shown (ADR-0049 decision 1) and its `xdg_positioner` is consumed by
 /// `get_popup`, so every field on this type is re-read from scratch on every open -- `parent`
 /// included, which is why it is an ordinary field and not a carve-out. What remains topology is the
-/// declaration itself: adding or removing a `popup` node changes the declared set (docs/adr/0001,
-/// docs/adr/0049 decision 3), while opening and closing one is explicitly a value change.
+/// declaration itself: adding or removing a `popup` node changes the declared set (ADR-0001,
+/// ADR-0049 decision 3), while opening and closing one is explicitly a value change.
 ///
 /// `on_dismiss` and `visible` are not fields here, same as [`WindowSpec`] and [`PanelSpec`]: the
 /// callback rides along in `RetainedNode::properties` like `on_click`, and `visible` is § 5.1 base
@@ -488,7 +488,7 @@ pub struct PopupSpec {
 pub fn popup_spec(properties: &HashMap<String, Value>) -> Result<PopupSpec, LayoutError> {
     // The one field here that is *not* deferred when it holds a `Signal` (see
     // [`is_deferred_signal`], which every other field below consults). `parent` decides which
-    // surface `get_popup` roots this popup under and docs/adr/0051 decision 1 pins that to one
+    // surface `get_popup` roots this popup under and ADR-0051 decision 1 pins that to one
     // parent instance chosen at creation, which is the structural-decision test
     // [`reject_signal_in_structural_field`] exists for -- `parse_string_property` applies it.
     let parent = parse_string_property(properties, "parent", None)?;

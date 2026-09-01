@@ -1,8 +1,8 @@
-//! Real PAM conversation (build-steps.md Phase 15 item 3, closing docs/adr/0015 item 1).
-//! Both halves of docs/adr/0028's design live here: they share the wire protocol
+//! Real PAM conversation (build-steps.md Phase 15 item 3, closing ADR-0015 item 1).
+//! Both halves of ADR-0028's design live here: they share the wire protocol
 //! (`shared::PamOutcome` over `shared::framing`) and the PAM service name ([`pam_service`]).
 //!
-//! docs/adr/0028: PAM runs in a re-exec'd worker process, not inline, because `nonstick`'s FFI is
+//! ADR-0028: PAM runs in a re-exec'd worker process, not inline, because `nonstick`'s FFI is
 //! blocking and this codebase's rule is no blocking call inline in the async Supervisor.
 //!
 //! - [`run_worker`] is the worker side: runs only when this binary is re-exec'd with
@@ -15,7 +15,7 @@
 //!   its piped stdin/stdout, and reports the result to polkitd via `AuthenticationAgentResponse2`.
 //!   [`authenticate_current_user`] is its sibling for the session lock: no polkit challenge, no
 //!   polkitd, the uid is this process's own owner, and the outcome is returned rather than
-//!   reported (docs/adr/0052).
+//!   reported (ADR-0052).
 //!
 //! No reuse of `RendererFrame`/`SupervisorFrame` for the worker protocol -- a different process
 //! boundary (Supervisor<->its own re-exec'd PAM worker), not Supervisor<->Renderer.
@@ -260,7 +260,7 @@ pub async fn drive_pam_and_respond(
 /// rather than routed through `spawn_blocking`. A uid lookup is local-passwd-file-fast on this
 /// system (no NSS/LDAP backend) and this rare (one challenge or one lock submission at a time),
 /// so a `spawn_blocking` hop would be speculative generality -- the same "the loop blocks for real
-/// work, bounded and rare" precedent docs/adr/0025 set for PBA swaps. Upgrade path if a networked NSS
+/// work, bounded and rare" precedent ADR-0025 set for PBA swaps. Upgrade path if a networked NSS
 /// backend appears: wrap this call in `tokio::task::spawn_blocking`.
 async fn authenticate_uid(uid: u32, secret: &[u8]) -> Result<shared::PamOutcome, String> {
     let username = match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
@@ -271,7 +271,7 @@ async fn authenticate_uid(uid: u32, secret: &[u8]) -> Result<shared::PamOutcome,
     spawn_worker_and_exchange(&username, secret).await.map_err(|err| format!("pam worker failed: {err}"))
 }
 
-/// [`drive_pam_and_respond`]'s sibling for the session lock (docs/adr/0042, docs/adr/0052): the
+/// [`drive_pam_and_respond`]'s sibling for the session lock (ADR-0042, ADR-0052): the
 /// same worker exchange, but with no polkit challenge to read a uid from and no polkitd to
 /// report to -- the user is this process's own owner, since the Supervisor runs as the session
 /// user.
@@ -280,7 +280,7 @@ async fn authenticate_uid(uid: u32, secret: &[u8]) -> Result<shared::PamOutcome,
 /// arm is the only caller, and `tokio::spawn`s this rather than awaiting it inline (an Enter key
 /// at a lock screen is neither bounded nor rare), so the outcome comes back over a channel to the
 /// `pam_outcomes` arm, the only place allowed to turn a `Success` into an unlock order
-/// (docs/adr/0042).
+/// (ADR-0042).
 ///
 /// `secret` is zeroized on every return path, and -- unlike [`drive_pam_and_respond`] -- also on
 /// a path that isn't a return at all: spawned rather than awaited inline, this future can be
@@ -313,7 +313,7 @@ pub async fn authenticate_current_user(mut secret: shared::Zeroizing<Vec<u8>>) -
 /// panic unwinding out of it, or this future being dropped mid-`.await` by a runtime shutdown.
 ///
 /// Without this wrapper, `LockController::try_begin_authentication` sets `authenticating`
-/// (docs/adr/0052), and only a `LockEvent::Authenticated` landing in `main.rs`'s `pam_outcomes`
+/// (ADR-0052), and only a `LockEvent::Authenticated` landing in `main.rs`'s `pam_outcomes`
 /// arm ever clears it. A task that never reaches its own `.send()` leaves that flag a one-way
 /// latch: `may_authenticate` stays false forever, stranding the session behind the lock with no
 /// way back short of a VT switch.

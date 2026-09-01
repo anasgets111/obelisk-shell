@@ -1,5 +1,5 @@
 //! Media players (`oblisk.mpris`, docs/oblisk-supervisor-services-dbus.md §3;
-//! docs/oblisk-hardware-event-pipeline.md §3; docs/oblisk-idl-api-specs.md §2.8; docs/adr/0036).
+//! docs/oblisk-hardware-event-pipeline.md §3; docs/oblisk-idl-api-specs.md §2.8; ADR-0036).
 //!
 //! Supervisor-owned session-bus MPRIS player discovery and zero-polling progress-sync state,
 //! so `mpris.players` survives a Renderer crash/reload the same way idle/lock authority does

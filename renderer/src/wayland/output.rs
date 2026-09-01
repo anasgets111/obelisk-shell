@@ -1,13 +1,13 @@
 //! Connected outputs (`wl_output`), the `screens` signal payload, and presentation feedback.
 //!
 //! `Screen`/`OutputFacts` and their conversions are the single source both the `screens` Lua
-//! signal and `layout::instance`'s monitor matching read (docs/adr/0041 decision 2), so a config's
+//! signal and `layout::instance`'s monitor matching read (ADR-0041 decision 2), so a config's
 //! `monitor` arithmetic and the engine's layout can never disagree about what exists.
 
 use super::*;
 use crate::wayland::surface::TrackedRole;
 
-/// One connected output, exactly as `wl_output` reports it (docs/adr/0041 decision 2). The single
+/// One connected output, exactly as `wl_output` reports it (ADR-0041 decision 2). The single
 /// source both consumers read: the `screens` Lua signal a config loops over to declare per-monitor
 /// panels, and the [`OutputGeometry`] list `layout::instance::expand_instances` matches `monitor`
 /// against -- two sources would let a config's arithmetic and the engine's layout disagree.
@@ -64,7 +64,7 @@ fn screen_entry(index: usize, facts: &OutputFacts) -> Option<Screen> {
 }
 /// The `screens` signal's payload: § 2.9's per-output fields as a JSON array, pushed into Lua
 /// through the same `Loader::to_lua_value` every capability's `StateSnapshot` goes through
-/// (docs/adr/0041 decision 2 -- Renderer-sourced, but not a second marshalling path).
+/// (ADR-0041 decision 2 -- Renderer-sourced, but not a second marshalling path).
 pub(super) fn screens_payload(screens: &[Screen]) -> serde_json::Value {
     serde_json::Value::Array(
         screens
@@ -135,18 +135,18 @@ impl App {
     /// One `wl_output` appeared, changed, or went away. Two jobs, one handler, because one event
     /// owes both.
     ///
-    /// First, the `screens` signal (docs/adr/0041 decision 2). Everything below is gated on that
+    /// First, the `screens` signal (ADR-0041 decision 2). Everything below is gated on that
     /// push reporting a real change: `update_output` also fires for things `screens` does not
     /// carry, and re-running the rest for one of those would rebuild nothing and ask the
     /// Supervisor for a reload cycle no output change justifies.
     ///
-    /// Second, the instance set (docs/adr/0038 decision 3). A `monitor = "All"` declaration expands
+    /// Second, the instance set (ADR-0038 decision 3). A `monitor = "All"` declaration expands
     /// to one instance per output, so an output appearing adds an instance and one going away
     /// removes it, in place with no generation swap -- plugging in a monitor is not a config edit.
     ///
     /// Finally [`crate::socket::RendererClient::request_reload`], the half this cannot do itself: a
     /// config that loops over `screens` declares genuinely different surface ids before and after,
-    /// which is a topology change and so a generation swap (docs/adr/0041 decision 3), decided only
+    /// which is a topology change and so a generation swap (ADR-0041 decision 3), decided only
     /// by the Supervisor. The two do not conflict: a candidate builds its own surface set from its
     /// own evaluation, so whatever this reconciled here is discarded if a swap does happen.
     ///
@@ -233,7 +233,7 @@ impl PresentationTimeHandler for App {
 
     /// The content update was never displayed. Logged only -- not a distinct fast-fail signal;
     /// the Supervisor's `evidence_timeout` is what catches this surface never presenting
-    /// (docs/adr/0025 item 6). Deliberately does **not** queue any `PresentationEvidence`.
+    /// (ADR-0025 item 6). Deliberately does **not** queue any `PresentationEvidence`.
     fn discarded(
         &mut self,
         _conn: &Connection,
@@ -292,7 +292,7 @@ impl OutputHandler for App {
     }
 
     // All three do the same two things, because one `wl_output` event owes both: update the
-    // `screens` signal, then ask for a re-evaluation (docs/adr/0041 decisions 2 and 4). See
+    // `screens` signal, then ask for a re-evaluation (ADR-0041 decisions 2 and 4). See
     // [`App::handle_output_change`].
     fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: wl_output::WlOutput) {
         self.handle_output_change(qh, None);
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn instance_expansion_reads_the_same_screen_list_the_signal_does() {
-        // One source, two consumers (docs/adr/0041 decision 2): a `monitor` match and a `screens`
+        // One source, two consumers (ADR-0041 decision 2): a `monitor` match and a `screens`
         // entry must never be able to disagree about which monitors exist or how large they are.
         let screens = [screen_entry(0, &facts(Some("eDP-1"))).unwrap()];
         assert_eq!(

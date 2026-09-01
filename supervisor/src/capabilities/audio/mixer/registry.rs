@@ -28,15 +28,15 @@ use super::write::apply_command;
 /// Runs the PipeWire registry listener until the process exits, sending an updated
 /// [`AudioState`] (per-app streams plus § 2.4 master volume/mute) over `updates` on every
 /// relevant node-added/-properties-changed/-removed/param-changed event, and an updated snapshot
-/// of [`VideoSourceApp`]s over `video_updates` on the equivalent video events (docs/adr/0034) --
+/// of [`VideoSourceApp`]s over `video_updates` on the equivalent video events (ADR-0034) --
 /// one PipeWire connection, two independent capabilities' worth of data, each publishing only on
 /// its own changes. Blocks the calling thread -- call from a dedicated `std::thread::spawn`,
 /// never an async task: `pipewire-rs`'s event loop and the `Rc`-based listener state here are
 /// single-threaded and non-`Send`.
 ///
-/// `updates` only reaches a log line in `main()` for now, not Lua -- see docs/adr/0017 for why
+/// `updates` only reaches a log line in `main()` for now, not Lua -- see ADR-0017 for why
 /// and what unblocks it. `video_updates` feeds `privacy::PrivacyController`'s name-enrichment
-/// (docs/adr/0034), not a log line.
+/// (ADR-0034), not a log line.
 ///
 /// ponytail: no shutdown path -- `main_loop.run()` returns only when the process exits. Phase
 /// 7/8's reload orchestrator is what would give this a `main_loop.quit()` trigger to react to;
@@ -291,7 +291,7 @@ fn bind_sink(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryR
     // subscription and so never gets a volume either. Recording its name unconditionally would
     // leave resolve_default_device free to resolve to a node whose props can never arrive, and
     // compute_master would then report MasterVolume::default()'s 0.0 forever -- a number that
-    // looks like a real 0% on a capability with no "unknown" sentinel (docs/adr/0053).
+    // looks like a real 0% on a capability with no "unknown" sentinel (ADR-0053).
     let node: pw::node::Node = match registry.bind(obj) {
         Ok(node) => node,
         Err(err) => {

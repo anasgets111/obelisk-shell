@@ -1,5 +1,5 @@
 //! [`ApplicationsController`]: the `oblisk.applications` state owner and its two write actions
-//! (docs/adr/0061).
+//! (ADR-0061).
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -10,7 +10,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use super::scan::{AppSummary, LaunchTarget, scan};
 
-/// `oblisk.applications`'s payload (docs/adr/0061 decision 2).
+/// `oblisk.applications`'s payload (ADR-0061 decision 2).
 ///
 /// `by_app_id` repeats the summaries in `entries` rather than indexing into it. An index would
 /// have to be a Lua array index, and Lua counts from one while the JSON array this serializes to
@@ -53,7 +53,7 @@ pub enum LaunchError {
 pub struct ApplicationsController {
     state: Arc<Mutex<ApplicationsState>>,
     /// Not part of the snapshot: an argv the config could read is an argv the config could be
-    /// tricked into rewriting before `launch` ran it (docs/adr/0061 decision 3).
+    /// tricked into rewriting before `launch` ran it (ADR-0061 decision 3).
     launch_targets: Arc<Mutex<HashMap<String, LaunchTarget>>>,
     dirs: Arc<Vec<PathBuf>>,
     events: UnboundedSender<ApplicationsSignal>,
@@ -104,7 +104,7 @@ impl ApplicationsController {
     /// entry, which is exactly the blocking filesystem work a tokio worker thread must not do.
     ///
     /// Pushes only on a real change. Every `StateSnapshot` marks the Renderer's scene dirty and
-    /// drives a full re-resolve and repaint (docs/adr/0044), so a config calling `refresh` each
+    /// drives a full re-resolve and repaint (ADR-0044), so a config calling `refresh` each
     /// time its launcher opens would otherwise repaint the whole shell for a list that is
     /// identical nearly every time.
     pub fn refresh(&self) {
@@ -130,7 +130,7 @@ impl ApplicationsController {
     ///
     /// Detached is the point, and it is why this is its own action rather than the config calling
     /// `process.run`: `process.run` pipes stdout and stderr and holds the child for its exit code
-    /// (docs/adr/0026), which for a launched GUI application means the Supervisor keeps two pipes
+    /// (ADR-0026), which for a launched GUI application means the Supervisor keeps two pipes
     /// and a `Child` alive for the whole life of a program it has nothing more to say to. A
     /// generation swap would also reap it, so opening a text editor and then editing the config
     /// would close the editor.
@@ -193,7 +193,7 @@ mod tests {
     }
 
     /// The whole point of `launch` being its own action: the argv lives here, keyed by id, and
-    /// never travels through the config (docs/adr/0061 decision 3).
+    /// never travels through the config (ADR-0061 decision 3).
     #[tokio::test]
     async fn launch_runs_the_entrys_own_command() {
         let marker = tempfile::tempdir().unwrap();
@@ -259,7 +259,7 @@ mod tests {
     }
 
     /// `refresh` must not push when nothing changed: every snapshot repaints the whole scene
-    /// (docs/adr/0044), and the dev config calls `refresh` each time its launcher opens.
+    /// (ADR-0044), and the dev config calls `refresh` each time its launcher opens.
     #[tokio::test]
     async fn refreshing_an_unchanged_directory_pushes_nothing() {
         let dir = tempfile::tempdir().unwrap();

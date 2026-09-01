@@ -137,7 +137,7 @@ impl BluetoothController {
 
     /// The immediate half of `bluetooth:start_discovery()`: queues
     /// [`BluetoothSignal::DiscoveryCleared`] so `discovered_devices` clears on initiation, not
-    /// once `StartDiscovery`'s D-Bus round trip completes (docs/adr/0030).
+    /// once `StartDiscovery`'s D-Bus round trip completes (ADR-0030).
     pub fn clear_discovered(&self) {
         let _ = self.events.send(BluetoothSignal::DiscoveryCleared);
     }

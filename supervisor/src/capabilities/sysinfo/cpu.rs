@@ -1,12 +1,12 @@
-//! `cpu_percent` sourcing: `/proc/stat`'s aggregate `cpu` line (docs/adr/0035).
+//! `cpu_percent` sourcing: `/proc/stat`'s aggregate `cpu` line (ADR-0035).
 
 /// One `/proc/stat` aggregate-line sample: enough to compute a busy percentage against a
-/// later sample, not every individual field (docs/adr/0035's `busy = total - (idle+iowait)`).
+/// later sample, not every individual field (ADR-0035's `busy = total - (idle+iowait)`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuSample {
     /// Sum of every field on the line (`user+nice+system+idle+iowait+irq+softirq+steal+guest+guest_nice`).
     pub total: u64,
-    /// `idle + iowait` -- the two fields that count as "not busy" (docs/adr/0035).
+    /// `idle + iowait` -- the two fields that count as "not busy" (ADR-0035).
     pub idle_total: u64,
 }
 
@@ -27,7 +27,7 @@ pub fn parse_stat_line(line: &str) -> Option<CpuSample> {
     Some(CpuSample { total, idle_total })
 }
 
-/// The busy-percentage delta between two samples (docs/adr/0035: `busy = total -
+/// The busy-percentage delta between two samples (ADR-0035: `busy = total -
 /// (idle+iowait)`, `percent = 100 * busy_delta / total_delta`). `0` if no time elapsed
 /// (`total_delta == 0`) rather than dividing by zero.
 pub fn delta_percent(prev: &CpuSample, current: &CpuSample) -> u8 {

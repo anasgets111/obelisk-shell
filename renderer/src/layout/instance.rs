@@ -1,5 +1,5 @@
 //! Expanding declared surfaces into the instances the compositor actually maps (`CONTEXT.md`,
-//! Surface instance; docs/adr/0038 decision 3; build-steps.md Phase 20 item 2 and Phase 22).
+//! Surface instance; ADR-0038 decision 3; build-steps.md Phase 20 item 2 and Phase 22).
 //!
 //! One declared surface is not one Wayland surface. A `panel` with `monitor = "All"` targets every
 //! connected output, each with its own `zwlr_layer_surface_v1` and configured size -- why the
@@ -19,7 +19,7 @@ use crate::layout::scene::LogicalSize;
 /// One `(panel, output)` pair (`CONTEXT.md`, Surface instance).
 ///
 /// `instance_id` is the one id space Lua, the retained scene, the Wayland surface, and the PBA
-/// handshake all share (docs/adr/0038): the `"{id}@{output}"` convention `supervisor/src/reload.rs`
+/// handshake all share (ADR-0038): the `"{id}@{output}"` convention `supervisor/src/reload.rs`
 /// already used for wallpaper, generalized to every surface.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SurfaceInstance {
@@ -51,7 +51,7 @@ pub struct OutputGeometry {
 }
 
 /// Every instance `specs` declares against the currently connected `outputs`, per role
-/// (docs/adr/0038 decision 3, docs/adr/0049 decision 1).
+/// (ADR-0038 decision 3, ADR-0049 decision 1).
 ///
 /// **`panel`**: expands per output. `monitor = "All"` (§ 6.1 default) produces one instance per
 /// output, in `outputs` order; any other value matches the one output with that name, or produces
@@ -61,7 +61,7 @@ pub struct OutputGeometry {
 /// yields `"bar@DP-1"`, not `"bar"`), so every consumer reads one shape.
 ///
 /// **`window`**: always exactly one instance, whatever `outputs` holds, including none -- the
-/// compositor places a toplevel, so there is no output to qualify the id with (docs/adr/0049
+/// compositor places a toplevel, so there is no output to qualify the id with (ADR-0049
 /// decision 2). Its instance exists from startup even though its `xdg_toplevel` does not; that
 /// instance is what lets the scene resolve the window's tree, and `visible` reads off that tree.
 /// `available` seeds from the first output's logical size as a bound for measuring § 5.1's
@@ -69,13 +69,13 @@ pub struct OutputGeometry {
 /// replaces it at the first `xdg_toplevel` configure. Zero when nothing is connected.
 ///
 /// **`popup`**: one instance on its bare declared id, for a `window`'s reason and one more
-/// (docs/adr/0051 decision 1): expanding per parent instance would mean one `visible` signal drove
+/// (ADR-0051 decision 1): expanding per parent instance would mean one `visible` signal drove
 /// `menu@eDP-1` and `menu@DP-1` both, opening a dropdown on every monitor from one click. Its
 /// parent is chosen at creation from the click that armed it, not here. `available` seeds from the
 /// popup's own § 6.3 `width`/`height` (both required, no `"Fill"`), since that size is
 /// `xdg_positioner::set_size`'s argument and so the budget its child is measured against.
 ///
-/// **`lock`**: expands per output like a `panel`, with no filter (docs/adr/0052 decision 2,
+/// **`lock`**: expands per output like a `panel`, with no filter (ADR-0052 decision 2,
 /// build-steps.md Phase 23): `ext-session-lock-v1` requires "lock surfaces for all outputs
 /// currently present" and rejects a second surface on one output with `duplicate_output`, so there
 /// is exactly one legal answer per output and no choice for § 6.4 to offer. Zero outputs produce
@@ -128,7 +128,7 @@ pub fn expand_instances(specs: &[SurfaceSpec], outputs: &[OutputGeometry]) -> Ve
 /// Whether `instance_id` names an instance of the surface declared as `declared_id` -- the inverse
 /// of the `"{id}@{output}"` rule [`expand_instances`] applies.
 ///
-/// One caller: `crate::wayland::App`'s popup parent lookup (docs/adr/0051 decision 1), which pairs
+/// One caller: `crate::wayland::App`'s popup parent lookup (ADR-0051 decision 1), which pairs
 /// a declared `parent` (§ 6.3) against a set of *instances*, across both spellings -- `"bar@eDP-1"`
 /// for a panel, bare `"settings"` for a window.
 ///
@@ -147,7 +147,7 @@ pub fn is_instance_of(instance_id: &str, declared_id: &str) -> bool {
     instance_id == declared_id || instance_id.strip_prefix(declared_id).is_some_and(|rest| rest.starts_with('@'))
 }
 
-/// What one output change does to a live generation's surface instances (docs/adr/0038 decision 3:
+/// What one output change does to a live generation's surface instances (ADR-0038 decision 3:
 /// "monitor hotplug adds and removes instances in place, with no generation swap"), computed by
 /// [`reconcile_instances`].
 ///

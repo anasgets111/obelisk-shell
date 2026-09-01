@@ -1,4 +1,4 @@
-//! The applications-directory scan (docs/adr/0061): which directories, in what precedence, and
+//! The applications-directory scan (ADR-0061): which directories, in what precedence, and
 //! how an `app_id` finds its entry.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -12,7 +12,7 @@ use super::entry::{desktop_file_id, flag, parse_group, tokenize_exec};
 /// directory the way `watcher.rs` has to.
 const MAX_DEPTH: usize = 4;
 
-/// One application as the config sees it (docs/adr/0061). Deliberately the display half only:
+/// One application as the config sees it (ADR-0061). Deliberately the display half only:
 /// the argv never crosses into Lua, because `applications:launch(id)` is what runs it and a
 /// config that could rewrite a command line before it ran would be a config that could be made
 /// to run something else.

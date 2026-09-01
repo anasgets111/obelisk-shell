@@ -1,5 +1,5 @@
 //! `oblisk.lock`: the session-lock command and the state a lock screen is built from
-//! (docs/adr/0042, docs/adr/0052 decisions 1 and 4).
+//! (ADR-0042, ADR-0052 decisions 1 and 4).
 //!
 //! The Renderer holds `ext_session_lock_v1` and paints it; this owns the decision to take it, the
 //! record of what became of it, and the one call site allowed to order an unlock. Every state
@@ -10,9 +10,9 @@ use std::sync::Mutex;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-/// `oblisk.lock`'s payload (docs/adr/0052 decision 4). `attempts` counts failed authentications
+/// `oblisk.lock`'s payload (ADR-0052 decision 4). `attempts` counts failed authentications
 /// since acquisition, and exists because Lua can't rebuild it: capability state is sampled at
-/// layout time (docs/adr/0044), not evented, so two identical consecutive failures are one
+/// layout time (ADR-0044), not evented, so two identical consecutive failures are one
 /// unchanged `error` string. `error`'s "nothing went wrong" value is the empty string, the same
 /// convention `keyboard`'s `active_layout` uses.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
@@ -39,7 +39,7 @@ pub struct LockState {
     /// ([`apply`]'s invariant), while the swap gate has to shut a round trip earlier:
     /// `ext_session_lock_v1` lets the compositor withhold `locked` until the client has presented
     /// on every output, and a swap started in that window reaps the process holding the lock
-    /// object and locks the user out for good (docs/adr/0042).
+    /// object and locks the user out for good (ADR-0042).
     #[serde(skip)]
     pub requested: bool,
     /// Which acquisition of the lock this state describes: bumped only when the Renderer reports
@@ -63,13 +63,13 @@ pub enum LockEvent {
     LockRequested,
     /// A `secure_submit(lock, authenticate)` arrived and its PAM conversation is starting.
     AuthenticationStarted,
-    /// That conversation's answer, straight from the re-exec'd worker (docs/adr/0028). Reached
+    /// That conversation's answer, straight from the re-exec'd worker (ADR-0028). Reached
     /// only through [`LockController::record_authentication`], which checks the answer against
     /// the lock it was started for.
     Authenticated(shared::PamOutcome),
     /// The Renderer holding the lock said what became of it.
     Reported(shared::LockOutcome),
-    /// The process holding `ext_session_lock_v1` died without reporting anything (docs/adr/0058
+    /// The process holding `ext_session_lock_v1` died without reporting anything (ADR-0058
     /// decision 4). Not a [`Self::Reported`]: there is no holder left to describe anything. The
     /// session is still locked at the compositor, which does not unlock on client death; what
     /// ended is this shell's ability to speak for it.
@@ -85,7 +85,7 @@ pub enum LockEvent {
 pub fn apply(state: &mut LockState, event: LockEvent) {
     match event {
         // Drop the previous attempt's refusal reason: a config fixed by an in-place reload must
-        // not keep showing why the old config failed (docs/adr/0052 decision 3).
+        // not keep showing why the old config failed (ADR-0052 decision 3).
         LockEvent::LockRequested => {
             state.requested = true;
             state.error.clear();
@@ -112,7 +112,7 @@ pub fn apply(state: &mut LockState, event: LockEvent) {
             state.acquisition += 1;
         }
         // `active` stays false: nothing was ever taken, so nothing was protected a moment
-        // earlier either (docs/adr/0052 decision 3).
+        // earlier either (ADR-0052 decision 3).
         LockEvent::Reported(shared::LockOutcome::Refused(reason)) => {
             state.requested = false;
             state.authenticating = false;
@@ -120,7 +120,7 @@ pub fn apply(state: &mut LockState, event: LockEvent) {
         }
         // `Finished` after `Locked` is a compositor teardown, not a failure this capability
         // reports: with the lock surfaces gone, the Renderer sets `oblisk.rescue` itself
-        // (docs/adr/0052 decision 4). `attempts` is left alone -- it resets on the next
+        // (ADR-0052 decision 4). `attempts` is left alone -- it resets on the next
         // acquisition, the only point a count "since acquired" means anything.
         LockEvent::Reported(shared::LockOutcome::Finished | shared::LockOutcome::Unlocked) => {
             state.active = false;
@@ -142,7 +142,7 @@ pub fn apply(state: &mut LockState, event: LockEvent) {
     }
 }
 
-/// docs/adr/0042: what defers a generation swap. Only one client may hold a session lock, so
+/// ADR-0042: what defers a generation swap. Only one client may hold a session lock, so
 /// candidate `N+1` cannot acquire the one generation `N` holds or is mid-acquiring. `requested`
 /// is the half a report hasn't resolved yet: ignoring it would reap the lock holder mid-handshake
 /// and leave the compositor locked with nobody able to unlock it.
@@ -151,7 +151,7 @@ pub fn defers_swap(state: &LockState) -> bool {
 }
 
 /// What one [`shared::LockOutcome`] says about the compositor's session lock, a different
-/// question from the one [`apply`] answers (docs/adr/0060).
+/// question from the one [`apply`] answers (ADR-0060).
 ///
 /// `LockState.active` means "this shell holds the lock". The compositor's lock outlives that:
 /// `RendererLost` clears `active` while the session stays locked (the compositor does not unlock
@@ -177,12 +177,12 @@ pub fn compositor_lock_change(outcome: &shared::LockOutcome) -> SessionLock {
     }
 }
 
-/// The one piece of lock state that outlives the Supervisor process (docs/adr/0060): a file in
+/// The one piece of lock state that outlives the Supervisor process (ADR-0060): a file in
 /// `$XDG_RUNTIME_DIR` that exists exactly while the compositor is locked.
 ///
 /// Exists because a restarted Supervisor's [`LockState`] is `Default`, so `active` reads false
 /// while the compositor is still locked from before, and the new shell paints its bar behind a
-/// lock fallback nothing can see (docs/adr/0058, 0059).
+/// lock fallback nothing can see (ADR-0058, 0059).
 ///
 /// A file, not anything richer: the question is a boolean and the storage must survive
 /// `SIGKILL`. `$XDG_RUNTIME_DIR`, not config/state: it goes away with the user's last session,
@@ -269,7 +269,7 @@ pub fn accepts_outcome(state: &LockState, acquisition: u64) -> bool {
 }
 
 /// The line a lock screen renders for a failed authentication, not `oblisk.rescue`: rescue is
-/// drawn by the config's ordinary surfaces, exactly what the lock is hiding (docs/adr/0052
+/// drawn by the config's ordinary surfaces, exactly what the lock is hiding (ADR-0052
 /// decision 4). `Success` is not a failure and [`apply`] never asks for its message.
 fn error_for_outcome(outcome: &shared::PamOutcome) -> String {
     match outcome {
@@ -325,7 +325,7 @@ impl LockController {
 
     /// Orders the unlock. Not reachable from Lua, deliberately absent from [`dispatch`]: its only
     /// caller is `main.rs`'s `secure_submit(lock, authenticate)` arm on a `PamOutcome::Success`,
-    /// making docs/adr/0042's "never unlock except on a successful authentication" checkable by
+    /// making ADR-0042's "never unlock except on a successful authentication" checkable by
     /// reading one arm.
     ///
     /// Records no event: `active` clears when the Renderer reports `Unlocked`, not when the order
@@ -390,7 +390,7 @@ impl LockController {
 ///
 /// Locking is the one direction a config may command. There is no `unlock` variant: a lock
 /// screen's `button` callbacks run while its Lua tree is the only thing on the glass, so an
-/// `unlock` action would be a one-click path past PAM -- exactly what docs/adr/0042 forbids.
+/// `unlock` action would be a one-click path past PAM -- exactly what ADR-0042 forbids.
 /// `"unlock"` names no variant, so it is logged and dropped like any other unanswered name.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -398,7 +398,7 @@ pub enum LockAction {
     Lock,
 }
 
-/// `oblisk.lock`'s action dispatch (docs/adr/0037). `lock` takes no arguments, so unlike
+/// `oblisk.lock`'s action dispatch (ADR-0037). `lock` takes no arguments, so unlike
 /// `keyboard` there is no `parse_*_args` sibling.
 pub fn dispatch(controller: &LockController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
@@ -505,7 +505,7 @@ mod tests {
         assert!(!state.active, "the lock object died with the process that held it");
         assert!(!state.requested, "a request nothing will answer must not keep the swap gate shut forever");
         // LockController::lock refuses while active. Without clearing it here, the replacement's
-        // re-acquisition is dropped before it reaches the wire (docs/adr/0058 decision 4).
+        // re-acquisition is dropped before it reaches the wire (ADR-0058 decision 4).
     }
 
     #[test]
@@ -555,7 +555,7 @@ mod tests {
 
     #[test]
     fn a_lock_request_defers_a_swap_before_the_renderer_has_confirmed_it() {
-        // docs/adr/0042: the gate shuts when the order goes out, not when the compositor confirms
+        // ADR-0042: the gate shuts when the order goes out, not when the compositor confirms
         // it -- that window can be long, and a swap inside it reaps the process owning the lock.
         let mut state = LockState::default();
         assert!(!defers_swap(&state), "an untouched session defers nothing");
@@ -850,7 +850,7 @@ mod tests {
 
     #[test]
     fn dispatch_refuses_to_unlock() {
-        // docs/adr/0042: an unlock action would make walking past PAM one mouse click. The
+        // ADR-0042: an unlock action would make walking past PAM one mouse click. The
         // asymmetry with lock is deliberate, pinned so it isn't re-added as an oversight.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let controller = LockController::new(tx);

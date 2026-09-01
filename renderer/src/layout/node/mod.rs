@@ -19,7 +19,7 @@
 //! `deserialize_lua_table` as deep as the getter wants. `layout::scene::MAX_TREE_DEPTH` is what caps
 //! that and raises [`LayoutError::TreeTooDeep`].
 //!
-//! [`SurfaceTopology`]'s five fields and every node's optional `id` (docs/adr/0045 decision 1) are
+//! [`SurfaceTopology`]'s five fields and every node's optional `id` (ADR-0045 decision 1) are
 //! structural carve-outs that keep rejecting a `Signal` outright -- see
 //! [`reject_signal_in_structural_field`]. A `panel`'s remaining § 6.1 properties are not carve-outs:
 //! layer-shell accepts each on a live surface, so a `Signal` in one resolves normally.
@@ -33,7 +33,7 @@ mod toplevel;
 
 // The paint-only parsers are imported, not re-exported. They were `pub` for `layout::paint`, which
 // ran them itself on every node on every frame; [`paint_style`] is their only caller now
-// (docs/adr/0068), so the way to ask what a node paints is to ask for its `PaintStyle`. `super::*`
+// (ADR-0068), so the way to ask what a node paints is to ask for its `PaintStyle`. `super::*`
 // is what carries them into `paint_style.rs`.
 use content::{
     parse_elide, parse_fit, parse_font_size, parse_foreground, parse_icon_name, parse_image_source,
@@ -184,7 +184,7 @@ const MAX_ERROR_VALUE_PREVIEW_BYTES: usize = 200;
 ///
 /// Cost here is a function of the cap, not of the input. 23.96 ms is more than a whole frame at
 /// 60fps, which is what made this worth fixing while `layout::paint` still validated a `background`
-/// or a `radius` while drawing. It no longer does (docs/adr/0068): every parser here runs once per
+/// or a `radius` while drawing. It no longer does (ADR-0068): every parser here runs once per
 /// node per apply, so the cap now buys a bounded `rescue` message rather than a bounded frame.
 ///
 /// `oversized_string_property_error_still_names_type_and_shows_a_recognizable_prefix` is the
@@ -301,24 +301,24 @@ fn parse_hex_color(property: &str, s: &str) -> Result<Rgba, LayoutError> {
 /// `zwlr_layer_shell_v1::get_layer_surface` fixes a namespace at creation and no request changes it
 /// on a live surface. The in-place `panel` fields -- `keyboard_interactivity`, `exclusive`,
 /// `margin`, `width`/`height` -- are deliberately *not* here: layer-shell permits changing each on a
-/// live surface, so a `Signal` in one resolves normally (docs/adr/0044 decision 1).
+/// live surface, so a `Signal` in one resolves normally (ADR-0044 decision 1).
 ///
 /// `window`, `popup` and `lock` add nothing to the carve-out (build-steps.md Phase 22 and 23), by
 /// the same live-object test: a `window`'s `set_title`/`set_app_id`/`set_min_size`/`set_max_size`
 /// are all valid requests on a mapped toplevel; a `popup`'s whole `xdg_positioner` is rebuilt on
-/// every open (docs/adr/0049 decision 1), so `parent`/`anchor_rect`/`anchor`/`gravity` are meant to
+/// every open (ADR-0049 decision 1), so `parent`/`anchor_rect`/`anchor`/`gravity` are meant to
 /// carry a `Signal`; a `lock`'s § 6.4 property list is only `id` and `child`. All three roles' `id`
 /// is already covered by the universal arm, since it is a reconcile identity rather than a protocol
 /// field.
 ///
-/// `hover` joins `id` in the universal arm for the same reason and on any kind (docs/adr/0062
+/// `hover` joins `id` in the universal arm for the same reason and on any kind (ADR-0062
 /// decision 3): it names the signal the pointer handler writes, and a resolved `hover` would arrive
 /// there as the boolean `false`, saying nothing about *which* signal that is. Structural properties
 /// are identities, and identities do not resolve.
 fn is_structural_property(kind: &str, property: &str) -> bool {
     property == "id"
         || property == "hover"
-        // docs/adr/0069 decision 4: the positioning pass reads this signal's number *and* writes
+        // ADR-0069 decision 4: the positioning pass reads this signal's number *and* writes
         // the clamped one back, so it needs the handle rather than a snapshot of it.
         || property == "scroll"
         || (kind == "panel" && matches!(property, "layer" | "anchor" | "monitor" | "namespace"))
@@ -384,7 +384,7 @@ fn is_structural_property(kind: &str, property: &str) -> bool {
 /// ponytail: resolving every property means every property *that holds a `Signal`* is evaluated on
 /// every pass, paint-only ones included -- `background`, `color` and `radius` are read here even
 /// though no parser in this module looks at them yet. Each one is its own `Signal::get_value` and
-/// therefore buys its own ADR-0021 5ms budget (docs/adr/0021, § 1.2), so a node with four
+/// therefore buys its own ADR-0021 5ms budget (ADR-0021, § 1.2), so a node with four
 /// signal-bound paint properties can spend four budgets in a pass that ADR-0044 decision 2's dirty
 /// flag now runs per capability push, on the Wayland dispatch thread. That is the price of the
 /// resolved map being a *complete* snapshot rather than a snapshot of the properties layout
@@ -401,7 +401,7 @@ pub fn resolve_properties(
     // randomised per process, so with two failing properties on one node the error a run reported
     // was whichever the hash seed happened to reach first -- eight runs of the same broken config
     // named two different properties. This message is what `renderer/src/socket.rs` puts in the
-    // `rescue` global's `error_log` for a human to read after the fact (§ 2.10, docs/adr/0024), so
+    // `rescue` global's `error_log` for a human to read after the fact (§ 2.10, ADR-0024), so
     // which property a given broken config names has to be a function of the config alone, not of
     // the hash seed the process happened to boot with. Do not "optimise" this into a bare
     // `for (property, value) in properties`.
@@ -440,7 +440,7 @@ pub fn resolve_properties(
 
 /// The carve-outs from decision 1's "parsers resolve a `Signal`" rule: [`SurfaceTopology`]'s five
 /// fields (`parse_surface_id`/`parse_layer`/`parse_anchor`/`parse_monitor`/`parse_namespace`) and
-/// every node's optional `id` ([`parse_node_id`], docs/adr/0045 decision 1) keep rejecting one
+/// every node's optional `id` ([`parse_node_id`], ADR-0045 decision 1) keep rejecting one
 /// outright, the same way every parser used to.
 ///
 /// The unifying reason: each is read exactly once per evaluation and a *structural* decision is
@@ -470,7 +470,7 @@ fn reject_signal_in_structural_field(property: &str, value: &Value) -> Result<()
 
 /// Whether `property` currently holds a live [`crate::lua::signal::Signal`] -- the one thing an **unresolved** property
 /// map can say that a resolved one cannot: "this pass is not in a position to check it"
-/// (docs/adr/0049's second amendment).
+/// (ADR-0049's second amendment).
 ///
 /// Only ever true on the evaluation-time pass. [`resolve_properties`] reads every `Signal` it is
 /// handed and stores the *result* in its place, refusing a result that is itself a `Signal`, so no
@@ -483,10 +483,10 @@ fn reject_signal_in_structural_field(property: &str, value: &Value) -> Result<()
 /// must not call one), a signal-bound property is skipped and left at the parser's documented
 /// placeholder; the authoritative value is re-read from the resolved tree by
 /// `App::apply_resolved_state` before anything is built from it. A *literal* is still fully
-/// validated on that pass, so a config typo fails fast into docs/adr/0046's `rescue` log rather than
+/// validated on that pass, so a config typo fails fast into ADR-0046's `rescue` log rather than
 /// surfacing as an `xdg_positioner` protocol error at first open.
 ///
-/// Without this, `anchor_rect = popup_anchor` -- the spelling docs/adr/0050 decision 3 tells a
+/// Without this, `anchor_rect = popup_anchor` -- the spelling ADR-0050 decision 3 tells a
 /// config to write -- would fail the whole evaluation: every parser below rejects a raw
 /// `Value::UserData` with a type error otherwise.
 fn is_deferred_signal(properties: &HashMap<String, Value>, property: &str) -> bool {

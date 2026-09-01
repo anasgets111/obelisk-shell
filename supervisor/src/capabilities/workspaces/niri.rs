@@ -50,7 +50,7 @@ fn focused_window(windows: &HashMap<u64, niri_ipc::Window>) -> Option<FocusedWin
 /// the event back when its part ignored it, so one `if let` chains both parts.
 ///
 /// A second event-stream connection to the same compositor: `keyboard` already holds one for
-/// `KeyboardLayoutsChanged` (docs/adr/0056 decision 2 weighs that against sharing it).
+/// `KeyboardLayoutsChanged` (ADR-0056 decision 2 weighs that against sharing it).
 ///
 /// ponytail: that reducer panics rather than degrading on two events, `WindowClosed` and
 /// `WindowLayoutsChanged` naming a window it has never seen (both are a bare `.expect` in

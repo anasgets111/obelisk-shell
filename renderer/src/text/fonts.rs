@@ -1,5 +1,5 @@
 //! Resolves the shell's declared font chain to concrete font files and loads only those
-//! into a `fontdb::Database` (docs/adr/0043 decision 2, docs/build-steps.md Phase 19 item 10).
+//! into a `fontdb::Database` (ADR-0043 decision 2, docs/build-steps.md Phase 19 item 10).
 //!
 //! `cosmic_text::FontSystem::new()` calls `Database::load_system_fonts()`, which parses face
 //! metadata for the whole system set (2648 faces on the dev machine ADR-0043 measured against,
@@ -21,7 +21,7 @@ use fontdb::{Database, Family, Query};
 const GENERIC_ALIASES: &[&str] = &["sans-serif", "serif", "monospace", "cursive", "fantasy"];
 
 /// What a config that declares no `fonts { ... }` gets: a system sans serif, then CJK coverage,
-/// then color emoji (docs/adr/0043 decision 2), covering codepoints that arrive from outside the
+/// then color emoji (ADR-0043 decision 2), covering codepoints that arrive from outside the
 /// shell's own strings (MPRIS titles, notification bodies, window titles).
 ///
 /// This is the fallback, not the chain. `crate::lua::fonts` records what a config asked for and
@@ -86,14 +86,14 @@ pub fn resolve_chain(chain: &[&str]) -> ResolvedFonts {
 /// entry genuinely absent. A real degradation path, not a panic.
 ///
 /// ponytail: this is `load_system_fonts()` plus a `SansSerif` query, exactly the ~1s-startup,
-/// whole-system-scan path docs/adr/0043 decision 2 spends this module avoiding. Correct only
+/// whole-system-scan path ADR-0043 decision 2 spends this module avoiding. Correct only
 /// because it's the last resort, not the common case -- if this line shows up in a real user's
 /// logs, the fix is diagnosing why `fc-match` isn't reachable, not tuning this fallback.
 fn system_fallback(chain: &[&str]) -> ResolvedFonts {
     eprintln!(
         "font chain: none of {chain:?} resolved via fc-match (fontconfig not installed, or \
          fc-match missing from $PATH) -- falling back to a full system font scan, which is \
-         the slow, memory-heavy path docs/adr/0043 decision 2 exists to avoid"
+         the slow, memory-heavy path ADR-0043 decision 2 exists to avoid"
     );
     let mut db = Database::new();
     db.load_system_fonts();

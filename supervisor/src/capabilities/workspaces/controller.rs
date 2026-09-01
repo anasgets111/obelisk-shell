@@ -31,7 +31,7 @@ pub struct WorkspacesState {
     pub active_client: Option<ActiveClient>,
 }
 
-/// One output's workspace state. `workspaces` is docs/adr/0056 decision 3's addition to
+/// One output's workspace state. `workspaces` is ADR-0056 decision 3's addition to
 /// § 2.9.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct OutputWorkspaces {
@@ -41,7 +41,7 @@ pub struct OutputWorkspaces {
     /// The [`WorkspaceEntry::id`] of the workspace visible on this output. Every output has one,
     /// focused or not.
     pub active_workspace: u64,
-    /// docs/adr/0056 decision 4: present only on the output that actually holds focus, so
+    /// ADR-0056 decision 4: present only on the output that actually holds focus, so
     /// `out.focused_workspace ~= nil` is the "is this the focused monitor" test.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub focused_workspace: Option<u64>,
@@ -66,7 +66,7 @@ pub struct WorkspaceEntry {
     pub name: Option<String>,
 }
 
-/// § 2.9's `active_client`, minus `is_fullscreen` (docs/adr/0056 decision 5: niri-ipc 26.4.0's
+/// § 2.9's `active_client`, minus `is_fullscreen` (ADR-0056 decision 5: niri-ipc 26.4.0's
 /// `Window` has no such field, and a fabricated `false` would be wrong for fullscreen windows).
 /// `class` is Wayland's `app_id`: X11's `WM_CLASS` has no Wayland equivalent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
@@ -93,7 +93,7 @@ pub struct WorkspaceRow {
     /// The workspace its own output is showing. Per output: every output has exactly one.
     pub is_active: bool,
     /// The workspace holding keyboard focus. Global: exactly one across the whole session, which
-    /// is what makes `OutputWorkspaces::focused_workspace` optional (docs/adr/0056 decision 4).
+    /// is what makes `OutputWorkspaces::focused_workspace` optional (ADR-0056 decision 4).
     pub is_focused: bool,
 }
 
@@ -106,7 +106,7 @@ pub struct WorkspaceRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FocusedWindow {
     pub title: String,
-    /// Wayland's `app_id`, which is what § 2.9's `class` is filled from (docs/adr/0056
+    /// Wayland's `app_id`, which is what § 2.9's `class` is filled from (ADR-0056
     /// decision 5).
     pub app_id: String,
     pub is_floating: bool,
@@ -200,7 +200,7 @@ pub struct WorkspacesController {
 
 impl WorkspacesController {
     /// Returns immediately. A session running something with no implementor never spawns a
-    /// reader and so never pushes at all (docs/adr/0056 decision 1).
+    /// reader and so never pushes at all (ADR-0056 decision 1).
     ///
     /// The match is exhaustive rather than defaulting, so adding a `CompositorKind` fails this
     /// build here: the arm a new compositor needs is the one this file exists to point at.
@@ -210,7 +210,7 @@ impl WorkspacesController {
         match compositor {
             Some(CompositorKind::Niri) => niri::spawn_reader(StatePublisher::new(Arc::clone(&state), events)),
             Some(CompositorKind::Hyprland) => eprintln!(
-                "workspaces: this session is Hyprland, which has no implementor yet (docs/adr/0056 decision 1); workspace reporting disabled for this run"
+                "workspaces: this session is Hyprland, which has no implementor yet (ADR-0056 decision 1); workspace reporting disabled for this run"
             ),
             None => {
                 eprintln!("workspaces: {}; workspace reporting disabled for this run", unsupported_session_report())
@@ -295,7 +295,7 @@ mod tests {
         assert_eq!(state.outputs[0].name, "DP-2");
     }
 
-    // ---- derive_state: focus (docs/adr/0056 decision 4) ----
+    // ---- derive_state: focus (ADR-0056 decision 4) ----
 
     #[test]
     fn derive_state_puts_focused_workspace_only_on_the_output_that_holds_focus() {
@@ -321,7 +321,7 @@ mod tests {
         assert_eq!(output["active_workspace"], 1);
     }
 
-    // ---- derive_state: active_client (docs/adr/0056 decision 5) ----
+    // ---- derive_state: active_client (ADR-0056 decision 5) ----
 
     #[test]
     fn derive_state_maps_the_focused_window_onto_active_client_with_app_id_standing_in_for_class() {
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn active_client_carries_no_is_fullscreen_key_at_all() {
-        // Pins docs/adr/0056 decision 5: if a later compositor gains `is_fullscreen`, this test
+        // Pins ADR-0056 decision 5: if a later compositor gains `is_fullscreen`, this test
         // says the omission was a decision.
         let json = serde_json::to_value(derive_state(&[], Some(&window("a title", "kitty", false)))).unwrap();
 
