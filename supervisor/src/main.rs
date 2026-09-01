@@ -1,15 +1,10 @@
-mod applications;
-mod audio;
 mod capabilities;
 mod cli;
 mod compositor;
-mod dbus;
 mod generation;
-mod hardware;
-mod lock;
 mod memory;
 mod pam_worker;
-mod privacy;
+mod polkit;
 mod process;
 mod reload;
 mod reload_link;
@@ -20,24 +15,21 @@ mod socket;
 // that tells a user their stubs are stale lives in `setup`, which is the thing that acts on it.
 #[cfg(test)]
 mod stubs;
-mod system;
-mod updates;
 mod watcher;
-mod workspaces;
 
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use lock::LockController;
-use dbus::network::NetworkController;
+use capabilities::lock::{self, LockController};
+use capabilities::network::NetworkController;
 use capabilities::{Capabilities, Startable};
 use generation::{
     Authoritative, RESTART_LIMIT, RESTART_WINDOW, RendererDeparture, RestartBrake, classify_departure,
     departure_report, renderer_binary_path,
 };
-use dbus::polkit::PolkitAgent;
+use polkit::PolkitAgent;
 use process::registry::{LiveProcesses, reap_all_processes, take_exited_process, wait_and_report_exit};
 use reload_link::SocketCandidateLink;
 use shared::{
@@ -249,7 +241,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     // Notifications' sound player (ADR-0033). The thread is one `std::sync::mpsc` recv loop with
     // no connection behind it, so it stays eager -- there is nothing for a config to gate.
     let (sound_tx, sound_rx) = std::sync::mpsc::channel::<PathBuf>();
-    std::thread::spawn(move || dbus::notifications::run_sound_player(sound_rx));
+    std::thread::spawn(move || capabilities::notifications::run_sound_player(sound_rx));
 
     // Idle capability (ADR-0032): notify rides its own Wayland connection (idle authority must
     // survive a Renderer crash or reload, ADR-0010); inhibit rides the shared connection. Built
@@ -314,7 +306,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     let mut revisions: HashMap<String, u32> = HashMap::new();
 
     // No multi-challenge queue, so keeping only the latest is correct.
-    let mut pending_challenge: Option<dbus::polkit::BeginAuthenticationCall> = None;
+    let mut pending_challenge: Option<polkit::BeginAuthenticationCall> = None;
 
     // Every process.run-spawned child still tracked (docs/adr/0026).
     // Whether a topology-changing reload was refused while locked (docs/adr/0042). A bool, not

@@ -141,7 +141,7 @@ fn class_to_category(class: u32) -> &'static str {
 /// `bluetooth:set_enabled(en)`'s `arguments: [en]`. Defined once in `dbus` (shared with
 /// `network::parse_bool_arg`) and re-exported here so `bluetooth::parse_bool_arg` keeps working
 /// unchanged at every call site.
-pub use crate::dbus::parse_bool_arg;
+pub use crate::capabilities::parse_bool_arg;
 
 /// `bluetooth:pair(mac)` / `connect(mac)` / `disconnect(mac)` / `forget(mac)`'s `arguments: [mac]`.
 pub fn parse_mac_arg(arguments: &[serde_json::Value]) -> Option<String> {

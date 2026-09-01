@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use inotify::{Inotify, WatchMask};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::audio::mixer::VideoSourceApp;
+use crate::capabilities::audio::mixer::VideoSourceApp;
 
 use super::video::{find_device_openers, read_comm};
 

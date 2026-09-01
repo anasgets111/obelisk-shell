@@ -13,7 +13,7 @@ use pw::spa::utils::dict::DictRef;
 use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::audio::master;
+use crate::capabilities::audio::master;
 
 /// `media.class` value stream playback nodes carry. Verified against real `pw-dump` output --
 /// see the module doc comment.

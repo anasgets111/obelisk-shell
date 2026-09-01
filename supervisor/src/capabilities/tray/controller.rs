@@ -45,7 +45,7 @@ impl TrayController {
 
         // Before anything can spool: a fresh Supervisor owns nothing in there, so whatever is left
         // is a previous run's and nothing will ever delete it otherwise (docs/adr/0074).
-        crate::dbus::shm_icons::sweep(super::icon::SPOOL_SUBDIR);
+        crate::capabilities::shm_icons::sweep(super::icon::SPOOL_SUBDIR);
 
         let registry: ItemRegistry = Arc::new(Mutex::new(HashMap::new()));
         let host_registered = Arc::new(Mutex::new(false));

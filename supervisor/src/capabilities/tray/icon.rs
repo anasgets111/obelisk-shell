@@ -2,7 +2,7 @@
 //! encoding/spooling (ADR-0031: prefer IconName, decode IconPixmap only as fallback).
 //! Split from `dbus::tray` -- see `dbus/tray/mod.rs` for the module-level doc.
 
-use crate::dbus::shm_icons::{self, PngEncodeError};
+use crate::capabilities::shm_icons::{self, PngEncodeError};
 
 use super::MAX_PIXMAP_DIMENSION;
 

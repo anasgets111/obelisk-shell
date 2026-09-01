@@ -179,7 +179,7 @@ pub(super) fn build_connection_dict(intent: &ConnectionIntent) -> HashMap<&str, 
 
 /// `network:set_networking_enabled(en)`'s `arguments: [en]`. Defined once in `dbus` (shared with
 /// `bluetooth::parse_bool_arg`) and re-exported here.
-pub use crate::dbus::parse_bool_arg;
+pub use crate::capabilities::parse_bool_arg;
 
 /// `network:connect(ssid, hidden)`'s `arguments: [ssid, hidden]`.
 pub fn parse_connect_args(arguments: &[serde_json::Value]) -> Option<(String, bool)> {

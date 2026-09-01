@@ -11,7 +11,7 @@ use tokio_stream::StreamExt;
 use zbus::names::{BusName, OwnedUniqueName};
 use zbus::zvariant::OwnedObjectPath;
 
-use crate::dbus::shm_icons;
+use crate::capabilities::shm_icons;
 
 use super::TraySignal;
 use super::icon::SPOOL_SUBDIR;

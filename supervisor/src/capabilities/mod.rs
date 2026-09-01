@@ -14,6 +14,15 @@
 //! (`build_state` vs `snapshot` vs an `async handle_signal`, one that is a channel rather than a
 //! controller at all), and `main.rs` needs the concrete types anyway; ADR-0037 decision 3 already
 //! settled that the dispatch is "static calls, no registry, no trait". This is that, moved.
+//!
+//! **One child module per roster entry, flat.** The roster is flat and it is the public interface
+//! -- the same name appears in `shared::Capability`, in `oblisk.<name>`, and in every command's
+//! `capability` field -- but these modules used to sit at four different depths under a `dbus/`
+//! and a `hardware/` that grouped by transport rather than by subject, which put `battery` and
+//! `power` in different trees for no reason a config author could see. The two helpers that
+//! grouping genuinely shared, [`read_attr`] and [`parse_bool_arg`], are here instead; `polkit` was
+//! never a capability and moved out to `crate::polkit`; `shm_icons` is shared by exactly two
+//! capabilities and sits beside them (docs/adr/0076).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -22,25 +31,59 @@ use shared::{Capability, CommandEnvelope};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::snapshot::push_snapshot;
-use crate::{applications, audio, dbus, hardware, lock, log_unstarted, socket, updates, workspaces};
-use crate::applications::{ApplicationsController, ApplicationsSignal};
-use crate::audio::mixer::{AudioState, VideoSourceApp};
-use crate::hardware::battery::{BatteryController, BatterySignal};
-use crate::dbus::bluetooth::{BluetoothController, BluetoothSignal};
-use crate::hardware::brightness::{BrightnessController, BrightnessSignal};
-use crate::hardware::idle::IdleController;
-use crate::hardware::keyboard::{KeyboardController, KeyboardSignal};
-use crate::lock::LockController;
-use crate::dbus::mpris::{MprisController, MprisSignal};
-use crate::dbus::network::{NetworkController, NetworkSignal};
-use crate::dbus::notifications::{NotificationsController, NotificationsSignal};
-use crate::dbus::power::{PowerController, PowerSignal};
-use crate::privacy::{PrivacyController, PrivacySignal};
-use crate::hardware::sysinfo::{SysinfoController, SysinfoSignal};
-use crate::system::{SystemController, SystemSignal};
-use crate::dbus::tray::{TrayController, TraySignal};
-use crate::updates::{UpdatesController, UpdatesSignal};
-use crate::workspaces::{WorkspacesController, WorkspacesSignal};
+use crate::{log_unstarted, socket};
+use applications::{ApplicationsController, ApplicationsSignal};
+use audio::mixer::{AudioState, VideoSourceApp};
+use battery::{BatteryController, BatterySignal};
+use bluetooth::{BluetoothController, BluetoothSignal};
+use brightness::{BrightnessController, BrightnessSignal};
+use idle::IdleController;
+use keyboard::{KeyboardController, KeyboardSignal};
+use lock::LockController;
+use mpris::{MprisController, MprisSignal};
+use network::{NetworkController, NetworkSignal};
+use notifications::{NotificationsController, NotificationsSignal};
+use power::{PowerController, PowerSignal};
+use privacy::{PrivacyController, PrivacySignal};
+use sysinfo::{SysinfoController, SysinfoSignal};
+use system::{SystemController, SystemSignal};
+use tray::{TrayController, TraySignal};
+use updates::{UpdatesController, UpdatesSignal};
+use workspaces::{WorkspacesController, WorkspacesSignal};
+
+pub mod applications;
+pub mod audio;
+pub mod battery;
+pub mod bluetooth;
+pub mod brightness;
+pub mod idle;
+pub mod keyboard;
+pub mod lock;
+pub mod mpris;
+pub mod network;
+pub mod notifications;
+pub mod power;
+pub mod privacy;
+pub mod scale;
+mod shm_icons;
+pub mod sysinfo;
+pub mod system;
+pub mod tray;
+pub mod updates;
+pub mod workspaces;
+
+/// Reads and trims one sysfs attribute file under `entry_dir`. `None` for both "file missing" and
+/// any other read error -- callers don't distinguish absent from unreadable: a device that can't
+/// be read is treated as a device that isn't there. Shared by `battery` and `brightness`.
+pub fn read_attr(entry_dir: &Path, name: &str) -> Option<String> {
+    std::fs::read_to_string(entry_dir.join(name)).ok().map(|text| text.trim().to_string())
+}
+
+/// Shared `arguments: [en]` boolean-argument parse for `*:set_*_enabled(en)`-style write actions
+/// -- reads the first argument as a JSON bool, or `None`.
+pub fn parse_bool_arg(arguments: &[serde_json::Value]) -> Option<bool> {
+    arguments.first()?.as_bool()
+}
 
 /// Every name a Renderer can ask this Supervisor to start: the roster, plus the two that are
 /// deliberately not on it.
@@ -439,7 +482,7 @@ impl Capabilities {
                 }
             }
             // Ranked firmware over platform over raw. No device found means it never pushes --
-            // see `hardware::brightness`'s module doc.
+            // see `brightness`'s module doc.
             Capability::Brightness => {
                 if self.brightness.is_none() {
                     self.brightness = Some(BrightnessController::new(
@@ -495,7 +538,7 @@ impl Capabilities {
 
     /// `idle`'s start, kept off [`Capabilities::start`] because `idle` is not a roster variant
     /// (ADR-0032). Reached only once a Renderer is connected, so notify setup's own
-    /// `spawn_blocking` task (`hardware::idle`'s module doc) cannot block the control socket.
+    /// `spawn_blocking` task (`idle`'s module doc) cannot block the control socket.
     pub async fn start_idle(&mut self) {
         if self.idle.is_none() {
             self.idle = Some(IdleController::new(self.connection.clone(), self.senders.idle.clone()).await);
@@ -643,16 +686,16 @@ impl Capabilities {
             };
         }
         match capability {
-            Capability::Network => to!(self.network, dbus::network::dispatch),
-            Capability::Bluetooth => to!(self.bluetooth, dbus::bluetooth::dispatch),
-            Capability::Tray => to!(self.tray, dbus::tray::dispatch),
-            Capability::Notifications => to!(self.notifications, dbus::notifications::dispatch),
-            Capability::Mpris => to!(self.mpris, dbus::mpris::dispatch),
-            Capability::Sysinfo => to!(self.sysinfo, hardware::sysinfo::dispatch),
-            Capability::Keyboard => to!(self.keyboard, hardware::keyboard::dispatch),
-            Capability::Brightness => to!(self.brightness, hardware::brightness::dispatch),
+            Capability::Network => to!(self.network, network::dispatch),
+            Capability::Bluetooth => to!(self.bluetooth, bluetooth::dispatch),
+            Capability::Tray => to!(self.tray, tray::dispatch),
+            Capability::Notifications => to!(self.notifications, notifications::dispatch),
+            Capability::Mpris => to!(self.mpris, mpris::dispatch),
+            Capability::Sysinfo => to!(self.sysinfo, sysinfo::dispatch),
+            Capability::Keyboard => to!(self.keyboard, keyboard::dispatch),
+            Capability::Brightness => to!(self.brightness, brightness::dispatch),
             Capability::Workspaces => to!(self.workspaces, workspaces::dispatch),
-            Capability::Power => to!(self.power, dbus::power::dispatch),
+            Capability::Power => to!(self.power, power::dispatch),
             Capability::Updates => to!(self.updates, updates::dispatch),
             Capability::Applications => to!(self.applications, applications::dispatch),
             Capability::Audio => to!(self.audio, audio::dispatch),
@@ -671,7 +714,7 @@ impl Capabilities {
     /// `idle`'s dispatch, off [`Capabilities::dispatch`] for the same reason its start is.
     pub fn dispatch_idle(&self, envelope: &CommandEnvelope) {
         match &self.idle {
-            Some(idle) => hardware::idle::dispatch(idle, envelope),
+            Some(idle) => idle::dispatch(idle, envelope),
             None => log_unstarted(envelope),
         }
     }

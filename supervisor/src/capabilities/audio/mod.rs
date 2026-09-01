@@ -39,7 +39,9 @@ pub fn dispatch(commands: &AudioCommandSender, envelope: &shared::CommandEnvelop
     let Some(action) = crate::parse_action::<AudioAction>(params) else { return };
     let command = match action {
         AudioAction::SetVolume => parse_volume_arg(&params.arguments).map(AudioCommand::SetMasterVolume),
-        AudioAction::SetMuted => crate::dbus::parse_bool_arg(&params.arguments).map(AudioCommand::SetMasterMuted),
+        AudioAction::SetMuted => {
+            crate::capabilities::parse_bool_arg(&params.arguments).map(AudioCommand::SetMasterMuted)
+        }
         AudioAction::ToggleMute => Some(AudioCommand::ToggleMasterMute),
         AudioAction::SetDefaultSink => parse_id_arg(&params.arguments).map(AudioCommand::SetDefaultSink),
         AudioAction::SetDefaultSource => parse_id_arg(&params.arguments).map(AudioCommand::SetDefaultSource),

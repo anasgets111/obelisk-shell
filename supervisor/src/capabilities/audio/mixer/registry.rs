@@ -16,7 +16,7 @@ use pw::spa::utils::dict::DictRef;
 use pw::types::ObjectType;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::audio::master;
+use crate::capabilities::audio::master;
 
 use super::state::{
     AudioApps, AudioCommand, AudioState, DEFAULT_AUDIO_SINK_KEY, DEFAULT_AUDIO_SOURCE_KEY, DefaultDevice, DeviceNames,

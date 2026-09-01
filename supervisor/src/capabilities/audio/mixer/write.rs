@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use pipewire as pw;
 
-use crate::audio::master;
+use crate::capabilities::audio::master;
 
 use super::state::{
     AudioCommand, DEFAULT_AUDIO_SINK_KEY, DEFAULT_AUDIO_SOURCE_KEY, DefaultDevice, MixerState, SinkRoute,

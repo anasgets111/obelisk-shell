@@ -73,7 +73,7 @@ pub fn dispatch(controller: &NotificationsController, envelope: &shared::Command
             Some((urgency, path)) => controller.set_sound(urgency, &path),
             None => crate::log_malformed_command(params),
         },
-        NotificationsAction::SetDnd => match crate::dbus::parse_bool_arg(&params.arguments) {
+        NotificationsAction::SetDnd => match crate::capabilities::parse_bool_arg(&params.arguments) {
             Some(enabled) => controller.set_dnd(enabled),
             None => crate::log_malformed_command(params),
         },

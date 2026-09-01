@@ -212,10 +212,10 @@ fn deny(secret: &mut Vec<u8>, cookie: &str, reason: impl std::fmt::Display) {
 /// call first (ADR-0005).
 pub async fn drive_pam_and_respond(
     authority: &zbus_polkit::policykit1::AuthorityProxy<'_>,
-    challenge: crate::dbus::polkit::BeginAuthenticationCall,
+    challenge: crate::polkit::BeginAuthenticationCall,
     mut secret: Vec<u8>,
 ) {
-    let Some(uid) = crate::dbus::polkit::first_unix_user_uid(&challenge.identities) else {
+    let Some(uid) = crate::polkit::first_unix_user_uid(&challenge.identities) else {
         deny(&mut secret, &challenge.cookie, "carried no unix-user identity; cannot authenticate");
         return;
     };

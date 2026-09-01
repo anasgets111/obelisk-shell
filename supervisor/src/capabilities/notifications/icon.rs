@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use zbus::zvariant::Value;
 
-use crate::dbus::shm_icons::{self, PngEncodeError};
+use crate::capabilities::shm_icons::{self, PngEncodeError};
 
 use super::markup::parse_markup;
 use super::{MAX_BODY_BYTES, MAX_IMAGE_DIMENSION, NotificationSpan, truncate_utf8_bytes};
