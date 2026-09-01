@@ -492,13 +492,6 @@ impl LiveSignalHandle {
         self.1.mark();
     }
 
-    /// [`Self::set`], except that storing the value already there does nothing at all: no write,
-    /// no dirty mark, and it answers `false`.
-    ///
-    /// ADR-0062 decision 4. The pointer handler calls this on every `wl_pointer` motion
-    /// event, which arrives at device rate, and one mark re-resolves every surface in the
-    /// generation (ADR-0044 decision 2). Comparing first turns that into one re-resolve per
-    /// hover boundary crossed rather than one per motion event.
     /// Writes without marking the scene dirty, for a value the pass that is running *derived* from
     /// its own geometry.
     ///
@@ -515,6 +508,13 @@ impl LiveSignalHandle {
         *self.0.borrow_mut() = value;
     }
 
+    /// [`Self::set`], except that storing the value already there does nothing at all: no write,
+    /// no dirty mark, and it answers `false`.
+    ///
+    /// ADR-0062 decision 4. The pointer handler calls this on every `wl_pointer` motion event,
+    /// which arrives at device rate, and one mark re-resolves every surface in the generation
+    /// (ADR-0044 decision 2). Comparing first turns that into one re-resolve per hover boundary
+    /// crossed rather than one per motion event.
     pub fn set_changed(&self, value: Value) -> bool {
         let unchanged = *self.0.borrow() == value;
         if unchanged {

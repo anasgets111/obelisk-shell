@@ -26,10 +26,10 @@ pub struct LogicalPoint {
 ///
 /// - **Containment gates descent.** A node whose rect does not hold the point is not entered and
 ///   neither are its children. This makes the hittable region of an overflowing child exactly its
-///   intersection with every ancestor -- the same region `paint::paint_node`'s `intersect_scissor`
+///   intersection with every ancestor -- the same region `paint::run`'s `intersect_scissor`
 ///   chain draws it in, so hitting and painting agree on overflow without either walk carrying a
 ///   clip rect.
-/// - **Children in reverse.** `paint_node` paints in declaration order, so the last child is on
+/// - **Children in reverse.** `run` paints in declaration order, so the last child is on
 ///   top and is asked first; the first child that yields a hit wins.
 /// - **Half-open bounds**, `rect.x <= point.x < rect.x + rect.width`. Two buttons sharing an edge
 ///   must not both claim it, and a zero-area rect must contain nothing.
@@ -63,7 +63,7 @@ pub fn absolute_rect(path: &[&ResolvedNode]) -> Option<LogicalRect> {
 
 /// Pushes `node` and its deepest hit descendant onto `path`, returning whether it was entered at
 /// all. `origin_x`/`origin_y` is the absolute origin of `node`'s parent, the same running sum
-/// `layout::paint::paint_node` carries.
+/// `layout::paint::run` carries.
 fn descend<'a>(
     node: &'a ResolvedNode,
     point: LogicalPoint,

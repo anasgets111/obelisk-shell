@@ -617,7 +617,7 @@ fn draw_for(
 /// The fill path is the *fitted* rect, not the node's box. femtovg clamps to the edge outside a
 /// paint's extent unless `REPEAT_X`/`REPEAT_Y` are set, so filling the whole box with a `Contain`
 /// paint would smear the image's outermost pixel row across the letterbox. `Cover`'s fitted rect is
-/// larger than the box instead, and `paint_node`'s scissor is what crops it.
+/// larger than the box instead, and `run`'s scissor is what crops it.
 /// Everything about one file draw except which file: the two `Draw` variants that reach
 /// [`draw_file`] carry the same five values and always travel together.
 #[derive(Debug, Clone, Copy)]
@@ -1902,7 +1902,7 @@ mod tests {
     /// sits to its right. The live MPRIS-title-through-two-cells bug the doc comment
     /// describes.
     ///
-    /// Proved this test is real, not just a green test: with `paint_node`'s `save`/
+    /// Proved this test is real, not just a green test: with `run`'s `save`/
     /// `intersect_scissor`/`restore` temporarily removed, this failed at the first scanned pixel
     /// row with a mix of white (glyph) and black-background pixels found past the box, exactly
     /// the escape this test exists to catch. Restored before finishing.

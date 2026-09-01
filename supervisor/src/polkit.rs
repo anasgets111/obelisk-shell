@@ -83,11 +83,10 @@ pub fn first_unix_user_uid(identities: &[(String, HashMap<String, OwnedValue>)])
 /// `org.freedesktop.PolicyKit1.AuthenticationAgent`, the interface polkitd calls back into
 /// once this process registers via [`register_agent`].
 ///
-/// ponytail: `begin_authentication` only forwards the parsed challenge over a channel; it
-/// does not drive a PAM conversation or push the challenge to the Renderer over IPC. Neither
-/// exists yet in this dependency tree (no PAM crate) or codebase (no IPC socket server, no
-/// `textfield` scene node) to hand the challenge to. See ADR-0015 for the real flow this
-/// stands in for and what unblocks it.
+/// `begin_authentication` only forwards the parsed challenge over a channel; it drives no PAM
+/// conversation itself. `main.rs` owns that half: it holds the challenge until a
+/// `secure_submit("polkit", "authenticate")` frame arrives from the Renderer, then hands both to
+/// [`crate::pam_worker::drive_pam_and_respond`] (ADR-0015, ADR-0028).
 pub struct AuthenticationAgent {
     challenges: UnboundedSender<BeginAuthenticationCall>,
 }
