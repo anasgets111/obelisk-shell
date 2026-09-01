@@ -380,7 +380,12 @@ impl App {
         // `Drop`, so without this every unplugged monitor and closed window leaks one EGL surface.
         // Must come before the `wl_egl_window` is destroyed, per [`BoundSurface`]'s contract that
         // the `WlEglSurface` outlives the EGL surface built from it.
-        if let Err(err) = self.egl.instance.destroy_surface(self.egl.display, bound.egl_surface) {
+        // `self.egl` is `Some` for any surface that reached `bound`, since `ensure_bound` is what
+        // creates both. Written as a guard rather than an `expect` because the cost of being wrong
+        // is a leaked EGL surface on a process that is already tearing one down.
+        if let Some(egl) = self.egl.as_ref()
+            && let Err(err) = egl.instance.destroy_surface(egl.display, bound.egl_surface)
+        {
             log_bind_failure(&self.surfaces[index].surface_id, "eglDestroySurface", err);
         }
         // `BoundSurface`'s drop, which is `wl_egl_window_destroy`.
@@ -763,8 +768,39 @@ impl App {
         eprintln!("[oblisk-renderer] {} mapping: visible = true", self.surfaces[index].surface_id);
     }
 
+    /// Builds the process's one EGL display, config and context if nothing has yet, reporting
+    /// whether [`App::egl`] is `Some` afterwards.
+    ///
+    /// Called from [`App::ensure_bound`] and nowhere else, which is what makes the whole Mesa load
+    /// conditional on a surface existing to draw into (docs/adr/0071). `surface_id` only names the
+    /// surface unlucky enough to be first in the log line; the state it builds is shared.
+    ///
+    /// A failure is fatal, matching every other bind failure in [`App::ensure_bound`]. That is a
+    /// later death than the `?` this replaced: a PBA Candidate now signals ready before it has
+    /// proven it can build a context, so an EGL that breaks between two generations of one session
+    /// takes the shell down rather than rolling back (docs/adr/0071 decision 3).
+    fn ensure_egl(&mut self, surface_id: &str) -> bool {
+        if self.egl.is_some() {
+            return true;
+        }
+        // SAFETY (`egl::init`'s): the pointer comes from the `Connection` this `App` owns, so the
+        // `wl_display` outlives every EGL object built from it.
+        match egl::init(self.conn.backend().display_ptr() as *mut c_void) {
+            Ok(state) => {
+                self.egl = Some(state);
+                true
+            }
+            Err(err) => {
+                log_bind_failure(surface_id, "egl::init", err);
+                self.exit = true;
+                false
+            }
+        }
+    }
+
     /// Creates this surface's `wl_egl_window` and EGL window surface against the shared context if
-    /// it has none yet, and initializes the process-wide `glow` context on the first one. Returns
+    /// it has none yet, building that context on the very first call (see [`App::ensure_egl`]) and
+    /// initializing the process-wide `glow` context on the first one. Returns
     /// whether the surface is bound afterwards; a failure is fatal (`self.exit`), exactly as it
     /// was before this was factored out of `bind_and_clear`.
     fn ensure_bound(&mut self, index: usize) -> bool {
@@ -782,6 +818,14 @@ impl App {
             return false;
         };
 
+        // The first surface to get this far is the one that pays for Mesa (docs/adr/0071). After
+        // the two cheap bails above, so a `window` that went invisible mid-bind still costs
+        // nothing.
+        if !self.ensure_egl(&surface_id) {
+            return false;
+        }
+        let egl = self.egl.as_ref().expect("ensure_egl returned true, so the state is built");
+
         let native_window = match WlEglSurface::new(surface_object_id, width, height) {
             Ok(w) => w,
             Err(e) => {
@@ -792,15 +836,10 @@ impl App {
         };
 
         // SAFETY: `native_window.ptr()` is a live `wl_egl_window*` just constructed above by
-        // `WlEglSurface::new`, matching `self.egl.display`/`self.egl.config`'s own platform --
-        // exactly the handle `eglCreateWindowSurface` requires.
+        // `WlEglSurface::new`, matching `egl.display`/`egl.config`'s own platform -- exactly the
+        // handle `eglCreateWindowSurface` requires.
         let egl_surface = unsafe {
-            self.egl.instance.create_window_surface(
-                self.egl.display,
-                self.egl.config,
-                native_window.ptr() as *mut c_void,
-                None,
-            )
+            egl.instance.create_window_surface(egl.display, egl.config, native_window.ptr() as *mut c_void, None)
         };
         let egl_surface = match egl_surface {
             Ok(s) => s,
@@ -811,12 +850,8 @@ impl App {
             }
         };
 
-        if let Err(e) = self.egl.instance.make_current(
-            self.egl.display,
-            Some(egl_surface),
-            Some(egl_surface),
-            Some(self.egl.context),
-        ) {
+        if let Err(e) = egl.instance.make_current(egl.display, Some(egl_surface), Some(egl_surface), Some(egl.context))
+        {
             log_bind_failure(&surface_id, "eglMakeCurrent", e);
             self.exit = true;
             return false;
@@ -828,7 +863,7 @@ impl App {
         // loop, with no other context switch between the two.
         self.gl.get_or_insert_with(|| unsafe {
             glow::Context::from_loader_function(|s| {
-                self.egl.instance.get_proc_address(s).map_or(std::ptr::null(), |f| f as *const c_void)
+                egl.instance.get_proc_address(s).map_or(std::ptr::null(), |f| f as *const c_void)
             })
         });
 
@@ -909,12 +944,13 @@ impl App {
         // Another surface's own paint may have made a different EGL surface current on this
         // thread since this one last drew -- the context is shared across every surface, so it is
         // re-established here rather than assumed still current.
-        if let Err(e) = self.egl.instance.make_current(
-            self.egl.display,
-            Some(egl_surface),
-            Some(egl_surface),
-            Some(self.egl.context),
-        ) {
+        // `Some` for any surface holding an `egl_surface`: `ensure_bound` built both. A surface
+        // that never bound never reaches here -- `paint_surface`'s caller checks `bound` first.
+        let Some(egl) = self.egl.as_ref() else {
+            return;
+        };
+        if let Err(e) = egl.instance.make_current(egl.display, Some(egl_surface), Some(egl_surface), Some(egl.context))
+        {
             log_bind_failure(&surface_id, "eglMakeCurrent", e);
             self.exit = true;
             return;
@@ -934,7 +970,7 @@ impl App {
         if self.text_painter.is_none() {
             let font_chain = self.shaping.font_chain_data();
             match TextPainter::new(
-                |s| self.egl.instance.get_proc_address(s).map_or(std::ptr::null(), |f| f as *const c_void),
+                |s| egl.instance.get_proc_address(s).map_or(std::ptr::null(), |f| f as *const c_void),
                 width,
                 height,
                 &font_chain,
@@ -953,7 +989,7 @@ impl App {
             layout::paint::execute(painter, &mut self.image_cache, &list, 1.0);
         }
 
-        if let Err(e) = self.egl.instance.swap_buffers(self.egl.display, egl_surface) {
+        if let Err(e) = egl.instance.swap_buffers(egl.display, egl_surface) {
             log_bind_failure(&surface_id, "eglSwapBuffers", e);
             self.exit = true;
             return;

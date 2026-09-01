@@ -86,8 +86,19 @@ pub struct App {
     /// which is why `finished` is two different events (docs/adr/0042) -- see
     /// `lock::finished_outcome`.
     session_lock: Option<SessionLock>,
-    egl: egl::EglState,
+    /// The shared EGL display, config and GLES3 context, or `None` until a surface needs one.
+    ///
+    /// Lazy because `eglInitialize` is what makes Mesa load its driver, which on this machine is
+    /// `libgallium` plus the LLVM it links: 125 MB of mapped pages and 13-35 ms, for a process
+    /// that may never draw. A config declaring no surfaces (docs/adr/0070 decision 7) never pays
+    /// either, and a PBA Candidate pays after `ActivateDraw` rather than inside its ready window,
+    /// since `activate_draw_one` is its only bind (docs/adr/0071).
+    egl: Option<egl::EglState>,
     gl: Option<glow::Context>,
+    /// Kept for the `wl_display` pointer [`App::ensure_egl`] needs, and kept as the whole
+    /// `Connection` rather than that raw pointer so the refcount is what guarantees `egl::init`'s
+    /// SAFETY precondition: the display outlives the EGL state built against it.
+    conn: Connection,
     /// The one `ShapingHandle` for the process; `client` holds a clone, so content-sizing and
     /// painting share one worker thread and one `FontSystem` (docs/adr/0039 decision 3).
     shaping: ShapingHandle,
@@ -214,8 +225,6 @@ pub fn run(
     // advertise it -- later `feedback()` calls fail with `GlobalError::MissingGlobal` instead.
     let presentation_time = PresentationTimeState::bind(&globals, &qh);
 
-    let egl_state = egl::init(conn.backend().display_ptr() as *mut c_void)?;
-
     let is_pba_candidate = std::env::var("OBLISK_PBA_CANDIDATE").is_ok();
 
     // One `ShapingHandle` for the process: `App` keeps this one, `RendererClient` gets a clone
@@ -233,8 +242,9 @@ pub fn run(
         xdg_shell,
         session_lock_state,
         session_lock: None,
-        egl: egl_state,
+        egl: None,
         gl: None,
+        conn: conn.clone(),
         shaping,
         text_painter: None,
         image_cache: ImageCache::new(),
