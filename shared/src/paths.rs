@@ -62,13 +62,27 @@ pub const CHECK_ENV: &str = "OBLISK_CHECK";
 /// of `target/debug` boots against the tracked dev config with nothing set up. Both variables win
 /// over it, so it is not a second source of truth, and a release build never compiles it in.
 pub fn config_dir() -> io::Result<PathBuf> {
+    config_dir_from(std::env::var_os(CONFIG_DIR_ENV), std::env::var_os("XDG_CONFIG_HOME"), std::env::var_os("HOME"))
+}
+
+/// The precedence [`config_dir`] applies, with the three lookups hoisted into parameters.
+///
+/// Split out so the precedence tests can pass values instead of calling `set_var`. `setenv`
+/// rewrites the process-wide `environ` block, so it races every concurrent `getenv` in the test
+/// binary regardless of which variable either one names; a test that mutates the environment to
+/// describe precedence was buying one assertion with a data race across the whole suite.
+fn config_dir_from(
+    explicit: Option<std::ffi::OsString>,
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> io::Result<PathBuf> {
     // Taken as the directory itself, not joined with `oblisk`: `-c` names the config, where
     // `$XDG_CONFIG_HOME` names the directory configs live in.
-    if let Some(explicit) = std::env::var_os(CONFIG_DIR_ENV) {
+    if let Some(explicit) = explicit {
         return Ok(PathBuf::from(explicit));
     }
 
-    if let Some(xdg_config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+    if let Some(xdg_config_home) = xdg_config_home {
         return Ok(PathBuf::from(xdg_config_home).join("oblisk"));
     }
 
@@ -79,8 +93,8 @@ pub fn config_dir() -> io::Result<PathBuf> {
         return Ok(PathBuf::from(DEV_CONFIG_DIR));
     }
 
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "neither XDG_CONFIG_HOME nor HOME is set"))?;
+    let home =
+        home.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "neither XDG_CONFIG_HOME nor HOME is set"))?;
     Ok(PathBuf::from(home).join(".config").join("oblisk"))
 }
 
@@ -93,24 +107,12 @@ pub fn shell_lua_path() -> io::Result<PathBuf> {
 mod tests {
     use super::*;
 
-    /// Serializes every test that reads or writes `$XDG_CONFIG_HOME`.
-    ///
-    /// `config_dir` resolves through a process-global environment variable, and one test here has
-    /// to set it to prove it still wins. Without this lock that write lands in the middle of
-    /// another test's two reads, and the two disagree: the first read sees the injected value and
-    /// the second sees the dev-config fallback. That failed about a third of the time, in a test
-    /// whose subject is a `join` -- so the noise pointed at the wrong function entirely.
-    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Kept even when a previous holder panicked: the guarded state is the environment, which the
-    /// holder restores itself, so a poisoned lock carries no broken invariant worth failing on.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
+    /// No lock guards these any more. The `ENV` mutex that used to live here serialized the one
+    /// test that called `set_var` against the ones that only read; with the precedence tests
+    /// moved onto [`config_dir_from`], nothing in this binary writes the environment, so there is
+    /// nothing left to serialize against.
     #[test]
     fn shell_lua_path_is_config_dir_joined_with_shell_lua() {
-        let _guard = env_lock();
         let path = shell_lua_path().unwrap();
         assert_eq!(path, config_dir().unwrap().join("shell.lua"));
         assert!(path.ends_with("oblisk/shell.lua"));
@@ -131,19 +133,9 @@ mod tests {
 
     /// `$XDG_CONFIG_HOME` must keep winning in a debug build, or the dev branch would be a second
     /// source of truth that silently overrides the documented one.
-    ///
-    /// Sets a process-global for the duration, so it is deliberately the only test here that
-    /// touches the environment.
     #[test]
     fn xdg_config_home_still_wins_over_the_dev_config_directory() {
-        let _guard = env_lock();
-        let previous = std::env::var_os("XDG_CONFIG_HOME");
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", "/tmp/oblisk-config-dir-test") };
-        let resolved = config_dir().unwrap();
-        match previous {
-            Some(value) => unsafe { std::env::set_var("XDG_CONFIG_HOME", value) },
-            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
-        }
+        let resolved = config_dir_from(None, Some("/tmp/oblisk-config-dir-test".into()), None).unwrap();
         assert_eq!(resolved, PathBuf::from("/tmp/oblisk-config-dir-test/oblisk"));
     }
 
@@ -151,25 +143,29 @@ mod tests {
     /// shell at a second config at all.
     #[test]
     fn the_explicit_config_dir_wins_over_xdg_config_home() {
-        let _guard = env_lock();
-        let previous_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        let previous_explicit = std::env::var_os(CONFIG_DIR_ENV);
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", "/tmp/oblisk-xdg");
-            std::env::set_var(CONFIG_DIR_ENV, "/tmp/oblisk-explicit");
-        }
-        let resolved = config_dir().unwrap();
-        unsafe {
-            match previous_xdg {
-                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-            match previous_explicit {
-                Some(value) => std::env::set_var(CONFIG_DIR_ENV, value),
-                None => std::env::remove_var(CONFIG_DIR_ENV),
-            }
-        }
+        let resolved =
+            config_dir_from(Some("/tmp/oblisk-explicit".into()), Some("/tmp/oblisk-xdg".into()), None).unwrap();
         // Taken whole, not joined with `oblisk`: this names the config directory itself.
         assert_eq!(resolved, PathBuf::from("/tmp/oblisk-explicit"));
+    }
+
+    /// The last rung of the ladder, which the previous `set_var` tests could not reach without
+    /// unsetting the developer's own `$HOME`.
+    #[test]
+    fn home_is_the_last_resort_and_is_joined_with_dot_config() {
+        // `$HOME` is only consulted in a release build; a debug build finds `DEV_CONFIG_DIR`
+        // first, which is the branch asserted by the dev-config test above.
+        #[cfg(not(debug_assertions))]
+        assert_eq!(
+            config_dir_from(None, None, Some("/home/someone".into())).unwrap(),
+            PathBuf::from("/home/someone/.config/oblisk")
+        );
+    }
+
+    /// Nothing set at all is an error rather than a guess, in a release build.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn no_variable_at_all_is_an_error() {
+        assert_eq!(config_dir_from(None, None, None).unwrap_err().kind(), io::ErrorKind::NotFound);
     }
 }

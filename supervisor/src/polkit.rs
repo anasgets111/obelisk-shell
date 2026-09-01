@@ -148,19 +148,30 @@ impl PolkitAgent {
     /// Registers with polkitd, once. Every failure logs and leaves this process without an agent,
     /// which costs it the challenges it would have been asked to answer and nothing else.
     pub async fn register(&mut self, connection: &zbus::Connection) {
-        let Some(agent) = self.agent.take() else {
-            return;
-        };
-        let subject = match current_session_subject() {
-            Ok(subject) => subject,
+        match current_session_subject() {
+            Ok(subject) => self.register_for(connection, &subject).await,
             Err(err) => {
                 eprintln!(
                     "polkit: $XDG_SESSION_ID names no session to register an agent for; agent disabled for this run: {err}"
                 );
-                return;
+                // Dropped rather than left for a later call to retry, which is the ordering the
+                // previous shape got by taking the agent before this lookup: the variable will
+                // not appear mid-run, so a second attempt would fail the same way.
+                self.agent = None;
             }
+        }
+    }
+
+    /// [`Self::register`] once the subject is known, holding the take-once rule.
+    ///
+    /// Split so the test can drive the real path twice without `set_var`: `register` resolves the
+    /// subject from `$XDG_SESSION_ID`, and `setenv` rewrites the process-wide `environ` block,
+    /// racing every concurrent `getenv` in the test binary whatever variable either one names.
+    async fn register_for(&mut self, connection: &zbus::Connection, subject: &Subject) {
+        let Some(agent) = self.agent.take() else {
+            return;
         };
-        match register_agent(connection, agent, &subject, "en_US.UTF-8", AGENT_OBJECT_PATH).await {
+        match register_agent(connection, agent, subject, "en_US.UTF-8", AGENT_OBJECT_PATH).await {
             Ok(()) => eprintln!("polkit: registered as this session's authentication agent"),
             Err(err) => eprintln!(
                 "polkit: RegisterAuthenticationAgent failed, so another agent answers this session; disabled for this run: {err}"
@@ -255,9 +266,6 @@ mod tests {
     /// reachable because every generation sends its own starts (ADR-0070 decision 3).
     #[tokio::test]
     async fn registering_twice_makes_only_one_wire_call() {
-        // SAFETY: `register` reads `$XDG_SESSION_ID`, and this is now the only test in the binary
-        // that writes it. Nothing asserts the value, only that the lookup succeeds.
-        unsafe { std::env::set_var("XDG_SESSION_ID", "c1") };
         let (authority_side, agent_side) = p2p_pair().await;
         let (calls_tx, mut calls_rx) = mpsc::unbounded_channel();
         authority_side
@@ -268,8 +276,9 @@ mod tests {
         let (challenges_tx, _challenges_rx) = mpsc::unbounded_channel();
         let mut agent = PolkitAgent::new(challenges_tx);
 
-        agent.register(&agent_side).await;
-        agent.register(&agent_side).await;
+        let subject = test_subject();
+        agent.register_for(&agent_side, &subject).await;
+        agent.register_for(&agent_side, &subject).await;
 
         calls_rx.recv().await.expect("the first register must reach the Authority");
         assert!(calls_rx.try_recv().is_err(), "the second register must be a no-op");

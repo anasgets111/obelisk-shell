@@ -143,6 +143,17 @@ pub fn check(config_dir: &Path) -> Result<String, String> {
 }
 
 pub fn run(config_dir: &Path, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    run_into(config_dir, force, None)
+}
+
+/// [`run`], with the user stub directory injectable.
+///
+/// `user_stubs` overrides where the no-packaged-copy branch writes. Production passes `None` and
+/// gets [`user_stub_dir`]'s `$XDG_DATA_HOME` lookup; tests pass a `tempdir`, which is what lets
+/// them run without `set_var`. Resolved lazily inside that branch rather than as an argument
+/// default, so a packaged install with neither `$XDG_DATA_HOME` nor `$HOME` set keeps working --
+/// eagerly calling `user_stub_dir()?` here would turn that into a hard error.
+fn run_into(config_dir: &Path, force: bool, user_stubs: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(config_dir)?;
     println!("oblisk init: {}", config_dir.display());
 
@@ -168,7 +179,10 @@ pub fn run(config_dir: &Path, force: bool) -> Result<(), Box<dyn std::error::Err
             // `watcher.rs` reloads the shell on any `.lua` file under the config directory, so
             // stubs living there would make `oblisk init` restyle a running bar, and a future
             // stub refresh would do it again. They are also not config.
-            let dir = user_stub_dir()?;
+            let dir = match user_stubs {
+                Some(dir) => dir.to_path_buf(),
+                None => user_stub_dir()?,
+            };
             // Rewritten whenever the version differs, and silently left alone when it matches.
             // These are generated files this binary owns, not config: a stub from an older oblisk
             // describes fields that no longer exist and misses ones that do, and it does that with
@@ -199,15 +213,11 @@ pub fn run(config_dir: &Path, force: bool) -> Result<(), Box<dyn std::error::Err
 mod tests {
     use super::*;
 
-    /// Serializes every test that touches `$XDG_DATA_HOME`, which is process-global. That is not
-    /// only the tests that set it: `run` resolves its stub directory through it, so a test that
-    /// merely calls `run` reads whatever another test had set at that instant, writes the stubs
-    /// into a `tempdir` about to be deleted, and fails on a missing file it never named.
-    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+    // The `ENV` mutex that used to live here serialized every test touching `$XDG_DATA_HOME`,
+    // because `run` resolved its stub directory through it. `run_into` takes that directory as an
+    // argument, so no test here reads or writes the environment and there is nothing left to
+    // serialize -- and none of them can write into the developer's real `~/.local/share` any
+    // more, which the reader tests did whenever the checked-in stub version differed.
 
     /// `packaged_stub_dir` fails silently when it is wrong: `init` falls through to the embedded
     /// copy and writes stubs that the package would otherwise have kept current, so the user ends
@@ -243,14 +253,9 @@ mod tests {
     fn stubs_generated_for_another_version_are_refreshed() {
         let data = tempfile::tempdir().unwrap();
         let config = tempfile::tempdir().unwrap();
-        // SAFETY: `$XDG_DATA_HOME` steers `user_stub_dir` away from the developer's real home.
-        // Serialized against the other test that writes it by `ENV`.
-        let _guard = env_lock();
-        let previous = std::env::var_os("XDG_DATA_HOME");
-        unsafe { std::env::set_var("XDG_DATA_HOME", data.path()) };
-
-        run(config.path(), false).unwrap();
         let stubs = data.path().join("oblisk/lua-meta");
+
+        run_into(config.path(), false, Some(&stubs)).unwrap();
         assert_eq!(stub_version(&stubs).as_deref(), Some(env!("CARGO_PKG_VERSION")));
 
         let oblisk_lua = stubs.join("oblisk.lua");
@@ -258,13 +263,7 @@ mod tests {
         std::fs::write(&oblisk_lua, aged).unwrap();
         assert_eq!(stub_version(&stubs).as_deref(), Some("0.0.9"));
 
-        run(config.path(), false).unwrap();
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("XDG_DATA_HOME", value),
-                None => std::env::remove_var("XDG_DATA_HOME"),
-            }
-        }
+        run_into(config.path(), false, Some(&stubs)).unwrap();
         assert_eq!(
             stub_version(&stubs).as_deref(),
             Some(env!("CARGO_PKG_VERSION")),
@@ -302,13 +301,12 @@ mod tests {
 
     #[test]
     fn init_writes_a_luarc_and_a_shell_lua_and_keeps_an_existing_one() {
-        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("oblisk");
         std::fs::create_dir_all(&config).unwrap();
         std::fs::write(config.join("shell.lua"), "-- mine\n").unwrap();
 
-        run(&config, false).unwrap();
+        run_into(&config, false, Some(&dir.path().join("stubs"))).unwrap();
 
         assert!(config.join(".luarc.json").is_file());
         assert_eq!(
@@ -320,11 +318,10 @@ mod tests {
 
     #[test]
     fn force_overwrites_the_starter_config() {
-        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().to_path_buf();
         std::fs::write(config.join("shell.lua"), "-- mine\n").unwrap();
-        run(&config, true).unwrap();
+        run_into(&config, true, Some(&config.join("stubs"))).unwrap();
         assert_ne!(std::fs::read_to_string(config.join("shell.lua")).unwrap(), "-- mine\n");
     }
 
@@ -332,9 +329,8 @@ mod tests {
     /// config directory and finds nothing, with no error anywhere.
     #[test]
     fn the_generated_luarc_points_at_an_absolute_stub_directory() {
-        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
-        run(dir.path(), false).unwrap();
+        run_into(dir.path(), false, Some(&dir.path().join("stubs"))).unwrap();
         let luarc: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.path().join(".luarc.json")).unwrap()).unwrap();
         let library = luarc["workspace.library"][0].as_str().unwrap();
