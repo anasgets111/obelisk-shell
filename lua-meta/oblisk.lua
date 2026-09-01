@@ -41,7 +41,7 @@ function Capability:invoke(command, ...) end
 ---@class ActiveClient
 ---§ 2.9's `active_client`, minus `is_fullscreen` (docs/adr/0056 decision 5: niri-ipc 26.4.0's
 ---`Window` has no such field, and a fabricated `false` would be wrong for fullscreen windows).
----`class` is niri's `app_id`: X11's `WM_CLASS` has no Wayland equivalent.
+---`class` is Wayland's `app_id`: X11's `WM_CLASS` has no Wayland equivalent.
 ---@field class string
 ---@field is_floating boolean
 ---@field title string
@@ -185,7 +185,7 @@ function Capability:invoke(command, ...) end
 ---key the sound registry directly.
 
 ---@class WorkspaceEntry
----`id` is niri's stable, monitor-independent identity: what `active_workspace`/
+---`id` is the compositor's stable, monitor-independent identity: what `active_workspace`/
 ---`focused_workspace` refer to and what `workspaces:focus(id)` takes. `idx` is the 1-based
 ---position on that output (what a keybind/button label means), not stable across a reorder.
 ---@field id integer

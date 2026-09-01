@@ -1,5 +1,12 @@
 # `workspaces` speaks niri, and § 2.9 is wrong in three places
 
+> Amended by ADR-0075. Every decision below stands: `workspaces` still has one implementor and no
+> trait, and `CompositorLink` still did not grow one. What changed is where two things sit. The
+> compositor probe that decision 1 reuses moved out of `hardware/keyboard/layout.rs` into a
+> top-level `compositor` module, and `derive_state` now takes neutral rows instead of `niri_ipc` types, with
+> everything that names `niri_ipc` in `workspaces/niri.rs`. That is decision 1's own stated upgrade
+> path prepared while there is still one implementor, not a reversal of it.
+
 ADR-0053 decision 1 held `workspaces` back from the batch that shipped `battery`, `system` and
 audio's master volume, on the grounds that "deciding whether the capability speaks one compositor's
 IPC or an abstraction over several is a design question, not an implementation one".

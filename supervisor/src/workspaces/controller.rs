@@ -1,5 +1,10 @@
-//! [`WorkspacesController`]: the `oblisk.workspaces` state owner and its one write action.
-//! Split from `workspaces` -- see `workspaces/mod.rs` for the module-level doc.
+//! [`WorkspacesController`]: the `oblisk.workspaces` state owner and its one write action, plus
+//! the compositor-neutral reduction behind them. Split from `workspaces` -- see
+//! `workspaces/mod.rs` for the module-level doc.
+//!
+//! Nothing in this file names a compositor's own types. [`derive_state`] takes [`WorkspaceRow`]s
+//! and a [`FocusedWindow`], which is the shape any compositor's IPC can be reduced to, and
+//! `workspaces::niri` is what does the reducing today.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -7,7 +12,9 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::hardware::keyboard::layout::{CompositorKind, detect_compositor};
+use crate::compositor::{CompositorKind, detect_compositor, unsupported_session_report};
+
+use super::niri;
 
 /// `oblisk.workspaces`'s full payload (§ 2.9). Field names are the JSON keys verbatim.
 /// `active_client` is `Option` (§ 2.9: "or `nil` if none focused"), omitted rather than
@@ -32,7 +39,7 @@ pub struct OutputWorkspaces {
     pub workspaces: Vec<WorkspaceEntry>,
 }
 
-/// `id` is niri's stable, monitor-independent identity: what `active_workspace`/
+/// `id` is the compositor's stable, monitor-independent identity: what `active_workspace`/
 /// `focused_workspace` refer to and what `workspaces:focus(id)` takes. `idx` is the 1-based
 /// position on that output (what a keybind/button label means), not stable across a reorder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
@@ -45,11 +52,43 @@ pub struct WorkspaceEntry {
 
 /// § 2.9's `active_client`, minus `is_fullscreen` (docs/adr/0056 decision 5: niri-ipc 26.4.0's
 /// `Window` has no such field, and a fabricated `false` would be wrong for fullscreen windows).
-/// `class` is niri's `app_id`: X11's `WM_CLASS` has no Wayland equivalent.
+/// `class` is Wayland's `app_id`: X11's `WM_CLASS` has no Wayland equivalent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct ActiveClient {
     pub title: String,
     pub class: String,
+    pub is_floating: bool,
+}
+
+/// One workspace as a compositor reports it, reduced to the six fields [`derive_state`] reads.
+/// The input type of the reduction, so the reduction and its tests belong to no compositor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceRow {
+    pub id: u64,
+    pub idx: u8,
+    pub name: Option<String>,
+    /// The connector this workspace sits on, or `None` when the compositor has no output to put
+    /// it on at all (niri reports that with no monitor connected). Such a row is dropped.
+    pub output: Option<String>,
+    /// The workspace its own output is showing. Per output: every output has exactly one.
+    pub is_active: bool,
+    /// The workspace holding keyboard focus. Global: exactly one across the whole session, which
+    /// is what makes `OutputWorkspaces::focused_workspace` optional (docs/adr/0056 decision 4).
+    pub is_focused: bool,
+}
+
+/// The focused toplevel, reduced to the three fields § 2.9's `active_client` carries.
+///
+/// *Which* window holds focus is the adaptor's question, not this module's: niri flags it on
+/// each window, and another compositor may answer it with a separate query entirely. What that
+/// window becomes in the payload is this module's, so the adaptor hands over the answer and
+/// [`derive_state`] does the mapping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FocusedWindow {
+    pub title: String,
+    /// Wayland's `app_id`, which is what § 2.9's `class` is filled from (docs/adr/0056
+    /// decision 5).
+    pub app_id: String,
     pub is_floating: bool,
 }
 
@@ -59,16 +98,14 @@ pub enum WorkspacesSignal {
     Changed,
 }
 
-/// Folds niri's two event-stream state parts into § 2.9's payload. Pure, so the whole mapping
-/// is unit tested without a compositor. Outputs are ordered by connector name and each
-/// output's workspaces by `idx` -- `HashMap` iteration order is not an order. An output with
-/// no active workspace is omitted rather than given a fabricated id (should be unreachable).
-pub fn derive_state(
-    workspaces: &HashMap<u64, niri_ipc::Workspace>,
-    windows: &HashMap<u64, niri_ipc::Window>,
-) -> WorkspacesState {
-    let mut by_output: HashMap<&str, Vec<&niri_ipc::Workspace>> = HashMap::new();
-    for workspace in workspaces.values() {
+/// Folds a compositor's rows into § 2.9's payload. Pure, so the whole mapping is unit tested
+/// without a compositor. Outputs are ordered by connector name and each output's workspaces by
+/// `idx` -- rows arrive in whatever order the adaptor's own map iterated, which is not an order.
+/// An output with no active workspace is omitted rather than given a fabricated id (should be
+/// unreachable).
+pub fn derive_state(workspaces: &[WorkspaceRow], focused: Option<&FocusedWindow>) -> WorkspacesState {
+    let mut by_output: HashMap<&str, Vec<&WorkspaceRow>> = HashMap::new();
+    for workspace in workspaces {
         let Some(output) = workspace.output.as_deref() else { continue };
         by_output.entry(output).or_default().push(workspace);
     }
@@ -88,45 +125,75 @@ pub fn derive_state(
         .collect();
     outputs.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let active_client = windows.values().find(|window| window.is_focused).map(|window| ActiveClient {
-        title: window.title.clone().unwrap_or_default(),
-        class: window.app_id.clone().unwrap_or_default(),
+    let active_client = focused.map(|window| ActiveClient {
+        title: window.title.clone(),
+        class: window.app_id.clone(),
         is_floating: window.is_floating,
     });
 
     WorkspacesState { outputs, active_client }
 }
 
+/// The half of a compositor reader that is not about the compositor: reduce, drop an update that
+/// changes nothing, store, and wake `main.rs`. An adaptor's event loop folds its own stream and
+/// calls [`StatePublisher::publish`]; everything after that is the same for all of them, which is
+/// the part worth not writing twice (and worth not having two of them disagree about).
+pub struct StatePublisher {
+    state: Arc<Mutex<WorkspacesState>>,
+    events: UnboundedSender<WorkspacesSignal>,
+    previous: WorkspacesState,
+}
+
+impl StatePublisher {
+    pub fn new(state: Arc<Mutex<WorkspacesState>>, events: UnboundedSender<WorkspacesSignal>) -> Self {
+        Self { state, events, previous: WorkspacesState::default() }
+    }
+
+    /// `false` once nothing is listening, which is a reader loop's exit condition. Deliberately
+    /// not debounced: a compositor that replays its startup state as several events pushes
+    /// several times, each one a real change (niri sends workspaces and windows separately, so
+    /// the first push lands before any window is known).
+    pub fn publish(&mut self, workspaces: &[WorkspaceRow], focused: Option<&FocusedWindow>) -> bool {
+        let current = derive_state(workspaces, focused);
+        if current == self.previous {
+            return true;
+        }
+        *self.state.lock().expect("workspaces state mutex poisoned") = current.clone();
+        self.previous = current;
+        self.events.send(WorkspacesSignal::Changed).is_ok()
+    }
+}
+
 /// `workspaces:focus(id)`'s `arguments: [id]`. Shape check only: whether the id names a
-/// workspace that exists is niri's question, answered by doing nothing.
+/// workspace that exists is the compositor's question, answered by doing nothing.
 pub fn parse_focus_args(arguments: &[serde_json::Value]) -> Option<u64> {
     arguments.first()?.as_u64()
 }
 
-/// `Clone` is deliberately absent: nothing here is handed to a spawned future.
-/// [`WorkspacesController::focus`] spawns its own OS thread and moves only the id, because
-/// niri's socket is a blocking `std::net::UnixStream`, not tokio-aware.
+/// `Clone` is deliberately absent: nothing here is handed to a spawned future. The adaptor
+/// spawns its own OS thread and moves only what it needs, because niri's socket is a blocking
+/// `std::net::UnixStream`, not tokio-aware.
 pub struct WorkspacesController {
     state: Arc<Mutex<WorkspacesState>>,
     compositor: Option<CompositorKind>,
 }
 
 impl WorkspacesController {
-    /// Returns immediately. A session that is not niri leaves `compositor` at something this
-    /// capability cannot read, never spawns the reader, and so never pushes at all
-    /// (docs/adr/0056 decision 1).
+    /// Returns immediately. A session running something with no implementor never spawns a
+    /// reader and so never pushes at all (docs/adr/0056 decision 1).
+    ///
+    /// The match is exhaustive rather than defaulting, so adding a `CompositorKind` fails this
+    /// build here: the arm a new compositor needs is the one this file exists to point at.
     pub fn new(events: UnboundedSender<WorkspacesSignal>) -> Self {
         let state = Arc::new(Mutex::new(WorkspacesState::default()));
         let compositor = detect_compositor();
         match compositor {
-            Some(CompositorKind::Niri) => spawn_niri_reader(Arc::clone(&state), events),
-            Some(CompositorKind::Hyprland) => {
-                eprintln!(
-                    "workspaces: this session is Hyprland, which has no implementor yet (docs/adr/0056 decision 1); workspace reporting disabled for this run"
-                );
-            }
+            Some(CompositorKind::Niri) => niri::spawn_reader(StatePublisher::new(Arc::clone(&state), events)),
+            Some(CompositorKind::Hyprland) => eprintln!(
+                "workspaces: this session is Hyprland, which has no implementor yet (docs/adr/0056 decision 1); workspace reporting disabled for this run"
+            ),
             None => {
-                eprintln!("workspaces: no supported compositor detected; workspace reporting disabled for this run")
+                eprintln!("workspaces: {}; workspace reporting disabled for this run", unsupported_session_report())
             }
         }
         Self { state, compositor }
@@ -136,151 +203,43 @@ impl WorkspacesController {
         self.state.lock().expect("workspaces state mutex poisoned").clone()
     }
 
-    /// `workspaces:focus(id)`. A fresh connection per call: `read_events` consumes and shuts
-    /// down the write half of the event-stream socket, so the reader's connection can't also
-    /// send this write. `WorkspaceReferenceArg::Id`, not `Index`: `idx` shifts under a
-    /// reorder, so addressing by index could focus the wrong workspace.
+    /// `workspaces:focus(id)`, routed to whichever adaptor is live. Exhaustive for the same
+    /// reason [`WorkspacesController::new`] is.
     pub fn focus(&self, id: u64) {
-        if self.compositor != Some(CompositorKind::Niri) {
-            eprintln!("workspaces: focus({id}) called but this session has no workspace implementor; ignored");
-            return;
-        }
-        std::thread::spawn(move || {
-            let mut socket = match niri_ipc::socket::Socket::connect() {
-                Ok(socket) => socket,
-                Err(err) => {
-                    eprintln!("workspaces: failed to connect to the niri IPC socket for focus: {err}");
-                    return;
-                }
-            };
-            let request = niri_ipc::Request::Action(niri_ipc::Action::FocusWorkspace {
-                reference: niri_ipc::WorkspaceReferenceArg::Id(id),
-            });
-            if let Err(err) = socket.send(request) {
-                eprintln!("workspaces: niri FocusWorkspace({id}) request failed: {err}");
+        match self.compositor {
+            Some(CompositorKind::Niri) => niri::focus(id),
+            Some(CompositorKind::Hyprland) | None => {
+                eprintln!("workspaces: focus({id}) called but this session has no workspace implementor; ignored")
             }
-        });
-    }
-}
-
-/// Connects, asks for the event stream, and folds every event into niri's own two state parts
-/// on its own OS thread (blocking `std::net::UnixStream`). `EventStreamStatePart::apply`
-/// returns the event back when its part ignored it, so one `if let` chains both parts.
-///
-/// ponytail: that reducer panics rather than degrading on two events, `WindowClosed` and
-/// `WindowLayoutsChanged` naming a window it has never seen (both are a bare `.expect` in
-/// `niri_ipc::state`). Those are niri's own invariants and this reader cannot violate them from
-/// the outside: it feeds one stream, in order, starting from the full replay. If one ever does
-/// fire, the panic kills this thread alone and workspaces silently stop updating for the rest of
-/// the run, with a backtrace on stderr as the only clue. The upgrade path is a `catch_unwind`
-/// around `apply` that resets both parts and re-requests the stream, and it is not built because
-/// it would be error handling for a case with no observed instance and no way to reach it from
-/// here.
-fn spawn_niri_reader(state: Arc<Mutex<WorkspacesState>>, events: UnboundedSender<WorkspacesSignal>) {
-    let mut socket = match niri_ipc::socket::Socket::connect() {
-        Ok(socket) => socket,
-        Err(err) => {
-            eprintln!(
-                "workspaces: failed to connect to the niri IPC socket; workspace reporting disabled for this run: {err}"
-            );
-            return;
-        }
-    };
-    match socket.send(niri_ipc::Request::EventStream) {
-        Ok(Ok(niri_ipc::Response::Handled)) => {}
-        Ok(Ok(_)) => {
-            eprintln!(
-                "workspaces: unexpected reply to the niri EventStream request; workspace reporting disabled for this run"
-            );
-            return;
-        }
-        Ok(Err(msg)) => {
-            eprintln!("workspaces: niri EventStream request failed: {msg}");
-            return;
-        }
-        Err(err) => {
-            eprintln!("workspaces: failed to send the niri EventStream request: {err}");
-            return;
         }
     }
-
-    std::thread::spawn(move || {
-        use niri_ipc::state::EventStreamStatePart;
-
-        let mut read_event = socket.read_events();
-        let mut niri_workspaces = niri_ipc::state::WorkspacesState::default();
-        let mut niri_windows = niri_ipc::state::WindowsState::default();
-        let mut previous = WorkspacesState::default();
-        loop {
-            let event = match read_event() {
-                Ok(event) => event,
-                Err(err) => {
-                    eprintln!("workspaces: niri event stream ended; workspaces will no longer update: {err}");
-                    return;
-                }
-            };
-            if let Some(event) = niri_workspaces.apply(event) {
-                niri_windows.apply(event);
-            }
-
-            // niri replays workspaces and windows as two separate startup events, so the first
-            // push lands before any window is known. Deliberately not debounced.
-            let current = derive_state(&niri_workspaces.workspaces, &niri_windows.windows);
-            if current != previous {
-                *state.lock().expect("workspaces state mutex poisoned") = current.clone();
-                previous = current;
-                if events.send(WorkspacesSignal::Changed).is_err() {
-                    return;
-                }
-            }
-        }
-    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Both fixtures deserialize niri's own wire JSON rather than a struct literal, copied from
-    /// a live `niri msg -j workspaces`/`-j windows` -- this would break if niri renamed a field.
-    fn workspace(id: u64, idx: u8, output: &str, is_active: bool, is_focused: bool) -> niri_ipc::Workspace {
-        serde_json::from_value(serde_json::json!({
-            "id": id, "idx": idx, "name": null, "output": output,
-            "is_urgent": false, "is_active": is_active, "is_focused": is_focused, "active_window_id": null
-        }))
-        .unwrap()
+    fn workspace(id: u64, idx: u8, output: &str, is_active: bool, is_focused: bool) -> WorkspaceRow {
+        WorkspaceRow { id, idx, name: None, output: Some(output.to_string()), is_active, is_focused }
     }
 
-    fn window(id: u64, title: &str, app_id: &str, is_focused: bool, is_floating: bool) -> niri_ipc::Window {
-        serde_json::from_value(serde_json::json!({
-            "id": id, "title": title, "app_id": app_id, "pid": 1481, "workspace_id": 3,
-            "is_focused": is_focused, "is_floating": is_floating, "is_urgent": false,
-            "layout": {
-                "pos_in_scrolling_layout": [3, 1], "tile_size": [1920.0, 1200.0], "window_size": [1920, 1200],
-                "tile_pos_in_workspace_view": null, "window_offset_in_tile": [0.0, 0.0]
-            },
-            "focus_timestamp": null
-        }))
-        .unwrap()
-    }
-
-    fn map<T>(items: Vec<(u64, T)>) -> HashMap<u64, T> {
-        items.into_iter().collect()
+    fn window(title: &str, app_id: &str, is_floating: bool) -> FocusedWindow {
+        FocusedWindow { title: title.to_string(), app_id: app_id.to_string(), is_floating }
     }
 
     // ---- derive_state: grouping and ordering ----
 
     #[test]
     fn derive_state_groups_by_output_and_orders_outputs_and_workspaces_deterministically() {
-        // Inserted out of order on purpose: `HashMap` iteration order is not an order.
-        let workspaces = map(vec![
-            (9, workspace(9, 3, "eDP-1", false, false)),
-            (2, workspace(2, 1, "DP-2", true, false)),
-            (5, workspace(5, 1, "eDP-1", true, true)),
-            (7, workspace(7, 2, "eDP-1", false, false)),
-        ]);
+        // Passed out of order on purpose: an adaptor folds a map, and map iteration is not an order.
+        let workspaces = [
+            workspace(9, 3, "eDP-1", false, false),
+            workspace(2, 1, "DP-2", true, false),
+            workspace(5, 1, "eDP-1", true, true),
+            workspace(7, 2, "eDP-1", false, false),
+        ];
 
-        let state = derive_state(&workspaces, &HashMap::new());
+        let state = derive_state(&workspaces, None);
 
         assert_eq!(state.outputs.iter().map(|out| out.name.as_str()).collect::<Vec<_>>(), ["DP-2", "eDP-1"]);
         let edp = &state.outputs[1];
@@ -292,9 +251,7 @@ mod tests {
     fn derive_state_reports_the_active_workspace_by_id_not_by_index() {
         // `id` and `idx` deliberately disagree: a reorder moves `idx` and leaves `id` alone, so
         // a mapping that reached for the wrong one would still pass if they happened to agree.
-        let workspaces = map(vec![(42, workspace(42, 1, "eDP-1", true, true))]);
-
-        let state = derive_state(&workspaces, &HashMap::new());
+        let state = derive_state(&[workspace(42, 1, "eDP-1", true, true)], None);
 
         assert_eq!(state.outputs[0].active_workspace, 42);
         assert_eq!(state.outputs[0].workspaces[0].idx, 1);
@@ -302,22 +259,19 @@ mod tests {
 
     #[test]
     fn derive_state_ignores_a_workspace_that_has_no_output() {
-        // niri reports `output: null` when no outputs are connected at all.
-        let mut orphan = workspace(1, 1, "eDP-1", true, true);
-        orphan.output = None;
-        let workspaces = map(vec![(1, orphan)]);
+        // Real: a compositor reports no output for a workspace when none are connected at all.
+        let orphan = WorkspaceRow { output: None, ..workspace(1, 1, "eDP-1", true, true) };
 
-        assert_eq!(derive_state(&workspaces, &HashMap::new()).outputs, Vec::new());
+        assert_eq!(derive_state(&[orphan], None).outputs, Vec::new());
     }
 
     #[test]
     fn derive_state_omits_an_output_with_no_active_workspace_rather_than_inventing_one() {
-        let workspaces =
-            map(vec![(1, workspace(1, 1, "eDP-1", false, false)), (2, workspace(2, 1, "DP-2", true, false))]);
+        let workspaces = [workspace(1, 1, "eDP-1", false, false), workspace(2, 1, "DP-2", true, false)];
 
-        let state = derive_state(&workspaces, &HashMap::new());
+        let state = derive_state(&workspaces, None);
 
-        assert_eq!(state.outputs.len(), 1, "an output niri reports no active workspace for is not listed");
+        assert_eq!(state.outputs.len(), 1, "an output with no active workspace reported is not listed");
         assert_eq!(state.outputs[0].name, "DP-2");
     }
 
@@ -325,10 +279,9 @@ mod tests {
 
     #[test]
     fn derive_state_puts_focused_workspace_only_on_the_output_that_holds_focus() {
-        let workspaces =
-            map(vec![(1, workspace(1, 1, "eDP-1", true, false)), (2, workspace(2, 1, "DP-2", true, true))]);
+        let workspaces = [workspace(1, 1, "eDP-1", true, false), workspace(2, 1, "DP-2", true, true)];
 
-        let state = derive_state(&workspaces, &HashMap::new());
+        let state = derive_state(&workspaces, None);
 
         let dp = state.outputs.iter().find(|out| out.name == "DP-2").unwrap();
         let edp = state.outputs.iter().find(|out| out.name == "eDP-1").unwrap();
@@ -338,9 +291,7 @@ mod tests {
 
     #[test]
     fn an_unfocused_output_omits_focused_workspace_from_its_json_entirely() {
-        let workspaces = map(vec![(1, workspace(1, 1, "eDP-1", true, false))]);
-
-        let json = serde_json::to_value(derive_state(&workspaces, &HashMap::new())).unwrap();
+        let json = serde_json::to_value(derive_state(&[workspace(1, 1, "eDP-1", true, false)], None)).unwrap();
 
         let output = &json["outputs"][0];
         assert!(
@@ -354,35 +305,26 @@ mod tests {
 
     #[test]
     fn derive_state_maps_the_focused_window_onto_active_client_with_app_id_standing_in_for_class() {
-        let windows = map(vec![
-            (2, window(2, "src/main.rs - Neovim", "kitty", true, true)),
-            (14, window(14, "Sign in | Slack", "slack", false, false)),
-        ]);
+        let focused = window("src/main.rs - Neovim", "kitty", true);
 
-        let client = derive_state(&HashMap::new(), &windows)
-            .active_client
-            .expect("a focused window must produce an active_client");
+        let client = derive_state(&[], Some(&focused)).active_client.expect("a focused window produces active_client");
 
         assert_eq!(client.title, "src/main.rs - Neovim");
-        assert_eq!(client.class, "kitty", "§ 2.9's `class` is niri's `app_id`; a Wayland toplevel has no WM_CLASS");
+        assert_eq!(client.class, "kitty", "§ 2.9's `class` is Wayland's `app_id`; a Wayland toplevel has no WM_CLASS");
         assert!(client.is_floating);
     }
 
     #[test]
     fn derive_state_has_no_active_client_when_no_window_holds_focus() {
         // Real, not hypothetical: focusing a layer-shell surface leaves every toplevel unfocused.
-        let windows = map(vec![(14, window(14, "Sign in | Slack", "slack", false, false))]);
-
-        assert_eq!(derive_state(&HashMap::new(), &windows).active_client, None);
+        assert_eq!(derive_state(&[workspace(1, 1, "eDP-1", true, true)], None).active_client, None);
     }
 
     #[test]
     fn active_client_carries_no_is_fullscreen_key_at_all() {
-        // Pins docs/adr/0056 decision 5: if a later niri gains `is_fullscreen`, this test says
-        // the omission was a decision.
-        let windows = map(vec![(2, window(2, "a title", "kitty", true, false))]);
-
-        let json = serde_json::to_value(derive_state(&HashMap::new(), &windows)).unwrap();
+        // Pins docs/adr/0056 decision 5: if a later compositor gains `is_fullscreen`, this test
+        // says the omission was a decision.
+        let json = serde_json::to_value(derive_state(&[], Some(&window("a title", "kitty", false)))).unwrap();
 
         let client = &json["active_client"];
         assert_eq!(client["title"], "a title");
@@ -395,6 +337,35 @@ mod tests {
 
         assert!(json.get("active_client").is_none());
         assert_eq!(json["outputs"], serde_json::json!([]));
+    }
+
+    // ---- StatePublisher ----
+
+    fn publisher() -> (StatePublisher, tokio::sync::mpsc::UnboundedReceiver<WorkspacesSignal>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (StatePublisher::new(Arc::new(Mutex::new(WorkspacesState::default())), tx), rx)
+    }
+
+    #[test]
+    fn publish_stores_the_state_and_signals_once_per_real_change() {
+        let (mut publisher, mut rx) = publisher();
+        let workspaces = [workspace(5, 1, "eDP-1", true, true)];
+
+        assert!(publisher.publish(&workspaces, None));
+        assert!(publisher.publish(&workspaces, None), "an event that changes nothing is not a change");
+        assert!(publisher.publish(&workspaces, Some(&window("a title", "kitty", false))));
+
+        assert_eq!(publisher.state.lock().unwrap().active_client.as_ref().unwrap().class, "kitty");
+        let signals = std::iter::from_fn(|| rx.try_recv().ok()).count();
+        assert_eq!(signals, 2, "the repeated middle publish must not wake main.rs");
+    }
+
+    #[test]
+    fn publish_reports_false_once_nothing_is_listening_so_a_reader_loop_can_stop() {
+        let (mut publisher, rx) = publisher();
+        drop(rx);
+
+        assert!(!publisher.publish(&[workspace(5, 1, "eDP-1", true, true)], None));
     }
 
     // ---- parse_focus_args ----

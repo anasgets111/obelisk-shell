@@ -189,8 +189,12 @@ The one input device Oblisk reads `oblisk.keyboard`'s per-key state from (backli
 _Avoid_: main keyboard, active keyboard
 
 **Compositor link**:
-The trait behind `keyboard.active_layout`/`keyboard:switch_layout`, one implementor per compositor (Hyprland, Niri). The Supervisor picks an implementor at startup by probing `$HYPRLAND_INSTANCE_SIGNATURE`/`$NIRI_SOCKET`. Scoped deliberately to what keyboard layout needs today. There is no workspace adaptor and this trait did not grow one: `oblisk.workspaces` has a single implementor and so has no trait at all, reusing only the compositor probe (ADR-0056). Extracting a shared trait is what a second live-tested compositor is for.
+The trait behind `keyboard.active_layout`/`keyboard:switch_layout`, one implementor per compositor (Hyprland, Niri). Scoped deliberately to what keyboard layout needs today. There is no workspace adaptor and this trait did not grow one: `oblisk.workspaces` has a single implementor and so has no trait at all (ADR-0056). Extracting a shared trait is what a second live-tested compositor is for, and whether it is one trait or two is still that commit's question.
 _Avoid_: workspace adaptor (never built; ADR-0056 decided against it), compositor adapter
+
+**Compositor probe**:
+`supervisor/src/compositor.rs`: `CompositorKind` plus the `PROBES` table of env vars each compositor sets for every process in its own session, which is how the Supervisor picks an implementor at startup. Session-level, not a capability's property -- `keyboard` and `workspaces` both ask and neither owns the answer, which is why it no longer lives beside the compositor link (ADR-0075). Detection only: it hands back a kind, never an adaptor. `$XDG_CURRENT_DESKTOP` is not a probe, because it is set by whatever launched the session rather than by a compositor that is running; it is only used to name an unsupported session in a log line.
+_Avoid_: compositor detection trait, session detector
 
 **Track identity**:
 A composite key (`mpris:trackid` + `xesam:url` + `xesam:title`) an `oblisk.mpris` player entry uses to detect whether its current track actually changed, since real players are observed to leave any one of `mpris:trackid`/`xesam:url`/`xesam:title` unchanged across a genuine track change (any single one changing counts as a change). Unchanged track identity across a resync means a missing/malformed `album_art_path`/`length` in that resync keeps its last known-good value instead of clearing; changed identity resets both before applying the new read (ADR-0036).

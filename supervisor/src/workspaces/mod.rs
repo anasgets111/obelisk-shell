@@ -8,8 +8,15 @@
 //! speculative generality. A session that is not niri never pushes, so `oblisk.workspaces`
 //! stays `nil` -- § 2.9 has no absence sentinel, and an empty `outputs` array would read as
 //! "no workspaces" rather than "nobody asked".
+//!
+//! The two halves are split by file rather than by trait. `controller` holds § 2.9's payload,
+//! the reduction onto it, and the publish contract, all in terms of its own row types; `niri`
+//! holds everything that names `niri_ipc`. That is where a trait would eventually go, and until
+//! a second implementor is live-tested it is a module boundary instead -- which keeps ADR-0056's
+//! decision while making its own stated upgrade path cheap.
 
 pub mod controller;
+pub mod niri;
 
 pub use controller::{WorkspacesController, WorkspacesSignal, parse_focus_args};
 

@@ -9,9 +9,11 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::StreamExt;
 
+use crate::compositor::{CompositorKind, detect_compositor, unsupported_session_report};
+
 use super::super::scale::{percent_from_raw, raw_from_percent};
 use super::backlight::KbdBacklightProxy;
-use super::layout::{CompositorKind, CompositorLink, HyprlandLink, NiriLink, detect_compositor};
+use super::layout::{CompositorLink, HyprlandLink, NiriLink};
 use super::locks::{read_led_on, resolve_lock_leds};
 
 /// `oblisk.keyboard`'s combined payload. `backlight_pct` is `-1` when this machine has no
@@ -84,7 +86,8 @@ impl KeyboardController {
     /// `GetMaxBrightness()` degrades to [`Backlight::Unavailable`] rather than failing
     /// construction. `leds_root` (real default `/sys/class/leds`) is the lock-state sysfs
     /// fallback's root, injected for testability. Layout picks one [`CompositorLink`] via
-    /// [`detect_compositor`]'s env-var probe -- `None` if neither compositor is detected.
+    /// `crate::compositor`'s env-var probe -- `None` for a session running something with no
+    /// implementor.
     pub async fn new(
         system_bus: zbus::Connection,
         leds_root: &Path,
@@ -102,9 +105,7 @@ impl KeyboardController {
             Some(CompositorKind::Niri) => NiriLink::new(Arc::clone(&state), events_tx.clone())
                 .map(|link| Box::new(link) as Box<dyn CompositorLink>),
             None => {
-                eprintln!(
-                    "keyboard: neither HYPRLAND_INSTANCE_SIGNATURE nor NIRI_SOCKET is set; layout reporting disabled for this run"
-                );
+                eprintln!("keyboard: {}; layout reporting disabled for this run", unsupported_session_report());
                 None
             }
         };
@@ -129,13 +130,13 @@ impl KeyboardController {
         // this call.
     }
 
-    /// `keyboard:switch_layout(index)`. A no-op (logged) when neither compositor was
+    /// `keyboard:switch_layout(index)`. A no-op (logged) when no supported compositor was
     /// detected. Synchronous, not `async`: `CompositorLink::switch_layout` itself is
     /// synchronous, fire-and-forget.
     pub fn switch_layout(&self, index: usize) {
         match self.layout.as_ref() {
             Some(link) => link.switch_layout(index),
-            None => eprintln!("keyboard: switch_layout called but no compositor was detected; ignored"),
+            None => eprintln!("keyboard: switch_layout called but no supported compositor was detected; ignored"),
         }
     }
 

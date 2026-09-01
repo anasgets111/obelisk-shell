@@ -1,9 +1,12 @@
 //! Keyboard layout half of `oblisk.keyboard` (ADR-0034): a deliberately narrow
-//! [`CompositorLink`] trait, picked at startup by probing `$HYPRLAND_INSTANCE_SIGNATURE`/
-//! `$NIRI_SOCKET`. Niri's implementor is live-tested on this dev machine; Hyprland's is built
-//! to its documented IPC protocol but not independently live-verified (ADR-0034 defers that to
-//! the user's own Hyprland machine). Neither env var set: `active_layout` degrades to
+//! [`CompositorLink`] trait, with an implementor picked at startup by `crate::compositor`'s
+//! probe. Niri's implementor is live-tested on this dev machine; Hyprland's is built to its
+//! documented IPC protocol but not independently live-verified (ADR-0034 defers that to the
+//! user's own Hyprland machine). No supported compositor: `active_layout` degrades to
 //! unavailable (empty string, index/count at `0`).
+//!
+//! `CompositorKind` and the probe itself moved to `crate::compositor` once `workspaces` became
+//! their second caller. This module owns the trait, not the detection.
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
@@ -13,13 +16,9 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::controller::{KeyboardSignal, KeyboardState};
+use crate::compositor::CompositorKind;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompositorKind {
-    Hyprland,
-    Niri,
-}
+use super::controller::{KeyboardSignal, KeyboardState};
 
 /// Methods are synchronous, fire-and-forget for `switch_layout` -- the real state update
 /// flows back through the implementor's own event stream, not a return value here. Not
@@ -28,19 +27,6 @@ pub enum CompositorKind {
 pub trait CompositorLink: Send + Sync {
     fn kind(&self) -> CompositorKind;
     fn switch_layout(&self, index: usize);
-}
-
-/// Probes the env vars each compositor sets for every process in its own session. Hyprland
-/// checked first: a session with both set (unlikely) picks the one the ADR lists first, an
-/// arbitrary but harmless tie-break since real sessions only ever run one compositor.
-pub fn detect_compositor() -> Option<CompositorKind> {
-    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
-        Some(CompositorKind::Hyprland)
-    } else if std::env::var_os("NIRI_SOCKET").is_some() {
-        Some(CompositorKind::Niri)
-    } else {
-        None
-    }
 }
 
 fn apply_niri_layout(state: &Arc<Mutex<KeyboardState>>, names: &[String], idx: u8) {
@@ -271,7 +257,7 @@ async fn resync_hyprland_layout(
 
 impl HyprlandLink {
     /// `signature` is `$HYPRLAND_INSTANCE_SIGNATURE`, already confirmed present by
-    /// [`detect_compositor`]. Spawns the event-listener thread and runs one initial resync so
+    /// `compositor::detect_compositor`. Spawns the event-listener thread and runs one initial resync so
     /// `active_layout` isn't empty until the first `activelayout` event arrives.
     pub fn new(signature: String, state: Arc<Mutex<KeyboardState>>, events: UnboundedSender<KeyboardSignal>) -> Self {
         let device_name: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));

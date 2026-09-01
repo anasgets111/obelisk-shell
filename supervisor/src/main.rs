@@ -1,6 +1,7 @@
 mod applications;
 mod audio;
 mod cli;
+mod compositor;
 mod dbus;
 mod generation;
 mod hardware;
