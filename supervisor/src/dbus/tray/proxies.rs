@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use serde::Deserialize;
-use zbus::names::OwnedUniqueName;
+use zbus::names::OwnedBusName;
 use zbus::zvariant::{Array, Dict, OwnedObjectPath, OwnedValue, Signature, Str, StructureBuilder, Type, Value};
 
 use super::{RawIconPixmap, RawToolTip};
@@ -137,20 +137,22 @@ pub(super) trait StatusNotifierWatcherClient {
     fn register_status_notifier_host(&self, service: &str) -> zbus::Result<()>;
 }
 
+/// `destination` rather than the item's unique name: a Chromium tray item answers only the
+/// well-known name it registered under (docs/adr/0072).
 pub(super) async fn bind_item(
     connection: &zbus::Connection,
-    unique_name: &OwnedUniqueName,
+    destination: &OwnedBusName,
     path: &OwnedObjectPath,
 ) -> zbus::Result<StatusNotifierItemProxy<'static>> {
-    StatusNotifierItemProxy::builder(connection).destination(unique_name.clone())?.path(path.clone())?.build().await
+    StatusNotifierItemProxy::builder(connection).destination(destination.clone())?.path(path.clone())?.build().await
 }
 
 pub(super) async fn bind_dbusmenu(
     connection: &zbus::Connection,
-    unique_name: &OwnedUniqueName,
+    destination: &OwnedBusName,
     path: &OwnedObjectPath,
 ) -> zbus::Result<DBusMenuProxy<'static>> {
-    DBusMenuProxy::builder(connection).destination(unique_name.clone())?.path(path.clone())?.build().await
+    DBusMenuProxy::builder(connection).destination(destination.clone())?.path(path.clone())?.build().await
 }
 
 #[cfg(test)]

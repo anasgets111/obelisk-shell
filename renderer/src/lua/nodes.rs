@@ -77,7 +77,10 @@ const NODE_PROPERTIES: &[(&str, &[&str])] = &[
     ("row", &["children", "scroll", "spacing"]),
     ("column", &["children", "scroll", "spacing"]),
     ("text", &["content", "elide", "font_size", "foreground", "text_align"]),
-    ("icon", &["name", "size"]),
+    // `foreground` here means what CSS `color` means: the value a `currentColor` fill in the
+    // resolved SVG resolves to (docs/adr/0072). A full-colour icon names no `currentColor` and is
+    // unaffected, so a config may pass it unconditionally.
+    ("icon", &["foreground", "name", "size"]),
     ("image", &["fit", "source"]),
     ("button", &["children", "on_click"]),
     ("list", &["direction", "itemfn", "key", "scroll", "source", "spacing"]),

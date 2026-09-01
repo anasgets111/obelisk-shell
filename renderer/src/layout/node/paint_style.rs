@@ -65,6 +65,10 @@ pub enum PaintStyle {
     /// icon theme.
     Icon {
         name: String,
+        /// § 5.1's `foreground`, which for an icon means what CSS `color` means: the value a
+        /// `currentColor` fill resolves to (docs/adr/0072). `None` leaves the file's own colours
+        /// alone, which is every full-colour app icon.
+        color: Option<Rgba>,
     },
     Image {
         source: String,
@@ -107,7 +111,9 @@ pub fn paint_style(kind: &str, properties: &HashMap<String, Value>) -> Result<Op
             align: parse_text_align(properties)?,
             elide: parse_elide(properties)?,
         },
-        "icon" => PaintStyle::Icon { name: parse_icon_name(properties)? },
+        "icon" => {
+            PaintStyle::Icon { name: parse_icon_name(properties)?, color: parse_optional_foreground(properties)? }
+        }
         "image" => PaintStyle::Image { source: parse_image_source(properties)?, fit: parse_fit(properties)? },
         "textfield" => PaintStyle::TextField {
             target: parse_secure_submit(properties)?,

@@ -160,6 +160,19 @@ pub fn parse_text_align(properties: &HashMap<String, Value>) -> Result<TextAlign
     }
 }
 
+/// § 5.1's `foreground` when the node declares one, and `None` when it does not.
+///
+/// Separate from [`parse_foreground`] because an `icon`'s default is not white: an icon with no
+/// `foreground` must rasterize exactly as its file says, and a themed default would repaint every
+/// full-colour app icon. Only a `currentColor` icon has anything to take a colour from
+/// (docs/adr/0072).
+pub fn parse_optional_foreground(properties: &HashMap<String, Value>) -> Result<Option<Rgba>, LayoutError> {
+    if !properties.contains_key("foreground") {
+        return Ok(None);
+    }
+    parse_foreground(properties).map(Some)
+}
+
 pub fn parse_foreground(properties: &HashMap<String, Value>) -> Result<Rgba, LayoutError> {
     let Some(value) = properties.get("foreground") else {
         return Ok(Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 });

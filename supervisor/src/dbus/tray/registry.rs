@@ -15,6 +15,7 @@ use super::TraySignal;
 use super::item::{TrayItem, fetch_tray_item_base};
 use super::menu::fetch_menu_via;
 use super::proxies::{DBusMenuProxy, StatusNotifierItemProxy, bind_dbusmenu, bind_item};
+use super::registration::ResolvedRegistration;
 
 pub(super) struct ItemEntry {
     pub(super) item: StatusNotifierItemProxy<'static>,
@@ -35,10 +36,10 @@ pub(super) async fn register_item(
     connection: &zbus::Connection,
     registry: &ItemRegistry,
     events: &UnboundedSender<TraySignal>,
-    unique_name: OwnedUniqueName,
-    object_path: OwnedObjectPath,
+    resolved: ResolvedRegistration,
 ) -> Result<(), String> {
-    let item = bind_item(connection, &unique_name, &object_path)
+    let ResolvedRegistration { unique_name, destination, object_path } = resolved;
+    let item = bind_item(connection, &destination, &object_path)
         .await
         .map_err(|err| format!("failed to bind StatusNotifierItem: {err}"))?;
 
@@ -47,7 +48,7 @@ pub(super) async fn register_item(
     let menu_path = item.menu().await.ok();
     let menu = match &menu_path {
         Some(path) if !path.as_str().is_empty() && path.as_str() != "/" => {
-            match bind_dbusmenu(connection, &unique_name, path).await {
+            match bind_dbusmenu(connection, &destination, path).await {
                 Ok(menu) => Some(menu),
                 Err(err) => {
                     eprintln!("tray: failed to bind DBusMenu for {unique_name} at {path}: {err}");

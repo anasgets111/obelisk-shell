@@ -16,6 +16,7 @@
 
 pub mod icons;
 
+use crate::layout::node::Rgba;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -42,6 +43,11 @@ struct CacheKey {
     path: PathBuf,
     raster_px: u32,
     version: FileVersion,
+    /// The `currentColor` value this texture was rasterized with, packed `0x00RRGGBB`
+    /// (docs/adr/0072). `None` for a raster file and for an untinted SVG. Part of the key because
+    /// one theme file drawn white on the bar and dim in a popup is two textures, and without it the
+    /// first tint would win for the life of the process.
+    tint: Option<u32>,
 }
 
 /// What tells one revision of a file from the next, at a path that keeps its name (docs/adr/0031's
@@ -158,16 +164,26 @@ impl ImageCache {
     /// is ready (docs/adr/0044 decision 2). That is also
     /// `oblisk-supervisor-services-dbus.md` § 9.2's "off-thread", met on this side of the process
     /// boundary. Not built now because nothing has measured a dropped frame from it.
-    pub fn image(&mut self, canvas: &mut Canvas<OpenGl>, path: &Path, box_px: u32) -> Option<ImageId> {
+    pub fn image(
+        &mut self,
+        canvas: &mut Canvas<OpenGl>,
+        path: &Path,
+        box_px: u32,
+        tint: Option<Rgba>,
+    ) -> Option<ImageId> {
+        let vector = is_vector(path);
         let key = CacheKey {
             path: path.to_path_buf(),
-            raster_px: if is_vector(path) { box_px.max(1) } else { 0 },
+            raster_px: if vector { box_px.max(1) } else { 0 },
             version: FileVersion::read(path),
+            // Only a vector can carry a `currentColor`, so a tint on a PNG is dropped rather than
+            // splitting that file's cache slot per colour it will never use.
+            tint: if vector { tint.map(packed_rgb) } else { None },
         };
         if let Some(cached) = self.entries.get(&key) {
             return *cached;
         }
-        let loaded = match load(canvas, &key.path, key.raster_px) {
+        let loaded = match load(canvas, &key.path, key.raster_px, tint) {
             Ok(id) => Some(id),
             Err(err) => {
                 eprintln!("[oblisk-renderer] image: {}: {err}", key.path.display());
@@ -202,7 +218,7 @@ fn is_vector(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
 }
 
-fn load(canvas: &mut Canvas<OpenGl>, path: &Path, raster_px: u32) -> Result<ImageId, String> {
+fn load(canvas: &mut Canvas<OpenGl>, path: &Path, raster_px: u32, tint: Option<Rgba>) -> Result<ImageId, String> {
     if raster_px == 0 {
         let (pixels, width, height) = decode_raster(path)?;
         // Straight alpha, which is what the `image` crate produces, so no flag: `PREMULTIPLIED`
@@ -210,7 +226,7 @@ fn load(canvas: &mut Canvas<OpenGl>, path: &Path, raster_px: u32) -> Result<Imag
         let source = ImageSource::from(femtovg::imgref::Img::new(pixels.as_rgba(), width as usize, height as usize));
         return canvas.create_image(source, ImageFlags::empty()).map_err(femtovg_error);
     }
-    let (pixels, width, height) = rasterize_svg(path, raster_px)?;
+    let (pixels, width, height) = rasterize_svg(path, raster_px, tint)?;
     // `PREMULTIPLIED` because tiny-skia's `Pixmap` is premultiplied RGBA8 and femtovg samples a
     // texture without this flag as straight alpha -- getting it wrong shows as a dark halo around
     // every anti-aliased icon edge rather than as an outright failure.
@@ -251,8 +267,12 @@ fn decode_raster(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
 /// one. A config passing an absolute `.svgz` path gets one log line and a blank box. The upgrade
 /// is two feature flags (`resvg/svgz`, `resvg/text`), and `text` costs a second `fontdb` that
 /// would then disagree with the one `text::shaping` already loaded the declared font chain into.
-fn rasterize_svg(path: &Path, box_px: u32) -> Result<(Vec<u8>, u32, u32), String> {
+fn rasterize_svg(path: &Path, box_px: u32, tint: Option<Rgba>) -> Result<(Vec<u8>, u32, u32), String> {
     let data = std::fs::read(path).map_err(|err| err.to_string())?;
+    let data = match tint {
+        Some(tint) => tinted_svg(&data, tint),
+        None => data,
+    };
     let tree = resvg::usvg::Tree::from_data(&data, &resvg::usvg::Options::default()).map_err(|err| err.to_string())?;
     let size = tree.size();
     let longest = size.width().max(size.height());
@@ -269,6 +289,90 @@ fn rasterize_svg(path: &Path, box_px: u32) -> Result<(Vec<u8>, u32, u32), String
         resvg::tiny_skia::Pixmap::new(width, height).ok_or_else(|| format!("no pixmap for {width}x{height}"))?;
     resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
     Ok((pixmap.take(), width, height))
+}
+
+/// `0x00RRGGBB` from a parsed colour, for [`CacheKey`]. Alpha is dropped because it is not part of
+/// what [`tinted_svg`] writes: a CSS `color` is `#RRGGBB`, and an icon's transparency is the draw
+/// call's `alpha` rather than the SVG's.
+fn packed_rgb(color: Rgba) -> u32 {
+    let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (channel(color.r) << 16) | (channel(color.g) << 8) | channel(color.b)
+}
+
+/// `#RRGGBB` for a parsed colour.
+fn hex_rgb(color: Rgba) -> String {
+    format!("#{:06x}", packed_rgb(color))
+}
+
+/// `data` with every `currentColor` made to resolve to `tint`, or `data` untouched when it holds no
+/// `currentColor` at all (docs/adr/0072).
+///
+/// Two rewrites, because symbolic icons come in two shapes and a theme mixes them freely.
+///
+/// The stylesheet one is what Breeze and Adwaita ship: a `<style id="current-color-scheme">` block
+/// setting `color:#232629` on a class every path carries. That is Breeze *Light*'s text colour
+/// baked into the file, and Plasma rewrites the block at load time rather than reading it. So does
+/// this. Without it the icon draws near-black on a dark bar, which is how this was found.
+///
+/// The root-attribute one covers a file that says `fill="currentColor"` and defines `color`
+/// nowhere, where CSS's own initial value for `color` is black. A presentation attribute on the
+/// root is the weakest thing that still beats nothing, so a file that does define `color` keeps its
+/// own definition and gets it rewritten by the first pass instead.
+///
+/// Byte-level and not a parse: `usvg` resolves `currentColor` while building the tree and exposes
+/// no hook before that. `str::from_utf8` rather than `from_utf8_lossy` so a file that is not UTF-8
+/// is handed back verbatim for `usvg` to reject with its own message.
+fn tinted_svg(data: &[u8], tint: Rgba) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(data) else {
+        return data.to_vec();
+    };
+    if !text.contains("currentColor") {
+        return data.to_vec();
+    }
+    let hex = hex_rgb(tint);
+    let rewritten = rewrite_color_declarations(text, &hex);
+    match rewritten.find("<svg") {
+        Some(at) => {
+            let mut out = String::with_capacity(rewritten.len() + hex.len() + 10);
+            out.push_str(&rewritten[..at + 4]);
+            out.push_str(&format!(" color=\"{hex}\""));
+            out.push_str(&rewritten[at + 4..]);
+            out.into_bytes()
+        }
+        None => rewritten.into_bytes(),
+    }
+}
+
+/// Every CSS `color:` declaration in `text` repointed at `hex`.
+///
+/// Only a bare `color`, never `stop-color`, `flood-color` or `lighting-color`: those name a
+/// specific paint rather than the value `currentColor` reads, and rewriting them would flatten a
+/// gradient. The guard is the character before the match, which must not be one an identifier could
+/// continue through.
+///
+/// ponytail: the match is textual, so a `color:` inside an XML comment or an attribute value would
+/// be rewritten too. No theme file this was tested against has one, and the upgrade path is a real
+/// CSS pass over the `<style>` body, which means a CSS parser this crate does not otherwise want.
+fn rewrite_color_declarations(text: &str, hex: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("color:") {
+        let after = at + "color:".len();
+        let continues_an_identifier =
+            rest[..at].chars().next_back().is_some_and(|c| c == '-' || c == '_' || c.is_alphanumeric());
+        out.push_str(&rest[..after]);
+        if continues_an_identifier {
+            rest = &rest[after..];
+            continue;
+        }
+        // The declaration's own value, up to whatever ends it. Replaced whole so `color: #232629`
+        // and `color:#232629` behave the same.
+        let value_len = rest[after..].find([';', '}', '"', '\'']).unwrap_or(rest.len() - after);
+        out.push_str(hex);
+        rest = &rest[after + value_len..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Where the image itself lands inside `box_rect`, given its own pixel dimensions and a [`Fit`].
@@ -336,6 +440,80 @@ mod tests {
     }
 
     #[test]
+    fn a_kde_symbolic_icon_is_recoloured_through_its_own_stylesheet() {
+        // The Telegram case. Breeze bakes Breeze *Light*'s text colour into the file and expects the
+        // toolkit to rewrite it; drawn as shipped it is near-black on a dark bar.
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22">
+  <defs><style id="current-color-scheme" type="text/css">
+      .ColorScheme-Text { color:#232629; }
+  </style></defs>
+  <path class="ColorScheme-Text" style="fill:currentColor" d="M0 0h1v1h-1z"/>
+</svg>"##;
+        let out = String::from_utf8(tinted_svg(svg, tint())).unwrap();
+        assert!(out.contains("color:#cdd6f4"), "the stylesheet's own declaration is repointed: {out}");
+        assert!(!out.contains("#232629"), "and the shipped colour is gone: {out}");
+    }
+
+    #[test]
+    fn an_icon_that_defines_no_colour_gets_one_on_the_root() {
+        // hicolor and Adwaita ship this shape. CSS's initial value for `color` is black, so without
+        // the root attribute `currentColor` is black whatever the caller asked for.
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M0 0h1v1h-1z"/></svg>"##;
+        let out = String::from_utf8(tinted_svg(svg, tint())).unwrap();
+        assert!(out.starts_with(r##"<svg color="#cdd6f4""##), "the root carries the colour: {out}");
+    }
+
+    #[test]
+    fn a_full_colour_icon_is_handed_back_byte_for_byte() {
+        // Every app icon. The tray passes a `foreground` for all of them and only the symbolic ones
+        // may change, or a themed Slack logo would come out flat.
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg"><path fill="#2eb67d" d="M0 0h1v1h-1z"/></svg>"##;
+        assert_eq!(tinted_svg(svg, tint()), svg.to_vec());
+    }
+
+    #[test]
+    fn a_gradient_stop_is_not_a_colour_declaration() {
+        // `stop-color:` contains `color:`. Rewriting it would flatten every gradient in the file to
+        // one colour, which is a worse bug than the one being fixed.
+        let out = rewrite_color_declarations("stop-color:#ff0000;color:#232629;flood-color:#00ff00", "#cdd6f4");
+        assert_eq!(out, "stop-color:#ff0000;color:#cdd6f4;flood-color:#00ff00");
+    }
+
+    #[test]
+    fn a_spaced_declaration_is_replaced_whole_rather_than_prefixed() {
+        // The value runs to the terminator, so `color: #232629 ` goes in one piece and the
+        // whitespace inside it goes with it. CSS does not care, and the alternative is trimming
+        // rules that would.
+        assert_eq!(rewrite_color_declarations("{ color: #232629 }", "#cdd6f4"), "{ color:#cdd6f4}");
+    }
+
+    #[test]
+    fn one_file_tinted_two_ways_is_two_cache_slots() {
+        // Without the tint in the key the first colour drawn wins for the life of the process, so an
+        // icon on the bar and the same icon dimmed in a popup would be one texture.
+        let a = CacheKey {
+            path: PathBuf::from("/x.svg"),
+            raster_px: 18,
+            version: FileVersion::default(),
+            tint: Some(0xffffff),
+        };
+        let b = CacheKey { tint: Some(0x808080), ..a.clone() };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_tint_packs_to_rgb_and_drops_alpha() {
+        assert_eq!(packed_rgb(Rgba { r: 1.0, g: 0.0, b: 0.0, a: 0.25 }), 0xff0000);
+        assert_eq!(hex_rgb(Rgba { r: 0.0, g: 0.0, b: 1.0, a: 1.0 }), "#0000ff");
+    }
+
+    /// `#cdd6f4`, the dev config's `theme.FG`, so a test asserting on the hex asserts on a value it
+    /// can read.
+    fn tint() -> Rgba {
+        Rgba { r: 0xcd as f32 / 255.0, g: 0xd6 as f32 / 255.0, b: 0xf4 as f32 / 255.0, a: 1.0 }
+    }
+
+    #[test]
     fn only_svg_is_rasterized_by_size() {
         assert!(is_vector(Path::new("/usr/share/icons/Adwaita/symbolic/x.svg")));
         assert!(is_vector(Path::new("/tmp/X.SVG")));
@@ -351,7 +529,7 @@ mod tests {
         // Exercises resvg end to end against the file `dev-config` actually ships (docs/adr/0055):
         // a tree that parses to nothing renders a fully transparent pixmap rather than an error.
         let svg = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/wallpaper.svg");
-        let (pixels, width, height) = rasterize_svg(&svg, 128).expect("the shipped wallpaper should parse");
+        let (pixels, width, height) = rasterize_svg(&svg, 128, None).expect("the shipped wallpaper should parse");
         // 1920x1080 viewBox, longest edge 128, so the aspect ratio survives the scale.
         assert_eq!((width, height), (128, 72));
         assert_eq!(pixels.len(), (width * height * 4) as usize);
@@ -414,7 +592,12 @@ mod tests {
     }
 
     fn key(path: &str, px: u32, version: FileVersion) -> CacheKey {
-        CacheKey { path: PathBuf::from(path), raster_px: if is_vector(Path::new(path)) { px } else { 0 }, version }
+        CacheKey {
+            path: PathBuf::from(path),
+            raster_px: if is_vector(Path::new(path)) { px } else { 0 },
+            version,
+            tint: None,
+        }
     }
 
     #[test]

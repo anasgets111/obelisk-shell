@@ -73,6 +73,10 @@ pub enum Draw {
         name: String,
         px: u32,
         alpha: f32,
+        /// What a `currentColor` fill in the resolved SVG resolves to (docs/adr/0072). Part of the
+        /// command and not just of the draw call because `ImageCache` keys on it: the same file
+        /// tinted two ways is two textures.
+        color: Option<Rgba>,
     },
     Image {
         source: String,
@@ -292,15 +296,17 @@ pub fn execute(painter: &mut TextPainter, images: &mut ImageCache, list: &Displa
             Draw::Text { content, font_size, color, align } => {
                 painter.draw_line(content, rect, *font_size, scale, *color, *align)
             }
-            Draw::Icon { name, px, alpha } => {
+            Draw::Icon { name, px, alpha, color } => {
                 // `u16` is `freedesktop-icons`'s own size type, and a theme has no directory above
                 // 512 anyway.
                 if let Some(path) = image::icons::resolve(name, (*px).min(512) as u16) {
-                    draw_file(painter.canvas_mut(), images, &path, Fit::Contain, rect, *px, *alpha);
+                    let draw = FileDraw { fit: Fit::Contain, rect, px: *px, alpha: *alpha, tint: *color };
+                    draw_file(painter.canvas_mut(), images, &path, draw);
                 }
             }
             Draw::Image { source, fit, px, alpha } => {
-                draw_file(painter.canvas_mut(), images, std::path::Path::new(source), *fit, rect, *px, *alpha)
+                let draw = FileDraw { fit: *fit, rect, px: *px, alpha: *alpha, tint: None };
+                draw_file(painter.canvas_mut(), images, std::path::Path::new(source), draw)
             }
         }
     }
@@ -385,10 +391,11 @@ fn draw_for(
         // § 5.2's "bounding box diameter", so an icon in a box that is not square should sit inside
         // it whole rather than be cropped to fill it. An icon is the one case where showing less of
         // the image is never the right answer.
-        PaintStyle::Icon { name } => Some(Draw::Icon {
+        PaintStyle::Icon { name, color } => Some(Draw::Icon {
             name: name.clone(),
             px: physical_edge(rect.width.min(rect.height), scale),
             alpha: opacity,
+            color: *color,
         }),
 
         // `image` (docs/adr/0054 decision 3): the file at `source`, fitted by `fit`. An empty
@@ -440,16 +447,21 @@ fn draw_for(
 /// paint's extent unless `REPEAT_X`/`REPEAT_Y` are set, so filling the whole box with a `Contain`
 /// paint would smear the image's outermost pixel row across the letterbox. `Cover`'s fitted rect is
 /// larger than the box instead, and `paint_node`'s scissor is what crops it.
-fn draw_file(
-    canvas: &mut Canvas<OpenGl>,
-    images: &mut ImageCache,
-    file: &std::path::Path,
+/// Everything about one file draw except which file: the two `Draw` variants that reach
+/// [`draw_file`] carry the same five values and always travel together.
+#[derive(Debug, Clone, Copy)]
+struct FileDraw {
     fit: Fit,
     rect: LogicalRect,
     px: u32,
     alpha: f32,
-) {
-    let Some(id) = images.image(canvas, file, px) else {
+    /// `None` for an `image`, which names a file the config chose rather than a themed icon.
+    tint: Option<Rgba>,
+}
+
+fn draw_file(canvas: &mut Canvas<OpenGl>, images: &mut ImageCache, file: &std::path::Path, draw: FileDraw) {
+    let FileDraw { fit, rect, px, alpha, tint } = draw;
+    let Some(id) = images.image(canvas, file, px, tint) else {
         return;
     };
     let Ok((width, height)) = canvas.image_size(id) else {

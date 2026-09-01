@@ -5,6 +5,12 @@
 -- note: a tray item ships its own artwork and nobody gets to recolour it. Everything else on this
 -- bar is a glyph precisely because this config chooses those and does not choose these.
 --
+-- One carve-out, and it is not really one: `foreground` on an `icon` is what CSS `color` is, the
+-- value a `currentColor` fill resolves to (ADR-0072). A symbolic icon is *defined* as taking the
+-- panel's colour, and Breeze bakes its own light-theme grey into the file expecting the toolkit to
+-- rewrite it. Telegram's tray icon drew near-black on this bar until it did. A full-colour app
+-- icon names no `currentColor` and ignores this, so it goes on every item unconditionally.
+--
 -- No ground, and absent when the tray is empty. It was a glass pill of a fixed 135px, which on a
 -- session that registers nothing is an empty box sitting on the bar looking like a control that
 -- failed to load, and on a session that registers two is a box with a lot of nothing to the right
@@ -58,7 +64,7 @@ return list {
         local entry = util.app_entry(oblisk.applications:get(), item.name or item.id)
         local art = item.icon_name or item.icon_path or (entry and entry.icon)
         if art then
-            return icon { name = art, size = theme.icon.md, align_v = "Center" }
+            return icon { name = art, size = theme.icon.md, align_v = "Center", foreground = theme.FG }
         end
         -- No artwork registered, which happens, and is what the faint smudge between the
         -- bluetooth circle and the clock was: two 9px letters at `DIM` next to a row of 22px

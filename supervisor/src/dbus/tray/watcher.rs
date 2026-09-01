@@ -26,16 +26,14 @@ impl StatusNotifierWatcher {
         #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         let sender = header.sender().map(|s| s.to_string());
-        let (unique_name, object_path) =
-            resolve_registration(&self.connection, &service, sender.as_deref()).await.map_err(|err| {
-                zbus::fdo::Error::Failed(format!(
-                    "RegisterStatusNotifierItem({service:?}) could not be resolved: {err}"
-                ))
-            })?;
+        let resolved = resolve_registration(&self.connection, &service, sender.as_deref()).await.map_err(|err| {
+            zbus::fdo::Error::Failed(format!("RegisterStatusNotifierItem({service:?}) could not be resolved: {err}"))
+        })?;
+        let unique_name = resolved.unique_name.clone();
 
-        register_item(&self.connection, &self.registry, &self.events, unique_name.clone(), object_path).await.map_err(
-            |err| zbus::fdo::Error::Failed(format!("RegisterStatusNotifierItem({service:?}) failed: {err}")),
-        )?;
+        register_item(&self.connection, &self.registry, &self.events, resolved).await.map_err(|err| {
+            zbus::fdo::Error::Failed(format!("RegisterStatusNotifierItem({service:?}) failed: {err}"))
+        })?;
 
         let _ = emitter.status_notifier_item_registered(unique_name.as_str()).await;
         Ok(())

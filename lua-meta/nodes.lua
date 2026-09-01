@@ -55,8 +55,9 @@
 ---@field text_align? "Start"|"Center"|"End" Where the glyph run sits inside this node's own box, which is a different question from `align_h`. Only visible when the box is wider than the text. Default `"Start"`.
 
 ---@class IconProps: NodeBase
----@field name? string|Signal A theme name, or an absolute path used as that path. Resolved in the renderer (ADR-0054). Carries no tint: use a glyph in a `text` node to colour by state.
+---@field name? string|Signal A theme name, or an absolute path used as that path. Resolved in the renderer (ADR-0054).
 ---@field size? integer Bounding box diameter, default `12`.
+---@field foreground? Color|Signal What a `currentColor` fill in the resolved SVG resolves to, which is what CSS `color` means (ADR-0072). A symbolic icon is drawn in this colour; a full-colour app icon names no `currentColor` and ignores it, so it is safe to pass unconditionally. Omitted leaves the file's own colours alone, which for a KDE symbolic icon means the near-black its stylesheet ships.
 
 ---@class ImageProps: NodeBase
 ---@field source? string|Signal An absolute path. Never a theme name; that is `icon`'s job.

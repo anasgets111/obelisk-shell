@@ -37,7 +37,7 @@ mod toplevel;
 // is what carries them into `paint_style.rs`.
 use content::{
     parse_elide, parse_fit, parse_font_size, parse_foreground, parse_icon_name, parse_image_source,
-    parse_mask_character, parse_placeholder, parse_text_align,
+    parse_mask_character, parse_optional_foreground, parse_placeholder, parse_text_align,
 };
 use spec::parse_secure_submit;
 use style::{parse_background, parse_border_color, parse_border_width, parse_radius};
