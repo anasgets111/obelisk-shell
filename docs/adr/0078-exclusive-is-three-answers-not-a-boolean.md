@@ -83,6 +83,8 @@ Their names describe how the number was arrived at; these describe what the surf
 `Ignore` is shared, deliberately, because its meaning is the protocol's rather than either
 implementation's.
 
-**The IDL version.** Cargo.toml's rule says minor for an IDL field changed. ADR-0069 added `scroll`
-to § 5.1 and left the version at 0.1.0, so this matches what the repo does rather than what that
-comment says. Worth reconciling once, for both, rather than half-applying it here.
+**The IDL version.** Cargo.toml's rule says minor for an IDL field added or changed, and this does
+not bump it. The rule has not started yet: nothing has been pushed to origin, so 0.1.0 is a
+placeholder rather than a released number and there is nobody downstream for a minor to inform.
+ADR-0069 added `scroll` to § 5.1 under the same conditions and left it alone. The first push is what
+turns the rule on; from then a change like this one is a minor.

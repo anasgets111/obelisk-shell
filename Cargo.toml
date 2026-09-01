@@ -11,6 +11,11 @@ resolver = "2"
 # Versioning tracks the Lua API, because that is the only public interface this has. Minor for an
 # IDL field added or changed, patch for everything else. A config gates on it with
 # `oblisk.version.minor >= n`.
+#
+# Not in force yet, which is why IDL changes keep landing against 0.1.0 (docs/adr/0069's `scroll`,
+# docs/adr/0078's `exclusive`). Nothing has been pushed to origin, so this number informs nobody and
+# 0.1.0 is a placeholder. The first push starts it; until then, do not bump, and do not re-litigate
+# the gap between this comment and the log every time an IDL field moves.
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
