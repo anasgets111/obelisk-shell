@@ -59,6 +59,80 @@ const MAX_TREE_DEPTH: u32 = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(u64);
 
+/// Every geometry property one node's layout reads, parsed exactly once per pass
+/// (build-steps.md Phase 19 item 5: "parsing geometry once into the retained node").
+///
+/// Item 5's first half made a node's *properties* resolve once, so the `Signal` behind `margin` is
+/// read once per node per pass. This is the second thing it names. A resolved property is still an
+/// `mlua::Value`, and a `Value::Table` carrying an `__index` answers every metamethod-aware
+/// `Table::get` afresh, so `margin` parsed in the parent's child loop, twice more in
+/// `intrinsic_content_size` and once more in `position_children` was four independent answers to
+/// one question. Measured before this existed: 16 `__index` invocations for one child's margin in
+/// one apply, and a row that measured itself 18 wide then placed its 10-wide child spanning
+/// 16..26, eight pixels outside the parent it had just been sized to fit. No `Signal` involved.
+///
+/// Parsed by the *parent*, in its child loop, for the same reason the property resolve is: a
+/// parent needs a child's `margin` to compute the budget it recurses with, so the one parse has to
+/// happen before the recursion, not at the top of it. `Scene::apply_one_instance` does it for a
+/// surface root, which has no parent. That is item 5's own "same once-per-node guarantee, one
+/// frame further up", applied a second time.
+///
+/// Every field is parsed for every kind, including the ones that kind ignores: `spacing` on a
+/// `text`, `align_h` on a `row`'s child where only `align_v` was ever read. That widens what fails
+/// the pass, deliberately and in the direction docs/adr/0068 already chose -- a malformed geometry
+/// property is now heard about while applying rather than on the day a config changes the node's
+/// kind and the property starts being read. It is the same trade item 5 made knowingly for
+/// resolution ("a getter that raises fails the apply even for a property nothing currently
+/// reads, which is correct").
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LayoutStyle {
+    margin: EdgeInsets,
+    padding: EdgeInsets,
+    width_mode: SizeMode,
+    height_mode: SizeMode,
+    align_h: Align,
+    align_v: Align,
+    spacing: f32,
+    visible: bool,
+    opacity: f32,
+}
+
+impl LayoutStyle {
+    /// The one parse of one node's geometry for one pass. `properties` must already be a
+    /// [`node::resolve_properties`] result: this reads values, it does not resolve signals.
+    fn parse(properties: &HashMap<String, Value>) -> Result<Self, LayoutError> {
+        Ok(Self {
+            margin: node::parse_edge_insets(properties, "margin")?,
+            padding: node::parse_edge_insets(properties, "padding")?,
+            width_mode: node::parse_size_mode(properties, "width")?,
+            height_mode: node::parse_size_mode(properties, "height")?,
+            align_h: node::parse_align(properties, "align_h")?,
+            align_v: node::parse_align(properties, "align_v")?,
+            spacing: node::parse_spacing(properties)?,
+            visible: node::parse_visible(properties)?,
+            opacity: node::parse_opacity(properties)?,
+        })
+    }
+
+    /// Whether this node asked to fill its parent's main axis, and so has to be sized from the
+    /// remainder its siblings leave rather than from the budget it was handed.
+    fn fills(&self, axis: MainAxis) -> bool {
+        let mode = match axis {
+            MainAxis::Horizontal => self.width_mode,
+            MainAxis::Vertical => self.height_mode,
+        };
+        mode == SizeMode::Fill
+    }
+
+    /// This node's margin along `axis`, both edges.
+    fn margin_on(&self, axis: MainAxis) -> f32 {
+        match axis {
+            MainAxis::Horizontal => self.margin.horizontal(),
+            MainAxis::Vertical => self.margin.vertical(),
+        }
+    }
+}
+
 /// The public, ID-less output of one node's resolution: geometry, this node's parsed paint
 /// properties, and a passthrough of the raw property map for the readers that want a Lua value
 /// rather than a parsed one (`hover`, `on_close`, `on_dismiss`, and the surface-role specs
@@ -113,8 +187,10 @@ struct RetainedNode {
     id: NodeId,
     kind: String,
     rect: LogicalRect,
-    visible: bool,
-    opacity: f32,
+    /// This node's geometry, parsed once for the pass that produced it. `visible` and `opacity`
+    /// live in here too, which is why they are no longer separate fields: they were parsed in the
+    /// same place and read by the same passes.
+    style: LayoutStyle,
     properties: HashMap<String, Value>,
     paint: Option<PaintStyle>,
     children: Vec<RetainedNode>,
@@ -125,8 +201,8 @@ impl RetainedNode {
         ResolvedNode {
             kind: self.kind.clone(),
             rect: self.rect,
-            visible: self.visible,
-            opacity: self.opacity,
+            visible: self.style.visible,
+            opacity: self.style.opacity,
             properties: self.properties.clone(),
             paint: self.paint.clone(),
             children: self.children.iter().map(RetainedNode::to_resolved).collect(),
@@ -245,19 +321,43 @@ impl Scene {
         let retiring_snapshot_len = self.retiring.len();
         let surfaces_snapshot = self.surfaces.clone();
 
+        // One budget for the whole pass, not one per getter call (build-steps.md Phase 19 item 5).
+        // It has to be entered out here rather than inside the walk for both of the things it
+        // bounds: the instruction hook stays installed across the gaps between signal evaluations,
+        // where a resolved table's `__index` used to run unhooked, and the deadline spans every
+        // node so a tree of individually-legal 5ms getters cannot add up to an unbounded pass.
+        let budget = match crate::lua::signal::LayoutPassBudget::enter(lua) {
+            Ok(budget) => budget,
+            Err(err) => return Err(node::invalid("layout", err.to_string())),
+        };
+        // Every exit reports a blown budget as a blown budget. Whatever error the walk raised on
+        // the way out is a symptom of it: the hook interrupts whichever `Table::get` or getter
+        // happened to be running, so without this the failure surfaces as an `InvalidProperty`
+        // naming an arbitrary property that is not itself wrong.
+        let blame_the_budget =
+            |outcome: LayoutError| if budget.exceeded() { LayoutError::PassBudgetExceeded } else { outcome };
+
         for instance in instances {
             if let Err(err) = self.apply_one_instance(fresh_surfaces, instance, shaping, lua) {
                 self.surfaces = surfaces_snapshot;
                 self.next_id = next_id_snapshot;
                 self.retiring.truncate(retiring_snapshot_len);
-                return Err(err);
+                return Err(blame_the_budget(err));
             }
         }
         if let Err(err) = admit(self) {
             self.surfaces = surfaces_snapshot;
             self.next_id = next_id_snapshot;
             self.retiring.truncate(retiring_snapshot_len);
-            return Err(err);
+            return Err(blame_the_budget(err));
+        }
+        // A pass that ran over but never tripped the hook (config Lua can catch the hook's error
+        // with `pcall`; it cannot catch this) still fails, and rolls back like any other failure.
+        if budget.exceeded() {
+            self.surfaces = surfaces_snapshot;
+            self.next_id = next_id_snapshot;
+            self.retiring.truncate(retiring_snapshot_len);
+            return Err(LayoutError::PassBudgetExceeded);
         }
         Ok(())
     }
@@ -299,6 +399,10 @@ impl Scene {
         // that needs its `margin` before it can recurse.
         ensure_node_admissible(&fresh.kind, 0)?;
         let properties = node::resolve_properties(&fresh.properties, &fresh.kind, lua)?;
+        // The root's one parse for this pass. Every other node's is done by its parent's child
+        // loop; a surface root has no parent, so this is where item 5's "one frame further up"
+        // runs out of frames.
+        let style = LayoutStyle::parse(&properties)?;
         // **An unsized `window` or `lock` root is its surface** (build-steps.md Phase 22 item 1,
         // Phase 23). A `panel` root sizes itself from § 6.1's `width`/`height`; § 6.2 gives a
         // `window` neither, because a toplevel's size is the compositor's, arriving as an
@@ -322,8 +426,8 @@ impl Scene {
         // because the spec parser rejected the config before the scene ever saw it.
         let forced = if matches!(fresh.kind.as_str(), "window" | "lock") {
             (
-                matches!(node::parse_size_mode(&properties, "width")?, SizeMode::Content).then_some(available.width),
-                matches!(node::parse_size_mode(&properties, "height")?, SizeMode::Content).then_some(available.height),
+                (style.width_mode == SizeMode::Content).then_some(available.width),
+                (style.height_mode == SizeMode::Content).then_some(available.height),
             )
         } else {
             (None, None)
@@ -333,6 +437,7 @@ impl Scene {
             existing,
             &fresh.kind,
             properties,
+            style,
             available,
             shaping,
             forced.0,
@@ -405,12 +510,11 @@ impl Scene {
     /// (`CONTEXT.md`, Lease: "tears down removed subtrees child-first so a parent never frees a
     /// resource a child still holds").
     fn retire_child_first(&mut self, node: RetainedNode) {
-        let RetainedNode { id, kind, rect, visible, opacity, properties, paint, children } = node;
+        let RetainedNode { id, kind, rect, style, properties, paint, children } = node;
         for child in children {
             self.retire_child_first(child);
         }
-        self.retiring
-            .push((id, RetainedNode { id, kind, rect, visible, opacity, properties, paint, children: Vec::new() }));
+        self.retiring.push((id, RetainedNode { id, kind, rect, style, properties, paint, children: Vec::new() }));
     }
 }
 
@@ -511,23 +615,26 @@ fn resolve_non_content(mode: SizeMode, available: f32) -> Option<f32> {
 /// (`own_*_known` is `Some`): when the parent's axis is `Content`-sized, its final size isn't
 /// determined until after this child resolves, so there's nothing to force yet -- `position_children`'s
 /// post-hoc patch is the fallback for that remaining case (docs/adr/0023).
+///
+/// Infallible since the alignments come off the child's already-parsed [`LayoutStyle`] rather than
+/// out of its property map: there is nothing left here that can be malformed.
 fn stretch_forced_size(
     parent_kind: &str,
-    child_properties: &HashMap<String, Value>,
+    child_style: &LayoutStyle,
     own_width_known: Option<f32>,
     own_height_known: Option<f32>,
     margined_budget: LogicalSize,
-) -> Result<(Option<f32>, Option<f32>), LayoutError> {
+) -> (Option<f32>, Option<f32>) {
     match parent_kind {
         "row" => {
-            let cross = node::parse_align(child_properties, "align_v")?;
-            let forced_h = (cross == Align::Stretch && own_height_known.is_some()).then_some(margined_budget.height);
-            Ok((None, forced_h))
+            let forced_h =
+                (child_style.align_v == Align::Stretch && own_height_known.is_some()).then_some(margined_budget.height);
+            (None, forced_h)
         }
         "column" => {
-            let cross = node::parse_align(child_properties, "align_h")?;
-            let forced_w = (cross == Align::Stretch && own_width_known.is_some()).then_some(margined_budget.width);
-            Ok((forced_w, None))
+            let forced_w =
+                (child_style.align_h == Align::Stretch && own_width_known.is_some()).then_some(margined_budget.width);
+            (forced_w, None)
         }
         // The stacking kinds, all four surface roles included: a child aligned `Stretch` on an
         // axis takes the whole margined slot in it (docs/adr/0023 item 4). A `window`'s, a
@@ -536,13 +643,13 @@ fn stretch_forced_size(
         // least conditionally: § 6.4 says a lock surface covers its output, so the tree inside one
         // is full-bleed by definition rather than by an author's choice.
         "rect" | "button" | "panel" | "window" | "popup" | "lock" => {
-            let align_h = node::parse_align(child_properties, "align_h")?;
-            let align_v = node::parse_align(child_properties, "align_v")?;
-            let forced_w = (align_h == Align::Stretch && own_width_known.is_some()).then_some(margined_budget.width);
-            let forced_h = (align_v == Align::Stretch && own_height_known.is_some()).then_some(margined_budget.height);
-            Ok((forced_w, forced_h))
+            let forced_w =
+                (child_style.align_h == Align::Stretch && own_width_known.is_some()).then_some(margined_budget.width);
+            let forced_h =
+                (child_style.align_v == Align::Stretch && own_height_known.is_some()).then_some(margined_budget.height);
+            (forced_w, forced_h)
         }
-        _ => Ok((None, None)),
+        _ => (None, None),
     }
 }
 
@@ -670,35 +777,26 @@ fn main_axis_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Optio
 struct PendingChild {
     reusable: Option<RetainedNode>,
     properties: HashMap<String, Value>,
-    margin: EdgeInsets,
+    style: LayoutStyle,
     budget: LogicalSize,
     /// Whether this child asked to fill its parent's *main* axis, and so has to wait for round two.
     /// Always `false` under a stacking parent, where `Fill` already means the whole box.
     fills_main: bool,
-    visible: bool,
 }
 
 /// This child's extent along `axis` including its margin -- the same number
 /// [`position_children`] calls a footprint and advances its cursor by.
 ///
-/// The margin is passed in rather than re-parsed off `child.properties`, because the remainder this
-/// feeds has to be built from the same margin the child was budgeted with. Re-reading it here would
-/// run a `margin` table's `__index` metamethod a second time and could get a different answer, which
-/// is the class of bug `resolve_properties`' own doc comment exists to describe.
-fn main_axis_footprint(child: &RetainedNode, margin: &EdgeInsets, axis: MainAxis) -> f32 {
+/// The margin comes off the child's own [`LayoutStyle`], which is the same parse the budget it was
+/// sized against came from. Re-parsing it here would run a `margin` table's `__index` metamethod
+/// again and could get a different answer, and then the remainder would be measured against a
+/// margin no child was ever given.
+fn main_axis_footprint(child: &RetainedNode, axis: MainAxis) -> f32 {
     let extent = match axis {
         MainAxis::Horizontal => child.rect.width,
         MainAxis::Vertical => child.rect.height,
     };
-    extent + main_axis_margin(margin, axis)
-}
-
-/// The margin a footprint carries on `axis`, so a forced size can have it subtracted back out.
-fn main_axis_margin(margin: &EdgeInsets, axis: MainAxis) -> f32 {
-    match axis {
-        MainAxis::Horizontal => margin.left + margin.right,
-        MainAxis::Vertical => margin.top + margin.bottom,
-    }
+    extent + child.style.margin_on(axis)
 }
 
 /// Recurses into one child that phase one already resolved.
@@ -722,7 +820,7 @@ fn resolve_pending_child(
     depth: u32,
 ) -> Result<RetainedNode, LayoutError> {
     let (stretch_width, stretch_height) =
-        stretch_forced_size(parent_kind, &child.properties, own_width_known, own_height_known, child.budget)?;
+        stretch_forced_size(parent_kind, &child.style, own_width_known, own_height_known, child.budget);
     let (forced_width, forced_height) = match main_axis {
         Some(MainAxis::Horizontal) => (forced_main.or(stretch_width), stretch_height),
         Some(MainAxis::Vertical) => (stretch_width, forced_main.or(stretch_height)),
@@ -733,6 +831,7 @@ fn resolve_pending_child(
         child.reusable,
         kind,
         child.properties,
+        child.style,
         child.budget,
         shaping,
         forced_width,
@@ -758,11 +857,13 @@ fn resolve_pending_child(
 /// map exactly once for this pass, replacing every `Signal` with its current value. The caller does
 /// that rather than this function, because a parent has to read a child's `margin` to compute the
 /// budget it recurses with, so the one read has to happen in the parent's loop; `apply_one_instance`
-/// does it for a surface root, which has no parent. Everything from here down reads that one map,
-/// so a `Signal` behind a property is read exactly once per node per pass and the sizing and
-/// positioning passes cannot disagree about *it*. They can still disagree about a property whose
-/// resolved value is a plain table with an `__index` metamethod, which every `table.get` re-runs:
-/// see `node::parse_edge_insets`'s `ponytail:`, since `margin` is the property both passes read.
+/// does it for a surface root, which has no parent. `style` arrives the same way and for the same
+/// reason: one [`LayoutStyle::parse`] per node per pass, in the parent's loop.
+///
+/// Together those are both halves of build-steps.md Phase 19 item 5. A `Signal` behind a property
+/// is read once, and the value it resolved to is parsed once, so the sizing and positioning passes
+/// read the same numbers by construction rather than by asking the same question twice and hoping.
+/// A resolved table's `__index` no longer gets a second chance to answer differently.
 // Ten parameters, but each is load-bearing for this single recursive pass (§ 3's "single...
 // pass", see the module doc comment); splitting them into a struct would just be a bag carrying
 // the same ten fields through the same one caller.
@@ -772,6 +873,7 @@ fn resolve_and_reconcile(
     retained: Option<RetainedNode>,
     kind: &str,
     properties: HashMap<String, Value>,
+    style: LayoutStyle,
     available: LogicalSize,
     shaping: &ShapingHandle,
     forced_width: Option<f32>,
@@ -788,17 +890,13 @@ fn resolve_and_reconcile(
     let old_children = retained.map(|r| r.children).unwrap_or_default();
     let id = id.unwrap_or_else(|| scene.alloc_id());
 
-    let padding = node::parse_edge_insets(&properties, "padding")?;
-    let visible = node::parse_visible(&properties)?;
-    let opacity = node::parse_opacity(&properties)?;
-    let width_mode = node::parse_size_mode(&properties, "width")?;
-    let height_mode = node::parse_size_mode(&properties, "height")?;
+    let padding = style.padding;
     // Before `intrinsic_content_size`, which sizes a `text` from the `content` and `font_size`
     // parsed here rather than parsing them a second time.
     let mut paint = node::paint_style(kind, &properties)?;
 
-    let own_width_known = forced_width.or_else(|| resolve_non_content(width_mode, available.width));
-    let own_height_known = forced_height.or_else(|| resolve_non_content(height_mode, available.height));
+    let own_width_known = forced_width.or_else(|| resolve_non_content(style.width_mode, available.width));
+    let own_height_known = forced_height.or_else(|| resolve_non_content(style.height_mode, available.height));
 
     // The wrap boundary a `text` child measures against (§ 3.2: "wraps text bounds when
     // exceeding available width limits"): its own explicit/forced width when known, otherwise
@@ -861,38 +959,35 @@ fn resolve_and_reconcile(
         // this child's own `margin`, and a second read of an impure signal would hand it a budget
         // computed from a value nothing downstream would ever see again.
         let child_properties = node::resolve_properties(&fresh_child.properties, &fresh_child.kind, lua)?;
+        // And this child's one *parse* for this pass, in the same iteration and for the same
+        // reason (build-steps.md Phase 19 item 5). Everything below reads this struct: the budget
+        // here, the remainder in round two, both `intrinsic_content_size` folds, and
+        // `position_children`. None of them can ask the property map again, so none of them can
+        // get a different answer out of an `__index`.
+        let child_style = LayoutStyle::parse(&child_properties)?;
 
         // § 3.1: a child's own margin comes out of the same available-space budget its parent's
         // padding already inset -- subtracted here, per child, since each child can carry a
         // different margin.
-        let child_margin = node::parse_edge_insets(&child_properties, "margin")?;
         let margined_budget = LogicalSize {
-            width: (child_budget.width - child_margin.left - child_margin.right).max(0.0),
-            height: (child_budget.height - child_margin.top - child_margin.bottom).max(0.0),
+            width: (child_budget.width - child_style.margin.horizontal()).max(0.0),
+            height: (child_budget.height - child_style.margin.vertical()).max(0.0),
         };
-        let fills_main = match main_axis {
-            Some(MainAxis::Horizontal) => matches!(node::parse_size_mode(&child_properties, "width")?, SizeMode::Fill),
-            Some(MainAxis::Vertical) => matches!(node::parse_size_mode(&child_properties, "height")?, SizeMode::Fill),
-            None => false,
-        };
-        // Read before the map moves into the struct. Needed here rather than off the resolved
-        // child, because round two's remainder counts visible siblings and a `Fill` child has not
-        // been recursed into yet when that count is taken.
-        let child_visible = node::parse_visible(&child_properties)?;
+        let fills_main = main_axis.is_some_and(|axis| child_style.fills(axis));
         pending.push(PendingChild {
             reusable,
             properties: child_properties,
-            margin: child_margin,
+            style: child_style,
             budget: margined_budget,
             fills_main,
-            visible: child_visible,
         });
     }
 
     // Phase two, round one: every child whose main-axis size does not depend on a sibling.
     // Copied out before the slots are drained: round one consumes each `PendingChild`, and round
-    // two still needs the margin of the siblings it is measuring the remainder against.
-    let child_margins: Vec<EdgeInsets> = pending.iter().map(|child| child.margin).collect();
+    // two still needs the visibility of the siblings it is measuring the remainder against, which
+    // is not on the resolved node yet for a `Fill` child that has not been recursed into.
+    let child_styles: Vec<LayoutStyle> = pending.iter().map(|child| child.style).collect();
     let mut slots: Vec<Option<PendingChild>> = pending.into_iter().map(Some).collect();
     let mut resolved: Vec<Option<RetainedNode>> = (0..slots.len()).map(|_| None).collect();
     for i in 0..slots.len() {
@@ -923,22 +1018,19 @@ fn resolve_and_reconcile(
     if let Some(axis) = main_axis
         && slots.iter().any(Option::is_some)
     {
-        let spacing = node::parse_spacing(&properties)?;
         let content_main = match axis {
             MainAxis::Horizontal => child_budget.width,
             MainAxis::Vertical => child_budget.height,
         };
-        let visible: Vec<bool> = (0..slots.len())
-            .map(|i| slots[i].as_ref().map_or_else(|| resolved[i].as_ref().is_some_and(|c| c.visible), |c| c.visible))
-            .collect();
+        let visible: Vec<bool> = child_styles.iter().map(|child| child.visible).collect();
         let taken: f32 = resolved
             .iter()
             .enumerate()
             .filter(|(i, _)| visible[*i])
             .filter_map(|(i, child)| Some((i, child.as_ref()?)))
-            .map(|(i, child)| main_axis_footprint(child, &child_margins[i], axis))
+            .map(|(_, child)| main_axis_footprint(child, axis))
             .sum();
-        let gaps = spacing * visible.iter().filter(|v| **v).count().saturating_sub(1) as f32;
+        let gaps = style.spacing * visible.iter().filter(|v| **v).count().saturating_sub(1) as f32;
         // Clamped, so fixed children that already overflow their parent collapse the `Fill`
         // children to nothing rather than handing them a negative budget. Matches every other
         // budget in this function, and matches flexbox without `flex-shrink`: the overflow stays
@@ -957,7 +1049,7 @@ fn resolve_and_reconcile(
             // The share is a footprint, and a footprint includes margin -- so the size forced on
             // the child is the share less its own margins, leaving `share` once the positioning
             // pass adds them back.
-            let forced_main = (fill_share - main_axis_margin(&child.margin, axis)).max(0.0);
+            let forced_main = (fill_share - child.style.margin_on(axis)).max(0.0);
             resolved[i] = Some(resolve_pending_child(
                 scene,
                 child,
@@ -993,12 +1085,13 @@ fn resolve_and_reconcile(
     // this the children are placed past the edge of the box meant to contain them (measured live
     // against dev-config, where a padded column reported its child's bare height at both 8px and
     // 50px of padding -- build-steps.md Phase 19 item 14).
-    let intrinsic = intrinsic_content_size(kind, &properties, paint.as_ref(), &new_children, text_wrap_width, shaping)?;
+    let intrinsic =
+        intrinsic_content_size(kind, &properties, &style, paint.as_ref(), &new_children, text_wrap_width, shaping)?;
     let own_width = own_width_known.unwrap_or(intrinsic.width + padding.horizontal());
     let own_height = own_height_known.unwrap_or(intrinsic.height + padding.vertical());
     let size = LogicalSize { width: own_width, height: own_height };
 
-    position_children(kind, &properties, &mut new_children, size, padding, own_width_known, own_height_known)?;
+    position_children(kind, &properties, &style, &mut new_children, size, own_width_known, own_height_known)?;
 
     // After sizing, because the width it fits into is this node's own, and before the node is
     // built, because what it rewrites is the string the display list will carry.
@@ -1008,8 +1101,7 @@ fn resolve_and_reconcile(
         id,
         kind: kind.to_string(),
         rect: LogicalRect { x: 0.0, y: 0.0, width: size.width, height: size.height },
-        visible,
-        opacity,
+        style,
         properties,
         paint,
         children: new_children,
@@ -1033,6 +1125,7 @@ fn flow_kind<'a>(kind: &'a str, properties: &HashMap<String, Value>) -> Result<&
 fn intrinsic_content_size(
     kind: &str,
     properties: &HashMap<String, Value>,
+    style: &LayoutStyle,
     paint: Option<&PaintStyle>,
     children: &[RetainedNode],
     text_wrap_width: f32,
@@ -1078,25 +1171,15 @@ fn intrinsic_content_size(
         "image" => Ok(LogicalSize::default()),
         "rect" if children.is_empty() => Ok(LogicalSize::default()),
         "row" => {
-            let spacing = node::parse_spacing(properties)?;
-            let visible: Vec<&RetainedNode> = children.iter().filter(|c| c.visible).collect();
+            let visible: Vec<&RetainedNode> = children.iter().filter(|c| c.style.visible).collect();
             // § 3.1: a child's margin travels with it -- its footprint on the row's main axis is
             // its own width plus its margin, matching `position_children`'s identical footprint
-            // math (the two must agree, or a child would be sized to fit but then overlap or
-            // leave a gap once positioned).
-            let width = visible
-                .iter()
-                .map(|c| Ok(c.rect.width + node::parse_edge_insets(&c.properties, "margin")?.horizontal()))
-                .collect::<Result<Vec<f32>, LayoutError>>()?
-                .into_iter()
-                .sum::<f32>()
-                + spacing * visible.len().saturating_sub(1) as f32;
-            let height = visible
-                .iter()
-                .map(|c| Ok(c.rect.height + node::parse_edge_insets(&c.properties, "margin")?.vertical()))
-                .collect::<Result<Vec<f32>, LayoutError>>()?
-                .into_iter()
-                .fold(0.0_f32, f32::max);
+            // math. The two must agree, or a child would be sized to fit but then overlap or leave
+            // a gap once positioned, and since item 5 they agree by construction: both read the
+            // one `LayoutStyle` the child was parsed into rather than each parsing it again.
+            let width = visible.iter().map(|c| c.rect.width + c.style.margin.horizontal()).sum::<f32>()
+                + style.spacing * visible.len().saturating_sub(1) as f32;
+            let height = visible.iter().map(|c| c.rect.height + c.style.margin.vertical()).fold(0.0_f32, f32::max);
             Ok(LogicalSize { width, height })
         }
         // `list` sizes exactly like `column` -- ADR-0045 decision 3 and § 5.2 item 7 say nothing
@@ -1114,21 +1197,10 @@ fn intrinsic_content_size(
         //
         // A `list` reaches here too, when its `direction` is `Vertical`.
         "column" => {
-            let spacing = node::parse_spacing(properties)?;
-            let visible: Vec<&RetainedNode> = children.iter().filter(|c| c.visible).collect();
-            let height = visible
-                .iter()
-                .map(|c| Ok(c.rect.height + node::parse_edge_insets(&c.properties, "margin")?.vertical()))
-                .collect::<Result<Vec<f32>, LayoutError>>()?
-                .into_iter()
-                .sum::<f32>()
-                + spacing * visible.len().saturating_sub(1) as f32;
-            let width = visible
-                .iter()
-                .map(|c| Ok(c.rect.width + node::parse_edge_insets(&c.properties, "margin")?.horizontal()))
-                .collect::<Result<Vec<f32>, LayoutError>>()?
-                .into_iter()
-                .fold(0.0_f32, f32::max);
+            let visible: Vec<&RetainedNode> = children.iter().filter(|c| c.style.visible).collect();
+            let height = visible.iter().map(|c| c.rect.height + c.style.margin.vertical()).sum::<f32>()
+                + style.spacing * visible.len().saturating_sub(1) as f32;
+            let width = visible.iter().map(|c| c.rect.width + c.style.margin.horizontal()).fold(0.0_f32, f32::max);
             Ok(LogicalSize { width, height })
         }
         // Stacking model (rect-with-children, button, and the three surface roles): § 3.2 gives no
@@ -1139,19 +1211,9 @@ fn intrinsic_content_size(
         // has a layout model of its own, and both are normally sized explicitly anyway (a `popup`
         // must be, § 6.3).
         _ => {
-            let visible: Vec<&RetainedNode> = children.iter().filter(|c| c.visible).collect();
-            let width = visible
-                .iter()
-                .map(|c| Ok(c.rect.width + node::parse_edge_insets(&c.properties, "margin")?.horizontal()))
-                .collect::<Result<Vec<f32>, LayoutError>>()?
-                .into_iter()
-                .fold(0.0_f32, f32::max);
-            let height = visible
-                .iter()
-                .map(|c| Ok(c.rect.height + node::parse_edge_insets(&c.properties, "margin")?.vertical()))
-                .collect::<Result<Vec<f32>, LayoutError>>()?
-                .into_iter()
-                .fold(0.0_f32, f32::max);
+            let visible: Vec<&RetainedNode> = children.iter().filter(|c| c.style.visible).collect();
+            let width = visible.iter().map(|c| c.rect.width + c.style.margin.horizontal()).fold(0.0_f32, f32::max);
+            let height = visible.iter().map(|c| c.rect.height + c.style.margin.vertical()).fold(0.0_f32, f32::max);
             Ok(LogicalSize { width, height })
         }
     }
@@ -1293,32 +1355,28 @@ fn elide_to_fit(paint: &mut Option<PaintStyle>, content_width: f32, shaping: &Sh
 fn position_children(
     kind: &str,
     properties: &HashMap<String, Value>,
+    style: &LayoutStyle,
     children: &mut [RetainedNode],
     size: LogicalSize,
-    padding: EdgeInsets,
     own_width_known: Option<f32>,
     own_height_known: Option<f32>,
 ) -> Result<(), LayoutError> {
+    let padding = style.padding;
     let content_x = padding.left;
     let content_y = padding.top;
     let content_width = (size.width - padding.left - padding.right).max(0.0);
     let content_height = (size.height - padding.top - padding.bottom).max(0.0);
 
-    let margins: Vec<EdgeInsets> =
-        children.iter().map(|c| node::parse_edge_insets(&c.properties, "margin")).collect::<Result<_, _>>()?;
-
     match flow_kind(kind, properties)? {
         "row" => {
-            let spacing = node::parse_spacing(properties)?;
-            let main_align = node::parse_align(properties, "align_h")?;
+            let main_align = style.align_h;
             let visible_indices: Vec<usize> =
-                children.iter().enumerate().filter(|(_, c)| c.visible).map(|(i, _)| i).collect();
+                children.iter().enumerate().filter(|(_, c)| c.style.visible).map(|(i, _)| i).collect();
             // § 3.1: a child's margin travels with it on the main axis, so a margined child pushes
             // its neighbors apart instead of overlapping them.
-            let footprints: Vec<f32> =
-                (0..children.len()).map(|i| children[i].rect.width + margins[i].left + margins[i].right).collect();
+            let footprints: Vec<f32> = children.iter().map(|c| c.rect.width + c.style.margin.horizontal()).collect();
             let total_main = visible_indices.iter().map(|&i| footprints[i]).sum::<f32>()
-                + spacing * visible_indices.len().saturating_sub(1) as f32;
+                + style.spacing * visible_indices.len().saturating_sub(1) as f32;
             let spare = (content_width - total_main).max(0.0);
             // Subtracted from the cursor, so a scrolled child sits left of the content box and the
             // clip `layout::paint` already computes per node cuts it. Alignment still runs, and is
@@ -1331,29 +1389,27 @@ fn position_children(
                 Align::End => spare,
             } - offset;
             for &i in &visible_indices {
-                let cross_align = node::parse_align(&children[i].properties, "align_v")?;
-                let slot_h = (content_height - margins[i].top - margins[i].bottom).max(0.0);
+                let cross_align = children[i].style.align_v;
+                let slot_h = (content_height - children[i].style.margin.vertical()).max(0.0);
                 let child_h = children[i].rect.height;
                 let y = cross_axis_offset(cross_align, slot_h, child_h);
-                children[i].rect.x = content_x + cursor + margins[i].left;
-                children[i].rect.y = content_y + y + margins[i].top;
+                children[i].rect.x = content_x + cursor + children[i].style.margin.left;
+                children[i].rect.y = content_y + y + children[i].style.margin.top;
                 if cross_align == Align::Stretch && own_height_known.is_none() {
                     children[i].rect.height = slot_h;
                 }
-                cursor += footprints[i] + spacing;
+                cursor += footprints[i] + style.spacing;
             }
         }
         // A `list` reaches here too, when its `direction` is `Vertical` -- `flow_kind` above has
         // already turned it into one of these two names.
         "column" => {
-            let spacing = node::parse_spacing(properties)?;
-            let main_align = node::parse_align(properties, "align_v")?;
+            let main_align = style.align_v;
             let visible_indices: Vec<usize> =
-                children.iter().enumerate().filter(|(_, c)| c.visible).map(|(i, _)| i).collect();
-            let footprints: Vec<f32> =
-                (0..children.len()).map(|i| children[i].rect.height + margins[i].top + margins[i].bottom).collect();
+                children.iter().enumerate().filter(|(_, c)| c.style.visible).map(|(i, _)| i).collect();
+            let footprints: Vec<f32> = children.iter().map(|c| c.rect.height + c.style.margin.vertical()).collect();
             let total_main = visible_indices.iter().map(|&i| footprints[i]).sum::<f32>()
-                + spacing * visible_indices.len().saturating_sub(1) as f32;
+                + style.spacing * visible_indices.len().saturating_sub(1) as f32;
             let spare = (content_height - total_main).max(0.0);
             let offset = scroll_offset(properties, content_height, total_main);
             let mut cursor = match main_align {
@@ -1362,16 +1418,16 @@ fn position_children(
                 Align::End => spare,
             } - offset;
             for &i in &visible_indices {
-                let cross_align = node::parse_align(&children[i].properties, "align_h")?;
-                let slot_w = (content_width - margins[i].left - margins[i].right).max(0.0);
+                let cross_align = children[i].style.align_h;
+                let slot_w = (content_width - children[i].style.margin.horizontal()).max(0.0);
                 let child_w = children[i].rect.width;
                 let x = cross_axis_offset(cross_align, slot_w, child_w);
-                children[i].rect.x = content_x + x + margins[i].left;
-                children[i].rect.y = content_y + cursor + margins[i].top;
+                children[i].rect.x = content_x + x + children[i].style.margin.left;
+                children[i].rect.y = content_y + cursor + children[i].style.margin.top;
                 if cross_align == Align::Stretch && own_width_known.is_none() {
                     children[i].rect.width = slot_w;
                 }
-                cursor += footprints[i] + spacing;
+                cursor += footprints[i] + style.spacing;
             }
         }
         // Stacking model: each child independently aligned within the full content box on both
@@ -1379,18 +1435,17 @@ fn position_children(
         // item 4. Reached by `rect`/`button` and by all three surface roles, matching
         // `intrinsic_content_size`'s catch-all and `stretch_forced_size`'s named arm.
         _ => {
-            for (i, child) in children.iter_mut().enumerate() {
-                if !child.visible {
+            for child in children.iter_mut() {
+                if !child.style.visible {
                     continue;
                 }
-                let align_h = node::parse_align(&child.properties, "align_h")?;
-                let align_v = node::parse_align(&child.properties, "align_v")?;
-                let slot_w = (content_width - margins[i].left - margins[i].right).max(0.0);
-                let slot_h = (content_height - margins[i].top - margins[i].bottom).max(0.0);
+                let (align_h, align_v) = (child.style.align_h, child.style.align_v);
+                let slot_w = (content_width - child.style.margin.horizontal()).max(0.0);
+                let slot_h = (content_height - child.style.margin.vertical()).max(0.0);
                 let x = cross_axis_offset(align_h, slot_w, child.rect.width);
                 let y = cross_axis_offset(align_v, slot_h, child.rect.height);
-                child.rect.x = content_x + x + margins[i].left;
-                child.rect.y = content_y + y + margins[i].top;
+                child.rect.x = content_x + x + child.style.margin.left;
+                child.rect.y = content_y + y + child.style.margin.top;
                 if align_h == Align::Stretch && own_width_known.is_none() {
                     child.rect.width = slot_w;
                 }
@@ -1474,7 +1529,7 @@ mod flow_kind_tests {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::lua::nodes::{deserialize_lua_table, register_node_constructors};
 
@@ -1490,7 +1545,7 @@ mod tests {
         (lua, node)
     }
 
-    fn full() -> LogicalSize {
+    pub(super) fn full() -> LogicalSize {
         LogicalSize { width: 1000.0, height: 500.0 }
     }
 
@@ -1500,7 +1555,7 @@ mod tests {
     /// function takes `SurfaceSpec`s, whose `panel` arm requires a `layer`, and these fixtures
     /// test layout rather than topology; `expand_instances` has its own direct tests in
     /// `layout::instance`.
-    fn apply_at(
+    pub(super) fn apply_at(
         scene: &mut Scene,
         surfaces: &[VirtualNode],
         available: LogicalSize,
@@ -3110,6 +3165,77 @@ mod tests {
         deserialize_lua_table(&table).unwrap()
     }
 
+    /// build-steps.md Phase 19 item 5's first half, and the shape it says the item did not close:
+    /// a plain Lua table with an `__index`, no `Signal` anywhere. Every metamethod-aware
+    /// `Table::get` used to re-run the metamethod, so `margin` was parsed four separate times per
+    /// child per pass and the four answers were free to differ.
+    fn surface_with_an_index_counting_margin(lua: &mlua::Lua) -> VirtualNode {
+        register_node_constructors(lua).unwrap();
+        crate::lua::signal::register(lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua
+            .load(
+                r#"
+                indexes = 0
+                local m = setmetatable({}, { __index = function(_, key)
+                    indexes = indexes + 1
+                    if key == "left" then return indexes end
+                    return 0
+                end })
+                return panel { id = "bar", child = row { children = {
+                    rect { width = 10, height = 10, margin = m },
+                } } }
+                "#,
+            )
+            .eval()
+            .unwrap();
+        deserialize_lua_table(&table).unwrap()
+    }
+
+    /// One parse, four keys. It was 16 invocations before `LayoutStyle`: the parent's child loop,
+    /// both `intrinsic_content_size` folds and `position_children`, each reading `top`, `right`,
+    /// `bottom` and `left` off the same table.
+    #[test]
+    fn a_margin_table_is_read_exactly_once_per_node_per_pass() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        let surface = surface_with_an_index_counting_margin(&lua);
+
+        apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap();
+
+        assert_eq!(
+            lua.globals().get::<u32>("indexes").unwrap(),
+            4,
+            "one `parse_edge_insets` over four keys, not one per reader"
+        );
+    }
+
+    /// The defect that count caused, pinned directly. An `__index` answering `left` with a fresh
+    /// number each read made the sizing pass and the positioning pass disagree: measured before
+    /// this fix, a row measured itself 18 wide and then placed its 10-wide child spanning 16..26,
+    /// eight pixels outside the parent it had just been sized to fit.
+    #[test]
+    fn an_index_metamethod_cannot_make_the_two_passes_disagree() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        let surface = surface_with_an_index_counting_margin(&lua);
+
+        apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap();
+
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        let child = &row.children[0];
+        assert_eq!(
+            child.rect.x + child.rect.width,
+            row.rect.width,
+            "the margin the row was measured with must be the margin its child was positioned with: \
+             the child spans {}..{} inside a {}-wide row",
+            child.rect.x,
+            child.rect.x + child.rect.width,
+            row.rect.width
+        );
+    }
+
     #[test]
     fn an_impure_margin_closure_positions_a_child_inside_the_size_its_parent_was_measured_at() {
         let mut scene = Scene::new();
@@ -3689,5 +3815,82 @@ mod tests {
             apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap_err(),
             LayoutError::UnsupportedNodeKind(k) if k == "dialog"
         ));
+    }
+}
+
+#[cfg(test)]
+mod pass_budget_tests {
+    use super::tests::{apply_at, full};
+    use super::*;
+    use crate::lua::nodes::{deserialize_lua_table, register_node_constructors};
+    use crate::text::shaping::ShapingHandle;
+
+    /// build-steps.md Phase 19 item 5's second half. The config here contains no `Signal` at all:
+    /// a plain table with an `__index` that never returns is Lua the pass runs outside any signal
+    /// evaluation, so ADR-0021's per-getter cap never covered it. Item 5 measured this exact shape
+    /// at 26.10 seconds returning `Ok(())`.
+    ///
+    /// Slow on purpose, and the only test here that is: what it pins is a wall-clock bound, so it
+    /// has to spend it. Roughly `LAYOUT_PASS_CAP`.
+    #[test]
+    fn a_runaway_index_metamethod_fails_the_pass_instead_of_hanging_it() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua
+            .load(
+                r#"
+                local m = setmetatable({}, { __index = function() while true do end end })
+                return panel { id = "bar", child = row { children = {
+                    rect { width = 10, height = 10, margin = m },
+                } } }
+                "#,
+            )
+            .eval()
+            .unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+
+        let started = std::time::Instant::now();
+        let outcome = apply_at(&mut scene, &[surface], full(), &shaping, &lua);
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(outcome, Err(LayoutError::PassBudgetExceeded)),
+            "an unbounded metamethod must blame the budget, not whichever property it was reading: {outcome:?}"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(20), "must be bounded, took {elapsed:?}");
+    }
+
+    /// The failure rolls back like every other one (`CONTEXT.md`, Rollback). A pass refused
+    /// halfway must not leave the scene holding a partly-resolved tree, or the next repaint draws
+    /// it.
+    #[test]
+    fn a_pass_refused_by_the_budget_leaves_the_scene_as_it_was() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+
+        let good: mlua::Table =
+            lua.load(r#"return panel { id = "bar", child = rect { width = 40, height = 10 } }"#).eval().unwrap();
+        apply_at(&mut scene, &[deserialize_lua_table(&good).unwrap()], full(), &shaping, &lua).unwrap();
+        let before = scene.surface("bar@TEST").unwrap().children[0].rect.width;
+
+        let runaway: mlua::Table = lua
+            .load(
+                r#"
+                local m = setmetatable({}, { __index = function() while true do end end })
+                return panel { id = "bar", child = rect { width = 99, height = 10, margin = m } }
+                "#,
+            )
+            .eval()
+            .unwrap();
+        let outcome = apply_at(&mut scene, &[deserialize_lua_table(&runaway).unwrap()], full(), &shaping, &lua);
+
+        assert!(matches!(outcome, Err(LayoutError::PassBudgetExceeded)), "{outcome:?}");
+        assert_eq!(scene.surface("bar@TEST").unwrap().children[0].rect.width, before, "the good tree survives");
     }
 }

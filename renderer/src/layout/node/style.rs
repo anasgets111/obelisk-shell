@@ -94,26 +94,28 @@ pub(super) fn table_number(property: &str, table: &mlua::Table, key: &str) -> Re
     }
 }
 
-/// ponytail: the four `table.get` calls below are metamethod-aware, so a resolved table carrying a
-/// side-effecting `__index` still answers per read, and this parser runs once per consumer of the
-/// property rather than once per node (a child's `margin` is parsed by its parent's child loop,
-/// both `intrinsic_content_size` folds and `position_children`). The *signal* behind it is read
-/// exactly once (build-steps.md Phase 19 item 5), which is the defect that item names; a table
-/// metamethod is a narrower hole. Closing it means parsing each geometry property once into the
-/// retained node too, not just resolving it once.
+/// The four `table.get` calls below are metamethod-aware, so a resolved table carrying a
+/// side-effecting `__index` answers per read rather than per node. That used to matter: this
+/// parser ran once per *consumer* of the property, so a child's `margin` was parsed by its
+/// parent's child loop, by both `intrinsic_content_size` folds and by `position_children`, four
+/// answers to one question with nothing making them agree. Measured then: 16 `__index`
+/// invocations for one child in one pass, and a row that measured itself 18 wide and placed its
+/// 10-wide child spanning 16..26.
 ///
-/// ponytail: those `table.get` calls also run entirely outside ADR-0021's 5ms cap, and so do
-/// `surface::parse_anchor`'s. `CpuBudget` installs its Lua hook inside `Signal::get_value` and drops it on
-/// return (`renderer/src/lua/signal.rs`), so the only Lua a budget ever covers is a signal getter's
-/// own body -- a metamethod this parser triggers afterwards runs unhooked. Measured: a `margin`
-/// table whose `__index` spins 200 million iterations made one `Scene::apply` take 26.10 seconds
-/// and return `Ok(())`, while the identical loop placed inside a `computed` was refused in 5.12ms.
-/// That is reachable from a config using no `Signal` at all, on the thread that also answers
-/// `configure` and runs the VM (docs/adr/0039), so § 1.2's "CPU runtime is capped at 5ms per
-/// evaluation" is a cap on signal evaluation, not on a layout pass. The upgrade path is a budget
-/// spanning the whole pass rather than one per `get_value` call, which would subsume the
-/// per-property budget multiplication [`resolve_properties`]'s own `ponytail:` records; not built
-/// here.
+/// Closed by build-steps.md Phase 19 item 5's second half. `layout::scene`'s `LayoutStyle` parses
+/// every geometry property once per node per pass, in the parent's child loop, and the sizing and
+/// positioning passes read that struct. This function still runs the metamethod, once, which is
+/// what any parser reading a Lua table has to do; what changed is that nothing calls it twice for
+/// the same node.
+///
+/// Those reads also used to run entirely outside ADR-0021's 5ms cap, and so did
+/// `surface::parse_anchor`'s: `CpuBudget` installed its Lua hook inside `Signal::get_value` and
+/// dropped it on return, so the only Lua a budget ever covered was a signal getter's own body.
+/// A `margin` table whose `__index` spins 200 million iterations made one `Scene::apply` take
+/// 26.10 seconds and return `Ok(())`, reachable from a config using no `Signal` at all, on the
+/// thread that also answers `configure` and runs the VM (docs/adr/0039). `lua::signal`'s
+/// `LayoutPassBudget` now holds the hook for the whole pass, so the same config is refused in
+/// 2 seconds with a `LayoutError::PassBudgetExceeded`.
 ///
 /// Scalar shorthand -- a bare number broadcasts to all four edges -- shared by `margin`, `padding`
 /// and `border_width` (docs/build-steps.md Phase 19 item 15). Carries no range check of its own:
@@ -217,8 +219,10 @@ pub fn parse_border_color(properties: &HashMap<String, Value>) -> Result<BorderC
     let Value::Table(table) = value else {
         return Err(invalid("border_color", format!("expected a string or a table, got {}", preview_for_error(value))));
     };
-    // ponytail: `table.get` is metamethod-aware, the same hole [`parse_edge_insets`]'s `ponytail:`
-    // documents for margin/padding -- see that comment for the cost and the upgrade path.
+    // `table.get` is metamethod-aware here too. Unlike margin/padding this was never read twice --
+    // docs/adr/0068 already had `paint_style` parse it once per node -- so all it needed was a
+    // budget to run under, which `lua::signal`'s `LayoutPassBudget` now provides for the whole
+    // pass. See [`parse_edge_insets`] for the measurements.
     let edge = |key: &str| -> Result<Option<Rgba>, LayoutError> {
         let v: Value = table.get(key).map_err(|e| invalid("border_color", e.to_string()))?;
         // Every error this closure raises names the edge, `key`, not just the property --

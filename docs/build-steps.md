@@ -825,6 +825,34 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    nothing beyond the pass it happens in. One pass, one answer per property, which is what makes the
    resolved tree a snapshot rather than four disagreeing reads.
 
+   > **Built, in a later slice.** Both of the two things below now exist, and the paragraph after
+   > this banner is kept as the record of what was missing rather than as a description of today.
+   >
+   > `layout::scene`'s `LayoutStyle` parses every geometry property once per node per pass, in the
+   > same parent loop iteration that resolves the node's signals, and `intrinsic_content_size` and
+   > `position_children` read that struct instead of the property map. Measured before: 16
+   > `__index` invocations for one child's `margin` in one apply, and a row measured 18 wide with
+   > its 10-wide child spanning 16..26. Measured after: 4 invocations, one parse over four keys,
+   > and the child ends exactly at the row's edge. Both numbers are pinned by tests.
+   >
+   > `lua::signal`'s `LayoutPassBudget` holds one deadline for the whole `Scene::apply` and keeps
+   > the instruction hook installed across it, so a metamethod running between signal evaluations
+   > is bounded for the first time. It runs *beside* `CpuBudget` rather than replacing it: the two
+   > deadlines are independent and whichever expires first fails the pass, which keeps § 1.2's 5ms
+   > per evaluation exactly as it was while capping what any number of individually-legal
+   > evaluations can add up to. The 200-million-iteration `__index` measured at 26.10 seconds below
+   > is now refused with a `LayoutError::PassBudgetExceeded`, and the pass rolls back.
+   >
+   > The cap is 2 seconds, and it is loose on purpose. It is a bound on damage rather than a
+   > performance target, and it has to clear legitimate work: a 2000-identified-sibling row (the
+   > shape item 4 above contemplates at up to 4000) measured 202ms and 298ms per apply in release
+   > under parallel test load, and 550ms to 1.10s in debug. 250ms was tried first and refused that
+   > config in both profiles. That 2000 siblings costs 200ms a pass at all is its own problem and
+   > this does not touch it.
+   >
+   > Still not delivered, unchanged: `Scene::apply`'s rollback snapshot. Resolution is still
+   > interleaved with the walk, so a failure at depth still leaves partial mutation to undo.
+
    Two things this item does not deliver, against how the paragraphs above read. The `__index` hole
    stays open, and it is worse than "a signal read twice": a plain Lua table with an `__index`
    reproduces the whole original bug with **no signal involved at all**. `parse_edge_insets` is still

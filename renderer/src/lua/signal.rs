@@ -26,6 +26,35 @@ use crate::lua::marshal;
 /// § 1.2: "CPU runtime is capped at 5ms per evaluation."
 const CPU_CAP: Duration = Duration::from_millis(5);
 
+/// What one whole `Scene::apply` gets, as distinct from what one signal evaluation gets
+/// (build-steps.md Phase 19 item 5: "bounding a whole layout pass rather than each getter call").
+///
+/// A separate, much larger number rather than [`CPU_CAP`] reused, because a legitimate pass is
+/// bigger than a legitimate getter by construction: it runs every getter in the tree and blocks on
+/// the shaping thread once per distinct text measurement. Sized against what a legitimate pass
+/// actually costs, measured rather than guessed, on a 2000-identified-sibling row (the shape
+/// build-steps.md Phase 19 item 4 already contemplates, at up to 4000):
+///
+/// - release, under full parallel test load: 202ms and 298ms;
+/// - debug, same load: 550ms and 1.10s.
+///
+/// 2 seconds is roughly 2x the worst of those and 7x the release figure, and around 300x
+/// docs/adr/0069's 6.14ms for a 500-row list, which is the shape a real config has. A tighter cap
+/// looked defensible until those numbers existed: 250ms fired on that 2000-sibling test in both
+/// profiles, which is a legitimate config being refused.
+///
+/// It is a bound on damage, not a performance target, and it is deliberately far too loose to be
+/// mistaken for one. What it exists to stop is the shape item 5 measured: a `margin` table whose
+/// `__index` spins made one `Scene::apply` run 26.10 seconds and return `Ok(())`, on the thread
+/// that also answers `configure` and runs the VM (docs/adr/0039). Under this the same config gets
+/// one 2 second stall and a `LayoutError` that `oblisk.rescue` can report, instead of a desktop
+/// that never comes back. Turning "forever" into "twice" is the whole of what it buys.
+///
+/// ponytail: 2000 siblings costing 200ms a pass is its own problem, and this cap does not touch
+/// it. At ADR-0044's push cadence that config drops frames whatever the budget says. The number
+/// here has to clear it because it is legal, not because it is fast.
+const LAYOUT_PASS_CAP: Duration = Duration::from_secs(2);
+
 /// One live evaluation's allowance, on both clocks.
 ///
 /// `cpu` is the one § 1.2 specifies and the only one that decides. `wall` is a pre-filter and
@@ -53,9 +82,9 @@ struct Deadline {
 }
 
 impl Deadline {
-    /// [`CPU_CAP`] from now, on both clocks.
-    fn starting_now() -> Self {
-        Self { wall: Instant::now() + CPU_CAP, cpu: thread_cpu_time().map(|used| used + CPU_CAP) }
+    /// `cap` from now, on both clocks.
+    fn lasting(cap: Duration) -> Self {
+        Self { wall: Instant::now() + cap, cpu: thread_cpu_time().map(|used| used + cap) }
     }
 
     fn expired(&self) -> bool {
@@ -110,6 +139,11 @@ const MAX_SIGNAL_NESTING_DEPTH: usize = 32;
 /// The one message both cap gates raise, so a caller matching on it does not have to know which
 /// gate fired (the hook mid-call, or [`CpuBudget::check_not_exceeded`] at the Rust boundary).
 const CPU_CAP_EXCEEDED: &str = "computed/map exceeded its 5ms CPU budget";
+
+/// The message the pass gate raises, kept distinct from [`CPU_CAP_EXCEEDED`] because the two name
+/// different budgets and a config author needs to know which one it blew. Reached by a plain
+/// `__index` metamethod with no signal anywhere, which is exactly the hole this budget closes.
+const LAYOUT_PASS_CAP_EXCEEDED: &str = "the layout pass exceeded its 2s CPU budget";
 
 #[derive(Clone)]
 enum SignalKind {
@@ -628,7 +662,7 @@ struct ScrollRegistry(HashMap<String, Signal>);
 /// evaluation as a whole, not a per-level allowance that resets on every recursive `:get()`.
 ///
 /// `stack[0]` is also, specifically, the *minimum*, so this is `first()` and not `iter().min()`:
-/// every entry is [`Deadline::starting_now`], and entries are pushed and popped strictly LIFO, so
+/// every entry is [`CPU_CAP`] from its own push, and entries are pushed and popped strictly LIFO, so
 /// the vector is non-decreasing and its first element is its minimum. Both clocks are monotonic,
 /// so that holds on each of the pair independently and the argument survived them becoming two.
 /// It matters because the hook runs every [`CHECK_EVERY_N_INSTRUCTIONS`] instructions: `first()`
@@ -636,6 +670,111 @@ struct ScrollRegistry(HashMap<String, Signal>);
 /// it to `last()` either -- that is the per-level reset this design exists to avoid.
 struct CpuBudget<'lua> {
     lua: &'lua Lua,
+}
+
+/// How many live budgets want the instruction hook installed. A [`CpuBudget`] holds one and a
+/// [`LayoutPassBudget`] holds one, and the hook is installed on the 0->1 transition and removed on
+/// the 1->0.
+///
+/// A count rather than [`CpuBudget`]'s own stack depth, because there are now two independent
+/// holders. Keyed on the depth alone, a signal evaluation finishing inside a layout pass took the
+/// stack back to 0 and removed the hook the pass was still relying on, which would have left every
+/// `__index` after the first signal read unbounded again -- the precise hole this exists to close.
+#[derive(Default)]
+struct HookHolders(usize);
+
+/// Installs the instruction hook if this is the first holder. Balanced by [`release_hook`].
+fn acquire_hook(lua: &Lua) -> mlua::Result<()> {
+    if lua.app_data_ref::<HookHolders>().is_none() {
+        lua.set_app_data(HookHolders::default());
+    }
+    let first = lua.app_data_ref::<HookHolders>().expect("just ensured the counter exists").0 == 0;
+    if first {
+        // `set_global_hook`, not `set_hook`: mlua's per-thread hook is keyed by Lua thread, so
+        // a coroutine created by a `computed` body inherited the hook C function from
+        // `lua_newthread` but found no callback for itself and *disabled* the hook on that
+        // thread -- measured 5.75s of uninterrupted Lua inside `coroutine.create`/`resume`,
+        // returning `Ok`. `HookKind::Global` stores one callback on the `Lua` itself, read
+        // whichever thread it fires on, so the inherited hook resolves and covers coroutines.
+        lua.set_global_hook(
+            mlua::HookTriggers { every_nth_instruction: Some(CHECK_EVERY_N_INSTRUCTIONS), ..mlua::HookTriggers::new() },
+            |lua, _| match expired_budget(lua) {
+                Some(message) => Err(mlua::Error::runtime(message)),
+                None => Ok(mlua::VmState::Continue),
+            },
+        )?;
+    }
+    lua.app_data_mut::<HookHolders>().expect("just ensured the counter exists").0 += 1;
+    Ok(())
+}
+
+/// Drops one hook claim, removing the hook when the last holder lets go.
+fn release_hook(lua: &Lua) {
+    let remaining = {
+        let mut holders = lua.app_data_mut::<HookHolders>().expect("acquire_hook always runs before its release");
+        holders.0 = holders.0.saturating_sub(1);
+        holders.0
+    };
+    if remaining == 0 {
+        // Both, in this order: `remove_global_hook` clears the callback so an inheriting
+        // coroutine stops calling back, and `remove_hook` clears the mask on *this* thread
+        // now, so unrelated Lua after a finished evaluation isn't paying for a hook that
+        // would otherwise just no-op.
+        lua.remove_global_hook();
+        lua.remove_hook();
+    }
+}
+
+/// The deadline covering one whole `Scene::apply`, if a pass is in flight.
+#[derive(Default)]
+struct PassDeadline(Option<Deadline>);
+
+/// An RAII claim on [`LAYOUT_PASS_CAP`], held for one entire layout pass rather than for one
+/// getter call (build-steps.md Phase 19 item 5's second half).
+///
+/// It closes two holes at once, and both need the same guard. A resolved table's `__index` runs
+/// through `layout::node`'s metamethod-aware `Table::get` *after* [`CpuBudget`] has returned and
+/// dropped its hook, so it was covered by no budget at all: `while true do end` behind a `margin`
+/// key hung the Wayland dispatch thread with no way out. And ADR-0021's cap is per `get_value`
+/// call, so a tree of margined nodes bought one 5ms budget each and the pass total was unbounded
+/// however many nodes it had.
+///
+/// It does not replace [`CpuBudget`], it runs beside it: [`expired_budget`] fails on whichever of
+/// the two expires first. That keeps § 1.2's per-evaluation 5ms exactly as it was, keeps
+/// [`CpuBudget`]'s LIFO stack strictly non-decreasing so `first()` is still its minimum, and adds
+/// a ceiling on the whole pass that no number of individually-legal evaluations can walk past.
+pub(crate) struct LayoutPassBudget<'lua> {
+    lua: &'lua Lua,
+}
+
+impl<'lua> LayoutPassBudget<'lua> {
+    /// Starts the pass clock and keeps the instruction hook installed for the whole pass, which is
+    /// what puts an `__index` metamethod under a budget for the first time.
+    pub(crate) fn enter(lua: &'lua Lua) -> mlua::Result<Self> {
+        if lua.app_data_ref::<PassDeadline>().is_none() {
+            lua.set_app_data(PassDeadline::default());
+        }
+        // Before the deadline is stored, so a failed install leaves nothing for `Drop` to undo --
+        // the ordering `CpuBudget::enter` uses for the same reason.
+        acquire_hook(lua)?;
+        lua.app_data_mut::<PassDeadline>().expect("just ensured the slot exists").0 =
+            Some(Deadline::lasting(LAYOUT_PASS_CAP));
+        Ok(Self { lua })
+    }
+
+    /// The gate at the Rust boundary, for the same reason [`CpuBudget::check_not_exceeded`] has
+    /// one: the hook raises an ordinary Lua error, and a `pcall` inside a config's `__index` or
+    /// getter can swallow it. Config Lua can catch the hook. It cannot catch this.
+    pub(crate) fn exceeded(&self) -> bool {
+        self.lua.app_data_ref::<PassDeadline>().and_then(|slot| slot.0).is_some_and(|d| d.expired())
+    }
+}
+
+impl Drop for LayoutPassBudget<'_> {
+    fn drop(&mut self) {
+        self.lua.app_data_mut::<PassDeadline>().expect("enter always runs before its Drop").0 = None;
+        release_hook(self.lua);
+    }
 }
 
 impl<'lua> CpuBudget<'lua> {
@@ -656,30 +795,10 @@ impl<'lua> CpuBudget<'lua> {
                 "signal nesting exceeded its maximum depth of {MAX_SIGNAL_NESTING_DEPTH} levels -- a computed/map chain recursing into itself, or a dependency chain that long?"
             )));
         }
-        if depth == 0 {
-            // `set_global_hook`, not `set_hook`: mlua's per-thread hook is keyed by Lua thread, so
-            // a coroutine created by a `computed` body inherited the hook C function from
-            // `lua_newthread` but found no callback for itself and *disabled* the hook on that
-            // thread -- measured 5.75s of uninterrupted Lua inside `coroutine.create`/`resume`,
-            // returning `Ok`. `HookKind::Global` stores one callback on the `Lua` itself, read
-            // whichever thread it fires on, so the inherited hook resolves and covers coroutines.
-            lua.set_global_hook(
-                mlua::HookTriggers {
-                    every_nth_instruction: Some(CHECK_EVERY_N_INSTRUCTIONS),
-                    ..mlua::HookTriggers::new()
-                },
-                |lua, _| {
-                    if governing_deadline_expired(lua) {
-                        Err(mlua::Error::runtime(CPU_CAP_EXCEEDED))
-                    } else {
-                        Ok(mlua::VmState::Continue)
-                    }
-                },
-            )?;
-        }
+        acquire_hook(lua)?;
         lua.app_data_mut::<Vec<Deadline>>()
             .expect("just ensured the deadline stack exists")
-            .push(Deadline::starting_now());
+            .push(Deadline::lasting(CPU_CAP));
         Ok(Self { lua })
     }
 
@@ -698,39 +817,35 @@ impl<'lua> CpuBudget<'lua> {
     /// upgrade path is the generation-swap process boundary (docs/adr/0039), which can kill a
     /// wedged renderer outright.
     fn check_not_exceeded(&self) -> mlua::Result<()> {
-        if governing_deadline_expired(self.lua) {
-            return Err(mlua::Error::runtime(CPU_CAP_EXCEEDED));
+        match expired_budget(self.lua) {
+            Some(message) => Err(mlua::Error::runtime(message)),
+            None => Ok(()),
         }
-        Ok(())
     }
 }
 
 impl Drop for CpuBudget<'_> {
     fn drop(&mut self) {
-        let remaining = {
-            let mut stack =
-                self.lua.app_data_mut::<Vec<Deadline>>().expect("CpuBudget::enter always runs before its Drop");
-            stack.pop();
-            stack.len()
-        };
-        if remaining == 0 {
-            // Both, in this order: `remove_global_hook` clears the callback so an inheriting
-            // coroutine stops calling back, and `remove_hook` clears the mask on *this* thread
-            // now, so unrelated Lua after a finished evaluation isn't paying for a hook that
-            // would otherwise just no-op.
-            self.lua.remove_global_hook();
-            self.lua.remove_hook();
-        }
+        self.lua.app_data_mut::<Vec<Deadline>>().expect("CpuBudget::enter always runs before its Drop").pop();
+        release_hook(self.lua);
     }
 }
 
-/// Whether the outermost live [`CpuBudget`]'s deadline has passed. `first()`, not `min()` or
-/// `last()`: see [`CpuBudget`]'s doc comment for why. An empty stack (no evaluation in flight) is
-/// never expired, which is what lets [`CpuBudget::enter`] install the hook before its first push.
-fn governing_deadline_expired(lua: &Lua) -> bool {
-    lua.app_data_ref::<Vec<Deadline>>()
-        .and_then(|stack| stack.first().copied())
-        .is_some_and(|deadline| deadline.expired())
+/// Which budget, if either, has run out: the message to raise, or `None` to keep going.
+///
+/// Two independent deadlines, and the earlier one wins. The signal deadline is the outermost live
+/// [`CpuBudget`]'s -- `first()`, not `min()` or `last()`, see that type's doc comment for why. The
+/// pass deadline is [`LayoutPassBudget`]'s, which is not in that stack precisely so the stack stays
+/// non-decreasing and `first()` stays O(1) and correct. Neither present (no evaluation and no pass
+/// in flight) is never expired, which is what lets [`acquire_hook`] install the hook before the
+/// first deadline is stored.
+fn expired_budget(lua: &Lua) -> Option<&'static str> {
+    let signal = lua.app_data_ref::<Vec<Deadline>>().and_then(|stack| stack.first().copied());
+    if signal.is_some_and(|deadline| deadline.expired()) {
+        return Some(CPU_CAP_EXCEEDED);
+    }
+    let pass = lua.app_data_ref::<PassDeadline>().and_then(|slot| slot.0);
+    pass.filter(Deadline::expired).map(|_| LAYOUT_PASS_CAP_EXCEEDED)
 }
 
 /// The one answer to "does this Lua userdata resolve like a signal?", and the `Signal` to

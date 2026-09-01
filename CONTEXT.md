@@ -96,6 +96,14 @@ _Avoid_: reload apply, tree diff
 A grace period that keeps a removed node's GPU resource alive past its removal from the retained scene, until whatever still needs it (a wallpaper crossfade, an in-flight transition) finishes consuming it. Child-first cleanup runs once the lease expires.
 _Avoid_: keepalive, grace period
 
+**Resolved style**:
+One node's geometry properties, parsed into typed values exactly once per layout pass and read by every pass that follows. A node's parent produces it in the same loop iteration that resolves the node's signals, because the parent needs the child's margin before it can hand it a budget; a surface root's is produced by the transaction itself. It exists because a resolved property is still a Lua value, and a table carrying an `__index` answers each read separately, so parsing the same property in the sizing pass and again in the positioning pass let the two disagree about one node's margin.
+_Avoid_: style (ambiguous: also the paint properties), computed style, layout cache
+
+**Layout pass budget**:
+The single CPU deadline covering one whole retained-scene transaction, as opposed to the per-evaluation cap that bounds one signal getter. It is what puts a resolved table's `__index` metamethod under a limit at all, since that runs between signal evaluations rather than inside one, and it is what stops a tree of individually-legal getters adding up to an unbounded pass. Exceeding it fails the transaction and rolls it back, like any other layout error.
+_Avoid_: frame budget (a different thing: how long a repaint may take), CPU cap (the per-evaluation one)
+
 **Paint pass**:
 The walk over one surface instance's resolved geometry that emits its draw calls and swaps its buffer. Runs per surface instance, never across them, and reads the retained scene without changing it. Distinct from the layout passes, which decide geometry; the paint pass only consumes what they resolved.
 _Avoid_: render pass (ambiguous: also a GPU term), draw loop, frame

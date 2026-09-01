@@ -137,6 +137,17 @@ pub enum LayoutError {
         "node tree exceeds the maximum depth of {max} levels (at `{kind}`, level {depth}) -- a node holding itself in `children`?"
     )]
     TreeTooDeep { kind: String, depth: u32, max: u32 },
+    /// build-steps.md Phase 19 item 5's second half: one whole `Scene::apply` ran past
+    /// `lua::signal`'s `LAYOUT_PASS_CAP`.
+    ///
+    /// Distinct from the `InvalidProperty` a blown per-getter budget produces, because the two
+    /// name different limits and only this one can be reached with no `Signal` in the config at
+    /// all -- a resolved table's `__index` metamethod is Lua the pass runs outside any signal
+    /// evaluation, and until this existed it was bounded by nothing.
+    #[error(
+        "the layout pass exceeded its CPU budget -- a property getter or an `__index` metamethod that does not return?"
+    )]
+    PassBudgetExceeded,
 }
 
 /// `pub(crate)` rather than private since build-steps.md Phase 20 item 4: `layout::scene`'s

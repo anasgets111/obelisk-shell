@@ -33,6 +33,27 @@
 > `Lua::set_global_hook` covers the second. The first needs a second gate at the Rust boundary,
 > after the call returns, that a config cannot catch. Until both land, treat ADR-0039's third
 > bounding argument as weaker than it reads.
+>
+> **The two gaps in the second paragraph are now closed, and not by changing this cap.** A layout
+> pass holds its own deadline, `lua::signal`'s `LayoutPassBudget`, entered by `Scene::apply` and
+> held until it returns. It keeps the instruction hook installed across the whole pass, which is
+> what finally puts a resolved table's `__index` under a limit: that metamethod runs between signal
+> evaluations, not inside one, so no per-`get_value` budget could ever have reached it. And because
+> one deadline spans the pass, four signal-valued properties no longer buy four independent 5ms
+> budgets.
+>
+> Two independent deadlines rather than one, and the earlier expiry wins. Folding the pass into
+> this ADR's stack would have broken the invariant the stack rests on: entries are pushed strictly
+> LIFO and each is `CPU_CAP` from its own push, so the vector is non-decreasing and `first()` is
+> its minimum in O(1). A longer pass deadline pushed underneath a shorter signal one destroys that.
+> Keeping them apart leaves § 1.2's 5ms per evaluation exactly as specified and adds a ceiling on
+> the pass that no number of individually-legal evaluations can walk past. The hook's callback and
+> the Rust-boundary gate both consult whichever expired, and say which.
+>
+> The instruction hook is now shared, so its install and removal are refcounted rather than keyed
+> on this stack's depth. Keyed on the depth, a signal evaluation finishing inside a layout pass
+> took the stack to 0 and removed the hook the pass still needed, which would have left every
+> metamethod after the first signal read unbounded again.
 
 Phase 10's title ("Lua VM Bootstrap & the Loader") and its build-steps.md text scope a real
 `mlua` VM instantiation and the loader: Lua evaluation of `shell.lua` into a node tree and
