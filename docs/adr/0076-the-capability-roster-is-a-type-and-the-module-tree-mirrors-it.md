@@ -1,5 +1,34 @@
 # The capability roster is a type, and the module tree mirrors it
 
+> **The "two arms" this ADR settled for were one short, and it is now three.** Decision 1's last
+> paragraph says a line added to `roster!` "fails the build in two places and nowhere else, which
+> was verified by adding one and reading the errors". That verification was right and the
+> conclusion drawn from it was too narrow. The 2026-09-01 review added `Probe => "probe"` again,
+> filled in the two arms it broke with `{}`, and the whole workspace built clean, leaving a
+> capability with a Lua member, generated stubs, a schema-check entry, a live controller and
+> working command dispatch, and no channel to answer on. Its member reads `nil` forever, which is
+> the exact failure the paragraph above this one describes as the reason the roster became an enum.
+>
+> Two of the three things this module's doc comment says a capability does were guarded. The third,
+> the push, was not, because the channel bundle is four more hand-written lists (`Signals`,
+> `Senders`, `Signals::next`, and the pairs `Capabilities::new` builds) and nothing tied any of
+> them to the roster. Two of those lists had already drifted out of roster order, harmlessly, which
+> is the tell: nothing was holding them together.
+>
+> `capabilities::capability_channels!` now derives all four from one list, and emits an otherwise
+> unused `every_capability_has_a_channel_row` that matches `Capability` exhaustively, so a roster
+> variant with neither a channel nor a stated reason for having none is an `E0004` naming that
+> list. `lock` is the one stated exception, for docs/adr/0060's and docs/adr/0052's reasons.
+>
+> Walked rather than assumed, by adding `Probe` a third time: the roster edit now fails in three
+> places at once; writing a channel row for it then fails on the `Signal` variant that row names
+> not existing; adding that variant then fails `push`. Four refusals end to end, each naming the
+> next thing to write. 50 lines of hand-written repetition went with them.
+>
+> `Signal` stays hand-written on purpose. Its variants encode which payload travels and which
+> collapses to a unit, with a comment per decision, and `push`'s exhaustive match already guards
+> it. Generating it would trade real documentation for punctuation and guard nothing new.
+
 The 2026-09-01 architecture review asked what makes a capability cheap to add. The answer was that
 nothing did: `run_supervisor` was one ~800-line function, and it was the only scope where sixteen
 controllers and twenty channels coexisted. Every capability was five locals in that function, so

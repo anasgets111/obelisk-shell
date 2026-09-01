@@ -137,76 +137,123 @@ pub enum Signal {
     Updates,
 }
 
-/// The receiving half of every capability channel: what the main loop awaits.
-pub struct Signals {
-    audio: UnboundedReceiver<AudioState>,
-    network: UnboundedReceiver<NetworkSignal>,
-    bluetooth: UnboundedReceiver<BluetoothSignal>,
-    tray: UnboundedReceiver<TraySignal>,
-    mpris: UnboundedReceiver<MprisSignal>,
-    notifications: UnboundedReceiver<NotificationsSignal>,
-    sysinfo: UnboundedReceiver<SysinfoSignal>,
-    keyboard: UnboundedReceiver<KeyboardSignal>,
-    battery: UnboundedReceiver<BatterySignal>,
-    brightness: UnboundedReceiver<BrightnessSignal>,
-    workspaces: UnboundedReceiver<WorkspacesSignal>,
-    power: UnboundedReceiver<PowerSignal>,
-    applications: UnboundedReceiver<ApplicationsSignal>,
-    system: UnboundedReceiver<SystemSignal>,
-    privacy: UnboundedReceiver<PrivacySignal>,
-    updates: UnboundedReceiver<UpdatesSignal>,
-}
-
-impl Signals {
-    /// Awaits whichever capability speaks first. Cancel-safe: every branch is a bare `recv()`.
-    ///
-    /// `None` only once every sender is dropped, which cannot happen while [`Capabilities`] is
-    /// alive -- it holds one of each. The main loop's `select!` therefore never disables this
-    /// branch, and a capability the config never reads simply keeps a sender nobody sends on.
-    pub async fn next(&mut self) -> Option<Signal> {
-        // Single-variant `Changed` signals collapse to a unit `Signal`; the two that carry
-        // meaning (`network`, `bluetooth`) and the one that carries a payload (`audio`) keep it.
-        tokio::select! {
-            Some(state) = self.audio.recv() => Some(Signal::Audio(state)),
-            Some(signal) = self.network.recv() => Some(Signal::Network(signal)),
-            Some(signal) = self.bluetooth.recv() => Some(Signal::Bluetooth(signal)),
-            Some(TraySignal::RegistryChanged) = self.tray.recv() => Some(Signal::Tray),
-            Some(MprisSignal::Changed) = self.mpris.recv() => Some(Signal::Mpris),
-            Some(NotificationsSignal::Changed) = self.notifications.recv() => Some(Signal::Notifications),
-            Some(SysinfoSignal::Changed) = self.sysinfo.recv() => Some(Signal::Sysinfo),
-            Some(KeyboardSignal::Changed) = self.keyboard.recv() => Some(Signal::Keyboard),
-            Some(BatterySignal::Changed) = self.battery.recv() => Some(Signal::Battery),
-            Some(BrightnessSignal::Changed) = self.brightness.recv() => Some(Signal::Brightness),
-            Some(WorkspacesSignal::Changed) = self.workspaces.recv() => Some(Signal::Workspaces),
-            Some(PowerSignal::Changed) = self.power.recv() => Some(Signal::Power),
-            Some(ApplicationsSignal::Changed) = self.applications.recv() => Some(Signal::Applications),
-            Some(SystemSignal::Changed) = self.system.recv() => Some(Signal::System),
-            Some(PrivacySignal::Changed) = self.privacy.recv() => Some(Signal::Privacy),
-            Some(UpdatesSignal::Changed) = self.updates.recv() => Some(Signal::Updates),
-            else => None,
+/// Declares every capability channel once, and derives from that one list the receiving half
+/// ([`Signals`]), the sending half ([`Senders`]), the cancel-safe [`Signals::next`] that races
+/// them, and the constructor that builds every pair.
+///
+/// A macro rather than four hand-kept lists, for the reason ADR-0076 gave for making the roster an
+/// enum: the failure it removes is a specific one, and it was measured rather than imagined. Add a
+/// variant to `shared::Capability` and exactly two things fail to compile, [`Capabilities::start`]
+/// and [`Capabilities::dispatch`]. Fill those two in and the whole workspace builds clean, with a
+/// capability that has a Lua member, generated stubs, a schema-check entry, a controller and
+/// command dispatch, and no way to push a `StateSnapshot` at all. Its member reads `nil` forever.
+/// That is the same silent failure ADR-0076 exists to kill, still open for the third of the three
+/// things this module's doc comment says a capability does.
+///
+/// So the `without_channel` section is not decoration. Every roster variant appears in one section
+/// or the other, and [`every_capability_has_a_channel_row`] matches over `shared::Capability`
+/// exhaustively to prove it, which makes a missing row an `E0004` naming this list.
+///
+/// `Signal` itself stays hand-written above. Its variants carry a real decision each -- which
+/// payload travels and which collapses to a unit -- and doc comments explaining them, which a
+/// macro row would flatten into punctuation. It is guarded anyway, by [`Capabilities::push`]'s
+/// exhaustive match over it.
+///
+/// The chain that leaves is walked rather than assumed. Adding a roster variant now fails in three
+/// places at once, `start`, `dispatch` and [`every_capability_has_a_channel_row`]. Writing a
+/// channel row for it then fails on the `Signal` variant that row names not existing. Adding that
+/// variant then fails `push`, which has to say what the capability answers with. Four refusals
+/// end to end, each naming the next thing to write, where before the third onwards was silence.
+macro_rules! capability_channels {
+    (
+        channels {
+            $($variant:ident => $field:ident : $payload:ty, $pattern:pat => $signal:expr;)+
         }
-    }
+        without_channel { $($no_channel:ident),* $(,)? }
+    ) => {
+        /// The receiving half of every capability channel: what the main loop awaits.
+        pub struct Signals {
+            $($field: UnboundedReceiver<$payload>,)+
+        }
+
+        /// The sending half, handed to each controller as it is constructed.
+        struct Senders {
+            $($field: UnboundedSender<$payload>,)+
+        }
+
+        impl Senders {
+            /// Every channel, both halves. One `unbounded_channel()` per roster entry that has one.
+            fn channels() -> (Self, Signals) {
+                // One binding per field holding both halves, then each struct takes its own.
+                // Partially moving a tuple is what lets the two `$field` repetitions stay separate
+                // without a second metavariable to name the receiver.
+                $(let $field = unbounded_channel();)+
+                (Self { $($field: $field.0,)+ }, Signals { $($field: $field.1,)+ })
+            }
+        }
+
+        impl Signals {
+            /// Awaits whichever capability speaks first. Cancel-safe: every branch is a bare
+            /// `recv()`.
+            ///
+            /// `None` only once every sender is dropped, which cannot happen while
+            /// [`Capabilities`] is alive -- it holds one of each. The main loop's `select!`
+            /// therefore never disables this branch, and a capability the config never reads
+            /// simply keeps a sender nobody sends on.
+            pub async fn next(&mut self) -> Option<Signal> {
+                tokio::select! {
+                    $($pattern = self.$field.recv() => Some($signal),)+
+                    else => None,
+                }
+            }
+        }
+
+        /// Never called. It exists so that a roster variant with neither a channel nor a stated
+        /// reason for having none is a build failure at this list, rather than a capability that
+        /// starts, accepts commands, and can never answer.
+        #[allow(dead_code)]
+        fn every_capability_has_a_channel_row(capability: Capability) {
+            match capability {
+                $(Capability::$variant => {})+
+                $(Capability::$no_channel => {})*
+            }
+        }
+    };
 }
 
-/// The sending half, handed to each controller as it is constructed.
-struct Senders {
-    audio: UnboundedSender<AudioState>,
-    network: UnboundedSender<NetworkSignal>,
-    bluetooth: UnboundedSender<BluetoothSignal>,
-    tray: UnboundedSender<TraySignal>,
-    mpris: UnboundedSender<MprisSignal>,
-    notifications: UnboundedSender<NotificationsSignal>,
-    sysinfo: UnboundedSender<SysinfoSignal>,
-    keyboard: UnboundedSender<KeyboardSignal>,
-    battery: UnboundedSender<BatterySignal>,
-    brightness: UnboundedSender<BrightnessSignal>,
-    workspaces: UnboundedSender<WorkspacesSignal>,
-    power: UnboundedSender<PowerSignal>,
-    applications: UnboundedSender<ApplicationsSignal>,
-    system: UnboundedSender<SystemSignal>,
-    privacy: UnboundedSender<PrivacySignal>,
-    updates: UnboundedSender<UpdatesSignal>,
-    idle: UnboundedSender<shared::IdleEvent>,
+capability_channels! {
+    channels {
+        // Carries its payload rather than naming a controller: the mixer thread sends state, it is
+        // not read back off one.
+        Audio => audio: AudioState, Some(state) => Signal::Audio(state);
+        // The two that carry meaning: their controller owns the signal's state semantics
+        // (ADR-0037) and is handed the value in `push`.
+        Network => network: NetworkSignal, Some(signal) => Signal::Network(signal);
+        Bluetooth => bluetooth: BluetoothSignal, Some(signal) => Signal::Bluetooth(signal);
+        // The rest are single-variant `Changed` signals, matched against that one variant and
+        // collapsed to a unit `Signal`: there is nothing in them to carry.
+        Tray => tray: TraySignal, Some(TraySignal::RegistryChanged) => Signal::Tray;
+        Mpris => mpris: MprisSignal, Some(MprisSignal::Changed) => Signal::Mpris;
+        Notifications => notifications: NotificationsSignal,
+            Some(NotificationsSignal::Changed) => Signal::Notifications;
+        Sysinfo => sysinfo: SysinfoSignal, Some(SysinfoSignal::Changed) => Signal::Sysinfo;
+        Keyboard => keyboard: KeyboardSignal, Some(KeyboardSignal::Changed) => Signal::Keyboard;
+        Privacy => privacy: PrivacySignal, Some(PrivacySignal::Changed) => Signal::Privacy;
+        Updates => updates: UpdatesSignal, Some(UpdatesSignal::Changed) => Signal::Updates;
+        Battery => battery: BatterySignal, Some(BatterySignal::Changed) => Signal::Battery;
+        System => system: SystemSignal, Some(SystemSignal::Changed) => Signal::System;
+        Brightness => brightness: BrightnessSignal, Some(BrightnessSignal::Changed) => Signal::Brightness;
+        Workspaces => workspaces: WorkspacesSignal, Some(WorkspacesSignal::Changed) => Signal::Workspaces;
+        Power => power: PowerSignal, Some(PowerSignal::Changed) => Signal::Power;
+        Applications => applications: ApplicationsSignal,
+            Some(ApplicationsSignal::Changed) => Signal::Applications;
+    }
+    // `lock` is the one roster entry with no signal channel, and it is deliberate rather than
+    // missing. Its controller is built at boot in `main.rs`, not here, because the Supervisor's own
+    // relock path commands it before any config has read anything (docs/adr/0060); it reports
+    // through the `LockOutcome` frames `main.rs` already handles, not through a `StateSnapshot`
+    // this module pushes (docs/adr/0052 decision 4).
+    without_channel { Lock }
 }
 
 /// Every controller that starts on demand, plus what starting one needs.
@@ -235,6 +282,11 @@ pub struct Capabilities {
     idle: Option<IdleController>,
 
     senders: Senders,
+    /// `idle` is not a roster entry and has no [`Senders`] field: it is event-shaped rather than
+    /// snapshot state (ADR-0032), so it never pushes a `StateSnapshot` and its events go straight
+    /// to `main.rs`'s own receiver. Kept here rather than in the generated bundle so the generated
+    /// bundle stays exactly the roster.
+    idle_tx: UnboundedSender<shared::IdleEvent>,
     /// The Supervisor's system bus, shared by every controller that rides it (ADR-0034). The three
     /// session-bus capabilities open their own.
     connection: zbus::Connection,
@@ -253,22 +305,7 @@ impl Capabilities {
         sound_tx: std::sync::mpsc::Sender<PathBuf>,
         idle_tx: UnboundedSender<shared::IdleEvent>,
     ) -> (Self, Signals) {
-        let (audio_tx, audio) = unbounded_channel();
-        let (network_tx, network) = unbounded_channel();
-        let (bluetooth_tx, bluetooth) = unbounded_channel();
-        let (tray_tx, tray) = unbounded_channel();
-        let (mpris_tx, mpris) = unbounded_channel();
-        let (notifications_tx, notifications) = unbounded_channel();
-        let (sysinfo_tx, sysinfo) = unbounded_channel();
-        let (keyboard_tx, keyboard) = unbounded_channel();
-        let (battery_tx, battery) = unbounded_channel();
-        let (brightness_tx, brightness) = unbounded_channel();
-        let (workspaces_tx, workspaces) = unbounded_channel();
-        let (power_tx, power) = unbounded_channel();
-        let (applications_tx, applications) = unbounded_channel();
-        let (system_tx, system) = unbounded_channel();
-        let (privacy_tx, privacy) = unbounded_channel();
-        let (updates_tx, updates) = unbounded_channel();
+        let (senders, signals) = Senders::channels();
         let (video_tx, video_sources) = unbounded_channel();
 
         let capabilities = Self {
@@ -289,47 +326,12 @@ impl Capabilities {
             applications: None,
             audio: None,
             idle: None,
-            senders: Senders {
-                audio: audio_tx,
-                network: network_tx,
-                bluetooth: bluetooth_tx,
-                tray: tray_tx,
-                mpris: mpris_tx,
-                notifications: notifications_tx,
-                sysinfo: sysinfo_tx,
-                keyboard: keyboard_tx,
-                battery: battery_tx,
-                brightness: brightness_tx,
-                workspaces: workspaces_tx,
-                power: power_tx,
-                applications: applications_tx,
-                system: system_tx,
-                privacy: privacy_tx,
-                updates: updates_tx,
-                idle: idle_tx,
-            },
+            senders,
+            idle_tx,
             connection,
             sound_tx,
             video_tx: Some(video_tx),
             video_sources: Some(video_sources),
-        };
-        let signals = Signals {
-            audio,
-            network,
-            bluetooth,
-            tray,
-            mpris,
-            notifications,
-            sysinfo,
-            keyboard,
-            battery,
-            brightness,
-            workspaces,
-            power,
-            applications,
-            system,
-            privacy,
-            updates,
         };
         (capabilities, signals)
     }
@@ -541,7 +543,7 @@ impl Capabilities {
     /// `spawn_blocking` task (`idle`'s module doc) cannot block the control socket.
     pub async fn start_idle(&mut self) {
         if self.idle.is_none() {
-            self.idle = Some(IdleController::new(self.connection.clone(), self.senders.idle.clone()).await);
+            self.idle = Some(IdleController::new(self.connection.clone(), self.idle_tx.clone()).await);
         }
     }
 
