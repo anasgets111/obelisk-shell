@@ -16,7 +16,7 @@
 ---@field id string Unique. A surface targeting several outputs is one Wayland surface per output, addressed as `"{id}@{output}"`.
 ---@field layer "Background"|"Bottom"|"Top"|"Overlay" Required, no default: a typo'd layer that quietly stacked a bar on `Background` would be worse than an error.
 ---@field anchor? { top?: boolean, bottom?: boolean, left?: boolean, right?: boolean }
----@field exclusive? boolean Reserves screen area along the anchored edge, derived from the height the compositor configures.
+---@field exclusive? boolean|"Ignore" `true` reserves screen area along the anchored edge, derived from the size the compositor configures. `false` (default) reserves none but still sits inside what other surfaces reserved. `"Ignore"` reserves none and ignores theirs, which is what a full-screen wallpaper needs to stay behind a bar rather than below it.
 ---@field margin? Edges Offsets from the anchored edges. Moves the surface itself, unlike `padding`.
 ---@field monitor? string An output name, or `"All"`.
 ---@field namespace? string What the compositor sees, for rules like Hyprland's `layerrule`. Defaults to `"oblisk-{id}"`.

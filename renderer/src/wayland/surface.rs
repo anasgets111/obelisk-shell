@@ -1210,7 +1210,7 @@ mod tests {
                 namespace: format!("oblisk-{id}"),
             },
             keyboard_interactivity: node::KeyboardInteractivity::None,
-            exclusive: true,
+            exclusive: node::Exclusive::Reserve,
             margin: node::EdgeInsets::default(),
             width: SizeMode::Fill,
             height: SizeMode::Pixels(32.0),

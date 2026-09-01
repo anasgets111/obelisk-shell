@@ -1,5 +1,10 @@
 # Surfaces come from `shell.lua`, not a fixed set of Rust-owned roles
 
+> **`exclusive` is no longer a boolean.** docs/adr/0078 gives it a third value, `"Ignore"`, for
+> layer-shell's `-1`: reserve nothing *and* ignore what other surfaces reserved. Decision 2's
+> in-place list is unchanged and so is everything else here -- `set_exclusive_zone` was already on
+> it, and the third value travels the same live-surface path the other two do.
+
 > Decision 2 is amended by ADR-0049. "Created once, at startup" holds for `panel`, the only role
 > that existed when this was written, and for `lock`. It cannot hold for the `popup` and `window`
 > roles ADR-0040 added: `xdg_popup` requires its grab before mapping with the serial of a real

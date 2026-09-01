@@ -515,7 +515,7 @@ A layer-shell surface container (`zwlr_layer_surface_v1`). Formerly named `surfa
 *   `id`: `string` (Unique window identifier. A surface targeting several outputs produces one Wayland surface per output, addressed as `"{id}@{output}"`)
 *   `layer`: `string` (`"Background"`, `"Bottom"`, `"Top"`, `"Overlay"`)
 *   `anchor`: `table` (`{ top, bottom, left, right }` edge booleans)
-*   `exclusive`: `boolean` (Reserves physical screen area for bar if true)
+*   `exclusive`: `boolean` / `string` (`true` reserves physical screen area along the anchored edge, sized from the surface. `false` (default) reserves none, but the compositor still keeps the surface inside the area other surfaces reserved. `"Ignore"` reserves none and ignores what others reserved, so the surface covers the whole output; a full-screen wallpaper needs it, because a surface anchored to all four edges has no single edge to reserve against and so gets nothing from `true`. These are layer-shell's three exclusive-zone cases: a positive zone, `0`, and `-1`)
 *   `height`: `integer` / `string` (Explicit height or `"Fill"`)
 *   `width`: `integer` / `string` (Explicit width or `"Fill"`)
 *   `margin`: `table` (`{ top, right, bottom, left }` offsets from the anchored edges. Distinct from a node's `padding`, which is inside the surface: `margin` moves the surface itself, so a floating panel inset from a screen edge needs it)

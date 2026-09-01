@@ -136,25 +136,68 @@ pub fn parse_keyboard_interactivity(properties: &HashMap<String, Value>) -> Resu
     }
 }
 
-/// § 6.1's `exclusive`: "Reserves physical screen area for bar if true". Default `false`, so an
-/// undeclared panel floats over whatever is behind it rather than pushing windows aside.
+/// What § 6.1's `exclusive` asks the compositor for, which is three answers rather than the two a
+/// boolean can carry. Each maps to one `zwlr_layer_surface_v1::set_exclusive_zone` value.
+///
+/// The third one exists because a boolean could not say what a wallpaper needs. Layer-shell's zone
+/// is a signed number with three meanings: a positive one reserves that much, `0` reserves nothing
+/// *and still sits inside what everyone else reserved*, and `-1` ignores every other surface's zone
+/// and covers the output. A full-screen backdrop wants the last of those, and before this it could
+/// reach neither: [`exclusive_zone_for`](crate::wayland) answers `0` for a surface anchored to all
+/// four edges, because there is no single edge to reserve against, so `true` and `false` were the
+/// same request on exactly the surface that needed a third.
+///
+/// Named for what each does rather than mirroring the protocol's integer, and deliberately the same
+/// three Quickshell's `ExclusionMode` settles on (`Auto`, `Normal`, `Ignore`): that enum is the
+/// prior art for this protocol and its `Ignore` carries the same "ignore exclusion zones of other
+/// shell layers" wording. The spellings differ because `Reserve`/`Respect` say which of the two
+/// non-ignoring answers a surface picked, where `Auto`/`Normal` name how the number was arrived at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exclusive {
+    /// Reserve screen area along the anchored edge, derived from the size the compositor
+    /// configured. § 6.1's "Reserves physical screen area for bar if true".
+    Reserve,
+    /// Reserve nothing, and stay inside the area other surfaces reserved. The default, and the
+    /// protocol's `0`.
+    Respect,
+    /// Reserve nothing and ignore what everyone else reserved, covering the output. The protocol's
+    /// `-1`, and the only setting under which a wallpaper stays full-bleed once a bar is up.
+    Ignore,
+}
+
+/// § 6.1's `exclusive`. Default [`Exclusive::Respect`], so an undeclared panel floats over whatever
+/// is behind it rather than pushing windows aside or covering them.
+///
+/// `boolean / string`, the same shape § 6.1 already gives `width`/`height` (`integer / "Fill"`):
+/// `true` and `false` keep exactly the meanings they had, and `"Ignore"` is the value neither could
+/// express. Additive on purpose -- every config written before this one means what it meant.
 ///
 /// In-place, same as [`parse_keyboard_interactivity`]: `set_exclusive_zone` is valid on a live
 /// surface. The *zone* itself is not computed here -- `crate::wayland` derives it at configure
 /// time from the size the compositor actually chose, which is the only point a real number exists.
-pub fn parse_exclusive(properties: &HashMap<String, Value>) -> Result<bool, LayoutError> {
+pub fn parse_exclusive(properties: &HashMap<String, Value>) -> Result<Exclusive, LayoutError> {
     // Deferred on the evaluation-time pass for [`parse_keyboard_interactivity`]'s reason:
     // `set_exclusive_zone` is valid on a live surface, so `exclusive = hide_bar` is a config § 5.1
-    // permits and only this pass cannot read. `false` is the placeholder an absent `exclusive` takes.
+    // permits and only this pass cannot read.
+    //
+    // `Respect` is the placeholder, and it has to be the one that reserves and covers nothing:
+    // this pass runs before any getter has been called, so the value is genuinely unknown, and both
+    // other answers are visible mistakes for a frame. Guessing `Ignore` would paint a wallpaper
+    // over the bar until the resolved pass corrected it; guessing `Reserve` would shove every
+    // window aside. Doing nothing is the only answer that looks like nothing.
     if is_deferred_signal(properties, "exclusive") {
-        return Ok(false);
+        return Ok(Exclusive::Respect);
     }
     let Some(value) = properties.get("exclusive") else {
-        return Ok(false);
+        return Ok(Exclusive::Respect);
     };
     match value {
-        Value::Boolean(b) => Ok(*b),
-        other => Err(invalid("exclusive", format!("expected a boolean, got {}", preview_for_error(other)))),
+        Value::Boolean(true) => Ok(Exclusive::Reserve),
+        Value::Boolean(false) => Ok(Exclusive::Respect),
+        Value::String(s) if checked_string("exclusive", s)? == "Ignore" => Ok(Exclusive::Ignore),
+        other => {
+            Err(invalid("exclusive", format!("expected a boolean or \"Ignore\", got {}", preview_for_error(other))))
+        }
     }
 }
 
@@ -201,7 +244,7 @@ pub struct PanelSpec {
     /// The swap fingerprint: id, layer, anchor, monitor, namespace.
     pub topology: SurfaceTopology,
     pub keyboard_interactivity: KeyboardInteractivity,
-    pub exclusive: bool,
+    pub exclusive: Exclusive,
     /// § 6.1's `margin`, which on a `panel` root is the layer-shell **anchor offset** -- how far
     /// the surface itself sits from the edges it is anchored to -- not layout spacing between the
     /// root and its child. There is no conflict with layout's own reading of the property because
@@ -404,21 +447,46 @@ mod tests {
     }
 
     #[test]
-    fn exclusive_absent_defaults_to_false() {
+    fn exclusive_absent_reserves_and_covers_nothing() {
         let props = HashMap::new();
-        assert!(!parse_exclusive(&props).unwrap());
+        assert_eq!(parse_exclusive(&props).unwrap(), Exclusive::Respect);
     }
 
     #[test]
-    fn exclusive_reads_the_boolean_and_rejects_anything_else() {
+    fn exclusive_reads_both_booleans_and_ignore_and_rejects_anything_else() {
         let lua = lua();
-        let table: mlua::Table = lua.load(r#"return { kind = "panel", exclusive = true }"#).eval().unwrap();
-        assert!(parse_exclusive(&props_from_table(&table)).unwrap());
+        let parse = |src: &str| {
+            let table: mlua::Table = lua.load(src).eval().unwrap();
+            parse_exclusive(&props_from_table(&table))
+        };
+        assert_eq!(parse(r#"return { kind = "panel", exclusive = true }"#).unwrap(), Exclusive::Reserve);
+        assert_eq!(parse(r#"return { kind = "panel", exclusive = false }"#).unwrap(), Exclusive::Respect);
+        assert_eq!(parse(r#"return { kind = "panel", exclusive = "Ignore" }"#).unwrap(), Exclusive::Ignore);
 
-        let bad: mlua::Table = lua.load(r#"return { kind = "panel", exclusive = 32 }"#).eval().unwrap();
-        assert!(
-            matches!(parse_exclusive(&props_from_table(&bad)).unwrap_err(), LayoutError::InvalidProperty { property, .. } if property == "exclusive")
-        );
+        // A number was the original rejection case and stays one. The unknown string is the new
+        // one, and it matters more: `"ignore"` and `"None"` are the shapes a config author actually
+        // reaches for, and silently reading either as `Respect` would be the quiet miss
+        // `NODE_PROPERTIES` exists to prevent one level up.
+        for bad in
+            [r#"return { kind = "panel", exclusive = 32 }"#, r#"return { kind = "panel", exclusive = "ignore" }"#]
+        {
+            assert!(
+                matches!(parse(bad).unwrap_err(), LayoutError::InvalidProperty { property, .. } if property == "exclusive"),
+                "{bad} must be refused by name"
+            );
+        }
+    }
+
+    /// The placeholder the raw pass takes, which has to be the answer that does nothing visible:
+    /// `crate::socket`'s `surface_specs` runs before any getter, so it cannot know, and both other
+    /// answers are a wrong frame on screen (a wallpaper over the bar, or every window shoved aside).
+    #[test]
+    fn a_signal_valued_exclusive_defers_to_respect_rather_than_guessing() {
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table =
+            lua.load(r#"return { kind = "panel", exclusive = state("hide_bar", true) }"#).eval().unwrap();
+        assert_eq!(parse_exclusive(&props_from_table(&table)).unwrap(), Exclusive::Respect);
     }
 
     #[test]
@@ -440,7 +508,7 @@ mod tests {
         assert_eq!(spec.topology.monitor, "DP-1");
         assert_eq!(spec.topology.namespace, "my-dock");
         assert_eq!(spec.keyboard_interactivity, KeyboardInteractivity::OnDemand);
-        assert!(spec.exclusive);
+        assert_eq!(spec.exclusive, Exclusive::Reserve);
         assert_eq!(spec.margin, EdgeInsets { top: 4.0, right: 0.0, bottom: 0.0, left: 8.0 });
         assert_eq!(spec.width, SizeMode::Fill);
         assert_eq!(spec.height, SizeMode::Pixels(48.0));
@@ -464,7 +532,7 @@ mod tests {
             KeyboardInteractivity::None,
             "§ 6.1's default, not the signal's current value"
         );
-        assert!(!spec.exclusive);
+        assert_eq!(spec.exclusive, Exclusive::Respect);
         assert_eq!(spec.margin, EdgeInsets::default());
         assert_eq!((spec.width, spec.height), (SizeMode::Content, SizeMode::Content));
     }

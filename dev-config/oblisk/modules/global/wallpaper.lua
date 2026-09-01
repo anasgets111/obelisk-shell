@@ -10,14 +10,18 @@
 -- happens to work at boot.
 local wallpaper = state("wallpaper", oblisk.config_dir .. "/wallpaper.svg")
 
--- All four edges anchored, so the compositor sizes both axes and this covers the output. Not
--- exclusive: a wallpaper that reserved screen area would push every other surface off the
--- screen it is behind.
+-- All four edges anchored, so the compositor sizes both axes and this covers the output.
+--
+-- `"Ignore"` rather than `false`, and the difference is the whole point. Both reserve nothing, but
+-- `false` still leaves the surface inside the area *other* surfaces reserved, so the moment the bar
+-- claimed its 39px this shrank to 1161 and sat below it. `"Ignore"` is layer-shell's `-1`: reserve
+-- nothing, ignore everyone else, cover the output. `true` would not have helped either -- a surface
+-- anchored to all four edges has no single edge to reserve against, so it reads as 0 (docs/adr/0078).
 return panel {
     id = "wallpaper",
     layer = "Background",
     anchor = { top = true, bottom = true, left = true, right = true },
-    exclusive = false,
+    exclusive = "Ignore",
     width = "Fill",
     height = "Fill",
     -- Painted under the image, so a source that does not decode leaves the desktop dark rather

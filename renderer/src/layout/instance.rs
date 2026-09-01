@@ -211,7 +211,7 @@ mod tests {
                 namespace: format!("oblisk-{id}"),
             },
             keyboard_interactivity: KeyboardInteractivity::None,
-            exclusive: false,
+            exclusive: crate::layout::node::Exclusive::Respect,
             margin: crate::layout::EdgeInsets::default(),
             width: SizeMode::Fill,
             height: SizeMode::Content,

@@ -113,10 +113,10 @@ struct SpecUpdate {
     margin: Option<node::EdgeInsets>,
     keyboard_interactivity: Option<node::KeyboardInteractivity>,
     size: Option<(u32, u32)>,
-    /// § 6.1's `exclusive` boolean. The zone itself is not here because it is not a spec field:
-    /// it is derived from the size the compositor configured (see [`exclusive_zone_for`]), so
-    /// this only reports that the derivation's *input* flipped.
-    exclusive: Option<bool>,
+    /// § 6.1's `exclusive` mode. The zone itself is not here because it is not a spec field:
+    /// `Reserve` derives it from the size the compositor configured (see [`exclusive_zone_for`])
+    /// and the other two are constants, so this only reports that the choice between them changed.
+    exclusive: Option<node::Exclusive>,
 }
 fn spec_update(applied: &PanelSpec, fresh: &PanelSpec, output: layout::LogicalSize) -> SpecUpdate {
     // Compared as the pixel pair that actually goes on the wire, not as the two `SizeMode`s: a
@@ -234,15 +234,16 @@ impl App {
         });
     }
 
-    /// `set_exclusive_zone`, computed from the size the compositor configured (see
-    /// [`exclusive_zone_for`]) for a surface the config marked `exclusive`, and an explicit `0`
-    /// for one it did not.
+    /// `set_exclusive_zone`, one value per [`node::Exclusive`]: `Reserve` derives it from the size
+    /// the compositor configured (see [`exclusive_zone_for`]), `Respect` sends an explicit `0`, and
+    /// `Ignore` sends `-1`.
     ///
     /// The explicit `0` matters: this used to leave a non-exclusive surface alone entirely, on the
     /// reasoning that the protocol's default zone is already 0 -- true only while `exclusive` could
     /// never change. It is a `Signal`-bindable property (docs/adr/0038 decision 2), so a dock
     /// turning `exclusive = false` has to take back the zone it previously reserved, and the
-    /// default is no help once a real value has been sent.
+    /// default is no help once a real value has been sent. `-1` makes that argument twice over:
+    /// a surface leaving `Ignore` has to be told, and nothing else would tell it.
     ///
     /// Stages only; the caller's commit carries it. Committing here would split one surface update
     /// across several commits, and on an unmapped surface a commit with no buffer attached is the
@@ -256,7 +257,13 @@ impl App {
         let TrackedRole::Panel { layer, spec, .. } = &tracked.role else {
             return;
         };
-        let zone = if spec.exclusive { exclusive_zone_for(spec.topology.anchor, tracked.configured_size) } else { 0 };
+        let zone = match spec.exclusive {
+            node::Exclusive::Reserve => exclusive_zone_for(spec.topology.anchor, tracked.configured_size),
+            node::Exclusive::Respect => 0,
+            // Not derived from anything, unlike the other two: `-1` is the protocol's own sentinel
+            // for "ignore every other surface's zone", so there is no size or anchor to read.
+            node::Exclusive::Ignore => -1,
+        };
         layer.set_exclusive_zone(zone);
     }
 
@@ -458,7 +465,7 @@ mod tests {
                 namespace: format!("oblisk-{id}"),
             },
             keyboard_interactivity: node::KeyboardInteractivity::None,
-            exclusive: true,
+            exclusive: node::Exclusive::Reserve,
             margin: node::EdgeInsets::default(),
             width: SizeMode::Fill,
             height: SizeMode::Pixels(32.0),
@@ -497,10 +504,20 @@ mod tests {
         );
 
         let mut stops_reserving = applied.clone();
-        stops_reserving.exclusive = false;
+        stops_reserving.exclusive = node::Exclusive::Respect;
         assert_eq!(
             spec_update(&applied, &stops_reserving, output_1080p()),
-            SpecUpdate { exclusive: Some(false), ..SpecUpdate::default() }
+            SpecUpdate { exclusive: Some(node::Exclusive::Respect), ..SpecUpdate::default() }
+        );
+
+        // The third mode has to diff as its own value, not collapse into "not reserving": a surface
+        // going `Reserve` -> `Ignore` and one going `Reserve` -> `Respect` send different zones
+        // (-1 against 0), and a boolean could not tell them apart.
+        let mut covers_everything = applied.clone();
+        covers_everything.exclusive = node::Exclusive::Ignore;
+        assert_eq!(
+            spec_update(&applied, &covers_everything, output_1080p()),
+            SpecUpdate { exclusive: Some(node::Exclusive::Ignore), ..SpecUpdate::default() }
         );
     }
 
