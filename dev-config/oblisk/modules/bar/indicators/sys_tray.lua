@@ -23,8 +23,28 @@ local cell = require("components.cell")
 
 local SCROLL = scroll("sys_tray")
 
+-- `Passive` means the item has nothing to say and the spec expects a bar to hide it, which is how
+-- an application whose tray icon you turned off stops haunting the panel. A presentation call, so
+-- it lives here rather than in the backend: `status` reaches Lua and some bars legitimately show
+-- Passive items dimmed instead.
 local function items_of(t)
-    return (t and t.items) or {}
+    local out = {}
+    for _, item in ipairs((t and t.items) or {}) do
+        if item.status ~= "Passive" then
+            out[#out + 1] = item
+        end
+    end
+    return out
+end
+
+-- `NeedsAttention` swaps in the item's own attention artwork when it ships some. Telegram does not
+-- (it rewrites `icon_name` to `-attention-symbolic` itself), which is exactly why this falls back
+-- to the base pair rather than drawing nothing.
+local function artwork(item)
+    if item.status == "NeedsAttention" and (item.attention_icon_name or item.attention_icon_path) then
+        return item.attention_icon_name or item.attention_icon_path
+    end
+    return item.icon_name or item.icon_path
 end
 
 -- The ceiling, not the width. A session that registers a dozen items scrolls rather than taking
@@ -62,7 +82,7 @@ return list {
     source = computed({ oblisk.tray, oblisk.applications }, items_of),
     itemfn = function(item)
         local entry = util.app_entry(oblisk.applications:get(), item.name or item.id)
-        local art = item.icon_name or item.icon_path or (entry and entry.icon)
+        local art = artwork(item) or (entry and entry.icon)
         if art then
             return icon { name = art, size = theme.icon.md, align_v = "Center", foreground = theme.FG }
         end

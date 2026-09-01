@@ -99,6 +99,18 @@ pub fn parse_activate_args(arguments: &[serde_json::Value]) -> Option<(String, i
     Some((id, x, y))
 }
 
+/// `tray:scroll(id, delta, orientation)`'s `arguments: [id, delta, orientation]` (docs/adr/0074).
+///
+/// Its own parser rather than a reuse of [`parse_activate_args`]: the shapes look alike, but the
+/// third argument is a string here and reusing the coordinate parser would silently drop every
+/// scroll whose orientation was spelled correctly.
+pub fn parse_scroll_args(arguments: &[serde_json::Value]) -> Option<(String, i32, String)> {
+    let id = arguments.first()?.as_str()?.to_string();
+    let delta = arguments.get(1)?.as_i64()? as i32;
+    let orientation = arguments.get(2)?.as_str()?.to_string();
+    Some((id, delta, orientation))
+}
+
 /// `tray:activate_menu_item(id, menu_item_id)`'s `arguments: [id, menu_item_id]`.
 pub fn parse_activate_menu_item_args(arguments: &[serde_json::Value]) -> Option<(String, i32)> {
     let id = arguments.first()?.as_str()?.to_string();
@@ -119,6 +131,8 @@ pub fn parse_menu_will_show_args(arguments: &[serde_json::Value]) -> Option<(Str
 #[serde(rename_all = "snake_case")]
 pub enum TrayAction {
     Activate,
+    SecondaryActivate,
+    Scroll,
     ActivateMenuItem,
     MenuWillShow,
 }
@@ -135,6 +149,25 @@ pub fn dispatch(controller: &TrayController, envelope: &shared::CommandEnvelope)
                 let controller = controller.clone();
                 tokio::spawn(async move {
                     controller.activate(&id, x, y).await;
+                });
+            }
+            None => crate::log_malformed_command(params),
+        },
+        // Same `[id, x, y]` shape as `Activate`, so the same parser (docs/adr/0074).
+        TrayAction::SecondaryActivate => match parse_activate_args(&params.arguments) {
+            Some((id, x, y)) => {
+                let controller = controller.clone();
+                tokio::spawn(async move {
+                    controller.secondary_activate(&id, x, y).await;
+                });
+            }
+            None => crate::log_malformed_command(params),
+        },
+        TrayAction::Scroll => match parse_scroll_args(&params.arguments) {
+            Some((id, delta, orientation)) => {
+                let controller = controller.clone();
+                tokio::spawn(async move {
+                    controller.scroll(&id, delta, &orientation).await;
                 });
             }
             None => crate::log_malformed_command(params),
@@ -201,6 +234,30 @@ mod tests {
     }
 
     // ---- arg parsers ----
+
+    #[test]
+    fn parse_scroll_args_reads_id_delta_orientation() {
+        let args = vec![serde_json::json!("1.42"), serde_json::json!(-120), serde_json::json!("vertical")];
+        assert_eq!(parse_scroll_args(&args), Some(("1.42".to_string(), -120, "vertical".to_string())));
+    }
+
+    #[test]
+    fn parse_scroll_args_refuses_a_numeric_orientation() {
+        // The reason this is not `parse_activate_args`: the shapes look alike, and reusing that one
+        // would read the orientation as a coordinate and drop every correctly spelled scroll.
+        let args = vec![serde_json::json!("1.42"), serde_json::json!(-120), serde_json::json!(3)];
+        assert_eq!(parse_scroll_args(&args), None);
+    }
+
+    #[test]
+    fn every_tray_action_the_idl_names_parses() {
+        // `secondary_activate` and `scroll` are new (docs/adr/0074); serde owns the mapping, so a
+        // rename that misses the stub fails here rather than at a config author's keyboard.
+        for name in ["activate", "secondary_activate", "scroll", "activate_menu_item", "menu_will_show"] {
+            let action: Result<TrayAction, _> = serde_json::from_value(serde_json::json!(name));
+            assert!(action.is_ok(), "{name} must deserialize into a TrayAction");
+        }
+    }
 
     #[test]
     fn parse_activate_args_reads_id_x_y() {

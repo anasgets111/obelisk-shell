@@ -16,6 +16,16 @@ pub struct TrayItem {
     pub name: String,
     pub icon_name: Option<String>,
     pub icon_path: Option<String>,
+    /// The `NeedsAttention` artwork, resolved the same way as `icon_name`/`icon_path`. Draw these
+    /// instead of the base pair while `status` is `"NeedsAttention"`. Both stay `nil` for an item
+    /// that declares no attention icon, which is most of them.
+    pub attention_icon_name: Option<String>,
+    pub attention_icon_path: Option<String>,
+    /// A badge, meant to be drawn over the base icon's corner rather than instead of it. Carried
+    /// rather than composited: a `stack` node is what puts one image on another, and the Supervisor
+    /// has no canvas. Both stay `nil` when the item declares no badge.
+    pub overlay_icon_name: Option<String>,
+    pub overlay_icon_path: Option<String>,
     pub tooltip: Option<String>,
     pub status: String,
     pub item_is_menu: bool,
@@ -48,34 +58,85 @@ pub(super) async fn fetch_tray_item_base(
 ) -> TrayItem {
     let id_prop = item.id().await.unwrap_or_default();
     let title = item.title().await.unwrap_or_default();
-    let icon_name_prop = item.icon_name().await.unwrap_or_default();
-    let pixmaps_raw = item.icon_pixmap().await.unwrap_or_default();
     let status = item.status().await.unwrap_or_default();
     let item_is_menu = item.item_is_menu().await.unwrap_or(false);
     let tooltip = item.tool_tip().await.ok();
+    // Read once and used by all three icon resolutions below: the directory is the item's, not any
+    // one icon's (docs/adr/0074).
+    let theme_path = item.icon_theme_path().await.unwrap_or_default();
 
     let sanitized = sanitize_unique_name(unique_name.as_str());
     let name = resolve_display_name(&title, &id_prop);
     let tooltip_flat = tooltip.and_then(|(_, _, tt_title, tt_text)| flatten_tooltip(&tt_title, &tt_text));
 
+    let (icon_name, icon_path) = resolve_variant(
+        item.icon_name().await.unwrap_or_default(),
+        item.icon_pixmap().await.unwrap_or_default(),
+        &theme_path,
+        &sanitized,
+        "",
+    );
+    let (attention_icon_name, attention_icon_path) = resolve_variant(
+        item.attention_icon_name().await.unwrap_or_default(),
+        item.attention_icon_pixmap().await.unwrap_or_default(),
+        &theme_path,
+        &sanitized,
+        "-attention",
+    );
+    let (overlay_icon_name, overlay_icon_path) = resolve_variant(
+        item.overlay_icon_name().await.unwrap_or_default(),
+        item.overlay_icon_pixmap().await.unwrap_or_default(),
+        &theme_path,
+        &sanitized,
+        "-overlay",
+    );
+
+    TrayItem {
+        id: sanitized,
+        name,
+        icon_name,
+        icon_path,
+        attention_icon_name,
+        attention_icon_path,
+        overlay_icon_name,
+        overlay_icon_path,
+        tooltip: tooltip_flat,
+        status,
+        item_is_menu,
+        menu: None,
+    }
+}
+
+/// One icon triple (`{X}IconName`, `{X}IconPixmap`, the item's `IconThemePath`) resolved to the
+/// `(name, path)` pair a config reads, for whichever of the three variants § 2.5 defines
+/// (docs/adr/0074).
+///
+/// `spool_suffix` distinguishes the spooled PNGs, since an item's three pixmaps would otherwise all
+/// land on `{unique_name}.png` and the last write would win.
+fn resolve_variant(
+    icon_name_prop: String,
+    pixmaps_raw: Vec<(i32, i32, Vec<u8>)>,
+    theme_path: &str,
+    sanitized: &str,
+    spool_suffix: &str,
+) -> (Option<String>, Option<String>) {
     let pixmaps: Vec<IconPixmap> =
         pixmaps_raw.into_iter().map(|(width, height, bytes)| IconPixmap { width, height, bytes }).collect();
-    let (icon_name, icon_path) = match resolve_icon_source(&icon_name_prop, &pixmaps) {
+    match resolve_icon_source(&icon_name_prop, &pixmaps, theme_path) {
+        IconSource::ThemePathFile(path) => (None, Some(path)),
         IconSource::Name(name) => (Some(name), None),
         IconSource::Pixmap => match largest_valid_pixmap(&pixmaps) {
-            Some(pixmap) => match write_icon_png(&sanitized, pixmap) {
+            Some(pixmap) => match write_icon_png(&format!("{sanitized}{spool_suffix}"), pixmap) {
                 Ok(path) => (None, Some(path)),
                 Err(err) => {
-                    eprintln!("tray: failed to spool icon PNG for {sanitized}: {err}");
+                    eprintln!("tray: failed to spool icon PNG for {sanitized}{spool_suffix}: {err}");
                     (None, None)
                 }
             },
             None => (None, None),
         },
         IconSource::None => (None, None),
-    };
-
-    TrayItem { id: sanitized, name, icon_name, icon_path, tooltip: tooltip_flat, status, item_is_menu, menu: None }
+    }
 }
 
 #[cfg(test)]

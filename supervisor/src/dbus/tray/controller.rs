@@ -43,6 +43,10 @@ impl TrayController {
             Err(err) => eprintln!("tray: RequestName({WATCHER_BUS_NAME}) failed: {err}"),
         }
 
+        // Before anything can spool: a fresh Supervisor owns nothing in there, so whatever is left
+        // is a previous run's and nothing will ever delete it otherwise (docs/adr/0074).
+        crate::dbus::shm_icons::sweep(super::icon::SPOOL_SUBDIR);
+
         let registry: ItemRegistry = Arc::new(Mutex::new(HashMap::new()));
         let host_registered = Arc::new(Mutex::new(false));
         let watcher = StatusNotifierWatcher {
@@ -128,6 +132,44 @@ impl TrayController {
         };
         if let Err(err) = item.activate(x, y).await {
             eprintln!("tray: activate({id:?}) failed: {err}");
+        }
+    }
+
+    /// `tray:secondary_activate(id, x, y)`: § 2.5's middle-click (docs/adr/0074).
+    ///
+    /// No `should_call_activate` gate, unlike [`Self::activate`]: `ItemIsMenu` says a *primary*
+    /// click must open the menu instead of activating, and says nothing about the secondary one.
+    /// An application that wants nothing to happen exports a method that does nothing.
+    pub async fn secondary_activate(&self, id: &str, x: i32, y: i32) {
+        let Some((key, _)) = self.find_item_id(id) else {
+            eprintln!("tray: secondary_activate({id:?}) failed: {}", TrayActionError::UnknownItem);
+            return;
+        };
+        let Some(item) = self.find_item_proxy(&key) else {
+            eprintln!("tray: secondary_activate({id:?}) failed: {}", TrayActionError::UnknownItem);
+            return;
+        };
+        if let Err(err) = item.secondary_activate(x, y).await {
+            eprintln!("tray: secondary_activate({id:?}) failed: {err}");
+        }
+    }
+
+    /// `tray:scroll(id, delta, orientation)`: § 2.5's scroll over the icon (docs/adr/0074).
+    ///
+    /// `orientation` reaches the application verbatim. The spec names `"vertical"` and
+    /// `"horizontal"` and this does not police it, because the string is the application's to
+    /// interpret and refusing a third value here would only turn a shrug into a dropped command.
+    pub async fn scroll(&self, id: &str, delta: i32, orientation: &str) {
+        let Some((key, _)) = self.find_item_id(id) else {
+            eprintln!("tray: scroll({id:?}) failed: {}", TrayActionError::UnknownItem);
+            return;
+        };
+        let Some(item) = self.find_item_proxy(&key) else {
+            eprintln!("tray: scroll({id:?}) failed: {}", TrayActionError::UnknownItem);
+            return;
+        };
+        if let Err(err) = item.scroll(delta, orientation).await {
+            eprintln!("tray: scroll({id:?}) failed: {err}");
         }
     }
 

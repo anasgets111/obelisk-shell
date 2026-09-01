@@ -29,6 +29,42 @@ pub fn icon_dir(subdir: &str) -> PathBuf {
     PathBuf::from(format!("/dev/shm/oblisk-{}/{subdir}", nix::unistd::Uid::current()))
 }
 
+/// Deletes one spooled PNG, best-effort.
+///
+/// `path` must be one this module wrote, which is checked rather than trusted: this deletes a file
+/// from a path that travelled through a `TrayItem` and back, and the check costs a prefix compare.
+/// A failure is silent because every caller is already tearing something down and there is nothing
+/// useful to do about a file that is already gone.
+pub fn remove_png(subdir: &str, path: &str) {
+    if !std::path::Path::new(path).starts_with(icon_dir(subdir)) {
+        return;
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+/// Empties `subdir` of the files a previous run left behind.
+///
+/// Safe only at startup, and only because a fresh Supervisor owns nothing in there yet: its registry
+/// is empty and every item re-registers from scratch, spooling again. `/dev/shm` outlives the
+/// process, so without this every icon a killed run spooled stays resident until the machine
+/// reboots -- files from the previous day were still sitting there when this was written.
+///
+/// ponytail: two Supervisors at once and the second sweeps the first's live files, which shows as a
+/// tray of blank icons until something makes each item re-spool. Two shells is a debugging accident
+/// rather than a mode, and the alternative is a lockfile or an mtime cutoff to avoid a leak measured
+/// in kilobytes.
+pub fn sweep(subdir: &str) {
+    let dir = icon_dir(subdir);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.path().is_file() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Writes already-encoded `png_bytes` to `/dev/shm/oblisk-$UID/{subdir}/{filename}`, creating the
 /// directory tree if missing. Same path overwritten in place on every call -- no cache-busting
 /// (ADR-0031, carried forward for notifications by ADR-0033).

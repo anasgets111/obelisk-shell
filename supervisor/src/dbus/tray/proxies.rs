@@ -14,6 +14,14 @@ use super::{RawIconPixmap, RawToolTip};
 pub(super) trait StatusNotifierItem {
     #[zbus(name = "Activate")]
     fn activate(&self, x: i32, y: i32) -> zbus::Result<()>;
+    /// Middle-click. A separate method in the spec rather than a flag on `Activate`, and Telegram,
+    /// Chromium and Qt's own tray all export it.
+    #[zbus(name = "SecondaryActivate")]
+    fn secondary_activate(&self, x: i32, y: i32) -> zbus::Result<()>;
+    /// A scroll over the icon. `orientation` is the spec's `"vertical"` or `"horizontal"`, and
+    /// `delta` its sign and magnitude, which is how a media player takes volume off the tray.
+    #[zbus(name = "Scroll")]
+    fn scroll(&self, delta: i32, orientation: &str) -> zbus::Result<()>;
 
     #[zbus(property, name = "Id")]
     fn id(&self) -> zbus::Result<String>;
@@ -43,6 +51,11 @@ pub(super) trait StatusNotifierItem {
     fn menu(&self) -> zbus::Result<OwnedObjectPath>;
     #[zbus(property, name = "WindowId")]
     fn window_id(&self) -> zbus::Result<i32>;
+    /// A directory the application ships its own icons in, to be searched before the session theme.
+    /// Set by applications that bundle artwork the theme has never heard of, which is most of the
+    /// packaged-runtime ones.
+    #[zbus(property, name = "IconThemePath")]
+    fn icon_theme_path(&self) -> zbus::Result<String>;
 
     #[zbus(signal, name = "NewTitle")]
     fn new_title(&self);

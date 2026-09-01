@@ -11,7 +11,10 @@ use tokio_stream::StreamExt;
 use zbus::names::{BusName, OwnedUniqueName};
 use zbus::zvariant::OwnedObjectPath;
 
+use crate::dbus::shm_icons;
+
 use super::TraySignal;
+use super::icon::SPOOL_SUBDIR;
 use super::item::{TrayItem, fetch_tray_item_base};
 use super::menu::fetch_menu_via;
 use super::proxies::{DBusMenuProxy, StatusNotifierItemProxy, bind_dbusmenu, bind_item};
@@ -224,6 +227,21 @@ pub(super) fn spawn_name_owner_changed_forwarder(
                 entry.properties_forwarder.abort();
                 if let Some(handle) = entry.menu_forwarder {
                     handle.abort();
+                }
+                // The item's own spooled pixmaps, gone with it. All three variants, since each
+                // spools to its own filename (docs/adr/0074). `/dev/shm` outlives this process, so
+                // without this every application restart leaves more PNGs resident until reboot:
+                // the filename is built from the connection's unique name, and a reconnecting
+                // application never gets the same one back.
+                for path in [
+                    &entry.last_known.icon_path,
+                    &entry.last_known.attention_icon_path,
+                    &entry.last_known.overlay_icon_path,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    shm_icons::remove_png(SPOOL_SUBDIR, path);
                 }
             }
             if events.send(TraySignal::RegistryChanged).is_err() {

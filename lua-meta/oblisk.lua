@@ -159,12 +159,16 @@ function Capability:invoke(command, ...) end
 ---@field title string
 
 ---@class TrayItem
+---@field attention_icon_name? string The `NeedsAttention` artwork, resolved the same way as `icon_name`/`icon_path`. Draw these instead of the base pair while `status` is `"NeedsAttention"`. Both stay `nil` for an item that declares no attention icon, which is most of them.
+---@field attention_icon_path? string
 ---@field icon_name? string
 ---@field icon_path? string
 ---@field id string
 ---@field item_is_menu boolean
 ---@field menu? MenuItem[]
 ---@field name string
+---@field overlay_icon_name? string A badge, meant to be drawn over the base icon's corner rather than instead of it. Carried rather than composited: a `stack` node is what puts one image on another, and the Supervisor has no canvas. Both stay `nil` when the item declares no badge.
+---@field overlay_icon_path? string
 ---@field status string
 ---@field tooltip? string
 
@@ -475,7 +479,7 @@ function TrayCapability:get() end
 ---@param fn fun(value: TrayState): any
 ---@return Signal
 function TrayCapability:map(fn) end
----@param command "activate"|"activate_menu_item"|"menu_will_show"
+---@param command "activate"|"secondary_activate"|"scroll"|"activate_menu_item"|"menu_will_show"
 ---@param ... any
 function TrayCapability:invoke(command, ...) end
 
