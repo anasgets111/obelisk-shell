@@ -55,7 +55,7 @@ function ProcessHandle:kill() end
 ---@param args string[] One element per argument, already split. Passing `"a b"` is one argument containing a space.
 ---@param out_cb fun(line: string, stream: "stdout"|"stderr") Both streams reach the same callback; branch on `stream`.
 ---@param exit_cb fun(code: integer?) `nil` when the process was killed by a signal rather than exiting.
----@return ProcessHandle Live immediately. The process is already running when this returns.
+---@return ProcessHandle # Live immediately. The process is already running when this returns.
 function process.run(cmd, args, out_cb, exit_cb) end
 
 ---@class oslib
@@ -67,16 +67,16 @@ os = {}
 
 ---@param format? string `strftime` directives, or `"*t"` for a table. Defaults to `"%c"`. A leading `!` reads UTC.
 ---@param time? integer Unix seconds to format. Defaults to now.
----@return string|table A string, or a table when `format` starts with `"*t"`.
+---@return string|table # A string, or a table when `format` starts with `"*t"`.
 function os.date(format, time) end
 
 ---@param t? table A `os.date("*t")`-shaped table to convert. Omitted means now.
----@return integer Unix seconds. Wall clock, so it moves when the clock is set; use `os.clock` for durations.
+---@return integer # Unix seconds. Wall clock, so it moves when the clock is set; use `os.clock` for durations.
 function os.time(t) end
 
----@return number CPU seconds used by this process, as a float. Monotonic and immune to a clock change, which is what makes it the one to subtract.
+---@return number # CPU seconds used by this process, as a float. Monotonic and immune to a clock change, which is what makes it the one to subtract.
 function os.clock() end
 
 ---@param name string The variable to read.
----@return string? Its value, or `nil` when unset. The shell's own environment, not the compositor's.
+---@return string? # Its value, or `nil` when unset. The shell's own environment, not the compositor's.
 function os.getenv(name) end

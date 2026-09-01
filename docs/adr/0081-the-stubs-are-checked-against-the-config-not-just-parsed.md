@@ -105,3 +105,19 @@ The check earns its place on the 174 generated payload fields rather than on the
 
 Optional in `check`, because `lua-language-server` is not a build dependency of this workspace and
 there is no CI to install it into. Absent means skipped with a line saying so, never a silent pass.
+
+## `lua-meta` is checked as itself, not only as a library
+
+The first version checked `dev-config` and `share/starter` and loaded `lua-meta` as their
+`workspace.library`. A library's own diagnostics are suppressed, so the stubs were the one thing the
+stub checker could not see.
+
+That hid a real fault the day it was written. `---@return T a, b` declares *two* returns, so a comma
+in a single return's prose makes the next word a type: `---@return Signal Read-only, like `map`.`
+declared a return of type `like`. Checking the config said nothing, correctly, because the config
+was fine.
+
+So `lua-meta` is now checked as its own workspace too, with no library of its own: these files
+declare everything they reference, which is what makes that possible. Single-return prose is written
+`---@return T # ...`, where `#` is LuaCATS' explicit "the rest is a comment" marker and the whole
+class goes away.

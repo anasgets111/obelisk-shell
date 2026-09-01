@@ -61,12 +61,18 @@ docs:
         echo "$crate: $count unresolved doc links (baseline $baseline)"
     done
 
-# The config type-checked against the stubs, which is the only thing that ever reads them as types.
+# The config type-checked against the stubs, and the stubs type-checked against themselves.
 #
 # `lua` above proves a file parses. This proves `dev-config` agrees with `lua-meta`, which is what
 # an author's editor will tell them: same engine, same `.luarc.json`, same stub directory. It is
 # the reason `lua-meta/nodes.lua` now spells `|Signal` on every union that takes one -- 21 of them
 # did not, and each was a red squiggle under working config code (docs/adr/0081).
+#
+# `lua-meta` is checked as its own workspace as well as being the others' library, because a
+# library's own diagnostics are suppressed. That hole hid a real one: `---@return T a, b` is two
+# returns, so a comma in a single return's prose makes the next word a type, and
+# `---@return Signal Read-only, like `map`` declared a return of type `like`. Checking the config
+# said nothing, because the config was fine. Single-return prose is written `---@return T # ...`.
 #
 # Optional, because `lua-language-server` is not a build dependency of this workspace and there is
 # no CI to install it into. Missing means skipped and said so, never a silent pass.
@@ -92,7 +98,7 @@ types:
         # An empty report is `{}` or `[]` depending on version, and no file at all when clean.
         report=$(tr -d '[:space:]' <"$log/check.json" 2>/dev/null || true)
         if [ -n "$report" ] && [ "$report" != "{}" ] && [ "$report" != "[]" ]; then
-            echo "$1 does not type-check against lua-meta:" >&2
+            echo "$1 has type diagnostics:" >&2
             cat "$log/check.json" >&2
             exit 1
         fi
@@ -101,7 +107,11 @@ types:
     # which also carries the `runtime.path` its `require`s need.
     check dev-config/oblisk
     check share/starter --configpath "$log/starter.luarc.json"
-    echo "dev-config and the starter type-check against lua-meta"
+    # No library: these files declare everything they reference, which is the point of checking
+    # them on their own.
+    printf '{"runtime.version":"Lua 5.4","workspace.checkThirdParty":false}\n' >"$log/meta.luarc.json"
+    check lua-meta --configpath "$log/meta.luarc.json"
+    echo "lua-meta type-checks, and dev-config and the starter type-check against it"
 
 # Every Lua file parses, config and stubs alike.
 lua:
