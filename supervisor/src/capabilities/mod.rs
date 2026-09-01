@@ -68,6 +68,8 @@ pub mod scale;
 mod shm_icons;
 pub mod sysinfo;
 pub mod system;
+#[cfg(test)]
+mod test_support;
 pub mod tray;
 pub mod updates;
 pub mod workspaces;

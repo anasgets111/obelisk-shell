@@ -13,7 +13,7 @@ use super::item::TrayItem;
 use super::menu::fetch_menu_via;
 use super::proxies::{DBusMenuProxy, StatusNotifierItemProxy, StatusNotifierWatcherClientProxy};
 use super::registration::{resolve_registration, sanitize_unique_name};
-use super::registry::{ItemKey, ItemRegistry, register_item, spawn_name_owner_changed_forwarder};
+use super::registry::{ItemKey, ItemRegistry, ordered_items, register_item, spawn_name_owner_changed_forwarder};
 use super::watcher::StatusNotifierWatcher;
 use super::{
     TrayActionError, TraySignal, TrayState, WATCHER_BUS_NAME, WATCHER_OBJECT_PATH, should_call_activate,
@@ -96,7 +96,7 @@ impl TrayController {
     /// Synchronous: every registry entry's `last_known` is already up to date (the forwarder
     /// tasks recompute it before ever sending a [`TraySignal`]).
     pub fn build_state(&self) -> TrayState {
-        TrayState { items: self.registry.lock().unwrap().values().map(|entry| entry.last_known.clone()).collect() }
+        TrayState { items: ordered_items(&self.registry) }
     }
 
     fn find_item_id(&self, id: &str) -> Option<(ItemKey, TrayItem)> {

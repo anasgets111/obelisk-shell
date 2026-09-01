@@ -200,7 +200,7 @@ mod tests {
     //      must be rejected, since a connection can only ever truthfully claim its own real
     //      unique name (the bus-daemon-authenticated sender) ----
 
-    use super::super::test_support::p2p_pair;
+    use crate::capabilities::test_support::p2p_pair;
 
     #[tokio::test]
     async fn resolve_registration_accepts_a_unique_name_matching_the_real_sender() {

@@ -3,6 +3,7 @@
 //! `dbus/mpris/mod.rs` for the module-level doc.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -49,9 +50,18 @@ pub struct PlayerState {
     pub length: i64,
 }
 
+/// Hands out [`PlayerEntry::registered`], on the same terms as the tray's own counter.
+static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(0);
+
 pub(super) struct PlayerEntry {
     pub(super) player: MprisPlayerProxy<'static>,
     pub(super) last_known: PlayerState,
+    /// When this player was first seen, and the order [`ordered_players`] puts the list in.
+    ///
+    /// The registry is a `HashMap`, so before this existed `mpris.players` came out in whatever
+    /// order the hash seed produced, and a widget bound to `players[1]` could swap tracks because
+    /// an unrelated player ticked its position.
+    registered: u64,
     track_identity: TrackIdentity,
     /// `mpris:trackid`, cached for `SetPosition`'s required `TrackId` argument (ADR-0036) --
     /// not an IDL-declared `PlayerState` field, so it isn't part of what gets pushed to Lua.
@@ -63,6 +73,18 @@ pub(super) struct PlayerEntry {
 }
 
 pub(super) type PlayerRegistry = Arc<Mutex<HashMap<String, PlayerEntry>>>;
+
+/// `mpris.players`, longest-running first.
+///
+/// Appearance order rather than a sort on [`PlayerState::id`]: a config that reaches for
+/// `players[1]` means "the one that has been there", and an alphabetical sort would hand it a
+/// browser tab that just started playing.
+pub(super) fn ordered_players(registry: &PlayerRegistry) -> Vec<PlayerState> {
+    let guard = registry.lock().expect("mpris registry mutex poisoned");
+    let mut entries: Vec<&PlayerEntry> = guard.values().collect();
+    entries.sort_by_key(|entry| entry.registered);
+    entries.into_iter().map(|entry| entry.last_known.clone()).collect()
+}
 
 /// `CLOCK_MONOTONIC`, in microseconds -- cross-process comparable on this machine (unlike
 /// `std::time::Instant`, which Rust deliberately keeps opaque/non-serializable), matching the
@@ -212,14 +234,24 @@ pub(super) async fn register_player(
 
     let Resynced { state, identity, trackid } = resync(&bus_name, &player, &root, None).await;
 
-    let entry = PlayerEntry {
+    let mut entry = PlayerEntry {
         player: player.clone(),
         last_known: state,
+        registered: 0,
         track_identity: identity,
         cached_trackid: trackid,
         forwarder: None,
     };
-    let previous = registry.lock().unwrap().insert(bus_name.clone(), entry);
+    let previous = {
+        let mut guard = registry.lock().unwrap();
+        entry.registered = match guard.get(&bus_name) {
+            // The same bus name is the same player, so it holds its place. A player that restarts
+            // takes a new unique name and is genuinely new.
+            Some(existing) => existing.registered,
+            None => NEXT_REGISTRATION.fetch_add(1, Ordering::Relaxed),
+        };
+        guard.insert(bus_name.clone(), entry)
+    };
     if let Some(previous) = previous
         && let Some(handle) = previous.forwarder
     {
@@ -300,5 +332,68 @@ pub(super) fn unregister_player(registry: &PlayerRegistry, bus_name: &str, event
             handle.abort();
         }
         let _ = events.send(MprisSignal::Changed);
+    }
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    use super::*;
+    use crate::capabilities::test_support::p2p_pair;
+
+    /// An entry with everything but the two fields the ordering depends on stubbed out. Binding a
+    /// proxy makes no call, so a p2p pair with nobody answering is enough.
+    async fn entry(connection: &zbus::Connection, id: &str, registered: u64) -> PlayerEntry {
+        PlayerEntry {
+            player: super::super::proxies::bind_player(connection, "org.mpris.MediaPlayer2.probe")
+                .await
+                .expect("binding makes no call"),
+            last_known: PlayerState { id: id.to_string(), ..PlayerState::default() },
+            registered,
+            track_identity: TrackIdentity::default(),
+            cached_trackid: None,
+            forwarder: None,
+        }
+    }
+
+    /// A `HashMap`'s iteration order is seeded per process, so this used to be whatever the seed
+    /// said: a config reaching for `players[1]` could get a different player between two pushes
+    /// over the same set, with nothing about that set having changed.
+    #[tokio::test]
+    async fn the_list_is_in_appearance_order_whatever_the_map_says() {
+        let (connection, _peer) = p2p_pair().await;
+        let registry: PlayerRegistry = Arc::new(Mutex::new(HashMap::new()));
+        // Built before the lock: holding a guard across an await is `clippy::await_holding_lock`.
+        let third = entry(&connection, "third", 2).await;
+        let first = entry(&connection, "first", 0).await;
+        let second = entry(&connection, "second", 1).await;
+        {
+            let mut guard = registry.lock().unwrap();
+            guard.insert("zed".to_string(), third);
+            guard.insert("alpha".to_string(), first);
+            guard.insert("mid".to_string(), second);
+        }
+        let ids: Vec<String> = ordered_players(&registry).into_iter().map(|player| player.id).collect();
+        assert_eq!(ids, ["first", "second", "third"], "an alphabetical sort would answer the other way");
+    }
+
+    /// A player that keeps pushing position updates must not move under a config holding its index.
+    #[tokio::test]
+    async fn a_player_that_resyncs_holds_its_place() {
+        let (connection, _peer) = p2p_pair().await;
+        let registry: PlayerRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let spotify = entry(&connection, "spotify", 0).await;
+        let firefox = entry(&connection, "firefox", 1).await;
+        {
+            let mut guard = registry.lock().unwrap();
+            guard.insert("spotify".to_string(), spotify);
+            guard.insert("firefox".to_string(), firefox);
+        }
+        let mut replacement = entry(&connection, "spotify-again", 999).await;
+        // What `register_player` does when a live bus name registers again: keep the sequence.
+        replacement.registered = registry.lock().unwrap().get("spotify").expect("just inserted").registered;
+        registry.lock().unwrap().insert("spotify".to_string(), replacement);
+
+        let ids: Vec<String> = ordered_players(&registry).into_iter().map(|player| player.id).collect();
+        assert_eq!(ids, ["spotify-again", "firefox"]);
     }
 }

@@ -55,9 +55,13 @@ pub use controller::TrayController;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct TrayState {
-    /// Every registered `StatusNotifierItem`, in no order at all: `build_state` collects a
-    /// `HashMap`'s values, so the sequence can differ between two pushes that registered the same
-    /// items. A strip that should not reshuffle has to sort, and [`TrayItem::id`] is the stable key.
+    /// Every registered `StatusNotifierItem`, oldest registration first. A new item appends and an
+    /// item updating a property does not move, so a strip can be drawn straight from this without
+    /// sorting.
+    ///
+    /// Registration order rather than id order because [`TrayItem::id`] is a D-Bus unique name like
+    /// `"1.234"`: sorting it lexicographically puts `1.100` before `1.20` and drops a newly started
+    /// application into the middle of the strip.
     pub items: Vec<TrayItem>,
 }
 
@@ -193,30 +197,6 @@ pub fn dispatch(controller: &TrayController, envelope: &shared::CommandEnvelope)
             }
             None => crate::log_malformed_command(params),
         },
-    }
-}
-
-/// Shared by every submodule's own `#[cfg(test)]` -- see [`p2p_pair`] for why this lives here
-/// instead of being copied into each one.
-#[cfg(test)]
-mod test_support {
-    use tokio::net::UnixStream;
-
-    /// A connected pair of p2p zbus connections, no bus daemon involved, with one addition:
-    /// the server side gets a short `method_timeout`. `register_item`'s real code path calls
-    /// out from this side to a peer that never registers any object server handler for some
-    /// calls -- with zbus's default timeout, each would hang until it lapses instead of
-    /// erroring quickly, and `register_item` awaits several sequentially.
-    pub(super) async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {
-        let (a, b) = UnixStream::pair().expect("failed to create a unix socket pair");
-        let guid = zbus::Guid::generate();
-        let server_builder = zbus::connection::Builder::unix_stream(a)
-            .server(guid)
-            .expect("p2p server builder setup")
-            .p2p()
-            .method_timeout(std::time::Duration::from_millis(200));
-        let client_builder = zbus::connection::Builder::unix_stream(b).p2p();
-        tokio::try_join!(server_builder.build(), client_builder.build()).expect("p2p handshake")
     }
 }
 

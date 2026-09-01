@@ -3,6 +3,7 @@
 //! Split from `dbus::tray` -- see `dbus/tray/mod.rs` for the module-level doc.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -20,12 +21,35 @@ use super::menu::fetch_menu_via;
 use super::proxies::{DBusMenuProxy, StatusNotifierItemProxy, bind_dbusmenu, bind_item};
 use super::registration::ResolvedRegistration;
 
+/// Hands out [`ItemEntry::registered`]. Process-wide rather than per-registry, because it only has
+/// to increase and one `TrayController` exists per session; two registries in one test process
+/// still each see a monotonic sequence, which is all the sort needs.
+static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(0);
+
 pub(super) struct ItemEntry {
     pub(super) item: StatusNotifierItemProxy<'static>,
     pub(super) menu: Option<DBusMenuProxy<'static>>,
     pub(super) last_known: TrayItem,
+    /// When this item first registered, and the order [`ordered_items`] puts the strip in.
+    ///
+    /// The registry is a `HashMap`, so before this existed `tray.items` came out in whatever order
+    /// the hash seed produced: a different sequence between two pushes over the same set, which
+    /// reshuffled a bar's tray icons every time one unrelated item updated a property.
+    registered: u64,
     properties_forwarder: JoinHandle<()>,
     menu_forwarder: Option<JoinHandle<()>>,
+}
+
+/// `tray.items`, oldest registration first.
+///
+/// Registration order rather than a sort on [`TrayItem::id`]: the id is a D-Bus unique name like
+/// `"1.234"`, so sorting it lexicographically puts `1.100` before `1.20` and drops a newly started
+/// app into the middle of the strip. Both orders are stable; only this one also appends.
+pub(super) fn ordered_items(registry: &ItemRegistry) -> Vec<TrayItem> {
+    let guard = registry.lock().expect("tray registry mutex poisoned");
+    let mut entries: Vec<&ItemEntry> = guard.values().collect();
+    entries.sort_by_key(|entry| entry.registered);
+    entries.into_iter().map(|entry| entry.last_known.clone()).collect()
 }
 
 pub(super) type ItemKey = (OwnedUniqueName, OwnedObjectPath);
@@ -103,8 +127,19 @@ pub(super) async fn register_item(
     let menu_forwarder =
         menu.clone().map(|menu| spawn_menu_signal_forwarder(menu, key.clone(), registry.clone(), events.clone()));
 
-    let entry = ItemEntry { item, menu, last_known: tray_item, properties_forwarder, menu_forwarder };
-    let previous = registry.lock().unwrap().insert(key, entry);
+    let mut entry =
+        ItemEntry { item, menu, last_known: tray_item, registered: 0, properties_forwarder, menu_forwarder };
+    let previous = {
+        let mut guard = registry.lock().unwrap();
+        entry.registered = match guard.get(&key) {
+            // The same key is the same item registering again, so it holds its place in the strip
+            // rather than jumping to the end. An application that re-registers on its own restart
+            // gets a new unique name and therefore a new key, which is a genuinely new item.
+            Some(existing) => existing.registered,
+            None => NEXT_REGISTRATION.fetch_add(1, Ordering::Relaxed),
+        };
+        guard.insert(key, entry)
+    };
     if let Some(previous) = previous {
         previous.properties_forwarder.abort();
         if let Some(handle) = previous.menu_forwarder {
@@ -249,4 +284,94 @@ pub(super) fn spawn_name_owner_changed_forwarder(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capabilities::test_support::p2p_pair;
+
+    /// An entry with everything but the two fields the ordering depends on stubbed out. The proxy
+    /// is bound against a p2p pair rather than mocked: binding makes no call, so it needs no peer
+    /// that answers.
+    async fn entry(connection: &zbus::Connection, id: &str, registered: u64) -> ItemEntry {
+        let destination = zbus::names::OwnedBusName::try_from("org.example.Item").expect("a valid bus name");
+        let path = OwnedObjectPath::try_from("/StatusNotifierItem").expect("a valid object path");
+        ItemEntry {
+            item: bind_item(connection, &destination, &path).await.expect("binding makes no call"),
+            menu: None,
+            last_known: TrayItem { id: id.to_string(), ..TrayItem::default() },
+            registered,
+            properties_forwarder: tokio::spawn(std::future::ready(())),
+            menu_forwarder: None,
+        }
+    }
+
+    fn key(unique: &str) -> ItemKey {
+        (
+            OwnedUniqueName::try_from(unique).expect("a valid unique name"),
+            OwnedObjectPath::try_from("/StatusNotifierItem").expect("a valid object path"),
+        )
+    }
+
+    /// The whole point: a `HashMap`'s iteration order is seeded per process, so this used to be
+    /// whatever the seed said, and a bar's tray reshuffled when one unrelated item updated.
+    #[tokio::test]
+    async fn the_strip_is_in_registration_order_whatever_the_map_says() {
+        let (connection, _peer) = p2p_pair().await;
+        let registry: ItemRegistry = Arc::new(Mutex::new(HashMap::new()));
+        // Built before the lock: `entry` is async, and holding a `std::sync::Mutex` guard across an
+        // await is the thing `clippy::await_holding_lock` exists to stop.
+        let third = entry(&connection, "third", 2).await;
+        let first = entry(&connection, "first", 0).await;
+        let second = entry(&connection, "second", 1).await;
+        // Inserted in an order that is not the registration order, which is what a `HashMap` is
+        // free to hand back.
+        {
+            let mut guard = registry.lock().unwrap();
+            guard.insert(key(":1.30"), third);
+            guard.insert(key(":1.10"), first);
+            guard.insert(key(":1.20"), second);
+        }
+        let ids: Vec<String> = ordered_items(&registry).into_iter().map(|item| item.id).collect();
+        assert_eq!(ids, ["first", "second", "third"]);
+    }
+
+    /// Registration order, not id order. These ids sort lexicographically the other way, which is
+    /// exactly the trap a sort on `TrayItem::id` would fall into with real D-Bus unique names.
+    #[tokio::test]
+    async fn a_later_registration_appends_even_when_its_id_sorts_first() {
+        let (connection, _peer) = p2p_pair().await;
+        let registry: ItemRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let older = entry(&connection, "1.9", 0).await;
+        let newer = entry(&connection, "1.100", 1).await;
+        {
+            let mut guard = registry.lock().unwrap();
+            guard.insert(key(":1.9"), older);
+            guard.insert(key(":1.100"), newer);
+        }
+        let ids: Vec<String> = ordered_items(&registry).into_iter().map(|item| item.id).collect();
+        assert_eq!(ids, ["1.9", "1.100"], "a lexicographic sort would put 1.100 first");
+    }
+
+    /// An item updating in place must not move, which is the failure a config actually sees.
+    #[tokio::test]
+    async fn an_item_that_re_registers_holds_its_place() {
+        let (connection, _peer) = p2p_pair().await;
+        let registry: ItemRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let first = entry(&connection, "first", 0).await;
+        let second = entry(&connection, "second", 1).await;
+        {
+            let mut guard = registry.lock().unwrap();
+            guard.insert(key(":1.10"), first);
+            guard.insert(key(":1.20"), second);
+        }
+        let mut replacement = entry(&connection, "first-again", 999).await;
+        // What `register_item` does on a repeat registration at a live key: keep the old sequence.
+        replacement.registered = registry.lock().unwrap().get(&key(":1.10")).expect("just inserted").registered;
+        registry.lock().unwrap().insert(key(":1.10"), replacement);
+
+        let ids: Vec<String> = ordered_items(&registry).into_iter().map(|item| item.id).collect();
+        assert_eq!(ids, ["first-again", "second"], "a re-registered item must not jump to the end");
+    }
 }

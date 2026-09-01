@@ -106,9 +106,9 @@ mod tests {
 
     use zbus::zvariant::OwnedObjectPath;
 
-    use super::super::test_support::p2p_pair;
     use super::super::{DEFAULT_ITEM_OBJECT_PATH, RawIconPixmap, RawToolTip, WATCHER_OBJECT_PATH};
     use super::*;
+    use crate::capabilities::test_support::p2p_pair;
 
     // ---- resolve_registration / register_status_notifier_item: a fabricated unique name
     //      must be rejected, since a connection can only ever truthfully claim its own real

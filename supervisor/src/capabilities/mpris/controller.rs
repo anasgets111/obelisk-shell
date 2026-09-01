@@ -13,9 +13,10 @@ use super::watcher::{service_name_for_id, spawn_discovery};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct MprisState {
-    /// Every MPRIS player on the bus, in no order at all: this is a `HashMap`'s values, so the
-    /// sequence can differ between two pushes over the same set. Sort by [`PlayerState::id`] for a
-    /// list that does not reshuffle. Empty when nothing is running, which is not an error.
+    /// Every MPRIS player on the bus, longest-running first. A player that appears appends, and one
+    /// pushing position updates does not move, so `players[1]` keeps meaning the same player.
+    ///
+    /// Empty when nothing is running, which is not an error.
     pub players: Vec<PlayerState>,
 }
 
@@ -96,7 +97,7 @@ impl MprisController {
     /// Synchronous: every registry entry's `last_known` is already up to date (the forwarder
     /// tasks recompute it before ever sending an [`MprisSignal`]).
     pub fn build_state(&self) -> MprisState {
-        MprisState { players: self.registry.lock().unwrap().values().map(|entry| entry.last_known.clone()).collect() }
+        MprisState { players: super::player::ordered_players(&self.registry) }
     }
 
     /// `mpris:send_command(id, cmd)`. `cmd` is already validated by [`parse_control_args`] against

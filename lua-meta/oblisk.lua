@@ -286,7 +286,7 @@ function Capability:invoke(command, ...) end
 ---@field error string Why the last attempt failed, in words fit to draw, e.g. `"too many attempts"`. Empty string when the last attempt succeeded and when none has been made. Rewritten on every PAM answer and cleared when a new lock is confirmed, so it always describes the lock now on screen.
 
 ---@class MprisState
----@field players PlayerState[] Every MPRIS player on the bus, in no order at all: this is a `HashMap`'s values, so the sequence can differ between two pushes over the same set. Sort by [`PlayerState::id`] for a list that does not reshuffle. Empty when nothing is running, which is not an error.
+---@field players PlayerState[] Every MPRIS player on the bus, longest-running first. A player that appears appends, and one pushing position updates does not move, so `players[1]` keeps meaning the same player. Empty when nothing is running, which is not an error.
 
 ---@class NetworkState
 ---`oblisk.network`'s live push state (docs/adr/0029). Scoped to exactly what §4.2 asks for --
@@ -329,7 +329,7 @@ function Capability:invoke(command, ...) end
 ---@field time integer Unix epoch seconds, not milliseconds -- §2.11 calls it "system time epoch" with no unit stated. `os.date` wants seconds, so a millis reading would be silently wrong by 1000x.
 
 ---@class TrayState
----@field items TrayItem[] Every registered `StatusNotifierItem`, in no order at all: `build_state` collects a `HashMap`'s values, so the sequence can differ between two pushes that registered the same items. A strip that should not reshuffle has to sort, and [`TrayItem::id`] is the stable key.
+---@field items TrayItem[] Every registered `StatusNotifierItem`, oldest registration first. A new item appends and an item updating a property does not move, so a strip can be drawn straight from this without sorting. Registration order rather than id order because [`TrayItem::id`] is a D-Bus unique name like `"1.234"`: sorting it lexicographically puts `1.100` before `1.20` and drops a newly started application into the middle of the strip.
 
 ---@class UpdatesState
 ---`oblisk.updates`'s combined payload. `check_error`/`install_error` are `None` when
