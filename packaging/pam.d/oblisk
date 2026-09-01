@@ -1,5 +1,5 @@
-# Oblisk's PAM stack, for the lock screen (docs/adr/0052) and polkit authentication
-# (docs/adr/0028). Install to /etc/pam.d/oblisk.
+# Oblisk's PAM stack, for the lock screen (ADR-0052) and polkit authentication
+# (ADR-0028). Install to /etc/pam.d/oblisk.
 #
 # Until this file exists the worker authenticates against "login" instead, which works but is the
 # console-login stack and does considerably more than an unlock needs: pam_shells, pam_nologin,

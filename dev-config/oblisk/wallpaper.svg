@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- The default wallpaper, and the reason it is SVG rather than a PNG: it is the only asset in
      this repository that a reviewer can read as text, and rasterizing it at the output's own width
-     is what exercises resvg (build-steps.md Phase 29 item 1). A 16:9 viewBox with `fit = "cover"`
+     is what exercises resvg. A 16:9 viewBox with `fit = "cover"`
      over it, so a 16:10 or ultrawide output crops rather than letterboxes. -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" width="1920" height="1080">
   <defs>

@@ -1,4 +1,4 @@
-# Reruns the shell when it dies (docs/adr/0059 decision 4).
+# Reruns the shell when it dies (ADR-0059 decision 4).
 #
 # niri's `spawn-at-startup` does not restart what it spawns. That is niri issue #2986's answer
 # verbatim -- "niri doesn't restart that for you, it is up to you to recover it" -- so the recovery
@@ -9,7 +9,7 @@
 #
 # Install: put both binaries in ~/.local/lib/oblisk. They have to be siblings, because the
 # Supervisor resolves the Renderer next to itself (`renderer_binary_path` in supervisor/src/main.rs;
-# no install-path configuration exists yet, docs/adr/0025). Then copy this file to
+# no install-path configuration exists yet, ADR-0025). Then copy this file to
 # ~/.config/systemd/user/ and run `systemctl --user daemon-reload`. For a dev run against the build
 # tree, point ExecStart at target/debug/supervisor instead.
 
@@ -30,7 +30,7 @@ Restart=always
 # A Supervisor that dies during its own startup would otherwise burn systemd's start limit in well
 # under a second and stop the shell for good.
 RestartSec=1
-# docs/adr/0059 decision 3. Exit 3 is docs/adr/0058's restart brake giving up: three Renderers died
+# ADR-0059 decision 3. Exit 3 is ADR-0058's restart brake giving up: three Renderers died
 # inside a minute, which is a config that kills whatever it is handed rather than a transient.
 # Restarting hands the same config to three more, once a minute, forever, and that is slow enough
 # that systemd's own start limit (5 starts in 10s by default) never sees it.
