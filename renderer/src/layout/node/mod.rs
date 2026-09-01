@@ -15,7 +15,7 @@
 //!
 //! Resolution happens exactly once per property: a signal resolving to another `Signal` is an
 //! error, not a second read. That guard is not a recursion bound -- a computed signal whose getter
-//! returns fresh depth on every call recurses through `resolve_and_reconcile` and
+//! returns fresh depth on every call recurses through `layout::scene::prepare` and
 //! `deserialize_lua_table` as deep as the getter wants. `layout::scene::MAX_TREE_DEPTH` is what caps
 //! that and raises [`LayoutError::TreeTooDeep`].
 //!
@@ -125,7 +125,7 @@ pub enum LayoutError {
     InvalidProperty { property: String, detail: String },
     #[error("`{0}` is a Signal handle, not a plain value -- read it via :get() before returning it from shell.lua")]
     UnsupportedSignalProperty(String),
-    /// build-steps.md Phase 19 item 3: `resolve_and_reconcile`'s recursion, bounded at
+    /// build-steps.md Phase 19 item 3: `layout::scene::prepare`'s recursion, bounded at
     /// `layout::scene::MAX_TREE_DEPTH`. Covers both a literal cyclic tree (`r.children = { r }`)
     /// and a computed `children` signal that generates fresh depth on every read -- both recurse
     /// through the same Rust call, so one cap catches both (see that constant's doc comment).

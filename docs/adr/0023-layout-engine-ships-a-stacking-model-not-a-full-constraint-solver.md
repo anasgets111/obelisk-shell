@@ -11,6 +11,14 @@
 > `id` scoped to their parent, and identified children pair before the rest fall back to this ADR's
 > positional rule. Item 1's deferred `list` gains a `key` requirement from the same ADR.
 >
+> **The title's second half is superseded by docs/adr/0077.** The layout math is `taffy`'s now.
+> Item 4's stacking model survives as a description (it is a single-cell grid, expressed rather than
+> reimplemented) and so do items 1 to 3, 5 to 9 and 12, which are about what Phase 12 did not build.
+> What goes is the decision section's single recursive function doing all three of § 3's passes,
+> along with item 11, which ADR-0077 fixes with the second constraint pass upgrade path (g) named.
+> Item 10 stays true and stays deliberate: a `Fill` or `Percent` child of a `Content`-sized row
+> still resolves to zero, which is also what CSS answers.
+>
 > Everything else here stands.
 
 Phase 12's title ("Retained Scene & the One-Pass Layout Engine") and its build-steps.md text scope

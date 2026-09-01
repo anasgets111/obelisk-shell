@@ -23,7 +23,7 @@
 //! item 4 already implements resolve overlaps the same way layout resolved them -- a later sibling
 //! or a child paints over what an earlier one already put down. An invisible node (`visible ==
 //! false`) and its whole subtree draw nothing, the same collapse
-//! `layout::scene::resolve_and_reconcile` picked for row/column space reservation.
+//! `layout::scene` picked for row/column space reservation.
 //!
 //! `ResolvedNode.rect` is parent-relative, so [`build_node`] accumulates an absolute origin as it
 //! descends rather than trusting `rect.x`/`rect.y` as already-absolute. Get this wrong and every
@@ -168,7 +168,7 @@ pub fn build(root: &ResolvedNode, scale: f32, focus: Option<&SecureField>) -> Di
 /// is the absolute position of this node's parent's content box -- added to `node.rect.x`/`.y`
 /// (parent-relative) to get this node's absolute rect, which is in turn what the next recursion
 /// level's origin becomes.
-// Eight parameters, and the same answer `resolve_and_reconcile` gives: three of them (`origin`,
+// Eight parameters, and the same answer `layout::scene`'s own walks give: three of them (`origin`,
 // `clip`, `inherited_opacity`) are what this recursion accumulates and the rest are invariants it
 // carries, so a struct would be a bag holding the same eight fields through the same one caller.
 #[allow(clippy::too_many_arguments)]
@@ -198,7 +198,7 @@ fn build_node(
     //
     // ponytail: clipping is the floor, not the finished behavior (build-steps.md Phase 19 item
     // 17 names this directly). § 3.2 gives `text` a wrap at the available width, and
-    // `layout::scene::intrinsic_content_size` already measures a `Content`-sized text box against
+    // `layout::scene`'s measure callback already measures a `Content`-sized text box against
     // exactly that width (its `text_wrap_width` local, passed to `ShapingHandle::shape` as
     // `max_width`) -- but `ShapeResult` returns only a bounding `width`/`height`, not the wrapped
     // lines that produced it, and `Draw::Text` carries the raw `content` string that `draw_line`
@@ -363,7 +363,7 @@ fn draw_for(
         // `foreground`.
         //
         // ponytail: a `Content`-sized `text` box comes from cosmic-text's measurement
-        // (`layout::scene::intrinsic_content_size`), while `build_node`'s clip cuts this draw off at
+        // (`layout::scene`'s measure callback), while `build_node`'s clip cuts this draw off at
         // that same box -- so if femtovg ever renders wider than cosmic-text measured, the clip
         // shaves the overrun off the right edge instead of letting it paint over a neighbour.
         // Checked against the current font chain (single-face Noto Sans, no fallback triggered)

@@ -224,7 +224,7 @@ impl Supervisor {
     }
 
     /// Records that a swap could not run because the session is locked (docs/adr/0042). A later
-    /// report that clears the lock redeems it in [`Session::record_lock_report`].
+    /// report that clears the lock redeems it in [`Supervisor::record_lock_report`].
     pub(crate) fn defer_swap(&mut self, sequence: u64) {
         eprintln!("generation swap for sequence {sequence} deferred: the session is locked (docs/adr/0042)");
         self.swap_owed_on_unlock = true;

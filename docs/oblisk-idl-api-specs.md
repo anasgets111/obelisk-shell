@@ -468,7 +468,7 @@ A **scroll offset** is engine-written reactive state naming how far one containe
 *   `scroll(name)` -> `Signal` (Global. A number, `0` at the top or left. Read-only to Lua: `signal:set()` refuses it, because the engine is the writer)
     *   `name`: `string` (The slot's identity, the way `hover(name)`'s and `state(name, initial)`'s are. An in-place reload finds the offset the user left, so an open panel does not jump back to the top when the config is edited)
 
-> **The wheel writes and the layout pass clamps.** A wheel event adds a distance to the offset without bounding it; `position_children` then clamps against the content extent it has just measured and writes back what it used, because that extent is a number no config can see. So the signal always reads where the container actually is, not what the last wheel asked for.
+> **The wheel writes and the layout pass clamps.** A wheel event adds a distance to the offset without bounding it; the layout pass then clamps against the content extent it has just measured and writes back what it used, because that extent is a number no config can see. So the signal always reads where the container actually is, not what the last wheel asked for.
 
 > **A container with nothing to scroll is a no-op, not an error.** A `Content`-sized column grows to fit its children, so its content and its viewport are the same number and the offset clamps to `0`. Same answer `"Fill"` gives in a `Content` parent, and for the same reason: there is no remainder.
 

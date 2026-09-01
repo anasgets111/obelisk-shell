@@ -1,13 +1,19 @@
 //! The one-pass resolve algorithm and the retained-scene transaction
 //! (`docs/oblisk-layout-engine-geometry.md` § 3-5, `CONTEXT.md`'s "Retained scene" entries).
 //!
-//! `resolve_and_reconcile` is the single recursive walk doing all three of § 3's passes
-//! (constraint down, size up, position down) per node in one recursion, matching the spec's
-//! literal "single... pass" language, while simultaneously matching fresh nodes to retained ones
+//! A pass is three steps. [`prepare`] walks the fresh tree in declaration order, resolving each
+//! node's properties once, parsing them once, matching it to the retained node it continues
 //! (`pair_children_by_id_then_position`, § 4 as amended by docs/adr/0045: children carrying an
 //! `id` pair by that `id` alone, scoped to their parent, and the id-less ones pair by position
-//! among themselves -- ADR-0023's original rule on a smaller set) and retiring removed subtrees
-//! child-first (`CONTEXT.md`, Lease).
+//! among themselves -- ADR-0023's original rule on a smaller set), retiring removed subtrees
+//! child-first (`CONTEXT.md`, Lease), and building a taffy node for it. [`solve`] runs § 3's three
+//! passes over that tree. [`finish`] reads the geometry back out.
+//!
+//! The § 3 math itself is taffy's since docs/adr/0077, which supersedes ADR-0023's one-pass
+//! stacking model. What is still this module's own is everything a solver has no opinion about:
+//! node identity, the lease, the depth cap, the once-per-pass resolution guarantee, the scroll
+//! writeback, and text elision. [`taffy_style`] is the seam between the two, and it is the only
+//! place that knows what a `row` or a `Fill` means.
 
 use std::collections::{HashMap, HashSet};
 
@@ -18,6 +24,7 @@ use crate::layout::node::{self, Align, EdgeInsets, LayoutError, PaintStyle, Size
 use crate::lua::nodes::VirtualNode;
 use crate::text::shaping::{ShapeRequest, ShapingHandle};
 use crate::text::snap::{LogicalRect, PhysicalRect, snap_to_physical};
+use taffy::prelude::{length, line, span};
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct LogicalSize {
@@ -25,7 +32,7 @@ pub struct LogicalSize {
     pub height: f32,
 }
 
-/// The recursion bound for `resolve_and_reconcile` (build-steps.md Phase 19 item 3): at most this
+/// The recursion bound for [`prepare`] (build-steps.md Phase 19 item 3): at most this
 /// many node levels are admitted, and the level past it is refused, the same "at most N levels"
 /// boundary `lua::signal`'s `MAX_SIGNAL_NESTING_DEPTH` uses. Applies to both a literal cyclic tree
 /// (`r.children = { r }`) and a computed `children` signal that manufactures fresh depth on every
@@ -33,27 +40,32 @@ pub struct LogicalSize {
 ///
 /// Exists to turn an abort into a `LayoutError`, not to express a design limit. Sizing it means
 /// sizing it *together with* `MAX_SIGNAL_NESTING_DEPTH`, because the two recursions compound: a
-/// node level resolves its `children` property, and that resolution can nest signals. Measured on
-/// a 2 MiB debug-build test thread (the tightest stack this runs on; production owns the Lua VM on
-/// the process main thread, 8 MiB by default), stack cost is additive and linear in each:
+/// node level resolves its `children` property, and that resolution can nest signals.
 ///
-/// - 5,216 B per `resolve_and_reconcile` level;
-/// - 14,864 B per nested `Signal::get_value` level of the expensive kind (a `computed` body
-///   calling `:get()`); a plain dependency chain (`s:map(f):map(g)`) is 1,840 B per level, so the
-///   body-nesting figure is the worst case.
+/// Measured end to end, by running the compound worst case -- a tree at this cap whose every level
+/// carries a 31-deep `computed` chain on its `margin` -- on a thread whose stack is shrunk until
+/// the process aborts. That is a different measurement from the one this comment used to carry,
+/// which modelled the peak from instrumented frame addresses and so counted only this module's own
+/// recursion. The model understated it: it predicted 809,472 B where the shipped code actually
+/// needed about 1,400 KiB, because the mlua frames below the deepest node and the error-formatting
+/// frames a refusal runs at full depth are real and were not in it. Shrinking a stack until it
+/// aborts counts everything.
 ///
-/// The signal nest is popped before descending to the next node level, so it is paid once rather
-/// than per level: the compounded worst case is `MAX_TREE_DEPTH * 5216 +
-/// MAX_SIGNAL_NESTING_DEPTH * 14864`. Verified against the model at (60, 24): predicted 669,696 B,
-/// measured 669,808 B.
+/// On the tightest stack this runs on, a 2 MiB debug test thread (production owns the Lua VM on the
+/// process main thread, 8 MiB by default, since `wayland::run` is called from `main`):
 ///
-/// 64, not the 128 it started at: 128 with a 32-deep signal nest peaks at 1,143,296 B, roughly 1.8x
-/// margin on a 2 MiB stack, and the measurement spans only the recursive frames, not the mlua/Lua
-/// frames below the deepest one or the error-formatting frames the refusal itself runs at full
-/// depth. 64 peaks at 809,472 B, roughly 2.6x, while leaving 4x headroom above the 10 to 15 levels
-/// a real `shell.lua` produces. `MAX_SIGNAL_NESTING_DEPTH` keeps its 32 because it is the cap that
-/// also bounds dependency chains, the shape a real config is likeliest to grow; the tree cap was
-/// the cheaper lever, at 2.85x fewer bytes per level.
+/// - about 590 KiB for a 64-level tree with no signals in it, near enough 8,960 B per level;
+/// - about 1,040 KiB for the same tree with a 31-deep signal nest on every level.
+///
+/// The nest costs about 450 KiB once rather than per level, because it is popped before the walk
+/// descends to the next node. So 64 levels peak at roughly half of a 2 MiB stack, a 1.97x margin.
+///
+/// 64 rather than fewer, and unchanged by the solver swap (docs/adr/0077), because that swap
+/// *lowered* this: the hand-written pass needed about 1,400 KiB for the same worst case, a 1.44x
+/// margin, so the cap is on firmer ground now than it was when it was written. A real `shell.lua`
+/// is 10 to 15 levels deep, which leaves 4x headroom above anything a config has asked for.
+/// `MAX_SIGNAL_NESTING_DEPTH` keeps its 32 because it is the cap that also bounds dependency
+/// chains, the shape a real config is likeliest to grow.
 const MAX_TREE_DEPTH: u32 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -65,11 +77,13 @@ pub struct NodeId(u64);
 /// Item 5's first half made a node's *properties* resolve once, so the `Signal` behind `margin` is
 /// read once per node per pass. This is the second thing it names. A resolved property is still an
 /// `mlua::Value`, and a `Value::Table` carrying an `__index` answers every metamethod-aware
-/// `Table::get` afresh, so `margin` parsed in the parent's child loop, twice more in
-/// `intrinsic_content_size` and once more in `position_children` was four independent answers to
-/// one question. Measured before this existed: 16 `__index` invocations for one child's margin in
-/// one apply, and a row that measured itself 18 wide then placed its 10-wide child spanning
-/// 16..26, eight pixels outside the parent it had just been sized to fit. No `Signal` involved.
+/// `Table::get` afresh, so `margin` parsed once in the parent's child loop, twice more while the
+/// hand-written pass sized the row and once more while it positioned the child was four
+/// independent answers to one question. Measured before this existed: 16 `__index` invocations for
+/// one child's margin in one apply, and a row that measured itself 18 wide then placed its 10-wide
+/// child spanning 16..26, eight pixels outside the parent it had just been sized to fit. No
+/// `Signal` involved. The solver reads this struct once too (docs/adr/0077): [`taffy_style`] is the
+/// only thing that touches it, and it runs once per node per pass.
 ///
 /// Parsed by the *parent*, in its child loop, for the same reason the property resolve is: a
 /// parent needs a child's `margin` to compute the budget it recurses with, so the one parse has to
@@ -112,16 +126,6 @@ impl LayoutStyle {
             visible: node::parse_visible(properties)?,
             opacity: node::parse_opacity(properties)?,
         })
-    }
-
-    /// Whether this node asked to fill its parent's main axis, and so has to be sized from the
-    /// remainder its siblings leave rather than from the budget it was handed.
-    fn fills(&self, axis: MainAxis) -> bool {
-        let mode = match axis {
-            MainAxis::Horizontal => self.width_mode,
-            MainAxis::Vertical => self.height_mode,
-        };
-        mode == SizeMode::Fill
     }
 
     /// This node's margin along `axis`, both edges.
@@ -276,7 +280,7 @@ impl Scene {
     ///
     /// Rolls back to exactly its pre-call state on `Err` (`CONTEXT.md`, Rollback; `socket.rs`'s
     /// `handle_reevaluate` already assumes this). A Signal getter can fail at any depth inside
-    /// `resolve_and_reconcile`, partway through mutating `self.next_id` and `self.retiring`, and
+    /// [`prepare`], partway through mutating `self.next_id` and `self.retiring`, and
     /// partway through a multi-surface `fresh_surfaces` list, so snapshotting
     /// `surfaces`/`next_id`/`retiring` up front and restoring the snapshot wholesale on any error is
     /// the smallest change that holds the invariant for all three.
@@ -432,20 +436,36 @@ impl Scene {
         } else {
             (None, None)
         };
-        let reconciled = resolve_and_reconcile(
-            self,
-            existing,
-            &fresh.kind,
-            properties,
-            style,
-            available,
-            shaping,
-            forced.0,
-            forced.1,
-            lua,
-            0,
-        )?;
-        self.surfaces.insert(key, reconciled);
+
+        // One tree per instance, built and dropped inside this call. Nothing carries across a pass:
+        // the identity that has to survive one is the `NodeId` on the retained tree, and taffy's own
+        // node ids are an implementation detail of the solve. That also means `apply_admitting`'s
+        // rollback has nothing extra to undo -- a failed walk drops the tree on the way out.
+        let mut tree: taffy::TaffyTree<Measure> = taffy::TaffyTree::new();
+        // The geometry this engine computes is fractional (`layout::text::snap` is what turns it
+        // into pixels, per surface scale, at paint time), and taffy rounds layouts to whole numbers
+        // unless told not to.
+        tree.disable_rounding();
+        let prepared = prepare(self, &mut tree, existing, &fresh.kind, properties, style, None, lua, 0)?;
+
+        // The root's own size, patched on after the walk because it is the one node whose `Fill`
+        // and `Percent` cannot mean what they mean anywhere else: there is no parent to take a
+        // share of or a percentage of, so both resolve against the room the surface was configured
+        // at. Every node below it takes its size from the solver.
+        let mut root_style = tree.style(prepared.taffy).map_err(taffy_failed)?.clone();
+        root_style.size = taffy::Size {
+            width: match forced.0.or_else(|| resolve_non_content(style.width_mode, available.width)) {
+                Some(width) => taffy::Dimension::length(width),
+                None => taffy::Dimension::auto(),
+            },
+            height: match forced.1.or_else(|| resolve_non_content(style.height_mode, available.height)) {
+                Some(height) => taffy::Dimension::length(height),
+                None => taffy::Dimension::auto(),
+            },
+        };
+        tree.set_style(prepared.taffy, root_style).map_err(taffy_failed)?;
+        solve(&mut tree, prepared.taffy, available, shaping)?;
+        self.surfaces.insert(key, finish(&tree, prepared, shaping)?);
         Ok(())
     }
 
@@ -533,9 +553,9 @@ fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
 
 /// Everything a node has to pass before *anything* reads its properties: a supported kind, and a
 /// level within [`MAX_TREE_DEPTH`]. Called at each site about to run `node::resolve_properties`
-/// over a node's raw map -- `Scene::apply_one_surface` for a surface root, `resolve_and_reconcile`'s
-/// child loop for every node below one -- and again at the top of `resolve_and_reconcile`, which is
-/// what keeps [`children_of`]'s `unreachable!` arm unreachable for any caller.
+/// over a node's raw map -- `Scene::apply_one_instance` for a surface root, [`prepare`]'s child
+/// loop for every node below one -- and again at the top of [`prepare`], which is what keeps
+/// [`children_of`]'s `unreachable!` arm unreachable for any caller.
 ///
 /// The ordering is the whole reason this is a function rather than two lines inline. Resolution
 /// calls back into Lua (ADR-0044 decision 1), so running it before these checks executes a rejected
@@ -597,59 +617,16 @@ fn children_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Vec<Vi
     }
 }
 
-/// `Content` stays unresolved (`None`) until children are known; every other mode is known
-/// upfront from `available` alone.
+/// A surface root's own size, and nothing else's. Every node below one gets its size from the
+/// solver, but the root is the one node whose `Fill` and `Percent` have no parent to mean anything
+/// against, so both resolve against the room the surface was configured at. `Content` stays
+/// unresolved (`None`) until children are known, which is the solver's `auto`.
 fn resolve_non_content(mode: SizeMode, available: f32) -> Option<f32> {
     match mode {
         SizeMode::Content => None,
         SizeMode::Pixels(n) => Some(n),
         SizeMode::Fill => Some(available),
         SizeMode::Percent(p) => Some(available * p),
-    }
-}
-
-/// Whether `child_properties` requests a `Stretch` cross-alignment from `parent_kind`, and if so,
-/// the forced size to hand `resolve_and_reconcile` for that axis -- `margined_budget`, the same
-/// budget the child would get anyway, so stretching is "take the whole margined slot" rather than
-/// a distinct sizing rule. Only fires when the parent's own size in that axis is already known
-/// (`own_*_known` is `Some`): when the parent's axis is `Content`-sized, its final size isn't
-/// determined until after this child resolves, so there's nothing to force yet -- `position_children`'s
-/// post-hoc patch is the fallback for that remaining case (docs/adr/0023).
-///
-/// Infallible since the alignments come off the child's already-parsed [`LayoutStyle`] rather than
-/// out of its property map: there is nothing left here that can be malformed.
-fn stretch_forced_size(
-    parent_kind: &str,
-    child_style: &LayoutStyle,
-    own_width_known: Option<f32>,
-    own_height_known: Option<f32>,
-    margined_budget: LogicalSize,
-) -> (Option<f32>, Option<f32>) {
-    match parent_kind {
-        "row" => {
-            let forced_h =
-                (child_style.align_v == Align::Stretch && own_height_known.is_some()).then_some(margined_budget.height);
-            (None, forced_h)
-        }
-        "column" => {
-            let forced_w =
-                (child_style.align_h == Align::Stretch && own_width_known.is_some()).then_some(margined_budget.width);
-            (forced_w, None)
-        }
-        // The stacking kinds, all four surface roles included: a child aligned `Stretch` on an
-        // axis takes the whole margined slot in it (docs/adr/0023 item 4). A `window`'s, a
-        // `popup`'s or a `lock`'s root is a surface container like a `panel`'s, so a full-bleed
-        // background inside one has to work the same way. A lock screen is the case that needs it
-        // least conditionally: § 6.4 says a lock surface covers its output, so the tree inside one
-        // is full-bleed by definition rather than by an author's choice.
-        "rect" | "button" | "panel" | "window" | "popup" | "lock" => {
-            let forced_w =
-                (child_style.align_h == Align::Stretch && own_width_known.is_some()).then_some(margined_budget.width);
-            let forced_h =
-                (child_style.align_v == Align::Stretch && own_height_known.is_some()).then_some(margined_budget.height);
-            (forced_w, forced_h)
-        }
-        _ => (None, None),
     }
 }
 
@@ -772,115 +749,258 @@ fn main_axis_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Optio
     })
 }
 
-/// One child resolved but not yet recursed into, held between the two phases of
-/// [`resolve_and_reconcile`]'s child loop.
-struct PendingChild {
-    reusable: Option<RetainedNode>,
-    properties: HashMap<String, Value>,
+/// What the solver cannot work out from a style alone: a leaf sized by its own content.
+///
+/// Every other kind takes the size its `width`/`height` ask for, or the size its children add up
+/// to, and taffy does both. These two do not. Parsed in [`prepare`] rather than in the measure
+/// callback below, because a callback returns a `Size<f32>` and has nowhere to put a
+/// [`LayoutError`] -- `icon`'s `size` is a property like any other and can be malformed.
+enum Measure {
+    /// § 3.2's text measurement, against the wrap width taffy offers.
+    Text { content: String, font_size: f32 },
+    /// § 5.1's `icon` `size`, the same number on both axes.
+    Square(f32),
+}
+
+/// One node after identity, resolution and parsing, and before geometry: everything a
+/// [`RetainedNode`] needs except the rect, plus the taffy node that rect will come out of.
+///
+/// The tree of these is what [`prepare`] builds walking the fresh `VirtualNode` tree in
+/// declaration order, and what [`finish`] walks again to read the solved geometry back.
+struct PreparedNode {
+    id: NodeId,
+    kind: String,
     style: LayoutStyle,
-    budget: LogicalSize,
-    /// Whether this child asked to fill its parent's *main* axis, and so has to wait for round two.
-    /// Always `false` under a stacking parent, where `Fill` already means the whole box.
-    fills_main: bool,
+    properties: HashMap<String, Value>,
+    paint: Option<PaintStyle>,
+    taffy: taffy::NodeId,
+    children: Vec<PreparedNode>,
 }
 
-/// This child's extent along `axis` including its margin -- the same number
-/// [`position_children`] calls a footprint and advances its cursor by.
-///
-/// The margin comes off the child's own [`LayoutStyle`], which is the same parse the budget it was
-/// sized against came from. Re-parsing it here would run a `margin` table's `__index` metamethod
-/// again and could get a different answer, and then the remainder would be measured against a
-/// margin no child was ever given.
-fn main_axis_footprint(child: &RetainedNode, axis: MainAxis) -> f32 {
-    let extent = match axis {
-        MainAxis::Horizontal => child.rect.width,
-        MainAxis::Vertical => child.rect.height,
-    };
-    extent + child.style.margin_on(axis)
+/// `Content` is the one mode with no answer until the children are known, which is exactly
+/// taffy's `auto`. `Fill` is `auto` too, and gets its meaning from the `flex_grow` or the stretch
+/// [`taffy_style`] pairs it with: what "fill" means depends on what the parent is doing, and the
+/// size property cannot say it on its own.
+fn taffy_dimension(mode: SizeMode) -> taffy::Dimension {
+    match mode {
+        SizeMode::Content | SizeMode::Fill => taffy::Dimension::auto(),
+        SizeMode::Pixels(n) => taffy::Dimension::length(n),
+        SizeMode::Percent(p) => taffy::Dimension::percent(p),
+    }
 }
 
-/// Recurses into one child that phase one already resolved.
+/// `Align` as the alignment of one item inside the slot its parent gives it.
+fn item_align(align: Align) -> taffy::AlignSelf {
+    match align {
+        Align::Start => taffy::AlignItems::START,
+        Align::Center => taffy::AlignItems::CENTER,
+        Align::End => taffy::AlignItems::END,
+        Align::Stretch => taffy::AlignItems::STRETCH,
+    }
+}
+
+/// `Align` as a flow container's packing of its children along the axis it flows in.
 ///
-/// `forced_main` is the main-axis size a `Fill` child was handed out of its parent's remainder, and
-/// `None` for every other child, which sizes itself from `budget` exactly as it always has. It is
-/// merged with, not layered over, [`stretch_forced_size`]'s answer: that function only ever forces
-/// the *cross* axis, so the two never name the same axis and the `or` below cannot mask it.
-#[allow(clippy::too_many_arguments)]
-fn resolve_pending_child(
-    scene: &mut Scene,
-    child: PendingChild,
+/// `Stretch` is not a packing and never was: the hand-written pass ran its main-axis cursor from
+/// the same place for `Start` and for `Stretch`, so `Stretch` on a row's own `align_h` has always
+/// read as `Start`. Kept, rather than quietly promoted to a distribution taffy could express.
+fn main_align(align: Align) -> taffy::JustifyContent {
+    match align {
+        Align::Start | Align::Stretch => taffy::JustifyContent::START,
+        Align::Center => taffy::JustifyContent::CENTER,
+        Align::End => taffy::JustifyContent::END,
+    }
+}
+
+/// One node's taffy style: the container half (how it lays its own children out) and the item half
+/// (how its parent lays *it* out), which is one value because that is how taffy's `Style` is
+/// shaped.
+///
+/// `parent_axis` is the axis this node's parent flows along, `None` when the parent stacks
+/// (docs/adr/0023 item 4) or when this is a surface root. It is what decides which of this node's
+/// two `Fill`s is a share of a remainder and which is the whole slot: filling a row's main axis
+/// means splitting what the siblings leave, and filling anything else means taking all of it.
+fn taffy_style(
     kind: &str,
-    parent_kind: &str,
-    main_axis: Option<MainAxis>,
-    forced_main: Option<f32>,
-    own_width_known: Option<f32>,
-    own_height_known: Option<f32>,
-    shaping: &ShapingHandle,
-    lua: &Lua,
-    depth: u32,
-) -> Result<RetainedNode, LayoutError> {
-    let (stretch_width, stretch_height) =
-        stretch_forced_size(parent_kind, &child.style, own_width_known, own_height_known, child.budget);
-    let (forced_width, forced_height) = match main_axis {
-        Some(MainAxis::Horizontal) => (forced_main.or(stretch_width), stretch_height),
-        Some(MainAxis::Vertical) => (stretch_width, forced_main.or(stretch_height)),
-        None => (stretch_width, stretch_height),
+    properties: &HashMap<String, Value>,
+    style: &LayoutStyle,
+    parent_axis: Option<MainAxis>,
+) -> Result<taffy::Style, LayoutError> {
+    // An invisible node leaves the layout entirely: no size, no position, and no `spacing` gap on
+    // either side of it. The first two are a narrowing of what the hand-written pass did, which
+    // resolved a hidden subtree's geometry in full and then declined to place it; nothing outside
+    // this module ever read that geometry, because `paint`, `hit` and `overlay_input_regions` all
+    // filter on `visible` first. The gap is the part that was always specified, and it still holds.
+    if !style.visible {
+        return Ok(taffy::Style { display: taffy::Display::None, ..taffy::Style::DEFAULT });
+    }
+
+    let mut out = taffy::Style {
+        // This engine has no shrink concept, and two taffy defaults have to be turned off to keep
+        // it that way. `flex_shrink` is the obvious one: a fixed child keeps the width it asked
+        // for even when the siblings already overflow the parent, which is the behaviour
+        // `fixed_children_that_already_overflow_collapse_a_fill_sibling_to_nothing` pins. The
+        // `min_size` is the other half -- taffy's automatic minimum size would floor a `Fill` item
+        // at its own content instead of letting it collapse, and every budget the hand-written
+        // pass computed was clamped at zero rather than at a content size.
+        flex_shrink: 0.0,
+        min_size: taffy::Size { width: length(0.0), height: length(0.0) },
+        padding: taffy::Rect {
+            left: length(style.padding.left),
+            right: length(style.padding.right),
+            top: length(style.padding.top),
+            bottom: length(style.padding.bottom),
+        },
+        margin: taffy::Rect {
+            left: length(style.margin.left),
+            right: length(style.margin.right),
+            top: length(style.margin.top),
+            bottom: length(style.margin.bottom),
+        },
+        size: taffy::Size { width: taffy_dimension(style.width_mode), height: taffy_dimension(style.height_mode) },
+        ..taffy::Style::DEFAULT
     };
-    resolve_and_reconcile(
-        scene,
-        child.reusable,
-        kind,
-        child.properties,
-        child.style,
-        child.budget,
-        shaping,
-        forced_width,
-        forced_height,
-        lua,
-        depth,
-    )
+
+    // The container half.
+    match main_axis_of(kind, properties)? {
+        Some(axis) => {
+            out.display = taffy::Display::Flex;
+            out.flex_direction = match axis {
+                MainAxis::Horizontal => taffy::FlexDirection::Row,
+                MainAxis::Vertical => taffy::FlexDirection::Column,
+            };
+            // § 3.3: a flow container's own `align_h`/`align_v` packs its children along the axis
+            // it flows in. The other axis is each child's own business and is read off the child.
+            out.justify_content = Some(main_align(match axis {
+                MainAxis::Horizontal => style.align_h,
+                MainAxis::Vertical => style.align_v,
+            }));
+            // § 3.1's `spacing`, between adjacent children only, which is what a flex gap is. Set
+            // on both axes because a single flex line only ever spends the one it flows along.
+            out.gap = taffy::Size { width: length(style.spacing), height: length(style.spacing) };
+        }
+        // The stacking model (docs/adr/0023 item 4) is a grid of exactly one cell holding every
+        // child: they overlap, each is aligned independently on both axes within the full content
+        // box, and the container's own `Content` size is their bounding union. That is what a
+        // single auto-sized grid track does, which is why this is a `Display::Grid` rather than an
+        // invented third mode. The cell is implicit -- the children pin themselves to line 1 on
+        // both axes below, and taffy's auto track sizing does the union.
+        None => out.display = taffy::Display::Grid,
+    }
+
+    // The item half. `Fill` on an axis this node's parent does not flow along means "the whole
+    // slot", and it outranks the alignment the config wrote: the hand-written pass sized such a
+    // child to the full slot first and then aligned it inside a box it had already filled, so the
+    // alignment could never move it. Stretching says the same thing to taffy in one property.
+    let fills_h = style.width_mode == SizeMode::Fill && parent_axis != Some(MainAxis::Horizontal);
+    let fills_v = style.height_mode == SizeMode::Fill && parent_axis != Some(MainAxis::Vertical);
+    let align_h = if fills_h { taffy::AlignItems::STRETCH } else { item_align(style.align_h) };
+    let align_v = if fills_v { taffy::AlignItems::STRETCH } else { item_align(style.align_v) };
+
+    // Which of the two alignments the parent actually applies, per axis. A flex item's main axis is
+    // packed by the container's `justify_content`, so the item's own alignment there is not its to
+    // state; a grid item in the stacking cell states both.
+    let (governed_h, governed_v) = match parent_axis {
+        Some(MainAxis::Horizontal) => (None, Some(align_v)),
+        Some(MainAxis::Vertical) => (Some(align_h), None),
+        None => (Some(align_h), Some(align_v)),
+    };
+
+    // The one place this mapping is not plain CSS. `align-self: stretch` applies only to an `auto`
+    // cross size, so a child writing both `height = 5` and `align_v = "Stretch"` would keep its 5 --
+    // but the hand-written pass overrode the resolved size outright, so this engine has always let
+    // the stretch win, and `row_child_stretch_alignment_fills_the_cross_axis` pins it. Blanking the
+    // size is how taffy is told the same thing. Kept rather than corrected because swapping the
+    // solver is the change being made here; whether a stated size should outrank a stated stretch is
+    // a config-facing question, and answering it silently inside a dependency swap is how a shell
+    // that laid out correctly yesterday stops doing so today.
+    if governed_h == Some(taffy::AlignItems::STRETCH) {
+        out.size.width = taffy::Dimension::auto();
+    }
+    if governed_v == Some(taffy::AlignItems::STRETCH) {
+        out.size.height = taffy::Dimension::auto();
+    }
+
+    match parent_axis {
+        // A flex item: the parent packs it on the main axis, so only the cross alignment is its
+        // own, and `Fill` on the main axis is a share of the remainder. A zero basis is what makes
+        // the share the whole remainder rather than the remainder on top of a content-sized start,
+        // which is the number `two_fill_siblings_split_the_remainder_equally` pins.
+        Some(MainAxis::Horizontal) => {
+            out.align_self = Some(align_v);
+            if style.width_mode == SizeMode::Fill {
+                out.flex_grow = 1.0;
+                out.flex_basis = taffy::Dimension::length(0.0);
+            }
+        }
+        Some(MainAxis::Vertical) => {
+            out.align_self = Some(align_h);
+            if style.height_mode == SizeMode::Fill {
+                out.flex_grow = 1.0;
+                out.flex_basis = taffy::Dimension::length(0.0);
+            }
+        }
+        // A grid item in the one shared cell. Both alignments are its own, which is the stacking
+        // model's "each child positioned per its own `align_h`/`align_v`, independently".
+        None => {
+            out.justify_self = Some(align_h);
+            out.align_self = Some(align_v);
+            out.grid_row = taffy::Line { start: line(1), end: span(1) };
+            out.grid_column = taffy::Line { start: line(1), end: span(1) };
+        }
+    }
+
+    Ok(out)
 }
 
-/// The single recursive walk: constraint pass on entry, size pass from the recursive children's
-/// results, position pass once this node's own size is known. Reconciles as it goes: `retained`
-/// is `Some` only when the caller already matched `fresh`'s kind at this position (§ 4).
+/// Builds one node's [`taffy_style`] and hands back the solver node holding it, with no children
+/// attached yet.
 ///
-/// `forced_width`/`forced_height` let the caller override this node's own size in an axis instead
-/// of resolving it from `width`/`height` -- how a `Stretch` cross-alignment (§ 3.3) is applied when
-/// the parent's own size in that axis is already known: the parent computes the forced size
-/// *before* recursing here, so this node's own children get positioned against the final, stretched
-/// size in the same pass instead of being patched afterward. `None` (the normal case, and always
-/// the case when the parent's own axis is itself `Content`-sized) falls back to the usual
-/// `width`/`height`-mode resolution.
+/// Split out of [`prepare`] purely for the stack. A `taffy::Style` is 552 bytes, and [`prepare`]
+/// recurses one frame per tree level with `MAX_TREE_DEPTH` of them allowed, so a `Style` built
+/// there is 552 bytes multiplied by the depth cap. Built here it lives in a frame that returns
+/// before the recursion descends.
+fn new_solver_node(
+    tree: &mut taffy::TaffyTree<Measure>,
+    kind: &str,
+    properties: &HashMap<String, Value>,
+    style: &LayoutStyle,
+    parent_axis: Option<MainAxis>,
+    measure: Option<Measure>,
+) -> Result<taffy::NodeId, LayoutError> {
+    let solver_style = taffy_style(kind, properties, style, parent_axis)?;
+    match measure {
+        Some(measure) => tree.new_leaf_with_context(solver_style, measure),
+        None => tree.new_leaf(solver_style),
+    }
+    .map_err(taffy_failed)
+}
+
+/// The first of the two walks: identity, resolution, parsing and tree construction, in the order
+/// the config wrote the nodes.
 ///
-/// `properties` arrives already resolved -- `node::resolve_properties` has run over this node's raw
-/// map exactly once for this pass, replacing every `Signal` with its current value. The caller does
-/// that rather than this function, because a parent has to read a child's `margin` to compute the
-/// budget it recurses with, so the one read has to happen in the parent's loop; `apply_one_instance`
-/// does it for a surface root, which has no parent. `style` arrives the same way and for the same
-/// reason: one [`LayoutStyle::parse`] per node per pass, in the parent's loop.
+/// This is where everything that can run Lua or fail happens, and it happens depth-first in
+/// declaration order, which is the guarantee build-steps.md Phase 19 item 5 states: every getter
+/// fires exactly once, in source order. The hand-written pass had to work to keep that, because it
+/// recursed into `Fill` children after their siblings and so had to split resolution out of the
+/// recursion; here there are no rounds, so declaration order and recursion order are the same one.
 ///
-/// Together those are both halves of build-steps.md Phase 19 item 5. A `Signal` behind a property
-/// is read once, and the value it resolved to is parsed once, so the sizing and positioning passes
-/// read the same numbers by construction rather than by asking the same question twice and hoping.
-/// A resolved table's `__index` no longer gets a second chance to answer differently.
-// Ten parameters, but each is load-bearing for this single recursive pass (§ 3's "single...
-// pass", see the module doc comment); splitting them into a struct would just be a bag carrying
-// the same ten fields through the same one caller.
+/// `properties` and `style` arrive already resolved and parsed, done by the parent for the same
+/// reason as before: [`taffy_style`] needs a child's `margin` and its size modes to build the node,
+/// so the one parse has to happen in the parent's loop. `Scene::apply_one_instance` does it for a
+/// surface root, which has no parent.
 #[allow(clippy::too_many_arguments)]
-fn resolve_and_reconcile(
+fn prepare(
     scene: &mut Scene,
+    tree: &mut taffy::TaffyTree<Measure>,
     retained: Option<RetainedNode>,
     kind: &str,
     properties: HashMap<String, Value>,
     style: LayoutStyle,
-    available: LogicalSize,
-    shaping: &ShapingHandle,
-    forced_width: Option<f32>,
-    forced_height: Option<f32>,
+    parent_axis: Option<MainAxis>,
     lua: &Lua,
     depth: u32,
-) -> Result<RetainedNode, LayoutError> {
+) -> Result<PreparedNode, LayoutError> {
     // Already run by whoever resolved `properties` (that is the ordering `ensure_node_admissible`
     // exists to enforce), and repeated here so this function holds its own preconditions rather
     // than trusting a call site -- notably `children_of`'s `unreachable!` arm below.
@@ -890,59 +1010,39 @@ fn resolve_and_reconcile(
     let old_children = retained.map(|r| r.children).unwrap_or_default();
     let id = id.unwrap_or_else(|| scene.alloc_id());
 
-    let padding = style.padding;
-    // Before `intrinsic_content_size`, which sizes a `text` from the `content` and `font_size`
+    // Before the children, because a `text`'s measurement reads the `content` and `font_size`
     // parsed here rather than parsing them a second time.
-    let mut paint = node::paint_style(kind, &properties)?;
-
-    let own_width_known = forced_width.or_else(|| resolve_non_content(style.width_mode, available.width));
-    let own_height_known = forced_height.or_else(|| resolve_non_content(style.height_mode, available.height));
-
-    // The wrap boundary a `text` child measures against (§ 3.2: "wraps text bounds when
-    // exceeding available width limits"): its own explicit/forced width when known, otherwise
-    // whatever room its parent handed down. Unused by every non-text kind.
-    let text_wrap_width = own_width_known.unwrap_or_else(|| (available.width - padding.left - padding.right).max(0.0));
-
-    // A `Content`-sized axis has no real budget to hand children yet (this node's own size in
-    // that axis isn't known until *after* they resolve) -- a `Fill`/`Percent` child in that axis
-    // resolves to 0.0 rather than something derived from the outer `available`.
-    //
-    // ponytail: one recursive pass, not a full two-pass constraint solver (docs/adr/0023 item
-    // 10). Correct for the Content-sized-parent case; wrong only for a child that specifically
-    // wants to fill a Content-sized ancestor in that same axis, which no fixture here needs. A
-    // second pass over just that axis is the upgrade path if this ever matters.
-    //
-    // The `Fill` rounds below are not that second pass and do not weaken this. Every node still
-    // resolves exactly once and the tree is still walked once; the rounds only order *siblings*
-    // within one parent, so that a child asking for the remainder is sized after the siblings whose
-    // sizes the remainder is made of. What stays unsolved is the case above, where the parent
-    // itself has no size yet -- and there the remainder is zero, which is why a `Fill` child of a
-    // Content-sized row still resolves to 0.
-    let child_budget = LogicalSize {
-        width: own_width_known.map_or(0.0, |w| (w - padding.left - padding.right).max(0.0)),
-        height: own_height_known.map_or(0.0, |h| (h - padding.top - padding.bottom).max(0.0)),
+    let paint = node::paint_style(kind, &properties)?;
+    let measure = match flow_kind(kind, &properties)? {
+        // `node::paint_style` gives every `text` a `PaintStyle::Text` and `flow_kind` cannot route
+        // another kind here, so the arm is total -- the same shape as `children_of`'s `unreachable!`.
+        "text" => {
+            let Some(PaintStyle::Text { content, font_size, .. }) = paint.as_ref() else {
+                unreachable!("a `text` node always carries a `PaintStyle::Text`")
+            };
+            Some(Measure::Text { content: content.clone(), font_size: *font_size })
+        }
+        "icon" => Some(Measure::Square(node::parse_icon_size(&properties)?)),
+        // `image` has no intrinsic size, unlike `icon`: knowing a file's own dimensions means
+        // decoding it, and this pass has no canvas to decode against and runs on every
+        // `Scene::apply`. So an `image` takes the box § 5.1's `width`/`height` give it and measures
+        // nothing without one, the same as an empty `rect`.
+        _ => None,
     };
 
     let fresh_children = children_of(kind, &properties)?;
     let matched_candidates = pair_children_by_id_then_position(scene, &fresh_children, old_children)?;
-    let main_axis = main_axis_of(kind, &properties)?;
+    let own_axis = main_axis_of(kind, &properties)?;
+    // Before the children, so their ids can be attached to it afterwards, and so the `taffy::Style`
+    // behind it is gone from the stack by the time this frame recurses -- see `new_solver_node`.
+    let taffy_id = new_solver_node(tree, kind, &properties, &style, parent_axis, measure)?;
 
-    // Phase one: resolve every child's own property map, in declaration order, and nothing else.
-    //
-    // Split out from the recursion below because a `Fill` child's main-axis size is the remainder
-    // its siblings leave, and a `Content`-sized sibling's size is only known by recursing into it.
-    // Declaration order is what this loop protects: `resolve_properties` is where a child's Lua
-    // getters run, so leaving them here keeps each one firing exactly once, in the order the config
-    // wrote it (build-steps.md Phase 19 item 5), while only the *recursion* order moves. A getter
-    // cannot observe which subtree the walk descends into next; it can observe being called out of
-    // order.
-    let mut pending = Vec::with_capacity(fresh_children.len());
+    let mut children = Vec::with_capacity(fresh_children.len());
     for (fresh_child, candidate) in fresh_children.iter().zip(matched_candidates) {
         // Before this child's own getters run, not after: resolving its property map calls back
         // into Lua, and a child the walk is about to refuse must not get to execute anything on the
         // way to being refused. `depth + 1` is the level this child would occupy, so the error is
-        // the same variant, kind and level the recursive call raised when this check lived one
-        // frame further down -- see `ensure_node_admissible`.
+        // the same variant, kind and level the recursive call raises -- see `ensure_node_admissible`.
         ensure_node_admissible(&fresh_child.kind, depth + 1)?;
 
         let reusable = match candidate {
@@ -954,163 +1054,172 @@ fn resolve_and_reconcile(
             None => None,
         };
 
-        // This child's one resolve for this pass (build-steps.md Phase 19 item 5). It happens here
-        // rather than inside the recursive call because the budget that call receives depends on
-        // this child's own `margin`, and a second read of an impure signal would hand it a budget
-        // computed from a value nothing downstream would ever see again.
+        // This child's one resolve and one parse for this pass (build-steps.md Phase 19 item 5),
+        // both here rather than inside the recursive call, because the style the call is handed is
+        // built from them and a second read of an impure `margin` could answer differently.
         let child_properties = node::resolve_properties(&fresh_child.properties, &fresh_child.kind, lua)?;
-        // And this child's one *parse* for this pass, in the same iteration and for the same
-        // reason (build-steps.md Phase 19 item 5). Everything below reads this struct: the budget
-        // here, the remainder in round two, both `intrinsic_content_size` folds, and
-        // `position_children`. None of them can ask the property map again, so none of them can
-        // get a different answer out of an `__index`.
         let child_style = LayoutStyle::parse(&child_properties)?;
-
-        // § 3.1: a child's own margin comes out of the same available-space budget its parent's
-        // padding already inset -- subtracted here, per child, since each child can carry a
-        // different margin.
-        let margined_budget = LogicalSize {
-            width: (child_budget.width - child_style.margin.horizontal()).max(0.0),
-            height: (child_budget.height - child_style.margin.vertical()).max(0.0),
-        };
-        let fills_main = main_axis.is_some_and(|axis| child_style.fills(axis));
-        pending.push(PendingChild {
-            reusable,
-            properties: child_properties,
-            style: child_style,
-            budget: margined_budget,
-            fills_main,
-        });
-    }
-
-    // Phase two, round one: every child whose main-axis size does not depend on a sibling.
-    // Copied out before the slots are drained: round one consumes each `PendingChild`, and round
-    // two still needs the visibility of the siblings it is measuring the remainder against, which
-    // is not on the resolved node yet for a `Fill` child that has not been recursed into.
-    let child_styles: Vec<LayoutStyle> = pending.iter().map(|child| child.style).collect();
-    let mut slots: Vec<Option<PendingChild>> = pending.into_iter().map(Some).collect();
-    let mut resolved: Vec<Option<RetainedNode>> = (0..slots.len()).map(|_| None).collect();
-    for i in 0..slots.len() {
-        if slots[i].as_ref().is_some_and(|child| child.fills_main) {
-            continue;
-        }
-        let child = slots[i].take().expect("phase one filled every slot and round one takes each at most once");
-        resolved[i] = Some(resolve_pending_child(
+        children.push(prepare(
             scene,
-            child,
-            &fresh_children[i].kind,
-            kind,
-            main_axis,
-            None,
-            own_width_known,
-            own_height_known,
-            shaping,
+            tree,
+            reusable,
+            &fresh_child.kind,
+            child_properties,
+            child_style,
+            own_axis,
             lua,
             depth + 1,
         )?);
     }
 
-    // Phase two, round two: the `Fill` children split what round one left.
-    //
-    // Counted exactly the way `position_children` counts it -- visible children only, `spacing`
-    // once between each adjacent pair -- because a remainder computed on any other basis sizes
-    // children to a box the positioning pass does not then put them in.
-    if let Some(axis) = main_axis
-        && slots.iter().any(Option::is_some)
-    {
-        let content_main = match axis {
-            MainAxis::Horizontal => child_budget.width,
-            MainAxis::Vertical => child_budget.height,
+    let child_ids: Vec<taffy::NodeId> = children.iter().map(|child| child.taffy).collect();
+    tree.set_children(taffy_id, &child_ids).map_err(taffy_failed)?;
+
+    Ok(PreparedNode { id, kind: kind.to_string(), style, properties, paint, taffy: taffy_id, children })
+}
+
+/// The second walk: solved geometry back out of the tree and into retained nodes.
+///
+/// taffy hands out a location relative to the parent's border box, which is the same frame
+/// `layout::paint` and `layout::hit` already accumulate down, so the rect goes across untouched.
+/// The two things that are still this module's own happen here, both because both need a size that
+/// only exists once the solve is done: a scrolled container shifts its children, and an over-wide
+/// `text` is cut to the box it ended up in.
+fn finish(
+    tree: &taffy::TaffyTree<Measure>,
+    prepared: PreparedNode,
+    shaping: &ShapingHandle,
+) -> Result<RetainedNode, LayoutError> {
+    let PreparedNode { id, kind, style, properties, mut paint, taffy: taffy_id, children } = prepared;
+    let layout = tree.layout(taffy_id).map_err(taffy_failed)?;
+    let size = LogicalSize { width: layout.size.width, height: layout.size.height };
+
+    let mut children: Vec<RetainedNode> =
+        children.into_iter().map(|child| finish(tree, child, shaping)).collect::<Result<_, _>>()?;
+
+    // docs/adr/0069 decision 4. Subtracted from every child's main coordinate, so a scrolled child
+    // sits before the content box and the clip `layout::paint` computes per node cuts it. The
+    // extent is summed here rather than read off taffy's `scrollable_overflow_rect` because the
+    // two disagree by a margin: CSS scrollable overflow is the union of the children's border
+    // boxes, and this engine's `spacing`-and-margin footprint is what `Fill` was sized against and
+    // what the tests pin.
+    if let Some(axis) = main_axis_of(&kind, &properties)? {
+        let padding = style.padding;
+        let (content_main, total_main) = match axis {
+            MainAxis::Horizontal => (
+                (size.width - padding.horizontal()).max(0.0),
+                extent_along(&children, MainAxis::Horizontal, style.spacing),
+            ),
+            MainAxis::Vertical => (
+                (size.height - padding.vertical()).max(0.0),
+                extent_along(&children, MainAxis::Vertical, style.spacing),
+            ),
         };
-        let visible: Vec<bool> = child_styles.iter().map(|child| child.visible).collect();
-        let taken: f32 = resolved
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| visible[*i])
-            .filter_map(|(i, child)| Some((i, child.as_ref()?)))
-            .map(|(_, child)| main_axis_footprint(child, axis))
-            .sum();
-        let gaps = style.spacing * visible.iter().filter(|v| **v).count().saturating_sub(1) as f32;
-        // Clamped, so fixed children that already overflow their parent collapse the `Fill`
-        // children to nothing rather than handing them a negative budget. Matches every other
-        // budget in this function, and matches flexbox without `flex-shrink`: the overflow stays
-        // visible instead of being silently absorbed.
-        let remainder = (content_main - taken - gaps).max(0.0);
-        // Divided among the *visible* `Fill` children, since an invisible one takes no space in
-        // `position_children` and must not shrink the sibling that does. An invisible one still
-        // gets the same share: it is never placed, and sizing its subtree to nothing would be a
-        // second surprise on the day it becomes visible.
-        let fill_share =
-            remainder / (0..slots.len()).filter(|&i| slots[i].is_some() && visible[i]).count().max(1) as f32;
-        for i in 0..slots.len() {
-            let Some(child) = slots[i].take() else {
-                continue;
-            };
-            // The share is a footprint, and a footprint includes margin -- so the size forced on
-            // the child is the share less its own margins, leaving `share` once the positioning
-            // pass adds them back.
-            let forced_main = (fill_share - child.style.margin_on(axis)).max(0.0);
-            resolved[i] = Some(resolve_pending_child(
-                scene,
-                child,
-                &fresh_children[i].kind,
-                kind,
-                main_axis,
-                Some(forced_main),
-                own_width_known,
-                own_height_known,
-                shaping,
-                lua,
-                depth + 1,
-            )?);
+        let offset = scroll_offset(&properties, content_main, total_main);
+        if offset != 0.0 {
+            for child in &mut children {
+                match axis {
+                    MainAxis::Horizontal => child.rect.x -= offset,
+                    MainAxis::Vertical => child.rect.y -= offset,
+                }
+            }
         }
     }
 
-    let mut new_children: Vec<RetainedNode> = resolved
-        .into_iter()
-        .map(|child| {
-            child.expect(
-                "every slot resolves in round one or round two, and `main_axis` is `None` when round two is skipped",
-            )
-        })
-        .collect();
-
-    // Padding is added here rather than inside `intrinsic_content_size`, and only on an axis whose
-    // size the config did not state. `intrinsic_content_size` answers "how much room do the
-    // contents need", which is the number the row/column sums and the stacking union are about; a
-    // node's own padding is a property of the node, not of what it contains. On a stated axis
-    // padding has already done its work by insetting `child_budget` above, so adding it here too
-    // would count it twice. On a `Content` axis nothing has accounted for it yet, and
-    // `position_children` below offsets every child by exactly this much inside `size`: without
-    // this the children are placed past the edge of the box meant to contain them (measured live
-    // against dev-config, where a padded column reported its child's bare height at both 8px and
-    // 50px of padding -- build-steps.md Phase 19 item 14).
-    let intrinsic =
-        intrinsic_content_size(kind, &properties, &style, paint.as_ref(), &new_children, text_wrap_width, shaping)?;
-    let own_width = own_width_known.unwrap_or(intrinsic.width + padding.horizontal());
-    let own_height = own_height_known.unwrap_or(intrinsic.height + padding.vertical());
-    let size = LogicalSize { width: own_width, height: own_height };
-
-    position_children(kind, &properties, &style, &mut new_children, size, own_width_known, own_height_known)?;
-
     // After sizing, because the width it fits into is this node's own, and before the node is
     // built, because what it rewrites is the string the display list will carry.
-    elide_to_fit(&mut paint, (size.width - padding.horizontal()).max(0.0), shaping);
+    elide_to_fit(&mut paint, (size.width - style.padding.horizontal()).max(0.0), shaping);
 
     Ok(RetainedNode {
         id,
-        kind: kind.to_string(),
-        rect: LogicalRect { x: 0.0, y: 0.0, width: size.width, height: size.height },
+        kind,
+        rect: LogicalRect { x: layout.location.x, y: layout.location.y, width: size.width, height: size.height },
         style,
         properties,
         paint,
-        children: new_children,
+        children,
     })
 }
 
-/// § 3.2's bottom-up size resolution, per kind. An invisible child contributes nothing here (see
-/// `resolve_and_reconcile`'s doc comment on the collapse-vs-reserve-space choice) -- filtered out
-/// before the row/column sum and the stacking union.
+/// How much room this container's visible children take along `axis`, margins and gaps included --
+/// the number a scroll offset is clamped against. The same footprint the sizing pass used, which is
+/// what keeps a scroll limit and the layout it scrolls in agreement.
+fn extent_along(children: &[RetainedNode], axis: MainAxis, spacing: f32) -> f32 {
+    let visible: Vec<&RetainedNode> = children.iter().filter(|c| c.style.visible).collect();
+    let extents: f32 = visible
+        .iter()
+        .map(|c| {
+            let extent = match axis {
+                MainAxis::Horizontal => c.rect.width,
+                MainAxis::Vertical => c.rect.height,
+            };
+            extent + c.style.margin_on(axis)
+        })
+        .sum();
+    extents + spacing * visible.len().saturating_sub(1) as f32
+}
+
+/// taffy's own errors are all "you handed me a node id I do not have", which this module cannot do:
+/// every id comes from the tree it is used against, and the tree lives no longer than the pass. So
+/// this is the `unreachable!` equivalent for a `Result` that has to be handled anyway, reported as
+/// a pass failure rather than a panic on the Wayland dispatch thread.
+fn taffy_failed(err: taffy::TaffyError) -> LayoutError {
+    node::invalid("layout", format!("the layout solver refused a node built by this pass: {err}"))
+}
+
+/// § 3's three passes, now taffy's: sizes up, positions down, and the constraints resolved between
+/// them. Given a prepared tree and the room its root has, it fills in every node's geometry.
+///
+/// The measure callback is the one place this crate is still asked a geometry question, and it is
+/// asked only about the two kinds whose size is their content: a `text`'s shaped extent and an
+/// `icon`'s square. taffy asks each of them a handful of times per pass rather than once, over a
+/// small set of distinct `(text, size, wrap width)` tuples, and `ShapingHandle`'s memo is keyed on
+/// exactly that tuple, so every repeat after the first is answered without crossing the channel.
+fn solve(
+    tree: &mut taffy::TaffyTree<Measure>,
+    root: taffy::NodeId,
+    available: LogicalSize,
+    shaping: &ShapingHandle,
+) -> Result<(), LayoutError> {
+    let space = taffy::Size {
+        width: taffy::AvailableSpace::Definite(available.width),
+        height: taffy::AvailableSpace::Definite(available.height),
+    };
+    tree.compute_layout_with_measure(root, space, |input, _node, context, style| {
+        taffy::compute_leaf_layout(
+            input,
+            style,
+            |_, _| 0.0,
+            |known, offered| {
+                let Some(measure) = context else {
+                    return taffy::Size::ZERO;
+                };
+                match measure {
+                    Measure::Square(size) => taffy::Size { width: *size, height: *size },
+                    Measure::Text { content, font_size } => {
+                        // § 3.2's wrap boundary: the width this box is already known to have, or the
+                        // width on offer when it is not. `MaxContent`/`MinContent` mean taffy is
+                        // asking what the string wants rather than offering it a box, and an
+                        // unconstrained measurement is the honest answer to that.
+                        let max_width = known.width.or(match offered.width {
+                            taffy::AvailableSpace::Definite(width) => Some(width),
+                            taffy::AvailableSpace::MinContent | taffy::AvailableSpace::MaxContent => None,
+                        });
+                        let shaped = shaping.shape(ShapeRequest {
+                            text: content.clone(),
+                            font_size: *font_size,
+                            line_height: *font_size * 1.2,
+                            max_width,
+                        });
+                        taffy::Size { width: shaped.width, height: shaped.height }
+                    }
+                }
+            },
+        )
+    })
+    .map_err(taffy_failed)
+}
+
 /// The kind whose layout `kind` actually uses. Every kind is itself except `list`, which borrows a
 /// `row`'s or a `column`'s arm depending on its `direction` (§ 5.2 item 7).
 ///
@@ -1120,111 +1229,6 @@ fn resolve_and_reconcile(
 /// stretch, rather than a second implementation that agrees with it until it does not.
 fn flow_kind<'a>(kind: &'a str, properties: &HashMap<String, Value>) -> Result<&'a str, LayoutError> {
     if kind == "list" { node::parse_list_direction(properties) } else { Ok(kind) }
-}
-
-fn intrinsic_content_size(
-    kind: &str,
-    properties: &HashMap<String, Value>,
-    style: &LayoutStyle,
-    paint: Option<&PaintStyle>,
-    children: &[RetainedNode],
-    text_wrap_width: f32,
-    shaping: &ShapingHandle,
-) -> Result<LogicalSize, LayoutError> {
-    match flow_kind(kind, properties)? {
-        "text" => {
-            // `node::paint_style` gives every `text` a `PaintStyle::Text`, and `flow_kind` cannot
-            // route another kind here, so the arm is total -- the same shape as `children_of`'s
-            // `unreachable!` below.
-            let Some(PaintStyle::Text { content, font_size, .. }) = paint else {
-                unreachable!("a `text` node always carries a `PaintStyle::Text`")
-            };
-            let (content, font_size) = (content.clone(), *font_size);
-            // A wrap width of 0 means nothing is known yet (a Content-sized text inside a
-            // Content-sized ancestor with no room resolved so far) -- treat that as unconstrained
-            // rather than forcing every word onto its own line.
-            let max_width = (text_wrap_width > 0.0).then_some(text_wrap_width);
-            // This asks per text node per `Scene::apply`, which ADR-0044 decision 2's dirty flag
-            // turned from once per config edit into once per push. `ShapingHandle::shape` now
-            // answers a repeat from its own memo without crossing the channel, so the round trip
-            // named here is paid once per distinct (text, size, line height, wrap width) rather
-            // than once per call. Measured on a 500-row list: 12.8ms per pass before, 6.1ms after,
-            // against a 2.0ms floor for the same list drawing no text at all.
-            //
-            // ponytail: what is left is not shaping. Cached, 500 text nodes still cost about 2ms
-            // over that floor, and it is allocation rather than measurement -- `content.clone()`
-            // just above, the `String` `node::paint_style` builds per node per pass, and hashing
-            // the text once per lookup. Interning a node's string across passes is the next move
-            // if this ever matters; it did not before the cache landed, because shaping hid it.
-            let shaped =
-                shaping.shape(ShapeRequest { text: content, font_size, line_height: font_size * 1.2, max_width });
-            Ok(LogicalSize { width: shaped.width, height: shaped.height })
-        }
-        "icon" => {
-            let size = node::parse_icon_size(properties)?;
-            Ok(LogicalSize { width: size, height: size })
-        }
-        // `image` has no intrinsic size, unlike `icon`: knowing a file's own dimensions means
-        // decoding it, and this pass has no canvas to decode against and runs on every
-        // `Scene::apply`. So an `image` takes the box § 5.1's `width`/`height` give it and
-        // measures nothing without one, the same as an empty `rect`.
-        "image" => Ok(LogicalSize::default()),
-        "rect" if children.is_empty() => Ok(LogicalSize::default()),
-        "row" => {
-            let visible: Vec<&RetainedNode> = children.iter().filter(|c| c.style.visible).collect();
-            // § 3.1: a child's margin travels with it -- its footprint on the row's main axis is
-            // its own width plus its margin, matching `position_children`'s identical footprint
-            // math. The two must agree, or a child would be sized to fit but then overlap or leave
-            // a gap once positioned, and since item 5 they agree by construction: both read the
-            // one `LayoutStyle` the child was parsed into rather than each parsing it again.
-            let width = visible.iter().map(|c| c.rect.width + c.style.margin.horizontal()).sum::<f32>()
-                + style.spacing * visible.len().saturating_sub(1) as f32;
-            let height = visible.iter().map(|c| c.rect.height + c.style.margin.vertical()).fold(0.0_f32, f32::max);
-            Ok(LogicalSize { width, height })
-        }
-        // `list` sizes exactly like `column` -- ADR-0045 decision 3 and § 5.2 item 7 say nothing
-        // about a list's geometry, only its reconciliation, so this is this slice's own
-        // interpretation, the same way ADR-0023 item 4 labels the stacking model as one.
-        //
-        // The no-horizontal-list ponytail that used to sit here is gone: `list` takes a
-        // `direction` and `flow_kind` routes it to the `row` arm above or to this one. The
-        // alternative it weighed against -- splicing a list's generated children into its
-        // *parent's* child list, so it inherits whichever direction that parent lays out in --
-        // stays rejected, and for the reason recorded then rather than for effort: ADR-0045
-        // identifies a node by its position in one parent's child list, and a spliced list has no
-        // single such list to hold a position in. `direction` needed a § 5.2 row, which it now
-        // has, and nothing else.
-        //
-        // A `list` reaches here too, when its `direction` is `Vertical`.
-        "column" => {
-            let visible: Vec<&RetainedNode> = children.iter().filter(|c| c.style.visible).collect();
-            let height = visible.iter().map(|c| c.rect.height + c.style.margin.vertical()).sum::<f32>()
-                + style.spacing * visible.len().saturating_sub(1) as f32;
-            let width = visible.iter().map(|c| c.rect.width + c.style.margin.horizontal()).fold(0.0_f32, f32::max);
-            Ok(LogicalSize { width, height })
-        }
-        // Stacking model (rect-with-children, button, and the three surface roles): § 3.2 gives no
-        // formula for a container that isn't row/column -- docs/adr/0023 item 4 documents this as
-        // this phase's own interpretation. Content size is the bounding union over
-        // independently-positioned children, each inflated by its own margin. `window` and `popup`
-        // reach it through the same catch-all `panel` does, which is right for both: neither role
-        // has a layout model of its own, and both are normally sized explicitly anyway (a `popup`
-        // must be, § 6.3).
-        _ => {
-            let visible: Vec<&RetainedNode> = children.iter().filter(|c| c.style.visible).collect();
-            let width = visible.iter().map(|c| c.rect.width + c.style.margin.horizontal()).fold(0.0_f32, f32::max);
-            let height = visible.iter().map(|c| c.rect.height + c.style.margin.vertical()).fold(0.0_f32, f32::max);
-            Ok(LogicalSize { width, height })
-        }
-    }
-}
-
-fn cross_axis_offset(align: Align, container: f32, child: f32) -> f32 {
-    match align {
-        Align::Start | Align::Stretch => 0.0,
-        Align::Center => ((container - child) / 2.0).max(0.0),
-        Align::End => (container - child).max(0.0),
-    }
 }
 
 /// The `Signal` behind a node's `scroll` property, or `None` if it declares none.
@@ -1341,121 +1345,6 @@ fn elide_to_fit(paint: &mut Option<PaintStyle>, content_width: f32, shaping: &Sh
         }
     }
     *content = format!("{}\u{2026}", &content[..cuts[low]]);
-}
-
-/// § 3.3's top-down position/stretch pass, per kind. `own_width_known`/`own_height_known` are the
-/// same values `resolve_and_reconcile` already resolved for this node: `Some` means a `Stretch`
-/// child in that axis was already forced to its final size before it resolved (see
-/// `stretch_forced_size`), so patching it again here would be redundant (harmless were the values
-/// still equal, but wrong once margin is subtracted below -- so it's skipped outright); `None`
-/// means this axis was `Content`-sized, so no forcing was possible and the post-hoc patch here is
-/// the only place a `Stretch` child in that axis gets its final size (its own descendants, if any,
-/// won't be repositioned for that new size -- the same Content-sized-parent limitation as
-/// docs/adr/0023 item 10, not the general bug that forcing above fixes).
-fn position_children(
-    kind: &str,
-    properties: &HashMap<String, Value>,
-    style: &LayoutStyle,
-    children: &mut [RetainedNode],
-    size: LogicalSize,
-    own_width_known: Option<f32>,
-    own_height_known: Option<f32>,
-) -> Result<(), LayoutError> {
-    let padding = style.padding;
-    let content_x = padding.left;
-    let content_y = padding.top;
-    let content_width = (size.width - padding.left - padding.right).max(0.0);
-    let content_height = (size.height - padding.top - padding.bottom).max(0.0);
-
-    match flow_kind(kind, properties)? {
-        "row" => {
-            let main_align = style.align_h;
-            let visible_indices: Vec<usize> =
-                children.iter().enumerate().filter(|(_, c)| c.style.visible).map(|(i, _)| i).collect();
-            // § 3.1: a child's margin travels with it on the main axis, so a margined child pushes
-            // its neighbors apart instead of overlapping them.
-            let footprints: Vec<f32> = children.iter().map(|c| c.rect.width + c.style.margin.horizontal()).collect();
-            let total_main = visible_indices.iter().map(|&i| footprints[i]).sum::<f32>()
-                + style.spacing * visible_indices.len().saturating_sub(1) as f32;
-            let spare = (content_width - total_main).max(0.0);
-            // Subtracted from the cursor, so a scrolled child sits left of the content box and the
-            // clip `layout::paint` already computes per node cuts it. Alignment still runs, and is
-            // a no-op whenever there is anything to scroll: `spare` is zero exactly when the
-            // content overflows, which is the only time the offset is non-zero.
-            let offset = scroll_offset(properties, content_width, total_main);
-            let mut cursor = match main_align {
-                Align::Start | Align::Stretch => 0.0,
-                Align::Center => spare / 2.0,
-                Align::End => spare,
-            } - offset;
-            for &i in &visible_indices {
-                let cross_align = children[i].style.align_v;
-                let slot_h = (content_height - children[i].style.margin.vertical()).max(0.0);
-                let child_h = children[i].rect.height;
-                let y = cross_axis_offset(cross_align, slot_h, child_h);
-                children[i].rect.x = content_x + cursor + children[i].style.margin.left;
-                children[i].rect.y = content_y + y + children[i].style.margin.top;
-                if cross_align == Align::Stretch && own_height_known.is_none() {
-                    children[i].rect.height = slot_h;
-                }
-                cursor += footprints[i] + style.spacing;
-            }
-        }
-        // A `list` reaches here too, when its `direction` is `Vertical` -- `flow_kind` above has
-        // already turned it into one of these two names.
-        "column" => {
-            let main_align = style.align_v;
-            let visible_indices: Vec<usize> =
-                children.iter().enumerate().filter(|(_, c)| c.style.visible).map(|(i, _)| i).collect();
-            let footprints: Vec<f32> = children.iter().map(|c| c.rect.height + c.style.margin.vertical()).collect();
-            let total_main = visible_indices.iter().map(|&i| footprints[i]).sum::<f32>()
-                + style.spacing * visible_indices.len().saturating_sub(1) as f32;
-            let spare = (content_height - total_main).max(0.0);
-            let offset = scroll_offset(properties, content_height, total_main);
-            let mut cursor = match main_align {
-                Align::Start | Align::Stretch => 0.0,
-                Align::Center => spare / 2.0,
-                Align::End => spare,
-            } - offset;
-            for &i in &visible_indices {
-                let cross_align = children[i].style.align_h;
-                let slot_w = (content_width - children[i].style.margin.horizontal()).max(0.0);
-                let child_w = children[i].rect.width;
-                let x = cross_axis_offset(cross_align, slot_w, child_w);
-                children[i].rect.x = content_x + x + children[i].style.margin.left;
-                children[i].rect.y = content_y + cursor + children[i].style.margin.top;
-                if cross_align == Align::Stretch && own_width_known.is_none() {
-                    children[i].rect.width = slot_w;
-                }
-                cursor += footprints[i] + style.spacing;
-            }
-        }
-        // Stacking model: each child independently aligned within the full content box on both
-        // axes, no spare-space distribution across siblings -- they can overlap. See docs/adr/0023
-        // item 4. Reached by `rect`/`button` and by all three surface roles, matching
-        // `intrinsic_content_size`'s catch-all and `stretch_forced_size`'s named arm.
-        _ => {
-            for child in children.iter_mut() {
-                if !child.style.visible {
-                    continue;
-                }
-                let (align_h, align_v) = (child.style.align_h, child.style.align_v);
-                let slot_w = (content_width - child.style.margin.horizontal()).max(0.0);
-                let slot_h = (content_height - child.style.margin.vertical()).max(0.0);
-                let x = cross_axis_offset(align_h, slot_w, child.rect.width);
-                let y = cross_axis_offset(align_v, slot_h, child.rect.height);
-                child.rect.x = content_x + x + child.style.margin.left;
-                child.rect.y = content_y + y + child.style.margin.top;
-                if align_h == Align::Stretch && own_width_known.is_none() {
-                    child.rect.width = slot_w;
-                }
-                if align_v == Align::Stretch && own_height_known.is_none() {
-                    child.rect.height = slot_h;
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// § 5.1's input-region scan: `surface_root`'s direct, visible children, projected to physical
@@ -1745,6 +1634,71 @@ pub(super) mod tests {
         );
     }
 
+    /// docs/adr/0023 item 11, closed by the solver rather than by anything written here.
+    ///
+    /// Same shape as the test above, minus the row's `height = "Fill"`, which is the whole
+    /// difference: the row is now `Content`-sized, so its own height is not known until after its
+    /// children resolve. The hand-written pass could not pre-force a `Stretch` child's size in that
+    /// case, so it patched the child's own `rect` afterwards and left the child's descendants
+    /// positioned against the pre-stretch height -- the grandchild centred in 6 rather than in 50.
+    /// ADR-0023's upgrade path (g) named "a second constraint pass" as the fix. That is what a
+    /// solver is.
+    #[test]
+    fn a_stretch_child_of_a_content_sized_row_repositions_its_descendants_too() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"panel { id = "bar", width = 100, height = 50, child = row { children = {
+                rect { width = 20, height = 50 },
+                rect { width = 20, align_v = "Stretch", children = {
+                    rect { width = 6, height = 6, align_h = "Center", align_v = "Center" },
+                } },
+            } } }"#,
+        );
+        apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!(row.rect.height, 50.0, "the row measures itself from the fixed sibling");
+        let stretched = &row.children[1];
+        assert_eq!(stretched.rect.height, 50.0, "and the stretched sibling takes that whole height");
+        assert_eq!(
+            stretched.children[0].rect.y,
+            (50.0 - 6.0) / 2.0,
+            "centered against the stretched height, which is docs/adr/0023 item 11 no longer holding"
+        );
+    }
+
+    /// The one thing the solver swap narrows, pinned so it stays a decision rather than a surprise.
+    ///
+    /// An invisible node leaves the layout entirely, so its whole subtree resolves to zero geometry
+    /// instead of being sized and then declined a position. Nothing outside this module can tell:
+    /// `layout::paint`, `layout::hit` and `overlay_input_regions` all filter on `visible` before
+    /// they read a rect, and the two readers that do look at a hidden node -- `layout::hover`, and
+    /// `wayland::surface`'s `panel_spec` re-derive -- read `properties`, which is still here in
+    /// full. What was always specified is the part that still holds: a hidden child reserves no
+    /// space and no `spacing` gap, which the two tests above this pin.
+    #[test]
+    fn an_invisible_subtree_resolves_to_no_geometry_at_all() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"panel { id = "bar", width = 100, height = 50, child = rect { width = 40, height = 30,
+                visible = false, children = { rect { width = 10, height = 10 } } } }"#,
+        );
+        apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
+        let hidden = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!((hidden.rect.width, hidden.rect.height), (0.0, 0.0), "the hidden node itself");
+        assert_eq!(
+            (hidden.children[0].rect.width, hidden.children[0].rect.height),
+            (0.0, 0.0),
+            "and everything under it"
+        );
+        assert_eq!(
+            hidden.properties.get("width").map(|w| w.to_string().unwrap()),
+            Some("40".to_string()),
+            "its properties survive in full, which is what `panel_spec` and `hover` read"
+        );
+    }
+
     #[test]
     fn row_start_alignment_packs_children_at_the_beginning() {
         let mut scene = Scene::new();
@@ -1853,7 +1807,7 @@ pub(super) mod tests {
         assert_eq!(row.children[1].rect.x, 300.0);
     }
 
-    /// A share is a footprint, and `position_children` advances its cursor by a footprint including
+    /// A share is a footprint, and the positioning advances by a footprint including
     /// margin. Forcing the share as the child's *size* instead would push every later sibling out
     /// by exactly the margin.
     #[test]
@@ -1873,7 +1827,7 @@ pub(super) mod tests {
     }
 
     /// The mirror of `a_fill_childs_margin_comes_out_of_its_own_share`, and the case that test
-    /// missed: the margin on the *sibling* rather than on the `Fill` child. `position_children`
+    /// missed: the margin on the *sibling* rather than on the `Fill` child. The positioning
     /// advances its cursor by a footprint that includes margin, so a remainder that counts only the
     /// sibling's box hands the `Fill` child exactly that margin too much and pushes it off the end.
     #[test]
@@ -1948,7 +1902,7 @@ pub(super) mod tests {
         assert_eq!(row.children[1].rect.width, 300.0, "the stated size is kept, not shrunk to fit");
     }
 
-    /// An invisible sibling takes no space in `position_children`, so it must reserve none here
+    /// An invisible sibling takes no space when positioned, so it must reserve none here
     /// either -- otherwise hiding a node would shrink the one beside it.
     #[test]
     fn an_invisible_sibling_reserves_nothing_from_a_fill_childs_share() {
@@ -2025,7 +1979,7 @@ pub(super) mod tests {
     }
 
     /// Unchanged, and deliberate: a row that states no width has no remainder to divide, so a
-    /// `Fill` child of it resolves to zero. See `resolve_and_reconcile`'s `child_budget` ponytail
+    /// `Fill` child of it resolves to zero. See docs/adr/0077's own note on item 10
     /// for the one-pass reasoning behind it and the upgrade path.
     #[test]
     fn a_fill_child_of_a_content_sized_row_still_resolves_to_zero() {
@@ -2106,7 +2060,7 @@ pub(super) mod tests {
         assert_eq!(ys, vec![0.0, 100.0]);
     }
 
-    /// Spacing counts toward the content extent, because `position_children` advances the cursor by
+    /// Spacing counts toward the content extent, because a gap advances the cursor by
     /// it. A bound computed without it would let the list scroll one gap short of its end.
     #[test]
     fn spacing_counts_toward_what_there_is_to_scroll() {
@@ -2188,7 +2142,7 @@ pub(super) mod tests {
 
     /// Found live against `dev-config`: a content-sized `column` with 8px of padding reported the
     /// bare height of its one child, and reported the same height with 50px of padding. Padding
-    /// insets the box children are laid out in (`position_children` offsets them by exactly this
+    /// insets the box children are laid out in (they are offset by exactly this
     /// much), so a content-sized container that does not also grow by it positions its children
     /// past its own edge.
     #[test]
@@ -3192,7 +3146,7 @@ pub(super) mod tests {
     }
 
     /// One parse, four keys. It was 16 invocations before `LayoutStyle`: the parent's child loop,
-    /// both `intrinsic_content_size` folds and `position_children`, each reading `top`, `right`,
+    /// both sizing folds and the positioning pass, each reading `top`, `right`,
     /// `bottom` and `left` off the same table.
     #[test]
     fn a_margin_table_is_read_exactly_once_per_node_per_pass() {
@@ -3274,14 +3228,18 @@ pub(super) mod tests {
         );
     }
 
-    /// The guarantee the two-round child loop had to preserve, and the one most likely to be lost
-    /// by a later edit: rounds order *recursion*, never property resolution.
+    /// build-steps.md Phase 19 item 5, and the guarantee most likely to be lost by a later edit:
+    /// every getter fires exactly once, in the order the config wrote it. An impure closure like
+    /// this one is what can observe it.
     ///
-    /// The `Fill` child is declared first and recursed into last, so if resolution had been folded
-    /// into the rounds this reads `b,a` instead of `a,b`. Each getter still firing exactly once is
-    /// build-steps.md Phase 19 item 5, which an impure closure like this one can observe.
+    /// This used to read `abBA`, and the difference is worth keeping in view. The `Fill` child is
+    /// declared first, and the hand-written pass recursed into it *last* so it could be sized from
+    /// what its siblings left, which forced resolution out of the recursion to keep the two
+    /// siblings in source order and left the grandchildren interleaved the other way. The solver
+    /// does its own sizing, so there is one walk again and it goes in declaration order: `aAbB`,
+    /// which is the tree read top to bottom. Same guarantee, and now it is the obvious one.
     #[test]
-    fn a_fill_child_resolves_its_properties_in_declaration_order_despite_being_recursed_into_last() {
+    fn every_getter_fires_exactly_once_in_the_order_the_config_wrote_it() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let lua = mlua::Lua::new();
@@ -3308,14 +3266,12 @@ pub(super) mod tests {
 
         apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap();
 
-        // `a` before `b` is the guarantee. `B` before `A` is the proof it is a real one: the
-        // grandchildren resolve during recursion, so the fixed child's subtree is walked before the
-        // `Fill` child's even though the `Fill` child was declared first. Fold resolution into the
-        // rounds and this reads `bBaA`.
+        // Four characters for four getters is the "exactly once" half. Their order is the other
+        // half: depth-first, declaration order, which is the order the Lua above reads.
         assert_eq!(
             lua.globals().get::<String>("order").unwrap(),
-            "abBA",
-            "siblings resolve in declaration order, and each getter fires exactly once"
+            "aAbB",
+            "every getter fires exactly once, in the order the config wrote it"
         );
         let row = &scene.surface("bar@TEST").unwrap().children[0];
         assert_eq!(row.children[0].rect.width, 500.0, "and the fill child was still sized from the remainder");

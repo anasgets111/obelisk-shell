@@ -205,9 +205,9 @@ pub fn parse_children(properties: &HashMap<String, Value>) -> Result<Vec<Virtual
 /// `pair_children_by_id_then_position` then matches 29 of them to retained nodes and throws the
 /// fresh ones away. § 5.2 calls `list` a "fast-reconciling virtual repeater", and the reconciling
 /// half is what ADR-0045 delivered; the repeater half still re-runs a Lua closure per item per
-/// pass. `resolve_and_reconcile` runs per `Scene::apply`, which ADR-0044 decision 2's dirty flag
+/// pass. `layout::scene`'s walk runs per `Scene::apply`, which ADR-0044 decision 2's dirty flag
 /// made per poll turn rather than per config edit, so this is the same cadence change item 14's
-/// text-reshaping `ponytail:` records against `intrinsic_content_size`.
+/// text-reshaping `ponytail:` records against the measure callback.
 ///
 /// The fix is to compute keys first and skip `itemfn` for an element whose key already matches a
 /// retained child, which is what makes it a virtual repeater rather than a loop. It is not built

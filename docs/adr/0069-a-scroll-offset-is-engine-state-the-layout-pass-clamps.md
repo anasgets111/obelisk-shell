@@ -1,5 +1,13 @@
 # A scroll offset is engine state the layout pass clamps
 
+> **`position_children` is gone; the clamp is not.** docs/adr/0077 handed sizing and positioning to
+> `taffy`, so the offset is applied in `finish`, the walk that reads solved geometry back out. It is
+> still subtracted from every visible child's main coordinate, still clamped against a content
+> extent this module sums itself (visible children's border boxes plus their margins plus the
+> `spacing` gaps, which is what `Fill` was sized against), and still written back quiet. Reading the
+> extent off taffy's `scrollable_overflow_rect` instead was considered and rejected: CSS scrollable
+> overflow excludes the children's margins, and this engine's footprint includes them.
+
 `build-steps.md`'s ranking puts `on_scroll` fifth of nine and says the open question is "what a
 scrollable container means, not what the callback looks like". This is that ADR.
 

@@ -2061,6 +2061,20 @@ the IDL-only entries fell between the two documents.
 > percentage still resolves against the parent rather than the remainder as a CSS percentage does,
 > and a `Fill` child of a `Content`-sized row still resolves to 0 because there is no remainder to
 > divide. No ADR: the tree is still one recursive pass and every node still resolves once.
+>
+> **Superseded by docs/adr/0077: the two rounds are gone, and so is the rest of the layout math.**
+> `taffy` sizes and positions now. `layout::scene` keeps identity, the lease, the depth cap, the
+> once-per-node resolve, the scroll clamp and text elision, and a pass is `prepare` (declaration
+> order, one taffy node per node), `solve`, `finish`. Every number the paragraphs above pin is
+> unchanged and every test that pins them is green, including the `Fill` remainder split, the
+> clamp at zero, and the four "deliberately unchanged" cases in the paragraph above this one.
+>
+> Two things do change, both recorded in ADR-0077. ADR-0023 item 11 is fixed: a `Stretch` child of
+> a `Content`-sized parent now repositions its own descendants, which the paragraph above could not
+> do because it had no second pass. And the getter order the paragraph above defends is now the
+> plain one: with no rounds, declaration order and recursion order are the same walk, so the
+> fixture that read `abBA` reads `aAbB`. The guarantee item 5 states, every getter exactly once in
+> the order the config wrote it, is what the rewritten test asserts.
 
 > **Built (item 2).** `brightness` reads `/sys/class/backlight`, picking one device by the `type`
 > attribute the kernel's own `Documentation/ABI/stable/sysfs-class-backlight` exposes for exactly

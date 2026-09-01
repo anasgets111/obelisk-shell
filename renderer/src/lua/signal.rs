@@ -388,7 +388,7 @@ impl Signal {
     /// This scroll signal's current offset, without a `Lua` to hand.
     ///
     /// [`Self::get_value`] would do, and needs a `&Lua` it cannot be given: `layout::scene`'s
-    /// `position_children` runs deep inside a pass that holds no VM reference, and threading one
+    /// The scroll clamp runs deep inside a pass that holds no VM reference, and threading one
     /// down to read a number out of a `RefCell` would be a parameter on every frame of the layout
     /// recursion for the benefit of one property.
     pub(crate) fn scroll_offset(&self) -> Option<f32> {

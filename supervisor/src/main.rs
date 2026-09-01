@@ -115,7 +115,7 @@ pub(crate) fn parse_action<A: serde::de::DeserializeOwned>(params: &shared::Comm
 enum Shutdown {
     /// `SIGINT`, `SIGTERM`, or every channel closing. Rerunning the shell is recovery.
     Requested,
-    /// [`RestartBrake`] refused another respawn. Rerunning would hand the same config to a fresh
+    /// `generation::RestartBrake` refused another respawn. Rerunning would hand the same config to a fresh
     /// Renderer, which dies the same way, forever.
     RestartBrakeTripped,
 }

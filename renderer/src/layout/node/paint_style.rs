@@ -25,7 +25,7 @@
 //! keyboard focus. Both are arithmetic over already-parsed data, not parsing.
 //!
 //! An `icon`'s `size` is absent here on purpose: it is the node's geometry, read by
-//! `layout::scene::intrinsic_content_size`, and the drawn pixel count comes from the resolved rect.
+//! `layout::scene`'s measure callback, and the drawn pixel count comes from the resolved rect.
 
 use std::collections::HashMap;
 

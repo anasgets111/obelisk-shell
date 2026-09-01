@@ -185,8 +185,8 @@ fn configure_positioner(positioner: &XdgPositioner, spec: &PopupSpec) {
 /// wants" is not a number this engine ever computes. The ceiling is that a config with no
 /// `min_size` opens at this size on a compositor that leaves the first configure at zero, whatever
 /// it actually draws. Two upgrade paths, either of which retires the constant: § 6.2 gaining an
-/// advisory initial size, or a real two-pass content measure that can size a `Content` root against
-/// a known budget (`resolve_and_reconcile`'s own `ponytail:` names that second pass).
+/// advisory initial size, or sizing a `Content` root against a known budget, which the solver
+/// docs/adr/0077 brought in can now express and nothing yet asks it for.
 const UNCONFIGURED_WINDOW_SIZE: (f32, f32) = (640.0, 480.0);
 /// The size a toplevel's buffer takes for one `xdg_toplevel` configure.
 ///

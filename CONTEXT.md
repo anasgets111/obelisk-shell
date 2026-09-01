@@ -97,8 +97,12 @@ A grace period that keeps a removed node's GPU resource alive past its removal f
 _Avoid_: keepalive, grace period
 
 **Resolved style**:
-One node's geometry properties, parsed into typed values exactly once per layout pass and read by every pass that follows. A node's parent produces it in the same loop iteration that resolves the node's signals, because the parent needs the child's margin before it can hand it a budget; a surface root's is produced by the transaction itself. It exists because a resolved property is still a Lua value, and a table carrying an `__index` answers each read separately, so parsing the same property in the sizing pass and again in the positioning pass let the two disagree about one node's margin.
+One node's geometry properties, parsed into typed values exactly once per layout pass. A node's parent produces it in the same loop iteration that resolves the node's signals; a surface root's is produced by the transaction itself. It exists because a resolved property is still a Lua value, and a table carrying an `__index` answers each read separately, so asking the same property twice in one pass let the two answers disagree about one node's margin. Since ADR-0077 exactly one thing reads it, the solver style below, which is what makes the once-per-node guarantee hold by construction rather than by discipline.
 _Avoid_: style (ambiguous: also the paint properties), computed style, layout cache
+
+**Solver style**:
+One node's resolved style translated into the layout solver's own vocabulary, and the only place in the Renderer that knows what a `row`, a `Fill` or the stacking model mean. Everything on the engine's side of it -- node identity, the lease, the depth cap, the once-per-node resolve, the scroll clamp, text elision -- is written against a tree whose geometry simply arrives. The engine computes no geometry of its own: `taffy` sizes and positions, and is asked to measure only the two node kinds whose size is their own content, a text's shaped extent and an icon's square (ADR-0077, superseding ADR-0023's one-pass stacking model).
+_Avoid_: taffy style (name the seam, not the crate), flex style, constraint
 
 **Layout pass budget**:
 The single CPU deadline covering one whole retained-scene transaction, as opposed to the per-evaluation cap that bounds one signal getter. It is what puts a resolved table's `__index` metamethod under a limit at all, since that runs between signal evaluations rather than inside one, and it is what stops a tree of individually-legal getters adding up to an unbounded pass. Exceeding it fails the transaction and rolls it back, like any other layout error.

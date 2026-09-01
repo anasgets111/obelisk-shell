@@ -97,7 +97,7 @@ pub(super) fn table_number(property: &str, table: &mlua::Table, key: &str) -> Re
 /// The four `table.get` calls below are metamethod-aware, so a resolved table carrying a
 /// side-effecting `__index` answers per read rather than per node. That used to matter: this
 /// parser ran once per *consumer* of the property, so a child's `margin` was parsed by its
-/// parent's child loop, by both `intrinsic_content_size` folds and by `position_children`, four
+/// parent's child loop, twice more while sizing and once more while positioning, four
 /// answers to one question with nothing making them agree. Measured then: 16 `__index`
 /// invocations for one child in one pass, and a row that measured itself 18 wide and placed its
 /// 10-wide child spanning 16..26.
@@ -169,7 +169,7 @@ pub fn parse_background(properties: &HashMap<String, Value>) -> Result<Option<Rg
 ///
 /// This bound stays private to `radius` and `border_width`, not extended to `margin`/`padding`:
 /// § 5.1 gives `margin`/`padding` no "Valid Range" entry at all, unlike `width`/`height`, and
-/// `layout::scene`'s `position_children` reads a negative margin the same way CSS does -- subtracted
+/// `layout::scene`'s solver reads a negative margin the same way CSS does -- subtracted
 /// into a child's footprint and slot size, so `margin = -8` deliberately pulls a child closer to (or
 /// over) its neighbor. That is layout math, not a femtovg stroke input, with no crash mode like
 /// `border_width`'s curve-divisions blowup.
