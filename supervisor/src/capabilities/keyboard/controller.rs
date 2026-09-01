@@ -23,12 +23,23 @@ use super::locks::{read_led_on, resolve_lock_leds};
 /// ADR-0034), `active_layout_index`/`layout_count` default `0`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct KeyboardState {
+    /// Keyboard backlight, `0` to `100`, or `-1` on a machine with no backlight device. `-1` is an
+    /// answer, not a failure: check for it before drawing a slider.
     pub backlight_pct: i32,
+    /// Caps Lock is on.
     pub caps_lock: bool,
+    /// Num Lock is on.
     pub num_lock: bool,
+    /// Scroll Lock is on.
     pub scroll_lock: bool,
+    /// The layout's display name, e.g. `"English (US)"`. Empty string before the compositor has
+    /// answered once.
     pub active_layout: String,
+    /// The active layout's 0-based position in the configured list. What
+    /// `keyboard:set_layout(index)` takes.
     pub active_layout_index: u32,
+    /// How many layouts are configured. `keyboard:cycle_layout` is a no-op below `2`, so this is
+    /// the check for whether to draw a layout indicator at all.
     pub layout_count: u32,
 }
 

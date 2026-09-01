@@ -14,12 +14,21 @@ use zbus::zvariant::OwnedValue;
 /// answer. See `power/mod.rs` for why this is four optional fields, not one on/off capability.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct PowerState {
+    /// The active platform profile, e.g. `"balanced"`. What `power:set_profile` sets. `nil` on a
+    /// host with no power-profiles-daemon, which is why every field here is optional.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_profile: Option<String>,
+    /// Every profile this hardware offers, in the daemon's own order, e.g.
+    /// `{"performance", "balanced", "power-saver"}`. `nil` when the daemon is absent. Drive a
+    /// selector off this rather than off a hardcoded list: not every machine has all three.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profiles: Option<Vec<String>>,
+    /// Running on battery rather than mains, from UPower. `nil` when UPower is absent. This is the
+    /// mains question; whether the battery is filling is `oblisk.battery`'s `state`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_battery: Option<bool>,
+    /// UPower's `EnergyRate` in watts, passed through unchanged. Positive in both directions, so it
+    /// is the magnitude and [`PowerState::on_battery`] is the sign. `nil` when UPower is absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub energy_rate: Option<f64>,
 }

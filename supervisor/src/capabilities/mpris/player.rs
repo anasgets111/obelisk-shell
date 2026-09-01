@@ -17,13 +17,32 @@ use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct PlayerState {
+    /// The bus name with `org.mpris.MediaPlayer2.` stripped, e.g. `"spotify"`. What every
+    /// `mpris:` command takes to name the player it acts on.
     pub id: String,
+    /// `MediaPlayer2.Identity`, the player's own display name, e.g. `"Spotify"`. Empty string
+    /// for a player that does not answer the property.
     pub identity: String,
+    /// `"Playing"`, `"Paused"` or `"Stopped"`. A player that fails to answer keeps its previous
+    /// value rather than dropping to a fabricated `"Stopped"`.
     pub play_state: String,
+    /// `xesam:title`. Empty string when the player publishes no metadata, which is the normal
+    /// state between tracks.
     pub title: String,
+    /// `xesam:artist`, joined with `", "` when there is more than one. Empty string when absent.
     pub artist: String,
+    /// An absolute path to the artwork, or an empty string. `mpris:artUrl` is taken only when it
+    /// is a `file://` URL that canonicalizes to a file that exists, so a remote URL and a stale
+    /// path both arrive as empty rather than as a path that fails to load. Held across an
+    /// update that did not change the track, so the cover does not blink on a position tick.
     pub album_art_path: String,
+    /// Playback offset in microseconds, correct as of [`PlayerState::position_updated_at`] and not
+    /// after. Nothing polls it while a track plays, so a progress bar has to add the elapsed time
+    /// itself rather than reading this every frame.
     pub position: i64,
+    /// `CLOCK_MONOTONIC` microseconds at the instant [`PlayerState::position`] was read. Monotonic,
+    /// not wall clock, so it survives a clock adjustment. Subtract it from a monotonic `now` to
+    /// get how far the track has moved since.
     pub position_updated_at: i64,
     /// `-1` when `mpris:length` is absent/malformed (a live stream, or a player that simply
     /// doesn't report it) -- a genuine unavailable, not a fabricated zero (ADR-0036).

@@ -32,19 +32,19 @@ function Capability:invoke(command, ...) end
 ---One scanned access point, already resolved to what `network.available_networks` needs
 ---(docs/oblisk-idl-api-specs.md §2.5). `Serialize`: this is what ends up in a `StateSnapshot`'s
 ---`payload`, same convention as `audio::mixer::AppStream`.
----@field active boolean
----@field band string
----@field secure boolean
----@field ssid string
----@field strength integer
+---@field active boolean This is the AP currently associated.
+---@field band string `"2.4 GHz"`, `"5 GHz"` or `"6 GHz"`, from the AP's frequency.
+---@field secure boolean A key is required: the AP advertises WEP privacy, or non-empty WPA1 or RSN key management.
+---@field ssid string The network name. The key entries are deduplicated on, so two radios of one network appear once, at the stronger signal.
+---@field strength integer Signal strength, `0` to `100`.
 
 ---@class ActiveClient
 ---§ 2.9's `active_client`, minus `is_fullscreen` (docs/adr/0056 decision 5: niri-ipc 26.4.0's
 ---`Window` has no such field, and a fabricated `false` would be wrong for fullscreen windows).
 ---`class` is Wayland's `app_id`: X11's `WM_CLASS` has no Wayland equivalent.
----@field class string
----@field is_floating boolean
----@field title string
+---@field class string The Wayland `app_id`, e.g. `"firefox"`. Named `class` for the X11 habit, but a Wayland toplevel has no `WM_CLASS`. The key `applications.by_app_id` is built to be looked up by.
+---@field is_floating boolean The compositor has this window floating rather than tiled.
+---@field title string The window title, e.g. `"src/main.rs - Neovim"`. Empty string for a window that sets none.
 
 ---@class AppStream
 ---One playback stream node PipeWire has advertised, filtered to
@@ -69,7 +69,7 @@ function Capability:invoke(command, ...) end
 ---to run something else.
 ---@field icon? string The `Icon=` key as written: a theme name, or an absolute path. `icon { name = ... }` takes either, which is exactly what ADR-0054 decision 2 built it for. `None` for an entry with no `Icon=` at all, so a config can tell "no icon" from an icon that failed to resolve.
 ---@field id string The desktop file id (`org.telegram.desktop`), and `launch`'s one argument.
----@field name string
+---@field name string The unlocalized `Name=`. `Name[xx]` is deliberately not read (ADR-0061), so this is English on a localized system.
 
 ---@class AudioDevice
 ---One § 2.4 `sinks`/`sources` entry. Both arrays are the same three fields, so they are the
@@ -82,7 +82,7 @@ function Capability:invoke(command, ...) end
 ---advertises, and only one is meant for a person.
 ---@field active boolean Whether this is the device the `default.audio.sink`/`default.audio.source` metadata key currently routes to.
 ---@field id integer PipeWire registry id, which is what `audio:set_default_sink(id)` takes.
----@field name string
+---@field name string The device description, e.g. `"Built-in Audio Analog Stereo"`, which is what to draw. Not stable across a reboot; [`AudioDevice::id`] is not either.
 
 ---@alias BatteryStatus
 ---| "Unknown" # UPower has no answer, which includes every host where the display device is not a battery.
@@ -108,98 +108,98 @@ function Capability:invoke(command, ...) end
 ---@class CameraUser
 ---One active camera user (ADR-0034: `privacy.camera_users: table`, array of `{app_name}`,
 ---empty = inactive).
----@field app_name string
+---@field app_name string The holding process's name, from its PipeWire node when it has one, then `/proc/<pid>/comm`, falling back to `"pid 1234"`. Always something drawable, never empty.
 
 ---@class ConnectedDevice
 ---@field battery integer `-1` if unsupported/unknown (no `Battery1` interface on this device, or its `Percentage` property failed to read) -- per the IDL comment, not a sentinel invented here.
----@field category string
+---@field category string A drawing hint from the device's class of device: `"keyboard"`, `"mouse"`, `"headphones"`, `"headset"`, `"phone"`, `"computer"`, or `"generic"` for anything the class bits do not place. Pick an icon from it; do not treat it as a capability.
 ---@field codec? string Always `None` this round -- codec query/control is deferred (ADR-0030): it needs a live PipeWire `Device` proxy, an `audio`-capability concern, not `bluetooth`'s.
----@field mac string
----@field name string
+---@field mac string The canonical MAC address, e.g. `"00:1A:7D:DA:71:11"`. What every `bluetooth:` command takes to name a device.
+---@field name string The device's advertised name.
 
 ---@class DiscoveredDevice
----@field mac string
----@field name string
+---@field mac string The canonical MAC address. What `bluetooth:pair(mac)` takes.
+---@field name string The advertised name. Often empty for a device that broadcasts only an address.
 ---@field paired boolean Always `false` -- per the IDL comment, every entry in this pool is by definition unpaired.
 
 ---@class MenuItem
 ---One node of a DBusMenu layout tree, already resolved into what `tray.items[].menu` needs
 ---(docs/oblisk-idl-api-specs.md §2.14).
----@field children MenuItem[]
----@field enabled boolean
----@field icon_name? string
----@field id integer
----@field label? string
----@field menu_type string
----@field toggle_state? integer
----@field toggle_type? string
+---@field children MenuItem[] Nested entries, recursive. The whole tree arrives in one `GetLayout(0, -1)` reply rather than a submenu at a time, so this is populated without any `tray:menu_will_show` first. Empty for a leaf, and also empty for a node past [`MAX_MENU_DEPTH`], whose children are dropped with a line on stderr.
+---@field enabled boolean `false` for an entry the application has greyed out. Activating one is a no-op, so draw it as unavailable rather than filtering it away: the gap is the application's own layout.
+---@field icon_name? string A theme icon name for the entry, or `nil`. DBusMenu's pixmap form is not carried.
+---@field id integer DBusMenu's own item id. What `tray:activate_menu_item` and `tray:menu_will_show` take.
+---@field label? string The entry text, exactly as the application sent it. `nil` when it sent none, which is the normal case on a separator. DBusMenu's `_` mnemonic markers are *not* stripped, so a label can arrive as `"_Quit"`; strip it in the config if you do not want the underscore drawn.
+---@field menu_type string `"standard"` or `"separator"`. A separator carries no label and is not clickable.
+---@field toggle_state? integer DBusMenu's own `0` off, `1` on, `-1` indeterminate. `nil` exactly when [`MenuItem::toggle_type`] is, and `-1` for an item that declared a toggle type and then sent no state, which is the same thing DBusMenu means by indeterminate.
+---@field toggle_type? string `"checkmark"`, `"radio"`, or `nil` for an entry that is not a toggle.
 
 ---@class Notification
 ---One queued notification -- `notifications.feed[]`'s object shape (docs/oblisk-idl-api-specs.md
 ---§2.7, ADR-0033's corrections: `body` is a span array not a flat string, `urgency`/`has_reply`
 ---are new fields). Trimmed to what the feed shape and write commands need -- the raw `actions`
 ---array is never stored, only the `has_reply` bool it collapses into.
----@field app_name string
----@field body NotificationSpan[]
----@field has_reply boolean
----@field icon_path? string
----@field id integer
----@field summary string
----@field urgency Urgency
+---@field app_name string The sending application's name, truncated to 64 bytes on a character boundary.
+---@field body NotificationSpan[] The message as a run of spans rather than one string, because the freedesktop body is markup. Truncated to 512 bytes before parsing. Each span is either text carrying its own bold/italic/underline/href, or an image whose path passed the trusted-root check, so a config draws the list in order and never has to parse markup itself.
+---@field has_reply boolean The sender offered an inline reply action, so `notifications:reply(id, text)` will be accepted. Calling it on a notification without one is refused, which is why this is carried rather than guessed.
+---@field icon_path? string An absolute path to a decoded, bounds-checked image spooled to `/dev/shm`, or `nil` for a notification that sent no icon. Never a theme name: this is a file that exists.
+---@field id integer The server-assigned id, counting up from `1`. What `notifications:dismiss`, `:reply` and `:invoke_action` take. Reused when an application replaces its own notification in place.
+---@field summary string The title, truncated to 128 bytes on a character boundary. Plain text: any markup the application sent is parsed out, not rendered.
+---@field urgency Urgency `"low"`, `"normal"` or `"critical"`. `"normal"` for a sender that set no urgency hint. Critical is the one that outlives do-not-disturb and never expires on its own.
 
 ---@class NotificationSpan
 ---One allowlisted body-markup run (CONTEXT.md's "Notification body span"; ADR-0033). A text run
 ---carries its own styling and, for a `<a href>`, the link target; an image run carries only a
 ---spooled/validated path -- `alt` text is parsed for grammar completeness but not carried
 ---forward, since nothing in this round's scope reads it.
----@field bold? boolean
----@field href? string
----@field image_path? string
----@field italic? boolean
+---@field bold? boolean The run sat inside `<b>`.
+---@field href? string The `<a href>` target this run links to, or `nil` for a run that is not a link. Carried as text, not opened: launching it is a config's decision.
+---@field image_path? string An absolute path to an image that exists under a trusted root. A path outside one is dropped during parsing rather than carried and refused later.
+---@field italic? boolean The run sat inside `<i>`.
 ---@field kind "text"|"image"
----@field text? string
----@field underline? boolean
+---@field text? string The run's text, already unescaped. Empty runs are not emitted.
+---@field underline? boolean The run sat inside `<u>`.
 
 ---@class OutputWorkspaces
 ---One output's workspace state. `workspaces` is docs/adr/0056 decision 3's addition to
 ---§ 2.9.
----@field active_workspace integer
+---@field active_workspace integer The [`WorkspaceEntry::id`] of the workspace visible on this output. Every output has one, focused or not.
 ---@field focused_workspace? integer docs/adr/0056 decision 4: present only on the output that actually holds focus, so `out.focused_workspace ~= nil` is the "is this the focused monitor" test.
----@field name string
----@field workspaces WorkspaceEntry[]
+---@field name string The connector name, e.g. `"eDP-1"`. Matches an `oblisk.screens` entry's `name` and a surface's `monitor`.
+---@field workspaces WorkspaceEntry[] The workspaces on this output, ordered by [`WorkspaceEntry::idx`]. What a strip draws: the two ids above are opaque on their own and name nothing a user would recognise.
 
 ---@class PlayerState
----@field album_art_path string
----@field artist string
----@field id string
----@field identity string
+---@field album_art_path string An absolute path to the artwork, or an empty string. `mpris:artUrl` is taken only when it is a `file://` URL that canonicalizes to a file that exists, so a remote URL and a stale path both arrive as empty rather than as a path that fails to load. Held across an update that did not change the track, so the cover does not blink on a position tick.
+---@field artist string `xesam:artist`, joined with `", "` when there is more than one. Empty string when absent.
+---@field id string The bus name with `org.mpris.MediaPlayer2.` stripped, e.g. `"spotify"`. What every `mpris:` command takes to name the player it acts on.
+---@field identity string `MediaPlayer2.Identity`, the player's own display name, e.g. `"Spotify"`. Empty string for a player that does not answer the property.
 ---@field length integer `-1` when `mpris:length` is absent/malformed (a live stream, or a player that simply doesn't report it) -- a genuine unavailable, not a fabricated zero (ADR-0036).
----@field play_state string
----@field position integer
----@field position_updated_at integer
----@field title string
+---@field play_state string `"Playing"`, `"Paused"` or `"Stopped"`. A player that fails to answer keeps its previous value rather than dropping to a fabricated `"Stopped"`.
+---@field position integer Playback offset in microseconds, correct as of [`PlayerState::position_updated_at`] and not after. Nothing polls it while a track plays, so a progress bar has to add the elapsed time itself rather than reading this every frame.
+---@field position_updated_at integer `CLOCK_MONOTONIC` microseconds at the instant [`PlayerState::position`] was read. Monotonic, not wall clock, so it survives a clock adjustment. Subtract it from a monotonic `now` to get how far the track has moved since.
+---@field title string `xesam:title`. Empty string when the player publishes no metadata, which is the normal state between tracks.
 
 ---@class TrayItem
 ---@field attention_icon_name? string The `NeedsAttention` artwork, resolved the same way as `icon_name`/`icon_path`. Draw these instead of the base pair while `status` is `"NeedsAttention"`. Both stay `nil` for an item that declares no attention icon, which is most of them.
----@field attention_icon_path? string
----@field icon_name? string
----@field icon_path? string
----@field id string
----@field item_is_menu boolean
----@field menu? MenuItem[]
----@field name string
+---@field attention_icon_path? string The file half of the attention artwork, on the same terms as `attention_icon_name`.
+---@field icon_name? string A theme icon name, for `icon { name = ... }`. Exactly one of this and [`TrayItem::icon_path`] is ever set, so a config draws whichever is present.
+---@field icon_path? string A decoded, bounds-checked PNG spooled to `/dev/shm`, for `image { source = ... }`. Set when the item sent pixels rather than a theme name.
+---@field id string § 2.14's stable id: the registering process's D-Bus unique name, sanitized (e.g. `"1.234"`). What every `tray:` command takes to name the item it acts on.
+---@field item_is_menu boolean The item saying a left click must open its menu instead of activating it. Honour it, or a click does nothing on the items that set it.
+---@field menu? MenuItem[] The top-level menu entries, or `nil` for an item with no `com.canonical.dbusmenu` menu. Fetched once when the item registers, then again on the item's own layout updates.
+---@field name string The display name. `Title`, falling back to `Id` when the item leaves `Title` empty.
 ---@field overlay_icon_name? string A badge, meant to be drawn over the base icon's corner rather than instead of it. Carried rather than composited: a `stack` node is what puts one image on another, and the Supervisor has no canvas. Both stay `nil` when the item declares no badge.
----@field overlay_icon_path? string
----@field status string
----@field tooltip? string
+---@field overlay_icon_path? string The file half of the badge, on the same terms as `overlay_icon_name`.
+---@field status string SNI's own `Status`: `"Active"`, `"Passive"` or `"NeedsAttention"`. `"Passive"` is the item asking to be hidden, which is a config's decision to honour or ignore.
+---@field tooltip? string The item's tooltip title and text, flattened to one string. `nil` when it has none.
 
 ---@class UpdateCandidate
 ---One installed package with a newer version in some sync repo.
----@field download_size integer
----@field installed_size integer
----@field name string
----@field new_version string
----@field old_version string
+---@field download_size integer Bytes to fetch, from alpm's own `download_size`, which answers `0` for a package already sitting in the pacman cache.
+---@field installed_size integer Bytes the new version occupies once unpacked. Not a delta: subtracting the old version's size is the config's job if it wants one.
+---@field name string The package name, as pacman spells it.
+---@field new_version string The version the synced repo offers.
+---@field old_version string The installed version, in pacman's `epoch:pkgver-pkgrel` spelling.
 
 ---@alias Urgency "low"|"normal"|"critical"
 ---The `low`/`normal`/`critical` tier (CONTEXT.md's "Notification urgency"). `Hash`/`Eq` so it can
@@ -209,9 +209,9 @@ function Capability:invoke(command, ...) end
 ---`id` is the compositor's stable, monitor-independent identity: what `active_workspace`/
 ---`focused_workspace` refer to and what `workspaces:focus(id)` takes. `idx` is the 1-based
 ---position on that output (what a keybind/button label means), not stable across a reorder.
----@field id integer
----@field idx integer
----@field name? string
+---@field id integer Stable identity, independent of which output the workspace sits on. What the two ids on [`OutputWorkspaces`] refer to and what `workspaces:focus(id)` takes.
+---@field idx integer 1-based position on this output. Not stable: a reorder renumbers it, which is why it is the thing to draw and [`WorkspaceEntry::id`] is the thing to send.
+---@field name? string The compositor's own name for the workspace, or `nil` when it has none. Most do not.
 
 ---@class ApplicationsState
 ---`oblisk.applications`'s payload (docs/adr/0061 decision 2).
@@ -220,40 +220,40 @@ function Capability:invoke(command, ...) end
 ---have to be a Lua array index, and Lua counts from one while the JSON array this serializes to
 ---counts from zero, so every config reading it would carry an off-by-one nobody can see in the
 ---payload. Repeating three small fields for a few hundred entries costs less than that trap.
----@field by_app_id table<string, AppSummary>
----@field entries AppSummary[]
+---@field by_app_id table<string, AppSummary> The same entries, keyed by the `app_id` a window reports, for a caller holding `workspaces.active_client.class` rather than a desktop file id. Keyed on exact `StartupWMClass` and exact desktop id first, then case-folded and last-dot-segment spellings, and an exact key is never displaced by a folded one. Miss on it before concluding an app is not installed: the mapping is a set of heuristics, not a registry.
+---@field entries AppSummary[] Every installed desktop entry that is visible and launchable, sorted by name. Rebuilt on `applications:refresh()`; nothing watches the directories, so an app installed mid-session does not appear until something asks.
 
 ---@class AudioState
 ---The full `oblisk.audio` payload (§ 2.4, docs/adr/0053 decision 3): master output
 ---volume/mute plus the per-app stream list.
----@field apps AppStream[]
+---@field apps AppStream[] One entry per application playing audio right now. Empty when nothing is, which is the normal state and not an error.
 ---@field muted boolean Master output mute.
----@field sinks AudioDevice[]
----@field sources AudioDevice[]
+---@field sinks AudioDevice[] Every output device. `audio:set_default_sink(id)` takes one's [`AudioDevice::id`].
+---@field sources AudioDevice[] Every input device, on the same terms as [`AudioState::sinks`].
 ---@field volume number Master output volume, range `[0.0, 1.0]` -- see [`master`]'s module doc comment for how this is derived from the default sink's `channelVolumes`.
 
 ---@class BatteryState
 ---`oblisk.battery`'s full payload (§ 2.2). Field names are the `StateSnapshot` JSON keys
 ---verbatim -- may not be renamed. `Default` is itself the correct "no battery hardware" answer
 ---for a desktop, not a placeholder needing a sentinel.
----@field percent integer
----@field present boolean
----@field state BatteryStatus
+---@field percent integer Charge, `0` to `100`, rounded. Against the battery's own full capacity, not against a charge limit, so a machine capped at 70 reads `70` and stays there rather than reading `100`.
+---@field present boolean UPower's display device is a battery and reports itself present. `false` on a desktop, which is an answer rather than a missing one: check it before drawing anything else here.
+---@field state BatteryStatus What the battery is doing, by UPower's own name. The field that separates holding a charge limit on mains (`PendingCharge`) from actually running down (`Discharging`), which a boolean could not.
 ---@field time_to_empty? integer Seconds until flat, or `nil`. UPower reports `0` both while charging and while it has not yet estimated, and neither is a duration, so both are the absent case here.
 ---@field time_to_full? integer Seconds until full, or `nil`, on the same terms as `time_to_empty`.
 
 ---@class BluetoothState
----@field connected_devices ConnectedDevice[]
----@field discovered_devices DiscoveredDevice[]
----@field discovering boolean
----@field enabled boolean
+---@field connected_devices ConnectedDevice[] Paired devices currently connected. In BlueZ's own object order, which is not sorted.
+---@field discovered_devices DiscoveredDevice[] Unpaired devices seen by the running scan. Empties when discovery stops.
+---@field discovering boolean A discovery scan is running, which is what fills [`BluetoothState::discovered_devices`].
+---@field enabled boolean The adapter is powered. `false` also when there is no adapter at all, so this is not proof the machine has Bluetooth hardware.
 
 ---@class BrightnessState
 ---`oblisk.brightness`'s full payload (§ 2.3). `percent` is the JSON key verbatim -- the
 ---Renderer routes it into the Lua `oblisk.brightness` signal table by name, unchanged.
 ---`Default` (`0`) is a placeholder before the first real read; never observed if no device
 ---was found, since no signal is sent in that case (see `brightness/mod.rs`).
----@field percent integer
+---@field percent integer Screen backlight, `0` to `100`. Read from sysfs `brightness`, the last requested value, rather than `actual_brightness`, so it matches what was asked for instead of lagging through a hardware fade.
 
 ---@class KeyboardState
 ---`oblisk.keyboard`'s combined payload. `backlight_pct` is `-1` when this machine has no
@@ -261,13 +261,13 @@ function Capability:invoke(command, ...) end
 ---`bool`) -- they default `false` and stay there, logged once, if neither evdev nor sysfs
 ---resolves. `active_layout` defaults to an empty string (IDL declares it non-nullable,
 ---ADR-0034), `active_layout_index`/`layout_count` default `0`.
----@field active_layout string
----@field active_layout_index integer
----@field backlight_pct integer
----@field caps_lock boolean
----@field layout_count integer
----@field num_lock boolean
----@field scroll_lock boolean
+---@field active_layout string The layout's display name, e.g. `"English (US)"`. Empty string before the compositor has answered once.
+---@field active_layout_index integer The active layout's 0-based position in the configured list. What `keyboard:set_layout(index)` takes.
+---@field backlight_pct integer Keyboard backlight, `0` to `100`, or `-1` on a machine with no backlight device. `-1` is an answer, not a failure: check for it before drawing a slider.
+---@field caps_lock boolean Caps Lock is on.
+---@field layout_count integer How many layouts are configured. `keyboard:cycle_layout` is a no-op below `2`, so this is the check for whether to draw a layout indicator at all.
+---@field num_lock boolean Num Lock is on.
+---@field scroll_lock boolean Scroll Lock is on.
 
 ---@class LockState
 ---`oblisk.lock`'s payload (docs/adr/0052 decision 4). `attempts` counts failed authentications
@@ -275,47 +275,47 @@ function Capability:invoke(command, ...) end
 ---layout time (docs/adr/0044), not evented, so two identical consecutive failures are one
 ---unchanged `error` string. `error`'s "nothing went wrong" value is the empty string, the same
 ---convention `keyboard`'s `active_layout` uses.
----@field active boolean
----@field attempts integer
----@field authenticating boolean
----@field error string
+---@field active boolean The session is locked and the Renderer has confirmed it. Never optimistic: a lock that has been asked for but not yet confirmed still reads `false`, so a config cannot draw an unlocked screen over a locked session or the reverse.
+---@field attempts integer Authentication attempts against the lock currently held. Counts every answer PAM returns, success included, and resets to `0` only when the Renderer confirms a *new* lock. So it is per-acquisition rather than per-failure: a lockout rule reads it together with [`LockState::error`], which is empty after the attempt that succeeded.
+---@field authenticating boolean A password is with PAM and no answer has come back. `pam_unix` takes about a second, so this is what a spinner reads. `lock:authenticate` is refused while it is true.
+---@field error string Why the last attempt failed, in words fit to draw, e.g. `"too many attempts"`. Empty string when the last attempt succeeded and when none has been made. Rewritten on every PAM answer and cleared when a new lock is confirmed, so it always describes the lock now on screen.
 
 ---@class MprisState
----@field players PlayerState[]
+---@field players PlayerState[] Every MPRIS player on the bus, in no order at all: this is a `HashMap`'s values, so the sequence can differ between two pushes over the same set. Sort by [`PlayerState::id`] for a list that does not reshuffle. Empty when nothing is running, which is not an error.
 
 ---@class NetworkState
 ---`oblisk.network`'s live push state (docs/adr/0029). Scoped to exactly what §4.2 asks for --
 ---scanning status and the deduplicated AP list -- not the full §2.5 read schema
 ---(`connected`/`ssid`/`wifi_enabled`/etc.), which §4 doesn't ask this controller to track.
----@field available_networks AccessPointInfo[]
----@field scanning boolean
+---@field available_networks AccessPointInfo[] The access points from the last completed scan: deduplicated by SSID keeping the strongest radio of each, sorted strongest first, and cut to 20. Keeps the previous list while [`NetworkState::scanning`] is true, so a panel does not blank out mid-scan.
+---@field scanning boolean A scan is in flight. Flipped to `true` the moment `network:scan()` is accepted rather than when NetworkManager confirms, so a spinner starts on the click instead of a round trip later.
 
 ---@class NotificationsState
 ---`notifications.feed`/`notifications.dnd`'s `StateSnapshot` payload shape (ADR-0033).
----@field dnd boolean
----@field feed Notification[]
+---@field dnd boolean Do-not-disturb, flipped by `notifications:set_dnd`. It gates exactly one thing in the Supervisor: a non-critical notification's sound does not play. Notifications are still accepted, still queued, and still appear in [`NotificationsState::feed`], so not drawing the popup is the config's decision, and `"critical"` is the urgency worth letting through.
+---@field feed Notification[] The newest 20 live notifications, most recent first. A truncated view of a 100-deep queue (ADR-0033), so a notification can leave this list while still being live and still dismissable by id.
 
 ---@class PowerState
 ---`oblisk.power`'s full payload (§ 2.13). Every field is `Option`, omitted from the JSON
 ---rather than serialized as `null`, so a config reads `nil` for anything this host cannot
 ---answer. See `power/mod.rs` for why this is four optional fields, not one on/off capability.
----@field active_profile? string
----@field energy_rate? number
----@field on_battery? boolean
----@field profiles? string[]
+---@field active_profile? string The active platform profile, e.g. `"balanced"`. What `power:set_profile` sets. `nil` on a host with no power-profiles-daemon, which is why every field here is optional.
+---@field energy_rate? number UPower's `EnergyRate` in watts, passed through unchanged. Positive in both directions, so it is the magnitude and [`PowerState::on_battery`] is the sign. `nil` when UPower is absent.
+---@field on_battery? boolean Running on battery rather than mains, from UPower. `nil` when UPower is absent. This is the mains question; whether the battery is filling is `oblisk.battery`'s `state`.
+---@field profiles? string[] Every profile this hardware offers, in the daemon's own order, e.g. `{"performance", "balanced", "power-saver"}`. `nil` when the daemon is absent. Drive a selector off this rather than off a hardcoded list: not every machine has all three.
 
 ---@class PrivacyState
----@field camera_users CameraUser[]
+---@field camera_users CameraUser[] Every process holding a camera open. Empty means no camera is in use, which is the whole signal: a config draws an indicator when this is non-empty.
 
 ---@class SysinfoState
 ---`oblisk.sysinfo`'s five Lua-visible fields (docs/oblisk-idl-api-specs.md §2.12). Field
 ---names are the `StateSnapshot` payload's JSON keys verbatim -- the Renderer routes them
 ---straight into the Lua signal table by name, unchanged.
----@field cpu_percent integer
----@field ram_percent integer
----@field swap_percent integer
----@field temp_cores integer[]
----@field temp_gpu integer
+---@field cpu_percent integer Total CPU utilization, `0` to `100`, across all cores. `0` before the first sample, which needs two reads a tick apart to produce a delta.
+---@field ram_percent integer Physical memory in use, `0` to `100`.
+---@field swap_percent integer Swap in use, `0` to `100`. `0` on a machine with no swap, which is indistinguishable from swap that is simply empty.
+---@field temp_cores integer[] Per-core temperatures in Celsius, from one hwmon pass. Empty on a machine that exposes none. Length is the sensor count, not the core count, and the order is hwmon's.
+---@field temp_gpu integer GPU temperature in Celsius, or `-1` when no GPU sensor was found. Read from the same hwmon pass as [`SysinfoState::temp_cores`], so it is never newer or older than they are.
 
 ---@class SystemState
 ---`oblisk.system`'s two Lua-visible fields (docs/oblisk-idl-api-specs.md §2.11). Field names
@@ -324,29 +324,29 @@ function Capability:invoke(command, ...) end
 ---@field time integer Unix epoch seconds, not milliseconds -- §2.11 calls it "system time epoch" with no unit stated. `os.date` wants seconds, so a millis reading would be silently wrong by 1000x.
 
 ---@class TrayState
----@field items TrayItem[]
+---@field items TrayItem[] Every registered `StatusNotifierItem`, in no order at all: `build_state` collects a `HashMap`'s values, so the sequence can differ between two pushes that registered the same items. A strip that should not reshuffle has to sort, and [`TrayItem::id`] is the stable key.
 
 ---@class UpdatesState
 ---`oblisk.updates`'s combined payload. `check_error`/`install_error` are `None` when
 ---nothing's gone wrong, not a fabricated empty string. `install_total_steps == 0` while
 ---`installing` is true means the transaction size isn't known yet (pacman hasn't printed it).
----@field check_error? string
----@field count integer
----@field install_current_package string
----@field install_current_step integer
----@field install_error? string
----@field install_total_steps integer
----@field installing boolean
----@field last_successful_check? integer
----@field packages UpdateCandidate[]
----@field reboot_required boolean
+---@field check_error? string Why the last check failed, or `nil` when the last one worked. A check runs against a throwaway copy of the pacman database, so this is a network or parse failure, never a half-applied change to the system.
+---@field count integer How many packages have a newer version in the synced repos. Always equal to `#packages`, and carried separately so a badge does not have to walk the list.
+---@field install_current_package string The package name from the step line pacman is on. Empty string before the first one, not `nil`, because a name is always a string once the transaction is under way.
+---@field install_current_step integer Which package of the transaction pacman is on, its own 1-based `(2/5)` counter. `0` before the first line is parsed.
+---@field install_error? string Why the last install failed, or `nil`. Unlike a check, this one ran as root against the real database, so a failure here can leave packages partly upgraded.
+---@field install_total_steps integer How many packages the transaction has. `0` while [`UpdatesState::installing`] is true means pacman has not printed a step line yet, so a progress bar has no denominator: show it as indeterminate rather than dividing.
+---@field installing boolean An install is running. The four `install_*` fields below only mean anything while this is true; `updates:install` refuses a second one.
+---@field last_successful_check? integer Unix seconds at the end of the last check that completed without error, or `nil` if none has since this session started. A failed check leaves it on the older, still-true value.
+---@field packages UpdateCandidate[] What would be upgraded, one entry each. A failed check leaves this and [`UpdatesState::count`] on the last good answer rather than clearing them, so a config keeps showing the count it knows while [`UpdatesState::check_error`] explains the gap.
+---@field reboot_required boolean A `linux` or `linux-*` package was installed at some point this session. Sticky on purpose: once set it stays set through later installs that do not touch the kernel, because the running kernel is still the old one until the machine restarts.
 
 ---@class WorkspacesState
 ---`oblisk.workspaces`'s full payload (§ 2.9). Field names are the JSON keys verbatim.
 ---`active_client` is `Option` (§ 2.9: "or `nil` if none focused"), omitted rather than
 ---serialized as `null`.
----@field active_client? ActiveClient
----@field outputs OutputWorkspaces[]
+---@field active_client? ActiveClient The focused toplevel, or `nil` when nothing holds focus. One window across the whole session, not one per output: there is no way to ask what is focused on an unfocused monitor (ADR-0056 decision 4).
+---@field outputs OutputWorkspaces[] One entry per connected output, keyed by connector name. Empty before the compositor's first answer.
 
 --- Capabilities -------------------------------------------------------------------------------
 
@@ -554,39 +554,39 @@ function Idle:inhibit(reason) end
 function Idle:release_inhibit() end
 
 ---@class Screen
----@field name string Matches a surface's `monitor`.
----@field width integer Logical pixels.
----@field height integer
----@field scale number
+---@field name string The connector name, e.g. `"eDP-1"`. What a surface's `monitor` takes, and what an `oblisk.workspaces` output entry is keyed by.
+---@field width integer Logical pixels, already divided by `scale`. Not the mode's pixel count.
+---@field height integer Logical pixels, on the same terms as `width`.
+---@field scale number The fractional output scale, e.g. `1.25`. Divide by it once, or a 2x display gets scaled twice.
 ---@field refresh number Hz. `0` for an output with no current mode, such as a virtual one.
 
 ---@class RescueState
----@field is_rescue boolean
----@field error_log string
+---@field is_rescue boolean A reload failed and the scene from before the edit is still on screen. Covers reloads only: a config that fails its very first evaluation has no tree to render a banner through (ADR-0046).
+---@field error_log string The Lua error that caused it, ready to draw. Empty while `is_rescue` is false.
 
 ---@class ObliskVersion
----@field major integer
----@field minor integer
----@field patch integer
+---@field major integer Breaking IDL changes.
+---@field minor integer Bumped for an IDL field added or changed, which is what `oblisk.version.minor >= n` gates on.
+---@field patch integer Everything else. Never affects what a config may use.
 
 ---@class Oblisk
----@field audio AudioCapability
----@field network NetworkCapability
----@field bluetooth BluetoothCapability
----@field tray TrayCapability
----@field notifications NotificationsCapability
----@field mpris MprisCapability
----@field sysinfo SysinfoCapability
----@field keyboard KeyboardCapability
----@field privacy PrivacyCapability
----@field updates UpdatesCapability
----@field lock LockCapability
----@field battery BatteryCapability
----@field system SystemCapability
----@field brightness BrightnessCapability
----@field workspaces WorkspacesCapability
----@field power PowerCapability
----@field applications ApplicationsCapability
+---@field audio AudioCapability PipeWire: master volume and mute, the output and input device lists, and one entry per application currently playing.
+---@field network NetworkCapability NetworkManager: scan state and the access points the last scan found. Connecting is a command, not a field.
+---@field bluetooth BluetoothCapability BlueZ: adapter power, discovery state, and the connected and discovered device lists.
+---@field tray TrayCapability StatusNotifierItem: every registered tray icon with its artwork, status and DBusMenu tree.
+---@field notifications NotificationsCapability The freedesktop notification server: the newest 20 live notifications and the do-not-disturb toggle.
+---@field mpris MprisCapability MPRIS: every media player on the bus, with track metadata, playback state and a position to extrapolate from.
+---@field sysinfo SysinfoCapability CPU, memory and swap load, plus hwmon temperatures. Sampled on a timer this capability owns.
+---@field keyboard KeyboardCapability Lock-key state, the active layout, and the keyboard backlight where the machine has one.
+---@field privacy PrivacyCapability Who is holding the camera open right now. Empty means nobody is.
+---@field updates UpdatesCapability Pending pacman upgrades, the progress of an install in flight, and whether the kernel changed under you.
+---@field lock LockCapability The session lock: whether it is held, whether a password is with PAM, and why the last attempt failed.
+---@field battery BatteryCapability UPower's display device: charge, what the battery is doing, and the time estimates when it has them.
+---@field system SystemCapability The persisted state dictionary and a clock that ticks once a second.
+---@field brightness BrightnessCapability The screen backlight, as a percentage.
+---@field workspaces WorkspacesCapability The compositor's workspaces per output, and the focused toplevel window.
+---@field power PowerCapability power-profiles-daemon's platform profiles, plus whether you are on mains and how many watts are moving.
+---@field applications ApplicationsCapability The installed desktop entries, listed and indexed by the `app_id` a window reports.
 ---@field idle Idle Idle thresholds and the inhibit pair. Methods only, no state to read (ADR-0032).
 ---@field screens Signal A `Screen[]`. Renderer-sourced, seeded to an empty list, and the one signal with a value at first evaluation (ADR-0041).
 ---@field rescue Signal A `RescueState`. Renderer-sourced, no commands (ADR-0046).

@@ -60,8 +60,15 @@ impl BatteryStatus {
 /// for a desktop, not a placeholder needing a sentinel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, schemars::JsonSchema)]
 pub struct BatteryState {
+    /// UPower's display device is a battery and reports itself present. `false` on a desktop, which
+    /// is an answer rather than a missing one: check it before drawing anything else here.
     pub present: bool,
+    /// Charge, `0` to `100`, rounded. Against the battery's own full capacity, not against a charge
+    /// limit, so a machine capped at 70 reads `70` and stays there rather than reading `100`.
     pub percent: u8,
+    /// What the battery is doing, by UPower's own name. The field that separates holding a charge
+    /// limit on mains (`PendingCharge`) from actually running down (`Discharging`), which a
+    /// boolean could not.
     pub state: BatteryStatus,
     /// Seconds until flat, or `nil`. UPower reports `0` both while charging and while it has not
     /// yet estimated, and neither is a duration, so both are the absent case here.

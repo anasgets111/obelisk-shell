@@ -8,10 +8,19 @@ use std::time::Duration;
 /// straight into the Lua signal table by name, unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct SysinfoState {
+    /// Total CPU utilization, `0` to `100`, across all cores. `0` before the first sample, which
+    /// needs two reads a tick apart to produce a delta.
     pub cpu_percent: u8,
+    /// Physical memory in use, `0` to `100`.
     pub ram_percent: u8,
+    /// Swap in use, `0` to `100`. `0` on a machine with no swap, which is indistinguishable from
+    /// swap that is simply empty.
     pub swap_percent: u8,
+    /// Per-core temperatures in Celsius, from one hwmon pass. Empty on a machine that exposes
+    /// none. Length is the sensor count, not the core count, and the order is hwmon's.
     pub temp_cores: Vec<i64>,
+    /// GPU temperature in Celsius, or `-1` when no GPU sensor was found. Read from the same hwmon
+    /// pass as [`SysinfoState::temp_cores`], so it is never newer or older than they are.
     pub temp_gpu: i64,
 }
 

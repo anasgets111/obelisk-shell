@@ -16,11 +16,15 @@ use super::video::{find_device_openers, read_comm};
 /// empty = inactive).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct CameraUser {
+    /// The holding process's name, from its PipeWire node when it has one, then `/proc/<pid>/comm`,
+    /// falling back to `"pid 1234"`. Always something drawable, never empty.
     pub app_name: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct PrivacyState {
+    /// Every process holding a camera open. Empty means no camera is in use, which is the whole
+    /// signal: a config draws an indicator when this is non-empty.
     pub camera_users: Vec<CameraUser>,
 }
 

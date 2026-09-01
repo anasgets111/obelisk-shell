@@ -20,6 +20,8 @@ const MAX_DEPTH: usize = 4;
 pub struct AppSummary {
     /// The desktop file id (`org.telegram.desktop`), and `launch`'s one argument.
     pub id: String,
+    /// The unlocalized `Name=`. `Name[xx]` is deliberately not read (ADR-0061), so this is English
+    /// on a localized system.
     pub name: String,
     /// The `Icon=` key as written: a theme name, or an absolute path. `icon { name = ... }`
     /// takes either, which is exactly what ADR-0054 decision 2 built it for. `None` for an

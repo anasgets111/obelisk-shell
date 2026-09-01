@@ -386,7 +386,7 @@ pub fn render() -> String {
     out.push_str("\n---@class Oblisk\n");
     for capability in shared::Capability::ALL {
         let name = capability.as_str();
-        out.push_str(&format!("---@field {name} {}\n", capability_class(name)));
+        out.push_str(&format!("---@field {name} {} {}\n", capability_class(name), capability.blurb()));
     }
     out.push_str(OBLISK_TAIL);
     out
@@ -448,20 +448,20 @@ function Idle:inhibit(reason) end
 function Idle:release_inhibit() end
 
 ---@class Screen
----@field name string Matches a surface's `monitor`.
----@field width integer Logical pixels.
----@field height integer
----@field scale number
+---@field name string The connector name, e.g. `"eDP-1"`. What a surface's `monitor` takes, and what an `oblisk.workspaces` output entry is keyed by.
+---@field width integer Logical pixels, already divided by `scale`. Not the mode's pixel count.
+---@field height integer Logical pixels, on the same terms as `width`.
+---@field scale number The fractional output scale, e.g. `1.25`. Divide by it once, or a 2x display gets scaled twice.
 ---@field refresh number Hz. `0` for an output with no current mode, such as a virtual one.
 
 ---@class RescueState
----@field is_rescue boolean
----@field error_log string
+---@field is_rescue boolean A reload failed and the scene from before the edit is still on screen. Covers reloads only: a config that fails its very first evaluation has no tree to render a banner through (ADR-0046).
+---@field error_log string The Lua error that caused it, ready to draw. Empty while `is_rescue` is false.
 
 ---@class ObliskVersion
----@field major integer
----@field minor integer
----@field patch integer
+---@field major integer Breaking IDL changes.
+---@field minor integer Bumped for an IDL field added or changed, which is what `oblisk.version.minor >= n` gates on.
+---@field patch integer Everything else. Never affects what a config may use.
 "#;
 
 const OBLISK_TAIL: &str = r#"---@field idle Idle Idle thresholds and the inhibit pair. Methods only, no state to read (ADR-0032).

@@ -132,9 +132,25 @@ const NOTIFICATIONS_CAPABILITIES: [&str; 10] = [
 #[serde(tag = "kind")]
 pub enum NotificationSpan {
     #[serde(rename = "text")]
-    Text { text: String, bold: bool, italic: bool, underline: bool, href: Option<String> },
+    Text {
+        /// The run's text, already unescaped. Empty runs are not emitted.
+        text: String,
+        /// The run sat inside `<b>`.
+        bold: bool,
+        /// The run sat inside `<i>`.
+        italic: bool,
+        /// The run sat inside `<u>`.
+        underline: bool,
+        /// The `<a href>` target this run links to, or `nil` for a run that is not a link. Carried
+        /// as text, not opened: launching it is a config's decision.
+        href: Option<String>,
+    },
     #[serde(rename = "image")]
-    Image { image_path: String },
+    Image {
+        /// An absolute path to an image that exists under a trusted root. A path outside one is
+        /// dropped during parsing rather than carried and refused later.
+        image_path: String,
+    },
 }
 
 /// The `low`/`normal`/`critical` tier (CONTEXT.md's "Notification urgency"). `Hash`/`Eq` so it can
@@ -176,12 +192,28 @@ fn parse_urgency_str(value: &str) -> Option<Urgency> {
 /// array is never stored, only the `has_reply` bool it collapses into.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct Notification {
+    /// The server-assigned id, counting up from `1`. What `notifications:dismiss`, `:reply` and
+    /// `:invoke_action` take. Reused when an application replaces its own notification in place.
     pub id: u32,
+    /// The sending application's name, truncated to 64 bytes on a character boundary.
     pub app_name: String,
+    /// The title, truncated to 128 bytes on a character boundary. Plain text: any markup the
+    /// application sent is parsed out, not rendered.
     pub summary: String,
+    /// The message as a run of spans rather than one string, because the freedesktop body is
+    /// markup. Truncated to 512 bytes before parsing. Each span is either text carrying its own
+    /// bold/italic/underline/href, or an image whose path passed the trusted-root check, so a
+    /// config draws the list in order and never has to parse markup itself.
     pub body: Vec<NotificationSpan>,
+    /// An absolute path to a decoded, bounds-checked image spooled to `/dev/shm`, or `nil` for a
+    /// notification that sent no icon. Never a theme name: this is a file that exists.
     pub icon_path: Option<String>,
+    /// `"low"`, `"normal"` or `"critical"`. `"normal"` for a sender that set no urgency hint.
+    /// Critical is the one that outlives do-not-disturb and never expires on its own.
     pub urgency: Urgency,
+    /// The sender offered an inline reply action, so `notifications:reply(id, text)` will be
+    /// accepted. Calling it on a notification without one is refused, which is why this is
+    /// carried rather than guessed.
     pub has_reply: bool,
     /// Bookkeeping only, `#[serde(skip)]`. Bumped every time `Notify` places new content at this
     /// id. Lets a stale expiry timer spawned for an earlier incarnation tell it's been
@@ -193,7 +225,14 @@ pub struct Notification {
 /// `notifications.feed`/`notifications.dnd`'s `StateSnapshot` payload shape (ADR-0033).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct NotificationsState {
+    /// The newest 20 live notifications, most recent first. A truncated view of a 100-deep queue
+    /// (ADR-0033), so a notification can leave this list while still being live and still
+    /// dismissable by id.
     pub feed: Vec<Notification>,
+    /// Do-not-disturb, flipped by `notifications:set_dnd`. It gates exactly one thing in the
+    /// Supervisor: a non-critical notification's sound does not play. Notifications are still
+    /// accepted, still queued, and still appear in [`NotificationsState::feed`], so not drawing the
+    /// popup is the config's decision, and `"critical"` is the urgency worth letting through.
     pub dnd: bool,
 }
 

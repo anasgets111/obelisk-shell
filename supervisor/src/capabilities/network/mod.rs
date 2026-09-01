@@ -45,10 +45,16 @@ pub use connection::{parse_bool_arg, parse_connect_args, parse_ssid_arg};
 /// `payload`, same convention as `audio::mixer::AppStream`.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AccessPointInfo {
+    /// The network name. The key entries are deduplicated on, so two radios of one network appear
+    /// once, at the stronger signal.
     pub ssid: String,
+    /// Signal strength, `0` to `100`.
     pub strength: u8,
+    /// A key is required: the AP advertises WEP privacy, or non-empty WPA1 or RSN key management.
     pub secure: bool,
+    /// `"2.4 GHz"`, `"5 GHz"` or `"6 GHz"`, from the AP's frequency.
     pub band: String,
+    /// This is the AP currently associated.
     pub active: bool,
 }
 
@@ -57,7 +63,12 @@ pub struct AccessPointInfo {
 /// (`connected`/`ssid`/`wifi_enabled`/etc.), which §4 doesn't ask this controller to track.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct NetworkState {
+    /// A scan is in flight. Flipped to `true` the moment `network:scan()` is accepted rather than
+    /// when NetworkManager confirms, so a spinner starts on the click instead of a round trip later.
     pub scanning: bool,
+    /// The access points from the last completed scan: deduplicated by SSID keeping the strongest
+    /// radio of each, sorted strongest first, and cut to 20. Keeps the previous list while
+    /// [`NetworkState::scanning`] is true, so a panel does not blank out mid-scan.
     pub available_networks: Vec<AccessPointInfo>,
 }
 

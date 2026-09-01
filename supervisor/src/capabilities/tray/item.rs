@@ -12,23 +12,39 @@ use super::registration::sanitize_unique_name;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct TrayItem {
+    /// § 2.14's stable id: the registering process's D-Bus unique name, sanitized (e.g. `"1.234"`).
+    /// What every `tray:` command takes to name the item it acts on.
     pub id: String,
+    /// The display name. `Title`, falling back to `Id` when the item leaves `Title` empty.
     pub name: String,
+    /// A theme icon name, for `icon { name = ... }`. Exactly one of this and [`TrayItem::icon_path`]
+    /// is ever set, so a config draws whichever is present.
     pub icon_name: Option<String>,
+    /// A decoded, bounds-checked PNG spooled to `/dev/shm`, for `image { source = ... }`.
+    /// Set when the item sent pixels rather than a theme name.
     pub icon_path: Option<String>,
     /// The `NeedsAttention` artwork, resolved the same way as `icon_name`/`icon_path`. Draw these
     /// instead of the base pair while `status` is `"NeedsAttention"`. Both stay `nil` for an item
     /// that declares no attention icon, which is most of them.
     pub attention_icon_name: Option<String>,
+    /// The file half of the attention artwork, on the same terms as `attention_icon_name`.
     pub attention_icon_path: Option<String>,
     /// A badge, meant to be drawn over the base icon's corner rather than instead of it. Carried
     /// rather than composited: a `stack` node is what puts one image on another, and the Supervisor
     /// has no canvas. Both stay `nil` when the item declares no badge.
     pub overlay_icon_name: Option<String>,
+    /// The file half of the badge, on the same terms as `overlay_icon_name`.
     pub overlay_icon_path: Option<String>,
+    /// The item's tooltip title and text, flattened to one string. `nil` when it has none.
     pub tooltip: Option<String>,
+    /// SNI's own `Status`: `"Active"`, `"Passive"` or `"NeedsAttention"`. `"Passive"` is the
+    /// item asking to be hidden, which is a config's decision to honour or ignore.
     pub status: String,
+    /// The item saying a left click must open its menu instead of activating it. Honour it, or
+    /// a click does nothing on the items that set it.
     pub item_is_menu: bool,
+    /// The top-level menu entries, or `nil` for an item with no `com.canonical.dbusmenu` menu.
+    /// Fetched once when the item registers, then again on the item's own layout updates.
     pub menu: Option<Vec<MenuItem>>,
 }
 

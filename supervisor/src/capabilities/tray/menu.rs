@@ -11,13 +11,29 @@ use super::proxies::{DBusMenuProxy, raw_menu_layout_to_value};
 /// (docs/oblisk-idl-api-specs.md §2.14).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct MenuItem {
+    /// DBusMenu's own item id. What `tray:activate_menu_item` and `tray:menu_will_show` take.
     pub id: i32,
+    /// `"standard"` or `"separator"`. A separator carries no label and is not clickable.
     pub menu_type: String,
+    /// The entry text, exactly as the application sent it. `nil` when it sent none, which is the
+    /// normal case on a separator. DBusMenu's `_` mnemonic markers are *not* stripped, so a label
+    /// can arrive as `"_Quit"`; strip it in the config if you do not want the underscore drawn.
     pub label: Option<String>,
+    /// `false` for an entry the application has greyed out. Activating one is a no-op, so draw it
+    /// as unavailable rather than filtering it away: the gap is the application's own layout.
     pub enabled: bool,
+    /// A theme icon name for the entry, or `nil`. DBusMenu's pixmap form is not carried.
     pub icon_name: Option<String>,
+    /// `"checkmark"`, `"radio"`, or `nil` for an entry that is not a toggle.
     pub toggle_type: Option<String>,
+    /// DBusMenu's own `0` off, `1` on, `-1` indeterminate. `nil` exactly when
+    /// [`MenuItem::toggle_type`] is, and `-1` for an item that declared a toggle type and then sent
+    /// no state, which is the same thing DBusMenu means by indeterminate.
     pub toggle_state: Option<i32>,
+    /// Nested entries, recursive. The whole tree arrives in one `GetLayout(0, -1)` reply rather
+    /// than a submenu at a time, so this is populated without any `tray:menu_will_show` first.
+    /// Empty for a leaf, and also empty for a node past [`MAX_MENU_DEPTH`], whose children are
+    /// dropped with a line on stderr.
     pub children: Vec<MenuItem>,
 }
 

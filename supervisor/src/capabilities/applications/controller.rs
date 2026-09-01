@@ -18,7 +18,15 @@ use super::scan::{AppSummary, LaunchTarget, scan};
 /// payload. Repeating three small fields for a few hundred entries costs less than that trap.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct ApplicationsState {
+    /// Every installed desktop entry that is visible and launchable, sorted by name. Rebuilt on
+    /// `applications:refresh()`; nothing watches the directories, so an app installed mid-session
+    /// does not appear until something asks.
     pub entries: Vec<AppSummary>,
+    /// The same entries, keyed by the `app_id` a window reports, for a caller holding
+    /// `workspaces.active_client.class` rather than a desktop file id. Keyed on exact
+    /// `StartupWMClass` and exact desktop id first, then case-folded and last-dot-segment
+    /// spellings, and an exact key is never displaced by a folded one. Miss on it before
+    /// concluding an app is not installed: the mapping is a set of heuristics, not a registry.
     pub by_app_id: BTreeMap<String, AppSummary>,
 }
 

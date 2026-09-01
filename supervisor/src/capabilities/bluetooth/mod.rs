@@ -49,7 +49,10 @@ pub use controller::BluetoothController;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct ConnectedDevice {
+    /// The canonical MAC address, e.g. `"00:1A:7D:DA:71:11"`. What every `bluetooth:` command takes
+    /// to name a device.
     pub mac: String,
+    /// The device's advertised name.
     pub name: String,
     /// `-1` if unsupported/unknown (no `Battery1` interface on this device, or its `Percentage`
     /// property failed to read) -- per the IDL comment, not a sentinel invented here.
@@ -57,12 +60,17 @@ pub struct ConnectedDevice {
     /// Always `None` this round -- codec query/control is deferred (ADR-0030): it needs a live
     /// PipeWire `Device` proxy, an `audio`-capability concern, not `bluetooth`'s.
     pub codec: Option<String>,
+    /// A drawing hint from the device's class of device: `"keyboard"`, `"mouse"`, `"headphones"`,
+    /// `"headset"`, `"phone"`, `"computer"`, or `"generic"` for anything the class bits do not
+    /// place. Pick an icon from it; do not treat it as a capability.
     pub category: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct DiscoveredDevice {
+    /// The canonical MAC address. What `bluetooth:pair(mac)` takes.
     pub mac: String,
+    /// The advertised name. Often empty for a device that broadcasts only an address.
     pub name: String,
     /// Always `false` -- per the IDL comment, every entry in this pool is by definition
     /// unpaired.
@@ -71,9 +79,15 @@ pub struct DiscoveredDevice {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct BluetoothState {
+    /// The adapter is powered. `false` also when there is no adapter at all, so this is not proof
+    /// the machine has Bluetooth hardware.
     pub enabled: bool,
+    /// A discovery scan is running, which is what fills
+    /// [`BluetoothState::discovered_devices`].
     pub discovering: bool,
+    /// Paired devices currently connected. In BlueZ's own object order, which is not sorted.
     pub connected_devices: Vec<ConnectedDevice>,
+    /// Unpaired devices seen by the running scan. Empties when discovery stops.
     pub discovered_devices: Vec<DiscoveredDevice>,
 }
 

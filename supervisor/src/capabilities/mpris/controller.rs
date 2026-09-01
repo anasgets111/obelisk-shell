@@ -13,6 +13,9 @@ use super::watcher::{service_name_for_id, spawn_discovery};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct MprisState {
+    /// Every MPRIS player on the bus, in no order at all: this is a `HashMap`'s values, so the
+    /// sequence can differ between two pushes over the same set. Sort by [`PlayerState::id`] for a
+    /// list that does not reshuffle. Empty when nothing is running, which is not an error.
     pub players: Vec<PlayerState>,
 }
 

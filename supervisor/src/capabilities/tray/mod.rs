@@ -55,6 +55,9 @@ pub use controller::TrayController;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct TrayState {
+    /// Every registered `StatusNotifierItem`, in no order at all: `build_state` collects a
+    /// `HashMap`'s values, so the sequence can differ between two pushes that registered the same
+    /// items. A strip that should not reshuffle has to sort, and [`TrayItem::id`] is the stable key.
     pub items: Vec<TrayItem>,
 }
 

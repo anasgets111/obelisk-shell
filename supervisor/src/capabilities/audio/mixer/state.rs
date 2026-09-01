@@ -207,8 +207,12 @@ pub struct AudioState {
     pub volume: f32,
     /// Master output mute.
     pub muted: bool,
+    /// Every output device. `audio:set_default_sink(id)` takes one's [`AudioDevice::id`].
     pub sinks: Vec<AudioDevice>,
+    /// Every input device, on the same terms as [`AudioState::sinks`].
     pub sources: Vec<AudioDevice>,
+    /// One entry per application playing audio right now. Empty when nothing is, which is the
+    /// normal state and not an error.
     pub apps: Vec<AppStream>,
 }
 
@@ -224,6 +228,8 @@ pub struct AudioState {
 pub struct AudioDevice {
     /// PipeWire registry id, which is what `audio:set_default_sink(id)` takes.
     pub id: u32,
+    /// The device description, e.g. `"Built-in Audio Analog Stereo"`, which is what to draw. Not
+    /// stable across a reboot; [`AudioDevice::id`] is not either.
     pub name: String,
     /// Whether this is the device the `default.audio.sink`/`default.audio.source` metadata key
     /// currently routes to.

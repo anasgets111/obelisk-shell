@@ -19,15 +19,39 @@ use crate::process;
 /// `installing` is true means the transaction size isn't known yet (pacman hasn't printed it).
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct UpdatesState {
+    /// How many packages have a newer version in the synced repos. Always equal to
+    /// `#packages`, and carried separately so a badge does not have to walk the list.
     pub count: u32,
+    /// What would be upgraded, one entry each. A failed check leaves this and
+    /// [`UpdatesState::count`] on the last good answer rather than clearing them, so a config
+    /// keeps showing the count it knows while [`UpdatesState::check_error`] explains the gap.
     pub packages: Vec<UpdateCandidate>,
+    /// Unix seconds at the end of the last check that completed without error, or `nil` if none has
+    /// since this session started. A failed check leaves it on the older, still-true value.
     pub last_successful_check: Option<i64>,
+    /// Why the last check failed, or `nil` when the last one worked. A check runs against a
+    /// throwaway copy of the pacman database, so this is a network or parse failure, never a
+    /// half-applied change to the system.
     pub check_error: Option<String>,
+    /// An install is running. The four `install_*` fields below only mean anything while this is
+    /// true; `updates:install` refuses a second one.
     pub installing: bool,
+    /// Which package of the transaction pacman is on, its own 1-based `(2/5)` counter.
+    /// `0` before the first line is parsed.
     pub install_current_step: u32,
+    /// How many packages the transaction has. `0` while [`UpdatesState::installing`] is true means
+    /// pacman has not printed a step line yet, so a progress bar has no denominator: show it
+    /// as indeterminate rather than dividing.
     pub install_total_steps: u32,
+    /// The package name from the step line pacman is on. Empty string before the first one, not
+    /// `nil`, because a name is always a string once the transaction is under way.
     pub install_current_package: String,
+    /// Why the last install failed, or `nil`. Unlike a check, this one ran as root against the
+    /// real database, so a failure here can leave packages partly upgraded.
     pub install_error: Option<String>,
+    /// A `linux` or `linux-*` package was installed at some point this session. Sticky on purpose:
+    /// once set it stays set through later installs that do not touch the kernel, because the
+    /// running kernel is still the old one until the machine restarts.
     pub reboot_required: bool,
 }
 

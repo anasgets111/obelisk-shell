@@ -18,6 +18,9 @@ use super::super::scale::{percent_from_raw, raw_from_percent};
 /// was found, since no signal is sent in that case (see `brightness/mod.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, schemars::JsonSchema)]
 pub struct BrightnessState {
+    /// Screen backlight, `0` to `100`. Read from sysfs `brightness`, the last requested value,
+    /// rather than `actual_brightness`, so it matches what was asked for instead of lagging
+    /// through a hardware fade.
     pub percent: u8,
 }
 

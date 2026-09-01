@@ -17,9 +17,21 @@ use tokio::sync::mpsc::UnboundedSender;
 /// convention `keyboard`'s `active_layout` uses.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct LockState {
+    /// The session is locked and the Renderer has confirmed it. Never optimistic: a lock that has
+    /// been asked for but not yet confirmed still reads `false`, so a config cannot draw an
+    /// unlocked screen over a locked session or the reverse.
     pub active: bool,
+    /// A password is with PAM and no answer has come back. `pam_unix` takes about a second, so this
+    /// is what a spinner reads. `lock:authenticate` is refused while it is true.
     pub authenticating: bool,
+    /// Authentication attempts against the lock currently held. Counts every answer PAM returns,
+    /// success included, and resets to `0` only when the Renderer confirms a *new* lock. So it is
+    /// per-acquisition rather than per-failure: a lockout rule reads it together with
+    /// [`LockState::error`], which is empty after the attempt that succeeded.
     pub attempts: u32,
+    /// Why the last attempt failed, in words fit to draw, e.g. `"too many attempts"`. Empty string
+    /// when the last attempt succeeded and when none has been made. Rewritten on every PAM answer
+    /// and cleared when a new lock is confirmed, so it always describes the lock now on screen.
     pub error: String,
     /// A `SetSessionLock { locked: true }` is out and the Renderer has not said what became of it
     /// yet. `#[serde(skip)]`: this is a fact about the swap gate, not part of a lock screen's

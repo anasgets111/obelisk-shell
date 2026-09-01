@@ -13,10 +13,17 @@ use super::pacman_conf::RepoServers;
 /// One installed package with a newer version in some sync repo.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct UpdateCandidate {
+    /// The package name, as pacman spells it.
     pub name: String,
+    /// The installed version, in pacman's `epoch:pkgver-pkgrel` spelling.
     pub old_version: String,
+    /// The version the synced repo offers.
     pub new_version: String,
+    /// Bytes to fetch, from alpm's own `download_size`, which answers `0` for a package already
+    /// sitting in the pacman cache.
     pub download_size: i64,
+    /// Bytes the new version occupies once unpacked. Not a delta: subtracting the old version's
+    /// size is the config's job if it wants one.
     pub installed_size: i64,
 }
 

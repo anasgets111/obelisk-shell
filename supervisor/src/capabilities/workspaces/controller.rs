@@ -21,7 +21,12 @@ use super::niri;
 /// serialized as `null`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct WorkspacesState {
+    /// One entry per connected output, keyed by connector name. Empty before the compositor's
+    /// first answer.
     pub outputs: Vec<OutputWorkspaces>,
+    /// The focused toplevel, or `nil` when nothing holds focus. One window across the whole
+    /// session, not one per output: there is no way to ask what is focused on an unfocused
+    /// monitor (ADR-0056 decision 4).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_client: Option<ActiveClient>,
 }
@@ -30,12 +35,18 @@ pub struct WorkspacesState {
 /// § 2.9.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct OutputWorkspaces {
+    /// The connector name, e.g. `"eDP-1"`. Matches an `oblisk.screens` entry's `name` and a
+    /// surface's `monitor`.
     pub name: String,
+    /// The [`WorkspaceEntry::id`] of the workspace visible on this output. Every output has one,
+    /// focused or not.
     pub active_workspace: u64,
     /// docs/adr/0056 decision 4: present only on the output that actually holds focus, so
     /// `out.focused_workspace ~= nil` is the "is this the focused monitor" test.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub focused_workspace: Option<u64>,
+    /// The workspaces on this output, ordered by [`WorkspaceEntry::idx`]. What a strip draws: the
+    /// two ids above are opaque on their own and name nothing a user would recognise.
     pub workspaces: Vec<WorkspaceEntry>,
 }
 
@@ -44,8 +55,13 @@ pub struct OutputWorkspaces {
 /// position on that output (what a keybind/button label means), not stable across a reorder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct WorkspaceEntry {
+    /// Stable identity, independent of which output the workspace sits on. What the two ids on
+    /// [`OutputWorkspaces`] refer to and what `workspaces:focus(id)` takes.
     pub id: u64,
+    /// 1-based position on this output. Not stable: a reorder renumbers it, which is why it is the
+    /// thing to draw and [`WorkspaceEntry::id`] is the thing to send.
     pub idx: u8,
+    /// The compositor's own name for the workspace, or `nil` when it has none. Most do not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
@@ -55,8 +71,12 @@ pub struct WorkspaceEntry {
 /// `class` is Wayland's `app_id`: X11's `WM_CLASS` has no Wayland equivalent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct ActiveClient {
+    /// The window title, e.g. `"src/main.rs - Neovim"`. Empty string for a window that sets none.
     pub title: String,
+    /// The Wayland `app_id`, e.g. `"firefox"`. Named `class` for the X11 habit, but a Wayland
+    /// toplevel has no `WM_CLASS`. The key `applications.by_app_id` is built to be looked up by.
     pub class: String,
+    /// The compositor has this window floating rather than tiled.
     pub is_floating: bool,
 }
 

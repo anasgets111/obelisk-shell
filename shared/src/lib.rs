@@ -38,7 +38,7 @@ pub use zeroize::{Zeroize, Zeroizing};
 /// generated stubs and the schema check -- all three of which iterate `ALL`. There is now nothing
 /// to forget.
 macro_rules! roster {
-    ($($variant:ident => $name:literal),+ $(,)?) => {
+    ($($variant:ident => $name:literal, $blurb:literal),+ $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
         #[serde(rename_all = "snake_case")]
         pub enum Capability {
@@ -56,28 +56,38 @@ macro_rules! roster {
                     $(Capability::$variant => $name),+
                 }
             }
+
+            /// One line naming what this capability is, for the `oblisk.<name>` field in the
+            /// generated stubs (`supervisor/src/stubs.rs`). Here rather than in the renderer
+            /// because this list is where a capability is declared, so a new variant cannot be
+            /// added without writing one.
+            pub const fn blurb(self) -> &'static str {
+                match self {
+                    $(Capability::$variant => $blurb),+
+                }
+            }
         }
     };
 }
 
 roster! {
-    Audio => "audio",
-    Network => "network",
-    Bluetooth => "bluetooth",
-    Tray => "tray",
-    Notifications => "notifications",
-    Mpris => "mpris",
-    Sysinfo => "sysinfo",
-    Keyboard => "keyboard",
-    Privacy => "privacy",
-    Updates => "updates",
-    Lock => "lock",
-    Battery => "battery",
-    System => "system",
-    Brightness => "brightness",
-    Workspaces => "workspaces",
-    Power => "power",
-    Applications => "applications",
+    Audio => "audio", "PipeWire: master volume and mute, the output and input device lists, and one entry per application currently playing.",
+    Network => "network", "NetworkManager: scan state and the access points the last scan found. Connecting is a command, not a field.",
+    Bluetooth => "bluetooth", "BlueZ: adapter power, discovery state, and the connected and discovered device lists.",
+    Tray => "tray", "StatusNotifierItem: every registered tray icon with its artwork, status and DBusMenu tree.",
+    Notifications => "notifications", "The freedesktop notification server: the newest 20 live notifications and the do-not-disturb toggle.",
+    Mpris => "mpris", "MPRIS: every media player on the bus, with track metadata, playback state and a position to extrapolate from.",
+    Sysinfo => "sysinfo", "CPU, memory and swap load, plus hwmon temperatures. Sampled on a timer this capability owns.",
+    Keyboard => "keyboard", "Lock-key state, the active layout, and the keyboard backlight where the machine has one.",
+    Privacy => "privacy", "Who is holding the camera open right now. Empty means nobody is.",
+    Updates => "updates", "Pending pacman upgrades, the progress of an install in flight, and whether the kernel changed under you.",
+    Lock => "lock", "The session lock: whether it is held, whether a password is with PAM, and why the last attempt failed.",
+    Battery => "battery", "UPower's display device: charge, what the battery is doing, and the time estimates when it has them.",
+    System => "system", "The persisted state dictionary and a clock that ticks once a second.",
+    Brightness => "brightness", "The screen backlight, as a percentage.",
+    Workspaces => "workspaces", "The compositor's workspaces per output, and the focused toplevel window.",
+    Power => "power", "power-profiles-daemon's platform profiles, plus whether you are on mains and how many watts are moving.",
+    Applications => "applications", "The installed desktop entries, listed and indexed by the `app_id` a window reports.",
 }
 
 impl Capability {
