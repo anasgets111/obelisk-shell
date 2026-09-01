@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Stops a commit that would carry stale generated stubs.
+#
+# `lua-meta/oblisk.lua` is generated from the Supervisor's payload types and `lua-meta/nodes.lua` is
+# hand-written against the Renderer's node schema. Both have golden-file tests, and both only fire
+# if someone runs them -- which at the end of a long session is exactly what gets skipped. The
+# language server reads these files straight from the working tree, so a stale one is wrong with
+# authority: it offers a field the engine does not send, or hides one it does.
+#
+# Regenerates rather than only complaining, then refuses the commit anyway. Staging the file itself
+# would be the convenient thing and it is wrong: the stub is generated from the working tree, not
+# from the index, so a partial `git add -p` would get a stub describing code the commit does not
+# contain. One `git add` is cheaper than that class of confusion.
+#
+# Install with `just hooks`. Skip once with `git commit --no-verify`.
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-commit: no cargo on PATH, skipping the stub check" >&2
+    exit 0
+fi
+
+before="$(git hash-object lua-meta/oblisk.lua)"
+if ! UPDATE_STUBS=1 cargo test --quiet -p supervisor stubs >/dev/null 2>&1; then
+    # Almost always a build error rather than the generator: this is the first thing to compile the
+    # crate after an edit. Do not guess which, just say where to look.
+    echo "pre-commit: the supervisor stub check did not run. Try: just stubs" >&2
+    exit 1
+fi
+after="$(git hash-object lua-meta/oblisk.lua)"
+
+if [ "$before" != "$after" ]; then
+    cat >&2 <<'MSG'
+pre-commit: lua-meta/oblisk.lua was stale and has been regenerated.
+
+  Review it, then:  git add lua-meta/oblisk.lua
+
+MSG
+    exit 1
+fi
+
+# `nodes.lua` is hand-written, so this can only report the drift, not fix it. The test names the
+# property that moved.
+if ! cargo test --quiet -p renderer meta_stub_tests >/dev/null 2>&1; then
+    echo "pre-commit: lua-meta/nodes.lua disagrees with the engine's node schema." >&2
+    echo "  cargo test -p renderer meta_stub_tests   names the property that moved." >&2
+    exit 1
+fi

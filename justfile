@@ -30,6 +30,12 @@ run: build
 # Everything a change has to pass before it is done.
 check: test lint docs lua
 
+# Point git at the tracked hooks in `.githooks`. Once per clone: git does not version `.git/hooks`,
+# so a hook only exists for whoever ran this.
+hooks:
+    git config core.hooksPath .githooks
+    @echo "core.hooksPath -> .githooks"
+
 test:
     cargo test --workspace
 
