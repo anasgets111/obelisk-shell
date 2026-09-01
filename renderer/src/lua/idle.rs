@@ -1,7 +1,7 @@
 //! `oblisk.idle`: idle-notify thresholds and the logind inhibit pair (docs/adr/0032,
 //! docs/oblisk-supervisor-services-dbus.md § 7).
 //!
-//! **Not a capability**, and deliberately outside `shared::CAPABILITIES` for the same reason
+//! **Not a capability**, and deliberately outside `shared::Capability::ALL` for the same reason
 //! `screens` and `rescue` are outside it, from the other direction: every roster name is a signal
 //! the Supervisor pushes a `StateSnapshot` for, and idle pushes none. `ext_idle_notifier_v1`
 //! reports that a threshold a config asked for was crossed; there is no idle *state* to read. A

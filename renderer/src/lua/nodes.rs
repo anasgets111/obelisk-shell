@@ -355,7 +355,7 @@ mod tests {
 /// So this guard covers the hand-written half. It checks the roster, not the fields, which is the
 /// drift that actually happens: someone adds a node kind and forgets the stub. The capability
 /// check stays here too, because a config reaches `oblisk.<name>` through the same file and this
-/// crate is the one that owns `shared::CAPABILITIES`'s Lua-side spelling.
+/// crate is the one that owns `shared::Capability::ALL`'s Lua-side spelling.
 #[cfg(test)]
 mod meta_stub_tests {
     use std::collections::BTreeSet;
@@ -502,7 +502,7 @@ mod meta_stub_tests {
         names
     }
 
-    /// Every `shared::CAPABILITIES` name, as a field on the `Oblisk` class.
+    /// Every `shared::Capability::ALL` name, as a field on the `Oblisk` class.
     #[test]
     fn the_stubs_declare_every_capability_and_no_others() {
         let source = meta("oblisk.lua");
@@ -518,7 +518,7 @@ mod meta_stub_tests {
             .filter_map(|line| line.split_whitespace().nth(1))
             .filter(|name| !off_roster.contains(name))
             .collect();
-        let expected: BTreeSet<&str> = shared::CAPABILITIES.iter().copied().collect();
-        assert_eq!(declared, expected, "lua-meta/oblisk.lua is out of step with shared::CAPABILITIES");
+        let expected: BTreeSet<&str> = shared::Capability::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(declared, expected, "lua-meta/oblisk.lua is out of step with shared::Capability::ALL");
     }
 }

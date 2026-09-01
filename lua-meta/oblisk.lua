@@ -506,7 +506,7 @@ function WorkspacesCapability:map(fn) end
 function WorkspacesCapability:invoke(command, ...) end
 
 --- Off-roster members ---------------------------------------------------------------------------
--- Not capabilities and not in `shared::CAPABILITIES`, so they have no payload struct to derive
+-- Not capabilities and not in `shared::Capability::ALL`, so they have no payload struct to derive
 -- from and are written by hand. `Screen` and `RescueState` come from the renderer's own state.
 -- `Idle` is the other direction: a supervisor service that pushes no state at all, because an idle
 -- threshold crossing is an event, not something to read (ADR-0032).

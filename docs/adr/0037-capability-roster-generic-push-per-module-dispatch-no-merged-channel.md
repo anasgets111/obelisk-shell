@@ -1,5 +1,15 @@
 # Capability roster in shared, generic snapshot push, per-module dispatch; merged push channel rejected
 
+> Amended by ADR-0076. Every decision below stands. The roster moved from `CAPABILITIES: &[&str]`
+> to the `shared::Capability` enum, which turns decision 2's `push_snapshot` `debug_assert` into a
+> type and deletes it; decision 3's per-module `dispatch` is unchanged but is now reached from one
+> exhaustive match in `supervisor/src/capabilities` rather than a literal `&str` match in `main.rs`.
+> The rejected merged channel stays rejected and its "do not re-propose" condition has not been
+> met: the channels are still one typed single-variant enum each, nothing serializes in a
+> controller, and `idle` and the audio arm are still the two carve-outs. Only the await site moved.
+> Worth noting that the rejection rested on each capability's residue being "a one-line select arm",
+> and docs/adr/0070's lazy-start `Option` wrapper is what later made each one six lines.
+
 The 2026-08-27 architecture review found every capability's depth in its own module (right) but its edges stamped out by hand across `main.rs`, `snapshot.rs`, and a renderer pre-seed list frozen at four names while nine snapshot capabilities existed (a `shell.lua` reading `mpris:get()` at boot dropped into rescue). We decided:
 
 1. **One generic `push_snapshot`** over `&impl Serialize` replaces the nine per-capability `push_*_snapshot` clones and the tenth inlined audio copy. ADR-0029 already keeps payloads untyped; the capability name is the only real datum.

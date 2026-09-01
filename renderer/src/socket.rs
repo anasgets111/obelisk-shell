@@ -182,7 +182,7 @@ pub struct RendererClient {
     /// and one `FontSystem` for the whole process (docs/adr/0023 item 8).
     shaping: ShapingHandle,
     /// One handle per capability seen so far, keyed by `StateSnapshot.capability`
-    /// (docs/adr/0029) -- every `shared::CAPABILITIES` roster name is seeded at construction
+    /// (docs/adr/0029) -- every `shared::Capability::ALL` roster name is seeded at construction
     /// (ADR-0037); an unrostered capability is added lazily by `apply_state_snapshot`. `RefCell`,
     /// not `&mut self`: `apply_state_snapshot` is called through a `&self` receiver.
     capabilities: RefCell<HashMap<String, CapabilityHandle>>,
@@ -192,7 +192,7 @@ pub struct RendererClient {
     commands: CommandSender,
     rescue_handle: LiveSignalHandle,
     /// `oblisk.screens`'s handle (docs/adr/0041 decision 2) -- Renderer-sourced, so deliberately
-    /// not in `capabilities` above or `shared::CAPABILITIES`. See `lua::namespace`'s
+    /// not in `capabilities` above or `shared::Capability::ALL`. See `lua::namespace`'s
     /// `register_screens_signal`.
     screens_handle: LiveSignalHandle,
     /// What `screens_handle` currently holds, mirrored as JSON so [`Self::set_screens`] can tell
@@ -1124,7 +1124,7 @@ mod tests {
         // Lua global on the spot, not error.
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let (client, _outbound_rx) = test_client(&missing);
-        assert!(!shared::CAPABILITIES.contains(&"workspace"), "this test needs a genuinely unrostered name");
+        assert!(shared::Capability::from_name("workspace").is_none(), "this test needs a genuinely unrostered name");
 
         let snapshot = StateSnapshot {
             capability: "workspace".to_string(),
@@ -1626,7 +1626,7 @@ mod tests {
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let (client, _outbound_rx) = test_client(&missing);
 
-        for capability in shared::CAPABILITIES {
+        for capability in shared::Capability::ALL.iter().map(|c| c.as_str()) {
             let setup = format!("is_nil = oblisk.{capability}:get() == nil");
             assert!(
                 probe::<bool>(&client.loader, &setup, "is_nil"),
@@ -1643,9 +1643,9 @@ mod tests {
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let (client, _outbound_rx) = test_client(&missing);
 
-        for capability in shared::CAPABILITIES {
+        for capability in shared::Capability::ALL.iter().map(|c| c.as_str()) {
             // `lock` is excluded: § 6.4's node constructor legitimately owns that global.
-            if *capability == "lock" {
+            if capability == "lock" {
                 continue;
             }
             let setup = format!("is_nil = {capability} == nil");
@@ -2440,7 +2440,7 @@ mod tests {
     // ADR-0044 decision 2: a `StateSnapshot` push marks the scene dirty, and a dirty scene
     // re-resolves against the last applied evaluation without running shell.lua again.
     // `workspace` is used as the pushed capability throughout because it isn't in
-    // `shared::CAPABILITIES`, so pushing it before `run_startup_evaluation` is what makes a
+    // `shared::Capability::ALL`, so pushing it before `run_startup_evaluation` is what makes a
     // `shell.lua` that references it bare (not `:get()`) evaluate at all.
 
     #[test]

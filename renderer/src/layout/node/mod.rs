@@ -346,7 +346,7 @@ fn is_structural_property(kind: &str, property: &str) -> bool {
 ///   signal resolving to nil means the property is absent") falls out of the map itself rather
 ///   than being re-checked in every parser. This matters at boot:
 ///   `RendererClient::run_startup_evaluation` runs before the poll loop has drained a single
-///   inbound frame, so every `shared::CAPABILITIES` signal still reads `nil` at the first
+///   inbound frame, so every `shared::Capability::ALL` signal still reads `nil` at the first
 ///   `Scene::apply`, and a config binding a bare capability signal must not fail layout there. It
 ///   also matches a Lua table's own inability to store `nil`, so `visible = nil` in a config and a
 ///   signal resolving to nil read the same;
@@ -518,7 +518,7 @@ mod tests {
     /// A *resolved* property bag whose `property` slot held a live signal currently reading `nil`
     /// -- exactly the state every rostered capability's global is in before its first
     /// `StateSnapshot` (`renderer/src/socket.rs`'s `RendererClient::new` seeds all of
-    /// `shared::CAPABILITIES` at `Value::Nil`), which is what a config binding a bare capability
+    /// `shared::Capability::ALL` at `Value::Nil`), which is what a config binding a bare capability
     /// signal resolves at startup. Routed through [`resolve_properties`] because that is where the
     /// nil rule now lives: the key is omitted from the resolved map rather than each parser
     /// checking for a `Value::Nil` of its own (build-steps.md Phase 19 item 5).

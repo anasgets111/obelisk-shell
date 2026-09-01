@@ -128,7 +128,7 @@ impl CommandSender {
 }
 
 /// One member of the `oblisk` table: the capability's live state signal plus its write path.
-/// `name` is the `shared::CAPABILITIES` roster name, both the Lua field it is registered under
+/// `name` is the `shared::Capability::ALL` roster name, both the Lua field it is registered under
 /// and the `capability` field of every envelope it sends.
 pub struct Capability {
     name: String,

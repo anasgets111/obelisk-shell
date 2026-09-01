@@ -80,7 +80,7 @@ pub struct NodeId(u64);
 /// each has a documented default and the two spellings of "no value here" must agree, which is the
 /// argument that rule rests on. For the paint-only properties it is a real difference collapsed:
 /// `node::paint_style` applies the parser's documented default to a property the config did bind,
-/// at precisely the moments a capability has not answered yet (every `CAPABILITIES` global reads
+/// at precisely the moments a capability has not answered yet (every `Capability::ALL` global reads
 /// `nil` until the first `StateSnapshot` drains, so this is the state at boot, not an edge case).
 /// Distinguishing them means a third state in the map, `Value::Nil` retained as "bound but
 /// unresolved", and every parser here re-learning to treat it as absent. Still not worth it: the

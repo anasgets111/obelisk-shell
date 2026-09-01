@@ -17,7 +17,7 @@ use crate::lua::signal::{DirtyFlag, LiveSignalHandle};
 /// after construction.
 pub(crate) struct Namespace {
     pub(crate) table: mlua::Table,
-    /// One handle per `shared::CAPABILITIES` name, for `StateSnapshot` pushes to hydrate.
+    /// One handle per `shared::Capability::ALL` name, for `StateSnapshot` pushes to hydrate.
     pub(crate) capabilities: HashMap<String, CapabilityHandle>,
     pub(crate) rescue: LiveSignalHandle,
     /// `oblisk.idle`'s registry, kept so an inbound `SupervisorFrame::IdleEvent` can find the
@@ -28,7 +28,7 @@ pub(crate) struct Namespace {
     pub(crate) screens_payload: serde_json::Value,
 }
 
-/// Builds the whole `oblisk` namespace: every `shared::CAPABILITIES` roster name, the two
+/// Builds the whole `oblisk` namespace: every `shared::Capability` roster name, the two
 /// Renderer-sourced signals `rescue` and `screens`, `idle`, `version`, and `config_dir`.
 ///
 /// **No roster name is on the table itself.** Every one is built here and parked in a side table
@@ -51,10 +51,11 @@ pub(crate) fn build(
     let table = loader.create_table()?;
     let mut capabilities = HashMap::new();
     let pending = loader.create_table()?;
-    for capability in shared::CAPABILITIES {
-        let (member, handle) = Capability::new(capability, dirty.clone(), commands.clone());
-        pending.set(*capability, member)?;
-        capabilities.insert((*capability).to_string(), handle);
+    for capability in shared::Capability::ALL {
+        let name = capability.as_str();
+        let (member, handle) = Capability::new(name, dirty.clone(), commands.clone());
+        pending.set(name, member)?;
+        capabilities.insert(name.to_string(), handle);
     }
     install_capability_index(loader, &table, pending, commands.clone())?;
     // Off-roster like `rescue` and `screens`, but for the opposite reason: those are Renderer
@@ -129,7 +130,7 @@ fn register_rescue_signal(loader: &Loader, oblisk: &mlua::Table, dirty: DirtyFla
 /// Registers the reactive `oblisk.screens` signal (docs/adr/0041 decision 2), seeded with
 /// `initial`.
 ///
-/// Deliberately outside `shared::CAPABILITIES` and outside the capability map, an exception to the
+/// Deliberately outside `shared::Capability::ALL` and outside the capability map, an exception to the
 /// shape ADR-0037 established that ADR-0041 decision 2 states as such: this is sourced in the
 /// Renderer from `smithay_client_toolkit`'s `OutputState`, not pushed by the Supervisor as a
 /// `StateSnapshot`, so the roster (the Supervisor's own dispatch and push list) has nothing to say

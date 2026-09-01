@@ -12,38 +12,87 @@ pub use secure_buffer::SecureBuffer;
 pub use zeroize::{Zeroize, Zeroizing};
 
 /// The capability roster (ADR-0037; CONTEXT.md's Capability roster entry): every
-/// snapshot-hydrated capability name. Each name is also the Lua name it appears under, as
-/// `oblisk.<name>` (§ 2), and the `capability` field of every command written through it (§ 3.2)
-/// -- one string for all three, so a config that reads `oblisk.audio` cannot write to something
-/// else.
+/// snapshot-hydrated capability. Each variant's [`Capability::as_str`] name is also the Lua name
+/// it appears under, as `oblisk.<name>` (§ 2), and the `capability` field of every command
+/// written through it (§ 3.2) -- one spelling for all three, so a config that reads `oblisk.audio`
+/// cannot write to something else.
 ///
 /// The Renderer hands a rostered name out on first read of `oblisk.<name>`, and that read is what
 /// starts the capability's controller on the Supervisor (docs/adr/0070). Until its first
 /// `StateSnapshot` the member reads `nil`, which is also what a name the config never reads costs:
-/// nothing runs behind it. The Supervisor's `push_snapshot` debug-asserts membership, so an
-/// off-roster capability fails loudly in development rather than as an index-into-nil error in a
-/// user's `shell.lua`. `idle` is deliberately absent: it's event-shaped, not snapshot state
-/// (ADR-0032).
-pub const CAPABILITIES: &[&str] = &[
-    "audio",
-    "network",
-    "bluetooth",
-    "tray",
-    "notifications",
-    "mpris",
-    "sysinfo",
-    "keyboard",
-    "privacy",
-    "updates",
-    "lock",
-    "battery",
-    "system",
-    "brightness",
-    "workspaces",
-    "power",
-    "applications",
-];
+/// nothing runs behind it. `idle` is deliberately absent: it's event-shaped, not snapshot state
+/// (ADR-0032), and neither is `polkit`, which is reached from a `secure_submit` rather than a read
+/// (docs/adr/0070 decision 5) -- the Supervisor's own `Startable` covers both.
+///
+/// An enum rather than the `&[&str]` this replaces (docs/adr/0076). The roster is matched on in
+/// two places that decide whether a capability starts and whether its commands are dispatched, and
+/// as strings both of them accepted a name nothing implemented, silently: the capability's Lua
+/// member existed and stayed `nil` forever. Exhaustive matches make adding a variant a build
+/// failure at exactly those two arms.
+/// Declares the roster once and derives the enum, [`Capability::ALL`] and [`Capability::as_str`]
+/// from that one list.
+///
+/// A macro rather than three hand-kept lists, because the failure it removes is specific: with
+/// `ALL` written out separately, a variant added to the enum and to `as_str` but forgotten in
+/// `ALL` compiled and passed every test, and was simply absent from the Lua namespace, the
+/// generated stubs and the schema check -- all three of which iterate `ALL`. There is now nothing
+/// to forget.
+macro_rules! roster {
+    ($($variant:ident => $name:literal),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum Capability {
+            $($variant),+
+        }
 
+        impl Capability {
+            /// Every variant, in the order the roster has always listed them.
+            pub const ALL: &'static [Capability] = &[$(Capability::$variant),+];
+
+            /// The one wire/Lua spelling, matching this enum's `snake_case` serde rename so the
+            /// JSON a `StateSnapshot` carries and the name a config indexes are the same string.
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Capability::$variant => $name),+
+                }
+            }
+        }
+    };
+}
+
+roster! {
+    Audio => "audio",
+    Network => "network",
+    Bluetooth => "bluetooth",
+    Tray => "tray",
+    Notifications => "notifications",
+    Mpris => "mpris",
+    Sysinfo => "sysinfo",
+    Keyboard => "keyboard",
+    Privacy => "privacy",
+    Updates => "updates",
+    Lock => "lock",
+    Battery => "battery",
+    System => "system",
+    Brightness => "brightness",
+    Workspaces => "workspaces",
+    Power => "power",
+    Applications => "applications",
+}
+
+impl Capability {
+    /// The roster entry a wire string names, or `None` for anything off it. The Renderer sends
+    /// these as free strings, so this is a trust boundary, not a lookup that cannot fail.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|capability| capability.as_str() == name)
+    }
+}
+
+impl std::fmt::Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 /// Guarded JSON-RPC 2.0 envelope wrapping a Lua write action.
 /// See docs/oblisk-idl-api-specs.md §7.2.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -634,5 +683,49 @@ mod tests {
             let parsed: PamOutcome = serde_json::from_value(wire).unwrap();
             assert_eq!(parsed, outcome);
         }
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::Capability;
+
+    #[test]
+    fn every_entry_round_trips_through_its_name() {
+        // `ALL` and `as_str` come from one `roster!` list, so this cannot catch a variant missing
+        // from one of them -- there is no way to write that. What it does pin is `from_name`
+        // agreeing with `as_str`, which is what the two wire-facing matches depend on.
+        assert_eq!(Capability::ALL.len(), 17, "a variant was added or removed; check every iterator over ALL");
+        for capability in Capability::ALL {
+            assert_eq!(Capability::from_name(capability.as_str()), Some(*capability));
+        }
+    }
+
+    #[test]
+    fn every_name_is_unique_so_two_variants_cannot_claim_one_lua_member() {
+        let mut names: Vec<&str> = Capability::ALL.iter().map(|capability| capability.as_str()).collect();
+        names.sort_unstable();
+        let count = names.len();
+        names.dedup();
+        assert_eq!(names.len(), count, "two capabilities share a name; `from_name` would resolve only the first");
+    }
+
+    #[test]
+    fn the_serde_spelling_is_the_same_string_as_as_str() {
+        // A `StateSnapshot`'s `capability` field is written from `as_str` and read by configs;
+        // if serde ever disagreed, a payload would arrive under a name nothing is listening on.
+        for capability in Capability::ALL {
+            let json = serde_json::to_string(capability).unwrap();
+            assert_eq!(json, format!("\"{}\"", capability.as_str()));
+        }
+    }
+
+    #[test]
+    fn a_name_that_is_not_on_the_roster_resolves_to_nothing() {
+        // `idle` and `polkit` are startable but deliberately off the roster; both must miss here.
+        assert_eq!(Capability::from_name("idle"), None);
+        assert_eq!(Capability::from_name("polkit"), None);
+        assert_eq!(Capability::from_name(""), None);
+        assert_eq!(Capability::from_name("Audio"), None);
     }
 }

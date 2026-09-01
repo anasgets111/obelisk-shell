@@ -149,8 +149,12 @@ A capability's state-version counter, carried on every snapshot it pushes and st
 _Avoid_: version, sequence number
 
 **Capability roster**:
-The `shared`-crate constant naming every snapshot-hydrated capability. Each rostered name is reachable from a generation's first evaluation and reads `nil` until its first dependency snapshot arrives (ADR-0037). One name serves as the Lua name, the roster key and the `capability` field of every command written through it.
-_Avoid_: pre-seed list, known capabilities
+`shared::Capability`, the enum naming every snapshot-hydrated capability. Each rostered name is reachable from a generation's first evaluation and reads `nil` until its first dependency snapshot arrives (ADR-0037). One name serves as the Lua name, the roster key and the `capability` field of every command written through it. The enum, its `ALL` and its `as_str` all come from one `roster!` macro list, so a variant cannot exist in one and be missing from another; adding a line to that list fails the build at the two arms that decide whether a capability starts and how its commands dispatch, and nowhere else (ADR-0076). `idle` and `polkit` are deliberately off it and covered by the Supervisor's `Startable`.
+_Avoid_: pre-seed list, known capabilities, `CAPABILITIES` (the `&[&str]` this replaced)
+
+**Capability registry**:
+`supervisor/src/capabilities`: `Capabilities`, holding every lazily-started controller and every signal sender, and `Signals`, the receiving half the main loop awaits. `start`/`push`/`dispatch` are the three things a capability does, one exhaustive match each. `Signals::next` is deliberately the only awaiting half -- bare `recv()`s, so a lost `tokio::select!` race drops nothing -- and `Capabilities::push` runs in the winning arm's body, which `select!` never cancels; the two capabilities that `await` while building state depend on that split (ADR-0076). Not a trait and not boxed objects: ADR-0037 decision 3's "static calls, no registry, no trait" is unchanged, the calls just have a struct to hang off. The module also holds one child module per roster entry, flat, because the roster is flat and is the public interface.
+_Avoid_: capability manager, service registry, plugin table
 
 **Capability start**:
 The first read of `oblisk.<name>` in a generation, which is what makes the Supervisor build that capability's controller (ADR-0070). A name no config reads has nothing running behind it. One-way for the life of the Supervisor process: nothing stops a started capability.

@@ -73,7 +73,7 @@ impl ApplicationsController {
     /// Not scanned inline: this runs inside `main`'s startup, and a few hundred `.desktop` files
     /// read off a cold page cache is real milliseconds spent before the first surface is up. The
     /// capability reads `nil` in Lua until the scan lands, which every capability already does
-    /// (`shared::CAPABILITIES`' own doc comment), so a config that handles an absent snapshot
+    /// (`shared::Capability::ALL`' own doc comment), so a config that handles an absent snapshot
     /// handles this with no extra branch.
     pub fn new(dirs: Vec<PathBuf>, events: UnboundedSender<ApplicationsSignal>) -> Self {
         let controller = ApplicationsController {

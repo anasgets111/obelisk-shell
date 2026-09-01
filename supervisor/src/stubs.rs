@@ -31,7 +31,7 @@ use schemars::{Schema, schema_for};
 /// accepts. Neither mapping exists anywhere else in the tree: `push_snapshot` takes
 /// `&impl Serialize`, so the payload type is inferred at each of the 17 call sites, and an action
 /// enum is named only by its own `dispatch`. `every_capability_has_a_schema` keeps this honest
-/// against `shared::CAPABILITIES`. `None` is a read-only capability, which gets the plain `invoke`
+/// against `shared::Capability::ALL`. `None` is a read-only capability, which gets the plain `invoke`
 /// it inherits from `Capability`.
 fn capability_schemas() -> Vec<(&'static str, Schema, Option<Schema>)> {
     vec![
@@ -40,7 +40,11 @@ fn capability_schemas() -> Vec<(&'static str, Schema, Option<Schema>)> {
             schema_for!(crate::applications::controller::ApplicationsState),
             Some(schema_for!(crate::applications::ApplicationsAction)),
         ),
-        ("audio", schema_for!(crate::audio::mixer::AudioState), Some(schema_for!(crate::audio::AudioAction))),
+        (
+            "audio",
+            schema_for!(crate::audio::mixer::AudioState),
+            Some(schema_for!(crate::audio::AudioAction)),
+        ),
         ("battery", schema_for!(crate::hardware::battery::controller::BatteryState), None),
         (
             "bluetooth",
@@ -57,7 +61,11 @@ fn capability_schemas() -> Vec<(&'static str, Schema, Option<Schema>)> {
             schema_for!(crate::hardware::keyboard::controller::KeyboardState),
             Some(schema_for!(crate::hardware::keyboard::KeyboardAction)),
         ),
-        ("lock", schema_for!(crate::lock::LockState), Some(schema_for!(crate::lock::LockAction))),
+        (
+            "lock",
+            schema_for!(crate::lock::LockState),
+            Some(schema_for!(crate::lock::LockAction)),
+        ),
         (
             "mpris",
             schema_for!(crate::dbus::mpris::controller::MprisState),
@@ -85,7 +93,11 @@ fn capability_schemas() -> Vec<(&'static str, Schema, Option<Schema>)> {
             Some(schema_for!(crate::hardware::sysinfo::SysinfoAction)),
         ),
         ("system", schema_for!(crate::system::controller::SystemState), None),
-        ("tray", schema_for!(crate::dbus::tray::TrayState), Some(schema_for!(crate::dbus::tray::TrayAction))),
+        (
+            "tray",
+            schema_for!(crate::dbus::tray::TrayState),
+            Some(schema_for!(crate::dbus::tray::TrayAction)),
+        ),
         (
             "updates",
             schema_for!(crate::updates::controller::UpdatesState),
@@ -324,8 +336,9 @@ pub fn render() -> String {
     out.push_str(RENDERER_SOURCED);
 
     out.push_str("\n---@class Oblisk\n");
-    for capability in shared::CAPABILITIES {
-        out.push_str(&format!("---@field {capability} {}\n", capability_class(capability)));
+    for capability in shared::Capability::ALL {
+        let name = capability.as_str();
+        out.push_str(&format!("---@field {name} {}\n", capability_class(name)));
     }
     out.push_str(OBLISK_TAIL);
     out
@@ -362,7 +375,7 @@ function Capability:invoke(command, ...) end
 
 const RENDERER_SOURCED: &str = r#"
 --- Off-roster members ---------------------------------------------------------------------------
--- Not capabilities and not in `shared::CAPABILITIES`, so they have no payload struct to derive
+-- Not capabilities and not in `shared::Capability::ALL`, so they have no payload struct to derive
 -- from and are written by hand. `Screen` and `RescueState` come from the renderer's own state.
 -- `Idle` is the other direction: a supervisor service that pushes no state at all, because an idle
 -- threshold crossing is an event, not something to read (ADR-0032).
@@ -467,7 +480,7 @@ mod tests {
     #[test]
     fn every_capability_has_a_schema() {
         let declared: BTreeSet<&str> = super::capability_schemas().into_iter().map(|(name, ..)| name).collect();
-        let expected: BTreeSet<&str> = shared::CAPABILITIES.iter().copied().collect();
-        assert_eq!(declared, expected, "capability_schemas is out of step with shared::CAPABILITIES");
+        let expected: BTreeSet<&str> = shared::Capability::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(declared, expected, "capability_schemas is out of step with shared::Capability::ALL");
     }
 }
