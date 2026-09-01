@@ -28,7 +28,7 @@ run: build
     OBLISK_CONFIG_DIR=dev-config/oblisk target/debug/oblisk
 
 # Everything a change has to pass before it is done.
-check: fmt-check test lint docs lua
+check: fmt-check test lint docs lua types
 
 # Point git at the tracked hooks in `.githooks`. Once per clone: git does not version `.git/hooks`,
 # so a hook only exists for whoever ran this.
@@ -60,6 +60,48 @@ docs:
         fi
         echo "$crate: $count unresolved doc links (baseline $baseline)"
     done
+
+# The config type-checked against the stubs, which is the only thing that ever reads them as types.
+#
+# `lua` above proves a file parses. This proves `dev-config` agrees with `lua-meta`, which is what
+# an author's editor will tell them: same engine, same `.luarc.json`, same stub directory. It is
+# the reason `lua-meta/nodes.lua` now spells `|Signal` on every union that takes one -- 21 of them
+# did not, and each was a red squiggle under working config code (docs/adr/0081).
+#
+# Optional, because `lua-language-server` is not a build dependency of this workspace and there is
+# no CI to install it into. Missing means skipped and said so, never a silent pass.
+types:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v lua-language-server >/dev/null 2>&1; then
+        echo "no lua-language-server on PATH, skipping the config type check (pacman -S lua-language-server)"
+        exit 0
+    fi
+    log=$(mktemp -d)
+    trap 'rm -rf "$log"' EXIT
+    # `share/starter` ships no `.luarc.json` on purpose: `oblisk init` writes one pointing at the
+    # *installed* stub directory (`setup.rs`'s `luarc_json`), so a checked-in copy would be a second
+    # answer that init immediately overwrites. This is that file, with an absolute library path
+    # because a relative one resolves against the workspace being checked, not against this config.
+    printf '{"runtime.version":"Lua 5.4","workspace.library":["%s/lua-meta"],"workspace.checkThirdParty":false}\n' "$PWD" >"$log/starter.luarc.json"
+    check() {
+        # Removed each round: a clean run writes no report at all, so a stale one from the previous
+        # directory would be read as this directory's failure.
+        rm -f "$log/check.json"
+        lua-language-server --check "$PWD/$1" --checklevel=Warning --logpath="$log" "${@:2}" >/dev/null
+        # An empty report is `{}` or `[]` depending on version, and no file at all when clean.
+        report=$(tr -d '[:space:]' <"$log/check.json" 2>/dev/null || true)
+        if [ -n "$report" ] && [ "$report" != "{}" ] && [ "$report" != "[]" ]; then
+            echo "$1 does not type-check against lua-meta:" >&2
+            cat "$log/check.json" >&2
+            exit 1
+        fi
+    }
+    # `dev-config/oblisk` has its own `.luarc.json`, which the language server finds on its own and
+    # which also carries the `runtime.path` its `require`s need.
+    check dev-config/oblisk
+    check share/starter --configpath "$log/starter.luarc.json"
+    echo "dev-config and the starter type-check against lua-meta"
 
 # Every Lua file parses, config and stubs alike.
 lua:

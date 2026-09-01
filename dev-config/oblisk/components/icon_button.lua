@@ -40,7 +40,12 @@ return function(glyph, on_activate, opts)
     -- a radius token, because a token that happened to be less than half would paint a rounded
     -- square and read as a near-miss rather than a decision.
     local radius = opts.radius or (opts.shape == "rounded" and theme.item_radius or side / 2)
+    -- Annotated because a theme token is a `Signal` on a scaled display and a plain string
+    -- otherwise, so inference picks whichever `theme.lua` happened to build and the `---@cast`
+    -- below then has nothing to narrow.
+    ---@type Color|Signal
     local base = opts.background or theme.GLASS_CONTROL
+    ---@type Color|Signal
     local base_hover = opts.background_hover or theme.GLASS_CONTROL_HOVER
 
     -- One `hover(slot)` call, reused across the four properties that read it. The registry is
@@ -57,18 +62,29 @@ return function(glyph, on_activate, opts)
         return type(value) == "userdata"
     end
 
+    -- `---@type` and `---@cast` because these hold either a colour string or a `Signal`, chosen at
+    -- runtime by `is_signal`, and the language server has no way to follow a
+    -- `type(x) == "userdata"` test: there are no user-defined type guards. Without the annotations
+    -- it narrows each local to whatever the first branch assigned and calls every other branch a
+    -- type error. This is the one place in `dev-config` that needs them, which is what makes them
+    -- worth writing rather than turning the diagnostic off.
+    ---@type Color|Signal
     local ground
     if not hovered then
         ground = base
     elseif is_signal(base) and is_signal(base_hover) then
+        ---@cast base Signal
+        ---@cast base_hover Signal
         ground = computed({ hovered, base, base_hover }, function(is_hovered, plain, lit)
             return is_hovered and lit or plain
         end)
     elseif is_signal(base) then
+        ---@cast base Signal
         ground = computed({ hovered, base }, function(is_hovered, plain)
             return is_hovered and base_hover or plain
         end)
     elseif is_signal(base_hover) then
+        ---@cast base_hover Signal
         ground = computed({ hovered, base_hover }, function(is_hovered, lit)
             return is_hovered and lit or base
         end)
@@ -78,11 +94,19 @@ return function(glyph, on_activate, opts)
         end)
     end
 
+    ---@type Color|Signal
     local foreground = opts.foreground
     if foreground == nil then
-        foreground = is_signal(ground) and ground:map(theme.text_contrast) or theme.text_contrast(ground)
+        if is_signal(ground) then
+            ---@cast ground Signal
+            foreground = ground:map(theme.text_contrast)
+        else
+            ---@cast ground Color
+            foreground = theme.text_contrast(ground)
+        end
     end
 
+    ---@type Color|Signal
     local border_color = theme.GLASS_BORDER
     if hovered then
         border_color = hovered:map(function(is_hovered)
