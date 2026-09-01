@@ -2022,7 +2022,15 @@ the IDL-only entries fell between the two documents.
 > **Built (items 1 and part of 5).** `battery` reads `/sys/class/power_supply` behind a real udev
 > monitor on `AsyncFd`, filtered to the one system battery: the mains adapter, the USB-C PD source
 > and any `scope=Device` peripheral battery are all excluded, and `Not charging` is matched exactly
-> rather than by substring, which a `contains` check would invert into charging. That monitor is the
+> rather than by substring, which a `contains` check would invert into charging.
+>
+> **Amended by docs/adr/0080.** The monitor is not enough on its own. Measured on this dev machine
+> while discharging, `capacity` fell 69 to 65 and `udevadm monitor --udev
+> --subsystem-match=power_supply` delivered zero events: this ACPI battery driver emits a uevent on
+> a plug or an unplug and on nothing else. The 30s poll now runs alongside the watch rather than
+> only when the watch fails to build, so `percent` no longer freezes between plug events. Quickshell
+> avoids the whole question by reading UPower's `DisplayDevice` over DBus and letting UPower do the
+> polling; that ADR records why this is not that, yet. That monitor is the
 > first caller `udev` has ever had. It has been a declared dependency since scaffolding, justified by
 > line 98's "§ 1.1's battery netlink monitor", which nothing then wrote. Its `send` feature had to be
 > enabled, and `AsyncFd::readable_mut` used rather than `readable`, because the shared-reference

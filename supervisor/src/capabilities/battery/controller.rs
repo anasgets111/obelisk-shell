@@ -72,14 +72,22 @@ pub fn read_battery_state(power_supply_root: &Path) -> BatteryState {
     BatteryState { present: true, percent, charging }
 }
 
-/// Cadence for the fallback path only. The udev watch is primary: `charging` flips instantly
-/// on plug/unplug, which matters more than `percent`'s slow drift.
+/// The floor the state is re-read at, whatever the udev watch does. The watch stays primary --
+/// `charging` flips within a frame of a plug or unplug, which a 30s timer cannot promise -- but it
+/// is a floor and not a fallback, and that distinction is the whole of docs/adr/0080.
 ///
-/// ponytail: 30s is a round-number guess for the fallback's staleness budget, not measured
-/// against anything -- it only matters on the already-degraded path (no working udev watch), so
-/// getting it exactly right matters far less than the primary path above does. If it ever needs
-/// to be tighter or user-tunable, `SysinfoController`'s configurable watch-channel interval
-/// (docs/adr/0035) is the pattern to reach for rather than hardcoding a different constant here.
+/// This used to run only when [`build_power_supply_watch`] failed to stand up, on the assumption
+/// that a working watch reports every change. It does not. Measured on this dev machine while
+/// discharging, with `udevadm monitor --udev --subsystem-match=power_supply` running alongside a
+/// one-second sampler: `capacity` fell 69 to 65 and the socket delivered **zero** events. UPower,
+/// watching the same battery, tracked every point, because UPower polls the hardware itself
+/// (`upower -i` reported "updated: 13 seconds ago"). The kernel's ACPI battery driver emits a
+/// uevent on a plug or unplug and, on this hardware, on nothing else.
+///
+/// 30s is UPower's own cadence for a battery that needs polling, which is the number to match: a
+/// bar showing a percentage two points stale is what a user reports, and no config can ask for
+/// tighter than the source updates. If it ever needs to be user-tunable,
+/// `SysinfoController`'s configurable watch-channel interval (docs/adr/0035) is the pattern.
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Not `Clone`: § 2.2 has no write action, so nothing needs a second handle.
@@ -102,9 +110,9 @@ impl BatteryController {
     }
 }
 
-/// Reads the initial state, sends it, then hands off to [`run_battery_watch_loop`]. Falls
-/// back to [`run_battery_poll_loop`] only if [`build_power_supply_watch`] fails to stand up --
-/// a broken udev socket must not leave a working battery unreported.
+/// Reads the initial state, sends it, then hands off to [`run_battery_loop`]. A udev watch that
+/// fails to stand up is not fatal: the loop runs on its timer alone, which is the same cadence a
+/// silent watch already leaves it on.
 async fn run_battery_task(
     power_supply_root: PathBuf,
     state: Arc<Mutex<BatteryState>>,
@@ -116,15 +124,14 @@ async fn run_battery_task(
         return;
     }
 
-    match build_power_supply_watch() {
-        Ok(watch) => run_battery_watch_loop(watch, power_supply_root, initial, state, events).await,
-        Err(err) => {
+    let watch = build_power_supply_watch()
+        .map_err(|err| {
             eprintln!(
-                "battery: failed to set up the udev power_supply watch ({err}); falling back to a {POLL_INTERVAL:?} poll"
+                "battery: failed to set up the udev power_supply watch ({err}); a plug or unplug will show up on the {POLL_INTERVAL:?} read instead of instantly"
             );
-            run_battery_poll_loop(power_supply_root, initial, state, events).await;
-        }
-    }
+        })
+        .ok();
+    run_battery_loop(watch, power_supply_root, initial, state, events).await;
 }
 
 /// Builds the `power_supply` subsystem udev watch (§ 2.2; docs/build-steps.md line 98). Needs
@@ -135,34 +142,58 @@ fn build_power_supply_watch() -> std::io::Result<AsyncFd<MonitorSocket>> {
     AsyncFd::new(socket)
 }
 
-/// Awaits the udev watch's fd becoming readable, drains pending netlink messages (a single
-/// plug/unplug can fire more than one; level-triggered readiness would otherwise re-fire on
-/// anything left undrained), then re-reads and pushes only on an actual change. Most wakeups
-/// get filtered out here since udev fires on every `power_supply` change, not just the ones
-/// this capability reports. Falls back to [`run_battery_poll_loop`] if the fd errors.
+/// One loop, two wakeup sources, one read. A readable udev fd or a [`POLL_INTERVAL`] tick both
+/// mean the same thing here -- go look again -- and only the comparison below decides whether
+/// anything is pushed. udev fires on every `power_supply` change, not just the ones this
+/// capability reports, so most wakeups get filtered out either way.
+///
+/// `watch` is `None` when the socket could not be built, and becomes `None` when its fd errors:
+/// the loop keeps running on the timer rather than returning, because a broken netlink socket must
+/// not leave a working battery unreported.
+///
+/// Drains the pending messages on each readiness, since one plug can fire more than one and
+/// level-triggered readiness would re-fire on anything left undrained.
 ///
 /// Uses `readable_mut` (not `readable`): only `udev`'s `send` feature is enabled (Cargo.toml),
 /// not `sync`, and `readable`'s guard needs `MonitorSocket: Sync` to be `Send` across `.await` --
 /// `readable_mut`'s guard only needs `MonitorSocket: Send`, which is already enabled.
-async fn run_battery_watch_loop(
-    mut watch: AsyncFd<MonitorSocket>,
+async fn run_battery_loop(
+    mut watch: Option<AsyncFd<MonitorSocket>>,
     power_supply_root: PathBuf,
     mut previous: BatteryState,
     state: Arc<Mutex<BatteryState>>,
     events: UnboundedSender<BatterySignal>,
 ) {
+    let mut ticker = tokio::time::interval(POLL_INTERVAL);
+    ticker.tick().await; // tokio::time::interval's first tick fires immediately; the caller's initial read already covers it
+
     loop {
-        let mut guard = match watch.readable_mut().await {
-            Ok(guard) => guard,
-            Err(err) => {
-                eprintln!(
-                    "battery: the udev power_supply watch's fd errored ({err}); falling back to a {POLL_INTERVAL:?} poll for the rest of this run"
-                );
-                return run_battery_poll_loop(power_supply_root, previous, state, events).await;
+        let watch_errored = tokio::select! {
+            // The `if` guard is what makes the `expect` sound: `select!` evaluates a branch's
+            // precondition before it ever polls that branch's future, so this arm cannot run
+            // while the socket is gone.
+            readiness = async { watch.as_mut().expect("guarded by watch.is_some()").readable_mut().await },
+                if watch.is_some() =>
+            {
+                match readiness {
+                    Ok(mut guard) => {
+                        for _event in guard.get_inner().iter() {}
+                        guard.clear_ready();
+                        false
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "battery: the udev power_supply watch's fd errored ({err}); reading on the {POLL_INTERVAL:?} timer alone for the rest of this run"
+                        );
+                        true
+                    }
+                }
             }
+            _ = ticker.tick() => false,
         };
-        for _event in guard.get_inner().iter() {}
-        guard.clear_ready();
+        if watch_errored {
+            watch = None;
+        }
 
         let current = read_battery_state(&power_supply_root);
         if current != previous {
@@ -170,30 +201,6 @@ async fn run_battery_watch_loop(
             previous = current;
             if events.send(BatterySignal::Changed).is_err() {
                 return;
-            }
-        }
-    }
-}
-
-/// The fallback path: re-reads on a fixed timer instead of a real event, same push-on-change
-/// filter as the primary path.
-async fn run_battery_poll_loop(
-    power_supply_root: PathBuf,
-    mut previous: BatteryState,
-    state: Arc<Mutex<BatteryState>>,
-    events: UnboundedSender<BatterySignal>,
-) {
-    let mut ticker = tokio::time::interval(POLL_INTERVAL);
-    ticker.tick().await; // tokio::time::interval's first tick fires immediately; the caller's initial (or pre-fallback) read already covers it
-
-    loop {
-        ticker.tick().await;
-        let current = read_battery_state(&power_supply_root);
-        if current != previous {
-            *state.lock().expect("battery state mutex poisoned") = current;
-            previous = current;
-            if events.send(BatterySignal::Changed).is_err() {
-                break;
             }
         }
     }
@@ -209,6 +216,53 @@ mod tests {
         for (attr, value) in attrs {
             std::fs::write(dir.join(attr), value).unwrap();
         }
+    }
+
+    // ---- run_battery_loop ----
+
+    /// The bug docs/adr/0080 was written for. A udev watch that never fires is indistinguishable
+    /// from no watch at all, so this drives the loop with `None` and lets the timer be the only
+    /// wakeup. Before the timer was a floor rather than a fallback, this hung: the watch loop
+    /// awaited an fd that had nothing to say and the poll loop was only reachable when the socket
+    /// failed to build.
+    #[tokio::test(start_paused = true)]
+    async fn a_capacity_change_with_no_udev_event_still_reaches_the_signal() {
+        let root = tempfile::tempdir().unwrap();
+        write_entry(root.path(), "BAT0", &[("type", "Battery"), ("capacity", "69"), ("status", "Discharging")]);
+
+        let initial = read_battery_state(root.path());
+        assert_eq!(initial, BatteryState { present: true, percent: 69, charging: false });
+
+        let state = Arc::new(Mutex::new(initial));
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let task =
+            tokio::spawn(run_battery_loop(None, root.path().to_path_buf(), initial, Arc::clone(&state), events));
+
+        // The four points this dev machine lost between two udev events that never arrived.
+        std::fs::write(root.path().join("BAT0").join("capacity"), "65").unwrap();
+
+        assert_eq!(received.recv().await, Some(BatterySignal::Changed));
+        assert_eq!(state.lock().unwrap().percent, 65);
+        task.abort();
+    }
+
+    /// The filter survives the change: a tick that finds nothing new pushes nothing, or every
+    /// `POLL_INTERVAL` would wake the renderer for a battery that has not moved.
+    #[tokio::test(start_paused = true)]
+    async fn a_tick_that_finds_nothing_new_pushes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        write_entry(root.path(), "BAT0", &[("type", "Battery"), ("capacity", "69"), ("status", "Discharging")]);
+
+        let initial = read_battery_state(root.path());
+        let state = Arc::new(Mutex::new(initial));
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let task =
+            tokio::spawn(run_battery_loop(None, root.path().to_path_buf(), initial, Arc::clone(&state), events));
+
+        // Long enough for many ticks under paused time, all of them reading the same files.
+        let quiet = tokio::time::timeout(POLL_INTERVAL * 10, received.recv()).await;
+        assert!(quiet.is_err(), "an unchanged battery pushed {quiet:?}");
+        task.abort();
     }
 
     // ---- is_system_battery ----

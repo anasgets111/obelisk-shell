@@ -41,4 +41,7 @@ zbus = { version = "5.19.0", features = ["tokio"] }
 zbus_polkit = { version = "5.0.0", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
+# `test-util` is not in tokio's `full`, and it is what `#[tokio::test(start_paused = true)]` needs.
+# `battery::controller`'s loop is on a 30s timer, so testing it in real time is not testing it.
+tokio = { version = "1.53.1", features = ["full", "test-util"] }
 zbus = { version = "5.19.0", features = ["tokio", "p2p"] }
