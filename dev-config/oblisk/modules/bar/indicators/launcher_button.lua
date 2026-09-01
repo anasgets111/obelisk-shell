@@ -11,7 +11,7 @@ local SLOT = "launcher"
 
 local launcher_button = icon_button(icons.launcher, function()
     -- Refreshing on the way open rather than on a timer, because the enumeration is a directory
-    -- walk and nothing outside this click cares whether it is current (docs/adr/0061).
+    -- walk and nothing outside this click cares whether it is current (ADR-0061).
     local opening = not ui_state.launcher_open:get()
     if opening then
         oblisk.applications:invoke("refresh")

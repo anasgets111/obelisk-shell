@@ -12,7 +12,7 @@
 --
 -- ponytail: the mirror pays that back with `ExpandingPill`, which collapses to just the focused
 -- workspace and expands on hover. That needs a per-slot `visible` driven by one hover region, which
--- this engine can express (`hover` is a signal, docs/adr/0062) but which also needs the collapse to
+-- this engine can express (`hover` is a signal, ADR-0062) but which also needs the collapse to
 -- be delayed past the pointer leaving one circle for the next, and nothing here has a timer that
 -- short (ADR-0021's 5ms cap is the ceiling). Until then the strip is always open.
 local theme = require("config.theme")

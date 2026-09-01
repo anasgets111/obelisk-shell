@@ -1,15 +1,14 @@
 //! Node constructors (`oblisk-idl-api-specs.md` § 5.2/§ 6.1) and `VirtualNode`, the loader's
 //! shallow, unvalidated table-to-Rust conversion.
 //!
-//! ponytail: `deserialize_lua_table` is shallow on purpose -- it reads `kind` and copies every
+//! ponytail: `deserialize_lua_table` is shallow on purpose: it reads `kind` and copies every
 //! other key as-is into `properties`, never recursing into a nested `children`/`child` table. A
-//! node's own properties (including its raw, unconverted `child`/`children` value) are exactly
-//! what build-steps.md Phase 10 calls "the loader's output... not the final in-memory node
-//! itself"; walking into it is Phase 12's retained-scene reconciliation, not this module's job.
-//! Field-level schema validation against § 5.2's table (e.g. rejecting a `width` that's neither
-//! an integer nor `"Fill"`) is the same deferral: Phase 12's layout engine is the actual consumer
-//! that needs typed, validated properties, so validating them here would be built ahead of its
-//! only real caller.
+//! node's own properties, including its raw, unconverted `child`/`children` value, are the
+//! loader's output, not the final in-memory node; walking into it is the retained-scene
+//! reconciliation's job, not this module's. Field-level schema validation against § 5.2's table
+//! (e.g. rejecting a `width` that's neither an integer nor `"Fill"`) is the same deferral: the
+//! layout engine is the actual consumer that needs typed, validated properties, so validating
+//! them here would be built ahead of its only real caller.
 
 use std::collections::HashMap;
 
@@ -45,7 +44,7 @@ const COMMON_PROPERTIES: &[&str] =
     &["align_h", "align_v", "height", "hover", "id", "margin", "opacity", "padding", "visible", "width"];
 
 /// What every kind that paints as a box takes on top of [`COMMON_PROPERTIES`]: the fill, then the
-/// border. The set is `node::paint_style`'s own first match arm -- `row`, `column` and `button`
+/// border. The set is `node::paint_style`'s own first match arm: `row`, `column` and `button`
 /// have no paint properties beyond a `rect`'s, and all four § 6 surface roles paint exactly like
 /// one.
 const BOX_PROPERTIES: &[&str] = &["background", "border_color", "border_width", "clip", "radius"];
@@ -60,7 +59,7 @@ const BOX_KINDS: [&str; 8] = ["rect", "row", "column", "button", "panel", "windo
 /// `aling_v = "Center"` in a config was silent, and the node just did not centre. Every parser
 /// only ever asks for the keys it knows, so nothing was in a position to notice.
 ///
-/// ponytail: hand-written, and it has to be. A node's schema is not a type -- it is roughly 60
+/// ponytail: hand-written, and it has to be. A node's schema is not a type: it is roughly 60
 /// `properties.get("...")` calls spread across `layout/node/`, `layout/scene.rs` and `wayland/`,
 /// each with its own defaulting and coercion rules, so there is nothing to derive it from the way
 /// `supervisor/src/stubs.rs` derives a capability payload. Two guards hold it in place:
@@ -144,7 +143,7 @@ fn accepted_properties(kind: &str) -> Vec<&'static str> {
 }
 
 /// A Lua node table, tagged with its constructor's `kind` and carrying every other prop
-/// untouched. Not the final in-memory scene node -- see the module doc comment.
+/// untouched. Not the final in-memory scene node. See the module doc comment.
 #[derive(Debug, Clone)]
 pub struct VirtualNode {
     pub kind: String,

@@ -1,4 +1,4 @@
-//! Theme name to file path, in the Renderer (ADR-0054, build-steps.md Phase 29 item 3).
+//! Theme name to file path, in the Renderer (ADR-0054).
 //!
 //! ADR-0054 settles the resolver here rather than in the Supervisor (`oblisk-supervisor-
 //! services-dbus.md` § 9.2's original plan): § 3.2 calls `system:find_icon` a synchronous lookup

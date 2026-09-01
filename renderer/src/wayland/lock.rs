@@ -17,9 +17,9 @@ use crate::wayland::surface::TrackedRole;
 /// config omission is not fail-secure, it is a denial of service spelled the same way.
 const NO_LOCK_DECLARED: &str = "this config declares no `lock` surface (§ 6.4), so locking the session would leave a black screen with no password field and no way back \
      in short of a VT switch; the lock was refused (ADR-0052 decision 3)";
-/// The second half of ADR-0052 decision 3's refusal, and the one the guard was missing.
+/// The second half of ADR-0052 decision 3's refusal.
 ///
-/// `node::lock_spec` requires only an `id` -- `child` is optional -- so `lock { id = "x" }` is a
+/// `node::lock_spec` requires only an `id`. `child` is optional, so `lock { id = "x" }` is a
 /// legal declaration that resolves to a surface with no password field, an empty input region and
 /// a transparent buffer. Counting tracked `lock` instances said "a lock screen exists" for exactly
 /// the black screen the decision refuses to allow, reached through the guard rather than around
@@ -48,9 +48,9 @@ const LOCK_DENIED: &str = "the compositor denied the session lock; another lock 
 const LOCK_TORN_DOWN: &str = "the compositor ended the session lock through its own mechanism; the session is unlocked and the lock screen is gone \
      (`ext_session_lock_v1::finished` after `locked`)";
 /// The exit code this process uses when the Supervisor's control socket is gone (ADR-0059
-/// decision 1). Nobody is left to read it -- the process that classifies exit codes just died --
-/// so this is for a journal and `$status`, not a handshake. Distinct from `0` (not a clean exit)
-/// and from `1` (not a failure of anything this process was asked to do).
+/// decision 1). Nobody is left to read it, since the process that classifies exit codes just
+/// died, so this is for a journal and `$status`, not a handshake. Distinct from `0` (not a
+/// clean exit) and from `1` (not a failure of anything this process was asked to do).
 pub(super) const EXIT_SUPERVISOR_GONE: i32 = 70;
 /// What this process says on its way out when the Supervisor's control socket is gone, split on
 /// whether it holds `ext_session_lock_v1` at that moment (ADR-0059 decisions 1 and 2).
@@ -152,7 +152,7 @@ impl App {
     ///
     /// The entry is what makes the retained scene resolve this instance's tree at all, letting an
     /// in-place reload restyle a live lock screen, and it is the only record that this config
-    /// declares a lock screen -- the fact ADR-0052 decision 3 refuses a lock on the absence of.
+    /// declares a lock screen, the fact ADR-0052 decision 3 refuses a lock on the absence of.
     /// [`App::set_session_lock`] asks that question by looking for these entries.
     ///
     /// No `visible` is consulted and there is none to consult: `layout::node::lock_spec` refuses the
@@ -180,19 +180,19 @@ impl App {
     }
 
     /// One `ext_session_lock_surface_v1` for every declared `lock` instance that does not have one
-    /// yet, or nothing at all if this process holds no lock (build-steps.md Phase 23 item 1).
+    /// yet, or nothing at all if this process holds no lock.
     ///
     /// Idempotent per output, a protocol requirement, not tidiness: a second lock surface on one
     /// output is a `duplicate_output` error, killing the connection with the session still locked.
     /// `expand_instances` produces one `lock` instance per output per declared lock spec
     /// (ADR-0052 decision 2), so "this instance already has a surface" and "this output already
-    /// has one" agree only while a config declares at most one `lock` -- which `crate::socket`'s
-    /// `surface_specs` now refuses to let through. The `surface: None` pattern below is the
+    /// has one" agree only while a config declares at most one `lock`, which `crate::socket`'s
+    /// `surface_specs` refuses to let through. The `surface: None` pattern below is the
     /// per-instance half of that invariant; the refusal is the other half.
     ///
     /// Three callers, one job: "make the set of lock surfaces match the set of outputs" is the same
     /// job whenever either set moves. Right after `lock` succeeds, since the protocol asks clients to
-    /// immediately create lock surfaces for all outputs present -- the compositor may wait for them
+    /// immediately create lock surfaces for all outputs present. The compositor may wait for them
     /// before sending `locked`, and a client that waits for `locked` first guarantees a blank frame
     /// for however long the compositor's time limit is. Again on `locked` itself, for an output
     /// advertised inside that window. And from [`App::create_surfaces`], the hotplug path.
@@ -293,7 +293,7 @@ impl App {
                     self.session_lock = Some(lock);
                     // Armed here rather than on `locked`. A reload landing between the request and
                     // the grant would otherwise strip the password field out of the very tree the
-                    // compositor is about to put on screen -- see `crate::socket`'s
+                    // compositor is about to put on screen. See `crate::socket`'s
                     // `lock_stays_authenticatable`, which is also why nothing but the fact of the
                     // lock is handed over: the ids the guard above answered on are the ids that
                     // existed *now*, and a monitor hotplug retires and replaces them.
@@ -323,13 +323,13 @@ impl App {
     /// sends only from the `pam_outcomes` arm of its `select!` loop, on a `PamOutcome::Success`.
     /// That makes "never unlock except on a successful authentication" a property of one call site
     /// in the Supervisor rather than a rule the Renderer has to be trusted with. No convenience
-    /// path may be added here -- not on shutdown, not on a `finished`, not on a config reload.
+    /// path may be added here: not on shutdown, not on a `finished`, not on a config reload.
     /// SCTK's `Drop` deliberately does not unlock, and the reason is the whole security model: a
     /// Renderer that dies while locked leaves the session locked, and anything in this file that
     /// unlocked on its own initiative would be the one way to turn a crash into an unlocked desktop.
     ///
-    /// `SessionLock::unlock` is itself a no-op unless `is_locked()`, so the in-flight case -- a
-    /// `lock` request whose `locked` has not arrived -- sends nothing and the `Drop` below sends the
+    /// `SessionLock::unlock` is itself a no-op unless `is_locked()`, so the in-flight case, a
+    /// `lock` request whose `locked` has not arrived, sends nothing and the `Drop` below sends the
     /// plain `destroy` the protocol requires there instead. That is also why [`run`] round-trips
     /// before calling this: `is_locked()` is set when `locked` is dispatched, not when the
     /// compositor sends it, so without that round trip an unread `locked` would make this send a
@@ -371,7 +371,7 @@ impl App {
     /// lock surfaces mapped and everything else hidden, reaching the config as `oblisk.lock` instead.
     ///
     /// Nothing clears this again on purpose: a later successful evaluation clears `rescue` on its own
-    /// success path (`RendererClient::handle_reevaluate`), the event that matters -- the ordinary way
+    /// success path (`RendererClient::handle_reevaluate`), the event that matters: the ordinary way
     /// out of `NO_LOCK_DECLARED` is editing the config to declare a lock screen, which is itself a
     /// re-evaluation.
     fn refuse_lock(&mut self, reason: &str) {
@@ -382,7 +382,7 @@ impl App {
 
     /// Queues one `LockReport` on the outbound channel, the way `ReadySignal` and
     /// `PresentationEvidence` are queued. Every lock state change goes through here, so the
-    /// Supervisor's `lock::apply` sees each transition exactly once -- its `active` flag moves on
+    /// Supervisor's `lock::apply` sees each transition exactly once. Its `active` flag moves on
     /// these reports alone and on nothing it ordered itself.
     fn report_lock(&mut self, outcome: LockOutcome) {
         if let Err(e) = self.outbound_tx.send(RendererFrame::LockReport(LockReport { outcome })) {
@@ -443,7 +443,7 @@ impl SessionLockHandler for App {
     /// unlocked and the shell is dead, with the `rescue` message set below never reaching a surface.
     ///
     /// This is not the convenience path ADR-0042 forbids: that rule is about initiating an
-    /// unlock, and the compositor initiated this one through its own secure mechanism --
+    /// unlock, and the compositor initiated this one through its own secure mechanism:
     /// `finished` is documented as "the compositor has decided that the session lock should be
     /// destroyed". The one path that ends a live lock is still [`App::release_session_lock`],
     /// reached only from a `SetSessionLock { locked: false }`.
@@ -467,7 +467,7 @@ impl SessionLockHandler for App {
         // For a denial (no `locked`), `SessionLockInner::Drop`'s plain `destroy` is the correct
         // verb and this is what sends it.
         self.session_lock = None;
-        // Whichever of the two events this was, no lock is held now -- disarmed for
+        // Whichever of the two events this was, no lock is held now. Disarmed for
         // [`App::release_session_lock`]'s reason.
         self.client.set_session_locked(false);
         let reason = match &outcome {
@@ -480,7 +480,7 @@ impl SessionLockHandler for App {
     }
 
     /// One `ext_session_lock_surface_v1.configure`, already acked by SCTK's own `Dispatch2` before
-    /// this runs -- so nothing here acks, exactly as the `window` and `popup` paths don't ack their
+    /// this runs, so nothing here acks, exactly as the `window` and `popup` paths don't ack their
     /// `xdg_surface`.
     ///
     /// Everything after the lookup is [`App::bind_and_clear`], shared verbatim with the other three

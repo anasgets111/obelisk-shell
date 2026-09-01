@@ -74,7 +74,7 @@ function util.count(list)
 end
 
 -- An `app_id` to its `.desktop` entry, through `oblisk.applications`'s own `by_app_id` map
--- (docs/adr/0061). Three callers want this and each holds a differently-spelled id:
+-- (ADR-0061). Three callers want this and each holds a differently-spelled id:
 -- `modules/global/launcher.lua` has a real desktop file id, `modules/bar/indicators/active_window.lua`
 -- has whatever the compositor reports as a toplevel's `app_id`, and
 -- `modules/bar/indicators/sys_tray.lua` has a StatusNotifierItem's self-declared `Id`.

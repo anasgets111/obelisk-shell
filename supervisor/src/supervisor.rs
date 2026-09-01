@@ -8,11 +8,10 @@
 //! branch and `&mut supervisor` in another compile fine, and the departure arm relies on that.
 //!
 //! One thing this buys that a comment could not. Several operations below must address the
-//! *authoritative* generation and never the one a frame arrived from. That used to be
-//! `authoritative.generation_id` passed by hand at each of those call sites, guarded by a comment
-//! (`RequestReload`'s "deliberately uses authoritative.generation_id, not inbound.generation_id");
-//! now there is no parameter to get wrong. The sends that legitimately target the reporting
-//! generation, `hydrate` and `answer_unchanged_report`, take it as an argument and say so.
+//! *authoritative* generation and never the one a frame arrived from, and there is no parameter
+//! to get wrong: `self.authoritative.generation_id` is read directly rather than passed by hand
+//! at each call site. The sends that legitimately target the reporting generation, `hydrate` and
+//! `answer_unchanged_report`, take it as an argument and say so.
 //!
 //! Not testable in isolation, and it is worth saying why rather than leaving the reader to find
 //! out: [`Capabilities`] needs a live system bus, so no unit test can build a `Supervisor`. The
@@ -87,7 +86,7 @@ pub(crate) struct Supervisor {
     /// The last StateSnapshot pushed per capability, keyed by name -- hydrates a fresh
     /// Candidate's first evaluation (§ 15.2 point 1; ADR-0029).
     last_snapshots: HashMap<String, shared::StateSnapshot>,
-    /// The most recently sent `Reevaluate`'s sequence (ADR-0024 item 2).
+    /// The most recently sent `Reevaluate`'s sequence (ADR-0024).
     next_sequence: u64,
     /// The id the next spawned generation gets, whether a PBA candidate or a crash replacement.
     next_generation_id: u32,
@@ -112,7 +111,7 @@ pub(crate) struct Supervisor {
 
 impl Supervisor {
     /// `boot_child` is generation 0, spawned before this so a spawn failure stays fatal to `main`
-    /// (ADR-0025 item 7).
+    /// (ADR-0025).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         registry: socket::GenerationRegistry,
@@ -198,7 +197,7 @@ impl Supervisor {
 
     /// Answers an `Unchanged` report: clears the reporting generation's idle registrations and
     /// sends the go-ahead, unless a newer `Reevaluate` already went out for this generation, in
-    /// which case the go-ahead must not fire for a superseded evaluation (ADR-0024 item 2).
+    /// which case the go-ahead must not fire for a superseded evaluation (ADR-0024).
     ///
     /// Addressed to the reporter, not the authoritative generation: the apply lands on whoever
     /// evaluated.
@@ -401,7 +400,7 @@ impl Supervisor {
             .await
         {
             Ok(outcome) => {
-                // ADR-0043 decision 1 item 3: the widest point of the handoff -- the Candidate
+                // ADR-0043 decision 1: the widest point of the handoff -- the Candidate
                 // has presented (run_pba returned Ok) and the superseded generation still owns
                 // every buffer, so both are fully resident. Sampled here rather than inside the
                 // swap, which reaps one of the two processes it would be measuring.

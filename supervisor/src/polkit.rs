@@ -2,7 +2,7 @@
 //!
 //! The real D-Bus method (verified against polkit's own source and introspection XML) is
 //! `RegisterAuthenticationAgent(subject: (sa{sv}), locale: s, object_path: s) -> ()`, not
-//! `RegisterAgent` as build-steps.md names it. The call-out uses `zbus_polkit`'s `Authority`
+//! `RegisterAgent`. The call-out uses `zbus_polkit`'s `Authority`
 //! proxy and `Subject` type directly rather than hand-deriving matching zvariant types
 //! (ADR-0013).
 //!
@@ -37,8 +37,7 @@ pub fn current_session_subject() -> Result<Subject, std::env::VarError> {
 
 /// The `Subject` half of [`current_session_subject`], split off the `$XDG_SESSION_ID` read so a
 /// test can check the shape without setting the variable. `set_var` races every other thread in
-/// the test binary that reads the environment, which is why Rust 2024 made it `unsafe`, and two
-/// tests here setting this one to different values is exactly the race that used to fire.
+/// the test binary that reads the environment, which is why Rust 2024 made it `unsafe`.
 fn session_subject(session_id: String) -> Subject {
     let mut subject_details = HashMap::new();
     subject_details.insert(
@@ -87,9 +86,8 @@ pub fn first_unix_user_uid(identities: &[(String, HashMap<String, OwnedValue>)])
 /// ponytail: `begin_authentication` only forwards the parsed challenge over a channel; it
 /// does not drive a PAM conversation or push the challenge to the Renderer over IPC. Neither
 /// exists yet in this dependency tree (no PAM crate) or codebase (no IPC socket server, no
-/// `textfield` scene node) to hand the challenge to. See
-/// ADR-0015-polkit-pam-conversation-and-textfield-wiring-deferred.md for the real flow
-/// this stands in for and what unblocks it.
+/// `textfield` scene node) to hand the challenge to. See ADR-0015 for the real flow this
+/// stands in for and what unblocks it.
 pub struct AuthenticationAgent {
     challenges: UnboundedSender<BeginAuthenticationCall>,
 }
@@ -131,9 +129,9 @@ impl AuthenticationAgent {
 /// The authentication agent, held unregistered until a config declares a `secure_submit` that
 /// names polkit (ADR-0070 decisions 5 and 6).
 ///
-/// Registration used to be the fourth statement of `run_supervisor` and propagated with `?`, which
-/// meant "An authentication agent already exists for the given subject" -- the normal answer on a
-/// machine running any other desktop -- stopped the shell from starting at all.
+/// A registration failure is logged, not propagated with `?`. "An authentication agent already
+/// exists for the given subject" is the normal answer on a machine running any other desktop, and
+/// it must not stop the shell from starting.
 pub struct PolkitAgent {
     /// Taken by the first [`Self::register`] call, so a second is a no-op rather than a second
     /// `RegisterAuthenticationAgent` for the same subject.
@@ -154,9 +152,8 @@ impl PolkitAgent {
                 eprintln!(
                     "polkit: $XDG_SESSION_ID names no session to register an agent for; agent disabled for this run: {err}"
                 );
-                // Dropped rather than left for a later call to retry, which is the ordering the
-                // previous shape got by taking the agent before this lookup: the variable will
-                // not appear mid-run, so a second attempt would fail the same way.
+                // Dropped rather than left for a later call to retry: `$XDG_SESSION_ID` will not
+                // appear mid-run, so a second attempt would fail the same way.
                 self.agent = None;
             }
         }
@@ -203,7 +200,7 @@ mod tests {
 
     /// A stand-in for polkitd's own `org.freedesktop.PolicyKit1.Authority` object, exported
     /// on the peer end of a p2p connection so `register_agent`'s real wire call can be
-    /// exercised without a live system bus (docs/oblisk-tdd-test-harness.md §2.2).
+    /// exercised without a live system bus.
     struct MockAuthority {
         calls: mpsc::UnboundedSender<(Subject, String, String)>,
     }

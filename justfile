@@ -66,7 +66,7 @@ docs:
 # `lua` above proves a file parses. This proves `dev-config` agrees with `lua-meta`, which is what
 # an author's editor will tell them: same engine, same `.luarc.json`, same stub directory. It is
 # the reason `lua-meta/nodes.lua` now spells `|Signal` on every union that takes one -- 21 of them
-# did not, and each was a red squiggle under working config code (docs/adr/0081).
+# did not, and each was a red squiggle under working config code (ADR-0081).
 #
 # `lua-meta` is checked as its own workspace as well as being the others' library, because a
 # library's own diagnostics are suppressed. That hole hid a real one: `---@return T a, b` is two

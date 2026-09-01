@@ -12,8 +12,8 @@ resolver = "2"
 # IDL field added or changed, patch for everything else. A config gates on it with
 # `oblisk.version.minor >= n`.
 #
-# Not in force yet, which is why IDL changes keep landing against 0.1.0 (docs/adr/0069's `scroll`,
-# docs/adr/0078's `exclusive`). Nothing has been pushed to origin, so this number informs nobody and
+# Not in force yet, which is why IDL changes keep landing against 0.1.0 (ADR-0069's `scroll`,
+# ADR-0078's `exclusive`). Nothing has been pushed to origin, so this number informs nobody and
 # 0.1.0 is a placeholder. The first push starts it; until then, do not bump, and do not re-litigate
 # the gap between this comment and the log every time an IDL field moves.
 [workspace.package]
@@ -48,5 +48,5 @@ strip = true
 # This costs a branch per arithmetic op and buys a clean abort instead. The architecture is already
 # built to absorb one: release is `panic = "abort"` and `supervisor/src/generation.rs`'s
 # `classify_departure` reads the signal, logs it, and restarts behind the crash-loop brake
-# (docs/adr/0058 decision 3). Cheaper than being wrong quietly.
+# (ADR-0058 decision 3). Cheaper than being wrong quietly.
 overflow-checks = true

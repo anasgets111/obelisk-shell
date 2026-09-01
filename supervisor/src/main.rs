@@ -32,7 +32,7 @@ use socket::send_frame_logged;
 use supervisor::Supervisor;
 
 /// How long the Watcher waits after the last relevant `shell.lua` change before dispatching a
-/// reload -- coalesces a multi-event save into one round trip. Fixed (ADR-0024 item 6).
+/// reload -- coalesces a multi-event save into one round trip. Fixed (ADR-0024).
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// § 15.2/15.3's ready-signal and evidence-verification deadlines (`reload::PbaTimings`), scaled
@@ -47,7 +47,7 @@ const PBA_TIMINGS: reload::PbaTimings = reload::PbaTimings {
 
 /// Whether an `Unchanged` report's `sequence` still names the most recently sent `Reevaluate`.
 /// A mismatch means a newer `Reevaluate` already went out for this generation, so the go-ahead
-/// must not fire for a superseded evaluation (ADR-0024 item 2).
+/// must not fire for a superseded evaluation (ADR-0024).
 fn is_current_reload(report_sequence: u64, next_sequence: u64) -> bool {
     report_sequence == next_sequence
 }
@@ -236,7 +236,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     let config_dir = shared::config_dir()?;
     let mut reload_events = watcher::spawn_watcher(&config_dir, RELOAD_DEBOUNCE)?;
 
-    // Generation 0 is boot-spawned by the Supervisor itself (ADR-0025 item 7) -- there is no
+    // Generation 0 is boot-spawned by the Supervisor itself (ADR-0025) -- there is no
     // shell without it, so a spawn failure here is fatal to main.
     let renderer_path = renderer_binary_path()?;
     let renderer_path_str = renderer_path.to_string_lossy().into_owned();
@@ -445,8 +445,8 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     // catch-all arm below. No pending-intent lookup, unlike polkit/network: the
                     // lock screen's submission carries everything needed.
                     //
-                    // try_begin_authentication refuses a submit with no lock held (build-steps.md
-                    // Phase 23 item 3) and a second submit while one is in flight. The acquisition
+                    // try_begin_authentication refuses a submit with no lock held and a second
+                    // submit while one is in flight. The acquisition
                     // it returns is carried through the worker so pam_outcomes above can tell
                     // this lock's answer from the one before it.
                     if let Some(acquisition) = supervisor.lock.try_begin_authentication() {
@@ -471,9 +471,9 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     }
                 }
                 RendererFrame::SecureSubmit(mut submit) => {
-                    // build-steps.md Phase 15 item 2 (ADR-0015 item 2's textfield/IPC half): a
-                    // channel-forward-and-log placeholder for every capability/action other than
-                    // the guarded arms above, none of which exist yet.
+                    // A channel-forward-and-log placeholder for every capability/action other
+                    // than the guarded arms above (ADR-0015's textfield/IPC half), none of
+                    // which exist yet.
                     //
                     // Never log the secret -- only its length -- and log before zeroizing, so the
                     // length read happens before the clear.

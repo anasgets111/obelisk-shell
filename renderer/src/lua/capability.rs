@@ -1,6 +1,5 @@
 //! The `oblisk` namespace's capability objects: one capability's read signal, its revision, and
-//! § 3.2's write path on the same handle (build-steps.md Phase 25 items 1 and 2, ADR-0052
-//! decision 1).
+//! § 3.2's write path share the same handle (ADR-0052 decision 1).
 //!
 //! [`CommandSender::send`] builds an envelope from `{capability, action, arguments}` and knows
 //! nothing about locking, so every § 3.2 write command lands on it rather than each growing a
@@ -20,11 +19,11 @@
 //! ponytail: the write method is spelled `capability:invoke("action", ...)` rather than § 3.2's
 //! `capability:action(...)`. § 7.1 wants the engine to "intercept all method invocations on
 //! exported singletons", which is an `__index` metamethod handing back a closure bound to
-//! whatever name was looked up -- the upgrade path, and it is deliberately not taken yet. A
-//! generated closure cannot tell `cap.lock()` from `cap:lock()` (the second passes the userdata
-//! as argument one, and ADR-0052 decision 1's own example uses the first spelling while § 3.2
-//! uses the second), so the sugar has to settle that ambiguity before it is worth the indirection
-//! of turning every typo'd field read into a callable.
+//! whatever name was looked up: the upgrade path, deliberately not taken yet. A generated closure
+//! cannot tell `cap.lock()` from `cap:lock()` (the second passes the userdata as argument one, and
+//! ADR-0052 decision 1's own example uses the first spelling while § 3.2 uses the second), so the
+//! sugar has to settle that ambiguity before it is worth the indirection of turning every typo'd
+//! field read into a callable.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -69,7 +68,7 @@ impl CommandSender {
     /// Asks the Supervisor to construct `capability`'s controller, once per generation.
     ///
     /// The Supervisor drops a repeat itself (ADR-0070 decision 3), so the local set is not what
-    /// makes this correct -- it is what keeps a `map` over `oblisk.audio` that re-resolves on every
+    /// makes this correct: it is what keeps a `map` over `oblisk.audio` that re-resolves on every
     /// layout pass from writing a frame per pass.
     pub(crate) fn start_capability(&self, capability: &str) {
         if !self.started.borrow_mut().insert(capability.to_string()) {
@@ -91,8 +90,8 @@ impl CommandSender {
     /// § 7.2's envelope, queued rather than written: see the module doc comment.
     ///
     /// `expected_revision` is the revision of the last `StateSnapshot` this capability hydrated
-    /// from -- § 7.3's staleness half: names which read a write was reacting to. [`CapabilityHandle`]
-    /// keeps it current.
+    /// from, § 7.3's staleness half: it names which read a write was reacting to.
+    /// [`CapabilityHandle`] keeps it current.
     ///
     /// `0` is not a revision any push can produce (`supervisor::snapshot::bump_revision` starts at
     /// `1`), so it means "never hydrated in this Renderer": honest for a write before the first
@@ -143,7 +142,7 @@ impl Capability {
     /// Builds one `oblisk.<name>` member and the handle `socket::RendererClient` hydrates it
     /// through. Returned together because the value and the revision must move as one: a `set`
     /// that missed its matching revision bump would stamp the previous read onto a write reacting
-    /// to the current one -- the race § 7.3 exists to drop.
+    /// to the current one: the race § 7.3 exists to drop.
     pub fn new(name: &str, dirty: DirtyFlag, commands: CommandSender) -> (Self, CapabilityHandle) {
         // `nil` until the Supervisor's first push (ADR-0037), paired with revision `0`, which no
         // push can produce.

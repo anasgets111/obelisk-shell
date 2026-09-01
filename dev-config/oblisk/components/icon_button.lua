@@ -6,7 +6,7 @@
 --
 -- This took an icon *theme name* and drew an `icon` node until now, and that is the single change
 -- that makes this bar look like the one it mirrors. A themed icon is artwork looked up by name
--- (docs/adr/0054) and paints in its own colours: `PaintStyle::Icon` carries no tint, so a bluetooth
+-- (ADR-0054) and paints in its own colours: `PaintStyle::Icon` carries no tint, so a bluetooth
 -- icon cannot go accent-coloured when a device connects and an update icon cannot go red on
 -- failure. Every state this bar wants to show had to be spelled as a word beside the icon instead,
 -- which is why the old bar read "bt", "apps", "up to date" where the mirror shows one glyph that
@@ -49,7 +49,7 @@ return function(glyph, on_activate, opts)
     local base_hover = opts.background_hover or theme.GLASS_CONTROL_HOVER
 
     -- One `hover(slot)` call, reused across the four properties that read it. The registry is
-    -- name-keyed so a second call returns the same signal (docs/adr/0062 decision 2), but naming the
+    -- name-keyed so a second call returns the same signal (ADR-0062 decision 2), but naming the
     -- slot four times reads as four regions.
     local hovered = opts.slot and hover(opts.slot) or nil
 

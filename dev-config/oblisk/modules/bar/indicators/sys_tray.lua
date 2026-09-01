@@ -48,7 +48,7 @@ local function artwork(item)
 end
 
 -- The ceiling, not the width. A session that registers a dozen items scrolls rather than taking
--- the whole zone (docs/adr/0069). The mirror has no cap because a QML `RowLayout` shrinks its
+-- the whole zone (ADR-0069). The mirror has no cap because a QML `RowLayout` shrinks its
 -- children; a `row` here does not.
 local TRAY_WIDTH = theme.s(150, 110)
 

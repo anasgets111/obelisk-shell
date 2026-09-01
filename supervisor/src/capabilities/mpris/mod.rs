@@ -1,13 +1,16 @@
 //! Media players (`oblisk.mpris`, docs/oblisk-supervisor-services-dbus.md §3;
-//! docs/oblisk-hardware-event-pipeline.md §3; docs/oblisk-idl-api-specs.md §2.8; ADR-0036).
+//! docs/oblisk-idl-api-specs.md §2.8; ADR-0036).
 //!
 //! Supervisor-owned session-bus MPRIS player discovery and zero-polling progress-sync state,
 //! so `mpris.players` survives a Renderer crash/reload the same way idle/lock authority does
-//! (ADR-0010). Hand-written `#[zbus::proxy]` traits (`proxies.rs` -- no maintained zbus proxy
-//! crate for MPRIS), a `HashMap<bus_name, entry>` dynamic registry hydrated live and kept live
-//! via one forwarder task per tracked player (`player.rs`), a `*Controller` struct owning that
-//! registry plus write-action dispatch (`controller.rs`), and pure parsing/comparison helpers
-//! unit-testable without a live D-Bus connection (`metadata.rs`).
+//! (ADR-0010). Position is captured once with a monotonic timestamp rather than polled; a
+//! progress bar interpolates the elapsed time client-side. Seeking reads a live position over
+//! D-Bus on demand instead of tracking one continuously. Hand-written `#[zbus::proxy]` traits
+//! (`proxies.rs` -- no maintained zbus proxy crate for MPRIS), a `HashMap<bus_name, entry>`
+//! dynamic registry hydrated live and kept live via one forwarder task per tracked player
+//! (`player.rs`), a `*Controller` struct owning that registry plus write-action dispatch
+//! (`controller.rs`), and pure parsing/comparison helpers unit-testable without a live D-Bus
+//! connection (`metadata.rs`).
 //!
 //! MPRIS players never register with anything -- discovery is active (`watcher.rs`):
 //! `ListNames` scanned once at startup, then `NameOwnerChanged` watched for the

@@ -1,13 +1,11 @@
-//! Glyph rasterization and GPU texture atlas management, via FemtoVG (build-steps.md
-//! Phase 4, point 2).
+//! Glyph rasterization and GPU texture atlas management, via FemtoVG.
 //!
 //! FemtoVG owns its glyph atlas entirely internally (see ADR-0012): rasterized glyphs pack
 //! into private atlas pages that start at a fixed size and grow by adding further pages, not by
-//! expanding one large texture -- there is no public API to configure a single fixed-size page
-//! the way build-steps.md's "2048x2048" literally describes, and no public API to feed it glyphs
-//! shaped by anything other than FemtoVG's own internal shaper. This module drives FemtoVG's
-//! atlas through its public font/text API (`add_font_mem`, `fill_text`) rather than
-//! reimplementing packing on top of it.
+//! expanding one large texture. There is no public API to configure a single fixed-size page,
+//! and no public API to feed it glyphs shaped by anything other than FemtoVG's own internal
+//! shaper. This module drives FemtoVG's atlas through its public font/text API (`add_font_mem`,
+//! `fill_text`) rather than reimplementing packing on top of it.
 
 use std::error::Error;
 use std::ffi::c_void;
@@ -88,8 +86,8 @@ impl TextPainter {
     }
 
     /// The same canvas `draw_line` fills text onto, exposed so `layout::paint`'s tree walk can
-    /// draw a node's background/border on it too (build-steps.md Phase 19 item 6, ADR-0023)
-    /// -- one canvas per surface, shared by every paint operation, not one per property kind.
+    /// draw a node's background/border on it too (ADR-0023): one canvas per surface, shared by
+    /// every paint operation, not one per property kind.
     pub fn canvas_mut(&mut self) -> &mut Canvas<OpenGl> {
         &mut self.canvas
     }
@@ -102,10 +100,9 @@ impl TextPainter {
         &self.fonts
     }
 
-    /// Draws `text` with its snapped top-left corner at `rect`'s origin (build-steps.md
-    /// Phase 4, point 3) in `color`. Does not flush or swap buffers -- `layout::paint`'s tree
-    /// walk draws a whole surface's worth of nodes onto this same canvas and flushes once at
-    /// the end (build-steps.md Phase 19 item 6).
+    /// Draws `text` with its snapped top-left corner at `rect`'s origin, in `color`. Does not
+    /// flush or swap buffers: `layout::paint`'s tree walk draws a whole surface's worth of
+    /// nodes onto this same canvas and flushes once at the end.
     pub fn draw_line(
         &mut self,
         text: &str,

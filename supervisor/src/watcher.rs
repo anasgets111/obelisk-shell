@@ -1,5 +1,4 @@
-//! Supervisor-side config-file watcher (build-steps.md Phase 13, extended by Phase 26 item 3;
-//! `CONTEXT.md`, Watcher; ADR-0047 decision 3).
+//! Supervisor-side config-file watcher (`CONTEXT.md`, Watcher; ADR-0047 decision 3).
 //!
 //! Watches the whole config directory tree (`~/.config/oblisk/` and everything under it, not
 //! just `shell.lua`) for changes to any `.lua` file, debounced: a burst of events one save
@@ -400,8 +399,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_write_to_a_non_shell_lua_file_at_the_top_level_still_fires_a_trigger() {
-        // Pins Phase 26 item 3: any .lua file matches, not just the literal name shell.lua, since
-        // a config can be split across files (ADR-0047).
+        // Any .lua file matches, not just the literal name shell.lua, since a config can be
+        // split across files (ADR-0047).
         let dir = tempfile::tempdir().unwrap();
         let mut rx = spawn_watcher(dir.path(), SHORT_DEBOUNCE).unwrap();
 

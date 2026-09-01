@@ -1,4 +1,4 @@
--- A hover tooltip: a `popup` that follows one hover slot (docs/adr/0062).
+-- A hover tooltip: a `popup` that follows one hover slot (ADR-0062).
 --
 -- Two bindings and no state machine, which is the whole reason hover is a signal rather than a
 -- callback. `visible` takes the boolean and `anchor_rect` takes the rect the engine wrote beside

@@ -1,4 +1,4 @@
-//! 4-byte big-endian length-prefixed wire framing (build-steps.md Phase 9).
+//! 4-byte big-endian length-prefixed wire framing.
 //!
 //! Generic over `AsyncRead`/`AsyncWrite` so both a real `UnixStream` and an in-memory duplex pipe
 //! drive the same code in tests -- no filesystem needed to exercise framing correctness.

@@ -80,7 +80,6 @@ struct ParsedStream {
     app_name: Option<String>,
 }
 
-/// Whether `props` is a playback stream node (`media.class == "Stream/Output/Audio"`).
 fn is_stream_output_audio(props: &impl PropsLookup) -> bool {
     props.get_prop(*keys::MEDIA_CLASS) == Some(STREAM_OUTPUT_AUDIO)
 }
@@ -107,7 +106,7 @@ pub(super) fn classify(props: &impl PropsLookup) -> Option<NodeKind> {
 
 /// Parses `props` into a [`ParsedStream`] if it's a `Stream/Output/Audio` node with a valid
 /// `application.process.id`. `None` for anything else, including a stream node PipeWire hasn't
-/// finished populating yet (see the module doc comment).
+/// finished populating yet (see [`apply_info_event`]).
 fn parse_stream_props(props: &impl PropsLookup) -> Option<ParsedStream> {
     if !is_stream_output_audio(props) {
         return None;
@@ -146,11 +145,10 @@ fn build_app_stream(node_id: u32, props: &impl PropsLookup) -> Option<AppStream>
 
 /// Applies one bound node's `info` event to `apps`. `has_props_change` is whether the event's
 /// `change_mask` included `NodeChangeMask::PROPS` -- a state-only or params/ports-only info
-/// event carries an empty props dict instead (see the module doc comment). Skipping the
-/// upsert/remove decision on those keeps a still-live stream from being dropped over an
-/// unrelated notification. Safe to gate unconditionally: PipeWire's `global_bind` always sends
-/// the first `info` call for a freshly bound node with every change-mask bit set, PROPS
-/// included.
+/// event carries an empty props dict instead. Skipping the upsert/remove decision on those keeps
+/// a still-live stream from being dropped over an unrelated notification. Safe to gate
+/// unconditionally: PipeWire's `global_bind` always sends the first `info` call for a freshly
+/// bound node with every change-mask bit set, PROPS included.
 pub(super) fn apply_info_event(
     apps: &mut AudioApps,
     node_id: u32,

@@ -6,7 +6,7 @@ mod socket;
 mod text;
 mod wayland;
 
-/// Two OS threads, two channels (ADR-0039, build-steps.md Phase 18). `wayland::run` owns the
+/// Two OS threads, two channels (ADR-0039). `wayland::run` owns the
 /// main thread: the Wayland dispatch loop, EGL, the Lua VM, the retained `Scene`, and the live
 /// signals all live there, because `mlua::Lua` is `!Send` and the scene has to be reachable from
 /// the thread that holds the GL context. `socket::spawn_client` owns one dedicated I/O thread with

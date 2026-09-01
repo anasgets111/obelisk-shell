@@ -14,15 +14,15 @@ use crate::image::Fit;
 
 use super::*;
 
-/// Absent `content` defaults to the empty string. It used to be required, but decision 1's nil
-/// rule (ADR-0044) means a `text` bound to a bare, not-yet-pushed capability signal resolves
-/// `content` to absent at boot, since every rostered signal reads `nil` until its first
-/// `StateSnapshot` and `run_startup_evaluation` runs before the poll loop drains one. Rejecting
-/// that would reject the whole tree and boot a blank shell.
+/// Absent `content` defaults to the empty string: decision 1's nil rule (ADR-0044) means a `text`
+/// bound to a bare, not-yet-pushed capability signal resolves `content` to absent at boot, since
+/// every rostered signal reads `nil` until its first `StateSnapshot` and `run_startup_evaluation`
+/// runs before the poll loop drains one. Rejecting that would reject the whole tree and boot a
+/// blank shell.
 ///
-/// Accepted cost: a misspelled `content` key now renders an empty node instead of being rejected --
-/// the better failure for a shell that has to boot; `oblisk.rescue` still exists for the failures
-/// that matter.
+/// Accepted cost: a misspelled `content` key now renders an empty node instead of being rejected.
+/// That is the better failure for a shell that has to boot; `oblisk.rescue` still exists for the
+/// failures that matter.
 pub fn parse_content(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     parse_optional_string(properties, "content")
 }
@@ -89,7 +89,7 @@ fn parse_optional_string(properties: &HashMap<String, Value>, property: &str) ->
     }
 }
 
-/// `text.foreground` (§ 5.2 item 4). Absent defaults to white -- `layout::paint`'s `paint_text`
+/// `text.foreground` (§ 5.2 item 4). Absent defaults to white: `layout::paint`'s `paint_text`
 /// falls back to the same white whenever this parser errors on a present-but-malformed value, so
 /// the rendered result agrees whether the key was omitted or rejected.
 /// Where a run of glyphs sits inside the box the node was given, as distinct from where the node
@@ -114,7 +114,7 @@ pub enum TextAlign {
 /// What to do with a run of text too wide for the box it was given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Elide {
-    /// Let the clip cut it off mid-glyph, which is what every `text` did before this existed.
+    /// Let the clip cut it off mid-glyph.
     #[default]
     None,
     /// Drop trailing characters and finish with a single-character ellipsis.
@@ -231,17 +231,17 @@ pub(super) fn parse_string_property(
 }
 
 /// A top-level surface's `id`: required, unique among the surfaces in one config, and keys
-/// `Scene::apply`'s `HashMap` (`docs/oblisk-layout-engine-geometry.md` § 4). Since ADR-0045,
-/// this same property is also the surface's *reconcile* identity: the root of a tree is the one
-/// node whose retained counterpart is found by key lookup rather than by [`parse_node_id`]'s
-/// per-parent pairing, because a surface has no parent to be scoped within -- decision 5 is
-/// explicit that this is the same mechanism restated at the level below, not a second one.
+/// `Scene::apply`'s `HashMap` for keyed reconciliation (ADR-0045). This same property is also
+/// the surface's *reconcile* identity: the root of a tree is the one node whose retained
+/// counterpart is found by key lookup rather than by [`parse_node_id`]'s per-parent pairing,
+/// because a surface has no parent to be scoped within. Decision 5 is explicit that this is
+/// the same mechanism restated at the level below, not a second one.
 pub fn parse_surface_id(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     parse_string_property(properties, "id", None)
 }
 
 /// The optional `id` base property on every node kind, one level below a surface's root
-/// (ADR-0045 decisions 1-2). `None` means "no id" and is not an error --
+/// (ADR-0045 decisions 1-2). `None` means "no id" and is not an error:
 /// `pair_children_by_id_then_position` pairs a child that carries none positionally against the
 /// other id-less children (ADR-0023's original rule applied to that subsequence). Adding or
 /// dropping an `id` is a change of identity, not a cosmetic edit: the retained counterpart is

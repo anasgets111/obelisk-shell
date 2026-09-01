@@ -153,10 +153,10 @@ pub enum FrameOutcome {
 /// **The field order below is load-bearing: `loader` must stay last.** Rust drops fields in
 /// declaration order, and almost every other field here holds `mlua::Value`s belonging to that
 /// `Loader`'s VM. Those values do not keep the VM alive (mlua 0.12's `ValueRef` holds a
-/// `WeakLua`; see [`ReloadState`]'s doc comment), so declaring `loader` first meant the `Lua` was
-/// dropped *before* them. It happens not to crash today only because `ValueRef::Drop` `try_lock`s
-/// and no-ops on a dead state -- but any read does lock, and `ValueRef::to_pointer` panics, which
-/// a `Debug` format of a `LoadOutput` reaches. Do not reorder `loader` back up.
+/// `WeakLua`; see [`ReloadState`]'s doc comment), so declaring `loader` first would drop the
+/// `Lua` before them. `ValueRef::Drop` `try_lock`s and no-ops on a dead state, so that alone
+/// would not crash -- but any read does lock, and `ValueRef::to_pointer` panics, which a `Debug`
+/// format of a `LoadOutput` reaches. Do not reorder `loader` back up.
 pub struct RendererClient {
     shell_lua_path: PathBuf,
     scene: Scene,
@@ -179,7 +179,7 @@ pub struct RendererClient {
     /// [`Self::instances`] instead, which `set_instances` keeps current.
     holds_session_lock: bool,
     /// A clone of the one `ShapingHandle` `crate::wayland::App` also holds -- one worker thread
-    /// and one `FontSystem` for the whole process (ADR-0023 item 8).
+    /// and one `FontSystem` for the whole process (ADR-0023).
     shaping: ShapingHandle,
     /// One handle per capability seen so far, keyed by `StateSnapshot.capability`
     /// (ADR-0029) -- every `shared::Capability::ALL` roster name is seeded at construction
@@ -300,11 +300,10 @@ impl RendererClient {
     /// actually differs from what is already in there.
     ///
     /// The early return is a correctness fix, not an optimization: writing through
-    /// `rescue_handle` marks the shared `DirtyFlag` (ADR-0044 decision 2), and rewriting an
-    /// unchanged value on a clean success path used to mark the scene dirty for nothing -- worse,
-    /// a `TopologyChanged` verdict left the flag set, mutating a generation's scene that must not
-    /// be mutated at all. Not the memoization ADR-0044 decision 3 rejects: a genuine rescue
-    /// transition still marks dirty.
+    /// `rescue_handle` marks the shared `DirtyFlag` (ADR-0044 decision 2). Rewriting an unchanged
+    /// value would mark the scene dirty for nothing, and on a `TopologyChanged` verdict would
+    /// leave the flag set, mutating a generation's scene that must not be mutated at all. Not the
+    /// memoization ADR-0044 decision 3 rejects: a genuine rescue transition still marks dirty.
     ///
     /// `pub` for the third caller, outside this module: `crate::wayland::App`'s
     /// `SessionLockHandler`, which ADR-0052 decision 4 requires to set `rescue` on a refused
@@ -323,11 +322,11 @@ impl RendererClient {
         }
     }
 
-    /// `StateSnapshot` pushes only hydrate `snapshot.capability`'s own live signal now -- no Lua
-    /// evaluation runs from this path any more (see the module doc comment). `&self`, not `&mut
-    /// self`: the lazy-registration path below needs interior mutability anyway, and
-    /// `capability_signals`'s own `RefCell` is what lets this stay a read-path method instead of
-    /// upgrading every caller to `&mut self`.
+    /// `StateSnapshot` pushes only hydrate `snapshot.capability`'s own live signal; no Lua
+    /// evaluation runs from this path (see the module doc comment). `&self`, not `&mut self`:
+    /// the lazy-registration path below needs interior mutability anyway, and `capabilities`'
+    /// own `RefCell` is what lets this stay a read-path method instead of upgrading every caller
+    /// to `&mut self`.
     fn apply_state_snapshot(&self, snapshot: StateSnapshot) -> mlua::Result<()> {
         let value = self.loader.to_lua_value(&snapshot.payload)?;
         // Value and revision together: the revision is what a later `oblisk.<name>:invoke(...)`
@@ -363,10 +362,10 @@ impl RendererClient {
 
     /// Evaluates `shell.lua` once at startup and applies it directly -- no round trip through the
     /// Supervisor needed, since there's no prior applied scene to protect yet. Leaves
-    /// `state.applied_topology` at `None` when the *evaluation* fails (ADR-0024 item 4): see
-    /// the module doc comment for why `None` also means "safe to apply". A failed *apply* no
-    /// longer clears it: the caller has already bound the declared surfaces, so a later topology
-    /// change genuinely needs a new generation (ADR-0038).
+    /// `state.applied_topology` at `None` when the *evaluation* fails (ADR-0024): see the module
+    /// doc comment for why `None` also means "safe to apply". A failed *apply* does not clear
+    /// it: the caller has already bound the declared surfaces, so a later topology change
+    /// genuinely needs a new generation (ADR-0038).
     ///
     /// Runs before any layer surface is bound (§ 15.2's order: evaluate, bind, null-buffer,
     /// signal ready). Split from the scene apply, forced by that same ordering: the caller needs
@@ -482,7 +481,7 @@ impl RendererClient {
 
     /// One instance's `available` size, replaced by the size the compositor actually configured
     /// that surface to, and the scene marked dirty so the next poll turn re-resolves it
-    /// (ADR-0023 item 6).
+    /// (ADR-0023).
     ///
     /// Reuses the one [`DirtyFlag`] ADR-0044 decision 2 already established: a configure and a
     /// capability push both mean the same thing to the scene, that the resolved geometry no
@@ -582,7 +581,7 @@ impl RendererClient {
             SupervisorFrame::ActivateDraw(activate) => return FrameOutcome::ActivateDraw(activate.nonce),
             SupervisorFrame::DeselectInput(DeselectInput { surface_id }) => {
                 // No per-surface input-region/focus machinery exists yet to hand this to
-                // (ADR-0025 item 4).
+                // (ADR-0025).
                 eprintln!(
                     "control-socket client: DeselectInput({surface_id}) received (no real input-region wiring yet)"
                 );
@@ -706,9 +705,9 @@ impl RendererClient {
     pub fn re_resolve_if_dirty(&mut self) -> bool {
         // `applied_output` is checked *before* the flag is taken, and that order is the whole
         // point: with nothing to re-resolve against there is nothing this call can do, so
-        // consuming the flag would silently discard the push that set it. Taking it first meant a
-        // config that failed its first apply swallowed every subsequent push and stayed blank
-        // until an inotify edit forced a re-evaluation.
+        // consuming the flag would silently discard the push that set it. Taking it first would
+        // let a config that fails its first apply swallow every subsequent push and stay blank
+        // until an inotify edit forces a re-evaluation.
         let Some(output) = self.state.applied_output.as_ref() else {
             return false;
         };
@@ -779,12 +778,12 @@ async fn run(
 ///
 /// The read and write directions each get their own long-lived loop, selected over as two whole
 /// futures rather than one frame each. `shared::framing::read_frame` does two sequential
-/// `read_exact` awaits, so partial progress lives in that future, not in `read_half` itself. The
-/// old shape -- `tokio::select!` racing one `read_json_frame` call against one
-/// `outbound_rx.recv()` -- dropped the read future whenever the outbound branch won first,
-/// discarding bytes already consumed, so the next iteration read a length prefix out of the
-/// middle of a JSON payload and desynced the connection. Neither loop below ever completes
-/// during normal operation, so `select!` never cancels a `read_exact` mid-frame.
+/// `read_exact` awaits, so partial progress lives in that future, not in `read_half` itself.
+/// Racing one `read_json_frame` call against one `outbound_rx.recv()` in a single `select!`
+/// would drop the read future whenever the outbound branch won, discarding bytes already
+/// consumed, so the next iteration would read a length prefix out of the middle of a JSON
+/// payload and desync the connection. Neither loop below ever completes during normal
+/// operation, so `select!` never cancels a `read_exact` mid-frame.
 async fn pump<R, W>(
     read_half: &mut R,
     write_half: &mut W,
@@ -853,12 +852,6 @@ fn frame_label(frame: &RendererFrame) -> &'static str {
     }
 }
 
-/// Logs each surface *instance*'s resolved geometry after a successful `scene.apply` --
-/// diagnostic visibility only.
-///
-/// Iterates instances rather than declared surfaces: one declared surface can be several
-/// instances, each resolved against a different size, so a per-declaration line would print one
-/// of them and hide the rest.
 /// Starts every capability an applied tree names in a `textfield`'s `secure_submit`
 /// (ADR-0070 decision 5).
 ///
@@ -881,6 +874,12 @@ fn start_secure_submit_capabilities(scene: &Scene, instances: &[SurfaceInstance]
     }
 }
 
+/// Logs each surface *instance*'s resolved geometry after a successful `scene.apply` --
+/// diagnostic visibility only.
+///
+/// Iterates instances rather than declared surfaces: one declared surface can be several
+/// instances, each resolved against a different size, so a per-declaration line would print one
+/// of them and hide the rest.
 fn log_applied_surfaces(scene: &Scene, instances: &[SurfaceInstance]) {
     for instance in instances {
         match scene.surface(&instance.instance_id) {
@@ -2687,7 +2686,7 @@ mod tests {
     fn repeated_re_resolves_that_retire_nodes_do_not_grow_the_lease_bag() {
         // `Scene::apply` runs up to once per poll turn, and `retire_child_first` pushes every
         // removed subtree onto `Scene::retiring`, which nothing in production drains
-        // (ADR-0023 item 7). A children signal that alternates its length would leak a
+        // (ADR-0023). A children signal that alternates its length would leak a
         // `RetainedNode` at push cadence, in a process meant to run for a whole session.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(

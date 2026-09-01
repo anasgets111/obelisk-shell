@@ -1,5 +1,5 @@
-//! PipeWire-backed audio state (build-steps.md Phase 6; § 2.4's master volume/mute added per
-//! ADR-0053 decision 3). `mixer` tracks the registry and every list § 2.4 names; `master`
+//! PipeWire-backed audio state; § 2.4's master volume/mute added per ADR-0053 decision 3.
+//! `mixer` tracks the registry and every list § 2.4 names; `master`
 //! holds the pure parsing/resolution logic `mixer` wires PipeWire events through.
 //!
 //! § 3.2's audio write actions live here too, in [`dispatch`]. Seven of the nine are built; see

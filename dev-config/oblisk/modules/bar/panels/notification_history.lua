@@ -1,10 +1,10 @@
 -- The notification feed as a list, which is the half of § 2.7 nothing was reading. The popup in
 -- `modules/notification/popup.lua` shows the newest one for as long as the Supervisor keeps it in
--- the feed (docs/adr/0033); this is where the rest of them are.
+-- the feed (ADR-0033); this is where the rest of them are.
 --
 -- Needed a scrolling container to exist at all: a feed is however many notifications have arrived,
 -- so a fixed panel could show the first four and clip the rest with no way to reach them
--- (docs/adr/0069).
+-- (ADR-0069).
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -51,12 +51,12 @@ local body = {
             return panel_row {
                 slot = "notification-" .. tostring(notification.id),
                 -- `icon_path` is a cached asset path or empty (§ 2.7), and `icon { name = ... }`
-                -- takes either a theme name or an absolute path (docs/adr/0054 decision 2), so the
+                -- takes either a theme name or an absolute path (ADR-0054 decision 2), so the
                 -- one property covers both without this having to tell them apart.
                 -- `art`, not `icon`: this is the sending application's own artwork, which nobody
                 -- here chose and nothing should recolour (`components/panel_row.lua` has the split).
                 -- `icon_path` is a cached asset path or empty (§ 2.7), and `icon { name = ... }`
-                -- takes either a theme name or an absolute path (docs/adr/0054 decision 2), so the
+                -- takes either a theme name or an absolute path (ADR-0054 decision 2), so the
                 -- one property covers both without this having to tell them apart.
                 art = (notification.icon_path ~= nil and notification.icon_path ~= "") and notification.icon_path
                     or "dialog-information",

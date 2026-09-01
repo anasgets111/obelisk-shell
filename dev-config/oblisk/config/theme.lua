@@ -51,7 +51,7 @@ end
 -- were written against. Deliberately not a separate "unscaled" branch: an unknown output and a
 -- 1080p output must produce identical tokens, or the bar a test measures is not the bar a session
 -- draws. `oblisk.screens` is empty during evaluation in `socket.rs`'s harness and populated during
--- evaluation in a real session (`wayland/mod.rs` seeds it first, docs/adr/0041 decision 2), so the
+-- evaluation in a real session (`wayland/mod.rs` seeds it first, ADR-0041 decision 2), so the
 -- two paths differ by exactly this value.
 local FALLBACK_HEIGHT = 1080
 
@@ -148,7 +148,7 @@ end
 theme.BG      = "#1e1e2eff"
 theme.SURFACE = "#313244ff"
 -- Catppuccin surface1, one step up from SURFACE. The hover shade: a module that highlights under
--- the pointer reads this rather than inventing its own lighter blue (docs/adr/0062).
+-- the pointer reads this rather than inventing its own lighter blue (ADR-0062).
 theme.HOVER   = "#45475aff"
 theme.FG      = "#cdd6f4ff"
 -- Catppuccin subtext0, which is `Theme.qml`'s `textInactiveColor`. This was overlay0 (#6c7086),

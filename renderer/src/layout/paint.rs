@@ -1,4 +1,4 @@
-//! Draws a resolved layout tree onto a shared femtovg canvas (build-steps.md Phase 19 item 6).
+//! Draws a resolved layout tree onto a shared femtovg canvas.
 //!
 //! Two halves, and the split is the point. [`build`] walks a `layout::scene::ResolvedNode` tree
 //! (`Scene::surface`'s output) and flattens it into a [`DisplayList`] of plain Rust data.
@@ -7,9 +7,7 @@
 //!
 //! Nothing here parses. `node::paint_style` did that while `Scene::apply` resolved the node, so
 //! [`build_node`] reads a typed `node::PaintStyle` and this module names no property and holds no
-//! `mlua::Value`. It used to run all fourteen paint-property parsers on every node on every frame,
-//! because the list comparison below is what makes a frame skippable and the parse was the price of
-//! finding out nothing had changed.
+//! `mlua::Value`.
 //!
 //! They were one function until the list existed. Splitting them buys two things a single walk
 //! could not: `wayland::App::paint_surface` compares this frame's list against the one it last
@@ -19,11 +17,10 @@
 //! fell about a third with it, since a full-surface commit made the compositor recomposite the
 //! screen behind it.
 //!
-//! Draws in tree order, parent then children: that is what makes the stacking model ADR-0023
-//! item 4 already implements resolve overlaps the same way layout resolved them -- a later sibling
-//! or a child paints over what an earlier one already put down. An invisible node (`visible ==
-//! false`) and its whole subtree draw nothing, the same collapse
-//! `layout::scene` picked for row/column space reservation.
+//! Draws in tree order, parent then children, so the stacking model ADR-0023 describes resolves
+//! overlaps the same way layout resolved them: a later sibling or a child paints over what an
+//! earlier one already put down. An invisible node (`visible == false`) and its whole subtree draw
+//! nothing, the same collapse `layout::scene` picked for row/column space reservation.
 //!
 //! `ResolvedNode.rect` is parent-relative, so [`build_node`] accumulates an absolute origin as it
 //! descends rather than trusting `rect.x`/`rect.y` as already-absolute. Get this wrong and every
@@ -44,8 +41,8 @@ use crate::text::snap::{LogicalRect, PhysicalRect, snap_border_band, snap_to_phy
 /// four kind arms that draw anything; a `textfield` or an unrecognised kind contributes no
 /// [`DrawCmd`] at all rather than an empty variant here.
 ///
-/// Plain Rust data on purpose, and that is the whole point of this type. The alternative --
-/// deriving `PartialEq` on `ResolvedNode` and comparing trees -- cannot work: its properties are a
+/// Plain Rust data on purpose. The alternative -- deriving `PartialEq` on `ResolvedNode` and
+/// comparing trees -- cannot work: its properties are a
 /// `HashMap<String, mlua::Value>`, and mlua compares tables by identity, so a signal resolving to
 /// a table yields a fresh unequal table every pass (the same trap `Signal::set_changed` documents
 /// for hover rects). Nothing below holds a Lua value, so equality means what it says.
@@ -171,9 +168,9 @@ pub struct SecureField<'a> {
 
 /// Flattens `root` into the list of draws it would produce, touching no canvas and no GL context.
 ///
-/// Pure, so the whole paint stage is testable without EGL for the first time: every existing test
-/// in this module below has to stand up a headless pbuffer and read pixels back, and none of them
-/// could say "these two trees paint the same" at all.
+/// Pure, so the whole paint stage is testable without EGL: every existing test in this module
+/// below stands up a headless pbuffer and reads pixels back, and none of them can say "these two
+/// trees paint the same" at all.
 pub fn build(root: &ResolvedNode, scale: f32, focus: Option<&SecureField>) -> DisplayList {
     let mut commands = Vec::new();
     build_node(root, 0.0, 0.0, scale, UNCLIPPED, 1.0, focus, &mut commands);
@@ -206,14 +203,13 @@ fn build_node(
     let y = origin_y + node.rect.y;
     let rect = LogicalRect { x, y, width: node.rect.width, height: node.rect.height };
 
-    // build-steps.md Phase 19 item 17: a node's own draw and its whole subtree are clipped to
-    // this box, snapped the same way `draw_line` snaps its glyph origin so the clip edge and the
-    // glyph's physical placement agree. Intersected with the ancestors' clip rather than
-    // replacing it, so a child can only shrink the clipped region further, never escape its
-    // parent's box.
+    // A node's own draw and its whole subtree are clipped to this box, snapped the same way
+    // `draw_line` snaps its glyph origin so the clip edge and the glyph's physical placement
+    // agree. Intersected with the ancestors' clip rather than replacing it, so a child can only
+    // shrink the clipped region further, never escape its parent's box.
     //
-    // ponytail: clipping is the floor, not the finished behavior (build-steps.md Phase 19 item
-    // 17 names this directly). § 3.2 gives `text` a wrap at the available width, and
+    // ponytail: clipping is the floor, not the finished behavior. § 3.2 gives `text` a wrap at
+    // the available width, and
     // `layout::scene`'s measure callback already measures a `Content`-sized text box against
     // exactly that width (its `text_wrap_width` local, passed to `ShapingHandle::shape` as
     // `max_width`) -- but `ShapeResult` returns only a bounding `width`/`height`, not the wrapped
@@ -325,14 +321,14 @@ fn split_fill_and_border(draw: Option<Draw>) -> (Option<Draw>, Option<Draw>) {
 /// everywhere else in this crate -- every existing call site in `wayland::mod` hardcodes `1.0`
 /// today, and this function makes no different assumption.
 ///
-/// `crate::wayland::App::paint_surface` is the production caller, since build-steps.md Phase 20
-/// item 4: `socket.rs`'s `RendererClient` keys a `Scene` by the `id` a config writes, and
-/// `wayland::App` keys a `wl_surface` the same way since ADR-0038 decision 1 deleted the
-/// fixed Rust-owned role enum that used to keep the two id spaces from overlapping.
-/// Test-only since the skip landed: production paints through [`build`] and [`execute`]
-/// separately, because `wayland::App::paint_surface` has to compare the list between the two.
-/// Kept because every pixel test below is written against "paint this tree and read the
-/// framebuffer", and routing them through the same two calls would say nothing extra.
+/// `crate::wayland::App::paint_surface` is the production caller: `socket.rs`'s `RendererClient`
+/// keys a `Scene` by the `id` a config writes, and `wayland::App` keys a `wl_surface` the same way
+/// since ADR-0038 decision 1 deleted the fixed Rust-owned role enum that used to keep the two id
+/// spaces from overlapping.
+/// Test-only: production paints through [`build`] and [`execute`] separately, because
+/// `wayland::App::paint_surface` has to compare the list between the two. Kept because every pixel
+/// test below is written against "paint this tree and read the framebuffer", and routing them
+/// through the same two calls would say nothing extra.
 #[cfg(test)]
 pub fn paint_tree(painter: &mut TextPainter, images: &mut ImageCache, root: &ResolvedNode, scale: f32) {
     execute(painter, images, &build(root, scale, None), scale);
@@ -498,8 +494,7 @@ fn draw_clipped(
 /// `textfield` needs to know whether it holds the keyboard. Both are arithmetic over parsed data.
 ///
 /// Nothing here can fail. A malformed paint property never reaches this function: `Scene::apply`
-/// refused the tree that carried it (see `node::paint_style`'s module doc comment), which is what
-/// replaced the per-frame log-and-default this function used to be five of.
+/// refused the tree that carried it (see `node::paint_style`'s module doc comment).
 /// One colour at `opacity`, multiplied into the alpha it already carries.
 ///
 /// Multiplied rather than replaced: a half-transparent colour inside a half-faded panel is a
@@ -563,8 +558,7 @@ fn draw_for(
             align: *align,
         }),
 
-        // `icon` (§ 5.2 item 5): the theme name, resolved to a file by [`execute`]
-        // (build-steps.md Phase 29 item 3, ADR-0054).
+        // `icon` (§ 5.2 item 5): the theme name, resolved to a file by [`execute`] (ADR-0054).
         //
         // `Contain` rather than `Cover`, and the *shorter* edge as the resolved size: `size` is
         // § 5.2's "bounding box diameter", so an icon in a box that is not square should sit inside
@@ -594,12 +588,10 @@ fn draw_for(
         // `textfield` (§ 5.2 item 8): the placeholder while empty, one `mask_character` per typed
         // character once it is not.
         //
-        // Until this existed the arm drew nothing, and `lock.lua` carried a comment measuring what
-        // that cost: a lock screen that "swallows keystrokes while showing no masked characters at
-        // all". That is worse than cosmetic. `pam_unix` answers a wrong password with a two second
-        // `pam_fail_delay` and `pam_faillock` locks the account after three, so typing blind means a
-        // typo is invisible, indistinguishable from a slow unlock, and three of them lock you out of
-        // your own session for ten minutes.
+        // Typing blind is worse than cosmetic: `pam_unix` answers a wrong password with a two
+        // second `pam_fail_delay` and `pam_faillock` locks the account after three, so a typo is
+        // indistinguishable from a slow unlock, and three of them lock you out of your own session
+        // for ten minutes.
         //
         // Only the focused field fills. An unfocused one shows its placeholder, which is also the
         // honest thing to draw: `input::retarget_secure_submit` zeroizes the buffer whenever focus
@@ -1238,7 +1230,7 @@ mod tests {
         );
     }
 
-    /// Draw order is tree order, which is what makes ADR-0023 item 4's stacking model come
+    /// Draw order is tree order, which is what makes ADR-0023's stacking model come
     /// out right: a child is painted after the parent it covers.
     #[test]
     fn a_parents_box_is_listed_before_its_childs() {
@@ -1842,7 +1834,7 @@ mod tests {
         assert_eq!(pixel_at(painter.canvas_mut(), 9, 30), (255, 0, 0, 255));
     }
 
-    /// The regression test for docs/build-steps.md Phase 19 item 10 / ADR-0043 decision 2:
+    /// The regression test for ADR-0043 decision 2:
     /// measurement (`ShapingHandle::shape`, cosmic-text) and paint (`TextPainter`, femtovg) must
     /// resolve the same font, or a `text` node's laid-out box and its painted glyphs disagree.
     /// Measured live on the dev machine before this fix: cosmic-text measured under
@@ -1905,9 +1897,9 @@ mod tests {
         );
     }
 
-    /// The regression test for build-steps.md Phase 19 item 17 itself: a `text` node's content
+    /// A `text` node's content
     /// wider than the box layout gave it must stop at that box's edge, not paint over whatever
-    /// sits to its right -- the live MPRIS-title-through-two-cells bug the item's own doc comment
+    /// sits to its right. The live MPRIS-title-through-two-cells bug the doc comment
     /// describes.
     ///
     /// Proved this test is real, not just a green test: with `paint_node`'s `save`/
@@ -1943,7 +1935,7 @@ mod tests {
         }
     }
 
-    /// Regression test for docs/build-steps.md Phase 19 item 7: a 1px border at a fractional
+    /// Regression test: a 1px border at a fractional
     /// position must land on exactly one physical pixel row, not blur across two.
     /// `padding.top = 10.3` puts the bordered rect's absolute y at a fractional offset --
     /// unsnapped, femtovg's own antialiasing fills part of row 10 and part of row 11 at
@@ -2062,8 +2054,8 @@ mod tests {
     }
 
     /// A `row`/`column`/`rect` container clips its children just as much as a `text` node clips
-    /// its glyphs -- build-steps.md Phase 19 item 17 calls out that a `row` whose children
-    /// overflow is the same defect as an overflowing `text`, not a separate case. This is the
+    /// its glyphs. A `row` whose children overflow is the same defect as an overflowing `text`,
+    /// not a separate case. This is the
     /// non-text half of that claim: a child rect explicitly larger than its parent must not paint
     /// past the parent's own box.
     ///

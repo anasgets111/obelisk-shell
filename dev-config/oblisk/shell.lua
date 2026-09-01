@@ -12,7 +12,7 @@
 --
 -- Laid out like a bar people actually run, because it is copied from one: the zones and the order
 -- of the modules in them are `~/.config/quickshell`'s, down to the clock sitting last on the right
--- rather than centred. That shape is not decoration. It is what found docs/adr/0053: writing it
+-- rather than centred. That shape is not decoration. It is what found ADR-0053: writing it
 -- required a clock, a battery and a volume readout, and none of the three had a data source until
 -- that ADR.
 --
@@ -46,7 +46,7 @@
 -- `femtovg` and `cosmic-text` both fall back across it per glyph, so one chain covers body text and
 -- the Nerd Font private-use glyphs the Quickshell config draws its whole chrome with: the codepoint
 -- picks the face, not the node. Without this the engine resolves `sans-serif` and those glyphs
--- render as tofu, which is what they did until the `fonts` declaration existed (docs/adr/0043
+-- render as tofu, which is what they did until the `fonts` declaration existed (ADR-0043
 -- decision 2).
 --
 -- Read once, at startup. Editing this list re-evaluates and changes nothing until the shell is
@@ -66,7 +66,7 @@ local settings = require("modules.bar.panels.settings")
 local panel_host = require("modules.shell.panel_host")
 local launcher = require("modules.global.launcher")
 -- A tooltip is a surface of its own, so each is listed here rather than nested in the bar: a
--- `popup` is an `xdg_popup` rooted under the bar, not a node inside it (§ 6.3, docs/adr/0062).
+-- `popup` is an `xdg_popup` rooted under the bar, not a node inside it (§ 6.3, ADR-0062).
 -- They cost nothing until hovered -- a popup with `visible = false` creates no Wayland object.
 local battery_tooltip = require("modules.bar.indicators.battery").tooltip
 local clock_tooltip = require("modules.bar.indicators.date_time").tooltip

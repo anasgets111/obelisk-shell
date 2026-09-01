@@ -79,9 +79,9 @@ pub enum LockEvent {
 /// The whole transition table, pure and synchronous so every case is unit-testable without a
 /// socket or a real PAM stack.
 ///
-/// The invariant worth stating once: only the Renderer's own report moves `active`. Neither the
-/// request to lock nor a successful password moves it -- both are orders the compositor has not
-/// confirmed yet, and a lock screen that believed either would paint the wrong thing.
+/// Only the Renderer's own report moves `active`. Neither the request to lock nor a successful
+/// password moves it: both are orders the compositor has not confirmed yet, and a lock screen
+/// that believed either would paint the wrong thing.
 pub fn apply(state: &mut LockState, event: LockEvent) {
     match event {
         // Drop the previous attempt's refusal reason: a config fixed by an in-place reload must
@@ -241,8 +241,8 @@ impl SessionLockedFlag {
 /// refusals:
 ///
 /// - Without `active`, the capability is an unbounded password oracle: nothing stops a config
-///   textfield calling it, and build-steps.md Phase 23 item 3 scopes authentication to the lock
-///   screen, which is exactly `active`.
+///   textfield calling it, and authentication is scoped to the lock screen, which is exactly
+///   `active`.
 /// - Without `!authenticating`, a held-down Enter key spawns one re-exec'd PAM worker per
 ///   keypress, each holding a plaintext secret copy and burning `pam_unix`'s failure delay.
 pub fn may_authenticate(state: &LockState) -> bool {

@@ -11,7 +11,7 @@
 -- fit to the current one. A panel that needs its own geometry wants its own surface.
 --
 -- That cost got much smaller. Every body now ends in a `list` with a `scroll` of its own
--- (docs/adr/0069), so the shared size bounds the *viewport* and a panel with more rows than fit
+-- (ADR-0069), so the shared size bounds the *viewport* and a panel with more rows than fit
 -- scrolls instead of being cut off. What still has to fit is the fixed rows above each list, which
 -- is what `the_shipped_dev_configs_bar_zones_hold_their_modules_without_overflowing` measures.
 local theme = require("config.theme")
@@ -64,7 +64,7 @@ local surface = popup {
     --
     -- A panel whose *list* is longer than this no longer has to fit, which is what changed: each
     -- body ends in a `list` with a `scroll` of its own, so the popup bounds the viewport rather
-    -- than the content (docs/adr/0069). The fixed rows above each list still have to fit, and that
+    -- than the content (ADR-0069). The fixed rows above each list still have to fit, and that
     -- is what the test measures.
     width = theme.panel_width,
     height = theme.panel_height,

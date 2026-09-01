@@ -2,13 +2,13 @@
 --
 -- These are Nerd Font codepoints in the private use area, rendered as `text` rather than as `icon`
 -- nodes, and that is the whole reason the bar can be one colour per state. An `icon` is a themed
--- raster looked up by name (docs/adr/0054) and paints in whatever colours the theme's artwork has;
+-- raster looked up by name (ADR-0054) and paints in whatever colours the theme's artwork has;
 -- `PaintStyle::Icon` carries no tint and `layout::paint` never applies one. A glyph is a `text`
 -- node, so it takes `foreground`, `font_size` and `opacity` like any other string and a caller can
 -- turn it accent-coloured on connect or red on error with one property.
 --
 -- They resolve because `shell.lua` declares "CaskaydiaCove Nerd Font Propo" first in the font chain
--- and the chain falls back per glyph (docs/adr/0043 decision 2): a codepoint in this file picks the
+-- and the chain falls back per glyph (ADR-0043 decision 2): a codepoint in this file picks the
 -- Nerd Font, and the Latin text beside it picks Noto Sans, with no node saying which face it wants.
 -- Without that declaration every one of these is tofu.
 --

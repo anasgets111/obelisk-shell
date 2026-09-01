@@ -49,7 +49,7 @@ fn read_max_brightness(entry_dir: &Path) -> i32 {
 }
 
 /// Picks one backlight device under `backlight_root`: entries with `max_brightness > 0`
-/// (ADR-0053 decision 6), ranked by [`device_type_rank`], ties broken by sorted
+/// (ADR-0053), ranked by [`device_type_rank`], ties broken by sorted
 /// directory name for a deterministic choice across boots. `None` if nothing qualifies.
 fn select_backlight_device(backlight_root: &Path) -> Option<(PathBuf, i32)> {
     let mut entries: Vec<(PathBuf, i32)> = std::fs::read_dir(backlight_root)
@@ -215,9 +215,9 @@ async fn run_brightness_task(
 /// Builds the `backlight` subsystem udev watch (same construction as
 /// `battery::controller::build_power_supply_watch`).
 ///
-/// Corrects docs/build-steps.md line 98: inotify does not fire reliably on a sysfs attribute
-/// write, confirmed via `udevadm monitor --udev --subsystem-match=backlight` while changing
-/// brightness, which does show a `change` uevent on the `backlight` subsystem.
+/// inotify does not fire reliably on a sysfs attribute write, confirmed via `udevadm monitor
+/// --udev --subsystem-match=backlight` while changing brightness, which does show a `change`
+/// uevent on the `backlight` subsystem.
 fn build_backlight_watch() -> std::io::Result<AsyncFd<MonitorSocket>> {
     let socket = udev::MonitorBuilder::new()?.match_subsystem("backlight")?.listen()?;
     AsyncFd::new(socket)

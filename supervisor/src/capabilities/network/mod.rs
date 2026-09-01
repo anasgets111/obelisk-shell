@@ -1,5 +1,5 @@
-//! NetworkManager D-Bus controller (`oblisk.network`, build-steps.md Phase 16;
-//! docs/oblisk-supervisor-services-dbus.md §4; ADR-0029).
+//! NetworkManager D-Bus controller (`oblisk.network`; docs/oblisk-supervisor-services-dbus.md §4;
+//! ADR-0029).
 //!
 //! Mirrors `dbus::polkit`'s structure (a controller holding proxies, exposing async methods per
 //! IDL write action) rather than `audio::mixer`'s dedicated-thread pattern: NetworkManager's API

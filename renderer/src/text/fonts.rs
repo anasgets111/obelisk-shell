@@ -1,5 +1,5 @@
 //! Resolves the shell's declared font chain to concrete font files and loads only those
-//! into a `fontdb::Database` (ADR-0043 decision 2, docs/build-steps.md Phase 19 item 10).
+//! into a `fontdb::Database` (ADR-0043 decision 2).
 //!
 //! `cosmic_text::FontSystem::new()` calls `Database::load_system_fonts()`, which parses face
 //! metadata for the whole system set (2648 faces on the dev machine ADR-0043 measured against,

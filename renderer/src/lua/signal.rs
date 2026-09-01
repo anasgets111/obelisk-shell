@@ -26,14 +26,14 @@ use crate::lua::marshal;
 /// § 1.2: "CPU runtime is capped at 5ms per evaluation."
 const CPU_CAP: Duration = Duration::from_millis(5);
 
-/// What one whole `Scene::apply` gets, as distinct from what one signal evaluation gets
-/// (build-steps.md Phase 19 item 5: "bounding a whole layout pass rather than each getter call").
+/// What one whole `Scene::apply` gets, as distinct from what one signal evaluation gets: a bound
+/// on a whole layout pass rather than on each getter call.
 ///
 /// A separate, much larger number rather than [`CPU_CAP`] reused, because a legitimate pass is
 /// bigger than a legitimate getter by construction: it runs every getter in the tree and blocks on
 /// the shaping thread once per distinct text measurement. Sized against what a legitimate pass
-/// actually costs, measured rather than guessed, on a 2000-identified-sibling row (the shape
-/// build-steps.md Phase 19 item 4 already contemplates, at up to 4000):
+/// actually costs, measured rather than guessed, on a 2000-identified-sibling row (a config shape
+/// that goes up to 4000 siblings):
 ///
 /// - release, under full parallel test load: 202ms and 298ms;
 /// - debug, same load: 550ms and 1.10s.
@@ -44,11 +44,11 @@ const CPU_CAP: Duration = Duration::from_millis(5);
 /// profiles, which is a legitimate config being refused.
 ///
 /// It is a bound on damage, not a performance target, and it is deliberately far too loose to be
-/// mistaken for one. What it exists to stop is the shape item 5 measured: a `margin` table whose
-/// `__index` spins made one `Scene::apply` run 26.10 seconds and return `Ok(())`, on the thread
-/// that also answers `configure` and runs the VM (ADR-0039). Under this the same config gets
-/// one 2 second stall and a `LayoutError` that `oblisk.rescue` can report, instead of a desktop
-/// that never comes back. Turning "forever" into "twice" is the whole of what it buys.
+/// mistaken for one. What it exists to stop: a `margin` table whose `__index` spins made one
+/// `Scene::apply` run 26.10 seconds and return `Ok(())`, on the thread that also answers
+/// `configure` and runs the VM (ADR-0039). Under this the same config gets one 2 second stall and
+/// a `LayoutError` that `oblisk.rescue` can report, instead of a desktop that never comes back.
+/// Turning "forever" into "twice" is the whole of what it buys.
 ///
 /// ponytail: 2000 siblings costing 200ms a pass is its own problem, and this cap does not touch
 /// it. At ADR-0044's push cadence that config drops frames whatever the budget says. The number
@@ -64,10 +64,10 @@ const LAYOUT_PASS_CAP: Duration = Duration::from_secs(2);
 /// `CLOCK_THREAD_CPUTIME_ID`'s 170.4ns, and the hook fires every
 /// [`CHECK_EVERY_N_INSTRUCTIONS`] instructions, so the common path pays the cheap clock.
 ///
-/// This was wall clock alone, which made the constant's name and § 1.2 both wrong: a descheduled
-/// evaluation was charged for time it did not run. On a 12-thread machine running the whole test
-/// suite that fired on configs a quiet machine evaluates in microseconds, 5 times in 53 full
-/// runs, a different test each time.
+/// Wall clock alone would make the constant's name and § 1.2 both wrong: a descheduled evaluation
+/// would be charged for time it did not run. That is not hypothetical: on a 12-thread machine
+/// running the whole test suite, a wall-only cap fired 5 times in 53 full runs on configs a quiet
+/// machine evaluates in microseconds.
 ///
 /// Nothing is lost by not counting the wait. A thread parked in a syscall executes no
 /// instructions, so the hook never fired during one anyway; ADR-0048 says so and answers it the
@@ -92,8 +92,7 @@ impl Deadline {
             return false;
         }
         // Past the wall pre-filter, so the CPU clock decides. An unreadable clock expires: a cap
-        // that cannot measure must fire rather than quietly stop existing, and falling back to
-        // the wall deadline is exactly the behaviour this replaced.
+        // that cannot measure must fire rather than quietly stop existing.
         self.cpu.is_none_or(|deadline| thread_cpu_time().is_none_or(|used| used > deadline))
     }
 }
@@ -388,9 +387,9 @@ impl Signal {
     /// This scroll signal's current offset, without a `Lua` to hand.
     ///
     /// [`Self::get_value`] would do, and needs a `&Lua` it cannot be given: `layout::scene`'s
-    /// The scroll clamp runs deep inside a pass that holds no VM reference, and threading one
-    /// down to read a number out of a `RefCell` would be a parameter on every frame of the layout
-    /// recursion for the benefit of one property.
+    /// positioning pass runs the scroll clamp deep inside a pass that holds no VM reference, and
+    /// threading one down to read a number out of a `RefCell` would be a parameter on every frame
+    /// of the layout recursion for the benefit of one property.
     pub(crate) fn scroll_offset(&self) -> Option<f32> {
         match &self.0 {
             SignalKind::Scroll { cell, .. } => match *cell.borrow() {
@@ -654,9 +653,9 @@ struct ScrollRegistry(HashMap<String, Signal>);
 /// removed only on the 1->0 transition: a finished inner call leaves the outer deadline in the
 /// stack, and enforcement hands back to the outer call instead of vanishing.
 ///
-/// The governing deadline is `stack[0]`, the outermost live call's -- not the innermost
-/// (`stack.last()`, this code's original design). Reading the innermost meant a monotonically
-/// deepening recursion always saw the *freshest* deadline, recomputed from `Instant::now()` at
+/// The governing deadline is `stack[0]`, the outermost live call's, not the innermost
+/// (`stack.last()`). Reading the innermost would mean a monotonically deepening recursion always
+/// sees the *freshest* deadline, recomputed from `Instant::now()` at
 /// every new level's own push, so the check could never observe an expired budget no matter how
 /// long the whole chain ran. `stack[0]` makes "5ms" mean what § 1.2 says: a budget for the
 /// evaluation as a whole, not a per-level allowance that resets on every recursive `:get()`.
@@ -730,7 +729,7 @@ fn release_hook(lua: &Lua) {
 struct PassDeadline(Option<Deadline>);
 
 /// An RAII claim on [`LAYOUT_PASS_CAP`], held for one entire layout pass rather than for one
-/// getter call (build-steps.md Phase 19 item 5's second half).
+/// getter call.
 ///
 /// It closes two holes at once, and both need the same guard. A resolved table's `__index` runs
 /// through `layout::node`'s metamethod-aware `Table::get` *after* [`CpuBudget`] has returned and

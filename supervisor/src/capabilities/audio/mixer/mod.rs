@@ -1,4 +1,4 @@
-//! PipeWire registry listener for per-app audio streams (build-steps.md Phase 6, point 2).
+//! PipeWire registry listener for per-app audio streams.
 //!
 //! A stream node's owning process pid is `application.process.id` (`PW_KEY_APP_PROCESS_ID`),
 //! set on the stream node's own properties -- not `sec.pid`/`node.client-id` (not real

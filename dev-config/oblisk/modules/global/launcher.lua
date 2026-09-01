@@ -3,7 +3,7 @@
 -- The list scrolls now. It did not before: a `window` clips its children to its own box and nothing
 -- moved them, so entry 20 of 61 was the last one that existed as far as a user was concerned.
 -- `scroll(name)` gives the column an offset the wheel writes and the layout pass clamps
--- (docs/adr/0069), which is the whole of it -- no viewport node, no scrollbar, no virtualization.
+-- (ADR-0069), which is the whole of it -- no viewport node, no scrollbar, no virtualization.
 --
 -- ponytail: 61 entries is one `list` of 61 resolved rows, re-laid out on every wheel event, at
 -- about 1.2ms per pass on this machine (ADR-0069 decision 1 has the numbers). That is fine at this

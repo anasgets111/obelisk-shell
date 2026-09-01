@@ -324,9 +324,8 @@ fn collect_surfaces(value: Value) -> Result<Vec<VirtualNode>, LoaderError> {
         require_surface(&node)?;
         surfaces.push(node);
     }
-    // `return {}` is a config that declares no surfaces, not a mistake (ADR-0070 decision 7).
-    // It used to be refused, which made "run nothing" a state this engine did not have -- and that
-    // is the only state in which a config gates every capability off.
+    // `return {}` is a config that declares no surfaces, not a mistake (ADR-0070 decision 7): the
+    // only state in which a config gates every capability off.
     Ok(surfaces)
 }
 

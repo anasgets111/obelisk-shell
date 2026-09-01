@@ -64,19 +64,18 @@ pub(super) struct ArmedClick {
 /// (ADR-0049's amendment, ADR-0051 decision 1). Armed by [`PointerHandler::pointer_frame`]
 /// and cleared by [`run`]'s poll loop at the end of the same turn.
 ///
-/// ADR-0049 decision 2 claimed the re-resolve that creates a popup "is still running inside
-/// input dispatch, so the engine has the serial of the event that caused it". It is not:
-/// `re_resolve_if_dirty` runs in the poll loop, after `dispatch_pending` returns, so the dispatch
-/// callback's stack -- and any serial on it -- is gone by then. Resolving inside dispatch would put
-/// a full `Scene::apply`, arbitrary Lua and Wayland object creation inside a `Dispatch` callback,
+/// The re-resolve that creates a popup runs in the poll loop, after `dispatch_pending` returns,
+/// not inside input dispatch: by the time `re_resolve_if_dirty` runs there, the dispatch
+/// callback's stack, and any serial on it, is gone. Resolving inside dispatch would put a full
+/// `Scene::apply`, arbitrary Lua and Wayland object creation inside a `Dispatch` callback,
 /// reentering the queue being dispatched from. So the serial lives in a field for one turn instead
 /// of on a stack; a re-resolve driven by anything other than input still finds nothing here.
 ///
 /// Both a press and a release arm it, latest wins: a click fires on the release (ADR-0050
 /// decision 2), so the release's serial is the one an `on_click` popup actually carries. `xdg_shell`
 /// only asks that the serial come from "a real input event (button press, key press, touch down)"
-/// and leaves recency to the compositor, which answers a refusal with an immediate `popup_done`
-/// -- normal (ADR-0051 decision 3), not an error.
+/// and leaves recency to the compositor, which answers a refusal with an immediate `popup_done`,
+/// normal (ADR-0051 decision 3), not an error.
 ///
 /// `instance_id`, not the tracked index: `self.surfaces` is a `Vec` an output change removes from
 /// (`destroy_surface_by_id`), and an unplugged monitor between click and re-resolve would leave an
@@ -121,7 +120,7 @@ struct PointerHit {
 ///
 /// `None` collapses two cases nothing downstream tells apart: no `textfield` on the path, and the
 /// innermost one declaring no `secure_submit`. Both mean the next completed submit has nowhere to
-/// go. There is no third, malformed case any more: `node::paint_style` parses the destination while
+/// go. There is no third, malformed case: `node::paint_style` parses the destination while
 /// `Scene::apply` resolves the node, so a `secure_submit` that does not parse fails the whole pass
 /// and no tree carrying one ever reaches a pointer event.
 ///
@@ -140,8 +139,8 @@ fn focused_target(path: &[&layout::ResolvedNode]) -> Option<node::SecureSubmitTa
 /// The frame a completed `wp-text-input-v3` submit produces, or `None` when no focused `textfield`
 /// named a destination for it (ADR-0050 decision 4).
 ///
-/// `None` is the point: before it, the submit was addressed to `"unknown"/"unknown"`, which no
-/// Supervisor capability routes -- a password put on the wire for nobody. Sending nothing is the
+/// `None` is the point: without it, the submit would address `"unknown"/"unknown"`, which no
+/// Supervisor capability routes, a password put on the wire for nobody. Sending nothing is the
 /// only safe answer to "whose password is this?".
 ///
 /// The buffer is zeroized on both branches; on the branch that sends nothing it is the only thing
@@ -153,7 +152,7 @@ fn submit_frame_for(
 ) -> Option<RendererFrame> {
     // An empty buffer is not a password, and sending one is not free. The Supervisor routes it
     // straight into PAM, which spends one of the user's counted attempts and one `pam_unix` failure
-    // delay answering a keystroke that said nothing -- on the lock screen, where attempts are the
+    // delay answering a keystroke that said nothing, on the lock screen, where attempts are the
     // scarce resource. Enter on an empty field does nothing, the way it does in every other password
     // prompt. Checked before the destination, because it is true whatever the destination was.
     let Some(target) = target.filter(|_| !buffer.is_empty()) else {
@@ -164,13 +163,12 @@ fn submit_frame_for(
 }
 /// A focused `secure_submit` field, together with the surface whose tree declared it.
 ///
-/// The surface id is what a past review's defects 2 and 3 were both missing: focus used to be
-/// nothing but a destination, so nothing could tell "the field on the surface that currently has
-/// the keyboard" from "the field on a surface this process destroyed ten seconds ago". Concretely:
-/// type a password on the lock screen, let the compositor send `finished`, and the plaintext sits
-/// in `App::secure_buffer` still addressed to `("lock", "authenticate")` with later bar keystrokes
-/// appending to it -- `wl_keyboard.leave` was relied on to notice, but the protocol does not
-/// require a compositor to send one for a surface the client itself destroyed.
+/// The surface id lets [`focus_is_still_armed`] tell "the field on the surface that currently has
+/// the keyboard" from "the field on a surface this process destroyed". The protocol does not
+/// require a compositor to send `wl_keyboard.leave` for a surface the client itself destroyed, so
+/// a destination alone could not tell them apart: type a password on the lock screen, let the
+/// compositor send `finished`, and the plaintext would sit in `App::secure_buffer`, still addressed
+/// to `("lock", "authenticate")`, with later bar keystrokes appending to it.
 ///
 /// So the field is bound to its surface, and [`focus_is_still_armed`] is the one question every
 /// keystroke asks, rather than a clearing call bolted onto each of the five or six sites that can
@@ -184,13 +182,11 @@ pub(super) struct FocusedField {
 /// The one place `App::focused_secure_submit` is ever written, and the reason it is one place.
 ///
 /// A `shared::SecureBuffer`'s lifetime belongs to the field the bytes were typed into, not to the
-/// transport that carried them. Three sites cleared or reassigned the focus target and left the
-/// plaintext behind -- `KeyboardHandler::leave`, `SeatHandler::remove_capability`'s keyboard arm,
-/// and the retargeting press in `PointerHandler::pointer_frame`. Concretely: type a login password
-/// into the lock screen's field and press nothing, let the compositor tear the lock surfaces down,
-/// take keyboard focus on a bar whose sole `secure_submit` is `("network", "connect")`, type a
-/// Wi-Fi PSK, press Enter, and [`submit_frame_for`] addresses `<login password><psk>` to the
-/// network capability -- exactly the routing ADR-0005 exists to make impossible.
+/// transport that carried them. Three sites reassign or clear focus: `KeyboardHandler::leave`,
+/// `SeatHandler::remove_capability`'s keyboard arm, and the retargeting press in
+/// `PointerHandler::pointer_frame`. Any one of them skipping the scrub lets a password typed into
+/// one field survive a focus change and reach [`submit_frame_for`] addressed to whatever capability
+/// the next focused field names, exactly the routing ADR-0005 exists to prevent.
 ///
 /// So the rule is enforced on the transition, not at each site that performs one: any change of
 /// destination, including one field to another directly, scrubs. A fifth caller inherits it by
@@ -201,7 +197,7 @@ pub(super) struct FocusedField {
 /// arrives here with the target unchanged.
 ///
 /// A free function, not a `&mut self` method, so the property is testable without a live Wayland
-/// connection -- the same reason [`secure_submit_frame`] is one.
+/// connection, the same reason [`secure_submit_frame`] is one.
 fn retarget_secure_submit(
     focused: &mut Option<FocusedField>,
     buffer: &mut shared::SecureBuffer,
@@ -215,13 +211,12 @@ fn retarget_secure_submit(
 /// What `focused_secure_submit` becomes when keyboard focus arrives on `surface_id`, given that
 /// surface's resolved tree and whatever is focused now.
 ///
-/// A total function -- defect 2. [`KeyboardHandler::enter`] used to spell its "nothing to arm"
-/// cases (an untracked surface, a tracked one with no sole `secure_submit`) as early returns that
-/// moved `keyboard_focus` on and left `focused_secure_submit` unchanged. `apply_secure_key` gates
-/// on focus alone, so keystrokes on a surface with no password field kept accumulating into the
-/// previous surface's field and could still be submitted to its capability. Every case answers
-/// here, pushed through [`App::focus_secure_submit`], so "nothing to arm" is the scrub it always
-/// should have been.
+/// A total function: an untracked surface and a tracked one with no sole `secure_submit` both
+/// answer `None` here rather than leaving `focused_secure_submit` untouched, and `None` is pushed
+/// through [`App::focus_secure_submit`] like any other result. `apply_secure_key` gates on focus
+/// alone, so a case that only advanced `keyboard_focus` without touching `focused_secure_submit`
+/// would leave keystrokes on a surface with no password field accumulating into the previous
+/// surface's field, still addressed to its capability.
 ///
 /// What survives an `enter` is a field on the surface that is entering, and only that: a press on
 /// a surface with several `secure_submit` fields picks one that [`sole_secure_submit`] refuses to
@@ -277,9 +272,9 @@ enum SecureKeyAction<'a> {
 /// a password must not be routed through an input method, which is why swaylock and hyprlock read
 /// xkb directly too.
 ///
-/// The `zwp_text_input_v3` binding is gone entirely. Keeping it would have left two independent
+/// The `zwp_text_input_v3` binding is gone entirely. Keeping it would leave two independent
 /// writers on one `shared::SecureBuffer`, with an IME able to land a character through both, and a
-/// live `ContentPurpose::Password` session open beside the keyboard reader -- exactly what
+/// live `ContentPurpose::Password` session open beside the keyboard reader, exactly what
 /// ADR-0027's amendment says must never see a password. Deleted rather than left dormant: a
 /// dormant enabled text-input object is still an IME session the compositor may route keystrokes
 /// into.
@@ -313,10 +308,8 @@ fn secure_key_action<'a>(event: &'a KeyEvent, repeat: bool) -> SecureKeyAction<'
             }
         }
         Keysym::BackSpace => SecureKeyAction::Backspace,
-        // Escape used to fall through to the control-character filter and be ignored, leaving one
-        // Backspace per character as the only way to abandon a mistyped password -- costly on a
-        // surface where a wrong attempt is counted by PAM. Every other password prompt clears on
-        // Escape; so does this one.
+        // A wrong attempt is counted by PAM, so Backspace-per-character to abandon a mistyped
+        // password would be costly. Every other password prompt clears on Escape; so does this one.
         Keysym::Escape => SecureKeyAction::Clear,
         _ => match event.utf8.as_deref() {
             Some(text) if !text.is_empty() && !text.chars().any(char::is_control) => SecureKeyAction::Append(text),
@@ -355,8 +348,8 @@ fn pointer_button_name(code: u32) -> Option<&'static str> {
 /// The narrower half of the pair with [`release_completes_click`]. Completing needs the same
 /// surface, rect and button; ending needs only the same button, since dragging off the node and
 /// releasing ends the press exactly as clicking does. A release of a different button must not end
-/// it: pressing left, pressing right, then releasing left used to clear the slot and lose the
-/// right click as well as the left one.
+/// it, or pressing left, then right, then releasing left would clear the slot and lose the right
+/// click along with the left one.
 fn release_ends_press(armed: Option<&ArmedClick>, button: u32) -> bool {
     armed.is_some_and(|armed| armed.button == button)
 }
@@ -410,7 +403,7 @@ pub(super) fn rect_table(lua: &Lua, rect: LogicalRect) -> mlua::Result<Table> {
 ///
 /// The one sanctioned read (`expose_secret`) and the explicit `.zeroize()` of the source buffer
 /// sit on adjacent lines here, so the accumulated secret stops existing the instant it has been
-/// copied into the outgoing envelope -- not left to `Drop`, and not left live while the frame
+/// copied into the outgoing envelope. It is not left to `Drop`, and not left live while the frame
 /// travels to the socket thread. The frame's own plaintext copy is the socket thread's to scrub,
 /// immediately after its wire write (`crate::socket`'s `pump`).
 ///
@@ -440,7 +433,7 @@ impl App {
     fn focus_secure_submit(&mut self, next: Option<FocusedField>) {
         retarget_secure_submit(&mut self.focused_secure_submit, &mut self.secure_buffer, next);
         // A focus change zeroizes the buffer, so the field that had dots must be repainted without
-        // them -- the same reason a keystroke sets this.
+        // them, the same reason a keystroke sets this.
         self.secure_input_changed = true;
     }
 
@@ -455,7 +448,7 @@ impl App {
     }
 
     /// Drops the focused field, and the half-typed secret with it, the moment [`focus_is_still_armed`]
-    /// stops holding -- through [`App::focus_secure_submit`], so the scrub is the same one every
+    /// stops holding, through [`App::focus_secure_submit`], so the scrub is the same one every
     /// other transition gets.
     ///
     /// Called before every keystroke, which is what makes the rule load-bearing rather than
@@ -473,27 +466,13 @@ impl App {
         }
     }
 
-    /// The half of [`App::prune_secure_focus`] that does not wait for a keystroke: a field whose
-    /// surface this process destroyed is dropped, and its buffer scrubbed, on the next poll turn.
-    ///
-    /// Only the liveness clause, deliberately: `prune_secure_focus`'s other clause is about routing --
-    /// which surface is receiving keys -- and it is only ever wrong at the moment a key arrives, which
-    /// is where it is asked. Applying it once a turn would also disarm the field a press on a
-    /// multi-field surface just chose, in the window before the compositor's matching `enter` lands,
-    /// and `sole_secure_submit` cannot re-choose it (see [`focus_on_enter`]).
-    ///
-    /// What this buys is the residency ceiling defect 3 named: type a password on the lock screen, let
-    /// the compositor send `finished`, and `teardown_lock_surfaces` destroys the `wl_surface` with no
-    /// `leave` required to follow. Without this the plaintext would sit in `secure_buffer`, still
-    /// addressed to `("lock", "authenticate")`, until some later keystroke happened to notice -- which
-    /// on a session where the user walks away is never.
     /// The focused `secure_submit` field's state, if the field lives on `surface_id`.
     ///
     /// Here rather than in `wayland::surface` because [`FocusedField`]'s halves are this module's:
     /// it is the one place that knows a focus is a surface plus a `{ capability, action }` pair,
     /// and `paint` should not learn that shape to ask one question.
     ///
-    /// The count, never the bytes -- see `layout::paint::SecureField`.
+    /// The count, never the bytes. See `layout::paint::SecureField`.
     pub(super) fn secure_field_for(&self, surface_id: &str) -> Option<layout::paint::SecureField<'_>> {
         let focused = self.focused_secure_submit.as_ref()?;
         if focused.surface_id != surface_id {
@@ -502,6 +481,19 @@ impl App {
         Some(layout::paint::SecureField { target: &focused.target, filled: self.secure_buffer.char_count() })
     }
 
+    /// The half of [`App::prune_secure_focus`] that does not wait for a keystroke: a field whose
+    /// surface this process destroyed is dropped, and its buffer scrubbed, on the next poll turn.
+    ///
+    /// Only the liveness clause, deliberately: `prune_secure_focus`'s other clause is about routing,
+    /// which surface is receiving keys, and it is only ever wrong at the moment a key arrives, which
+    /// is where it is asked. Applying it once a turn would also disarm the field a press on a
+    /// multi-field surface just chose, in the window before the compositor's matching `enter` lands,
+    /// and `sole_secure_submit` cannot re-choose it (see [`focus_on_enter`]).
+    ///
+    /// What this buys is the liveness clause's residency ceiling: a `wl_surface` this process
+    /// destroys, such as `teardown_lock_surfaces` tearing down the lock screen, may never produce a
+    /// `leave`. Without this the plaintext would sit in `secure_buffer` until some later keystroke
+    /// happened to notice, never on a session where the user walks away.
     pub(super) fn drop_secure_focus_if_its_surface_is_gone(&mut self) {
         let gone = self.focused_secure_submit.as_ref().is_some_and(|field| !self.surface_is_live(&field.surface_id));
         if gone {
@@ -518,7 +510,7 @@ impl App {
     /// The focus check is the gate: `focused_secure_submit` is `Some` only when some field named a
     /// destination for the next secret, so a keystroke that reaches the buffer already has somewhere
     /// to be sent. A `textfield` with no `secure_submit` leaves it `None` (see [`focused_target`]),
-    /// and a key arriving then is dropped rather than accumulated -- buffering a password for a field
+    /// and a key arriving then is dropped rather than accumulated: buffering a password for a field
     /// that can never submit it is a secret held for no reason.
     ///
     /// Nothing here touches Lua: the bytes go from the `KeyEvent` into a native `shared::SecureBuffer`
@@ -545,8 +537,8 @@ impl App {
             // Through the seam in both directions, not the buffer directly: the scrub Escape wants
             // is the one `retarget_secure_submit` performs on a transition, and re-arming the
             // identical field immediately after leaves the user still in it, free to retype. A
-            // fifth writer of `secure_buffer` with its own idea of clearing is what this file has
-            // spent two reviews avoiding.
+            // fifth writer of `secure_buffer` with its own idea of clearing is exactly what routing
+            // every write through this seam exists to prevent.
             SecureKeyAction::Clear => {
                 let field = self.focused_secure_submit.clone();
                 self.focus_secure_submit(None);
@@ -564,7 +556,7 @@ impl App {
     /// [`submit_frame_for`] refuses on two counts and both end here: no focused destination
     /// (ADR-0050 decision 4) and an empty buffer. Logged rather than silent: a user who pressed
     /// enter deserves an explanation, and it is almost always a `textfield` missing its
-    /// `secure_submit` table -- the empty case explains itself on the glass, since there is nothing
+    /// `secure_submit` table. The empty case explains itself on the glass, since there is nothing
     /// in the field.
     fn finish_secure_submit(&mut self) {
         let target = self.focused_secure_submit.as_ref().map(|field| &field.target);
@@ -615,7 +607,7 @@ impl App {
     /// a `Signal` is an `Rc` handle, so the clone is a refcount bump rather than a copy of anything.
     ///
     /// Nothing marks the scene dirty here directly. `set_changed` marks it, and only when the value
-    /// actually moved (decision 4) -- a pointer sitting still inside one button re-resolves nothing,
+    /// actually moved (decision 4), so a pointer sitting still inside one button re-resolves nothing,
     /// which matters because `wl_pointer` reports motion at device rate and one mark re-resolves
     /// every surface in the generation (ADR-0044 decision 2).
     ///
@@ -709,8 +701,8 @@ impl App {
             let crossed = handle.set_changed(mlua::Value::Boolean(write.hovered));
             // Only on the edge into the node, and the guard is not an optimisation. `set_changed`
             // compares with `PartialEq`, and two `mlua` tables holding identical numbers are not
-            // equal -- table equality is identity -- so a freshly built rect table always counts as
-            // a change. Writing it per motion event would mark the scene dirty on every one of
+            // equal, since table equality is identity, so a freshly built rect table always counts
+            // as a change. Writing it per motion event would mark the scene dirty on every one of
             // them and undo exactly what decision 4 is for. Writing it once per entry is also all
             // that is wanted: the node does not move while the pointer sits inside it, and if a
             // re-resolve does move it, that re-resolve happened for its own reasons anyway.
@@ -760,7 +752,7 @@ impl SeatHandler for App {
 
     fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
 
-    /// Pointer and keyboard, and no touch object at all -- § 5.2 has no touch-specific property for
+    /// Pointer and keyboard, and no touch object at all. § 5.2 has no touch-specific property for
     /// one to serve.
     ///
     /// Idempotent by the `is_none` guards, not by trusting the compositor: `wl_seat::capabilities`
@@ -860,8 +852,7 @@ impl PointerHandler for App {
             };
             match event.kind {
                 // Left, right and middle (ADR-0050's second amendment). Any other code is not
-                // a button a config can name, so it arms nothing and fires nothing, which is what
-                // decision 2's original `BTN_LEFT`-only match did for every code but one.
+                // a button a config can name, so it arms nothing and fires nothing.
                 PointerEventKind::Press { button, serial, .. } => {
                     if pointer_button_name(button).is_none() {
                         continue;
@@ -924,7 +915,7 @@ impl PointerHandler for App {
                     self.armed = None;
                     self.sync_hover(index, None);
                 }
-                // A motion that leaves the armed rect deliberately does *not* disarm -- dragging
+                // A motion that leaves the armed rect deliberately does *not* disarm. Dragging
                 // back onto the button and releasing still clicks it, which is what every toolkit
                 // does. Both kinds carry a position and both update hover, because an `Enter` is
                 // the only event a pointer that appears already inside a surface sends.
@@ -988,10 +979,9 @@ impl KeyboardHandler for App {
                 eprintln!("[oblisk-renderer] keyboard focus entered {id}, which declares no sole `secure_submit` field")
             }
         }
-        // Unconditional, and that is defect 2. Both "nothing to arm" cases used to be early returns
-        // that moved `keyboard_focus` on and left the previous surface's field armed with its
-        // half-typed secret, which `apply_secure_key` would then go on appending to and submitting
-        // to that surface's capability. A focus that arms nothing has to *disarm*.
+        // Unconditional: a case that arms nothing must still disarm, or `apply_secure_key` would
+        // keep appending keystrokes to the previous surface's half-typed field and submitting them
+        // to its capability.
         self.focus_secure_submit(next);
     }
 
@@ -1009,9 +999,8 @@ impl KeyboardHandler for App {
         let left = self.keyboard_focus.take().unwrap_or_else(|| "an untracked surface".to_string());
         // ADR-0050 decision 4's third clearing source. The user is demonstrably somewhere
         // else, so the `textfield` stops owning the next secret and the armed press will never see
-        // its release -- the same answer `PointerEventKind::Leave` gives for the same reason. The
-        // scrub that used to live on `zwp_text_input_v3`'s `leave` is now this call's, and it is the
-        // load-bearing half: no submit is coming for those bytes.
+        // its release, the same answer `PointerEventKind::Leave` gives for the same reason. This is
+        // the load-bearing scrub: no submit is coming for those bytes.
         self.focus_secure_submit(None);
         self.armed = None;
         eprintln!("[oblisk-renderer] keyboard focus left {left}");
@@ -1114,7 +1103,7 @@ mod tests {
 
     #[test]
     fn secure_submit_frame_carries_the_accumulated_secret_and_zeroizes_the_buffer_it_read() {
-        // build-steps.md Phase 15 item 2 / ADR-0005/ADR-0027: the frame carries the exact secret
+        // ADR-0005, ADR-0027: the frame carries the exact secret
         // this thread accumulated, tagged with this process's own generation_id, and the source
         // buffer is scrubbed in the same breath as the read rather than left live.
         let mut buffer = shared::SecureBuffer::new();

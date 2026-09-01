@@ -1,6 +1,6 @@
 //! `oblisk.power` capability: power profiles and the battery's charge/discharge rate
 //! (`docs/oblisk-idl-api-specs.md` § 2.13), read from two D-Bus services
-//! (`docs/build-steps.md` Phase 28 item 4, ADR-0053's `power` amendment).
+//! (ADR-0053's `power` amendment).
 //!
 //! Two services, because § 2.13 is two unrelated facts wearing one name. `active_profile` and
 //! `profiles` come from power-profiles-daemon; `on_battery` and `energy_rate` come from UPower.

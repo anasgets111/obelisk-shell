@@ -360,10 +360,9 @@ pub fn run(
         // channel (ADR-0039), so a burst of `StateSnapshot` pushes must not be spread one
         // per 15ms poll tick.
         //
-        // `Disconnected` is a separate answer from `Empty` here (ADR-0059 decision 1). It
-        // used to be one: `while let Ok(frame)` treated a dead socket thread the same as an idle
-        // one, so killing the Supervisor left this process spinning its 15ms poll forever at
-        // 17.8% of a core, painting a shell with no capability data and no way to reach one.
+        // `Disconnected` is a separate answer from `Empty` here (ADR-0059 decision 1): treating
+        // a dead socket thread as idle would leave this process spinning its 15ms poll forever
+        // at 17.8% of a core, painting a shell with no capability data and no way to reach one.
         //
         // An `ActivateDraw` nonce is collected here rather than serviced in place: drawing inside
         // the loop body painted whatever layout the scene held at that instant, so a

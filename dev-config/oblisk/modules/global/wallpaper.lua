@@ -1,4 +1,4 @@
--- The wallpaper, which is not a capability and never was (docs/adr/0055). Everything
+-- The wallpaper, which is not a capability and never was (ADR-0055). Everything
 -- `wallpaper:set(mon, path, fit, anim, dur)` was going to carry already had a home once ADR-0038
 -- moved surface declaration here and Phase 21 built `state`: the monitor is `panel.monitor`, the
 -- path is `image.source`, the fit is `image.fit`, and the two animation arguments need an animation
@@ -16,7 +16,7 @@ local wallpaper = state("wallpaper", oblisk.config_dir .. "/wallpaper.svg")
 -- `false` still leaves the surface inside the area *other* surfaces reserved, so the moment the bar
 -- claimed its 39px this shrank to 1161 and sat below it. `"Ignore"` is layer-shell's `-1`: reserve
 -- nothing, ignore everyone else, cover the output. `true` would not have helped either -- a surface
--- anchored to all four edges has no single edge to reserve against, so it reads as 0 (docs/adr/0078).
+-- anchored to all four edges has no single edge to reserve against, so it reads as 0 (ADR-0078).
 return panel {
     id = "wallpaper",
     layer = "Background",

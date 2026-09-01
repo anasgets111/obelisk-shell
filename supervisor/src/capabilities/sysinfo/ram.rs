@@ -44,7 +44,7 @@ pub fn compute_percentages(info: &MemInfo) -> (u8, u8) {
 }
 
 /// Reads and parses `{proc_root}/meminfo`. `proc_root` is a parameter, never a hardcoded
-/// `/proc` (docs/oblisk-tdd-test-harness.md's mandate).
+/// `/proc`, so a test can point it at a tempdir.
 pub fn read_meminfo(proc_root: &std::path::Path) -> std::io::Result<MemInfo> {
     let content = std::fs::read_to_string(proc_root.join("meminfo"))?;
     parse_meminfo(&content)

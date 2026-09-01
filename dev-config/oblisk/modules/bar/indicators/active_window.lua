@@ -4,7 +4,7 @@
 -- nothing asking it to. It used to be a click: the title lived in a `state` signal that a
 -- `process.run("niri", {"msg", "-j", "focused-window"})` filled in, and until you clicked it the bar
 -- read "click for the focused window". That was there to demonstrate `process.run` feeding
--- `json.decode` (docs/adr/0057), and it was the wrong module to demonstrate it in. ADR-0056 keeps
+-- `json.decode` (ADR-0057), and it was the wrong module to demonstrate it in. ADR-0056 keeps
 -- window *lists* out of `workspaces`, which is true and is not this: the focused window alone has
 -- been in every snapshot since that ADR, as `active_client`, which is where the icon was already
 -- getting `class`. Shelling out to niri for a string the supervisor had already pushed bought a
@@ -29,7 +29,7 @@ local function focused(workspaces)
     return workspaces and workspaces.active_client
 end
 
--- The second `oblisk.applications` consumer (docs/adr/0061). `active_client.class` is a toplevel's
+-- The second `oblisk.applications` consumer (ADR-0061). `active_client.class` is a toplevel's
 -- `app_id` (ADR-0056 decision 5), which is the spelling `util.app_entry` maps onto a `.desktop`
 -- entry. Before that capability existed there was nowhere for an `app_id` to become an icon, which
 -- is the caller ADR-0054 decision 5 said would arrive one day.

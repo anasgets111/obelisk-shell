@@ -1,6 +1,6 @@
 -- Not in the mirror, and first on the bar anyway: a config error is the one thing that must not be
 -- pushed off the edge by whatever is beside it. It occupies no width unless the config has failed
--- (docs/adr/0046).
+-- (ADR-0046).
 --
 -- A red warning circle rather than the words "config error", now that every other module on this
 -- bar is a glyph. It is the same size as its neighbours, so a bar that has broken looks like a bar

@@ -1,19 +1,18 @@
-//! The one-pass resolve algorithm and the retained-scene transaction
-//! (`docs/oblisk-layout-engine-geometry.md` § 3-5, `CONTEXT.md`'s "Retained scene" entries).
+//! The resolve pass and the retained-scene transaction (`CONTEXT.md`'s "Retained scene" entries).
 //!
 //! A pass is three steps. [`prepare`] walks the fresh tree in declaration order, resolving each
 //! node's properties once, parsing them once, matching it to the retained node it continues
-//! (`pair_children_by_id_then_position`, § 4 as amended by ADR-0045: children carrying an
-//! `id` pair by that `id` alone, scoped to their parent, and the id-less ones pair by position
-//! among themselves -- ADR-0023's original rule on a smaller set), retiring removed subtrees
-//! child-first (`CONTEXT.md`, Lease), and building a taffy node for it. [`solve`] runs § 3's three
-//! passes over that tree. [`finish`] reads the geometry back out.
+//! (`pair_children_by_id_then_position`: children carrying an `id` pair by that `id` alone,
+//! scoped to their parent, and the id-less ones pair by position among themselves, ADR-0023's
+//! original rule on a smaller set, amended by ADR-0045), retiring removed subtrees child-first
+//! (`CONTEXT.md`, Lease), and building a taffy node for it. [`solve`] hands that tree to taffy,
+//! which runs its own layout passes over it. [`finish`] reads the geometry back out.
 //!
-//! The § 3 math itself is taffy's since ADR-0077, which supersedes ADR-0023's one-pass
-//! stacking model. What is still this module's own is everything a solver has no opinion about:
-//! node identity, the lease, the depth cap, the once-per-pass resolution guarantee, the scroll
-//! writeback, and text elision. [`taffy_style`] is the seam between the two, and it is the only
-//! place that knows what a `row` or a `Fill` means.
+//! The layout math itself is taffy's: ADR-0077 replaced this module's hand-written one-pass
+//! stacking solver (ADR-0023) with it. What is still this module's own is everything a solver
+//! has no opinion about: node identity, the lease, the depth cap, the once-per-pass resolution
+//! guarantee, the scroll writeback, and text elision. [`taffy_style`] is the seam between the
+//! two, and it is the only place that knows what a `row` or a `Fill` means.
 
 use std::collections::{HashMap, HashSet};
 
@@ -32,24 +31,20 @@ pub struct LogicalSize {
     pub height: f32,
 }
 
-/// The recursion bound for [`prepare`] (build-steps.md Phase 19 item 3): at most this
-/// many node levels are admitted, and the level past it is refused, the same "at most N levels"
-/// boundary `lua::signal`'s `MAX_SIGNAL_NESTING_DEPTH` uses. Applies to both a literal cyclic tree
-/// (`r.children = { r }`) and a computed `children` signal that manufactures fresh depth on every
-/// read: both recurse through this same function, so one counter catches both.
+/// The recursion bound for [`prepare`]: at most this many node levels are admitted, and the
+/// level past it is refused, the same "at most N levels" boundary `lua::signal`'s
+/// `MAX_SIGNAL_NESTING_DEPTH` uses. Applies to both a literal cyclic tree (`r.children = { r }`)
+/// and a computed `children` signal that manufactures fresh depth on every read: both recurse
+/// through this same function, so one counter catches both.
 ///
 /// Exists to turn an abort into a `LayoutError`, not to express a design limit. Sizing it means
 /// sizing it *together with* `MAX_SIGNAL_NESTING_DEPTH`, because the two recursions compound: a
 /// node level resolves its `children` property, and that resolution can nest signals.
 ///
-/// Measured end to end, by running the compound worst case -- a tree at this cap whose every level
-/// carries a 31-deep `computed` chain on its `margin` -- on a thread whose stack is shrunk until
-/// the process aborts. That is a different measurement from the one this comment used to carry,
-/// which modelled the peak from instrumented frame addresses and so counted only this module's own
-/// recursion. The model understated it: it predicted 809,472 B where the shipped code actually
-/// needed about 1,400 KiB, because the mlua frames below the deepest node and the error-formatting
-/// frames a refusal runs at full depth are real and were not in it. Shrinking a stack until it
-/// aborts counts everything.
+/// Measured end to end by running the compound worst case (a tree at this cap whose every level
+/// carries a 31-deep `computed` chain on its `margin`) on a thread whose stack is shrunk until the
+/// process aborts, which counts every frame: the mlua frames below the deepest node and the
+/// error-formatting frames a refusal runs at full depth, not only this module's own recursion.
 ///
 /// On the tightest stack this runs on, a 2 MiB debug test thread (production owns the Lua VM on the
 /// process main thread, 8 MiB by default, since `wayland::run` is called from `main`):
@@ -71,16 +66,15 @@ const MAX_TREE_DEPTH: u32 = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(u64);
 
-/// Every geometry property one node's layout reads, parsed exactly once per pass
-/// (build-steps.md Phase 19 item 5: "parsing geometry once into the retained node").
+/// Every geometry property one node's layout reads, parsed exactly once per pass.
 ///
-/// Item 5's first half made a node's *properties* resolve once, so the `Signal` behind `margin` is
-/// read once per node per pass. This is the second thing it names. A resolved property is still an
-/// `mlua::Value`, and a `Value::Table` carrying an `__index` answers every metamethod-aware
-/// `Table::get` afresh, so `margin` parsed once in the parent's child loop, twice more while the
-/// hand-written pass sized the row and once more while it positioned the child was four
-/// independent answers to one question. Measured before this existed: 16 `__index` invocations for
-/// one child's margin in one apply, and a row that measured itself 18 wide then placed its 10-wide
+/// A node's properties resolve once, so the `Signal` behind `margin` is read once per node per
+/// pass; parsing the resolved value once is the second half of the same guarantee. A resolved
+/// property is still an `mlua::Value`, and a `Value::Table` carrying an `__index` answers every
+/// metamethod-aware `Table::get` afresh, so parsing `margin` once in the parent's child loop,
+/// rather than separately wherever a sizing pass needs it, avoids the answer changing between
+/// reads. Measured on the hand-written pass this replaced: 16 `__index` invocations for one
+/// child's margin in one apply, and a row that measured itself 18 wide then placed its 10-wide
 /// child spanning 16..26, eight pixels outside the parent it had just been sized to fit. No
 /// `Signal` involved. The solver reads this struct once too (ADR-0077): [`taffy_style`] is the
 /// only thing that touches it, and it runs once per node per pass.
@@ -88,16 +82,16 @@ pub struct NodeId(u64);
 /// Parsed by the *parent*, in its child loop, for the same reason the property resolve is: a
 /// parent needs a child's `margin` to compute the budget it recurses with, so the one parse has to
 /// happen before the recursion, not at the top of it. `Scene::apply_one_instance` does it for a
-/// surface root, which has no parent. That is item 5's own "same once-per-node guarantee, one
-/// frame further up", applied a second time.
+/// surface root, which has no parent, extending the same once-per-node guarantee one frame
+/// further up.
 ///
 /// Every field is parsed for every kind, including the ones that kind ignores: `spacing` on a
 /// `text`, `align_h` on a `row`'s child where only `align_v` was ever read. That widens what fails
-/// the pass, deliberately and in the direction ADR-0068 already chose -- a malformed geometry
+/// the pass, deliberately and in the direction ADR-0068 already chose: a malformed geometry
 /// property is now heard about while applying rather than on the day a config changes the node's
-/// kind and the property starts being read. It is the same trade item 5 made knowingly for
-/// resolution ("a getter that raises fails the apply even for a property nothing currently
-/// reads, which is correct").
+/// kind and the property starts being read. It is the same trade made knowingly for resolution
+/// ("a getter that raises fails the apply even for a property nothing currently reads, which is
+/// correct").
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct LayoutStyle {
     margin: EdgeInsets,
@@ -231,14 +225,13 @@ impl RetainedNode {
 ///
 /// Everything below a surface's root reconciles through `pair_children_by_id_then_position`: an
 /// optional, per-parent-scoped `id` pairs only against the same `id`, and the children carrying
-/// none fall back to ADR-0023's original positional rule among themselves (§ 4 as amended by
-/// ADR-0045).
+/// none fall back to ADR-0023's original positional rule among themselves, amended by ADR-0045.
 #[derive(Default)]
 pub struct Scene {
     surfaces: HashMap<String, RetainedNode>,
     /// Removed subtrees, held alive child-first order until [`Scene::release`] finalizes the
-    /// drop (`CONTEXT.md`, Lease). Nothing calls `release` in production yet -- see ADR-0023
-    /// item 7. `Vec`, not a `HashMap`, specifically so insertion order (child-first) is
+    /// drop (`CONTEXT.md`, Lease). Nothing calls `release` in production yet (see ADR-0023).
+    /// `Vec`, not a `HashMap`, specifically so insertion order (child-first) is
     /// observable, both for a future consumer and for this module's own tests.
     retiring: Vec<(NodeId, RetainedNode)>,
     next_id: u64,
@@ -256,8 +249,7 @@ impl Scene {
     }
 
     /// Reconciles one retained tree per entry in `instances` into the retained scene, each keyed by
-    /// its `instance_id` and resolved against that instance's own `available` size (build-steps.md
-    /// Phase 20 items 2 and 4).
+    /// its `instance_id` and resolved against that instance's own `available` size.
     ///
     /// The two arguments answer different questions and neither implies the other. `fresh_surfaces`
     /// is what the config *declared*; `instances` is what the compositor is actually being asked to
@@ -286,17 +278,16 @@ impl Scene {
     /// the smallest change that holds the invariant for all three.
     ///
     /// ponytail: the snapshot is taken unconditionally, so every apply deep-clones the retained
-    /// tree whether or not anything fails, and item 2's dirty flag turns that into once per
-    /// capability push rather than once per config edit. The clone is structural (a
+    /// tree whether or not anything fails; the dirty flag that gates a capability push turns that
+    /// into once per capability push rather than once per config edit. The clone is structural (a
     /// `RetainedNode`'s `mlua::Value` properties are refcount bumps, not deep copies), so it is
-    /// O(nodes), not O(Lua heap). This comment used to name build-steps.md Phase 19 item 5 as the
-    /// fix, on the theory that resolving every property up front would finish all the fallible
-    /// work before any state was touched. Item 5 landed and that turned out to be wrong: a parent
-    /// must know a child's `margin` before it can hand that child a budget, so resolution is
-    /// interleaved with the walk rather than preceding it, and a Signal getter can still fail at
-    /// arbitrary depth with `next_id` and `retiring` already mutated. Removing the snapshot needs
-    /// the whole fresh tree resolved into a separate tree first, which is a second traversal and a
-    /// second allocation to save a clone that is already O(nodes).
+    /// O(nodes), not O(Lua heap). Resolving every property up front, before touching any state,
+    /// does not remove the clone: a parent must know a child's `margin` before it can hand that
+    /// child a budget, so resolution is interleaved with the walk rather than preceding it, and a
+    /// Signal getter can still fail at arbitrary depth with `next_id` and `retiring` already
+    /// mutated. Removing the snapshot needs the whole fresh tree resolved into a separate tree
+    /// first, which is a second traversal and a second allocation to save a clone that is already
+    /// O(nodes).
     /// The unguarded spelling, gated `#[cfg(test)]` so it cannot become a production call site.
     /// Threading a `|_| Ok(())` through every fixture would only make the real callers' guard
     /// easier to leave off by accident; gating this on `test` keeps [`Scene::apply_admitting`] the
@@ -325,11 +316,11 @@ impl Scene {
         let retiring_snapshot_len = self.retiring.len();
         let surfaces_snapshot = self.surfaces.clone();
 
-        // One budget for the whole pass, not one per getter call (build-steps.md Phase 19 item 5).
-        // It has to be entered out here rather than inside the walk for both of the things it
-        // bounds: the instruction hook stays installed across the gaps between signal evaluations,
-        // where a resolved table's `__index` used to run unhooked, and the deadline spans every
-        // node so a tree of individually-legal 5ms getters cannot add up to an unbounded pass.
+        // One budget for the whole pass, not one per getter call. It has to be entered out here
+        // rather than inside the walk for both of the things it bounds: the instruction hook
+        // stays installed across the gaps between signal evaluations, where a resolved table's
+        // `__index` would otherwise run unhooked, and the deadline spans every node so a tree of
+        // individually-legal 5ms getters cannot add up to an unbounded pass.
         let budget = match crate::lua::signal::LayoutPassBudget::enter(lua) {
             Ok(budget) => budget,
             Err(err) => return Err(node::invalid("layout", err.to_string())),
@@ -404,11 +395,11 @@ impl Scene {
         ensure_node_admissible(&fresh.kind, 0)?;
         let properties = node::resolve_properties(&fresh.properties, &fresh.kind, lua)?;
         // The root's one parse for this pass. Every other node's is done by its parent's child
-        // loop; a surface root has no parent, so this is where item 5's "one frame further up"
-        // runs out of frames.
+        // loop; a surface root has no parent, so this is where the once-per-node-per-pass parse
+        // guarantee runs out of frames one level up.
         let style = LayoutStyle::parse(&properties)?;
-        // **An unsized `window` or `lock` root is its surface** (build-steps.md Phase 22 item 1,
-        // Phase 23). A `panel` root sizes itself from § 6.1's `width`/`height`; § 6.2 gives a
+        // **An unsized `window` or `lock` root is its surface.** A `panel` root sizes itself from
+        // § 6.1's `width`/`height`; § 6.2 gives a
         // `window` neither, because a toplevel's size is the compositor's, arriving as an
         // `xdg_toplevel` configure `set_instance_size` has already turned into this `available`.
         //
@@ -482,9 +473,9 @@ impl Scene {
     ///
     /// ponytail: no production caller yet -- nothing in this codebase owns a per-node GPU
     /// resource to guard, so nothing needs to signal "done consuming this retired subtree." The
-    /// mechanism is built ahead of that consumer per build-steps.md Phase 12's own instruction
-    /// (ADR-0023 item 7), matching `supervisor/src/socket.rs`'s `GenerationRegistry::send_to`
-    /// precedent from Phase 9. Exercised by this module's own tests only.
+    /// mechanism is built ahead of that consumer (ADR-0023), matching
+    /// `supervisor/src/socket.rs`'s `GenerationRegistry::send_to` precedent. Exercised by this
+    /// module's own tests only.
     #[allow(dead_code)]
     pub fn release(&mut self, id: NodeId) -> bool {
         if let Some(pos) = self.retiring.iter().position(|(rid, _)| *rid == id) {
@@ -504,7 +495,7 @@ impl Scene {
     /// as well as Rust memory in a process meant to live for a whole session.
     ///
     /// Unconditional, and only correct because it is: nothing in this codebase holds a lease
-    /// today, so nothing can be mid-teardown when this runs (ADR-0023 item 7, the same fact
+    /// today, so nothing can be mid-teardown when this runs (ADR-0023, the same fact
     /// [`Self::release`]'s own ponytail records).
     ///
     /// ponytail: this is the wrong shape the moment a real lease holder exists. Once a paint stage
@@ -540,7 +531,7 @@ impl Scene {
 
 /// All four § 6 roles are here per ADR-0040 decision 1. Every one is a surface container: a
 /// role for a `wl_surface`, a `child` tree inside it, and no layout model of their own beyond the
-/// stacking one ADR-0023 item 4 already gives `panel`. `lock` is admitted the same way
+/// stacking model ADR-0023 already gives `panel`. `lock` is admitted the same way
 /// (ADR-0052 decision 2): this admits a *node kind* into the walk, and a lock screen's tree
 /// has to be walked whether or not the compositor has handed out a surface to paint it into.
 fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
@@ -566,13 +557,12 @@ fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
 /// effects for a node that never entered the accepted tree.
 ///
 /// `depth` is the level the node being checked would occupy, so a parent at `depth` checks its
-/// children at `depth + 1` -- the same number the recursive call is handed, and the same
-/// `TreeTooDeep` this used to raise one frame later.
+/// children at `depth + 1`, the same number the recursive call is handed.
 fn ensure_node_admissible(kind: &str, depth: u32) -> Result<(), LayoutError> {
     ensure_supported_kind(kind)?;
-    // build-steps.md Phase 19 item 3: a cyclic or infinitely-generating tree returns a LayoutError
-    // at MAX_TREE_DEPTH's own stack depth, not somewhere further down (see MAX_TREE_DEPTH's doc
-    // comment for the measured stack cost this leaves margin against).
+    // A cyclic or infinitely-generating tree returns a LayoutError at MAX_TREE_DEPTH's own stack
+    // depth, not somewhere further down (see MAX_TREE_DEPTH's doc comment for the measured stack
+    // cost this leaves margin against).
     //
     // `>=`, not `>`: `depth` counts levels already entered, root at 0, so this admits levels
     // 0..MAX_TREE_DEPTH-1 -- exactly MAX_TREE_DEPTH of them, which is what the constant and the
@@ -608,9 +598,9 @@ fn children_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Vec<Vi
             Ok(node::parse_single_child(properties, "child")?.into_iter().collect())
         }
         "rect" | "row" | "column" | "button" => node::parse_children(properties),
-        // ADR-0045 decision 3, build-steps.md Phase 19 item 12: a `list`'s children don't exist
-        // as a literal Lua table -- they're generated from `source`, one per element, which is
-        // why this is its own parser rather than a `parse_children` variant.
+        // ADR-0045 decision 3: a `list`'s children don't exist as a literal Lua table, they're
+        // generated from `source`, one per element, which is why this is its own parser rather
+        // than a `parse_children` variant.
         "list" => node::parse_list_children(properties),
         "text" | "icon" | "image" | "textfield" => Ok(Vec::new()),
         other => unreachable!("ensure_supported_kind already rejected `{other}`"),
@@ -630,10 +620,9 @@ fn resolve_non_content(mode: SizeMode, available: f32) -> Option<f32> {
     }
 }
 
-/// Pairs `fresh_children` against `old_children` (`docs/oblisk-layout-engine-geometry.md` § 4,
-/// ADR-0045 decisions 1-2) by partitioning both sides into identified and unidentified
-/// subsequences, because an `id` means "this is the same node, and *only* the same node", in both
-/// directions:
+/// Pairs `fresh_children` against `old_children` (ADR-0045 decisions 1-2) by partitioning both
+/// sides into identified and unidentified subsequences, because an `id` means "this is the same
+/// node, and *only* the same node", in both directions:
 ///
 /// - a fresh child **with** an `id` matches only a retained child carrying the same `id`. If none
 ///   exists it is new, and it must not fall through to the positional pool -- otherwise a node
@@ -756,7 +745,7 @@ fn main_axis_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Optio
 /// callback below, because a callback returns a `Size<f32>` and has nowhere to put a
 /// [`LayoutError`] -- `icon`'s `size` is a property like any other and can be malformed.
 enum Measure {
-    /// § 3.2's text measurement, against the wrap width taffy offers.
+    /// A `text` node's shaped extent, against the wrap width taffy offers.
     Text { content: String, font_size: f32 },
     /// § 5.1's `icon` `size`, the same number on both axes.
     Square(f32),
@@ -817,7 +806,7 @@ fn main_align(align: Align) -> taffy::JustifyContent {
 /// shaped.
 ///
 /// `parent_axis` is the axis this node's parent flows along, `None` when the parent stacks
-/// (ADR-0023 item 4) or when this is a surface root. It is what decides which of this node's
+/// (ADR-0023) or when this is a surface root. It is what decides which of this node's
 /// two `Fill`s is a share of a remainder and which is the whole slot: filling a row's main axis
 /// means splitting what the siblings leave, and filling anything else means taking all of it.
 fn taffy_style(
@@ -869,17 +858,17 @@ fn taffy_style(
                 MainAxis::Horizontal => taffy::FlexDirection::Row,
                 MainAxis::Vertical => taffy::FlexDirection::Column,
             };
-            // § 3.3: a flow container's own `align_h`/`align_v` packs its children along the axis
-            // it flows in. The other axis is each child's own business and is read off the child.
+            // A flow container's own `align_h`/`align_v` packs its children along the axis it
+            // flows in. The other axis is each child's own business and is read off the child.
             out.justify_content = Some(main_align(match axis {
                 MainAxis::Horizontal => style.align_h,
                 MainAxis::Vertical => style.align_v,
             }));
-            // § 3.1's `spacing`, between adjacent children only, which is what a flex gap is. Set
-            // on both axes because a single flex line only ever spends the one it flows along.
+            // `spacing`, between adjacent children only, which is what a flex gap is. Set on both
+            // axes because a single flex line only ever spends the one it flows along.
             out.gap = taffy::Size { width: length(style.spacing), height: length(style.spacing) };
         }
-        // The stacking model (ADR-0023 item 4) is a grid of exactly one cell holding every
+        // The stacking model (ADR-0023) is a grid of exactly one cell holding every
         // child: they overlap, each is aligned independently on both axes within the full content
         // box, and the container's own `Content` size is their bounding union. That is what a
         // single auto-sized grid track does, which is why this is a `Display::Grid` rather than an
@@ -980,8 +969,8 @@ fn new_solver_node(
 /// the config wrote the nodes.
 ///
 /// This is where everything that can run Lua or fail happens, and it happens depth-first in
-/// declaration order, which is the guarantee build-steps.md Phase 19 item 5 states: every getter
-/// fires exactly once, in source order. The hand-written pass had to work to keep that, because it
+/// declaration order, which is what guarantees every getter fires exactly once, in source order.
+/// The hand-written pass had to work to keep that, because it
 /// recursed into `Fill` children after their siblings and so had to split resolution out of the
 /// recursion; here there are no rounds, so declaration order and recursion order are the same one.
 ///
@@ -1054,9 +1043,9 @@ fn prepare(
             None => None,
         };
 
-        // This child's one resolve and one parse for this pass (build-steps.md Phase 19 item 5),
-        // both here rather than inside the recursive call, because the style the call is handed is
-        // built from them and a second read of an impure `margin` could answer differently.
+        // This child's one resolve and one parse for this pass, both here rather than inside the
+        // recursive call, because the style the call is handed is built from them and a second
+        // read of an impure `margin` could answer differently.
         let child_properties = node::resolve_properties(&fresh_child.properties, &fresh_child.kind, lua)?;
         let child_style = LayoutStyle::parse(&child_properties)?;
         children.push(prepare(
@@ -1167,8 +1156,9 @@ fn taffy_failed(err: taffy::TaffyError) -> LayoutError {
     node::invalid("layout", format!("the layout solver refused a node built by this pass: {err}"))
 }
 
-/// § 3's three passes, now taffy's: sizes up, positions down, and the constraints resolved between
-/// them. Given a prepared tree and the room its root has, it fills in every node's geometry.
+/// Runs taffy's own layout passes over the tree: sizes up, positions down, and the constraints
+/// resolved between them. Given a prepared tree and the room its root has, it fills in every
+/// node's geometry.
 ///
 /// The measure callback is the one place this crate is still asked a geometry question, and it is
 /// asked only about the two kinds whose size is their content: a `text`'s shaped extent and an
@@ -1197,7 +1187,7 @@ fn solve(
                 match measure {
                     Measure::Square(size) => taffy::Size { width: *size, height: *size },
                     Measure::Text { content, font_size } => {
-                        // § 3.2's wrap boundary: the width this box is already known to have, or the
+                        // The wrap boundary: the width this box is already known to have, or the
                         // width on offer when it is not. `MaxContent`/`MinContent` mean taffy is
                         // asking what the string wants rather than offering it a box, and an
                         // unconstrained measurement is the honest answer to that.
@@ -1634,7 +1624,8 @@ pub(super) mod tests {
         );
     }
 
-    /// ADR-0023 item 11, closed by the solver rather than by anything written here.
+    /// A `Stretch` child of a `Content`-sized row: the solver closes this, not anything written
+    /// here (ADR-0023).
     ///
     /// Same shape as the test above, minus the row's `height = "Fill"`, which is the whole
     /// difference: the row is now `Content`-sized, so its own height is not known until after its
@@ -1663,7 +1654,7 @@ pub(super) mod tests {
         assert_eq!(
             stretched.children[0].rect.y,
             (50.0 - 6.0) / 2.0,
-            "centered against the stretched height, which is ADR-0023 item 11 no longer holding"
+            "centered against the stretched height, which the old stacking model did not do"
         );
     }
 
@@ -1942,7 +1933,7 @@ pub(super) mod tests {
     }
 
     /// Also correct before this pass and pinned: a stacking parent has no main axis, its children
-    /// may overlap by design (ADR-0023 item 4), and `Fill` there means the whole box.
+    /// may overlap by design (ADR-0023), and `Fill` there means the whole box.
     #[test]
     fn fill_under_a_stacking_parent_is_still_the_whole_box() {
         let mut scene = Scene::new();
@@ -2164,7 +2155,7 @@ pub(super) mod tests {
     }
 
     /// The surface root resolves through the same `unwrap_or`, and a popup sized to its contents
-    /// is the case this actually bites (build-steps.md Phase 19 item 14).
+    /// is the case this actually bites.
     #[test]
     fn padding_grows_a_content_sized_surface_too() {
         let mut scene = Scene::new();
@@ -3100,7 +3091,7 @@ pub(super) mod tests {
 
     /// The three tests below share one shape: a `margin` that is a `computed` signal counting its
     /// own reads into a Lua global, so what a single `Scene::apply` does with that property is
-    /// observable from the config's side (build-steps.md Phase 19 item 5).
+    /// observable from the config's side.
     fn surface_with_a_read_counting_margin(lua: &mlua::Lua) -> VirtualNode {
         register_node_constructors(lua).unwrap();
         crate::lua::signal::register(lua, crate::lua::signal::DirtyFlag::new()).unwrap();
@@ -3119,8 +3110,8 @@ pub(super) mod tests {
         deserialize_lua_table(&table).unwrap()
     }
 
-    /// build-steps.md Phase 19 item 5's first half, and the shape it says the item did not close:
-    /// a plain Lua table with an `__index`, no `Signal` anywhere. Every metamethod-aware
+    /// The shape resolving-once does not close: a plain Lua table with an `__index`, no `Signal`
+    /// anywhere. Every metamethod-aware
     /// `Table::get` used to re-run the metamethod, so `margin` was parsed four separate times per
     /// child per pass and the four answers were free to differ.
     fn surface_with_an_index_counting_margin(lua: &mlua::Lua) -> VirtualNode {
@@ -3228,8 +3219,8 @@ pub(super) mod tests {
         );
     }
 
-    /// build-steps.md Phase 19 item 5, and the guarantee most likely to be lost by a later edit:
-    /// every getter fires exactly once, in the order the config wrote it. An impure closure like
+    /// The guarantee most likely to be lost by a later edit: every getter fires exactly once, in
+    /// the order the config wrote it. An impure closure like
     /// this one is what can observe it.
     ///
     /// This used to read `abBA`, and the difference is worth keeping in view. The `Fill` child is
@@ -3781,7 +3772,7 @@ mod pass_budget_tests {
     use crate::lua::nodes::{deserialize_lua_table, register_node_constructors};
     use crate::text::shaping::ShapingHandle;
 
-    /// build-steps.md Phase 19 item 5's second half. The config here contains no `Signal` at all:
+    /// The config here contains no `Signal` at all:
     /// a plain table with an `__index` that never returns is Lua the pass runs outside any signal
     /// evaluation, so ADR-0021's per-getter cap never covered it. Item 5 measured this exact shape
     /// at 26.10 seconds returning `Ok(())`.

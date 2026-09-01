@@ -41,7 +41,7 @@ pub fn delta_percent(prev: &CpuSample, current: &CpuSample) -> u8 {
 }
 
 /// Reads and parses `{proc_root}/stat`'s aggregate `cpu` line. `proc_root` is a parameter,
-/// never hardcoded `/proc` (docs/oblisk-tdd-test-harness.md's mandate).
+/// never hardcoded `/proc`, so a test can point it at a tempdir.
 pub fn read_sample(proc_root: &std::path::Path) -> std::io::Result<CpuSample> {
     let content = std::fs::read_to_string(proc_root.join("stat"))?;
     let line = content.lines().next().unwrap_or("");

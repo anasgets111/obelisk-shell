@@ -1,8 +1,8 @@
 //! `process` global table and `ProcessHandle` userdata (`oblisk-idl-api-specs.md` § 3.2/3.3,
-//! `docs/oblisk-supervisor-services-dbus.md` § 12, build-steps.md Phase 15 item 1, ADR-0026).
+//! `docs/oblisk-supervisor-services-dbus.md` § 12, ADR-0026).
 //!
 //! `process.run(cmd, args, out_cb, exit_cb)` executes on the Wayland dispatch thread, inside a Lua
-//! evaluation, with no socket in scope -- so it can't write the outbound `"process"`/`"run"`
+//! evaluation, with no socket in scope, so it can't write the outbound `"process"`/`"run"`
 //! `CommandEnvelope` directly. [`ProcessRegistry`] instead queues it onto the same
 //! `mpsc::UnboundedSender<RendererFrame>` every other outbound frame goes to, which the socket
 //! thread's `pump` drains and writes (ADR-0039).
@@ -10,8 +10,8 @@
 //! `Rc<RefCell<_>>`, not `Arc<Mutex<_>>`: [`ProcessRegistry`] is confined to the one Wayland
 //! dispatch thread, alongside the Lua VM whose closures drive it.
 //!
-//! Callback calling convention (not pinned down by the spec docs, decided here -- see
-//! ADR-0026): `out_cb(line, stream)` with `stream` the Lua string `"stdout"`/`"stderr"` (the
+//! Callback calling convention, not pinned down by the spec docs, decided here (ADR-0026):
+//! `out_cb(line, stream)` with `stream` the Lua string `"stdout"`/`"stderr"` (the
 //! wire type stays a real `shared::ProcessStream` enum; Lua has no enums). `exit_cb(code)` with
 //! `code` an integer or `nil`, `Option<i32>`'s own natural `IntoLua` mapping.
 

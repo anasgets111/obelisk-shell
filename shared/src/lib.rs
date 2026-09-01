@@ -185,14 +185,14 @@ pub struct ActivateDraw {
 
 /// § 15.2 points 2-3 ("Null-Buffer Staging"): the Candidate's one-time report that every tracked
 /// Wayland surface has committed its null buffer and is staged, waiting for `ActivateDraw`.
-/// `surfaces` is a surface_id list, not a monitor id list (ADR-0025 item 2).
+/// `surfaces` is a surface_id list, not a monitor id list (ADR-0025).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReadySignal {
     pub surfaces: Vec<String>,
 }
 
 /// § 15.3 point 4 ("Evidence Verification"): one message per surface_id that received its
-/// `wp_presentation_feedback` `presented` event (ADR-0019 item 5).
+/// `wp_presentation_feedback` `presented` event (ADR-0019).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PresentationEvidence {
     pub nonce: u64,
@@ -201,7 +201,7 @@ pub struct PresentationEvidence {
 
 /// § 15.4 point 1 ("Input Deselection"): tells the superseded generation to stop treating
 /// `surface_id` as authoritative. No per-surface input-region/focus wiring exists yet to hand
-/// this to (ADR-0025 item 4).
+/// this to (ADR-0025).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeselectInput {
     pub surface_id: String,

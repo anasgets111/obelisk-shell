@@ -1,6 +1,6 @@
-//! Typed property parsing for the layout engine (build-steps.md Phase 12,
-//! `docs/oblisk-idl-api-specs.md` § 5.1). `lua::nodes::VirtualNode` leaves every property as a raw
-//! `mlua::Value`; this module turns it into typed, validated properties.
+//! Typed property parsing for the layout engine (`docs/oblisk-idl-api-specs.md` § 5.1).
+//! `lua::nodes::VirtualNode` leaves every property as a raw `mlua::Value`; this module turns it
+//! into typed, validated properties.
 //!
 //! A `Value::UserData` holding a `Signal` (§ 1.2) is resolved rather than rejected (ADR-0044
 //! decision 1), and every one of those reads happens in exactly one place: [`resolve_properties`],
@@ -125,10 +125,10 @@ pub enum LayoutError {
     InvalidProperty { property: String, detail: String },
     #[error("`{0}` is a Signal handle, not a plain value -- read it via :get() before returning it from shell.lua")]
     UnsupportedSignalProperty(String),
-    /// build-steps.md Phase 19 item 3: `layout::scene::prepare`'s recursion, bounded at
-    /// `layout::scene::MAX_TREE_DEPTH`. Covers both a literal cyclic tree (`r.children = { r }`)
-    /// and a computed `children` signal that generates fresh depth on every read -- both recurse
-    /// through the same Rust call, so one cap catches both (see that constant's doc comment).
+    /// `layout::scene::prepare`'s recursion, bounded at `layout::scene::MAX_TREE_DEPTH`. Covers
+    /// both a literal cyclic tree (`r.children = { r }`) and a computed `children` signal that
+    /// generates fresh depth on every read: both recurse through the same Rust call, so one cap
+    /// catches both (see that constant's doc comment).
     ///
     /// `max` is the number of levels actually admitted and `depth` is the 1-based level that was
     /// refused, so `depth` is always `max + 1` -- the message states the limit the code enforces,
@@ -137,22 +137,21 @@ pub enum LayoutError {
         "node tree exceeds the maximum depth of {max} levels (at `{kind}`, level {depth}) -- a node holding itself in `children`?"
     )]
     TreeTooDeep { kind: String, depth: u32, max: u32 },
-    /// build-steps.md Phase 19 item 5's second half: one whole `Scene::apply` ran past
-    /// `lua::signal`'s `LAYOUT_PASS_CAP`.
+    /// One whole `Scene::apply` ran past `lua::signal`'s `LAYOUT_PASS_CAP`.
     ///
-    /// Distinct from the `InvalidProperty` a blown per-getter budget produces, because the two
-    /// name different limits and only this one can be reached with no `Signal` in the config at
-    /// all -- a resolved table's `__index` metamethod is Lua the pass runs outside any signal
-    /// evaluation, and until this existed it was bounded by nothing.
+    /// Distinct from the `InvalidProperty` a blown per-getter budget produces: the two name
+    /// different limits, and only this one can be reached with no `Signal` in the config at all,
+    /// since a resolved table's `__index` metamethod is Lua the pass runs outside any signal
+    /// evaluation.
     #[error(
         "the layout pass exceeded its CPU budget -- a property getter or an `__index` metamethod that does not return?"
     )]
     PassBudgetExceeded,
 }
 
-/// `pub(crate)` rather than private since build-steps.md Phase 20 item 4: `layout::scene`'s
-/// `Scene::apply_one_instance` raises an `id`-scoped error for an instance naming an undeclared
-/// surface, and every other `InvalidProperty` in this crate is built here rather than by hand.
+/// `pub(crate)` rather than private: `layout::scene`'s `Scene::apply_one_instance` raises an
+/// `id`-scoped error for an instance naming an undeclared surface, and every other
+/// `InvalidProperty` in this crate is built here rather than by hand.
 pub(crate) fn invalid(property: &str, detail: impl Into<String>) -> LayoutError {
     LayoutError::InvalidProperty { property: property.to_string(), detail: detail.into() }
 }
@@ -164,8 +163,8 @@ pub(crate) fn invalid(property: &str, detail: impl Into<String>) -> LayoutError 
 /// a paste buffer.
 const MAX_ERROR_VALUE_PREVIEW_BYTES: usize = 200;
 
-/// `pub(crate)` since `layout::scene`'s `list` node (build-steps.md Phase 19 item 12) rejects a bad
-/// `source`/`itemfn`/`key` value from outside this module and needs the same bounded preview.
+/// `pub(crate)` since `layout::scene`'s `list` node rejects a bad `source`/`itemfn`/`key` value
+/// from outside this module and needs the same bounded preview.
 ///
 /// Renders a `Value` for an [`invalid`] detail without ever formatting its `Debug` form in full
 /// first. `format!("{value:?}")` on an oversized `Value::String` allocates and escapes the whole
@@ -303,8 +302,8 @@ fn parse_hex_color(property: &str, s: &str) -> Result<Rgba, LayoutError> {
 /// `margin`, `width`/`height` -- are deliberately *not* here: layer-shell permits changing each on a
 /// live surface, so a `Signal` in one resolves normally (ADR-0044 decision 1).
 ///
-/// `window`, `popup` and `lock` add nothing to the carve-out (build-steps.md Phase 22 and 23), by
-/// the same live-object test: a `window`'s `set_title`/`set_app_id`/`set_min_size`/`set_max_size`
+/// `window`, `popup` and `lock` add nothing to the carve-out, by the same live-object test: a
+/// `window`'s `set_title`/`set_app_id`/`set_min_size`/`set_max_size`
 /// are all valid requests on a mapped toplevel; a `popup`'s whole `xdg_positioner` is rebuilt on
 /// every open (ADR-0049 decision 1), so `parent`/`anchor_rect`/`anchor`/`gravity` are meant to
 /// carry a `Signal`; a `lock`'s § 6.4 property list is only `id` and `child`. All three roles' `id`
@@ -331,10 +330,10 @@ fn is_structural_property(kind: &str, property: &str) -> bool {
 ///
 /// Once, and once is load-bearing. `Signal::get_value` runs a `computed` signal's Lua closure, and
 /// a closure that is not a pure function of unchanged state (`os.clock()`, `math.random`, an
-/// accumulator upvalue) answers differently on every call. `margin` used to be read four separate
-/// times in one `Scene::apply`, so a row could be measured against one answer and position its
-/// child against another. One read per property makes the resolved tree a snapshot of one pass, and
-/// stops ADR-0021's per-`get_value` 5ms budget being paid four times over for one property.
+/// accumulator upvalue) answers differently on every call. One read per property makes the
+/// resolved tree a snapshot of one pass, so a row that measures `margin` against one answer
+/// positions its child against that same answer, and stops ADR-0021's per-`get_value` 5ms budget
+/// being paid four times over for one property.
 ///
 /// The snapshot is a snapshot of the *signals*, and only of them. A plain table with an `__index`
 /// metamethod is copied through as that table, and each `table.get` a parser makes runs the
@@ -388,9 +387,9 @@ fn is_structural_property(kind: &str, property: &str) -> bool {
 /// signal-bound paint properties can spend four budgets in a pass that ADR-0044 decision 2's dirty
 /// flag now runs per capability push, on the Wayland dispatch thread. That is the price of the
 /// resolved map being a *complete* snapshot rather than a snapshot of the properties layout
-/// happens to consume; the alternative, resolving only what a parser asks for, is what item 5 was
-/// written to end. Charging one budget per pass instead of one per property needs the whole-pass
-/// budget noted in [`parse_edge_insets`]'s `ponytail:`, not a smaller resolve.
+/// happens to consume; the alternative, resolving only what a parser asks for, is the design this
+/// function replaces. Charging one budget per pass instead of one per property needs the
+/// whole-pass budget noted in [`parse_edge_insets`]'s `ponytail:`, not a smaller resolve.
 pub fn resolve_properties(
     properties: &HashMap<String, Value>,
     kind: &str,
@@ -441,7 +440,7 @@ pub fn resolve_properties(
 /// The carve-outs from decision 1's "parsers resolve a `Signal`" rule: [`SurfaceTopology`]'s five
 /// fields (`parse_surface_id`/`parse_layer`/`parse_anchor`/`parse_monitor`/`parse_namespace`) and
 /// every node's optional `id` ([`parse_node_id`], ADR-0045 decision 1) keep rejecting one
-/// outright, the same way every parser used to.
+/// outright.
 ///
 /// The unifying reason: each is read exactly once per evaluation and a *structural* decision is
 /// then made from it and acted on -- where a surface is placed, or which retained node a fresh one
@@ -532,7 +531,7 @@ mod tests {
     /// `shared::Capability::ALL` at `Value::Nil`), which is what a config binding a bare capability
     /// signal resolves at startup. Routed through [`resolve_properties`] because that is where the
     /// nil rule now lives: the key is omitted from the resolved map rather than each parser
-    /// checking for a `Value::Nil` of its own (build-steps.md Phase 19 item 5).
+    /// checking for a `Value::Nil` of its own.
     fn props_with_nil_signal(lua: &mlua::Lua, kind: &str, property: &str) -> HashMap<String, Value> {
         crate::lua::signal::register(lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(Value::Nil, crate::lua::signal::DirtyFlag::new()).0;

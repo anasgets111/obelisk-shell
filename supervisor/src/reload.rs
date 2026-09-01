@@ -1,9 +1,9 @@
-//! Presentation-Before-Authority (PBA) hot-reload orchestration (build-steps.md Phase 8,
-//! `docs/oblisk-supervisor-services-dbus.md` § 15.1-15.4).
+//! Presentation-Before-Authority (PBA) hot-reload orchestration
+//! (`docs/oblisk-supervisor-services-dbus.md` § 15.1-15.4).
 //!
-//! This module is the ordering/gating state machine only: the numbered sequence build-steps.md
-//! draws (Overlapping Spawn, State Hydration, Null-Buffer Staging, Activate Draw, Evidence
-//! Verification, Swap & Reap), against two real primitives and one seam:
+//! This module is the ordering/gating state machine only: the six-step sequence (Overlapping
+//! Spawn, State Hydration, Null-Buffer Staging, Activate Draw, Evidence Verification, Swap &
+//! Reap), against two real primitives and one seam:
 //!
 //! - Real process lifecycle: [`process::spawn_group_leader`] and [`process::reap_process_group`]
 //!   do the actual spawning and reaping.
@@ -39,7 +39,7 @@ use crate::process;
 
 /// The control-socket operations § 15.2-15.3 describe crossing from the Supervisor to the
 /// Candidate generation. This trait is the seam a fake implementation drives in this module's
-/// own tests; `socket::SocketCandidateLink` (Phase 14) is the real Unix-socket implementation.
+/// own tests; `socket::SocketCandidateLink` is the real Unix-socket implementation.
 pub trait CandidateLink {
     /// What a control-link call can fail with.
     type Error: std::fmt::Debug;
@@ -52,7 +52,7 @@ pub trait CandidateLink {
     /// § 15.2 points 2-3 / step 3 ("Null-Buffer Staging"): block until the Candidate signals it
     /// has completed its Wayland layer-shell handshake and committed its null buffers, i.e. it's
     /// ready for `ActivateDraw`. Returns the surface_ids it staged null buffers for; `run_pba`
-    /// uses this as the expected set for evidence collection (ADR-0025 item 2).
+    /// uses this as the expected set for evidence collection (ADR-0025).
     async fn recv_ready_signal(&mut self) -> Result<Vec<String>, Self::Error>;
 
     /// § 15.2 point 3 / step 4 ("Activate Draw"): write the unique, nonce-bound `ActivateDraw`
@@ -141,7 +141,7 @@ pub struct PbaOutcome {
 ///
 /// Evidence collection loops over every surface_id `recv_ready_signal` returned, wrapped in one
 /// `timeout(evidence_timeout, ...)` for the whole loop, not one per surface: § 15.4's promotion
-/// gate is all expected surface_ids within one shared deadline (ADR-0025 item 3). Returns
+/// gate is all expected surface_ids within one shared deadline (ADR-0025). Returns
 /// the confirmed surface_ids in `expected`'s order once every one has reported.
 async fn drive_handshake<L: CandidateLink>(
     link: &mut L,

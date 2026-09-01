@@ -29,7 +29,7 @@ pub struct InboundFrame {
 
 /// A registry entry paired with a monotonic token identifying which connection registered it.
 /// Needed because two connections can legitimately claim the same `generation_id` in sequence
-/// (a reconnect, or duplicate `OBLISK_GENERATION_ID=0` defaults, ADR-0020 item 5):
+/// (a reconnect, or duplicate `OBLISK_GENERATION_ID=0` defaults, ADR-0020):
 /// without the token, the old connection's cleanup would unregister the new one's live entry.
 struct Entry {
     token: u64,

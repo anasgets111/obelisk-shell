@@ -4,7 +4,7 @@
 -- A scrolling list rather than three summary lines, which is what this was. The summary was not a
 -- design choice; `oblisk.network` has carried `available_networks` since ADR-0053 and the panel
 -- could not show them, because a column taller than the popup was simply cut off with no way to
--- reach the rest. `scroll(name)` is what changed (docs/adr/0069).
+-- reach the rest. `scroll(name)` is what changed (ADR-0069).
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")

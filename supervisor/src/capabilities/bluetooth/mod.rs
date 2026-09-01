@@ -1,4 +1,4 @@
-//! BlueZ Bluetooth D-Bus controller (`oblisk.bluetooth`, build-steps.md; docs/oblisk-supervisor-
+//! BlueZ Bluetooth D-Bus controller (`oblisk.bluetooth`; docs/oblisk-supervisor-
 //! services-dbus.md §5; docs/oblisk-idl-api-specs.md §2.6; ADR-0030).
 //!
 //! Every proxy here is hand-written against BlueZ's own D-Bus API docs (ADR-0030's "no

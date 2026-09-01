@@ -1,9 +1,7 @@
-//! Subpixel-to-physical-pixel snapping math (build-steps.md Phase 4, point 3).
+//! Subpixel-to-physical-pixel snapping math.
 //!
-//! build-steps.md cites `docs/oblisk-layout-engine-geometry.md § 5` for this, but that section
-//! is "Overlay Input Region Bounding Box Calculations" (Phase 3's click-through region) -- a
-//! stale cross-reference (see ADR-0012). The real technique: floor the top-left corner,
-//! ceil the bottom-right, so the physical box always fully contains the logical one.
+//! Floor the top-left corner and ceil the bottom-right, so the physical box always fully
+//! contains the logical one.
 //!
 //! Borders round differently, and the two must not be conflated. [`snap_to_physical`] grows a
 //! box outward, right for a containment box and wrong for a border: growing a 1px border
@@ -42,16 +40,14 @@ pub fn snap_to_physical(rect: LogicalRect, scale: f32) -> PhysicalRect {
 }
 
 /// Snaps a border band's two edges to whole physical pixels, and returns the snapped
-/// `(start, thickness)`, still in logical units (docs/build-steps.md Phase 19 item 7).
+/// `(start, thickness)`, still in logical units.
 ///
 /// `start` is the band's smaller coordinate along its thin axis, `thickness` its extent. Both
 /// edges round to the nearest integer independently, then divide back by `scale`. Rounding the
 /// edges rather than a centerline is what makes stroke parity fall out for free: measured
 /// against femtovg 0.26.0 on this machine's Mesa/Iris, a 1px stroke centered on a half-integer
 /// is one fully-lit row, a 4px stroke centered the same way blurs across five rows at partial
-/// alpha, while centered on an integer it is exactly four fully-lit rows. The deleted
-/// `snap_border_to_physical` picked a half-integer centerline unconditionally and was correct
-/// only for odd widths.
+/// alpha, while centered on an integer it is exactly four fully-lit rows.
 ///
 /// Returns logical units, not physical: `layout::paint` builds every path in logical
 /// coordinates and `TextPainter::resize` hardcodes a device pixel ratio of 1.0, so logical and

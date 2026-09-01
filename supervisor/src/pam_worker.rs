@@ -1,4 +1,4 @@
-//! Real PAM conversation (build-steps.md Phase 15 item 3, closing ADR-0015 item 1).
+//! Real PAM conversation, closing ADR-0015.
 //! Both halves of ADR-0028's design live here: they share the wire protocol
 //! (`shared::PamOutcome` over `shared::framing`) and the PAM service name ([`pam_service`]).
 //!

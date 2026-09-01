@@ -2,7 +2,7 @@
 -- pointer is on it.
 --
 -- The expansion is two properties, not an animation. `hover` is a signal the engine writes
--- (docs/adr/0062), so the button's `width` reads it and the readout's `visible` reads it, and the
+-- (ADR-0062), so the button's `width` reads it and the readout's `visible` reads it, and the
 -- control is wide exactly while it is hovered. The mirror tweens the width over 147ms; this snaps,
 -- because nothing in the engine interpolates a property between two resolves.
 --

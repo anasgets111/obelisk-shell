@@ -1,5 +1,6 @@
-//! `xdg_toplevel` and `xdg_positioner` specs: [`WindowSpec`] (§ 6.2, title/app_id/min_size/max_size)
-//! and [`PopupSpec`] (§ 6.3, anchor/gravity/constraint_adjustment/offset/grab), plus every parser
+//! `xdg_toplevel` and `xdg_positioner` specs: [`WindowSpec`] (§ 6.2,
+//! title/app_id/min_size/max_size) and [`PopupSpec`] (§ 6.3,
+//! anchor/gravity/constraint_adjustment/offset/grab), plus every parser
 //! that builds one field of either. Grouped together because both describe a live, positioned
 //! `xdg_shell` object rather than a layer-shell surface or the session lock.
 //!
@@ -29,8 +30,8 @@ pub fn parse_title(properties: &HashMap<String, Value>) -> Result<String, Layout
     // Deferred rather than rejected on the evaluation-time pass ([`is_deferred_signal`]): § 6.2
     // spells `title` as `string`/`Signal`, and `parse_string_property`'s `Signal` refusal is meant
     // for the topology fields it also backs. Same placeholder an absent `title` gets, and for the
-    // same reason -- a toplevel that never sends `set_title` has no title -- since `show_window`
-    // builds the real one from the resolved spec.
+    // same reason: a toplevel that never sends `set_title` has no title. `show_window` builds the
+    // real one from the resolved spec.
     if is_deferred_signal(properties, "title") {
         return Ok(String::new());
     }
@@ -38,13 +39,14 @@ pub fn parse_title(properties: &HashMap<String, Value>) -> Result<String, Layout
 }
 
 /// § 6.2's `app_id`, the string a compositor matches its own window rules against. Defaults to
-/// `"oblisk-{id}"` for exactly the reason `surface::parse_namespace` defaults the same way: it is the
-/// toplevel's half of the same problem, and without a default nobody could write a `windowrule`
-/// against their own window without naming an app id by hand.
+/// `"oblisk-{id}"` for exactly the reason `surface::parse_namespace` defaults the same way: it is
+/// the toplevel's half of the same problem, and without a default nobody could write a
+/// `windowrule` against their own window without naming an app id by hand.
 ///
-/// **Not** an [`is_structural_property`] carve-out, and the protocol decides that: `xdg-shell.xml`'s
-/// own `set_app_id` description says a request "can be sent after the xdg_toplevel has been mapped
-/// to update the property" -- it changes on a live object, the test `keyboard_interactivity` passes
+/// **Not** an [`is_structural_property`] carve-out, and the protocol decides that:
+/// `xdg-shell.xml`'s own `set_app_id` description says a request "can be sent after the
+/// xdg_toplevel has been mapped
+/// to update the property": it changes on a live object, the test `keyboard_interactivity` passes
 /// and `namespace` fails (`get_layer_surface` fixes a namespace at creation; `set_app_id` fixes
 /// nothing). A `window`'s `id` is a carve-out on every kind regardless: it is the reconcile
 /// identity, not a protocol field (ADR-0045 decision 1).
@@ -61,7 +63,7 @@ pub fn parse_app_id(properties: &HashMap<String, Value>, id: &str) -> Result<Str
 
 /// § 6.2's `min_size`/`max_size` value, `{ width, height }`. Advisory, in the spec's own words and
 /// the protocol's: "The client should not rely on the compositor to obey the maximum size." So
-/// nothing in `layout` clamps a resolved tree against these -- they are carried to
+/// nothing in `layout` clamps a resolved tree against these: they are carried to
 /// `set_min_size`/`set_max_size` and no further.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SizeHint {
@@ -74,7 +76,7 @@ pub struct SizeHint {
 /// dimension" in a request that *was* sent.
 ///
 /// Both axes are required when the table is present. A `min_size` naming only a width is a config
-/// typo, not a request to leave the height unconstrained -- that spelling is an explicit `0`.
+/// typo, not a request to leave the height unconstrained: that spelling is an explicit `0`.
 fn parse_size_hint(properties: &HashMap<String, Value>, property: &str) -> Result<Option<SizeHint>, LayoutError> {
     // Deferred on the evaluation-time pass, and `None` is the honest placeholder: the request is
     // simply not sent from a spec built there, and `show_window` sends the resolved one.
@@ -98,8 +100,9 @@ fn parse_size_hint(properties: &HashMap<String, Value>, property: &str) -> Resul
             )
         })?;
         // Negative is the one value the requests refuse outright ("Using strictly negative values
-        // for width or height will result in an invalid_size error"); the upper end is § 5.1's own
-        // `[0, 8192]`, already enforced by `parse_size_mode` for the same quantity on the same node.
+        // for width or height will result in an invalid_size error"); the upper end is § 5.1's
+        // own `[0, 8192]`, already enforced by `parse_size_mode` for the same quantity on the same
+        // node.
         if !(0.0..=8192.0).contains(&n) {
             return Err(invalid(property, format!("`{key}` must be within [0, 8192], got {n}")));
         }
@@ -113,9 +116,9 @@ fn parse_size_hint(properties: &HashMap<String, Value>, property: &str) -> Resul
 /// maximum is not a maximum below the minimum.
 ///
 /// Checked here, per axis, so a config typo is a [`LayoutError`] a human reads out of `rescue`'s
-/// `error_log` (§ 2.10) rather than a protocol error that takes the Wayland connection -- and the
-/// whole shell -- down with it. Same call build-steps.md Phase 20's `ambiguous_zero_axis` made for
-/// a singly-anchored layer surface's `set_size(0)`.
+/// `error_log` (§ 2.10) rather than a protocol error that takes the Wayland connection, and the
+/// whole shell, down with it. The same check `layer::ambiguous_zero_axis` makes for a
+/// singly-anchored layer surface's `set_size(0)`.
 fn check_max_size_above_min(min: Option<SizeHint>, max: Option<SizeHint>) -> Result<(), LayoutError> {
     let (Some(min), Some(max)) = (min, max) else {
         return Ok(());
@@ -133,8 +136,8 @@ fn check_max_size_above_min(min: Option<SizeHint>, max: Option<SizeHint>) -> Res
     Ok(())
 }
 
-/// Everything one `xdg_toplevel` needs, read off a `window` node's properties in one pass (§ 6.2,
-/// build-steps.md Phase 22), the way [`PanelSpec`] does for a layer surface.
+/// Everything one `xdg_toplevel` needs, read off a `window` node's properties in one pass (§ 6.2),
+/// the way [`PanelSpec`] does for a layer surface.
 ///
 /// A `window` is a **top-level** node returned from `shell.lua`, a sibling of `panel`, not
 /// something nested inside a panel's child tree (ADR-0040 decision 1).
@@ -202,7 +205,7 @@ pub enum PopupAnchor {
 /// gives them identical enums, so `property` exists only to name which one a config got wrong.
 ///
 /// Absent defaults to [`PopupAnchor::Center`], the protocol's own default rather than a choice
-/// invented here -- unlike [`parse_constraint_adjustment`], where § 6.3 departs from the protocol
+/// invented here: unlike [`parse_constraint_adjustment`], where § 6.3 departs from the protocol
 /// default on purpose.
 pub fn parse_popup_anchor(properties: &HashMap<String, Value>, property: &str) -> Result<PopupAnchor, LayoutError> {
     if is_deferred_signal(properties, property) {
@@ -241,7 +244,7 @@ pub fn parse_popup_anchor(properties: &HashMap<String, Value>, property: &str) -
 /// value. Six booleans say that. A `Vec` of adjustments would preserve an ordering the protocol
 /// discards and invite a reader to think the config chose the precedence.
 ///
-/// [`Default`] is § 6.3's `{ "FlipY", "SlideX" }` -- dropdown behaviour, and deliberately **not**
+/// [`Default`] is § 6.3's `{ "FlipY", "SlideX" }`: dropdown behaviour, and deliberately **not**
 /// the protocol's own default of no adjustment at all (ADR-0040 decision 3). An explicitly
 /// empty array is how a config asks for [`ConstraintAdjustment::NONE`] back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,8 +344,8 @@ pub fn parse_popup_offset(properties: &HashMap<String, Value>) -> Result<PopupOf
 /// straight from the rect `button`'s `on_click` hands back", so the same rect round-trips through
 /// the config and lands back in the type it left as.
 ///
-/// Required. `x`/`y` default to 0 when the table omits them -- an origin at the parent's own
-/// top-left corner is a legitimate rect -- but `width`/`height` do not, because a zero size is
+/// Required. `x`/`y` default to 0 when the table omits them (an origin at the parent's own
+/// top-left corner is a legitimate rect), but `width`/`height` do not, because a zero size is
 /// precisely the failure this parser exists to catch. Two different protocol errors sit behind
 /// that: `set_anchor_rect` itself raises `invalid_input` only on a *negative* size, while a *zero*
 /// size leaves the positioner incomplete ("must have a non-zero size set by set_size, and a
@@ -359,7 +362,7 @@ pub fn parse_popup_offset(properties: &HashMap<String, Value>) -> Result<PopupOf
 /// It never reaches a compositor: ADR-0049's second amendment re-derives the authoritative
 /// spec from the resolved tree in `App::apply_resolved_state`, before `apply_visibility` can create
 /// anything from it. The one place it is observable is `expand_instances`, which seeds a popup
-/// instance's `available` from the declared `width`/`height` -- a popup that signal-binds a size
+/// instance's `available` from the declared `width`/`height`: a popup that signal-binds a size
 /// measures its child against 1x1 until its first configure replaces `available`, and it is not on
 /// screen before then, since no `xdg_popup` exists until `visible` resolves true.
 const DEFERRED_POPUP_EXTENT: f32 = 1.0;
@@ -409,7 +412,7 @@ pub fn parse_anchor_rect(properties: &HashMap<String, Value>) -> Result<LogicalR
 /// `f32` rather than `i32` even though § 6.3 and the request both say integer: this is the popup's
 /// logical size and becomes its child's layout budget, which is `LogicalSize`'s `f32` like every
 /// other budget in this engine. It quantizes once, at the `set_size` call site that also knows the
-/// output scale -- the same split [`PanelSpec`]'s `width` already documents for layer-shell.
+/// output scale: the same split [`PanelSpec`]'s `width` already documents for layer-shell.
 fn parse_popup_extent(properties: &HashMap<String, Value>, property: &str) -> Result<f32, LayoutError> {
     if is_deferred_signal(properties, property) {
         return Ok(DEFERRED_POPUP_EXTENT);
@@ -451,7 +454,7 @@ pub fn parse_grab(properties: &HashMap<String, Value>) -> Result<bool, LayoutErr
 }
 
 /// Everything one `xdg_popup` and its `xdg_positioner` need, read off a `popup` node's properties
-/// in one pass (§ 6.3, build-steps.md Phase 22).
+/// in one pass (§ 6.3).
 ///
 /// A `popup` is a **top-level** node returned from `shell.lua`, a sibling of `panel`, and it names
 /// its parent surface by id through `parent` rather than sitting inside that surface's child tree.
@@ -461,7 +464,7 @@ pub fn parse_grab(properties: &HashMap<String, Value>) -> Result<bool, LayoutErr
 ///
 /// **No `PopupTopology`, for a stronger reason than [`WindowSpec`] has.** A popup's Wayland object
 /// exists only while it is shown (ADR-0049 decision 1) and its `xdg_positioner` is consumed by
-/// `get_popup`, so every field on this type is re-read from scratch on every open -- `parent`
+/// `get_popup`, so every field on this type is re-read from scratch on every open: `parent`
 /// included, which is why it is an ordinary field and not a carve-out. What remains topology is the
 /// declaration itself: adding or removing a `popup` node changes the declared set (ADR-0001,
 /// ADR-0049 decision 3), while opening and closing one is explicitly a value change.
@@ -490,7 +493,7 @@ pub fn popup_spec(properties: &HashMap<String, Value>) -> Result<PopupSpec, Layo
     // [`is_deferred_signal`], which every other field below consults). `parent` decides which
     // surface `get_popup` roots this popup under and ADR-0051 decision 1 pins that to one
     // parent instance chosen at creation, which is the structural-decision test
-    // [`reject_signal_in_structural_field`] exists for -- `parse_string_property` applies it.
+    // [`reject_signal_in_structural_field`] exists for: `parse_string_property` applies it.
     let parent = parse_string_property(properties, "parent", None)?;
     if parent.is_empty() {
         return Err(invalid("parent", "must name the `id` of the `panel` or `window` this popup anchors to"));

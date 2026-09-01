@@ -1,6 +1,6 @@
 //! Layer-shell topology: `layer`, `anchor`, `monitor`, `namespace`, `keyboard_interactivity`,
 //! `exclusive`, and the [`PanelSpec`] that bundles them with a panel's margin and size for
-//! `panel_spec` to build in one pass (§ 6.1, build-steps.md Phase 20).
+//! `panel_spec` to build in one pass (§ 6.1).
 //!
 //! `layer`, `anchor`, `monitor` and `namespace` are the structural carve-outs
 //! [`is_structural_property`] names: `get_layer_surface` fixes all five at creation, so a `Signal`
@@ -16,7 +16,7 @@ use super::*;
 /// § 6.1's `layer`, the layer-shell stacking level a `panel` is created on. `layout`'s own enum
 /// rather than smithay-client-toolkit's `Layer`, for the same reason [`KeyboardInteractivity`]
 /// below is: this module stays free of Wayland types, and `crate::wayland` maps it at its one call
-/// site (build-steps.md Phase 20 item 3).
+/// site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerKind {
     Background,
@@ -31,7 +31,7 @@ pub enum LayerKind {
 /// Validates rather than passing the raw string through: `crate::wayland::App::create_panel`
 /// creates one layer surface per instance straight from this value (ADR-0038 decision 1), so
 /// an unrecognized string is a config error the author must see rather than a silent fall to some
-/// default layer -- a typo'd `layer = "Toop"` that quietly stacked a bar on `Background` would be a
+/// default layer: a typo'd `layer = "Toop"` that quietly stacked a bar on `Background` would be a
 /// far worse failure than a rejected config, because nothing on screen would say why.
 pub fn parse_layer(properties: &HashMap<String, Value>) -> Result<LayerKind, LayoutError> {
     match parse_string_property(properties, "layer", None)?.as_str() {
@@ -75,7 +75,7 @@ pub fn parse_anchor(properties: &HashMap<String, Value>) -> Result<Anchor, Layou
     Ok(Anchor { top: edge("top")?, right: edge("right")?, bottom: edge("bottom")?, left: edge("left")? })
 }
 
-/// § 6.1's `monitor` (a specific output EDID, or `"All"`). Absent defaults to `"All"` -- an
+/// § 6.1's `monitor` (a specific output EDID, or `"All"`). Absent defaults to `"All"`: an
 /// unqualified surface targets every monitor, matching the IDL's own documented meaning for that
 /// value rather than treating the property as required.
 pub fn parse_monitor(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
@@ -113,9 +113,10 @@ pub enum KeyboardInteractivity {
 /// valid on a live surface, so a `Signal` here resolves like any other property
 /// (ADR-0044 decision 1) and an edit to it is a value change, not a swap.
 pub fn parse_keyboard_interactivity(properties: &HashMap<String, Value>) -> Result<KeyboardInteractivity, LayoutError> {
-    // Deferred on the evaluation-time pass ([`is_deferred_signal`]), same split as [`parse_title`]'s:
-    // this doc comment's own argument is what makes it a deferral rather than a rejection, since a
-    // field valid on a live surface is one only the resolved pass is in a position to read.
+    // Deferred on the evaluation-time pass ([`is_deferred_signal`]), same split as
+    // [`parse_title`]'s: this doc comment's own argument is what makes it a deferral rather than a
+    // rejection, since a field valid on a live surface is one only the resolved pass is in a
+    // position to read.
     if is_deferred_signal(properties, "keyboard_interactivity") {
         return Ok(KeyboardInteractivity::None);
     }
@@ -170,10 +171,10 @@ pub enum Exclusive {
 ///
 /// `boolean / string`, the same shape § 6.1 already gives `width`/`height` (`integer / "Fill"`):
 /// `true` and `false` keep exactly the meanings they had, and `"Ignore"` is the value neither could
-/// express. Additive on purpose -- every config written before this one means what it meant.
+/// express. Additive on purpose: every config written before this one means what it meant.
 ///
 /// In-place, same as [`parse_keyboard_interactivity`]: `set_exclusive_zone` is valid on a live
-/// surface. The *zone* itself is not computed here -- `crate::wayland` derives it at configure
+/// surface. The *zone* itself is not computed here: `crate::wayland` derives it at configure
 /// time from the size the compositor actually chose, which is the only point a real number exists.
 pub fn parse_exclusive(properties: &HashMap<String, Value>) -> Result<Exclusive, LayoutError> {
     // Deferred on the evaluation-time pass for [`parse_keyboard_interactivity`]'s reason:
@@ -204,7 +205,7 @@ pub fn parse_exclusive(properties: &HashMap<String, Value>) -> Result<Exclusive,
 /// A surface's topology-relevant fields (`CONTEXT.md`, Topology change: a config edit that adds or
 /// removes a top-level `surface` node, or changes its layer, anchor, monitor target, or
 /// namespace). Structural equality on `Vec<SurfaceTopology>` (order-sensitive) is the Renderer's
-/// own topology diff -- see `renderer/src/socket.rs`.
+/// own topology diff: see `renderer/src/socket.rs`.
 ///
 /// This is the whole of the swap fingerprint, and [`PanelSpec`]'s other fields are deliberately
 /// not in it: `margin`, `keyboard_interactivity`, `exclusive`, `width` and `height` are all
@@ -232,7 +233,7 @@ pub fn surface_topology(properties: &HashMap<String, Value>) -> Result<SurfaceTo
 }
 
 /// Everything one `zwlr_layer_surface_v1` needs, read off a `panel` node's properties in one pass
-/// (§ 6.1, build-steps.md Phase 20 item 3). `crate::socket`'s `surface_specs` builds one per
+/// (§ 6.1). `crate::socket`'s `surface_specs` builds one per
 /// declared `panel`; `layout::instance::expand_instances` turns them into per-output instances, and
 /// `crate::wayland::App::create_panel` is what actually binds them.
 ///
@@ -245,8 +246,8 @@ pub struct PanelSpec {
     pub topology: SurfaceTopology,
     pub keyboard_interactivity: KeyboardInteractivity,
     pub exclusive: Exclusive,
-    /// § 6.1's `margin`, which on a `panel` root is the layer-shell **anchor offset** -- how far
-    /// the surface itself sits from the edges it is anchored to -- not layout spacing between the
+    /// § 6.1's `margin`, which on a `panel` root is the layer-shell **anchor offset** (how far
+    /// the surface itself sits from the edges it is anchored to), not layout spacing between the
     /// root and its child. There is no conflict with layout's own reading of the property because
     /// layout never reads it here: `layout::scene`'s `Scene::apply_one_surface` passes `None` for
     /// both parent-margin arguments when it resolves a surface root, so a root's `margin` is

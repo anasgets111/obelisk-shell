@@ -1,5 +1,5 @@
 //! Expanding declared surfaces into the instances the compositor actually maps (`CONTEXT.md`,
-//! Surface instance; ADR-0038 decision 3; build-steps.md Phase 20 item 2 and Phase 22).
+//! Surface instance; ADR-0038 decision 3).
 //!
 //! One declared surface is not one Wayland surface. A `panel` with `monitor = "All"` targets every
 //! connected output, each with its own `zwlr_layer_surface_v1` and configured size -- why the
@@ -75,10 +75,10 @@ pub struct OutputGeometry {
 /// popup's own § 6.3 `width`/`height` (both required, no `"Fill"`), since that size is
 /// `xdg_positioner::set_size`'s argument and so the budget its child is measured against.
 ///
-/// **`lock`**: expands per output like a `panel`, with no filter (ADR-0052 decision 2,
-/// build-steps.md Phase 23): `ext-session-lock-v1` requires "lock surfaces for all outputs
-/// currently present" and rejects a second surface on one output with `duplicate_output`, so there
-/// is exactly one legal answer per output and no choice for § 6.4 to offer. Zero outputs produce
+/// **`lock`**: expands per output like a `panel`, with no filter (ADR-0052 decision 2):
+/// `ext-session-lock-v1` requires "lock surfaces for all outputs currently present" and rejects a
+/// second surface on one output with `duplicate_output`, so there is exactly one legal answer per
+/// output and no choice for § 6.4 to offer. Zero outputs produce
 /// zero lock instances; the surfaces appear when the outputs do, through a re-expansion of this
 /// same function (ADR-0042).
 pub fn expand_instances(specs: &[SurfaceSpec], outputs: &[OutputGeometry]) -> Vec<SurfaceInstance> {

@@ -1,15 +1,15 @@
-//! Off-thread wrapper around `cosmic-text`'s font shaping (build-steps.md Phase 4, point 1), so
-//! measuring a dynamic string never blocks the render thread.
+//! Off-thread wrapper around `cosmic-text`'s font shaping, so measuring a dynamic string never
+//! blocks the render thread.
 //!
 //! The worker builds its `FontSystem` from `text::fonts::resolve_chain`'s declared chain rather
-//! than `FontSystem::new()`, which walks the whole system font database (up to ~1s per
-//! cosmic-text's own docs -- ADR-0043 decision 2, Phase 19 item 10). A plain `std::thread`
-//! plus `mpsc`, not tokio's multi-thread runtime: this is one dedicated CPU-bound worker, and
-//! renderer's Cargo.toml only carries tokio's `rt`/`net`/`macros` features.
+//! than `FontSystem::new()`, which walks the whole system font database and takes up to ~1s per
+//! cosmic-text's own docs (ADR-0043 decision 2). A plain `std::thread` plus `mpsc` runs it, not
+//! tokio's multi-thread runtime, because this is one dedicated CPU-bound worker and renderer's
+//! Cargo.toml only carries tokio's `rt`/`net`/`macros` features.
 //!
 //! `shape()` asks for `Family::Name(primary_family)`, the resolved chain's own first hit, so
 //! `text::atlas::TextPainter` loads the exact same chain in the exact same order into femtovg.
-//! A mismatch here is not theoretical: the old code measured under `Family::SansSerif` while a
+//! The mismatch is not theoretical: the old code measured under `Family::SansSerif` while a
 //! separate `fontdb` query for paint missed that alias and fell back to the first face in scan
 //! order, leaving a `text` node's box measured roughly 30% narrower than the glyphs painted
 //! into it.
@@ -28,9 +28,8 @@ pub struct ShapeRequest {
     pub text: String,
     pub font_size: f32,
     pub line_height: f32,
-    /// Logical-pixel width to wrap at (`oblisk-layout-engine-geometry.md` § 3.2: "wraps text
-    /// bounds when exceeding available width limits"). `None` measures the text unconstrained,
-    /// on one line -- the pre-Phase-12 behavior every existing caller still gets.
+    /// Logical-pixel width to wrap at. `None` measures the text unconstrained, on one line,
+    /// which is what every existing caller gets.
     pub max_width: Option<f32>,
 }
 
@@ -46,10 +45,10 @@ pub struct ShapeResult {
 /// The inner `Arc` is `fontdb`'s: `Database::make_shared_face_data` maps the file and rewrites
 /// every face that came from it to point at the mapping, so cosmic-text (which owns the
 /// `Database`) and femtovg (which is handed this) read the same pages rather than each holding a
-/// copy. That is the whole point of the type. The bytes are `Shared_Clean` and page-cache backed,
-/// so a second process using the same font pays nothing for it, and the kernel can evict them.
+/// copy. The bytes are `Shared_Clean` and page-cache backed, so a second process using the same
+/// font pays nothing for it, and the kernel can evict them.
 ///
-/// The newtype is what femtovg's `add_shared_font_with_index` needs: it takes
+/// The newtype exists because femtovg's `add_shared_font_with_index` takes
 /// `T: AsRef<[u8]> + 'static` by value, and `Arc<dyn AsRef<[u8]>>` does not itself implement
 /// `AsRef<[u8]>`.
 #[derive(Clone)]
@@ -113,14 +112,14 @@ struct ShapeKey {
 /// A handle to a dedicated shaping worker thread and its warm font cache.
 ///
 /// `Clone` clones the request `Sender` alone, so every clone still addresses the one worker
-/// thread and `FontSystem` -- what lets `wayland::App` and the `RendererClient` it owns share a
-/// warm font cache instead of each paying `FontSystem::new()`'s ~1s startup (ADR-0023 item
-/// 8, closed by ADR-0039 decision 3).
+/// thread and `FontSystem`. That lets `wayland::App` and the `RendererClient` it owns share a
+/// warm font cache instead of each paying `FontSystem::new()`'s ~1s startup (ADR-0023, closed
+/// by ADR-0039 decision 3).
 ///
 /// The measurement cache is `Arc`-shared for the same reason and hangs on this side of the
-/// channel rather than inside the worker, which is the whole point of it: a worker-side cache
-/// would still pay an `mpsc` round trip and a thread wake per text node, and measured against a
-/// 500-row list those are a real fraction of the 17us each node costs, not a rounding error.
+/// channel rather than inside the worker. A worker-side cache would still pay an `mpsc` round
+/// trip and a thread wake per text node, and measured against a 500-row list those are a real
+/// fraction of the 17us each node costs, not a rounding error.
 #[derive(Clone)]
 pub struct ShapingHandle {
     requests: mpsc::Sender<Request>,
@@ -181,17 +180,17 @@ impl ShapingHandle {
     /// [`ShapingHandle::set_chain`] is the one thing that can, and it clears the whole map rather
     /// than trying to decide which measurements the new faces would have changed.
     ///
-    /// Why this exists: `Scene::apply` re-measures every text node it resolves, and ADR-0044
-    /// decision 2's dirty flag turned that from once per config edit into once per push. Measured
-    /// on a 500-row list, this memo takes 6.64ms off a 10.61ms pass, and takes exactly the same
-    /// 6.64ms off the 12.78ms variant that also draws an icon, which is what says the saving is
-    /// measurement and not something else moving.
+    /// `Scene::apply` re-measures every text node it resolves, and ADR-0044 decision 2's dirty
+    /// flag turned that from once per config edit into once per push. Measured on a 500-row list,
+    /// this memo takes 6.64ms off a 10.61ms pass, and takes exactly the same 6.64ms off the
+    /// 12.78ms variant that also draws an icon, which shows the saving is measurement and not
+    /// something else moving.
     ///
     /// Panics on a miss if the worker thread has died: a bug, not a recoverable runtime state. A
     /// hit does not reach the worker at all, so a key measured while it was alive keeps answering
-    /// after it dies. That is correct rather than lucky (nothing can change what a key measures to)
-    /// but it does mean the first symptom of a dead worker is the next new string, not the next
-    /// call.
+    /// after the worker dies. Nothing can change what a key measures to, so this is correct rather
+    /// than lucky, but it means the first symptom of a dead worker is the next new string, not the
+    /// next call.
     pub fn shape(&self, request: ShapeRequest) -> ShapeResult {
         // The text moves into the key rather than being cloned into it, so a hit allocates
         // nothing and only a miss pays for the copy the worker needs.
@@ -224,9 +223,9 @@ impl ShapingHandle {
 
         let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
         // Cleared wholesale rather than evicted one entry at a time. An LRU needs a recency order
-        // maintained on every hit, which is work on the path this exists to make cheap, and the
-        // thing that overflows this map is a clock producing strings nobody asks for twice -- so
-        // the entries worth keeping are re-measured on the next pass anyway.
+        // maintained on every hit, which is work on the path this exists to make cheap. The thing
+        // that overflows this map is a clock producing strings nobody asks for twice, so the
+        // entries worth keeping are re-measured on the next pass anyway.
         //
         // ponytail: a working set genuinely larger than the cap would re-shape everything on every
         // pass, which is slower than no cache at all because it also pays the hashing. Nothing this
@@ -239,17 +238,15 @@ impl ShapingHandle {
         result
     }
 
-    /// Replaces the font chain every reader measures and paints against, and drops every
-    /// measurement taken under the old one.
+    /// Replaces the font chain every reader measures and paints against, and clears the
+    /// measurement cache, since every entry in it was measured against the faces this call
+    /// replaces.
     ///
     /// Called once, after the startup evaluation, with whatever chain the config declared. The
     /// ordering is what makes this work rather than a respawn: `ShapingHandle::spawn` runs before
     /// any Lua has been read (`wayland/mod.rs`), and `TextPainter` is built lazily on a surface's
-    /// first paint, which is after. So femtovg picks up the new faces on its own, provided the
+    /// first paint, which is after. Femtovg picks up the new faces on its own, provided the
     /// caller drops any painter it already built.
-    ///
-    /// The cache is cleared, and that is correctness rather than hygiene: every entry in it was
-    /// measured against faces this call is replacing.
     ///
     /// A no-op for an empty chain. A config that declares no fonts keeps
     /// [`fonts::DEFAULT_CHAIN`], and one that declares a chain no font on the system can honour
@@ -275,13 +272,12 @@ impl ShapingHandle {
         self.cache.lock().unwrap_or_else(PoisonError::into_inner).len()
     }
 
-    /// Returns the loaded font chain's shared bytes, in chain order -- what femtovg (no system
-    /// font discovery of its own) loads via `add_shared_font_with_index` so paint rasterizes with
-    /// the exact chain, in the exact order, that cosmic-text shaped against
+    /// Returns the loaded font chain's shared bytes, in chain order. Femtovg has no system font
+    /// discovery of its own; it loads these via `add_shared_font_with_index` so paint rasterizes
+    /// with the exact chain, in the exact order, that cosmic-text shaped against
     /// (`text::atlas::TextPainter::new`).
     ///
-    /// Cheap and repeatable: cloning `FontData` clones an `Arc`, so this no longer copies a font
-    /// file per call the way the `Vec<Vec<u8>>` it replaces did.
+    /// Cloning `FontData` clones an `Arc`, so repeated calls are cheap and copy no font file.
     pub fn font_chain_data(&self) -> Vec<FontData> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.requests.send(Request::FontChainData(reply_tx)).expect("oblisk-text-shaping worker thread died");
@@ -289,7 +285,7 @@ impl ShapingHandle {
     }
 
     /// Returns the font chain's resolved primary family: the same name `shape()` asks
-    /// cosmic-text for via `Family::Name`. Test-only -- see `Request::ResolvedPrimaryFamily`.
+    /// cosmic-text for via `Family::Name`. Test-only. See `Request::ResolvedPrimaryFamily`.
     #[cfg(test)]
     pub fn resolved_primary_family(&self) -> String {
         let (reply_tx, reply_rx) = mpsc::channel();
@@ -316,13 +312,13 @@ fn shape(font_system: &mut FontSystem, primary_family: &str, request: &ShapeRequ
     ShapeResult { width, height: line_count as f32 * metrics.line_height }
 }
 
-/// One entry per unique source *file*, in the database's own iteration (load/chain) order --
+/// One entry per unique source *file*, in the database's own iteration (load/chain) order,
 /// not one per face.
 ///
 /// `db.faces()` yields one `FaceInfo` per face, and a `.ttc` collection can hold many (Inter's
 /// own `Inter.ttc` on this machine has 36). A shared mapping covers the *whole file* regardless
 /// of which face's `id` asked for it, so without deduping by source path a collection entry
-/// would appear once per face inside it -- 36 identical entries for Inter.
+/// would appear once per face inside it: 36 identical entries for Inter.
 ///
 /// Maps rather than reads, which is the entire memory story here. `Noto Color Emoji` is an 11MB
 /// CBDT bitmap font, and the `data.to_vec()` this replaces held it three times over: once in the
@@ -365,7 +361,7 @@ fn font_chain_data(db: &mut fontdb::Database) -> Vec<FontData> {
             continue;
         }
         // SAFETY: mapping a font file the process does not own, as the doc comment above spells
-        // out -- a rewrite in place changes the bytes under the mapping. Same bargain cosmic-text
+        // out. A rewrite in place changes the bytes under the mapping. Same bargain cosmic-text
         // already makes for every font it renders.
         match unsafe { db.make_shared_face_data(id) } {
             Some((bytes, _face_index)) => data.push(FontData(bytes)),

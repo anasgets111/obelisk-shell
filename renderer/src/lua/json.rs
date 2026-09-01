@@ -1,5 +1,5 @@
-//! `json` global table (`oblisk-idl-api-specs.md` § 3.3, ADR-0057, build-steps.md section 6
-//! item 2) -- the config's only reader for structured subprocess output.
+//! `json` global table (`oblisk-idl-api-specs.md` § 3.3, ADR-0057), the config's only reader for
+//! structured subprocess output.
 //!
 //! `process.run`'s `out_cb` fires once per line, newline stripped, so a config polling
 //! `lsblk --json` accumulates lines and decodes the buffer. Without a decoder every such
@@ -16,10 +16,10 @@ use mlua::{IntoLua, Lua, LuaSerdeExt, MultiValue, Value};
 /// payload (`Loader::to_lua_value`) and `json.decode` below.
 ///
 /// mlua's serde bridge defaults `serialize_none_to_null`/`serialize_unit_to_null` to true, which
-/// maps `Value::Null` to a lightuserdata sentinel rather than Lua `nil` -- and lightuserdata is
-/// truthy, so `if payload.field then` took the branch that assumes a real value (docs/build-steps.md
-/// Phase 19 item 16). Both options are turned off here so `null` becomes `nil`, which also erases
-/// the key from the table entirely rather than leaving it present with a nil-ish value.
+/// maps `Value::Null` to a lightuserdata sentinel rather than Lua `nil`, and lightuserdata is
+/// truthy, so `if payload.field then` takes the branch that assumes a real value. Both options
+/// are turned off here so `null` becomes `nil`, which also erases the key from the table entirely
+/// rather than leaving it present with a nil-ish value.
 ///
 /// The cost: a `null` sitting in a JSON *array* now leaves a hole, and `ipairs` stops at a hole.
 /// Measured on `[1, null, 3]`: `ipairs` yields one element, while `#` returns 3 and `xs[3]` still
@@ -33,7 +33,7 @@ pub fn to_lua(lua: &Lua, json: &serde_json::Value) -> mlua::Result<Value> {
 
 /// Both ways this can fail, flattened into the one message `json.decode` hands back: a convention
 /// a config has to `pcall` around anyway is not a convention, it is a raise with extra steps. The
-/// two are told apart by their wording -- bad input is the config author's problem, a conversion
+/// two are told apart by their wording: bad input is the config author's problem, a conversion
 /// failure is this engine's.
 ///
 /// The conversion arm is not reached by any test and may not be reachable at all today, since
@@ -48,7 +48,7 @@ fn decode(lua: &Lua, bytes: &[u8]) -> Result<Value, String> {
 ///
 /// The return convention is Lua's own, not cjson's: one value on success, `nil` plus a message on
 /// failure, matching `io.open`. Raising is wrong here because a decode failure is a *routine*
-/// path -- `out_cb` delivers a line at a time, so a config often decodes a partial buffer or a
+/// path: `out_cb` delivers a line at a time, so a config often decodes a partial buffer or a
 /// failing subprocess's non-JSON stdout, and raising would put a `pcall` around every call site.
 /// One value on success rather than a trailing `nil` is load-bearing too: with three arguments
 /// `table.insert` reads the second as a *position*, so `table.insert(t, decoded, nil)` raises

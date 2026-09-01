@@ -233,7 +233,7 @@ impl PresentationTimeHandler for App {
 
     /// The content update was never displayed. Logged only -- not a distinct fast-fail signal;
     /// the Supervisor's `evidence_timeout` is what catches this surface never presenting
-    /// (ADR-0025 item 6). Deliberately does **not** queue any `PresentationEvidence`.
+    /// (ADR-0025). Deliberately does **not** queue any `PresentationEvidence`.
     fn discarded(
         &mut self,
         _conn: &Connection,

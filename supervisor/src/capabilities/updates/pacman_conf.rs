@@ -159,7 +159,7 @@ mod tests {
         );
     }
 
-    // ---- resolve_repo_servers (real fs I/O against a tempdir -- docs/oblisk-tdd-test-harness.md's convention) ----
+    // ---- resolve_repo_servers (real fs I/O against a tempdir) ----
 
     #[test]
     fn resolve_repo_servers_follows_a_real_include_file() {

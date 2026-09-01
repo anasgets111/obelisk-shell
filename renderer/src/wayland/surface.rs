@@ -473,9 +473,6 @@ impl App {
             let surface = self.surfaces[index].role.wl_surface().cloned();
             if let Some(surface) = surface.filter(|_| self.surfaces[index].map_state.presents()) {
                 if !self.surfaces[index].null_buffered {
-                    // verified against wayland_client::protocol::wl_surface::WlSurface's generated
-                    // API: `attach(&self, buffer: Option<&wl_buffer::WlBuffer>, x: i32, y: i32)`,
-                    // `commit(&self)`.
                     surface.attach(None, 0, 0);
                     self.surfaces[index].null_buffered = true;
                 }
@@ -507,9 +504,7 @@ impl App {
         // A repeat configure carrying a new size (a mode change, an exclusive zone shifting a
         // neighbour) has to move the `wl_egl_window` too, or the surface keeps rendering into a
         // buffer sized at its first configure. This is `wayland-egl`'s own resize request, not a
-        // rebind: the `WlEglSurface` and the EGL surface built from it both stay valid. It went
-        // unnoticed before ADR-0038 because the one surface that drew anything drew a fixed
-        // proof string; the resized frame is real content now.
+        // rebind: the `WlEglSurface` and the EGL surface built from it both stay valid.
         if let Some(bound) = self.surfaces[index].bound.as_ref() {
             bound.native_window.resize(width.max(1) as i32, height.max(1) as i32, 0, 0);
         }
@@ -775,10 +770,10 @@ impl App {
     /// conditional on a surface existing to draw into (ADR-0071). `surface_id` only names the
     /// surface unlucky enough to be first in the log line; the state it builds is shared.
     ///
-    /// A failure is fatal, matching every other bind failure in [`App::ensure_bound`]. That is a
-    /// later death than the `?` this replaced: a PBA Candidate now signals ready before it has
-    /// proven it can build a context, so an EGL that breaks between two generations of one session
-    /// takes the shell down rather than rolling back (ADR-0071 decision 3).
+    /// A failure is fatal, matching every other bind failure in [`App::ensure_bound`]: a PBA
+    /// Candidate now signals ready before it has proven it can build a context, so an EGL that
+    /// breaks between two generations of one session takes the shell down rather than rolling
+    /// back (ADR-0071 decision 3).
     fn ensure_egl(&mut self, surface_id: &str) -> bool {
         if self.egl.is_some() {
             return true;
@@ -800,9 +795,8 @@ impl App {
 
     /// Creates this surface's `wl_egl_window` and EGL window surface against the shared context if
     /// it has none yet, building that context on the very first call (see [`App::ensure_egl`]) and
-    /// initializing the process-wide `glow` context on the first one. Returns
-    /// whether the surface is bound afterwards; a failure is fatal (`self.exit`), exactly as it
-    /// was before this was factored out of `bind_and_clear`.
+    /// initializing the process-wide `glow` context on the first one. Returns whether the
+    /// surface is bound afterwards; a failure is fatal (`self.exit`).
     fn ensure_bound(&mut self, index: usize) -> bool {
         if self.surfaces[index].bound.is_some() {
             return true;
@@ -1096,15 +1090,13 @@ impl App {
         }
 
         // § 15.3 point 2: request presentation feedback before the commit `paint_surface`'s
-        // `swap_buffers` performs, so the request associates with it -- confirmed against
-        // `wayland-client-0.31.15`'s own client examples' placement convention; verify with
-        // `WAYLAND_DEBUG=1` during a manual smoke test that `feedback` appears on the wire
-        // before the corresponding `commit`.
+        // `swap_buffers` performs, so the request associates with it. Verify with
+        // `WAYLAND_DEBUG=1` that `feedback` appears on the wire before the corresponding `commit`.
         if let Some(surface) = self.surfaces[index].role.wl_surface().cloned()
             && let Err(e) = self.presentation_time.feedback(&surface, &self.queue_handle)
         {
             // Not fatal to the whole candidate -- the Supervisor's evidence_timeout is what
-            // catches a surface that never presents (ADR-0025 item 6); don't invent a
+            // catches a surface that never presents (ADR-0025); don't invent a
             // second failure-reporting path here.
             log_bind_failure(&self.surfaces[index].surface_id.clone(), "wp_presentation::feedback", e);
         }

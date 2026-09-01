@@ -15,8 +15,8 @@ pub struct ConfigAttribs {
     pub alpha_size: egl::Int,
 }
 
-/// Phase 3 requires a config that can back an on-screen window surface, render GLES3, and give
-/// exactly 8-bit-per-channel ARGB (docs/build-steps.md Phase 3, point 2).
+/// A config must back an on-screen window surface, render GLES3, and give exactly
+/// 8-bit-per-channel ARGB.
 ///
 /// `eglChooseConfig` is supposed to only return matches, but its attribute lists are bitmask
 /// supersets and driver behavior around exact-vs-minimum component sizes is inconsistent enough

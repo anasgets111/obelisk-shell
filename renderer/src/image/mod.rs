@@ -1,5 +1,4 @@
-//! Decodes a file into a GPU texture, caches it, and fits it into a box (ADR-0054,
-//! build-steps.md Phase 29 items 1 and 2).
+//! Decodes a file into a GPU texture, caches it, and fits it into a box (ADR-0054).
 //!
 //! PNG and JPEG decode through the `image` crate ([`decode_raster`]). SVG decodes through `resvg`,
 //! needed because Adwaita ships scalable SVG icons.

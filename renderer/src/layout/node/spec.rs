@@ -15,10 +15,10 @@ use crate::lua::nodes::{VirtualNode, deserialize_lua_table};
 
 use super::*;
 
-/// § 6.4's `lock`, whose whole property list is `id` and `child` (build-steps.md Phase 23,
-/// ADR-0052 decision 2). `child` is not a field here for the same reason it is not one on the
-/// other three roles: `layout::scene::children_of` walks it into the retained tree, and a spec
-/// carries what the Wayland side has to be told, not what the layout engine reads.
+/// § 6.4's `lock`, whose whole property list is `id` and `child` (ADR-0052 decision 2). `child`
+/// is not a field here for the same reason it is not one on the other three roles:
+/// `layout::scene::children_of` walks it into the retained tree, and a spec carries what the
+/// Wayland side has to be told, not what the layout engine reads.
 ///
 /// So this is one field, and it stays a struct rather than collapsing into a
 /// `SurfaceSpec::Lock(String)`: [`lock_spec`] is where § 6.4's four refusals live, and a bare
@@ -40,16 +40,16 @@ pub struct LockSpec {
 /// **Refusing rather than ignoring is this parser's one real decision.** `visible = false` on a
 /// lock screen implies the config decides when the lock is up, and it does not: the compositor
 /// creates lock surfaces after `locked` and destroys them at `unlock_and_destroy`, and obeying the
-/// property mid-session would destroy a surface the compositor is still showing -- ADR-0042
+/// property mid-session would destroy a surface the compositor is still showing. ADR-0042
 /// records that as what makes the compositor "fall back to rendering a solid color". Ignoring it
 /// silently would leave the wrong mental model in place until the author meets it from the other
 /// side, locked out by a screen that did not do what they wrote. An error lands in `rescue`'s
 /// `error_log` (§ 2.10, ADR-0046) at evaluation time, where a human is reading and the session
-/// is not locked -- the cheapest place the correction can happen.
+/// is not locked, the cheapest place the correction can happen.
 ///
 /// `monitor`, `anchor`, `width` and `height` get the same treatment for a weaker reason: each is
 /// inert rather than dangerous (a lock surface's geometry is entirely the compositor's configure,
-/// and it expands per output because the protocol says so, not because a `monitor` asked --
+/// and it expands per output because the protocol says so, not because a `monitor` asked, per
 /// ADR-0052 decision 2), and a property that quietly does nothing is worse unreported than
 /// reported.
 ///
@@ -93,7 +93,7 @@ pub enum SurfaceSpec {
 }
 
 impl SurfaceSpec {
-    /// The `id` this surface was declared with, whatever its role -- what
+    /// The `id` this surface was declared with, whatever its role: what
     /// `layout::scene::Scene`'s apply matches a `SurfaceInstance` back to its `VirtualNode` by.
     pub fn declared_id(&self) -> &str {
         match self {
@@ -123,7 +123,7 @@ impl SurfaceSpec {
 /// preference. A `panel` carries all five of [`SurfaceTopology`]'s fields, because
 /// `get_layer_surface` fixes every one of them at creation. A `window`, a `popup` and a `lock`
 /// carry their `id` alone: everything else they hold is either a request on a live object
-/// (`set_title`, `set_app_id`, the two size hints -- see [`WindowSpec`]'s own "no `WindowTopology`"
+/// (`set_title`, `set_app_id`, the two size hints, see [`WindowSpec`]'s own "no `WindowTopology`"
 /// note) or rebuilt per open (the whole `xdg_positioner`, ADR-0049 decision 1), so none of it
 /// can strand a live object the way a changed `namespace` would. A `lock` reaches the same
 /// one-field answer from the other end: § 6.4 gives it `id` and `child` alone, so the only
@@ -147,7 +147,7 @@ pub enum SurfaceFingerprint {
 }
 
 /// A single-node property (`panel.child`), converted from its raw table via
-/// `lua::nodes::deserialize_lua_table` -- not re-implemented here.
+/// `lua::nodes::deserialize_lua_table`, not re-implemented here.
 pub fn parse_single_child(
     properties: &HashMap<String, Value>,
     property: &str,
@@ -179,8 +179,8 @@ pub fn parse_children(properties: &HashMap<String, Value>) -> Result<Vec<Virtual
     Ok(children)
 }
 
-/// A `list` node's children (`oblisk-idl-api-specs.md` § 5.2 item 7, ADR-0045 decision 3,
-/// build-steps.md Phase 19 item 12). Parallels [`parse_children`]'s role for
+/// A `list` node's children (`oblisk-idl-api-specs.md` § 5.2 item 7, ADR-0045 decision 3).
+/// Parallels [`parse_children`]'s role for
 /// `rect`/`row`/`column`/`button`, but a `list`'s children are never a literal Lua table: they are
 /// generated here, once per element of `source`, by calling `itemfn(element)` and deserializing the
 /// node table it returns.
@@ -189,9 +189,9 @@ pub fn parse_children(properties: &HashMap<String, Value>) -> Result<Vec<Virtual
 /// property, so a `Signal` there was read exactly once before this function ever runs.
 ///
 /// Without `key`, a generated child gets no `id` at all, so
-/// `layout::scene::pair_children_by_id_then_position` matches list items by position -- the same
+/// `layout::scene::pair_children_by_id_then_position` matches list items by position, the same
 /// rule an id-less literal child already gets, and exactly what decision 3 specifies. With `key`,
-/// `key(element)` -- called on the source element, never on the node `itemfn` built -- becomes that
+/// `key(element)`, called on the source element and never on the node `itemfn` built, becomes that
 /// child's `id`, overwriting whatever `id` `itemfn`'s own node table carried: a list item's
 /// identity belongs to the list, and honoring an inner `id` instead would let two items that happen
 /// to declare the same one collide.
@@ -206,8 +206,8 @@ pub fn parse_children(properties: &HashMap<String, Value>) -> Result<Vec<Virtual
 /// fresh ones away. § 5.2 calls `list` a "fast-reconciling virtual repeater", and the reconciling
 /// half is what ADR-0045 delivered; the repeater half still re-runs a Lua closure per item per
 /// pass. `layout::scene`'s walk runs per `Scene::apply`, which ADR-0044 decision 2's dirty flag
-/// made per poll turn rather than per config edit, so this is the same cadence change item 14's
-/// text-reshaping `ponytail:` records against the measure callback.
+/// made per poll turn rather than per config edit, the same cadence a `ponytail:` comment on the
+/// measure callback records for its own text-reshaping cost.
 ///
 /// The fix is to compute keys first and skip `itemfn` for an element whose key already matches a
 /// retained child, which is what makes it a virtual repeater rather than a loop. It is not built
@@ -261,7 +261,7 @@ pub fn parse_list_children(properties: &HashMap<String, Value>) -> Result<Vec<Vi
             if !seen_keys.insert(key_text.clone()) {
                 return Err(invalid("key", format!("duplicate key `{key_text}` among list items")));
             }
-            // The key wins over any `id` the node itemfn built already carried -- see this
+            // The key wins over any `id` the node itemfn built already carried, see this
             // function's doc comment.
             node.properties.insert("id".to_string(), Value::String(key_str));
         }
@@ -274,9 +274,9 @@ pub fn parse_list_children(properties: &HashMap<String, Value>) -> Result<Vec<Vi
 /// `textfield.secure_submit` (§ 5.2 item 8): the `{ capability, action }` pair a masked field's
 /// committed buffer is addressed to once the focused field submits, instead of the value ever
 /// reaching Lua (ADR-0005, ADR-0027). The submit is Enter on `wl_keyboard`, read natively
-/// in `renderer/src/wayland/mod.rs` -- ADR-0027's `zwp_text_input_v3` bridge was the original
-/// transport and no longer carries this path at all; see that file's `secure_key_action` for why a
-/// password must not travel through an input method. This pair becomes the routing key on a
+/// in `renderer/src/wayland/mod.rs`, not through the `zwp_text_input_v3` bridge ADR-0027 also
+/// covers; see that file's `secure_key_action` for why a password must not travel through an
+/// input method. This pair becomes the routing key on a
 /// `RendererFrame::SecureSubmit` envelope (ADR-0050 decision 4), which is why both fields are
 /// required rather than falling back to some default capability.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,11 +285,11 @@ pub struct SecureSubmitTarget {
     pub action: String,
 }
 
-/// `Ok(None)` when the property is absent -- `secure_submit` is optional even on a masked field
+/// `Ok(None)` when the property is absent: `secure_submit` is optional even on a masked field
 /// (§ 5.2 item 8's own note: without it, a masked value is just unreadable from Lua).
 ///
 /// `secure_submit` is not in [`is_structural_property`]'s carve-out, so a signal-bound value
-/// arrives here already resolved -- nothing reconciles a node by its `secure_submit`, so there is
+/// arrives here already resolved: nothing reconciles a node by its `secure_submit`, so there is
 /// no structural decision here for a live-changing signal to undermine.
 ///
 /// `capability`/`action` are refused non-UTF-8 rather than converted lossily, the same call
