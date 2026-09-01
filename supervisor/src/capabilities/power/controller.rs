@@ -46,7 +46,7 @@ trait UPower {
 /// The composite `DisplayDevice`, not a specific `battery_BAT0`: UPower already sums every
 /// battery on the machine into this one object. `EnergyRate` is a magnitude in Watts, positive
 /// while charging and discharging alike; § 2.13 asks for the rate with no direction, so this
-/// reports the rate -- a config needing direction reads `oblisk.battery.charging`.
+/// reports the rate -- a config needing direction reads `oblisk.battery.state`.
 #[zbus::proxy(
     interface = "org.freedesktop.UPower.Device",
     default_service = "org.freedesktop.UPower",

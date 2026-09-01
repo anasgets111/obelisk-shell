@@ -18,11 +18,18 @@ local tooltip = require("components.tooltip")
 
 local SLOT = "battery"
 
--- No charging branch. The glyph below already says charging, and a second signal for it here just
--- meant that plugging in and standing at 90% painted the same green.
+-- No per-state branch beyond the draining check. The glyph below already says what the cable is
+-- doing, and a second signal for it here just meant that plugging in and standing at 90% painted
+-- the same green.
 local function battery_color(b)
     if b == nil or not b.present then
         return theme.DIM
+    end
+    -- Only a battery that is actually running down gets a warning colour. Red at 14% while the
+    -- charger is in says the wrong thing, and it is the reference service's own rule:
+    -- `isLowAndNotCharging` gates its threshold on `isOnBattery` for exactly this.
+    if not util.battery_is_draining(b.state) then
+        return theme.GREEN
     end
     if b.percent < 15 then
         return theme.RED
@@ -37,8 +44,14 @@ local function battery_glyph(b)
     if b == nil or not b.present then
         return icons.battery_ac
     end
-    if b.charging then
+    -- Taking current gets the bolt. Sitting on mains at a charge limit, or full, gets the plug:
+    -- the cable is in and the level is not moving, which is a different thing to show and used to
+    -- be indistinguishable from running on battery.
+    if b.state == "Charging" then
         return icons.battery_pending
+    end
+    if b.state == "PendingCharge" or b.state == "FullyCharged" then
+        return icons.battery_ac
     end
     -- Five buckets over 0..100, which is `icons[min(floor(fraction * 5), 4)]` with Lua's 1-based
     -- indexing folded in: 100% lands in bucket 5 rather than falling off the end.
@@ -106,7 +119,7 @@ local battery_tooltip = tooltip({
             if not b.present then
                 return "no battery"
             end
-            return string.format("%d%% %s", b.percent, b.charging and "charging" or "discharging")
+            return string.format("%d%% %s%s", b.percent, util.battery_phrase(b.state), util.battery_eta(b))
         end), theme.FG, theme.font.sm),
         cell(util.label(oblisk.power, function(p)
             local parts = {}

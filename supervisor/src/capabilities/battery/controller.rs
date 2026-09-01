@@ -1,24 +1,75 @@
 //! [`BatteryController`]: the `oblisk.battery` state owner. Read-only telemetry (§ 2.2) --
 //! no write actions. Split from `battery` -- see `battery/mod.rs` for the module-level doc.
 
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use tokio::io::unix::AsyncFd;
+use futures_util::StreamExt;
+use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
-use udev::MonitorSocket;
 
-use super::super::read_attr;
+/// § 2.2's `battery.state`, one of UPower's seven `Device.State` values.
+///
+/// A boolean cannot carry this, and that is why it is not one. The four states a laptop with a
+/// charge threshold moves between are `Charging`, `PendingCharge` (the limit is reached and the
+/// mains adapter is holding the battery there), `PendingDischarge` (the battery is above the
+/// limit and draining down to it, still on mains) and `Discharging` (on battery). Under the
+/// `charging: bool` this replaced, the middle two both read `false`, so a config could not tell
+/// "the limit is reached" from "you are on battery" -- which on this dev machine, whose
+/// `charge_control_end_threshold` is 70, is most of every day.
+///
+/// Serialized by name, so Lua compares `b.state == "PendingCharge"`. The same shape
+/// `mpris`'s `play_state` already uses at this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, schemars::JsonSchema)]
+pub enum BatteryStatus {
+    /// UPower has no answer, which includes every host where the display device is not a battery.
+    #[default]
+    Unknown,
+    /// Taking current from the mains adapter.
+    Charging,
+    /// Running off the battery, with no mains adapter supplying it.
+    Discharging,
+    /// Flat, which UPower reports in place of `Discharging` only at the very end.
+    Empty,
+    /// At the top of the battery, on mains, holding. A charge limit gives `PendingCharge` instead.
+    FullyCharged,
+    /// On mains, at the charge limit, not taking current. "Charge limit reached".
+    PendingCharge,
+    /// On mains, above the charge limit, draining down to it. The cable is in and the level falls.
+    PendingDischarge,
+}
+
+impl BatteryStatus {
+    /// UPower's own numbering (`org.freedesktop.UPower.Device.State`). An unknown number is
+    /// [`BatteryStatus::Unknown`] rather than an error: a future UPower adding an eighth state
+    /// must not fail this capability.
+    fn from_upower(state: u32) -> Self {
+        match state {
+            1 => Self::Charging,
+            2 => Self::Discharging,
+            3 => Self::Empty,
+            4 => Self::FullyCharged,
+            5 => Self::PendingCharge,
+            6 => Self::PendingDischarge,
+            _ => Self::Unknown,
+        }
+    }
+}
 
 /// `oblisk.battery`'s full payload (§ 2.2). Field names are the `StateSnapshot` JSON keys
-/// verbatim -- may not be renamed. `Default` (`false`, `0`, `false`) is itself the correct
-/// "no battery hardware" answer for a desktop, not a placeholder needing a sentinel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, schemars::JsonSchema)]
+/// verbatim -- may not be renamed. `Default` is itself the correct "no battery hardware" answer
+/// for a desktop, not a placeholder needing a sentinel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, schemars::JsonSchema)]
 pub struct BatteryState {
     pub present: bool,
     pub percent: u8,
-    pub charging: bool,
+    pub state: BatteryStatus,
+    /// Seconds until flat, or `nil`. UPower reports `0` both while charging and while it has not
+    /// yet estimated, and neither is a duration, so both are the absent case here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_to_empty: Option<u32>,
+    /// Seconds until full, or `nil`, on the same terms as `time_to_empty`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_to_full: Option<u32>,
 }
 
 /// One shared signal, `Changed` only.
@@ -27,68 +78,36 @@ pub enum BatterySignal {
     Changed,
 }
 
-/// § 2.2's battery-selection predicate: `type` must be exactly `Battery` (excludes `Mains`
-/// adapters and USB-PD sources), and `scope` must not be `Device` (a peripheral's battery,
-/// not the system's). An absent `scope` file means system scope.
-fn is_system_battery(entry_dir: &Path) -> bool {
-    if read_attr(entry_dir, "type").as_deref() != Some("Battery") {
-        return false;
-    }
-    read_attr(entry_dir, "scope").as_deref() != Some("Device")
-}
-
-/// Picks the one entry [`is_system_battery`] qualifies, in sorted-by-name order (not
-/// `read_dir`'s unspecified order) for a deterministic choice across boots on a two-battery
-/// laptop. `None` if nothing qualifies.
-fn select_system_battery(power_supply_root: &Path) -> Option<PathBuf> {
-    let mut entries: Vec<PathBuf> =
-        std::fs::read_dir(power_supply_root).ok()?.flatten().map(|entry| entry.path()).collect();
-    entries.sort();
-    entries.into_iter().find(|entry| is_system_battery(entry))
-}
-
-/// `battery.charging`: true exactly when `status` is `Charging` or `Full`. An exact match,
-/// not a substring test -- `Not charging` (a real fourth status value) contains "charging"
-/// as a substring and would wrongly match.
-fn charging_from_status(status: &str) -> bool {
-    status == "Charging" || status == "Full"
-}
-
-/// `battery.percent`: `capacity` clamped to `[0, 100]` -- some firmware reports over 100.
-/// Missing/unparseable `capacity` reads as `0` rather than panicking.
-fn percent_from_capacity(capacity: Option<&str>) -> u8 {
-    capacity.and_then(|text| text.parse::<u32>().ok()).unwrap_or(0).min(100) as u8
-}
-
-/// Reads the whole `oblisk.battery` state in one pass: [`select_system_battery`] first, then
-/// `capacity`/`status` off the winner. No qualifying entry is `BatteryState::default()`, the
-/// correct answer, not an error.
-pub fn read_battery_state(power_supply_root: &Path) -> BatteryState {
-    let Some(entry) = select_system_battery(power_supply_root) else {
-        return BatteryState::default();
-    };
-    let percent = percent_from_capacity(read_attr(&entry, "capacity").as_deref());
-    let charging = read_attr(&entry, "status").is_some_and(|status| charging_from_status(&status));
-    BatteryState { present: true, percent, charging }
-}
-
-/// The floor the state is re-read at, whatever the udev watch does. The watch stays primary --
-/// `charging` flips within a frame of a plug or unplug, which a 30s timer cannot promise -- but it
-/// is a floor and not a fallback, and that distinction is the whole of docs/adr/0080.
+/// UPower's `DisplayDevice`, the composite it sums every battery on the machine into. The same
+/// object `power::controller` reads `EnergyRate` off, and the one Quickshell's
+/// `services/upower/core.cpp` binds through `GetDisplayDevice()`.
 ///
-/// This used to run only when [`build_power_supply_watch`] failed to stand up, on the assumption
-/// that a working watch reports every change. It does not. Measured on this dev machine while
-/// discharging, with `udevadm monitor --udev --subsystem-match=power_supply` running alongside a
-/// one-second sampler: `capacity` fell 69 to 65 and the socket delivered **zero** events. UPower,
-/// watching the same battery, tracked every point, because UPower polls the hardware itself
-/// (`upower -i` reported "updated: 13 seconds ago"). The kernel's ACPI battery driver emits a
-/// uevent on a plug or unplug and, on this hardware, on nothing else.
-///
-/// 30s is UPower's own cadence for a battery that needs polling, which is the number to match: a
-/// bar showing a percentage two points stale is what a user reports, and no config can ask for
-/// tighter than the source updates. If it ever needs to be user-tunable,
-/// `SysinfoController`'s configurable watch-channel interval (docs/adr/0035) is the pattern.
-const POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// The path is well-known and fixed, so this proxies it directly rather than calling
+/// `GetDisplayDevice()` for an address that is documented to be exactly this one.
+#[zbus::proxy(
+    interface = "org.freedesktop.UPower.Device",
+    default_service = "org.freedesktop.UPower",
+    default_path = "/org/freedesktop/UPower/devices/DisplayDevice"
+)]
+trait DisplayDevice {
+    /// `2` is Battery. On a desktop the display device exists but is not one.
+    #[zbus(property, name = "Type")]
+    fn device_type(&self) -> zbus::Result<u32>;
+    #[zbus(property)]
+    fn is_present(&self) -> zbus::Result<bool>;
+    /// `[0, 100]`, not a fraction.
+    #[zbus(property)]
+    fn percentage(&self) -> zbus::Result<f64>;
+    #[zbus(property)]
+    fn state(&self) -> zbus::Result<u32>;
+    #[zbus(property)]
+    fn time_to_empty(&self) -> zbus::Result<i64>;
+    #[zbus(property)]
+    fn time_to_full(&self) -> zbus::Result<i64>;
+}
+
+/// UPower's `Type` value for a battery.
+const UPOWER_TYPE_BATTERY: u32 = 2;
 
 /// Not `Clone`: § 2.2 has no write action, so nothing needs a second handle.
 pub struct BatteryController {
@@ -96,12 +115,10 @@ pub struct BatteryController {
 }
 
 impl BatteryController {
-    /// `power_supply_root` (real default `/sys/class/power_supply`) is injected for
-    /// testability. Returns immediately; [`run_battery_task`] does the real reading in a
-    /// spawned task.
-    pub fn new(power_supply_root: PathBuf, events: UnboundedSender<BatterySignal>) -> Self {
+    /// Returns immediately; [`run_battery_task`] does the reading in a spawned task.
+    pub fn new(system_bus: zbus::Connection, events: UnboundedSender<BatterySignal>) -> Self {
         let state = Arc::new(Mutex::new(BatteryState::default()));
-        tokio::spawn(run_battery_task(power_supply_root, Arc::clone(&state), events));
+        tokio::spawn(run_battery_task(system_bus, Arc::clone(&state), events));
         Self { state }
     }
 
@@ -110,92 +127,97 @@ impl BatteryController {
     }
 }
 
-/// Reads the initial state, sends it, then hands off to [`run_battery_loop`]. A udev watch that
-/// fails to stand up is not fatal: the loop runs on its timer alone, which is the same cadence a
-/// silent watch already leaves it on.
+/// A duration UPower has actually estimated, or `None`. `0` is its "no answer" value on both
+/// properties, and a negative one is not a duration at all.
+fn seconds(reported: i64) -> Option<u32> {
+    u32::try_from(reported).ok().filter(|seconds| *seconds > 0)
+}
+
+/// Reads the whole payload off one device. A property read that fails leaves its field at the
+/// default rather than keeping the last value, the same rule `power::controller::read_state`
+/// follows and for the same reason: a stale number that looks live is worse than an honest zero.
+///
+/// `present` needs both halves of the answer. `IsPresent` alone is true on hardware that is not a
+/// battery at all, so the type is checked with it -- the same pair Quickshell's `isLaptopBattery`
+/// tests before it believes a percentage.
+async fn read_state(device: &DisplayDeviceProxy<'static>) -> BatteryState {
+    let is_battery = device.device_type().await.is_ok_and(|kind| kind == UPOWER_TYPE_BATTERY);
+    let present = is_battery && device.is_present().await.unwrap_or(false);
+    if !present {
+        return BatteryState::default();
+    }
+
+    BatteryState {
+        present: true,
+        // `round`, not a cast: a cast truncates, so 69.8% would show as 69 for the whole minute
+        // before it reached 70.
+        percent: device.percentage().await.unwrap_or(0.0).clamp(0.0, 100.0).round() as u8,
+        state: device.state().await.map(BatteryStatus::from_upower).unwrap_or_default(),
+        time_to_empty: device.time_to_empty().await.ok().and_then(seconds),
+        time_to_full: device.time_to_full().await.ok().and_then(seconds),
+    }
+}
+
+/// Reads once, pushes, then follows the device's `PropertiesChanged`. Every wake re-reads the
+/// whole payload rather than patching the one property that fired, which is what
+/// `power::controller` already does and what keeps the five fields consistent with each other.
+///
+/// One subscription for the whole object, not one per property: `org.freedesktop.DBus.Properties`
+/// batches a device's changes into a single signal, and a percentage that moves while the state
+/// flips arrives as one message. This is Quickshell's `DBusPropertyGroup` shape.
+///
+/// **No timer, and that is the point of docs/adr/0080.** The sysfs reader this replaced could not
+/// see a change the kernel did not announce, and measured on this machine the kernel announced a
+/// plug and nothing else: `capacity` fell 69 to 65 with zero `power_supply` uevents delivered.
+/// UPower polls the hardware itself and emits on every refresh, so the polling moves to the one
+/// process already doing it for every other client on the system.
 async fn run_battery_task(
-    power_supply_root: PathBuf,
+    system_bus: zbus::Connection,
     state: Arc<Mutex<BatteryState>>,
     events: UnboundedSender<BatterySignal>,
 ) {
-    let initial = read_battery_state(&power_supply_root);
-    *state.lock().expect("battery state mutex poisoned") = initial;
+    let device = match DisplayDeviceProxy::new(&system_bus).await {
+        Ok(proxy) => proxy,
+        Err(err) => {
+            eprintln!("battery: no UPower DisplayDevice reachable ({err}); battery will not be reported this run");
+            return;
+        }
+    };
+
+    // Subscribed before the first read, for `power::controller`'s reason: each subscription is
+    // its own round trip, and a cable pulled during that window would land between a read and a
+    // subscription that does not exist yet.
+    let properties = match zbus::fdo::PropertiesProxy::builder(&system_bus)
+        .destination("org.freedesktop.UPower")
+        .and_then(|builder| builder.path("/org/freedesktop/UPower/devices/DisplayDevice"))
+    {
+        Ok(builder) => match builder.build().await {
+            Ok(proxy) => proxy,
+            Err(err) => {
+                eprintln!("battery: cannot watch the UPower DisplayDevice for changes ({err}); giving up on it");
+                return;
+            }
+        },
+        Err(err) => {
+            eprintln!("battery: cannot address the UPower DisplayDevice ({err}); giving up on it");
+            return;
+        }
+    };
+    let Ok(mut changed) = properties.receive_properties_changed().await else {
+        eprintln!("battery: cannot subscribe to the UPower DisplayDevice's properties; giving up on it");
+        return;
+    };
+
+    let mut previous = read_state(&device).await;
+    *state.lock().expect("battery state mutex poisoned") = previous;
     if events.send(BatterySignal::Changed).is_err() {
         return;
     }
 
-    let watch = build_power_supply_watch()
-        .map_err(|err| {
-            eprintln!(
-                "battery: failed to set up the udev power_supply watch ({err}); a plug or unplug will show up on the {POLL_INTERVAL:?} read instead of instantly"
-            );
-        })
-        .ok();
-    run_battery_loop(watch, power_supply_root, initial, state, events).await;
-}
-
-/// Builds the `power_supply` subsystem udev watch (§ 2.2; docs/build-steps.md line 98). Needs
-/// `udev`'s `send` feature (Cargo.toml) to typecheck -- `MonitorBuilder`/`MonitorSocket` must
-/// be `Send` to live inside the `tokio::spawn`ed future.
-fn build_power_supply_watch() -> std::io::Result<AsyncFd<MonitorSocket>> {
-    let socket = udev::MonitorBuilder::new()?.match_subsystem("power_supply")?.listen()?;
-    AsyncFd::new(socket)
-}
-
-/// One loop, two wakeup sources, one read. A readable udev fd or a [`POLL_INTERVAL`] tick both
-/// mean the same thing here -- go look again -- and only the comparison below decides whether
-/// anything is pushed. udev fires on every `power_supply` change, not just the ones this
-/// capability reports, so most wakeups get filtered out either way.
-///
-/// `watch` is `None` when the socket could not be built, and becomes `None` when its fd errors:
-/// the loop keeps running on the timer rather than returning, because a broken netlink socket must
-/// not leave a working battery unreported.
-///
-/// Drains the pending messages on each readiness, since one plug can fire more than one and
-/// level-triggered readiness would re-fire on anything left undrained.
-///
-/// Uses `readable_mut` (not `readable`): only `udev`'s `send` feature is enabled (Cargo.toml),
-/// not `sync`, and `readable`'s guard needs `MonitorSocket: Sync` to be `Send` across `.await` --
-/// `readable_mut`'s guard only needs `MonitorSocket: Send`, which is already enabled.
-async fn run_battery_loop(
-    mut watch: Option<AsyncFd<MonitorSocket>>,
-    power_supply_root: PathBuf,
-    mut previous: BatteryState,
-    state: Arc<Mutex<BatteryState>>,
-    events: UnboundedSender<BatterySignal>,
-) {
-    let mut ticker = tokio::time::interval(POLL_INTERVAL);
-    ticker.tick().await; // tokio::time::interval's first tick fires immediately; the caller's initial read already covers it
-
-    loop {
-        let watch_errored = tokio::select! {
-            // The `if` guard is what makes the `expect` sound: `select!` evaluates a branch's
-            // precondition before it ever polls that branch's future, so this arm cannot run
-            // while the socket is gone.
-            readiness = async { watch.as_mut().expect("guarded by watch.is_some()").readable_mut().await },
-                if watch.is_some() =>
-            {
-                match readiness {
-                    Ok(mut guard) => {
-                        for _event in guard.get_inner().iter() {}
-                        guard.clear_ready();
-                        false
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "battery: the udev power_supply watch's fd errored ({err}); reading on the {POLL_INTERVAL:?} timer alone for the rest of this run"
-                        );
-                        true
-                    }
-                }
-            }
-            _ = ticker.tick() => false,
-        };
-        if watch_errored {
-            watch = None;
-        }
-
-        let current = read_battery_state(&power_supply_root);
+    // Ends when UPower goes away, which drops the proxies and their connection references. There
+    // is nothing else to wake this task, so parking on a dead stream would leak it.
+    while changed.next().await.is_some() {
+        let current = read_state(&device).await;
         if current != previous {
             *state.lock().expect("battery state mutex poisoned") = current;
             previous = current;
@@ -210,239 +232,72 @@ async fn run_battery_loop(
 mod tests {
     use super::*;
 
-    fn write_entry(root: &Path, name: &str, attrs: &[(&str, &str)]) {
-        let dir = root.join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        for (attr, value) in attrs {
-            std::fs::write(dir.join(attr), value).unwrap();
+    // ---- BatteryStatus::from_upower ----
+
+    /// The whole reason § 2.2 has a `state` and not a `charging`. Each of these is a distinct
+    /// thing to show a user, and the three middle rows all collapsed to `false` before.
+    #[test]
+    fn every_upower_state_maps_to_its_own_name() {
+        for (reported, expected) in [
+            (0, BatteryStatus::Unknown),
+            (1, BatteryStatus::Charging),
+            (2, BatteryStatus::Discharging),
+            (3, BatteryStatus::Empty),
+            (4, BatteryStatus::FullyCharged),
+            (5, BatteryStatus::PendingCharge),
+            (6, BatteryStatus::PendingDischarge),
+        ] {
+            assert_eq!(BatteryStatus::from_upower(reported), expected, "State = {reported}");
         }
     }
 
-    // ---- run_battery_loop ----
-
-    /// The bug docs/adr/0080 was written for. A udev watch that never fires is indistinguishable
-    /// from no watch at all, so this drives the loop with `None` and lets the timer be the only
-    /// wakeup. Before the timer was a floor rather than a fallback, this hung: the watch loop
-    /// awaited an fd that had nothing to say and the poll loop was only reachable when the socket
-    /// failed to build.
-    #[tokio::test(start_paused = true)]
-    async fn a_capacity_change_with_no_udev_event_still_reaches_the_signal() {
-        let root = tempfile::tempdir().unwrap();
-        write_entry(root.path(), "BAT0", &[("type", "Battery"), ("capacity", "69"), ("status", "Discharging")]);
-
-        let initial = read_battery_state(root.path());
-        assert_eq!(initial, BatteryState { present: true, percent: 69, charging: false });
-
-        let state = Arc::new(Mutex::new(initial));
-        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
-        let task =
-            tokio::spawn(run_battery_loop(None, root.path().to_path_buf(), initial, Arc::clone(&state), events));
-
-        // The four points this dev machine lost between two udev events that never arrived.
-        std::fs::write(root.path().join("BAT0").join("capacity"), "65").unwrap();
-
-        assert_eq!(received.recv().await, Some(BatterySignal::Changed));
-        assert_eq!(state.lock().unwrap().percent, 65);
-        task.abort();
-    }
-
-    /// The filter survives the change: a tick that finds nothing new pushes nothing, or every
-    /// `POLL_INTERVAL` would wake the renderer for a battery that has not moved.
-    #[tokio::test(start_paused = true)]
-    async fn a_tick_that_finds_nothing_new_pushes_nothing() {
-        let root = tempfile::tempdir().unwrap();
-        write_entry(root.path(), "BAT0", &[("type", "Battery"), ("capacity", "69"), ("status", "Discharging")]);
-
-        let initial = read_battery_state(root.path());
-        let state = Arc::new(Mutex::new(initial));
-        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
-        let task =
-            tokio::spawn(run_battery_loop(None, root.path().to_path_buf(), initial, Arc::clone(&state), events));
-
-        // Long enough for many ticks under paused time, all of them reading the same files.
-        let quiet = tokio::time::timeout(POLL_INTERVAL * 10, received.recv()).await;
-        assert!(quiet.is_err(), "an unchanged battery pushed {quiet:?}");
-        task.abort();
-    }
-
-    // ---- is_system_battery ----
-
+    /// An eighth state in some future UPower must degrade, not fail: this capability reports what
+    /// it understands and a config renders `"Unknown"` rather than the whole payload going away.
     #[test]
-    fn is_system_battery_excludes_mains_and_usb_types() {
-        let root = tempfile::tempdir().unwrap();
-        write_entry(root.path(), "AC0", &[("type", "Mains")]);
-        write_entry(root.path(), "ucsi-source-psy-USBC000:001", &[("type", "USB"), ("scope", "System")]);
-
-        assert!(!is_system_battery(&root.path().join("AC0")));
-        assert!(!is_system_battery(&root.path().join("ucsi-source-psy-USBC000:001")));
+    fn a_state_number_this_build_does_not_know_reads_as_unknown() {
+        assert_eq!(BatteryStatus::from_upower(7), BatteryStatus::Unknown);
+        assert_eq!(BatteryStatus::from_upower(u32::MAX), BatteryStatus::Unknown);
     }
 
+    /// The names are the wire format: a config compares against these strings, so a rename here
+    /// is a breaking change to § 2.2 and has to look like one.
     #[test]
-    fn is_system_battery_treats_an_absent_scope_file_as_system_scope() {
-        let root = tempfile::tempdir().unwrap();
-        write_entry(root.path(), "BAT0", &[("type", "Battery")]); // real BAT0 on this dev machine has no scope file
-
-        assert!(is_system_battery(&root.path().join("BAT0")));
+    fn the_state_serializes_under_the_name_a_config_compares_against() {
+        let json = serde_json::to_string(&BatteryState {
+            present: true,
+            percent: 70,
+            state: BatteryStatus::PendingCharge,
+            time_to_empty: None,
+            time_to_full: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"present":true,"percent":70,"state":"PendingCharge"}"#);
     }
 
+    // ---- seconds ----
+
+    /// UPower reports `0` on `TimeToEmpty` the entire time a battery is charging, and on both
+    /// properties before it has enough history to estimate. Neither is a duration.
     #[test]
-    fn is_system_battery_excludes_a_device_scoped_peripheral_battery() {
-        let root = tempfile::tempdir().unwrap();
-        write_entry(root.path(), "hid-aa-bb-battery", &[("type", "Battery"), ("scope", "Device")]);
-
-        assert!(!is_system_battery(&root.path().join("hid-aa-bb-battery")));
+    fn an_unestimated_or_negative_duration_is_absent_rather_than_zero() {
+        assert_eq!(seconds(0), None);
+        assert_eq!(seconds(-1), None);
+        assert_eq!(seconds(8040), Some(8040));
     }
 
-    // ---- charging_from_status ----
-
+    /// A desktop's display device exists and is not a battery, which is `present = false` and the
+    /// default payload -- not an error and not an absent capability.
     #[test]
-    fn charging_from_status_is_true_only_for_charging_and_full() {
-        assert!(charging_from_status("Charging"));
-        assert!(charging_from_status("Full"));
-        assert!(!charging_from_status("Discharging"));
-        // "Not charging" contains "charging" as a substring -- must not match via a contains check.
-        assert!(!charging_from_status("Not charging"));
-    }
-
-    // ---- percent_from_capacity ----
-
-    #[test]
-    fn percent_from_capacity_clamps_a_value_over_one_hundred() {
-        assert_eq!(percent_from_capacity(Some("105")), 100);
-    }
-
-    #[test]
-    fn percent_from_capacity_is_zero_for_a_missing_or_malformed_reading() {
-        assert_eq!(percent_from_capacity(None), 0);
-        assert_eq!(percent_from_capacity(Some("not-a-number")), 0);
-    }
-
-    // ---- select_system_battery ----
-
-    #[test]
-    fn select_system_battery_picks_bat0_over_bat1_by_sorted_name() {
-        let root = tempfile::tempdir().unwrap();
-        write_entry(root.path(), "BAT1", &[("type", "Battery"), ("capacity", "40"), ("status", "Discharging")]);
-        write_entry(root.path(), "BAT0", &[("type", "Battery"), ("capacity", "90"), ("status", "Charging")]);
-
-        assert_eq!(select_system_battery(root.path()), Some(root.path().join("BAT0")));
-    }
-
-    #[test]
-    fn select_system_battery_is_none_against_an_empty_or_nonexistent_root() {
-        let root = tempfile::tempdir().unwrap();
-        assert_eq!(select_system_battery(root.path()), None);
-        assert_eq!(select_system_battery(&root.path().join("does-not-exist")), None);
-    }
-
-    // ---- read_battery_state ----
-
-    #[test]
-    fn read_battery_state_picks_bat0_over_the_mains_adapter_and_the_usb_pd_source() {
-        // Real captured shape from this dev machine's own /sys/class/power_supply/.
-        let root = tempfile::tempdir().unwrap();
-        write_entry(root.path(), "AC0", &[("type", "Mains")]);
-        write_entry(root.path(), "BAT0", &[("type", "Battery"), ("capacity", "59"), ("status", "Not charging")]);
-        write_entry(
-            root.path(),
-            "ucsi-source-psy-USBC000:001",
-            &[("type", "USB"), ("scope", "System"), ("status", "Not charging")],
-        );
-
-        assert_eq!(read_battery_state(root.path()), BatteryState { present: true, percent: 59, charging: false });
-    }
-
-    #[test]
-    fn read_battery_state_excludes_a_device_scoped_peripheral_battery() {
-        let root = tempfile::tempdir().unwrap();
-        write_entry(
-            root.path(),
-            "hid-aa-bb-battery",
-            &[("type", "Battery"), ("scope", "Device"), ("capacity", "80"), ("status", "Discharging")],
-        );
-
-        assert_eq!(read_battery_state(root.path()), BatteryState::default());
-    }
-
-    #[test]
-    fn read_battery_state_reads_charging_true_for_charging_and_full() {
-        let root = tempfile::tempdir().unwrap();
-        write_entry(root.path(), "BAT0", &[("type", "Battery"), ("capacity", "20"), ("status", "Charging")]);
-        assert!(read_battery_state(root.path()).charging);
-
-        let root = tempfile::tempdir().unwrap();
-        write_entry(root.path(), "BAT0", &[("type", "Battery"), ("capacity", "100"), ("status", "Full")]);
-        assert!(read_battery_state(root.path()).charging);
-    }
-
-    #[test]
-    fn read_battery_state_reads_charging_false_for_discharging_and_not_charging() {
-        let root = tempfile::tempdir().unwrap();
-        write_entry(root.path(), "BAT0", &[("type", "Battery"), ("capacity", "80"), ("status", "Discharging")]);
-        assert!(!read_battery_state(root.path()).charging);
-
-        let root = tempfile::tempdir().unwrap();
-        write_entry(root.path(), "BAT0", &[("type", "Battery"), ("capacity", "59"), ("status", "Not charging")]);
-        assert!(!read_battery_state(root.path()).charging);
-    }
-
-    #[test]
-    fn read_battery_state_is_the_default_sentinel_for_an_empty_directory() {
-        let root = tempfile::tempdir().unwrap();
-        assert_eq!(read_battery_state(root.path()), BatteryState { present: false, percent: 0, charging: false });
-    }
-
-    #[test]
-    fn read_battery_state_is_the_default_sentinel_against_a_nonexistent_root() {
-        let root = tempfile::tempdir().unwrap();
-        assert_eq!(read_battery_state(&root.path().join("does-not-exist")), BatteryState::default());
-    }
-
-    #[test]
-    fn read_battery_state_clamps_an_over_range_capacity_reading() {
-        let root = tempfile::tempdir().unwrap();
-        write_entry(root.path(), "BAT0", &[("type", "Battery"), ("capacity", "105"), ("status", "Full")]);
-
-        assert_eq!(read_battery_state(root.path()), BatteryState { present: true, percent: 100, charging: true });
-    }
-
-    #[test]
-    fn read_battery_state_picks_bat0_over_bat1_deterministically() {
-        let root = tempfile::tempdir().unwrap();
-        write_entry(root.path(), "BAT1", &[("type", "Battery"), ("capacity", "40"), ("status", "Discharging")]);
-        write_entry(root.path(), "BAT0", &[("type", "Battery"), ("capacity", "90"), ("status", "Charging")]);
-
-        assert_eq!(read_battery_state(root.path()), BatteryState { present: true, percent: 90, charging: true });
-    }
-
-    // ---- BatteryController (construction/task wiring) ----
-
-    #[tokio::test]
-    async fn battery_controller_pushes_the_initial_state_before_the_first_poll_tick() {
-        let root = tempfile::tempdir().unwrap();
-        write_entry(root.path(), "BAT0", &[("type", "Battery"), ("capacity", "59"), ("status", "Not charging")]);
-        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let controller = BatteryController::new(root.path().to_path_buf(), events_tx);
-
-        let signal = tokio::time::timeout(std::time::Duration::from_secs(2), events_rx.recv()).await;
+    fn the_default_payload_is_the_no_battery_answer() {
         assert_eq!(
-            signal,
-            Ok(Some(BatterySignal::Changed)),
-            "must announce the initial state without waiting for the first poll tick"
+            BatteryState::default(),
+            BatteryState {
+                present: false,
+                percent: 0,
+                state: BatteryStatus::Unknown,
+                time_to_empty: None,
+                time_to_full: None
+            }
         );
-        assert_eq!(controller.snapshot(), BatteryState { present: true, percent: 59, charging: false });
-    }
-
-    #[tokio::test]
-    async fn battery_controller_still_pushes_one_signal_when_no_battery_hardware_exists() {
-        let root = tempfile::tempdir().unwrap(); // empty -- the desktop case
-        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let controller = BatteryController::new(root.path().to_path_buf(), events_tx);
-
-        let signal = tokio::time::timeout(std::time::Duration::from_secs(2), events_rx.recv()).await;
-        assert_eq!(signal, Ok(Some(BatterySignal::Changed)));
-        assert_eq!(controller.snapshot(), BatteryState::default());
     }
 }

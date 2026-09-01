@@ -150,6 +150,35 @@ fn string_enum(fragment: &serde_json::Value) -> Option<String> {
     if names.is_empty() { None } else { Some(names.join("|")) }
 }
 
+/// The same fieldless enum, spelled the other way schemars spells it: one `oneOf` branch per
+/// variant, each a bare `const`. That is what it emits as soon as a variant carries a doc comment,
+/// and `BatteryStatus` is the first enum here whose variants needed one -- `PendingCharge` and
+/// `PendingDischarge` do not explain themselves.
+///
+/// Returns each variant with its own description, because losing those is most of why documenting
+/// the variants was worth doing.
+fn const_enum(body: &serde_json::Value) -> Option<Vec<(&str, Option<&str>)>> {
+    let branches = body.get("oneOf")?.as_array()?;
+    let mut variants: Vec<(&str, Option<&str>)> = Vec::new();
+    for branch in branches {
+        let description = branch.get("description").and_then(|d| d.as_str());
+        // schemars splits a fieldless enum two ways in the same `oneOf`: a documented variant is
+        // its own `const` branch, and every undocumented one is pooled into a single `enum` branch.
+        // Both are strings and both belong in the alias.
+        if let Some(name) = branch.get("const").and_then(|c| c.as_str()) {
+            variants.push((name, description));
+            continue;
+        }
+        // Neither spelling means an object branch, so this is a tagged union and the caller
+        // renders it as a class.
+        let pooled = branch.get("enum").and_then(|e| e.as_array())?;
+        for name in pooled.iter().filter_map(|v| v.as_str()) {
+            variants.push((name, description));
+        }
+    }
+    (!variants.is_empty()).then_some(variants)
+}
+
 /// A JSON Schema fragment as a LuaCATS type expression.
 ///
 /// The five shapes that appear in these payloads, and nothing else: a `$ref` into `$defs`, an
@@ -225,6 +254,25 @@ fn render_class(name: &str, body: &serde_json::Value, out: &mut String) {
         && let Some(union) = string_enum(body)
     {
         out.push_str(&format!("\n---@alias {name} {union}\n"));
+        if let Some(description) = body.get("description").and_then(|d| d.as_str()) {
+            for line in description.lines() {
+                out.push_str(&format!("---{line}\n"));
+            }
+        }
+        return;
+    }
+    // The documented spelling of the same thing. One line per variant so each keeps its own
+    // description, which the flat `"a"|"b"` union above has nowhere to put.
+    if body.get("properties").is_none()
+        && let Some(variants) = const_enum(body)
+    {
+        out.push_str(&format!("\n---@alias {name}\n"));
+        for (variant, description) in variants {
+            match description.and_then(|d| d.lines().next()) {
+                Some(first) => out.push_str(&format!("---| \"{variant}\" # {first}\n")),
+                None => out.push_str(&format!("---| \"{variant}\"\n")),
+            }
+        }
         if let Some(description) = body.get("description").and_then(|d| d.as_str()) {
             for line in description.lines() {
                 out.push_str(&format!("---{line}\n"));

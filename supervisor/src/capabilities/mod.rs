@@ -473,14 +473,12 @@ impl Capabilities {
                     ));
                 }
             }
-            // The root is a parameter, not a constant, so device selection is testable against a
-            // fixture directory (docs/adr/0053, § 2.2).
+            // UPower's DisplayDevice, the composite across every battery on the machine. A host
+            // with no UPower never pushes (docs/adr/0080, § 2.2).
             Capability::Battery => {
                 if self.battery.is_none() {
-                    self.battery = Some(BatteryController::new(
-                        PathBuf::from("/sys/class/power_supply"),
-                        self.senders.battery.clone(),
-                    ));
+                    self.battery =
+                        Some(BatteryController::new(self.connection.clone(), self.senders.battery.clone()));
                 }
             }
             // Ranked firmware over platform over raw. No device found means it never pushes --

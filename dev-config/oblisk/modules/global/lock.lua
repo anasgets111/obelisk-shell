@@ -85,7 +85,7 @@ return lock {
                 if not b.present then
                     return ""
                 end
-                return string.format("battery %d%%%s", b.percent, b.charging and " charging" or "")
+                return string.format("battery %d%% %s", b.percent, util.battery_phrase(b.state))
             end), theme.DIM, theme.font.xs),
         },
     },

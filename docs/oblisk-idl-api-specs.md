@@ -66,9 +66,13 @@ Two consequences worth knowing. A capability reads `nil` until its first `StateS
 *   `keyboard.active_layout`: `string` (The user-friendly active layout name, e.g., `"English (US)"`)
 
 ### 2.2 Battery Status (`oblisk.battery`)
-*   `battery.present`: `boolean` (True if physical battery detected)
-*   `battery.percent`: `integer` (`0` to `100`)
-*   `battery.charging`: `boolean` (True if status is "Charging" or "Full")
+Read off UPower's `DisplayDevice`, the composite across every battery on the machine (docs/adr/0080). A host with no UPower reports nothing at all, the same way § 2.13 handles a missing power-profiles-daemon.
+
+*   `battery.present`: `boolean` (True if the display device is a battery and reports itself present. False on a desktop, which is an answer rather than an absence)
+*   `battery.percent`: `integer` (`0` to `100`, rounded)
+*   `battery.state`: `string` (One of `"Unknown"`, `"Charging"`, `"Discharging"`, `"Empty"`, `"FullyCharged"`, `"PendingCharge"`, `"PendingDischarge"` -- UPower's own seven `Device.State` values, by name. This replaced a `charging: boolean`, which could not tell a charge limit being held (`"PendingCharge"`) from running on battery (`"Discharging"`), nor either from draining down to a limit with the cable still in (`"PendingDischarge"`). A laptop with `charge_control_end_threshold` set sits in the first of those most of the day)
+*   `battery.time_to_empty`: `integer` (Seconds until flat, or `nil`. UPower reports `0` while charging and before it has estimated, and neither is a duration, so both arrive as `nil`)
+*   `battery.time_to_full`: `integer` (Seconds until full, or `nil`, on the same terms)
 
 ### 2.3 Brightness State (`oblisk.brightness`)
 *   `brightness.percent`: `integer` (`0` to `100` percent)

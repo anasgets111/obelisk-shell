@@ -60,7 +60,7 @@ local body = {
         if not b.present then
             return "on ac power"
         end
-        return string.format("battery %d%% %s", b.percent, b.charging and "charging" or "discharging")
+        return string.format("battery %d%% %s%s", b.percent, util.battery_phrase(b.state), util.battery_eta(b))
     end), theme.DIM, theme.font.xs),
     panel_row {
         slot = "power-lock",

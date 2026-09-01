@@ -84,6 +84,27 @@ function Capability:invoke(command, ...) end
 ---@field id integer PipeWire registry id, which is what `audio:set_default_sink(id)` takes.
 ---@field name string
 
+---@alias BatteryStatus
+---| "Unknown" # UPower has no answer, which includes every host where the display device is not a battery.
+---| "Charging" # Taking current from the mains adapter.
+---| "Discharging" # Running off the battery, with no mains adapter supplying it.
+---| "Empty" # Flat, which UPower reports in place of `Discharging` only at the very end.
+---| "FullyCharged" # At the top of the battery, on mains, holding. A charge limit gives `PendingCharge` instead.
+---| "PendingCharge" # On mains, at the charge limit, not taking current. "Charge limit reached".
+---| "PendingDischarge" # On mains, above the charge limit, draining down to it. The cable is in and the level falls.
+---§ 2.2's `battery.state`, one of UPower's seven `Device.State` values.
+---
+---A boolean cannot carry this, and that is why it is not one. The four states a laptop with a
+---charge threshold moves between are `Charging`, `PendingCharge` (the limit is reached and the
+---mains adapter is holding the battery there), `PendingDischarge` (the battery is above the
+---limit and draining down to it, still on mains) and `Discharging` (on battery). Under the
+---`charging: bool` this replaced, the middle two both read `false`, so a config could not tell
+---"the limit is reached" from "you are on battery" -- which on this dev machine, whose
+---`charge_control_end_threshold` is 70, is most of every day.
+---
+---Serialized by name, so Lua compares `b.state == "PendingCharge"`. The same shape
+---`mpris`'s `play_state` already uses at this boundary.
+
 ---@class CameraUser
 ---One active camera user (ADR-0034: `privacy.camera_users: table`, array of `{app_name}`,
 ---empty = inactive).
@@ -213,11 +234,13 @@ function Capability:invoke(command, ...) end
 
 ---@class BatteryState
 ---`oblisk.battery`'s full payload (§ 2.2). Field names are the `StateSnapshot` JSON keys
----verbatim -- may not be renamed. `Default` (`false`, `0`, `false`) is itself the correct
----"no battery hardware" answer for a desktop, not a placeholder needing a sentinel.
----@field charging boolean
+---verbatim -- may not be renamed. `Default` is itself the correct "no battery hardware" answer
+---for a desktop, not a placeholder needing a sentinel.
 ---@field percent integer
 ---@field present boolean
+---@field state BatteryStatus
+---@field time_to_empty? integer Seconds until flat, or `nil`. UPower reports `0` both while charging and while it has not yet estimated, and neither is a duration, so both are the absent case here.
+---@field time_to_full? integer Seconds until full, or `nil`, on the same terms as `time_to_empty`.
 
 ---@class BluetoothState
 ---@field connected_devices ConnectedDevice[]

@@ -2024,13 +2024,15 @@ the IDL-only entries fell between the two documents.
 > and any `scope=Device` peripheral battery are all excluded, and `Not charging` is matched exactly
 > rather than by substring, which a `contains` check would invert into charging.
 >
-> **Amended by docs/adr/0080.** The monitor is not enough on its own. Measured on this dev machine
-> while discharging, `capacity` fell 69 to 65 and `udevadm monitor --udev
-> --subsystem-match=power_supply` delivered zero events: this ACPI battery driver emits a uevent on
-> a plug or an unplug and on nothing else. The 30s poll now runs alongside the watch rather than
-> only when the watch fails to build, so `percent` no longer freezes between plug events. Quickshell
-> avoids the whole question by reading UPower's `DisplayDevice` over DBus and letting UPower do the
-> polling; that ADR records why this is not that, yet. That monitor is the
+> **Superseded by docs/adr/0080.** None of the paragraph above is how this reads the battery any
+> more. The udev monitor was not enough on its own: measured on this dev machine while discharging,
+> `capacity` fell 69 to 65 and `udevadm monitor --udev --subsystem-match=power_supply` delivered
+> zero events, because this ACPI battery driver emits a uevent on a plug or an unplug and on nothing
+> else. Separately, `Not charging` matched exactly is still the right read of that word and still
+> could not be *reported*: a `charging: boolean` had no way to say "at the charge limit on mains" as
+> distinct from "on battery". `oblisk.battery` now reads UPower's `DisplayDevice` and follows its
+> `PropertiesChanged`, with seven states by name, which is what Quickshell does and why its config
+> never had either problem. `udev` stays a dependency for `brightness`. That monitor is the
 > first caller `udev` has ever had. It has been a declared dependency since scaffolding, justified by
 > line 98's "§ 1.1's battery netlink monitor", which nothing then wrote. Its `send` feature had to be
 > enabled, and `AsyncFd::readable_mut` used rather than `readable`, because the shared-reference

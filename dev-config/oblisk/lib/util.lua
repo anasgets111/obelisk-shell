@@ -20,6 +20,55 @@ function util.label(signal, read)
     end)
 end
 
+-- `oblisk.battery.state`'s seven UPower names as words a person reads. Three files show this line
+-- (the pill's tooltip, the power menu, the lock screen) and the wording has to be the same in all
+-- three, which is the whole reason it is not written out at each of them.
+--
+-- `PendingCharge` is the one worth having: a laptop with `charge_control_end_threshold` set sits
+-- there whenever it is plugged in and at the limit, and under the old `charging` boolean it read as
+-- "discharging" -- the opposite of what the cable was doing. `PendingDischarge` is its mirror, the
+-- battery draining down to a limit that was lowered under it.
+local BATTERY_PHRASES = {
+    Charging = "charging",
+    Discharging = "discharging",
+    Empty = "empty",
+    FullyCharged = "full",
+    PendingCharge = "charge limit reached",
+    PendingDischarge = "draining to limit",
+    Unknown = "state unknown",
+}
+
+function util.battery_phrase(state)
+    return BATTERY_PHRASES[state] or "state unknown"
+end
+
+-- Whether a battery is actually running down, which is the only time a low reading is worth
+-- colouring. `Discharging` on mains does not exist; `PendingDischarge` is on mains by definition and
+-- stops at the limit, so it is not the same thing and does not warn.
+-- `", 2h 14m left"` or `""`. UPower estimates one of the two durations at a time and neither while
+-- it is still learning the rate, so the empty string is the common case for the first minute after
+-- a plug or a boot rather than an error.
+function util.battery_eta(b)
+    local seconds, suffix
+    if b.time_to_empty then
+        seconds, suffix = b.time_to_empty, "left"
+    elseif b.time_to_full then
+        seconds, suffix = b.time_to_full, "to full"
+    else
+        return ""
+    end
+    local hours = math.floor(seconds / 3600)
+    local minutes = math.floor((seconds % 3600) / 60)
+    if hours > 0 then
+        return string.format(", %dh %02dm %s", hours, minutes, suffix)
+    end
+    return string.format(", %dm %s", minutes, suffix)
+end
+
+function util.battery_is_draining(state)
+    return state == "Discharging" or state == "Empty"
+end
+
 function util.count(list)
     return list and #list or 0
 end
