@@ -1,11 +1,11 @@
 ---
 name: implement
-description: "Implement an Oblisk slice from the plan or build steps."
+description: "Implement an Oblisk slice."
 ---
 
-Implement the requested Oblisk slice against `docs/build-steps.md`, the
-relevant ADRs in `docs/adr/`, and the user's request. Use the canonical terms
-in `CONTEXT.md`.
+Implement the requested Oblisk slice against `docs/oblisk-idl-api-specs.md`, the
+relevant entries in `docs/decisions.md`, and the user's request. `docs/roadmap.md`
+lists what is not built. Use the canonical terms in `CONTEXT.md`.
 
 Use `/tdd` where possible, at pre-agreed module seams. Keep Rust ownership in
 the engine and supervisor, and keep Lua focused on generation configuration and

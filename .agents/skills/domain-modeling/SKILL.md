@@ -15,17 +15,14 @@ Most repos have a single context:
 /
 ├── CONTEXT.md
 ├── docs/
-│   └── adr/
-│       ├── 0001-presentation-before-authority.md
-│       └── 0002-shared-dependency-snapshot.md
-├── plan.md
-└── build-steps.md
+│   └── decisions.md
+└── roadmap.md
 ```
 
 If a `CONTEXT-MAP.md` exists at the root, read it before choosing a context.
 The map names each context and its relationships.
 
-Create files lazily: only when you have something to write. If no `CONTEXT.md` exists, create one when the first term is resolved. If no `docs/adr/` exists, create it when the first ADR is needed.
+Create files lazily: only when you have something to write. If no `CONTEXT.md` exists, create one when the first term is resolved. If no `docs/decisions.md` exists, create it when the first decision is worth recording.
 
 ## During the session
 

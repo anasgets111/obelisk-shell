@@ -1,7 +1,0 @@
-# Renderer loads GL function pointers via glow, not the `gl` crate
-
-`build-steps.md` Phase 1's renderer `Cargo.toml` listed `gl = "latest"` as the GLES3 function-pointer loader, and Phase 3 targets `EGL_OPENGL_ES3_BIT`/GLES3 contexts throughout. Checked the actual `gl` crate (`brendanzab/gl-rs`, the one published as `gl` on crates.io) directly: its `build.rs` hardcodes `Registry::new(Api::Gl, (4, 5), Profile::Core, ...)`, generating desktop OpenGL 4.5 Core bindings with no feature flag to select `Api::Gles2`/`Api::Gles3` instead. It cannot produce GLES3 bindings at all, regardless of configuration.
-
-`femtovg` (already a Phase 1 dependency, for Phase 4) pulls in `glow` transitively for its own OpenGL backend. `glow` loads function pointers generically via any `get_proc_address`-shaped closure and supports desktop GL, GLES, and WebGL from the same crate, so it's both the crate that actually solves this phase's requirement and the one Phase 4's rendering engine will hand a context to directly (femtovg's GL backend is constructed from a `glow::Context`).
-
-Decision: renderer depends on `glow` directly (not just transitively through femtovg) and loads it via `khronos_egl::Instance::get_proc_address` after context creation. `gl` is dropped from `renderer/Cargo.toml` entirely — nothing in the dependency tree can make it produce GLES bindings, so keeping it declared would be dead weight pointing at the wrong API.

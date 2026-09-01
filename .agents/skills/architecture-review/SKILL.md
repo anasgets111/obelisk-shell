@@ -10,7 +10,7 @@ Surface architectural friction. Propose **deepening opportunities** (converting 
 
 **Strict Vocabulary Definition:** 
 Always use: **module**, **interface**, **depth**, **seam**, **adapter**, **leverage**, **locality**. 
-Never use: component, service, API, boundary. Use `CONTEXT.md` for domain terminology. Respect existing `docs/adr/`.
+Never use: component, service, API, boundary. Use `CONTEXT.md` for domain terminology. Respect existing `docs/decisions.md`.
 
 ## Process
 
@@ -19,7 +19,7 @@ Never use: component, service, API, boundary. Use `CONTEXT.md` for domain termin
 Do not review stable code. Deepening only pays off if the code changes. 
 
 - **Target Hotspots:** Run `git log --oneline` to locate frequently touched files.
-- **Read Context:** Parse `CONTEXT.md` and `docs/adr/` for the target area.
+- **Read Context:** Parse `CONTEXT.md` and `docs/decisions.md` for the target area.
 - **Audit for Friction (Spawn Sub-Agent):**
   - Locate **shallow modules** (interface complexity ≈ implementation complexity).
   - Locate leaked abstractions (e.g., Eloquent queries bleeding into Vue components).
@@ -42,7 +42,7 @@ Write a self-contained HTML file to the OS temp directory. Do not pollute the re
 - **Open:** Execute `xdg-open <path>`.
 - **Format:** Refer to `HTML-REPORT.md` for the strict dark-mode visual spec. Hand-written CSS and Mermaid only. No Tailwind, no CSS framework.
 - **Candidate Data:** Files, Problem, Solution, Benefits (using strict vocabulary), Recommendation Strength (`Strong`, `Worth exploring`, `Speculative`), Before/After Diagram, and how the claim was confirmed.
-- **ADR Conflicts:** Only surface a conflicting candidate if the friction justifies reopening the ADR. Mark it explicitly.
+- **Decision Conflicts:** Only surface a conflicting candidate if the friction justifies reopening the entry in `docs/decisions.md`. Mark it explicitly.
 
 *Do not propose new interfaces yet. Output the file, open it, and ask: "Which of these do we explore?"*
 
@@ -52,5 +52,5 @@ Once the user selects a candidate, execute `grill` to stress-test the architectu
 
 **Inline Side Effects:**
 - **Missing Domain Term?** Update `CONTEXT.md` immediately.
-- **User Rejects Candidate?** Ask to record an ADR to prevent future re-suggestions. (Skip if the reason is ephemeral).
+- **User Rejects Candidate?** Ask to record an entry in `docs/decisions.md` to prevent future re-suggestions. (Skip if the reason is ephemeral).
 - **Alternative Interfaces?** Spawn parallel sub-agents to design it twice using the codebase-design principles.

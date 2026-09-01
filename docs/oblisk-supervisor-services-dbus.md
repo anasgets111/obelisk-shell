@@ -288,7 +288,7 @@ When a configuration file edit is detected (via the Supervisor's `inotify` watch
 
 ### 15.2 Null-Buffer Staging & Nonce-Bound Handshake
 During startup, the Candidate process (Generation `N+1`) performs initial, non-visual setups:
-1.  **Fast AST Evaluation**: It compiles and evaluates `shell.lua` [oblisk-reference-fixtures § 1]. High-overhead system queries are completely bypassed; instead, the Candidate instantly hydrates its signals using a state snapshot pushed by the Supervisor over the IPC.
+1.  **Fast AST Evaluation**: It compiles and evaluates `shell.lua`. High-overhead system queries are completely bypassed; instead, the Candidate instantly hydrates its signals using a state snapshot pushed by the Supervisor over the IPC.
 2.  **Null-Buffer Registration**: The Candidate binds to the Wayland layer-shell protocol (`zwlr_layer_surface_v1`) [oblisk-idl-api-specs § 6.1]. It acknowledges the compositor’s initial `configure` dimensions, but it commits **null-buffers** to the compositor. The Candidate remains completely invisible, occupying zero physical on-screen display coordinates.
 3.  **The Nonce Handshake**: Once initialization is complete, the Candidate signals its readiness to the Supervisor. The Supervisor verifies process integrity and writes a unique, nonce-bound **`ActivateDraw`** command over the private control socket.
 

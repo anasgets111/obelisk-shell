@@ -66,7 +66,7 @@ Two consequences worth knowing. A capability reads `nil` until its first `StateS
 *   `keyboard.active_layout`: `string` (The user-friendly active layout name, e.g., `"English (US)"`)
 
 ### 2.2 Battery Status (`oblisk.battery`)
-Read off UPower's `DisplayDevice`, the composite across every battery on the machine (docs/adr/0080). A host with no UPower reports nothing at all, the same way § 2.13 handles a missing power-profiles-daemon.
+Read off UPower's `DisplayDevice`, the composite across every battery on the machine (ADR-0080). A host with no UPower reports nothing at all, the same way § 2.13 handles a missing power-profiles-daemon.
 
 *   `battery.present`: `boolean` (True if the display device is a battery and reports itself present. False on a desktop, which is an answer rather than an absence)
 *   `battery.percent`: `integer` (`0` to `100`, rounded)
@@ -176,7 +176,7 @@ Workspace state only. Output geometry lives in `oblisk.screens` (§ 2.15), which
     *   `is_floating`: `boolean` (True if marked floating/pinned by compositor)
     *   `is_fullscreen`: `boolean` (True if window occupies entire display boundary. **Not reported**, per ADR-0056 decision 5)
 
-> **Two things a real workspace strip wants and this section does not carry.** There is no per-workspace window list, so a config can name and focus a workspace but cannot draw the icon of what runs on it. `active_client` is one window across every output, not one per workspace, and niri-ipc's `Window.workspace_id` makes closing that an additive field rather than a redesign. Special workspaces are not modelled at all. ADR-0056's one-compositor decision makes both cheap to build and awkward to name, since neither term survives a second compositor unchanged. See `build-steps.md` section 6, "Data no capability carries".
+> **Two things a real workspace strip wants and this section does not carry.** There is no per-workspace window list, so a config can name and focus a workspace but cannot draw the icon of what runs on it. `active_client` is one window across every output, not one per workspace, and niri-ipc's `Window.workspace_id` makes closing that an additive field rather than a redesign. Special workspaces are not modelled at all. ADR-0056's one-compositor decision makes both cheap to build and awkward to name, since neither term survives a second compositor unchanged. Both are listed in `roadmap.md`.
 
 ### 2.10 Rescue Mode & Recovery State (`oblisk.rescue`)
 *   `rescue.is_rescue`: `boolean` (True if the user configuration is broken and Rescue Mode is active)
@@ -201,7 +201,7 @@ This signal covers **reload** failures only, where the scene from before the edi
 *   `power.on_battery`: `boolean` (True if running on battery power)
 *   `power.energy_rate`: `number` (Active battery discharge or charge rate in Watts, floating-point)
 
-### 2.14 Tray State (`oblisk.tray`) (docs/adr/0031)
+### 2.14 Tray State (`oblisk.tray`) (ADR-0031)
 *   `tray.items`: `table` (Array of registered `StatusNotifierItem` tray icons):
     *   Tray Item object:
         *   `id`: `string` (Stable id -- the sanitized D-Bus unique name of the registering process, e.g. `"1.234"`)
@@ -222,7 +222,7 @@ This signal covers **reload** failures only, where the scene from before the edi
                 *   `toggle_state`: `integer` (DBusMenu's own `-1`/`0`/`1`, or `nil` if not a toggle entry)
                 *   `children`: `table` (Array of nested Menu Item objects, recursive, empty if none)
 
-### 2.15 Screens (`oblisk.screens`) (docs/adr/0041)
+### 2.15 Screens (`oblisk.screens`) (ADR-0041)
 The connected outputs, read from `wl_output` in the Renderer rather than pushed by the Supervisor. This is the one signal in § 2 that is not a Supervisor-owned capability and does not appear in `shared::CAPABILITIES`; it needs no compositor adaptor and is available from a generation's first evaluation. Iterating it is how a config declares one panel per monitor (ADR-0041), and it updates on monitor hotplug.
 *   `screens`: `table` (Array of connected output structures)
     *   Screen structure:
@@ -232,7 +232,7 @@ The connected outputs, read from `wl_output` in the Renderer rather than pushed 
         *   `scale`: `number` (Fractional scaling factor, e.g. `1.25`)
         *   `refresh`: `number` (Refresh rate in Hz, or `nil` if the compositor does not report one)
 
-### 2.16 Installed Applications (`oblisk.applications`) (docs/adr/0061)
+### 2.16 Installed Applications (`oblisk.applications`) (ADR-0061)
 The installed `.desktop` entries, enumerated from `$XDG_DATA_HOME/applications` and each `$XDG_DATA_DIRS/applications` in precedence order, with the first occurrence of a desktop file id winning so a user's own copy overrides the system one. Entries that are `NoDisplay`, `Hidden`, not `Type=Application`, or missing `Name`/`Exec` are omitted. Scanned once at startup and again on `applications:refresh()`; nothing watches the directories (ADR-0061 decision 4), and a rescan that finds no change pushes nothing.
 
 This is the capability ADR-0054 decision 5 deferred until a caller appeared. It is enumeration rather than that decision's per-`app_id` lookup, because the launcher that wanted it wants the whole list, and because a synchronous lookup has no reply shape on the control socket.
@@ -259,13 +259,13 @@ All write actions are serialized as JSON-RPC 2.0 payloads over the private Unix 
 | Module Method | IPC Command JSON Payload Details |
 | :--- | :--- |
 | `system:write_state(key, val)` | `capability: "system", action: "write_state", arguments: [key, val]`<br>**Validation**: `key` must be alphanumeric. `val` must be string, number, or boolean. |
-| `system:find_icon(app_id, name, fallback_name)` | *Synchronous internal Rust lookup* returning `string` path.<br>**Validation**: `app_id` and `name` are strings. Falls back to desktop entry values. **Not built, and not planned as written (ADR-0054 decision 5).** The theme-name half of this lookup lives in the Renderer and is reached through `icon.name` (§ 5.2 item 5), which leaves this function nothing to be asked for; the `app_id` to `.desktop` to `Icon=` half has no caller. "Synchronous" is the row that settled where the resolver lives: the control socket carries one-way commands and one-way state snapshots, with no request/response shape to return a path over. **A caller has since appeared** (`build-steps.md` section 6, "Data no capability carries"). An application launcher needs `app_id` to display name and icon for every entry, which is desktop-entry enumeration rather than a per-`app_id` lookup, so it does not want this row's signature. ADR-0054 was right that this function has no asker, and wrong that the underlying data has no want. **Built as `oblisk.applications` (§ 2.16, docs/adr/0061)**, in the enumerated shape rather than this row's, which leaves this signature with no caller and no plan. |
+| `system:find_icon(app_id, name, fallback_name)` | *Synchronous internal Rust lookup* returning `string` path.<br>**Validation**: `app_id` and `name` are strings. Falls back to desktop entry values. **Not built, and not planned as written (ADR-0054 decision 5).** The theme-name half of this lookup lives in the Renderer and is reached through `icon.name` (§ 5.2 item 5), which leaves this function nothing to be asked for; the `app_id` to `.desktop` to `Icon=` half has no caller. "Synchronous" is the row that settled where the resolver lives: the control socket carries one-way commands and one-way state snapshots, with no request/response shape to return a path over. **A caller has since appeared.** An application launcher needs `app_id` to display name and icon for every entry, which is desktop-entry enumeration rather than a per-`app_id` lookup, so it does not want this row's signature. ADR-0054 was right that this function has no asker, and wrong that the underlying data has no want. **Built as `oblisk.applications` (§ 2.16, ADR-0061)**, in the enumerated shape rather than this row's, which leaves this signature with no caller and no plan. |
 | `audio:set_volume(vol)` | `capability: "audio", action: "set_volume", arguments: [vol]`<br>**Validation**: `vol` must be a float in range `[0.0, 1.0]`. |
 | `audio:set_muted(bool)` | `capability: "audio", action: "set_muted", arguments: [bool]`<br>**Validation**: `bool` is boolean. |
 | `audio:toggle_mute()` | `capability: "audio", action: "toggle_mute", arguments: []` |
 | `audio:set_default_sink(id)` | `capability: "audio", action: "set_default_sink", arguments: [id]`<br>**Validation**: `id` must be an active Sink Node ID. |
 | `audio:set_default_source(id)` | `capability: "audio", action: "set_default_source", arguments: [id]`<br>**Validation**: `id` must be an active Source Node ID. |
-| `audio:set_source_muted(bool)` | **Not specified, and that is a hole rather than a decision.** It would be `capability: "audio", action: "set_source_muted", arguments: [bool]`, mirroring `set_muted`. A microphone-mute toggle is the click target of every privacy indicator that exists, and this table gives the default sink a mute with no counterpart for the default source. The mixer already writes node props, so this is a dispatch arm and a row, not a mechanism. See `build-steps.md` section 6. |
+| `audio:set_source_muted(bool)` | **Not specified, and that is a hole rather than a decision.** It would be `capability: "audio", action: "set_source_muted", arguments: [bool]`, mirroring `set_muted`. A microphone-mute toggle is the click target of every privacy indicator that exists, and this table gives the default sink a mute with no counterpart for the default source. The mixer already writes node props, so this is a dispatch arm and a row, not a mechanism. Listed in `roadmap.md`. |
 | `audio:set_app_volume(id, vol)` | `capability: "audio", action: "set_app_volume", arguments: [id, vol]`<br>**Validation**: `id` is application node ID, `vol` float `[0.0, 1.0]`. |
 | `audio:set_app_muted(id, bool)` | `capability: "audio", action: "set_app_muted", arguments: [id, bool]`<br>**Validation**: `id` is application node ID, `bool` is boolean. |
 | `audio:play_sound(sound)` | `capability: "audio", action: "play_sound", arguments: [sound]`<br>**Validation**: `sound` must be string path or system theme icon name. |
@@ -293,18 +293,18 @@ All write actions are serialized as JSON-RPC 2.0 payloads over the private Unix 
 | `oblisk.idle:inhibit(reason)` | `capability: "idle", action: "inhibit", arguments: [reason]`<br>**Validation**: `reason` is a string, shown by `loginctl list-inhibitors`. Counted per generation, so two holders need two releases. |
 | `oblisk.idle:release_inhibit()` | `capability: "idle", action: "release_inhibit", arguments: []`<br>**Validation**: None. Releases one hold, not every hold. A release with no matching `inhibit` is a no-op. |
 | `oblisk.lock:lock()` | `capability: "lock", action: "lock", arguments: []`<br>**Validation**: None. Asks the Supervisor to lock the session; it commands the Renderer, which holds `ext_session_lock_v1` (ADR-0042). Refused if the config declares no § 6.4 `lock` surface, reported through `rescue` (ADR-0052). **There is deliberately no `unlock` action**: a lock screen's own tree is Lua and its callbacks run while it is the only thing on the glass, so one would be a click-through past PAM. The only unlock is the Supervisor's, on a successful `secure_submit(lock, authenticate)`. Spelled `oblisk.lock:invoke("lock")` for now: Phase 25 item 1's envelope-building method is built, but the `capability:action(...)` sugar this table uses throughout is not. |
-| `oblisk.applications:refresh()` | `capability: "applications", action: "refresh", arguments: []`<br>**Validation**: None. Rescans the applications directories off-thread and pushes a new `StateSnapshot` only if the result differs. Cheap to call on every launcher open, which is what `dev-config` does instead of watching the directories (docs/adr/0061 decision 4). |
-| `oblisk.applications:launch(id)` | `capability: "applications", action: "launch", arguments: [id]`<br>**Validation**: `id` is a string and must be an `entries[].id` from the current snapshot; an unknown id is logged and nothing is spawned. Runs the entry's own `Exec=`, detached and in its own process group, so a generation swap does not reap it and no pipe is held for it (unlike `process.run`, docs/adr/0026). An entry with `Terminal=true` is wrapped in `$TERMINAL -e`, and refused with a log line if `$TERMINAL` is unset. |
-| `wallpaper:set(mon, path, fit, anim, dur)` | **Superseded by ADR-0055. There is no `wallpaper` capability and none is planned.** A wallpaper is an `image` node on a config-declared `Background` panel: `mon` is `panel.monitor`, `path` is `image.source`, `fit` is `image.fit`, and a runtime change is a write to the `state()` signal bound to `source`, with no IPC in the path. `anim` and `dur` are the two arguments with nowhere to go, because the engine has no animation model at all (`build-steps.md`, "The missing animation model"). |
+| `oblisk.applications:refresh()` | `capability: "applications", action: "refresh", arguments: []`<br>**Validation**: None. Rescans the applications directories off-thread and pushes a new `StateSnapshot` only if the result differs. Cheap to call on every launcher open, which is what `dev-config` does instead of watching the directories (ADR-0061 decision 4). |
+| `oblisk.applications:launch(id)` | `capability: "applications", action: "launch", arguments: [id]`<br>**Validation**: `id` is a string and must be an `entries[].id` from the current snapshot; an unknown id is logged and nothing is spawned. Runs the entry's own `Exec=`, detached and in its own process group, so a generation swap does not reap it and no pipe is held for it (unlike `process.run`, ADR-0026). An entry with `Terminal=true` is wrapped in `$TERMINAL -e`, and refused with a log line if `$TERMINAL` is unset. |
+| `wallpaper:set(mon, path, fit, anim, dur)` | **Superseded by ADR-0055. There is no `wallpaper` capability and none is planned.** A wallpaper is an `image` node on a config-declared `Background` panel: `mon` is `panel.monitor`, `path` is `image.source`, `fit` is `image.fit`, and a runtime change is a write to the `state()` signal bound to `source`, with no IPC in the path. `anim` and `dur` are the two arguments with nowhere to go, because the engine has no animation model at all (`roadmap.md`). |
 | `workspaces:focus(id)` | `capability: "workspaces", action: "focus", arguments: [id]`<br>**Validation**: `id` must be an integer. Focuses target workspace. |
 | `rescue:reload_config()` | `capability: "rescue", action: "reload_config", arguments: []`<br>**Validation**: Runs compiler pass on `shell.lua` and reloads Renderer if valid. |
 | `sysinfo:configure(cfg)` | `capability: "sysinfo", action: "configure", arguments: [cfg]`<br>**Validation**: `cfg` is dictionary containing integers `cpu_interval`, `ram_interval`, `temp_interval` in seconds. An interval of `0` suspends the matching monitor thread. |
 | `power:set_profile(p)` | `capability: "power", action: "set_profile", arguments: [p]`<br>**Validation**: `p` is string matching active host profiles. |
 | `process.run(cmd, args, out_cb, exit_cb)`| *Internal non-blocking shell fork* returning `ProcessHandle`. <br>**Validation**: `cmd` is string, `args` array table of strings, callbacks are Lua functions. <br>**Callbacks**: `out_cb(line, stream)` where `stream` is `"stdout"` or `"stderr"`, so both streams reach one callback and a caller wanting only one branches on it. `exit_cb(code)` where `code` is `nil` if a signal killed the process rather than it exiting. |
 | `json.decode(text)` | *Pure function, no IPC.* Returns the decoded value, or `nil` plus a message string on malformed input (ADR-0057). <br>**Validation**: `text` is a string; non-UTF-8 bytes are reported as a decode error rather than raised. |
-| `tray:activate(id, x, y)` | `capability: "tray", action: "activate", arguments: [id, x, y]`<br>**Validation**: `id` is string, `x`/`y` are integers. No-ops (does not call the real `Activate`) when the item's `item_is_menu` is `true` (docs/adr/0031). |
+| `tray:activate(id, x, y)` | `capability: "tray", action: "activate", arguments: [id, x, y]`<br>**Validation**: `id` is string, `x`/`y` are integers. No-ops (does not call the real `Activate`) when the item's `item_is_menu` is `true` (ADR-0031). |
 | `tray:activate_menu_item(id, menu_item_id)` | `capability: "tray", action: "activate_menu_item", arguments: [id, menu_item_id]`<br>**Validation**: `id` is string, `menu_item_id` is integer matching a `menu[].id` from `tray.items`. |
-| `tray:menu_will_show(id, submenu_id)` | `capability: "tray", action: "menu_will_show", arguments: [id, submenu_id]`<br>**Validation**: `id` is string, `submenu_id` is integer. Fires DBusMenu's `AboutToShow` and refreshes `tray.items[].menu` before Lua renders it -- required for correctness with apps that populate submenus lazily (docs/adr/0031). |
+| `tray:menu_will_show(id, submenu_id)` | `capability: "tray", action: "menu_will_show", arguments: [id, submenu_id]`<br>**Validation**: `id` is string, `submenu_id` is integer. Fires DBusMenu's `AboutToShow` and refreshes `tray.items[].menu` before Lua renders it -- required for correctness with apps that populate submenus lazily (ADR-0031). |
 
 ### 3.3 The Non-Blocking Process Control Handle (`ProcessHandle`)
 The `process.run` function yields an opaque `ProcessHandle` object to Lua:
@@ -386,7 +386,7 @@ A flexible rectangular element representing either a containment box or a solid 
 *   `clip`: `string` (`"Box"` or `"Rounded"`. What this node cuts its children down to. `"Box"` is the default and is what a node has always done: its own rectangle, square corners, whatever `radius` says. `"Rounded"` uses `radius` instead, so a child overflowing a pill is cut by the same arc the pill's fill draws. Opt-in rather than implied by `radius` because it costs an offscreen render pass, where a square clip is a scissor rectangle the GPU applies for free; QML draws the same line, with a rectangular `Item.clip` and a separate `ClippingRectangle` for the rounded case)
 *   `children`: `table` (Optional dense array of child node structures. If specified, the layout engine instantiates this node as a layout parent container; if omitted, it resolves as a static childless leaf shape, e.g. a progress bar or background spacer.)
 
-> **A `rect` has no gradient and no shadow.** `background` takes one flat colour. Both are cheap to add: femtovg 0.26, this workspace's only drawing dependency, already ships `Paint::linear_gradient` / `radial_gradient` / `box_gradient` and a Canvas-2D shadow model on `Canvas`, so the work is parsers and rows here, not rendering. Backdrop blur is a separate and much harder question. See `build-steps.md` section 6, "Paint has four operations", for both.
+> **A `rect` has no gradient and no shadow.** `background` takes one flat colour. Both are cheap to add: femtovg 0.26, this workspace's only drawing dependency, already ships `Paint::linear_gradient` / `radial_gradient` / `box_gradient` and a Canvas-2D shadow model on `Canvas`, so the work is parsers and rows here, not rendering. Backdrop blur is a separate and much harder question. Gradient came off the list: the reference config uses none in any of its 129 files. Shadow stands on 16 uses across 7 files. Blur is in `roadmap.md`.
 
 #### 2. `row`
 Arranges children horizontally.
@@ -427,10 +427,10 @@ Receives input focus and pointer events.
 
 > A handler declaring one parameter still works untouched, because Lua drops arguments a function does not declare. It does now run on a right or middle click as well as a left one, where before those events did nothing. `if button ~= "left" then return end` restores the old behavior for a handler that wants it.
 
-> **This row is most of the pointer model, and the model is now complete.** The frame handler in `renderer/src/wayland/input.rs` matches `Press`, `Release` and `Leave` for clicks, `Enter`/`Motion`/`Leave` for hover (`hover` below), and `Axis` for the wheel (`scroll` below). Nothing is dropped: the match over `PointerEventKind` is exhaustive and the `_ => {}` arm that used to swallow the rest is gone. The design decision this paragraph asked for, what a scrollable container *is*, is docs/adr/0069.
+> **This row is most of the pointer model, and the model is now complete.** The frame handler in `renderer/src/wayland/input.rs` matches `Press`, `Release` and `Leave` for clicks, `Enter`/`Motion`/`Leave` for hover (`hover` below), and `Axis` for the wheel (`scroll` below). Nothing is dropped: the match over `PointerEventKind` is exhaustive and the `_ => {}` arm that used to swallow the rest is gone. The design decision this paragraph asked for, what a scrollable container *is*, is ADR-0069.
 
 #### Fonts (`fonts`)
-The font chain this shell measures and paints with, in fallback order (docs/adr/0043 decision 2).
+The font chain this shell measures and paints with, in fallback order (ADR-0043 decision 2).
 
 *   `fonts(chain)` (Global, called at the top level of `shell.lua`. Takes an array of family-name strings. Refused if any entry is not a string, naming which one, because Lua would otherwise coerce a number into a family nobody can find)
     *   `chain`: `table` (A dense array of family names as fontconfig resolves them, e.g. `"CaskaydiaCove Nerd Font Propo"`. Refused if it has a hole or a named key, because a sparse table would otherwise lose its tail silently: `sequence_values` stops at the first `nil` and Lua's `#` is undefined on one. An entry no font on the system matches is skipped with a diagnostic rather than substituted, so a typo costs that entry and not the chain)
@@ -442,7 +442,7 @@ The font chain this shell measures and paints with, in fallback order (docs/adr/
 > **Read once, at startup.** Editing the declaration re-evaluates like any other edit and changes nothing until the shell restarts. A chain change invalidates every measurement in the shell, which is closer to a topology change than to the in-place restyle a reload is for.
 
 #### Named state (`state(name, initial)`)
-The one signal a config writes. Reactive state the config owns, keyed by a name that outlives any single evaluation, so an in-place reload hands back the signal the last one built (docs/adr/0044 decision 5).
+The one signal a config writes. Reactive state the config owns, keyed by a name that outlives any single evaluation, so an in-place reload hands back the signal the last one built (ADR-0044 decision 5).
 
 *   `state(name, initial)` -> `Signal` (Global. Writable: `signal:set(value)` stores a new value and marks the scene dirty, so the next pass re-resolves every node reading it)
     *   `name`: `string` (The identity. Two calls with one name are one signal, so the button that writes it and the surface that reads it need not be the same file)
@@ -457,7 +457,7 @@ The one signal a config writes. Reactive state the config owns, keyed by a name 
 > **Dies on a generation swap**, since the map lives in the process being reaped. A swap means the config's structure changed, so a closed dropdown is not a surprise.
 
 #### Hover (`hover`, `hover(name)`, `hover_rect(name)`)
-A **hover slot** is engine-written reactive state naming one region of one surface: whether the pointer is inside it, and where it is. Declared on any node, read from anywhere (docs/adr/0062).
+A **hover slot** is engine-written reactive state naming one region of one surface: whether the pointer is inside it, and where it is. Declared on any node, read from anywhere (ADR-0062).
 
 *   `hover`: `Signal` (A node property. Takes the signal `hover(name)` returns and marks that node's box as the slot's region. Structural: the handle is what is stored, so this property does not resolve to a value the way every other one does)
 *   `hover(name)` -> `Signal` (Global. A boolean, `false` until the pointer is inside the region. Read-only to Lua: `signal:set()` refuses it, because the engine is the writer)
@@ -467,7 +467,7 @@ A **hover slot** is engine-written reactive state naming one region of one surfa
 > **A node and every ancestor of it are hovered.** Hover uses `on_click`'s own hit path (ADR-0050 decision 1), so a `pill` that is a `row` wrapping a `button` wrapping a `text` reports all three, and a config binds the outermost. Two overlapping siblings resolve the way paint does: the one drawn last is the hovered one.
 
 #### Scroll (`scroll`, `scroll(name)`)
-A **scroll offset** is engine-written reactive state naming how far one container has been scrolled along its main axis, in logical pixels. Declared on any container that flows, read from anywhere (docs/adr/0069).
+A **scroll offset** is engine-written reactive state naming how far one container has been scrolled along its main axis, in logical pixels. Declared on any container that flows, read from anywhere (ADR-0069).
 
 *   `scroll`: `Signal` (A node property on `row`, `column` and `list`. Takes the signal `scroll(name)` returns and makes that node a viewport its children move inside. Structural, like `hover`: the handle is what is stored, because the layout pass both reads the offset and writes back the one it used)
 *   `scroll(name)` -> `Signal` (Global. A number, `0` at the top or left. Read-only to Lua: `signal:set()` refuses it, because the engine is the writer)
@@ -481,7 +481,7 @@ A **scroll offset** is engine-written reactive state naming how far one containe
 
 > **A tooltip is a `popup` with `grab = false`.** There is no tooltip role. A grabbing popup would take the pointer off the node whose hover opened it, and `grab = false` is also what lets a hover open one at all, since there is no click to carry the input serial § 6.3 otherwise requires.
 
-> **No callback on the edge, and no keyboard equivalent.** A hover is a condition a config binds to `visible`, not an event it acts on, so there is nothing to fire a request or start a timer from (docs/adr/0062 decision 1). A shell driven entirely from the keyboard reads `false` everywhere; the signal that answers *that* question is `focused`, and it does not exist.
+> **No callback on the edge, and no keyboard equivalent.** A hover is a condition a config binds to `visible`, not an event it acts on, so there is nothing to fire a request or start a timer from (ADR-0062 decision 1). A shell driven entirely from the keyboard reads `false` everywhere; the signal that answers *that* question is `focused`, and it does not exist.
 
 #### 7. `list`
 A fast-reconciling virtual repeater element.
@@ -490,7 +490,7 @@ A fast-reconciling virtual repeater element.
 *   `key`: `function` (Maps a `source` element to a stable string, called on the element rather than on the node `itemfn` builds. Items reconcile by key, so inserting one element rebuilds one item instead of every item below it. Duplicate keys are an error. Without `key`, items match by index and an insertion rebuilds everything after it, which is fine for a short static list and wrong for anything driven by a capability. ADR-0045)
 *   `direction`: `string` (`"Vertical"` (default) or `"Horizontal"`. Which way the generated items stack. A `list` is a repeater rather than a third layout: it reconciles by key and then lays out through the `row` or `column` arm this names, so spacing, margins, `align_h`/`align_v` and `Stretch` behave identically to a hand-built one. `"Vertical"` is the default because it was the only behaviour before this property existed)
 
-> **A `list` has no viewport.** A list longer than its surface overflows it in whichever direction it stacks. Clipping is already built: `layout::paint::paint_tree` pushes an `intersect_scissor` per node, cutting a subtree to its parent's box. What is missing is a scroll offset applied during layout, and the input to drive it. `build-steps.md` section 6 ranks both.
+> **A `list` scrolls.** Clipping cuts a subtree to its parent's box (`layout::paint::paint_tree` pushes an `intersect_scissor` per node), and ADR-0069 added the offset the layout pass clamps and the wheel input that drives it. Bind `scroll` on the `list` to make it a viewport.
 
 > **The rejected alternative to `direction` was splicing.** A list's generated children could be spliced into its *parent's* child list, making it a true repeater that inherits whichever direction the parent already lays out in and needs no property at all. It conflicts with ADR-0045's identity rule -- a node is identified by its position in one parent's child list, and a spliced list has no single such list to hold a position in -- so it would need that ADR amended rather than just this code.
 
@@ -500,7 +500,7 @@ An IME-aware native input field mapped directly to Rust-owned `wp-text-input-v3`
 *   `mask_character`: `string` (Capped at 1 byte; if specified, hides typed input)
 *   `secure_submit`: `table` (`{ capability, action }`; see § 5's `textfield` glossary entry in `CONTEXT.md`. Only meaningful alongside `mask_character` -- without it, a masked field's value is unreadable from Lua entirely)
 *   `on_change`: `function` (Lua callback executed on each committed edit batch from `wp-text-input-v3`, not per keystroke; IME composition is not character-by-character. Key events are swallowed inside Rust's memory blocks during sensitive lock states)
-*   `on_submit`: `function` (Fires on `zwp_text_input_v3`'s protocol-native `submit` action, e.g. Enter -- IME-correct, not a raw keystroke check. Takes the committed text as its one argument, *except* when both `mask_character` and `secure_submit` are set: fires with no argument, since the Renderer's IPC layer attaches the native input buffer directly to the named capability/action envelope instead. docs/adr/0005, docs/adr/0027)
+*   `on_submit`: `function` (Fires on `zwp_text_input_v3`'s protocol-native `submit` action, e.g. Enter -- IME-correct, not a raw keystroke check. Takes the committed text as its one argument, *except* when both `mask_character` and `secure_submit` are set: fires with no argument, since the Renderer's IPC layer attaches the native input buffer directly to the named capability/action envelope instead. ADR-0005, ADR-0027)
 
 ## 6. Top-Level Surface Nodes
 
