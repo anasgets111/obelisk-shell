@@ -26,12 +26,18 @@ impl StatusNotifierWatcher {
         #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         let sender = header.sender().map(|s| s.to_string());
+        // Logged as well as returned. The error reply goes to the registering application, which
+        // is usually a tray icon that then shows nothing and says nothing, so without this a
+        // refused registration is invisible from the shell's side -- which is how a Vesktop
+        // registration went missing for a whole debugging session.
         let resolved = resolve_registration(&self.connection, &service, sender.as_deref()).await.map_err(|err| {
+            eprintln!("tray: RegisterStatusNotifierItem({service:?}) could not be resolved: {err}");
             zbus::fdo::Error::Failed(format!("RegisterStatusNotifierItem({service:?}) could not be resolved: {err}"))
         })?;
         let unique_name = resolved.unique_name.clone();
 
         register_item(&self.connection, &self.registry, &self.events, resolved).await.map_err(|err| {
+            eprintln!("tray: RegisterStatusNotifierItem({service:?}) failed: {err}");
             zbus::fdo::Error::Failed(format!("RegisterStatusNotifierItem({service:?}) failed: {err}"))
         })?;
 

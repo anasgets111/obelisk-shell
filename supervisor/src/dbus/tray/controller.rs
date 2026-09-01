@@ -12,8 +12,8 @@ use zbus::zvariant::Value;
 use super::item::TrayItem;
 use super::menu::fetch_menu_via;
 use super::proxies::{DBusMenuProxy, StatusNotifierItemProxy, StatusNotifierWatcherClientProxy};
-use super::registration::sanitize_unique_name;
-use super::registry::{ItemKey, ItemRegistry, spawn_name_owner_changed_forwarder};
+use super::registration::{resolve_registration, sanitize_unique_name};
+use super::registry::{ItemKey, ItemRegistry, register_item, spawn_name_owner_changed_forwarder};
 use super::watcher::StatusNotifierWatcher;
 use super::{
     TrayActionError, TraySignal, TrayState, WATCHER_BUS_NAME, WATCHER_OBJECT_PATH, should_call_activate,
@@ -71,6 +71,7 @@ impl TrayController {
 
         match zbus::fdo::DBusProxy::new(&connection).await {
             Ok(dbus_proxy) => {
+                adopt_existing_items(&connection, &dbus_proxy, &registry, &events).await;
                 spawn_name_owner_changed_forwarder(dbus_proxy, registry.clone(), events.clone());
             }
             Err(err) => eprintln!("tray: failed to bind org.freedesktop.DBus for NameOwnerChanged tracking: {err}"),
@@ -174,5 +175,92 @@ impl TrayController {
             }
             Err(err) => eprintln!("tray: menu_will_show({id:?}, {submenu_id}) GetLayout failed: {err}"),
         }
+    }
+}
+
+/// Whether `name` is an item's own well-known bus name, the
+/// `org.{kde,freedesktop}.StatusNotifierItem-PID-N` an application claims before it calls
+/// `RegisterStatusNotifierItem` (docs/adr/0073).
+///
+/// Both spellings, because both are in the wild: KDE's is the de-facto one and Chromium claims the
+/// `org.freedesktop` one. The trailing `-` is what keeps this off `org.kde.StatusNotifierWatcher`
+/// and off any name that merely starts the same way.
+fn is_item_bus_name(name: &str) -> bool {
+    ["org.kde.StatusNotifierItem-", "org.freedesktop.StatusNotifierItem-"].iter().any(|prefix| name.starts_with(prefix))
+}
+
+/// Registers every tray item already on the bus when this host starts (docs/adr/0073).
+///
+/// The spec's answer to a host starting late is `StatusNotifierHostRegistered`, which this watcher
+/// emits and which an application is meant to re-register on. Slack does not, so restarting the
+/// shell lost its icon until Slack itself was restarted. This asks the bus rather than waiting to be
+/// told.
+///
+/// Serial rather than joined: each `register_item` reads a handful of properties and an optional
+/// `GetLayout`, and a session has a handful of tray items, so the whole scan is a few round trips
+/// against a Supervisor that has already made several. A duplicate is harmless, since the registry
+/// is keyed by `(unique_name, object_path)` and an application that does re-register overwrites its
+/// own entry rather than adding a second.
+///
+/// ponytail: this finds only items that claimed a well-known name. One that called
+/// `RegisterStatusNotifierItem("/some/object/path")` and owns no `StatusNotifierItem-*` name is
+/// invisible to it, because nothing on the bus says which connections export the interface without
+/// asking each one. Vesktop is that shape and does not need this, since it re-registers on the
+/// signal. The upgrade path is introspecting every connection on the session bus, which is dozens of
+/// round trips at startup to look for something usually not there.
+async fn adopt_existing_items(
+    connection: &zbus::Connection,
+    dbus_proxy: &zbus::fdo::DBusProxy<'_>,
+    registry: &ItemRegistry,
+    events: &UnboundedSender<TraySignal>,
+) {
+    let names = match dbus_proxy.list_names().await {
+        Ok(names) => names,
+        Err(err) => {
+            eprintln!("tray: ListNames failed, so no already-running item is adopted this run: {err}");
+            return;
+        }
+    };
+    for name in names.iter().filter(|name| is_item_bus_name(name.as_str())) {
+        // No sender: `resolve_registration`'s well-known branch never reads one, and there is no
+        // calling message here to take it from.
+        let resolved = match resolve_registration(connection, name.as_str(), None).await {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                eprintln!("tray: {name} looks like an item but could not be resolved: {err}");
+                continue;
+            }
+        };
+        match register_item(connection, registry, events, resolved).await {
+            Ok(()) => eprintln!("tray: adopted {name}, registered before this host started"),
+            Err(err) => eprintln!("tray: failed to adopt {name}: {err}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_item_name_is_recognized_in_both_spellings() {
+        assert!(is_item_bus_name("org.kde.StatusNotifierItem-1240273-1"));
+        assert!(is_item_bus_name("org.freedesktop.StatusNotifierItem-1240273-1"));
+    }
+
+    #[test]
+    fn the_watcher_is_not_an_item() {
+        // The name this Supervisor owns itself. Adopting it would have the host register its own
+        // watcher as a tray icon.
+        assert!(!is_item_bus_name("org.kde.StatusNotifierWatcher"));
+        assert!(!is_item_bus_name("org.kde.StatusNotifierHost-1234"));
+    }
+
+    #[test]
+    fn a_name_that_only_starts_the_same_way_is_not_an_item() {
+        // The trailing `-` is the whole guard: without it every one of these matches.
+        assert!(!is_item_bus_name("org.kde.StatusNotifierItemRegistry"));
+        assert!(!is_item_bus_name("org.kde.StatusNotifierItem"));
+        assert!(!is_item_bus_name("com.example.org.kde.StatusNotifierItem-1-1"));
     }
 }
