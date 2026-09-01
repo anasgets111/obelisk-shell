@@ -13,7 +13,12 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-cosmic-text = "0.19.0"
+# `swash` is cosmic-text's default rasterizer and nothing here calls it. femtovg rasterizes every
+# glyph this shell draws (`text/atlas.rs`'s `fill_text`), and cosmic-text is reached only from
+# `text/shaping.rs` and `text/fonts.rs`, for shaping and measurement. On the defaults it pulled a
+# whole second font-parsing stack alongside the `ttf-parser` one `fontdb` already brings: swash,
+# skrifa, read-fonts, font-types, zeno and yazi, six crates nothing reads. 157 to 151.
+cosmic-text = { version = "0.19.0", default-features = false, features = ["std", "fontconfig"] }
 femtovg = "0.26.0"
 fontdb = "0.23.0"
 freedesktop-icons = "0.4.0"
