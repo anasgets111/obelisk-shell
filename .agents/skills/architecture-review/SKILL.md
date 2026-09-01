@@ -26,19 +26,27 @@ Do not review stable code. Deepening only pays off if the code changes.
   - Identify pure functions lacking **locality** (extracted for tests, but real bugs hide in the untested callers).
 - **The Deletion Test:** Would deleting this module concentrate complexity, or just move it? If it concentrates, it is shallow. Target it.
 
-### 2. Generate HTML Report
+### 2. Confirm Every Candidate
+
+A claim read off the source and a claim proven by a failing test are not the same claim. Confirm before writing the report, and say in the report which kind each one is.
+
+- **Prove it if it is provable.** Write the throwaway test, run the build with the changed feature, count with a script rather than a naive grep. Then revert the probe and confirm `git status` is clean.
+- **Report corrections as corrections.** A number that was wrong on the first pass stays visible as a correction. A silently fixed count reads as a count nobody checked.
+- **Say `Read only` when nothing was run.** Do not dress a source read up as evidence.
+
+### 3. Generate HTML Report
 
 Write a self-contained HTML file to the OS temp directory. Do not pollute the repo.
 
 - **Path:** `/tmp/architecture-review-<timestamp>.html` (Fallback: `$TMPDIR`).
 - **Open:** Execute `xdg-open <path>`.
-- **Format:** Refer to `HTML-REPORT.md` for the strict Tailwind/Mermaid visual spec.
-- **Candidate Data:** Files, Problem, Solution, Benefits (using strict vocabulary), Recommendation Strength (`Strong`, `Worth exploring`, `Speculative`), Before/After Diagram.
+- **Format:** Refer to `HTML-REPORT.md` for the strict dark-mode visual spec. Hand-written CSS and Mermaid only. No Tailwind, no CSS framework.
+- **Candidate Data:** Files, Problem, Solution, Benefits (using strict vocabulary), Recommendation Strength (`Strong`, `Worth exploring`, `Speculative`), Before/After Diagram, and how the claim was confirmed.
 - **ADR Conflicts:** Only surface a conflicting candidate if the friction justifies reopening the ADR. Mark it explicitly.
 
 *Do not propose new interfaces yet. Output the file, open it, and ask: "Which of these do we explore?"*
 
-### 3. The Grilling Loop
+### 4. The Grilling Loop
 
 Once the user selects a candidate, execute `grill` to stress-test the architectural decision tree.
 
