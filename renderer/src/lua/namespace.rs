@@ -31,10 +31,13 @@ pub(crate) struct Namespace {
 /// Builds the whole `oblisk` namespace: every `shared::CAPABILITIES` roster name, the two
 /// Renderer-sourced signals `rescue` and `screens`, `idle`, `version`, and `config_dir`.
 ///
-/// **Every roster name is pre-seeded here**, not left to a lazy path, so a `shell.lua` reading any
-/// rostered capability before its first push gets a live signal reading `nil` instead of an
-/// index-into-nil error and rescue (ADR-0037). The lazy path stays as the fallback for unrostered
-/// names, in `crate::socket`, because it is reached from a `StateSnapshot` rather than from here.
+/// **No roster name is on the table itself.** Every one is built here and parked in a side table
+/// that `oblisk`'s `__index` moves across on first read, which is what tells the Supervisor to
+/// construct that capability's controller (docs/adr/0070 decision 1). A config still reads a live
+/// signal holding `nil` before the first push rather than indexing into nil (ADR-0037); the
+/// difference is that a name the config never reads costs a `nil` and nothing else, where it used
+/// to cost a D-Bus subscription. The unrostered lazy path in `crate::socket` is unrelated: it is
+/// reached from a `StateSnapshot` rather than from here.
 ///
 /// **One table, so a typo is a Lua error rather than silence.** § 6.4's `lock` node constructor
 /// owns the global `lock`, and a bare `lock` signal used to silently overwrite it and break every
@@ -47,11 +50,13 @@ pub(crate) fn build(
 ) -> mlua::Result<Namespace> {
     let table = loader.create_table()?;
     let mut capabilities = HashMap::new();
+    let pending = loader.create_table()?;
     for capability in shared::CAPABILITIES {
         let (member, handle) = Capability::new(capability, dirty.clone(), commands.clone());
-        table.set(*capability, member)?;
+        pending.set(*capability, member)?;
         capabilities.insert((*capability).to_string(), handle);
     }
+    install_capability_index(loader, &table, pending, commands.clone())?;
     // Off-roster like `rescue` and `screens`, but for the opposite reason: those are Renderer
     // state the Supervisor never pushes, and idle is a Supervisor service that pushes nothing --
     // its events are threshold crossings, not state. See `lua::idle`.
@@ -73,6 +78,39 @@ pub(crate) fn build(
         .set("config_dir", shell_lua_path.parent().map(|dir| dir.to_string_lossy().into_owned()).unwrap_or_default())?;
     loader.set_global("oblisk", table.clone())?;
     Ok(Namespace { table, capabilities, rescue, idle, screens, screens_payload })
+}
+
+/// Puts `pending`'s members behind `oblisk`'s `__index`, so reading one both hands it over and
+/// starts its controller (docs/adr/0070 decision 1).
+///
+/// The member is `raw_set` onto `oblisk` on the way out, so the metamethod fires exactly once per
+/// name and the second read is an ordinary table lookup. That matters more than it looks: a
+/// `computed({ oblisk.audio }, f)` inside a `list`'s `itemfn` indexes `oblisk` once per row per
+/// layout pass.
+///
+/// Returns `nil` for a name `pending` does not hold, which is what an ordinary table does for an
+/// absent key -- a typo like `oblisk.audioo` must stay a Lua nil-index error naming the config's
+/// line, not become an error raised from inside a metamethod.
+fn install_capability_index(
+    loader: &Loader,
+    oblisk: &mlua::Table,
+    pending: mlua::Table,
+    commands: CommandSender,
+) -> mlua::Result<()> {
+    let index = loader.lua().create_function(move |_, (table, key): (mlua::Table, mlua::LuaString)| {
+        let name = key.to_str()?.to_owned();
+        let member: mlua::Value = pending.raw_get(name.as_str())?;
+        if member.is_nil() {
+            return Ok(mlua::Value::Nil);
+        }
+        table.raw_set(name.as_str(), member.clone())?;
+        commands.start_capability(&name);
+        Ok(member)
+    })?;
+    let meta = loader.create_table()?;
+    meta.set("__index", index)?;
+    oblisk.set_metatable(Some(meta))?;
+    Ok(())
 }
 
 /// `oblisk.rescue` (§ 2.10). Returns the handle so later evaluations can update it.

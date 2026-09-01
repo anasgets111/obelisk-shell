@@ -51,7 +51,12 @@ impl IdleRegistry {
         IdleRegistry(Rc::new(RefCell::new(Inner { thresholds: HashMap::new(), commands })))
     }
 
-    /// `idle:register_threshold(sec, on_idle, on_resume)` (§ 7.1). The registration is local and
+    /// `idle:register_threshold(sec, on_idle, on_resume)` (§ 7.1). Sends the start ahead of the
+    /// command, because `idle` is off the roster and so has no `oblisk` member for
+    /// `lua::namespace`'s `__index` to catch (docs/adr/0070 decision 1). Both are deduplicated by
+    /// `CommandSender`, so the second call sends only the command.
+    ///
+    /// The registration is local and
     /// the command tells the Supervisor to create the listener; nothing waits for a reply, so a
     /// config registering a threshold gets no acknowledgement and none is needed -- an inert
     /// notify half (no `ext_idle_notifier_v1`, ADR-0032) is a listener that never fires, which
@@ -59,18 +64,23 @@ impl IdleRegistry {
     fn register_threshold(&self, sec: u64, on_idle: Function, on_resume: Function) {
         let mut inner = self.0.borrow_mut();
         inner.thresholds.entry(sec).or_default().push(Threshold { on_idle, on_resume });
+        inner.commands.start_capability("idle");
         inner.commands.send("idle", "register", vec![serde_json::json!(sec)], 0);
     }
 
     /// `idle:inhibit(reason)` (ADR-0032). The count is the Supervisor's, per generation, so two
     /// callers here hold two references to one logind fd and neither release kills the other.
     fn inhibit(&self, reason: String) {
-        self.0.borrow().commands.send("idle", "inhibit", vec![serde_json::json!(reason)], 0);
+        let inner = self.0.borrow();
+        inner.commands.start_capability("idle");
+        inner.commands.send("idle", "inhibit", vec![serde_json::json!(reason)], 0);
     }
 
     /// `idle:release_inhibit()`. Releases one hold, not every hold: see [`Self::inhibit`].
     fn release_inhibit(&self) {
-        self.0.borrow().commands.send("idle", "release_inhibit", Vec::new(), 0);
+        let inner = self.0.borrow();
+        inner.commands.start_capability("idle");
+        inner.commands.send("idle", "release_inhibit", Vec::new(), 0);
     }
 
     /// `SupervisorFrame::IdleEvent` dispatch: runs every callback registered for
@@ -151,11 +161,49 @@ mod tests {
         (lua, registry, rx)
     }
 
+    /// The next queued command, stepping over the `idle` start that every method sends ahead of
+    /// its first command (docs/adr/0070). `every_idle_method_starts_the_capability_first` is what
+    /// asserts on those.
     fn queued_command(rx: &mut mpsc::UnboundedReceiver<RendererFrame>) -> Option<CommandEnvelope> {
-        match rx.try_recv().ok()? {
-            RendererFrame::Command(envelope) => Some(envelope),
-            other => panic!("idle commands must be queued as RendererFrame::Command, got {other:?}"),
+        loop {
+            match rx.try_recv().ok()? {
+                RendererFrame::Command(envelope) => return Some(envelope),
+                RendererFrame::StartCapability { .. } => continue,
+                other => panic!("idle commands must be queued as RendererFrame::Command, got {other:?}"),
+            }
         }
+    }
+
+    /// docs/adr/0070 decision 1: `idle` is off the roster, so nothing indexes `oblisk` to reach
+    /// it and the methods have to send the start themselves. Without this the Supervisor never
+    /// builds `IdleController` and a `register` command lands on nothing.
+    #[test]
+    fn every_idle_method_starts_the_capability_first() {
+        for call in [
+            "idle:register_threshold(60, function() end, function() end)",
+            "idle:inhibit(\"video\")",
+            "idle:release_inhibit()",
+        ] {
+            let (lua, _registry, mut rx) = lua_with_idle(0);
+            lua.load(call).exec().unwrap();
+            let first = rx.try_recv().expect("a method must queue something");
+            assert!(
+                matches!(&first, RendererFrame::StartCapability { capability } if capability == "idle"),
+                "{call} must send the start ahead of its command, got {first:?}"
+            );
+        }
+    }
+
+    /// One start for the whole generation, not one per call.
+    #[test]
+    fn a_second_idle_call_sends_no_second_start() {
+        let (lua, _registry, mut rx) = lua_with_idle(0);
+        lua.load(r#"idle:inhibit("a"); idle:inhibit("b")"#).exec().unwrap();
+
+        let starts = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|frame| matches!(frame, RendererFrame::StartCapability { .. }))
+            .count();
+        assert_eq!(starts, 1);
     }
 
     #[test]

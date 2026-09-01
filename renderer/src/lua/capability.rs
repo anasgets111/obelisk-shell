@@ -26,7 +26,8 @@
 //! uses the second), so the sugar has to settle that ambiguity before it is worth the indirection
 //! of turning every typo'd field read into a callable.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use mlua::{Function, LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value};
@@ -45,6 +46,11 @@ pub struct CommandSender {
     /// one sender, so two capabilities cannot hand out the same id for two different writes.
     /// `Rc<Cell<_>>` for this module's single-threaded confinement.
     next_id: Rc<Cell<u64>>,
+    /// Every capability this generation has already asked the Supervisor to start, so the second
+    /// reader of `oblisk.audio` costs nothing. Shared across every clone of this sender because
+    /// `lua::namespace`'s `__index` and `socket`'s `secure_submit` sweep are two callers of the
+    /// same question (docs/adr/0070 decisions 1 and 5).
+    started: Rc<RefCell<HashSet<String>>>,
     outbound_tx: UnboundedSender<RendererFrame>,
 }
 
@@ -52,7 +58,27 @@ impl CommandSender {
     /// `generation_id` is this Renderer's own generation id (`socket::generation_id_from_env`),
     /// the same value `ProcessRegistry` stamps and the field § 7.3's guard rule drops a packet on.
     pub fn new(generation_id: u32, outbound_tx: UnboundedSender<RendererFrame>) -> Self {
-        CommandSender { generation_id, next_id: Rc::new(Cell::new(0)), outbound_tx }
+        CommandSender {
+            generation_id,
+            next_id: Rc::new(Cell::new(0)),
+            started: Rc::new(RefCell::new(HashSet::new())),
+            outbound_tx,
+        }
+    }
+
+    /// Asks the Supervisor to construct `capability`'s controller, once per generation.
+    ///
+    /// The Supervisor drops a repeat itself (ADR-0070 decision 3), so the local set is not what
+    /// makes this correct -- it is what keeps a `map` over `oblisk.audio` that re-resolves on every
+    /// layout pass from writing a frame per pass.
+    pub(crate) fn start_capability(&self, capability: &str) {
+        if !self.started.borrow_mut().insert(capability.to_string()) {
+            return;
+        }
+        let frame = RendererFrame::StartCapability { capability: capability.to_string() };
+        if self.outbound_tx.send(frame).is_err() {
+            eprintln!("oblisk.{capability}: failed to queue the start request, the control-socket writer is gone");
+        }
     }
 
     /// The one outbound frame channel this sender writes to, handed back so `RendererClient` can

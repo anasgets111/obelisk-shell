@@ -152,6 +152,10 @@ _Avoid_: version, sequence number
 The `shared`-crate constant naming every snapshot-hydrated capability. Each rostered name is reachable from a generation's first evaluation and reads `nil` until its first dependency snapshot arrives (ADR-0037). One name serves as the Lua name, the roster key and the `capability` field of every command written through it.
 _Avoid_: pre-seed list, known capabilities
 
+**Capability start**:
+The first read of `oblisk.<name>` in a generation, which is what makes the Supervisor build that capability's controller (ADR-0070). A name no config reads has nothing running behind it. One-way for the life of the Supervisor process: nothing stops a started capability.
+_Avoid_: activation, subscription, enabling a capability
+
 **Oblisk namespace**:
 The single Lua table every capability, `rescue`, `screens` and `version` hang off. It is what keeps engine vocabulary (the node constructors a config calls) and system state (the things a config reads and commands) from sharing a name.
 _Avoid_: globals, the state tree

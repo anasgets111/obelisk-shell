@@ -3,6 +3,10 @@
 
 This specification defines the low-level system services and D-Bus interfaces managed entirely inside the long-lived **Oblisk Supervisor** process. These backends are implemented in native Rust, running off-thread to provide zero-polling, sub-millisecond, event-driven reactive state updates and command execution pipelines to the Lua VM.
 
+**None of them is built until a config asks for it** (ADR-0070). The Renderer sends a `StartCapability` frame the first time an evaluation reads `oblisk.<name>`, and that frame is what constructs the controller described below. A section here describes what a capability does once started, not what this process does at boot. With a config that reads nothing, this process connects to the system bus, binds the control socket, spawns the Renderer, and does nothing else: no bus name is claimed, no D-Bus subscription is made, no poll task runs, and no authentication agent is registered.
+
+Registering the polkit authentication agent is gated on a `textfield` declaring `secure_submit = { capability = "polkit", ... }`, since polkit has no capability member to read, and every failure to register logs rather than stopping the process. "An authentication agent already exists for the given subject" is the normal answer beside any other desktop.
+
 ---
 
 ## 1. Durable D-Bus Notifications Server (`org.freedesktop.Notifications`)

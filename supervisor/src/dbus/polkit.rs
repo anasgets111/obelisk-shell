@@ -121,6 +121,47 @@ impl AuthenticationAgent {
     }
 }
 
+/// The authentication agent, held unregistered until a config declares a `secure_submit` that
+/// names polkit (docs/adr/0070 decisions 5 and 6).
+///
+/// Registration used to be the fourth statement of `run_supervisor` and propagated with `?`, which
+/// meant "An authentication agent already exists for the given subject" -- the normal answer on a
+/// machine running any other desktop -- stopped the shell from starting at all.
+pub struct PolkitAgent {
+    /// Taken by the first [`Self::register`] call, so a second is a no-op rather than a second
+    /// `RegisterAuthenticationAgent` for the same subject.
+    agent: Option<AuthenticationAgent>,
+}
+
+impl PolkitAgent {
+    pub fn new(challenges: UnboundedSender<BeginAuthenticationCall>) -> Self {
+        PolkitAgent { agent: Some(AuthenticationAgent::new(challenges)) }
+    }
+
+    /// Registers with polkitd, once. Every failure logs and leaves this process without an agent,
+    /// which costs it the challenges it would have been asked to answer and nothing else.
+    pub async fn register(&mut self, connection: &zbus::Connection) {
+        let Some(agent) = self.agent.take() else {
+            return;
+        };
+        let subject = match current_session_subject() {
+            Ok(subject) => subject,
+            Err(err) => {
+                eprintln!(
+                    "polkit: $XDG_SESSION_ID names no session to register an agent for; agent disabled for this run: {err}"
+                );
+                return;
+            }
+        };
+        match register_agent(connection, agent, &subject, "en_US.UTF-8", AGENT_OBJECT_PATH).await {
+            Ok(()) => eprintln!("polkit: registered as this session's authentication agent"),
+            Err(err) => eprintln!(
+                "polkit: RegisterAuthenticationAgent failed, so another agent answers this session; disabled for this run: {err}"
+            ),
+        }
+    }
+}
+
 /// Registers `agent` as the polkit authentication agent for `subject`/`locale`. Exports
 /// `agent` on `connection`'s object server *before* calling `RegisterAuthenticationAgent`, so
 /// a callback arriving right after registration succeeds always finds a live object.
@@ -201,6 +242,29 @@ mod tests {
         );
         assert_eq!(locale, "en_US.UTF-8");
         assert_eq!(object_path, AGENT_OBJECT_PATH);
+    }
+
+    /// Registering twice would ask polkitd for a second agent on one subject. The second call is
+    /// reachable because every generation sends its own starts (ADR-0070 decision 3).
+    #[tokio::test]
+    async fn registering_twice_makes_only_one_wire_call() {
+        // SAFETY: see the test above.
+        unsafe { std::env::set_var("XDG_SESSION_ID", "c1") };
+        let (authority_side, agent_side) = p2p_pair().await;
+        let (calls_tx, mut calls_rx) = mpsc::unbounded_channel();
+        authority_side
+            .object_server()
+            .at("/org/freedesktop/PolicyKit1/Authority", MockAuthority { calls: calls_tx })
+            .await
+            .expect("failed to export the mock Authority");
+        let (challenges_tx, _challenges_rx) = mpsc::unbounded_channel();
+        let mut agent = PolkitAgent::new(challenges_tx);
+
+        agent.register(&agent_side).await;
+        agent.register(&agent_side).await;
+
+        calls_rx.recv().await.expect("the first register must reach the Authority");
+        assert!(calls_rx.try_recv().is_err(), "the second register must be a no-op");
     }
 
     #[tokio::test]

@@ -521,6 +521,7 @@ impl RendererClient {
         match applied {
             Ok(()) => {
                 log_applied_surfaces(&self.scene, &self.instances);
+                start_secure_submit_capabilities(&self.scene, &self.instances, &self.commands);
                 // Nothing holds a lease, so nothing can be holding a subtree this apply retired --
                 // see `Scene::release_all_retired`.
                 self.scene.release_all_retired();
@@ -667,6 +668,7 @@ impl RendererClient {
         }) {
             Ok(()) => {
                 log_applied_surfaces(&self.scene, &self.instances);
+                start_secure_submit_capabilities(&self.scene, &self.instances, &self.commands);
                 self.scene.release_all_retired();
                 // Both fields, on a successful apply only -- an `ApplyPendingReload` only ever
                 // follows an `Unchanged` verdict, so this cannot disagree with the earlier
@@ -847,6 +849,7 @@ fn frame_label(frame: &RendererFrame) -> &'static str {
         RendererFrame::SecureSubmit(_) => "SecureSubmit",
         RendererFrame::LockReport(_) => "LockReport",
         RendererFrame::RequestReload => "RequestReload",
+        RendererFrame::StartCapability { .. } => "StartCapability",
     }
 }
 
@@ -856,6 +859,28 @@ fn frame_label(frame: &RendererFrame) -> &'static str {
 /// Iterates instances rather than declared surfaces: one declared surface can be several
 /// instances, each resolved against a different size, so a per-declaration line would print one
 /// of them and hide the rest.
+/// Starts every capability an applied tree names in a `textfield`'s `secure_submit`
+/// (docs/adr/0070 decision 5).
+///
+/// The only way a config can ask for `polkit`, which has no roster entry and so no
+/// `oblisk.polkit` for `lua::namespace`'s `__index` to catch. Deduplicated by
+/// `CommandSender::start_capability`, so calling it on every apply costs one `HashSet` probe per
+/// declared field after the first.
+///
+/// ponytail: called from the two apply sites that follow an evaluation, not from
+/// `re_resolve_if_dirty`. Reading the targets means `Scene::surface`, which deep-clones the tree,
+/// and a re-resolve runs on every dirty repaint. The gap is a `textfield` that only enters the
+/// tree on a later push -- its capability waits for the next evaluation. The upgrade path is a
+/// `secure_submit` roster the apply itself accumulates, rather than a walk after the fact.
+fn start_secure_submit_capabilities(scene: &Scene, instances: &[SurfaceInstance], commands: &CommandSender) {
+    for instance in instances {
+        let Some(tree) = scene.surface(&instance.instance_id) else { continue };
+        for target in crate::layout::secure_submit::secure_submit_targets(&tree) {
+            commands.start_capability(&target.capability);
+        }
+    }
+}
+
 fn log_applied_surfaces(scene: &Scene, instances: &[SurfaceInstance]) {
     for instance in instances {
         match scene.surface(&instance.instance_id) {
@@ -980,8 +1005,102 @@ mod tests {
     }
 
     /// The one frame `client` queued, or a panic naming what was missing.
+    /// The next queued frame that is not a capability start.
+    ///
+    /// Skipping those is not hiding them: reading `oblisk.lock` at all queues one
+    /// (docs/adr/0070 decision 1), so every test that reaches a capability would otherwise have to
+    /// step over it before asserting on what it actually queued.
+    /// `a_capability_read_asks_the_supervisor_to_start_it` is what holds the starts to account.
     fn queued_frame(outbound_rx: &mut mpsc::UnboundedReceiver<RendererFrame>) -> RendererFrame {
-        outbound_rx.try_recv().expect("a frame must have been queued for the socket thread")
+        loop {
+            match outbound_rx.try_recv().expect("a frame must have been queued for the socket thread") {
+                RendererFrame::StartCapability { .. } => continue,
+                frame => return frame,
+            }
+        }
+    }
+
+    /// Every frame queued so far, so a test can assert on the starts `queued_frame` steps over.
+    fn queued_starts(outbound_rx: &mut mpsc::UnboundedReceiver<RendererFrame>) -> Vec<String> {
+        let mut started = Vec::new();
+        while let Ok(frame) = outbound_rx.try_recv() {
+            if let RendererFrame::StartCapability { capability } = frame {
+                started.push(capability);
+            }
+        }
+        started
+    }
+
+    /// docs/adr/0070 decision 1: the read is the start. Nothing else in this process asks the
+    /// Supervisor to build a controller, so a capability a config never mentions never runs.
+    #[test]
+    fn a_capability_read_asks_the_supervisor_to_start_it() {
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (client, mut outbound_rx) = test_client(&missing);
+
+        client.loader.lua().load("local _ = oblisk.audio").exec().unwrap();
+
+        assert_eq!(queued_starts(&mut outbound_rx), vec!["audio".to_string()]);
+    }
+
+    /// The whole point of the gate: an evaluation that touches nothing costs nothing.
+    #[test]
+    fn a_config_that_reads_no_capability_starts_none() {
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (client, mut outbound_rx) = test_client(&missing);
+
+        client.loader.lua().load("local _ = oblisk.version.major").exec().unwrap();
+
+        assert!(queued_starts(&mut outbound_rx).is_empty(), "`version` is off the roster and has nothing behind it");
+    }
+
+    /// `__index` fires once per name, because the member is moved onto the table on the way out.
+    /// A `computed` inside a `list`'s `itemfn` reads `oblisk.audio` once per row per layout pass,
+    /// so a start per read would be a frame per row per frame.
+    #[test]
+    fn re_reading_a_capability_queues_no_second_start() {
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (client, mut outbound_rx) = test_client(&missing);
+
+        client.loader.lua().load("for _ = 1, 50 do local _ = oblisk.audio end").exec().unwrap();
+
+        assert_eq!(queued_starts(&mut outbound_rx), vec!["audio".to_string()]);
+    }
+
+    /// A typo must stay an ordinary nil, so the config's own line is what the error names. The
+    /// metamethod answering with anything else would turn `oblisk.audioo:get()` into an error
+    /// raised from inside the engine.
+    #[test]
+    fn a_name_no_capability_owns_reads_nil_and_starts_nothing() {
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (client, mut outbound_rx) = test_client(&missing);
+
+        let is_nil: bool = client.loader.lua().load("return oblisk.audioo == nil").eval().unwrap();
+
+        assert!(is_nil);
+        assert!(queued_starts(&mut outbound_rx).is_empty());
+    }
+
+    /// docs/adr/0070 decision 5. polkit has no roster entry and no `oblisk.polkit`, so a
+    /// `secure_submit` naming it is the only thing a config can write that asks for the
+    /// authentication agent.
+    #[test]
+    fn a_secure_submit_target_starts_the_capability_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shell.lua");
+        std::fs::write(
+            &path,
+            r#"return panel { id = "prompt", layer = "Top", child = textfield {
+                   secure_submit = { capability = "polkit", action = "authenticate" } } }"#,
+        )
+        .unwrap();
+        let (mut client, mut outbound_rx) = test_client(&path);
+
+        client.run_startup_evaluation().unwrap();
+        client.set_instances(instances_for(&["prompt"]));
+        assert!(client.apply_instances());
+
+        assert!(queued_starts(&mut outbound_rx).contains(&"polkit".to_string()));
     }
 
     #[test]

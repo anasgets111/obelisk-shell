@@ -112,8 +112,9 @@ pub enum LoaderError {
     /// `shell.lua` failed to parse or raised a runtime error while evaluating.
     #[error("shell.lua failed to evaluate: {0}")]
     Eval(#[from] mlua::Error),
-    /// The script evaluated cleanly, but its top-level return wasn't a `panel` node or a
-    /// non-empty array of `panel` nodes (§ 6.1).
+    /// The script evaluated cleanly, but its top-level return wasn't a surface node or an array of
+    /// them (§ 6.1). An *empty* array is fine, and so is no return at all: a config may declare no
+    /// surfaces (docs/adr/0070 decision 7).
     #[error("shell.lua's top-level return must be a `panel` node or an array of them: {0}")]
     InvalidTopLevelReturn(String),
     /// [`Loader::evaluate_file`] couldn't read `shell.lua` off disk (missing file, permissions).
@@ -290,6 +291,9 @@ call in last position expands to both: bind it to a local first";
 fn collect_surfaces(value: Value) -> Result<Vec<VirtualNode>, LoaderError> {
     let table = match value {
         Value::Table(t) => t,
+        // A config that declares nothing, which is legal (docs/adr/0070 decision 7) and is the
+        // shape an empty `shell.lua` returns: Lua's own `nil` for a chunk with no `return`.
+        Value::Nil => return Ok(Vec::new()),
         other => {
             return Err(LoaderError::InvalidTopLevelReturn(format!("expected a table, got {}", other.type_name())));
         }
@@ -320,11 +324,9 @@ fn collect_surfaces(value: Value) -> Result<Vec<VirtualNode>, LoaderError> {
         require_surface(&node)?;
         surfaces.push(node);
     }
-    if surfaces.is_empty() {
-        return Err(LoaderError::InvalidTopLevelReturn(
-            "the returned table has no `kind` field and no array elements".to_string(),
-        ));
-    }
+    // `return {}` is a config that declares no surfaces, not a mistake (docs/adr/0070 decision 7).
+    // It used to be refused, which made "run nothing" a state this engine did not have -- and that
+    // is the only state in which a config gates every capability off.
     Ok(surfaces)
 }
 
@@ -809,6 +811,31 @@ mod tests {
         let loader = test_loader();
         let err = loader.evaluate(r#"return rect { background = "red" }"#).unwrap_err();
         assert!(matches!(err, LoaderError::InvalidTopLevelReturn(_)));
+    }
+
+    /// docs/adr/0070 decision 7. "Run nothing" is the only state in which a config gates every
+    /// capability off, so it has to be a state this engine has.
+    #[test]
+    fn a_config_may_declare_no_surfaces_at_all() {
+        let loader = test_loader();
+        assert!(loader.evaluate("return {}").unwrap().surfaces.is_empty());
+    }
+
+    /// An empty file is a chunk with no `return`, which is Lua's own `nil` rather than a table.
+    #[test]
+    fn an_empty_shell_lua_declares_no_surfaces_rather_than_failing() {
+        let loader = test_loader();
+        assert!(loader.evaluate("").unwrap().surfaces.is_empty());
+    }
+
+    /// The empty cases above must not have widened the shape check: a top-level return that is
+    /// the wrong *kind* of thing is still a config error naming what it got.
+    #[test]
+    fn a_top_level_return_that_is_neither_a_table_nor_nil_is_still_refused() {
+        let loader = test_loader();
+        let err = loader.evaluate(r#"return "bar""#).unwrap_err();
+        assert!(matches!(err, LoaderError::InvalidTopLevelReturn(_)), "{err:?}");
+        assert!(err.to_string().contains("string"), "the message has to say what it got: {err}");
     }
 
     #[test]

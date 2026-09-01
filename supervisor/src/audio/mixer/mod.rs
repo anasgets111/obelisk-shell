@@ -53,7 +53,7 @@ mod write;
 
 pub use registry::{AudioCommandSender, command_channel, run};
 pub use state::{AudioCommand, VideoSourceApp};
-// `main.rs` only ever gets this type by inference, through `run`'s channel, so nothing outside
-// needed to name it until `stubs.rs` had to ask it for its schema.
-#[cfg(test)]
+// `main.rs` names this on `ensure_mixer_thread`'s sender parameter, which is what the lazy start
+// (docs/adr/0070) cost: the channel outlives the thread's construction, so its item type can no
+// longer be inferred from `run`'s own signature at the one call site.
 pub use state::AudioState;

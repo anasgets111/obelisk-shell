@@ -55,6 +55,12 @@ The four `surface` topology fields (`id`, `layer`, `anchor`, `monitor`) are the 
 
 The active Renderer process populates the global `oblisk` state tree with the following schema. No other properties exist in the global space. All fields below return a `Signal` wrapping the indicated inner type.
 
+**Reading a capability is what starts it** (ADR-0070). Nothing runs behind `oblisk.bluetooth` until a config indexes that name: the first read hands back the member and tells the Supervisor to build the controller, and every read after it is an ordinary table lookup. A config that never mentions a capability never pays for its D-Bus subscription, poll task or bus-name claim, and a config that declares no surfaces at all (`return {}`) starts nothing.
+
+Two consequences worth knowing. A capability reads `nil` until its first `StateSnapshot`, which is now also the window between the read that started it and the controller's first push, so a `:map` must handle `nil` (it always had to). And a start is one-way: an edit that removes the last reader of a capability does not stop it until the session ends.
+
+`oblisk.idle` is off the roster and has no member to index, so its own methods (`register_threshold`, `inhibit`, `release_inhibit`) send the start. `polkit` has no member either; a `textfield` naming it in `secure_submit` (§ 5.2 item 8) is what registers the authentication agent.
+
 ### 2.1 Keyboard Modifier & Layout State (`oblisk.keyboard`)
 *   `keyboard.caps_lock`: `boolean` (Active = `true`, Inactive = `false`)
 *   `keyboard.active_layout`: `string` (The user-friendly active layout name, e.g., `"English (US)"`)

@@ -17,11 +17,13 @@ pub use zeroize::{Zeroize, Zeroizing};
 /// -- one string for all three, so a config that reads `oblisk.audio` cannot write to something
 /// else.
 ///
-/// The Renderer seeds every rostered name onto `oblisk` at construction, so each reads `nil`
-/// until its first `StateSnapshot` (including `sysinfo`, dormant until `sysinfo:configure`).
-/// The Supervisor's `push_snapshot` debug-asserts membership, so an off-roster capability fails
-/// loudly in development rather than as an index-into-nil error in a user's `shell.lua`. `idle`
-/// is deliberately absent: it's event-shaped, not snapshot state (ADR-0032).
+/// The Renderer hands a rostered name out on first read of `oblisk.<name>`, and that read is what
+/// starts the capability's controller on the Supervisor (docs/adr/0070). Until its first
+/// `StateSnapshot` the member reads `nil`, which is also what a name the config never reads costs:
+/// nothing runs behind it. The Supervisor's `push_snapshot` debug-asserts membership, so an
+/// off-roster capability fails loudly in development rather than as an index-into-nil error in a
+/// user's `shell.lua`. `idle` is deliberately absent: it's event-shaped, not snapshot state
+/// (ADR-0032).
 pub const CAPABILITIES: &[&str] = &[
     "audio",
     "network",
@@ -297,6 +299,17 @@ pub enum RendererFrame {
     /// one it most recently sent, so a Renderer that fabricated one would have its own
     /// `ReevaluateReport` discarded as stale.
     RequestReload,
+    /// Asks the Supervisor to construct `capability`'s controller, sent the first time this
+    /// generation's config reads `oblisk.<capability>` (docs/adr/0070 decision 1) or applies a
+    /// scene whose `secure_submit` names it (decision 5).
+    ///
+    /// Carries no generation id in the payload for the same reason [`Self::RequestReload`] carries
+    /// no sequence: the socket already knows which generation wrote the frame. Idempotent -- a
+    /// name whose controller exists is logged and dropped, since every generation sends its own
+    /// starts (decision 3).
+    StartCapability {
+        capability: String,
+    },
 }
 
 /// The Supervisor's own PAM worker subprocess's one-shot result, written once to the worker's

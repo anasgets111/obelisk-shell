@@ -32,7 +32,7 @@ use applications::{ApplicationsController, ApplicationsSignal};
 use dbus::bluetooth::{self, BluetoothController, BluetoothSignal};
 use dbus::network::{self, NetworkController, NetworkSignal};
 use dbus::notifications::{self, NotificationsController, NotificationsSignal};
-use dbus::polkit::{AGENT_OBJECT_PATH, AuthenticationAgent, current_session_subject, register_agent};
+use dbus::polkit::PolkitAgent;
 use dbus::power::{self, PowerController, PowerSignal};
 use dbus::tray::{self, TrayController, TraySignal};
 use generation::{
@@ -100,6 +100,20 @@ pub(crate) fn log_malformed_command(params: &shared::CommandParams) {
 /// [`log_malformed_command`]'s sibling for a `dispatch` adapter's unmatched-action fallback.
 pub(crate) fn log_unknown_action(params: &shared::CommandParams) {
     eprintln!("{}: unknown action {:?} from generation {}", params.capability, params.action, params.generation_id);
+}
+
+/// Logs a command for a capability whose controller was never built (docs/adr/0070).
+///
+/// Not reachable from a config: reading `oblisk.<name>` is what hands out the object an `invoke`
+/// is a method on, and that read sends the start on the same socket, in order, ahead of the
+/// command. What reaches here is a Renderer that sent a command without the read -- a bug in this
+/// codebase or a hand-written frame -- so it names the capability rather than being silent.
+pub(crate) fn log_unstarted(envelope: &shared::CommandEnvelope) {
+    let params = &envelope.params;
+    eprintln!(
+        "generation {}'s oblisk.{}:invoke({:?}) arrived before anything started {}; dropping",
+        params.generation_id, params.capability, params.action, params.capability
+    );
 }
 
 /// Reads `params.action` as a capability's action enum, logging and returning `None` when it names
@@ -227,153 +241,112 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
+/// Spawns the PipeWire registry thread if it is not already running, and hands back the command
+/// channel it reads.
+///
+/// Two capabilities need it and either may be the one a config reads first: `audio` is the mixer,
+/// and `privacy` gets the application names it enriches a camera indicator with off the same
+/// registry (docs/adr/0034). Whichever arrives first pays for the connection.
+///
+/// `video_tx` is taken rather than cloned because `mixer::run` owns it for the life of the thread.
+/// A second call finds it gone and returns, which is the same no-op the `is_some` guard makes.
+///
+/// `pipewire-rs`'s event loop is `Rc`-based and `!Send`, so this is an OS thread rather than a
+/// tokio task, and the handle is a `pipewire::channel` rather than a controller.
+fn ensure_mixer_thread(
+    commands: &mut Option<audio::mixer::AudioCommandSender>,
+    audio_tx: &tokio::sync::mpsc::UnboundedSender<audio::mixer::AudioState>,
+    video_tx: &mut Option<tokio::sync::mpsc::UnboundedSender<Vec<audio::mixer::VideoSourceApp>>>,
+) {
+    if commands.is_some() {
+        return;
+    }
+    let Some(video_tx) = video_tx.take() else {
+        return;
+    };
+    let (command_tx, command_rx) = audio::mixer::command_channel();
+    let audio_tx = audio_tx.clone();
+    std::thread::spawn(move || audio::mixer::run(audio_tx, video_tx, command_rx));
+    *commands = Some(command_tx);
+}
+
 async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     let connection = zbus::Connection::system().await?;
-    let subject = current_session_subject()?;
 
     let (tx, mut challenges) = tokio::sync::mpsc::unbounded_channel();
-    let agent = AuthenticationAgent::new(tx);
-    register_agent(&connection, agent, &subject, "en_US.UTF-8", AGENT_OBJECT_PATH).await?;
+    let mut polkit_agent = PolkitAgent::new(tx);
     // Long-lived proxy for the polkit reply once a challenge's PAM conversation finishes
     // (docs/adr/0028) -- built once here, not per-challenge.
-    let authority = zbus_polkit::policykit1::AuthorityProxy::new(&connection).await?;
-
-    // NetworkManager shares the system bus with polkit (docs/adr/0029). Anything pushed before
-    // the boot Renderer's connection exists is replayed by connected.recv() below.
-    let (network_signal_tx, mut network_signals) = tokio::sync::mpsc::unbounded_channel::<NetworkSignal>();
-    let network = NetworkController::new(connection.clone(), network_signal_tx).await?;
-
-    // BlueZ shares the system bus too (docs/adr/0030).
-    let (bluetooth_signal_tx, mut bluetooth_signals) = tokio::sync::mpsc::unbounded_channel::<BluetoothSignal>();
-    let bluetooth = BluetoothController::new(connection.clone(), bluetooth_signal_tx).await;
-
-    // The tray host is a session-bus protocol, unlike NetworkManager/BlueZ/polkit above, so it
-    // needs its own connection. A missing session bus degrades to TrayController::inert.
-    let (tray_signal_tx, mut tray_signals) = tokio::sync::mpsc::unbounded_channel::<TraySignal>();
-    let tray = match zbus::Connection::session().await {
-        Ok(tray_connection) => TrayController::new(tray_connection, tray_signal_tx).await,
+    let authority = match zbus_polkit::policykit1::AuthorityProxy::new(&connection).await {
+        Ok(authority) => Some(authority),
         Err(err) => {
-            eprintln!("tray: failed to connect to the session bus; tray host disabled for this run: {err}");
-            TrayController::inert(tray_signal_tx)
+            eprintln!("polkit: failed to bind the Authority proxy; authentication agent disabled for this run: {err}");
+            None
         }
     };
 
-    let (audio_tx, mut audio_apps) = tokio::sync::mpsc::unbounded_channel();
-    // video_tx feeds oblisk.privacy's PipeWire name-enrichment (docs/adr/0034), same registry
-    // thread as audio.
-    let (video_tx, video_sources) = tokio::sync::mpsc::unbounded_channel();
-    // pipewire-rs's event loop is Rc-based and !Send -- needs its own OS thread, not a tokio
-    // task. audio_commands is a pipewire::channel, not a controller handle, for the same reason.
-    let (audio_commands, audio_command_rx) = audio::mixer::command_channel();
-    std::thread::spawn(move || audio::mixer::run(audio_tx, video_tx, audio_command_rx));
-
-    // Notifications get their own session-bus connection (ADR-0033): a real desktop may already
-    // own org.freedesktop.Notifications, degrading to inert via RequestName's DoNotQueue.
-    let (sound_tx, sound_rx) = std::sync::mpsc::channel::<PathBuf>();
-    std::thread::spawn(move || notifications::run_sound_player(sound_rx));
+    // Every capability's signal channel, built here and its controller built on demand
+    // (docs/adr/0070 decision 1). The receivers below are what the select loop waits on; a
+    // capability the config never reads keeps a sender nobody holds, so its arm never fires.
+    let (network_signal_tx, mut network_signals) = tokio::sync::mpsc::unbounded_channel::<NetworkSignal>();
+    let (bluetooth_signal_tx, mut bluetooth_signals) = tokio::sync::mpsc::unbounded_channel::<BluetoothSignal>();
+    let (tray_signal_tx, mut tray_signals) = tokio::sync::mpsc::unbounded_channel::<TraySignal>();
     let (notifications_signal_tx, mut notifications_signals) =
         tokio::sync::mpsc::unbounded_channel::<NotificationsSignal>();
-    let notifications = match zbus::Connection::session().await {
-        Ok(notifications_connection) => {
-            NotificationsController::new(notifications_connection, notifications_signal_tx, sound_tx.clone()).await
-        }
-        Err(err) => {
-            eprintln!(
-                "notifications: failed to connect to the session bus; notifications server disabled for this run: {err}"
-            );
-            NotificationsController::inert(notifications_signal_tx, sound_tx.clone())
-        }
-    };
-
-    // MPRIS gets its own session-bus connection too (ADR-0036). MprisController::new is not
-    // async: it spawns discovery and returns immediately.
     let (mpris_signal_tx, mut mpris_signals) = tokio::sync::mpsc::unbounded_channel::<dbus::mpris::MprisSignal>();
-    let mpris = match zbus::Connection::session().await {
-        Ok(mpris_connection) => dbus::mpris::MprisController::new(mpris_connection, mpris_signal_tx),
-        Err(err) => {
-            eprintln!("mpris: failed to connect to the session bus; player discovery disabled for this run: {err}");
-            dbus::mpris::MprisController::inert(mpris_signal_tx)
-        }
-    };
+    let (sysinfo_signal_tx, mut sysinfo_signals) = tokio::sync::mpsc::unbounded_channel::<SysinfoSignal>();
+    let (keyboard_signal_tx, mut keyboard_signals) = tokio::sync::mpsc::unbounded_channel::<KeyboardSignal>();
+    let (privacy_signal_tx, mut privacy_signals) = tokio::sync::mpsc::unbounded_channel::<PrivacySignal>();
+    let (updates_signal_tx, mut updates_signals) = tokio::sync::mpsc::unbounded_channel::<UpdatesSignal>();
+    let (battery_signal_tx, mut battery_signals) = tokio::sync::mpsc::unbounded_channel::<BatterySignal>();
+    let (brightness_signal_tx, mut brightness_signals) = tokio::sync::mpsc::unbounded_channel::<BrightnessSignal>();
+    let (workspaces_signal_tx, mut workspaces_signals) = tokio::sync::mpsc::unbounded_channel::<WorkspacesSignal>();
+    let (power_signal_tx, mut power_signals) = tokio::sync::mpsc::unbounded_channel::<PowerSignal>();
+    let (system_signal_tx, mut system_signals) = tokio::sync::mpsc::unbounded_channel::<SystemSignal>();
+    let (applications_signal_tx, mut applications_signals) =
+        tokio::sync::mpsc::unbounded_channel::<ApplicationsSignal>();
+    let (audio_tx, mut audio_apps) = tokio::sync::mpsc::unbounded_channel();
+    // video_tx feeds oblisk.privacy's PipeWire name-enrichment (docs/adr/0034), same registry
+    // thread as audio. Held in an Option because starting either capability moves one end of it:
+    // audio spawns the mixer thread that owns the sender, privacy owns the receiver.
+    let (video_tx, video_sources) = tokio::sync::mpsc::unbounded_channel();
+    let mut video_tx = Some(video_tx);
+    let mut video_sources = Some(video_sources);
+    // Notifications' sound player (ADR-0033). The thread is one `std::sync::mpsc` recv loop with
+    // no connection behind it, so it stays eager -- there is nothing for a config to gate.
+    let (sound_tx, sound_rx) = std::sync::mpsc::channel::<PathBuf>();
+    std::thread::spawn(move || notifications::run_sound_player(sound_rx));
+
+    // Every controller, `None` until this generation's config reads its `oblisk` member
+    // (docs/adr/0070). `audio` has no controller: starting it spawns the PipeWire thread and keeps
+    // the command channel that thread reads, so it is an `Option` of that channel instead.
+    let mut network: Option<NetworkController> = None;
+    let mut bluetooth: Option<BluetoothController> = None;
+    let mut tray: Option<TrayController> = None;
+    let mut notifications: Option<NotificationsController> = None;
+    let mut mpris: Option<dbus::mpris::MprisController> = None;
+    let mut sysinfo: Option<SysinfoController> = None;
+    let mut keyboard: Option<KeyboardController> = None;
+    let mut privacy: Option<PrivacyController> = None;
+    let mut updates: Option<UpdatesController> = None;
+    let mut battery: Option<BatteryController> = None;
+    let mut brightness: Option<BrightnessController> = None;
+    let mut workspaces: Option<WorkspacesController> = None;
+    let mut power: Option<PowerController> = None;
+    let mut system: Option<SystemController> = None;
+    let mut applications: Option<ApplicationsController> = None;
+    let mut audio_commands: Option<audio::mixer::AudioCommandSender> = None;
 
     let socket_path = shared::control_socket_path()?;
     let (registry, mut inbound_frames, mut connected) = socket::spawn_listener(&socket_path)?;
 
     // Idle capability (ADR-0032): notify rides its own Wayland connection (idle authority must
-    // survive a Renderer crash or reload, ADR-0010); inhibit rides the shared connection.
-    // Constructed after spawn_listener so notify setup's own spawn_blocking task (see
-    // hardware::idle's module doc) can't block the control socket.
+    // survive a Renderer crash or reload, ADR-0010); inhibit rides the shared connection. Built
+    // when the config first calls a method on `oblisk.idle` like every other capability
+    // (docs/adr/0070) -- off the roster, so its own methods send the start rather than an
+    // `__index` (`renderer/src/lua/idle.rs`).
     let (idle_signal_tx, mut idle_signals) = tokio::sync::mpsc::unbounded_channel::<shared::IdleEvent>();
-    let idle = IdleController::new(connection.clone(), idle_signal_tx).await;
-
-    // sysinfo capability (docs/adr/0035): three independently-configurable poll tasks, dormant
-    // until Lua calls sysinfo:configure.
-    let (sysinfo_signal_tx, mut sysinfo_signals) = tokio::sync::mpsc::unbounded_channel::<SysinfoSignal>();
-    let sysinfo = SysinfoController::new(PathBuf::from("/proc"), PathBuf::from("/sys/class/hwmon"), sysinfo_signal_tx);
-
-    // keyboard capability (docs/adr/0034): a missing KbdBacklight degrades in place to
-    // backlight_pct: -1, a missing lock source to false.
-    let (keyboard_signal_tx, mut keyboard_signals) = tokio::sync::mpsc::unbounded_channel::<KeyboardSignal>();
-    let keyboard =
-        KeyboardController::new(connection.clone(), &PathBuf::from("/sys/class/leds"), keyboard_signal_tx).await;
-
-    // privacy capability (docs/adr/0034): kernel-level /dev/videoN open/close via inotify plus a
-    // /proc fd-scan, enriched by video_sources from the mixer thread above.
-    let (privacy_signal_tx, mut privacy_signals) = tokio::sync::mpsc::unbounded_channel::<PrivacySignal>();
-    let privacy = PrivacyController::new(
-        PathBuf::from("/proc"),
-        &PathBuf::from("/sys/class/video4linux"),
-        video_sources,
-        privacy_signal_tx,
-    );
-
-    // updates capability (docs/adr/0034): alpm-based Arch update checking, separate from
-    // sysinfo's own scheduler.
-    let (updates_signal_tx, mut updates_signals) = tokio::sync::mpsc::unbounded_channel::<UpdatesSignal>();
-    let updates =
-        UpdatesController::new(PathBuf::from("/etc/pacman.conf"), PathBuf::from("/var/lib/pacman"), updates_signal_tx);
-
-    // battery capability (docs/adr/0053, § 2.2). The root is a parameter, not a constant, so
-    // device selection is testable against a fixture directory.
-    let (battery_signal_tx, mut battery_signals) = tokio::sync::mpsc::unbounded_channel::<BatterySignal>();
-    let battery = BatteryController::new(PathBuf::from("/sys/class/power_supply"), battery_signal_tx);
-
-    // brightness capability (docs/adr/0053, § 2.3): ranked firmware over platform over raw. No
-    // device found means it never pushes -- see hardware::brightness's module doc.
-    let (brightness_signal_tx, mut brightness_signals) = tokio::sync::mpsc::unbounded_channel::<BrightnessSignal>();
-    let brightness =
-        BrightnessController::new(PathBuf::from("/sys/class/backlight"), connection.clone(), brightness_signal_tx);
-
-    // workspaces capability (docs/adr/0056, § 2.9): niri's IPC stream via $NIRI_SOCKET. A
-    // non-niri session never pushes.
-    let (workspaces_signal_tx, mut workspaces_signals) = tokio::sync::mpsc::unbounded_channel::<WorkspacesSignal>();
-    let workspaces = WorkspacesController::new(workspaces_signal_tx);
-
-    // power capability (§ 2.13, docs/adr/0053): UPower for on_battery/energy_rate,
-    // power-profiles-daemon for active_profile/profiles. Either can be missing.
-    let (power_signal_tx, mut power_signals) = tokio::sync::mpsc::unbounded_channel::<PowerSignal>();
-    let power = PowerController::new(connection.clone(), power_signal_tx);
-
-    // system capability (docs/adr/0053, § 2.11): the 1 Hz clock plus persisted state.json.
-    let (system_signal_tx, mut system_signals) = tokio::sync::mpsc::unbounded_channel::<SystemSignal>();
-    let system = SystemController::new(
-        PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| std::ffi::OsString::from("/"))),
-        std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
-        system_signal_tx,
-    );
-
-    // applications capability (docs/adr/0061): the installed `.desktop` entries. Scans in the
-    // background from construction, so this returns before the first surface is up.
-    let (applications_signal_tx, mut applications_signals) =
-        tokio::sync::mpsc::unbounded_channel::<ApplicationsSignal>();
-    let applications = ApplicationsController::new(
-        applications::application_dirs(
-            std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
-            std::env::var("XDG_DATA_DIRS").ok(),
-            Path::new(&std::env::var_os("HOME").unwrap_or_else(|| std::ffi::OsString::from("/"))),
-        ),
-        applications_signal_tx,
-    );
+    let mut idle: Option<IdleController> = None;
 
     // lock capability (docs/adr/0042, docs/adr/0052): the Renderer holds ext_session_lock_v1 and
     // paints it; this side owns the decision to take it. The channel exists because the
@@ -546,29 +519,39 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
             }
             Some(signal) = network_signals.recv() => {
                 // The controller owns the signal's state semantics (ADR-0037).
-                let state = network.handle_signal(signal).await;
-                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "network", &state);
+                if let Some(network) = &network {
+                    let state = network.handle_signal(signal).await;
+                    push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "network", &state);
+                }
             }
             Some(signal) = bluetooth_signals.recv() => {
-                let state = bluetooth.handle_signal(signal).await;
-                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "bluetooth", &state);
+                if let Some(bluetooth) = &bluetooth {
+                    let state = bluetooth.handle_signal(signal).await;
+                    push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "bluetooth", &state);
+                }
             }
             Some(TraySignal::RegistryChanged) = tray_signals.recv() => {
                 // No debounce (docs/adr/0031): build_state is a synchronous snapshot of already-
                 // live data the forwarder task recomputed before sending.
-                let tray_state = tray.build_state();
-                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "tray", &tray_state);
+                if let Some(tray) = &tray {
+                    let tray_state = tray.build_state();
+                    push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "tray", &tray_state);
+                }
             }
             Some(dbus::mpris::MprisSignal::Changed) = mpris_signals.recv() => {
                 // No debounce (ADR-0036).
-                let mpris_state = mpris.build_state();
-                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "mpris", &mpris_state);
+                if let Some(mpris) = &mpris {
+                    let mpris_state = mpris.build_state();
+                    push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "mpris", &mpris_state);
+                }
             }
             Some(NotificationsSignal::Changed) = notifications_signals.recv() => {
                 // No debounce (ADR-0033): every mutation fully re-derives notifications state
                 // before signaling.
-                let notifications_state = notifications.build_state();
-                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "notifications", &notifications_state);
+                if let Some(notifications) = &notifications {
+                    let notifications_state = notifications.build_state();
+                    push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "notifications", &notifications_state);
+                }
             }
             Some(event) = idle_signals.recv() => {
                 // Routed to whichever generation made the register_threshold call now firing
@@ -580,51 +563,71 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
             Some(SysinfoSignal::Changed) = sysinfo_signals.recv() => {
                 // No debounce: whichever of the three poll tasks fired already wrote its field(s)
                 // under its own lock (docs/adr/0035); this arm just clones and pushes.
-                let state = sysinfo.snapshot();
-                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "sysinfo", &state);
+                if let Some(sysinfo) = &sysinfo {
+                    let state = sysinfo.snapshot();
+                    push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "sysinfo", &state);
+                }
             }
             Some(KeyboardSignal::Changed) = keyboard_signals.recv() => {
-                let state = keyboard.snapshot();
-                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "keyboard", &state);
+                if let Some(keyboard) = &keyboard {
+                    let state = keyboard.snapshot();
+                    push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "keyboard", &state);
+                }
             }
             Some(BatterySignal::Changed) = battery_signals.recv() => {
-                let state = battery.snapshot();
-                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "battery", &state);
+                if let Some(battery) = &battery {
+                    let state = battery.snapshot();
+                    push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "battery", &state);
+                }
             }
             Some(BrightnessSignal::Changed) = brightness_signals.recv() => {
                 // Fires only when a backlight device was found (docs/adr/0053).
-                let state = brightness.snapshot();
-                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "brightness", &state);
+                if let Some(brightness) = &brightness {
+                    let state = brightness.snapshot();
+                    push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "brightness", &state);
+                }
             }
             Some(WorkspacesSignal::Changed) = workspaces_signals.recv() => {
                 // The controller filters niri's stream down to real changes already.
-                let state = workspaces.snapshot();
-                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "workspaces", &state);
+                if let Some(workspaces) = &workspaces {
+                    let state = workspaces.snapshot();
+                    push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "workspaces", &state);
+                }
             }
             Some(PowerSignal::Changed) = power_signals.recv() => {
                 // UPower re-emits EnergyRate roughly once a minute; the controller filters that
                 // to real changes first.
-                let state = power.snapshot();
-                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "power", &state);
+                if let Some(power) = &power {
+                    let state = power.snapshot();
+                    push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "power", &state);
+                }
             }
             Some(ApplicationsSignal::Changed) = applications_signals.recv() => {
-                let state = applications.snapshot();
-                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "applications", &state);
+                if let Some(applications) = &applications {
+                    let state = applications.snapshot();
+                    push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "applications", &state);
+                }
             }
             Some(SystemSignal::Changed) = system_signals.recv() => {
                 // The only capability pushing on a timer, once per wall-clock second (docs/adr/
                 // 0053 decision 2) -- emitted only when the epoch second actually changed.
-                let state = system.snapshot();
-                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "system", &state);
+                if let Some(system) = &system {
+                    let state = system.snapshot();
+                    push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "system", &state);
+                }
             }
             Some(PrivacySignal::Changed) = privacy_signals.recv() => {
-                let state = privacy.snapshot();
-                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "privacy", &state);
+                if let Some(privacy) = &privacy {
+                    let state = privacy.snapshot();
+                    push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "privacy", &state);
+                }
             }
             Some(UpdatesSignal::Changed) = updates_signals.recv() => {
                 // Fires after a periodic check and install progress updates.
-                let state = updates.snapshot();
-                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "updates", &state);
+                if let Some(updates) = &updates {
+                    let state = updates.snapshot();
+                    push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, "updates", &state);
+                }
             }
             Some(command) = lock_commands.recv() => {
                 // The only place a SetSessionLock is addressed. The state push rides along: every
@@ -713,23 +716,25 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                 }
                 RendererFrame::Command(envelope) => match envelope.params.capability.as_str() {
                     // One arm per capability: each dispatch adapter owns its own action match,
-                    // argument parse, and write-action spawn (ADR-0037).
+                    // argument parse, and write-action spawn (ADR-0037). Every arm but `process`
+                    // and `lock` reads an `Option`, because a controller exists only once the
+                    // config has read its member (docs/adr/0070) -- see `log_unstarted`.
                     "process" => process::registry::dispatch(&mut processes, &registry, &process_done_tx, &envelope).await,
-                    "network" => network::dispatch(&network, &envelope),
-                    "bluetooth" => bluetooth::dispatch(&bluetooth, &envelope),
-                    "tray" => tray::dispatch(&tray, &envelope),
-                    "idle" => idle::dispatch(&idle, &envelope),
-                    "sysinfo" => sysinfo::dispatch(&sysinfo, &envelope),
-                    "keyboard" => keyboard::dispatch(&keyboard, &envelope),
-                    "brightness" => brightness::dispatch(&brightness, &envelope),
-                    "workspaces" => workspaces::dispatch(&workspaces, &envelope),
-                    "power" => power::dispatch(&power, &envelope),
-                    "audio" => audio::dispatch(&audio_commands, &envelope),
-                    "mpris" => dbus::mpris::dispatch(&mpris, &envelope),
-                    "updates" => updates::dispatch(&updates, &envelope),
-                    "notifications" => notifications::dispatch(&notifications, &envelope),
+                    "network" => match &network { Some(c) => network::dispatch(c, &envelope), None => log_unstarted(&envelope) },
+                    "bluetooth" => match &bluetooth { Some(c) => bluetooth::dispatch(c, &envelope), None => log_unstarted(&envelope) },
+                    "tray" => match &tray { Some(c) => tray::dispatch(c, &envelope), None => log_unstarted(&envelope) },
+                    "idle" => match &idle { Some(c) => idle::dispatch(c, &envelope), None => log_unstarted(&envelope) },
+                    "sysinfo" => match &sysinfo { Some(c) => sysinfo::dispatch(c, &envelope), None => log_unstarted(&envelope) },
+                    "keyboard" => match &keyboard { Some(c) => keyboard::dispatch(c, &envelope), None => log_unstarted(&envelope) },
+                    "brightness" => match &brightness { Some(c) => brightness::dispatch(c, &envelope), None => log_unstarted(&envelope) },
+                    "workspaces" => match &workspaces { Some(c) => workspaces::dispatch(c, &envelope), None => log_unstarted(&envelope) },
+                    "power" => match &power { Some(c) => power::dispatch(c, &envelope), None => log_unstarted(&envelope) },
+                    "audio" => match &audio_commands { Some(c) => audio::dispatch(c, &envelope), None => log_unstarted(&envelope) },
+                    "mpris" => match &mpris { Some(c) => dbus::mpris::dispatch(c, &envelope), None => log_unstarted(&envelope) },
+                    "updates" => match &updates { Some(c) => updates::dispatch(c, &envelope), None => log_unstarted(&envelope) },
+                    "notifications" => match &notifications { Some(c) => notifications::dispatch(c, &envelope), None => log_unstarted(&envelope) },
                     "lock" => lock::dispatch(&lock, &envelope),
-                    "applications" => applications::dispatch(&applications, &envelope),
+                    "applications" => match &applications { Some(c) => applications::dispatch(c, &envelope), None => log_unstarted(&envelope) },
                     _ => eprintln!("inbound command from generation {}: {:?}", inbound.generation_id, envelope),
                 },
                 RendererFrame::ReadySignal(_) | RendererFrame::PresentationEvidence(_) => {
@@ -739,6 +744,147 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     // a wire-protocol desync.
                     eprintln!("generation {}'s handshake frame arrived outside any in-flight PBA handshake; dropping: {:?}", inbound.generation_id, inbound.frame);
                 }
+                RendererFrame::StartCapability { capability } => {
+                    // docs/adr/0070: the config read `oblisk.<capability>` (or declared a
+                    // `secure_submit` naming it), and this is the first time anything in this
+                    // process has. Awaited inline rather than spawned -- decision 4 says why.
+                    match capability.as_str() {
+                        "network" if network.is_none() => {
+                            match NetworkController::new(connection.clone(), network_signal_tx.clone()).await {
+                                Ok(controller) => network = Some(controller),
+                                Err(err) => eprintln!("network: NetworkManager is unreachable; capability disabled for this run: {err}"),
+                            }
+                        }
+                        "bluetooth" if bluetooth.is_none() => {
+                            bluetooth = Some(BluetoothController::new(connection.clone(), bluetooth_signal_tx.clone()).await);
+                        }
+                        // The tray host is a session-bus protocol, unlike NetworkManager/BlueZ/
+                        // polkit above, so it needs its own connection. A missing session bus
+                        // degrades to TrayController::inert.
+                        "tray" if tray.is_none() => {
+                            tray = Some(match zbus::Connection::session().await {
+                                Ok(tray_connection) => TrayController::new(tray_connection, tray_signal_tx.clone()).await,
+                                Err(err) => {
+                                    eprintln!("tray: failed to connect to the session bus; tray host disabled for this run: {err}");
+                                    TrayController::inert(tray_signal_tx.clone())
+                                }
+                            });
+                        }
+                        // Notifications get their own session-bus connection (ADR-0033): a real
+                        // desktop may already own org.freedesktop.Notifications, degrading to
+                        // inert via RequestName's DoNotQueue.
+                        "notifications" if notifications.is_none() => {
+                            notifications = Some(match zbus::Connection::session().await {
+                                Ok(bus) => NotificationsController::new(bus, notifications_signal_tx.clone(), sound_tx.clone()).await,
+                                Err(err) => {
+                                    eprintln!("notifications: failed to connect to the session bus; notifications server disabled for this run: {err}");
+                                    NotificationsController::inert(notifications_signal_tx.clone(), sound_tx.clone())
+                                }
+                            });
+                        }
+                        // MPRIS gets its own session-bus connection too (ADR-0036).
+                        // MprisController::new is not async: it spawns discovery and returns.
+                        "mpris" if mpris.is_none() => {
+                            mpris = Some(match zbus::Connection::session().await {
+                                Ok(bus) => dbus::mpris::MprisController::new(bus, mpris_signal_tx.clone()),
+                                Err(err) => {
+                                    eprintln!("mpris: failed to connect to the session bus; player discovery disabled for this run: {err}");
+                                    dbus::mpris::MprisController::inert(mpris_signal_tx.clone())
+                                }
+                            });
+                        }
+                        // Three independently-configurable poll tasks, still dormant after this
+                        // until Lua calls sysinfo:configure (docs/adr/0035).
+                        "sysinfo" if sysinfo.is_none() => {
+                            sysinfo = Some(SysinfoController::new(PathBuf::from("/proc"), PathBuf::from("/sys/class/hwmon"), sysinfo_signal_tx.clone()));
+                        }
+                        // A missing KbdBacklight degrades in place to backlight_pct: -1, a missing
+                        // lock source to false (docs/adr/0034).
+                        "keyboard" if keyboard.is_none() => {
+                            keyboard = Some(KeyboardController::new(connection.clone(), &PathBuf::from("/sys/class/leds"), keyboard_signal_tx.clone()).await);
+                        }
+                        // Kernel-level /dev/videoN open/close via inotify plus a /proc fd-scan,
+                        // enriched by the mixer thread's video_sources (docs/adr/0034).
+                        "privacy" if privacy.is_none() => {
+                            ensure_mixer_thread(&mut audio_commands, &audio_tx, &mut video_tx);
+                            if let Some(video_sources) = video_sources.take() {
+                                privacy = Some(PrivacyController::new(
+                                    PathBuf::from("/proc"),
+                                    &PathBuf::from("/sys/class/video4linux"),
+                                    video_sources,
+                                    privacy_signal_tx.clone(),
+                                ));
+                            }
+                        }
+                        // alpm-based Arch update checking, separate from sysinfo's own scheduler
+                        // and equally dormant until Lua sets an interval (docs/adr/0034).
+                        "updates" if updates.is_none() => {
+                            updates = Some(UpdatesController::new(PathBuf::from("/etc/pacman.conf"), PathBuf::from("/var/lib/pacman"), updates_signal_tx.clone()));
+                        }
+                        // The root is a parameter, not a constant, so device selection is testable
+                        // against a fixture directory (docs/adr/0053, § 2.2).
+                        "battery" if battery.is_none() => {
+                            battery = Some(BatteryController::new(PathBuf::from("/sys/class/power_supply"), battery_signal_tx.clone()));
+                        }
+                        // Ranked firmware over platform over raw. No device found means it never
+                        // pushes -- see hardware::brightness's module doc.
+                        "brightness" if brightness.is_none() => {
+                            brightness = Some(BrightnessController::new(PathBuf::from("/sys/class/backlight"), connection.clone(), brightness_signal_tx.clone()));
+                        }
+                        // niri's IPC stream via $NIRI_SOCKET. A non-niri session never pushes.
+                        "workspaces" if workspaces.is_none() => {
+                            workspaces = Some(WorkspacesController::new(workspaces_signal_tx.clone()));
+                        }
+                        // UPower for on_battery/energy_rate, power-profiles-daemon for
+                        // active_profile/profiles. Either can be missing (§ 2.13, docs/adr/0053).
+                        "power" if power.is_none() => {
+                            power = Some(PowerController::new(connection.clone(), power_signal_tx.clone()));
+                        }
+                        // The 1 Hz clock plus persisted state.json (docs/adr/0053, § 2.11).
+                        "system" if system.is_none() => {
+                            system = Some(SystemController::new(
+                                PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| std::ffi::OsString::from("/"))),
+                                std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+                                system_signal_tx.clone(),
+                            ));
+                        }
+                        // The installed `.desktop` entries. Scans in the background from
+                        // construction, so this arm returns before the first entry is parsed.
+                        "applications" if applications.is_none() => {
+                            applications = Some(ApplicationsController::new(
+                                applications::application_dirs(
+                                    std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+                                    std::env::var("XDG_DATA_DIRS").ok(),
+                                    Path::new(&std::env::var_os("HOME").unwrap_or_else(|| std::ffi::OsString::from("/"))),
+                                ),
+                                applications_signal_tx.clone(),
+                            ));
+                        }
+                        "audio" if audio_commands.is_none() => {
+                            ensure_mixer_thread(&mut audio_commands, &audio_tx, &mut video_tx);
+                        }
+                        // Constructed after `spawn_listener` in every case, since this arm only
+                        // runs once a Renderer is connected: notify setup's own spawn_blocking
+                        // task (hardware::idle's module doc) cannot block the control socket.
+                        "idle" if idle.is_none() => {
+                            idle = Some(IdleController::new(connection.clone(), idle_signal_tx.clone()).await);
+                        }
+                        // Not a controller: `LockController` is a state holder built at boot
+                        // because the Supervisor's own relock path (docs/adr/0060) commands it
+                        // before any config has read anything.
+                        "lock" => {}
+                        // ADR-0070 decision 5: the only name that reaches here from a
+                        // `secure_submit` rather than from a capability read.
+                        "polkit" => polkit_agent.register(&connection).await,
+                        // Decision 3: every generation sends its own starts, so a swap re-sends
+                        // every name the previous one read.
+                        already if already == "idle" || shared::CAPABILITIES.contains(&already) => {}
+                        other => eprintln!(
+                            "generation {} asked to start {other:?}, which is not a capability this Supervisor builds",
+                            inbound.generation_id
+                        ),
+                    }
+                }
                 RendererFrame::RequestReload => {
                     // docs/adr/0041 decision 4: a wl_output appeared or disappeared. Deliberately
                     // uses authoritative.generation_id, not inbound.generation_id -- a superseded
@@ -747,7 +893,11 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                 }
                 RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence }) => {
                     if is_current_reload(sequence, next_sequence) {
-                        idle.reset_registrations(inbound.generation_id).await;
+                        // Only if the config ever asked for a threshold: with no controller
+                        // there is nothing registered to reset.
+                        if let Some(idle) = &idle {
+                            idle.reset_registrations(inbound.generation_id).await;
+                        }
                         send_frame_logged(&registry, inbound.generation_id, &SupervisorFrame::ApplyPendingReload(ApplyPendingReload { sequence }));
                     } else {
                         eprintln!(
@@ -803,12 +953,12 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                 RendererFrame::SecureSubmit(mut submit) if submit.capability == "polkit" && submit.action == "authenticate" => {
                     // docs/adr/0028: the polkit-routed case. Must come before the catch-all
                     // SecureSubmit arm below -- match arms are tried in order.
-                    match pending_challenge.take() {
-                        Some(challenge) => {
+                    match pending_challenge.take().zip(authority.as_ref()) {
+                        Some((challenge, authority)) => {
                             // mem::take moves the plaintext out for drive_pam_and_respond to own
                             // and zeroize on every return path -- nothing left in submit to zeroize.
                             let secret = std::mem::take(&mut submit.secret);
-                            pam_worker::drive_pam_and_respond(&authority, challenge, secret).await;
+                            pam_worker::drive_pam_and_respond(authority, challenge, secret).await;
                         }
                         None => {
                             eprintln!(
@@ -823,12 +973,12 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     // ADR-0029, mirroring the polkit arm above: an empty secret means an open
                     // network, a non-empty one becomes the wpa-psk password. Must come before the
                     // catch-all arm below, same ordering reason.
-                    match network.take_connect_intent() {
+                    match network.as_ref().and_then(NetworkController::take_connect_intent) {
                         Some(pending) => {
                             // mem::take moves the plaintext out for NetworkController::connect to
                             // own and zeroize on every return path.
                             let secret = std::mem::take(&mut submit.secret);
-                            let controller = network.clone();
+                            let controller = network.clone().expect("take_connect_intent above only answers from a live controller");
                             tokio::spawn(async move { controller.connect(pending, secret).await; });
                         }
                         None => {
