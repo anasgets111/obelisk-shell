@@ -1,9 +1,7 @@
 //! Core surface bookkeeping shared by every role: the `TrackedRole`/`TrackedSurface`/`MapState`
 //! data model, EGL binding, and the create/destroy/paint/(un)map lifecycle every configure handler
-//! in the sibling modules ultimately calls into.
-//!
-//! Role-specific behavior (what a `panel`, `window`, `popup` or `lock` surface does with its own
-//! protocol object) lives in `layer`, `xdg_shell` and `lock`; this module is what they all share.
+//! calls into. Role-specific behavior lives in `layer`, `xdg_shell` and `lock`; this module is
+//! what they all share.
 
 use super::*;
 use crate::wayland::layer::anchor_for;
@@ -11,10 +9,10 @@ use crate::wayland::layer::keyboard_interactivity_for;
 use crate::wayland::layer::layer_extent_for;
 
 /// A window surface bound to the shared EGL context after its first configure.
-/// Field order matters: wayland-egl requires `WlEglSurface` to outlive the EGL surface
-/// built from it, and Rust drops fields top to bottom, so `egl_surface` is declared first.
-/// `khronos_egl::Surface` has no `Drop` of its own, so dropping this struct never calls
-/// `eglDestroySurface` -- only [`App::destroy_surface_by_id`] does that.
+/// Field order matters: wayland-egl requires `WlEglSurface` to outlive the EGL surface built
+/// from it, and Rust drops fields top to bottom, so `egl_surface` is declared first.
+/// `khronos_egl::Surface` has no `Drop`, so dropping this struct never calls `eglDestroySurface` --
+/// only [`App::destroy_surface_by_id`] does that.
 pub(super) struct BoundSurface {
     egl_surface: EglSurface,
     #[allow(dead_code)]
@@ -29,14 +27,13 @@ pub(super) fn log_bind_failure(surface_id: &str, stage: &str, err: impl std::fmt
 /// § 6.1's `visible`, as the compositor currently sees it (ADR-0038 decision 2: within a
 /// live generation, `visible` maps and unmaps a surface without destroying it).
 ///
-/// Three states, not two: `zwlr_layer_surface_v1` requires a re-map to commit with no buffer
-/// attached and wait for a configure before attaching one, and a surface's first map obeys the
-/// same rule, so both share `AwaitingConfigure`.
+/// Three states, not two: a re-map must commit with no buffer, then wait for a configure before
+/// attaching one, and a surface's first map obeys the same rule. Both share `AwaitingConfigure`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MapState {
     /// `visible` is false: no buffer was ever attached, or a null buffer unmapped one. Nothing
-    /// may be painted or committed here -- see [`App::unmap`] -- since an empty commit is the
-    /// re-map.
+    /// may be painted or committed here, since an empty commit is the re-map (see
+    /// [`App::unmap`]).
     Unmapped,
     /// The map (or re-map) commit is out and the compositor has not configured the surface yet.
     AwaitingConfigure,
@@ -45,16 +42,16 @@ pub(super) enum MapState {
     Mapped,
 }
 impl MapState {
-    /// Whether this surface will put a frame on screen, which is the one predicate PBA's expected
-    /// set and PBA's drawn set must agree on -- see [`presenting_surface_ids`].
+    /// Whether this surface will put a frame on screen: the one predicate PBA's expected set
+    /// and its drawn set must agree on. See [`presenting_surface_ids`].
     fn presents(self) -> bool {
         self != MapState::Unmapped
     }
 }
 /// The protocol object a tracked surface's `wl_surface` has been given a role by, plus the spec
-/// its state was last set from (§ 6, ADR-0040 decision 1). One enum, not a `Vec` per role,
-/// because the EGL binding, paint pass, input routing and PBA staging are identical across roles
-/// and all index one `App::surfaces`.
+/// its state was last set from (§ 6, ADR-0040 decision 1). One enum, not a `Vec` per role: EGL
+/// binding, paint, input routing and PBA staging are identical across roles and all index one
+/// `App::surfaces`.
 ///
 /// Variants differ in how long the Wayland object lives (ADR-0049 decision 1): a `panel`'s
 /// lives for the generation, a `window`'s or `popup`'s only while shown, hence `Option`.
@@ -62,16 +59,14 @@ pub(super) enum TrackedRole {
     Panel {
         layer: LayerSurface,
         /// The diff baseline `layer::spec_update` compares a fresh resolve against, so only fields
-        /// that actually moved are pushed (ADR-0038 decision 2). Also the standing
-        /// anchor/exclusive answer [`App::apply_exclusive_zone`] needs once `configure` reports
-        /// a size.
+        /// that actually moved are pushed (ADR-0038 decision 2). Also the standing anchor/exclusive
+        /// answer [`App::apply_exclusive_zone`] needs once `configure` reports a size.
         spec: PanelSpec,
         /// This surface's output's logical size, the basis `SizeMode::Percent` resolves against.
         /// Kept per surface rather than read from `SurfaceInstance::available`: `set_instance_size`
         /// overwrites `available` with the compositor-granted size after the first configure, so
-        /// resolving a percent against it later would take a percentage of a percentage and
-        /// shrink the surface on every push. Panel-only: § 6.2 gives a `window` no `width`/
-        /// `height` to resolve.
+        /// resolving a percent against it later would shrink the surface on every push. Panel-only:
+        /// § 6.2 gives a `window` no `width`/`height` to resolve.
         output_size: layout::LogicalSize,
     },
     Window {
@@ -79,8 +74,9 @@ pub(super) enum TrackedRole {
         /// do not exist at all (ADR-0049 decision 1). A declared-but-never-shown window
         /// costs one retained node and zero Wayland objects.
         window: Option<Window>,
-        /// This toplevel's state's diff baseline for `xdg_shell::window_update`. Maintained even while
-        /// `window` is `None`, so [`App::show_window`] builds from the last re-resolve's spec.
+        /// This toplevel's state's diff baseline for `xdg_shell::window_update`. Maintained even
+        /// while `window` is `None`, so [`App::show_window`] builds from the last re-resolve's
+        /// spec.
         spec: WindowSpec,
     },
     Popup {
@@ -88,24 +84,23 @@ pub(super) enum TrackedRole {
         /// anchored once cannot be re-anchored (ADR-0049); every open builds a fresh
         /// positioner, `wl_surface` and `xdg_popup`.
         popup: Option<Popup>,
-        /// The spec the next open builds from -- not a diff baseline like a panel's or window's:
+        /// The spec the next open builds from. Not a diff baseline like a panel's or window's:
         /// every field is an `xdg_positioner` request consumed at creation, so this is a plain
         /// store, re-read whole at the next [`App::show_popup`].
         spec: PopupSpec,
-        /// ADR-0051 decision 2's latch: [`App::pointer_input_count`] when the compositor
-        /// dismissed this popup, or `None` if not dismissed. No replacement is created while
-        /// the counter is unmoved -- without the latch, a click-outside livelocks: `popup_done`
-        /// destroys the object but leaves `visible = true`, so the next re-resolve reopens it
-        /// for the same click-outside, forever.
+        /// ADR-0051 decision 2's latch: [`App::pointer_input_count`] when the compositor dismissed
+        /// this popup, `None` if not. No replacement opens while the counter is unmoved, or a
+        /// click-outside livelocks: `popup_done` destroys the object but leaves `visible = true`,
+        /// reopening it on the next re-resolve, forever.
         ///
-        /// A count, not the bool decision 2 first specified (ADR-0051's first amendment):
-        /// the `visible = false` edge meant to clear it is unobservable in this case, so a bool
-        /// latches permanently. See `xdg_shell::popup_visibility_action`, which reads this.
+        /// A count, not a bool (ADR-0051's first amendment): the `visible = false` edge meant to
+        /// clear it is unobservable here, so a bool would latch permanently. See
+        /// `xdg_shell::popup_visibility_action`, which reads this.
         dismissed_at: Option<u64>,
-        /// Which of [`App::show_popup`]'s refusals was last logged for this `visible = true`
-        /// run, or `None` if none has been -- ADR-0049's amendment: log a refusal once,
-        /// not once per re-resolve. Not a second latch: it does not stop retries, only repeated
-        /// logging. Cleared on a successful create or `visible = false`.
+        /// Which of [`App::show_popup`]'s refusals was last logged for this `visible = true` run,
+        /// or `None` if none has (ADR-0049's amendment: log a refusal once, not per re-resolve).
+        /// Not a second latch, it only suppresses repeated logging. Cleared on a successful
+        /// create or `visible = false`.
         refusal_logged: Option<PopupRefusal>,
     },
     Lock {
@@ -116,7 +111,7 @@ pub(super) enum TrackedRole {
         /// handle is the teardown and nothing else is: `SessionLockSurfaceInner::Drop` sends
         /// `ext_session_lock_surface_v1.destroy`, which makes the compositor fall back to a
         /// solid color on outputs still present. Cleared only by an output removal
-        /// ([`App::destroy_surface_by_id`]) or the end of the lock ([`App::teardown_lock_surfaces`]).
+        /// ([`App::destroy_surface_by_id`]) or the lock ending ([`App::teardown_lock_surfaces`]).
         surface: Option<SessionLockSurface>,
     },
 }
@@ -139,9 +134,10 @@ impl TrackedRole {
             TrackedRole::Panel { layer, .. } => Some(PopupParent::Layer(layer.clone())),
             TrackedRole::Window { window, .. } => window.as_ref().map(|w| PopupParent::Xdg(w.xdg_surface().clone())),
             TrackedRole::Popup { popup, .. } => popup.as_ref().map(|p| PopupParent::Xdg(p.xdg_surface().clone())),
-            // `ext_session_lock_surface_v1` is neither an `xdg_surface` nor a `zwlr_layer_surface_v1`,
-            // the only two `get_popup` accepts, so no request can root a popup here. That matches the
-            // protocol anyway: while locked the compositor shows lock surfaces only (ADR-0042).
+            // `ext_session_lock_surface_v1` is neither an `xdg_surface` nor a
+            // `zwlr_layer_surface_v1`, the only two `get_popup` accepts, so no request can root a
+            // popup here. That matches the protocol: while locked the compositor shows lock
+            // surfaces only (ADR-0042).
             TrackedRole::Lock { .. } => None,
         }
     }
@@ -161,10 +157,9 @@ pub(super) enum PopupRefusal {
 /// The two ways a popup gets rooted, which differ in when rather than what.
 ///
 /// `Popup::from_surface` takes an `Option<&xdg_surface>` and roots at creation, covering a
-/// `window` or nested `popup`. A `panel`'s surface has a layer-shell role and no `xdg_surface`,
-/// so layer-shell's own `zwlr_layer_surface_v1.get_popup` sends the raw `xdg_popup` back, which
-/// must happen after the popup object exists and before the initial commit, so [`Popup::new`],
-/// which commits for you, cannot be used here.
+/// `window` or nested `popup`. A `panel`'s surface has a layer-shell role and no `xdg_surface`:
+/// `zwlr_layer_surface_v1.get_popup` sends the raw `xdg_popup` back after the popup object exists
+/// and before the initial commit, so [`Popup::new`], which commits for you, cannot be used here.
 pub(super) enum PopupParent {
     Layer(LayerSurface),
     Xdg(xdg_surface::XdgSurface),
@@ -179,7 +174,7 @@ pub(super) struct TrackedSurface {
     pub(super) map_state: MapState,
     /// Set once this surface's null buffer is committed (PBA candidate mode only, § 15.2 points
     /// 2-3); always `false` outside candidate mode. Never set for a `window` not shown, since
-    /// staging happens on a configure it will never get -- see [`candidate_has_staged`].
+    /// staging happens on a configure it will never get. See [`candidate_has_staged`].
     pub(super) null_buffered: bool,
     /// The most recent `configure` size, so [`App::activate_draw`] has a real size to bind EGL
     /// to: in candidate mode the first configure doesn't bind EGL (see [`App::bind_and_clear`]).
@@ -187,26 +182,24 @@ pub(super) struct TrackedSurface {
     /// What this surface last actually painted, and at what size, so [`App::paint_surface`] can
     /// skip a repaint that would put down identical pixels.
     ///
-    /// Carries the size as well as the list because the same list at a new size is a different
-    /// frame: the EGL surface behind it was resized and its buffer holds nothing. Cleared
-    /// outright when the surface is (re)bound, since a fresh `EGLSurface`'s buffers are undefined
-    /// and the pixels this recorded are gone with the old one.
+    /// Carries the size because the same list at a new size is a different frame: the EGL surface
+    /// behind it was resized and its buffer holds nothing. Cleared when the surface is (re)bound,
+    /// since a fresh `EGLSurface`'s buffers are undefined.
     ///
-    /// `None` means "must paint", which is the correct answer for every state this cannot vouch
-    /// for. Getting the invalidation wrong in the other direction leaves a stale frame on screen
-    /// with nothing to trigger a redraw, so every branch that cannot prove the buffer still holds
-    /// what this says clears it.
+    /// `None` means "must paint". Getting invalidation wrong the other way leaves a stale frame on
+    /// screen with nothing to trigger a redraw, so every branch that cannot prove the buffer still
+    /// matches clears it.
     pub(super) last_painted: Option<((u32, u32), layout::paint::DisplayList)>,
 }
-/// § 5.1's `visible` at the moment [`App::create_surfaces`] first builds one instance, given
-/// what its resolved tree says (`None` when it has none) and which role was declared.
+/// § 5.1's `visible` at the moment [`App::create_surfaces`] first builds one instance, given what
+/// its resolved tree says (`None` when it has none) and which role was declared.
 ///
 /// Role-aware fallback: an absent tree means the startup apply failed and rolled back
-/// (`Scene::apply` restores its pre-call state on error), so a `panel` (ADR-0038 decision 2)
-/// treats it as visible -- "keep the shell up", painting nothing until the next re-resolve.
-/// `window`/`popup` have create-and-destroy semantics (ADR-0049 decision 1), so an absent
-/// tree is not a declaration of `visible = true`. A `lock` has no `visible` property at all
-/// (§ 6.4, ADR-0042); `false` is the answer that stays correct if a future caller reads it.
+/// (`Scene::apply` restores its pre-call state on error). A `panel` (ADR-0038 decision 2) treats
+/// it as visible ("keep the shell up"), painting nothing until the next re-resolve. `window`/
+/// `popup` have create-and-destroy semantics (ADR-0049 decision 1), so an absent tree is not
+/// `visible = true`. A `lock` has no `visible` property (§ 6.4, ADR-0042); `false` stays correct
+/// if a future caller reads it.
 fn starting_visible(resolved: Option<bool>, roster: &SurfaceSpec) -> bool {
     resolved.unwrap_or(match roster {
         SurfaceSpec::Panel(_) => true,
@@ -216,12 +209,12 @@ fn starting_visible(resolved: Option<bool>, roster: &SurfaceSpec) -> bool {
 /// One surface's [`SurfaceSpec`] re-derived from its resolved properties, and the § 6 role word
 /// for the log line if it fails (ADR-0049's second amendment).
 ///
-/// `roster` contributes only the role; everything else comes from `properties`, already read
-/// once this pass (ADR-0044 decision 1). The role cannot come from properties instead: `kind` is
-/// what built the roster, and a disagreeing resolved tree would be a reconcile bug.
+/// `roster` contributes only the role; everything else comes from `properties`, already read once
+/// this pass (ADR-0044 decision 1). The role cannot come from properties instead: `kind` is what
+/// built the roster, and a disagreeing resolved tree would be a reconcile bug.
 ///
-/// One caller, [`App::create_surfaces`]; [`App::apply_resolved_state`] does the same parses
-/// inline since it dispatches on the tracked role, not a roster entry.
+/// One caller, [`App::create_surfaces`]; `apply_resolved_state` does the same parses inline since
+/// it dispatches on the tracked role, not a roster entry.
 fn resolved_surface_spec(
     roster: &SurfaceSpec,
     properties: &HashMap<String, Value>,
@@ -234,43 +227,38 @@ fn resolved_surface_spec(
     }
 }
 /// The surface ids a PBA Candidate both announces in its `ReadySignal` and then draws on
-/// `ActivateDraw` -- one function, called from [`App::maybe_send_ready_signal`], and the same
+/// `ActivateDraw`. Called from [`App::maybe_send_ready_signal`], using the same
 /// [`MapState::presents`] predicate [`App::activate_draw`] skips on.
 ///
-/// The two sets must be identical; both directions of a mismatch are fatal in
-/// `supervisor/src/reload.rs`'s `drive_handshake`. Announcing a surface that never draws leaves
-/// `while collected.len() < expected.len()` waiting for evidence that cannot arrive until
-/// `evidence_timeout`. Drawing one that was not announced trips `!expected.contains(&surface_id)`
-/// and aborts the Candidate as `PbaFailure::UnexpectedEvidence`.
+/// The two sets must be identical; either mismatch is fatal in `supervisor/src/reload.rs`'s
+/// `drive_handshake`. An announced surface that never draws leaves `collected.len() <
+/// expected.len()` waiting past `evidence_timeout`. A drawn surface that was never announced
+/// trips `!expected.contains(&surface_id)` and aborts as `PbaFailure::UnexpectedEvidence`.
 ///
-/// A panel declared `visible = false` forces the filter: ADR-0038 decision 2 still creates
-/// it, so it stages like every other surface but never presents a frame. `window`/`popup` declared
-/// `visible = false` reach the same answer by a shorter route (ADR-0049 decision 1 does not
-/// create their role object at all). A `popup` is strongest: a Candidate freezes
-/// [`App::apply_visibility`] and has no armed serial to grab with, so it never presents during a
-/// handshake whatever `visible` says.
+/// A panel declared `visible = false` still stages (ADR-0038 decision 2 creates it regardless)
+/// but never presents, so the filter must catch it. `window`/`popup` reach the same answer since
+/// ADR-0049 decision 1 never creates their role object when hidden, and a Candidate additionally
+/// freezes a `popup`'s [`App::apply_visibility`] with no armed serial to grab with.
 ///
-/// An empty result is legal, not a degenerate case: `drive_handshake`'s collection loop exits
-/// immediately on an empty expected set.
+/// An empty result is legal: `drive_handshake`'s collection loop exits immediately on an empty
+/// expected set.
 fn presenting_surface_ids<'a>(surfaces: impl Iterator<Item = (&'a str, MapState)>) -> Vec<String> {
     surfaces.filter(|(_, state)| state.presents()).map(|(id, _)| id.to_string()).collect()
 }
 /// Whether every tracked surface has staged everything a PBA Candidate owes it, which is
-/// [`App::maybe_send_ready_signal`]'s gate (§ 15.2 points 2-3). Takes `(null_buffered, exists)` per
-/// surface, where `exists` is whether the surface currently has a Wayland object at all.
+/// [`App::maybe_send_ready_signal`]'s gate (§ 15.2 points 2-3). Takes `(null_buffered, exists)`
+/// per surface, where `exists` is whether it currently has a Wayland object at all.
 ///
-/// The `exists` half is a gate, not a staging difference. Staging really does generalize:
-/// xdg-shell's initial-commit discipline is layer-shell's, so a shown `window` attaches a null
-/// buffer on its first configure the same way. What does not generalize is the assumption
-/// underneath a plain `all(null_buffered)` -- that every tracked surface gets a configure. A
-/// `panel` always does, since it is created and committed at startup even when `visible` is false.
-/// A `window` declared `visible = false` has no `xdg_toplevel` at all (ADR-0049 decision 1),
-/// so no configure ever arrives, `null_buffered` stays false forever, and the Candidate would
-/// never send `ReadySignal` -- a `ready_timeout` hang on any config declaring a hidden window,
-/// which the dev config already does. A `popup` widens that further: a Candidate freezes `visible`
-/// ([`App::apply_visibility`]), so a popup's `xdg_popup` never exists during a handshake at all.
+/// The `exists` half is a gate, not a staging difference: xdg-shell's initial-commit discipline is
+/// layer-shell's, so a shown `window` attaches a null buffer on its first configure too. What does
+/// not generalize is the plain `all(null_buffered)` assumption that every tracked surface gets a
+/// configure. A `panel` always does, created and committed at startup even when `visible` is
+/// false. A `window` declared `visible = false` has no `xdg_toplevel` (ADR-0049 decision 1), so
+/// `null_buffered` stays false forever and the Candidate never sends `ReadySignal`, a
+/// `ready_timeout` hang. A `popup` widens that further: a Candidate freezes `visible`
+/// ([`App::apply_visibility`]), so its `xdg_popup` never exists during a handshake.
 ///
-/// A surface with no object has nothing to stage or present, so it is complete by construction.
+/// A surface with no object has nothing to stage, so it is complete by construction.
 /// [`presenting_surface_ids`] filters it out on the same `MapState::Unmapped` that makes it
 /// objectless here, keeping the two in step.
 fn candidate_has_staged(surfaces: impl Iterator<Item = (bool, bool)>) -> bool {
@@ -281,24 +269,23 @@ impl App {
     /// One tracked surface per surface instance, built from the evaluation that declared it
     /// (ADR-0038 decision 1, ADR-0049 decision 1).
     ///
-    /// The roles diverge in what "create" means, and only there. A `panel` gets its
-    /// `zwlr_layer_surface_v1` here whatever its `visible` says, because that object lives as long
-    /// as the generation. A `window` or `popup` gets a `TrackedSurface` here and its Wayland object
-    /// only if `visible` already resolves true, through the same [`App::show_window`] and
-    /// [`App::show_popup`] a later flip uses -- one creation path, not a startup special case.
+    /// The roles diverge only in what "create" means. A `panel` gets its `zwlr_layer_surface_v1`
+    /// here whatever `visible` says, since that object lives as long as the generation. A `window`
+    /// or `popup` gets a `TrackedSurface` here and its Wayland object only if `visible` already
+    /// resolves true, through the same [`App::show_window`] and [`App::show_popup`] a later flip
+    /// uses: one creation path, not a startup special case.
     ///
     /// `instances` and `specs` come from the same evaluation, so an instance whose declared id has
-    /// no spec cannot happen; it is skipped with a log rather than panicking, on the same
-    /// "keep the shell up" principle as every other failure in this file.
+    /// no spec cannot happen; it is skipped with a log rather than panicking, the same "keep the
+    /// shell up" principle as every other failure in this file.
     ///
     /// `specs` contributes the roster, not the field values ([`resolved_surface_spec`],
-    /// [`starting_visible`]): it is parsed from the evaluation's unresolved properties, so every
-    /// signal-bound field in it is still at its parser placeholder. What it is right for is which
-    /// declarations exist and what role each is, neither of which a re-resolve can change
-    /// (ADR-0049 decision 3).
+    /// [`starting_visible`]): parsed from the evaluation's unresolved properties, so a signal-bound
+    /// field is still at its parser placeholder. Right for which declarations exist and what role
+    /// each is, neither of which a re-resolve can change (ADR-0049 decision 3).
     ///
-    /// Called with the whole instance set at startup and with only the added instances on a monitor
-    /// hotplug (see [`App::handle_output_change`]) -- the same function either way.
+    /// Called with the whole instance set at startup, and with only the added instances on a
+    /// monitor hotplug (see [`App::handle_output_change`]); the same function either way.
     pub(super) fn create_surfaces(
         &mut self,
         qh: &QueueHandle<App>,
@@ -331,14 +318,12 @@ impl App {
             let visible = starting_visible(tree.as_ref().map(|tree| tree.visible), roster);
             // Built from the resolved properties, as `apply_resolved_state` builds it on every
             // later pass (ADR-0049's second amendment). `run` parses `specs` from the raw,
-            // pre-resolve properties, so a signal-bound field is still at its parser placeholder --
-            // and for a popup that is permanent damage, not one stale frame: every `PopupSpec`
-            // field is an `xdg_positioner` request the positioner consumes at `get_popup`, and
-            // `xdg_popup.reposition` is not built, so a popup shown from the roster spec keeps
-            // `DEFERRED_POPUP_EXTENT`'s 1x1-at-(0,0) placeholder for its whole life.
-            //
-            // A `panel` goes through the same path: `resolve_properties` copies structural
-            // properties through raw, so its topology is identical either way.
+            // pre-resolve properties, so a signal-bound field is still at its parser placeholder.
+            // For a popup that is permanent damage, not one stale frame: every `PopupSpec` field
+            // is an `xdg_positioner` request consumed at `get_popup`, and `xdg_popup.reposition`
+            // is not built, so a popup shown from the roster spec keeps `DEFERRED_POPUP_EXTENT`'s
+            // 1x1-at-(0,0) placeholder for its whole life. A `panel` goes through the same path:
+            // `resolve_properties` copies structural properties through raw either way.
             let spec = match tree.as_ref().map(|tree| resolved_surface_spec(roster, &tree.properties)) {
                 Some((_, Ok(fresh))) => fresh,
                 Some((role, Err(err))) => {
@@ -365,13 +350,13 @@ impl App {
         self.ensure_lock_surfaces(qh);
     }
 
-    /// Frees one surface's rendering side -- its EGL surface and its `wl_egl_window` -- and leaves
-    /// it unbound, with its role object untouched. Steps 1 and 2 of the teardown order
+    /// Frees one surface's rendering side, its EGL surface and its `wl_egl_window`, and leaves it
+    /// unbound, with its role object untouched. Steps 1 and 2 of the teardown order
     /// [`App::destroy_surface_by_id`] documents; whoever calls this owns step 3.
     ///
-    /// Two callers, and they differ in what they do with the role object rather than in how they
-    /// free this half: `destroy_surface_by_id` drops it, and [`App::hide_window`] drops only the
-    /// `xdg_toplevel` and keeps the tracking entry (ADR-0049 decision 1).
+    /// Two callers differ in what they do with the role object, not in how they free this half:
+    /// `destroy_surface_by_id` drops it, and [`App::hide_window`] drops only the `xdg_toplevel`
+    /// and keeps the tracking entry (ADR-0049 decision 1).
     pub(super) fn release_bound(&mut self, index: usize) {
         let Some(bound) = self.surfaces[index].bound.take() else {
             return;
@@ -379,10 +364,10 @@ impl App {
         // `eglDestroySurface`, by hand: `khronos_egl::Surface` is a plain copyable handle with no
         // `Drop`, so without this every unplugged monitor and closed window leaks one EGL surface.
         // Must come before the `wl_egl_window` is destroyed, per [`BoundSurface`]'s contract that
-        // the `WlEglSurface` outlives the EGL surface built from it.
-        // `self.egl` is `Some` for any surface that reached `bound`, since `ensure_bound` is what
-        // creates both. Written as a guard rather than an `expect` because the cost of being wrong
-        // is a leaked EGL surface on a process that is already tearing one down.
+        // the `WlEglSurface` outlives the EGL surface built from it. `self.egl` is `Some` for any
+        // surface that reached `bound`, since `ensure_bound` creates both. Written as a guard
+        // rather than an `expect`: the cost of being wrong is a leaked EGL surface on a process
+        // already tearing one down.
         if let Some(egl) = self.egl.as_ref()
             && let Err(err) = egl.instance.destroy_surface(egl.display, bound.egl_surface)
         {
@@ -395,21 +380,21 @@ impl App {
 
     /// Destroys one surface instance: its role object, its `wl_surface`, its `wl_egl_window`, and
     /// its EGL surface (ADR-0038 decision 3's removal half). A no-op for an id this process has
-    /// no surface for, the normal case for the second of the two events an unplugged monitor
-    /// produces -- `zwlr_layer_surface_v1::closed` and `OutputHandler::output_destroyed` both arrive,
-    /// in either order, and whichever comes first does the work.
+    /// no surface for: the normal case for the second of the two events an unplugged monitor
+    /// produces, `zwlr_layer_surface_v1::closed` and `OutputHandler::output_destroyed` both
+    /// arrive, in either order, and whichever comes first does the work.
     ///
-    /// Teardown runs outermost-first, and the explicit steps below are what make that so rather than
-    /// leaving it to field order (`TrackedSurface` declares `role` before `bound`, so a plain drop
-    /// would destroy the `wl_surface` out from under the `wl_egl_window` still pointing at it):
+    /// Teardown runs outermost-first. The explicit steps below make that so rather than leaving it
+    /// to field order (`TrackedSurface` declares `role` before `bound`, so a plain drop would
+    /// destroy the `wl_surface` out from under the `wl_egl_window` still pointing at it):
     ///
     /// 0. Every popup rooted under this surface ([`App::drop_child_popups`]): xdg-shell refuses to
     ///    destroy an `xdg_surface` that still has one.
     /// 1. `eglDestroySurface`, by hand ([`App::release_bound`]).
     /// 2. `BoundSurface`'s drop, which is `wl_egl_window_destroy` (also `release_bound`).
-    /// 3. The role object's drop, destroying the role (`zwlr_layer_surface_v1`, or an `xdg_toplevel`
-    ///    preceded by its decoration object) and then the `wl_surface`, in that order -- both
-    ///    protocols require it and SCTK implements it.
+    /// 3. The role object's drop, destroying the role (`zwlr_layer_surface_v1`, or an
+    ///    `xdg_toplevel` preceded by its decoration object) and then the `wl_surface`: both
+    ///    protocols require that order and SCTK implements it.
     pub(super) fn destroy_surface_by_id(&mut self, instance_id: &str) {
         let Some(index) = self.surfaces.iter().position(|s| s.surface_id == instance_id) else {
             return;
@@ -428,16 +413,16 @@ impl App {
     /// derive the exclusive zone from it, bind EGL if this surface has not been bound yet, and
     /// paint.
     ///
-    /// PBA candidate mode (`self.is_pba_candidate`, § 15.2 points 2-3) stops after the null buffer
-    /// instead: a first configure commits a null buffer directly on the raw `wl_surface` rather
-    /// than binding EGL at all -- the Candidate stays invisible, occupying zero on-screen
+    /// PBA candidate mode (`self.is_pba_candidate`, § 15.2 points 2-3) stops after the null
+    /// buffer instead: a first configure commits a null buffer directly on the raw `wl_surface`
+    /// rather than binding EGL. The Candidate stays invisible, occupying zero on-screen
     /// coordinates, until [`App::activate_draw`] does the real EGL bind later.
     ///
     /// Role-agnostic: xdg-shell's initial-commit discipline is `zwlr_layer_surface_v1`'s
-    /// (ADR-0040 decision 4), so an `xdg_toplevel` configure lands here through the same path with
-    /// nothing branching on which protocol asked. The two callers differ only in where the size
-    /// comes from -- layer-shell hands one over, a toplevel's may be the client's to pick (see
-    /// `xdg_shell::toplevel_size_for`).
+    /// (ADR-0040 decision 4), so an `xdg_toplevel` configure lands here through the same path
+    /// with nothing branching on which protocol asked. The two callers differ only in where the
+    /// size comes from: layer-shell hands one over, a toplevel's may be the client's to pick
+    /// (see `xdg_shell::toplevel_size_for`).
     pub(super) fn bind_and_clear(&mut self, index: usize, width: u32, height: u32) {
         self.surfaces[index].configured_size = (width, height);
         // Only here does a real size for this instance exist: the startup resolve used the whole
@@ -445,9 +430,9 @@ impl App {
         // the scene dirty so the next poll turn re-resolves against it.
         //
         // So `paint_surface` below draws the previous resolve, and `run`'s loop repaints with the
-        // corrected one on the very next turn -- sub-frame, not a visible lag. Re-resolving here
-        // instead would run one whole `Scene::apply` per configure in a startup burst rather than
-        // one for the burst, the coalescing ADR-0044 decision 2 built the flag for.
+        // corrected one on the very next turn: sub-frame, not a visible lag. Re-resolving here
+        // instead would run one whole `Scene::apply` per configure in a startup burst, rather than
+        // one for the burst, which is what the coalescing flag ADR-0044 decision 2 built is for.
         self.client.set_instance_size(
             &self.surfaces[index].surface_id,
             layout::LogicalSize { width: width as f32, height: height as f32 },
@@ -483,8 +468,8 @@ impl App {
             } else {
                 // `visible = false`: no buffer was ever attached, so this surface is already in
                 // the invisible state § 15.2 point 3 asks a Candidate to reach. Marked staged
-                // without touching the wire, so `maybe_send_ready_signal`'s gate still completes --
-                // the surface is filtered out of the announced set by `presenting_surface_ids`.
+                // without touching the wire, so `maybe_send_ready_signal`'s gate still completes.
+                // The surface is filtered out of the announced set by `presenting_surface_ids`.
                 self.surfaces[index].null_buffered = true;
             }
             self.maybe_send_ready_signal();
@@ -492,7 +477,7 @@ impl App {
         }
 
         // `!= Mapped`, not "is unmapped": `apply_resolved_state` above may have just issued a
-        // re-map commit, and the protocol's wait applies to that too -- the configure answering it
+        // re-map commit, and the protocol's wait applies to that too. The configure answering it
         // has not arrived, so no buffer may be attached this pass. See [`App::unmap`].
         if self.surfaces[index].map_state != MapState::Mapped {
             return;
@@ -525,33 +510,32 @@ impl App {
     /// role permits changing on a live object, the input region, and whether the surface is shown
     /// at all (ADR-0038 decision 2, ADR-0049 decisions 1-2).
     ///
-    /// This is where a `window`'s authoritative [`WindowSpec`] is derived, and "resolved" is the
-    /// whole point (ADR-0049's second amendment). `crate::socket::surface_specs` parses the
-    /// unresolved properties, which is right for a `panel`'s topology fields -- they reject a
-    /// `Signal` on purpose, since `get_layer_surface` fixes them at creation. A `window`'s `title`
-    /// is the opposite case: § 6.2 spells it as `string`/`Signal` precisely so it can move, and
-    /// parsing it at evaluation time would freeze it at whatever the file last saw. `tree.properties`
-    /// here is a `resolve_properties` result, so every `Signal` in it has already been read exactly
-    /// once for this pass (ADR-0044 decision 1) -- the same read `visible` and the input region
-    /// below use.
+    /// This is where a `window`'s authoritative [`WindowSpec`] is derived; "resolved" is the whole
+    /// point (ADR-0049's second amendment). `crate::socket::surface_specs` parses the unresolved
+    /// properties, right for a `panel`'s topology fields since they reject a `Signal` on purpose
+    /// (`get_layer_surface` fixes them at creation). A `window`'s `title` is the opposite: § 6.2
+    /// spells it `string`/`Signal` precisely so it can move, and parsing at evaluation time would
+    /// freeze it at whatever the file last saw. `tree.properties` is a `resolve_properties` result,
+    /// so every `Signal` in it has already been read once for this pass (ADR-0044 decision 1), the
+    /// same read `visible` and the input region below use.
     ///
-    /// All three pushes are double-buffered `wl_surface` state and are therefore staged here, not
-    /// committed: the caller's commit -- `paint_surface`'s `swap_buffers` on a mapped surface, the
-    /// candidate branch's own commit on a staging Candidate -- carries the whole update at once. The
-    /// exceptions are the map, unmap, create and destroy transitions, which are commits by definition.
+    /// All three pushes are double-buffered `wl_surface` state, so they are staged here, not
+    /// committed: the caller's commit (`paint_surface`'s `swap_buffers`, or the candidate branch's
+    /// own commit) carries the whole update at once. Map, unmap, create and destroy are the
+    /// exceptions, being commits by definition.
     ///
-    /// The spec push runs before `apply_visibility`, and for a `window` that ordering is load-bearing:
-    /// a `visible` flip from false to true creates the `xdg_toplevel` out of the stored spec, so the
-    /// spec must be this pass's before the object is built from it.
+    /// The spec push runs before `apply_visibility`, and for a `window` that ordering is
+    /// load-bearing: a `visible` flip from false to true creates the `xdg_toplevel` from the
+    /// stored spec, so the spec must be this pass's before the object is built from it.
     fn apply_resolved_state(&mut self, index: usize) {
         let surface_id = self.surfaces[index].surface_id.clone();
         // Owned, so the immutable borrow of `self.client` ends before the `&mut self` calls below.
         let Some(tree) = self.client.scene().surface(&surface_id) else {
             // No resolved tree for this instance: a startup whose apply failed, or a re-resolve
             // that rolled back (`Scene::apply` restores its pre-call state on error). Every field
-            // stays at what was last applied, which is the same "keep the last good frame"
-            // principle `re_resolve_if_dirty` already follows -- pushing protocol defaults here
-            // would resize and un-anchor a working surface over a transient bad capability value.
+            // stays at what was last applied, the same "keep the last good frame" principle
+            // `re_resolve_if_dirty` already follows. Pushing protocol defaults here would resize
+            // and un-anchor a working surface over a transient bad capability value.
             return;
         };
 
@@ -570,8 +554,8 @@ impl App {
             },
             TrackedRole::Popup { .. } => match node::popup_spec(&tree.properties) {
                 // A store, not a diff: every field on a `PopupSpec` is an `xdg_positioner` request
-                // consumed by `get_popup`, and `xdg_popup.reposition` is not built. So there is
-                // nothing to send at a live popup -- what this push buys is that the next
+                // consumed by `get_popup`, and `xdg_popup.reposition` is not built. There is
+                // nothing to send at a live popup. What this push buys is that the next
                 // `show_popup` builds its positioner from this pass's `anchor_rect` (ADR-0049's
                 // second amendment). The click that opens a dropdown writes the button's rect to a
                 // `state` signal on the same turn this reads it.
@@ -590,9 +574,9 @@ impl App {
             //
             // The create path does call `node::lock_spec`, through [`resolved_surface_spec`], but
             // not in disagreement: that call rebuilds a `SurfaceSpec` for `create_surfaces`'s
-            // four-arm `match`, with no equivalent here to feed. What does still run for a lock is
-            // everything past this match: the input region, and `apply_visibility`, which
-            // deliberately does nothing for this role.
+            // four-arm `match`, with no equivalent here to feed. Everything past this match still
+            // runs for a lock: the input region, and `apply_visibility`, which deliberately does
+            // nothing for this role.
             TrackedRole::Lock { .. } => {}
         }
         self.apply_input_region(index, &tree);
@@ -602,22 +586,21 @@ impl App {
     /// `wl_surface::set_input_region` from this surface's own resolved tree (§ 5.1, ADR-0038
     /// decision 5).
     ///
-    /// Per surface, not for one overlay. Three cases fall out of the same code rather than needing
-    /// three branches: a root with no visible children yields an empty region, so every click
-    /// passes through to whatever is behind it; a root whose child fills it yields a region
-    /// covering the surface, the protocol default already, so a tightly sized bar is a no-op; and
-    /// anything in between -- a fullscreen transparent panel holding one small OSD -- gets exactly
-    /// its visible content.
+    /// Per surface, not for one overlay. Three cases fall out of the same code, not three
+    /// branches: a root with no visible children yields an empty region, so clicks pass through
+    /// to whatever is behind it; a root whose child fills it yields a region covering the
+    /// surface, the protocol default already; anything in between, a fullscreen transparent
+    /// panel holding one small OSD, gets exactly its visible content.
     ///
-    /// The scale is `1.0`, matching `paint_surface`'s for the same reason: nothing calls
-    /// `set_buffer_scale`, so surface-local coordinates and the framebuffer are both at scale 1.
+    /// The scale is `1.0`, matching `paint_surface`'s: nothing calls `set_buffer_scale`, so
+    /// surface-local coordinates and the framebuffer are both at scale 1.
     ///
-    /// Not diffed against the last region pushed, unlike the spec fields: this only runs when the
-    /// scene actually re-resolved, and the full GPU repaint that follows costs orders of magnitude
-    /// more than one `wl_region` round of requests.
+    /// Not diffed against the last region, unlike the spec fields: this only runs on an actual
+    /// re-resolve, and the GPU repaint that follows costs far more than one `wl_region` round
+    /// trip.
     ///
-    /// Skipped for a `window` that is not shown: there is no `wl_surface` to set a region on, and
-    /// [`App::show_window`]'s first re-resolve after the window opens sets one.
+    /// Skipped for a `window` not shown: there is no `wl_surface` to set a region on, and
+    /// [`App::show_window`]'s first re-resolve after it opens sets one.
     fn apply_input_region(&mut self, index: usize, tree: &layout::ResolvedNode) {
         let Some(surface) = self.surfaces[index].role.wl_surface().cloned() else {
             return;
@@ -637,24 +620,24 @@ impl App {
             region.add(rect.x0, rect.y0, rect.x1 - rect.x0, rect.y1 - rect.y0);
         }
         surface.set_input_region(Some(region.wl_region()));
-        // `region` drops here, destroying the `wl_region` -- `wl_surface::set_input_region` copies
+        // `region` drops here, destroying the `wl_region`. `wl_surface::set_input_region` copies
         // its contents, so the object has no reason to outlive the request.
     }
 
-    /// Applies § 5.1's `visible` to a live surface, by whichever mechanism the role's lifetime rule
-    /// calls for (ADR-0038 decision 2, ADR-0049 decisions 1-2).
+    /// Applies § 5.1's `visible` to a live surface, by whichever mechanism the role's lifetime
+    /// rule calls for (ADR-0038 decision 2, ADR-0049 decisions 1-2).
     ///
     /// The same Lua-facing property, two different mechanics underneath, and this is the one
     /// function where that divergence lives. A `panel`'s Wayland object outlives every flip, so
-    /// `visible` is a map or an unmap commit. A `window`'s exists only while shown, so `visible` is
-    /// a create or a destroy.
+    /// `visible` is a map or unmap commit. A `window`'s exists only while shown, so `visible` is a
+    /// create or a destroy.
     ///
-    /// Frozen for a PBA Candidate, and that is the one line in this file where a mistake hangs the
-    /// shell rather than failing a test. `maybe_send_ready_signal` announces the surfaces this process
-    /// will present and `activate_draw` draws exactly that set; if `visible` could move between those
-    /// two points -- and it can, since § 15.2 point 2 hydrates a Candidate with cached capability
-    /// state precisely in that window -- the announced and drawn sets would disagree, which is either
-    /// an `evidence_timeout` hang or a `PbaFailure::UnexpectedEvidence` abort (see
+    /// Frozen for a PBA Candidate: this is the one line in this file where a mistake hangs the
+    /// shell instead of failing a test. `maybe_send_ready_signal` announces the surfaces this
+    /// process will present, and `activate_draw` draws exactly that set. If `visible` could move
+    /// between those two points, and it can, since § 15.2 point 2 hydrates a Candidate with cached
+    /// capability state precisely in that window, the announced and drawn sets would disagree: an
+    /// `evidence_timeout` hang or a `PbaFailure::UnexpectedEvidence` abort (see
     /// [`presenting_surface_ids`]). Freezing makes them agree by construction. The deferred change
     /// applies on the first re-resolve after promotion clears `is_pba_candidate`.
     fn apply_visibility(&mut self, index: usize, visible: bool) {
@@ -679,26 +662,26 @@ impl App {
                 _ => {}
             },
             // Its own function, not a third `map_state` arm: a popup answers on two inputs, not
-            // one -- ADR-0051 decision 2's latch is the second, and a dismissed popup sits in
-            // `MapState::Unmapped` with `visible` still true, a state the other two roles never reach.
+            // one. ADR-0051 decision 2's latch is the second, and a dismissed popup sits in
+            // `MapState::Unmapped` with `visible` still true, a state the other roles never reach.
             TrackedRole::Popup { .. } => self.apply_popup_visibility(index, visible),
             // The one role where `visible` is not a property at all: `layout::node::lock_spec`
             // refuses the key, so the `true` this is called with is `parse_visible`'s default. A
-            // lock surface's lifetime is the compositor's end to end -- created once `locked`
-            // arrives, destroyed at `unlock_and_destroy` -- so acting on `visible` here could only
-            // destroy a surface the compositor is still showing (ADR-0042, ADR-0052
-            // decision 2).
+            // lock surface's lifetime is the compositor's end to end, created once `locked`
+            // arrives, destroyed at `unlock_and_destroy`, so acting on `visible` here could only
+            // destroy a surface the compositor is still showing (ADR-0042, ADR-0052 decision 2).
             TrackedRole::Lock { .. } => {}
         }
     }
 
     /// `zwlr_layer_surface_v1`'s own unmap procedure, taken literally: "Attaching a null buffer to
     /// a layer surface unmaps it." One commit, no destroyed protocol objects, the whole point of
-    /// ADR-0038 decision 2 -- toggling a launcher costs this instead of a process spawn.
+    /// ADR-0038 decision 2: toggling a launcher costs this instead of a process spawn.
     ///
     /// This is the only commit an unmapped surface ever gets. Nothing else in this file may commit
     /// one, because the same description says "the client can re-map the surface by performing a
-    /// commit without any buffer attached" -- a stray bookkeeping commit here would silently re-map it.
+    /// commit without any buffer attached"; a stray bookkeeping commit here would silently re-map
+    /// it.
     fn unmap(&mut self, index: usize) {
         let TrackedRole::Panel { layer, .. } = &self.surfaces[index].role else {
             return;
@@ -714,33 +697,30 @@ impl App {
     ///
     /// Every layer-shell field is re-sent, not just the ones a diff would find, because the same
     /// description says an unmapped surface "returns to the state it had right after
-    /// layer_shell.get_layer_surface". `anchor` is included for that reason alone: it is a topology
-    /// field that can never change on a live surface, but it can be reset out from under one. The
-    /// exclusive zone is not re-sent: it is not a spec field, and the configure re-derives it from
-    /// the size the compositor grants.
+    /// layer_shell.get_layer_surface". `anchor` is included for that reason alone: it never
+    /// changes on a live surface, but it can be reset out from under one. The exclusive zone is
+    /// not re-sent, it is not a spec field, and the configure re-derives it from the granted size.
     ///
-    /// `set_size` needs no `layer::ambiguous_zero_axis` guard: the applied spec's size is only ever one
-    /// that already passed it, in [`App::create_panel`] or [`App::apply_spec_change`], which both
-    /// refuse rather than store a size the protocol would reject.
+    /// `set_size` needs no `layer::ambiguous_zero_axis` guard: the applied spec's size already
+    /// passed it, in [`App::create_panel`] or [`App::apply_spec_change`], which both refuse
+    /// rather than store a size the protocol would reject.
     ///
-    /// Two starting states share this one request sequence and end in different `MapState`s, and the
-    /// difference is the compositor's, not a choice made here. Measured against niri with
-    /// `WAYLAND_DEBUG=1`:
+    /// Two starting states share this one request sequence and end in different `MapState`s; the
+    /// difference is the compositor's, not a choice made here (measured against niri with
+    /// `WAYLAND_DEBUG=1`):
     ///
     /// - A panel declared `visible = false` at startup was never mapped: it performed the initial
-    ///   commit `get_layer_surface` requires, was configured and acked, but never attached a buffer.
-    ///   Its layer-surface state was never reset, so the commit below changes nothing the compositor
-    ///   has an opinion about and no configure comes back. It goes straight to [`MapState::Mapped`]
-    ///   and the next [`App::repaint_mapped_surfaces`] binds and draws it.
-    /// - A surface that really was mapped and then null-buffered has been reset, so this commit is a
-    ///   fresh initial commit and a configure does come back. Attaching a buffer before acking it is
-    ///   exactly what `get_layer_surface`'s description forbids, so that case waits in
-    ///   [`MapState::AwaitingConfigure`] and lets `bind_and_clear` handle the configure with no
-    ///   re-map special case.
+    ///   commit, was configured and acked, but never attached a buffer. Its layer-surface state
+    ///   was never reset, so this commit changes nothing and no configure comes back. It goes
+    ///   straight to [`MapState::Mapped`] and the next [`App::repaint_mapped_surfaces`] draws it.
+    /// - A surface that really was mapped and then null-buffered has been reset, so this commit
+    ///   is a fresh initial commit and a configure does come back. Attaching a buffer before
+    ///   acking it is exactly what the protocol forbids, so that case waits in
+    ///   [`MapState::AwaitingConfigure`] and lets `bind_and_clear` handle the configure normally.
     ///
-    /// `bound.is_some()` is the honest test for which of the two this is: an EGL surface exists only
-    /// for a surface that has been through the bind-and-paint path, and every trip through it ends
-    /// in a `swap_buffers`, so the two questions are the same question.
+    /// `bound.is_some()` is the honest test for which of the two this is: an EGL surface exists
+    /// only for a surface that went through bind-and-paint, and every trip through it ends in a
+    /// `swap_buffers`, so the two questions are the same question.
     fn remap(&mut self, index: usize) {
         let was_mapped = self.surfaces[index].bound.is_some();
         let TrackedRole::Panel { layer, spec, output_size } = &self.surfaces[index].role else {
@@ -870,13 +850,12 @@ impl App {
     }
 
     /// Draws one bound surface's whole retained tree: make its EGL surface current, resize the
-    /// shared canvas to it, clear, draw the surface's [`layout::paint::DisplayList`], and
-    /// swap.
+    /// shared canvas to it, clear, draw the surface's [`layout::paint::DisplayList`], and swap.
     ///
     /// One `TextPainter` serves every surface. All surfaces share one EGL context; under EGL a
     /// context owns its GL objects while a surface is only the framebuffer being drawn into, so
     /// `eglMakeCurrent` with a different draw surface leaves the canvas's textures, shaders and
-    /// glyph atlas valid. What genuinely is per surface is the canvas's viewport, which is what
+    /// glyph atlas valid. Only the canvas's viewport is genuinely per surface, which is what
     /// `TextPainter::resize` (and so `Canvas::set_size`) sets on every call here. If a live run
     /// ever shows otherwise, one canvas per surface is the fallback, not a redesign.
     ///
@@ -884,12 +863,10 @@ impl App {
     /// instance the scene has not resolved yet) is cleared and swapped, not skipped: the buffer
     /// still has to be attached or the compositor keeps showing the last frame.
     ///
-    /// ponytail: the paint scale is hardcoded `1.0`. Nothing calls `wl_surface::set_buffer_scale`
-    /// and the `wl_egl_window` is sized in the logical pixels `configure` reports, so on a HiDPI
-    /// output the whole shell renders at scale 1 and the compositor upscales it. The upgrade path
-    /// is all three together -- `set_buffer_scale`, a `WlEglSurface::resize` to the scaled
-    /// physical size, and this argument -- since passing a scale here alone would snap geometry to
-    /// a physical grid the framebuffer does not have.
+    /// ponytail: the paint scale is hardcoded `1.0`, so a HiDPI output renders at scale 1 and the
+    /// compositor upscales it. Upgrade path: `set_buffer_scale`, a `WlEglSurface::resize` to the
+    /// scaled physical size, and this argument, applied together. Passing scale here alone would
+    /// snap geometry to a physical grid the framebuffer lacks.
     fn paint_surface(&mut self, index: usize) {
         // An unmapped surface has no buffer, and one still waiting for the configure that follows
         // its (re-)map commit may not attach one yet (ADR-0038 decision 2; see [`MapState`]).
@@ -913,12 +890,12 @@ impl App {
         //
         // This is what stops the 1920x1200 wallpaper being redrawn once a second because the
         // clock's seconds digit advanced. ADR-0044 decision 2's dirty flag is one flag for the
-        // whole scene, so [`App::repaint_mapped_surfaces`] has to offer every mapped surface a
-        // repaint; comparing the display list is how a surface declines one.
+        // whole scene, so [`App::repaint_mapped_surfaces`] offers every mapped surface a repaint;
+        // comparing the display list is how a surface declines one.
         //
-        // An absent tree gives an empty list rather than an early return: a surface whose tree
-        // went away should paint nothing over its old contents, and it has to reach the clear and
-        // the swap below to do that.
+        // An absent tree gives an empty list, not an early return: a surface whose tree went away
+        // should paint nothing over its old contents, and it has to reach the clear and swap
+        // below to do that.
         let tree = self.client.scene().surface(&surface_id);
         // Scoped so the immutable borrow of `self` that `secure_field_for` holds ends before the
         // painter is borrowed mutably below. Nothing in the list borrows it: `Draw::Text` owns its
@@ -936,10 +913,10 @@ impl App {
         }
 
         // Another surface's own paint may have made a different EGL surface current on this
-        // thread since this one last drew -- the context is shared across every surface, so it is
+        // thread since this one last drew. The context is shared across every surface, so it is
         // re-established here rather than assumed still current.
         // `Some` for any surface holding an `egl_surface`: `ensure_bound` built both. A surface
-        // that never bound never reaches here -- `paint_surface`'s caller checks `bound` first.
+        // that never bound never reaches here, `paint_surface`'s caller checks `bound` first.
         let Some(egl) = self.egl.as_ref() else {
             return;
         };
@@ -1000,8 +977,8 @@ impl App {
     /// which surfaces changed is not information this process has.
     ///
     /// This is also the commit that carries everything [`App::apply_resolved_surface_state`] staged
-    /// for each surface on the same poll turn -- `paint_surface` ends in `swap_buffers`, a `wl_surface`
-    /// commit.
+    /// for each surface on the same poll turn: `paint_surface` ends in `swap_buffers`, a
+    /// `wl_surface` commit.
     pub(super) fn repaint_mapped_surfaces(&mut self) {
         for index in 0..self.surfaces.len() {
             if self.surfaces[index].map_state != MapState::Mapped {
@@ -1010,12 +987,12 @@ impl App {
             if self.surfaces[index].bound.is_none() {
                 // A panel that started `visible = false` and has just been mapped by a `visible`
                 // flip has no EGL surface yet: it was created and configured, but the configure
-                // path returned before `ensure_bound` because there was nothing to draw into it.
-                // This is the one place that bind can happen, since no further configure is coming
-                // (see [`App::remap`]).
+                // path returned before `ensure_bound` since there was nothing to draw into it.
+                // This is the one place that bind can happen, since no further configure is
+                // coming (see [`App::remap`]).
                 //
-                // Never for a Candidate, whatever the scene does: § 15.2 point 3 keeps it
-                // invisible until `ActivateDraw`, and `activate_draw_one` is its only bind.
+                // Never for a Candidate: § 15.2 point 3 keeps it invisible until `ActivateDraw`,
+                // and `activate_draw_one` is its only bind.
                 if self.is_pba_candidate || !self.ensure_bound(index) {
                     continue;
                 }
@@ -1029,12 +1006,12 @@ impl App {
 
     /// § 15.2 points 2-3: once every tracked surface has staged, computes the surface_id list the
     /// Supervisor will expect presentation evidence from and queues it once as a `ReadySignal`. A
-    /// no-op if already sent, or if some surface hasn't staged yet -- called on every candidate-mode
-    /// configure, since any of them might be the one that completes the set.
+    /// no-op if already sent, or if some surface hasn't staged yet, called on every candidate-mode
+    /// configure since any of them might complete the set.
     ///
     /// Two different sets, deliberately: the gate is every surface, since a Candidate is not ready
-    /// until each has been dealt with, but the payload is only the surfaces that will present a frame
-    /// -- see [`presenting_surface_ids`] for what each direction of a mismatch costs.
+    /// until each has been dealt with, but the payload is only the surfaces that will present.
+    /// See [`presenting_surface_ids`] for what each direction of a mismatch costs.
     pub(super) fn maybe_send_ready_signal(&mut self) {
         let staged =
             candidate_has_staged(self.surfaces.iter().map(|s| (s.null_buffered, s.role.wl_surface().is_some())));
@@ -1049,13 +1026,13 @@ impl App {
     }
 
     /// § 15.3: draws the first real frame in response to `ActivateDraw`, requesting
-    /// `wp_presentation_feedback` for each surface drawn. `nonce` is remembered as `active_nonce` so
-    /// the later `presented` callback knows which handshake attempt to tag its evidence with.
+    /// `wp_presentation_feedback` for each surface drawn. `nonce` is remembered as `active_nonce`
+    /// so the later `presented` callback knows which handshake attempt to tag its evidence with.
     ///
     /// The surfaces that present, not every tracked surface: exactly the set
     /// `maybe_send_ready_signal` announced, filtered by the same [`MapState::presents`] predicate
-    /// over a `map_state` [`App::apply_visibility`] holds still for a Candidate's whole life. That is
-    /// what makes the announced and drawn sets identical rather than merely similar -- see
+    /// over a `map_state` [`App::apply_visibility`] holds still for a Candidate's whole life. That
+    /// makes the announced and drawn sets identical, not merely similar. See
     /// [`presenting_surface_ids`] for why "similar" is a hang.
     pub(super) fn activate_draw(&mut self, nonce: u64) {
         self.active_nonce = Some(nonce);
@@ -1068,10 +1045,10 @@ impl App {
                 return;
             }
         }
-        // Promotion completes this process's PBA handshake -- from now on it behaves like an
+        // Promotion completes this process's PBA handshake. From now on it behaves like an
         // ordinary (non-candidate) generation, so a later `configure` (resize, output change, a
-        // duplicate ack) must fall through to `bind_and_clear`'s ordinary EGL-bind/resize path
-        // instead of re-taking the null-buffer-staging branch forever: that branch no-ops once
+        // duplicate ack) must fall through to `bind_and_clear`'s ordinary EGL-bind/resize path,
+        // not re-take the null-buffer-staging branch forever: that branch no-ops once
         // `null_buffered` is already `true`, permanently disabling resize. `activate_draw_one`
         // already populated `tracked.bound` in the shape the non-candidate path expects, so
         // flipping this alone is enough.
@@ -1082,8 +1059,8 @@ impl App {
     /// [`App::bind_and_clear`]'s non-candidate path does, plus a `wp_presentation_feedback`
     /// request placed before the paint so it associates with the commit `swap_buffers` performs.
     /// Indexes into `self.surfaces` rather than holding a `&mut TrackedSurface` across the whole
-    /// body -- this needs `&mut self` for EGL/GL state and `self.text_painter` at several points,
-    /// which a held borrow of one surface would conflict with.
+    /// body, since this needs `&mut self` for EGL/GL state and `self.text_painter` at several
+    /// points, which a held borrow of one surface would conflict with.
     fn activate_draw_one(&mut self, index: usize, nonce: u64) {
         if !self.ensure_bound(index) {
             return;
@@ -1095,9 +1072,9 @@ impl App {
         if let Some(surface) = self.surfaces[index].role.wl_surface().cloned()
             && let Err(e) = self.presentation_time.feedback(&surface, &self.queue_handle)
         {
-            // Not fatal to the whole candidate -- the Supervisor's evidence_timeout is what
-            // catches a surface that never presents (ADR-0025); don't invent a
-            // second failure-reporting path here.
+            // Not fatal to the whole candidate: the Supervisor's evidence_timeout catches a
+            // surface that never presents (ADR-0025). Don't invent a second failure-reporting
+            // path here.
             log_bind_failure(&self.surfaces[index].surface_id.clone(), "wp_presentation::feedback", e);
         }
 
@@ -1117,14 +1094,14 @@ impl App {
     /// pointer event, or a keyboard focus event) to the tracked surface that owns it.
     ///
     /// `None` is routine, not exceptional, on every one of those paths: a `wl_pointer`, a
-    /// `wl_keyboard` and a feedback object are all per seat or per commit, not per surface, so any of
-    /// them can name a surface this process has since destroyed -- an output change, or a `visible`
-    /// flip that took a `window`'s toplevel away (ADR-0049 decision 1).
+    /// `wl_keyboard` and a feedback object are all per seat or per commit, not per surface, so
+    /// any of them can name a surface this process has since destroyed: an output change, or a
+    /// `visible` flip that took a `window`'s toplevel away (ADR-0049 decision 1).
     pub(super) fn index_of_surface(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
         self.surfaces.iter().position(|s| s.role.wl_surface() == Some(surface))
     }
 
-    /// [`App::index_of_surface`]'s answer as the surface id -- shared by `presented`/`discarded`.
+    /// [`App::index_of_surface`]'s answer as the surface id, shared by `presented`/`discarded`.
     pub(super) fn surface_id_for(&self, surface: &wl_surface::WlSurface) -> Option<&str> {
         self.index_of_surface(surface).map(|index| self.surfaces[index].surface_id.as_str())
     }

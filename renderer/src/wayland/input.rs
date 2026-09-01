@@ -1,10 +1,10 @@
-//! Pointer input (`on_click`, ADR-0050) and keyboard focus, including the `secure_submit`
-//! accumulation that turns keystrokes into a `SecureSubmit` frame with no Lua value ever holding
-//! the plaintext (ADR-0005/ADR-0027).
+//! Pointer input (`on_click`, ADR-0050) and keyboard focus, including `secure_submit`
+//! accumulation: keystrokes become a `SecureSubmit` frame with no Lua value ever holding the
+//! plaintext (ADR-0005/ADR-0027).
 //!
-//! `SeatHandler`, `PointerHandler` and `KeyboardHandler` all live here, next to the pure helpers
-//! their callbacks call: which button armed a click, which `textfield` a press or a keyboard
-//! `enter` focuses, and what one key event does to the field currently focused.
+//! `SeatHandler`, `PointerHandler` and `KeyboardHandler` live here, beside the pure helpers they
+//! call: which button armed a click, which `textfield` a press or `enter` focuses, and what one
+//! key event does to the focused field.
 
 use super::*;
 use crate::layout::secure_submit::{secure_submit_targets, sole_secure_submit};
@@ -12,21 +12,20 @@ use crate::layout::secure_submit::{secure_submit_targets, sole_secure_submit};
 /// What one notch of a mouse wheel scrolls, in logical pixels, when the compositor sends a step
 /// count instead of a distance (ADR-0069 decision 6).
 ///
-/// A flat 39, not three lines of anything: nothing here reads a font size, and a per-container step
-/// would need one the container does not carry. It is sized as roughly three lines of the 13px text
-/// the shipped config uses, which is the convention toolkits land on, and it is the only number in
-/// this file that is a choice rather than a measurement. A touchpad never reaches it, reporting real
-/// pixels that are used as sent.
+/// A flat 39: nothing here reads a font size, and a per-container step would need one the
+/// container does not carry. It approximates three lines of the shipped config's 13px text, the
+/// convention toolkits use, and is the only chosen number in this file. A touchpad never reaches
+/// it: it reports real pixels, used as sent.
 const WHEEL_STEP_PIXELS: f32 = 39.0;
 
 /// How far one wheel event scrolls, in logical pixels (ADR-0069 decision 6).
 ///
-/// `pixels` is what a touchpad sends and is used as sent. `steps` is `value120`, where 120 is one
-/// logical notch, and is all a mouse wheel sends; it is only consulted when there is no distance,
-/// because a compositor that sends both sends the same motion twice.
+/// `pixels` is what a touchpad sends, used as sent. `steps` is `value120` (120 per logical notch),
+/// all a mouse wheel sends; it is only consulted when there is no distance, since a compositor
+/// sending both is sending the same motion twice.
 ///
-/// Its own function so the arithmetic is testable: everything around it needs a live `wl_pointer`
-/// and a compositor to deliver a real notch.
+/// Its own function so the arithmetic is testable: the rest needs a live `wl_pointer` and a
+/// compositor to deliver a real notch.
 fn wheel_delta(pixels: f64, steps: i32) -> f32 {
     if pixels != 0.0 {
         return pixels as f32;
@@ -34,15 +33,14 @@ fn wheel_delta(pixels: f64, steps: i32) -> f32 {
     steps as f32 / 120.0 * WHEEL_STEP_PIXELS
 }
 
-/// One press waiting for its release (ADR-0050 decision 2): a click is a press and a
-/// release on the same node, so a user who presses a button, notices the mistake, and drags off
-/// it releases harmlessly.
+/// One press waiting for its release (ADR-0050 decision 2): a click is a press and a release on
+/// the same node, so a user who presses, notices the mistake, and drags off releases harmlessly.
 ///
 /// "Same node" is this pair, not a node identity: `ResolvedNode` has none (`NodeId` lives on
-/// `RetainedNode`, dropped by `to_resolved`). The rect is the proxy, and the case it gets
-/// "wrong" it gets right anyway: a re-resolve between press and release that moves the button
-/// cancels the click, the same answer a real identity would give for a button moved out from
-/// under the pointer.
+/// `RetainedNode`, dropped by `to_resolved`). The rect is the proxy, and it gets the one "wrong"
+/// case right anyway: a re-resolve between press and release that moves the button cancels the
+/// click, the same answer a real identity would give for a button moved out from under the
+/// pointer.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ArmedClick {
     instance_id: String,
@@ -50,51 +48,44 @@ pub(super) struct ArmedClick {
     /// The evdev code the press carried, so the release must be the same button, not merely
     /// a button (ADR-0050's second amendment).
     ///
-    /// ponytail: one armed click, so chording drops both. `armed` is a single `Option`, and a
-    /// second press overwrites the first, so pressing right then left on the same node and
-    /// releasing either fires nothing: the release that arrives finds a different button armed, and
-    /// the one after it finds nothing armed at all. It fails in the safe direction (a wrong handler
-    /// never runs, a click is only lost) and it needs two buttons held at once, which nobody does
-    /// to a shell. The upgrade is `armed` becoming keyed by button, an `ArrayVec` of three or a
-    /// small map, with the same instance-id-and-rect comparison per entry; do it if a config ever
-    /// wants a chord, or if a real mouse turns out to emit overlapping pairs on its own.
+    /// ponytail: one armed click, so chording drops both. A second press overwrites `armed`, so
+    /// pressing right then left on one node and releasing either fires nothing. Upgrade: key
+    /// `armed` by button, an `ArrayVec` of three or a small map, with the same instance-id-and-rect
+    /// comparison per entry; do it when a config wants a chord.
     button: u32,
 }
-/// The serial `xdg_popup.grab` needs, plus the surface the event carrying it was delivered to
-/// (ADR-0049's amendment, ADR-0051 decision 1). Armed by [`PointerHandler::pointer_frame`]
-/// and cleared by [`run`]'s poll loop at the end of the same turn.
+/// The serial `xdg_popup.grab` needs, plus the surface that carried it (ADR-0049's amendment,
+/// ADR-0051 decision 1). Armed by [`PointerHandler::pointer_frame`], cleared by [`run`]'s poll
+/// loop at the end of the same turn.
 ///
-/// The re-resolve that creates a popup runs in the poll loop, after `dispatch_pending` returns,
-/// not inside input dispatch: by the time `re_resolve_if_dirty` runs there, the dispatch
-/// callback's stack, and any serial on it, is gone. Resolving inside dispatch would put a full
-/// `Scene::apply`, arbitrary Lua and Wayland object creation inside a `Dispatch` callback,
-/// reentering the queue being dispatched from. So the serial lives in a field for one turn instead
-/// of on a stack; a re-resolve driven by anything other than input still finds nothing here.
+/// Set in a field, not read off the dispatch stack: a popup's re-resolve runs later, in the poll
+/// loop after `dispatch_pending` returns, by which point that stack is gone. Resolving inside
+/// dispatch would nest `Scene::apply` and Lua/Wayland object creation inside a `Dispatch`
+/// callback, reentering the queue being dispatched from.
 ///
-/// Both a press and a release arm it, latest wins: a click fires on the release (ADR-0050
-/// decision 2), so the release's serial is the one an `on_click` popup actually carries. `xdg_shell`
-/// only asks that the serial come from "a real input event (button press, key press, touch down)"
-/// and leaves recency to the compositor, which answers a refusal with an immediate `popup_done`,
-/// normal (ADR-0051 decision 3), not an error.
+/// A press and a release both arm it, latest wins: a click fires on the release (ADR-0050
+/// decision 2), so the release's serial is what an `on_click` popup carries. `xdg_shell` only
+/// requires a serial from "a real input event," so a stale one still gets a normal `popup_done`
+/// refusal (ADR-0051 decision 3), not an error.
 ///
-/// `instance_id`, not the tracked index: `self.surfaces` is a `Vec` an output change removes from
-/// (`destroy_surface_by_id`), and an unplugged monitor between click and re-resolve would leave an
-/// index naming a different surface. The id is stable and is what `is_instance_of` compares anyway.
+/// `instance_id`, not the tracked index: an output change can remove entries from
+/// `self.surfaces`, so an unplugged monitor between click and re-resolve could rename the index.
+/// The id is stable, matching what `is_instance_of` compares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ArmedSerial {
     pub(super) serial: u32,
     pub(super) instance_id: String,
 }
-/// The innermost `button` in a [`layout::hit::hit_path`] result carrying a callable `on_click`, as
-/// that button's absolute rect and its function (ADR-0050 decision 1).
+/// The innermost `button` in a [`layout::hit::hit_path`] result carrying a callable `on_click`,
+/// as that button's absolute rect and its function (ADR-0050 decision 1).
 ///
 /// Scans from the deep end: the deepest node under the pointer is normally the `button`'s `text`
-/// child, which has no `on_click`. A `button` without one is transparent to this scan, not a
-/// barrier, so a plain `button` nested inside a handled one still lets the outer one fire.
+/// child, which has no `on_click`. A `button` without one is transparent, not a barrier, so a
+/// plain `button` nested inside a handled one still lets the outer one fire.
 ///
-/// `on_click` must be a `Value::Function`; anything else the config wrote there is not a click
-/// handler. `layout::node` has no parser for the key (§ 5.2 leaves it opaque), so this predicate
-/// is the only place its type is checked.
+/// `on_click` must be a `Value::Function`; anything else is not a click handler. `layout::node`
+/// has no parser for the key (§ 5.2 leaves it opaque), so this predicate is the only place its
+/// type is checked.
 fn clickable_button<'a>(path: &[&'a layout::ResolvedNode]) -> Option<(LogicalRect, &'a Function)> {
     path.iter().enumerate().rev().find_map(|(depth, node)| {
         if node.kind != "button" {
@@ -121,14 +112,11 @@ struct PointerHit {
 /// `None` collapses two cases nothing downstream tells apart: no `textfield` on the path, and the
 /// innermost one declaring no `secure_submit`. Both mean the next completed submit has nowhere to
 /// go. There is no third, malformed case: `node::paint_style` parses the destination while
-/// `Scene::apply` resolves the node, so a `secure_submit` that does not parse fails the whole pass
-/// and no tree carrying one ever reaches a pointer event.
+/// `Scene::apply` resolves the node, so a `secure_submit` that fails to parse fails the whole pass.
 ///
-/// ponytail: focus is therefore stored as its destination rather than as a node identity, so a
-/// focused field with no destination is indistinguishable from no focus at all. Nothing reads focus
-/// for any other purpose yet -- there is no caret, no selection, and no `on_key` (ADR-0050's
-/// consequences). Upgrade path: carry the field's `NodeId` alongside the target once something has
-/// to paint or address the *field* rather than its submit.
+/// ponytail: focus is stored as its destination, not a node identity, so a focused field with no
+/// destination looks like no focus at all. Upgrade: carry the field's `NodeId` alongside the
+/// target once something has to paint or address the *field* rather than its submit.
 fn focused_target(path: &[&layout::ResolvedNode]) -> Option<node::SecureSubmitTarget> {
     let field = path.iter().rev().find(|node| node.kind == "textfield")?;
     let Some(node::PaintStyle::TextField { target, .. }) = &field.paint else {
@@ -139,22 +127,21 @@ fn focused_target(path: &[&layout::ResolvedNode]) -> Option<node::SecureSubmitTa
 /// The frame a completed `wp-text-input-v3` submit produces, or `None` when no focused `textfield`
 /// named a destination for it (ADR-0050 decision 4).
 ///
-/// `None` is the point: without it, the submit would address `"unknown"/"unknown"`, which no
-/// Supervisor capability routes, a password put on the wire for nobody. Sending nothing is the
-/// only safe answer to "whose password is this?".
+/// `None` is the point: without it, the submit would address `"unknown"/"unknown"`, a password
+/// put on the wire for nobody. Sending nothing is the only safe answer to "whose password is
+/// this?".
 ///
-/// The buffer is zeroized on both branches; on the branch that sends nothing it is the only thing
-/// that happens, so a dropped submit never leaves the accumulated secret sitting in `App`.
+/// The buffer is zeroized on both branches, so a dropped submit never leaves the accumulated
+/// secret sitting in `App`.
 fn submit_frame_for(
     generation_id: u32,
     target: Option<&node::SecureSubmitTarget>,
     buffer: &mut shared::SecureBuffer,
 ) -> Option<RendererFrame> {
-    // An empty buffer is not a password, and sending one is not free. The Supervisor routes it
-    // straight into PAM, which spends one of the user's counted attempts and one `pam_unix` failure
-    // delay answering a keystroke that said nothing, on the lock screen, where attempts are the
-    // scarce resource. Enter on an empty field does nothing, the way it does in every other password
-    // prompt. Checked before the destination, because it is true whatever the destination was.
+    // An empty buffer is not a password, and sending one is not free: the Supervisor routes it
+    // into PAM, spending one counted attempt and one `pam_unix` failure delay on a keystroke that
+    // said nothing, on the lock screen, where attempts are the scarce resource. Checked before the
+    // destination, since it is true whatever the destination was.
     let Some(target) = target.filter(|_| !buffer.is_empty()) else {
         buffer.zeroize();
         return None;
@@ -163,12 +150,11 @@ fn submit_frame_for(
 }
 /// A focused `secure_submit` field, together with the surface whose tree declared it.
 ///
-/// The surface id lets [`focus_is_still_armed`] tell "the field on the surface that currently has
-/// the keyboard" from "the field on a surface this process destroyed". The protocol does not
-/// require a compositor to send `wl_keyboard.leave` for a surface the client itself destroyed, so
-/// a destination alone could not tell them apart: type a password on the lock screen, let the
-/// compositor send `finished`, and the plaintext would sit in `App::secure_buffer`, still addressed
-/// to `("lock", "authenticate")`, with later bar keystrokes appending to it.
+/// The surface id lets [`focus_is_still_armed`] tell a field on the surface holding the keyboard
+/// from one on a surface this process destroyed. The protocol does not require a
+/// `wl_keyboard.leave` for a surface the client destroyed, so the destination alone could not
+/// tell them apart (a lock-screen password would otherwise sit in `App::secure_buffer`, still
+/// addressed to `("lock", "authenticate")`, with later bar keystrokes appending to it).
 ///
 /// So the field is bound to its surface, and [`focus_is_still_armed`] is the one question every
 /// keystroke asks, rather than a clearing call bolted onto each of the five or six sites that can
@@ -179,25 +165,21 @@ pub(super) struct FocusedField {
     surface_id: String,
     target: node::SecureSubmitTarget,
 }
-/// The one place `App::focused_secure_submit` is ever written, and the reason it is one place.
-///
-/// A `shared::SecureBuffer`'s lifetime belongs to the field the bytes were typed into, not to the
-/// transport that carried them. Three sites reassign or clear focus: `KeyboardHandler::leave`,
+/// The one place `App::focused_secure_submit` is ever written: a `shared::SecureBuffer`'s
+/// lifetime belongs to the field the bytes were typed into, not the transport that carried them.
+/// Three sites reassign or clear focus (`KeyboardHandler::leave`,
 /// `SeatHandler::remove_capability`'s keyboard arm, and the retargeting press in
-/// `PointerHandler::pointer_frame`. Any one of them skipping the scrub lets a password typed into
-/// one field survive a focus change and reach [`submit_frame_for`] addressed to whatever capability
-/// the next focused field names, exactly the routing ADR-0005 exists to prevent.
+/// `PointerHandler::pointer_frame`); skipping the scrub at any one lets a password typed into one
+/// field reach [`submit_frame_for`] addressed to the next focused field's capability, exactly the
+/// routing ADR-0005 exists to prevent.
 ///
-/// So the rule is enforced on the transition, not at each site that performs one: any change of
-/// destination, including one field to another directly, scrubs. A fifth caller inherits it by
-/// construction.
+/// Enforced on the transition, not at each site: any change of destination scrubs, including one
+/// field to another directly, so a fifth caller inherits it by construction. Re-arming the same
+/// destination deliberately does not scrub: a press decides focus unconditionally (ADR-0050
+/// decision 4), so clicking twice in the field being typed into leaves the target unchanged.
 ///
-/// Re-arming the same destination deliberately does not scrub: a press decides focus
-/// unconditionally (ADR-0050 decision 4), so clicking twice in the field being typed into
-/// arrives here with the target unchanged.
-///
-/// A free function, not a `&mut self` method, so the property is testable without a live Wayland
-/// connection, the same reason [`secure_submit_frame`] is one.
+/// A free function, not a `&mut self` method, for [`secure_submit_frame`]'s reason: it makes the
+/// read/zeroize contract unit-testable without a live Wayland connection.
 fn retarget_secure_submit(
     focused: &mut Option<FocusedField>,
     buffer: &mut shared::SecureBuffer,
@@ -212,11 +194,10 @@ fn retarget_secure_submit(
 /// surface's resolved tree and whatever is focused now.
 ///
 /// A total function: an untracked surface and a tracked one with no sole `secure_submit` both
-/// answer `None` here rather than leaving `focused_secure_submit` untouched, and `None` is pushed
-/// through [`App::focus_secure_submit`] like any other result. `apply_secure_key` gates on focus
-/// alone, so a case that only advanced `keyboard_focus` without touching `focused_secure_submit`
-/// would leave keystrokes on a surface with no password field accumulating into the previous
-/// surface's field, still addressed to its capability.
+/// answer `None`, pushed through [`App::focus_secure_submit`] like any other result, rather than
+/// leaving `focused_secure_submit` untouched. `apply_secure_key` gates on focus alone, so a case
+/// that only advanced `keyboard_focus` would leave keystrokes on a surface with no password field
+/// accumulating into the previous surface's field, still addressed to its capability.
 ///
 /// What survives an `enter` is a field on the surface that is entering, and only that: a press on
 /// a surface with several `secure_submit` fields picks one that [`sole_secure_submit`] refuses to
@@ -236,17 +217,17 @@ fn focus_on_enter(
     }
     Some(FocusedField { surface_id: id.to_string(), target: sole_secure_submit(tree)? })
 }
-/// Whether a focused field is still armed: its own surface both holds the keyboard and still exists
+/// Whether a focused field is still armed: its surface both holds the keyboard and still exists
 /// as a live `wl_surface` in this process.
 ///
 /// Both clauses, neither redundant. The keyboard clause is defect 2: a pointer press arms focus on
 /// whatever surface it landed on, so without it a field on a `keyboard_interactivity = none` panel
 /// stays armed while another surface actually receives keys. The liveness clause is defect 3: a
-/// `wl_surface` this process destroyed may never produce a `leave`, so the field on a torn-down
-/// lock screen would otherwise stay armed with a login password in it.
+/// `wl_surface` this process destroyed may never produce a `leave`, so a field on a torn-down lock
+/// screen would otherwise stay armed with a login password in it.
 ///
-/// Asked at the point of use rather than enforced at each of the five or six sites that can break
-/// it, so a field is armed only while both facts are true, by construction.
+/// Asked at the point of use, not enforced at each of the five or six sites that can break it, so
+/// a field is armed only while both facts are true, by construction.
 fn focus_is_still_armed(field: &FocusedField, keyboard_focus: Option<&str>, its_surface_is_live: bool) -> bool {
     keyboard_focus == Some(field.surface_id.as_str()) && its_surface_is_live
 }
@@ -266,38 +247,32 @@ enum SecureKeyAction<'a> {
 /// One `wl_keyboard` key, as an edit to a focused `secure_submit` buffer.
 ///
 /// Why the keyboard and not `zwp_text_input_v3`: text-input-v3 only produces a `commit_string`
-/// when the compositor has an input method bound to the seat, so on an ordinary session with no
-/// IME running, no byte reached `shared::SecureBuffer` and a granted lock could not be
-/// authenticated out of at all. It is also the security-correct transport independently of that:
-/// a password must not be routed through an input method, which is why swaylock and hyprlock read
-/// xkb directly too.
+/// when an input method is bound, so with no IME running no byte would reach
+/// `shared::SecureBuffer`. It is also security-correct on its own: a password must not route
+/// through an input method, why swaylock and hyprlock read xkb directly too.
 ///
-/// The `zwp_text_input_v3` binding is gone entirely. Keeping it would leave two independent
-/// writers on one `shared::SecureBuffer`, with an IME able to land a character through both, and a
-/// live `ContentPurpose::Password` session open beside the keyboard reader, exactly what
-/// ADR-0027's amendment says must never see a password. Deleted rather than left dormant: a
-/// dormant enabled text-input object is still an IME session the compositor may route keystrokes
-/// into.
+/// The `zwp_text_input_v3` binding is gone entirely, not left dormant: a dormant text-input
+/// object is still an IME session the compositor may route keystrokes into. Keeping it would put
+/// two independent writers on one `shared::SecureBuffer`, with a live `ContentPurpose::Password`
+/// session open beside the keyboard reader, exactly what ADR-0027's amendment forbids.
 ///
-/// ADR-0027 still records the right design for the *other* field kind: an ordinary
-/// Lua-readable `textfield` with `on_change`/`on_submit` (§ 5.2 item 8's unmasked half) needs IME
-/// composition and must not be a raw keysym reader, binds without `ContentPurpose::Password`, and
-/// shares nothing with this path but the node kind.
+/// ADR-0027 still covers the *other* field kind: an ordinary Lua-readable `textfield` with
+/// `on_change`/`on_submit` (§ 5.2 item 8's unmasked half) needs IME composition and must not be a
+/// raw keysym reader; it shares nothing with this path but the node kind.
 ///
-/// This adds no IDL surface: the bytes go into a native buffer and out to the Supervisor, the whole
-/// definition of a `secure_submit` field (ADR-0005), and a key that does not land in one is
-/// [`Ignore`d]. § 5.2 still declares no `on_key`.
+/// This adds no IDL surface: the bytes go into a native buffer and out to the Supervisor, the
+/// whole definition of a `secure_submit` field (ADR-0005); a key that misses is [`Ignore`d]. §
+/// 5.2 still declares no `on_key`.
 ///
 /// [`Ignore`d]: SecureKeyAction::Ignore
 ///
-/// Control characters are filtered by their text, not an allow-list of keysyms: `utf8` is `Some`
-/// for Escape, Tab and Return alike (xkbcommon hands back the C0 control character), so an
-/// unfiltered append would bury an ESC byte inside a secret and leave PAM rejecting it for no
-/// visible reason.
+/// Control characters are filtered by their text, not a keysym allow-list: `utf8` is `Some` for
+/// Escape, Tab and Return alike (xkbcommon hands back the C0 control character), so an unfiltered
+/// append would bury an ESC byte in a secret, with PAM rejecting it for no visible reason.
 ///
 /// `repeat` exists for one case: a held Enter must not submit twice. A submit zeroizes the buffer
 /// as it reads it (see [`secure_submit_frame`]), so a repeat would send an empty password to PAM
-/// and spend one of the user's attempts on it.
+/// and spend an attempt on it.
 fn secure_key_action<'a>(event: &'a KeyEvent, repeat: bool) -> SecureKeyAction<'a> {
     match event.keysym {
         Keysym::Return | Keysym::KP_Enter => {
@@ -328,13 +303,11 @@ fn secure_key_action<'a>(event: &'a KeyEvent, repeat: bool) -> SecureKeyAction<'
 /// The set that fires has to equal the set a config can name: handed `"other"` for `BTN_TASK`, a
 /// config cannot tell it from `BTN_EXTRA` and would run whatever was written for the left button.
 ///
-/// ponytail: back and forward do nothing, on a mouse that has them. Three of the eight `BTN_*`
-/// codes `smithay_client_toolkit::seat::pointer` names are handled here and the other five are
-/// dropped, which costs a five-button mouse its two thumb buttons. Adding them is not a rename:
-/// real mice emit `BTN_SIDE` (0x113) and `BTN_EXTRA` (0x114) for back and forward, while
-/// `BTN_BACK` (0x116) and `BTN_FORWARD` (0x115) carry the literal names and are rarer, so a correct
-/// mapping is four codes onto two names and there is no caller to check it against yet. Map both
-/// pairs with the first config that asks; this function is the only place that changes.
+/// ponytail: back and forward do nothing on a mouse that has them. Three of the eight `BTN_*`
+/// codes `smithay_client_toolkit::seat::pointer` names are handled, dropping a five-button
+/// mouse's two thumb buttons. Real mice emit `BTN_SIDE` (0x113)/`BTN_EXTRA` (0x114) for back and
+/// forward, and the rarer `BTN_BACK` (0x116)/`BTN_FORWARD` (0x115); map all four when a config
+/// asks.
 fn pointer_button_name(code: u32) -> Option<&'static str> {
     match code {
         BTN_LEFT => Some("left"),
@@ -374,12 +347,12 @@ fn release_completes_click(
 /// `on_click`'s single argument: the button's rect as `{ x, y, width, height }` in its surface's
 /// logical coordinates (ADR-0050 decision 3).
 ///
-/// The rect travels to the callback, not back from it. § 6's `popup` entry says the anchor rect is
-/// "passed straight from the rect `button`'s `on_click` hands back", which is the round trip
-/// through the config: `on_click = function(rect) menu_anchor:set(rect) end`, with the `popup`
-/// declaring `anchor_rect = menu_anchor`. `Err` names the step as well as the error: a rect table
-/// this engine could not build is the engine's bug, a handler that raised is the config's, and
-/// merging them would send a config author looking at their own Lua for a fault that isn't there.
+/// The rect travels to the callback, not back from it: § 6's `popup` entry has the anchor rect
+/// "passed straight from the rect `button`'s `on_click` hands back", the round trip through
+/// `on_click = function(rect) menu_anchor:set(rect) end` and `popup`'s `anchor_rect = menu_anchor`.
+/// `Err` names the step as well as the error: a rect table this engine could not build is the
+/// engine's bug, a handler that raised is the config's, and merging them would send a config
+/// author looking at their own Lua for a fault that isn't there.
 fn call_on_click(
     lua: &Lua,
     on_click: &Function,
@@ -401,15 +374,14 @@ pub(super) fn rect_table(lua: &Lua, rect: LogicalRect) -> mlua::Result<Table> {
 }
 /// Builds one `RendererFrame::SecureSubmit` out of `buffer` (ADR-0005/ADR-0027).
 ///
-/// The one sanctioned read (`expose_secret`) and the explicit `.zeroize()` of the source buffer
-/// sit on adjacent lines here, so the accumulated secret stops existing the instant it has been
-/// copied into the outgoing envelope. It is not left to `Drop`, and not left live while the frame
-/// travels to the socket thread. The frame's own plaintext copy is the socket thread's to scrub,
-/// immediately after its wire write (`crate::socket`'s `pump`).
+/// The one sanctioned read (`expose_secret`) and the explicit `.zeroize()` sit on adjacent lines,
+/// so the accumulated secret stops existing the instant it is copied into the outgoing envelope,
+/// not left to `Drop` or left live while the frame travels to the socket thread. The frame's own
+/// plaintext copy is the socket thread's to scrub, right after its wire write (`crate::socket`'s
+/// `pump`).
 ///
-/// A free function, not a `&mut self` method, for [`retarget_secure_submit`]'s reason: it makes the
-/// whole read/zeroize contract directly unit-testable, which nothing involving a live `wl_surface`
-/// is.
+/// A free function, not a `&mut self` method, for [`retarget_secure_submit`]'s reason: it makes
+/// the read/zeroize contract unit-testable, which nothing involving a live `wl_surface` is.
 fn secure_submit_frame(
     generation_id: u32,
     capability: &str,
@@ -439,21 +411,21 @@ impl App {
 
     /// Whether `instance_id` is still a surface this process has a live `wl_surface` for.
     ///
-    /// `TrackedRole::wl_surface` is the whole test, and it is the right one because it answers
-    /// `None` for both shapes a gone surface takes here: the entry removed outright
-    /// ([`App::destroy_surface_by_id`]) and the entry kept with its role object dropped
-    /// ([`App::hide_window`], [`App::teardown_lock_surfaces`], [`App::drop_popup_object`]).
+    /// `TrackedRole::wl_surface` is the right test: it answers `None` for both shapes a gone
+    /// surface takes here, the entry removed outright ([`App::destroy_surface_by_id`]) and the
+    /// entry kept with its role object dropped ([`App::hide_window`],
+    /// [`App::teardown_lock_surfaces`], [`App::drop_popup_object`]).
     fn surface_is_live(&self, instance_id: &str) -> bool {
         self.surfaces.iter().any(|tracked| tracked.surface_id == instance_id && tracked.role.wl_surface().is_some())
     }
 
-    /// Drops the focused field, and the half-typed secret with it, the moment [`focus_is_still_armed`]
-    /// stops holding, through [`App::focus_secure_submit`], so the scrub is the same one every
-    /// other transition gets.
+    /// Drops the focused field, and the half-typed secret with it, the moment
+    /// [`focus_is_still_armed`] stops holding, through [`App::focus_secure_submit`] so the scrub
+    /// is the same one every other transition gets.
     ///
-    /// Called before every keystroke, which is what makes the rule load-bearing rather than
-    /// advisory: nothing can reach `secure_buffer` through a focus that has gone stale, whatever
-    /// took the surface away and whether or not a `leave` ever followed.
+    /// Called before every keystroke, which makes the rule load-bearing rather than advisory:
+    /// nothing can reach `secure_buffer` through a stale focus, whatever took the surface away
+    /// and whether or not a `leave` ever followed.
     fn prune_secure_focus(&mut self) {
         let armed = self.focused_secure_submit.as_ref().is_some_and(|field| {
             focus_is_still_armed(field, self.keyboard_focus.as_deref(), self.surface_is_live(&field.surface_id))
@@ -468,9 +440,9 @@ impl App {
 
     /// The focused `secure_submit` field's state, if the field lives on `surface_id`.
     ///
-    /// Here rather than in `wayland::surface` because [`FocusedField`]'s halves are this module's:
-    /// it is the one place that knows a focus is a surface plus a `{ capability, action }` pair,
-    /// and `paint` should not learn that shape to ask one question.
+    /// Here rather than in `wayland::surface`: this is the one place that knows a focus is a
+    /// surface plus a `{ capability, action }` pair, and `paint` should not learn that shape to
+    /// ask one question.
     ///
     /// The count, never the bytes. See `layout::paint::SecureField`.
     pub(super) fn secure_field_for(&self, surface_id: &str) -> Option<layout::paint::SecureField<'_>> {
@@ -484,16 +456,15 @@ impl App {
     /// The half of [`App::prune_secure_focus`] that does not wait for a keystroke: a field whose
     /// surface this process destroyed is dropped, and its buffer scrubbed, on the next poll turn.
     ///
-    /// Only the liveness clause, deliberately: `prune_secure_focus`'s other clause is about routing,
-    /// which surface is receiving keys, and it is only ever wrong at the moment a key arrives, which
-    /// is where it is asked. Applying it once a turn would also disarm the field a press on a
-    /// multi-field surface just chose, in the window before the compositor's matching `enter` lands,
-    /// and `sole_secure_submit` cannot re-choose it (see [`focus_on_enter`]).
+    /// Only the liveness clause, deliberately: the routing clause is only ever wrong at the moment
+    /// a key arrives, which is where it is asked. Applying it once a turn would also disarm the
+    /// field a press on a multi-field surface just chose, before the compositor's matching `enter`
+    /// lands, which `sole_secure_submit` cannot re-choose (see [`focus_on_enter`]).
     ///
     /// What this buys is the liveness clause's residency ceiling: a `wl_surface` this process
-    /// destroys, such as `teardown_lock_surfaces` tearing down the lock screen, may never produce a
-    /// `leave`. Without this the plaintext would sit in `secure_buffer` until some later keystroke
-    /// happened to notice, never on a session where the user walks away.
+    /// destroys, such as `teardown_lock_surfaces` tearing down the lock screen, may never produce
+    /// a `leave`. Without this the plaintext would sit in `secure_buffer` until a later keystroke
+    /// noticed, never on a session where the user walks away.
     pub(super) fn drop_secure_focus_if_its_surface_is_gone(&mut self) {
         let gone = self.focused_secure_submit.as_ref().is_some_and(|field| !self.surface_is_live(&field.surface_id));
         if gone {
@@ -504,17 +475,17 @@ impl App {
         }
     }
 
-    /// One key event applied to the focused `secure_submit` field, or nothing at all when no field
-    /// is focused (ADR-0005).
+    /// One key event applied to the focused `secure_submit` field, or nothing when no field is
+    /// focused (ADR-0005).
     ///
-    /// The focus check is the gate: `focused_secure_submit` is `Some` only when some field named a
-    /// destination for the next secret, so a keystroke that reaches the buffer already has somewhere
-    /// to be sent. A `textfield` with no `secure_submit` leaves it `None` (see [`focused_target`]),
-    /// and a key arriving then is dropped rather than accumulated: buffering a password for a field
-    /// that can never submit it is a secret held for no reason.
+    /// The focus check is the gate: `focused_secure_submit` is `Some` only when a field named a
+    /// destination, so a keystroke that reaches the buffer already has somewhere to be sent. A
+    /// `textfield` with no `secure_submit` leaves it `None` (see [`focused_target`]), and a key
+    /// arriving then is dropped rather than accumulated: buffering a password for a field that
+    /// can never submit it is a secret held for no reason.
     ///
-    /// Nothing here touches Lua: the bytes go from the `KeyEvent` into a native `shared::SecureBuffer`
-    /// and out to the Supervisor, and no Lua value is ever built from them.
+    /// Nothing here touches Lua: the bytes go from the `KeyEvent` into a native
+    /// `shared::SecureBuffer` and out to the Supervisor.
     fn apply_secure_key(&mut self, event: &KeyEvent, repeat: bool) {
         // Before the gate, not after it: the gate reads `focused_secure_submit` alone, and a focus
         // whose surface is gone or is no longer the one receiving keys is exactly the state this key
@@ -534,11 +505,11 @@ impl App {
             SecureKeyAction::Backspace => {
                 self.secure_buffer.pop_char();
             }
-            // Through the seam in both directions, not the buffer directly: the scrub Escape wants
-            // is the one `retarget_secure_submit` performs on a transition, and re-arming the
-            // identical field immediately after leaves the user still in it, free to retype. A
-            // fifth writer of `secure_buffer` with its own idea of clearing is exactly what routing
-            // every write through this seam exists to prevent.
+            // Through the seam in both directions, not the buffer directly: the scrub Escape
+            // wants is the one `retarget_secure_submit` performs on a transition, and re-arming
+            // the identical field right after leaves the user still in it, free to retype. A
+            // fifth writer of `secure_buffer` is exactly what routing every write through this
+            // seam prevents.
             SecureKeyAction::Clear => {
                 let field = self.focused_secure_submit.clone();
                 self.focus_secure_submit(None);
@@ -549,15 +520,14 @@ impl App {
         }
     }
 
-    /// A completed `secure_submit`: builds the outgoing frame out of the accumulated buffer and
+    /// A completed `secure_submit`: builds the outgoing frame from the accumulated buffer and
     /// queues it for the socket thread. [`submit_frame_for`] performs the one sanctioned read and
     /// leaves `self.secure_buffer` scrubbed and empty on either branch.
     ///
-    /// [`submit_frame_for`] refuses on two counts and both end here: no focused destination
-    /// (ADR-0050 decision 4) and an empty buffer. Logged rather than silent: a user who pressed
-    /// enter deserves an explanation, and it is almost always a `textfield` missing its
-    /// `secure_submit` table. The empty case explains itself on the glass, since there is nothing
-    /// in the field.
+    /// [`submit_frame_for`] refuses on two counts, both logged here: no focused destination
+    /// (ADR-0050 decision 4) and an empty buffer. Logged rather than silent since a user who
+    /// pressed enter deserves an explanation, almost always a `textfield` missing its
+    /// `secure_submit` table. The empty case explains itself on the glass.
     fn finish_secure_submit(&mut self) {
         let target = self.focused_secure_submit.as_ref().map(|field| &field.target);
         let Some(frame) = submit_frame_for(self.generation_id, target, &mut self.secure_buffer) else {
@@ -574,18 +544,18 @@ impl App {
     /// One hit-test of surface `index` at `position`, answering both of [`PointerHit`]'s questions
     /// (ADR-0050 decisions 1 and 4).
     ///
-    /// `position` is surface-local and logical, the space `layout::hit` walks `ResolvedNode::rect` in,
-    /// so there is no conversion here. That holds only while `paint_surface` paints at scale `1.0` and
-    /// nothing calls `wl_surface::set_buffer_scale`; ADR-0050's consequences name this as a
-    /// caller that a future HiDPI change has to move together with `paint_surface` and
+    /// `position` is surface-local and logical, the space `layout::hit` walks `ResolvedNode::rect`
+    /// in, so there is no conversion here. That holds only while `paint_surface` paints at scale
+    /// `1.0` and nothing calls `wl_surface::set_buffer_scale`; ADR-0050's consequences name this a
+    /// caller a future HiDPI change must move together with `paint_surface` and
     /// `apply_input_region`.
     ///
-    /// A surface with no resolved tree answers the same as a point that missed everything: no button,
-    /// no focused destination.
+    /// A surface with no resolved tree answers like a point that missed everything: no button, no
+    /// focused destination.
     ///
     /// Owned on the way out, every part: `Scene::surface` clones into a `ResolvedNode` (the same
-    /// property `paint_surface` relies on), so the borrow of `self.client` ends on that line, and both
-    /// the `Function` and the target are cloned out of the local tree before it is dropped.
+    /// property `paint_surface` relies on), so the borrow of `self.client` ends there, and both the
+    /// `Function` and the target are cloned out of the local tree before it is dropped.
     fn hit_under(&self, index: usize, position: (f64, f64)) -> PointerHit {
         let Some(tree) = self.client.scene().surface(&self.surfaces[index].surface_id) else {
             return PointerHit { button: None, focus: None };
@@ -601,40 +571,33 @@ impl App {
     /// Writes every `hover` signal in one surface against the pointer's position, or turns them all
     /// off when `position` is `None` (ADR-0062).
     ///
-    /// Two phases, and the split is forced: `layout::hover::hover_writes` borrows the resolved tree
-    /// out of `self.client`, and `LiveSignalHandle::set_changed` runs while that borrow is still
-    /// alive only if the writes are collected first. Cloning the `Signal`s is what ends the borrow;
-    /// a `Signal` is an `Rc` handle, so the clone is a refcount bump rather than a copy of anything.
+    /// Two phases, forced by borrowing: `layout::hover::hover_writes` borrows the tree from
+    /// `self.client`, so the writes must be collected before `LiveSignalHandle::set_changed` can
+    /// run. Cloning the `Signal`s (an `Rc` handle, a refcount bump) is what ends the borrow.
     ///
-    /// Nothing marks the scene dirty here directly. `set_changed` marks it, and only when the value
-    /// actually moved (decision 4), so a pointer sitting still inside one button re-resolves nothing,
-    /// which matters because `wl_pointer` reports motion at device rate and one mark re-resolves
-    /// every surface in the generation (ADR-0044 decision 2).
+    /// Nothing marks the scene dirty here directly: `set_changed` marks it, only when the value
+    /// moved (decision 4), so a pointer sitting still inside one button re-resolves nothing. That
+    /// matters since `wl_pointer` reports motion at device rate, and one mark re-resolves every
+    /// surface in the generation (ADR-0044 decision 2).
     ///
-    /// ponytail: `Scene::surface` deep-clones the retained subtree into a `ResolvedNode`, property
-    /// maps and all, and this asks for it on every motion event rather than on every click. For the
-    /// dev bar that is a few hundred small `HashMap` clones per event while the pointer is moving
-    /// across a shell surface, on the Wayland dispatch thread. The guard above is what keeps it off
-    /// every config that does not use hover, which is why it is a guard and not an assertion. The
-    /// real fix is a borrowing accessor -- `Scene` handing out `&RetainedNode`, or running this
-    /// walk against the retained tree behind a closure -- and it is not built here because
-    /// `layout::hit` and `layout::hover` are both written against `ResolvedNode` and changing that
-    /// is a wider edit than this slice. Do it when a profile names this, or when the second
-    /// per-motion consumer arrives.
+    /// ponytail: `Scene::surface` deep-clones the retained subtree into a `ResolvedNode` on every
+    /// motion event, a few hundred small `HashMap` clones per event for the dev bar, on the
+    /// Wayland dispatch thread; the guard above keeps it off configs that skip hover. Upgrade: a
+    /// borrowing accessor (`Scene` handing out `&RetainedNode`), once a profile demands it.
     /// One notch or one swipe, applied to the innermost scrollable container under the pointer.
     ///
-    /// **Pixels when the compositor sends them, a step when it does not** (ADR-0069 decision
-    /// 6). A touchpad reports `absolute` in logical pixels and a notched wheel reports only
-    /// `value120`, where 120 is one logical step. `discrete` is ignored: it is deprecated, and every
-    /// compositor that still sends it sends `value120` alongside.
+    /// **Pixels when the compositor sends them, a step when it does not** (ADR-0069 decision 6). A
+    /// touchpad reports `absolute` in logical pixels; a notched wheel reports only `value120` (120
+    /// per logical step). `discrete` is ignored: deprecated, and every compositor still sending it
+    /// sends `value120` alongside.
     ///
     /// **Innermost wins and nothing chains.** A wheel over a list inside a scrollable panel moves
-    /// the list, and moves nothing when the list hits its end. Chaining to the parent is what a
-    /// browser does and is a rule with edge cases (when does the handoff happen, does it reset on a
-    /// new gesture) that no config here has asked for.
+    /// the list, and moves nothing once the list hits its end. Chaining to the parent, what a
+    /// browser does, is a rule with edge cases (when the handoff happens, whether it resets on a
+    /// new gesture) no config here has asked for.
     ///
-    /// The offset written is unclamped. `layout::scene`'s positioning pass owns the bound, because
-    /// it is the only place that knows the content extent, and it writes back what it used.
+    /// The offset written is unclamped. `layout::scene`'s positioning pass owns the bound: it is
+    /// the only place that knows the content extent, and it writes back what it used.
     fn scroll_at(
         &mut self,
         index: usize,
@@ -699,17 +662,16 @@ impl App {
             // The boolean decides whether anything happens at all, and it is checked first because
             // its answer is what gates the rect below.
             let crossed = handle.set_changed(mlua::Value::Boolean(write.hovered));
-            // Only on the edge into the node, and the guard is not an optimisation. `set_changed`
+            // Only on the edge into the node, and the guard is not an optimisation: `set_changed`
             // compares with `PartialEq`, and two `mlua` tables holding identical numbers are not
-            // equal, since table equality is identity, so a freshly built rect table always counts
-            // as a change. Writing it per motion event would mark the scene dirty on every one of
-            // them and undo exactly what decision 4 is for. Writing it once per entry is also all
-            // that is wanted: the node does not move while the pointer sits inside it, and if a
-            // re-resolve does move it, that re-resolve happened for its own reasons anyway.
+            // equal since table equality is identity, so a freshly built rect table always counts
+            // as a change. Writing it per motion event would undo exactly what decision 4 is for.
+            // Writing it once per entry is also all that is wanted: the node does not move while
+            // the pointer sits inside it, and a re-resolve that does move it happened for its own
+            // reasons anyway.
             //
-            // Order does not matter to a reader. Both land before the poll loop's single
-            // `re_resolve_if_dirty` for this turn, so nothing ever resolves against one and not
-            // the other.
+            // Order does not matter to a reader: both land before the poll loop's single
+            // `re_resolve_if_dirty` for this turn.
             if crossed
                 && let Some(rect) = write.rect
                 && let Some(rect_handle) = write.signal.hover_rect_handle()
@@ -731,10 +693,9 @@ impl App {
     /// Calls one `button`'s `on_click` with its rect (ADR-0050 decision 3).
     ///
     /// A raise is logged against the surface it happened on and swallowed. A broken `on_click` is
-    /// a config bug, and a config bug must not take a shell that is otherwise painting down with
-    /// it; ADR-0046's rescue path is for an evaluation that failed, not for one misbehaving
-    /// handler, so this deliberately does not set `self.exit` and deliberately does not enter
-    /// rescue.
+    /// a config bug, and a config bug must not take down a shell that is otherwise painting fine.
+    /// ADR-0046's rescue path is for a failed evaluation, not a misbehaving handler, so this
+    /// deliberately does not set `self.exit` or enter rescue.
     fn fire_on_click(&mut self, instance_id: &str, rect: LogicalRect, button: &str, on_click: &Function) {
         // Nothing marks the scene dirty here. A handler that changes what is painted does it by
         // writing a `state(name, initial)` signal, and `signal:set()` marks the flag itself
@@ -756,10 +717,10 @@ impl SeatHandler for App {
     /// one to serve.
     ///
     /// Idempotent by the `is_none` guards, not by trusting the compositor: `wl_seat::capabilities`
-    /// is a full re-statement of the current set on every change, so a seat that gains a keyboard
-    /// re-announces its pointer, and SCTK turns each announcement into this call. A second
-    /// `wl_pointer` would deliver duplicate events into one `armed` slot, and a second
-    /// `wl_keyboard` two `enter`/`leave` streams into one `keyboard_focus`.
+    /// restates the full current set on every change, so a seat gaining a keyboard re-announces
+    /// its pointer, and SCTK turns each announcement into this call. A second `wl_pointer` would
+    /// deliver duplicate events into one `armed` slot; a second `wl_keyboard`, two
+    /// `enter`/`leave` streams into one `keyboard_focus`.
     fn new_capability(
         &mut self,
         _conn: &Connection,
@@ -871,7 +832,7 @@ impl PointerHandler for App {
                     //
                     // Bound to the surface the press landed on, per [`FocusedField`]: a field armed
                     // here stays armed only while that surface is both alive and the one the
-                    // compositor is sending keys to.
+                    // compositor sends keys to.
                     let focus = hit.focus.map(|target| FocusedField { surface_id: instance_id.clone(), target });
                     // Through the seam, because this is the site that *reassigns* rather than
                     // clears: a press moving from one `textfield` to another is the direct A-to-B
@@ -1007,11 +968,11 @@ impl KeyboardHandler for App {
     }
 
     // A key reaches exactly one place and it is not a config: § 5.2 declares no key-handler
-    // property on any node, and ADR-0050's consequences say this ADR does not invent one. What
-    // it does have is the `secure_submit` field ADR-0005 defines: [`App::apply_secure_key`]
-    // pushes bytes into a native `shared::SecureBuffer` and out to the Supervisor without a Lua
-    // value ever existing, adding no IDL surface. See [`secure_key_action`] for why this is the
-    // keyboard and not text-input.
+    // property on any node, and ADR-0050's consequences say this ADR does not invent one. What it
+    // has is the `secure_submit` field ADR-0005 defines: [`App::apply_secure_key`] pushes bytes
+    // into a native `shared::SecureBuffer` and out to the Supervisor with no Lua value ever
+    // existing, adding no IDL surface. See [`secure_key_action`] for why this is the keyboard,
+    // not text-input.
     fn press_key(
         &mut self,
         _conn: &Connection,

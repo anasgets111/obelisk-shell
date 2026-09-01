@@ -1,25 +1,17 @@
 //! Draws a resolved layout tree onto a shared femtovg canvas.
 //!
-//! Two halves, and the split is the point. [`build`] walks a `layout::scene::ResolvedNode` tree
-//! (`Scene::surface`'s output) and flattens it into a [`DisplayList`] of plain Rust data.
-//! [`execute`] turns that list into femtovg draw calls on `text::atlas::TextPainter`'s canvas, the
-//! same canvas `draw_line` already draws glyphs on -- one canvas, one flush per surface per frame.
+//! Two halves, one function until the list existed. [`build`] walks a `layout::scene::ResolvedNode`
+//! tree into a [`DisplayList`] of plain Rust data; [`execute`] turns that list into femtovg draw
+//! calls on `text::atlas::TextPainter`'s canvas, the same canvas `draw_line` draws glyphs on. This
+//! lets `wayland::App::paint_surface` skip the draw plus `eglSwapBuffers` when a frame's list
+//! equals the last, and lets [`build`] be tested without an EGL context. Measured on an idle bar
+//! with a clock: a 1920x1200 wallpaper went from repainting twice a second to never, niri's CPU
+//! fell about a third, since a full-surface commit recomposites the whole screen behind it.
 //!
-//! Nothing here parses. `node::paint_style` did that while `Scene::apply` resolved the node, so
-//! [`build_node`] reads a typed `node::PaintStyle` and this module names no property and holds no
-//! `mlua::Value`.
-//!
-//! They were one function until the list existed. Splitting them buys two things a single walk
-//! could not: `wayland::App::paint_surface` compares this frame's list against the one it last
-//! painted and skips the whole draw plus `eglSwapBuffers` when they match, and [`build`] is
-//! testable without standing up an EGL context. Measured on an idle bar with a clock: the
-//! 1920x1200 wallpaper went from repainting roughly twice a second to never, and niri's own CPU
-//! fell about a third with it, since a full-surface commit made the compositor recomposite the
-//! screen behind it.
-//!
-//! Draws in tree order, parent then children, so the stacking model ADR-0023 describes resolves
-//! overlaps the same way layout resolved them: a later sibling or a child paints over what an
-//! earlier one already put down. An invisible node (`visible == false`) and its whole subtree draw
+//! Nothing here parses: `node::paint_style` did that while `Scene::apply` resolved the node, so
+//! [`build_node`] reads a typed `node::PaintStyle` and holds no `mlua::Value`. Draws in tree order,
+//! parent then children, matching the stacking model ADR-0023 describes: a later sibling or child
+//! paints over what came before. An invisible node (`visible == false`) and its subtree draw
 //! nothing, the same collapse `layout::scene` picked for row/column space reservation.
 //!
 //! `ResolvedNode.rect` is parent-relative, so [`build_node`] accumulates an absolute origin as it
@@ -37,15 +29,13 @@ use crate::layout::scene::ResolvedNode;
 use crate::text::atlas::TextPainter;
 use crate::text::snap::{LogicalRect, PhysicalRect, snap_border_band, snap_to_physical};
 
-/// What one node actually draws, with every paint property already parsed. The variants are the
-/// four kind arms that draw anything; a `textfield` or an unrecognised kind contributes no
-/// [`DrawCmd`] at all rather than an empty variant here.
+/// What one node actually draws, with every paint property already parsed. The four variants are
+/// the kind arms that draw anything; a `textfield` or unrecognised kind contributes no [`DrawCmd`].
 ///
-/// Plain Rust data on purpose. The alternative -- deriving `PartialEq` on `ResolvedNode` and
-/// comparing trees -- cannot work: its properties are a
-/// `HashMap<String, mlua::Value>`, and mlua compares tables by identity, so a signal resolving to
-/// a table yields a fresh unequal table every pass (the same trap `Signal::set_changed` documents
-/// for hover rects). Nothing below holds a Lua value, so equality means what it says.
+/// Plain Rust data on purpose: `ResolvedNode` properties are a `HashMap<String, mlua::Value>`, and
+/// mlua compares tables by identity, so deriving `PartialEq` there would give a signal's resolved
+/// table a fresh unequal value every pass (the trap `Signal::set_changed` documents for hover
+/// rects). Nothing below holds a Lua value, so equality here means what it says.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Draw {
     /// `rect`/`row`/`column`/`button` and all four surface roles: the fill, then the border.
@@ -61,20 +51,17 @@ pub enum Draw {
         color: Rgba,
         align: TextAlign,
     },
-    /// The theme *name*, not the resolved path: [`execute`] does the `image::icons::resolve`
-    /// lookup. Keeping the filesystem hit out of [`build`] is what lets the build run on every
-    /// re-resolve without touching the icon theme, and the name plus the size is what decides the
-    /// pixels either way.
-    /// `alpha` rather than a tinted colour, because an icon is blitted rather than filled:
-    /// `femtovg`'s `Paint::image` takes the alpha as its last argument, where a `Box` or a `Text`
-    /// can carry the same information inside the `Rgba` it already had.
+    /// The theme *name*, not the resolved path: [`execute`] resolves it via
+    /// `image::icons::resolve`, which keeps the filesystem hit out of [`build`] so a re-resolve
+    /// never touches the icon theme. `alpha` rather than a tinted colour, because an icon is
+    /// blitted, not filled: `femtovg`'s `Paint::image` takes alpha as its last argument, where a
+    /// `Box` or `Text` bakes it into `Rgba`.
     Icon {
         name: String,
         px: u32,
         alpha: f32,
-        /// What a `currentColor` fill in the resolved SVG resolves to (ADR-0072). Part of the
-        /// command and not just of the draw call because `ImageCache` keys on it: the same file
-        /// tinted two ways is two textures.
+        /// What a `currentColor` fill in the resolved SVG resolves to (ADR-0072). `ImageCache` keys
+        /// on it, so the same file tinted two ways is two textures.
         color: Option<Rgba>,
     },
     Image {
@@ -84,15 +71,13 @@ pub enum Draw {
         alpha: f32,
     },
     /// A whole subtree drawn through the arc of the node that declared `clip = "Rounded"`, rather
-    /// than through its bounding rectangle. `radius` is that node's own, and the carrying
-    /// [`DrawCmd`]'s `rect` is the box the arc is built on.
+    /// than its bounding rectangle. `radius` is that node's own; the carrying [`DrawCmd`]'s `rect`
+    /// is the box the arc is built on.
     ///
-    /// The one recursive variant, and it has to be: every other clip in this module is an
-    /// axis-aligned rectangle, which is why [`DrawCmd`] can carry one flattened `clip` per command
-    /// instead of a save/restore nest. A rounded shape does not intersect into a rectangle, so the
-    /// subtree it applies to has to stay grouped for [`execute`] to render it apart and mask it as
-    /// a whole. `Vec<DrawCmd>` rather than a `DisplayList` so the type stays what its name says:
-    /// a `DisplayList` is one surface's finished output.
+    /// The one recursive variant: every other clip here is axis-aligned, so [`DrawCmd`] carries one
+    /// flattened `clip` instead of a save/restore nest. A rounded shape does not intersect into a
+    /// rectangle, so its subtree stays grouped for [`execute`] to mask as a whole. `Vec<DrawCmd>`,
+    /// not `DisplayList`, since a `DisplayList` is one surface's finished output.
     Clipped {
         radius: f32,
         commands: Vec<DrawCmd>,
@@ -101,11 +86,10 @@ pub enum Draw {
 
 /// One drawable node: what, where, and the clip it draws under.
 ///
-/// `clip` is the intersection of this node's snapped box with every ancestor's, computed during
-/// [`build`] rather than rebuilt from a `save`/`intersect_scissor`/`restore` nest at draw time.
-/// The two are equivalent because every clip here is an axis-aligned rect, intersection is
-/// associative, and this crate applies no canvas transform (`TextPainter::resize` calls
-/// `set_size(w, h, 1.0)` and nothing else touches it).
+/// `clip` is the intersection of this node's snapped box with every ancestor's, computed once
+/// during [`build`] rather than rebuilt from a save/restore scissor nest at draw time. The two are
+/// equivalent: every clip here is axis-aligned, intersection is associative, and this crate applies
+/// no canvas transform (`TextPainter::resize` calls `set_size(w, h, 1.0)` only).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DrawCmd {
     pub rect: LogicalRect,
@@ -117,17 +101,16 @@ pub struct DrawCmd {
 /// later), flattened out of the tree.
 ///
 /// Exists to be compared. `wayland::App::paint_surface` keeps the list it last painted and skips
-/// the whole paint plus `eglSwapBuffers` when the new one is equal, which is what stops a
-/// 1920x1200 wallpaper being redrawn every second because a clock's seconds digit advanced.
-/// Before this, `repaint_mapped_surfaces` repainted every mapped surface on every re-resolve,
-/// because ADR-0044 decision 2's single dirty flag left the process no way to tell which surface
-/// had changed. This gives it one without touching that flag: the flag still says *something*
-/// changed, and the list says *what*.
+/// the whole paint plus `eglSwapBuffers` when the new one is equal, which stops a 1920x1200
+/// wallpaper redrawing every second because a clock's seconds digit advanced. Before this,
+/// `repaint_mapped_surfaces` repainted every mapped surface on every re-resolve, because ADR-0044
+/// decision 2's single dirty flag could not say which surface changed; this list says *what*
+/// without touching that flag.
 ///
-/// Float equality is the right comparison here even though it is usually the wrong one. Both
-/// sides come from the same parsers over the same property values, so an unchanged input is
-/// bit-identical, not merely close. A `NaN` compares unequal to itself and so repaints forever,
-/// which is the safe direction to fail: too many frames, never a stale one.
+/// Float equality is the right comparison here even though it is usually wrong: both sides come
+/// from the same parsers over the same property values, so an unchanged input is bit-identical,
+/// not merely close. A `NaN` compares unequal to itself and so repaints forever, the safe direction
+/// to fail: too many frames, never a stale one.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DisplayList {
     pub commands: Vec<DrawCmd>,
@@ -139,8 +122,8 @@ pub struct DisplayList {
 const UNCLIPPED: PhysicalRect = PhysicalRect { x0: i32::MIN, y0: i32::MIN, x1: i32::MAX, y1: i32::MAX };
 
 /// Overlap of two snapped boxes. Empty (`x1 <= x0` or `y1 <= y0`) means nothing can draw, which
-/// [`build_node`] treats as a whole-subtree skip -- a child's clip is this intersected further,
-/// so it can only be empty too.
+/// [`build_node`] treats as a whole-subtree skip: a child's clip is this intersected further, so it
+/// can only be empty too.
 fn intersect(a: PhysicalRect, b: PhysicalRect) -> PhysicalRect {
     PhysicalRect { x0: a.x0.max(b.x0), y0: a.y0.max(b.y0), x1: a.x1.min(b.x1), y1: a.y1.min(b.y1) }
 }
@@ -151,15 +134,14 @@ fn is_empty(clip: PhysicalRect) -> bool {
 
 /// The focused `secure_submit` field's state, as much of it as paint is allowed to know.
 ///
-/// A count, never the bytes. `shared::SecureBuffer` has one sanctioned read (`expose_secret`,
-/// into an outgoing IPC envelope) and this is deliberately not it: ADR-0005 keeps a typed secret
-/// out of the Lua VM, and a display list that carried the characters would put it somewhere just
-/// as wrong -- a `Draw::Text` this process clones, compares and keeps in `last_painted` until the
-/// surface changes.
+/// A count, never the bytes. `shared::SecureBuffer` has one sanctioned read (`expose_secret`, into
+/// an outgoing IPC envelope), deliberately not this one: ADR-0005 keeps a typed secret out of the
+/// Lua VM, and a `Draw::Text` this process clones, compares and retains in `last_painted` would be
+/// just as wrong a place for it.
 ///
-/// `target` rather than a node id because that is what the input layer actually tracks:
-/// `wayland::input::FocusedField` names a surface and a `{ capability, action }` pair, and the
-/// node that declared that pair is the focused one.
+/// `target` rather than a node id, because that is what the input layer tracks:
+/// `wayland::input::FocusedField` names a surface and a `{ capability, action }` pair, and the node
+/// that declared that pair is the focused one.
 pub struct SecureField<'a> {
     pub target: &'a node::SecureSubmitTarget,
     /// `shared::SecureBuffer::char_count`, so one glyph is drawn per keystroke.
@@ -178,12 +160,12 @@ pub fn build(root: &ResolvedNode, scale: f32, focus: Option<&SecureField>) -> Di
 }
 
 /// One node, then its children (tree order, see this module's doc comment). `origin_x`/`origin_y`
-/// is the absolute position of this node's parent's content box -- added to `node.rect.x`/`.y`
-/// (parent-relative) to get this node's absolute rect, which is in turn what the next recursion
-/// level's origin becomes.
-// Eight parameters, and the same answer `layout::scene`'s own walks give: three of them (`origin`,
-// `clip`, `inherited_opacity`) are what this recursion accumulates and the rest are invariants it
-// carries, so a struct would be a bag holding the same eight fields through the same one caller.
+/// is the absolute position of this node's parent's content box, added to `node.rect.x`/`.y`
+/// (parent-relative) to get this node's absolute rect, which becomes the next recursion level's
+/// origin.
+// Eight parameters, the same answer `layout::scene`'s own walks give: three (`origin`, `clip`,
+// `inherited_opacity`) are what this recursion accumulates, the rest are invariants it carries, so
+// a struct would just bag the same eight fields through the same one caller.
 #[allow(clippy::too_many_arguments)]
 fn build_node(
     node: &ResolvedNode,
@@ -204,49 +186,40 @@ fn build_node(
     let rect = LogicalRect { x, y, width: node.rect.width, height: node.rect.height };
 
     // A node's own draw and its whole subtree are clipped to this box, snapped the same way
-    // `draw_line` snaps its glyph origin so the clip edge and the glyph's physical placement
-    // agree. Intersected with the ancestors' clip rather than replacing it, so a child can only
-    // shrink the clipped region further, never escape its parent's box.
+    // `draw_line` snaps its glyph origin so the clip edge and the glyph agree. Intersected with
+    // the ancestors' clip rather than replacing it, so a child can only shrink the region further,
+    // never escape its parent's box.
     //
-    // ponytail: clipping is the floor, not the finished behavior. § 3.2 gives `text` a wrap at
-    // the available width, and
-    // `layout::scene`'s measure callback already measures a `Content`-sized text box against
-    // exactly that width (its `text_wrap_width` local, passed to `ShapingHandle::shape` as
-    // `max_width`) -- but `ShapeResult` returns only a bounding `width`/`height`, not the wrapped
-    // lines that produced it, and `Draw::Text` carries the raw `content` string that `draw_line`
-    // renders in one `fill_text` call. So a box sized correctly for N wrapped lines gets one
-    // unwrapped line painted into it, and this clip cuts that line off at the first line's width
-    // instead of showing the rest on line two. The honest fix is paint asking for the same
-    // wrapped line breaks layout already measured with, not a new clip strategy.
+    // ponytail: clipping is the floor, not the finished behavior. `ShapeResult` gives only a
+    // bounding `width`/`height`, not the wrapped lines `layout::scene`'s measure callback found
+    // for a `Content`-sized `text` (§ 3.2), so this clip cuts an unwrapped `Draw::Text` off at line
+    // one's width. Upgrade path: paint should ask for the same wrapped line breaks layout measured.
     //
     // This clip is always rectangular, `radius` or not. A node that wants its children cut by its
-    // arc says `clip = "Rounded"` and gets a `Draw::Clipped` group below, which is a whole
-    // offscreen pass -- so the rectangle stays the default and the arc is asked for. femtovg's
-    // `intersect_rounded_scissor` is not the alternative it looks like: [`draw_clipped`] records
-    // what it does to a pill with a part-width child, measured.
+    // arc says `clip = "Rounded"` and gets a `Draw::Clipped` group below, a whole offscreen pass.
+    // femtovg's `intersect_rounded_scissor` is not the alternative it looks like: [`draw_clipped`]
+    // measures what it does to a pill with a part-width child.
     //
-    // ponytail: `layout::hit` intersects the same rectangles and knows nothing about the arc, so
-    // the corner of a pill is outside its fill and still takes a click. Four pixels on a 34px
-    // control, and the honest fix is hit testing sharing this walk rather than a second copy of
-    // the rounding rule.
+    // ponytail: `layout::hit` intersects the same rectangles but knows nothing about the arc, so a
+    // pill's corner is outside its fill yet still takes a click (four pixels on a 34px control).
+    // Upgrade path: hit testing should share this walk rather than keep a second copy of the
+    // rounding rule.
     let clip = intersect(clip, snap_to_physical(rect, scale));
     // Nothing in this subtree can put down a pixel, so none of it reaches the list. Behaviourally
-    // identical to the `save`/`intersect_scissor`/`restore` walk this replaced, which recursed
-    // into fully-clipped children and had every draw discarded by the scissor.
+    // identical to the save/`intersect_scissor`/restore walk this replaced, which recursed into
+    // fully-clipped children and had every draw discarded by the scissor.
     if is_empty(clip) {
         return;
     }
 
-    // `node.kind` is not consulted at all: `node::paint_style` already made that decision, once,
-    // while `Scene::apply` resolved this node. A kind it does not recognise carries no style and
-    // draws nothing, which stays deliberate -- on a lock surface that silence is a transparent
-    // buffer over a locked session, the black screen ADR-0052 decision 3 refuses a lock to
-    // avoid, reached by another route.
-    // Multiplied down the tree the same way `clip` is intersected down it, and for the same
-    // reason: a child can only ever be fainter than its parent, never solid inside a faded panel.
-    // Baked into the draw here rather than applied when `execute` runs, because ADR-0063 skips a
-    // repaint when the new display list equals the last one -- a fade that lived outside the list
-    // would be a change the surface never noticed.
+    // `node.kind` is not consulted here: `node::paint_style` already decided, once, while
+    // `Scene::apply` resolved this node. An unrecognised kind carries no style and draws nothing,
+    // deliberately: on a lock surface that silence is a transparent buffer over a locked session,
+    // the black screen ADR-0052 decision 3 refuses a lock to avoid, reached by another route.
+    // Opacity multiplies down the tree the same way `clip` intersects down it: a child can only be
+    // fainter than its parent, never solid inside a faded panel. Baked in here rather than applied
+    // in `execute`, because ADR-0063 skips a repaint when the new list equals the last one, and a
+    // fade living outside the list would be a change the surface never noticed.
     let opacity = inherited_opacity * node.opacity;
     let draw = node.paint.as_ref().and_then(|style| draw_for(style, rect, scale, opacity, focus));
 
@@ -261,10 +234,9 @@ fn build_node(
     };
 
     // `clip = "Rounded"`. Three commands where the square case emits one, in the order QML's own
-    // rounded clip uses: this node's fill, then the subtree masked by the arc, then this node's
-    // border over the top. Painting the border first would have it covered wherever a child reaches
-    // the arc, which on a pill with a filled ground is the whole left cap -- the exact place the
-    // border is doing its work.
+    // rounded clip uses: fill, then the subtree masked by the arc, then the border on top. Painting
+    // the border first would have it covered wherever a child reaches the arc, on a pill with a
+    // filled ground that is the whole left cap, the exact place the border does its work.
     let (fill, border) = split_fill_and_border(draw);
     if let Some(fill) = fill {
         out.push(DrawCmd { rect, clip, draw: fill });
@@ -300,8 +272,8 @@ fn rounded_clip(node: &ResolvedNode) -> Option<f32> {
 /// [`Draw::Clipped`] between them. Either half is `None` when it would paint nothing.
 ///
 /// Anything that is not a `Draw::Box` comes back whole in the first slot: [`rounded_clip`] only
-/// answers for a `PaintStyle::Box`, so that arm is unreachable, and it costs less than a panic to
-/// say so.
+/// answers for a `PaintStyle::Box`, so that arm is unreachable, and returning it costs less than a
+/// panic.
 fn split_fill_and_border(draw: Option<Draw>) -> (Option<Draw>, Option<Draw>) {
     let Some(Draw::Box { background, radius, colors, widths }) = draw else {
         return (draw, None);
@@ -346,10 +318,10 @@ pub fn execute(painter: &mut TextPainter, images: &mut ImageCache, list: &Displa
     run(painter, images, &list.commands, scale, RenderTarget::Screen, &mut scratch);
     painter.canvas_mut().reset_scissor();
     painter.canvas_mut().flush();
-    // After the flush, never before it. femtovg records draw calls and executes them there, so an
-    // image deleted any earlier is deleted out from under a queued draw -- the rule
-    // `ImageCache::release_evicted` follows from the other end, and the one femtovg's own
-    // `release_shadow_images` follows for the offscreen images its drop shadow allocates.
+    // After the flush, never before it: femtovg records draw calls and executes them there, so an
+    // image deleted any earlier is pulled out from under a queued draw.
+    // `ImageCache::release_evicted` follows this rule from the other end, the same one femtovg's
+    // own `release_shadow_images` follows for its drop shadow's offscreen images.
     for id in scratch {
         painter.canvas_mut().delete_image(id);
     }
@@ -357,11 +329,11 @@ pub fn execute(painter: &mut TextPainter, images: &mut ImageCache, list: &Displa
 
 /// One run of commands against one render target. Recursive because [`Draw::Clipped`] is.
 ///
-/// `target` is what this run is drawing into, so a nested [`Draw::Clipped`] can put it back rather
-/// than assuming the screen: femtovg keeps the current target private, and restoring the wrong one
-/// sends a doubly-nested subtree to the framebuffer instead of its parent's image.
+/// `target` is what this run draws into, so a nested [`Draw::Clipped`] can restore it rather than
+/// assume the screen: femtovg keeps the current target private, and restoring the wrong one sends a
+/// doubly-nested subtree to the framebuffer instead of its parent's image.
 ///
-/// `scratch` collects the offscreen images allocated along the way for [`execute`] to free once it
+/// `scratch` collects the offscreen images allocated along the way, for [`execute`] to free once it
 /// has flushed.
 fn run(
     painter: &mut TextPainter,
@@ -386,8 +358,7 @@ fn run(
         match &command.draw {
             Draw::Box { background, radius, colors, widths } => {
                 // `None` skips the fill entirely; `Some` with alpha 0 still paints a transparent
-                // rect -- `parse_background`'s own doc comment calls this distinction deliberate,
-                // so both arms matter even though a transparent fill is invisible either way.
+                // rect, a distinction `parse_background`'s own doc comment calls deliberate.
                 if let Some(color) = background {
                     fill_rect(painter.canvas_mut(), rect, *radius, *color);
                 }
@@ -416,26 +387,24 @@ fn run(
 }
 
 /// Draws `commands` into an offscreen image the size of `clip`, then fills the node's own rounded
-/// path with that image. The mask is the path, so its antialiased edge *is* the clip's edge and
-/// nothing else has to agree with it.
+/// path with that image. The mask is the path, so its antialiased edge *is* the clip's edge.
 ///
-/// **Why not femtovg's `intersect_rounded_scissor`.** femtovg 0.26 carries one scissor in its state
-/// and it is a single rounded rectangle, so "this rect and that arc" has nowhere to live: given a
-/// rounded pill and a child covering its left 30px, the intersection falls back to re-rounding the
-/// child's own 30px box, which turns a fill that should be flat on its right edge into a lozenge.
-/// Measured on a 80x32 pill at radius 16 with a 30px child: the scissor route leaks the ground
-/// through at 8% where the pill's top edge is straight, this route does not. That lozenge is the
-/// same artefact `dev-config`'s battery indicator worked around by giving its fill the pill's
-/// radius, so the scissor would have moved the bug rather than fixed it.
+/// **Why not femtovg's `intersect_rounded_scissor`.** femtovg 0.26 carries one scissor, a single
+/// rounded rectangle, so "this rect and that arc" has nowhere to live: given a rounded pill and a
+/// child covering its left 30px, the intersection re-rounds the child's own 30px box, turning a
+/// fill that should be flat on its right edge into a lozenge. Measured on an 80x32 pill at radius
+/// 16 with a 30px child: the scissor route leaks the ground through at 8% where the pill's top edge
+/// is straight, this route does not. `dev-config`'s battery indicator worked around the same
+/// lozenge by giving its fill the pill's radius, so the scissor would only move the bug, not fix it.
 ///
 /// This is QML's answer too, shape for shape: Quickshell's `ClippingRectangle` renders its content
-/// to a `ShaderEffectSource` and composites it through a mask texture. It spends two offscreen
-/// targets because the mask has to be a texture for its fragment shader to sample; femtovg fills a
-/// path with an image paint directly, so the path is the mask and one target does it.
+/// to a `ShaderEffectSource` and composites it through a mask texture, spending two offscreen
+/// targets since the mask must be a texture for its fragment shader to sample. femtovg fills a path
+/// with an image paint directly, so the path is the mask and one target does it.
 ///
-/// ponytail: one image allocated and freed per clipping node per repaint. The upgrade path is a
-/// pool keyed by size next to `ImageCache`, which is worth writing when a config puts a rounded clip
-/// on something that repaints at pointer rate. Today the bar repaints when a signal changes.
+/// ponytail: one image allocated and freed per clipping node per repaint. Upgrade path: a pool
+/// keyed by size next to `ImageCache`, worth building once a config puts a rounded clip on
+/// something that repaints at pointer rate.
 // Nine parameters, and the same answer [`build_node`] gives for its eight: four of them are one
 // command taken apart (`rect`, `clip`, `radius`, `commands`) and the rest are what [`run`] carries.
 // Passing the `DrawCmd` whole would trade them for a re-match on a variant the caller has already
@@ -453,15 +422,16 @@ fn draw_clipped(
     scratch: &mut Vec<ImageId>,
 ) {
     let (width, height) = ((clip.x1 - clip.x0) as usize, (clip.y1 - clip.y0) as usize);
-    // `PREMULTIPLIED` because an offscreen target stores premultiplied results, and without it the
-    // composite premultiplies a second time and darkens every partially transparent texel.
-    // `FLIP_Y` because a GL framebuffer object puts canvas y = 0 on the *last* texture row. Both
-    // flags and both reasons are femtovg's own, from the drop-shadow pass that does this same
-    // render-aside-and-composite (femtovg 0.26.0 `src/lib.rs`, `PREMULTIPLIED | FLIP_Y`).
+    // `PREMULTIPLIED`: an offscreen target stores premultiplied results, and without it the
+    // composite premultiplies twice, darkening every partially transparent texel. `FLIP_Y`: a GL
+    // framebuffer object puts canvas y = 0 on the *last* texture row. Both flags and reasons are
+    // femtovg's own, from its drop-shadow pass (femtovg 0.26.0 `src/lib.rs`,
+    // `PREMULTIPLIED | FLIP_Y`).
     let flags = ImageFlags::PREMULTIPLIED | ImageFlags::FLIP_Y;
     let Ok(image) = painter.canvas_mut().create_image_empty(width, height, PixelFormat::Rgba8, flags) else {
-        // Out of texture memory. Draw the subtree unmasked rather than dropping it: a square-cornered
-        // child is the behaviour every node had before this existed, and an empty pill is worse.
+        // Out of texture memory: draw the subtree unmasked rather than dropping it. A
+        // square-cornered child is the behaviour every node had before this existed; an empty pill
+        // is worse.
         run(painter, images, commands, scale, target, scratch);
         return;
     };
@@ -471,10 +441,10 @@ fn draw_clipped(
     canvas.save();
     canvas.set_render_target(RenderTarget::Image(image));
     canvas.clear_rect(0, 0, width as u32, height as u32, Color::rgbaf(0.0, 0.0, 0.0, 0.0));
-    // Set, not premultiplied by `translate`: a clipping node nested inside another one would
-    // otherwise compose both offsets and land its subtree at the sum of them. Every `scissor` the
-    // inner run sets is transformed by this, so the absolute coordinates the commands carry map
-    // into the image with no further arithmetic.
+    // Set, not accumulated via `translate`: a nested clipping node would otherwise compose both
+    // offsets and land its subtree at their sum. Every `scissor` the inner run sets is transformed
+    // by this too, so the commands' absolute coordinates map into the image with no extra
+    // arithmetic.
     canvas.reset_transform();
     canvas.translate(-clip.x0 as f32, -clip.y0 as f32);
     run(painter, images, commands, scale, RenderTarget::Image(image), scratch);
@@ -489,12 +459,11 @@ fn draw_clipped(
 
 /// One node's parsed paint properties as the draw they produce, or `None` when they produce none.
 ///
-/// `scale` and `focus` are the whole reason this is here rather than in `node::paint_style`: an
-/// `icon` or an `image` needs the physical pixel count its resolved rect works out to, and a
-/// `textfield` needs to know whether it holds the keyboard. Both are arithmetic over parsed data.
-///
-/// Nothing here can fail. A malformed paint property never reaches this function: `Scene::apply`
-/// refused the tree that carried it (see `node::paint_style`'s module doc comment).
+/// `scale` and `focus` are the whole reason this lives here rather than in `node::paint_style`: an
+/// `icon`/`image` needs the physical pixel count its resolved rect works out to, and a `textfield`
+/// needs to know whether it holds the keyboard, both arithmetic over parsed data. Nothing here can
+/// fail: a malformed paint property never reaches this function, since `Scene::apply` refused the
+/// tree that carried it (see `node::paint_style`'s module doc comment).
 /// One colour at `opacity`, multiplied into the alpha it already carries.
 ///
 /// Multiplied rather than replaced: a half-transparent colour inside a half-faded panel is a
@@ -523,9 +492,8 @@ fn draw_for(
 ) -> Option<Draw> {
     match style {
         // The shared paint of `rect`/`row`/`column`/`button` and all four surface roles: background
-        // fill, then borders (`oblisk-idl-api-specs.md` § 5.2 item 1).
-        // `clip` is not read here: it decides what this node's *children* are cut to, which is
-        // `build_node`'s question, not this one's.
+        // fill, then borders (`oblisk-idl-api-specs.md` § 5.2 item 1). `clip` is not read here: it
+        // decides what this node's *children* are cut to, `build_node`'s question, not this one's.
         PaintStyle::Box { background, radius, colors, widths, clip: _ } => Some(Draw::Box {
             background: background.map(|color| fade(color, opacity)),
             radius: *radius,
@@ -537,20 +505,15 @@ fn draw_for(
         // `foreground`.
         //
         // ponytail: a `Content`-sized `text` box comes from cosmic-text's measurement
-        // (`layout::scene`'s measure callback), while `build_node`'s clip cuts this draw off at
-        // that same box -- so if femtovg ever renders wider than cosmic-text measured, the clip
-        // shaves the overrun off the right edge instead of letting it paint over a neighbour.
-        // Checked against the current font chain (single-face Noto Sans, no fallback triggered)
-        // with a scratch test rendering unclipped and scanning pixels past the measured edge, for
-        // both a short string at 24px and a 53-character string at 32px: femtovg's `measure_text`
-        // agreed with cosmic-text's `shape()` to within 0.0001px on the longer string, and the last
-        // lit (non-background) pixel in both cases sat 3-4 physical pixels inside the measured edge,
-        // not past it. No shaving observed on this chain. It is still the correct outcome if a
-        // future font or fallback face renders wider than it measures: the alternative is the
-        // overrun landing on whatever sits to the right, which is the exact bug this fixes.
-        // `elide` is absent here on purpose: `Scene::apply` has already rewritten `content` to the
-        // string that fits, because that is the only place the box width and the shaping worker are
-        // both in reach. By the time a draw is built there is nothing left to decide.
+        // (`layout::scene`'s measure callback), so if femtovg ever renders wider than cosmic-text
+        // measured, this draw's clip shaves the overrun off the right edge rather than letting it
+        // paint over a neighbour. Verified on the current chain (single-face Noto Sans): femtovg's
+        // `measure_text` agreed with cosmic-text's `shape()` to within 0.0001px on a 53-character,
+        // 32px string, with the last lit pixel landing 3-4 physical pixels inside the measured edge.
+        // No shaving observed today, but keeping the clip is the safe direction: the alternative is
+        // an overrun painting over whatever sits to the right.
+        // `elide` is absent here on purpose: `Scene::apply` already rewrote `content` to the string
+        // that fits, the only place the box width and shaping worker are both in reach.
         PaintStyle::Text { content, font_size, color, align, elide: _ } => Some(Draw::Text {
             content: content.clone(),
             font_size: *font_size,
@@ -560,10 +523,9 @@ fn draw_for(
 
         // `icon` (§ 5.2 item 5): the theme name, resolved to a file by [`execute`] (ADR-0054).
         //
-        // `Contain` rather than `Cover`, and the *shorter* edge as the resolved size: `size` is
-        // § 5.2's "bounding box diameter", so an icon in a box that is not square should sit inside
-        // it whole rather than be cropped to fill it. An icon is the one case where showing less of
-        // the image is never the right answer.
+        // `Contain`, not `Cover`, with the *shorter* edge as the resolved size: `size` is § 5.2's
+        // "bounding box diameter", so an icon in a non-square box sits inside it whole rather than
+        // being cropped to fill it. Showing less of the image is never the right answer here.
         PaintStyle::Icon { name, color } => Some(Draw::Icon {
             name: name.clone(),
             px: physical_edge(rect.width.min(rect.height), scale),
@@ -571,13 +533,13 @@ fn draw_for(
             color: *color,
         }),
 
-        // `image` (ADR-0054 decision 3): the file at `source`, fitted by `fit`. An empty
-        // `source` is the absent-key default, so it draws nothing rather than reaching the cache
-        // with a path of "".
+        // `image` (ADR-0054 decision 3): the file at `source`, fitted by `fit`. An empty `source`
+        // is the absent-key default, so it draws nothing rather than reaching the cache with a path
+        // of "".
         //
         // The *longer* edge, unlike an icon's: `Cover` scales the image up until it covers the box,
-        // so rasterizing an SVG wallpaper against the shorter edge would upload it at exactly the
-        // resolution the fit is about to scale past.
+        // so rasterizing against the shorter edge would upload at exactly the resolution `fit` is
+        // about to scale past.
         PaintStyle::Image { source, fit } => (!source.is_empty()).then(|| Draw::Image {
             source: source.clone(),
             fit: *fit,
@@ -589,13 +551,12 @@ fn draw_for(
         // character once it is not.
         //
         // Typing blind is worse than cosmetic: `pam_unix` answers a wrong password with a two
-        // second `pam_fail_delay` and `pam_faillock` locks the account after three, so a typo is
-        // indistinguishable from a slow unlock, and three of them lock you out of your own session
-        // for ten minutes.
+        // second `pam_fail_delay`, and `pam_faillock` locks the account after three, so a typo is
+        // indistinguishable from a slow unlock and three of them cost a ten-minute lockout.
         //
-        // Only the focused field fills. An unfocused one shows its placeholder, which is also the
-        // honest thing to draw: `input::retarget_secure_submit` zeroizes the buffer whenever focus
-        // moves, so there is no typed state left anywhere else to represent.
+        // Only the focused field fills. An unfocused one shows its placeholder, the honest thing to
+        // draw: `input::retarget_secure_submit` zeroizes the buffer whenever focus moves, so no
+        // typed state survives anywhere else to represent.
         PaintStyle::TextField { target, placeholder, mask, font_size, color, align } => {
             let filled = focus
                 .filter(|focus| target.as_ref().is_some_and(|declared| declared == focus.target))
@@ -614,10 +575,10 @@ fn draw_for(
 /// The shared half of [`Draw::Icon`] and [`Draw::Image`]: cache lookup, then one `fill_path` over
 /// exactly the rect the image occupies.
 ///
-/// The fill path is the *fitted* rect, not the node's box. femtovg clamps to the edge outside a
+/// The fill path is the *fitted* rect, not the node's box: femtovg clamps to the edge outside a
 /// paint's extent unless `REPEAT_X`/`REPEAT_Y` are set, so filling the whole box with a `Contain`
 /// paint would smear the image's outermost pixel row across the letterbox. `Cover`'s fitted rect is
-/// larger than the box instead, and `run`'s scissor is what crops it.
+/// larger than the box instead, and `run`'s scissor crops it.
 /// Everything about one file draw except which file: the two `Draw` variants that reach
 /// [`draw_file`] carry the same five values and always travel together.
 #[derive(Debug, Clone, Copy)]
@@ -663,12 +624,11 @@ fn physical_edge(logical: f32, scale: f32) -> u32 {
 ///
 /// At exactly half, the four straight segments between the corner arcs have zero length and the
 /// fill collapses to the bounding rectangle: a square ground under a round border. Just short of
-/// half, the segments are back but the tessellator flags a bevel join at each one, and the
-/// half-pixel inset it applies to the fill fan (`path::cache`'s `woff`, and the `TODO: woff = 0.0
-/// produces no artifaacts` beside it) folds the fan back over itself there. An opaque fill hides
-/// the fold. A translucent one blends every folded sliver twice: on the dev bar's controls, ground
-/// at 42% alpha, that is a one-pixel chord from each cap's midpoint across the pill at 1.6x the
-/// alpha asked for.
+/// half, the segments return but the tessellator flags a bevel join at each one, and the half-pixel
+/// inset it applies to the fill fan (`path::cache`'s `woff`, and the `TODO: woff = 0.0 produces no
+/// artifaacts` beside it) folds the fan back over itself there. An opaque fill hides the fold; a
+/// translucent one blends every folded sliver twice, a one-pixel chord at 1.6x alpha on the dev
+/// bar's 42%-alpha controls.
 ///
 /// Filling square boxes from 24 to 43.5 logical pixels at two sub-pixel offsets, 80 geometries per
 /// row:
@@ -679,25 +639,23 @@ fn physical_edge(logical: f32, scale: f32) -> u32 {
 /// | 0.0001 to 0.01 px | 0             | 29             |
 /// | 0.05 px and more  | 0             | 0              |
 ///
-/// So a shortfall does clear both bands, and a shipped `FILL_RADIUS_EPSILON` of 0.01 sat in the
-/// second one. Qt's own rounded rect takes that route and clamps to `qMin(w, h) * 0.4999f`
-/// (`qsgbasicinternalrectanglenode.cpp`), which lands in the bad band at every size here. Backing
-/// off further would work at the sizes swept and is still a constant tuned against one
-/// tessellator, so this builds the shape instead.
+/// So a shortfall clears both bands, and a shipped `FILL_RADIUS_EPSILON` of 0.01 sat in the second
+/// one. Qt's own rounded rect clamps to `qMin(w, h) * 0.4999f` (`qsgbasicinternalrectanglenode.cpp`),
+/// which lands in the bad band at every size here. Backing off further would work at the sizes
+/// swept but is still a constant tuned against one tessellator, so this builds the shape instead.
 ///
 /// Half the smaller side is how a config spells a pill, not an edge case, which is why this is
 /// load-bearing: `components/icon_button.lua` writes `side / 2` for a circle, and
-/// `theme.item_radius` lands above half because it is scaled independently of `item_height`. So
-/// the shape is built as what it actually is. A square box is a circle, and femtovg's own `circle`
-/// is four beziers with no straight segments at all. Anything else is two semicircular caps joined
-/// by two segments whose length is `|width - height|`, which is above zero by construction here.
-/// Both wind the same way as `rounded_rect` (left, bottom, right, top), because the fill fan's
-/// inset direction is computed from the contour's winding.
+/// `theme.item_radius` lands above half because it scales independently of `item_height`. So the
+/// shape is built as what it actually is: a square box is a circle, and femtovg's own `circle` is
+/// four beziers with no straight segments. Anything else is two semicircular caps joined by two
+/// segments whose length is `|width - height|`, above zero by construction here. Both wind the same
+/// way as `rounded_rect` (left, bottom, right, top), since the fill fan's inset direction is
+/// computed from the contour's winding.
 ///
 /// A box whose two sides differ by a hair still leaves a hair-length segment and so can still
-/// bevel. Nothing produces one: a config either asks for a circle, where the sides are equal
-/// because one expression sets both, or for a pill, where they differ by the whole run of the
-/// content.
+/// bevel. Nothing produces one: a config either asks for a circle, where one expression sets both
+/// sides equal, or a pill, where they differ by the whole run of the content.
 fn box_path(rect: LogicalRect, radius: f32) -> Path {
     let LogicalRect { x, y, width: w, height: h } = rect;
     let mut path = Path::new();
@@ -735,19 +693,17 @@ fn fill_rect(canvas: &mut Canvas<OpenGl>, rect: LogicalRect, radius: f32, color:
     canvas.fill_path(&path, &Paint::color(Color::rgbaf(color.r, color.g, color.b, color.a)));
 }
 
-/// femtovg has no per-edge border primitive, so this covers exactly two cases. Uniform borders --
-/// all four edges the same width and colour -- with `radius` above 0 get one `stroke_path` over
-/// the rounded rect, inset by half the stroke width: femtovg strokes centred on the path, so
-/// drawing directly on `rect`'s own edge would have the stroke straddle it, half inside and half
-/// outside the box. Everything else -- any edge differing from another, or radius 0 -- fills each
-/// edge that declares both a non-zero width and a colour as its own rectangle.
+/// femtovg has no per-edge border primitive, so this covers exactly two cases. Uniform borders
+/// (all four edges the same width and colour) with `radius` above 0 get one `stroke_path` over the
+/// rounded rect, inset by half the stroke width: femtovg strokes centred on the path, so drawing
+/// directly on `rect`'s own edge would have the stroke straddle it, half inside and half outside
+/// the box. Everything else, any edge differing from another or radius 0, fills each edge that
+/// declares both a non-zero width and a colour as its own rectangle.
 ///
-/// ponytail: the per-edge-rectangle fallback ignores `radius` entirely, so a config that combines
-/// a radius with per-edge widths or colours gets square corners where the rounded background
-/// underneath shows through. femtovg exposes no public per-corner arc primitive this could build
-/// on without duplicating its internal `rounded_rect_varying` construction; the upgrade path is
-/// exactly that -- four independent corner arcs plus four edge segments, mitred at each join --
-/// once a real config needs a rounded per-edge border rather than this approximation.
+/// ponytail: the per-edge-rectangle fallback ignores `radius`, so a config combining a radius with
+/// per-edge widths or colours gets square corners where the rounded background shows through.
+/// Upgrade path: four independent corner arcs plus four edge segments, mitred at each join, once a
+/// real config needs a rounded per-edge border.
 fn paint_border(
     canvas: &mut Canvas<OpenGl>,
     rect: LogicalRect,
@@ -764,13 +720,12 @@ fn paint_border(
 
     if uniform_width && uniform_color && widths.top > 0.0 && radius > 0.0 {
         let color = colors.top.expect("uniform_color's match arm above guarantees Some on every edge");
-        // Rounding a box's own two edges to nearest is exactly what `snap_border_band`
-        // does, so it also snaps the node's span on each axis, not only a hairline's
-        // thickness. The stroke's thickness is snapped the same way (band-of-one
-        // starting at `rect.x`, only the thickness half of the result kept) so that
-        // with integer box edges and an integer thickness, the centerline lands on an
-        // integer for an even width and a half-integer for an odd one -- the parity
-        // femtovg actually rasterizes (this module's `snap_border_band` doc comment).
+        // Rounding a box's own two edges to nearest is exactly what `snap_border_band` does, so it
+        // also snaps the node's span on each axis, not only a hairline's thickness. The stroke's
+        // thickness is snapped the same way (band-of-one starting at `rect.x`, only the thickness
+        // half kept), so with integer box edges and an integer thickness the centerline lands on an
+        // integer for an even width and a half-integer for an odd one, the parity femtovg actually
+        // rasterizes (this module's `snap_border_band` doc comment).
         let (box_x, box_width) = snap_border_band(rect.x, rect.width, scale);
         let (box_y, box_height) = snap_border_band(rect.y, rect.height, scale);
         let (_, width) = snap_border_band(rect.x, widths.top, scale);
@@ -790,9 +745,8 @@ fn paint_border(
         return;
     }
 
-    // Corners overlap here rather than mitre -- each edge is its own filled rect spanning the
-    // node's full width or height, so two adjacent non-zero edges both cover the corner they
-    // share.
+    // Corners overlap here rather than mitre: each edge is its own filled rect spanning the node's
+    // full width or height, so two adjacent non-zero edges both cover the corner they share.
     paint_border_edge(
         canvas,
         colors.top,
@@ -827,21 +781,21 @@ fn paint_border(
     );
 }
 
-/// Which dimension of an edge rect is the thin one -- top/bottom edges span the node's full width
-/// and are thin in y, left/right span the full height and are thin in x. `paint_border_edge` needs
-/// this to know which axis to hand `snap_border_band`; inferring it from the rect's own
-/// width/height would be ambiguous whenever a node's height happens to equal its border width.
+/// Which dimension of an edge rect is the thin one: top/bottom edges span the node's full width and
+/// are thin in y, left/right span the full height and are thin in x. `paint_border_edge` needs this
+/// to know which axis to hand `snap_border_band`; inferring it from the rect's own width/height
+/// would be ambiguous whenever a node's height happens to equal its border width.
 enum EdgeAxis {
     Horizontal,
     Vertical,
 }
 
 /// One border edge: paints only where both a colour and a non-zero width say so
-/// (`node::parse_border_color`'s doc comment -- `border_width` alone is documented § 5.2
-/// behaviour, not a bug this should work around). Snaps the edge's thin axis with
-/// `snap_border_band` before building the path, so a filled-edge border gets the same
-/// whole-physical-pixel treatment as the uniform-radius stroke above -- the long axis is left
-/// alone, since only the thin axis can straddle a pixel boundary and blur.
+/// (`node::parse_border_color`'s doc comment: `border_width` alone is documented § 5.2 behaviour,
+/// not a bug to work around). Snaps the edge's thin axis with `snap_border_band` before building
+/// the path, so a filled-edge border gets the same whole-physical-pixel treatment as the
+/// uniform-radius stroke above; the long axis is left alone, since only the thin axis can straddle
+/// a pixel boundary and blur.
 fn paint_border_edge(
     canvas: &mut Canvas<OpenGl>,
     color: Option<Rgba>,
