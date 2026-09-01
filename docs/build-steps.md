@@ -1223,6 +1223,14 @@ tree into pixels. Build them in that order, since item 9's gating condition is i
    clip contains it, which is false for anything nested; shipping corners that are exact at the
    root and silently square below it is worse than square everywhere.
 
+   **Closed by docs/adr/0079,** and the upgrade path named above turned out to be the wrong one.
+   `intersect_rounded_scissor` does not degrade to a square when it cannot be exact: it re-rounds
+   the intersection with the old radius, so a part-width child of a pill comes out a lozenge --
+   the exact artefact the battery indicator was already working around. A `rect` now takes
+   `clip = "Rounded"`, which renders its children into an offscreen image and composites them
+   through the node's own path, the way QML's `ClippingRectangle` does. The default stays
+   rectangular because the rounded shape costs a render target and a composite per node.
+
    The wrap follow-up above is more work than "paint renders the wrapped lines" implies, and this
    slice found why. `layout::scene::intrinsic_content_size` does measure a `Content`-sized text
    box against the wrap width, passing it to `ShapingHandle::shape` as `max_width`, but

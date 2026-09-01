@@ -48,7 +48,7 @@ const COMMON_PROPERTIES: &[&str] =
 /// border. The set is `node::paint_style`'s own first match arm -- `row`, `column` and `button`
 /// have no paint properties beyond a `rect`'s, and all four § 6 surface roles paint exactly like
 /// one.
-const BOX_PROPERTIES: &[&str] = &["background", "border_color", "border_width", "radius"];
+const BOX_PROPERTIES: &[&str] = &["background", "border_color", "border_width", "clip", "radius"];
 
 /// Which kinds that arm covers.
 const BOX_KINDS: [&str; 8] = ["rect", "row", "column", "button", "panel", "window", "popup", "lock"];

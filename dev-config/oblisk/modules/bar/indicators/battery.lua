@@ -7,10 +7,9 @@
 -- axis, so its children stack at its origin and `Fill` means its whole box. That puts the fill under
 -- the text with no z-order property and no overlay node.
 --
--- ponytail: the fill has the pill's own radius rather than being clipped to it, so at low charge it
--- draws as a lozenge inside the left end instead of a filled arc. `layout::paint`'s clip is
--- rectangular (its own note says so), so a square-cornered fill would poke out of the rounded left
--- edge, which looks worse. The upgrade is the rounded scissor that note describes.
+-- The pill carries `clip = "Rounded"`, so the fill is a plain square-cornered rect and the pill's
+-- own arc cuts it. It used to carry the pill's radius instead and draw as a lozenge inside the left
+-- end at low charge, because the engine only clipped to rectangles.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -62,7 +61,6 @@ local fill = rect {
         return string.format("%d%%", math.floor(math.max(0, math.min(100, b.percent or 0)) + 0.5))
     end),
     height = "Fill",
-    radius = theme.item_radius,
     background = oblisk.battery:map(function(b)
         return theme.with_opacity(battery_color(b), 0.38)
     end),
@@ -90,6 +88,7 @@ local battery_module = rect {
     height = theme.item_height,
     align_v = "Center",
     radius = theme.item_radius,
+    clip = "Rounded",
     background = theme.GLASS_CONTROL,
     border_width = theme.border_width,
     border_color = theme.GLASS_BORDER,

@@ -193,6 +193,46 @@ pub fn parse_radius(properties: &HashMap<String, Value>) -> Result<f32, LayoutEr
     Ok(n)
 }
 
+/// What a node cuts its children down to.
+///
+/// Every node has always clipped its subtree to its own box (`layout::paint::build_node`), and
+/// [`ClipShape::Box`] is that. The choice this type adds is whether `radius` takes part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClipShape {
+    /// The node's rectangle, square corners, whatever its `radius` says.
+    #[default]
+    Box,
+    /// The node's rounded shape, so a child overflowing a pill is cut by the same arc the pill's
+    /// own background fill draws.
+    Rounded,
+}
+
+/// `rect.clip` (§ 5.2 item 1). Absent is [`ClipShape::Box`].
+///
+/// Opt-in rather than implied by `radius`, and the cost is the whole reason: a rounded clip is an
+/// offscreen render target plus a composite (`layout::paint::execute`), where a square one is a
+/// scissor rectangle the GPU applies for free. Most rounded boxes on a bar have no child that
+/// overflows them, and charging every one of them for a pass none of them needs is the wrong
+/// default. QML draws the same line -- `Item.clip` is rectangular and ignores `radius`, and reaching
+/// the rounded shape means reaching for Quickshell's `ClippingRectangle`, which spends two offscreen
+/// targets on it.
+///
+/// `"Box"` is spelled out rather than left as the absent case alone so a config can write the
+/// default back into a shared style table.
+pub fn parse_clip(properties: &HashMap<String, Value>) -> Result<ClipShape, LayoutError> {
+    let Some(value) = properties.get("clip") else {
+        return Ok(ClipShape::Box);
+    };
+    let Value::String(s) = value else {
+        return Err(invalid("clip", format!("must be a string, got {}", preview_for_error(value))));
+    };
+    match checked_string("clip", s)?.as_str() {
+        "Box" => Ok(ClipShape::Box),
+        "Rounded" => Ok(ClipShape::Rounded),
+        other => Err(invalid("clip", format!("must be \"Box\" or \"Rounded\", got {other:?}"))),
+    }
+}
+
 /// `rect.border_color` (§ 5.2 item 1), one colour per edge. `None` on an edge means "not painted",
 /// the same absence [`parse_background`] returns for a missing fill and the same zero
 /// [`parse_border_width`] defaults an edge to -- an edge with width 0 needs no colour, and an edge
@@ -668,6 +708,41 @@ mod tests {
             matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "background" && detail.contains("6 or 8") && detail.contains("got 0")),
             "{err}"
         );
+    }
+
+    #[test]
+    fn clip_absent_defaults_to_the_nodes_box() {
+        let props = HashMap::new();
+        assert_eq!(parse_clip(&props).unwrap(), ClipShape::Box);
+    }
+
+    #[test]
+    fn clip_reads_both_shapes() {
+        for (declared, expected) in [("Box", ClipShape::Box), ("Rounded", ClipShape::Rounded)] {
+            let lua = mlua::Lua::new();
+            let src = format!(r#"return {{ kind = "rect", clip = "{declared}" }}"#);
+            let table: mlua::Table = lua.load(&src).eval().unwrap();
+            let props = deserialize_lua_table(&table).unwrap().properties;
+            assert_eq!(parse_clip(&props).unwrap(), expected, "clip = {declared:?}");
+        }
+    }
+
+    /// The whole point of a named shape over a boolean: `clip = true` would have to mean something,
+    /// and the two shapes are not on/off -- a node clips either way.
+    #[test]
+    fn an_unknown_clip_shape_is_rejected_naming_both() {
+        let lua = mlua::Lua::new();
+        let table: mlua::Table = lua.load(r#"return { kind = "rect", clip = "Circle" }"#).eval().unwrap();
+        let props = deserialize_lua_table(&table).unwrap().properties;
+        let err = parse_clip(&props).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail } if property == "clip" && detail.contains("\"Box\" or \"Rounded\"")),
+            "got {err:?}"
+        );
+
+        let table: mlua::Table = lua.load(r#"return { kind = "rect", clip = true }"#).eval().unwrap();
+        let props = deserialize_lua_table(&table).unwrap().properties;
+        assert!(matches!(parse_clip(&props).unwrap_err(), LayoutError::InvalidProperty { property, .. } if property == "clip"));
     }
 
     #[test]

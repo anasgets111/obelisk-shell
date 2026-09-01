@@ -33,6 +33,7 @@
 ---@field radius? integer Corner rounding, default `0`.
 ---@field border_color? Color|Edges A bare string applies to all four edges. No default: an edge paints only where both a colour and a non-zero width say so.
 ---@field border_width? integer|Edges A bare number applies to all four edges. Default `0`.
+---@field clip? "Box"|"Rounded" What this node cuts its children down to. Default `"Box"`, its rectangle with square corners, which is what a node has always done. `"Rounded"` uses `radius` instead, so a child overflowing a pill is cut by the same arc the pill's fill draws. Costs an offscreen pass, which is why `radius` alone does not imply it.
 
 ---@class RectProps: NodeBase, BoxBase
 ---@field children? Node[]

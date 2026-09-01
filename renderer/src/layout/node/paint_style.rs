@@ -47,11 +47,16 @@ use super::*;
 #[derive(Debug, Clone, PartialEq)]
 pub enum PaintStyle {
     /// `rect`/`row`/`column`/`button` and all four surface roles: the fill, then the border.
+    ///
+    /// `clip` is here with `radius` rather than off in `LayoutStyle` because it is the property
+    /// that decides what `radius` means to everything underneath this node, and the two are read
+    /// together. It draws nothing itself: `layout::paint::build_node` is its only reader.
     Box {
         background: Option<Rgba>,
         radius: f32,
         colors: BorderColor,
         widths: EdgeInsets,
+        clip: ClipShape,
     },
     Text {
         content: String,
@@ -103,6 +108,7 @@ pub fn paint_style(kind: &str, properties: &HashMap<String, Value>) -> Result<Op
             radius: parse_radius(properties)?,
             colors: parse_border_color(properties)?,
             widths: parse_border_width(properties)?,
+            clip: parse_clip(properties)?,
         },
         "text" => PaintStyle::Text {
             content: parse_content(properties)?,

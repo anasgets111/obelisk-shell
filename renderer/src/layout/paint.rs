@@ -32,10 +32,10 @@
 use std::f32::consts::{FRAC_PI_2, PI};
 
 use femtovg::renderer::OpenGl;
-use femtovg::{Canvas, Color, Paint, Path, Solidity};
+use femtovg::{Canvas, Color, ImageFlags, ImageId, Paint, Path, PixelFormat, RenderTarget, Solidity};
 
 use crate::image::{self, Fit, ImageCache};
-use crate::layout::node::{self, BorderColor, EdgeInsets, PaintStyle, Rgba, TextAlign};
+use crate::layout::node::{self, BorderColor, ClipShape, EdgeInsets, PaintStyle, Rgba, TextAlign};
 use crate::layout::scene::ResolvedNode;
 use crate::text::atlas::TextPainter;
 use crate::text::snap::{LogicalRect, PhysicalRect, snap_border_band, snap_to_physical};
@@ -85,6 +85,20 @@ pub enum Draw {
         fit: Fit,
         px: u32,
         alpha: f32,
+    },
+    /// A whole subtree drawn through the arc of the node that declared `clip = "Rounded"`, rather
+    /// than through its bounding rectangle. `radius` is that node's own, and the carrying
+    /// [`DrawCmd`]'s `rect` is the box the arc is built on.
+    ///
+    /// The one recursive variant, and it has to be: every other clip in this module is an
+    /// axis-aligned rectangle, which is why [`DrawCmd`] can carry one flattened `clip` per command
+    /// instead of a save/restore nest. A rounded shape does not intersect into a rectangle, so the
+    /// subtree it applies to has to stay grouped for [`execute`] to render it apart and mask it as
+    /// a whole. `Vec<DrawCmd>` rather than a `DisplayList` so the type stays what its name says:
+    /// a `DisplayList` is one surface's finished output.
+    Clipped {
+        radius: f32,
+        commands: Vec<DrawCmd>,
     },
 }
 
@@ -209,17 +223,16 @@ fn build_node(
     // instead of showing the rest on line two. The honest fix is paint asking for the same
     // wrapped line breaks layout already measured with, not a new clip strategy.
     //
-    // ponytail: this clip is always rectangular, so a node with `radius > 0.0` clips overflowing
-    // children to square corners while its own background underneath is rounded -- an escaping
-    // child's corner pixels sit outside the round fill but inside the square clip. femtovg's
-    // `intersect_rounded_scissor` exists and `Draw::Box` already carries `radius` for this exact
-    // node, but that function's own doc comment (femtovg 0.26.0 src/lib.rs:895-899) only gives
-    // exact rounded corners "when this is the first active scissor or... the previous clip is a
-    // containing rectangle with the same transform" -- false in general here, since a nested
-    // node's clip is intersected against every ancestor's, not the first. Rather than ship
-    // rounded corners that are exact for a root node and silently degrade to square for anything
-    // nested under one, this keeps the clip rectangular everywhere; switching to
-    // `intersect_rounded_scissor` is the upgrade path once a config actually needs it.
+    // This clip is always rectangular, `radius` or not. A node that wants its children cut by its
+    // arc says `clip = "Rounded"` and gets a `Draw::Clipped` group below, which is a whole
+    // offscreen pass -- so the rectangle stays the default and the arc is asked for. femtovg's
+    // `intersect_rounded_scissor` is not the alternative it looks like: [`draw_clipped`] records
+    // what it does to a pill with a part-width child, measured.
+    //
+    // ponytail: `layout::hit` intersects the same rectangles and knows nothing about the arc, so
+    // the corner of a pill is outside its fill and still takes a click. Four pixels on a 34px
+    // control, and the honest fix is hit testing sharing this walk rather than a second copy of
+    // the rounding rule.
     let clip = intersect(clip, snap_to_physical(rect, scale));
     // Nothing in this subtree can put down a pixel, so none of it reaches the list. Behaviourally
     // identical to the `save`/`intersect_scissor`/`restore` walk this replaced, which recursed
@@ -239,13 +252,73 @@ fn build_node(
     // repaint when the new display list equals the last one -- a fade that lived outside the list
     // would be a change the surface never noticed.
     let opacity = inherited_opacity * node.opacity;
-    if let Some(draw) = node.paint.as_ref().and_then(|style| draw_for(style, rect, scale, opacity, focus)) {
-        out.push(DrawCmd { rect, clip, draw });
+    let draw = node.paint.as_ref().and_then(|style| draw_for(style, rect, scale, opacity, focus));
+
+    let Some(radius) = rounded_clip(node) else {
+        if let Some(draw) = draw {
+            out.push(DrawCmd { rect, clip, draw });
+        }
+        for child in &node.children {
+            build_node(child, x, y, scale, clip, opacity, focus, out);
+        }
+        return;
+    };
+
+    // `clip = "Rounded"`. Three commands where the square case emits one, in the order QML's own
+    // rounded clip uses: this node's fill, then the subtree masked by the arc, then this node's
+    // border over the top. Painting the border first would have it covered wherever a child reaches
+    // the arc, which on a pill with a filled ground is the whole left cap -- the exact place the
+    // border is doing its work.
+    let (fill, border) = split_fill_and_border(draw);
+    if let Some(fill) = fill {
+        out.push(DrawCmd { rect, clip, draw: fill });
     }
 
+    let mut inner = Vec::new();
     for child in &node.children {
-        build_node(child, x, y, scale, clip, opacity, focus, out);
+        build_node(child, x, y, scale, clip, opacity, focus, &mut inner);
     }
+    // No children, no offscreen pass. A leaf that asked for a rounded clip has nothing to clip, and
+    // the empty group would still cost `execute` a render target and a composite.
+    if !inner.is_empty() {
+        out.push(DrawCmd { rect, clip, draw: Draw::Clipped { radius, commands: inner } });
+    }
+
+    if let Some(border) = border {
+        out.push(DrawCmd { rect, clip, draw: border });
+    }
+}
+
+/// This node's radius when it asked for its children to be cut by it, `None` otherwise.
+///
+/// A zero radius is `None` too: the rounded shape of a square-cornered box *is* its rectangle, and
+/// the flattened `clip` already does that for free.
+fn rounded_clip(node: &ResolvedNode) -> Option<f32> {
+    match node.paint {
+        Some(PaintStyle::Box { clip: ClipShape::Rounded, radius, .. }) if radius > 0.0 => Some(radius),
+        _ => None,
+    }
+}
+
+/// One `Draw::Box` as the fill alone and the border alone, so [`build_node`] can put a
+/// [`Draw::Clipped`] between them. Either half is `None` when it would paint nothing.
+///
+/// Anything that is not a `Draw::Box` comes back whole in the first slot: [`rounded_clip`] only
+/// answers for a `PaintStyle::Box`, so that arm is unreachable, and it costs less than a panic to
+/// say so.
+fn split_fill_and_border(draw: Option<Draw>) -> (Option<Draw>, Option<Draw>) {
+    let Some(Draw::Box { background, radius, colors, widths }) = draw else {
+        return (draw, None);
+    };
+    let fill = background.map(|color| Draw::Box {
+        background: Some(color),
+        radius,
+        colors: BorderColor::default(),
+        widths: EdgeInsets::default(),
+    });
+    let border = (widths != EdgeInsets::default())
+        .then_some(Draw::Box { background: None, radius, colors, widths });
+    (fill, border)
 }
 
 /// Draws `root` and its whole subtree onto `painter`'s canvas, then flushes once. `scale` is the
@@ -274,15 +347,45 @@ pub fn execute(painter: &mut TextPainter, images: &mut ImageCache, list: &Displa
     // recorded nothing yet, so this is the only point where deleting a texture cannot pull it out
     // from under a queued draw call (see `ImageCache::release_evicted`).
     images.release_evicted(painter.canvas_mut());
-    for command in &list.commands {
+    let mut scratch = Vec::new();
+    run(painter, images, &list.commands, scale, RenderTarget::Screen, &mut scratch);
+    painter.canvas_mut().reset_scissor();
+    painter.canvas_mut().flush();
+    // After the flush, never before it. femtovg records draw calls and executes them there, so an
+    // image deleted any earlier is deleted out from under a queued draw -- the rule
+    // `ImageCache::release_evicted` follows from the other end, and the one femtovg's own
+    // `release_shadow_images` follows for the offscreen images its drop shadow allocates.
+    for id in scratch {
+        painter.canvas_mut().delete_image(id);
+    }
+}
+
+/// One run of commands against one render target. Recursive because [`Draw::Clipped`] is.
+///
+/// `target` is what this run is drawing into, so a nested [`Draw::Clipped`] can put it back rather
+/// than assuming the screen: femtovg keeps the current target private, and restoring the wrong one
+/// sends a doubly-nested subtree to the framebuffer instead of its parent's image.
+///
+/// `scratch` collects the offscreen images allocated along the way for [`execute`] to free once it
+/// has flushed.
+fn run(
+    painter: &mut TextPainter,
+    images: &mut ImageCache,
+    commands: &[DrawCmd],
+    scale: f32,
+    target: RenderTarget,
+    scratch: &mut Vec<ImageId>,
+) {
+    for command in commands {
         // `scissor`, not `intersect_scissor`: the intersection with every ancestor's box is
         // already in `command.clip` (see [`DrawCmd`]), so each draw sets the finished clip
         // outright instead of rebuilding it through a save/restore nest.
+        let clip = command.clip;
         painter.canvas_mut().scissor(
-            command.clip.x0 as f32,
-            command.clip.y0 as f32,
-            (command.clip.x1 - command.clip.x0) as f32,
-            (command.clip.y1 - command.clip.y0) as f32,
+            clip.x0 as f32,
+            clip.y0 as f32,
+            (clip.x1 - clip.x0) as f32,
+            (clip.y1 - clip.y0) as f32,
         );
         let rect = command.rect;
         match &command.draw {
@@ -310,10 +413,83 @@ pub fn execute(painter: &mut TextPainter, images: &mut ImageCache, list: &Displa
                 let draw = FileDraw { fit: *fit, rect, px: *px, alpha: *alpha, tint: None };
                 draw_file(painter.canvas_mut(), images, std::path::Path::new(source), draw)
             }
+            Draw::Clipped { radius, commands } => {
+                draw_clipped(painter, images, rect, clip, *radius, commands, scale, target, scratch)
+            }
         }
     }
-    painter.canvas_mut().reset_scissor();
-    painter.canvas_mut().flush();
+}
+
+/// Draws `commands` into an offscreen image the size of `clip`, then fills the node's own rounded
+/// path with that image. The mask is the path, so its antialiased edge *is* the clip's edge and
+/// nothing else has to agree with it.
+///
+/// **Why not femtovg's `intersect_rounded_scissor`.** femtovg 0.26 carries one scissor in its state
+/// and it is a single rounded rectangle, so "this rect and that arc" has nowhere to live: given a
+/// rounded pill and a child covering its left 30px, the intersection falls back to re-rounding the
+/// child's own 30px box, which turns a fill that should be flat on its right edge into a lozenge.
+/// Measured on a 80x32 pill at radius 16 with a 30px child: the scissor route leaks the ground
+/// through at 8% where the pill's top edge is straight, this route does not. That lozenge is the
+/// same artefact `dev-config`'s battery indicator worked around by giving its fill the pill's
+/// radius, so the scissor would have moved the bug rather than fixed it.
+///
+/// This is QML's answer too, shape for shape: Quickshell's `ClippingRectangle` renders its content
+/// to a `ShaderEffectSource` and composites it through a mask texture. It spends two offscreen
+/// targets because the mask has to be a texture for its fragment shader to sample; femtovg fills a
+/// path with an image paint directly, so the path is the mask and one target does it.
+///
+/// ponytail: one image allocated and freed per clipping node per repaint. The upgrade path is a
+/// pool keyed by size next to `ImageCache`, which is worth writing when a config puts a rounded clip
+/// on something that repaints at pointer rate. Today the bar repaints when a signal changes.
+// Nine parameters, and the same answer [`build_node`] gives for its eight: four of them are one
+// command taken apart (`rect`, `clip`, `radius`, `commands`) and the rest are what [`run`] carries.
+// Passing the `DrawCmd` whole would trade them for a re-match on a variant the caller has already
+// matched, and an unreachable `else` arm to go with it.
+#[allow(clippy::too_many_arguments)]
+fn draw_clipped(
+    painter: &mut TextPainter,
+    images: &mut ImageCache,
+    rect: LogicalRect,
+    clip: PhysicalRect,
+    radius: f32,
+    commands: &[DrawCmd],
+    scale: f32,
+    target: RenderTarget,
+    scratch: &mut Vec<ImageId>,
+) {
+    let (width, height) = ((clip.x1 - clip.x0) as usize, (clip.y1 - clip.y0) as usize);
+    // `PREMULTIPLIED` because an offscreen target stores premultiplied results, and without it the
+    // composite premultiplies a second time and darkens every partially transparent texel.
+    // `FLIP_Y` because a GL framebuffer object puts canvas y = 0 on the *last* texture row. Both
+    // flags and both reasons are femtovg's own, from the drop-shadow pass that does this same
+    // render-aside-and-composite (femtovg 0.26.0 `src/lib.rs`, `PREMULTIPLIED | FLIP_Y`).
+    let flags = ImageFlags::PREMULTIPLIED | ImageFlags::FLIP_Y;
+    let Ok(image) = painter.canvas_mut().create_image_empty(width, height, PixelFormat::Rgba8, flags) else {
+        // Out of texture memory. Draw the subtree unmasked rather than dropping it: a square-cornered
+        // child is the behaviour every node had before this existed, and an empty pill is worse.
+        run(painter, images, commands, scale, target, scratch);
+        return;
+    };
+    scratch.push(image);
+
+    let canvas = painter.canvas_mut();
+    canvas.save();
+    canvas.set_render_target(RenderTarget::Image(image));
+    canvas.clear_rect(0, 0, width as u32, height as u32, Color::rgbaf(0.0, 0.0, 0.0, 0.0));
+    // Set, not premultiplied by `translate`: a clipping node nested inside another one would
+    // otherwise compose both offsets and land its subtree at the sum of them. Every `scissor` the
+    // inner run sets is transformed by this, so the absolute coordinates the commands carry map
+    // into the image with no further arithmetic.
+    canvas.reset_transform();
+    canvas.translate(-clip.x0 as f32, -clip.y0 as f32);
+    run(painter, images, commands, scale, RenderTarget::Image(image), scratch);
+
+    let canvas = painter.canvas_mut();
+    canvas.restore();
+    canvas.set_render_target(target);
+    let path = box_path(rect, radius);
+    let paint = Paint::image(image, clip.x0 as f32, clip.y0 as f32, width as f32, height as f32, 0.0, 1.0);
+    canvas.fill_path(&path, &paint);
 }
 
 /// One node's parsed paint properties as the draw they produce, or `None` when they produce none.
@@ -354,7 +530,9 @@ fn draw_for(
     match style {
         // The shared paint of `rect`/`row`/`column`/`button` and all four surface roles: background
         // fill, then borders (`oblisk-idl-api-specs.md` § 5.2 item 1).
-        PaintStyle::Box { background, radius, colors, widths } => Some(Draw::Box {
+        // `clip` is not read here: it decides what this node's *children* are cut to, which is
+        // `build_node`'s question, not this one's.
+        PaintStyle::Box { background, radius, colors, widths, clip: _ } => Some(Draw::Box {
             background: background.map(|color| fade(color, opacity)),
             radius: *radius,
             colors: fade_border(*colors, opacity),
@@ -1912,5 +2090,239 @@ mod tests {
 
         assert_eq!(pixel_at(painter.canvas_mut(), 15, 15), (0, 255, 0, 255));
         assert_eq!(pixel_at(painter.canvas_mut(), 50, 50), (255, 0, 255, 255));
+    }
+
+    // ---- `clip = "Rounded"` ----
+
+    /// The shape `dev-config`'s battery indicator is: a pill with a child filling its left third.
+    /// Without the rounded clip that child is a square-cornered block poking out of the left cap,
+    /// which is why the config gave it the pill's own radius and got a lozenge instead.
+    #[test]
+    fn a_rounded_clip_cuts_a_child_by_the_parents_arc() {
+        let Some(instance) = init_headless_egl(96, 48) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 96, 48) else { return };
+
+        let root = resolved_surface(
+            &lua,
+            r##"return panel { id = "bar", width = 96, height = 48, background = "#FF0000FF",
+                padding = { top = 8, left = 8 }, child = rect {
+                    width = 80, height = 32, radius = 16, clip = "Rounded",
+                    children = { rect { width = 30, height = "Fill", background = "#0000FFFF" } },
+                } }"##,
+            LogicalSize { width: 96.0, height: 48.0 },
+        );
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
+
+        // The pill spans (8, 8) to (88, 40) with radius 16, so its corner arcs are centred at
+        // (24, 24) and the child covers x in [8, 38).
+        let canvas = painter.canvas_mut();
+        assert_eq!(
+            pixel_at(canvas, 10, 10),
+            (255, 0, 0, 255),
+            "the child's own top-left corner is outside the pill's arc, so the panel shows through"
+        );
+        assert_eq!(pixel_at(canvas, 10, 24), (0, 0, 255, 255), "at the pill's waist the child reaches its edge");
+        assert_eq!(
+            pixel_at(canvas, 30, 10),
+            (0, 0, 255, 255),
+            "past the arc the pill's top edge is straight, so nothing may round the child there"
+        );
+        assert_eq!(pixel_at(canvas, 50, 24), (255, 0, 0, 255), "the child ends at x = 38 and nothing extends it");
+    }
+
+    /// The default is unchanged and costs nothing: no `clip` means square corners, which is what
+    /// every node did before this property existed.
+    #[test]
+    fn without_the_property_a_radius_still_clips_square() {
+        let Some(instance) = init_headless_egl(96, 48) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 96, 48) else { return };
+
+        let root = resolved_surface(
+            &lua,
+            r##"return panel { id = "bar", width = 96, height = 48, background = "#FF0000FF",
+                padding = { top = 8, left = 8 }, child = rect {
+                    width = 80, height = 32, radius = 16,
+                    children = { rect { width = 30, height = "Fill", background = "#0000FFFF" } },
+                } }"##,
+            LogicalSize { width: 96.0, height: 48.0 },
+        );
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
+        assert_eq!(pixel_at(painter.canvas_mut(), 10, 10), (0, 0, 255, 255));
+    }
+
+    /// A child that would escape the parent entirely is still bound by the rectangle, so the
+    /// rounded pass narrows the clip rather than replacing it.
+    #[test]
+    fn a_rounded_clip_still_holds_a_child_to_the_parents_box() {
+        let Some(instance) = init_headless_egl(96, 48) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 96, 48) else { return };
+
+        let root = resolved_surface(
+            &lua,
+            r##"return panel { id = "bar", width = 96, height = 48, background = "#FF0000FF",
+                padding = { top = 8, left = 8 }, child = rect {
+                    width = 40, height = 32, radius = 16, clip = "Rounded",
+                    children = { rect { width = 90, height = 90, background = "#0000FFFF" } },
+                } }"##,
+            LogicalSize { width: 96.0, height: 48.0 },
+        );
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
+        let canvas = painter.canvas_mut();
+        assert_eq!(pixel_at(canvas, 60, 24), (255, 0, 0, 255), "the pill ends at x = 48");
+        assert_eq!(pixel_at(canvas, 24, 44), (255, 0, 0, 255), "and at y = 40");
+        assert_eq!(pixel_at(canvas, 24, 24), (0, 0, 255, 255));
+    }
+
+    /// One rounded clip inside another. The inner pass has to put the render target back to its
+    /// parent's image rather than to the screen, and this is the assertion that catches it: were
+    /// the inner subtree sent to the framebuffer it would paint unmasked and outside the outer arc.
+    #[test]
+    fn a_rounded_clip_nests_inside_another_one() {
+        let Some(instance) = init_headless_egl(96, 96) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 96, 96) else { return };
+
+        // A 64x64 circle at (16, 16), holding a 64x64 child that is itself a rounded clip holding a
+        // square block covering the whole box. Both arcs have to survive.
+        let root = resolved_surface(
+            &lua,
+            r##"return panel { id = "bar", width = 96, height = 96, background = "#FF0000FF",
+                padding = { top = 16, left = 16 }, child = rect {
+                    width = 64, height = 64, radius = 32, clip = "Rounded",
+                    children = { rect {
+                        width = 64, height = 64, radius = 32, clip = "Rounded",
+                        children = { rect { width = 64, height = 64, background = "#0000FFFF" } },
+                    } },
+                } }"##,
+            LogicalSize { width: 96.0, height: 96.0 },
+        );
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
+        let canvas = painter.canvas_mut();
+        assert_eq!(pixel_at(canvas, 48, 48), (0, 0, 255, 255), "the middle of the disc");
+        assert_eq!(pixel_at(canvas, 20, 20), (255, 0, 0, 255), "the corner of the box is outside the disc");
+    }
+
+    /// A translucent child blends with what is behind it once, not twice. The offscreen pass is
+    /// where this can go wrong: femtovg stores premultiplied results in a render target, and
+    /// compositing without `PREMULTIPLIED` multiplies the alpha in a second time.
+    #[test]
+    fn a_translucent_child_under_a_rounded_clip_blends_once() {
+        let Some(instance) = init_headless_egl(96, 48) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 96, 48) else { return };
+
+        // Blue at 50% over the panel's red: one blend is 128 of each, two would be 64 blue.
+        let root = resolved_surface(
+            &lua,
+            r##"return panel { id = "bar", width = 96, height = 48, background = "#FF0000FF",
+                padding = { top = 8, left = 8 }, child = rect {
+                    width = 80, height = 32, radius = 16, clip = "Rounded",
+                    children = { rect { width = 30, height = "Fill", background = "#0000FF80" } },
+                } }"##,
+            LogicalSize { width: 96.0, height: 48.0 },
+        );
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
+        let (r, _, b, _) = pixel_at(painter.canvas_mut(), 20, 24);
+        assert!((126..=129).contains(&r) && (126..=129).contains(&b), "blended to ({r}, _, {b}, _), expected ~128");
+    }
+
+    /// The border paints over the clipped subtree, the way QML's `ClippingRectangle` does. A fill
+    /// reaching the arc otherwise covers the border exactly where the arc is, which is the half of
+    /// a pill's outline most worth seeing.
+    #[test]
+    fn a_rounded_clips_border_paints_over_its_children() {
+        let Some(instance) = init_headless_egl(96, 48) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 96, 48) else { return };
+
+        let root = resolved_surface(
+            &lua,
+            r##"return panel { id = "bar", width = 96, height = 48, background = "#FF0000FF",
+                padding = { top = 8, left = 8 }, child = rect {
+                    width = 80, height = 32, radius = 16, clip = "Rounded",
+                    border_width = 4, border_color = "#00FF00FF",
+                    children = { rect { width = 30, height = "Fill", background = "#0000FFFF" } },
+                } }"##,
+            LogicalSize { width: 96.0, height: 48.0 },
+        );
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
+        assert_eq!(
+            pixel_at(painter.canvas_mut(), 10, 24),
+            (0, 255, 0, 255),
+            "the left cap's border is where the child reaches, so it has to be on top"
+        );
+    }
+
+    /// A leaf that asks for a rounded clip has nothing to clip, so it buys no offscreen pass.
+    #[test]
+    fn a_childless_rounded_clip_builds_no_group() {
+        let lua = Lua::new();
+        let root = resolved_surface(
+            &lua,
+            r##"return panel { id = "bar", width = 96, height = 48, child = rect {
+                width = 80, height = 32, radius = 16, clip = "Rounded", background = "#0000FFFF",
+            } }"##,
+            LogicalSize { width: 96.0, height: 48.0 },
+        );
+        let list = build(&root, 1.0, None);
+        assert!(!list.commands.iter().any(|cmd| matches!(cmd.draw, Draw::Clipped { .. })));
+    }
+
+    /// The property is in the display list, so turning it on repaints: ADR-0063 skips the frame
+    /// when the list compares equal, and a clip that changed shape without changing the list would
+    /// never be drawn.
+    #[test]
+    fn changing_only_the_clip_changes_the_display_list() {
+        let size = LogicalSize { width: 96.0, height: 48.0 };
+        let src = |clip: &str| {
+            format!(
+                r##"return panel {{ id = "bar", width = 96, height = 48, child = rect {{
+                    width = 80, height = 32, radius = 16, clip = "{clip}",
+                    children = {{ rect {{ width = 30, height = "Fill", background = "#0000FFFF" }} }},
+                }} }}"##
+            )
+        };
+        let boxed = build(&resolved_surface(&Lua::new(), &src("Box"), size), 1.0, None);
+        let rounded = build(&resolved_surface(&Lua::new(), &src("Rounded"), size), 1.0, None);
+        assert_ne!(boxed, rounded);
+    }
+
+    /// The group's own clip can be narrower than the node's box, when an ancestor cuts it. The
+    /// offscreen image is sized to that clip while the mask path is drawn on the full box, so this
+    /// is where the two coordinate systems have to agree.
+    #[test]
+    fn a_rounded_clip_hanging_off_its_parent_still_lands_where_it_belongs() {
+        let Some(instance) = init_headless_egl(96, 48) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 96, 48) else { return };
+
+        // A 64-wide pill starting 40px into a 60px-wide parent, so its right 44px are cut away by
+        // the parent's box and the group's clip runs (48, 8) to (108, 40) intersected to x < 68.
+        let root = resolved_surface(
+            &lua,
+            r##"return panel { id = "bar", width = 96, height = 48, background = "#FF0000FF",
+                padding = { top = 8, left = 8 }, child = rect {
+                    width = 60, height = 32, children = { rect {
+                        margin = { left = 40 }, width = 64, height = 32, radius = 16, clip = "Rounded",
+                        children = { rect { width = 64, height = "Fill", background = "#0000FFFF" } },
+                    } },
+                } }"##,
+            LogicalSize { width: 96.0, height: 48.0 },
+        );
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
+        let canvas = painter.canvas_mut();
+        assert_eq!(pixel_at(canvas, 60, 24), (0, 0, 255, 255), "inside the pill and inside the parent");
+        assert_eq!(pixel_at(canvas, 50, 10), (255, 0, 0, 255), "the pill's left cap still rounds");
+        assert_eq!(pixel_at(canvas, 72, 24), (255, 0, 0, 255), "and the parent's box still ends at x = 68");
     }
 }

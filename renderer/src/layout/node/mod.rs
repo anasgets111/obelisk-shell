@@ -40,7 +40,7 @@ use content::{
     parse_mask_character, parse_optional_foreground, parse_placeholder, parse_text_align,
 };
 use spec::parse_secure_submit;
-use style::{parse_background, parse_border_color, parse_border_width, parse_radius};
+use style::{parse_background, parse_border_color, parse_border_width, parse_clip, parse_radius};
 
 pub use content::{Elide, TextAlign, parse_content, parse_icon_size, parse_node_id, parse_surface_id};
 pub use paint_style::{PaintStyle, paint_style};
@@ -53,7 +53,7 @@ pub use spec::{
 #[cfg(test)]
 pub use spec::LockSpec;
 pub use style::{
-    BorderColor, parse_align, parse_edge_insets, parse_list_direction, parse_opacity, parse_size_mode, parse_spacing,
+    BorderColor, ClipShape, parse_align, parse_edge_insets, parse_list_direction, parse_opacity, parse_size_mode, parse_spacing,
     parse_visible,
 };
 pub use surface::{Anchor, Exclusive, KeyboardInteractivity, LayerKind, PanelSpec, SurfaceTopology, panel_spec};
