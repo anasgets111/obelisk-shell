@@ -502,6 +502,249 @@ mod meta_stub_tests {
         names
     }
 
+    /// Every type `lua-meta` declares, fed to the engine through a real `Scene::apply`.
+    ///
+    /// The other two tests here check *names*. This one checks the claims the names carry, which is
+    /// the half nothing checked until ADR-0081: 21 properties declared a type that refused a
+    /// `Signal` the engine takes, and the stubs had said so for as long as they had existed.
+    ///
+    /// It runs in this direction only. A member the engine accepts and the stub omits is invisible
+    /// here, and is what `just types` catches from the other side by checking `dev-config` against
+    /// these same declarations. Together they close the loop: this proves the stub does not promise
+    /// what the engine refuses, and `just types` proves a config written to the stub compiles.
+    ///
+    /// All 408 of them, with no skips: a type `sample` has no row for fails the test rather than
+    /// passing quietly, so the table cannot rot into covering half the file.
+    ///
+    /// ponytail: this checks the types, it does not derive them. `lua-meta/nodes.lua` is still
+    /// hand-written, because a node's schema is 49 parse functions and 45 `properties.get` calls
+    /// across ten files rather than a type to hang a derive on. The upgrade path is a per-kind
+    /// props struct the parsers read fields off, which would make the file generable the way
+    /// `oblisk.lua` is; it is a rewrite of the parse layer, and it would trade this crate's
+    /// property-by-property error messages for serde's. Not worth it while this test holds.
+    #[test]
+    fn every_type_the_stubs_declare_is_accepted_by_the_engine() {
+        let source = meta("nodes.lua") + &meta("surfaces.lua");
+        let classes = parse_typed_classes(&source);
+
+        let mut failures: Vec<String> = Vec::new();
+        let mut unsampled: Vec<String> = Vec::new();
+        let mut probed = 0usize;
+        for kind in super::NODE_KINDS {
+            let class = format!("{}Props", capitalize(kind));
+            for (field, ty) in typed_fields(&classes, &class) {
+                // Split on `|` only when the spelling is a flat union. `constraint_adjustment` is
+                // `("SlideX"|"SlideY"|...)[]`, an array *of* a union, and splitting it yields
+                // fragments that are not types. Those go in the sample table whole, or not at all.
+                let members: Vec<&str> =
+                    if ty.contains(['(', '[', '{']) { vec![ty.as_str()] } else { ty.split('|').collect() };
+                for member in members {
+                    // A `Signal` is not a type of its own here, it is a carrier: the engine
+                    // resolves it and then applies the sibling member's rules to what came out. So
+                    // the probe wraps a sibling's sample rather than an arbitrary value, which is
+                    // the difference between testing `align_h = Signal` and testing
+                    // `align_h = <a signal holding 8>`.
+                    // A `Signal` prefers to wrap a sibling, and only falls back to the field's own
+                    // sample when it has none. The order matters both ways: `image.source` is
+                    // `string|Signal` and wants a signal holding a string, while `list.source` is
+                    // `Signal` alone and wants one holding an array. Keying on the field first would
+                    // give both the array; keying on the wrap first would give both the string.
+                    let literal = if member == "Signal" {
+                        // `ty.split` is safe here: a bracketed type never splits, so it never
+                        // reaches this branch with `member == "Signal"`.
+                        ty.split('|')
+                            .filter(|m| *m != "Signal")
+                            .find_map(|m| sample(&field, m))
+                            .map(|inner| format!("state(\"probe\", {inner})"))
+                            .or_else(|| sample(&field, member))
+                    } else {
+                        sample(&field, member)
+                    };
+                    let Some(literal) = literal else {
+                        unsampled.push(format!("  {kind}.{field}: `{member}`"));
+                        continue;
+                    };
+                    probed += 1;
+                    if let Err(err) = apply_one(kind, &field, &literal) {
+                        failures.push(format!("  {kind}.{field} declares `{member}`, engine says: {err}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} declared type(s) the engine refuses:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+        // A skip is a hole in the check, so it fails here rather than passing quietly. Adding a
+        // spelling to `sample` is how you close one; there is no arm for "cannot be probed".
+        assert!(
+            unsampled.is_empty(),
+            "{} declared type(s) have no sample, so nothing checked them. Add a row to `sample`:\n{}",
+            unsampled.len(),
+            unsampled.join("\n")
+        );
+        assert_eq!(probed, 408, "the number of declared type members moved; confirm the change is intended");
+    }
+
+    /// One Lua literal per declared type. `None` means "no sample", which skips rather than guesses.
+    ///
+    /// Takes the field name because two properties share a spelling and not a domain: `opacity` is
+    /// a `number` in `[0, 1]` where `size` is a `number` of pixels, and `border_color`'s `Edges`
+    /// holds colours where `margin`'s holds lengths. A type-only table would probe those with a
+    /// value the engine is right to refuse, and the test would be reporting itself.
+    fn sample(field: &str, ty: &str) -> Option<String> {
+        match (field, ty) {
+            ("opacity", _) => return Some("0.5".to_string()),
+            ("border_color", "Edges") => return Some("{ top = \"#112233\" }".to_string()),
+            ("constraint_adjustment", _) => return Some("{ \"SlideX\" }".to_string()),
+            // The inline table shapes, which have no alias to key off.
+            ("anchor", shape) if shape.starts_with('{') => return Some("{ top = true, left = true }".to_string()),
+            ("min_size" | "max_size", _) => return Some("{ width = 8, height = 8 }".to_string()),
+            ("offset", _) => return Some("{ x = 1, y = 1 }".to_string()),
+            ("secure_submit", _) => {
+                return Some("{ capability = \"lock\", action = \"authenticate\" }".to_string());
+            }
+            // A callback: the parsers ask whether it is a function, not what its arity is. The two
+            // a `list` calls during layout are the exception, since it uses what comes back.
+            // Typed `Signal` with nothing beside it: these three take the handle itself.
+            ("hover", _) => return Some("hover(\"probe\")".to_string()),
+            ("scroll", _) => return Some("scroll(\"probe\")".to_string()),
+            ("source", "Signal") => return Some("SIGNAL_LIST".to_string()),
+            ("itemfn", _) => return Some("function(item) return rect {} end".to_string()),
+            ("key", _) => return Some("function(item) return tostring(item) end".to_string()),
+            (_, shape) if shape.starts_with("fun(") || shape.starts_with("fun()") => {
+                return Some("function() end".to_string());
+            }
+            _ => {}
+        }
+        Some(
+            match ty {
+                "integer" | "number" => "8",
+                "string" => "\"x\"",
+                "boolean" => "true",
+                "Color" => "\"#112233\"",
+                "Length" => "\"Fill\"",
+                "Edges" => "{ top = 1 }",
+                "Node" => "rect {}",
+                "Node[]" => "{ rect {} }",
+                "Align" => "\"Center\"",
+                // No row for a bare `Signal`: the caller wraps a sibling member's sample instead,
+                // and the three properties typed `Signal` alone are handled by field above. A row
+                // here would shadow both and probe every property with the same wrong payload.
+                "Rect" => "{ x = 0, y = 0, width = 1, height = 1 }",
+                "PopupAnchor" => "\"Top\"",
+                // A string-literal union: its first member stands for all of them, since the
+                // parser matches them in one `match`.
+                literal if literal.starts_with('"') => literal,
+                _ => return None,
+            }
+            .to_string(),
+        )
+    }
+
+    /// The properties each kind cannot be built without, so a probe of one optional field is not
+    /// rejected for the absence of a required one. Taken from the stubs' own non-optional fields.
+    fn required(kind: &str) -> &'static [(&'static str, &'static str)] {
+        match kind {
+            "panel" => &[("id", "\"probe\""), ("layer", "\"Top\"")],
+            "window" | "lock" => &[("id", "\"probe\"")],
+            "popup" => &[
+                ("id", "\"probe\""),
+                ("parent", "\"host\""),
+                ("anchor_rect", "{ x = 0, y = 0, width = 1, height = 1 }"),
+                ("width", "8"),
+                ("height", "8"),
+            ],
+            "list" => &[("source", "SIGNAL_LIST"), ("itemfn", "function(item) return rect {} end")],
+            _ => &[],
+        }
+    }
+
+    /// `kind { field = literal }` through `Scene::apply`, which is what actually calls all 49
+    /// parsers. A surface role is its own root; anything else hangs under a minimal `panel`.
+    fn apply_one(kind: &str, field: &str, literal: &str) -> Result<(), String> {
+        let mut props: Vec<String> = required(kind)
+            .iter()
+            .filter(|(name, _)| *name != field)
+            .map(|(name, value)| format!("{name} = {value}"))
+            .collect();
+        props.push(format!("{field} = {literal}"));
+        let node = format!("{kind} {{ {} }}", props.join(", "));
+        let surface = if SURFACE_KINDS.contains(&kind) {
+            node
+        } else {
+            format!("panel {{ id = \"probe\", layer = \"Top\", child = {node} }}")
+        };
+
+        let lua = mlua::Lua::new();
+        super::register_node_constructors(&lua).map_err(|e| e.to_string())?;
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).map_err(|e| e.to_string())?;
+        // `state` rather than a bare `signal()`, because there is no such global: the five the
+        // engine registers are `state`, `computed`, `hover`, `hover_rect` and `scroll`, which is
+        // what `lua-meta/signals.lua` declares.
+        let prelude = r#"
+            local SIGNAL_LIST = state("probe_list", { 1, 2 })
+        "#;
+        let table: mlua::Table = lua.load(format!("{prelude}\nreturn {surface}")).eval().map_err(|e| e.to_string())?;
+        let virtual_node = super::deserialize_lua_table(&table).map_err(|e| format!("{e:?}"))?;
+        let mut scene = crate::layout::scene::Scene::new();
+        let shaping = crate::text::shaping::ShapingHandle::spawn();
+        // `scene::tests::apply_at` is `pub(super)` and stays that way: widening a test helper's
+        // visibility to reach it from here is the move the `docs` baseline in the justfile exists to
+        // discourage. One instance, one output, which is all this probe needs.
+        let declared = crate::layout::node::parse_surface_id(&virtual_node.properties).map_err(|e| format!("{e:?}"))?;
+        let instances = [crate::layout::instance::SurfaceInstance {
+            instance_id: format!("{declared}@PROBE"),
+            declared_id: declared,
+            output: "PROBE".to_string(),
+            available: crate::layout::LogicalSize { width: 1000.0, height: 500.0 },
+        }];
+        scene.apply(std::slice::from_ref(&virtual_node), &instances, &shaping, &lua).map_err(|e| format!("{e:?}"))
+    }
+
+    const SURFACE_KINDS: [&str; 4] = ["panel", "window", "popup", "lock"];
+
+    /// One `---@class` as the checker needs it: its name, the classes it extends, and its own
+    /// `(field, declared type)` pairs in declaration order.
+    type TypedClass = (String, Vec<String>, Vec<(String, String)>);
+
+    /// Like [`parse_classes`], keeping each field's declared type alongside its name.
+    fn parse_typed_classes(source: &str) -> Vec<TypedClass> {
+        let mut classes: Vec<TypedClass> = Vec::new();
+        for line in source.lines() {
+            if let Some(rest) = line.strip_prefix("---@class ") {
+                let (name, parents) = match rest.split_once(':') {
+                    Some((name, parents)) => (name.trim(), parents.split(',').map(|p| p.trim().to_string()).collect()),
+                    None => (rest.trim(), Vec::new()),
+                };
+                classes.push((name.to_string(), parents, Vec::new()));
+            } else if let Some(rest) = line.strip_prefix("---@field ")
+                && let Some(current) = classes.last_mut()
+            {
+                let mut parts = rest.split_whitespace();
+                if let (Some(name), Some(ty)) = (parts.next(), parts.next()) {
+                    current.2.push((name.trim_end_matches('?').to_string(), ty.to_string()));
+                }
+            }
+        }
+        classes
+    }
+
+    /// One class's `(field, type)` pairs plus every parent's.
+    fn typed_fields(classes: &[TypedClass], name: &str) -> Vec<(String, String)> {
+        let Some((_, parents, own)) = classes.iter().find(|(class, ..)| class == name) else {
+            panic!("lua-meta declares no `{name}` class");
+        };
+        let mut out = Vec::new();
+        for parent in parents {
+            out.extend(typed_fields(classes, parent));
+        }
+        out.extend(own.iter().cloned());
+        out
+    }
+
     /// Every `shared::Capability::ALL` name, as a field on the `Oblisk` class.
     #[test]
     fn the_stubs_declare_every_capability_and_no_others() {

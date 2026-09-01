@@ -52,6 +52,46 @@ identities and an identity does not resolve. The engine really does refuse a `Si
 other property and are then refused for not being a function. Declaring `fun(...)|Signal` would be
 true and would only make completion worse.
 
+## Why the hand-written half is not generated
+
+The obvious follow-up is to generate `nodes.lua` and `surfaces.lua` too, and stop having two kinds
+of stub. Measured, that does not do what it sounds like it does.
+
+The *names* are already data: `NODE_KINDS`, `COMMON_PROPERTIES`, `BOX_PROPERTIES` and
+`NODE_PROPERTIES` in `renderer/src/lua/nodes.rs` are exactly the roster a generator would iterate.
+The types and the prose are not. They live in 49 `parse_*` functions and 45 `properties.get("...")`
+call sites across ten files, each with its own defaulting and coercion.
+
+So a generator would need a table of `(property, Lua type, description)` in Rust, and that table
+would be a hand-written claim in a `.rs` file instead of a hand-written claim in a `.lua` file. The
+prose moves; nothing becomes derived. The only spelling that would genuinely derive is a per-kind
+props struct the parsers read fields off, the way a capability payload is a `Serialize` struct.
+That is a rewrite of the parse layer, and it trades this crate's property-by-property error
+messages (`radius: expected a number, got String("x")`) for serde's.
+
+What was missing was not generation, it was a check. `every_type_the_stubs_declare_is_accepted_by_the_engine`
+builds `kind { property = <sample of the declared type> }` and runs a real `Scene::apply`, which is
+what calls all 49 parsers. All 408 declared type members, no skips: a type with no sample fails the
+test rather than passing quietly. Verified by injecting `font_size? Color|integer|Signal`, which it
+names.
+
+That closes the direction generation would have closed, without moving a word of prose.
+
+## Two directions, two tools
+
+The engine test and `just types` check opposite claims and neither subsumes the other.
+
+| | catches | how |
+| --- | --- | --- |
+| `every_type_the_stubs_declare_is_accepted_by_the_engine` | the stub promises what the engine refuses | feeds each declared type to `Scene::apply` |
+| `just types` | the stub omits what the engine accepts | checks real config code against the declarations |
+
+The engine test cannot do the second direction. Trying every *undeclared* sample and asserting a
+refusal collapses on aliases: `width` is `Length|Signal` and accepts a bare `integer`, `content` is
+`string` and accepts a `Color` sample because a hex colour is a string. Both would report as
+findings and both are correct code. Structural checking against real config is the right tool for
+that half, which is why both exist.
+
 ## What the check is worth
 
 `dev-config` came back with six diagnostics, all in `components/icon_button.lua`, and none of them

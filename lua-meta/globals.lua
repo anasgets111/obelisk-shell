@@ -1,6 +1,12 @@
 ---@meta
 -- The remaining engine globals, and the stdlib as ADR-0048 actually left it.
 --
+-- HAND-WRITTEN. `just stubs` does not touch this file, and nothing else checks it either: unlike
+-- `nodes.lua` there is no roster test behind it, because these globals are registered one at a time
+-- in `renderer/src/lua/` rather than from a list. `just types` is the only thing that exercises it,
+-- indirectly, by checking `dev-config` against these signatures. Edit it in the same commit as the
+-- Rust that changes, or nothing will tell you.
+--
 -- The sandbox is the reason this file matters most. The config VM loads only
 -- `COROUTINE | TABLE | STRING | UTF8 | MATH | PACKAGE | OS`, and then replaces `os` with a table
 -- holding four calls. Without the `runtime.builtin` disables in `.luarc.json` plus the `os`
@@ -17,7 +23,7 @@
 ---Refused if an entry is not a string, or if the table has a hole or a named key: `#` is undefined
 ---on a sparse table, so a hole would silently lose the tail. A family no font matches is skipped
 ---with a diagnostic, so a typo costs that entry and not the chain.
----@param chain string[]
+---@param chain string[] Family names in fallback order, densest first. A dense array: a hole truncates it.
 function fonts(chain) end
 
 json = {}
@@ -28,7 +34,7 @@ json = {}
 ---goes through the same mapping every capability payload does, so a successful null and a failure
 ---are indistinguishable. Both mean "no data" (ADR-0057). A `null` array element leaves a hole and
 ---`ipairs` stops at it.
----@param text string
+---@param text string The JSON document. Any input is safe, including an empty string.
 ---@return any value, string? error
 function json.decode(text) end
 
@@ -45,11 +51,11 @@ function ProcessHandle:kill() end
 ---`out_cb` fires once per line with the newline stripped, because the supervisor reads the child
 ---through `BufReader::lines()`. A pretty-printed JSON document therefore arrives in pieces, and
 ---only `exit_cb` knows the buffer is whole: accumulate in one, decode in the other.
----@param cmd string
----@param args string[]
+---@param cmd string The executable. Resolved on `PATH`; no shell, so no globbing, no pipes and no quoting rules.
+---@param args string[] One element per argument, already split. Passing `"a b"` is one argument containing a space.
 ---@param out_cb fun(line: string, stream: "stdout"|"stderr") Both streams reach the same callback; branch on `stream`.
 ---@param exit_cb fun(code: integer?) `nil` when the process was killed by a signal rather than exiting.
----@return ProcessHandle
+---@return ProcessHandle Live immediately. The process is already running when this returns.
 function process.run(cmd, args, out_cb, exit_cb) end
 
 ---@class oslib
@@ -59,18 +65,18 @@ function process.run(cmd, args, out_cb, exit_cb) end
 ---executes no instructions, so a blocking call cannot be caught and would wedge the Wayland thread.
 os = {}
 
----@param format? string
----@param time? integer
----@return string|table
+---@param format? string `strftime` directives, or `"*t"` for a table. Defaults to `"%c"`. A leading `!` reads UTC.
+---@param time? integer Unix seconds to format. Defaults to now.
+---@return string|table A string, or a table when `format` starts with `"*t"`.
 function os.date(format, time) end
 
----@param t? table
----@return integer
+---@param t? table A `os.date("*t")`-shaped table to convert. Omitted means now.
+---@return integer Unix seconds. Wall clock, so it moves when the clock is set; use `os.clock` for durations.
 function os.time(t) end
 
----@return number
+---@return number CPU seconds used by this process, as a float. Monotonic and immune to a clock change, which is what makes it the one to subtract.
 function os.clock() end
 
----@param name string
----@return string?
+---@param name string The variable to read.
+---@return string? Its value, or `nil` when unset. The shell's own environment, not the compositor's.
 function os.getenv(name) end

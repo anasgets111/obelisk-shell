@@ -2,6 +2,20 @@
 -- The eight geometric nodes (`oblisk-idl-api-specs.md` § 5.2) and the properties every one of them
 -- shares (§ 5.1).
 --
+-- HAND-WRITTEN. `just stubs` does not touch this file. Of the five in `lua-meta`, only `oblisk.lua`
+-- is generated, because a capability payload is a real `Serialize` struct to derive from. A node's
+-- schema is 29 scattered `properties.get("...")` calls across `renderer/src/layout/node/`, so it is
+-- control flow rather than data and there is nothing to derive from.
+--
+-- Two things keep it honest instead. `renderer/src/lua/nodes.rs`'s `meta_stub_tests` matches the
+-- constructor roster and every kind's `---@field` names against `accepted_properties`, so a
+-- property added to the engine and forgotten here fails the build. `just types` runs the language
+-- server over `dev-config` with these declarations, so a *type* that is wrong shows up as a
+-- diagnostic on working config code (ADR-0081).
+--
+-- The `---@param props` and `---@return Node` on each constructor carry no prose on purpose. The
+-- type is the whole content of the sentence, and twelve copies of "the properties above" is noise.
+--
 -- Every property here accepts a `Signal` in place of a literal, and every union spells it out. The
 -- engine resolves the handle once per pass (`node::resolve_properties`) and then applies that
 -- property's normal rules to the result, so `radius = someSignal` is as ordinary as `radius = 8`.
@@ -26,8 +40,8 @@
 ---@alias Color string Hex `#RRGGBB` or `#RRGGBBAA`. Strict: no shorthand, no named colours.
 
 ---@class NodeBase
----@field width? Length|Signal
----@field height? Length|Signal
+---@field width? Length|Signal Pixels, or `"Fill"` to take what the parent has left. Omitted means the node sizes to its content.
+---@field height? Length|Signal The same, on the cross axis. `"Fill"` on both is how a background covers its parent.
 ---@field margin? Edges Outer spacing.
 ---@field padding? Edges Inner spacing.
 ---@field align_h? Align|Signal On a stacking parent this places the node in the content box; on a `row` it is read off the row itself as the main-axis distribution and ignored on the children.
@@ -48,17 +62,17 @@
 ---@field clip? "Box"|"Rounded"|Signal What this node cuts its children down to. Default `"Box"`, its rectangle with square corners, which is what a node has always done. `"Rounded"` uses `radius` instead, so a child overflowing a pill is cut by the same arc the pill's fill draws. Costs an offscreen pass, which is why `radius` alone does not imply it.
 
 ---@class RectProps: NodeBase, BoxBase
----@field children? Node[]
+---@field children? Node[] Drawn in order. A hole in the array truncates it, since `#` is undefined on a sparse table.
 
 ---@class RowProps: NodeBase, BoxBase
 ---@field spacing? integer|Signal Pixels between siblings. A hidden child costs nothing, including its gap.
----@field children? Node[]
+---@field children? Node[] Drawn in order. A hole in the array truncates it, since `#` is undefined on a sparse table.
 ---@field scroll? Signal The signal `scroll(name)` returned. Makes this a viewport its children move inside.
 
 ---@class ColumnProps: NodeBase, BoxBase
----@field spacing? integer|Signal
----@field children? Node[]
----@field scroll? Signal
+---@field spacing? integer|Signal Pixels between siblings, on the vertical axis here.
+---@field children? Node[] Drawn in order. A hole in the array truncates it, since `#` is undefined on a sparse table.
+---@field scroll? Signal The signal `scroll(name)` returned. Makes this a viewport its children move inside.
 
 ---@class TextProps: NodeBase
 ---@field content? string|Signal Default `""`, so a text bound to a capability renders empty until the first push rather than failing at boot.
@@ -77,7 +91,7 @@
 ---@field fit? "cover"|"contain"|"stretch"|Signal Default `"cover"`. An image has no intrinsic size and takes the box `width`/`height` give it.
 
 ---@class ButtonProps: NodeBase, BoxBase
----@field children? Node[]
+---@field children? Node[] Drawn in order. A hole in the array truncates it, since `#` is undefined on a sparse table.
 ---@field on_click? fun(rect: Rect, button: "left"|"right"|"middle") Fires on the release, and only when the release lands on the same node and the same button the press armed. A handler declaring one parameter still works.
 
 ---@class ListProps: NodeBase
@@ -85,14 +99,14 @@
 ---@field itemfn fun(item: any): Node Built for every element.
 ---@field key? fun(item: any): string Maps an element to a stable string. Items reconcile by key, so inserting one rebuilds one. Duplicate keys are an error. Without it items match by index and an insertion rebuilds everything after it.
 ---@field direction? "Vertical"|"Horizontal"|Signal Default `"Vertical"`. Which way the generated items stack.
----@field spacing? integer|Signal
----@field scroll? Signal
+---@field spacing? integer|Signal Pixels between generated items, along `direction`.
+---@field scroll? Signal The signal `scroll(name)` returned. Makes this a viewport its children move inside.
 
 ---@class TextfieldProps: NodeBase
 ---A `textfield` parses and lays out, but nothing delivers keystrokes to it yet: `zwp_text_input_v3`
 ---is unwired, so neither callback below has ever fired. The properties are typed to ADR-0027's
 ---settled wire shape so a config written against them keeps working when the protocol lands.
----@field placeholder? string|Signal
+---@field placeholder? string|Signal Drawn in the foreground colour while the field is empty. Not the value: submitting an untouched field submits an empty string.
 ---@field mask_character? string|Signal Capped at 1 byte. Hides typed input.
 ---@field secure_submit? { capability: string, action: string } Only meaningful alongside `mask_character`; without it a masked field's value is unreadable from Lua entirely (ADR-0005, ADR-0027).
 ---@field on_change? fun(text: string) Per committed edit batch from `wp-text-input-v3`, not per keystroke.
