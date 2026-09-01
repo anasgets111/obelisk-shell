@@ -32,13 +32,20 @@ pub const AGENT_OBJECT_PATH: &str = "/org/oblisk/PolicyKit1/AuthenticationAgent"
 /// exists in this crate for an unrelated reason (it doesn't yet -- ADR-0010 covers Wayland
 /// idle/lock, not logind sessions).
 pub fn current_session_subject() -> Result<Subject, std::env::VarError> {
-    let session_id = std::env::var("XDG_SESSION_ID")?;
+    Ok(session_subject(std::env::var("XDG_SESSION_ID")?))
+}
+
+/// The `Subject` half of [`current_session_subject`], split off the `$XDG_SESSION_ID` read so a
+/// test can check the shape without setting the variable. `set_var` races every other thread in
+/// the test binary that reads the environment, which is why Rust 2024 made it `unsafe`, and two
+/// tests here setting this one to different values is exactly the race that used to fire.
+fn session_subject(session_id: String) -> Subject {
     let mut subject_details = HashMap::new();
     subject_details.insert(
         "session-id".to_string(),
         OwnedValue::try_from(Value::from(session_id)).expect("String -> OwnedValue conversion is infallible"),
     );
-    Ok(Subject { subject_kind: "unix-session".to_string(), subject_details })
+    Subject { subject_kind: "unix-session".to_string(), subject_details }
 }
 
 /// One `BeginAuthentication` call as polkitd sent it, parsed off the wire.
@@ -248,7 +255,8 @@ mod tests {
     /// reachable because every generation sends its own starts (ADR-0070 decision 3).
     #[tokio::test]
     async fn registering_twice_makes_only_one_wire_call() {
-        // SAFETY: see the test above.
+        // SAFETY: `register` reads `$XDG_SESSION_ID`, and this is now the only test in the binary
+        // that writes it. Nothing asserts the value, only that the lookup succeeds.
         unsafe { std::env::set_var("XDG_SESSION_ID", "c1") };
         let (authority_side, agent_side) = p2p_pair().await;
         let (calls_tx, mut calls_rx) = mpsc::unbounded_channel();
@@ -267,13 +275,14 @@ mod tests {
         assert!(calls_rx.try_recv().is_err(), "the second register must be a no-op");
     }
 
-    #[tokio::test]
-    async fn current_session_subject_reads_xdg_session_id() {
-        // SAFETY: this test crate is single-threaded per-test-process for env mutation
-        // purposes here (tokio's multi-thread test runtime still executes this test body on
-        // one task; no other test in this binary reads/writes XDG_SESSION_ID).
-        unsafe { std::env::set_var("XDG_SESSION_ID", "test-session-42") };
-        let subject = current_session_subject().expect("XDG_SESSION_ID was just set");
+    /// Was `current_session_subject_reads_xdg_session_id`, which set `$XDG_SESSION_ID` and read it
+    /// back through [`current_session_subject`]. Its safety comment claimed no other test in the
+    /// binary touched that variable; `registering_twice_makes_only_one_wire_call` sets it to `c1`,
+    /// and the harness runs both on parallel threads, so the read-back saw `c1` whenever it lost.
+    /// Testing [`session_subject`] instead keeps the assertion and needs no environment at all.
+    #[test]
+    fn a_session_id_becomes_a_unix_session_subject() {
+        let subject = session_subject("test-session-42".to_string());
         assert_eq!(subject.subject_kind, "unix-session");
         assert_eq!(
             subject.subject_details.get("session-id").cloned().and_then(|v| String::try_from(v).ok()),
