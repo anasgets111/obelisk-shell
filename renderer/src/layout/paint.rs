@@ -484,7 +484,37 @@ fn physical_edge(logical: f32, scale: f32) -> u32 {
     physical.round() as u32
 }
 
+/// How far short of half the box a fill's corner radius stops, in logical pixels.
+///
+/// femtovg already limits a radius to half the box on each axis
+/// (`Path::rounded_rect_varying`'s `rad.min(halfw)`), and at *exactly* that value the four straight
+/// segments between the corner arcs have zero length and its fill tessellation collapses to the
+/// bounding rectangle. It does not do so consistently, which is what makes an epsilon the fix
+/// rather than a special case: sweeping square boxes at radius exactly half, 16, 28 and 32 filled
+/// as squares while 20, 24, 36, 40, 44, 48 and 52 filled as circles. Backing off by one ULP is not
+/// enough either -- 40x40 rounded and 32x32 did not.
+///
+/// 0.01 rather than the 0.001 that was also measured to work at every one of those sizes: ten times
+/// the smallest shortfall that held, still a hundredth of a logical pixel, which is a fiftieth of a
+/// physical one at 2x. Nothing can see it, and the number it is protecting against is zero.
+const FILL_RADIUS_EPSILON: f32 = 0.01;
+
+/// The background fill, rounded when the node asked for it.
+///
+/// The clamp is the whole content of this function and it is not defensive: see
+/// [`FILL_RADIUS_EPSILON`] for the degeneracy it steers around.
+///
+/// A radius at or above half is the pill-and-circle case, not an edge case, which is why this is
+/// load-bearing. Half the smaller side is exactly how a config spells a stadium:
+/// `components/icon_button.lua` writes `side / 2` for a circle, and `theme.item_radius` lands
+/// *above* half because it is scaled independently of `item_height` (18 and 34 unscaled, 17 and 32
+/// at 0.93). So every pill and every circle on the dev bar drew a square ground under a correctly
+/// rounded border, which is what made it read as the radius reaching only half the draw.
+/// [`paint_border`] needs no such clamp: its `stroke_path` has no degeneracy at half, which is
+/// precisely why the border kept its corners while the fill lost them, and pinning that asymmetry
+/// is what `a_radius_of_half_the_box_fills_a_stadium_not_a_square` is for.
 fn fill_rect(canvas: &mut Canvas<OpenGl>, rect: LogicalRect, radius: f32, color: Rgba) {
+    let radius = radius.min(rect.width.min(rect.height) / 2.0 - FILL_RADIUS_EPSILON);
     let mut path = Path::new();
     if radius > 0.0 {
         path.rounded_rect(rect.x, rect.y, rect.width, rect.height, radius);
@@ -1448,6 +1478,61 @@ mod tests {
             lit_pixels > 0,
             "text with a foreground colour must paint at least one non-background pixel inside its rect"
         );
+    }
+
+    /// The bar's own shape, and the bug it hid. `components/icon_button.lua` asks for
+    /// `radius = side / 2` because that is what a circle is, and `theme.item_radius` sits above half
+    /// the item height because the two tokens scale independently. Both reached femtovg's own
+    /// half-the-box clamp, where its fill tessellation collapses to the bounding rectangle, so every
+    /// pill and circle on the bar painted a square ground under a round border.
+    ///
+    /// 32x32 at radius 16 is the live case, taken off the dev bar's own display list. 40x40 at 20 is
+    /// here because it *did* round before the fix and 32x32 did not, which is the measurement that
+    /// showed the degeneracy is erratic by size rather than a clean threshold, and so that a future
+    /// edit cannot satisfy this test by tightening the epsilon back to one ULP.
+    ///
+    /// Both halves of each case are asserted, because the asymmetry is the tell: the corner must
+    /// show the parent through it (the fill is round) *and* the mid-edge must still be border (the
+    /// stroke was always round). A fix that squared the border to match the fill would satisfy one
+    /// and not the other.
+    #[test]
+    fn a_radius_of_half_the_box_fills_a_stadium_not_a_square() {
+        let Some(instance) = init_headless_egl(64, 64) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 64, 64) else { return };
+
+        // side, radius. The third is the over-asked radius `theme.item_radius` produces against
+        // `theme.item_height`, which must clamp to the same stadium rather than square off.
+        for (side, radius) in [(32.0_f32, 16.0_f32), (40.0, 20.0), (32.0, 17.0)] {
+            let src = format!(
+                r##"return panel {{ id = "bar", width = 64, height = 64, background = "#FF0000FF", padding = {{ top = 4, left = 4 }}, child = rect {{
+                    width = {side}, height = {side}, background = "#000000FF", radius = {radius},
+                    border_width = 2, border_color = "#FFFFFFFF",
+                }} }}"##
+            );
+            let root = resolved_surface(&lua, &src, LogicalSize { width: 64.0, height: 64.0 });
+            paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
+
+            let case = format!("{side}x{side} radius {radius}");
+            // Well outside the inscribed circle: the box corner is `side/2 * (sqrt(2) - 1)` clear of
+            // it, roughly 6px at 32 and 8px at 40, so this is not an antialiasing read.
+            assert_eq!(
+                pixel_at(painter.canvas_mut(), 5, 5),
+                (255, 0, 0, 255),
+                "{case}: the corner of a stadium is outside it, so the panel behind must show through"
+            );
+            assert_eq!(
+                pixel_at(painter.canvas_mut(), 4 + side as usize / 2, 4 + side as usize / 2),
+                (0, 0, 0, 255),
+                "{case}: and the middle is still filled"
+            );
+            assert_eq!(
+                pixel_at(painter.canvas_mut(), 5, 4 + side as usize / 2),
+                (255, 255, 255, 255),
+                "{case}: the border was always round here and must stay so"
+            );
+        }
     }
 
     /// The uniform-border-with-radius branch of [`paint_border`] had no test at all: the per-edge
