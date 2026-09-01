@@ -15,9 +15,9 @@ mod socket;
 // that tells a user their stubs are stale lives in `setup`, which is the thing that acts on it.
 #[cfg(test)]
 mod stubs;
+mod supervisor;
 mod watcher;
 
-use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -25,18 +25,11 @@ use std::time::Duration;
 use capabilities::lock::{self, LockController};
 use capabilities::network::NetworkController;
 use capabilities::{Capabilities, Startable};
-use generation::{
-    Authoritative, RESTART_LIMIT, RESTART_WINDOW, RendererDeparture, RestartBrake, classify_departure,
-    departure_report, renderer_binary_path,
-};
+use generation::renderer_binary_path;
 use polkit::PolkitAgent;
-use process::registry::{LiveProcesses, reap_all_processes, take_exited_process, wait_and_report_exit};
-use reload_link::SocketCandidateLink;
-use shared::{
-    ApplyPendingReload, Capability, ReevaluateReport, ReevaluateRequest, RendererFrame, SupervisorFrame, Zeroize,
-};
-use snapshot::push_snapshot;
+use shared::{Capability, ReevaluateReport, ReevaluateRequest, RendererFrame, SupervisorFrame, Zeroize};
 use socket::send_frame_logged;
+use supervisor::Supervisor;
 
 /// How long the Watcher waits after the last relevant `shell.lua` change before dispatching a
 /// reload -- coalesces a multi-event save into one round trip. Fixed (docs/adr/0024 item 6).
@@ -138,37 +131,6 @@ impl Shutdown {
     }
 }
 
-/// Why a generation is being asked to take a lock it did not request -- the log line differs by
-/// cause even though both arrive at the same state: a lock the compositor already holds with
-/// nothing of ours on it. Naming it beats a `bool` whose two sides read identically at the call
-/// site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RelockReason {
-    /// docs/adr/0058 decision 4: the Renderer holding the lock died and a replacement was spawned.
-    RendererReplaced,
-    /// docs/adr/0060: this Supervisor started with `$XDG_RUNTIME_DIR`'s marker set, so a previous
-    /// one died while the session was locked.
-    SupervisorRestarted,
-}
-
-impl RelockReason {
-    /// The subject noun for the outcome messages below.
-    fn subject(self) -> &'static str {
-        match self {
-            RelockReason::RendererReplaced => "the replacement",
-            RelockReason::SupervisorRestarted => "the restarted shell",
-        }
-    }
-
-    /// Why the lock is going out unasked, for the request-in-flight log line.
-    fn because(self) -> &'static str {
-        match self {
-            RelockReason::RendererReplaced => "the Renderer that held it died",
-            RelockReason::SupervisorRestarted => "the Supervisor that held it died",
-        }
-    }
-}
-
 /// Branches into the PAM worker's own tokio-free path (ADR-0028) before the normal Supervisor.
 /// Must run before any D-Bus/tokio-runtime/audio-thread setup -- the worker path must not
 /// construct a tokio runtime at all.
@@ -229,7 +191,9 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     let (tx, mut challenges) = tokio::sync::mpsc::unbounded_channel();
     let mut polkit_agent = PolkitAgent::new(tx);
     // Long-lived proxy for the polkit reply once a challenge's PAM conversation finishes
-    // (docs/adr/0028) -- built once here, not per-challenge.
+    // (docs/adr/0028) -- built once here, not per-challenge. Kept out of `Session` with
+    // `pending_challenge` below: the polkit agent answers a D-Bus caller and touches no
+    // generation state, so it is the one path through this loop that needs none of it.
     let authority = match zbus_polkit::policykit1::AuthorityProxy::new(&connection).await {
         Ok(authority) => Some(authority),
         Err(err) => {
@@ -237,6 +201,8 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
             None
         }
     };
+    // No multi-challenge queue, so keeping only the latest is correct.
+    let mut pending_challenge: Option<polkit::BeginAuthenticationCall> = None;
 
     // Notifications' sound player (ADR-0033). The thread is one `std::sync::mpsc` recv loop with
     // no connection behind it, so it stays eager -- there is nothing for a config to gate.
@@ -254,7 +220,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     // Every capability's channel and controller (docs/adr/0076). `capabilities` owns what is
     // running and every sender; `signals` is the receiving half this loop awaits. A capability the
     // config never reads keeps a sender nobody sends on, so it simply never wakes the loop.
-    let (mut capabilities, mut signals) = Capabilities::new(connection.clone(), sound_tx, idle_signal_tx);
+    let (capabilities, mut signals) = Capabilities::new(connection.clone(), sound_tx, idle_signal_tx);
 
     let socket_path = shared::control_socket_path()?;
     let (registry, mut inbound_frames, mut connected) = socket::spawn_listener(&socket_path)?;
@@ -264,13 +230,11 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     // controller must not cache the authoritative generation id -- a swap reassigns it.
     let (lock_command_tx, mut lock_commands) = tokio::sync::mpsc::unbounded_channel::<shared::SetSessionLock>();
     let lock = LockController::new(lock_command_tx);
-    // Kept alive for the whole run so the channel never closes. Each outcome carries the
-    // acquisition it answers for (see lock::accepts_outcome).
     let (pam_outcome_tx, mut pam_outcomes) = tokio::sync::mpsc::unbounded_channel::<(u64, shared::PamOutcome)>();
+    let (process_done_tx, mut process_done) = tokio::sync::mpsc::unbounded_channel::<(u32, u64)>();
 
     let config_dir = shared::config_dir()?;
     let mut reload_events = watcher::spawn_watcher(&config_dir, RELOAD_DEBOUNCE)?;
-    let mut next_sequence: u64 = 0;
 
     // Generation 0 is boot-spawned by the Supervisor itself (docs/adr/0025 item 7) -- there is no
     // shell without it, so a spawn failure here is fatal to main.
@@ -281,48 +245,22 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
         &[],
         &[(shared::GENERATION_ID_ENV.to_string(), "0".to_string())],
     )?;
-    let mut authoritative = Authoritative { generation_id: 0, child: boot_child };
-    let mut next_generation_id: u32 = 1;
-    let mut restart_brake = RestartBrake::new(RESTART_LIMIT, RESTART_WINDOW);
-    // docs/adr/0058 decision 4, docs/adr/0060: set when a Renderer dies holding the lock, or
-    // this process started with the session already locked. relock_when_connected is the
-    // intent, relock_in_flight lets LockReport tell a re-acquisition's answer from an ordinary
-    // one's. Read once, before anything can connect -- reading later would race the boot
-    // Renderer's registration.
-    let locked_flag = lock::SessionLockedFlag::at(shared::session_locked_flag_path()?);
-    let mut relock_when_connected = locked_flag.is_set().then_some(RelockReason::SupervisorRestarted);
-    let mut relock_in_flight: Option<RelockReason> = None;
-    if relock_when_connected.is_some() {
-        eprintln!(
-            "the session was locked when the last Supervisor stopped and the compositor has not unlocked it, so the boot Renderer will be asked \
-             to take that lock over (docs/adr/0060)"
-        );
-    }
 
-    // The last StateSnapshot pushed per capability, keyed by name -- hydrates a fresh
-    // Candidate's first evaluation (§ 15.2 point 1; docs/adr/0029).
-    let mut last_snapshots: HashMap<String, shared::StateSnapshot> = HashMap::new();
-    // Every capability's state-version counter, keyed by name (ADR-0004).
-    let mut revisions: HashMap<String, u32> = HashMap::new();
+    let mut supervisor = Supervisor::new(
+        registry,
+        boot_child,
+        renderer_path_str,
+        capabilities,
+        lock,
+        lock::SessionLockedFlag::at(shared::session_locked_flag_path()?),
+        pam_outcome_tx.clone(),
+        process_done_tx,
+    );
 
-    // No multi-challenge queue, so keeping only the latest is correct.
-    let mut pending_challenge: Option<polkit::BeginAuthenticationCall> = None;
-
-    // Every process.run-spawned child still tracked (docs/adr/0026).
-    // Whether a topology-changing reload was refused while locked (docs/adr/0042). A bool, not
-    // a queue: a second change while locked is still one reload to run.
-    let mut swap_owed_on_unlock = false;
-
-    let mut processes: LiveProcesses = HashMap::new();
-    let (process_done_tx, mut process_done) = tokio::sync::mpsc::unbounded_channel::<(u32, u64)>();
     // With no handler, Ctrl-C killed the Supervisor on the spot, leaving the Renderer orphaned
     // and running headless. SIGTERM gets the same treatment.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-
     let mut memory_sampler = memory::sampler_from_env();
-    // Set only by the departure arm below, so shutdown can tell "still running, needs reaping"
-    // from "already gone".
-    let mut renderer_departed = false;
     // Every break below leaves this alone except the brake's, the one exit a service manager must
     // not restart into (docs/adr/0059 decision 3).
     let mut shutdown = Shutdown::Requested;
@@ -339,147 +277,40 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
             }
             // docs/adr/0058 decision 1: a dead Renderer sends no frames, and a healthy idle one
             // sends none either -- without this arm the difference never reaches select! at all.
-            status = authoritative.child.wait() => {
-                let departure = match status {
-                    Ok(status) => classify_departure(status),
-                    Err(err) => {
-                        eprintln!("failed to wait on generation {}'s renderer: {err}", authoritative.generation_id);
-                        RendererDeparture::Failed { code: -1 }
-                    }
-                };
-                let was_locked = lock.snapshot().active;
-                eprintln!("{}", departure_report(departure, authoritative.generation_id, was_locked));
-                renderer_departed = true;
-
-                // Checked before the spawn, not after a failure (docs/adr/0058 decision 3): the
-                // loop this defends against is one where every spawn succeeds and every Renderer
-                // then dies on the same config.
-                if !restart_brake.allow(std::time::Instant::now()) {
-                    eprintln!(
-                        "giving up: {RESTART_LIMIT} renderers have died within {}s, which is a config that kills whatever it is \
-                         handed rather than a transient (docs/adr/0058 decision 3)",
-                        RESTART_WINDOW.as_secs()
-                    );
-                    shutdown = Shutdown::RestartBrakeTripped;
+            status = supervisor.authoritative.child.wait() => {
+                if let Some(reason) = supervisor.replace_departed_renderer(status) {
+                    shutdown = reason;
                     break;
-                }
-                let replacement_generation_id = next_generation_id;
-                next_generation_id += 1;
-                match process::spawn_group_leader(
-                    &renderer_path_str,
-                    &[],
-                    &[(shared::GENERATION_ID_ENV.to_string(), replacement_generation_id.to_string())],
-                ) {
-                    Ok(child) => {
-                        authoritative = Authoritative { generation_id: replacement_generation_id, child };
-                        renderer_departed = false;
-                        eprintln!("spawned generation {replacement_generation_id} to replace it");
-                        // Hydration needs no code here: the replacement's connected registration
-                        // replays every last_snapshots entry via the arm below.
-                        if was_locked {
-                            // docs/adr/0058 decision 4: the lock object died with the process, so
-                            // active no longer describes anything this shell holds. RendererLost
-                            // is what lets lock() through despite that. The request waits for the
-                            // replacement to register -- send_frame_logged needs a connection.
-                            lock.record(lock::LockEvent::RendererLost);
-                            relock_when_connected = Some(RelockReason::RendererReplaced);
-                            eprintln!(
-                                "the session is still locked, so generation {replacement_generation_id} will be asked to retake the lock once it connects"
-                            );
-                        }
-                    }
-                    Err(err) => {
-                        eprintln!("could not spawn a replacement renderer: {err}");
-                        break;
-                    }
                 }
             }
             Some(_) = memory::tick_sampler(&mut memory_sampler) => {
-                memory::log_sample("steady state", &[(authoritative.generation_id, &authoritative.child)]);
+                memory::log_sample("steady state", &[(supervisor.authoritative.generation_id, &supervisor.authoritative.child)]);
             }
             Some(challenge) = challenges.recv() => {
                 eprintln!("polkit authentication challenge received: {challenge:?}");
                 pending_challenge = Some(challenge);
             }
-            Some(generation_id) = connected.recv() => {
-                // Authoritative only: a PBA candidate gets its own hydration from run_pba's
-                // snapshots argument (docs/adr/0029); replaying here too would be redundant.
-                // Fixes the boot-time race noted above -- whatever network/bluetooth captured
-                // before this connection existed is delivered now.
-                if generation_id == authoritative.generation_id {
-                    for snapshot in last_snapshots.values() {
-                        send_frame_logged(&registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
-                    }
-                    // docs/adr/0058 decision 4, and it must come after the replay above: a lock
-                    // acquired before hydration paints one frame of defaults on the surface where
-                    // that's indistinguishable from a broken shell. No auth-capability check here
-                    // -- the Renderer refuses and reports Refused when its tree has no way to
-                    // reach PAM (docs/adr/0052 decision 3).
-                    if let Some(reason) = relock_when_connected.take() {
-                        relock_in_flight = Some(reason);
-                        eprintln!(
-                            "asking generation {generation_id} to take the session lock over, because {} (docs/adr/0058 decision 4, docs/adr/0060)",
-                            reason.because()
-                        );
-                        lock.lock();
-                    }
-                }
-            }
+            Some(generation_id) = connected.recv() => supervisor.hydrate(generation_id),
             // One arm for every snapshot capability (docs/adr/0076). `Signals::next` is the
             // cancel-safe half -- bare `recv()`s -- and `Capabilities::push` runs here in the
             // winning arm's body, which `select!` never cancels, so the two capabilities that
             // `await` while building their state cannot lose a signal to a busier branch.
-            Some(signal) = signals.next() => {
-                capabilities.push(signal, &registry, authoritative.generation_id, &mut revisions, &mut last_snapshots).await;
-            }
+            Some(signal) = signals.next() => supervisor.push_capability_signal(signal).await,
             Some(event) = idle_signals.recv() => {
                 // Routed to whichever generation made the register_threshold call now firing
                 // (event.generation_id), not the authoritative one -- ADR-0006. Sent as a raw
                 // IdleEvent, not through the StateSnapshot/revision path: idle is event-shaped,
                 // not pollable state (ADR-0032).
-                send_frame_logged(&registry, event.generation_id, &SupervisorFrame::IdleEvent(event));
+                send_frame_logged(&supervisor.registry, event.generation_id, &SupervisorFrame::IdleEvent(event));
             }
-            Some(command) = lock_commands.recv() => {
-                // The only place a SetSessionLock is addressed. The state push rides along: every
-                // command this capability sends is also a state change a lock screen must see
-                // (docs/adr/0052 decision 4).
-                send_frame_logged(&registry, authoritative.generation_id, &SupervisorFrame::SetSessionLock(command));
-                push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, Capability::Lock, &lock.snapshot());
-            }
-            Some((acquisition, outcome)) = pam_outcomes.recv() => {
-                // The other half of the secure_submit(lock, authenticate) arm below -- the one
-                // place a Success becomes an unlock order (docs/adr/0042).
-                //
-                // `acquisition` matters because a PAM answer outlives the lock it answers for: it
-                // takes about a second (pam_unix), up to PAM_EXCHANGE_TIMEOUT's thirty on a wedged
-                // worker, and inside that window the compositor can end the lock
-                // (loginctl unlock-session) or an idle timer can take a new one.
-                // record_authentication refuses an answer that no longer matches the lock on the
-                // glass.
-                let succeeded = outcome == shared::PamOutcome::Success;
-                if !lock.record_authentication(acquisition, outcome) {
-                    // No push: a refused answer changed no state, and push_snapshot bumps the
-                    // revision unconditionally.
-                    eprintln!("lock: dropping a pam outcome for acquisition {acquisition}, which is no longer the lock on the glass");
-                } else if succeeded {
-                    // The command's own arm pushes the snapshot that goes with it.
-                    lock.unlock();
-                } else {
-                    push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, Capability::Lock, &lock.snapshot());
-                }
-            }
-            Some(()) = reload_events.recv() => {
-                begin_reload(&registry, authoritative.generation_id, &mut next_sequence);
-            }
-            Some((generation_id, id)) = process_done.recv() => {
-                // wait must never block select! -- see wait_and_report_exit's own doc comment --
-                // so only the fast, synchronous removal happens inline.
-                if let Some(child) = take_exited_process(&mut processes, generation_id, id) {
-                    tokio::spawn(wait_and_report_exit(registry.clone(), generation_id, id, child));
-                }
-            }
+            Some(command) = lock_commands.recv() => supervisor.send_lock_command(command),
+            // The other half of the secure_submit(lock, authenticate) arm below -- the one place a
+            // Success becomes an unlock order (docs/adr/0042).
+            Some((acquisition, outcome)) = pam_outcomes.recv() => supervisor.record_pam_outcome(acquisition, outcome),
+            Some(()) = reload_events.recv() => supervisor.begin_reload(),
+            Some((generation_id, id)) = process_done.recv() => supervisor.reap_exited_process(generation_id, id),
             Some(inbound) = inbound_frames.recv() => match inbound.frame {
-                RendererFrame::LockReport(report) if inbound.generation_id != authoritative.generation_id => {
+                RendererFrame::LockReport(report) if inbound.generation_id != supervisor.authoritative.generation_id => {
                     // A superseded-but-not-yet-reaped connection is a real frame source, and
                     // either direction of a stale report corrupts the swap gate: a stale
                     // Unlocked/Finished reopens the gate into a swap that reaps the live lock
@@ -487,52 +318,19 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     // reopens it.
                     eprintln!(
                         "generation {}'s lock report arrived from a non-authoritative generation (authoritative is {}); dropping: {report:?}",
-                        inbound.generation_id, authoritative.generation_id
+                        inbound.generation_id, supervisor.authoritative.generation_id
                     );
                 }
-                RendererFrame::LockReport(report) => {
-                    // docs/adr/0052 decision 4: the outcome is this capability's state, straight
-                    // back out as a snapshot. Also docs/adr/0042's gate: a swap deferred while shut
-                    // runs the moment it opens.
-                    //
-                    // Checked as defers_swap after the report, not "was the outcome Finished/
-                    // Unlocked": Refused opens the gate too, since a request in flight shuts it --
-                    // otherwise a refusal after a deferred topology change would leave a swap owed
-                    // that nothing ever redeems.
-                    if let Some(who) = relock_in_flight.take() {
-                        let who = who.subject();
-                        match &report.outcome {
-                            shared::LockOutcome::Locked => eprintln!("{who} took the session lock over; the lock screen is back on the glass"),
-                            // Deliberately not lock_stays_authenticatable's wording: nothing is on
-                            // screen here but the compositor's own fallback.
-                            shared::LockOutcome::Refused(reason) => eprintln!(
-                                "{who} could not take the session lock over: {reason}. The session stays locked with no lock screen on it, \
-                                 so the way back in is a VT switch (docs/adr/0058 decision 4, docs/adr/0060)"
-                            ),
-                            other => eprintln!("{who}'s lock re-acquisition ended as {other:?} rather than a lock"),
-                        }
-                    }
-                    // Before record, and off the outcome rather than LockState: the marker must
-                    // keep saying "locked" through a RendererLost that clears active
-                    // (docs/adr/0060).
-                    locked_flag.apply(lock::compositor_lock_change(&report.outcome));
-                    lock.record(lock::LockEvent::Reported(report.outcome));
-                    push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, Capability::Lock, &lock.snapshot());
-                    if !lock.defers_swap() && std::mem::take(&mut swap_owed_on_unlock) {
-                        // A fresh reload call, not the deferred evaluation replayed: its sequence
-                        // is stale by now and the config may have changed again since.
-                        begin_reload(&registry, authoritative.generation_id, &mut next_sequence);
-                    }
-                }
+                RendererFrame::LockReport(report) => supervisor.record_lock_report(report),
                 RendererFrame::Command(envelope) => match envelope.params.capability.as_str() {
                     // Three names reach dispatch that are not roster capabilities: `process`,
                     // which is addressable but never started, `idle`, which is event-shaped
                     // (ADR-0032), and anything else, which is a Renderer bug or a hand-written
                     // frame. Everything else is one exhaustive match inside `Capabilities`.
-                    "process" => process::registry::dispatch(&mut processes, &registry, &process_done_tx, &envelope).await,
-                    "idle" => capabilities.dispatch_idle(&envelope),
+                    "process" => supervisor.dispatch_process_command(&envelope).await,
+                    "idle" => supervisor.capabilities.dispatch_idle(&envelope),
                     name => match Capability::from_name(name) {
-                        Some(capability) => capabilities.dispatch(capability, &envelope, &lock).await,
+                        Some(capability) => supervisor.dispatch_capability_command(capability, &envelope).await,
                         None => eprintln!("inbound command from generation {}: {:?}", inbound.generation_id, envelope),
                     },
                 },
@@ -550,8 +348,8 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     // Re-entrant: decision 3 has every generation re-send every name it read, and
                     // each arm below is a no-op once its controller exists.
                     match Startable::from_name(&capability) {
-                        Some(Startable::Capability(capability)) => capabilities.start(capability).await,
-                        Some(Startable::Idle) => capabilities.start_idle().await,
+                        Some(Startable::Capability(capability)) => supervisor.capabilities.start(capability).await,
+                        Some(Startable::Idle) => supervisor.capabilities.start_idle().await,
                         // ADR-0070 decision 5: the only name that arrives from a `secure_submit`
                         // rather than from a capability read.
                         Some(Startable::Polkit) => polkit_agent.register(&connection).await,
@@ -561,67 +359,21 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                         ),
                     }
                 }
-                RendererFrame::RequestReload => {
-                    // docs/adr/0041 decision 4: a wl_output appeared or disappeared. Deliberately
-                    // uses authoritative.generation_id, not inbound.generation_id -- a superseded
-                    // generation must not be able to start a cycle.
-                    begin_reload(&registry, authoritative.generation_id, &mut next_sequence);
-                }
+                // docs/adr/0041 decision 4: a wl_output appeared or disappeared.
+                RendererFrame::RequestReload => supervisor.begin_reload(),
                 RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence }) => {
-                    if is_current_reload(sequence, next_sequence) {
-                        // Only if the config ever asked for a threshold: with no controller
-                        // there is nothing registered to reset.
-                        if let Some(idle) = capabilities.idle() {
-                            idle.reset_registrations(inbound.generation_id).await;
-                        }
-                        send_frame_logged(&registry, inbound.generation_id, &SupervisorFrame::ApplyPendingReload(ApplyPendingReload { sequence }));
-                    } else {
-                        eprintln!(
-                            "generation {}'s Unchanged report (sequence {sequence}) is stale -- a newer Reevaluate (sequence {next_sequence}) is \
-                             already in flight; not applying",
-                            inbound.generation_id
-                        );
-                    }
+                    supervisor.answer_unchanged_report(inbound.generation_id, sequence).await;
                 }
-                RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence }) if lock.defers_swap() => {
+                RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence }) if supervisor.lock.defers_swap() => {
                     // docs/adr/0042: candidate N+1 cannot acquire the lock generation N holds, so
                     // PBA's handoff waits until the lock clears. In-place reloads (Unchanged
                     // above) are not gated. Checked as defers_swap, not is_active: a lock order
                     // that's out but not yet reported is just as unswappable, and that window can
                     // be long -- a swap inside it would reap the process owning the lock object.
-                    eprintln!("generation swap for sequence {sequence} deferred: the session is locked (docs/adr/0042)");
-                    swap_owed_on_unlock = true;
+                    supervisor.defer_swap(sequence);
                 }
                 RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence }) => {
-                    // Inlined synchronously, not tokio::spawn'd (docs/adr/0025): swaps are rare
-                    // and bounded (seconds, PBA_TIMINGS above), and nothing else capability-routed
-                    // over this socket yet to starve.
-                    let candidate_generation_id = next_generation_id;
-                    next_generation_id += 1;
-                    let candidate_envs = vec![
-                        (shared::GENERATION_ID_ENV.to_string(), candidate_generation_id.to_string()),
-                        ("OBLISK_PBA_CANDIDATE".to_string(), "1".to_string()),
-                    ];
-                    // Every capability's latest snapshot hydrates the fresh Candidate's first
-                    // evaluation (§ 15.2 point 1; docs/adr/0029), not just audio's.
-                    let snapshots: Vec<shared::StateSnapshot> = last_snapshots.values().cloned().collect();
-                    let mut link = SocketCandidateLink { registry: registry.clone(), candidate_generation_id, inbound: &mut inbound_frames };
-
-                    match reload::run_pba(&renderer_path_str, &[], &candidate_envs, &mut link, &snapshots, sequence, PBA_TIMINGS).await {
-                        Ok(outcome) => {
-                            // docs/adr/0043 decision 1 item 3: the widest point of the handoff --
-                            // the Candidate has presented (run_pba returned Ok) and the superseded
-                            // generation still owns every buffer, so both are fully resident.
-                            // Sampled here rather than inside the swap, which reaps one of the two
-                            // processes it would be measuring.
-                            memory::log_sample("pba handoff", &[(authoritative.generation_id, &authoritative.child), (candidate_generation_id, &outcome.candidate)]);
-                            reload::swap_and_reap(&registry, &mut processes, &mut authoritative, candidate_generation_id, outcome).await;
-                        }
-                        Err(failure) => {
-                            eprintln!("generation swap for sequence {sequence} failed: {failure}");
-                            eprintln!("{} stays authoritative", authoritative.generation_id);
-                        }
-                    }
+                    supervisor.swap_generation(sequence, &mut inbound_frames).await;
                 }
                 RendererFrame::ReevaluateReport(ReevaluateReport::Failed { sequence, error }) => {
                     eprintln!("generation {}'s shell.lua re-evaluation (sequence {sequence}) failed: {error}", inbound.generation_id);
@@ -649,13 +401,16 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     // ADR-0029, mirroring the polkit arm above: an empty secret means an open
                     // network, a non-empty one becomes the wpa-psk password. Must come before the
                     // catch-all arm below, same ordering reason.
-                    match capabilities.network().and_then(NetworkController::take_connect_intent) {
+                    match supervisor.capabilities.network().and_then(NetworkController::take_connect_intent) {
                         Some(pending) => {
                             // mem::take moves the plaintext out for NetworkController::connect to
                             // own and zeroize on every return path.
                             let secret = std::mem::take(&mut submit.secret);
-                            let controller =
-                                capabilities.network().cloned().expect("take_connect_intent above only answers from a live controller");
+                            let controller = supervisor
+                                .capabilities
+                                .network()
+                                .cloned()
+                                .expect("take_connect_intent above only answers from a live controller");
                             tokio::spawn(async move { controller.connect(pending, secret).await; });
                         }
                         None => {
@@ -670,7 +425,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                 RendererFrame::SecureSubmit(mut submit)
                     if submit.capability == "lock"
                         && submit.action == "authenticate"
-                        && inbound.generation_id != authoritative.generation_id =>
+                        && inbound.generation_id != supervisor.authoritative.generation_id =>
                 {
                     // The same stale-frame guard the LockReport arm above takes: only the
                     // authoritative generation paints the lock screen a password can have been
@@ -679,7 +434,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     // exactly one generation (docs/adr/0042).
                     eprintln!(
                         "generation {}'s secure_submit(lock, authenticate) is stale -- {} is authoritative; dropping",
-                        submit.generation_id, authoritative.generation_id
+                        submit.generation_id, supervisor.authoritative.generation_id
                     );
                     submit.secret.zeroize();
                 }
@@ -694,8 +449,8 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     // Phase 23 item 3) and a second submit while one is in flight. The acquisition
                     // it returns is carried through the worker so pam_outcomes above can tell
                     // this lock's answer from the one before it.
-                    if let Some(acquisition) = lock.try_begin_authentication() {
-                        push_snapshot(&registry, authoritative.generation_id, &mut revisions, &mut last_snapshots, Capability::Lock, &lock.snapshot());
+                    if let Some(acquisition) = supervisor.lock.try_begin_authentication() {
+                        supervisor.push_lock_state();
                         // mem::take moves the plaintext out for run_lock_authentication to own and
                         // zeroize on every exit path, including a panic or shutdown cancellation.
                         let secret = std::mem::take(&mut submit.secret);
@@ -705,7 +460,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                         // stall every LockReport, reload, and process reap behind it.
                         // run_lock_authentication, not authenticate_current_user directly, so
                         // outcome_tx gets a PamOutcome even if this task panics or is dropped.
-                        let outcome_tx = pam_outcome_tx.clone();
+                        let outcome_tx = supervisor.pam_outcome_tx.clone();
                         tokio::spawn(pam_worker::run_lock_authentication(shared::Zeroizing::new(secret), acquisition, outcome_tx));
                     } else {
                         eprintln!(
@@ -736,19 +491,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
         }
     }
 
-    // Reap the authoritative Renderer and every still-live process.run child rather than exit out
-    // from under them (SIGTERM-then-SIGKILL, process::DEFAULT_REAP_GRACE).
-    // Skipped when the departure arm already collected it: reap_process_group asking for a pid
-    // that's already cleared logs "already reaped" right under the crash report that explains it.
-    if !renderer_departed
-        && let Err(err) = process::reap_process_group(&mut authoritative.child, process::DEFAULT_REAP_GRACE).await
-    {
-        eprintln!(
-            "failed to reap authoritative generation {}'s renderer on shutdown: {err}",
-            authoritative.generation_id
-        );
-    }
-    reap_all_processes(&mut processes).await;
+    supervisor.reap().await;
     // Best-effort: socket::bind's own stale-file removal covers a missed unlink on the next boot.
     let _ = std::fs::remove_file(&socket_path);
     Ok(shutdown)
