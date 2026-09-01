@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stops a commit that would carry stale generated stubs.
+# Stops a commit that would carry stale generated stubs, or that does not pass `just check`.
 #
 # `lua-meta/oblisk.lua` is generated from the Supervisor's payload types and `lua-meta/nodes.lua` is
 # hand-written against the Renderer's node schema. Both have golden-file tests, and both only fire
@@ -11,6 +11,10 @@
 # would be the convenient thing and it is wrong: the stub is generated from the working tree, not
 # from the index, so a partial `git add -p` would get a stub describing code the commit does not
 # contain. One `git add` is cheaper than that class of confusion.
+#
+# The `just check` at the end is the slow half and the reason this hook is worth having twice over.
+# `check` was green on 71266cb and c83e79e while both carried unformatted files, because formatting
+# was not in it and nobody ran the recipe that was. A gate nothing runs is not a gate.
 #
 # Install with `just hooks`. Skip once with `git commit --no-verify`.
 set -euo pipefail
@@ -47,5 +51,19 @@ fi
 if ! cargo test --quiet -p renderer meta_stub_tests >/dev/null 2>&1; then
     echo "pre-commit: lua-meta/nodes.lua disagrees with the engine's node schema." >&2
     echo "  cargo test -p renderer meta_stub_tests   names the property that moved." >&2
+    exit 1
+fi
+
+# Everything else: formatting, the full test run, clippy, intra-doc links, and that every Lua file
+# parses. The two targeted runs above stay even though `cargo test --workspace` re-runs both, because
+# they regenerate the stub and name the property that moved. This one only says which recipe failed.
+if ! command -v just >/dev/null 2>&1; then
+    echo "pre-commit: no just on PATH, skipping the full check" >&2
+    exit 0
+fi
+
+if ! just check; then
+    echo >&2
+    echo "pre-commit: just check failed. Fix it, or commit with --no-verify and own that." >&2
     exit 1
 fi

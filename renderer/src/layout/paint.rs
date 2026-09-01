@@ -316,8 +316,7 @@ fn split_fill_and_border(draw: Option<Draw>) -> (Option<Draw>, Option<Draw>) {
         colors: BorderColor::default(),
         widths: EdgeInsets::default(),
     });
-    let border = (widths != EdgeInsets::default())
-        .then_some(Draw::Box { background: None, radius, colors, widths });
+    let border = (widths != EdgeInsets::default()).then_some(Draw::Box { background: None, radius, colors, widths });
     (fill, border)
 }
 

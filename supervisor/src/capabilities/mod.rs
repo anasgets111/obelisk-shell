@@ -477,8 +477,7 @@ impl Capabilities {
             // with no UPower never pushes (docs/adr/0080, § 2.2).
             Capability::Battery => {
                 if self.battery.is_none() {
-                    self.battery =
-                        Some(BatteryController::new(self.connection.clone(), self.senders.battery.clone()));
+                    self.battery = Some(BatteryController::new(self.connection.clone(), self.senders.battery.clone()));
                 }
             }
             // Ranked firmware over platform over raw. No device found means it never pushes --

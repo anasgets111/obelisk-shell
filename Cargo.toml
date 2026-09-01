@@ -37,3 +37,16 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# On in release, which is not the default. The Renderer does its geometry in `i32` physical pixels
+# and hands the results to allocators: `layout/paint.rs`'s `draw_clipped` computes
+# `(clip.x1 - clip.x0) as usize` and asks femtovg for a texture that size. A wrapped subtraction
+# there is a `usize::MAX` allocation and no message, and the 134 casts clippy's pedantic group
+# flags across this workspace are all deliberate, so gating them at compile time would cost 134
+# `#[allow]`s to catch nothing.
+#
+# This costs a branch per arithmetic op and buys a clean abort instead. The architecture is already
+# built to absorb one: release is `panic = "abort"` and `supervisor/src/generation.rs`'s
+# `classify_departure` reads the signal, logs it, and restarts behind the crash-loop brake
+# (docs/adr/0058 decision 3). Cheaper than being wrong quietly.
+overflow-checks = true

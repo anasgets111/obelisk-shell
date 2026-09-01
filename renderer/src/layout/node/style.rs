@@ -742,7 +742,9 @@ mod tests {
 
         let table: mlua::Table = lua.load(r#"return { kind = "rect", clip = true }"#).eval().unwrap();
         let props = deserialize_lua_table(&table).unwrap().properties;
-        assert!(matches!(parse_clip(&props).unwrap_err(), LayoutError::InvalidProperty { property, .. } if property == "clip"));
+        assert!(
+            matches!(parse_clip(&props).unwrap_err(), LayoutError::InvalidProperty { property, .. } if property == "clip")
+        );
     }
 
     #[test]

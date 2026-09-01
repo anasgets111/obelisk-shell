@@ -28,7 +28,7 @@ run: build
     OBLISK_CONFIG_DIR=dev-config/oblisk target/debug/oblisk
 
 # Everything a change has to pass before it is done.
-check: test lint docs lua
+check: fmt-check test lint docs lua
 
 # Point git at the tracked hooks in `.githooks`. Once per clone: git does not version `.git/hooks`,
 # so a hook only exists for whoever ran this.
@@ -72,6 +72,15 @@ lua:
 stubs:
     UPDATE_STUBS=1 cargo test -p supervisor stubs
     @git diff --stat -- lua-meta/oblisk.lua
+
+# Formatting as a gate, not a habit. `just fmt` fixes whatever this reports.
+#
+# Separate from `lint` because rustfmt and clippy fail differently: one is a diff, the other is a
+# warning, and folding them together buries the diff. This recipe exists because 71266cb and c83e79e
+# landed four unformatted files between them with `just check` green on both. `just fmt` was there
+# the whole time and nothing made anyone run it.
+fmt-check:
+    cargo fmt --all -- --check
 
 fmt:
     cargo fmt --all
