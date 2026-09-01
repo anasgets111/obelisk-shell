@@ -29,8 +29,10 @@
 //! descends rather than trusting `rect.x`/`rect.y` as already-absolute. Get this wrong and every
 //! subtree nests at the surface's top-left corner instead of its real position.
 
+use std::f32::consts::{FRAC_PI_2, PI};
+
 use femtovg::renderer::OpenGl;
-use femtovg::{Canvas, Color, Paint, Path};
+use femtovg::{Canvas, Color, Paint, Path, Solidity};
 
 use crate::image::{self, Fit, ImageCache};
 use crate::layout::node::{self, BorderColor, EdgeInsets, PaintStyle, Rgba, TextAlign};
@@ -484,43 +486,83 @@ fn physical_edge(logical: f32, scale: f32) -> u32 {
     physical.round() as u32
 }
 
-/// How far short of half the box a fill's corner radius stops, in logical pixels.
+/// The path a box with `radius` asks for: a rectangle, a rounded rectangle, or a stadium.
 ///
-/// femtovg already limits a radius to half the box on each axis
-/// (`Path::rounded_rect_varying`'s `rad.min(halfw)`), and at *exactly* that value the four straight
-/// segments between the corner arcs have zero length and its fill tessellation collapses to the
-/// bounding rectangle. It does not do so consistently, which is what makes an epsilon the fix
-/// rather than a special case: sweeping square boxes at radius exactly half, 16, 28 and 32 filled
-/// as squares while 20, 24, 36, 40, 44, 48 and 52 filled as circles. Backing off by one ULP is not
-/// enough either -- 40x40 rounded and 32x32 did not.
+/// The third case is the reason this is a function rather than one `rounded_rect` call. femtovg
+/// limits a radius to half the box on each axis (`Path::rounded_rect_varying`'s `rad.min(halfw)`),
+/// and around that value a rounded rect fails in two different ways, in two adjacent bands.
 ///
-/// 0.01 rather than the 0.001 that was also measured to work at every one of those sizes: ten times
-/// the smallest shortfall that held, still a hundredth of a logical pixel, which is a fiftieth of a
-/// physical one at 2x. Nothing can see it, and the number it is protecting against is zero.
-const FILL_RADIUS_EPSILON: f32 = 0.01;
-
-/// The background fill, rounded when the node asked for it.
+/// At exactly half, the four straight segments between the corner arcs have zero length and the
+/// fill collapses to the bounding rectangle: a square ground under a round border. Just short of
+/// half, the segments are back but the tessellator flags a bevel join at each one, and the
+/// half-pixel inset it applies to the fill fan (`path::cache`'s `woff`, and the `TODO: woff = 0.0
+/// produces no artifaacts` beside it) folds the fan back over itself there. An opaque fill hides
+/// the fold. A translucent one blends every folded sliver twice: on the dev bar's controls, ground
+/// at 42% alpha, that is a one-pixel chord from each cap's midpoint across the pill at 1.6x the
+/// alpha asked for.
 ///
-/// The clamp is the whole content of this function and it is not defensive: see
-/// [`FILL_RADIUS_EPSILON`] for the degeneracy it steers around.
+/// Filling square boxes from 24 to 43.5 logical pixels at two sub-pixel offsets, 80 geometries per
+/// row:
 ///
-/// A radius at or above half is the pill-and-circle case, not an edge case, which is why this is
-/// load-bearing. Half the smaller side is exactly how a config spells a stadium:
-/// `components/icon_button.lua` writes `side / 2` for a circle, and `theme.item_radius` lands
-/// *above* half because it is scaled independently of `item_height` (18 and 34 unscaled, 17 and 32
-/// at 0.93). So every pill and every circle on the dev bar drew a square ground under a correctly
-/// rounded border, which is what made it read as the radius reaching only half the draw.
-/// [`paint_border`] needs no such clamp: its `stroke_path` has no degeneracy at half, which is
-/// precisely why the border kept its corners while the fill lost them, and pinning that asymmetry
-/// is what `a_radius_of_half_the_box_fills_a_stadium_not_a_square` is for.
-fn fill_rect(canvas: &mut Canvas<OpenGl>, rect: LogicalRect, radius: f32, color: Rgba) {
-    let radius = radius.min(rect.width.min(rect.height) / 2.0 - FILL_RADIUS_EPSILON);
+/// | radius below half | filled square | interior seams |
+/// | ----------------- | ------------- | -------------- |
+/// | 0 (exactly half)  | 80            | 0              |
+/// | 0.0001 to 0.01 px | 0             | 29             |
+/// | 0.05 px and more  | 0             | 0              |
+///
+/// So a shortfall does clear both bands, and a shipped `FILL_RADIUS_EPSILON` of 0.01 sat in the
+/// second one. Qt's own rounded rect takes that route and clamps to `qMin(w, h) * 0.4999f`
+/// (`qsgbasicinternalrectanglenode.cpp`), which lands in the bad band at every size here. Backing
+/// off further would work at the sizes swept and is still a constant tuned against one
+/// tessellator, so this builds the shape instead.
+///
+/// Half the smaller side is how a config spells a pill, not an edge case, which is why this is
+/// load-bearing: `components/icon_button.lua` writes `side / 2` for a circle, and
+/// `theme.item_radius` lands above half because it is scaled independently of `item_height`. So
+/// the shape is built as what it actually is. A square box is a circle, and femtovg's own `circle`
+/// is four beziers with no straight segments at all. Anything else is two semicircular caps joined
+/// by two segments whose length is `|width - height|`, which is above zero by construction here.
+/// Both wind the same way as `rounded_rect` (left, bottom, right, top), because the fill fan's
+/// inset direction is computed from the contour's winding.
+///
+/// A box whose two sides differ by a hair still leaves a hair-length segment and so can still
+/// bevel. Nothing produces one: a config either asks for a circle, where the sides are equal
+/// because one expression sets both, or for a pill, where they differ by the whole run of the
+/// content.
+fn box_path(rect: LogicalRect, radius: f32) -> Path {
+    let LogicalRect { x, y, width: w, height: h } = rect;
     let mut path = Path::new();
-    if radius > 0.0 {
-        path.rounded_rect(rect.x, rect.y, rect.width, rect.height, radius);
+
+    if radius <= 0.0 || w <= 0.0 || h <= 0.0 {
+        path.rect(x, y, w, h);
+    } else if radius < w.min(h) / 2.0 {
+        path.rounded_rect(x, y, w, h, radius);
+    } else if w == h {
+        path.circle(x + w / 2.0, y + h / 2.0, w / 2.0);
+    } else if w > h {
+        let r = h / 2.0;
+        let (cy, right) = (y + r, x + w - r);
+        // Top of the left cap, round the left to its bottom; the bottom edge; the right cap, round
+        // to its top; `close` walks the top edge back. `Solidity::Solid` sweeps by *decreasing*
+        // angle, which with y pointing down is the left-bottom-right-top direction wanted here.
+        path.arc(x + r, cy, r, 3.0 * FRAC_PI_2, FRAC_PI_2, Solidity::Solid);
+        path.arc(right, cy, r, FRAC_PI_2, -FRAC_PI_2, Solidity::Solid);
+        path.close();
     } else {
-        path.rect(rect.x, rect.y, rect.width, rect.height);
+        let r = w / 2.0;
+        let (cx, bottom) = (x + r, y + h - r);
+        path.arc(cx, y + r, r, 0.0, -PI, Solidity::Solid);
+        path.arc(cx, bottom, r, PI, 0.0, Solidity::Solid);
+        path.close();
     }
+
+    path
+}
+
+/// The background fill, rounded when the node asked for it. See [`box_path`] for why a radius at
+/// half the box is its own shape rather than a `rounded_rect` argument.
+fn fill_rect(canvas: &mut Canvas<OpenGl>, rect: LogicalRect, radius: f32, color: Rgba) {
+    let path = box_path(rect, radius);
     canvas.fill_path(&path, &Paint::color(Color::rgbaf(color.r, color.g, color.b, color.a)));
 }
 
@@ -564,12 +606,13 @@ fn paint_border(
         let (box_y, box_height) = snap_border_band(rect.y, rect.height, scale);
         let (_, width) = snap_border_band(rect.x, widths.top, scale);
         let inset = width / 2.0;
-        let mut path = Path::new();
-        path.rounded_rect(
-            box_x + inset,
-            box_y + inset,
-            (box_width - width).max(0.0),
-            (box_height - width).max(0.0),
+        let path = box_path(
+            LogicalRect {
+                x: box_x + inset,
+                y: box_y + inset,
+                width: (box_width - width).max(0.0),
+                height: (box_height - width).max(0.0),
+            },
             radius,
         );
         let mut paint = Paint::color(Color::rgbaf(color.r, color.g, color.b, color.a));
@@ -1489,7 +1532,10 @@ mod tests {
     /// 32x32 at radius 16 is the live case, taken off the dev bar's own display list. 40x40 at 20 is
     /// here because it *did* round before the fix and 32x32 did not, which is the measurement that
     /// showed the degeneracy is erratic by size rather than a clean threshold, and so that a future
-    /// edit cannot satisfy this test by tightening the epsilon back to one ULP.
+    /// edit cannot satisfy this test at one size and call it fixed. Both are the stadium branch of
+    /// [`box_path`] now, and this is the half of the pair that catches a radius left at exactly
+    /// half; a radius shaved just short of it passes here and folds its fill fan over instead,
+    /// which is what [`a_translucent_ground_at_half_radius_blends_once_not_twice`] is for.
     ///
     /// Both halves of each case are asserted, because the asymmetry is the tell: the corner must
     /// show the parent through it (the fill is round) *and* the mid-edge must still be border (the
@@ -1533,6 +1579,63 @@ mod tests {
                 "{case}: the border was always round here and must stay so"
             );
         }
+    }
+
+    /// A translucent ground at radius half the box must blend exactly once everywhere inside it.
+    ///
+    /// The shape being right is not enough, and that is the point of this test sitting beside
+    /// [`a_radius_of_half_the_box_fills_a_stadium_not_a_square`]: `rounded_rect` at exactly half
+    /// draws a correct outline and then folds its fill fan over itself at each of the four
+    /// collapsed straight segments, so a translucent ground gets a second helping of itself along
+    /// a one-pixel chord out of each cap. Opaque fills hide it. Every control on the dev bar is at
+    /// 42% alpha, so none of them did.
+    ///
+    /// 33x33 at offset 20 rather than a round 32, because the fold is erratic in the size: a sweep
+    /// of square boxes from 24 to 43.5 at radius exactly half found seams at 30 of the 80
+    /// geometries tried, and 32x32 at an integer offset was one of the clean ones. This case is one
+    /// of the dirty ones, so it fails against a plain `rounded_rect`.
+    #[test]
+    fn a_translucent_ground_at_half_radius_blends_once_not_twice() {
+        let Some(instance) = init_headless_egl(96, 96) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 96, 96) else { return };
+
+        // Black at 42% over the panel's red: one blend is 255 * 0.58, two is 255 * 0.58^2 = 86.
+        let root = resolved_surface(
+            &lua,
+            r##"return panel { id = "bar", width = 96, height = 96, background = "#FF0000FF", padding = { top = 20, left = 20 }, child = rect {
+                width = 33, height = 33, background = "#0000006B", radius = 16.5,
+            } }"##,
+            LogicalSize { width: 96.0, height: 96.0 },
+        );
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
+        let image = painter.canvas_mut().screenshot().expect("screenshot reads back the pbuffer's own framebuffer");
+
+        // The inscribed disc less four pixels, which clears the antialiased rim on every side.
+        let centre = 20.0 + 33.0 / 2.0;
+        let radius = 33.0 / 2.0 - 4.0;
+        let mut doubled = Vec::new();
+        for y in 0..96usize {
+            for x in 0..96usize {
+                let (dx, dy) = (x as f32 + 0.5 - centre, y as f32 + 0.5 - centre);
+                if dx * dx + dy * dy > radius * radius {
+                    continue;
+                }
+                let pixel = image[(x, y)];
+                if (pixel.r, pixel.g, pixel.b) != (148, 0, 0) {
+                    doubled.push((x, y, pixel.r));
+                }
+            }
+        }
+        assert!(doubled.is_empty(), "the ground blended twice at {doubled:?}");
+
+        // And the shape is still a circle, so nothing above can be satisfied by drawing less.
+        assert_eq!(
+            pixel_at(painter.canvas_mut(), 21, 21),
+            (255, 0, 0, 255),
+            "the corner of a circle is outside it, so the panel behind must show through"
+        );
     }
 
     /// The uniform-border-with-radius branch of [`paint_border`] had no test at all: the per-edge
