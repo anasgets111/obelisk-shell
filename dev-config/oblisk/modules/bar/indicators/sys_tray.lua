@@ -8,26 +8,44 @@
 -- No ground, and absent when the tray is empty. It was a glass pill of a fixed 135px, which on a
 -- session that registers nothing is an empty box sitting on the bar looking like a control that
 -- failed to load, and on a session that registers two is a box with a lot of nothing to the right
--- of them. The width is still capped, because a `row` does not shrink its children and a dozen
--- registrations would otherwise push the clock off the edge; with no ground behind it that cap
--- reads as whitespace rather than as a container.
+-- of them. The fixed 150px that replaced it kept the second half of that: a `list` sizes to its
+-- content when `width` is omitted, so stating one is a floor as well as a ceiling, and two tray
+-- items sat in 110px of empty bar. The width is computed from the item count now, capped.
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
 
 local SCROLL = scroll("sys_tray")
 
--- Bounded, so a session that registers a dozen items scrolls rather than taking the whole zone
--- (docs/adr/0069). The mirror has no cap because a QML `RowLayout` shrinks its children; a `row`
--- here does not.
-local TRAY_WIDTH = theme.s(150, 110)
-
 local function items_of(t)
     return (t and t.items) or {}
 end
 
+-- The ceiling, not the width. A session that registers a dozen items scrolls rather than taking
+-- the whole zone (docs/adr/0069). The mirror has no cap because a QML `RowLayout` shrinks its
+-- children; a `row` here does not.
+local TRAY_WIDTH = theme.s(150, 110)
+
+-- Content-sized up to that ceiling, which § 5.1 has no `max_width` for. `width` takes a signal and
+-- a signal resolves before the property is parsed (ADR-0044), so the item count can state the
+-- number the engine would otherwise have measured -- the same trick `components/meter.lua` uses to
+-- get a progress bar out of a `"NN%"` string.
+--
+-- ponytail: this re-derives the row's own measurement in Lua, and only `itemfn`'s icon branch is
+-- `icon.md` wide. An item that registered no artwork falls back to two glyphs at `font.sm`, which
+-- shape to something else, so a tray holding one of those is off by the difference. The upgrade
+-- path is a `max_width` on § 5.1: the engine already knows every child's real width and this
+-- guesses at it.
+local ITEM_WIDTH = theme.icon.md + theme.spacing.xs
+
+local function tray_width(count)
+    return math.max(0, math.min(TRAY_WIDTH, count * ITEM_WIDTH - theme.spacing.xs))
+end
+
 return list {
-    width = TRAY_WIDTH,
+    width = computed({ oblisk.tray }, function(t)
+        return tray_width(#items_of(t))
+    end),
     direction = "Horizontal",
     spacing = theme.spacing.xs,
     align_v = "Center",
