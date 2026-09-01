@@ -66,6 +66,10 @@ impl TextPainter {
         if font_chain.is_empty() {
             return Err("TextPainter::new requires at least one loaded font".into());
         }
+        // SAFETY: femtovg loads every GL entry point through `load_fn` and calls them on this
+        // thread. The caller binds the context with `eglMakeCurrent` before constructing this
+        // (`wayland::surface` at its two call sites, the headless EGL helper in paint's tests),
+        // and the renderer is used only from that same thread.
         let renderer = unsafe { OpenGl::new_from_function(load_fn)? };
         let text_context = TextContext::default();
         let mut canvas = Canvas::new_with_text_context(renderer, text_context.clone())?;

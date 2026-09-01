@@ -364,6 +364,9 @@ fn font_chain_data(db: &mut fontdb::Database) -> Vec<FontData> {
         if path.is_some_and(|path| !seen_paths.insert(path)) {
             continue;
         }
+        // SAFETY: mapping a font file the process does not own, as the doc comment above spells
+        // out -- a rewrite in place changes the bytes under the mapping. Same bargain cosmic-text
+        // already makes for every font it renders.
         match unsafe { db.make_shared_face_data(id) } {
             Some((bytes, _face_index)) => data.push(FontData(bytes)),
             None => eprintln!("font chain: face {id:?} could not be mapped, skipped"),

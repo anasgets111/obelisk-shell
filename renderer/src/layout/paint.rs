@@ -655,6 +655,9 @@ mod tests {
     fn init_headless_egl(width: i32, height: i32) -> Option<egl::Instance<egl::Static>> {
         let instance = egl::Instance::new(egl::Static);
 
+        // SAFETY: `eglGetPlatformDisplay` with `EGL_PLATFORM_SURFACELESS_MESA` takes no native
+        // handle -- `EGL_DEFAULT_DISPLAY` is the null sentinel the extension defines -- and the
+        // attribute list is a `EGL_NONE`-terminated slice, which is the contract for this call.
         let display = match unsafe {
             instance.get_platform_display(PLATFORM_SURFACELESS_MESA, egl::DEFAULT_DISPLAY, &[egl::ATTRIB_NONE])
         } {
@@ -1174,6 +1177,9 @@ mod tests {
     ) -> Option<(egl::Instance<egl::Static>, egl::Display, egl::Context, egl::Surface, egl::Surface)> {
         let instance = egl::Instance::new(egl::Static);
 
+        // SAFETY: `eglGetPlatformDisplay` with `EGL_PLATFORM_SURFACELESS_MESA` takes no native
+        // handle -- `EGL_DEFAULT_DISPLAY` is the null sentinel the extension defines -- and the
+        // attribute list is a `EGL_NONE`-terminated slice, which is the contract for this call.
         let display = match unsafe {
             instance.get_platform_display(PLATFORM_SURFACELESS_MESA, egl::DEFAULT_DISPLAY, &[egl::ATTRIB_NONE])
         } {

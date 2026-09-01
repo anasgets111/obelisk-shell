@@ -9,6 +9,9 @@ edition.workspace = true
 name = "oblisk-renderer"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 cosmic-text = "0.19.0"
 femtovg = "0.26.0"

@@ -32,8 +32,13 @@ static LEAK_FOUND: AtomicBool = AtomicBool::new(false);
 
 struct LeakCheckingAllocator;
 
+// SAFETY: `alloc`/`dealloc` delegate every allocation to `System`, adding only a read of memory
+// that is still live. The `GlobalAlloc` contract -- returning correctly aligned blocks for the
+// requested layout, and freeing only what it handed out -- is `System`'s, unchanged.
 unsafe impl GlobalAlloc for LeakCheckingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: `layout` is whatever the caller asked for and is forwarded untouched, which
+        // is exactly what `System`'s own `alloc` requires.
         unsafe { System.alloc(layout) }
     }
 
@@ -46,6 +51,8 @@ unsafe impl GlobalAlloc for LeakCheckingAllocator {
                 LEAK_FOUND.store(true, Ordering::SeqCst);
             }
         }
+        // SAFETY: `ptr`/`layout` are the pair the caller received from `alloc` above and are
+        // forwarded unchanged; the reads before this point do not alter either.
         unsafe { System.dealloc(ptr, layout) }
     }
 }

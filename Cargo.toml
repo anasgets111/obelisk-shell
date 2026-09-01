@@ -15,6 +15,17 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 
+# Every `unsafe` block in this workspace is a real one -- a C API (EGL, GL, fontdb's mmap) or the
+# one process-wide `set_var` in `main`. `undocumented_unsafe_blocks` makes the SAFETY comment a
+# build requirement rather than a convention, because the convention had already drifted: two
+# comments claimed no other test touched the variable they were setting while another test set it,
+# which is how a `just check` failed on a race that had been latent for weeks.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
 [profile.release]
 opt-level = 3
 lto = true

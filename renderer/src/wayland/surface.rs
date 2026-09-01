@@ -960,6 +960,8 @@ impl App {
         // `gl`'s own loader -- the `eglMakeCurrent` above is that context, and it's the only one
         // live on this thread.
         if let Some(gl) = self.gl.as_ref() {
+            // SAFETY: as above -- the `eglMakeCurrent` earlier in this function bound the context
+            // these entry points belong to, on this thread, with nothing switching it since.
             unsafe {
                 use glow::HasContext;
                 gl.clear_color(0.0, 0.0, 0.0, 0.0);
