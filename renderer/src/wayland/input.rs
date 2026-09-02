@@ -5,7 +5,7 @@
 //! focuses, and what one key event does to the focused field.
 
 use super::*;
-use crate::layout::secure_submit::{secure_submit_targets, sole_secure_submit};
+use crate::layout::secure_submit::{secure_submit_targets, sole_secure_submit_in_scope};
 
 /// What one notch of a mouse wheel scrolls, in logical pixels, when the compositor sends a step
 /// count instead of a distance (ADR-0069 decision 6). A flat 39, the only chosen number in this
@@ -154,40 +154,41 @@ fn retarget_secure_submit(
     }
     *focused = next;
 }
-/// What `focused_secure_submit` becomes when keyboard focus arrives on `surface_id`, given that
-/// surface's resolved tree and whatever is focused now. A total function: an untracked surface and
-/// a tracked one with no sole `secure_submit` both answer `None`, pushed through
-/// [`App::focus_secure_submit`] like any other result rather than leaving `focused_secure_submit`
-/// untouched. `apply_secure_key` gates on focus alone, so a case that only advanced
-/// `keyboard_focus` would leave keystrokes accumulating into the previous surface's field, still
-/// addressed to its capability. What survives an `enter` is a field on the entering surface, and
-/// only that: a press on a surface with several `secure_submit` fields picks one that
-/// [`sole_secure_submit`] refuses to, and the compositor's `enter` commonly follows that press, so
-/// discarding it would make a multi-field surface untypable by clicking. Requiring the tree to
-/// still declare that destination keeps a reload from pointing at a deleted field.
-fn focus_on_enter(
-    surface_id: Option<&str>,
-    tree: Option<&layout::ResolvedNode>,
-    current: Option<&FocusedField>,
-) -> Option<FocusedField> {
-    let (id, tree) = (surface_id?, tree?);
-    if let Some(current) =
-        current.filter(|field| field.surface_id == id && secure_submit_targets(tree).contains(&field.target))
-    {
+/// What `focused_secure_submit` becomes when keyboard focus arrives, given the resolved trees of
+/// [`App::keyboard_focus_scope`] and whatever is focused now. A total function: an empty scope (an
+/// untracked surface, or none focused) and a scope with no sole `secure_submit` both answer `None`,
+/// pushed through [`App::focus_secure_submit`] like any other result rather than leaving
+/// `focused_secure_submit` untouched. `apply_secure_key` gates on focus alone, so a case that only
+/// advanced `keyboard_focus` would leave keystrokes accumulating into the previous surface's field,
+/// still addressed to its capability. What survives an `enter` is a field still inside the scope,
+/// and only that: a press on a surface with several `secure_submit` fields picks one that
+/// [`sole_secure_submit_in_scope`] refuses to, and the compositor's `enter` commonly follows that
+/// press, so discarding it would make a multi-field surface untypable by clicking. Requiring the
+/// tree to still declare that destination keeps a reload from pointing at a deleted field.
+fn focus_on_enter(scope: &[(&str, &layout::ResolvedNode)], current: Option<&FocusedField>) -> Option<FocusedField> {
+    let still_declared = |field: &&FocusedField| {
+        scope.iter().any(|(id, tree)| *id == field.surface_id && secure_submit_targets(tree).contains(&field.target))
+    };
+    if let Some(current) = current.filter(still_declared) {
         return Some(current.clone());
     }
-    Some(FocusedField { surface_id: id.to_string(), target: sole_secure_submit(tree)? })
+    let (surface_id, target) = sole_secure_submit_in_scope(scope)?;
+    Some(FocusedField { surface_id: surface_id.to_string(), target })
 }
-/// Whether a focused field is still armed: its surface both holds the keyboard and still exists as
-/// a live `wl_surface` in this process. Both clauses, neither redundant. The keyboard clause is
-/// defect 2: a pointer press arms focus on whatever surface it landed on, so without it a field on
-/// a `keyboard_interactivity = none` panel stays armed while another surface actually receives
-/// keys. The liveness clause is defect 3: a `wl_surface` this process destroyed may never produce a
-/// `leave`, so a field on a torn-down lock screen would otherwise stay armed with a login password
-/// in it. Asked at the point of use rather than enforced at each of the five or six sites that can
-/// break it, so a field is armed only while both facts hold, by construction.
-fn focus_is_still_armed(field: &FocusedField, keyboard_focus: Option<&str>, its_surface_is_live: bool) -> bool {
-    keyboard_focus == Some(field.surface_id.as_str()) && its_surface_is_live
+/// Whether a focused field is still armed: its surface is one a keystroke now reaches, and still
+/// exists as a live `wl_surface` in this process. Both clauses, neither redundant. The reachability
+/// clause is defect 2: a pointer press arms focus on whatever surface it landed on, so without it a
+/// field on a `keyboard_interactivity = none` panel stays armed while another surface actually
+/// receives keys. The liveness clause is defect 3: a `wl_surface` this process destroyed may never
+/// produce a `leave`, so a field on a torn-down lock screen would otherwise stay armed with a login
+/// password in it. Asked at the point of use rather than enforced at each of the five or six sites
+/// that can break it, so a field is armed only while both facts hold, by construction.
+///
+/// `scope`, not one `keyboard_focus` id, for the reason [`sole_secure_submit_in_scope`] takes one:
+/// a field on a shown popup is reachable while the keyboard sits on the popup's parent. The two
+/// must read the same scope or `enter` would arm a field the next keystroke immediately prunes.
+fn focus_is_still_armed(field: &FocusedField, scope: &[String], its_surface_is_live: bool) -> bool {
+    scope.contains(&field.surface_id) && its_surface_is_live
 }
 /// What one key event does to a focused `secure_submit` field. Borrowed rather than owned so the
 /// decision costs no allocation: the `String` only ever exists because SCTK already built one on
@@ -352,15 +353,93 @@ impl App {
         self.surfaces.iter().any(|tracked| tracked.surface_id == instance_id && tracked.role.wl_surface().is_some())
     }
 
+    /// The surfaces a keystroke arriving now can reach: whichever surface holds keyboard focus,
+    /// followed by every popup currently shown under it. Empty when nothing here holds the
+    /// keyboard, or when the compositor's focus names a surface this process no longer tracks.
+    ///
+    /// The popups are the point. `wl_keyboard` focus is one surface, but an `xdg_popup` is only
+    /// handed it by niri when its parent already held the keyboard at the moment the popup mapped
+    /// -- and `modules/bar/init.lua` raises the bar's `keyboard_interactivity` in response to
+    /// `network.password_ssid`, which is set by a click *inside* the already-open panel popup. So
+    /// the keys land on the bar while the field that wants them is on `panel_host`. Asking the
+    /// parent alone made the prompt untypable until the panel was closed and reopened, which is
+    /// what a second map fixed by accident.
+    ///
+    /// Reuses `xdg_shell`'s [`App::shown_popups_under`], the same walk `hide_popup` destroys by, so
+    /// "shown under this surface" has one definition. Ids rather than trees: the per-keystroke
+    /// caller ([`App::prune_secure_focus`]) needs only the ids, and `Scene::surface` rebuilds an
+    /// owned tree per call.
+    fn keyboard_focus_scope(&self) -> Vec<String> {
+        let Some(focused) = self.keyboard_focus.as_deref() else {
+            return Vec::new();
+        };
+        let Some(index) = self.surfaces.iter().position(|tracked| tracked.surface_id == focused) else {
+            return Vec::new();
+        };
+        let mut popups = Vec::new();
+        self.shown_popups_under(index, &mut popups);
+        let mut scope = vec![focused.to_string()];
+        scope.extend(popups.into_iter().map(|popup| self.surfaces[popup].surface_id.clone()));
+        scope
+    }
+
+    /// [`focus_on_enter`] over a scope's resolved trees. Split out because two callers ask the same
+    /// question at different moments: `KeyboardHandler::enter`, when focus arrives, and
+    /// [`App::arm_secure_focus_if_the_scope_now_declares_one`], when the trees change under a focus
+    /// that already arrived.
+    fn field_the_scope_declares(&self, scope: &[String], current: Option<FocusedField>) -> Option<FocusedField> {
+        // `Scene::surface` hands back an owned tree, so the borrow of `self.client` ends with
+        // `trees` and the caller's write is free to take `&mut self`.
+        let trees: Vec<(&str, layout::ResolvedNode)> =
+            scope.iter().filter_map(|id| self.client.scene().surface(id).map(|tree| (id.as_str(), tree))).collect();
+        let borrowed: Vec<(&str, &layout::ResolvedNode)> = trees.iter().map(|(id, tree)| (*id, tree)).collect();
+        focus_on_enter(&borrowed, current.as_ref())
+    }
+
+    /// Arms the scope's sole `secure_submit` field when the *tree* is what changed, rather than the
+    /// focus.
+    ///
+    /// `KeyboardHandler::enter` is not enough on its own, and the network password prompt is the
+    /// case that proves it. The bar takes the keyboard when a panel opens, which is one `enter`;
+    /// the prompt appears later, when a click inside that panel sets `network.password_ssid`. No
+    /// second `enter` follows, because focus never moved -- so the field that just became visible
+    /// would never be armed, and the prompt would sit there refusing every keystroke.
+    ///
+    /// Why the panel cannot simply take the keyboard when the prompt appears instead: changing a
+    /// mapped layer surface's `keyboard_interactivity` makes the compositor re-evaluate focus,
+    /// which breaks the popup's grab, and niri then dismisses the popup the prompt is drawn in.
+    /// Measured: the field armed and the panel vanished in the same frame.
+    ///
+    /// Only when nothing is armed, so this can never take a field away from the press that chose
+    /// it on a surface declaring several -- the guess [`sole_secure_submit_in_scope`] refuses to
+    /// make (ADR-0050 decision 4). Re-arming what is already armed is left to
+    /// `KeyboardHandler::enter`, which keeps a still-declared field by construction.
+    pub(super) fn arm_secure_focus_if_the_scope_now_declares_one(&mut self) {
+        if self.focused_secure_submit.is_some() || self.keyboard_focus.is_none() {
+            return;
+        }
+        let scope = self.keyboard_focus_scope();
+        let Some(field) = self.field_the_scope_declares(&scope, None) else {
+            return;
+        };
+        eprintln!(
+            "[oblisk-renderer] {}'s `secure_submit` field ({}/{}) became typable under the keyboard focus already held",
+            field.surface_id, field.target.capability, field.target.action
+        );
+        self.focus_secure_submit(Some(field));
+    }
+
     /// Drops the focused field, and the half-typed secret with it, the moment
     /// [`focus_is_still_armed`] stops holding, through [`App::focus_secure_submit`] so the scrub is
     /// the same one every other transition gets. Called before every keystroke, so the rule is
     /// load-bearing rather than advisory: nothing can reach `secure_buffer` through a stale focus,
     /// whatever took the surface away and whether or not a `leave` followed.
     fn prune_secure_focus(&mut self) {
-        let armed = self.focused_secure_submit.as_ref().is_some_and(|field| {
-            focus_is_still_armed(field, self.keyboard_focus.as_deref(), self.surface_is_live(&field.surface_id))
-        });
+        let scope = self.keyboard_focus_scope();
+        let armed = self
+            .focused_secure_submit
+            .as_ref()
+            .is_some_and(|field| focus_is_still_armed(field, &scope, self.surface_is_live(&field.surface_id)));
         if self.focused_secure_submit.is_some() && !armed {
             eprintln!(
                 "[oblisk-renderer] the focused secure_submit field is no longer the one receiving keys; dropping it and scrubbing its buffer"
@@ -809,21 +888,27 @@ impl KeyboardHandler for App {
         // compositor sent it (a `visible` flip, an output change); that is the `None` below and it
         // is not an error.
         self.keyboard_focus = self.surface_id_for(surface).map(str::to_string);
-        // `Scene::surface` hands back an owned tree, so the borrow of `self.client` ends on this
-        // line and the write below is free to take `&mut self`.
-        let tree = self.keyboard_focus.as_ref().and_then(|id| self.client.scene().surface(id));
-        // The rule that makes a lock screen typable with no click: keyboard focus on a surface
-        // declaring exactly one `secure_submit` field focuses it (see [`sole_secure_submit`]).
-        let next = focus_on_enter(self.keyboard_focus.as_deref(), tree.as_ref(), self.focused_secure_submit.as_ref());
+        // Not just the entering surface: the keys it is about to receive also reach the popups
+        // shown under it, which is where a panel's password prompt lives (see
+        // [`App::keyboard_focus_scope`]).
+        let scope = self.keyboard_focus_scope();
+        // The rule that makes a lock screen typable with no click: keyboard focus on a scope
+        // declaring exactly one `secure_submit` field focuses it (see [`sole_secure_submit_in_scope`]).
+        let next = self.field_the_scope_declares(&scope, self.focused_secure_submit.clone());
         match (&self.keyboard_focus, &next) {
             (None, _) => eprintln!("[oblisk-renderer] keyboard focus entered an untracked surface; not tracking it"),
             (Some(id), Some(field)) => eprintln!(
-                "[oblisk-renderer] {id}: keyboard focus takes its `secure_submit` field ({}/{})",
-                field.target.capability, field.target.action
+                "[oblisk-renderer] keyboard focus entered {id} and takes {}'s `secure_submit` field ({}/{})",
+                field.surface_id, field.target.capability, field.target.action
             ),
-            (Some(id), None) => {
-                eprintln!("[oblisk-renderer] keyboard focus entered {id}, which declares no sole `secure_submit` field")
-            }
+            // The scope is named, not just the surface: "declares no field" has two very different
+            // causes -- the popup holding the field is not in reach, or it is in reach and its
+            // field is not visible -- and they are indistinguishable without knowing what was
+            // searched.
+            (Some(id), None) => eprintln!(
+                "[oblisk-renderer] keyboard focus entered {id}, and neither it nor its shown popups {:?} declare a sole `secure_submit` field",
+                &scope[1..]
+            ),
         }
         // Unconditional: a case that arms nothing must still disarm, or `apply_secure_key` would
         // keep appending keystrokes to the previous surface's field and submitting to its
@@ -907,6 +992,7 @@ impl KeyboardHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::secure_submit::sole_secure_submit;
     use crate::layout::secure_submit::tree_can_authenticate;
 
     /// ADR-0069 decision 6. The rest of `scroll_at` needs a compositor to deliver a notch;
@@ -1254,19 +1340,15 @@ mod tests {
         let lua = Lua::new();
         let untypable = tree_with(&lua, vec![textfield(&lua, None)]);
         let armed = field("screen@TEST", "lock", "authenticate");
+        assert_eq!(focus_on_enter(&[], Some(&armed)), None, "an `enter` on a surface this process already destroyed");
         assert_eq!(
-            focus_on_enter(None, None, Some(&armed)),
-            None,
-            "an `enter` on a surface this process already destroyed"
-        );
-        assert_eq!(
-            focus_on_enter(Some("bar@TEST"), Some(&untypable), Some(&armed)),
+            focus_on_enter(&[("bar@TEST", &untypable)], Some(&armed)),
             None,
             "a surface whose tree names no destination"
         );
 
         let typable = tree_with(&lua, vec![textfield(&lua, Some(secure_submit_table(&lua, "lock", "authenticate")))]);
-        assert_eq!(focus_on_enter(Some("screen@TEST"), Some(&typable), None), Some(armed.clone()));
+        assert_eq!(focus_on_enter(&[("screen@TEST", &typable)], None), Some(armed.clone()));
 
         // What an `enter` must *not* undo: a press on a surface declaring two fields picked one the
         // sole-field rule refuses to pick, and the compositor's `enter` for that surface commonly
@@ -1279,12 +1361,37 @@ mod tests {
             ],
         );
         let pressed = field("screen@TEST", "polkit", "authenticate");
-        assert_eq!(focus_on_enter(Some("screen@TEST"), Some(&two_fields), Some(&pressed)), Some(pressed));
+        assert_eq!(focus_on_enter(&[("screen@TEST", &two_fields)], Some(&pressed)), Some(pressed));
         assert_eq!(
-            focus_on_enter(Some("screen@TEST"), Some(&two_fields), Some(&field("bar@TEST", "network", "connect"))),
+            focus_on_enter(&[("screen@TEST", &two_fields)], Some(&field("bar@TEST", "network", "connect"))),
             None,
-            "a field belonging to another surface is not this surface's to keep"
+            "a field belonging to no surface in scope is not this scope's to keep"
         );
+    }
+
+    #[test]
+    fn keyboard_focus_on_a_panel_takes_the_field_on_the_popup_shown_under_it() {
+        // The network password prompt. `modules/bar/init.lua` raises the bar's
+        // `keyboard_interactivity` when `network.password_ssid` appears, but that appears from a
+        // click inside the panel popup that is already open, and niri only hands a popup the
+        // keyboard if its parent held it when the popup mapped. So the keys arrive on the bar while
+        // the only field in reach is on `panel_host`. Scoped to the entering surface alone this
+        // armed nothing, and the prompt stayed dead until the panel was closed and reopened.
+        let lua = Lua::new();
+        let bar = tree_with(&lua, vec![]);
+        let panel = tree_with(&lua, vec![textfield(&lua, Some(secure_submit_table(&lua, "network", "connect")))]);
+
+        assert_eq!(
+            focus_on_enter(&[("bar@TEST", &bar), ("panel_host@TEST", &panel)], None),
+            Some(field("panel_host@TEST", "network", "connect")),
+            "the field is armed on the surface that declares it, not on the one holding the keyboard"
+        );
+
+        // And the sole-field rule still spans the whole scope rather than each tree separately:
+        // one field on the bar and one on its popup is still two destinations to guess between.
+        let typable_bar =
+            tree_with(&lua, vec![textfield(&lua, Some(secure_submit_table(&lua, "lock", "authenticate")))]);
+        assert_eq!(focus_on_enter(&[("bar@TEST", &typable_bar), ("panel_host@TEST", &panel)], None), None);
     }
 
     #[test]
@@ -1295,13 +1402,20 @@ mod tests {
         // `teardown_lock_surfaces` destroys the `wl_surface` with no `leave` required to follow, so
         // the plaintext used to stay live in `App::secure_buffer`.
         let armed = field("screen@TEST", "lock", "authenticate");
-        assert!(focus_is_still_armed(&armed, Some("screen@TEST"), true));
+        let scope = |ids: &[&str]| ids.iter().map(|id| (*id).to_string()).collect::<Vec<_>>();
+        assert!(focus_is_still_armed(&armed, &scope(&["screen@TEST"]), true));
         assert!(
-            !focus_is_still_armed(&armed, Some("screen@TEST"), false),
+            !focus_is_still_armed(&armed, &scope(&["screen@TEST"]), false),
             "its `wl_surface` is gone, whether or not a `leave` ever came"
         );
-        assert!(!focus_is_still_armed(&armed, Some("bar@TEST"), true), "another surface is the one receiving keys");
-        assert!(!focus_is_still_armed(&armed, None, true), "the keyboard is on a surface this process does not own");
+        assert!(!focus_is_still_armed(&armed, &scope(&["bar@TEST"]), true), "another surface is receiving the keys");
+        assert!(!focus_is_still_armed(&armed, &[], true), "the keyboard is on a surface this process does not own");
+        // The half `keyboard_focus_scope` buys: the keyboard sits on the bar, the field is on the
+        // popup shown under it, and a keystroke reaches it. Without this clause every key pruned
+        // the focus `enter` had just armed.
+        let on_popup = field("panel_host@TEST", "network", "connect");
+        assert!(focus_is_still_armed(&on_popup, &scope(&["bar@TEST", "panel_host@TEST"]), true));
+        assert!(!focus_is_still_armed(&on_popup, &scope(&["bar@TEST"]), true), "the popup is no longer shown");
     }
 
     /// A `lock` tree as the scene hands one back: a root with the password field somewhere under it.

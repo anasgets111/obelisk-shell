@@ -606,7 +606,7 @@ impl App {
     /// an object, and it cannot hold one unless its parent held one first ([`App::show_popup`]
     /// refuses otherwise), so a `parent` cycle, including a popup naming itself, has no member
     /// that ever opens.
-    fn shown_popups_under(&self, index: usize, out: &mut Vec<usize>) {
+    pub(super) fn shown_popups_under(&self, index: usize, out: &mut Vec<usize>) {
         let parent_id = self.surfaces[index].surface_id.clone();
         let children: Vec<usize> = (0..self.surfaces.len())
             .filter(|&child| child != index)

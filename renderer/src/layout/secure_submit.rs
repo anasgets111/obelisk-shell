@@ -56,7 +56,8 @@ pub(crate) fn secure_submit_targets(tree: &ResolvedNode) -> Vec<SecureSubmitTarg
     found
 }
 
-/// The destination a surface takes on keyboard focus, when its tree declares exactly one.
+/// The destination a keyboard-focus scope takes, when the whole scope declares exactly one, and
+/// which surface in the scope declares it.
 ///
 /// Why keyboard focus focuses a field at all: without it, `focused_secure_submit` was set only by
 /// a pointer press, requiring a mouse click before a keystroke could reach `shared::SecureBuffer`
@@ -67,9 +68,39 @@ pub(crate) fn secure_submit_targets(tree: &ResolvedNode) -> Vec<SecureSubmitTarg
 /// "whose password is this?", the guess `wayland::input`'s `submit_frame_for` already refuses to
 /// make (ADR-0050 decision 4). Zero is the same answer. Both cases leave focus alone for a
 /// press to decide, which buys the single-field case: every lock screen and password prompt.
+///
+/// **Why a scope and not a surface.** A key does not reach the surface that painted the field, it
+/// reaches whichever surface holds the keyboard, and an `xdg_popup` is not always that surface even
+/// while it is the thing on screen: niri hands a grabbing popup the keyboard only if its parent
+/// already held it when the popup mapped, so a `panel` that raises its `keyboard_interactivity`
+/// while its own popup is open keeps the keyboard on the panel. Scoped per surface, that made the
+/// network password prompt untypable at exactly the moment it was asking -- and typable after
+/// closing and reopening the panel, since the second map found the parent focused. `wayland::input`
+/// passes the focused surface plus every popup currently shown under it, so the rule is asked of
+/// what the keystroke can actually reach.
+pub(crate) fn sole_secure_submit_in_scope<'a>(
+    scope: &[(&'a str, &ResolvedNode)],
+) -> Option<(&'a str, SecureSubmitTarget)> {
+    let mut sole = None;
+    for (surface_id, tree) in scope {
+        for target in secure_submit_targets(tree) {
+            if sole.is_some() {
+                return None;
+            }
+            sole = Some((*surface_id, target));
+        }
+    }
+    sole
+}
+
+/// [`sole_secure_submit_in_scope`] of one tree alone, for the callers that have a surface and no
+/// scope: the lock guard and its veto, which ask about a `lock` surface no popup can root under
+/// (`SurfaceInstance`'s `as_popup_parent` answers `None` for one).
+///
+/// Delegating rather than counting again, so widening the focus scope cannot leave the lock rules
+/// answering to an older version of "exactly one".
 pub(crate) fn sole_secure_submit(tree: &ResolvedNode) -> Option<SecureSubmitTarget> {
-    let mut targets = secure_submit_targets(tree);
-    (targets.len() == 1).then(|| targets.remove(0))
+    sole_secure_submit_in_scope(&[("", tree)]).map(|(_, target)| target)
 }
 
 /// Whether a `lock` surface's resolved tree can actually be authenticated out of -- the predicate

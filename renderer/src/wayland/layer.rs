@@ -242,6 +242,12 @@ impl App {
             layer.set_margin(margin.top as i32, margin.right as i32, margin.bottom as i32, margin.left as i32);
         }
         if let Some(mode) = update.keyboard_interactivity {
+            // Worth a line every time it moves. This surface taking the keyboard is the shell
+            // taking it away from whatever the user was typing in, so it should never be something
+            // that has to be inferred from behaviour; and a password prompt that never becomes
+            // typable is either this request not being sent or the compositor not acting on it,
+            // which nothing else here can tell apart.
+            eprintln!("[oblisk-renderer] {}: keyboard_interactivity -> {mode:?}", self.surfaces[index].surface_id);
             layer.set_keyboard_interactivity(keyboard_interactivity_for(mode));
         }
         if let Some(size) = update.size {
