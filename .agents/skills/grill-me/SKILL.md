@@ -19,10 +19,10 @@ Operate in strict rounds. Attack the **frontier**: questions whose prerequisites
 
 Number each question. Be brutally concise. Always provide an opinionated, boring, minimal-code recommendation.
 
-❓ **Q[#] - [Target System / Decision]:**
+**Q[#] - [Target System / Decision]:**
 [1-2 lines detailing the constraint, missing logic, or potential edge-case failure.]
 
-➡️ **Recommendation:** [The edge-case-correct, standard-library, or minimal abstraction solution]
+**Recommendation:** [The edge-case-correct, standard-library, or minimal abstraction solution]
 
 ## Completion Rule
 
