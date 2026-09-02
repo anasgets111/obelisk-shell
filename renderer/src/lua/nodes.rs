@@ -1,27 +1,21 @@
 //! Node constructors (`oblisk-idl-api-specs.md` § 5.2/§ 6.1) and `VirtualNode`, the loader's
 //! shallow, unvalidated table-to-Rust conversion.
 //!
-//! ponytail: `deserialize_lua_table` is shallow on purpose: it reads `kind` and copies every
-//! other key as-is into `properties`, never recursing into a nested `children`/`child` table. A
-//! node's own properties, including its raw, unconverted `child`/`children` value, are the
-//! loader's output, not the final in-memory node; walking into it is the retained-scene
-//! reconciliation's job, not this module's. Field-level schema validation against § 5.2's table
-//! (e.g. rejecting a `width` that's neither an integer nor `"Fill"`) is the same deferral: the
-//! layout engine is the actual consumer that needs typed, validated properties, so validating
-//! them here would be built ahead of its only real caller.
+//! ponytail: shallow by design. `deserialize_lua_table` reads `kind`, copies every other key
+//! as-is into `properties`, and never recurses into a nested `children`/`child` table (that's
+//! reconciliation's job) or validates a value's shape, e.g. a `width` that's neither an integer
+//! nor `"Fill"` (that's the layout engine's, the only real consumer of typed properties).
 
 use std::collections::HashMap;
 
 use mlua::{Lua, Table, Value};
 
 /// § 5.2's eight geometric nodes plus all four top-level surface roles a config declares: § 6.1's
-/// `panel`, § 6.2's `window`, § 6.3's `popup` and § 6.4's `lock` (ADR-0040: these are surface
-/// *roles*; "surface" is the umbrella term covering all four).
-///
-/// `lock` joined this array under ADR-0052 decision 2: a constructor decides where a
-/// declaration is *written*, which ADR-0049 already separated from when the Wayland object
-/// exists. `window` and `popup` own no `xdg_toplevel`/`xdg_popup` until `visible` says so; `lock`
-/// is the same shape with the compositor's `locked` event as its trigger instead of a signal.
+/// `panel`, § 6.2's `window`, § 6.3's `popup` and § 6.4's `lock` (ADR-0040: surface *roles*;
+/// "surface" is the umbrella term). `lock` joined under ADR-0052 decision 2: a constructor only
+/// decides where a declaration is *written*, separate (ADR-0049) from when the Wayland object
+/// exists. `window`/`popup` own no `xdg_toplevel`/`xdg_popup` until `visible`; `lock`'s trigger
+/// is the compositor's `locked` event instead.
 const NODE_KINDS: [&str; 13] = [
     "rect",
     "row",
@@ -44,41 +38,32 @@ const COMMON_PROPERTIES: &[&str] =
     &["align_h", "align_v", "height", "hover", "id", "margin", "opacity", "padding", "visible", "width"];
 
 /// What every kind that paints as a box takes on top of [`COMMON_PROPERTIES`]: the fill, then the
-/// border. The set is `node::paint_style`'s own first match arm: `row`, `column` and `button`
-/// have no paint properties beyond a `rect`'s, and all four § 6 surface roles paint exactly like
-/// one.
+/// border. This is `node::paint_style`'s first match arm: `row`, `column` and `button` paint no
+/// differently from a `rect`, and neither do the four § 6 surface roles.
 const BOX_PROPERTIES: &[&str] = &["background", "border_color", "border_width", "clip", "radius"];
 
 /// Which kinds that arm covers.
 const BOX_KINDS: [&str; 8] = ["rect", "row", "column", "button", "panel", "window", "popup", "lock"];
 
-/// What each `kind` accepts beyond the two lists above, and the reason [`deserialize_lua_table`]
-/// can reject an unknown key at all.
+/// What each `kind` accepts beyond the two lists above, and why [`deserialize_lua_table`] can
+/// reject an unknown key at all: before this, a misspelled `aling_v = "Center"` was copied into
+/// `properties` and read by nothing, so the node silently didn't centre.
 ///
-/// Until this existed, an unrecognized key was copied into `properties` and then read by nothing:
-/// `aling_v = "Center"` in a config was silent, and the node just did not centre. Every parser
-/// only ever asks for the keys it knows, so nothing was in a position to notice.
+/// ponytail: hand-written, because a node's schema is not a type: it's ~60 `properties.get("...")`
+/// calls across `layout/node/`, `layout/scene.rs` and `wayland/`, each with its own defaulting and
+/// coercion, guarded against drift by `every_property_a_parser_reads_is_accepted` and
+/// `the_stubs_declare_the_same_properties`. Upgrade path: a per-kind props struct, a rewrite.
 ///
-/// ponytail: hand-written, and it has to be. A node's schema is not a type: it is roughly 60
-/// `properties.get("...")` calls spread across `layout/node/`, `layout/scene.rs` and `wayland/`,
-/// each with its own defaulting and coercion rules, so there is nothing to derive it from the way
-/// `supervisor/src/stubs.rs` derives a capability payload. Two guards hold it in place:
-/// `every_property_a_parser_reads_is_accepted` greps those calls out of the source, and
-/// `the_stubs_declare_the_same_properties` compares it against `lua-meta`. The upgrade path is a
-/// per-kind props struct the parsers read fields off, which is a rewrite of the parse layer rather
-/// than a derive.
-///
-/// A name here that no parser reads yet is allowed and deliberate: `textfield`'s `on_change` and
-/// `on_submit` are typed to ADR-0027's settled shape while `zwp_text_input_v3` is unwired, and
-/// rejecting them would make a config written against the documented API fail to load.
+/// A name here that no parser reads yet is deliberate: `textfield`'s `on_change`/`on_submit` are
+/// typed to ADR-0027's shape while `zwp_text_input_v3` is unwired; rejecting them would fail a
+/// config written against the documented API.
 const NODE_PROPERTIES: &[(&str, &[&str])] = &[
     ("rect", &["children"]),
     ("row", &["children", "scroll", "spacing"]),
     ("column", &["children", "scroll", "spacing"]),
     ("text", &["content", "elide", "font_size", "foreground", "text_align"]),
-    // `foreground` here means what CSS `color` means: the value a `currentColor` fill in the
-    // resolved SVG resolves to (ADR-0072). A full-colour icon names no `currentColor` and is
-    // unaffected, so a config may pass it unconditionally.
+    // `foreground` means what CSS `color` means: what a `currentColor` fill in the resolved SVG
+    // resolves to (ADR-0072). A full-colour icon names no `currentColor`, so this is always safe.
     ("icon", &["foreground", "name", "size"]),
     ("image", &["fit", "source"]),
     ("button", &["children", "on_click"]),
@@ -117,10 +102,9 @@ const NODE_PROPERTIES: &[(&str, &[&str])] = &[
     ("lock", &["child"]),
 ];
 
-/// Whether `kind` accepts `property`. An unknown `kind` accepts everything:
-/// `register_node_constructors` is the only thing that tags a table with one, so a kind missing
-/// from [`NODE_PROPERTIES`] is a new constructor whose row has not been written, and refusing
-/// every property of it would be a worse failure than the silence this replaces.
+/// Whether `kind` accepts `property`. An unknown `kind` accepts everything: it's a new
+/// constructor whose [`NODE_PROPERTIES`] row isn't written yet, and refusing it all would be
+/// worse than the silence this replaces.
 fn accepts(kind: &str, property: &str) -> bool {
     let Some((_, own)) = NODE_PROPERTIES.iter().find(|(name, _)| *name == kind) else {
         return true;
@@ -165,8 +149,7 @@ pub enum DeserializeError {
 }
 
 /// Registers every [`NODE_KINDS`] entry as Lua-callable sugar: each takes the props table Lua
-/// passed and tags it with `kind`. One loop over the array rather than a list spelled out again
-/// here, so adding a role is one edit.
+/// passed and tags it with `kind`. One loop, so adding a role is one edit.
 pub fn register_node_constructors(lua: &Lua) -> mlua::Result<()> {
     for kind in NODE_KINDS {
         lua.globals().set(

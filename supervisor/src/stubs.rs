@@ -1,27 +1,21 @@
 //! Generates `lua-meta/oblisk.lua` from the types that actually cross the socket.
 //!
-//! The stubs were hand-written first, and hand-writing them was wrong twice in one session: the
-//! `process.run` callback arity, and `oblisk.notifications`'s command list, which claimed seven
-//! commands where `dispatch` has four (`low`/`normal`/`critical` are urgency arms inside
-//! `parse_set_sound_args`, not actions). Both were the same failure. A second copy of a schema,
-//! maintained by hand, describes what someone believed rather than what runs.
+//! The stubs were hand-written first, and wrong twice in one session: `process.run`'s callback
+//! arity, and `oblisk.notifications`'s claimed seven commands where `dispatch` has four
+//! (`low`/`normal`/`critical` are urgency arms, not actions). A hand-maintained schema copy
+//! describes what someone believed, not what runs.
 //!
-//! So the payload half is derived. Every capability's `*State` already derives `Serialize`, which
-//! is what `push_snapshot` calls to build the `StateSnapshot`; adding `JsonSchema` beside it makes
-//! the same type describe itself. Rust doc comments become LuaCATS descriptions, so the prose lives
-//! next to the field it documents instead of in a parallel file that goes stale.
+//! So the payload half is derived: every capability's `*State` already derives `Serialize`, and
+//! adding `JsonSchema` beside it lets a field's Rust doc comment become its LuaCATS description.
 //!
 //! The command half is derived the same way. Each capability's actions are a
 //! `#[derive(Deserialize, JsonSchema)]` enum next to its `dispatch`, and `parse_action` at the
-//! socket boundary is what turns the wire string into one. The names Lua may pass to `invoke` are
-//! that enum's variants, so an action with no dispatch arm, or an arm with no action, fails the
-//! build rather than the golden test.
+//! socket boundary turns the wire string into one, so a mismatched action fails the build rather
+//! than the golden test.
 //!
-//! ponytail: argument types stay `...`. The next step is a payload enum (`Set(u32)`) carrying its
-//! parsed arguments, which would delete all 19 `parse_*_args` functions, but
-//! `CommandParams.arguments` is a positional array and serde reads a single-field variant as a
-//! newtype, which wants the bare value rather than a one-element array. Typed arguments cost an
-//! IDL change to named arguments (docs/oblisk-idl-api-specs.md § 7.2), not a derive.
+//! ponytail: argument types stay `...`. The upgrade is a payload enum (`Set(u32)`) carrying its
+//! parsed arguments, deleting all 19 `parse_*_args` functions, but that costs an IDL change to
+//! named arguments (docs/oblisk-idl-api-specs.md § 7.2), not a derive.
 
 use std::collections::BTreeMap;
 

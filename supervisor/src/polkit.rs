@@ -1,13 +1,12 @@
 //! Polkit authentication agent registration handshake.
 //!
-//! The real D-Bus method (verified against polkit's own source and introspection XML) is
-//! `RegisterAuthenticationAgent(subject: (sa{sv}), locale: s, object_path: s) -> ()`, not
-//! `RegisterAgent`. The call-out uses `zbus_polkit`'s `Authority`
-//! proxy and `Subject` type directly rather than hand-deriving matching zvariant types
-//! (ADR-0013).
+//! `RegisterAuthenticationAgent(subject: (sa{sv}), locale: s, object_path: s) -> ()` is the real
+//! D-Bus method (verified against polkit's source and introspection XML), not `RegisterAgent`;
+//! the call-out uses `zbus_polkit`'s `Authority` proxy and `Subject` type directly, skipping
+//! hand-derived zvariant types (ADR-0013).
 //!
-//! The agent side, `org.freedesktop.PolicyKit1.AuthenticationAgent`, has no maintained crate,
-//! so `AuthenticationAgent` below is hand-written against the verified signature:
+//! `org.freedesktop.PolicyKit1.AuthenticationAgent`, the agent side, has no maintained crate, so
+//! `AuthenticationAgent` below is hand-written against the verified signature:
 //! `BeginAuthentication(action_id: s, message: s, icon_name: s, details: a{ss}, cookie: s,
 //! identities: a(sa{sv})) -> ()` and `CancelAuthentication(cookie: s) -> ()`.
 
@@ -19,18 +18,15 @@ use zbus::zvariant::{OwnedValue, Value};
 pub use zbus_polkit::policykit1::{AuthorityProxy, Subject};
 
 /// Object path this agent is exported at on our own unique connection name. Any path under
-/// our control is valid -- the spec's `object_path` argument is caller-chosen, not fixed.
+/// our control is valid: the spec's `object_path` argument is caller-chosen, not fixed.
 pub const AGENT_OBJECT_PATH: &str = "/org/oblisk/PolicyKit1/AuthenticationAgent";
 
 /// Builds the `unix-session` `Subject` for the session this process is running in.
 ///
-/// ponytail: resolves the session id from `$XDG_SESSION_ID` rather than the general-purpose
-/// route (asking logind's `Manager.GetSessionByPID` for this process's own pid). systemd's
-/// pam_systemd sets `$XDG_SESSION_ID` for every session it opens, which covers every real
-/// graphical login this supervisor runs under; the logind round-trip is the upgrade path if
-/// this ever needs to run somewhere pam_systemd doesn't apply, or once a logind client
-/// exists in this crate for an unrelated reason (it doesn't yet -- ADR-0010 covers Wayland
-/// idle/lock, not logind sessions).
+/// ponytail: resolves the session id from `$XDG_SESSION_ID`, not the general-purpose route
+/// (asking logind's `Manager.GetSessionByPID` for this pid). The logind round-trip is the
+/// upgrade path once pam_systemd doesn't set it, or once a logind client exists here for
+/// another reason (ADR-0010 covers Wayland idle/lock, not logind sessions).
 pub fn current_session_subject() -> Result<Subject, std::env::VarError> {
     Ok(session_subject(std::env::var("XDG_SESSION_ID")?))
 }
@@ -65,13 +61,10 @@ pub struct BeginAuthenticationCall {
 /// from `BeginAuthentication`'s `identities` list: a `unix-user` identity carries its uid
 /// under the `"uid"` key, typed `uint32`.
 ///
-/// ponytail: takes the *first* `unix-user` identity in the list, not all of them. polkitd can
-/// list multiple identities that could satisfy an action (e.g. every member of `wheel`) --
-/// picking one to authenticate as is normally a user-facing choice (an identity picker), which
-/// doesn't exist here: this codebase's only `secure_submit` UI is a single password field with
-/// no picker. First-match is the simplest correct behavior until a picker exists to make the
-/// choice meaningful; see this ADR's upgrade path (ADR-0028) for where that UI would need
-/// to attach.
+/// ponytail: takes the *first* `unix-user` identity, not all of them. polkitd can list several
+/// (e.g. every member of `wheel`), and picking one is normally a user-facing choice this
+/// codebase has no picker for. First-match is correct until one exists; see the upgrade path at
+/// ADR-0028.
 pub fn first_unix_user_uid(identities: &[(String, HashMap<String, OwnedValue>)]) -> Option<u32> {
     identities
         .iter()
@@ -80,12 +73,11 @@ pub fn first_unix_user_uid(identities: &[(String, HashMap<String, OwnedValue>)])
         .and_then(|v| u32::try_from(v.clone()).ok())
 }
 
-/// `org.freedesktop.PolicyKit1.AuthenticationAgent`, the interface polkitd calls back into
-/// once this process registers via [`register_agent`].
+/// `org.freedesktop.PolicyKit1.AuthenticationAgent`, the interface polkitd calls back into once
+/// this process registers via [`register_agent`].
 ///
-/// `begin_authentication` only forwards the parsed challenge over a channel; it drives no PAM
-/// conversation itself. `main.rs` owns that half: it holds the challenge until a
-/// `secure_submit("polkit", "authenticate")` frame arrives from the Renderer, then hands both to
+/// `begin_authentication` only forwards the parsed challenge over a channel; PAM itself runs in
+/// `main.rs`, triggered by a `secure_submit("polkit", "authenticate")` frame and handed to
 /// [`crate::pam_worker::drive_pam_and_respond`] (ADR-0015, ADR-0028).
 pub struct AuthenticationAgent {
     challenges: UnboundedSender<BeginAuthenticationCall>,
@@ -120,17 +112,16 @@ impl AuthenticationAgent {
     }
 
     async fn cancel_authentication(&self, _cookie: String) {
-        // ponytail: nothing is tracking in-flight challenges yet to cancel -- see the struct
-        // doc comment. A real implementation cancels the matching PAM conversation.
+        // ponytail: nothing tracks in-flight challenges yet to cancel; see the struct doc
+        // comment. A real implementation cancels the matching PAM conversation.
     }
 }
 
 /// The authentication agent, held unregistered until a config declares a `secure_submit` that
 /// names polkit (ADR-0070 decisions 5 and 6).
 ///
-/// A registration failure is logged, not propagated with `?`. "An authentication agent already
-/// exists for the given subject" is the normal answer on a machine running any other desktop, and
-/// it must not stop the shell from starting.
+/// A registration failure is logged, not propagated with `?`, since "An authentication agent
+/// already exists for the given subject" is normal elsewhere and must not stop the shell.
 pub struct PolkitAgent {
     /// Taken by the first [`Self::register`] call, so a second is a no-op rather than a second
     /// `RegisterAuthenticationAgent` for the same subject.
@@ -160,9 +151,8 @@ impl PolkitAgent {
 
     /// [`Self::register`] once the subject is known, holding the take-once rule.
     ///
-    /// Split so the test can drive the real path twice without `set_var`: `register` resolves the
-    /// subject from `$XDG_SESSION_ID`, and `setenv` rewrites the process-wide `environ` block,
-    /// racing every concurrent `getenv` in the test binary whatever variable either one names.
+    /// Split off so tests can drive this path twice without `set_var`: `setenv` rewrites the
+    /// process-wide `environ` block, racing any concurrent `getenv` regardless of which variable.
     async fn register_for(&mut self, connection: &zbus::Connection, subject: &Subject) {
         let Some(agent) = self.agent.take() else {
             return;

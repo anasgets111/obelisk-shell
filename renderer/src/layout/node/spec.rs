@@ -1,11 +1,9 @@
 //! The surface-spec envelope: [`LockSpec`] (§ 6.4), the [`SurfaceSpec`] enum every surface role
-//! resolves to and its [`SurfaceFingerprint`] (the swap-detection key), the generic child-list
-//! parsers (`parse_single_child`/`parse_children`/`parse_list_children`), and the masked
-//! [`SecureSubmitTarget`] (§ 5.2 item 8).
-//!
-//! `parse_children`/`parse_list_children` are the two places a node's `kind` decides how its
-//! `children`/`itemfn` property is walked, so they carry the `HashSet` dedup check for a `list`'s
-//! keys.
+//! resolves to and its [`SurfaceFingerprint`] (swap-detection key), the generic child-list parsers
+//! (`parse_single_child`/`parse_children`/`parse_list_children`), and the masked
+//! [`SecureSubmitTarget`] (§ 5.2 item 8). `parse_children`/`parse_list_children` are where a
+//! node's `kind` decides how its `children`/`itemfn` property is walked, carrying the `HashSet`
+//! dedup check for a `list`'s keys.
 
 use std::collections::{HashMap, HashSet};
 
@@ -15,51 +13,38 @@ use crate::lua::nodes::{VirtualNode, deserialize_lua_table};
 
 use super::*;
 
-/// § 6.4's `lock`, whose whole property list is `id` and `child` (ADR-0052 decision 2). `child`
+/// § 6.4's `lock`: `id` and `child` are its whole property list (ADR-0052 decision 2). `child`
 /// is not a field here for the same reason it is not one on the other three roles:
-/// `layout::scene::children_of` walks it into the retained tree, and a spec carries what the
-/// Wayland side has to be told, not what the layout engine reads.
+/// `layout::scene::children_of` walks it into the retained tree, and a spec carries what Wayland
+/// needs told, not what layout reads. Stays a struct rather than `SurfaceSpec::Lock(String)`:
+/// [`lock_spec`] hangs § 6.4's four refusals off it, which a bare `String` variant could not.
 ///
-/// So this is one field, and it stays a struct rather than collapsing into a
-/// `SurfaceSpec::Lock(String)`: [`lock_spec`] is where § 6.4's four refusals live, and a bare
-/// `String` variant would leave them with no parser to hang off.
-///
-/// **No `LockTopology`, for a stronger reason than [`PopupSpec`] has.** A lock surface has *no*
-/// protocol field at all that a config could set: `ext_session_lock_surface_v1` has exactly one
-/// request, `ack_configure`, and the size arrives in the configure rather than being asked for.
-/// There is nothing for a topology diff to compare beyond the declaration's existence, which is
-/// what [`SurfaceFingerprint::Lock`] holds.
+/// **No `LockTopology`, for a stronger reason than [`PopupSpec`] has:** a lock surface has *no*
+/// protocol field a config could set. `ext_session_lock_surface_v1` has one request,
+/// `ack_configure`, and its size arrives in the configure, never asked for. Nothing exists to
+/// diff beyond the declaration's existence, which [`SurfaceFingerprint::Lock`] holds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LockSpec {
     pub id: String,
 }
 
-/// § 6.4's parser. Refuses the properties § 6.4 says a `lock` does not have, then reads the one it
-/// does.
+/// § 6.4's parser: refuses the properties a `lock` does not have, then reads the one it does.
 ///
-/// **Refusing rather than ignoring is this parser's one real decision.** `visible = false` on a
-/// lock screen implies the config decides when the lock is up, and it does not: the compositor
-/// creates lock surfaces after `locked` and destroys them at `unlock_and_destroy`, and obeying the
-/// property mid-session would destroy a surface the compositor is still showing. ADR-0042
-/// records that as what makes the compositor "fall back to rendering a solid color". Ignoring it
-/// silently would leave the wrong mental model in place until the author meets it from the other
-/// side, locked out by a screen that did not do what they wrote. An error lands in `rescue`'s
-/// `error_log` (§ 2.10, ADR-0046) at evaluation time, where a human is reading and the session
-/// is not locked, the cheapest place the correction can happen.
+/// Refusing rather than ignoring is the real decision. `visible = false` implies the config
+/// decides when the lock is up, but the compositor creates and destroys lock surfaces itself, at
+/// `locked` and `unlock_and_destroy`; obeying it mid-session would tear down a surface it still
+/// shows, which ADR-0042 says makes it "fall back to rendering a solid color". The error lands in
+/// `rescue`'s `error_log` (§ 2.10, ADR-0046) at evaluation time instead, while a human is reading
+/// and the session is not locked.
 ///
 /// `monitor`, `anchor`, `width` and `height` get the same treatment for a weaker reason: each is
-/// inert rather than dangerous (a lock surface's geometry is entirely the compositor's configure,
-/// and it expands per output because the protocol says so, not because a `monitor` asked, per
-/// ADR-0052 decision 2), and a property that quietly does nothing is worse unreported than
-/// reported.
-///
-/// The refusals run *before* `id` is read, deliberately: `lock { visible = false }` with no `id`
-/// has two problems, and leading with "missing `id`" would hide the one that says the author's
-/// whole mental model of the role is wrong.
-///
-/// Nothing here consults [`is_deferred_signal`]: a refusal tests for the *key*, so a `Signal` under
-/// it is refused exactly as a literal is, and § 6.4 leaves a `lock` no movable property for the
-/// two-pass split ADR-0049's second amendment set up for `window` and `popup` to apply to.
+/// inert rather than dangerous (geometry is entirely the compositor's configure, expanding per
+/// output because the protocol says so, not a `monitor`, per ADR-0052 decision 2), but a silent
+/// no-op is still worse than a reported one. The refusals run before `id` is read, so a `lock`
+/// missing both leads with the problem about the role, not the merely missing `id`.
+/// [`is_deferred_signal`] is never consulted either: a refusal tests the *key*, so a `Signal`
+/// under it is refused like a literal, since § 6.4 leaves `lock` no movable property for
+/// ADR-0049's second amendment to apply to.
 pub fn lock_spec(properties: &HashMap<String, Value>) -> Result<LockSpec, LayoutError> {
     for property in ["visible", "monitor", "anchor", "width", "height"] {
         if properties.contains_key(property) {
@@ -76,14 +61,11 @@ pub fn lock_spec(properties: &HashMap<String, Value>) -> Result<LockSpec, Layout
 }
 
 /// One declared top-level surface, parsed by whichever § 6 role its `kind` names (ADR-0040
-/// decision 1). `crate::socket`'s `surface_specs` builds one per node the evaluation returned, and
-/// this is the roster every later stage reads: `layout::instance::expand_instances` turns it into
-/// surface instances and `crate::wayland::App::create_surfaces` binds them.
-///
-/// One enum rather than three parallel lists, because the *order* of the declarations is part of
-/// the swap fingerprint (see [`SurfaceFingerprint`]) and three lists would lose the interleaving.
-/// It is also what keeps a surface's role one `match` away at every consumer instead of a lookup in
-/// whichever list happens to hold it.
+/// decision 1). `crate::socket`'s `surface_specs` builds one per evaluated node; later stages
+/// read this roster, `expand_instances` turning it into surface instances and `create_surfaces`
+/// binding them. One enum rather than three parallel lists: declaration *order* is part of the
+/// swap fingerprint (see [`SurfaceFingerprint`]), which three lists would lose, and it keeps a
+/// surface's role one `match` away instead of a lookup in whichever list holds it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SurfaceSpec {
     Panel(PanelSpec),
@@ -116,28 +98,23 @@ impl SurfaceSpec {
 }
 
 /// One declared surface's share of the topology `crate::socket`'s `handle_reevaluate` diffs to
-/// choose a generation swap over an in-place reload (ADR-0001, `CONTEXT.md`'s Topology
-/// change). Order-sensitive equality on `Vec<SurfaceFingerprint>` is that diff.
+/// choose a generation swap over an in-place reload (ADR-0001, `CONTEXT.md`'s Topology change).
+/// Order-sensitive equality on `Vec<SurfaceFingerprint>` is that diff.
 ///
-/// The four roles contribute different amounts, and the protocol decides how much rather than a
-/// preference. A `panel` carries all five of [`SurfaceTopology`]'s fields, because
-/// `get_layer_surface` fixes every one of them at creation. A `window`, a `popup` and a `lock`
-/// carry their `id` alone: everything else they hold is either a request on a live object
-/// (`set_title`, `set_app_id`, the two size hints, see [`WindowSpec`]'s own "no `WindowTopology`"
-/// note) or rebuilt per open (the whole `xdg_positioner`, ADR-0049 decision 1), so none of it
-/// can strand a live object the way a changed `namespace` would. A `lock` reaches the same
-/// one-field answer from the other end: § 6.4 gives it `id` and `child` alone, so the only
-/// question a topology diff can ask about it is whether it is still there.
+/// The protocol decides how much each role contributes. A `panel` carries all five of
+/// [`SurfaceTopology`]'s fields because `get_layer_surface` fixes every one at creation. A
+/// `window`, `popup` and `lock` carry only their `id`: everything else is a request on a live
+/// object (`set_title`, `set_app_id`, the two size hints, see [`WindowSpec`]'s "no
+/// `WindowTopology`" note) or rebuilt per open (`xdg_positioner`, ADR-0049 decision 1), so none of
+/// it can strand a live object the way a changed `namespace` would; a `lock` lands on the same
+/// one field because § 6.4 gives it only `id` and `child` to begin with.
 ///
-/// What the three `id` arms *do* catch is the case ADR-0049 decision 3 names: adding or
-/// removing a declaration is a topology change for every role, including the three whose Wayland
-/// object comes and goes inside one generation. Deleting a `lock` mid-session is the sharpest case:
-/// it is a topology change, so it is a swap, so ADR-0042's rule queues it until unlock and a
-/// live lock screen cannot lose its tree underneath it (ADR-0052, Consequences).
-///
-/// The role itself is part of the fingerprint by construction: rewriting `panel { id = "x" }` as
-/// `window { id = "x" }` changes the variant, which is a different Wayland object entirely and so a
-/// swap.
+/// The three `id` arms still catch ADR-0049 decision 3: adding or removing a declaration is a
+/// topology change for every role, even one whose Wayland object comes and goes inside a
+/// generation. Deleting a `lock` mid-session is the sharpest case: ADR-0042's rule queues that
+/// swap until unlock, so a live lock screen cannot lose its tree underneath it (ADR-0052,
+/// Consequences). The role itself is part of the fingerprint too: rewriting `panel { id = "x" }`
+/// as `window { id = "x" }` changes the variant, a different Wayland object and so a swap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurfaceFingerprint {
     Panel(SurfaceTopology),
@@ -180,41 +157,26 @@ pub fn parse_children(properties: &HashMap<String, Value>) -> Result<Vec<Virtual
 }
 
 /// A `list` node's children (`oblisk-idl-api-specs.md` § 5.2 item 7, ADR-0045 decision 3).
-/// Parallels [`parse_children`]'s role for
-/// `rect`/`row`/`column`/`button`, but a `list`'s children are never a literal Lua table: they are
-/// generated here, once per element of `source`, by calling `itemfn(element)` and deserializing the
-/// node table it returns.
+/// Parallels [`parse_children`] for `rect`/`row`/`column`/`button`, but a `list`'s children are
+/// never a literal Lua table: they are generated here, once per element of `source`, by calling
+/// `itemfn(element)` and deserializing the node table it returns. `source` arrives already
+/// resolved: `resolve_properties` treats it like any other non-structural property, so a `Signal`
+/// there was read exactly once before this runs.
 ///
-/// `source` arrives already resolved: `resolve_properties` treats it like any other non-structural
-/// property, so a `Signal` there was read exactly once before this function ever runs.
-///
-/// Without `key`, a generated child gets no `id` at all, so
-/// `layout::scene::pair_children_by_id_then_position` matches list items by position, the same
-/// rule an id-less literal child already gets, and exactly what decision 3 specifies. With `key`,
-/// `key(element)`, called on the source element and never on the node `itemfn` built, becomes that
-/// child's `id`, overwriting whatever `id` `itemfn`'s own node table carried: a list item's
-/// identity belongs to the list, and honoring an inner `id` instead would let two items that happen
-/// to declare the same one collide.
-///
-/// Duplicate keys are rejected here, before any `id` reaches `pair_children_by_id_then_position`,
-/// so that function's own "duplicate id" message stays about a literal sibling `id` and a list
+/// Without `key`, a generated child gets no `id`, so `pair_children_by_id_then_position` matches
+/// list items by position, the rule an id-less literal child already gets and exactly what
+/// decision 3 specifies. With `key`, `key(element)` (called on the source element, never on the
+/// node `itemfn` built) becomes that child's `id`, overwriting whatever `itemfn`'s own table
+/// carried: identity belongs to the list, so an inner `id` could let two items collide. Duplicate
+/// keys are rejected here, before any `id` reaches `pair_children_by_id_then_position`, so a list
 /// author gets a message naming `key`, the property they actually wrote.
 ///
-/// ponytail: `key` makes *reconciliation* cheap, not *evaluation*. This calls `itemfn` for every
-/// element on every resolve, so a 30-item tray builds 30 fresh nodes each time, and
-/// `pair_children_by_id_then_position` then matches 29 of them to retained nodes and throws the
-/// fresh ones away. § 5.2 calls `list` a "fast-reconciling virtual repeater", and the reconciling
-/// half is what ADR-0045 delivered; the repeater half still re-runs a Lua closure per item per
-/// pass. `layout::scene`'s walk runs per `Scene::apply`, which ADR-0044 decision 2's dirty flag
-/// made per poll turn rather than per config edit, the same cadence a `ponytail:` comment on the
-/// measure callback records for its own text-reshaping cost.
-///
-/// The fix is to compute keys first and skip `itemfn` for an element whose key already matches a
-/// retained child, which is what makes it a virtual repeater rather than a loop. It is not built
-/// here because this function cannot see the retained children: `children_of` hands it only the
-/// fresh node's own properties, and giving it the retained side means changing that signature and
-/// the two other `children_of` arms with it. Worth doing when a real config drives a list from a
-/// capability that pushes often, not before.
+/// ponytail: `key` makes reconciliation cheap, not evaluation. `itemfn` still runs for every
+/// element on every resolve, so a 30-item tray builds 30 fresh nodes and throws 29 away each
+/// pass, at ADR-0044 decision 2's per-poll-turn cadence (§ 5.2 calls `list` a "fast-reconciling
+/// virtual repeater"). The fix, computing keys first and skipping `itemfn` for unchanged ones,
+/// is not built because `children_of` hands this only the fresh node's properties, never the
+/// retained side.
 pub fn parse_list_children(properties: &HashMap<String, Value>) -> Result<Vec<VirtualNode>, LayoutError> {
     let source_value = properties.get("source").ok_or_else(|| invalid("source", "required for `list`, got nothing"))?;
     let Value::Table(source) = source_value else {
@@ -261,8 +223,7 @@ pub fn parse_list_children(properties: &HashMap<String, Value>) -> Result<Vec<Vi
             if !seen_keys.insert(key_text.clone()) {
                 return Err(invalid("key", format!("duplicate key `{key_text}` among list items")));
             }
-            // The key wins over any `id` the node itemfn built already carried, see this
-            // function's doc comment.
+            // The key wins over any `id` itemfn's node already carried; see this fn's doc comment.
             node.properties.insert("id".to_string(), Value::String(key_str));
         }
 
@@ -272,30 +233,26 @@ pub fn parse_list_children(properties: &HashMap<String, Value>) -> Result<Vec<Vi
 }
 
 /// `textfield.secure_submit` (§ 5.2 item 8): the `{ capability, action }` pair a masked field's
-/// committed buffer is addressed to once the focused field submits, instead of the value ever
-/// reaching Lua (ADR-0005, ADR-0027). The submit is Enter on `wl_keyboard`, read natively
-/// in `renderer/src/wayland/mod.rs`, not through the `zwp_text_input_v3` bridge ADR-0027 also
-/// covers; see that file's `secure_key_action` for why a password must not travel through an
-/// input method. This pair becomes the routing key on a
-/// `RendererFrame::SecureSubmit` envelope (ADR-0050 decision 4), which is why both fields are
-/// required rather than falling back to some default capability.
+/// committed buffer is addressed to once it submits, instead of reaching Lua (ADR-0005,
+/// ADR-0027). Submit is Enter on `wl_keyboard`, read natively in `renderer/src/wayland/mod.rs`,
+/// not through the `zwp_text_input_v3` bridge (see that file's `secure_key_action` for why a
+/// password must not travel through an input method). This pair is the routing key on a
+/// `RendererFrame::SecureSubmit` envelope (ADR-0050 decision 4), so both fields are required.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecureSubmitTarget {
     pub capability: String,
     pub action: String,
 }
 
-/// `Ok(None)` when the property is absent: `secure_submit` is optional even on a masked field
-/// (§ 5.2 item 8's own note: without it, a masked value is just unreadable from Lua).
-///
-/// `secure_submit` is not in [`is_structural_property`]'s carve-out, so a signal-bound value
-/// arrives here already resolved: nothing reconciles a node by its `secure_submit`, so there is
-/// no structural decision here for a live-changing signal to undermine.
+/// `Ok(None)` when absent: `secure_submit` is optional even on a masked field (§ 5.2 item 8: an
+/// unread mask is just unreadable from Lua). Not in [`is_structural_property`]'s carve-out, so a
+/// signal-bound value arrives already resolved: nothing reconciles a node by its `secure_submit`,
+/// so there is no structural decision here for a live-changing signal to undermine.
 ///
 /// `capability`/`action` are refused non-UTF-8 rather than converted lossily, the same call
-/// [`parse_node_id`] makes for the same reason: this pair addresses a secret to a Supervisor
-/// capability, so a lossy conversion could collapse two distinct byte strings onto the same name
-/// and route a password to a capability nobody registered.
+/// [`parse_node_id`] makes: this pair addresses a secret to a Supervisor capability, and a lossy
+/// conversion could collapse two distinct byte strings onto one name, routing a password to a
+/// capability nobody registered.
 pub fn parse_secure_submit(properties: &HashMap<String, Value>) -> Result<Option<SecureSubmitTarget>, LayoutError> {
     let Some(value) = properties.get("secure_submit") else {
         return Ok(None);

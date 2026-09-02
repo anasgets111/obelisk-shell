@@ -2,90 +2,79 @@
 //! (ADR-0042, ADR-0052 decisions 1 and 4).
 //!
 //! The Renderer holds `ext_session_lock_v1` and paints it; this owns the decision to take it, the
-//! record of what became of it, and the one call site allowed to order an unlock. Every state
-//! change arrives as a [`LockEvent`] and is applied by [`apply`], a pure function, so the whole
-//! transition table is testable without a socket or a PAM stack.
+//! record of what became of it, and the one call site allowed to order an unlock. State changes
+//! arrive as a [`LockEvent`], applied by the pure [`apply`], testable without a socket or PAM.
 
 use std::sync::Mutex;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-/// `oblisk.lock`'s payload (ADR-0052 decision 4). `attempts` counts failed authentications
-/// since acquisition, and exists because Lua can't rebuild it: capability state is sampled at
-/// layout time (ADR-0044), not evented, so two identical consecutive failures are one
-/// unchanged `error` string. `error`'s "nothing went wrong" value is the empty string, the same
-/// convention `keyboard`'s `active_layout` uses.
+/// `oblisk.lock`'s payload (ADR-0052 decision 4). `attempts` counts failed authentications since
+/// acquisition; Lua can't rebuild it because state is sampled at layout time (ADR-0044), not
+/// evented, so two identical consecutive failures are one unchanged `error` string. `error`'s
+/// "nothing went wrong" value is the empty string, like `keyboard`'s `active_layout`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct LockState {
-    /// The session is locked and the Renderer has confirmed it. Never optimistic: a lock that has
-    /// been asked for but not yet confirmed still reads `false`, so a config cannot draw an
-    /// unlocked screen over a locked session or the reverse.
+    /// The session is locked and the Renderer has confirmed it: never optimistic, so a lock asked
+    /// for but not yet confirmed still reads `false`, and a config can't draw the wrong screen.
     pub active: bool,
     /// A password is with PAM and no answer has come back. `pam_unix` takes about a second, so this
     /// is what a spinner reads. `lock:authenticate` is refused while it is true.
     pub authenticating: bool,
-    /// Authentication attempts against the lock currently held. Counts every answer PAM returns,
-    /// success included, and resets to `0` only when the Renderer confirms a *new* lock. So it is
-    /// per-acquisition rather than per-failure: a lockout rule reads it together with
-    /// [`LockState::error`], which is empty after the attempt that succeeded.
+    /// Authentication attempts against the lock currently held: counts every PAM answer including
+    /// success, resetting to `0` only on a *new* confirmed lock, so it's per-acquisition, not
+    /// per-failure. A lockout rule reads it with [`LockState::error`].
     pub attempts: u32,
-    /// Why the last attempt failed, in words fit to draw, e.g. `"too many attempts"`. Empty string
-    /// when the last attempt succeeded and when none has been made. Rewritten on every PAM answer
-    /// and cleared when a new lock is confirmed, so it always describes the lock now on screen.
+    /// Why the last attempt failed, in words fit to draw, e.g. `"too many attempts"`. Empty when
+    /// the last attempt succeeded or none has been made, rewritten on every PAM answer and
+    /// cleared on a new lock, so it always describes the lock now on screen.
     pub error: String,
-    /// A `SetSessionLock { locked: true }` is out and the Renderer has not said what became of it
-    /// yet. `#[serde(skip)]`: this is a fact about the swap gate, not part of a lock screen's
-    /// payload. It exists because `active` must keep meaning only "the Renderer confirmed it"
-    /// ([`apply`]'s invariant), while the swap gate has to shut a round trip earlier:
-    /// `ext_session_lock_v1` lets the compositor withhold `locked` until the client has presented
-    /// on every output, and a swap started in that window reaps the process holding the lock
-    /// object and locks the user out for good (ADR-0042).
+    /// A `SetSessionLock { locked: true }` is out and the Renderer hasn't said what became of it.
+    /// `#[serde(skip)]`: a swap-gate fact, not a lock screen's payload. `active` must keep meaning
+    /// only "the Renderer confirmed it" ([`apply`]'s invariant), but the gate has to shut a round
+    /// trip earlier: `ext_session_lock_v1` withholds `locked` until every output has presented,
+    /// and a swap in that window reaps the lock holder and locks the user out for good (ADR-0042).
     #[serde(skip)]
     pub requested: bool,
     /// Which acquisition of the lock this state describes: bumped only when the Renderer reports
-    /// `Locked`. `#[serde(skip)]` for the same reason as `requested`.
-    ///
-    /// Exists because a PAM outcome outlives the lock it was started for: `pam_unix` takes about
-    /// a second and `PAM_EXCHANGE_TIMEOUT` allows thirty, and inside that window the compositor
-    /// can end the lock (`finished` after `locked`, what `loginctl unlock-session` produces) and
-    /// an idle timer can take a new one. Without a number tying an answer to its question, a
-    /// stale success releases a lock nobody authenticated against. See [`accepts_outcome`].
+    /// `Locked`. `#[serde(skip)]` for the same reason as `requested`. A PAM outcome outlives the
+    /// lock it was started for (`pam_unix` ~1s, `PAM_EXCHANGE_TIMEOUT` allows 30s): the compositor
+    /// can end the lock in that window (`finished` after `locked`, what `loginctl unlock-session`
+    /// produces) while an idle timer takes a new one, so a stale success needs a number tying it
+    /// to its question, or it releases a lock nobody authenticated against ([`accepts_outcome`]).
     #[serde(skip)]
     pub acquisition: u64,
 }
 
 /// Everything that can move a [`LockState`]. The Supervisor learns of the lock from three
-/// unrelated places -- a Lua `lock()` call, its own PAM worker, and the Renderer holding the
-/// protocol object -- and this enum lets all three land in one pure [`apply`].
+/// unrelated places (a Lua `lock()` call, its own PAM worker, and the Renderer holding the
+/// protocol object), and this enum lets all three land in one pure [`apply`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LockEvent {
     /// `lock.lock()` reached [`dispatch`] and the `SetSessionLock` is on its way out.
     LockRequested,
     /// A `secure_submit(lock, authenticate)` arrived and its PAM conversation is starting.
     AuthenticationStarted,
-    /// That conversation's answer, straight from the re-exec'd worker (ADR-0028). Reached
-    /// only through [`LockController::record_authentication`], which checks the answer against
-    /// the lock it was started for.
+    /// That conversation's answer, straight from the re-exec'd worker (ADR-0028), checked by
+    /// [`LockController::record_authentication`] against the lock it was started for.
     Authenticated(shared::PamOutcome),
     /// The Renderer holding the lock said what became of it.
     Reported(shared::LockOutcome),
     /// The process holding `ext_session_lock_v1` died without reporting anything (ADR-0058
-    /// decision 4). Not a [`Self::Reported`]: there is no holder left to describe anything. The
-    /// session is still locked at the compositor, which does not unlock on client death; what
-    /// ended is this shell's ability to speak for it.
+    /// decision 4): not a [`Self::Reported`], since no holder remains. The compositor does not
+    /// unlock on client death, so the session stays locked; only this shell's ability to speak
+    /// for it ended.
     RendererLost,
 }
 
 /// The whole transition table, pure and synchronous so every case is unit-testable without a
-/// socket or a real PAM stack.
-///
-/// Only the Renderer's own report moves `active`. Neither the request to lock nor a successful
-/// password moves it: both are orders the compositor has not confirmed yet, and a lock screen
-/// that believed either would paint the wrong thing.
+/// socket or a real PAM stack. Only the Renderer's own report moves `active`; neither the lock
+/// request nor a successful password does, since both are unconfirmed orders a lock screen must
+/// not paint as if true.
 pub fn apply(state: &mut LockState, event: LockEvent) {
     match event {
-        // Drop the previous attempt's refusal reason: a config fixed by an in-place reload must
-        // not keep showing why the old config failed (ADR-0052 decision 3).
+        // Drop the previous refusal reason: an in-place reload must not keep showing why the
+        // old config failed (ADR-0052 decision 3).
         LockEvent::LockRequested => {
             state.requested = true;
             state.error.clear();
@@ -100,9 +89,8 @@ pub fn apply(state: &mut LockState, event: LockEvent) {
             state.attempts += 1;
             state.error = error_for_outcome(&outcome);
         }
-        // The one place `acquisition` moves: a confirmed lock is a different lock from the one
-        // before it, and every answer still in flight from the previous one is about a lock
-        // that's gone (see [`accepts_outcome`]).
+        // The one place `acquisition` moves: a confirmed lock differs from the last, so an
+        // in-flight answer from that lock is now about one that's gone (see [`accepts_outcome`]).
         LockEvent::Reported(shared::LockOutcome::Locked) => {
             state.active = true;
             state.requested = false;
@@ -118,22 +106,17 @@ pub fn apply(state: &mut LockState, event: LockEvent) {
             state.authenticating = false;
             state.error = reason;
         }
-        // `Finished` after `Locked` is a compositor teardown, not a failure this capability
-        // reports: with the lock surfaces gone, the Renderer sets `oblisk.rescue` itself
-        // (ADR-0052 decision 4). `attempts` is left alone -- it resets on the next
-        // acquisition, the only point a count "since acquired" means anything.
+        // `Finished` after `Locked` is a teardown, not a failure this reports: the Renderer sets
+        // `oblisk.rescue` once the lock surfaces are gone (ADR-0052 decision 4). `attempts` stays.
         LockEvent::Reported(shared::LockOutcome::Finished | shared::LockOutcome::Unlocked) => {
             state.active = false;
             state.requested = false;
             state.authenticating = false;
             state.error.clear();
         }
-        // `active` means "this shell holds the lock", false after a crash even though the
-        // session is still locked. Clearing it lets a replacement re-acquire at all
-        // ([`LockController::lock`] drops a request while `active`). `authenticating` clears in
-        // the same arm (see [`accepts_outcome`]): every transition clearing `active` releases the
-        // conversation slot too. `acquisition` does not move -- only a confirmed `Locked` numbers
-        // a lock. `error` is left alone so a refusal's reason survives.
+        // `active` means "this shell holds the lock", cleared here so a replacement can
+        // re-acquire ([`LockController::lock`] drops a request while `active`); `authenticating`
+        // clears with it (see [`accepts_outcome`]). `acquisition` stays put and `error` survives.
         LockEvent::RendererLost => {
             state.active = false;
             state.requested = false;
@@ -143,20 +126,18 @@ pub fn apply(state: &mut LockState, event: LockEvent) {
 }
 
 /// ADR-0042: what defers a generation swap. Only one client may hold a session lock, so
-/// candidate `N+1` cannot acquire the one generation `N` holds or is mid-acquiring. `requested`
-/// is the half a report hasn't resolved yet: ignoring it would reap the lock holder mid-handshake
-/// and leave the compositor locked with nobody able to unlock it.
+/// candidate `N+1` cannot acquire the one `N` holds or is mid-acquiring; `requested` is the half a
+/// report hasn't resolved, and ignoring it would reap the lock holder mid-handshake with nobody
+/// left able to unlock the compositor.
 pub fn defers_swap(state: &LockState) -> bool {
     state.active || state.requested
 }
 
 /// What one [`shared::LockOutcome`] says about the compositor's session lock, a different
-/// question from the one [`apply`] answers (ADR-0060).
-///
-/// `LockState.active` means "this shell holds the lock". The compositor's lock outlives that:
-/// `RendererLost` clears `active` while the session stays locked (the compositor does not unlock
-/// on client death), so reading the marker off `active` would erase the fact a restarted
-/// Supervisor needs. Read off the outcome instead, where `RendererLost` cannot reach it.
+/// question from the one [`apply`] answers (ADR-0060). `LockState.active` means "this shell holds
+/// the lock", but the compositor's lock outlives that: `RendererLost` clears `active` while the
+/// session stays locked (no unlock on client death). A restarted Supervisor reads the outcome
+/// instead, where `RendererLost` cannot erase the fact it needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionLock {
     Taken,
@@ -178,15 +159,11 @@ pub fn compositor_lock_change(outcome: &shared::LockOutcome) -> SessionLock {
 }
 
 /// The one piece of lock state that outlives the Supervisor process (ADR-0060): a file in
-/// `$XDG_RUNTIME_DIR` that exists exactly while the compositor is locked.
-///
-/// Exists because a restarted Supervisor's [`LockState`] is `Default`, so `active` reads false
-/// while the compositor is still locked from before, and the new shell paints its bar behind a
-/// lock fallback nothing can see (ADR-0058, 0059).
-///
-/// A file, not anything richer: the question is a boolean and the storage must survive
-/// `SIGKILL`. `$XDG_RUNTIME_DIR`, not config/state: it goes away with the user's last session,
-/// bounding how stale the answer can get.
+/// `$XDG_RUNTIME_DIR` that exists exactly while the compositor is locked. A restarted
+/// Supervisor's [`LockState`] is `Default`, so without it `active` would read false while still
+/// locked from before, painting the bar behind an invisible lock fallback (ADR-0058, 0059). A
+/// file, not richer, since the question is a boolean and storage must survive `SIGKILL`;
+/// `$XDG_RUNTIME_DIR`, not config/state, bounds staleness by going with the last session.
 pub struct SessionLockedFlag {
     path: std::path::PathBuf,
 }
@@ -198,18 +175,15 @@ impl SessionLockedFlag {
         Self { path }
     }
 
-    /// Whether the compositor was locked when whoever wrote this last spoke.
-    ///
-    /// A read error reads as "not locked", the wrong direction on purpose: the alternative is a
-    /// Supervisor that can't read one file and locks the screen at every boot until someone works
-    /// out why.
+    /// Whether the compositor was locked when whoever wrote this last spoke. A read error reads
+    /// as "not locked", the wrong direction on purpose: the alternative is a Supervisor that
+    /// can't read one file and locks the screen at every boot until someone works out why.
     pub fn is_set(&self) -> bool {
         self.path.exists()
     }
 
-    /// Idempotent in both directions -- both repeat in ordinary use: two `Locked` reports across
-    /// two acquisitions, and a `Finished` landing after an `Unlocked` already cleared it.
-    ///
+    /// Idempotent in both directions, since both repeat in ordinary use: two `Locked` reports
+    /// across two acquisitions, and a `Finished` landing after an `Unlocked` already cleared it.
     /// Failures are logged and swallowed: a marker that failed to appear costs a relock after a
     /// crash that may never happen, and one that failed to clear costs one password prompt.
     pub fn apply(&self, change: SessionLock) {
@@ -238,32 +212,24 @@ impl SessionLockedFlag {
 }
 
 /// Whether a `secure_submit(lock, authenticate)` may start a PAM conversation. Two independent
-/// refusals:
-///
-/// - Without `active`, the capability is an unbounded password oracle: nothing stops a config
-///   textfield calling it, and authentication is scoped to the lock screen, which is exactly
-///   `active`.
-/// - Without `!authenticating`, a held-down Enter key spawns one re-exec'd PAM worker per
-///   keypress, each holding a plaintext secret copy and burning `pam_unix`'s failure delay.
+/// refusals: without `active`, authentication (scoped to the lock screen) is an unbounded
+/// password oracle any config textfield could call; without `!authenticating`, a held-down Enter
+/// key spawns one re-exec'd PAM worker per keypress, each holding a plaintext secret copy and
+/// burning `pam_unix`'s failure delay.
 pub fn may_authenticate(state: &LockState) -> bool {
     state.active && !state.authenticating
 }
 
 /// Whether an answer tagged `acquisition` (from [`LockController::try_begin_authentication`]) is
-/// still about the lock on the glass. `active` catches an answer arriving after the compositor
-/// tore the lock down with nothing taking a new one. `acquisition` catches the bypass: between
-/// the worker starting and answering, a `Finished` can end lock N and something else take lock
-/// N+1, so `active` is true again by the time the answer lands and only the number says the
-/// password was typed against a lock that's gone.
-///
-/// This also bounds the hole `!authenticating` alone can't close: a teardown clears
-/// `authenticating` while the first worker still runs, admitting a second against the new lock
-/// with two plaintext copies live at once, bound to different acquisitions -- at most one answer
-/// is ever applied, and the older worker's copy dies with it inside `PAM_EXCHANGE_TIMEOUT`.
-///
-/// Dropping the event on a mismatch cannot strand `authenticating` (what `pam_worker::
-/// ReportOnDrop` guards against): every [`apply`] arm clearing `active` or moving `acquisition`
-/// clears `authenticating` in the same arm.
+/// still about the lock on the glass, not merely whether one is held: between a worker starting
+/// and answering, a `Finished` can end lock N while something else takes lock N+1, so `active`
+/// alone reads true again before the stale answer lands, and only the number says which lock the
+/// password was typed against. It also closes what `!authenticating` alone can't: a teardown
+/// clears it while the first worker still runs, admitting a second with two plaintext copies live
+/// at once, bound to different acquisitions (at most one answer applies; the older copy dies
+/// with it inside `PAM_EXCHANGE_TIMEOUT`). A mismatch drops the event but cannot strand
+/// `authenticating` (`pam_worker::ReportOnDrop` guards against that): every [`apply`] arm clearing
+/// `active` or `acquisition` clears `authenticating` too.
 pub fn accepts_outcome(state: &LockState, acquisition: u64) -> bool {
     state.active && state.acquisition == acquisition
 }
@@ -282,8 +248,7 @@ fn error_for_outcome(outcome: &shared::PamOutcome) -> String {
 }
 
 /// Owns [`LockState`] and the outbound `SetSessionLock` queue. Not `Clone` (unlike
-/// `KeyboardController`): every mutation happens inline in `main.rs`'s `select!`, so no spawned
-/// task needs a copy.
+/// `KeyboardController`): every mutation is inline in `main.rs`'s `select!`, no copy needed.
 pub struct LockController {
     state: Mutex<LockState>,
     commands_tx: UnboundedSender<shared::SetSessionLock>,
@@ -296,21 +261,15 @@ impl LockController {
         Self { state: Mutex::new(LockState::default()), commands_tx }
     }
 
-    /// `lock.lock()`.
+    /// `lock.lock()`. A `lock()` against a lock already on the glass is dropped here, not recorded
+    /// and sent: `requested` must never be set by a request nothing will resolve. The Renderer's
+    /// `lock_command` answers `Nothing` for `(locked: true, lock_held: true)` with no `LockReport`,
+    /// so recording the request would shut the swap gate on an event that never comes.
     ///
-    /// A `lock()` against a lock already on the glass is dropped here, not recorded and sent:
-    /// `requested` must never be set by a request nothing will resolve. The Renderer's
-    /// `lock_command` answers `Nothing` for `(locked: true, lock_held: true)`, and `Nothing`
-    /// emits no `LockReport` -- recording the request would shut the swap gate on an event that
-    /// never comes.
-    ///
-    /// ponytail: this reads `active` to predict what the Renderer already holds, and the two
-    /// disagree for as long as a `Finished` report is in flight -- the compositor ended the lock,
-    /// the Renderer holds nothing, and a `lock()` landing in that window is dropped instead of
-    /// taking a new lock. The window is one socket hop, and the failure is a lost lock request,
-    /// not a wrongly released lock, which is why this is the direction to be wrong in. Upgrade
-    /// path: have the Renderer report `Nothing` as a `LockOutcome` too, so every request has a
-    /// resolving event and this guard goes away.
+    /// ponytail: reads `active` to predict what the Renderer holds, which disagrees with it for
+    /// one socket hop while a `Finished` report is in flight, dropping a `lock()` landing there
+    /// instead of taking a new lock. Upgrade path: have the Renderer report `Nothing` as a
+    /// `LockOutcome` too, so every request has a resolving event and this guard goes away.
     pub fn lock(&self) {
         {
             let mut state = self.state.lock().unwrap();
@@ -325,11 +284,8 @@ impl LockController {
 
     /// Orders the unlock. Not reachable from Lua, deliberately absent from [`dispatch`]: its only
     /// caller is `main.rs`'s `secure_submit(lock, authenticate)` arm on a `PamOutcome::Success`,
-    /// making ADR-0042's "never unlock except on a successful authentication" checkable by
-    /// reading one arm.
-    ///
-    /// Records no event: `active` clears when the Renderer reports `Unlocked`, not when the order
-    /// goes out, per [`apply`]'s invariant.
+    /// making ADR-0042's "never unlock except on a successful authentication" checkable by reading
+    /// one arm. Records no event: `active` clears on the Renderer's `Unlocked` report, not here.
     pub fn unlock(&self) {
         self.send(shared::SetSessionLock { locked: false });
     }
@@ -342,19 +298,16 @@ impl LockController {
         self.state.lock().unwrap().clone()
     }
 
-    /// [`defers_swap`] against the live state -- `main.rs`'s `TopologyChanged` gate.
+    /// [`defers_swap`] against the live state: `main.rs`'s `TopologyChanged` gate.
     pub fn defers_swap(&self) -> bool {
         defers_swap(&self.state.lock().unwrap())
     }
 
-    /// Admits at most one PAM conversation at a time and marks it started, or refuses. One
-    /// method, not a `may_authenticate` getter followed by a `record`: the check and the mark
-    /// must happen under the same lock, since `main.rs` spawns the conversation rather than
-    /// awaiting it inline.
-    ///
-    /// The `Some` carries the acquisition the conversation is about, to be carried back to
-    /// [`Self::record_authentication`] -- handed out here because a worker outlives the lock it
-    /// was started for, and this is the only moment the right number is knowable.
+    /// Admits at most one PAM conversation at a time and marks it started, or refuses. One method,
+    /// not a `may_authenticate` getter then a `record`: the check and the mark share a lock, since
+    /// `main.rs` spawns the conversation instead of awaiting it inline. The `Some` carries the
+    /// acquisition for [`Self::record_authentication`]: a worker outlives the lock it started
+    /// for, so this is the only moment the right number is knowable.
     pub fn try_begin_authentication(&self) -> Option<u64> {
         let mut state = self.state.lock().unwrap();
         if !may_authenticate(&state) {
@@ -364,10 +317,9 @@ impl LockController {
         Some(state.acquisition)
     }
 
-    /// Applies a PAM answer to the lock it was started for, or refuses it. Returns whether it was
-    /// applied, so the caller (`main.rs`'s `pam_outcomes` arm) knows not to order an unlock: a
-    /// refused `Success` is a password typed against a lock that no longer exists (see
-    /// [`accepts_outcome`]).
+    /// Applies a PAM answer to the lock it was started for, or refuses it, so the caller
+    /// (`main.rs`'s `pam_outcomes` arm) knows not to order an unlock: a refused `Success` is a
+    /// password typed against a lock that no longer exists (see [`accepts_outcome`]).
     pub fn record_authentication(&self, acquisition: u64, outcome: shared::PamOutcome) -> bool {
         let mut state = self.state.lock().unwrap();
         if !accepts_outcome(&state, acquisition) {
@@ -377,7 +329,7 @@ impl LockController {
         true
     }
 
-    /// A closed channel means `main.rs`'s loop is gone -- logged and dropped.
+    /// A closed channel means `main.rs`'s loop is gone; logged and dropped.
     fn send(&self, command: shared::SetSessionLock) {
         if self.commands_tx.send(command).is_err() {
             eprintln!("lock: the command channel is closed; dropping {command:?}");
@@ -386,12 +338,10 @@ impl LockController {
 }
 
 /// Every action `oblisk.lock:invoke(...)` accepts. `dispatch` matches this rather than a string,
-/// so a variant with no arm (or an arm with no variant) fails the build.
-///
-/// Locking is the one direction a config may command. There is no `unlock` variant: a lock
-/// screen's `button` callbacks run while its Lua tree is the only thing on the glass, so an
-/// `unlock` action would be a one-click path past PAM -- exactly what ADR-0042 forbids.
-/// `"unlock"` names no variant, so it is logged and dropped like any other unanswered name.
+/// so a variant with no arm (or an arm with no variant) fails the build. There is no `unlock`
+/// variant: a lock screen's `button` callbacks run while its Lua tree is the only thing on the
+/// glass, and that action would be a one-click path past PAM, exactly what ADR-0042 forbids.
+/// `"unlock"` names no variant, so it's logged and dropped like any other unanswered name.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum LockAction {

@@ -1,8 +1,7 @@
 //! The tracked-state maps behind `oblisk.audio`: per-app streams, video sources, sinks/sources,
-//! and `MixerState`, the struct the registry listener in `registry` mutates on every PipeWire
-//! event. Also the pure parsing helpers (`classify`, `parse_stream_props`, ...) neither
-//! `registry` nor `write` need to touch a live PipeWire proxy to run, which is what keeps them
-//! unit-testable against recorded `pw-dump` properties instead of a live daemon.
+//! and `MixerState`, the struct `registry`'s listener mutates on every PipeWire event. Also the
+//! pure parsing helpers (`classify`, `parse_stream_props`, ...), unit-testable against recorded
+//! `pw-dump` properties without touching a live PipeWire proxy.
 
 use std::collections::HashMap;
 use std::fs;
@@ -15,27 +14,23 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::capabilities::audio::master;
 
-/// `media.class` value stream playback nodes carry. Verified against real `pw-dump` output --
-/// see the module doc comment.
+/// `media.class` value stream playback nodes carry. Verified against real `pw-dump` output, see
+/// the module doc comment.
 const STREAM_OUTPUT_AUDIO: &str = "Stream/Output/Audio";
 
-/// `media.class` value a camera-capture PipeWire node carries (ADR-0034). Tracked here,
-/// not a second PipeWire connection, purely as a name-enrichment source for `oblisk.privacy`'s
-/// camera detection -- PipeWire only sees the portal-routed subset of camera users, so this is
-/// supplementary to that capability's own kernel-level detection, never primary.
+/// `media.class` value a camera-capture PipeWire node carries (ADR-0034), tracked purely as a
+/// name-enrichment source for `oblisk.privacy`'s camera detection: PipeWire sees only the
+/// portal-routed subset, so this supplements that capability's own kernel-level detection.
 const VIDEO_SOURCE: &str = "Video/Source";
 
 /// One playback stream node PipeWire has advertised, filtered to
-/// `media.class == "Stream/Output/Audio"` and resolved to its owning process.
-///
-/// `Serialize`: this is what `main.rs` puts in a `StateSnapshot`'s `payload`, pushed to the
-/// Renderer over the control socket as-is. Field names match § 2.4's spelling (`id`, `name`,
-/// ADR-0053 decision 3). `pid`/`process_name` are kept even though § 2.4 doesn't list them
-/// -- ADR-0016 exists because finding the owning process was genuinely hard, and discarding
-/// that answer would throw away the one part of this payload that took real work.
+/// `media.class == "Stream/Output/Audio"` and resolved to its owning process. `main.rs` puts
+/// this as-is in a `StateSnapshot`'s `payload`. Field names match § 2.4's spelling (`id`, `name`,
+/// ADR-0053 decision 3); `pid`/`process_name` are kept beyond § 2.4 because ADR-0016's
+/// owning-process lookup was hard-won and worth keeping.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AppStream {
-    /// PipeWire registry id of the stream node -- the key [`AudioApps`] tracks entries by.
+    /// PipeWire registry id of the stream node: the key [`AudioApps`] tracks entries by.
     pub id: u32,
     /// `application.process.id`: the pid PipeWire recorded for the stream's owning process.
     pub pid: i32,
@@ -43,19 +38,16 @@ pub struct AppStream {
     pub name: Option<String>,
     /// `/proc/{pid}/comm` for `pid`, if the process still existed when this stream was seen.
     pub process_name: Option<String>,
-    /// § 2.4's per-app volume, range `[0.0, 1.0]`. Read from this stream node's own
-    /// `SPA_PARAM_Props` through the same cube-root conversion the master sink uses (see
-    /// [`master`]): a stream stores `channelVolumes` cubed exactly as a sink does, confirmed
-    /// with `pw-cli enum-params <id> Props` against a live playback stream. `1.0` until that
-    /// param arrives, PipeWire's own untouched value for a stream never adjusted.
+    /// § 2.4's per-app volume, range `[0.0, 1.0]`, read from `SPA_PARAM_Props` through the same
+    /// cube-root conversion the master sink uses (see [`master`]): `pw-cli enum-params <id>
+    /// Props` confirms a stream cubes `channelVolumes` like a sink. `1.0` until that param arrives.
     pub volume: f32,
     /// § 2.4's per-app mute, from the same `Props` param as `volume`.
     pub muted: bool,
 }
 
-/// String key/value lookup PipeWire property dicts implement -- lets the parsing below run
-/// against both a live `DictRef` and, in tests, a plain map built from recorded `pw-dump`
-/// output.
+/// String key/value lookup PipeWire property dicts implement, so the parsing below runs against
+/// both a live `DictRef` and, in tests, a plain map built from recorded `pw-dump` output.
 pub(super) trait PropsLookup {
     fn get_prop(&self, key: &str) -> Option<&str>;
 }
@@ -84,10 +76,9 @@ fn is_stream_output_audio(props: &impl PropsLookup) -> bool {
     props.get_prop(*keys::MEDIA_CLASS) == Some(STREAM_OUTPUT_AUDIO)
 }
 
-/// Which of the two node kinds this listener tracks a `global` event as, decided once at
-/// `global` time and carried into the bound node's `info` closure -- an `info` event's own
-/// props dict can be empty (a state-only change), so the kind can't be re-derived from every
-/// `info` call, only remembered from the classification made here.
+/// Which node kind this listener tracks a `global` event as, decided at `global` time and
+/// carried into the bound node's `info` closure: an `info` event's own props dict can be empty
+/// (a state-only change), so the kind must be remembered, not re-derived per `info` call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NodeKind {
     Audio,
@@ -123,8 +114,8 @@ fn resolve_process_name(pid: i32) -> Option<String> {
     Some(comm.trim_end().to_string())
 }
 
-/// Parses `props` and resolves the owning process's name in one step -- what both the
-/// registry `global` handler and the bound node's `info` handler call.
+/// Parses `props` and resolves the owning process's name in one step: what both the registry
+/// `global` handler and the bound node's `info` handler call.
 fn build_app_stream(node_id: u32, props: &impl PropsLookup) -> Option<AppStream> {
     let parsed = parse_stream_props(props)?;
     let process_name = resolve_process_name(parsed.pid);
@@ -133,22 +124,20 @@ fn build_app_stream(node_id: u32, props: &impl PropsLookup) -> Option<AppStream>
         pid: parsed.pid,
         name: parsed.app_name,
         process_name,
-        // What PipeWire itself reports for a stream nobody has touched, confirmed with a live
-        // pw-cli enum-params <id> Props. Replaced as soon as this node's own Props param
-        // arrives. Not MasterVolume::default()'s 0.0: that's the right unknown for a master
-        // volume nothing has resolved yet, wrong here, where silence is a state a stream can
-        // really be in.
+        // What PipeWire reports for an untouched stream, confirmed live with pw-cli
+        // enum-params <id> Props; replaced once this node's own Props param arrives. Not
+        // MasterVolume::default()'s 0.0, which is right for an unresolved master: silence is a
+        // state a stream can really be in.
         volume: 1.0,
         muted: false,
     })
 }
 
-/// Applies one bound node's `info` event to `apps`. `has_props_change` is whether the event's
-/// `change_mask` included `NodeChangeMask::PROPS` -- a state-only or params/ports-only info
-/// event carries an empty props dict instead. Skipping the upsert/remove decision on those keeps
-/// a still-live stream from being dropped over an unrelated notification. Safe to gate
-/// unconditionally: PipeWire's `global_bind` always sends the first `info` call for a freshly
-/// bound node with every change-mask bit set, PROPS included.
+/// Applies one bound node's `info` event to `apps`. `has_props_change` is whether
+/// `change_mask` included `NodeChangeMask::PROPS`: a state-only event carries an empty props
+/// dict, and skipping upsert/remove on those keeps a still-live stream from being dropped over
+/// an unrelated notification. Safe unconditionally: `global_bind`'s first `info` call always
+/// sets every change-mask bit, PROPS included.
 pub(super) fn apply_info_event(
     apps: &mut AudioApps,
     node_id: u32,
@@ -200,7 +189,7 @@ impl AudioApps {
 /// volume/mute plus the per-app stream list.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AudioState {
-    /// Master output volume, range `[0.0, 1.0]` -- see [`master`]'s module doc comment for how
+    /// Master output volume, range `[0.0, 1.0]`; see [`master`]'s module doc comment for how
     /// this is derived from the default sink's `channelVolumes`.
     pub volume: f32,
     /// Master output mute.
@@ -209,25 +198,21 @@ pub struct AudioState {
     pub sinks: Vec<AudioDevice>,
     /// Every input device, on the same terms as [`AudioState::sinks`].
     pub sources: Vec<AudioDevice>,
-    /// One entry per application playing audio right now. Empty when nothing is, which is the
-    /// normal state and not an error.
+    /// One entry per app playing audio right now; empty is normal, not an error.
     pub apps: Vec<AppStream>,
 }
 
-/// One § 2.4 `sinks`/`sources` entry. Both arrays are the same three fields, so they are the
-/// same type: an output and an input differ in which `media.class` produced them and in
-/// nothing a config reads.
-///
-/// `name` is § 2.4's "user-friendly description", which is `node.description` (`"Built-in Audio
-/// Analog Stereo"`), not the `node.name` the metadata keys route by
-/// (`"alsa_output.pci-0000_00_1f.3.analog-stereo"`). Both exist on every device this machine
-/// advertises, and only one is meant for a person.
+/// One § 2.4 `sinks`/`sources` entry. Both arrays share this one type: an output and an input
+/// differ only in which `media.class` produced them, never in what a config reads. `name` is
+/// § 2.4's "user-friendly description": `node.description` (`"Built-in Audio Analog Stereo"`),
+/// not the routing `node.name` (`"alsa_output.pci-0000_00_1f.3.analog-stereo"`). Both exist on
+/// every device this machine advertises; only one is meant for a person.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct AudioDevice {
     /// PipeWire registry id, which is what `audio:set_default_sink(id)` takes.
     pub id: u32,
-    /// The device description, e.g. `"Built-in Audio Analog Stereo"`, which is what to draw. Not
-    /// stable across a reboot; [`AudioDevice::id`] is not either.
+    /// The device description, e.g. `"Built-in Audio Analog Stereo"`. Not stable across a
+    /// reboot; [`AudioDevice::id`] is not either.
     pub name: String,
     /// Whether this is the device the `default.audio.sink`/`default.audio.source` metadata key
     /// currently routes to.
@@ -257,8 +242,8 @@ impl DeviceNames {
 pub(super) struct SinkEntry {
     pub(super) names: DeviceNames,
     /// The raw `Props` last read off this node, or `None` before its first `param` event. Raw,
-    /// not the derived [`master::MasterVolume`]: the write path needs the channel count and the
-    /// mute the caller is not changing.
+    /// not [`master::MasterVolume`]: the write path needs the channel count and mute the caller
+    /// isn't changing.
     pub(super) props: Option<master::RawSinkProps>,
     /// The hardware device behind this sink, for sinks that have one. `None` for a virtual or
     /// null sink, whose volume really does live on the node.
@@ -301,11 +286,10 @@ pub(super) fn device_display_name(props: &impl PropsLookup) -> Option<String> {
 }
 
 /// One `Video/Source` node PipeWire has advertised, resolved just enough for `oblisk.privacy`'s
-/// name-enrichment (ADR-0034): `pid` is what a kernel-detected `/dev/videoN` opener's own
-/// pid gets matched against; `app_name` is the nicer name PipeWire supplies for the match. No
-/// `process_name` field (unlike [`AppStream`]) -- `oblisk.privacy`'s own `/proc/{pid}/comm`
-/// fallback already covers that case for pids PipeWire doesn't see at all, so resolving it here
-/// too would be redundant work this capability never reads.
+/// name-enrichment (ADR-0034): `pid` is matched against a kernel-detected `/dev/videoN`
+/// opener's own pid; `app_name` is the nicer name PipeWire supplies for the match. No
+/// `process_name` field (unlike [`AppStream`]): `oblisk.privacy`'s own `/proc/{pid}/comm`
+/// fallback already covers pids PipeWire doesn't see, so resolving one here too is redundant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct VideoSourceApp {
     pub node_id: u32,
@@ -314,7 +298,7 @@ pub struct VideoSourceApp {
 }
 
 /// Parses `props` into a [`VideoSourceApp`] if it's a `Video/Source` node with a valid
-/// `application.process.id` -- mirrors [`parse_stream_props`], one field simpler.
+/// `application.process.id`; mirrors [`parse_stream_props`], one field simpler.
 fn parse_video_source_props(node_id: u32, props: &impl PropsLookup) -> Option<VideoSourceApp> {
     if props.get_prop(*keys::MEDIA_CLASS) != Some(VIDEO_SOURCE) {
         return None;
@@ -324,7 +308,7 @@ fn parse_video_source_props(node_id: u32, props: &impl PropsLookup) -> Option<Vi
     Some(VideoSourceApp { node_id, pid, app_name })
 }
 
-/// Applies one bound `Video/Source` node's `info` event -- mirrors [`apply_info_event`]'s
+/// Applies one bound `Video/Source` node's `info` event; mirrors [`apply_info_event`]'s
 /// props-change gating exactly (the same PipeWire event-ordering quirks, not specific to audio).
 pub(super) fn apply_video_info_event(
     sources: &mut VideoSourceApps,
@@ -343,9 +327,9 @@ pub(super) fn apply_video_info_event(
     }
 }
 
-/// Live `Video/Source` node list, keyed by PipeWire node id -- mirrors [`AudioApps`]'s shape
-/// (duplicated rather than made generic over the two: this codebase keeps small near-identical
-/// collections boring and separate rather than generic).
+/// Live `Video/Source` node list, keyed by PipeWire node id. Mirrors [`AudioApps`]'s shape,
+/// duplicated rather than made generic: this codebase keeps small near-identical collections
+/// boring and separate.
 #[derive(Debug, Default)]
 pub struct VideoSourceApps {
     sources: HashMap<u32, VideoSourceApp>,
@@ -360,10 +344,9 @@ impl VideoSourceApps {
         self.sources.insert(source.node_id, source);
     }
 
-    /// Returns whether an entry was actually present and removed -- lets `global_remove` (which
-    /// doesn't know in advance whether a removed node id was an audio stream or a video source)
-    /// decide which of the two update channels to publish on, without tracking node kind
-    /// separately from which collection holds it.
+    /// Whether an entry was actually present and removed: lets `global_remove`, which doesn't
+    /// know in advance whether a removed node id was a stream or a video source, pick which
+    /// update channel to publish on without tracking node kind separately.
     pub fn remove(&mut self, node_id: u32) -> bool {
         self.sources.remove(&node_id).is_some()
     }
@@ -375,17 +358,15 @@ impl VideoSourceApps {
     }
 }
 
-/// One § 3.2 audio write, crossing from the tokio runtime into the PipeWire loop.
+/// One § 3.2 audio write, crossing from the tokio runtime into the PipeWire loop. A channel,
+/// not a method call: every proxy here is `!Send`, dispatched only by the thread's own blocking
+/// `main_loop.run()`. `pipewire::channel` hands the loop an eventfd to poll beside its own
+/// sources, so a command applies between two PipeWire events rather than racing them.
 ///
-/// A channel, not a method call: every proxy this thread holds is `!Send`, and the loop that
-/// dispatches them is the thread's own blocking `main_loop.run()`. `pipewire::channel` hands the
-/// loop an eventfd to poll beside its own sources, so a command applies between two PipeWire
-/// events rather than racing them.
-///
-/// Ids are PipeWire registry ids, matching § 2.4's `sinks`/`sources`/`apps` arrays, resolved
-/// against the live maps at apply time. An id whose node has gone away since the config read it
-/// is logged and dropped: PipeWire recycles registry ids, so acting on a stale one is how a
-/// volume change lands on somebody else's stream.
+/// Ids are PipeWire registry ids from § 2.4's `sinks`/`sources`/`apps` arrays, resolved against
+/// the live maps at apply time. A node gone since the config read it is logged and dropped:
+/// PipeWire recycles registry ids, so acting on a stale one would land a volume change on
+/// somebody else's stream.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AudioCommand {
     SetMasterVolume(f32),
@@ -397,30 +378,27 @@ pub enum AudioCommand {
     SetAppMuted { id: u32, muted: bool },
 }
 
-/// Shared state the registry/node listener closures mutate: the running app/video-source lists,
-/// the bound `Node` proxies (and their listeners) that keep property-change events flowing, and
-/// where updated snapshots get sent. Held for the thread's whole lifetime -- see the `run` doc
-/// comment for what a graceful shutdown would need that doesn't exist yet.
+/// Shared state the registry/node listeners mutate: app/video-source lists, the bound `Node`
+/// proxies/listeners keeping property-change events flowing, and where snapshots get sent. Held
+/// for the thread's lifetime; see `run`'s doc comment for what graceful shutdown still lacks.
 ///
 /// The `sink_*`/`metadata*`/`default_sink_name` fields are § 2.4's master-volume tracking
-/// (ADR-0053 decision 3) -- see [`master`]. `sink_nodes` is separate from `nodes` (which
-/// only holds stream/video-source proxies) because a sink's proxy outlives its own,
-/// differently-shaped `param` listener rather than the `info` listener `nodes` entries carry.
+/// (ADR-0053 decision 3, see [`master`]). `sink_nodes` is separate from `nodes` (stream/video
+/// only): a sink's proxy carries a differently-shaped `param` listener, not `nodes`' `info`.
 pub(super) struct MixerState {
     pub(super) apps: AudioApps,
     pub(super) video_sources: VideoSourceApps,
     pub(super) nodes: HashMap<u32, (pw::node::Node, pw::node::NodeListener)>,
     pub(super) updates: UnboundedSender<AudioState>,
     pub(super) video_updates: UnboundedSender<Vec<VideoSourceApp>>,
-    /// `Audio/Sink` node id -> everything tracked about that sink (see `registry::bind_sink` for why
-    /// `info` isn't needed here the way it is for stream nodes).
+    /// `Audio/Sink` node id -> everything tracked about that sink (`info` isn't needed here the
+    /// way it is for stream nodes; see `registry::bind_sink`).
     pub(super) sinks: HashMap<u32, SinkEntry>,
-    /// Bound sink proxies and their `param` listeners, kept alive for the same reason `nodes`
-    /// keeps stream/video-source proxies alive. Separate from `sinks` so that struct stays plain
-    /// data a test can build.
+    /// Bound sink proxies and their `param` listeners, kept alive like `nodes` keeps
+    /// stream/video-source proxies. Separate from `sinks` so that struct stays plain test data.
     pub(super) sink_nodes: HashMap<u32, (pw::node::Node, pw::node::NodeListener)>,
-    /// `Audio/Source` node id -> its two names. No proxy and no listener beside them: § 2.4's
-    /// source object needs nothing a `global` event doesn't already carry (see `registry::AUDIO_SOURCE`).
+    /// `Audio/Source` node id -> its two names. No proxy or listener: § 2.4's source object
+    /// needs nothing a `global` event doesn't already carry (see `registry::AUDIO_SOURCE`).
     pub(super) sources: HashMap<u32, DeviceNames>,
     /// Bound ALSA `Device` proxies and their `param` listeners. Bound only for the write path:
     /// a hardware sink's volume lives on its device's `Route` param, not on the node, so without
@@ -432,30 +410,29 @@ pub(super) struct MixerState {
     /// `Stream/Output/Audio` node id -> that stream's own raw `Props` values. The same type a
     /// sink uses, since it's the same pod shape parsed by the same function.
     pub(super) app_props: HashMap<u32, master::RawSinkProps>,
-    /// The `node.name` the `default` metadata object's `default.audio.sink` and
-    /// `default.audio.source` keys currently name, or `None` before that property has ever
-    /// arrived this run.
+    /// The `node.name` the `default` metadata object's `default.audio.sink`/`default.audio.source`
+    /// keys currently name, or `None` before that property has arrived this run.
     pub(super) default_sink_name: Option<String>,
     pub(super) default_source_name: Option<String>,
     /// The bound `default` `Metadata` proxy/listener, and the registry id it was bound from (so
-    /// `global_remove` can tell whether a removed id was this object -- `Metadata` exposes no id
+    /// `global_remove` can tell whether a removed id was this object; `Metadata` exposes no id
     /// accessor). `None` until `on_global` finds the `metadata.name == "default"` global.
     pub(super) metadata: Option<(pw::metadata::Metadata, pw::metadata::MetadataListener)>,
     pub(super) metadata_id: Option<u32>,
 }
 
 impl MixerState {
-    /// A dropped receiver means nothing is draining yet, or the process is mid-shutdown -- not
-    /// a reason to stop tracking streams.
+    /// A dropped receiver means nothing is draining yet, or the process is mid-shutdown: not a
+    /// reason to stop tracking streams.
     pub(super) fn publish_audio(&self) {
         let master = master::compute_master(
             self.default_sink_name.as_deref(),
             self.sinks.iter().map(|(&id, sink)| (id, sink.names.node_name.as_str())),
             |id| self.sinks.get(&id).and_then(|sink| sink.props.clone()),
         );
-        // Applied here, not inside AudioApps: a stream's identity and volume arrive on two
-        // different PipeWire events (info and param) with no ordering between them, and folding
-        // volume into the entry at info time would overwrite a reading already landed.
+        // Applied here, not inside AudioApps: identity and volume arrive on two different
+        // PipeWire events (info, param) with no ordering, so folding volume in at info time
+        // could overwrite a reading already landed.
         let apps = self
             .apps
             .snapshot()
@@ -486,9 +463,8 @@ impl MixerState {
     }
 }
 
-/// Which of the two default-device names a metadata `property` event is about. An enum rather
-/// than a bool so the arm that reads the key and the arm that writes the field name the same
-/// thing.
+/// Which of the two default-device names a metadata `property` event is about; an enum, not a
+/// bool, so the key-reading arm and the field-writing arm name the same thing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DefaultDevice {
     Sink,

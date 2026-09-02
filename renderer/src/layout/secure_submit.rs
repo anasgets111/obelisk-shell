@@ -1,14 +1,13 @@
 //! Which `secure_submit` destinations a resolved tree declares, and whether a `lock` surface built
 //! from that tree can be authenticated out of (`CONTEXT.md`, **Secure submit**).
 //!
-//! Here rather than in `crate::wayland::input`, where these grew: every one of them takes a
+//! Here, not in `crate::wayland::input` where these grew: everything here takes a
 //! [`ResolvedNode`](crate::layout::ResolvedNode) or a
-//! [`SecureSubmitTarget`](crate::layout::node::SecureSubmitTarget) and returns one, so they are
-//! tree analysis that input routing consumes rather than input routing itself. Their three callers
-//! sit in three different modules (`wayland::input` arms the keyboard from them, `wayland::lock`
-//! grants the lock, `crate::socket` vetoes a reload), and while they lived under `wayland` the last
-//! of those had to reach back into `crate::wayland` by fully-qualified path for a predicate the
-//! module re-exported upward for it alone.
+//! [`SecureSubmitTarget`](crate::layout::node::SecureSubmitTarget) and returns one, tree analysis
+//! that input routing consumes rather than performs. The three callers sit in three modules
+//! (`wayland::input` arms the keyboard, `wayland::lock` grants the lock, `crate::socket` vetoes a
+//! reload); under `wayland`, the last of those needed a fully-qualified path back into
+//! `crate::wayland` for a predicate the module re-exported upward for it alone.
 
 use crate::layout::instance::SurfaceInstance;
 use crate::layout::node::{self, SecureSubmitTarget};
@@ -16,35 +15,35 @@ use crate::layout::{ResolvedNode, Scene};
 
 /// The `(capability, action)` pair that reaches PAM, and the only one that can ever end a session
 /// lock. `supervisor/src/main.rs` routes `SecureSubmit { capability: "lock", action:
-/// "authenticate" }` to the PAM worker and answers a `PamOutcome::Success` with the one
-/// `SetSessionLock { locked: false }` this process will ever see; every other pair lands in some
-/// other capability's dispatch and can no more unlock the session than a `print` could.
+/// "authenticate" }` to the PAM worker and answers `PamOutcome::Success` with the one
+/// `SetSessionLock { locked: false }` this process will ever see; every other pair cannot unlock
+/// the session.
 const UNLOCK_TARGET: (&str, &str) = ("lock", "authenticate");
 
 /// Whether this destination is the one that ends a session lock.
 ///
-/// Named rather than compared inline because two callers want it for opposite reasons:
-/// `wayland::lock`'s `lock_command` refuses a lock screen that has no such field, and nothing else
-/// may quietly grow a second opinion about which pair unlocks. See [`UNLOCK_TARGET`].
+/// Named rather than compared inline: `wayland::lock`'s `lock_command` refuses a lock screen with
+/// no such field, and nothing else may quietly grow a second opinion about which pair unlocks.
+/// See [`UNLOCK_TARGET`].
 fn unlocks_the_session(target: &SecureSubmitTarget) -> bool {
     (target.capability.as_str(), target.action.as_str()) == UNLOCK_TARGET
 }
 
 /// Every `secure_submit` destination a resolved tree declares, in document order.
 ///
-/// Whole-tree, unlike `wayland::input`'s `focused_target`: a press names one node and walks a hit
-/// path for the innermost, but these callers have no node to start from -- asking what a surface
-/// offers before any event has arrived on it.
+/// Whole-tree, unlike `wayland::input`'s `focused_target`, which walks a hit path from one node
+/// for the innermost: these callers have no node to start from, asking what a surface offers
+/// before any event has arrived.
 ///
-/// Reads the target `node::paint_style` already parsed, so there is no malformed case left to
-/// skip: a `secure_submit` that does not parse now fails `Scene::apply` and this never sees the
-/// tree. A `None` here is a `textfield` that declared no destination at all.
+/// Reads `node::paint_style` already parsed, so there is no malformed case left to skip: an
+/// unparseable `secure_submit` fails `Scene::apply` first. `None` here is a `textfield` that
+/// declared no destination.
 ///
 /// **Not the admission rule.** Asking whether *any* target here unlocks is the bug
 /// [`tree_can_authenticate`] exists to have fixed: it grants a lock the keyboard then arms nothing
-/// on, and the compositor does not unlock when the client dies. Admission and focus read
-/// [`sole_secure_submit`]. This is `pub(crate)` for `wayland::input`'s `focus_on_enter`, which
-/// asks the different question of whether a field it already holds is still declared.
+/// on, since the compositor does not unlock when the client dies. Admission and focus both read
+/// [`sole_secure_submit`] instead; this is `pub(crate)` only for `wayland::input`'s
+/// `focus_on_enter`, asking whether a field it already holds is still declared.
 pub(crate) fn secure_submit_targets(tree: &ResolvedNode) -> Vec<SecureSubmitTarget> {
     let mut found = Vec::new();
     let mut stack = vec![tree];

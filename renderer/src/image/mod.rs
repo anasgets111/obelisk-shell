@@ -1,17 +1,13 @@
-//! Decodes a file into a GPU texture, caches it, and fits it into a box (ADR-0054).
+//! Decodes a file into a GPU texture, caches it, and fits it into a box (ADR-0054). PNG and JPEG
+//! decode through the `image` crate ([`decode_raster`]); SVG decodes through `resvg`, needed
+//! because Adwaita ships scalable SVG icons.
 //!
-//! PNG and JPEG decode through the `image` crate ([`decode_raster`]). SVG decodes through `resvg`,
-//! needed because Adwaita ships scalable SVG icons.
-//!
-//! The cache key is the path, and for SVG only, the rasterized pixel size: a raster file has one
-//! decode regardless of the box it lands in, but a vector rasterized for a 12px box would be
-//! served blurry to a 24px box under a path-only key. The key also carries the file's mtime and
-//! length (ADR-0031), so a producer that overwrites a path in place -- the tray does -- gets
-//! a fresh texture rather than the one it wrote last time.
-//!
-//! Failures are cached too, as `None`, so an unreadable file or `.svgz` (see [`rasterize_svg`])
-//! isn't retried every frame from inside `layout::paint`'s draw loop. A *missing* file is the one
-//! failure that still retries, because its key changes the moment it appears.
+//! The cache key is the path plus, for SVG only, the rasterized pixel size: a raster file decodes
+//! once regardless of the box, but a vector rasterized for a 12px box would look blurry served to
+//! a 24px box under a path-only key. It also carries the file's mtime and length (ADR-0031), so
+//! the tray overwriting a path in place still gets a fresh texture. Failures are cached too, as
+//! `None`, so an unreadable file or `.svgz` (see [`rasterize_svg`]) isn't retried every frame from
+//! `layout::paint`'s draw loop; a *missing* file still retries since its key changes on appearing.
 
 pub mod icons;
 
@@ -25,14 +21,11 @@ use femtovg::{Canvas, ErrorKind, ImageFlags, ImageId, ImageSource};
 
 use crate::text::snap::LogicalRect;
 
-/// Entries, not bytes.
-///
-/// ponytail: oldest-out, which is FIFO rather than the LRU `oblisk-supervisor-services-dbus.md`
-/// § 9.2 asks for, so a wallpaper loaded once at startup is evicted before a tray icon loaded
-/// forty times. FIFO is a `VecDeque` and a counter; LRU needs a touch on every hit and either a
-/// dependency or an intrusive list. The eviction that actually matters is by bytes rather than by
-/// count (ADR-0043's budget: one 4K wallpaper is 32 MB and 127 tray icons are not), and
-/// neither is worth building before there is a cache to measure.
+/// Entries, not bytes. ponytail: oldest-out FIFO, not the LRU
+/// `oblisk-supervisor-services-dbus.md` § 9.2 asks for, so a wallpaper loaded once at startup is
+/// evicted before a tray icon loaded forty times. Evicting by bytes (ADR-0043's budget: one 4K
+/// wallpaper is 32 MB, 127 tray icons are not) matters more than LRU, and neither is worth
+/// building before there is a cache to measure.
 const CACHE_CAPACITY: usize = 128;
 
 /// One cache slot. `raster_px` is the longest edge the SVG was rasterized for, or `0` for a file
@@ -42,22 +35,18 @@ struct CacheKey {
     path: PathBuf,
     raster_px: u32,
     version: FileVersion,
-    /// The `currentColor` value this texture was rasterized with, packed `0x00RRGGBB`
-    /// (ADR-0072). `None` for a raster file and for an untinted SVG. Part of the key because
-    /// one theme file drawn white on the bar and dim in a popup is two textures, and without it the
-    /// first tint would win for the life of the process.
+    /// The `currentColor` value this texture was rasterized with, packed `0x00RRGGBB` (ADR-0072).
+    /// `None` for a raster file and an untinted SVG. Part of the key because one theme file drawn
+    /// white on the bar and dim in a popup is two textures, else the first tint wins for good.
     tint: Option<u32>,
 }
 
 /// What tells one revision of a file from the next, at a path that keeps its name (ADR-0031's
-/// deferred item: the tray spools every icon update over the same
-/// `/dev/shm/oblisk-$UID/tray/{name}.png`, no revision suffix).
-///
-/// Mtime and length together, not a content hash: tmpfs mtime is nanosecond-precise, length is
-/// free, and hashing would mean reading the file to decide whether to read the file.
-///
-/// A file that cannot be stat'd takes the default, which is what makes a *missing* file retry
-/// instead of staying negatively cached forever: once it appears, its key changes.
+/// deferred item: the tray spools every icon update over `/dev/shm/oblisk-$UID/tray/{name}.png`,
+/// no revision suffix). Mtime and length, not a content hash: tmpfs mtime is nanosecond-precise,
+/// length is free, and hashing would mean reading the file to decide whether to read it. A file
+/// that cannot be stat'd takes the default, so a *missing* file retries instead of staying cached
+/// negative forever.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 struct FileVersion {
     mtime_secs: i64,
@@ -105,9 +94,8 @@ impl Fit {
     }
 }
 
-/// Path-and-size to uploaded texture, for one generation (`CONTEXT.md`, **Image cache**).
-///
-/// Not shared with the Supervisor and not persisted: the Renderer is swapped as an OS process on
+/// Path-and-size to uploaded texture, for one generation (`CONTEXT.md`, **Image cache**). Not
+/// shared with the Supervisor and not persisted: the Renderer is swapped as an OS process on
 /// every reload, so this is cold again after each config edit (ADR-0054).
 pub struct ImageCache {
     entries: HashMap<CacheKey, Option<ImageId>>,
@@ -127,42 +115,26 @@ impl ImageCache {
         ImageCache { entries: HashMap::new(), order: VecDeque::new(), evicted: Vec::new() }
     }
 
-    /// Frees the textures evicted during the previous frame. `layout::paint::paint_tree` calls this
-    /// before it walks anything.
-    ///
-    /// Cannot happen where the eviction does: femtovg batches a frame's draw calls and resolves an
-    /// `ImageId` to a texture at `flush`, not at `fill_path`, so deleting mid-walk unbinds a
-    /// texture an already-recorded command still names -- and femtovg answers a missing id with
-    /// default paint parameters rather than a failure, so the symptom is a silently blank image.
+    /// Frees textures evicted last frame; `layout::paint::paint_tree` calls this before walking
+    /// anything, since femtovg resolves an `ImageId` to a texture at `flush`, not `fill_path`, so
+    /// deleting mid-walk unbinds a texture a recorded command still names, drawing silently blank.
     pub fn release_evicted(&mut self, canvas: &mut Canvas<OpenGl>) {
         for id in self.evicted.drain(..) {
             canvas.delete_image(id);
         }
     }
 
-    /// The uploaded texture for `path`, decoding and uploading on the first ask. `box_px` is the
-    /// longest edge of the box this will be drawn into, in physical pixels, and is what an SVG
-    /// rasterizes against; a raster file ignores it.
+    /// The uploaded texture for `path`, decoding and uploading on the first ask. `box_px`, the
+    /// longest edge of the box in physical pixels, is what an SVG rasterizes against; a raster
+    /// file ignores it. `None` for anything that did not decode, logged once, not once per frame.
+    /// The canvas must be current on the calling thread, the only one that paints since ADR-0039.
+    /// Stats the file on every call, including a hit, since the key carries its revision (see
+    /// [`FileVersion`]): one `stat` per node per frame, six hundred a second for ten icons at 60Hz.
     ///
-    /// `None` for anything that did not decode, logged once rather than once per frame. The canvas
-    /// must be current on the calling thread, which since ADR-0039 is the only thread that
-    /// paints.
-    ///
-    /// Stats the file on every call, including a hit, because the key carries the file's revision
-    /// (see [`FileVersion`]). That is one `stat` per image node per frame -- six hundred a second
-    /// for ten icons at 60Hz against tmpfs -- and is the cheapest correct answer: the alternative
-    /// to asking whether the bytes changed is re-reading them to find out.
-    ///
-    /// ponytail: a miss reads the file, and for an SVG rasterizes it, inside the frame. That thread
-    /// is also the Wayland dispatch thread and the one the config VM runs on (ADR-0039), so a
-    /// cold `list` of thirty tray icons on a cold page cache is thirty `open`/`read` pairs plus
-    /// thirty resvg renders before the first `swap_buffers`. Steady state after that is one hash
-    /// lookup per node per frame, which is why this is a startup and reload cost rather than a
-    /// per-frame one. The upgrade path is the shape `text::shaping` already has: hand the path and
-    /// the size to a worker, return `None` for this frame, and mark the scene dirty when the upload
-    /// is ready (ADR-0044 decision 2). That is also
-    /// `oblisk-supervisor-services-dbus.md` § 9.2's "off-thread", met on this side of the process
-    /// boundary. Not built now because nothing has measured a dropped frame from it.
+    /// ponytail: a miss reads the file, and for an SVG rasterizes it, inside the frame, which is
+    /// also the Wayland dispatch thread and the config VM's thread (ADR-0039). Upgrade path: the
+    /// shape `text::shaping` already has, a worker plus a dirty flag on upload (ADR-0044 decision
+    /// 2), meeting `oblisk-supervisor-services-dbus.md` § 9.2's "off-thread".
     pub fn image(
         &mut self,
         canvas: &mut Canvas<OpenGl>,
@@ -175,8 +147,8 @@ impl ImageCache {
             path: path.to_path_buf(),
             raster_px: if vector { box_px.max(1) } else { 0 },
             version: FileVersion::read(path),
-            // Only a vector can carry a `currentColor`, so a tint on a PNG is dropped rather than
-            // splitting that file's cache slot per colour it will never use.
+            // Only a vector can carry `currentColor`; a PNG's tint is dropped rather than
+            // splitting its cache slot per colour it will never use.
             tint: if vector { tint.map(packed_rgb) } else { None },
         };
         if let Some(cached) = self.entries.get(&key) {
@@ -194,9 +166,8 @@ impl ImageCache {
     }
 
     /// Evicts before inserting, so the map never exceeds [`CACHE_CAPACITY`]. Queues the evicted
-    /// texture for [`ImageCache::release_evicted`] rather than deleting it here: femtovg keys its
-    /// own image store by `ImageId` and frees nothing until told to, so losing the id leaks the GPU
-    /// allocation for the life of the process.
+    /// texture for [`ImageCache::release_evicted`] rather than deleting it here: femtovg frees
+    /// nothing by `ImageId` until told to, so losing the id leaks the GPU allocation for good.
     fn insert(&mut self, key: CacheKey, value: Option<ImageId>) {
         while self.order.len() >= CACHE_CAPACITY {
             let Some(oldest) = self.order.pop_front() else {
@@ -220,15 +191,15 @@ fn is_vector(path: &Path) -> bool {
 fn load(canvas: &mut Canvas<OpenGl>, path: &Path, raster_px: u32, tint: Option<Rgba>) -> Result<ImageId, String> {
     if raster_px == 0 {
         let (pixels, width, height) = decode_raster(path)?;
-        // Straight alpha, which is what the `image` crate produces, so no flag: `PREMULTIPLIED`
-        // below is the SVG path's answer to tiny-skia, not a house default.
+        // Straight alpha, what the `image` crate produces, so no flag: `PREMULTIPLIED` below is
+        // the SVG path's answer to tiny-skia, not a house default.
         let source = ImageSource::from(femtovg::imgref::Img::new(pixels.as_rgba(), width as usize, height as usize));
         return canvas.create_image(source, ImageFlags::empty()).map_err(femtovg_error);
     }
     let (pixels, width, height) = rasterize_svg(path, raster_px, tint)?;
     // `PREMULTIPLIED` because tiny-skia's `Pixmap` is premultiplied RGBA8 and femtovg samples a
-    // texture without this flag as straight alpha -- getting it wrong shows as a dark halo around
-    // every anti-aliased icon edge rather than as an outright failure.
+    // texture without this flag as straight alpha: getting it wrong shows as a dark halo around
+    // every anti-aliased icon edge, not an outright failure.
     let source = ImageSource::from(femtovg::imgref::Img::new(pixels.as_rgba(), width as usize, height as usize));
     canvas.create_image(source, ImageFlags::PREMULTIPLIED).map_err(femtovg_error)
 }
@@ -239,17 +210,12 @@ fn femtovg_error(err: ErrorKind) -> String {
     format!("{err:?}")
 }
 
-/// Decodes a PNG or JPEG to straight-alpha RGBA8, and the reason `image` is a direct dependency
-/// (`renderer/Cargo.toml`).
-///
-/// femtovg's `Canvas::load_image_file` would be the obvious call and cannot decode anything: the
-/// crate declares `image` with `default-features = false` and enables no format, so every PNG
-/// comes back `Unsupported(Exact(Png))`. That took the tray's and the notification daemon's
-/// spooled pixmaps (ADR-0031) with it, since both spool PNG.
-///
-/// `into_rgba8` also covers the grayscale-plus-alpha and 16-bit variants femtovg's own
-/// `ImageSource` conversion refuses outright, and costs nothing when the file already decoded to
-/// RGBA8, which every icon in a theme does.
+/// Decodes a PNG or JPEG to straight-alpha RGBA8, the reason `image` is a direct dependency
+/// (`renderer/Cargo.toml`). femtovg's `Canvas::load_image_file` cannot decode anything: it
+/// declares `image` with `default-features = false` and no format, so every PNG came back
+/// `Unsupported(Exact(Png))`, taking the tray's and notification daemon's spooled pixmaps
+/// (ADR-0031) with it. `into_rgba8` also covers the grayscale-plus-alpha and 16-bit variants
+/// femtovg's own conversion refuses, at no cost since every theme icon already decodes to RGBA8.
 fn decode_raster(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
     let decoded = ::image::open(path).map_err(|err| err.to_string())?;
     let rgba = decoded.into_rgba8();
@@ -258,14 +224,10 @@ fn decode_raster(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
 }
 
 /// Rasterizes at `box_px` on the longest edge, preserving the aspect ratio; [`fitted_rect`] does
-/// the rest.
-///
-/// ponytail: `resvg` is built with no default features, which drops SVG text rendering and gzipped
-/// `.svgz`. Neither has a caller: `freedesktop-icons` only ever returns `.svg` and `.png`, and an
-/// icon with a `<text>` element in it is rare enough that no theme this was tested against has
-/// one. A config passing an absolute `.svgz` path gets one log line and a blank box. The upgrade
-/// is two feature flags (`resvg/svgz`, `resvg/text`), and `text` costs a second `fontdb` that
-/// would then disagree with the one `text::shaping` already loaded the declared font chain into.
+/// the rest. ponytail: `resvg` has no default features, dropping SVG text rendering and gzipped
+/// `.svgz`. A config passing an absolute `.svgz` path gets one log line and a blank box. The
+/// upgrade is two feature flags (`resvg/svgz`, `resvg/text`), and `text` costs a second `fontdb`
+/// that would disagree with the one `text::shaping` already loaded the declared font chain into.
 fn rasterize_svg(path: &Path, box_px: u32, tint: Option<Rgba>) -> Result<(Vec<u8>, u32, u32), String> {
     let data = std::fs::read(path).map_err(|err| err.to_string())?;
     let data = match tint {
@@ -275,9 +237,8 @@ fn rasterize_svg(path: &Path, box_px: u32, tint: Option<Rgba>) -> Result<(Vec<u8
     let tree = resvg::usvg::Tree::from_data(&data, &resvg::usvg::Options::default()).map_err(|err| err.to_string())?;
     let size = tree.size();
     let longest = size.width().max(size.height());
-    // `is_finite` as well as the sign: a NaN here would sail through a bare `<= 0.0` and produce
-    // a NaN `scale`, then a zero-sized pixmap allocation, which is a worse error message than this
-    // one at a further remove from its cause.
+    // `is_finite` as well as the sign: a bare `<= 0.0` lets NaN through to a NaN `scale` and a
+    // zero-sized pixmap allocation, a worse error message further from its cause.
     if !longest.is_finite() || longest <= 0.0 {
         return Err(format!("svg declares a {}x{} viewport", size.width(), size.height()));
     }
@@ -290,9 +251,8 @@ fn rasterize_svg(path: &Path, box_px: u32, tint: Option<Rgba>) -> Result<(Vec<u8
     Ok((pixmap.take(), width, height))
 }
 
-/// `0x00RRGGBB` from a parsed colour, for [`CacheKey`]. Alpha is dropped because it is not part of
-/// what [`tinted_svg`] writes: a CSS `color` is `#RRGGBB`, and an icon's transparency is the draw
-/// call's `alpha` rather than the SVG's.
+/// `0x00RRGGBB` from a parsed colour, for [`CacheKey`]. Alpha is dropped: a CSS `color` is
+/// `#RRGGBB`, and an icon's transparency is the draw call's `alpha`, not the SVG's.
 fn packed_rgb(color: Rgba) -> u32 {
     let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
     (channel(color.r) << 16) | (channel(color.g) << 8) | channel(color.b)
@@ -303,24 +263,17 @@ fn hex_rgb(color: Rgba) -> String {
     format!("#{:06x}", packed_rgb(color))
 }
 
-/// `data` with every `currentColor` made to resolve to `tint`, or `data` untouched when it holds no
-/// `currentColor` at all (ADR-0072).
-///
-/// Two rewrites, because symbolic icons come in two shapes and a theme mixes them freely.
-///
-/// The stylesheet one is what Breeze and Adwaita ship: a `<style id="current-color-scheme">` block
-/// setting `color:#232629` on a class every path carries. That is Breeze *Light*'s text colour
-/// baked into the file, and Plasma rewrites the block at load time rather than reading it. So does
-/// this. Without it the icon draws near-black on a dark bar, which is how this was found.
-///
-/// The root-attribute one covers a file that says `fill="currentColor"` and defines `color`
-/// nowhere, where CSS's own initial value for `color` is black. A presentation attribute on the
-/// root is the weakest thing that still beats nothing, so a file that does define `color` keeps its
-/// own definition and gets it rewritten by the first pass instead.
-///
-/// Byte-level and not a parse: `usvg` resolves `currentColor` while building the tree and exposes
-/// no hook before that. `str::from_utf8` rather than `from_utf8_lossy` so a file that is not UTF-8
-/// is handed back verbatim for `usvg` to reject with its own message.
+/// `data` with every `currentColor` resolved to `tint`, or untouched with none (ADR-0072). Two
+/// rewrites, since symbolic icons come in two shapes a theme mixes freely. The stylesheet one,
+/// what Breeze and Adwaita ship, is a `<style id="current-color-scheme">` block setting
+/// `color:#232629`, Breeze *Light*'s text colour, on a class every path carries; Plasma rewrites
+/// it at load time rather than reading it, and so does this (shipped as-is, the icon draws
+/// near-black on a dark bar). The root-attribute one covers `fill="currentColor"` with no `color`
+/// defined, where CSS's initial value is black; a presentation attribute on the root beats that,
+/// so a file that does define `color` keeps it and is rewritten by the first pass. Byte-level, not
+/// a parse: `usvg` resolves `currentColor` while building the tree with no hook before that.
+/// `str::from_utf8`, not `from_utf8_lossy`, hands a non-UTF-8 file back verbatim for `usvg` to
+/// reject with its own message.
 fn tinted_svg(data: &[u8], tint: Rgba) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(data) else {
         return data.to_vec();
@@ -342,16 +295,12 @@ fn tinted_svg(data: &[u8], tint: Rgba) -> Vec<u8> {
     }
 }
 
-/// Every CSS `color:` declaration in `text` repointed at `hex`.
-///
-/// Only a bare `color`, never `stop-color`, `flood-color` or `lighting-color`: those name a
-/// specific paint rather than the value `currentColor` reads, and rewriting them would flatten a
-/// gradient. The guard is the character before the match, which must not be one an identifier could
-/// continue through.
-///
-/// ponytail: the match is textual, so a `color:` inside an XML comment or an attribute value would
-/// be rewritten too. No theme file this was tested against has one, and the upgrade path is a real
-/// CSS pass over the `<style>` body, which means a CSS parser this crate does not otherwise want.
+/// Every CSS `color:` declaration in `text` repointed at `hex`. Only a bare `color`, never
+/// `stop-color`, `flood-color` or `lighting-color`: those name a specific paint rather than the
+/// value `currentColor` reads, and rewriting them would flatten a gradient. The guard is the
+/// character before the match, which must not continue an identifier. ponytail: the match is
+/// textual, so a `color:` inside an XML comment or attribute value would be rewritten too.
+/// Upgrade path is a real CSS pass over the `<style>` body: a parser this crate does not want.
 fn rewrite_color_declarations(text: &str, hex: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -364,8 +313,8 @@ fn rewrite_color_declarations(text: &str, hex: &str) -> String {
             rest = &rest[after..];
             continue;
         }
-        // The declaration's own value, up to whatever ends it. Replaced whole so `color: #232629`
-        // and `color:#232629` behave the same.
+        // The value, up to whatever ends it, replaced whole so `color: #232629` and `color:#232629`
+        // behave the same.
         let value_len = rest[after..].find([';', '}', '"', '\'']).unwrap_or(rest.len() - after);
         out.push_str(hex);
         rest = &rest[after + value_len..];
@@ -375,12 +324,11 @@ fn rewrite_color_declarations(text: &str, hex: &str) -> String {
 }
 
 /// Where the image itself lands inside `box_rect`, given its own pixel dimensions and a [`Fit`].
-///
 /// Returns the rect the *image* occupies, which for `Cover` is deliberately larger than
-/// `box_rect`: `layout::paint` has already pushed a scissor for the node's box, so the overflow is
-/// cropped by the clip rather than by arithmetic here. femtovg clamps to the edge outside a
-/// paint's extent unless `REPEAT_X`/`REPEAT_Y` are set, so a smaller extent would smear the
-/// image's edge pixels rather than leave a gap -- `Contain` returns the smaller rect instead.
+/// `box_rect`: `layout::paint` already pushed a scissor for the node's box, so the overflow is
+/// cropped by the clip, not by arithmetic here. femtovg clamps to the edge outside a paint's
+/// extent unless `REPEAT_X`/`REPEAT_Y` are set, so a smaller extent would smear the image's edge
+/// pixels rather than leave a gap; `Contain` returns the smaller rect instead.
 pub fn fitted_rect(box_rect: LogicalRect, image_width: f32, image_height: f32, fit: Fit) -> LogicalRect {
     if fit == Fit::Stretch || image_width <= 0.0 || image_height <= 0.0 {
         return box_rect;

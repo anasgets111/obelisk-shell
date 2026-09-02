@@ -1,27 +1,14 @@
 //! Renderer-side Unix control-socket client, and the `SupervisorFrame` handling hanging off it.
-//!
-//! Connects to `$XDG_RUNTIME_DIR/oblisk-shell.sock` as a client; the Supervisor is the listener
-//! (`supervisor/src/socket.rs`). Sends a `shared::ConnectionHandshake` as the first frame, then
-//! holds the connection open.
-//!
-//! Two threads, two channels (ADR-0039): the socket thread only does framed I/O, [`pump`] moving
-//! `SupervisorFrame`s to the Wayland dispatch thread and `RendererFrame`s to the wire. Everything
-//! touching Lua state — [`RendererClient`], its [`Loader`], the retained [`Scene`], the
-//! live-signal map — lives on the *Wayland* thread instead, since `mlua::Lua` is `!Send` and the
-//! paint pass owns the GL context. `crate::wayland::run` calls [`RendererClient::start`] there
-//! and drives [`RendererClient::handle_frame`] from its poll loop.
-//!
-//! A `StateSnapshot` push only hydrates that capability's live signal and marks the scene dirty
-//! (ADR-0044 decision 2); only `SupervisorFrame::Reevaluate` triggers a Lua evaluation, which
-//! `handle_reevaluate` diffs against `applied_topology` as `Unchanged`, `TopologyChanged` or
-//! `Failed`, holding an `Unchanged` result as `pending` until `ApplyPendingReload` names its
-//! sequence. `applied_topology == None` means "safe to apply", not "empty topology": a startup
-//! failure has nothing to protect, so misclassifying it as `TopologyChanged` would blank the
-//! shell.
-//!
-//! Reconnection on a dropped connection is refused, not deferred (ADR-0059 decision 1): the
-//! Supervisor holds every capability, `process.run` child and PAM, so there is no shell left
-//! here to reconnect with.
+//! Connects to `$XDG_RUNTIME_DIR/oblisk-shell.sock`; the Supervisor listens
+//! (`supervisor/src/socket.rs`) and gets a `shared::ConnectionHandshake` as the first frame.
+//! Two threads, two channels (ADR-0039): the socket thread only does framed I/O ([`pump`]); Lua
+//! state lives on the *Wayland* thread instead, since `mlua::Lua` is `!Send` and the paint pass
+//! owns the GL context. A `StateSnapshot` only hydrates a capability's signal and dirties the scene
+//! (ADR-0044 decision 2); only `Reevaluate` triggers a Lua evaluation, classified as `Unchanged`,
+//! `TopologyChanged` or `Failed` against `applied_topology`, `None` meaning "safe to apply", not
+//! "empty topology" (misclassifying a startup failure would blank the shell). A dropped
+//! connection is not reconnected (ADR-0059 decision 1): the Supervisor holds every capability,
+//! `process.run` child and PAM, so nothing here is left to reconnect with.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -48,9 +35,8 @@ use crate::lua::surfaces::{evaluate_and_specs, surface_specs};
 use crate::lua::{self, Loader};
 use crate::text::shaping::ShapingHandle;
 
-/// This Renderer's own generation id (`OBLISK_GENERATION_ID`, defaulting to `0`). Read once in
-/// `main`, then handed to both threads: the socket thread stamps it into the handshake, the
-/// Wayland thread stamps it into every outbound `CommandEnvelope` and `SecureSubmit`.
+/// This Renderer's own generation id (`OBLISK_GENERATION_ID`, defaulting to `0`), stamped into
+/// the handshake and every outbound `CommandEnvelope`/`SecureSubmit`.
 pub fn generation_id_from_env() -> u32 {
     std::env::var(shared::GENERATION_ID_ENV).ok().and_then(|value| value.parse().ok()).unwrap_or(0)
 }
@@ -66,11 +52,9 @@ async fn connect_and_handshake(
     Ok(stream)
 }
 
-/// Spawns the dedicated connect-and-hold-open thread. A connection failure (wrong path, a
-/// Supervisor that is not there) logs and ends this thread, which drops `inbound_tx`, which the
-/// Wayland thread reads as `Disconnected` and exits on (ADR-0059 decision 1). No startup
-/// race to tolerate: `supervisor/src/main.rs` binds the control socket before spawning the first
-/// Renderer.
+/// Spawns the dedicated connect-and-hold-open thread. A connection failure logs and drops
+/// `inbound_tx`, read by the Wayland thread as `Disconnected` (ADR-0059 decision 1). No startup
+/// race: `supervisor/src/main.rs` binds the control socket before spawning the first Renderer.
 pub fn spawn_client(
     generation_id: u32,
     inbound_tx: std::sync::mpsc::Sender<SupervisorFrame>,
@@ -88,23 +72,14 @@ pub fn spawn_client(
     });
 }
 
-/// One connection's reload bookkeeping. `applied_topology` is the topology this generation's
-/// surfaces were built from, `None` only when no evaluation has produced one (see the module doc
-/// comment). `pending` holds the evaluated-but-unapplied output and topology between a
-/// `Reevaluate` that reported `Unchanged` and its matching `ApplyPendingReload`.
-///
-/// `applied_output` is the evaluation later re-resolves run against (ADR-0044 decision 2's
-/// re-resolve target), set by `handle_apply_pending` on a successful apply and by
-/// `run_startup_evaluation` on a successful evaluation (§ 15.2 needs surfaces bound before
-/// anything resolves). It outlives that evaluation so a later push can re-resolve against it
-/// without re-running `shell.lua`.
-///
-/// That safety is a *drop-order* obligation: mlua 0.12's `ValueRef` holds a `WeakLua`, so a
-/// retained `mlua::Value` does not keep the VM alive, and reading one out of a dead state
-/// panics via `ValueRef::to_pointer`, which `LoadOutput`'s derived `Debug` reaches — only
-/// `ValueRef::Drop` survives a dead state, via `try_lock`. `Lua` must therefore outlive every
-/// retained value, which Rust's declaration-order field drop enforces: see [`RendererClient`]'s
-/// field ordering.
+/// One connection's reload bookkeeping. `applied_topology` is this generation's surface
+/// topology, `None` only when nothing has evaluated yet (module doc comment). `pending` holds
+/// the evaluated-but-unapplied output/topology between an `Unchanged` `Reevaluate` and its
+/// `ApplyPendingReload`. `applied_output` is ADR-0044 decision 2's re-resolve target (§ 15.2),
+/// outliving its evaluation so a later push skips re-running `shell.lua`. mlua 0.12's `ValueRef`
+/// holds a `WeakLua`, so a retained `mlua::Value` doesn't keep the VM alive and panics via
+/// `ValueRef::to_pointer` on a dead state; `Lua` must outlive it, per Rust's field-drop order
+/// (see [`RendererClient`]).
 struct ReloadState {
     applied_topology: Option<Vec<SurfaceFingerprint>>,
     applied_output: Option<lua::LoadOutput>,
@@ -112,98 +87,68 @@ struct ReloadState {
 }
 
 /// What one inbound [`SupervisorFrame`] still owes the Wayland thread after
-/// [`RendererClient::handle_frame`] has done everything it can do on its own.
-///
-/// One enum, not an `Option<u64>` plus a second out-parameter: `ActivateDraw` and
-/// `SetSessionLock` are the two frames whose work lives on `crate::wayland::App` (EGL and surface
-/// state for the first, SCTK's `SessionLockState` and the lock surfaces for the second,
-/// ADR-0042), and a second `Option` beside the first would let a caller service both, neither,
-/// or the wrong one.
-///
-/// `Handled` is not "nothing happened": most frames, a `StateSnapshot` hydrating a signal, a
-/// `Reevaluate` producing a report, do their whole job inside `handle_frame` and owe the caller
-/// only the knowledge that they did.
+/// [`RendererClient::handle_frame`]. One enum, not an `Option<u64>` plus an out-parameter:
+/// `ActivateDraw` and `SetSessionLock` are the two frames whose work lives on
+/// `crate::wayland::App` (EGL/surface state for the first, SCTK's `SessionLockState` and lock
+/// surfaces for the second, ADR-0042), and two `Option`s could let a caller service both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameOutcome {
     /// Fully serviced inside [`RendererClient::handle_frame`].
     Handled,
-    /// § 15.3's `ActivateDraw`: draw the announced surface set and request presentation feedback
-    /// for each, tagged with this nonce (`crate::wayland::App::activate_draw`).
+    /// § 15.3's `ActivateDraw`: draw the surface set, request presentation feedback per surface,
+    /// tagged with this nonce (`crate::wayland::App::activate_draw`).
     ActivateDraw(u64),
-    /// ADR-0042/ADR-0052's `SetSessionLock`: make the session lock match this flag
+    /// ADR-0042/ADR-0052's `SetSessionLock`: match the session lock to this flag
     /// (`crate::wayland::App::set_session_lock`).
     SetSessionLock(bool),
 }
 
-/// One generation's whole Lua side: the VM, the retained scene, the live signals, and the
-/// reload bookkeeping, grouped so they travel as one receiver instead of a long parameter list.
-///
-/// `!Send`, deliberately: `crate::wayland::App` owns one of these directly (ADR-0039), so a Lua
-/// closure, a scene reconcile, and the EGL context are all reachable from one another without a
-/// channel hop.
-///
-/// **The field order below is load-bearing: `loader` must stay last.** Almost every other field
-/// holds `mlua::Value`s belonging to that `Loader`'s VM, which do not keep the VM alive (see
-/// [`ReloadState`]'s doc comment on `ValueRef`'s `WeakLua`). Declaring `loader` first would drop
-/// the `Lua` before them, and a read after that panics through the same `ValueRef::to_pointer`
-/// path. Do not reorder `loader` back up.
+/// One generation's whole Lua side: the VM, the retained scene, the live signals, and reload
+/// bookkeeping, grouped to travel as one receiver. `!Send` deliberately: `crate::wayland::App`
+/// owns one directly (ADR-0039), so a Lua closure, a scene reconcile, and the EGL context are
+/// all reachable without a channel hop. **Field order is load-bearing: `loader` must stay
+/// last**, since almost every other field holds `mlua::Value`s that don't keep the VM alive (see
+/// [`ReloadState`]'s doc comment on `ValueRef`'s `WeakLua`); `loader` first would drop `Lua`
+/// before them and panic.
 pub struct RendererClient {
     shell_lua_path: PathBuf,
     scene: Scene,
-    /// The `(surface, output)` pairs this generation is currently resolving
-    /// (`layout::instance::expand_instances`). Owned here because [`Self::apply_instances`],
-    /// [`Self::handle_apply_pending`], and [`Self::re_resolve_if_dirty`] all need the same set,
-    /// and only `crate::wayland` knows the outputs they expanded from.
+    /// The `(surface, output)` pairs this generation is resolving (`expand_instances`); shared by
+    /// [`Self::apply_instances`], [`Self::handle_apply_pending`], [`Self::re_resolve_if_dirty`].
     instances: Vec<SurfaceInstance>,
-    /// Whether this process is holding, or has just asked for, a session lock, written only by
-    /// `crate::wayland::App::set_session_lock` and its teardown paths, through
-    /// [`Self::set_session_locked`].
-    ///
-    /// The arming half of [`lock_stays_authenticatable`]: `SurfaceFingerprint::Lock` carries only
-    /// the `id`, so editing a lock's `child` reads as `Unchanged` and reloads *in place*, and
-    /// deleting the password field while the lock is up would leave no way out but a VT switch.
-    ///
-    /// **A `bool`, not the instance ids.** A remembered list could not survive a hotplug (`Scene`
-    /// keeps a retired instance's tree standing), so the veto reads [`Self::instances`] instead,
-    /// kept current by `set_instances`.
+    /// Whether this process holds or has asked for a session lock, via
+    /// [`Self::set_session_locked`]. Arms [`lock_stays_authenticatable`]:
+    /// `SurfaceFingerprint::Lock` carries only the `id`, so a lock's `child` reads `Unchanged`
+    /// and reloads *in place*, and deleting the password field while up would leave no way out
+    /// but a VT switch. Written only by `crate::wayland::App::set_session_lock` and its teardown.
+    /// **A `bool`, not instance ids**: a list couldn't survive a hotplug, so the veto reads
+    /// [`Self::instances`] instead.
     holds_session_lock: bool,
-    /// A clone of the one `ShapingHandle` `crate::wayland::App` also holds: one worker thread
-    /// and one `FontSystem` for the whole process (ADR-0023).
+    /// A clone of `crate::wayland::App`'s `ShapingHandle`: one worker thread, one `FontSystem`
+    /// for the whole process (ADR-0023).
     shaping: ShapingHandle,
-    /// One handle per capability seen so far, keyed by `StateSnapshot.capability`
-    /// (ADR-0029); every `shared::Capability::ALL` roster name is seeded at construction
-    /// (ADR-0037), and an unrostered capability is added lazily by `apply_state_snapshot`.
-    /// `RefCell`, not `&mut self`: `apply_state_snapshot` is called through a `&self` receiver.
+    /// One handle per capability, keyed by `StateSnapshot.capability` (ADR-0029), seeded from
+    /// `shared::Capability::ALL` at construction (ADR-0037). `RefCell`: reached via `&self`.
     capabilities: RefCell<HashMap<String, CapabilityHandle>>,
-    /// Cloned into every [`Capability`] this client builds, including the lazy path's. Kept
-    /// rather than consumed by the constructor because that lazy path builds a `Capability` long
-    /// after `new` has returned.
+    /// Cloned into every [`Capability`] this client builds, including the lazy path's.
     commands: CommandSender,
     rescue_handle: LiveSignalHandle,
-    /// `oblisk.screens`'s handle (ADR-0041 decision 2). Renderer-sourced, so deliberately
-    /// not in `capabilities` above or `shared::Capability::ALL`. See `lua::namespace`'s
-    /// `register_screens_signal`.
+    /// `oblisk.screens`'s handle (ADR-0041 decision 2), Renderer-sourced, not in `capabilities`.
     screens_handle: LiveSignalHandle,
-    /// What `screens_handle` currently holds, mirrored as JSON so [`Self::set_screens`] can tell
-    /// a real output change from a re-push of the same list.
+    /// What `screens_handle` holds, mirrored as JSON so [`Self::set_screens`] detects real change.
     screens_payload: serde_json::Value,
-    /// What `rescue_handle` currently holds, mirrored as a plain tuple so
-    /// [`Self::set_rescue_state`] can tell a real change from a no-op rewrite.
+    /// What `rescue_handle` holds, mirrored so [`Self::set_rescue_state`] can detect a no-op.
     rescue_state: (bool, String),
     process_registry: ProcessRegistry,
-    /// `oblisk.idle`'s threshold callbacks (ADR-0032). Renderer-sourced like
-    /// `screens_handle`, so deliberately not in `capabilities`: see `lua::idle`.
+    /// `oblisk.idle`'s threshold callbacks (ADR-0032), Renderer-sourced like `screens_handle`.
     idle_registry: crate::lua::idle::IdleRegistry,
-    /// The scene-dirty flag (ADR-0044 decision 2). Cloned into every `LiveSignalHandle` this
-    /// client hands out, so a `set` on any of them marks this same flag.
+    /// The scene-dirty flag (ADR-0044 decision 2), cloned into every `LiveSignalHandle` handed out.
     dirty: DirtyFlag,
     state: ReloadState,
-    /// Where a `ReevaluateReport` goes: the socket thread's [`pump`] drains this and writes each
-    /// frame to the wire.
+    /// Where a `ReevaluateReport` goes: the socket thread's [`pump`] drains this to the wire.
     outbound_tx: mpsc::UnboundedSender<RendererFrame>,
-    /// The `oblisk` table itself, held so [`Self::capability_handle`]'s lazy path can add a
-    /// member to it after construction. Above `loader` for the drop-order reason this struct's
-    /// own doc comment gives.
+    /// The `oblisk` table, so [`Self::capability_handle`] can add a member later. Above `loader`
+    /// for this struct's own drop-order reason.
     oblisk: mlua::Table,
     /// Last, and that is load-bearing: see this struct's own doc comment.
     loader: Loader,
@@ -212,11 +157,9 @@ pub struct RendererClient {
 impl RendererClient {
     /// Builds one generation's entire Lua side on the calling thread: the VM, the rescue signal,
     /// the `process` global's registry, and the capability roster's seeded signals. Called from
-    /// `crate::wayland::run`, never the socket thread, since `mlua::Lua` is `!Send` and must be
-    /// constructed on the thread that runs it (ADR-0039).
-    ///
-    /// Every failure here is fatal to the process rather than logged-and-survived: a Renderer
-    /// with no VM can never evaluate `shell.lua` or put anything on screen.
+    /// `crate::wayland::run`, never the socket thread: `mlua::Lua` is `!Send` and must be built
+    /// on the thread that runs it (ADR-0039). Fatal on failure: a Renderer with no VM can never
+    /// evaluate `shell.lua` or put anything on screen.
     pub fn start(
         shaping: ShapingHandle,
         outbound_tx: mpsc::UnboundedSender<RendererFrame>,
@@ -224,12 +167,10 @@ impl RendererClient {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let shell_lua_path =
             shared::shell_lua_path().map_err(|err| format!("failed to resolve shell.lua's path: {err}"))?;
-        // One flag for this whole generation (ADR-0044 decision 2), created before anything that
-        // hands out a `LiveSignalHandle` so the rescue signal shares it too.
+        // One flag for the whole generation (ADR-0044 decision 2), so the rescue signal shares it.
         let dirty = DirtyFlag::new();
-        // The directory holding the `shell.lua` about to be evaluated, where `require` will look
-        // and nowhere else (ADR-0047 decision 1). Taken from the resolved path rather than by
-        // asking `shared::config_dir()` a second time, so the two can never disagree.
+        // Where `require` looks and nowhere else (ADR-0047 decision 1); derived here so it can't
+        // disagree with a second `shared::config_dir()` call.
         let config_dir = shell_lua_path.parent().ok_or("shell.lua's path has no parent directory")?.to_path_buf();
         let loader =
             Loader::new(dirty.clone(), &config_dir).map_err(|err| format!("failed to start the Lua loader: {err}"))?;
@@ -237,18 +178,17 @@ impl RendererClient {
         loader
             .register_process(process_registry.clone())
             .map_err(|err| format!("failed to register the process global: {err}"))?;
-        // The one write path § 3.2's commands all take, stamped with the same generation id
-        // `ProcessRegistry` above stamps, from the same source: § 7.3's guard rule drops a
-        // stale-generation packet, so a second source here would be a second way to be ignored.
+        // Same generation id `ProcessRegistry` stamps, so § 7.3's guard can't disagree with it.
+        // § 3.2's commands all take this one write path.
         let commands = CommandSender::new(generation_id, outbound_tx);
         let client = Self::new(loader, shell_lua_path, shaping, commands, process_registry, dirty)
             .map_err(|err| format!("failed to build the `oblisk` namespace: {err}"))?;
         Ok(client)
     }
 
-    /// The `oblisk` namespace is [`lua::namespace::build`]'s, not this function's: it is
-    /// construction rather than frame handling, and [`Self::capability_handle`] holds the lazy
-    /// fallback for an unrostered name because that one *is* reached from a `StateSnapshot`.
+    /// The `oblisk` namespace is [`lua::namespace::build`]'s, not this function's; construction is
+    /// separate from frame handling, and [`Self::capability_handle`] holds the lazy fallback for
+    /// an unrostered name since that one *is* reached from a `StateSnapshot`.
     fn new(
         loader: Loader,
         shell_lua_path: PathBuf,
@@ -257,8 +197,7 @@ impl RendererClient {
         process_registry: ProcessRegistry,
         dirty: DirtyFlag,
     ) -> mlua::Result<Self> {
-        // Taken off `commands` rather than passed alongside it: visibly one channel, not two
-        // clones of one that could drift apart.
+        // Taken off `commands`, not a separate clone that could drift from it.
         let outbound_tx = commands.frames();
         let namespace = lua::namespace::build(&loader, &dirty, &commands, &shell_lua_path)?;
         Ok(Self {
@@ -272,7 +211,7 @@ impl RendererClient {
             rescue_handle: namespace.rescue,
             screens_handle: namespace.screens,
             screens_payload: namespace.screens_payload,
-            // Matches the table `lua::namespace::build` already put in the `rescue` signal.
+            // Matches what `lua::namespace::build` already put in the `rescue` signal.
             rescue_state: (false, String::new()),
             process_registry,
             idle_registry: namespace.idle,
@@ -284,18 +223,12 @@ impl RendererClient {
         })
     }
 
-    /// Writes the `rescue` global's `{ is_rescue, error_log }` table, but only when the value
-    /// actually differs from what is already there.
-    ///
-    /// The early return is a correctness fix, not an optimization: writing through
-    /// `rescue_handle` marks the shared `DirtyFlag` (ADR-0044 decision 2), and rewriting an
-    /// unchanged value would dirty the scene for nothing — or, on a `TopologyChanged` verdict,
-    /// leave the flag set on a generation that must not be mutated. Not the memoization
-    /// ADR-0044 decision 3 rejects: a genuine rescue transition still marks dirty.
-    ///
-    /// `pub` for the third caller, outside this module: `crate::wayland::App`'s
-    /// `SessionLockHandler`, which ADR-0052 decision 4 requires to set `rescue` on a refused
-    /// lock and both `finished` cases — the only channel reaching the user there.
+    /// Writes the `rescue` global's `{ is_rescue, error_log }` table, but only when it differs.
+    /// Not an optimization: writing marks the shared `DirtyFlag` (ADR-0044 decision 2), and a
+    /// rewrite could leave it set on a generation that must not be mutated (not the memoization
+    /// ADR-0044 decision 3 rejects: a genuine transition still dirties). `pub` for
+    /// `crate::wayland::App`'s `SessionLockHandler`, per ADR-0052 decision 4: called on a refused
+    /// lock and both `finished` cases, the only channel reaching the user there.
     pub fn set_rescue_state(&mut self, is_rescue: bool, error_log: &str) {
         if self.rescue_state.0 == is_rescue && self.rescue_state.1 == error_log {
             return;
@@ -309,29 +242,21 @@ impl RendererClient {
         }
     }
 
-    /// `StateSnapshot` pushes only hydrate `snapshot.capability`'s own live signal; no Lua
-    /// evaluation runs from this path (see the module doc comment). `&self`, not `&mut self`:
-    /// the lazy-registration path below needs interior mutability anyway, and `capabilities`'
-    /// own `RefCell` is what lets this stay a read-path method instead of upgrading every caller
-    /// to `&mut self`.
+    /// Only hydrates `snapshot.capability`'s own live signal; no Lua evaluation runs here (module
+    /// doc comment). `&self`: the lazy-registration path below needs `capabilities`' `RefCell`
+    /// anyway.
     fn apply_state_snapshot(&self, snapshot: StateSnapshot) -> mlua::Result<()> {
         let value = self.loader.to_lua_value(&snapshot.payload)?;
-        // Value and revision together: the revision is what a later `oblisk.<name>:invoke(...)`
-        // stamps onto its envelope for § 7.3's staleness guard, and this push is the only thing
-        // that moves it.
+        // The revision is what a later `oblisk.<name>:invoke(...)` stamps for § 7.3's guard.
         self.capability_handle(&snapshot.capability)?.hydrate(value, snapshot.revision);
         Ok(())
     }
 
-    /// Looks up `capability`'s handle, adding a fresh `oblisk.<capability>` member (value `nil`,
-    /// revision `0`) the first time this capability is ever seen (ADR-0029). Unreachable in a
-    /// debug build, since `push_snapshot`'s `debug_assert` rejects an off-roster capability
-    /// before it is sent; in release it just appears under `oblisk` and works.
-    ///
-    /// **It refuses to overwrite a name the table already holds.** `oblisk` also carries
-    /// `rescue`, `screens` and `version`, and `Table::set` over an existing key is silent. An
-    /// off-roster push named `rescue` would replace the signal that reports config failures with
-    /// an empty one: ADR-0052 decision 1's bug, one level down.
+    /// Looks up `capability`'s handle, adding a fresh `oblisk.<capability>` member (`nil`,
+    /// revision `0`) the first time it is seen (ADR-0029); unreachable in a debug build, since
+    /// `push_snapshot`'s `debug_assert` rejects an off-roster capability first. **Refuses to
+    /// overwrite a held name**: `Table::set` is silent over an existing key, and an off-roster
+    /// `rescue` push would replace the config-failure signal (ADR-0052 decision 1's bug).
     fn capability_handle(&self, capability: &str) -> mlua::Result<CapabilityHandle> {
         if let Some(handle) = self.capabilities.borrow().get(capability) {
             return Ok(handle.clone());
@@ -347,24 +272,18 @@ impl RendererClient {
         Ok(handle)
     }
 
-    /// Evaluates `shell.lua` once at startup, no round trip through the Supervisor needed since
-    /// there's no prior applied scene to protect yet. Leaves `state.applied_topology` at `None`
-    /// when the *evaluation* fails (ADR-0024): see the module doc comment for why `None` also
-    /// means "safe to apply". A failed *apply* does not clear it: the caller has already bound
-    /// the declared surfaces, so a later topology change genuinely needs a new generation
-    /// (ADR-0038).
-    ///
-    /// Runs before any layer surface is bound (§ 15.2's order: evaluate, bind, null-buffer,
-    /// signal ready), split from the scene apply by that same ordering: the caller needs the
-    /// returned [`SurfaceSpec`](layout::node::SurfaceSpec)s to expand into surface instances
-    /// before there is anything to resolve a tree against. [`Self::apply_instances`] is the
-    /// other half.
+    /// Evaluates `shell.lua` once at startup; no Supervisor round trip needed yet (ADR-0024,
+    /// "safe to apply" per the module doc comment). `state.applied_topology` stays `None` only
+    /// when the *evaluation* fails; a failed *apply* leaves it, since the caller has already
+    /// bound the declared surfaces and a later topology change needs a new generation (ADR-0038).
+    /// Runs before any layer surface is bound (§ 15.2's order), split so the caller can expand
+    /// the returned [`SurfaceSpec`](layout::node::SurfaceSpec)s via [`Self::apply_instances`].
     pub fn run_startup_evaluation(&mut self) -> Option<Vec<SurfaceSpec>> {
         match evaluate_and_specs(&self.loader, &self.shell_lua_path) {
             Ok((output, specs)) => {
                 self.state.applied_topology = Some(specs.iter().map(SurfaceSpec::fingerprint).collect());
-                // ADR-0044 decision 2: hold the applied evaluation so a later push can re-resolve
-                // against it without re-running shell.lua.
+                // ADR-0044 decision 2's re-resolve target, held so a later push doesn't need
+                // shell.lua re-run.
                 self.state.applied_output = Some(output);
                 Some(specs)
             }
@@ -376,21 +295,16 @@ impl RendererClient {
         }
     }
 
-    /// Replaces the `(surface, output)` pairs this generation resolves against. Called from
-    /// `crate::wayland::run` between the startup evaluation and the first apply, and again from
-    /// `crate::wayland::App`'s `OutputHandler` on every monitor hotplug (ADR-0038 decision 3).
+    /// Replaces the `(surface, output)` pairs this generation resolves against, from
+    /// `crate::wayland::run` before the first apply and from `OutputHandler` on every hotplug
+    /// (ADR-0038 decision 3).
     pub fn set_instances(&mut self, instances: Vec<SurfaceInstance>) {
         self.instances = instances;
     }
 
-    /// Arms or disarms the lock-authentication veto every `Scene::apply` in this module carries
-    /// (ADR-0052 decision 3). `crate::wayland::App::set_session_lock` arms it the moment it asks
-    /// the compositor for the lock, not when `locked` arrives: a reload landing inside that
-    /// window would strip the field out of the tree the compositor is about to show. Every path
-    /// that gives the lock up disarms it.
-    ///
-    /// Carries no instance ids: which surfaces the veto has to defend is a question only the
-    /// apply that is running can answer. See [`Self::holds_session_lock`].
+    /// Arms or disarms the lock-authentication veto every `Scene::apply` carries (ADR-0052
+    /// decision 3), the moment the lock is asked for rather than when `locked` arrives: a reload
+    /// landing in that window would strip the field from the tree the compositor is about to show.
     pub fn set_session_locked(&mut self, locked: bool) {
         self.holds_session_lock = locked;
     }
@@ -401,15 +315,10 @@ impl RendererClient {
         &self.instances
     }
 
-    /// The whole declared surface roster of the evaluation currently applied, re-parsed from the
-    /// retained `applied_output` rather than re-read from `shell.lua`.
-    ///
-    /// This is what a monitor hotplug expands against (ADR-0038 decision 3): the declared set is
-    /// unchanged by an output appearing, and re-evaluating here would both cost an evaluation
-    /// and race the `Reevaluate` the Supervisor is about to send anyway (ADR-0041 decision 4).
-    ///
-    /// Empty when nothing has ever applied (a startup evaluation that failed): there are no
-    /// declared surfaces to expand, so a hotplug adds none.
+    /// The whole declared surface roster of the evaluation applied, re-parsed from
+    /// `applied_output` rather than re-read from `shell.lua`. What a hotplug expands against
+    /// (ADR-0038 decision 3): re-evaluating would race the Supervisor's own `Reevaluate`
+    /// (ADR-0041 decision 4). Empty when nothing has ever applied.
     pub fn applied_surface_specs(&self) -> Vec<SurfaceSpec> {
         let Some(output) = self.state.applied_output.as_ref() else {
             return Vec::new();
@@ -417,37 +326,27 @@ impl RendererClient {
         match surface_specs(output) {
             Ok(specs) => specs,
             Err(err) => {
-                // Unreachable in practice: `applied_output` is only ever stored after
-                // `surface_specs` already succeeded on it, but a panic here would take down a
-                // shell that is painting fine.
+                // Unreachable in practice: `surface_specs` already succeeded on `applied_output`.
+                // Not a panic, which would take down a shell that is painting fine.
                 eprintln!("control-socket client: the applied evaluation's surface specs no longer parse: {err}");
                 Vec::new()
             }
         }
     }
 
-    /// Asks the Supervisor to start a reload cycle (ADR-0041 decision 4), sent when the output
-    /// list changed: a config that loops over `screens` declares a different surface set before
-    /// and after, a topology change and so a generation swap that only the Supervisor decides
-    /// (ADR-0041 decision 3).
-    ///
-    /// Carries no sequence: `supervisor/src/main.rs` owns `next_sequence` and drops any report
-    /// that does not name the one it most recently sent, so this asks it to *begin* a cycle
-    /// rather than fabricating one.
+    /// Asks the Supervisor to start a reload cycle (ADR-0041 decision 4): a topology change only
+    /// it decides (ADR-0041 decision 3). Carries no sequence: `supervisor/src/main.rs` drops any
+    /// report not naming its own `next_sequence`, so this only asks it to *begin* a cycle. Sent
+    /// when a config that loops over `screens` declares a different surface set.
     pub fn request_reload(&self) {
         if let Err(err) = self.outbound_tx.send(RendererFrame::RequestReload) {
             eprintln!("control-socket client: failed to request a reload after an output change: {err}");
         }
     }
 
-    /// Pushes the `screens` signal's new value (ADR-0041 decision 2) and reports whether it
-    /// actually changed.
-    ///
-    /// The early return is the same correctness rule `set_rescue_state` documents, with one extra
-    /// consequence: `update_output` fires for changes this signal does not carry, so re-pushing
-    /// an identical list would both dirty the scene for nothing and, since the caller gates
-    /// [`Self::request_reload`] on this return value, ask for a reload cycle no output change
-    /// justifies.
+    /// Pushes the `screens` signal's new value (ADR-0041 decision 2), reporting whether it
+    /// changed. Same early-return rule as `set_rescue_state`: the caller gates
+    /// [`Self::request_reload`] on this, so a re-push would ask for an unjustified reload too.
     pub fn set_screens(&mut self, payload: serde_json::Value) -> bool {
         if self.screens_payload == payload {
             return false;
@@ -465,35 +364,25 @@ impl RendererClient {
         }
     }
 
-    /// One instance's `available` size, replaced by the size the compositor actually configured
-    /// that surface to, and the scene marked dirty so the next poll turn re-resolves it
-    /// (ADR-0023).
-    ///
-    /// Reuses the one [`DirtyFlag`] ADR-0044 decision 2 already established: a configure and a
-    /// capability push both mean the same thing to the scene, that the resolved geometry no
-    /// longer matches its inputs. An unknown `instance_id` is ignored: silently doing nothing
-    /// beats marking the whole scene dirty over a configure for a surface that shouldn't exist.
+    /// One instance's `available` size, replaced by what the compositor configured, dirtying the
+    /// scene (ADR-0023) via [`DirtyFlag`] from ADR-0044 decision 2. An unknown `instance_id` is
+    /// ignored: doing nothing beats dirtying the whole scene over a surface that shouldn't exist.
     pub fn set_instance_size(&mut self, instance_id: &str, size: layout::LogicalSize) {
         let Some(instance) = self.instances.iter_mut().find(|i| i.instance_id == instance_id) else {
             return;
         };
         if instance.available == size {
-            // Same early-return rule as `set_rescue_state`'s: a configure repeating a size
-            // already resolved against must not claim the scene changed.
+            // Same early-return rule as `set_rescue_state`'s.
             return;
         }
         instance.available = size;
         self.dirty.mark();
     }
 
-    /// Resolves the last evaluation against the current instance set, setting rescue on failure.
-    /// The second half of [`Self::run_startup_evaluation`]'s split; returns whether the apply
-    /// succeeded, so the caller (`crate::wayland::run`) can tell a Candidate that must exit from
-    /// one that may carry on.
-    ///
-    /// Takes no instance argument on purpose: [`Self::set_instances`] is the one place the set is
-    /// written, and the same stored set is what [`Self::re_resolve_if_dirty`] and
-    /// [`Self::handle_apply_pending`] resolve against.
+    /// The second half of [`Self::run_startup_evaluation`]'s split: resolves the last evaluation
+    /// against the current instance set, setting rescue on failure. Returns whether it succeeded,
+    /// so `crate::wayland::run` can tell a Candidate that must exit from one that may carry on.
+    /// Takes no instance argument: [`Self::set_instances`] is the one place the set is written.
     pub fn apply_instances(&mut self) -> bool {
         let Some(output) = self.state.applied_output.as_ref() else {
             return false;
@@ -507,18 +396,12 @@ impl RendererClient {
             Ok(()) => {
                 log_applied_surfaces(&self.scene, &self.instances);
                 start_secure_submit_capabilities(&self.scene, &self.instances, &self.commands);
-                // Nothing holds a lease, so nothing can be holding a subtree this apply retired:
-                // see `Scene::release_all_retired`.
+                // Nothing holds a lease, so nothing can be holding a subtree this apply retired.
                 self.scene.release_all_retired();
                 self.set_rescue_state(false, "");
-                // This apply resolved against every signal's *current* value, so anything marked
-                // dirty before it is already accounted for, notably `crate::wayland::run`'s
-                // `set_screens` seed, which must run before the startup evaluation (ADR-0041
-                // decision 2). Without this, a clean startup would enter its poll loop dirty and
-                // buy one whole redundant `Scene::apply` before drawing anything.
-                //
-                // Only on success: a failed apply leaves the prior state standing, and the flag
-                // with it, so whatever marked it is still picked up by the next apply that works.
+                // Accounts for `set_screens`'s seed (ADR-0041 decision 2), which must run before
+                // the startup evaluation; only on success, so a
+                // failed apply leaves the flag for the next one.
                 self.dirty.take();
                 true
             }
@@ -537,23 +420,16 @@ impl RendererClient {
     }
 
     /// This generation's `Lua`, for building the one argument `button`'s `on_click` takes
-    /// (ADR-0050 decision 3). `crate::wayland::App` holds the resolved tree's
-    /// `mlua::Function` but no VM to construct a `Table` in.
-    ///
-    /// Narrower than it looks: `Loader::lua` has been public within the crate all along; this
-    /// just adds a path to it that does not make `loader` itself public. Callers must not hold
-    /// the borrow across the Lua call it feeds; see [`crate::wayland::App::fire_on_click`].
+    /// (ADR-0050 decision 3): `crate::wayland::App` holds the `mlua::Function` but no VM.
+    /// Callers must not hold the borrow across the Lua call it feeds; see
+    /// [`crate::wayland::App::fire_on_click`].
     pub fn lua(&self) -> &mlua::Lua {
         self.loader.lua()
     }
 
-    /// Handles one inbound `SupervisorFrame`, decoded off the wire by [`pump`] and handed over by
-    /// `crate::wayland::run`'s poll loop.
-    ///
-    /// Returns a [`FrameOutcome`]: `Handled` for every frame this finishes on its own, and one of
-    /// the two hand-backs for the two it cannot — both needing state on `crate::wayland::App`,
-    /// the EGL and surface state a draw needs (§ 15.3), and SCTK's `SessionLockState` plus the
-    /// lock surfaces a `SetSessionLock` needs (ADR-0042).
+    /// Handles one inbound `SupervisorFrame`, decoded by [`pump`]. Returns [`FrameOutcome`]:
+    /// `Handled`, or a hand-back needing `crate::wayland::App` state: EGL/surface for a draw
+    /// (§ 15.3), or SCTK's `SessionLockState`/lock surfaces for `SetSessionLock` (ADR-0042).
     #[must_use]
     pub fn handle_frame(&mut self, frame: SupervisorFrame) -> FrameOutcome {
         match frame {
@@ -566,8 +442,7 @@ impl RendererClient {
             SupervisorFrame::ApplyPendingReload(apply) => self.handle_apply_pending(apply),
             SupervisorFrame::ActivateDraw(activate) => return FrameOutcome::ActivateDraw(activate.nonce),
             SupervisorFrame::DeselectInput(DeselectInput { surface_id }) => {
-                // No per-surface input-region/focus machinery exists yet to hand this to
-                // (ADR-0025).
+                // No per-surface input-region/focus machinery exists yet (ADR-0025).
                 eprintln!(
                     "control-socket client: DeselectInput({surface_id}) received (no real input-region wiring yet)"
                 );
@@ -581,14 +456,10 @@ impl RendererClient {
             SupervisorFrame::ProcessExited(ProcessExited { id, code }) => {
                 self.process_registry.dispatch_exit(id, code);
             }
-            // Handed straight back: `ext_session_lock_v1` is a Wayland object, so servicing this
-            // (taking the lock, creating one `ext_session_lock_surface_v1` per output, tearing
-            // them down again) lives on `crate::wayland::App` (ADR-0042, ADR-0052 decision 1),
-            // which also owns the tracked surface set this decision needs.
+            // `ext_session_lock_v1` is a Wayland object; servicing it lives on
+            // `crate::wayland::App` (ADR-0042, ADR-0052 decision 1).
             SupervisorFrame::SetSessionLock(SetSessionLock { locked }) => return FrameOutcome::SetSessionLock(locked),
-            // `generation_id` is not checked: the Supervisor fans an event out to the generations
-            // that registered the threshold and writes it down this generation's own socket, so a
-            // frame arriving here is already addressed to this process (ADR-0032).
+            // Not checked: the Supervisor addresses this process via its own socket (ADR-0032).
             SupervisorFrame::IdleEvent(IdleEvent { generation_id: _, threshold_sec, state }) => {
                 self.idle_registry.dispatch_event(threshold_sec, state);
             }
@@ -596,19 +467,13 @@ impl RendererClient {
         FrameOutcome::Handled
     }
 
-    /// Runs one `Reevaluate` request: evaluates `shell.lua`, classifies the result against
-    /// `state.applied_topology`, updates `state.pending` and the rescue signal, and queues the
-    /// verdict on the outbound channel. `applied_topology == None` (no evaluation has produced
-    /// one, e.g. a startup evaluation failure) counts as "not changed": see the module doc
-    /// comment for why.
-    ///
-    /// The diff reads each spec's [`SurfaceFingerprint`](layout::node::SurfaceFingerprint) and
-    /// nothing else, the swap-versus-in-place split itself (ADR-0038 decision 2, ADR-0049
-    /// decision 3): an edit to a `margin`, `keyboard_interactivity`, `exclusive`, a size, or a
-    /// `window`'s `title` is a request the protocol accepts on a live object, so it must report
-    /// `Unchanged` and reload in place rather than respawn. Comparing whole specs would make
-    /// every one of those a generation swap. The fingerprint catches, for every role, only a
-    /// declaration appearing or disappearing.
+    /// Runs one `Reevaluate` request: evaluates `shell.lua`, classifies against
+    /// `state.applied_topology`, updates `state.pending`/rescue, and queues the verdict.
+    /// `None` counts as "not changed" (module doc comment). Diffs only each spec's
+    /// [`SurfaceFingerprint`](layout::node::SurfaceFingerprint) (ADR-0038 decision 2, ADR-0049
+    /// decision 3): a `margin`, `keyboard_interactivity`, `exclusive`, size, or `window` `title`
+    /// edit is accepted on a live object, so it reports `Unchanged` and reloads in place, not the
+    /// generation swap comparing whole specs would trigger.
     fn handle_reevaluate(&mut self, request: ReevaluateRequest) {
         let report = match evaluate_and_specs(&self.loader, &self.shell_lua_path) {
             Ok((output, specs)) => {
@@ -616,8 +481,7 @@ impl RendererClient {
                 self.set_rescue_state(false, "");
                 let topology_changed = self.state.applied_topology.as_ref().is_some_and(|applied| applied != &topology);
                 if topology_changed {
-                    // A topology-changed generation must not have its own scene mutated: that's
-                    // the swap path, a different generation's job.
+                    // The swap path is a different generation's job; this one's scene stays put.
                     ReevaluateReport::TopologyChanged { sequence: request.sequence }
                 } else {
                     self.state.pending = Some((request.sequence, output, topology));
@@ -636,8 +500,7 @@ impl RendererClient {
     }
 
     /// Applies `state.pending` to the `Scene` only if it's still the evaluation `apply.sequence`
-    /// refers to: a mismatch means a newer `Reevaluate` already superseded it, logged and
-    /// ignored, not fatal.
+    /// refers to: a mismatch means a newer `Reevaluate` already superseded it, logged and ignored.
     fn handle_apply_pending(&mut self, apply: ApplyPendingReload) {
         if !matches!(&self.state.pending, Some((sequence, _, _)) if *sequence == apply.sequence) {
             eprintln!(
@@ -655,16 +518,11 @@ impl RendererClient {
                 log_applied_surfaces(&self.scene, &self.instances);
                 start_secure_submit_capabilities(&self.scene, &self.instances, &self.commands);
                 self.scene.release_all_retired();
-                // Both fields, on a successful apply only: an `ApplyPendingReload` only ever
-                // follows an `Unchanged` verdict, so this cannot disagree with the earlier
-                // evaluation-time write.
+                // `ApplyPendingReload` only follows `Unchanged`, so this matches the earlier write.
                 self.state.applied_topology = Some(topology);
                 // ADR-0044 decision 2's re-resolve target.
                 self.state.applied_output = Some(output);
-                // An in-place reload changed the retained scene, and until this line nothing told
-                // the screen: the poll loop only repaints when `re_resolve_if_dirty` reports a
-                // change. The cost is one redundant `Scene::apply` on the next poll turn, the
-                // right trade against a second "something changed" signal beside this one flag.
+                // Nothing else told the screen; the poll loop repaints on `re_resolve_if_dirty`.
                 self.dirty.mark();
             }
             Err(err) => {
@@ -673,30 +531,18 @@ impl RendererClient {
         }
     }
 
-    /// Re-runs `Scene::apply` against `state.applied_output` when a live signal's `set` has
-    /// marked the scene dirty since the last resolve (ADR-0044 decision 2). Does not touch
-    /// `shell.lua`: the retained `VirtualNode` tree in `applied_output` still holds the `Signal`
-    /// handles Lua put there, so re-applying it reads their current values through decision 1's
-    /// resolve-at-layout-time rule. Those stale `mlua::Value`s stay readable only because of this
-    /// client's field ordering: see [`ReloadState`]'s doc comment.
-    ///
-    /// `crate::wayland::run`'s poll loop calls this once per turn, after draining every pending
-    /// inbound frame, not once per frame: `DirtyFlag::take` collapses however many pushes arrived
-    /// in that drain into a single `true`.
-    ///
-    /// Returns whether it actually re-resolved, telling `crate::wayland::run`'s poll loop whether
-    /// to repaint. `false` covers both "nothing was dirty" and "the re-resolve failed and the
-    /// prior scene still stands": either way nothing on screen needs redrawing.
+    /// Re-runs `Scene::apply` against `state.applied_output` when a live signal's `set` marked
+    /// the scene dirty (ADR-0044 decision 2). Does not touch `shell.lua`: `applied_output`'s
+    /// retained tree still holds the `Signal` handles Lua put there, readable via this client's
+    /// field ordering through decision 1's resolve-at-layout-time rule. Called once per poll turn
+    /// after draining inbound frames: `DirtyFlag::take` collapses many pushes into one `true`.
+    /// Returns whether it re-resolved; `false` covers "nothing was dirty" and "failed".
     pub fn re_resolve_if_dirty(&mut self) -> bool {
-        // `applied_output` is checked *before* the flag is taken, and that order is the whole
-        // point: with nothing to re-resolve against there is nothing this call can do, so
-        // consuming the flag would silently discard the push that set it. Taking it first would
-        // let a config that fails its first apply swallow every subsequent push and stay blank
-        // until an inotify edit forces a re-evaluation.
+        // Checked *before* the flag is taken: taking it first would let a config that fails its
+        // first apply swallow every push and stay blank until an inotify edit forces a re-eval.
         let Some(output) = self.state.applied_output.as_ref() else {
             return false;
         };
-        // Read and clear in one step, on the path that actually acts on it.
         if !self.dirty.take() {
             return false;
         }
@@ -706,21 +552,16 @@ impl RendererClient {
                 lock_stays_authenticatable(scene, instances, locked)
             });
         if let Err(err) = applied {
-            // `Scene::apply` rolls back to its exact pre-call state on error, so the prior good
-            // scene is still applied and still on screen. Deliberately not routed to
-            // `set_rescue_state`: rescue means shell.lua failed to evaluate, and this is a
-            // capability push that some property's parser rejected. Entering rescue here would
-            // flap the whole shell to an error screen over one capability's transient bad value.
+            // Rolls back on error, keeping the prior scene on screen. Not `set_rescue_state`:
+            // that's for shell.lua failing to evaluate, not one capability's rejected push.
             //
-            // ponytail: logging is the only signal this gets. A broken signal-valued property
-            // logs this line on every push forever, with nothing user-visible. Upgrade path: a
-            // distinct rescue-adjacent channel for "a pushed value was rejected".
+            // ponytail: logging forever, nothing user-visible. Upgrade: a rescue-adjacent
+            // channel for a rejected pushed value.
             eprintln!("control-socket client: dirty-scene re-resolve failed, keeping the prior scene: {err}");
             return false;
         }
-        // The one path where an undrained lease bag actually leaks at cadence: a re-resolve that
-        // shortens a `children` list retires the tail on every poll turn that carries a push.
-        // Same "nothing holds a lease" argument as the other two apply sites.
+        // The one apply site that leaks an undrained lease bag at cadence: a re-resolve that
+        // shortens a `children` list retires the tail on every poll turn carrying a push.
         self.scene.release_all_retired();
         true
     }
@@ -752,21 +593,13 @@ async fn run(
 }
 
 /// The socket thread's entire job after the handshake: forward every decoded `SupervisorFrame`
-/// to the Wayland dispatch thread, and write every `RendererFrame` that thread queues out to the
-/// wire (ADR-0039).
-///
-/// A frame that fails to decode is a transport-level failure here (one sender, a fixed set of
-/// message shapes: a bad frame means the two sides have desynced), unlike an
-/// `ApplyPendingReload` sequence mismatch, an expected, recoverable race.
-///
-/// The read and write directions each get their own long-lived loop, selected over as two whole
-/// futures rather than one frame each. `shared::framing::read_frame` does two sequential
-/// `read_exact` awaits, so partial progress lives in that future, not in `read_half` itself.
-/// Racing one `read_json_frame` call against one `outbound_rx.recv()` in a single `select!`
-/// would drop the read future whenever the outbound branch won, discarding bytes already
-/// consumed, so the next iteration would read a length prefix from the middle of a JSON
-/// payload and desync the connection. Neither loop below ever completes in normal operation,
-/// so `select!` never cancels a `read_exact` mid-frame.
+/// to the Wayland dispatch thread, and write every queued `RendererFrame` to the wire (ADR-0039).
+/// A frame that fails to decode is a transport-level failure (one sender, fixed shapes: a bad
+/// frame means desync), unlike an expected, recoverable `ApplyPendingReload` sequence mismatch.
+/// Read and write get their own long-lived loop, selected as two whole futures rather than one
+/// frame each: `read_json_frame`'s two sequential `read_exact` awaits keep partial progress in
+/// that future, so racing it against `outbound_rx.recv()` in one `select!` would drop it whenever
+/// outbound won, desyncing the connection; neither loop completes normally, so this never happens.
 async fn pump<R, W>(
     read_half: &mut R,
     write_half: &mut W,
@@ -797,15 +630,10 @@ async fn pump<R, W>(
             if let Err(err) = write_json_frame(write_half, &frame).await {
                 eprintln!("control-socket client: failed to send a {} frame: {err}", frame_label(&frame));
             }
-            // The plaintext copy a `SecureSubmit` carried across the channel is scrubbed the
-            // instant its write completes, not left to `Drop` (ADR-0005/ADR-0027). The source
-            // `shared::SecureBuffer` was already zeroized where the frame was built, in
-            // `crate::wayland`'s `secure_submit_frame`.
+            // Scrubbed the instant the write completes, not left to `Drop` (ADR-0005/ADR-0027).
             //
-            // ponytail: this reaches every copy this call site controls, not every copy that
-            // exists. `write_json_frame`'s call into `serde_json::to_vec` (and the Supervisor's
-            // read-side mirror) allocates its own JSON buffer internally and drops it unscrubbed.
-            // Upgrade path: a custom, non-JSON wire path for this frame variant.
+            // ponytail: covers only copies this site controls; `write_json_frame`'s
+            // `serde_json::to_vec` drops its own buffer unscrubbed. Upgrade: non-JSON wire path.
             if let RendererFrame::SecureSubmit(inner) = &mut frame {
                 inner.secret.zeroize();
             }
@@ -820,7 +648,7 @@ async fn pump<R, W>(
 
 /// Names an outbound frame for a write-failure log line. A fixed label per variant, not
 /// `{frame:?}`: `RendererFrame`'s derived `Debug` would print a `SecureSubmit`'s `secret` bytes
-/// straight into the log (ADR-0005).
+/// into the log (ADR-0005).
 fn frame_label(frame: &RendererFrame) -> &'static str {
     match frame {
         RendererFrame::ReadySignal(_) => "ReadySignal",
@@ -834,18 +662,12 @@ fn frame_label(frame: &RendererFrame) -> &'static str {
     }
 }
 
-/// Starts every capability an applied tree names in a `textfield`'s `secure_submit`
-/// (ADR-0070 decision 5).
+/// Starts every capability an applied tree names in a `textfield`'s `secure_submit` (ADR-0070
+/// decision 5): the only way to ask for `polkit`, unrostered for `__index` to catch.
+/// Deduplicated by `CommandSender::start_capability`.
 ///
-/// The only way a config can ask for `polkit`, which has no roster entry and so no
-/// `oblisk.polkit` for `lua::namespace`'s `__index` to catch. Deduplicated by
-/// `CommandSender::start_capability`, so calling it on every apply costs one `HashSet` probe per
-/// declared field after the first.
-///
-/// ponytail: called from the two apply sites that follow an evaluation, not from
-/// `re_resolve_if_dirty`: reading targets means `Scene::surface`, which deep-clones the tree, and
-/// re-resolve runs on every dirty repaint. Gap: a `textfield` entering only on a later push waits
-/// for the next evaluation. Upgrade path: a `secure_submit` roster the apply itself accumulates.
+/// ponytail: not called from `re_resolve_if_dirty` (`Scene::surface` deep-clones every repaint).
+/// Gap: a later-pushed `textfield` waits for the next evaluation. Upgrade: an accumulated roster.
 fn start_secure_submit_capabilities(scene: &Scene, instances: &[SurfaceInstance], commands: &CommandSender) {
     for instance in instances {
         let Some(tree) = scene.surface(&instance.instance_id) else { continue };
@@ -855,12 +677,9 @@ fn start_secure_submit_capabilities(scene: &Scene, instances: &[SurfaceInstance]
     }
 }
 
-/// Logs each surface *instance*'s resolved geometry after a successful `scene.apply`,
-/// diagnostic visibility only.
-///
-/// Iterates instances rather than declared surfaces: one declared surface can be several
-/// instances, each resolved against a different size, so a per-declaration line would print one
-/// of them and hide the rest.
+/// Logs each surface *instance*'s resolved geometry after a `scene.apply`, diagnostic only.
+/// Iterates instances, not declared surfaces: one declaration can be several instances at
+/// different sizes.
 fn log_applied_surfaces(scene: &Scene, instances: &[SurfaceInstance]) {
     for instance in instances {
         match scene.surface(&instance.instance_id) {

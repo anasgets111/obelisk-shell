@@ -1,10 +1,10 @@
 //! [`WorkspacesController`]: the `oblisk.workspaces` state owner and its one write action, plus
-//! the compositor-neutral reduction behind them. Split from `workspaces` -- see
-//! `workspaces/mod.rs` for the module-level doc.
+//! the compositor-neutral reduction behind them. Split from `workspaces`, see `workspaces/mod.rs`
+//! for the module-level doc.
 //!
-//! Nothing in this file names a compositor's own types. [`derive_state`] takes [`WorkspaceRow`]s
-//! and a [`FocusedWindow`], which is the shape any compositor's IPC can be reduced to, and
-//! `workspaces::niri` is what does the reducing today.
+//! Nothing here names a compositor's own type: [`derive_state`] takes [`WorkspaceRow`]s and a
+//! [`FocusedWindow`], the shape any compositor's IPC reduces to; `workspaces::niri` does the
+//! reducing today.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -16,30 +16,25 @@ use crate::compositor::{CompositorKind, detect_compositor, unsupported_session_r
 
 use super::niri;
 
-/// `oblisk.workspaces`'s full payload (§ 2.9). Field names are the JSON keys verbatim.
-/// `active_client` is `Option` (§ 2.9: "or `nil` if none focused"), omitted rather than
-/// serialized as `null`.
+/// `oblisk.workspaces`'s full payload (§ 2.9); field names are the JSON keys verbatim, and
+/// `active_client` (`Option`, § 2.9's "or `nil` if none focused") is omitted, not `null`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct WorkspacesState {
-    /// One entry per connected output, keyed by connector name. Empty before the compositor's
-    /// first answer.
+    /// One entry per output, keyed by connector name; empty until the compositor first answers.
     pub outputs: Vec<OutputWorkspaces>,
-    /// The focused toplevel, or `nil` when nothing holds focus. One window across the whole
-    /// session, not one per output: there is no way to ask what is focused on an unfocused
-    /// monitor (ADR-0056 decision 4).
+    /// The focused toplevel, or `nil` if none. One window per session, not per output: there is
+    /// no way to ask what is focused on an unfocused monitor (ADR-0056 decision 4).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_client: Option<ActiveClient>,
 }
 
-/// One output's workspace state. `workspaces` is ADR-0056 decision 3's addition to
-/// § 2.9.
+/// One output's workspace state; `workspaces` is ADR-0056 decision 3's addition to § 2.9.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct OutputWorkspaces {
     /// The connector name, e.g. `"eDP-1"`. Matches an `oblisk.screens` entry's `name` and a
     /// surface's `monitor`.
     pub name: String,
-    /// The [`WorkspaceEntry::id`] of the workspace visible on this output. Every output has one,
-    /// focused or not.
+    /// The [`WorkspaceEntry::id`] of the workspace visible on this output; every output has one.
     pub active_workspace: u64,
     /// ADR-0056 decision 4: present only on the output that actually holds focus, so
     /// `out.focused_workspace ~= nil` is the "is this the focused monitor" test.
@@ -66,9 +61,9 @@ pub struct WorkspaceEntry {
     pub name: Option<String>,
 }
 
-/// § 2.9's `active_client`, minus `is_fullscreen` (ADR-0056 decision 5: niri-ipc 26.4.0's
-/// `Window` has no such field, and a fabricated `false` would be wrong for fullscreen windows).
-/// `class` is Wayland's `app_id`: X11's `WM_CLASS` has no Wayland equivalent.
+/// § 2.9's `active_client`, minus `is_fullscreen` (ADR-0056 decision 5: niri-ipc 26.4.0's `Window`
+/// has no such field, and a fabricated `false` would be wrong for fullscreen windows); `class` is
+/// Wayland's `app_id`, since X11's `WM_CLASS` has no Wayland equivalent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct ActiveClient {
     /// The window title, e.g. `"src/main.rs - Neovim"`. Empty string for a window that sets none.
@@ -99,15 +94,13 @@ pub struct WorkspaceRow {
 
 /// The focused toplevel, reduced to the three fields § 2.9's `active_client` carries.
 ///
-/// *Which* window holds focus is the adaptor's question, not this module's: niri flags it on
-/// each window, and another compositor may answer it with a separate query entirely. What that
-/// window becomes in the payload is this module's, so the adaptor hands over the answer and
-/// [`derive_state`] does the mapping.
+/// *Which* window holds focus is the adaptor's question, not this module's: niri flags it on each
+/// window, another compositor may query it separately. What that window becomes in the payload is
+/// this module's job, done by [`derive_state`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FocusedWindow {
     pub title: String,
-    /// Wayland's `app_id`, which is what § 2.9's `class` is filled from (ADR-0056
-    /// decision 5).
+    /// Wayland's `app_id`, filling § 2.9's `class` (ADR-0056 decision 5).
     pub app_id: String,
     pub is_floating: bool,
 }
@@ -119,10 +112,9 @@ pub enum WorkspacesSignal {
 }
 
 /// Folds a compositor's rows into § 2.9's payload. Pure, so the whole mapping is unit tested
-/// without a compositor. Outputs are ordered by connector name and each output's workspaces by
-/// `idx` -- rows arrive in whatever order the adaptor's own map iterated, which is not an order.
-/// An output with no active workspace is omitted rather than given a fabricated id (should be
-/// unreachable).
+/// without a compositor. Outputs sort by connector name and workspaces by `idx`, since rows
+/// arrive in whatever order the adaptor's map iterated, not an order; an output with no active
+/// workspace is omitted rather than given a fabricated id (should be unreachable).
 pub fn derive_state(workspaces: &[WorkspaceRow], focused: Option<&FocusedWindow>) -> WorkspacesState {
     let mut by_output: HashMap<&str, Vec<&WorkspaceRow>> = HashMap::new();
     for workspace in workspaces {
@@ -154,10 +146,9 @@ pub fn derive_state(workspaces: &[WorkspaceRow], focused: Option<&FocusedWindow>
     WorkspacesState { outputs, active_client }
 }
 
-/// The half of a compositor reader that is not about the compositor: reduce, drop an update that
-/// changes nothing, store, and wake `main.rs`. An adaptor's event loop folds its own stream and
-/// calls [`StatePublisher::publish`]; everything after that is the same for all of them, which is
-/// the part worth not writing twice (and worth not having two of them disagree about).
+/// The half of a compositor reader that isn't about the compositor: reduce, drop a no-op update,
+/// store, and wake `main.rs`, shared by every adaptor through [`StatePublisher::publish`] so the
+/// logic is written, and agreed on, exactly once.
 pub struct StatePublisher {
     state: Arc<Mutex<WorkspacesState>>,
     events: UnboundedSender<WorkspacesSignal>,
@@ -169,10 +160,10 @@ impl StatePublisher {
         Self { state, events, previous: WorkspacesState::default() }
     }
 
-    /// `false` once nothing is listening, which is a reader loop's exit condition. Deliberately
-    /// not debounced: a compositor that replays its startup state as several events pushes
-    /// several times, each one a real change (niri sends workspaces and windows separately, so
-    /// the first push lands before any window is known).
+    /// `false` once nothing is listening, a reader loop's exit condition. Deliberately not
+    /// debounced: a compositor replaying startup state as several events pushes several times,
+    /// each real (niri sends workspaces and windows separately, so the first push predates any
+    /// known window).
     pub fn publish(&mut self, workspaces: &[WorkspaceRow], focused: Option<&FocusedWindow>) -> bool {
         let current = derive_state(workspaces, focused);
         if current == self.previous {
@@ -199,11 +190,9 @@ pub struct WorkspacesController {
 }
 
 impl WorkspacesController {
-    /// Returns immediately. A session running something with no implementor never spawns a
-    /// reader and so never pushes at all (ADR-0056 decision 1).
-    ///
-    /// The match is exhaustive rather than defaulting, so adding a `CompositorKind` fails this
-    /// build here: the arm a new compositor needs is the one this file exists to point at.
+    /// Returns immediately: a session with no implementor never spawns a reader and so never
+    /// pushes (ADR-0056 decision 1). The match is exhaustive, not defaulted, so a new
+    /// `CompositorKind` fails this build at the arm this file exists to add.
     pub fn new(events: UnboundedSender<WorkspacesSignal>) -> Self {
         let state = Arc::new(Mutex::new(WorkspacesState::default()));
         let compositor = detect_compositor();

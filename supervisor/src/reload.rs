@@ -1,28 +1,19 @@
 //! Presentation-Before-Authority (PBA) hot-reload orchestration
 //! (`docs/oblisk-supervisor-services-dbus.md` § 15.1-15.4).
 //!
-//! This module is the ordering/gating state machine only: the six-step sequence (Overlapping
-//! Spawn, State Hydration, Null-Buffer Staging, Activate Draw, Evidence Verification, Swap &
-//! Reap), against two real primitives and one seam:
-//!
-//! - Real process lifecycle: [`process::spawn_group_leader`] and [`process::reap_process_group`]
-//!   do the actual spawning and reaping.
-//! - [`CandidateLink`]: an operation-level trait over the control socket. `socket::
-//!   SocketCandidateLink` is the real implementation; a fake drives this module's own tests.
-//!
-//! Not built here (ADR-0025): true independent per-output timing (ADR-0003's model, where
-//! each output transfers the moment its own evidence lands with no barrier on siblings -- this
-//! module gates the Swap on all expected surface_ids within one shared `evidence_timeout`
-//! instead, a deliberate safety-motivated simplification) and a partial-candidate-abort
-//! primitive.
-//!
-//! Failure semantics, chosen as the reading consistent with PBA's whole point (never a black
+//! Ordering/gating state machine only, for six steps (Overlapping Spawn, State Hydration,
+//! Null-Buffer Staging, Activate Draw, Evidence Verification, Swap & Reap): [`process::
+//! spawn_group_leader`]/[`process::reap_process_group`] do the real spawning and reaping, and
+//! [`CandidateLink`] is the control-socket trait, `socket::SocketCandidateLink` in production and
+//! a fake in this module's own tests. Not built here (ADR-0025): true independent per-output
+//! timing (ADR-0003's model, where each output transfers the moment its own evidence lands with
+//! no barrier on siblings; this gates the Swap on all expected surface_ids within one shared
+//! `evidence_timeout` instead, a deliberate safety-motivated simplification), and a
+//! partial-candidate-abort primitive. Failure semantics follow PBA's whole point (never a black
 //! frame, never an unverified swap): any failure before every expected surface_id's evidence is
-//! verified aborts the Candidate and leaves Generation `N` untouched. `run_pba` never touches `N`
-//! (see [`PbaOutcome`]) -- [`swap_and_reap`] does that, after sending the Swap messages. All
-//! four [`CandidateLink`] steps are deadline-gated: `ready_timeout` bounds `push_state_snapshot`
-//! and `recv_ready_signal`, `evidence_timeout` bounds `send_activate_draw` and the whole
-//! evidence-collection loop -- see [`PbaTimings`] and [`drive_handshake`].
+//! verified aborts the Candidate and leaves Generation `N` untouched. `run_pba` never touches
+//! `N`; [`swap_and_reap`] does (see [`PbaOutcome`]). All four [`CandidateLink`] steps are
+//! deadline-gated (see [`PbaTimings`] and [`drive_handshake`]).
 
 use std::fmt;
 use std::io;
@@ -37,32 +28,28 @@ use tokio::time::timeout;
 
 use crate::process;
 
-/// The control-socket operations § 15.2-15.3 describe crossing from the Supervisor to the
-/// Candidate generation. This trait is the seam a fake implementation drives in this module's
-/// own tests; `socket::SocketCandidateLink` is the real Unix-socket implementation.
+/// The control-socket operations § 15.2-15.3 describe, crossing from the Supervisor to the
+/// Candidate generation.
 pub trait CandidateLink {
     /// What a control-link call can fail with.
     type Error: std::fmt::Debug;
 
     /// § 15.2 point 1 / step 2 ("State Hydration"): push every pre-cached per-capability state
-    /// snapshot down to the Candidate so it can hydrate its signals without querying the system
-    /// itself (ADR-0029).
+    /// snapshot to the Candidate, so it can hydrate without querying the system itself (ADR-0029).
     async fn push_state_snapshot(&mut self, snapshots: &[shared::StateSnapshot]) -> Result<(), Self::Error>;
 
-    /// § 15.2 points 2-3 / step 3 ("Null-Buffer Staging"): block until the Candidate signals it
-    /// has completed its Wayland layer-shell handshake and committed its null buffers, i.e. it's
-    /// ready for `ActivateDraw`. Returns the surface_ids it staged null buffers for; `run_pba`
-    /// uses this as the expected set for evidence collection (ADR-0025).
+    /// § 15.2 points 2-3 / step 3 ("Null-Buffer Staging"): block until the Candidate's Wayland
+    /// layer-shell handshake and null-buffer commit are done, i.e. it's ready for `ActivateDraw`.
+    /// Returns the surface_ids it staged, the expected set `run_pba` uses for evidence (ADR-0025).
     async fn recv_ready_signal(&mut self) -> Result<Vec<String>, Self::Error>;
 
     /// § 15.2 point 3 / step 4 ("Activate Draw"): write the unique, nonce-bound `ActivateDraw`
     /// command telling the Candidate to compile its layout and draw its first GPU frame.
     async fn send_activate_draw(&mut self, nonce: u64) -> Result<(), Self::Error>;
 
-    /// § 15.3 point 4 / step 5 ("Evidence Verification"): block until the Candidate transmits one
-    /// piece of presentation evidence for `nonce` -- confirmation the compositor's
-    /// `wp_presentation_feedback` `presented` callback fired for one tracked surface. Returns
-    /// which surface_id this evidence is for. Called once per expected surface_id.
+    /// § 15.3 point 4 / step 5 ("Evidence Verification"): block until the Candidate reports
+    /// evidence for `nonce` (`wp_presentation_feedback`'s `presented` fired for a surface).
+    /// Returns that surface_id; called once per surface.
     async fn recv_presentation_evidence(&mut self, nonce: u64) -> Result<String, Self::Error>;
 }
 
@@ -79,31 +66,25 @@ pub enum Stage {
     EvidenceVerification,
 }
 
-/// Why a PBA reload didn't reach a successful [`PbaOutcome`]. Every variant except `SpawnFailed`
-/// implies the Candidate's process group was aborted (reaped) before returning. Generation `N`
-/// is never touched by any of these (see `PbaOutcome`'s doc comment).
+/// Why a PBA reload didn't reach [`PbaOutcome`]: every variant but `SpawnFailed` means the
+/// Candidate was reaped before returning, and Generation `N` stays untouched (see `PbaOutcome`).
 #[derive(Debug)]
 pub enum PbaFailure<E> {
-    /// Step 1 (Overlapping Spawn) itself failed -- there's no Candidate process to abort.
+    /// Step 1 (Overlapping Spawn) itself failed; there's no Candidate process to abort.
     SpawnFailed(io::Error),
     /// A `CandidateLink` call returned an error during `stage`.
     Link { stage: Stage, source: E },
-    /// `recv_ready_signal` or the evidence-collection loop didn't resolve before its deadline
-    /// during `stage`.
+    /// `recv_ready_signal` or evidence collection didn't resolve before its deadline in `stage`.
     Timeout { stage: Stage },
     /// The Candidate reported evidence for a surface_id `recv_ready_signal` never announced, or
-    /// reported the same surface_id twice -- a wire-protocol desync, not an ordinary timeout or
-    /// link error.
+    /// reported one twice: a wire-protocol desync, not an ordinary timeout or link error.
     UnexpectedEvidence { stage: Stage, surface_id: String },
-    /// A failure above happened, and the abort-reap that followed it also failed. Both are kept
-    /// rather than the reap error replacing the original, so nothing about why the reload
-    /// failed gets lost.
+    /// The abort-reap after a failure above also failed; both are kept so nothing gets lost.
     AbortReapFailed { original: Box<PbaFailure<E>>, reap_error: io::Error },
 }
 
-/// The sentence a failed swap is logged as. Here rather than as a match at the call site so the
-/// wording lives beside the variants it describes, and so `AbortReapFailed` renders its nested
-/// `original` as the same sentence rather than as a `Debug` struct dump.
+/// How a failed swap is logged, kept beside the variants it describes so `AbortReapFailed`
+/// renders its nested `original` as this sentence, not a `Debug` struct dump.
 impl<E: fmt::Display> fmt::Display for PbaFailure<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -121,13 +102,11 @@ impl<E: fmt::Display> fmt::Display for PbaFailure<E> {
 }
 
 /// A completed PBA reload: Generation `N+1` (`candidate`) is confirmed presented on every
-/// expected surface. `promoted_surfaces` is every surface_id that completed evidence
-/// verification, in `ReadySignal`'s order. `run_pba` does not reap Generation `N`
-/// (`superseded`), and doesn't even take it as a parameter: § 15.4's ordering is Input
-/// Deselection -> Candidate Promotion -> Reap, and the Swap messages
-/// (`DeselectInput`/`PromoteGeneration`) go to two different connections while `CandidateLink`
-/// is scoped to only the candidate's. [`swap_and_reap`] sends those Swap messages, then reaps
-/// `superseded` itself via [`process::reap_process_group`].
+/// expected surface, with `promoted_surfaces` listing each verified surface_id in
+/// `ReadySignal`'s order. `run_pba` never reaps or takes Generation `N` (`superseded`): § 15.4
+/// orders Deselection, Promotion, then Reap, and the Swap messages go to two different
+/// connections while `CandidateLink` reaches only the candidate's. [`swap_and_reap`] sends those
+/// messages, then reaps `superseded` via [`process::reap_process_group`].
 #[derive(Debug)]
 pub struct PbaOutcome {
     pub candidate: Child,
@@ -135,14 +114,11 @@ pub struct PbaOutcome {
 }
 
 /// Runs steps 2-5 (State Hydration through Evidence Verification) against an already-spawned
-/// Candidate's `link`. Split out from [`run_pba`] so its one job -- drive the handshake and tag
-/// any failure with the [`Stage`] it happened during -- stays separate from spawn/abort/reap,
-/// which need the Candidate's process handle this function never touches.
-///
-/// Evidence collection loops over every surface_id `recv_ready_signal` returned, wrapped in one
-/// `timeout(evidence_timeout, ...)` for the whole loop, not one per surface: § 15.4's promotion
-/// gate is all expected surface_ids within one shared deadline (ADR-0025). Returns
-/// the confirmed surface_ids in `expected`'s order once every one has reported.
+/// Candidate's `link`, tagging failures with the [`Stage`] they happened during; split out to
+/// stay separate from spawn/abort/reap, which need the process handle it never touches. Evidence
+/// collection loops over every surface_id `recv_ready_signal` returned, in one
+/// `timeout(evidence_timeout, ...)` for the whole loop, not one per surface, returning the
+/// confirmed surface_ids in `expected`'s order.
 async fn drive_handshake<L: CandidateLink>(
     link: &mut L,
     snapshots: &[shared::StateSnapshot],
@@ -185,9 +161,8 @@ async fn drive_handshake<L: CandidateLink>(
     Ok(expected)
 }
 
-/// Aborts a Candidate that failed before evidence verification: reaps its process group and
-/// folds a reap error into `failure` rather than discarding either. The one place that ever
-/// reaps a Candidate on a failure path.
+/// Aborts a Candidate that failed before evidence verification: reaps its process group, folding
+/// a reap error into `failure` rather than discarding either. The only failure-path reap.
 async fn abort_candidate<E>(candidate: &mut Child, grace: Duration, failure: PbaFailure<E>) -> PbaFailure<E> {
     match process::reap_process_group(candidate, grace).await {
         Ok(_) => failure,
@@ -195,13 +170,12 @@ async fn abort_candidate<E>(candidate: &mut Child, grace: Duration, failure: Pba
     }
 }
 
-/// The three durations [`run_pba`] gates on: how long to wait for the Candidate's ready signal
-/// and its presentation evidence before treating the reload as failed, and how long to give a
-/// process group to honor `SIGTERM` before escalating to `SIGKILL` (passed to
-/// [`process::reap_process_group`]). `ready_timeout` and `evidence_timeout` each bound two
-/// handshake steps, not one -- § 15.2's hydration+ready-wait and § 15.3's activate+evidence-wait
-/// are each one logical stage (see [`drive_handshake`]). Grouped into one struct purely to keep
-/// `run_pba`'s parameter count reasonable; these three share no invariant with each other.
+/// The three durations [`run_pba`] gates on: how long to wait for ready signal and presentation
+/// evidence before failing, and how long a process group gets `SIGTERM` before `SIGKILL` (passed
+/// to [`process::reap_process_group`]). `ready_timeout`/`evidence_timeout` each bound two
+/// handshake steps: § 15.2's hydration+ready-wait and § 15.3's activate+evidence-wait are one
+/// stage each (see [`drive_handshake`]). Grouped only for `run_pba`'s parameter count; the three
+/// share no invariant.
 #[derive(Debug, Clone, Copy)]
 pub struct PbaTimings {
     pub ready_timeout: Duration,
@@ -216,11 +190,8 @@ pub struct PbaTimings {
 /// 2. **State Hydration** through 5. **Evidence Verification**: see [`drive_handshake`] and
 ///    [`CandidateLink`].
 ///
-/// Step 6 (**Swap & Reap**) is not implemented here -- see [`PbaOutcome`] for why reaping
-/// `superseded` moved to the caller, alongside sending § 15.4's Swap messages.
-///
-/// Any failure in steps 1-5 aborts the Candidate and leaves the still-authoritative superseded
-/// generation alone.
+/// Step 6 (**Swap & Reap**) isn't implemented here (see [`PbaOutcome`]). Any failure in steps
+/// 1-5 aborts the Candidate and leaves the still-authoritative superseded generation alone.
 pub async fn run_pba<L: CandidateLink>(
     candidate_cmd: &str,
     candidate_args: &[String],
@@ -240,12 +211,10 @@ pub async fn run_pba<L: CandidateLink>(
 }
 
 /// § 15.4's Swap messages, in the order they go on the wire: for each promoted surface, the
-/// superseded generation is told to stop taking input before the candidate is told to start.
-///
-/// Its own function so that order is a value a test can assert on. Inside [`swap_and_reap`] the
-/// two sends are indistinguishable from each other to anything observable: a `send_frame_logged`
-/// to a generation with no connection logs and drops, so a test driving the real function proves
-/// nothing about which frame went first.
+/// superseded generation stops taking input before the candidate starts. Split out so that
+/// order is a value a test can assert on: inside [`swap_and_reap`] the two sends are
+/// indistinguishable to anything observable, since `send_frame_logged` to a disconnected
+/// generation just logs and drops, proving nothing about which went first.
 fn swap_frames(
     superseded_generation_id: u32,
     candidate_generation_id: u32,
@@ -270,27 +239,18 @@ fn swap_frames(
         .collect()
 }
 
-/// § 15.4's Swap & Reap, the sixth step of the sequence this module's doc comment names and the
-/// one it did not hold: [`run_pba`] stops at verified evidence, and everything after it lived in
-/// `main.rs`'s `TopologyChanged` arm.
-///
-/// Two rules, only one of which the code makes obvious:
-///
-/// 1. **Input deselection before promotion**, per surface (§ 15.4). The superseded generation
-///    stops taking input before the candidate starts, so no surface is live on two generations at
-///    once. [`swap_frames`] holds that order, so it is checkable without a live connection.
-/// 2. **The reassignment last**, which is the one a reader has to be told. `PromoteGeneration`
-///    carries `candidate_generation_id` and is unaffected, but the `DeselectInput` frames and both
-///    reaps read `authoritative.generation_id`, so promoting first would deselect input on the
-///    candidate and sweep the candidate's own `process.run` children while the superseded
-///    generation kept both.
-///
-/// The two reaps are not ordered against each other. The generation's `process.run` children are
-/// their own process group leaders (§ 12, ADR-0026), so the Renderer's group reap never
-/// reaches them and `reap_generations_processes` collects them whichever side of it runs.
-///
-/// Takes the whole [`PbaOutcome`] by value because promoting it consumes it: `candidate` becomes
-/// the new authoritative child, so nothing may hold it afterwards.
+/// § 15.4's Swap & Reap, the sixth step this module names but does not hold: [`run_pba`] stops
+/// at verified evidence; everything after lived in `main.rs`'s `TopologyChanged` arm. Two rules,
+/// only one obvious from the code: (1) input deselection before promotion, per surface (§ 15.4),
+/// an order [`swap_frames`] holds so it's checkable without a live connection; (2) the
+/// reassignment last. `PromoteGeneration` carries `candidate_generation_id` and is unaffected,
+/// but the `DeselectInput` frames and both reaps read `authoritative.generation_id`, so promoting
+/// first would deselect input on the candidate and sweep its own `process.run` children while the
+/// superseded generation kept both. The two reaps aren't ordered against each other: each
+/// generation's `process.run` children are their own process group leaders (§ 12, ADR-0026), so
+/// the Renderer's group reap never reaches them, and `reap_generations_processes` collects them
+/// whichever side runs first. Takes the whole [`PbaOutcome`] by value: promoting it consumes it,
+/// since `candidate` becomes the new authoritative child and nothing may hold it afterwards.
 pub(crate) async fn swap_and_reap(
     registry: &GenerationRegistry,
     processes: &mut LiveProcesses,

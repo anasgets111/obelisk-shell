@@ -12,10 +12,10 @@ use super::scan::{AppSummary, LaunchTarget, scan};
 
 /// `oblisk.applications`'s payload (ADR-0061 decision 2).
 ///
-/// `by_app_id` repeats the summaries in `entries` rather than indexing into it. An index would
-/// have to be a Lua array index, and Lua counts from one while the JSON array this serializes to
-/// counts from zero, so every config reading it would carry an off-by-one nobody can see in the
-/// payload. Repeating three small fields for a few hundred entries costs less than that trap.
+/// `by_app_id` repeats the summaries in `entries` rather than indexing into it. A Lua array
+/// index counts from one while the JSON array this serializes to counts from zero, so an index
+/// would carry an off-by-one nobody can see in the payload; repeating three small fields for a
+/// few hundred entries costs less than that trap.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct ApplicationsState {
     /// Every installed desktop entry that is visible and launchable, sorted by name. Rebuilt on
@@ -42,7 +42,7 @@ pub enum LaunchError {
     /// No entry with that desktop file id, which for a config reading `entries` means a scan has
     /// replaced the list since it was drawn.
     Unknown,
-    /// `Terminal=true` with no `$TERMINAL` set -- see [`ApplicationsController::launch`].
+    /// `Terminal=true` with no `$TERMINAL` set, see [`ApplicationsController::launch`].
     NoTerminal,
     Spawn(String),
 }
@@ -62,9 +62,9 @@ pub struct ApplicationsController {
 /// The argv `launch` actually spawns, given the entry and whatever `$TERMINAL` says.
 ///
 /// Split out from [`ApplicationsController::launch`] so the `Terminal=true` rule is testable
-/// without writing to the process environment, the same shape `system::should_emit` and
-/// `layer::exclusive_zone_for` already use for their own decisions. An empty `$TERMINAL` counts as
-/// unset: exporting it blank is how a shell leaves a variable it never assigned.
+/// without writing to the process environment, as `system::should_emit` and
+/// `layer::exclusive_zone_for` already do. An empty `$TERMINAL` counts as unset: exporting it
+/// blank is how a shell leaves a variable it never assigned.
 fn command_line(terminal: Option<String>, target: LaunchTarget) -> Result<(String, Vec<String>), LaunchError> {
     if !target.terminal {
         return Ok((target.command, target.args));
@@ -79,10 +79,9 @@ impl ApplicationsController {
     /// Builds the controller empty and starts the first scan in the background.
     ///
     /// Not scanned inline: this runs inside `main`'s startup, and a few hundred `.desktop` files
-    /// read off a cold page cache is real milliseconds spent before the first surface is up. The
-    /// capability reads `nil` in Lua until the scan lands, which every capability already does
-    /// (`shared::Capability::ALL`' own doc comment), so a config that handles an absent snapshot
-    /// handles this with no extra branch.
+    /// read off a cold page cache is real milliseconds before the first surface is up. The
+    /// capability reads `nil` in Lua until the scan lands, same as every capability
+    /// (`shared::Capability::ALL`'s own doc comment), so this needs no extra branch.
     pub fn new(dirs: Vec<PathBuf>, events: UnboundedSender<ApplicationsSignal>) -> Self {
         let controller = ApplicationsController {
             state: Arc::new(Mutex::new(ApplicationsState::default())),
@@ -101,12 +100,11 @@ impl ApplicationsController {
     /// Rescans the applications directories off-thread, then signals `main`'s `select!` to push.
     ///
     /// `spawn_blocking` rather than a plain task: this is `read_dir` plus a `read_to_string` per
-    /// entry, which is exactly the blocking filesystem work a tokio worker thread must not do.
+    /// entry, exactly the blocking filesystem work a tokio worker thread must not do.
     ///
     /// Pushes only on a real change. Every `StateSnapshot` marks the Renderer's scene dirty and
-    /// drives a full re-resolve and repaint (ADR-0044), so a config calling `refresh` each
-    /// time its launcher opens would otherwise repaint the whole shell for a list that is
-    /// identical nearly every time.
+    /// drives a full re-resolve and repaint (ADR-0044), so a config calling `refresh` on each
+    /// launcher open would otherwise repaint the whole shell for an identical list.
     pub fn refresh(&self) {
         let state = Arc::clone(&self.state);
         let launch_targets = Arc::clone(&self.launch_targets);

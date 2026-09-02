@@ -1,9 +1,7 @@
 //! The box-model and paint-adjacent parsers: size, margin/padding, alignment, visibility,
-//! spacing, background, radius, and border color/width. Every parser here reads `&HashMap<String,
-//! Value>` and returns a typed value or a [`LayoutError`] naming the offending property.
-//!
-//! `table_number` is `pub(super)`: `toplevel`'s size-hint and popup-offset/anchor-rect parsers
-//! reuse the same one-field-out-of-a-table helper this module defines.
+//! spacing, background, radius, and border color/width. Each reads `&HashMap<String, Value>` and
+//! returns a typed value or a [`LayoutError`] naming the offending property. `table_number` is
+//! `pub(super)` since `toplevel`'s size-hint and popup-offset/anchor-rect parsers reuse it.
 
 use std::collections::HashMap;
 
@@ -12,8 +10,8 @@ use mlua::Value;
 use super::*;
 
 /// `"NN%"` (`^\d+(\.\d+)?%$`) as `SizeMode::Percent`. Not a confirmed spec syntax: § 5.1's base
-/// property table only documents integer/`"Fill"` for width/height even though § 3.1 names
-/// `Percent(f32)` as a size class without giving it a literal Lua form. See ADR-0023.
+/// property table only documents integer/`"Fill"` for width/height, though § 3.1 names
+/// `Percent(f32)` as a size class with no literal Lua form given. See ADR-0023.
 fn parse_percent(s: &str) -> Option<f32> {
     let digits = s.strip_suffix('%')?;
     let mut parts = digits.splitn(2, '.');
@@ -29,20 +27,17 @@ fn parse_percent(s: &str) -> Option<f32> {
     digits.parse::<f32>().ok().map(|n| n / 100.0)
 }
 
-/// An explicit pixel value is range-checked against § 5.1's base property table
-/// (`[0, 8192]`): ADR-0021 names the layout engine as the "actual consumer that needs typed,
-/// validated properties" this range check serves.
-///
-/// `properties` is a [`resolve_properties`] result, here and in every parser below: an absent key
-/// covers both a property the config omitted and one whose signal read `nil`, which is why none of
-/// them takes a `&Lua` or handles a `Value::Nil` of its own.
+/// An explicit pixel value is range-checked against § 5.1's base property table (`[0, 8192]`):
+/// ADR-0021 names the layout engine as the "actual consumer that needs typed, validated
+/// properties" this check serves. `properties` is a [`resolve_properties`] result, here and
+/// below: an absent key covers both an omitted property and a signal that read `nil`, so no
+/// parser needs a `&Lua` or `Value::Nil` arm.
 pub fn parse_size_mode(properties: &HashMap<String, Value>, property: &str) -> Result<SizeMode, LayoutError> {
     // Deferred on the evaluation-time pass ([`is_deferred_signal`]): § 6.1's `width`/`height` are a
-    // layer-shell `set_size`, which ADR-0038 decision 2 lists among the requests that are valid
-    // on a live surface, so `crate::wayland::App::apply_spec_change` re-derives both from the
-    // resolved tree on every pass. Same placeholder an absent property gets. The guard cannot fire
-    // below a surface root, where this parser is also used: `resolve_properties` has already
-    // replaced every `Signal` in an inner node's map.
+    // layer-shell `set_size`, valid on a live surface per ADR-0038 decision 2, so
+    // `crate::wayland::App::apply_spec_change` re-derives both every pass (same placeholder an
+    // absent property gets); cannot fire below a surface root, where `resolve_properties` already
+    // replaced every `Signal`.
     if is_deferred_signal(properties, property) {
         return Ok(SizeMode::Content);
     }
@@ -74,16 +69,12 @@ pub fn parse_size_mode(properties: &HashMap<String, Value>, property: &str) -> R
 }
 
 /// One numeric field out of a table-valued property (`margin.top`, `anchor_rect.width`,
-/// `offset.x`, `min_size.height`). `Ok(None)` means the key is absent, which every caller answers
-/// differently: [`parse_edge_insets`] defaults an edge to 0, `toplevel::parse_anchor_rect`
-/// defaults an origin to 0 but refuses an absent extent, and `toplevel::parse_size_hint` refuses
-/// either axis.
-///
-/// A `Signal` only resolves at the top level of the property map ([`resolve_properties`] never
-/// looks inside a table value), so one surviving into a nested slot is refused outright rather than
-/// misreported as "must be a number, got AnyUserData(Ref(0x...))", an opaque pointer and a wrong
-/// claim about the type. `UnsupportedSignalProperty` already carries the right advice (read it via
-/// `:get()` first); `{property}.{key}` names both the property and which field.
+/// `offset.x`, `min_size.height`). `Ok(None)` means the key is absent; callers differ on it:
+/// [`parse_edge_insets`] defaults an edge to 0, `toplevel::parse_anchor_rect` defaults an origin
+/// to 0 but refuses an absent extent, `toplevel::parse_size_hint` refuses either axis. `Signal`
+/// only resolves at the top of the property map, so one nested here is refused outright, not
+/// misreported as "must be a number, got AnyUserData(Ref(0x...))"; `{property}.{key}` names the
+/// failing field for `UnsupportedSignalProperty`.
 pub(super) fn table_number(property: &str, table: &mlua::Table, key: &str) -> Result<Option<f32>, LayoutError> {
     let v: Value = table.get(key).map_err(|e| invalid(property, e.to_string()))?;
     match v {
@@ -95,37 +86,26 @@ pub(super) fn table_number(property: &str, table: &mlua::Table, key: &str) -> Re
     }
 }
 
-/// The four `table.get` calls below are metamethod-aware, so a resolved table carrying a
-/// side-effecting `__index` answers per read rather than per node. That used to matter: this
-/// parser ran once per *consumer* of the property, so a child's `margin` was parsed by its
-/// parent's child loop, twice more while sizing and once more while positioning, four
-/// answers to one question with nothing making them agree. Measured then: 16 `__index`
-/// invocations for one child in one pass, and a row that measured itself 18 wide and placed its
-/// 10-wide child spanning 16..26.
-///
-/// `layout::scene`'s `LayoutStyle` parses every geometry property once per node per pass, in the
-/// parent's child loop, and the sizing and positioning passes read that struct. This function
-/// still runs the metamethod, once, which is what any parser reading a Lua table has to do; what
-/// changed is that nothing calls it twice for the same node.
-///
-/// Those reads also used to run entirely outside ADR-0021's 5ms cap, and so did
-/// `surface::parse_anchor`'s: `CpuBudget` installed its Lua hook inside `Signal::get_value` and
-/// dropped it on return, so the only Lua a budget ever covered was a signal getter's own body.
-/// A `margin` table whose `__index` spins 200 million iterations made one `Scene::apply` take
-/// 26.10 seconds and return `Ok(())`, reachable from a config using no `Signal` at all, on the
-/// thread that also answers `configure` and runs the VM (ADR-0039). `lua::signal`'s
-/// `LayoutPassBudget` now holds the hook for the whole pass, so the same config is refused in
-/// 2 seconds with a `LayoutError::PassBudgetExceeded`.
-///
-/// Scalar shorthand, a bare number broadcasts to all four edges, shared by `margin`, `padding`
-/// and `border_width`. Carries no range check of its own: see [`check_geometry_range`]'s doc
-/// comment for why `border_width` keeps a bound this function does not apply to
-/// `margin`/`padding`.
+/// The four `table.get` calls below are metamethod-aware, so a table with a side-effecting
+/// `__index` answers per read rather than per node. This parser used to run once per *consumer* (a
+/// child's `margin` read by the parent's child loop, twice more while sizing, once more
+/// positioning), four answers with nothing making them agree: measured, 16 `__index` invocations
+/// for one child in one pass, and a row that measured itself 18 wide while placing its 10-wide
+/// child at 16..26. `layout::scene`'s `LayoutStyle` now parses every geometry property once per
+/// node per pass, so the metamethod runs once, never twice per node. Those reads also ran outside
+/// ADR-0021's 5ms cap, and so did `surface::parse_anchor`'s: `CpuBudget` hooked `Signal::get_value`
+/// and dropped the hook on return, covering only a signal getter's own body. A `margin` table
+/// whose `__index` spins 200 million iterations made one `Scene::apply` take 26.10 seconds and
+/// return `Ok(())`, with no `Signal` at all, on the thread that also runs the VM (ADR-0039).
+/// `LayoutPassBudget` now holds the hook for the whole pass, refusing the same config in 2 seconds
+/// with `PassBudgetExceeded`. Scalar shorthand (a bare number broadcasts to all four edges) is
+/// shared by `margin`/`padding`/`border_width`, with no range check here: see
+/// [`check_geometry_range`] for why `border_width` alone keeps one.
 pub fn parse_edge_insets(properties: &HashMap<String, Value>, property: &str) -> Result<EdgeInsets, LayoutError> {
     // Deferred on the evaluation-time pass, for [`parse_size_mode`]'s reason: on a `panel` root
-    // `margin` is the layer-shell anchor offset, which `set_margin` changes on a live surface
-    // (ADR-0038 decision 2). Zero insets are the placeholder an absent `margin` already takes,
-    // and the same "cannot fire below a root" note applies.
+    // `margin` is the layer-shell anchor offset, changed by `set_margin` on a live surface
+    // (ADR-0038 decision 2); zero is the placeholder an absent `margin` already takes, and the
+    // same "cannot fire below a root" note applies.
     if is_deferred_signal(properties, property) {
         return Ok(EdgeInsets::default());
     }
@@ -159,20 +139,16 @@ pub fn parse_background(properties: &HashMap<String, Value>) -> Result<Option<Rg
 }
 
 /// Shared `[0, 8192]` bound for `radius` and `border_width`: the same range [`parse_size_mode`]
-/// already enforces for `width`/`height` (§ 5.1's base property table). Traced in femtovg 0.26:
-/// `radius = -4` silently draws square corners (`path.rs:458` treats anything under 0.1 as
-/// unrounded) and `border_width = -4` clamps to 0.0 and multiplies paint alpha by zero, so both
-/// negative ends fail silently rather than raising. The upper end matters most: above roughly
-/// 8.4e6, `curve_divisions` (`path/cache.rs:911`) computes `acos(1.0) == 0.0`, divides by it, and
-/// `inf as u32` saturates to `u32::MAX` as a stroke-loop bound in `round_join`/`round_cap_start`:
-/// billions of iterations and tens of gigabytes of vertices on the Wayland dispatch thread.
-///
-/// This bound stays private to `radius` and `border_width`, not extended to `margin`/`padding`:
-/// § 5.1 gives `margin`/`padding` no "Valid Range" entry at all, unlike `width`/`height`, and
-/// `layout::scene`'s solver reads a negative margin the same way CSS does: subtracted into a
-/// child's footprint and slot size, so `margin = -8` deliberately pulls a child closer to (or
-/// over) its neighbor. That is layout math, not a femtovg stroke input, with no crash mode like
-/// `border_width`'s curve-divisions blowup.
+/// enforces for `width`/`height` (§ 5.1). Traced in femtovg 0.26: `radius = -4` silently draws
+/// square corners (`path.rs:458` treats anything under 0.1 as unrounded), and `border_width = -4`
+/// clamps to 0.0 and zeroes paint alpha, so both fail silently rather than raising. The upper end
+/// matters most: above roughly 8.4e6, `curve_divisions` (`path/cache.rs:911`) computes
+/// `acos(1.0) == 0.0`, divides by it, and `inf as u32` saturates to `u32::MAX` as a stroke-loop
+/// bound in `round_join`/`round_cap_start`: billions of iterations and tens of gigabytes of
+/// vertices on the Wayland dispatch thread. Stays private to `radius`/`border_width`: § 5.1 gives
+/// `margin`/`padding` no "Valid Range" entry, and `layout::scene`'s solver reads a negative margin
+/// like CSS (subtracted into a child's footprint and slot size, so `margin = -8` pulls a child
+/// closer to or over its neighbor): layout math, not a femtovg stroke input with this crash mode.
 fn check_geometry_range(property: &str, n: f32) -> Result<(), LayoutError> {
     if !(0.0..=8192.0).contains(&n) {
         return Err(invalid(property, format!("must be within [0, 8192], got {n}")));
@@ -193,10 +169,9 @@ pub fn parse_radius(properties: &HashMap<String, Value>) -> Result<f32, LayoutEr
     Ok(n)
 }
 
-/// What a node cuts its children down to.
-///
-/// Every node has always clipped its subtree to its own box (`layout::paint::build_node`), and
-/// [`ClipShape::Box`] is that. The choice this type adds is whether `radius` takes part.
+/// What a node cuts its children down to. Every node has always clipped its subtree to its own
+/// box (`layout::paint::build_node`), and [`ClipShape::Box`] is that; the choice this type adds is
+/// whether `radius` takes part.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClipShape {
     /// The node's rectangle, square corners, whatever its `radius` says.
@@ -207,18 +182,13 @@ pub enum ClipShape {
     Rounded,
 }
 
-/// `rect.clip` (§ 5.2 item 1). Absent is [`ClipShape::Box`].
-///
-/// Opt-in rather than implied by `radius`, and the cost is the whole reason: a rounded clip is an
-/// offscreen render target plus a composite (`layout::paint::execute`), where a square one is a
-/// scissor rectangle the GPU applies for free. Most rounded boxes on a bar have no child that
-/// overflows them, and charging every one of them for a pass none of them needs is the wrong
-/// default. QML draws the same line: `Item.clip` is rectangular and ignores `radius`, and
-/// reaching the rounded shape means reaching for Quickshell's `ClippingRectangle`, which spends
-/// two offscreen targets on it.
-///
-/// `"Box"` is spelled out rather than left as the absent case alone so a config can write the
-/// default back into a shared style table.
+/// `rect.clip` (§ 5.2 item 1). Absent is [`ClipShape::Box`], spelled out rather than left implicit
+/// so a config can write the default back into a shared style table. Opt-in rather than implied
+/// by `radius`, and the cost is why: a rounded clip is an offscreen render target plus a composite
+/// (`layout::paint::execute`), where a square one is a scissor rectangle the GPU applies for free,
+/// and most rounded boxes on a bar have no overflowing child to justify charging for the pass. QML
+/// draws the same line: `Item.clip` ignores `radius`, and the rounded shape means reaching for
+/// Quickshell's `ClippingRectangle`, which spends two offscreen targets on it.
 pub fn parse_clip(properties: &HashMap<String, Value>) -> Result<ClipShape, LayoutError> {
     let Some(value) = properties.get("clip") else {
         return Ok(ClipShape::Box);
@@ -233,12 +203,11 @@ pub fn parse_clip(properties: &HashMap<String, Value>) -> Result<ClipShape, Layo
     }
 }
 
-/// `rect.border_color` (§ 5.2 item 1), one colour per edge. `None` on an edge means "not painted",
-/// the same absence [`parse_background`] returns for a missing fill and the same zero
-/// [`parse_border_width`] defaults an edge to: an edge with width 0 needs no colour, and an edge
-/// with a colour but width 0 still paints nothing, so the drawing pass can read either field first
-/// and get the same answer. § 5.2 gives the table form no per-edge default colour to fall back to,
-/// so an absent edge takes `None` rather than an invented default.
+/// `rect.border_color` (§ 5.2 item 1), one colour per edge. `None` means "not painted", the same
+/// absence [`parse_background`] returns for a missing fill: an edge at width 0 needs no colour,
+/// and one with a colour at width 0 still paints nothing, so the drawing pass gets the same answer
+/// either way. § 5.2 gives the table form no per-edge default, so an absent edge takes `None`
+/// rather than an invented one.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct BorderColor {
     pub top: Option<Rgba>,
@@ -259,15 +228,14 @@ pub fn parse_border_color(properties: &HashMap<String, Value>) -> Result<BorderC
     let Value::Table(table) = value else {
         return Err(invalid("border_color", format!("expected a string or a table, got {}", preview_for_error(value))));
     };
-    // `table.get` is metamethod-aware here too. Unlike margin/padding this was never read twice:
-    // ADR-0068 already had `paint_style` parse it once per node, so all it needed was a
-    // budget to run under, which `lua::signal`'s `LayoutPassBudget` now provides for the whole
-    // pass. See [`parse_edge_insets`] for the measurements.
+    // Metamethod-aware here too, but unlike margin/padding this was never read twice: ADR-0068
+    // had `paint_style` parse it once per node, needing only the budget `LayoutPassBudget` now
+    // provides. See [`parse_edge_insets`].
     let edge = |key: &str| -> Result<Option<Rgba>, LayoutError> {
         let v: Value = table.get(key).map_err(|e| invalid("border_color", e.to_string()))?;
-        // Every error this closure raises names the edge, `key`, not just the property:
-        // see the `Value::UserData` arm below and `name_edge` for why the String arm needs help
-        // to do that too, since `checked_string`/`parse_hex_color` only know the property.
+        // Every error this closure raises names the edge, `key`, not just the property: the
+        // `Value::UserData` arm below does that itself; `name_edge` does it for the String arm,
+        // since `checked_string`/`parse_hex_color` only know the property.
         let name_edge = |e: LayoutError| match e {
             LayoutError::InvalidProperty { property, detail } => {
                 LayoutError::InvalidProperty { property, detail: format!("`{key}`: {detail}") }
@@ -276,9 +244,8 @@ pub fn parse_border_color(properties: &HashMap<String, Value>) -> Result<BorderC
         };
         match v {
             Value::Nil => Ok(None),
-            // Same hole as `parse_edge_insets`'s `edge` closure, same fix: a Signal only resolves
-            // at the top level of the property map, so one nested here is refused outright rather
-            // than falling into the `other` arm and being misreported as a bad hex string.
+            // Same hole as `parse_edge_insets`'s `edge` closure, same fix: nested here, a Signal
+            // is refused outright rather than falling into `other` and misreported as a bad hex.
             Value::UserData(_) => Err(LayoutError::UnsupportedSignalProperty(format!("border_color.{key}"))),
             Value::String(s) => {
                 let s = checked_string("border_color", &s).map_err(name_edge)?;
@@ -293,12 +260,10 @@ pub fn parse_border_color(properties: &HashMap<String, Value>) -> Result<BorderC
     Ok(BorderColor { top: edge("top")?, right: edge("right")?, bottom: edge("bottom")?, left: edge("left")? })
 }
 
-/// `rect.border_width` (§ 5.2 item 1), reusing [`EdgeInsets`] rather than a new per-edge type since
-/// the shape (four `f32`, default 0) is already exactly that. Both the scalar and table forms
-/// come straight from [`parse_edge_insets`], which also defaults an absent edge to 0; the one
-/// thing this wrapper still adds is the `[0, 8192]` range check, run on every edge of the result.
-/// That check stays here rather than moving into `parse_edge_insets` itself: see
-/// [`check_geometry_range`]'s doc comment for why `margin`/`padding` don't get it.
+/// `rect.border_width` (§ 5.2 item 1), reusing [`EdgeInsets`] since its shape (four `f32`,
+/// default 0) is already exactly that. Both forms come from [`parse_edge_insets`]; this wrapper
+/// only adds the `[0, 8192]` range check, kept here rather than in `parse_edge_insets` itself: see
+/// [`check_geometry_range`] for why `margin`/`padding` don't get it.
 pub fn parse_border_width(properties: &HashMap<String, Value>) -> Result<EdgeInsets, LayoutError> {
     let insets = parse_edge_insets(properties, "border_width")?;
     for n in [insets.top, insets.right, insets.bottom, insets.left] {
@@ -323,12 +288,10 @@ pub fn parse_align(properties: &HashMap<String, Value>, property: &str) -> Resul
     }
 }
 
-/// `list.direction` (§ 5.2 item 7): `"Vertical"` (the default) or `"Horizontal"`.
-///
-/// Returns the kind whose layout a `list` borrows, because that is all the property does:
-/// `layout::scene` has one `row` arm and one `column` arm, and a `list` is routed to whichever the
-/// direction names rather than growing a third. `"Vertical"` is the default so a config written
-/// without `direction` keeps its existing vertical layout.
+/// `list.direction` (§ 5.2 item 7): `"Vertical"` (the default) or `"Horizontal"`. Returns the kind
+/// whose layout a `list` borrows, since that's all the property does: `layout::scene` has one
+/// `row` arm and one `column` arm, and a `list` is routed to whichever the direction names rather
+/// than growing a third; `"Vertical"` defaults so an unset `direction` keeps existing layouts.
 pub fn parse_list_direction(properties: &HashMap<String, Value>) -> Result<&'static str, LayoutError> {
     let Some(value) = properties.get("direction") else {
         return Ok("column");
@@ -344,25 +307,17 @@ pub fn parse_list_direction(properties: &HashMap<String, Value>) -> Result<&'sta
 }
 
 /// `opacity` (`oblisk-idl-api-specs.md` § 5.1): how much of this node and everything under it
-/// reaches the screen, 0 for invisible and 1 for solid. Absent defaults to 1.
-///
-/// § 5.1 and not § 5.2, because this belongs to every kind rather than to the ones that draw a box.
-/// A `list` paints nothing itself and still has to fade what is inside it, which is also why the
-/// value lives on `ResolvedNode` rather than inside `PaintStyle`.
-///
-/// **Inherited, and multiplied.** The value parsed here is one node's own contribution;
-/// `layout::paint::build_node` multiplies it into whatever its ancestors already applied, the same
-/// way it intersects a clip rather than replacing one. That is what makes fading a whole panel one
-/// property instead of a walk over its children.
-///
-/// **Not `visible = false`.** A fully transparent node still lays out, still occupies space in its
-/// parent's flow, and still hit-tests, because `layout::hit` gates descent on `visible` alone. That
-/// is what lets a fade run without the layout jumping under it, and it matches what the reference
-/// config expects from the property it uses in 32 files.
-///
-/// Refused rather than clamped outside `[0, 1]`, matching every other paint property since
-/// ADR-0068: a config that writes `opacity = 50` meaning percent should hear about it while
-/// applying, not stare at an invisible panel.
+/// reaches the screen, 0 for invisible and 1 for solid. Absent defaults to 1. § 5.1, not § 5.2:
+/// this belongs to every kind, not just the ones that draw a box, which is also why a `list` (it
+/// paints nothing itself) still has to fade its contents, and why the value lives on
+/// `ResolvedNode` rather than `PaintStyle`. **Inherited, and multiplied**:
+/// `layout::paint::build_node` multiplies this node's own value into whatever its ancestors
+/// applied, the same way it intersects a clip rather than replacing one, so fading a whole panel
+/// is one property. **Not `visible = false`**: a fully transparent node still lays out, occupies
+/// space, and hit-tests, since `layout::hit` gates descent on `visible` alone, so a fade runs
+/// without the layout jumping, matching the reference config's use of the property in 32 files.
+/// Refused rather than clamped outside `[0, 1]`, matching every paint property since ADR-0068:
+/// writing `opacity = 50` meaning percent should error, not blank a panel.
 pub fn parse_opacity(properties: &HashMap<String, Value>) -> Result<f32, LayoutError> {
     let Some(value) = properties.get("opacity") else {
         return Ok(1.0);
@@ -371,8 +326,8 @@ pub fn parse_opacity(properties: &HashMap<String, Value>) -> Result<f32, LayoutE
         return Err(invalid("opacity", format!("must be a number, got {}", preview_for_error(value))));
     };
     // `NaN` and the infinities never reach this: `value_as_f32` goes through
-    // `marshal::check_number` first, which refuses a non-finite before any range test would have
-    // to decide what `(0.0..=1.0).contains(&NaN)` ought to mean.
+    // `marshal::check_number` first, refusing a non-finite before `(0.0..=1.0).contains(&NaN)`
+    // would have to mean something.
     if !(0.0..=1.0).contains(&n) {
         return Err(invalid("opacity", format!("must be within [0, 1], got {n}")));
     }

@@ -40,32 +40,29 @@ function Capability:invoke(command, ...) end
 ---@field active boolean This is the AP currently associated.
 ---@field band string `"2.4 GHz"`, `"5 GHz"` or `"6 GHz"`, from the AP's frequency.
 ---@field secure boolean A key is required: the AP advertises WEP privacy, or non-empty WPA1 or RSN key management.
----@field ssid string The network name. The key entries are deduplicated on, so two radios of one network appear once, at the stronger signal.
+---@field ssid string The network name; entries dedupe on this, keeping only the stronger of two radios.
 ---@field strength integer Signal strength, `0` to `100`.
 
 ---@class ActiveClient
----§ 2.9's `active_client`, minus `is_fullscreen` (ADR-0056 decision 5: niri-ipc 26.4.0's
----`Window` has no such field, and a fabricated `false` would be wrong for fullscreen windows).
----`class` is Wayland's `app_id`: X11's `WM_CLASS` has no Wayland equivalent.
+---§ 2.9's `active_client`, minus `is_fullscreen` (ADR-0056 decision 5: niri-ipc 26.4.0's `Window`
+---has no such field, and a fabricated `false` would be wrong for fullscreen windows); `class` is
+---Wayland's `app_id`, since X11's `WM_CLASS` has no Wayland equivalent.
 ---@field class string The Wayland `app_id`, e.g. `"firefox"`. Named `class` for the X11 habit, but a Wayland toplevel has no `WM_CLASS`. The key `applications.by_app_id` is built to be looked up by.
 ---@field is_floating boolean The compositor has this window floating rather than tiled.
 ---@field title string The window title, e.g. `"src/main.rs - Neovim"`. Empty string for a window that sets none.
 
 ---@class AppStream
 ---One playback stream node PipeWire has advertised, filtered to
----`media.class == "Stream/Output/Audio"` and resolved to its owning process.
----
----`Serialize`: this is what `main.rs` puts in a `StateSnapshot`'s `payload`, pushed to the
----Renderer over the control socket as-is. Field names match § 2.4's spelling (`id`, `name`,
----ADR-0053 decision 3). `pid`/`process_name` are kept even though § 2.4 doesn't list them
------ ADR-0016 exists because finding the owning process was genuinely hard, and discarding
----that answer would throw away the one part of this payload that took real work.
----@field id integer PipeWire registry id of the stream node -- the key [`AudioApps`] tracks entries by.
+---`media.class == "Stream/Output/Audio"` and resolved to its owning process. `main.rs` puts
+---this as-is in a `StateSnapshot`'s `payload`. Field names match § 2.4's spelling (`id`, `name`,
+---ADR-0053 decision 3); `pid`/`process_name` are kept beyond § 2.4 because ADR-0016's
+---owning-process lookup was hard-won and worth keeping.
+---@field id integer PipeWire registry id of the stream node: the key [`AudioApps`] tracks entries by.
 ---@field muted boolean § 2.4's per-app mute, from the same `Props` param as `volume`.
 ---@field name? string `application.name`, if the client set one.
 ---@field pid integer `application.process.id`: the pid PipeWire recorded for the stream's owning process.
 ---@field process_name? string `/proc/{pid}/comm` for `pid`, if the process still existed when this stream was seen.
----@field volume number § 2.4's per-app volume, range `[0.0, 1.0]`. Read from this stream node's own `SPA_PARAM_Props` through the same cube-root conversion the master sink uses (see [`master`]): a stream stores `channelVolumes` cubed exactly as a sink does, confirmed with `pw-cli enum-params <id> Props` against a live playback stream. `1.0` until that param arrives, PipeWire's own untouched value for a stream never adjusted.
+---@field volume number § 2.4's per-app volume, range `[0.0, 1.0]`, read from `SPA_PARAM_Props` through the same cube-root conversion the master sink uses (see [`master`]): `pw-cli enum-params <id> Props` confirms a stream cubes `channelVolumes` like a sink. `1.0` until that param arrives.
 
 ---@class AppSummary
 ---One application as the config sees it (ADR-0061). Deliberately the display half only:
@@ -77,17 +74,14 @@ function Capability:invoke(command, ...) end
 ---@field name string The unlocalized `Name=`. `Name[xx]` is deliberately not read (ADR-0061), so this is English on a localized system.
 
 ---@class AudioDevice
----One § 2.4 `sinks`/`sources` entry. Both arrays are the same three fields, so they are the
----same type: an output and an input differ in which `media.class` produced them and in
----nothing a config reads.
----
----`name` is § 2.4's "user-friendly description", which is `node.description` (`"Built-in Audio
----Analog Stereo"`), not the `node.name` the metadata keys route by
----(`"alsa_output.pci-0000_00_1f.3.analog-stereo"`). Both exist on every device this machine
----advertises, and only one is meant for a person.
+---One § 2.4 `sinks`/`sources` entry. Both arrays share this one type: an output and an input
+---differ only in which `media.class` produced them, never in what a config reads. `name` is
+---§ 2.4's "user-friendly description": `node.description` (`"Built-in Audio Analog Stereo"`),
+---not the routing `node.name` (`"alsa_output.pci-0000_00_1f.3.analog-stereo"`). Both exist on
+---every device this machine advertises; only one is meant for a person.
 ---@field active boolean Whether this is the device the `default.audio.sink`/`default.audio.source` metadata key currently routes to.
 ---@field id integer PipeWire registry id, which is what `audio:set_default_sink(id)` takes.
----@field name string The device description, e.g. `"Built-in Audio Analog Stereo"`, which is what to draw. Not stable across a reboot; [`AudioDevice::id`] is not either.
+---@field name string The device description, e.g. `"Built-in Audio Analog Stereo"`. Not stable across a reboot; [`AudioDevice::id`] is not either.
 
 ---@alias BatteryStatus
 ---| "Unknown" # UPower has no answer, which includes every host where the display device is not a battery.
@@ -166,23 +160,22 @@ function Capability:invoke(command, ...) end
 ---@field underline? boolean The run sat inside `<u>`.
 
 ---@class OutputWorkspaces
----One output's workspace state. `workspaces` is ADR-0056 decision 3's addition to
----§ 2.9.
----@field active_workspace integer The [`WorkspaceEntry::id`] of the workspace visible on this output. Every output has one, focused or not.
+---One output's workspace state; `workspaces` is ADR-0056 decision 3's addition to § 2.9.
+---@field active_workspace integer The [`WorkspaceEntry::id`] of the workspace visible on this output; every output has one.
 ---@field focused_workspace? integer ADR-0056 decision 4: present only on the output that actually holds focus, so `out.focused_workspace ~= nil` is the "is this the focused monitor" test.
 ---@field name string The connector name, e.g. `"eDP-1"`. Matches an `oblisk.screens` entry's `name` and a surface's `monitor`.
 ---@field workspaces WorkspaceEntry[] The workspaces on this output, ordered by [`WorkspaceEntry::idx`]. What a strip draws: the two ids above are opaque on their own and name nothing a user would recognise.
 
 ---@class PlayerState
----@field album_art_path string An absolute path to the artwork, or an empty string. `mpris:artUrl` is taken only when it is a `file://` URL that canonicalizes to a file that exists, so a remote URL and a stale path both arrive as empty rather than as a path that fails to load. Held across an update that did not change the track, so the cover does not blink on a position tick.
----@field artist string `xesam:artist`, joined with `", "` when there is more than one. Empty string when absent.
----@field id string The bus name with `org.mpris.MediaPlayer2.` stripped, e.g. `"spotify"`. What every `mpris:` command takes to name the player it acts on.
----@field identity string `MediaPlayer2.Identity`, the player's own display name, e.g. `"Spotify"`. Empty string for a player that does not answer the property.
----@field length integer `-1` when `mpris:length` is absent/malformed (a live stream, or a player that simply doesn't report it) -- a genuine unavailable, not a fabricated zero (ADR-0036).
----@field play_state string `"Playing"`, `"Paused"` or `"Stopped"`. A player that fails to answer keeps its previous value rather than dropping to a fabricated `"Stopped"`.
----@field position integer Playback offset in microseconds, correct as of [`PlayerState::position_updated_at`] and not after. Nothing polls it while a track plays, so a progress bar has to add the elapsed time itself rather than reading this every frame.
----@field position_updated_at integer `CLOCK_MONOTONIC` microseconds at the instant [`PlayerState::position`] was read. Monotonic, not wall clock, so it survives a clock adjustment. Subtract it from a monotonic `now` to get how far the track has moved since.
----@field title string `xesam:title`. Empty string when the player publishes no metadata, which is the normal state between tracks.
+---@field album_art_path string An absolute path to the artwork, or empty. `mpris:artUrl` counts only as a `file://` URL that canonicalizes to an existing file, so a remote or stale URL both arrive empty rather than a path that fails to load; held across a same-track update so the cover doesn't blink.
+---@field artist string `xesam:artist`, joined with `", "` when there is more than one. Empty when absent.
+---@field id string Bus name with `org.mpris.MediaPlayer2.` stripped, e.g. `"spotify"`; what `mpris:` commands use to name a player.
+---@field identity string `MediaPlayer2.Identity`, the player's display name, e.g. `"Spotify"`; empty if unanswered.
+---@field length integer `-1` when `mpris:length` is absent or malformed: a live stream, or a player that simply doesn't report it. A genuine unavailable, not a fabricated zero (ADR-0036).
+---@field play_state string `"Playing"`, `"Paused"` or `"Stopped"`; keeps its previous value rather than fabricating `"Stopped"` if the player fails to answer.
+---@field position integer Playback offset in microseconds, correct as of [`PlayerState::position_updated_at`] and not after; nothing polls it while playing, so a progress bar must add elapsed time itself.
+---@field position_updated_at integer `CLOCK_MONOTONIC` microseconds when [`PlayerState::position`] was read. Monotonic, not wall clock, so it survives a clock adjustment; subtract from a monotonic `now` for elapsed.
+---@field title string `xesam:title`; empty when the player publishes no metadata, the normal state between tracks.
 
 ---@class TrayItem
 ---@field attention_icon_name? string The `NeedsAttention` artwork, resolved the same way as `icon_name`/`icon_path`. Draw these instead of the base pair while `status` is `"NeedsAttention"`. Both stay `nil` for an item that declares no attention icon, which is most of them.
@@ -221,21 +214,21 @@ function Capability:invoke(command, ...) end
 ---@class ApplicationsState
 ---`oblisk.applications`'s payload (ADR-0061 decision 2).
 ---
----`by_app_id` repeats the summaries in `entries` rather than indexing into it. An index would
----have to be a Lua array index, and Lua counts from one while the JSON array this serializes to
----counts from zero, so every config reading it would carry an off-by-one nobody can see in the
----payload. Repeating three small fields for a few hundred entries costs less than that trap.
+---`by_app_id` repeats the summaries in `entries` rather than indexing into it. A Lua array
+---index counts from one while the JSON array this serializes to counts from zero, so an index
+---would carry an off-by-one nobody can see in the payload; repeating three small fields for a
+---few hundred entries costs less than that trap.
 ---@field by_app_id table<string, AppSummary> The same entries, keyed by the `app_id` a window reports, for a caller holding `workspaces.active_client.class` rather than a desktop file id. Keyed on exact `StartupWMClass` and exact desktop id first, then case-folded and last-dot-segment spellings, and an exact key is never displaced by a folded one. Miss on it before concluding an app is not installed: the mapping is a set of heuristics, not a registry.
 ---@field entries AppSummary[] Every installed desktop entry that is visible and launchable, sorted by name. Rebuilt on `applications:refresh()`; nothing watches the directories, so an app installed mid-session does not appear until something asks.
 
 ---@class AudioState
 ---The full `oblisk.audio` payload (§ 2.4, ADR-0053 decision 3): master output
 ---volume/mute plus the per-app stream list.
----@field apps AppStream[] One entry per application playing audio right now. Empty when nothing is, which is the normal state and not an error.
+---@field apps AppStream[] One entry per app playing audio right now; empty is normal, not an error.
 ---@field muted boolean Master output mute.
 ---@field sinks AudioDevice[] Every output device. `audio:set_default_sink(id)` takes one's [`AudioDevice::id`].
 ---@field sources AudioDevice[] Every input device, on the same terms as [`AudioState::sinks`].
----@field volume number Master output volume, range `[0.0, 1.0]` -- see [`master`]'s module doc comment for how this is derived from the default sink's `channelVolumes`.
+---@field volume number Master output volume, range `[0.0, 1.0]`; see [`master`]'s module doc comment for how this is derived from the default sink's `channelVolumes`.
 
 ---@class BatteryState
 ---`oblisk.battery`'s full payload (§ 2.2). Field names are the `StateSnapshot` JSON keys
@@ -275,25 +268,24 @@ function Capability:invoke(command, ...) end
 ---@field scroll_lock boolean Scroll Lock is on.
 
 ---@class LockState
----`oblisk.lock`'s payload (ADR-0052 decision 4). `attempts` counts failed authentications
----since acquisition, and exists because Lua can't rebuild it: capability state is sampled at
----layout time (ADR-0044), not evented, so two identical consecutive failures are one
----unchanged `error` string. `error`'s "nothing went wrong" value is the empty string, the same
----convention `keyboard`'s `active_layout` uses.
----@field active boolean The session is locked and the Renderer has confirmed it. Never optimistic: a lock that has been asked for but not yet confirmed still reads `false`, so a config cannot draw an unlocked screen over a locked session or the reverse.
----@field attempts integer Authentication attempts against the lock currently held. Counts every answer PAM returns, success included, and resets to `0` only when the Renderer confirms a *new* lock. So it is per-acquisition rather than per-failure: a lockout rule reads it together with [`LockState::error`], which is empty after the attempt that succeeded.
+---`oblisk.lock`'s payload (ADR-0052 decision 4). `attempts` counts failed authentications since
+---acquisition; Lua can't rebuild it because state is sampled at layout time (ADR-0044), not
+---evented, so two identical consecutive failures are one unchanged `error` string. `error`'s
+---"nothing went wrong" value is the empty string, like `keyboard`'s `active_layout`.
+---@field active boolean The session is locked and the Renderer has confirmed it: never optimistic, so a lock asked for but not yet confirmed still reads `false`, and a config can't draw the wrong screen.
+---@field attempts integer Authentication attempts against the lock currently held: counts every PAM answer including success, resetting to `0` only on a *new* confirmed lock, so it's per-acquisition, not per-failure. A lockout rule reads it with [`LockState::error`].
 ---@field authenticating boolean A password is with PAM and no answer has come back. `pam_unix` takes about a second, so this is what a spinner reads. `lock:authenticate` is refused while it is true.
----@field error string Why the last attempt failed, in words fit to draw, e.g. `"too many attempts"`. Empty string when the last attempt succeeded and when none has been made. Rewritten on every PAM answer and cleared when a new lock is confirmed, so it always describes the lock now on screen.
+---@field error string Why the last attempt failed, in words fit to draw, e.g. `"too many attempts"`. Empty when the last attempt succeeded or none has been made, rewritten on every PAM answer and cleared on a new lock, so it always describes the lock now on screen.
 
 ---@class MprisState
 ---@field players PlayerState[] Every MPRIS player on the bus, longest-running first. A player that appears appends, and one pushing position updates does not move, so `players[1]` keeps meaning the same player. Empty when nothing is running, which is not an error.
 
 ---@class NetworkState
----`oblisk.network`'s live push state (ADR-0029). Scoped to exactly what §4.2 asks for --
----scanning status and the deduplicated AP list -- not the full §2.5 read schema
----(`connected`/`ssid`/`wifi_enabled`/etc.), which §4 doesn't ask this controller to track.
----@field available_networks AccessPointInfo[] The access points from the last completed scan: deduplicated by SSID keeping the strongest radio of each, sorted strongest first, and cut to 20. Keeps the previous list while [`NetworkState::scanning`] is true, so a panel does not blank out mid-scan.
----@field scanning boolean A scan is in flight. Flipped to `true` the moment `network:scan()` is accepted rather than when NetworkManager confirms, so a spinner starts on the click instead of a round trip later.
+---`oblisk.network`'s live push state (ADR-0029). Scoped to §4.2's scanning status and
+---deduplicated AP list, not the full §2.5 read schema (`connected`/`ssid`/`wifi_enabled`/etc.),
+---which §4 doesn't ask this controller to track.
+---@field available_networks AccessPointInfo[] Access points from the last completed scan: deduplicated by SSID, sorted strongest first, cut to 20, and kept as-is while [`NetworkState::scanning`] is true so a panel doesn't blank.
+---@field scanning boolean A scan is in flight. Flipped to `true` the moment `network:scan()` is accepted rather than when NetworkManager confirms, so a spinner starts on the click, not a round trip later.
 
 ---@class NotificationsState
 ---`notifications.feed`/`notifications.dnd`'s `StateSnapshot` payload shape (ADR-0033).
@@ -347,11 +339,10 @@ function Capability:invoke(command, ...) end
 ---@field reboot_required boolean A `linux` or `linux-*` package was installed at some point this session. Sticky on purpose: once set it stays set through later installs that do not touch the kernel, because the running kernel is still the old one until the machine restarts.
 
 ---@class WorkspacesState
----`oblisk.workspaces`'s full payload (§ 2.9). Field names are the JSON keys verbatim.
----`active_client` is `Option` (§ 2.9: "or `nil` if none focused"), omitted rather than
----serialized as `null`.
----@field active_client? ActiveClient The focused toplevel, or `nil` when nothing holds focus. One window across the whole session, not one per output: there is no way to ask what is focused on an unfocused monitor (ADR-0056 decision 4).
----@field outputs OutputWorkspaces[] One entry per connected output, keyed by connector name. Empty before the compositor's first answer.
+---`oblisk.workspaces`'s full payload (§ 2.9); field names are the JSON keys verbatim, and
+---`active_client` (`Option`, § 2.9's "or `nil` if none focused") is omitted, not `null`.
+---@field active_client? ActiveClient The focused toplevel, or `nil` if none. One window per session, not per output: there is no way to ask what is focused on an unfocused monitor (ADR-0056 decision 4).
+---@field outputs OutputWorkspaces[] One entry per output, keyed by connector name; empty until the compositor first answers.
 
 --- Capabilities -------------------------------------------------------------------------------
 

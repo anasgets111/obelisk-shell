@@ -1,17 +1,12 @@
 //! The `Signal` reactive primitive (`oblisk-idl-api-specs.md` § 1.2): `signal:get()`,
 //! `signal:map(fn)`, `signal:set(value)`, and the globals `computed(dependencies, fn)` and
-//! `state(name, initial)` (ADR-0044 decision 5).
+//! `state(name, initial)` (ADR-0044 decision 5). Lua never constructs a bare `Signal` itself:
+//! § 1.2 exposes it as Rust-owned userdata handed to Lua. It calls `fn` with each dependency's
+//! current value, not the `Signal` handles, so a `computed` body doesn't call `:get()` on its
+//! own deps.
 //!
-//! Lua never constructs a bare `Signal` itself. § 1.2 exposes it as Rust-owned userdata handed to
-//! Lua, never built by Lua from a raw value.
-//!
-//! ponytail: `computed`/`map` recompute their function fresh on every `:get()`, with no
-//! memoization and no dependency-invalidation graph. The upgrade path, deciding when a cached
-//! value goes stale, is the Watcher's job (`CONTEXT.md`, Watcher), not this loader's.
-//!
-//! `computed(dependencies, fn)` calls `fn` with each dependency's current value as a positional
-//! argument, not the `Signal` handles themselves, so a `computed` body doesn't need to call
-//! `:get()` on its own dependencies.
+//! ponytail: `computed`/`map` recompute fresh on every `:get()`, no memoization, no
+//! dependency-invalidation graph. Deciding when a cached value goes stale is the Watcher's job.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -25,42 +20,29 @@ use crate::lua::marshal;
 /// § 1.2: "CPU runtime is capped at 5ms per evaluation."
 const CPU_CAP: Duration = Duration::from_millis(5);
 
-/// What one whole `Scene::apply` gets, distinct from what one signal evaluation gets: a bound on
-/// a whole layout pass, not each getter call.
+/// What one whole `Scene::apply` gets, distinct from one signal evaluation: a bound on a whole
+/// layout pass, not each getter call. Larger than [`CPU_CAP`]: a legitimate pass runs every
+/// getter and blocks on the shaping thread once per text measurement. Measured on a 2000-sibling
+/// row (up to 4000): release 202ms/298ms, debug 550ms/1.10s. 2 seconds is ~2x the worst of those
+/// and ~300x ADR-0069's 6.14ms for a 500-row list, the shape a real config has; a tighter 250ms
+/// cap refused that legitimate config.
 ///
-/// A larger number than [`CPU_CAP`], because a legitimate pass runs every getter in the tree and
-/// blocks on the shaping thread once per text measurement. Measured on a 2000-sibling row (goes up
-/// to 4000): release 202ms/298ms, debug 550ms/1.10s.
-///
-/// 2 seconds is roughly 2x the worst of those, 7x the release figure, and ~300x ADR-0069's 6.14ms
-/// for a 500-row list, the shape a real config has. A tighter 250ms cap fired on the 2000-sibling
-/// test in both profiles: a legitimate config refused.
-///
-/// It bounds damage, not performance, and is deliberately loose. What it stops: a `margin` table
-/// whose `__index` spins ran one `Scene::apply` for 26.10 seconds returning `Ok(())`, on the
-/// thread that also answers `configure` and runs the VM (ADR-0039). This turns that into one 2
-/// second stall and a `LayoutError` `oblisk.rescue` can report, not a desktop that never returns.
-///
-/// ponytail: 200ms for 2000 siblings is its own problem this cap doesn't touch; at ADR-0044's push
-/// cadence that config drops frames regardless. Upgrade path: a real per-pass budget sized to what
-/// a legitimate pass costs, not merely to be legal.
+/// Bounds damage, not performance: it stops a `margin` table whose spinning `__index` ran one
+/// `Scene::apply` for 26.10 seconds returning `Ok(())` on the thread that also answers `configure`
+/// and runs the VM (ADR-0039), now a 2 second stall and a reportable `LayoutError`. ponytail:
+/// 200ms for 2000 siblings is its own problem this cap doesn't touch, dropping frames regardless
+/// at ADR-0044's push cadence. Upgrade path: a real per-pass budget sized to cost.
 const LAYOUT_PASS_CAP: Duration = Duration::from_secs(2);
 
-/// One live evaluation's allowance, on both clocks.
-///
-/// `cpu` is the one § 1.2 specifies and decides. `wall` is a pre-filter only: CPU time advances at
-/// most as fast as the clock, so an unexpired wall deadline proves an unexpired CPU one and
-/// [`Deadline::expired`] can answer "keep going" without a syscall. `Instant::now()` is 23.6ns
-/// against `CLOCK_THREAD_CPUTIME_ID`'s 170.4ns, so the common path (checked every
-/// [`CHECK_EVERY_N_INSTRUCTIONS`]) pays the cheap clock.
-///
-/// Wall clock alone would charge a descheduled evaluation for time it didn't run: on a 12-thread
-/// machine running the whole suite, a wall-only cap fired 5 times in 53 full runs on configs a
-/// quiet machine evaluates in microseconds.
-///
-/// Nothing is lost by not counting the wait: a parked thread runs no instructions, so the hook
-/// never fires during one. ADR-0048 removes every call that can block instead: `io` is absent from
-/// `lua::config_stdlib`, and `lua::restrict_os` keeps only four `os` calls, none of which wait.
+/// One live evaluation's allowance, on both clocks. `cpu` is the one § 1.2 specifies and decides.
+/// `wall` is a pre-filter only, since CPU time advances at most as fast as the clock: an
+/// unexpired wall deadline proves an unexpired CPU one, so [`Deadline::expired`] answers "keep
+/// going" without a syscall. `Instant::now()`'s 23.6ns beats `CLOCK_THREAD_CPUTIME_ID`'s 170.4ns,
+/// so the common path pays the cheap clock. Wall alone would charge a descheduled evaluation for
+/// time it didn't run: on a 12-thread machine it fired 5 times in 53 full suite runs on configs a
+/// quiet machine evaluates in microseconds. Nothing is lost: a parked thread fires no instruction
+/// hook, and ADR-0048 removes every blocking call anyway (`io` absent from `lua::config_stdlib`;
+/// `lua::restrict_os`'s four `os` calls never wait).
 #[derive(Clone, Copy)]
 struct Deadline {
     wall: Instant,
@@ -85,7 +67,6 @@ impl Deadline {
 }
 
 /// How much CPU the calling thread has burned, which is what § 1.2's cap is written against.
-///
 /// Per *thread*, not per process: one evaluation runs start to finish on the thread that entered
 /// it, and the Lua VM is single-threaded by construction (ADR-0039 puts it on the Wayland
 /// thread). A process-wide clock would charge a config for the shaping worker.
@@ -100,23 +81,17 @@ fn thread_cpu_time() -> Option<Duration> {
 /// seconds.
 const CHECK_EVERY_N_INSTRUCTIONS: u32 = 1000;
 
-/// The recursion bound for [`Signal::get_value`]'s `Computed` arm: how many of those calls may be
-/// live on the stack before the next returns an `mlua::Error` instead of recursing further, the
-/// same "at most N levels" boundary `layout::scene`'s `MAX_TREE_DEPTH` uses.
-///
-/// Bounds both shapes of `get_value` recursion, since [`CpuBudget::enter`] runs before dependency
-/// resolution rather than around the closure call alone: body nesting (a `computed`/`map` body
-/// calling `:get()` on another signal, directly or through a self- or mutually-referential cycle)
-/// and dependency chains (`s:map(f):map(g):...`, which resolve recursively and nest no Lua call).
-///
-/// Pushing the deadline only around the closure call leaves a chain nesting Rust frames while the
-/// deadline stack stays at depth 1: a 200-link chain reaches `get_value` depth 200 with max stack
-/// depth 1, and a 5000-link chain aborts with `fatal runtime error: stack overflow`. The 5ms CPU
-/// cap alone can't catch it either, since a chain does no Lua work between levels and the
-/// instruction hook may never fire before the guard page does.
-///
-/// A legitimate chain is shallow, so 32 is generous headroom; see
-/// `layout::scene::MAX_TREE_DEPTH` for the measured compounded stack cost that sets both constants.
+/// The recursion bound for [`Signal::get_value`]'s `Computed` arm: how many calls may be live on
+/// the stack before the next returns an `mlua::Error`, the same "at most N levels" boundary
+/// `layout::scene`'s `MAX_TREE_DEPTH` uses. Bounds both shapes of recursion, since
+/// [`CpuBudget::enter`] runs before dependency resolution, not around the closure call alone:
+/// body nesting (a `computed`/`map` body calling `:get()` on another signal, directly or through
+/// a cycle) and dependency chains (`s:map(f):map(g):...`, which nest no Lua call).
+/// A 200-link chain reaches `get_value` depth 200 with Rust stack depth 1 if the deadline pushes
+/// only around the closure call, and a 5000-link chain aborts with `fatal runtime error: stack
+/// overflow`; the 5ms CPU cap can't catch it either, since a chain does no Lua work for the hook
+/// to fire on. 32 is generous headroom; see `layout::scene::MAX_TREE_DEPTH` for the measured
+/// stack cost that sets both constants.
 const MAX_SIGNAL_NESTING_DEPTH: usize = 32;
 
 /// The one message both cap gates raise, so a caller matching on it does not have to know which
@@ -143,17 +118,12 @@ enum SignalKind {
     /// dedicated OS thread (the Wayland dispatch thread, ADR-0039).
     Live(Rc<RefCell<Value>>),
     /// The engine's own reactive state: a boolean `crate::wayland`'s pointer handler writes and a
-    /// config only reads, built by the `hover(name)` global (ADR-0062).
-    ///
-    /// Structurally identical to [`SignalKind::Live`] but kept separate over who may write:
-    /// `Signal::hover_handle` hands out a write end for this variant only, so a config binding
-    /// `hover = oblisk.network` gets no writer instead of a pointer overwriting a capability
-    /// snapshot.
-    ///
-    /// `paired_rect` is the hover slot's other half: the boolean `hover(name)` returns carries a
-    /// reference to the rect cell `hover_rect(name)` reads, so the pointer handler writes both from
-    /// one handle. `None` on the rect signal itself, which is a hover signal in every other respect
-    /// and is not itself a trigger.
+    /// config only reads, built by the `hover(name)` global (ADR-0062). Structurally identical to
+    /// [`SignalKind::Live`] but kept separate over who may write: `Signal::hover_handle` hands a
+    /// write end only for this variant, so `hover = oblisk.network` gets no writer.
+    /// `paired_rect` is the slot's other half: the boolean `hover(name)` returns carries a
+    /// reference to the rect cell `hover_rect(name)` reads, so one handle writes both. `None` on
+    /// the rect signal itself, a hover signal in every respect but not itself a trigger.
     Hover {
         cell: Rc<RefCell<Value>>,
         paired_rect: Option<Rc<RefCell<Value>>>,
@@ -162,27 +132,22 @@ enum SignalKind {
     /// How far a scrollable container has been scrolled along its main axis, in logical pixels
     /// (ADR-0069). Written by `crate::wayland`'s pointer handler on a wheel and by
     /// `layout::scene`'s positioning pass when it clamps; read by a config that wants to know.
-    ///
     /// A fifth variant for [`SignalKind::Hover`]'s reason, not a reuse of it:
-    /// `Signal::scroll_handle` hands out a write end for this kind alone, so a config naming
-    /// `scroll = oblisk.network` gets no writer instead of a wheel overwriting a capability
-    /// snapshot.
+    /// `Signal::scroll_handle` hands a write end only for this kind, so `scroll = oblisk.network`
+    /// gets no writer instead of a wheel overwriting a capability snapshot.
     Scroll {
         cell: Rc<RefCell<Value>>,
         dirty: DirtyFlag,
     },
-    /// Lua-authored state (ADR-0044 decision 5): the one signal kind `Signal::set` accepts, built
-    /// by the `state(name, initial)` global and written from a config's own `on_click`.
-    ///
-    /// A fourth variant rather than a reuse of `Live`, though the storage is identical. ADR-0044
+    /// Lua-authored state (ADR-0044 decision 5): the one signal kind `Signal::set` accepts,
+    /// built by the `state(name, initial)` global and written from a config's own `on_click`.
+    /// A fourth variant rather than a reuse of `Live`, though the storage is identical: ADR-0044
     /// makes capability signals read-only to Lua, and a `set` accepting `Live` would let a config
-    /// overwrite the network SSID the Supervisor just pushed, with every reader downstream
-    /// believing it. A distinct writable kind makes that rule a fact the type system holds, not a
-    /// comment `set` has to remember, and makes it testable.
-    ///
-    /// Carries its own `DirtyFlag` clone rather than reaching for one at write time: `set` is a
-    /// `UserData` method with no `RendererClient` in reach, and every signal in a generation
-    /// shares the one flag decision 2 specifies anyway.
+    /// overwrite the network SSID the Supervisor just pushed and every reader believe it. A
+    /// distinct writable kind makes that rule a type-system fact, testable, not a comment.
+    /// Carries its own `DirtyFlag` clone since `set` is a `UserData` method with no
+    /// `RendererClient` in reach; every signal in a generation shares the one flag decision 2
+    /// specifies anyway.
     State {
         cell: Rc<RefCell<Value>>,
         dirty: DirtyFlag,
@@ -205,11 +170,9 @@ impl SignalKind {
 
 /// The marshalling boundary (`marshal.rs`, § 1.1) applied to one Lua-authored value: checks the
 /// types § 1.1 constrains (`Number`/`Integer`/`String`); every other shape passes through
-/// untouched.
-///
-/// Shared by [`Signal::try_new_direct`], [`Signal::new_state`] and `set`, which all guard a value
-/// hand-authored in Lua crossing into Rust. `Signal::new_live` doesn't, since its value comes out
-/// of a Rust struct.
+/// untouched. Shared by [`Signal::try_new_direct`], [`Signal::new_state`] and `set`, which guard
+/// a value hand-authored in Lua crossing into Rust. `Signal::new_live` doesn't: its value comes
+/// from a Rust struct.
 fn check_lua_authored(value: &Value) -> Result<(), marshal::MarshalError> {
     match value {
         Value::Number(n) => {
@@ -226,21 +189,19 @@ fn check_lua_authored(value: &Value) -> Result<(), marshal::MarshalError> {
     Ok(())
 }
 
-/// Whether a `state` literal is one this can compare across two evaluations.
-///
-/// Tables, functions and userdata are not, because `mlua` compares them by pointer and every
-/// evaluation builds fresh ones, so one would always look edited.
+/// Whether a `state` literal is one this can compare across two evaluations. Tables, functions
+/// and userdata are not, because `mlua` compares them by pointer and every evaluation builds
+/// fresh ones, so one would always look edited.
 fn is_comparable_literal(value: &Value) -> bool {
     matches!(value, Value::Nil | Value::Boolean(_) | Value::Integer(_) | Value::Number(_) | Value::String(_))
 }
 
 /// Did the config author edit this `state` call's literal since the evaluation that seeded it?
-/// `None` means the question cannot be answered, which ADR-0044's amendment reads as "no".
-///
-/// The `false` answer for a table is the load-bearing one. `lib/ui_state.lua`'s `popup_anchor`
-/// default is a table, so a pointer comparison would call every reload an edit and snap an open
-/// popup back to the corner. Numbers compare across `Integer`/`Number` the way Lua's own `==`
-/// does, so rewriting `0` as `0.0` is not an edit; two scalars of different types are.
+/// `None` means unanswerable, which ADR-0044's amendment reads as "no". The `false` for a table
+/// is load-bearing: `lib/ui_state.lua`'s `popup_anchor` default is a table, and a pointer
+/// comparison would call every reload an edit, snapping an open popup back to the corner.
+/// Numbers compare across `Integer`/`Number` as Lua's own `==` does, so `0` vs `0.0` is not an
+/// edit; two scalars of different types are.
 fn literal_was_edited(current: &Value, seeded: &Value) -> Option<bool> {
     if !is_comparable_literal(current) || !is_comparable_literal(seeded) {
         return None;
@@ -257,13 +218,10 @@ fn literal_was_edited(current: &Value, seeded: &Value) -> Option<bool> {
 pub struct Signal(SignalKind);
 
 impl Signal {
-    /// Wraps `value` as a `Direct` signal, enforcing the marshalling boundary (`marshal.rs`) on the
-    /// types it constrains (`Number`/`Integer`/`String`); every other shape passes through
-    /// untouched.
-    ///
-    /// ponytail: no production caller yet; every live value today goes through `Signal::new_live`
-    /// instead. A real Lua-constructed `Direct` signal is a future phase's job. Exercised by this
-    /// module's tests only.
+    /// Wraps `value` as a `Direct` signal, enforcing the marshalling boundary (`marshal.rs`) on
+    /// the types it constrains (`Number`/`Integer`/`String`); every other shape passes untouched.
+    /// ponytail: no production caller yet, every live value goes through `Signal::new_live`
+    /// instead; a real Lua-constructed `Direct` signal is a future phase's job. Tests only.
     #[allow(dead_code)]
     pub fn try_new_direct(value: Value) -> Result<Self, marshal::MarshalError> {
         check_lua_authored(&value)?;
@@ -271,10 +229,9 @@ impl Signal {
     }
 
     /// The signal behind `state(name, initial)` (ADR-0044 decision 5): writable from Lua through
-    /// `signal:set(value)`, which marks `dirty` so the next poll turn re-resolves.
-    ///
-    /// Marshal-checked, unlike [`Self::new_live`]: `initial` is written in `shell.lua`, so it is
-    /// a hand-authored value crossing into Rust, the boundary `marshal.rs` exists for.
+    /// `signal:set(value)`, which marks `dirty` so the next poll turn re-resolves. Marshal-checked,
+    /// unlike [`Self::new_live`]: `initial` is written in `shell.lua`, so it is a hand-authored
+    /// value crossing into Rust, the boundary `marshal.rs` exists for.
     pub fn new_state(initial: Value, dirty: DirtyFlag) -> Result<Self, marshal::MarshalError> {
         check_lua_authored(&initial)?;
         Ok(Signal(SignalKind::State { cell: Rc::new(RefCell::new(initial)), dirty }))
@@ -282,14 +239,10 @@ impl Signal {
 
     /// Overwrites a `state` signal's value with a new `initial`, for ADR-0044's amendment: the
     /// config author changed the literal, so the file is the later write and beats whatever
-    /// `signal:set()` last left here.
-    ///
-    /// Marks dirty through the same flag `set` does: a re-seed that marked nothing would be a
-    /// write no other path guarantees to pick up, and the amendment is about a value the author
-    /// expects to see on screen.
-    ///
-    /// Only [`SignalKind::State`] can be re-seeded, the only kind the state registry holds; every
-    /// other kind reaching here is a caller bug, not a config error.
+    /// `signal:set()` last left here. Marks dirty through the same flag `set` does: the amendment
+    /// is about a value the author expects to see on screen, and a silent re-seed would defeat
+    /// that. Only [`SignalKind::State`] can be re-seeded, the only kind the state registry holds;
+    /// any other kind here is a caller bug, not a config error.
     pub fn reseed(&self, value: Value) -> Result<(), marshal::MarshalError> {
         check_lua_authored(&value)?;
         let SignalKind::State { cell, dirty } = &self.0 else {
@@ -304,34 +257,25 @@ impl Signal {
     /// A signal Rust can push new values into after construction via the paired
     /// [`LiveSignalHandle`]. `try_new_direct`'s marshalling checks don't apply: the value arrives
     /// already `serde_json`-serialized from a Rust struct, which can't produce a NaN/Inf/oversized
-    /// string the way hand-authored Lua can.
-    ///
-    /// `dirty` is the scene-dirty flag (ADR-0044 decision 2) the paired [`LiveSignalHandle`] marks
-    /// on every `set`. Every live signal in one generation shares the same `DirtyFlag`
-    /// (`renderer/src/socket.rs`'s `RendererClient` holds the clone that reads and clears it),
-    /// decision 2's "one flag for the whole scene."
+    /// string the way hand-authored Lua can. `dirty` is decision 2's scene-dirty flag, marked by
+    /// the paired [`LiveSignalHandle`] on every `set`; every live signal in one generation shares
+    /// the same `DirtyFlag` (`renderer/src/socket.rs`'s `RendererClient` holds the clone that
+    /// reads and clears it): one flag for the whole scene.
     pub fn new_live(initial: Value, dirty: DirtyFlag) -> (Self, LiveSignalHandle) {
         let cell = Rc::new(RefCell::new(initial));
         (Signal(SignalKind::Live(Rc::clone(&cell))), LiveSignalHandle(cell, dirty))
     }
 
     /// The signal `hover(name)` builds: a boolean the engine writes from `wl_pointer`, read-only
-    /// to Lua (ADR-0062 decision 2).
-    ///
-    /// Its own kind rather than a second [`Self::new_live`] caller, so `signal:set()` can refuse
-    /// it by name (telling a config it holds a hover slot, not a capability) and
-    /// [`Self::hover_handle`] can answer `None` for every other kind, keeping `hover =
-    /// oblisk.network` from getting a pointer that overwrites a capability's snapshot.
-    ///
-    /// Starts `false`, not nil: a config binds this straight to `visible`, and nil there would
-    /// mean the property is absent (ADR-0044 decision 1's amendment), not "the pointer isn't here."
-    ///
-    /// `initial_rect` applies the same rule to the other half, and isn't optional. A tooltip binds
-    /// `anchor_rect` to the rect signal, § 6.3 requires it non-zero, and the popup resolves from
-    /// the first frame, before any pointer has been near it. A nil rect refuses the popup on every
-    /// re-resolve until something hovers, which a live run reported before this argument existed.
-    /// The caller passes a real 1x1 rect since building a `Value::Table` needs a `Lua` this
-    /// constructor doesn't have.
+    /// to Lua (ADR-0062 decision 2). Its own kind rather than a second [`Self::new_live`] caller,
+    /// so `signal:set()` refuses it by name (a hover slot, not a capability) and
+    /// [`Self::hover_handle`] answers `None` for every other kind. Starts `false`, not nil: a
+    /// config binds this straight to `visible`, and nil would mean the property absent (ADR-0044
+    /// decision 1's amendment), not "no pointer yet."
+    /// `initial_rect` isn't optional for the same reason: § 6.3 requires the `anchor_rect` a
+    /// tooltip binds non-zero, and the popup resolves from the first frame, before any pointer has
+    /// been near it, so a nil rect would refuse it until something hovers. The caller passes a
+    /// real 1x1 rect since a `Value::Table` needs a `Lua` this constructor doesn't have.
     pub fn new_hover(dirty: DirtyFlag, initial_rect: Value) -> (Self, Self) {
         let over = Rc::new(RefCell::new(Value::Boolean(false)));
         let rect = Rc::new(RefCell::new(initial_rect));
@@ -345,11 +289,10 @@ impl Signal {
         )
     }
 
-    /// A scroll offset, starting at the top (ADR-0069 decision 2).
-    ///
-    /// A plain number rather than a pair like [`Self::new_hover`]'s: the content extent a scrollbar
-    /// would also want is deliberately not published, because nothing draws one yet and the first
-    /// config that does is the place to decide what shape it should arrive in.
+    /// A scroll offset, starting at the top (ADR-0069 decision 2). A plain number rather than a
+    /// pair like [`Self::new_hover`]'s: the content extent a scrollbar would also want is
+    /// deliberately not published, since nothing draws one yet and the first config that does is
+    /// the place to decide what shape it should arrive in.
     pub fn new_scroll(dirty: DirtyFlag) -> Self {
         Signal(SignalKind::Scroll { cell: Rc::new(RefCell::new(Value::Number(0.0))), dirty })
     }
@@ -364,12 +307,10 @@ impl Signal {
         }
     }
 
-    /// This scroll signal's current offset, without a `Lua` to hand.
-    ///
-    /// [`Self::get_value`] needs a `&Lua` this can't supply: `layout::scene`'s positioning pass
-    /// runs the scroll clamp deep inside a pass holding no VM reference, and threading one down
-    /// just to read a number out of a `RefCell` would add a parameter to every frame of the
-    /// layout recursion for one property's benefit.
+    /// This scroll signal's current offset, without a `Lua` to hand. [`Self::get_value`] needs a
+    /// `&Lua` this can't supply: `layout::scene`'s positioning pass runs the scroll clamp deep
+    /// inside a pass holding no VM reference, and threading one down just to read a number out of
+    /// a `RefCell` would add a parameter to every frame of the layout recursion for one property.
     pub(crate) fn scroll_offset(&self) -> Option<f32> {
         match &self.0 {
             SignalKind::Scroll { cell, .. } => match *cell.borrow() {
@@ -392,7 +333,6 @@ impl Signal {
 
     /// The write end of the rect half of this hover slot: where the node carrying it last was, in
     /// its surface's logical coordinates, which is what a tooltip `popup` binds `anchor_rect` to.
-    ///
     /// `None` for every kind but the boolean half of a hover slot, including the rect half itself,
     /// which no node's `hover` property should be naming.
     pub(crate) fn hover_rect_handle(&self) -> Option<LiveSignalHandle> {
@@ -405,21 +345,19 @@ impl Signal {
     }
 
     /// The signal `map(f)` builds: a `Computed` with this one as its only dependency, recomputed
-    /// on every read like any other (ADR-0044 decision 3, no memoization).
-    ///
-    /// Lifted out of the Lua-facing `map` method so a Rust caller can build the same thing:
-    /// `lua::capability::Capability` delegates its own `map` here, so `oblisk.lock` reads exactly
-    /// like the bare capability globals beside it instead of a second, drift-prone construction.
+    /// on every read like any other (ADR-0044 decision 3, no memoization). Lifted out of the
+    /// Lua-facing `map` method so a Rust caller can build the same thing:
+    /// `lua::capability::Capability` delegates its own `map` here, so `oblisk.lock` reads like
+    /// the bare capability globals beside it instead of a second, drift-prone construction.
     pub(crate) fn mapped(&self, func: Function) -> Signal {
         Signal(SignalKind::Computed { deps: vec![self.clone()], func })
     }
 
     /// Reads this signal's current value (ADR-0044 decision 1). `pub(crate)`, not private:
     /// `layout::node`'s property parsers call this directly to resolve a `Signal` userdata in a
-    /// property slot instead of rejecting it. `&Lua` is threaded in rather than recovered from
-    /// `self`: a `Computed` closure runs under a [`CpuBudget`], which needs a real `Lua` to
-    /// install its instruction-count hook, and mlua 0.12 exposes no way to recover one from an
-    /// `AnyUserData`/`Value`.
+    /// slot instead of rejecting it. `&Lua` is threaded in rather than recovered from `self`: a
+    /// `Computed` closure runs under a [`CpuBudget`], which needs one to install its hook, and
+    /// mlua 0.12 exposes no way to recover a `Lua` from an `AnyUserData`/`Value`.
     pub(crate) fn get_value(&self, lua: &Lua) -> mlua::Result<Value> {
         match &self.0 {
             SignalKind::Direct(value) => Ok(value.clone()),
@@ -428,16 +366,15 @@ impl Signal {
             SignalKind::Scroll { cell, .. } => Ok(cell.borrow().clone()),
             SignalKind::State { cell, .. } => Ok(cell.borrow().clone()),
             SignalKind::Computed { deps, func } => {
-                // Entered before dependency resolution, not around `func.call` alone: this keeps
-                // the deadline-stack depth equal to the true `get_value` nesting depth, so
-                // MAX_SIGNAL_NESTING_DEPTH bounds dependency chains as well as body nesting, and
-                // the outermost deadline stays live across the graph instead of resetting per leaf.
+                // Entered before dependency resolution, not around `func.call` alone: keeps the
+                // deadline-stack depth equal to the true `get_value` nesting depth, so
+                // MAX_SIGNAL_NESTING_DEPTH bounds dependency chains as well as body nesting.
                 let budget = CpuBudget::enter(lua)?;
 
                 // ponytail: resolving every dependency on every read, with no memoization
-                // (ADR-0044 decision 3), makes evaluation exponential in graph depth: a
-                // diamond `computed({s, s}, f)` N deep evaluates `s` 2^N times (1,048,575 calls
-                // at N = 20). Upgrade path: memoize a dependency's resolved value per `get_value`.
+                // (ADR-0044 decision 3), makes evaluation exponential in graph depth: a diamond
+                // `computed({s, s}, f)` N deep evaluates `s` 2^N times (1,048,575 calls at N =
+                // 20). Upgrade path: memoize a dependency's resolved value per `get_value`.
                 let mut args = Vec::with_capacity(deps.len());
                 for dep in deps {
                     args.push(dep.get_value(lua)?);
@@ -451,9 +388,8 @@ impl Signal {
 }
 
 /// The Rust-side handle to a [`Signal::new_live`] signal's storage: lets Rust push a new value in
-/// after construction, e.g. on every received `StateSnapshot`. The paired `Signal` (Lua-side)
-/// always reads whatever was last set here, with no memoization, matching every other `Signal`
-/// kind in this file.
+/// after construction, e.g. on every received `StateSnapshot`. The paired Lua-side `Signal`
+/// always reads whatever was last set here, with no memoization, like every other kind here.
 #[derive(Clone)]
 pub struct LiveSignalHandle(Rc<RefCell<Value>>, DirtyFlag);
 
@@ -468,10 +404,9 @@ impl LiveSignalHandle {
 
     /// Writes without marking the scene dirty, for a value the running pass derives from its own
     /// geometry. `layout::scene`'s positioning pass is the only caller: it clamps a scroll offset
-    /// against the content extent it just measured, and marking dirty there would schedule another
-    /// pass to observe a number this pass already used for nothing, since clamping is idempotent.
-    ///
-    /// The cost is one frame of staleness, only when the clamp actually bit: a config reading
+    /// against the content extent it just measured, and marking dirty there would schedule
+    /// another pass to observe a number this one already used, since clamping is idempotent. The
+    /// cost is one frame of staleness, only when the clamp actually bit: a config reading
     /// `scroll("x")` in the same pass sees what the wheel asked for, then the clamped value from
     /// the next pass on. Invisible for the scroll itself, positioned from the clamped number here;
     /// it matters only to a derived readout like a scrollbar.
@@ -480,12 +415,10 @@ impl LiveSignalHandle {
     }
 
     /// [`Self::set`], except storing the value already there does nothing: no write, no dirty
-    /// mark, and it answers `false`.
-    ///
-    /// ADR-0062 decision 4. The pointer handler calls this on every `wl_pointer` motion event
-    /// (device rate), and one mark re-resolves every surface in the generation (ADR-0044 decision
-    /// 2). Comparing first turns that into one re-resolve per hover boundary crossed, not per
-    /// motion event.
+    /// mark, and it answers `false`. ADR-0062 decision 4: the pointer handler calls this on every
+    /// `wl_pointer` motion event (device rate), and one mark re-resolves every surface in the
+    /// generation (ADR-0044 decision 2). Comparing first turns that into one re-resolve per
+    /// boundary crossed, not per event.
     pub fn set_changed(&self, value: Value) -> bool {
         let unchanged = *self.0.borrow() == value;
         if unchanged {
@@ -498,13 +431,11 @@ impl LiveSignalHandle {
 }
 
 /// The one scene-dirty flag ADR-0044 decision 2 specifies: a single `bool`, shared by every
-/// [`LiveSignalHandle`] in a generation and by the `RendererClient` that reads and clears it, not
-/// a per-signal or per-surface set. `Rc<Cell<bool>>`, not `Arc<AtomicBool>`: this lives entirely
-/// on the Wayland dispatch thread (ADR-0039).
-///
-/// `ponytail:` one flag for the whole scene means any push re-resolves every surface, even one
-/// reading nothing from the capability that changed. Upgrade path: a per-surface flag keyed on
-/// which signals a surface reads, which needs read-tracking that doesn't exist yet.
+/// [`LiveSignalHandle`] in a generation and the `RendererClient` that reads and clears it, not
+/// per-signal or per-surface. `Rc<Cell<bool>>`, not `Arc<AtomicBool>`: lives on the Wayland
+/// dispatch thread alone (ADR-0039). ponytail: one flag for the whole scene re-resolves every
+/// surface on any push. Upgrade path: a per-surface flag keyed on signals read, needing
+/// read-tracking that doesn't exist yet.
 #[derive(Clone)]
 pub struct DirtyFlag(Rc<Cell<bool>>);
 
@@ -561,11 +492,10 @@ impl UserData for Signal {
     }
 }
 
-/// Whether this VM's config ever called `hover(name)`.
-///
-/// `crate::wayland`'s pointer handler asks before doing any hover work at all, so a config with no
-/// tooltip and no expand-on-hover pays nothing for the feature existing: no tree clone, no walk,
-/// no signal writes, on an event that arrives at pointer-report rate.
+/// Whether this VM's config ever called `hover(name)`. `crate::wayland`'s pointer handler asks
+/// before doing any hover work at all, so a config with no tooltip and no expand-on-hover pays
+/// nothing for the feature existing: no tree clone, no walk, no signal writes, on an event that
+/// arrives at pointer-report rate.
 pub fn any_hover_registered(lua: &Lua) -> bool {
     lua.app_data_ref::<HoverRegistry>().is_some_and(|registry| !registry.0.is_empty())
 }
@@ -577,28 +507,23 @@ pub fn any_scroll_registered(lua: &Lua) -> bool {
 }
 
 /// The `name -> (Signal, literal)` map ADR-0044 decision 5 hangs `state` off: the name is the
-/// identity, so an in-place reload finds the signal it built last time, still holding the user's
-/// last click, and an open dropdown stays open across a config edit.
+/// identity, so an in-place reload finds the signal built last time, still holding the user's
+/// last click, and an open dropdown stays open across a config edit. The second half is decision
+/// 5's amendment: the `initial` this name was last seeded from, to ask whether the config author
+/// edited the literal. An edit wins over the live value; without it a `state` default would be
+/// the one value editing can't change, the wallpaper path that found this.
 ///
-/// The second half is decision 5's amendment: the `initial` this name was last seeded from, kept
-/// to ask whether the config author edited the literal. An edit wins over the live value; without
-/// this a `state` default is the one value editing can't change, which is how the wallpaper path
-/// found this.
-///
-/// Lives in `Lua::set_app_data`, the storage [`CpuBudget::enter`] keeps its deadline stack in, so
-/// it needs no explicit lifetime management: decision 4 keeps the VM alive across a reload, and a
-/// generation swap is a new process with a new VM, giving decision 5's "named state dies on a
-/// generation swap" for free.
+/// Lives in `Lua::set_app_data`, like [`CpuBudget::enter`]'s deadline stack: decision 4 keeps the
+/// VM alive across a reload, and a generation swap is a new process with a new VM, giving
+/// decision 5's "named state dies on a generation swap" for free.
 #[derive(Default)]
 struct StateRegistry(HashMap<String, (Signal, Value)>);
 
-/// `state`'s registry, for `hover(name)` (ADR-0062 decision 2). Separate map, same rule and
-/// the same lifetime: the name is the identity, so an in-place reload finds the signal it built
-/// last time and a tooltip open across a `config/theme.lua` edit stays open.
-///
-/// Not shared with [`StateRegistry`]: one name space would let `state("volume", 0)` and
-/// `hover("volume")` collide, and the collision would surface as `signal:set()` refusing a name
-/// the config thought it owned.
+/// `state`'s registry, for `hover(name)` (ADR-0062 decision 2). Same rule and lifetime: the name
+/// is the identity, so an in-place reload finds the signal built last time and a tooltip open
+/// across a `config/theme.lua` edit stays open. Not shared with [`StateRegistry`]: one name space
+/// would let `state("volume", 0)` and `hover("volume")` collide, surfacing as `signal:set()`
+/// refusing a name the config thought it owned.
 #[derive(Default)]
 struct HoverRegistry(HashMap<String, (Signal, Signal)>);
 
@@ -611,39 +536,28 @@ struct ScrollRegistry(HashMap<String, Signal>);
 /// An RAII claim on the 5ms evaluation budget, held for one `Computed` [`Signal::get_value`]:
 /// dependency resolution and the closure call, not the closure call alone. Entering pushes a
 /// deadline onto a per-`Lua` stack in `app_data`; dropping pops it.
-///
-/// A stack, not mlua's single hook slot, because this reenters three ways: a dependency can
-/// itself be `Computed`, a body can read a second `Signal` (an upvalue or global, not just its
-/// declared `dependencies`), and a `computed` can be self- or mutually-referential.
-/// `Lua::set_hook`/`set_global_hook` keep one unstacked callback, so installing and removing per
-/// call let an inner call's removal strip the outer call's still-active cap. The hook installs
-/// only on the 0->1 transition and removes only on 1->0, so a finished inner call leaves the outer
-/// deadline on the stack and enforcement hands back to it.
-///
+/// A stack, not mlua's single hook slot: this reenters three ways, a dependency can itself be
+/// `Computed`, a body can read a second `Signal` (an upvalue or global, not just a declared
+/// dependency), and a `computed` can be self- or mutually-referential. `Lua::set_hook` keeps one
+/// unstacked callback, so installing/removing per call would let an inner removal strip the outer
+/// call's still-active cap; the hook installs only on the 0->1 transition and removes on 1->0,
+/// leaving a finished inner call's outer deadline on the stack.
 /// The governing deadline is `stack[0]`, the outermost call's, not `stack.last()`: the innermost
-/// would always be the freshest deadline, recomputed at every push, so the check could never
-/// observe an expired budget no matter how long the chain ran. `stack[0]` makes "5ms" mean what
-/// § 1.2 says, a budget for the whole evaluation, not a per-level allowance reset on every
-/// recursive `:get()`.
-///
-/// `stack[0]` is also the minimum, hence `first()` and not `iter().min()`: entries are pushed and
-/// popped strictly LIFO and each is [`CPU_CAP`] from its own push, so the stack is non-decreasing
-/// and its first element is its minimum. The hook fires every
-/// [`CHECK_EVERY_N_INSTRUCTIONS`] instructions, so `first()`'s O(1) matters against `min()`'s walk
-/// of up to [`MAX_SIGNAL_NESTING_DEPTH`] entries. Never "fix" it to `last()`, that's the per-level
-/// reset this design avoids.
+/// is always the freshest, recomputed on every push, so it could never observe an expired budget.
+/// `stack[0]` makes "5ms" mean § 1.2's whole-evaluation budget, not a per-level reset on `:get()`.
+/// `stack[0]` is also the minimum: entries push/pop strictly LIFO with each [`CPU_CAP`] from its
+/// own push, so the stack is non-decreasing, and `first()`'s O(1) beats `min()`'s walk of up to
+/// [`MAX_SIGNAL_NESTING_DEPTH`] entries on every [`CHECK_EVERY_N_INSTRUCTIONS`] hook fire. Never
+/// "fix" it to `last()`, the per-level reset this avoids.
 struct CpuBudget<'lua> {
     lua: &'lua Lua,
 }
 
-/// How many live budgets want the instruction hook installed: a [`CpuBudget`] holds one, a
-/// [`LayoutPassBudget`] holds one, and the hook installs on the 0->1 transition and removes on
-/// 1->0.
-///
-/// A count, not [`CpuBudget`]'s own stack depth, because there are now two independent holders.
-/// Keyed on depth alone, a signal evaluation finishing inside a layout pass would take the stack
-/// back to 0 and remove the hook the pass still relies on, leaving every `__index` after the
-/// first signal read unbounded again, the hole this closes.
+/// How many live budgets want the instruction hook installed: a [`CpuBudget`] and a
+/// [`LayoutPassBudget`] can each hold one, installing on the 0->1 transition and removing on
+/// 1->0. A count, not [`CpuBudget`]'s own stack depth: keyed on depth alone, a signal evaluation
+/// finishing inside a layout pass would take the stack to 0 and remove the hook the pass still
+/// relies on, leaving every `__index` after the first signal read unbounded again.
 #[derive(Default)]
 struct HookHolders(usize);
 
@@ -655,11 +569,10 @@ fn acquire_hook(lua: &Lua) -> mlua::Result<()> {
     let first = lua.app_data_ref::<HookHolders>().expect("just ensured the counter exists").0 == 0;
     if first {
         // `set_global_hook`, not `set_hook`: mlua's per-thread hook is keyed by Lua thread, so a
-        // coroutine created by a `computed` body inherited the hook C function from
-        // `lua_newthread`, found no callback for itself, and disabled the hook on that thread,
-        // measured 5.75s of uninterrupted Lua inside `coroutine.create`/`resume` returning `Ok`.
-        // `HookKind::Global` stores one callback on the `Lua` itself, so the inherited hook
-        // resolves on whichever thread fires and covers coroutines.
+        // coroutine created by a `computed` body inherited the hook C function, found no callback
+        // for itself, and disabled the hook on that thread, measured 5.75s of uninterrupted Lua
+        // inside `coroutine.create`/`resume` returning `Ok`. `HookKind::Global` stores one
+        // callback on the `Lua` itself, resolving on whichever thread fires, covering coroutines.
         lua.set_global_hook(
             mlua::HookTriggers { every_nth_instruction: Some(CHECK_EVERY_N_INSTRUCTIONS), ..mlua::HookTriggers::new() },
             |lua, _| match expired_budget(lua) {
@@ -680,10 +593,8 @@ fn release_hook(lua: &Lua) {
         holders.0
     };
     if remaining == 0 {
-        // Both, in this order: `remove_global_hook` clears the callback so an inheriting
-        // coroutine stops calling back, and `remove_hook` clears the mask on *this* thread
-        // now, so unrelated Lua after a finished evaluation isn't paying for a hook that
-        // would otherwise just no-op.
+        // Both, in order: `remove_global_hook` stops an inheriting coroutine calling back, and
+        // `remove_hook` clears the mask on *this* thread so later Lua isn't paying for a no-op.
         lua.remove_global_hook();
         lua.remove_hook();
     }
@@ -694,16 +605,13 @@ fn release_hook(lua: &Lua) {
 struct PassDeadline(Option<Deadline>);
 
 /// An RAII claim on [`LAYOUT_PASS_CAP`], held for one entire layout pass, not one getter call.
-///
-/// Closes two holes at once. A resolved table's `__index` runs through `layout::node`'s
-/// metamethod-aware `Table::get` after [`CpuBudget`] has returned and dropped its hook, so it was
-/// covered by no budget at all: `while true do end` behind a `margin` key hung the Wayland
-/// dispatch thread with no way out. And ADR-0021's cap is per `get_value` call, so a tree of
-/// margined nodes bought one 5ms budget each, unbounded however many nodes the pass had.
-///
-/// Runs beside [`CpuBudget`], not instead of it: [`expired_budget`] fails on whichever expires
-/// first, keeping § 1.2's per-evaluation 5ms intact and [`CpuBudget`]'s LIFO stack non-decreasing,
-/// while adding a ceiling no number of individually-legal evaluations can walk past.
+/// Closes two holes: a resolved table's `__index` runs through `layout::node`'s metamethod-aware
+/// `Table::get` after [`CpuBudget`] dropped its hook, covered by no budget at all (`while true do
+/// end` behind a `margin` key hung the Wayland dispatch thread), and ADR-0021's cap is per
+/// `get_value` call, so a tree of margined nodes bought one 5ms budget each, unbounded across
+/// however many nodes the pass had. Runs beside [`CpuBudget`], not instead of it:
+/// [`expired_budget`] fails on whichever expires first, keeping § 1.2's 5ms intact and adding a
+/// ceiling.
 pub(crate) struct LayoutPassBudget<'lua> {
     lua: &'lua Lua,
 }
@@ -715,8 +623,7 @@ impl<'lua> LayoutPassBudget<'lua> {
         if lua.app_data_ref::<PassDeadline>().is_none() {
             lua.set_app_data(PassDeadline::default());
         }
-        // Before the deadline is stored, so a failed install leaves nothing for `Drop` to undo,
-        // the ordering `CpuBudget::enter` uses for the same reason.
+        // Before the deadline is stored, so a failed install leaves nothing for `Drop` to undo.
         acquire_hook(lua)?;
         lua.app_data_mut::<PassDeadline>().expect("just ensured the slot exists").0 =
             Some(Deadline::lasting(LAYOUT_PASS_CAP));
@@ -739,13 +646,11 @@ impl Drop for LayoutPassBudget<'_> {
 }
 
 impl<'lua> CpuBudget<'lua> {
-    /// Claims one nesting level, refusing past [`MAX_SIGNAL_NESTING_DEPTH`].
-    ///
-    /// The hook installs before the deadline is pushed, so no early return can leave the stack
-    /// unbalanced: an install failure returns with nothing pushed and nothing to pop, where
-    /// pushing first would strand an entry the depth-1 branch never revisits, silently disabling
-    /// the cap for the rest of the VM's life. No Lua runs between install and push, and the hook
-    /// tolerates an empty stack.
+    /// Claims one nesting level, refusing past [`MAX_SIGNAL_NESTING_DEPTH`]. The hook installs
+    /// before the deadline is pushed, so no early return leaves the stack unbalanced: pushing
+    /// first would strand an entry the depth-1 branch never revisits, silently disabling the cap
+    /// for the VM's life. No Lua runs between install and push, and the hook tolerates an empty
+    /// stack.
     fn enter(lua: &'lua Lua) -> mlua::Result<Self> {
         if lua.app_data_ref::<Vec<Deadline>>().is_none() {
             lua.set_app_data(Vec::<Deadline>::new());
@@ -763,17 +668,14 @@ impl<'lua> CpuBudget<'lua> {
         Ok(Self { lua })
     }
 
-    /// The second gate on the 5ms budget, at the Rust boundary rather than inside the VM. The
-    /// hook raises an ordinary Lua error inside the running function, so a `pcall` in a
-    /// `computed` body catches it and carries on: measured, a body looping over
-    /// `pcall(function() ... end)` ran 7.5x the cap and returned a partially computed `Ok` value.
-    /// Checking the governing deadline again once the call returns makes a caught-and-ignored
-    /// hook error an `Err` anyway: config Lua can catch the hook, but not this.
-    ///
-    /// ponytail: this gate only runs when the call returns. A body that swallows the hook error
-    /// and never returns (`while true do pcall(f) end`) still spins until a hook fire lands
-    /// outside the `pcall`. Bounding that needs preemption this VM can't offer; upgrade path is
-    /// the generation-swap process boundary (ADR-0039), which can kill a wedged renderer outright.
+    /// The second gate on the 5ms budget, at the Rust boundary rather than the VM: the hook raises
+    /// an ordinary Lua error inside the running function, so a `pcall` in a `computed` body
+    /// catches it and carries on, measured running 7.5x the cap and returning a partially computed
+    /// `Ok`. Checking the deadline again once the call returns makes a caught hook error an `Err`
+    /// anyway: config Lua can catch the hook, but not this.
+    /// ponytail: runs only when the call returns; a body that swallows the hook error and never
+    /// returns still spins until a fire lands outside the `pcall`. Needs preemption this VM can't
+    /// offer; upgrade path is the generation-swap process boundary (ADR-0039).
     fn check_not_exceeded(&self) -> mlua::Result<()> {
         match expired_budget(self.lua) {
             Some(message) => Err(mlua::Error::runtime(message)),
@@ -789,13 +691,11 @@ impl Drop for CpuBudget<'_> {
     }
 }
 
-/// Which budget, if either, has run out: the message to raise, or `None` to keep going.
-///
-/// Two independent deadlines, and the earlier one wins. The signal deadline is the outermost live
-/// [`CpuBudget`]'s, `first()`, not `min()` or `last()` (see that type's doc comment for why). The
-/// pass deadline is [`LayoutPassBudget`]'s, kept out of that stack so it stays non-decreasing and
-/// `first()` stays O(1) and correct. Neither present is never expired, letting [`acquire_hook`]
-/// install the hook before the first deadline is stored.
+/// Which budget, if either, has run out: the message to raise, or `None` to keep going. Two
+/// independent deadlines, the earlier one wins. The signal deadline is the outermost live
+/// [`CpuBudget`]'s, `first()` not `min()`/`last()` (see that type's doc for why); the pass
+/// deadline is [`LayoutPassBudget`]'s, kept out of that stack so `first()` stays O(1) and correct.
+/// Neither present is never expired, letting [`acquire_hook`] install before the first deadline.
 fn expired_budget(lua: &Lua) -> Option<&'static str> {
     let signal = lua.app_data_ref::<Vec<Deadline>>().and_then(|stack| stack.first().copied());
     if signal.is_some_and(|deadline| deadline.expired()) {
@@ -806,14 +706,11 @@ fn expired_budget(lua: &Lua) -> Option<&'static str> {
 }
 
 /// The one answer to "does this Lua userdata resolve like a signal?", and the `Signal` to
-/// resolve it through.
-///
-/// Two userdata types answer yes: [`Signal`], the obvious one, and `capability::Capability`,
-/// which is why this function exists. Every § 2 capability sits behind a `Capability` so it can
-/// be read and commanded, so `computed({oblisk.audio}, f)` and `content = oblisk.mpris` hand the
-/// engine a `Capability`, not a bare `Signal`. Without one shared answer, every live capability
-/// binding would be a value the resolver skipped, a skipped property being a literal, so every
-/// bar would freeze at its first frame with nothing logged.
+/// resolve it through. Two userdata types answer yes: [`Signal`] and `capability::Capability`.
+/// Every § 2 capability sits behind a `Capability`, so `computed({oblisk.audio}, f)` and
+/// `content = oblisk.mpris` hand the engine a `Capability`, not a bare `Signal`. Without one
+/// shared answer, every live capability binding would resolve as a skipped, literal property,
+/// freezing at the first frame.
 pub fn from_userdata(ud: &mlua::AnyUserData) -> Option<Signal> {
     if let Ok(signal) = ud.borrow::<Signal>() {
         return Some(signal.clone());
@@ -829,11 +726,10 @@ pub fn is_signal(ud: &mlua::AnyUserData) -> bool {
 
 /// Registers the `computed(dependencies, fn)` global (§ 1.2) and the `state(name, initial)`
 /// global (ADR-0044 decision 5). `dependencies` must be an array of `Signal` userdata handles.
-///
 /// `dirty` is decision 2's one scene-dirty flag, taken explicitly rather than fished out of
 /// `app_data`: a hidden coupling failing inside a config author's own `state()` call is worse
-/// than threading one argument through. It must be the same flag `Signal::new_live` hands out and
-/// `RendererClient` drains, or `:set()` would mark a flag nothing reads.
+/// than threading one argument through, and it must be the same flag `Signal::new_live` hands
+/// out and `RendererClient` drains, or `:set()` would mark a flag nothing reads.
 pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
     let hover_dirty = dirty.clone();
     let rect_dirty = dirty.clone();
@@ -844,8 +740,8 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
             let mut collected = Vec::new();
             for dep in deps.sequence_values::<mlua::AnyUserData>() {
                 let dep = dep?;
-                // Named rather than left to `borrow`'s own type error, which reports the mlua
-                // type name of whatever was passed and never says what was expected.
+                // Named rather than left to `borrow`'s own type error, which never says what was
+                // expected.
                 let signal = from_userdata(&dep).ok_or_else(|| {
                     mlua::Error::runtime("computed() dependencies must be Signals or `oblisk` capabilities, § 1.2")
                 })?;
@@ -868,11 +764,8 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
                 .cloned();
             if let Some((signal, seeded)) = existing {
                 // Decision 5: a name already in the map wins, so an in-place reload keeps the
-                // value instead of resetting it.
-                //
-                // Its amendment narrows that to a literal the author left alone: an `initial`
-                // differing from the one this name was seeded from is an edit to the config file,
-                // and an edit is a later write than the `:set()` it overwrites.
+                // value. Its amendment narrows that to a literal the author left alone: an
+                // `initial` differing from the seed is an edit, and an edit outweighs a `:set()`.
                 if literal_was_edited(&initial, &seeded) == Some(true) {
                     signal.reseed(initial.clone()).map_err(|err| {
                         mlua::Error::runtime(format!(
@@ -936,13 +829,10 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
 
 /// One hover slot by name, built on first ask: the boolean `hover(name)` returns and the rect
 /// `hover_rect(name)` returns, in that order (ADR-0062 decision 2).
-///
-/// The name is the identity, exactly as `state(name, initial)` (ADR-0044 decision 5): it carries
-/// a hover across an in-place reload and lets two files reach one slot. Both globals build the
-/// pair, so naming the rect first is not a different slot from naming the boolean first.
-///
-/// No marshalling check on either initial: these only ever hold the booleans and the rect table
-/// the pointer handler writes, none of them hand-authored in Lua.
+/// The name is the identity, as `state(name, initial)` (ADR-0044 decision 5): it carries a hover
+/// across an in-place reload and lets two files reach one slot; both globals build the pair, so
+/// naming either first is not a different slot. No marshalling check on either initial: these
+/// only hold the booleans and rect table the pointer handler writes, none hand-authored in Lua.
 fn hover_slot(lua: &Lua, dirty: &DirtyFlag, name: String) -> mlua::Result<(Signal, Signal)> {
     if lua.app_data_ref::<HoverRegistry>().is_none() {
         lua.set_app_data(HoverRegistry::default());
@@ -958,12 +848,9 @@ fn hover_slot(lua: &Lua, dirty: &DirtyFlag, name: String) -> mlua::Result<(Signa
 }
 
 /// What `hover_rect(name)` reads before the pointer has ever been on its node: a 1x1 rect at the
-/// origin.
-///
-/// Non-zero on both axes because § 6.3 refuses a zero `anchor_rect`; a real table, not nil,
-/// because a nil property is absent. A tooltip bound to this resolves from the first frame and
-/// sits at the origin, which nothing sees: `visible = hover(name)` is false until the same event
-/// replaces this with the node's real rect.
+/// origin. Non-zero on both axes because § 6.3 refuses a zero `anchor_rect`; a real table, not
+/// nil, since a nil property is absent. A tooltip bound to this sits invisibly at the origin
+/// (`visible = hover(name)` is false) until the same event replaces this with the real rect.
 fn unhovered_rect(lua: &Lua) -> mlua::Result<mlua::Table> {
     let rect = lua.create_table()?;
     rect.set("x", 0.0)?;

@@ -1,49 +1,38 @@
 //! Expanding declared surfaces into the instances the compositor actually maps (`CONTEXT.md`,
-//! Surface instance; ADR-0038 decision 3).
-//!
-//! One declared surface is not one Wayland surface. A `panel` with `monitor = "All"` targets every
-//! connected output, each with its own `zwlr_layer_surface_v1` and configured size -- why the
-//! retained scene keys by instance id rather than declared id (see `Scene`'s doc comment). Pure: no
-//! Wayland types, which makes it the testable seam in a file whose neighbours have no headless
-//! harness.
-//!
-//! Per-output resolves to three different answers per role: § 6.2 gives a `window` no `monitor`
-//! (the compositor places a toplevel, so one declaration is one instance regardless of monitor
-//! count); § 6.4 gives a `lock` no `monitor` for the opposite reason (the protocol requires a
-//! surface on every output, so one declaration is always every monitor); only a `panel` expands per
-//! output, because a property asked it to.
+//! Surface instance; ADR-0038 decision 3). One declared surface is not one Wayland surface: a
+//! `panel` with `monitor = "All"` targets every connected output, each with its own
+//! `zwlr_layer_surface_v1` and size, why the retained scene keys by instance id, not declared id.
+//! Pure: no Wayland types, the testable seam with no headless harness. Per-output resolves to
+//! three answers per role: § 6.2 gives a `window` no `monitor` (one instance regardless of
+//! monitor count); § 6.4 gives a `lock` no `monitor` for the opposite reason (always every
+//! monitor); only a `panel` expands per output.
 
 use crate::layout::node::SurfaceSpec;
 use crate::layout::scene::LogicalSize;
 
-/// One `(panel, output)` pair (`CONTEXT.md`, Surface instance).
-///
-/// `instance_id` is the one id space Lua, the retained scene, the Wayland surface, and the PBA
-/// handshake all share (ADR-0038): the `"{id}@{output}"` convention `supervisor/src/reload.rs`
-/// already used for wallpaper, generalized to every surface.
+/// One `(panel, output)` pair (`CONTEXT.md`, Surface instance). `instance_id` is the one id space
+/// Lua, the retained scene, the Wayland surface, and the PBA handshake all share (ADR-0038): the
+/// `"{id}@{output}"` convention `supervisor/src/reload.rs` already used for wallpaper, generalized.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SurfaceInstance {
-    /// `"bar@DP-1"` for a `panel`; the bare declared id (`"settings"`) for a `window`, which has no
-    /// output to qualify it with. Keys `Scene`'s surface map and names this surface in every
+    /// `"bar@DP-1"` for a `panel`; the bare declared id (`"settings"`) for a `window`, with no
+    /// output to qualify it. Keys `Scene`'s surface map and names this surface in every
     /// `ReadySignal`/`PresentationEvidence` frame.
     pub instance_id: String,
-    /// `"bar"`. What `node::parse_surface_id` reads off the declared node; pairs this instance back
-    /// to its `VirtualNode` when the scene resolves.
+    /// `"bar"`: what `node::parse_surface_id` reads off the node, pairing it to its `VirtualNode`.
     pub declared_id: String,
     /// The output this instance lives on, or empty for a `window` (§ 6.2 gives a toplevel no
     /// `monitor`; the compositor places it).
     pub output: String,
     /// The size this instance resolves its tree against. Seeded from the output's logical size at
     /// startup, replaced per instance by `RendererClient::set_instance_size` once the compositor
-    /// configures that surface -- differs from the output for any surface smaller than it, which is
-    /// every bar.
+    /// configures that surface: differs from the output for any surface smaller than it, every bar.
     pub available: LogicalSize,
 }
 
 /// One connected output, as far as instance expansion cares: a name to match `monitor` against and
-/// a size to seed `available` with. Not `smithay_client_toolkit::output::OutputInfo` -- `layout`
-/// holds no Wayland types; `crate::wayland::App::output_geometries` derives these from a real
-/// `wl_output`.
+/// a size to seed `available` with. Not `smithay_client_toolkit::output::OutputInfo`: `layout` has
+/// no Wayland types; `crate::wayland::App::output_geometries` derives these from a `wl_output`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutputGeometry {
     pub name: String,
@@ -53,34 +42,25 @@ pub struct OutputGeometry {
 /// Every instance `specs` declares against the currently connected `outputs`, per role
 /// (ADR-0038 decision 3, ADR-0049 decision 1).
 ///
-/// **`panel`**: expands per output. `monitor = "All"` (§ 6.1 default) produces one instance per
-/// output, in `outputs` order; any other value matches the one output with that name, or produces
-/// no instance at all when nothing matches -- a config naming an unplugged display gets no surface
-/// rather than one placed elsewhere. Logging the miss is the caller's job; this stays pure. The
-/// `"{id}@{output}"` id form is uniform even for a single-output match (`monitor = "DP-1"` still
-/// yields `"bar@DP-1"`, not `"bar"`), so every consumer reads one shape.
+/// **`panel`**: expands per output. `monitor = "All"` (§ 6.1 default) yields one instance per
+/// output, in `outputs` order; other values match the named output, else none. The
+/// `"{id}@{output}"` id form stays uniform even for a single match (`"DP-1"` yields `"bar@DP-1"`).
 ///
-/// **`window`**: always exactly one instance, whatever `outputs` holds, including none -- the
-/// compositor places a toplevel, so there is no output to qualify the id with (ADR-0049
-/// decision 2). Its instance exists from startup even though its `xdg_toplevel` does not; that
-/// instance is what lets the scene resolve the window's tree, and `visible` reads off that tree.
-/// `available` seeds from the first output's logical size as a bound for measuring § 5.1's
-/// `Content` sizing against, not a size the window will have -- `RendererClient::set_instance_size`
-/// replaces it at the first `xdg_toplevel` configure. Zero when nothing is connected.
+/// **`window`**: always exactly one instance, whatever `outputs` holds, including none, since the
+/// compositor places a toplevel, with no output to qualify the id (ADR-0049 decision 2). The
+/// instance exists from startup though `xdg_toplevel` does not, so the scene can resolve its tree.
+/// `available` seeds from the first output's size as a § 5.1 `Content`-sizing bound, replaced by
+/// `RendererClient::set_instance_size` at first configure; zero when none is connected.
 ///
 /// **`popup`**: one instance on its bare declared id, for a `window`'s reason and one more
-/// (ADR-0051 decision 1): expanding per parent instance would mean one `visible` signal drove
-/// `menu@eDP-1` and `menu@DP-1` both, opening a dropdown on every monitor from one click. Its
-/// parent is chosen at creation from the click that armed it, not here. `available` seeds from the
-/// popup's own § 6.3 `width`/`height` (both required, no `"Fill"`), since that size is
-/// `xdg_positioner::set_size`'s argument and so the budget its child is measured against.
+/// (ADR-0051 decision 1): expanding per parent would open a dropdown on every monitor from one
+/// `visible` signal (its parent is chosen at creation instead). `available` seeds from the popup's
+/// own § 6.3 `width`/`height` (both required, no `"Fill"`), `xdg_positioner::set_size`'s argument.
 ///
 /// **`lock`**: expands per output like a `panel`, with no filter (ADR-0052 decision 2):
 /// `ext-session-lock-v1` requires "lock surfaces for all outputs currently present" and rejects a
-/// second surface on one output with `duplicate_output`, so there is exactly one legal answer per
-/// output and no choice for § 6.4 to offer. Zero outputs produce
-/// zero lock instances; the surfaces appear when the outputs do, through a re-expansion of this
-/// same function (ADR-0042).
+/// second surface on one output with `duplicate_output`, leaving § 6.4 no choice. Surfaces appear
+/// when outputs do, via a re-expansion of this function (ADR-0042).
 pub fn expand_instances(specs: &[SurfaceSpec], outputs: &[OutputGeometry]) -> Vec<SurfaceInstance> {
     let mut instances = Vec::new();
     for spec in specs {
@@ -125,37 +105,27 @@ pub fn expand_instances(specs: &[SurfaceSpec], outputs: &[OutputGeometry]) -> Ve
     instances
 }
 
-/// Whether `instance_id` names an instance of the surface declared as `declared_id` -- the inverse
-/// of the `"{id}@{output}"` rule [`expand_instances`] applies.
-///
-/// One caller: `crate::wayland::App`'s popup parent lookup (ADR-0051 decision 1), which pairs
-/// a declared `parent` (§ 6.3) against a set of *instances*, across both spellings -- `"bar@eDP-1"`
-/// for a panel, bare `"settings"` for a window.
-///
-/// A prefix test rather than a split on `'@'`: § 6.1 puts no character restriction on `id`, so
-/// `"a@b"` on output `"DP-1"` must match both `"a@b"` and `"a@b@DP-1"`, which splitting on the
+/// Whether `instance_id` names an instance of the surface declared as `declared_id`: the inverse
+/// of the `"{id}@{output}"` rule [`expand_instances`] applies. One caller:
+/// `crate::wayland::App`'s popup parent lookup (ADR-0051 decision 1), pairing a declared `parent`
+/// (§ 6.3) against instances across both spellings: `"bar@eDP-1"` for a panel, bare `"settings"`
+/// for a window. A prefix test, not a split on `'@'`: § 6.1 puts no character restriction on `id`,
+/// so `"a@b"` on output `"DP-1"` must match both `"a@b"` and `"a@b@DP-1"`, which splitting on the
 /// first `'@'` gets wrong.
 ///
-/// ponytail: the id space is ambiguous at the edges and this cannot fix that, only avoid making it
-/// worse. `"a@b@DP-1"` is what `panel { id = "a@b" }` produces on output `"DP-1"` *and* what
-/// `panel { id = "a" }` would produce on an output named `"b@DP-1"`, so both answers are "yes" and
-/// only one can be right. It bites nothing today -- a `wl_output` name is a connector like
-/// `"eDP-1"` and holds no `'@'` -- and the fix is to stop encoding a pair in a string, by carrying
-/// `SurfaceInstance`'s own `declared_id` on `crate::wayland::TrackedSurface` instead of re-deriving
-/// it here. That is a wider change than this one caller justifies.
+/// ponytail: the id space is ambiguous at the edges; `"a@b@DP-1"` is what `panel { id = "a@b" }`
+/// on `"DP-1"` produces, and also what `panel { id = "a" }` on `"b@DP-1"` would. Fix: carry
+/// `SurfaceInstance`'s `declared_id` on `TrackedSurface` instead of re-deriving it here.
 pub fn is_instance_of(instance_id: &str, declared_id: &str) -> bool {
     instance_id == declared_id || instance_id.strip_prefix(declared_id).is_some_and(|rest| rest.starts_with('@'))
 }
 
 /// What one output change does to a live generation's surface instances (ADR-0038 decision 3:
 /// "monitor hotplug adds and removes instances in place, with no generation swap"), computed by
-/// [`reconcile_instances`].
-///
-/// Three fields because the caller does three things with them: `added` needs a
+/// [`reconcile_instances`]. Three fields because the caller does three things: `added` needs a
 /// `zwlr_layer_surface_v1` built, `removed` needs one destroyed, `instances` is the whole new set
-/// for `RendererClient::set_instances` to resolve against. An instance in neither list is
-/// deliberately untouched -- its surface keeps its EGL binding, configure history, and place on
-/// screen.
+/// for `RendererClient::set_instances` to resolve against. An instance in neither list keeps its
+/// EGL binding, configure history, and place on screen.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstanceReconcile {
     /// Every instance that should exist after the change, in `fresh` order.
@@ -168,12 +138,11 @@ pub struct InstanceReconcile {
 /// Diffs the instance set a generation is currently resolving against the one
 /// [`expand_instances`] produces from the outputs now connected.
 ///
-/// A retained instance is carried over from `current` **unchanged** -- the one thing a plain
-/// re-expansion cannot do. `expand_instances` seeds `available` from the output's logical size;
-/// `RendererClient::set_instance_size` has since replaced it with the size the compositor actually
-/// configured (a bar's 1920x32, not its output's 1920x1080). Handing back the re-expanded size
-/// would resolve a surviving surface against its whole output until the next `configure`, which
-/// never comes for a surface whose size did not change -- it would simply stay wrong.
+/// A retained instance carries over from `current` **unchanged**, the one thing a plain
+/// re-expansion cannot do: `expand_instances` seeds `available` from the output's logical size,
+/// but `RendererClient::set_instance_size` has replaced it with what the compositor configured (a
+/// bar's 1920x32, not its output's 1920x1080); the re-expanded size would stick until a
+/// `configure` that never comes if the size is unchanged.
 pub fn reconcile_instances(current: &[SurfaceInstance], fresh: &[SurfaceInstance]) -> InstanceReconcile {
     let mut instances = Vec::with_capacity(fresh.len());
     let mut added = Vec::new();

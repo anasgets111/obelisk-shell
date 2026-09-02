@@ -1,16 +1,12 @@
 //! Connected outputs (`wl_output`), the `screens` signal payload, and presentation feedback.
-//!
 //! `Screen`/`OutputFacts` and their conversions are the single source both the `screens` Lua
-//! signal and `layout::instance`'s monitor matching read (ADR-0041 decision 2), so a config's
-//! `monitor` arithmetic and the engine's layout can never disagree about what exists.
+//! signal and `layout::instance`'s monitor matching read (ADR-0041 decision 2).
 
 use super::*;
 use crate::wayland::surface::TrackedRole;
 
-/// One connected output, exactly as `wl_output` reports it (ADR-0041 decision 2). The single
-/// source both consumers read: the `screens` Lua signal a config loops over to declare per-monitor
-/// panels, and the [`OutputGeometry`] list `layout::instance::expand_instances` matches `monitor`
-/// against -- two sources would let a config's arithmetic and the engine's layout disagree.
+/// One connected output, exactly as `wl_output` reports it (ADR-0041 decision 2): the source both
+/// the `screens` Lua signal and `layout::instance::expand_instances`'s `monitor` matching read.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Screen {
     name: String,
@@ -21,34 +17,24 @@ pub(super) struct Screen {
     /// config against, so the division happens once here rather than in every config.
     refresh: f64,
 }
-/// The `smithay_client_toolkit::output::OutputInfo` fields [`screen_entry`] reads, lifted off it
-/// by [`App::screens`].
-///
-/// A separate struct, not the real thing: `OutputInfo` is `#[non_exhaustive]` with no public
-/// constructor, so a function taking one could never be built in a unit test -- and every decision
-/// in this conversion (the `logical_size` fallback, millihertz to Hz, the positional name
-/// fallback) is exactly what wants testing in a file with no headless Wayland harness.
+/// The `smithay_client_toolkit::output::OutputInfo` fields [`screen_entry`] reads, lifted off it by
+/// [`App::screens`]. A separate struct since `OutputInfo` is `#[non_exhaustive]` with no public
+/// constructor, so a function taking one could never be unit-tested, unlike this conversion.
 struct OutputFacts {
     name: Option<String>,
     logical_size: Option<(i32, i32)>,
-    /// The *current* `Mode`'s `(dimensions, refresh_rate)`, or `None` for an output advertising no
-    /// current mode. Both fields come from the same mode, so they travel together rather than as
-    /// two `Option`s that could disagree about which mode they describe.
+    /// The *current* `Mode`'s `(dimensions, refresh_rate)`, or `None` if none is advertised. Both
+    /// fields travel together so they can't disagree about which mode they describe.
     current_mode: Option<((i32, i32), i32)>,
     scale_factor: i32,
 }
 /// One output's `screens` entry, or `None` for an output whose size cannot be known.
-///
 /// `logical_size` first (`xdg_output`/`wl_output` v4's compositor-space size, the space a layer
-/// surface's own coordinates are in), falling back to the current `Mode`'s `dimensions`. An output
-/// with neither yields nothing rather than a default: a made-up size would resolve every surface
-/// on that monitor against a fiction, and the caller logs the miss.
-///
-/// ponytail: a nameless output (a compositor below `wl_output` v4) takes a positional
-/// `"output-{index}"` id, carried over from the deleted `wallpaper_surface_id`. It keeps the shell
-/// working there, at the cost that `monitor = "DP-1"` can never match on such a compositor -- the
-/// config has no name to write. Upgrade path: none available client-side; the name genuinely does
-/// not exist.
+/// surface's own coordinates are in), falling back to the current `Mode`'s `dimensions`. Neither
+/// present yields nothing rather than a made-up size; the caller logs the miss.
+/// ponytail: a nameless output (below `wl_output` v4) takes a positional `"output-{index}"` id,
+/// carried over from the deleted `wallpaper_surface_id`. `monitor = "DP-1"` can never match there;
+/// no client-side upgrade path exists, since the name genuinely does not exist.
 fn screen_entry(index: usize, facts: &OutputFacts) -> Option<Screen> {
     let (width, height) = facts.logical_size.or_else(|| facts.current_mode.map(|(dimensions, _)| dimensions))?;
     Some(Screen {
@@ -57,14 +43,13 @@ fn screen_entry(index: usize, facts: &OutputFacts) -> Option<Screen> {
         height,
         scale: facts.scale_factor,
         // `Mode`'s own docs already allow a zero refresh rate ("if an output has no correct
-        // refresh rate, such as a virtual output"), so an output with no current mode reads the
-        // same way rather than needing a nil case every config would have to guard.
+        // refresh rate, such as a virtual output"), so no current mode reads the same way.
         refresh: facts.current_mode.map_or(0.0, |(_, rate)| f64::from(rate) / 1000.0),
     })
 }
 /// The `screens` signal's payload: § 2.9's per-output fields as a JSON array, pushed into Lua
 /// through the same `Loader::to_lua_value` every capability's `StateSnapshot` goes through
-/// (ADR-0041 decision 2 -- Renderer-sourced, but not a second marshalling path).
+/// (ADR-0041 decision 2: Renderer-sourced, but not a second marshalling path).
 pub(super) fn screens_payload(screens: &[Screen]) -> serde_json::Value {
     serde_json::Value::Array(
         screens
@@ -81,8 +66,8 @@ pub(super) fn screens_payload(screens: &[Screen]) -> serde_json::Value {
             .collect(),
     )
 }
-/// The same screen list as `layout::instance` needs it: a name to match `monitor` against and a
-/// logical size to seed each instance's `available` with.
+/// The same screen list `layout::instance` needs: a name to match `monitor` against, a size to
+/// seed `available` with.
 pub(super) fn geometries_from(screens: &[Screen]) -> Vec<OutputGeometry> {
     screens
         .iter()
@@ -94,13 +79,10 @@ pub(super) fn geometries_from(screens: &[Screen]) -> Vec<OutputGeometry> {
 }
 
 impl App {
-    /// Every connected output as [`Screen`] describes it, skipping (with a log) any whose size
-    /// `wl_output` cannot answer for.
-    ///
-    /// `departing` is the output an `output_destroyed` event is announcing, excluded by hand: SCTK's
-    /// `remove_global` calls `OutputHandler::output_destroyed` before removing the output from its
-    /// own `OutputState`, so a plain `outputs()` read from inside that callback still lists it.
-    /// `None` everywhere else.
+    /// Every connected output as [`Screen`], skipping (with a log) any whose size `wl_output`
+    /// cannot answer for. `departing` is the output an `output_destroyed` event is announcing,
+    /// excluded by hand: SCTK's `remove_global` calls `OutputHandler::output_destroyed` before
+    /// removing it from its own `OutputState`, so `outputs()` here still lists it. `None` else.
     pub(super) fn screens(&self, departing: Option<&wl_output::WlOutput>) -> Vec<Screen> {
         let mut screens = Vec::new();
         for (index, output) in self.output_state.outputs().enumerate() {
@@ -132,37 +114,29 @@ impl App {
         screens
     }
 
-    /// One `wl_output` appeared, changed, or went away. Two jobs, one handler, because one event
-    /// owes both.
+    /// One `wl_output` appeared, changed, or went away. One event, three jobs.
     ///
-    /// First, the `screens` signal (ADR-0041 decision 2). Everything below is gated on that
-    /// push reporting a real change: `update_output` also fires for things `screens` does not
-    /// carry, and re-running the rest for one of those would rebuild nothing and ask the
-    /// Supervisor for a reload cycle no output change justifies.
+    /// The `screens` signal (ADR-0041 decision 2), gated on that push reporting a real change:
+    /// `update_output` also fires for things `screens` does not carry, and re-running the rest for
+    /// one of those would ask the Supervisor for an unjustified reload. Then the instance set
+    /// (ADR-0038 decision 3): a `monitor = "All"` declaration expands to one instance per output,
+    /// so appearing or leaving adds or removes one in place, no generation swap, since plugging
+    /// in a monitor is not a config edit. Finally
+    /// [`crate::socket::RendererClient::request_reload`], the half this cannot do itself: a config
+    /// looping over `screens` declares different surface ids before and after, a topology change
+    /// and so a generation swap (ADR-0041 decision 3), decided only by the Supervisor; a candidate
+    /// builds its own surface set from its own evaluation, so the two do not conflict.
     ///
-    /// Second, the instance set (ADR-0038 decision 3). A `monitor = "All"` declaration expands
-    /// to one instance per output, so an output appearing adds an instance and one going away
-    /// removes it, in place with no generation swap -- plugging in a monitor is not a config edit.
-    ///
-    /// Finally [`crate::socket::RendererClient::request_reload`], the half this cannot do itself: a
-    /// config that loops over `screens` declares genuinely different surface ids before and after,
-    /// which is a topology change and so a generation swap (ADR-0041 decision 3), decided only
-    /// by the Supervisor. The two do not conflict: a candidate builds its own surface set from its
-    /// own evaluation, so whatever this reconciled here is discarded if a swap does happen.
-    ///
-    /// ponytail: an output change landing inside a PBA Candidate's own ready window is not
-    /// handled. `maybe_send_ready_signal` announces the surfaces this process will present exactly
-    /// once, so a surface added after that point would present evidence the Supervisor never
-    /// expected (`PbaFailure::UnexpectedEvidence`), and a `RequestReload` sent while a handshake
-    /// is draining `inbound_frames` is logged and skipped by `SocketCandidateLink::recv_matching`.
-    /// The window is the seconds of `PBA_TIMINGS`, and the fix is a Candidate deferring output
-    /// changes the way `apply_visibility` already defers `visible`; not built until a hotplug
-    /// during a swap is something anyone has actually hit.
+    /// ponytail: a hotplug inside a PBA Candidate's own ready window is not handled.
+    /// `maybe_send_ready_signal` announces surfaces once, so one added after would trip
+    /// `PbaFailure::UnexpectedEvidence`, and a `RequestReload` while draining `inbound_frames` is
+    /// skipped by `SocketCandidateLink::recv_matching`. Window: `PBA_TIMINGS`'s seconds. Fix: defer
+    /// like `apply_visibility` defers `visible`; not built until this is actually hit.
     fn handle_output_change(&mut self, qh: &QueueHandle<App>, departing: Option<&wl_output::WlOutput>) {
         let screens = self.screens(departing);
         if !self.client.set_screens(screens_payload(&screens)) || !self.startup_complete {
-            // The signal is pushed either way -- seeding it from the initial output burst is the
-            // point (see `App::startup_complete`) -- but nothing below it applies yet.
+            // Pushed either way: seeding it from the initial output burst is the point (see
+            // `App::startup_complete`), but nothing below it applies yet.
             return;
         }
         eprintln!(
@@ -177,11 +151,9 @@ impl App {
         for instance_id in &reconcile.removed {
             self.destroy_surface_by_id(instance_id);
         }
-        // A surviving panel's `output_size` is the basis a `SizeMode::Percent` resolves against, so
-        // a mode change that resized the monitor under it has to move it -- `fresh` carries the
-        // output's current logical size, while the instance set keeps the size the compositor
-        // configured each surface to (see `reconcile_instances`). A `window` has no such field:
-        // § 6.2 gives it no size request.
+        // A surviving panel's `output_size` is what `SizeMode::Percent` resolves against, so a
+        // resize must move it: `fresh` has the output's current logical size, the instance set the
+        // size the compositor configured (see `reconcile_instances`). `window` has none: § 6.2.
         for instance in &fresh {
             if let Some(TrackedRole::Panel { output_size, .. }) =
                 self.surfaces.iter_mut().find(|s| s.surface_id == instance.instance_id).map(|s| &mut s.role)
@@ -189,8 +161,8 @@ impl App {
                 *output_size = instance.available;
             }
         }
-        // Before `create_surfaces`, which reads the scene by instance id to decide a new surface's
-        // starting `visible`.
+        // Before `create_surfaces`, which reads the scene by instance id for a new surface's
+        // `visible`.
         self.client.set_instances(reconcile.instances);
         self.create_surfaces(qh, &specs, &reconcile.added);
         self.client.request_reload();
@@ -231,9 +203,8 @@ impl PresentationTimeHandler for App {
         }
     }
 
-    /// The content update was never displayed. Logged only -- not a distinct fast-fail signal;
-    /// the Supervisor's `evidence_timeout` is what catches this surface never presenting
-    /// (ADR-0025). Deliberately does **not** queue any `PresentationEvidence`.
+    /// The content update was never displayed. Logged only: the Supervisor's `evidence_timeout`
+    /// catches this surface never presenting (ADR-0025). Does **not** queue `PresentationEvidence`.
     fn discarded(
         &mut self,
         _conn: &Connection,
@@ -291,26 +262,21 @@ impl OutputHandler for App {
         &mut self.output_state
     }
 
-    // All three do the same two things, because one `wl_output` event owes both: update the
-    // `screens` signal, then ask for a re-evaluation (ADR-0041 decisions 2 and 4). See
-    // [`App::handle_output_change`].
+    // All three: update the `screens` signal, then ask for a re-evaluation (ADR-0041 decisions 2
+    // and 4). See [`App::handle_output_change`].
     fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: wl_output::WlOutput) {
         self.handle_output_change(qh, None);
     }
 
-    // Not only a mode or scale change: `smithay_client_toolkit` also routes an output's *first*
-    // `xdg_output` arrival here rather than to `new_output` when the `wl_output` was already
-    // known, so this is a real path for a monitor's size becoming knowable, not just for one
-    // changing.
+    // Not only mode/scale changes: SCTK also routes an output's *first* `xdg_output` arrival here,
+    // not to `new_output`, when the `wl_output` was already known.
     fn update_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: wl_output::WlOutput) {
         self.handle_output_change(qh, None);
     }
 
     fn output_destroyed(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
-        // Passed through explicitly because `smithay_client_toolkit`'s `remove_global` calls this
-        // *before* removing the output from its own `OutputState` -- a plain read of `outputs()`
-        // from in here still lists the monitor that just went away, so it has to be excluded by
-        // identity (see [`App::screens`]).
+        // Passed through explicitly: SCTK's `remove_global` calls this before removing the output
+        // from its own `OutputState`, so `outputs()` here still lists it (see [`App::screens`]).
         self.handle_output_change(qh, Some(&output));
     }
 }

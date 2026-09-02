@@ -1,10 +1,8 @@
 //! Leaf-node content parsers: text content, icon name/size, image source/fit, font size,
-//! foreground color, and the two identity strings (`id`, `surface_id`). Most of these carry no
-//! children and do not affect the box model; [`paint_style`](super::paint_style) runs them once per
-//! node per pass, alongside the geometry parsers rather than after them.
-//!
-//! `parse_string_property` is `pub(super)`: `surface`, `toplevel` and `popup`-adjacent code in
-//! `toplevel` reuse it for `namespace`, `title`, `app_id` and the like.
+//! foreground color, and identity strings (`id`, `surface_id`). None affect the box model;
+//! [`paint_style`](super::paint_style) runs them once per node per pass, alongside the geometry
+//! parsers. `parse_string_property` is `pub(super)`, reused by `surface`/`toplevel`/`popup` code
+//! for `namespace`, `title`, `app_id` and the like.
 
 use std::collections::HashMap;
 
@@ -14,43 +12,35 @@ use crate::image::Fit;
 
 use super::*;
 
-/// Absent `content` defaults to the empty string: decision 1's nil rule (ADR-0044) means a `text`
-/// bound to a bare, not-yet-pushed capability signal resolves `content` to absent at boot, since
-/// every rostered signal reads `nil` until its first `StateSnapshot` and `run_startup_evaluation`
-/// runs before the poll loop drains one. Rejecting that would reject the whole tree and boot a
-/// blank shell.
-///
-/// Accepted cost: a misspelled `content` key now renders an empty node instead of being rejected.
-/// That is the better failure for a shell that has to boot; `oblisk.rescue` still exists for the
-/// failures that matter.
+/// Absent `content` defaults to the empty string (ADR-0044 decision 1's nil rule): a `text` bound
+/// to a not-yet-pushed capability signal reads `nil` until its first `StateSnapshot`, and
+/// `run_startup_evaluation` runs before the poll loop drains one. Rejecting that would boot a
+/// blank shell. Accepted cost: a misspelled `content` key renders an empty node instead of
+/// failing the whole tree; `oblisk.rescue` covers the failures that matter.
 pub fn parse_content(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     parse_optional_string(properties, "content")
 }
 
-/// `icon.name` (§ 5.2 item 5): a theme name, or an absolute path, which `image::icons::resolve`
-/// tells apart. Defaults to `""` for the same boot reason `content` does (ADR-0044): a `name`
-/// bound to a capability signal is `nil` until that capability's first push, and rejecting the
-/// tree over it would fail every config that binds one.
+/// `icon.name` (§ 5.2 item 5): a theme name or an absolute path, told apart by
+/// `image::icons::resolve`. Defaults to `""` for the same boot reason `content` does (ADR-0044): a
+/// signal-bound `name` is `nil` until its first push, and rejecting the tree would fail every
+/// config that binds one.
 pub fn parse_icon_name(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     parse_optional_string(properties, "name")
 }
 
-/// `image.source` (ADR-0054 decision 3): an absolute path, never a theme name. The split from
-/// [`parse_icon_name`] is the whole difference between the two node kinds, so they do not share a
-/// property spelling either.
-/// `textfield.placeholder` (§ 5.2 item 8): what an empty field shows. Defaults to `""`, the same
+/// `image.source` (ADR-0054 decision 3): an absolute path, never a theme name, the whole
+/// difference from [`parse_icon_name`] and why the two share no property spelling.
+/// `textfield.placeholder` (§ 5.2 item 8): what an empty field shows; defaults to `""`, the same
 /// boot-tolerance [`parse_content`] takes.
 pub fn parse_placeholder(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     parse_optional_string(properties, "placeholder")
 }
 
-/// `textfield.mask_character` (§ 5.2 item 8): the glyph drawn once per typed character.
-///
-/// Defaults to U+2022 BULLET, which is what a password field looks like everywhere else. An empty
-/// string is honoured as "draw nothing", since a config that wants a field revealing no length at
-/// all has said so explicitly. Anything longer than one character is truncated to the first rather
-/// than rejected: the property names a *character*, and a whole tree is not worth failing over a
-/// config that wrote two.
+/// `textfield.mask_character` (§ 5.2 item 8): the glyph drawn once per typed character. Defaults
+/// to U+2022 BULLET, the usual password-field glyph. An empty string means "draw nothing",
+/// honoured since a config wanting no visible length says so explicitly. Longer strings truncate
+/// to the first character: the property names a *character*, not worth failing a tree over.
 pub fn parse_mask_character(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     let declared = parse_optional_string(properties, "mask_character")?;
     if !properties.contains_key("mask_character") {
@@ -63,9 +53,8 @@ pub fn parse_image_source(properties: &HashMap<String, Value>) -> Result<String,
     parse_optional_string(properties, "source")
 }
 
-/// `image.fit` (ADR-0055 decision 3). Absent is `cover`; a string that is not one of the three
-/// modes is an error rather than a silent fallback, because `fit = "fill"` is a config author
-/// reaching for a mode that does not exist and a silently-covered image would hide that.
+/// `image.fit` (ADR-0055 decision 3). Absent is `cover`; an unrecognised string errors rather
+/// than silently falling back, so `fit = "fill"` doesn't hide behind a silently-covered image.
 pub fn parse_fit(properties: &HashMap<String, Value>) -> Result<Fit, LayoutError> {
     let Some(value) = properties.get("fit") else {
         return Ok(Fit::default());
@@ -77,8 +66,7 @@ pub fn parse_fit(properties: &HashMap<String, Value>) -> Result<Fit, LayoutError
     Fit::from_str(&s).ok_or_else(|| invalid("fit", format!("expected `cover`, `contain` or `stretch`, got {s:?}")))
 }
 
-/// The shared shape of every § 5.2 string property that defaults to empty when absent. One
-/// function rather than three copies of the same six lines.
+/// The shared shape behind every § 5.2 string property that defaults to empty when absent.
 fn parse_optional_string(properties: &HashMap<String, Value>, property: &str) -> Result<String, LayoutError> {
     let Some(value) = properties.get(property) else {
         return Ok(String::new());
@@ -92,17 +80,13 @@ fn parse_optional_string(properties: &HashMap<String, Value>, property: &str) ->
 /// `text.foreground` (§ 5.2 item 4). Absent defaults to white: `layout::paint`'s `paint_text`
 /// falls back to the same white whenever this parser errors on a present-but-malformed value, so
 /// the rendered result agrees whether the key was omitted or rejected.
-/// Where a run of glyphs sits inside the box the node was given, as distinct from where the node
-/// sits inside its parent (`align_h`).
+/// Where a run of glyphs sits inside the box the node was given, distinct from where the node
+/// sits inside its parent (`align_h`). Only visible when the box is wider than the text, so it
+/// does nothing on a `Content`-sized node measuring that same string; an explicit `width`,
+/// `"Fill"`, or a `Stretch`ed cross axis makes room for it to matter.
 ///
-/// Only visible when the box is wider than the text, so it does nothing on a `Content`-sized node
-/// whose box came from measuring that same string. An explicit `width`, a `"Fill"`, or a
-/// `Stretch`ed cross axis is what makes room for it to matter.
-///
-/// Its own type rather than a reuse of [`Align`](super::Align), whose match arms look the same. That
-/// one carries `Stretch`, which forces a child's size during layout; a run of glyphs has no size to
-/// force, so a shared type would give this property a fourth value with no meaning and every reader
-/// of it a case to invent an answer for.
+/// Its own type rather than reusing [`Align`](super::Align): that carries `Stretch`, which would
+/// be meaningless here since a run of glyphs has no size to force.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TextAlign {
     #[default]
@@ -121,11 +105,9 @@ pub enum Elide {
     End,
 }
 
-/// `elide` (`oblisk-idl-api-specs.md` § 5.2 item 4). Absent is `None`.
-///
-/// Only `"End"` is offered. QML also has head and middle elision; the reference config uses neither,
-/// and a middle elide has to decide how to split a grapheme budget across two runs, which is real
-/// work for nothing that has asked.
+/// `elide` (`oblisk-idl-api-specs.md` § 5.2 item 4). Absent is `None`. Only `"End"` is offered:
+/// QML also has head and middle elision, but the reference config uses neither, and middle elide
+/// has to split a grapheme budget across two runs, real work nothing has asked for.
 pub fn parse_elide(properties: &HashMap<String, Value>) -> Result<Elide, LayoutError> {
     let Some(value) = properties.get("elide") else {
         return Ok(Elide::None);
@@ -140,11 +122,9 @@ pub fn parse_elide(properties: &HashMap<String, Value>) -> Result<Elide, LayoutE
     }
 }
 
-/// `text_align` (`oblisk-idl-api-specs.md` § 5.2 item 4). Absent is `Start`.
-///
-/// Strings rather than an enum-like table, matching what `fit`, `layer`, `align_h` and `on_click`'s
-/// button name already do at this boundary. `Start`/`End` rather than `Left`/`Right` for the same
-/// reason `align_h` uses them: they are the names the rest of § 5.2 uses for the same axis.
+/// `text_align` (`oblisk-idl-api-specs.md` § 5.2 item 4). Absent is `Start`. A string, matching
+/// `fit`, `layer`, `align_h` and `on_click`'s button name at this boundary. `Start`/`End` rather
+/// than `Left`/`Right`, the names § 5.2 uses for the same axis elsewhere, as `align_h` does.
 pub fn parse_text_align(properties: &HashMap<String, Value>) -> Result<TextAlign, LayoutError> {
     let Some(value) = properties.get("text_align") else {
         return Ok(TextAlign::Start);
@@ -160,12 +140,9 @@ pub fn parse_text_align(properties: &HashMap<String, Value>) -> Result<TextAlign
     }
 }
 
-/// § 5.1's `foreground` when the node declares one, and `None` when it does not.
-///
-/// Separate from [`parse_foreground`] because an `icon`'s default is not white: an icon with no
-/// `foreground` must rasterize exactly as its file says, and a themed default would repaint every
-/// full-colour app icon. Only a `currentColor` icon has anything to take a colour from
-/// (ADR-0072).
+/// § 5.1's `foreground` when the node declares one, `None` when it does not. Separate from
+/// [`parse_foreground`] because an icon's default is not white: with none set it rasterizes
+/// exactly as its file says. Only a `currentColor` icon takes a colour from this (ADR-0072).
 pub fn parse_optional_foreground(properties: &HashMap<String, Value>) -> Result<Option<Rgba>, LayoutError> {
     if !properties.contains_key("foreground") {
         return Ok(None);
@@ -230,35 +207,27 @@ pub(super) fn parse_string_property(
     }
 }
 
-/// A top-level surface's `id`: required, unique among the surfaces in one config, and keys
-/// `Scene::apply`'s `HashMap` for keyed reconciliation (ADR-0045). This same property is also
-/// the surface's *reconcile* identity: the root of a tree is the one node whose retained
-/// counterpart is found by key lookup rather than by [`parse_node_id`]'s per-parent pairing,
-/// because a surface has no parent to be scoped within. Decision 5 is explicit that this is
-/// the same mechanism restated at the level below, not a second one.
+/// A top-level surface's `id`: required, unique per config, and keys `Scene::apply`'s `HashMap`
+/// for keyed reconciliation (ADR-0045). It is also the surface's *reconcile* identity: the tree
+/// root is found by key lookup rather than [`parse_node_id`]'s per-parent pairing, since a surface
+/// has no parent to scope within (decision 5: the same mechanism restated one level down).
 pub fn parse_surface_id(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     parse_string_property(properties, "id", None)
 }
 
 /// The optional `id` base property on every node kind, one level below a surface's root
-/// (ADR-0045 decisions 1-2). `None` means "no id" and is not an error:
-/// `pair_children_by_id_then_position` pairs a child that carries none positionally against the
-/// other id-less children (ADR-0023's original rule applied to that subsequence). Adding or
-/// dropping an `id` is a change of identity, not a cosmetic edit: the retained counterpart is
-/// retired and a new node allocated. Rejects a `Signal` via [`reject_signal_in_structural_field`]
-/// for the same reason [`parse_surface_id`] does: this is a reconcile identity, decided once at
-/// match time, not a value that should drift between the fresh tree and whatever the match
-/// produces.
+/// (ADR-0045 decisions 1-2). `None` means "no id", not an error:
+/// `pair_children_by_id_then_position` pairs an id-less child positionally against its id-less
+/// siblings (ADR-0023's rule applied to that subsequence). Adding or dropping an `id` changes
+/// identity, retiring the retained counterpart and allocating a new node. Rejects a `Signal` via
+/// [`reject_signal_in_structural_field`], same as [`parse_surface_id`]: reconcile identity is
+/// decided once at match time, not left to drift.
 ///
-/// Non-UTF-8 bytes are refused rather than converted, unlike [`checked_string`]'s lossy handling of
-/// display-oriented properties like `content`. An id is an *equality key*: with `to_string_lossy`,
-/// `"\xFF"` and `"\xFE"` both become `U+FFFD` and two genuinely distinct ids compare equal, so
-/// `pair_children_by_id_then_position`'s duplicate check would reject a valid config and a fresh
-/// child could claim the wrong retained counterpart.
-///
-/// Scoping ("unique among siblings, not across the tree") and duplicate rejection are
-/// `pair_children_by_id_then_position`'s job, not this parser's: a duplicate can only be detected
-/// by comparing this node's id against its siblings', which this function has no visibility into.
+/// Non-UTF-8 bytes are refused rather than converted, unlike [`checked_string`]'s lossy handling
+/// of `content`-like properties: `to_string_lossy` maps `"\xFF"` and `"\xFE"` both to `U+FFFD`, so
+/// distinct ids would compare equal and a fresh child could claim the wrong counterpart. Scoping
+/// and duplicate rejection belong to `pair_children_by_id_then_position`, which has visibility
+/// into siblings that this parser does not.
 pub fn parse_node_id(properties: &HashMap<String, Value>) -> Result<Option<String>, LayoutError> {
     let Some(value) = properties.get("id") else {
         return Ok(None);

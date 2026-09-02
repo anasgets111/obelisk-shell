@@ -1,24 +1,19 @@
 //! Supervisor-side config-file watcher (`CONTEXT.md`, Watcher; ADR-0047 decision 3).
 //!
-//! Watches the whole config directory tree (`~/.config/oblisk/` and everything under it, not
-//! just `shell.lua`) for changes to any `.lua` file, debounced: a burst of events one save
-//! produces (`CREATE`+`MODIFY`+`CLOSE_WRITE`, or `MOVED_TO` for an atomic-save editor) coalesces
-//! into exactly one trigger, sent only after the debounce window elapses since the last relevant
-//! event. Watches directories, not files' own inodes: an atomic-save editor unlinks and
-//! recreates the file rather than writing in place, which would silently break an inode-bound
-//! watch.
+//! Watches the whole config directory tree (`~/.config/oblisk/`, not just `shell.lua`) for
+//! changes to any `.lua` file, debounced: a save's event burst (`CREATE`+`MODIFY`+`CLOSE_WRITE`,
+//! or `MOVED_TO` for an atomic-save editor) coalesces into one trigger, sent after the debounce
+//! window elapses since the last relevant event. Watches directories, not inodes, since an
+//! atomic-save editor unlinks and recreates rather than writing in place, breaking an inode watch.
 //!
-//! `inotify` has no recursive watch mode, so one watch is added per directory, and a `wd ->
-//! directory path` map turns an event's bare `WatchDescriptor` back into a full path. A
-//! directory created after startup gets its own watch added the moment its `CREATE` arrives, and
-//! is walked in case it appeared non-empty (`mkdir -p a/b/c`, an archive extracted in one shot)
-//! -- see the `EventMask::ISDIR` arm below for the race that remains despite this.
+//! `inotify` has no recursive watch mode, so one watch is added per directory, with a `wd ->
+//! directory path` map turning an event's bare `WatchDescriptor` into a full path. A directory
+//! created after startup gets its own watch on `CREATE`, walked in case it arrived non-empty
+//! (`mkdir -p a/b/c`); see the `EventMask::ISDIR` arm for the race that remains.
 //!
-//! A `path -> hash` map (ADR-0047 decision 3) rejects saves that changed no bytes: editors
-//! routinely truncate-and-rewrite a file with unchanged contents, which is an inotify event but
-//! not a config change. Not a duplicate of the debounce above: debouncing collapses the burst
-//! one real save produces, hashing rejects a "save" with no real change. A deleted file has no
-//! bytes to hash and is unconditionally a change.
+//! A `path -> hash` map (ADR-0047 decision 3) rejects saves that changed no bytes (editors
+//! routinely truncate-and-rewrite unchanged contents); not a duplicate of the debounce above,
+//! which only collapses one save's burst. A deleted file has no bytes to hash and always counts.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -33,9 +28,9 @@ use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask, Watches};
 use tokio::sync::mpsc;
 
 /// Every inotify event kind this watcher acts on: creation, in-place modification, an
-/// atomic-save editor's rename-into-place, its rename-away counterpart (also how a plain
-/// delete-via-rename looks), an outright delete, and a completed write. Read events (`ACCESS`,
-/// `OPEN`, ...) are not requested, so they never reach the loop below.
+/// atomic-save editor's rename-into-place and rename-away (also how a plain delete-via-rename
+/// looks), an outright delete, and a completed write. Read events (`ACCESS`, `OPEN`, ...) are
+/// never requested.
 fn watch_mask() -> WatchMask {
     WatchMask::CREATE
         | WatchMask::MODIFY
@@ -45,15 +40,12 @@ fn watch_mask() -> WatchMask {
         | WatchMask::CLOSE_WRITE
 }
 
-/// Adds a watch on `dir` itself, then recurses into every subdirectory it currently contains --
-/// so a config tree that already has `widgets/` at startup is fully covered before the first
-/// event can arrive, and so is a directory that appears later and gets walked from this same
-/// function (see the `ISDIR` arm in `spawn_watcher`). `wd_to_dir` records the directory each new
-/// watch covers, since an inotify event carries only a bare `WatchDescriptor` and a name
-/// relative to it, never a full path.
-///
-/// Each call starts its own `visited` set rather than sharing one across the process, so a
-/// directory that is deleted and recreated is walked again rather than skipped as already seen.
+/// Adds a watch on `dir` itself, then recurses into every subdirectory it currently contains, so a
+/// config tree with `widgets/` already at startup is covered before the first event, and so is a
+/// directory that appears later and gets walked from here (see the `ISDIR` arm in
+/// `spawn_watcher`). `wd_to_dir` records each new watch's directory, since an inotify event
+/// carries only a bare `WatchDescriptor`. Each call starts its own `visited` set rather than
+/// sharing one process-wide, so a deleted-and-recreated directory is walked again, not skipped.
 fn watch_tree(watches: &mut Watches, wd_to_dir: &mut HashMap<WatchDescriptor, PathBuf>, dir: &Path) -> io::Result<()> {
     walk(watches, wd_to_dir, &mut HashSet::new(), dir)
 }
@@ -72,11 +64,9 @@ fn walk(
     let wd = watches.add(dir, watch_mask())?;
     wd_to_dir.insert(wd, dir.to_path_buf());
 
-    // Failing to descend is reported and skipped, never propagated: the caller at startup passes
-    // this straight into the Supervisor's `?`, and one unreadable subdirectory must not stop the
-    // shell from starting. Not watching a directory is a worse config experience; refusing to
-    // boot over one is a worse bug. The `add` above is still fatal: it's the directory this call
-    // was asked to watch.
+    // Failing to descend is reported and skipped, never propagated: the caller passes this into
+    // the Supervisor's startup `?`, and one unreadable subdirectory must not stop the shell
+    // booting. The `add` above stays fatal: it's the directory this call was asked to watch.
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) => {
@@ -86,10 +76,8 @@ fn walk(
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        // entry.file_type() calls a symlink a symlink, never a directory -- it would skip
-        // `widgets -> ~/dotfiles/oblisk/widgets`, a dotfiles-repo layout, and the config would
-        // load fine (Lua's require follows the link) and simply never reload. metadata follows
-        // the link; visited above cuts the cycle that opens up.
+        // file_type() calls a symlink a symlink, never a directory, which would skip and silently
+        // never reload `widgets -> ~/dotfiles/oblisk/widgets`; metadata follows the link instead.
         if !path.metadata().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
@@ -101,17 +89,12 @@ fn walk(
 }
 
 /// Drops everything this watcher remembers about `dir` and the tree beneath it, and reports
-/// whether any `.lua` file it had already hashed was among them.
-///
-/// Needed because a rename is not a delete: moving a directory out sends one `MOVED_FROM` for
-/// the directory and no `DELETE` for anything inside it, so without this the watches leak (one
-/// per move, against `fs.inotify.max_user_watches`) and the hashes stay keyed on paths that no
-/// longer exist -- recreating that path with the same bytes then matches the stale hash and the
-/// reload is suppressed. `rm -rf` does not hit this (it sends a `DELETE` per file); `git stash`
-/// and `git checkout` do.
-///
-/// Reports on hashed files, not any `.lua` present: a directory never touched since startup was
-/// never hashed, so its removal doesn't trigger here and waits for the next edit.
+/// whether any `.lua` file it had already hashed was among them. Needed because a rename is not
+/// a delete: moving a directory out sends one `MOVED_FROM` for it and no `DELETE` for anything
+/// inside, so without this the watches leak (against `fs.inotify.max_user_watches`) and stale
+/// hashes suppress a reload when the same path is recreated with the same bytes. `rm -rf` does
+/// not hit this (a `DELETE` per file); `git stash`/`git checkout` do. Reports on hashed files
+/// only, since an untouched directory was never hashed and its removal waits for the next edit.
 fn forget_subtree(
     watches: &mut Watches,
     wd_to_dir: &mut HashMap<WatchDescriptor, PathBuf>,
@@ -122,7 +105,6 @@ fn forget_subtree(
         wd_to_dir.iter().filter(|(_, watched)| watched.starts_with(dir)).map(|(wd, _)| wd.clone()).collect();
     for wd in doomed {
         // A failure means the kernel already invalidated this watch (deleted, not moved).
-        // Nothing left to remove either way.
         let _ = watches.remove(wd.clone());
         wd_to_dir.remove(&wd);
     }
@@ -131,10 +113,8 @@ fn forget_subtree(
     known != hashes.len()
 }
 
-/// Hashes `path`'s current contents, or `None` if it can no longer be read -- a delete or move
-/// that raced ahead of this read. `DefaultHasher` is unspecified across Rust versions and not
-/// cryptographic; neither matters, since the hash never leaves this process and only has to tell
-/// "same bytes as last time" from "different".
+/// Hashes `path`'s current contents, or `None` if it can no longer be read (a delete/move that
+/// raced ahead). `DefaultHasher` is unspecified and not cryptographic; neither matters here.
 fn hash_file(path: &Path) -> Option<u64> {
     let bytes = std::fs::read(path).ok()?;
     let mut hasher = DefaultHasher::new();
@@ -142,9 +122,8 @@ fn hash_file(path: &Path) -> Option<u64> {
     Some(hasher.finish())
 }
 
-/// Watches `dir`'s whole tree for changes to `.lua` files, debounced by `debounce`. Returns a
-/// channel that receives one `()` per settled burst of relevant changes -- see the module doc
-/// comment for what "relevant" excludes (non-`.lua` files, and a rewrite that changed no bytes).
+/// Watches `dir`'s whole tree for `.lua` changes, debounced by `debounce`, returning a channel
+/// with one `()` per settled burst (see the module doc for what "relevant" excludes).
 pub fn spawn_watcher(dir: &Path, debounce: Duration) -> io::Result<mpsc::UnboundedReceiver<()>> {
     let inotify = Inotify::init()?;
     let mut watches = inotify.watches();
@@ -154,15 +133,13 @@ pub fn spawn_watcher(dir: &Path, debounce: Duration) -> io::Result<mpsc::Unbound
 
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        // path -> last-seen content hash (ADR-0047 decision 3). Starts empty rather than
-        // pre-hashing the tree at startup: the first event for any file always counts as a
-        // change, the same answer pre-hashing would give, for less bookkeeping.
+        // path -> last-seen content hash (ADR-0047 decision 3); starts empty since the first
+        // event for any file counts as a change either way.
         let mut hashes: HashMap<PathBuf, u64> = HashMap::new();
 
-        // An absolute deadline, not a relative sleep(debounce) re-armed on every loop iteration:
-        // only a relevant event may push this forward. An irrelevant event still loops this
-        // select! back, and a relative sleep reconstructed there would silently restart the
-        // window from "now", delaying the trigger for as long as unrelated activity kept arriving.
+        // An absolute deadline, not a relative sleep(debounce) re-armed each loop iteration: a
+        // sleep reconstructed on an irrelevant event would silently restart the window, delaying
+        // the trigger for as long as unrelated activity kept arriving.
         let mut deadline: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {
@@ -170,30 +147,25 @@ pub fn spawn_watcher(dir: &Path, debounce: Duration) -> io::Result<mpsc::Unbound
                     match event {
                         Some(Ok(event)) => {
                             if event.mask.contains(EventMask::IGNORED) {
-                                // The directory this watch covered is gone -- the kernel already dropped the
-                                // watch; this just stops wd_to_dir accumulating dead entries.
+                                // The kernel already dropped this watch; stop wd_to_dir accumulating it.
                                 wd_to_dir.remove(&event.wd);
                                 continue;
                             }
 
                             let Some(parent) = wd_to_dir.get(&event.wd) else {
-                                continue; // an event for a watch already cleaned up above -- ignore stragglers.
+                                continue; // watch already cleaned up above: ignore stragglers.
                             };
                             let Some(name) = event.name.as_deref() else {
-                                continue; // event about the watched directory itself, not an entry inside it.
+                                continue; // event about the watched directory itself, not an entry.
                             };
                             let path = parent.join(name);
 
                             if event.mask.contains(EventMask::ISDIR) {
                                 if event.mask.intersects(EventMask::CREATE | EventMask::MOVED_TO) {
-                                    // A directory appeared after startup: watch it, and walk it in case it
-                                    // arrived non-empty (mkdir -p a/b/c, a directory moved in). ponytail: this
-                                    // does not close every race -- a file written into the new directory
-                                    // between the kernel sending this CREATE and this arm running still slips
-                                    // past, unwatched, until something else touches that directory. Closing
-                                    // that gap needs a real recursive watcher (the notify crate's
-                                    // RecommendedWatcher), more machinery than a hand-edited config directory
-                                    // has ever justified.
+                                    // A directory appeared: watch it, and walk it (mkdir -p a/b/c may arrive
+                                    // non-empty). ponytail: a file written between this CREATE and here still
+                                    // slips past unwatched. Upgrade: a real recursive watcher (notify's
+                                    // RecommendedWatcher), more than a config directory has justified.
                                     let _ = watch_tree(&mut watches, &mut wd_to_dir, &path);
                                 } else if event.mask.intersects(EventMask::DELETE | EventMask::MOVED_FROM)
                                     && forget_subtree(&mut watches, &mut wd_to_dir, &mut hashes, &path)
@@ -204,18 +176,18 @@ pub fn spawn_watcher(dir: &Path, debounce: Duration) -> io::Result<mpsc::Unbound
                             }
 
                             if path.extension() != Some(OsStr::new("lua")) {
-                                continue; // not a config file -- README, shell script, editor swap file, whatever.
+                                continue; // not a config file: README, shell script, editor swap file, whatever.
                             }
 
                             if event.mask.intersects(EventMask::DELETE | EventMask::MOVED_FROM) {
-                                // Nothing left to hash, and a deletion is unconditionally a change.
+                                // Nothing left to hash; a deletion is always a change.
                                 hashes.remove(&path);
                                 deadline = Some(tokio::time::Instant::now() + debounce);
                                 continue;
                             }
 
                             match hash_file(&path) {
-                                Some(hash) if hashes.get(&path) == Some(&hash) => {} // same bytes as last time -- not a real change.
+                                Some(hash) if hashes.get(&path) == Some(&hash) => {} // same bytes as last time.
                                 Some(hash) => {
                                     hashes.insert(path, hash);
                                     deadline = Some(tokio::time::Instant::now() + debounce);
@@ -226,13 +198,13 @@ pub fn spawn_watcher(dir: &Path, debounce: Duration) -> io::Result<mpsc::Unbound
                         Some(Err(err)) => {
                             eprintln!("config watcher: inotify read failed: {err}");
                         }
-                        None => break, // the inotify fd closed -- nothing left to watch.
+                        None => break, // the inotify fd closed: nothing left to watch.
                     }
                 }
                 _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {
                     deadline = None;
                     if tx.send(()).is_err() {
-                        break; // receiver dropped -- nobody's listening any more.
+                        break; // receiver dropped: nobody's listening any more.
                     }
                 }
             }

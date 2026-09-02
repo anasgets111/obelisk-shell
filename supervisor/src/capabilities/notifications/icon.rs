@@ -1,7 +1,6 @@
-//! Path-trust validator and icon-data handling: validates `<img src>`/`image-path`/action-icon
-//! paths against a trusted-directory allowlist, decodes/bounds-checks/spools raw image-data
-//! hints, and deletes spooled icon files safely. Split from `dbus::notifications` -- see
-//! `dbus/notifications/mod.rs` for the module-level doc.
+//! Path-trust validator and icon-data handler: checks `<img src>`/`image-path`/action-icon paths
+//! against a trusted allowlist, decodes/bounds-checks/spools raw image-data hints, and deletes
+//! spooled icons safely. Split from `dbus::notifications`; see `dbus/notifications/mod.rs`.
 
 use std::path::{Path, PathBuf};
 
@@ -31,13 +30,11 @@ pub(super) fn default_trusted_icon_roots() -> Vec<PathBuf> {
 }
 
 /// Accepts `path` only as an absolute path that really exists as a regular file under one of
-/// `trusted_roots` (ADR-0033). `canonicalize()` resolves both `..` traversal and symlinks before
-/// the trusted-root check runs, so a symlink planted inside a trusted directory that points
-/// outside it is rejected just like an out-of-tree path would be -- the check compares fully
-/// resolved paths on both sides (`canonical.starts_with(canonicalized_root)`), not raw strings.
-/// A relative path or a bare theme name (no `/`) is rejected outright by the `is_absolute` check,
-/// degrading to "no icon" rather than attempting any theme-name resolution (`system:find_icon` is
-/// separate, unbuilt IDL row -- ADR-0033).
+/// `trusted_roots` (ADR-0033). `canonicalize()` resolves `..` traversal and symlinks first, then
+/// compares fully resolved paths (`canonical.starts_with(canonicalized_root)`), so a symlink
+/// inside a trusted directory pointing outside it is rejected too. A relative path or bare theme
+/// name (no `/`) fails the `is_absolute` check, degrading to "no icon": theme-name resolution is
+/// a separate, unbuilt IDL row (`system:find_icon`, ADR-0033).
 pub(super) fn validate_trusted_path(path: &str, trusted_roots: &[PathBuf]) -> Option<PathBuf> {
     let candidate = Path::new(path);
     if !candidate.is_absolute() {
@@ -58,11 +55,10 @@ pub(super) fn strip_file_uri(path: &str) -> &str {
     path.strip_prefix("file://").unwrap_or(path)
 }
 
-/// Runs `Notify`'s raw `body` through the full sanitize pipeline: byte-cap truncation
+/// Runs `Notify`'s raw `body` through the sanitize pipeline: byte-cap truncation
 /// ([`truncate_utf8_bytes`]), the allowlist grammar ([`parse_markup`]), then the path-trust
-/// validator against every `<img src>` -- an image whose path isn't a real, trusted file is
-/// dropped from the body entirely (ADR-0033: "closes off arbitrary local-file disclosure through
-/// body markup").
+/// validator on every `<img src>`, dropping images whose path isn't a real, trusted file
+/// (ADR-0033: "closes off arbitrary local-file disclosure through body markup").
 pub(super) fn sanitize_body(raw_body: &str, trusted_roots: &[PathBuf]) -> Vec<NotificationSpan> {
     let truncated = truncate_utf8_bytes(raw_body, MAX_BODY_BYTES);
     parse_markup(&truncated)
@@ -76,11 +72,10 @@ pub(super) fn sanitize_body(raw_body: &str, trusted_roots: &[PathBuf]) -> Vec<No
 }
 
 // -------------------------------------------------------------------------------------------
-// Image hint decoding: the real freedesktop `image-data`/`icon_data` struct shape
-// `(iiibiiay)` -- width, height, rowstride, has_alpha, bits_per_sample, channels, data -- decoded
-// by hand from the already-unwrapped `zvariant::Value`, same technique `dbus::tray::parse_menu_node`
-// already uses for a `Value::Structure`. Not tray's `IconPixmap` shape (square-only ARGB32); this
-// is a different, real struct with its own field layout.
+// Image hint decoding: the freedesktop `image-data`/`icon_data` struct shape `(iiibiiay)`
+// (width, height, rowstride, has_alpha, bits_per_sample, channels, data), decoded by hand from
+// the unwrapped `zvariant::Value`, the same technique `dbus::tray::parse_menu_node` uses for a
+// `Value::Structure`. Not tray's `IconPixmap` (square-only ARGB32): a different struct layout.
 // -------------------------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
@@ -131,9 +126,8 @@ fn value_as_bytes(value: &Value<'_>) -> Option<Vec<u8>> {
     }
 }
 
-/// Decodes an `image-data`/`icon_data` hint's `(iiibiiay)` structure. `None` for anything that
-/// isn't a 7-field structure with exactly this field-type layout -- a malformed hint degrades to
-/// "no image from this source", never a panic.
+/// Decodes an `image-data`/`icon_data` hint's `(iiibiiay)` structure; `None` for anything but a
+/// 7-field structure with this exact type layout, so a malformed hint yields no image, not a panic.
 pub(super) fn decode_raw_image_data(value: &Value<'_>) -> Option<RawImageData> {
     let Value::Structure(structure) = value else { return None };
     let fields = structure.fields();
@@ -152,11 +146,10 @@ pub(super) fn decode_raw_image_data(value: &Value<'_>) -> Option<RawImageData> {
 }
 
 /// Bounds-checks a decoded `image-data`/`icon_data` hint (docs/oblisk-supervisor-services-dbus.md
-/// §1.1's "ARGB icon rejection" extended to the real struct shape): positive, capped at
-/// [`MAX_IMAGE_DIMENSION`], 8-bit samples only (ponytail: no 16-bit/float sample support --
-/// nothing checked shows a real sender using anything else), a channel count matching `has_alpha`
-/// exactly (3 = RGB, 4 = RGBA), no row padding (`rowstride == width * channels` exactly), and the
-/// data buffer's real length matching `rowstride * height` exactly.
+/// §1.1's "ARGB icon rejection" extended to this struct shape): positive dimensions capped at
+/// [`MAX_IMAGE_DIMENSION`], 8-bit samples only (ponytail: no 16-bit/float support, no real sender
+/// checked uses anything else), `channels` matching `has_alpha` (3=RGB, 4=RGBA), no row padding
+/// (`rowstride == width * channels`), and `data.len() == rowstride * height`.
 pub(super) fn image_data_is_valid(image: &RawImageData) -> bool {
     image.width > 0
         && image.height > 0
@@ -169,7 +162,7 @@ pub(super) fn image_data_is_valid(image: &RawImageData) -> bool {
 }
 
 /// Encodes an already-bounds-checked [`RawImageData`] to PNG. Unlike `dbus::tray`'s
-/// `encode_argb32_to_png`, no channel reordering is needed -- the freedesktop `image-data` hint is
+/// `encode_argb32_to_png`, no channel reordering is needed: the freedesktop `image-data` hint is
 /// already RGB(A) row-major, not ARGB network byte order.
 pub(super) fn encode_image_data_to_png(image: &RawImageData) -> Result<Vec<u8>, PngEncodeError> {
     let mut buffer = Vec::new();
@@ -184,8 +177,8 @@ pub(super) fn encode_image_data_to_png(image: &RawImageData) -> Result<Vec<u8>, 
 }
 
 /// `/dev/shm/oblisk-$UID/notifications` (ADR-0033: "gets the `$UID` fix ADR-0031 already
-/// established for tray"). Our own icon spool root -- the only directory [`delete_icon_file`] is
-/// ever allowed to delete from (finding 1).
+/// established for tray"): our own icon spool root, the only directory [`delete_icon_file`] may
+/// ever delete from (finding 1).
 fn notifications_icon_dir() -> PathBuf {
     shm_icons::icon_dir("notifications")
 }
@@ -194,15 +187,13 @@ pub(super) fn write_icon_png(id: u32, png_bytes: &[u8]) -> std::io::Result<Strin
     shm_icons::write_png("notifications", &format!("notif-{id}.png"), png_bytes)
 }
 
-/// Whether `path` is safe for [`delete_icon_file`] to actually delete: it must canonicalize to a
-/// real file living under `spool_root` (also canonicalized) -- the same canonicalize-both-sides
-/// care [`validate_trusted_path`] already takes. `false` for anything that fails to canonicalize
-/// (already gone, or never existed) or resolves outside `spool_root`.
+/// Whether `path` is safe for [`delete_icon_file`] to delete: it must canonicalize to a real file
+/// under `spool_root` (also canonicalized), the same both-sides care [`validate_trusted_path`]
+/// takes. `false` if canonicalization fails or resolves outside `spool_root`.
 ///
-/// Finding 1: `Notification.icon_path` is set identically whether it's our own SHM spool copy or a
-/// client-supplied `image-path`/`app_icon` hint that [`validate_trusted_path`] resolved to a real,
-/// externally-owned file under a trusted theme directory (`/usr/share/icons`, `~/.local/share/icons`,
-/// etc.) -- deleting on dismiss/expiry/eviction must never touch the latter.
+/// Finding 1: `Notification.icon_path` looks the same whether it's our own SHM spool copy or a
+/// client-supplied `image-path`/`app_icon` hint resolved to a real, externally-owned theme icon
+/// (`/usr/share/icons`, `~/.local/share/icons`, etc.); deleting must never touch the latter.
 fn path_is_within_spool_root(path: &str, spool_root: &Path) -> bool {
     let Ok(spool_root) = spool_root.canonicalize() else { return false };
     match Path::new(path).canonicalize() {
@@ -211,10 +202,9 @@ fn path_is_within_spool_root(path: &str, spool_root: &Path) -> bool {
     }
 }
 
-/// Deletes `path` only if it lives under our own SHM spool root ([`notifications_icon_dir`]) --
-/// never a client-supplied icon hint resolved to a real, externally-owned file (finding 1). A path
-/// outside our spool root is a silent no-op: we simply forget the reference, we never delete or
-/// even touch a file we don't own.
+/// Deletes `path` only if it lives under our own SHM spool root ([`notifications_icon_dir`]),
+/// never a client-supplied icon hint resolved to a real, externally-owned file (finding 1). Outside
+/// the spool root this is a silent no-op: we forget the reference but never touch the file.
 pub(super) fn delete_icon_file(path: &str) {
     if !path_is_within_spool_root(path, &notifications_icon_dir()) {
         return;

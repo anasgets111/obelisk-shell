@@ -1,22 +1,17 @@
 //! NetworkManager D-Bus controller (`oblisk.network`; docs/oblisk-supervisor-services-dbus.md §4;
-//! ADR-0029).
+//! ADR-0029). Mirrors `dbus::polkit`'s controller-holding-proxies structure rather than
+//! `audio::mixer`'s dedicated-thread pattern: NetworkManager's API is D-Bus-native, so its signal
+//! streams merge into `main.rs`'s top-level `tokio::select!` instead of needing a thread of their
+//! own (ADR-0029). D-Bus access goes through `rusty_network_manager` (ADR-0013, ADR-0029) rather
+//! than hand-written proxies.
 //!
-//! Mirrors `dbus::polkit`'s structure (a controller holding proxies, exposing async methods per
-//! IDL write action) rather than `audio::mixer`'s dedicated-thread pattern: NetworkManager's API
-//! is D-Bus-native, so its signal streams merge into `main.rs`'s top-level `tokio::select!`
-//! instead of needing a thread of their own (ADR-0029).
+//! ponytail: the Wi-Fi/Ethernet device set is resolved once, at [`NetworkController::new`] time,
+//! never re-discovered, so a USB dongle plugged in after start needs a restart to be picked up.
+//! Upgrade path: subscribe to `NetworkManagerProxy::device_added`/`device_removed` and rescan.
 //!
-//! D-Bus access goes through `rusty_network_manager` (ADR-0013, ADR-0029) rather than
-//! hand-written proxies.
-//!
-//! ponytail: the Wi-Fi and Ethernet device set is resolved once, at [`NetworkController::new`]
-//! time, never re-discovered -- a USB Wi-Fi dongle plugged in after the Supervisor starts
-//! wouldn't be picked up until restart. Upgrade path: subscribe to
-//! `NetworkManagerProxy::device_added`/`device_removed` and re-run the same scan.
-//!
-//! ponytail: exactly one Wi-Fi device is tracked (the first `GetAllDevices` returns). Multiple
-//! simultaneous adapters would need `available_networks`/`scan`/`connect` to carry a device
-//! selector; nothing in docs/oblisk-idl-api-specs.md §2.5's schema has one yet.
+//! ponytail: exactly one Wi-Fi device is tracked (the first `GetAllDevices` returns); multiple
+//! adapters would need `available_networks`/`scan`/`connect` to carry a device selector, which
+//! docs/oblisk-idl-api-specs.md §2.5's schema doesn't have yet.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -45,8 +40,7 @@ pub use connection::{parse_bool_arg, parse_connect_args, parse_ssid_arg};
 /// `payload`, same convention as `audio::mixer::AppStream`.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AccessPointInfo {
-    /// The network name. The key entries are deduplicated on, so two radios of one network appear
-    /// once, at the stronger signal.
+    /// The network name; entries dedupe on this, keeping only the stronger of two radios.
     pub ssid: String,
     /// Signal strength, `0` to `100`.
     pub strength: u8,
@@ -58,22 +52,22 @@ pub struct AccessPointInfo {
     pub active: bool,
 }
 
-/// `oblisk.network`'s live push state (ADR-0029). Scoped to exactly what §4.2 asks for --
-/// scanning status and the deduplicated AP list -- not the full §2.5 read schema
-/// (`connected`/`ssid`/`wifi_enabled`/etc.), which §4 doesn't ask this controller to track.
+/// `oblisk.network`'s live push state (ADR-0029). Scoped to §4.2's scanning status and
+/// deduplicated AP list, not the full §2.5 read schema (`connected`/`ssid`/`wifi_enabled`/etc.),
+/// which §4 doesn't ask this controller to track.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct NetworkState {
-    /// A scan is in flight. Flipped to `true` the moment `network:scan()` is accepted rather than
-    /// when NetworkManager confirms, so a spinner starts on the click instead of a round trip later.
+    /// A scan is in flight. Flipped to `true` the moment `network:scan()` is accepted rather
+    /// than when NetworkManager confirms, so a spinner starts on the click, not a round trip
+    /// later.
     pub scanning: bool,
-    /// The access points from the last completed scan: deduplicated by SSID keeping the strongest
-    /// radio of each, sorted strongest first, and cut to 20. Keeps the previous list while
-    /// [`NetworkState::scanning`] is true, so a panel does not blank out mid-scan.
+    /// Access points from the last completed scan: deduplicated by SSID, sorted strongest first,
+    /// cut to 20, and kept as-is while [`NetworkState::scanning`] is true so a panel doesn't blank.
     pub available_networks: Vec<AccessPointInfo>,
 }
 
-/// A pending `network:connect(ssid, hidden)` intent, stashed in the controller (ADR-0037) --
-/// single-slot semantics like `pending_challenge` (ADR-0028) -- until the paired
+/// A pending `network:connect(ssid, hidden)` intent, stashed in the controller (ADR-0037) with
+/// single-slot semantics like `pending_challenge` (ADR-0028), until the paired
 /// `secure_submit(network, connect)` arrives with the password bytes (ADR-0029).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingNetworkConnect {
@@ -81,18 +75,18 @@ pub struct PendingNetworkConnect {
     pub hidden: bool,
 }
 
-/// What the Wi-Fi signal forwarder task reports back to `main.rs`'s top-level `select!` -- just
+/// What the Wi-Fi signal forwarder task reports back to `main.rs`'s top-level `select!`: just
 /// enough to know what kind of rebuild-and-push is needed, not the payload itself (that needs a
 /// fresh D-Bus round trip through [`NetworkController::build_available_networks`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkSignal {
-    /// An access point was added or removed -- the AP list needs rebuilding.
+    /// An access point was added or removed, so the AP list needs rebuilding.
     AccessPointsChanged,
     /// `LastScan` changed, meaning a scan this Supervisor triggered has finished.
     ScanCompleted,
-    /// Sent by [`NetworkController::mark_scanning`], not the forwarder: `scanning` must flip to
-    /// `true` immediately, before `RequestScan`'s D-Bus round trip completes (§4.2). Routed
-    /// through the same channel as the real signals for FIFO ordering.
+    /// Sent by [`NetworkController::mark_scanning`], not the forwarder, so `scanning` flips
+    /// `true` before `RequestScan`'s round trip completes (§4.2). Routed through the same channel
+    /// as the real signals for FIFO ordering.
     ScanStarted,
 }
 
@@ -100,13 +94,11 @@ fn root_object_path() -> ObjectPath<'static> {
     ObjectPath::try_from("/").expect("\"/\" is always a valid D-Bus object path")
 }
 
-/// `rusty_network_manager`'s own hand-written `<Proxy>::new_from_path` helpers declare a return
-/// type whose lifetime is tied to the `&Connection` argument's borrow, even though the generated
-/// `builder()` they call internally clones the connection into an owned value right away and
-/// never holds onto that borrow. That signature makes it impossible to store the resulting proxy
-/// past the borrow's scope, which this controller needs to do. These four wrappers call the
-/// same macro-generated `builder()` directly, which has no such lifetime-elision bug, letting
-/// the caller bind the result to `'static`.
+/// `rusty_network_manager`'s hand-written `<Proxy>::new_from_path` helpers tie their return type's
+/// lifetime to the `&Connection` borrow, though the generated `builder()` they call clones the
+/// connection immediately and never holds it, making it impossible to store the proxy past the
+/// borrow's scope, which this controller needs. These four wrappers call `builder()` directly,
+/// binding the result to `'static`.
 async fn bind_device(connection: &zbus::Connection, path: OwnedObjectPath) -> zbus::Result<DeviceProxy<'static>> {
     DeviceProxy::builder(connection).path(path)?.build().await
 }
@@ -138,9 +130,9 @@ struct WifiDevice {
 }
 
 /// Holds every proxy `oblisk.network`'s write actions and AP survey need, resolved once at
-/// construction. `Clone`: every field is a cheap `zbus` proxy/connection handle, so a clone can
-/// be moved into a `tokio::spawn`ed task for one write action without the caller losing its own
-/// handle (ADR-0029: write actions spawn rather than await inline).
+/// construction. `Clone` since every field is a cheap `zbus` handle, letting a clone move into a
+/// `tokio::spawn`ed write action without the caller losing its own (ADR-0029: writes spawn rather
+/// than await inline).
 #[derive(Clone)]
 pub struct NetworkController {
     connection: zbus::Connection,
@@ -152,19 +144,19 @@ pub struct NetworkController {
     /// [`handle_signal`](Self::handle_signal). `Mutex` because the controller is `Clone`; never
     /// held across an await.
     state: Arc<Mutex<NetworkState>>,
-    /// The single pending `network:connect` intent slot -- see [`PendingNetworkConnect`].
+    /// The single pending `network:connect` intent slot, see [`PendingNetworkConnect`].
     pending_connect: Arc<Mutex<Option<PendingNetworkConnect>>>,
-    /// Clone of the signal channel's sender: lets [`mark_scanning`](Self::mark_scanning) route
-    /// its immediate flip through the same FIFO as the forwarder's real signals, and keeps the
-    /// channel open even with no Wi-Fi device.
+    /// Clone of the signal channel's sender: routes [`mark_scanning`](Self::mark_scanning)'s
+    /// immediate flip through the same FIFO as real signals, and keeps the channel open with no
+    /// Wi-Fi device.
     events: UnboundedSender<NetworkSignal>,
 }
 
 impl NetworkController {
-    /// Connects to NetworkManager over `connection` (the Supervisor's existing system-bus
-    /// connection), resolves the Wi-Fi and Ethernet device sets, and spawns the Wi-Fi signal
-    /// forwarder feeding `events` (ADR-0037). A device whose own `DeviceType` can't be read is
-    /// logged and skipped, not fatal to startup.
+    /// Connects to NetworkManager over `connection` (the Supervisor's system-bus connection),
+    /// resolves the Wi-Fi and Ethernet device sets, and spawns the Wi-Fi signal forwarder feeding
+    /// `events` (ADR-0037). A device whose `DeviceType` can't be read is logged and skipped, not
+    /// fatal to startup.
     pub async fn new(connection: zbus::Connection, events: UnboundedSender<NetworkSignal>) -> zbus::Result<Self> {
         let nm = NetworkManagerProxy::new(&connection).await?;
         let settings = SettingsProxy::new(&connection).await?;
@@ -214,8 +206,8 @@ impl NetworkController {
     }
 
     /// Applies one [`NetworkSignal`] to the controller-owned [`NetworkState`] and returns the
-    /// updated state to push (ADR-0029: no debounce -- every relevant event fully
-    /// re-derives the AP list from scratch).
+    /// updated state to push (ADR-0029: no debounce, every relevant event fully re-derives the
+    /// AP list from scratch).
     pub async fn handle_signal(&self, signal: NetworkSignal) -> NetworkState {
         match signal {
             NetworkSignal::ScanStarted => {
@@ -235,10 +227,9 @@ impl NetworkController {
         }
     }
 
-    /// The immediate half of `network:scan()`: queues [`NetworkSignal::ScanStarted`] so
-    /// `scanning` flips to `true` on initiation, not once `RequestScan` completes. Only when a
-    /// Wi-Fi device exists: with none, [`scan`](Self::scan) silently no-ops and no
-    /// `ScanCompleted` will ever arrive to flip `scanning` back, leaving it stuck `true`.
+    /// The immediate half of `network:scan()`: queues [`NetworkSignal::ScanStarted`] so `scanning`
+    /// flips to `true` on initiation, not once `RequestScan` completes. Only when a Wi-Fi device
+    /// exists, since with none [`scan`](Self::scan) no-ops and `scanning` would stay stuck `true`.
     pub fn mark_scanning(&self) {
         if self.wifi.is_some() {
             let _ = self.events.send(NetworkSignal::ScanStarted);
@@ -246,19 +237,19 @@ impl NetworkController {
     }
 
     /// Stashes a `network:connect(ssid, hidden)` intent until its paired
-    /// `secure_submit(network, connect)` arrives -- newest intent wins (single slot).
+    /// `secure_submit(network, connect)` arrives. Newest intent wins (single slot).
     pub fn stash_connect_intent(&self, pending: PendingNetworkConnect) {
         *self.pending_connect.lock().unwrap() = Some(pending);
     }
 
-    /// Takes the pending connect intent, if any -- the `secure_submit(network, connect)` arm's
+    /// Takes the pending connect intent, if any: the `secure_submit(network, connect)` arm's
     /// one consumer.
     pub fn take_connect_intent(&self) -> Option<PendingNetworkConnect> {
         self.pending_connect.lock().unwrap().take()
     }
 
-    /// § 4.1: `NetworkingEnabled` is a NetworkManager read-only property -- only
-    /// `WirelessEnabled`/`WwanEnabled`/`WimaxEnabled` have setters. The real, only way to toggle
+    /// § 4.1: `NetworkingEnabled` is a NetworkManager read-only property; only
+    /// `WirelessEnabled`/`WwanEnabled`/`WimaxEnabled` have setters. The only real way to toggle
     /// it is the `Enable(bool)` method, deviating from the spec text's literal "sets the
     /// `NetworkingEnabled` property".
     pub async fn set_networking_enabled(&self, enabled: bool) {
@@ -275,8 +266,8 @@ impl NetworkController {
     }
 
     /// § 4.1 / ADR-0029: `false` disconnects every wired device; `true` activates each device's
-    /// existing autoconnect profile, if any, and is a no-op for a device with none -- there is
-    /// no NM method that fabricates a carrier connection without a profile already present.
+    /// existing autoconnect profile, if any, and is a no-op for a device with none, since no NM
+    /// method fabricates a carrier connection without a profile already present.
     pub async fn set_ethernet_enabled(&self, enabled: bool) {
         for path in &self.ethernet_device_paths {
             let device = match bind_device(&self.connection, path.clone()).await {
@@ -303,7 +294,7 @@ impl NetworkController {
             }
         };
         let Some(conn_path) = profile else {
-            // No profile exists for this device -- nothing D-Bus can do about that (ADR-0029).
+            // No profile exists for this device, nothing D-Bus can do about that (ADR-0029).
             return;
         };
         if let Err(err) = self.nm.activate_connection(&conn_path, device_path, &root_object_path()).await {
@@ -339,7 +330,7 @@ impl NetworkController {
     }
 
     /// § 4.2: dispatches `RequestScan({})` off the calling path. A missing Wi-Fi device is
-    /// logged, not a panic -- a system with no wireless hardware still runs everything else.
+    /// logged, not a panic: a system with no wireless hardware still runs everything else.
     pub async fn scan(&self) {
         let Some(wifi) = &self.wifi else {
             eprintln!("network: scan() requested but no Wi-Fi device is present");
@@ -350,9 +341,8 @@ impl NetworkController {
         }
     }
 
-    /// § 4.2: fully re-queries the Wi-Fi device's current AP list and returns it deduplicated
-    /// and capped at the top 20 by strength (ADR-0029: no debounce). Empty, not an error,
-    /// when there's no Wi-Fi device.
+    /// § 4.2: fully re-queries the Wi-Fi device's current AP list, deduplicated and capped at
+    /// the top 20 by strength (ADR-0029: no debounce). Empty, not an error, with no Wi-Fi device.
     pub async fn build_available_networks(&self) -> Vec<AccessPointInfo> {
         let Some(wifi) = &self.wifi else {
             return Vec::new();
@@ -383,9 +373,9 @@ impl NetworkController {
         let ap = bind_access_point(&self.connection, path.clone()).await.ok()?;
         let ssid_bytes = ap.ssid().await.ok()?;
         if ssid_bytes.is_empty() {
-            // ponytail: a hidden AP reports an empty SSID -- no name to show or dedupe by, and
-            // including it would collapse every hidden AP in range into one bogus "" entry.
-            // Connecting still works via network:connect(ssid, hidden=true).
+            // ponytail: a hidden AP reports an empty SSID, no name to show or dedupe by, so
+            // including it would collapse every hidden AP into one bogus "" entry. Connecting
+            // still works via network:connect(ssid, hidden=true).
             return None;
         }
         let strength = ap.strength().await.ok()?;
@@ -404,9 +394,8 @@ impl NetworkController {
 
     /// § 4.3: `pending`'s SSID/hidden flag plus `secret` (empty means open, non-empty means
     /// WPA-PSK) become `AddAndActivateConnection2`'s connection dict. `secret` is zeroized
-    /// immediately after use regardless of outcome (ADR-0005/ADR-0014): the caller has already
-    /// `mem::take`n it out of the wire `SecureSubmit` frame, so this is that plaintext's one
-    /// owner.
+    /// immediately after use regardless of outcome (ADR-0005/ADR-0014): the caller already
+    /// `mem::take`s it out of the wire `SecureSubmit` frame, making this that plaintext's owner.
     pub async fn connect(&self, pending: PendingNetworkConnect, mut secret: Vec<u8>) {
         let result = self.connect_inner(&pending, &secret).await;
         secret.zeroize();
@@ -422,9 +411,8 @@ impl NetworkController {
         let result =
             self.nm.add_and_activate_connection2(dict, &wifi.device_path, &root_object_path(), HashMap::new()).await;
         // intent.psk is build_connection_dict's own plaintext-password copy, zeroized explicitly
-        // here on every exit path rather than left to Drop alone (ADR-0005/ADR-0014). dict
-        // borrows from intent and is fully consumed by the call above, so this is the first
-        // point it's safe to mutate.
+        // here rather than left to Drop alone (ADR-0005/ADR-0014): dict borrows from intent and
+        // is fully consumed above, so this is the first point it's safe to mutate.
         if let Some(psk) = intent.psk.as_mut() {
             psk.zeroize();
         }
@@ -432,8 +420,8 @@ impl NetworkController {
         Ok(())
     }
 
-    /// § 4.3: deletes every connection profile matching `ssid` (plural, per spec -- not just
-    /// the first match).
+    /// § 4.3: deletes every connection profile matching `ssid` (plural, per spec, not just the
+    /// first match).
     pub async fn forget(&self, ssid: &str) {
         let paths = match self.settings.list_connections().await {
             Ok(paths) => paths,
@@ -480,8 +468,8 @@ pub enum NetworkAction {
 }
 
 /// `oblisk.network`'s action dispatch (ADR-0037). Write actions are `tokio::spawn`ed rather than
-/// awaited inline (ADR-0029); `connect` only stashes its intent, the actual connect runs when
-/// the paired `secure_submit(network, connect)` arrives.
+/// awaited inline (ADR-0029); `connect` only stashes its intent until the paired
+/// `secure_submit(network, connect)` arrives.
 pub fn dispatch(controller: &NetworkController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     let Some(action) = crate::parse_action::<NetworkAction>(params) else { return };
@@ -536,14 +524,12 @@ pub fn dispatch(controller: &NetworkController, envelope: &shared::CommandEnvelo
     }
 }
 
-/// Runs until `wireless`'s connection drops, forwarding `AccessPointAdded`/`AccessPointRemoved`/
-/// `LastScan`-changed signals to `events` as [`NetworkSignal`]s. Spawned once, from
-/// [`NetworkController::new`], with its own clone of the `WirelessProxy` -- keeps the
-/// borrow-heavy `PropertyStream`/`SignalStream` types local to this task's own async block,
-/// rather than threading borrowed streams through `main.rs`'s top-level `select!`.
-///
-/// A dropped `events` receiver (Supervisor shutting down) ends this task the next time it tries
-/// to forward a signal, the same posture every channel-forwarding task in this codebase takes.
+/// Runs until `wireless`'s connection drops, forwarding
+/// `AccessPointAdded`/`AccessPointRemoved`/`LastScan`-changed signals to `events` as
+/// [`NetworkSignal`]s. Spawned once from [`NetworkController::new`] with its own `WirelessProxy`
+/// clone, keeping the borrow-heavy stream types local to this task rather than threading them
+/// through `main.rs`'s top-level `select!`. A dropped `events` receiver (shutdown) ends the task
+/// on its next forward attempt, the same posture every channel-forwarding task here takes.
 fn spawn_wifi_signal_forwarder(wireless: WirelessProxy<'static>, events: UnboundedSender<NetworkSignal>) {
     tokio::spawn(async move {
         let mut ap_added = match wireless.receive_access_point_added().await {

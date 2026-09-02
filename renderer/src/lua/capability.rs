@@ -1,29 +1,20 @@
 //! The `oblisk` namespace's capability objects: one capability's read signal, its revision, and
-//! § 3.2's write path share the same handle (ADR-0052 decision 1).
-//!
-//! [`CommandSender::send`] builds an envelope from `{capability, action, arguments}` and knows
-//! nothing about locking, so every § 3.2 write command lands on it rather than each growing a
-//! bespoke binding. The revision lives beside it in the same object for the same reason:
-//! [`Capability`] and [`CapabilityHandle`] are the two ends of one capability, so the number a
-//! write is stamped with and the push that moves it never drift into two separate maps.
-//!
-//! A Lua call on the Wayland dispatch thread has no socket in scope, so it queues a
-//! `RendererFrame::Command` onto the one outbound channel the socket thread's `pump` drains
-//! (ADR-0039). `Rc`, not `Arc`: everything here is confined to that one thread.
+//! § 3.2's write path share the same handle (ADR-0052 decision 1). [`CommandSender::send`] builds
+//! an envelope from `{capability, action, arguments}` so every write lands on one binding, and the
+//! revision lives beside it so a write's stamp and the push that moves it never drift into two
+//! maps ([`Capability`] and [`CapabilityHandle`] are the two ends of one). A Lua call on the
+//! Wayland dispatch thread has no socket in scope, so it queues a `RendererFrame::Command` onto
+//! the one outbound channel the socket thread's `pump` drains (ADR-0039); `Rc`, not `Arc`, since
+//! everything here is confined to that one thread.
 //!
 //! One userdata rather than a signal beside a writer: § 3.2 writes every command as a method on
-//! the capability itself, and ADR-0052 decision 4 reads a lock screen's state off the same name
-//! it locks through. [`Capability`] delegates `get`/`map` to the wrapped [`Signal`], so
-//! `oblisk.lock:get().attempts` and `oblisk.lock:invoke("lock")` are the same object.
+//! the capability itself, and ADR-0052 decision 4 reads a lock screen's state off the same name it
+//! locks through, so [`Capability`] delegates `get`/`map` to the wrapped [`Signal`] and
+//! `oblisk.lock:get().attempts` / `oblisk.lock:invoke("lock")` are the same object.
 //!
-//! ponytail: the write method is spelled `capability:invoke("action", ...)` rather than § 3.2's
-//! `capability:action(...)`. § 7.1 wants the engine to "intercept all method invocations on
-//! exported singletons", which is an `__index` metamethod handing back a closure bound to
-//! whatever name was looked up: the upgrade path, deliberately not taken yet. A generated closure
-//! cannot tell `cap.lock()` from `cap:lock()` (the second passes the userdata as argument one, and
-//! ADR-0052 decision 1's own example uses the first spelling while § 3.2 uses the second), so the
-//! sugar has to settle that ambiguity before it is worth the indirection of turning every typo'd
-//! field read into a callable.
+//! ponytail: `capability:invoke("action", ...)`, not § 3.2's `capability:action(...)`. The
+//! upgrade is an `__index` metamethod per § 7.1, not taken because it cannot tell `cap.lock()`
+//! from `cap:lock()` (ADR-0052 decision 1 vs. § 3.2's spelling).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -35,20 +26,17 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::lua::signal::{DirtyFlag, LiveSignalHandle, Signal};
 
-/// Builds § 7.2's generation-guarded envelope for any `{capability, action, arguments}` and
-/// queues it for the socket thread. One per generation, cloned into every [`Capability`] the
-/// `oblisk` table carries.
+/// Builds § 7.2's generation-guarded envelope and queues it for the socket thread. One per
+/// generation, cloned into every [`Capability`] on the `oblisk` table.
 #[derive(Clone)]
 pub struct CommandSender {
     generation_id: u32,
-    /// JSON-RPC's request id (§ 7.2's `"id": 105`). Shared across every [`Capability`] built from
-    /// one sender, so two capabilities cannot hand out the same id for two different writes.
-    /// `Rc<Cell<_>>` for this module's single-threaded confinement.
+    /// JSON-RPC's request id (§ 7.2's `"id": 105`), shared across [`Capability`] clones so two
+    /// capabilities never hand out the same id. `Rc<Cell<_>>`: single-threaded.
     next_id: Rc<Cell<u64>>,
-    /// Every capability this generation has already asked the Supervisor to start, so the second
-    /// reader of `oblisk.audio` costs nothing. Shared across every clone of this sender because
-    /// `lua::namespace`'s `__index` and `socket`'s `secure_submit` sweep are two callers of the
-    /// same question (ADR-0070 decisions 1 and 5).
+    /// Capabilities this generation already asked the Supervisor to start, so a second reader of
+    /// `oblisk.audio` costs nothing. Shared across clones: `lua::namespace` and `secure_submit`'s
+    /// sweep both ask this (ADR-0070 decisions 1, 5).
     started: Rc<RefCell<HashSet<String>>>,
     outbound_tx: UnboundedSender<RendererFrame>,
 }
@@ -65,11 +53,9 @@ impl CommandSender {
         }
     }
 
-    /// Asks the Supervisor to construct `capability`'s controller, once per generation.
-    ///
-    /// The Supervisor drops a repeat itself (ADR-0070 decision 3), so the local set is not what
-    /// makes this correct: it is what keeps a `map` over `oblisk.audio` that re-resolves on every
-    /// layout pass from writing a frame per pass.
+    /// Asks the Supervisor to construct `capability`'s controller, once per generation. The
+    /// Supervisor already drops a repeat (ADR-0070 decision 3); the local set instead keeps a
+    /// `map` over `oblisk.audio` that re-resolves every layout pass from writing a frame per pass.
     pub(crate) fn start_capability(&self, capability: &str) {
         if !self.started.borrow_mut().insert(capability.to_string()) {
             return;
@@ -80,23 +66,18 @@ impl CommandSender {
         }
     }
 
-    /// The one outbound frame channel this sender writes to, handed back so `RendererClient` can
-    /// queue its own non-command frames (`ReevaluateReport`, `RequestReload`) onto the same
-    /// channel a command goes out on.
+    /// The outbound frame channel, handed back so `RendererClient` can queue its own non-command
+    /// frames (`ReevaluateReport`, `RequestReload`) onto the same channel a command goes out on.
     pub fn frames(&self) -> UnboundedSender<RendererFrame> {
         self.outbound_tx.clone()
     }
 
     /// § 7.2's envelope, queued rather than written: see the module doc comment.
-    ///
-    /// `expected_revision` is the revision of the last `StateSnapshot` this capability hydrated
-    /// from, § 7.3's staleness half: it names which read a write was reacting to.
-    /// [`CapabilityHandle`] keeps it current.
-    ///
-    /// `0` is not a revision any push can produce (`supervisor::snapshot::bump_revision` starts at
-    /// `1`), so it means "never hydrated in this Renderer": honest for a write before the first
-    /// snapshot, and permanently correct for a capability with no state to be stale about, which
-    /// is why `lock` (ADR-0052 decision 1) and `process.rs` both send it forever.
+    /// `expected_revision` is the revision of the last `StateSnapshot` hydrated, § 7.3's staleness
+    /// half ([`CapabilityHandle`] keeps it current). `0` is not a revision any push can produce
+    /// (`bump_revision` starts at `1`), so it means "never hydrated": honest before the first
+    /// snapshot, and permanently correct for a capability with no state to be stale about (`lock`,
+    /// ADR-0052 decision 1, and `process.rs` send it forever).
     pub(crate) fn send(
         &self,
         capability: &str,
@@ -132,17 +113,16 @@ impl CommandSender {
 pub struct Capability {
     name: String,
     signal: Signal,
-    /// Shared with the [`CapabilityHandle`] built beside this member, so an `invoke` stamps the
-    /// revision of the snapshot the config could last have read. See [`CommandSender::send`].
+    /// Shared with the [`CapabilityHandle`] built beside this member, so `invoke` stamps the
+    /// revision of the snapshot the config could last have read; see [`CommandSender::send`].
     revision: Rc<Cell<u32>>,
     commands: CommandSender,
 }
 
 impl Capability {
     /// Builds one `oblisk.<name>` member and the handle `socket::RendererClient` hydrates it
-    /// through. Returned together because the value and the revision must move as one: a `set`
-    /// that missed its matching revision bump would stamp the previous read onto a write reacting
-    /// to the current one: the race § 7.3 exists to drop.
+    /// through: returned together since value and revision must move as one, or a `set` missing its
+    /// bump could stamp a stale read onto the current write, the race § 7.3 exists to drop.
     pub fn new(name: &str, dirty: DirtyFlag, commands: CommandSender) -> (Self, CapabilityHandle) {
         // `nil` until the Supervisor's first push (ADR-0037), paired with revision `0`, which no
         // push can produce.
@@ -154,16 +134,15 @@ impl Capability {
 
     /// The wrapped read signal, for `signal::from_userdata`: lets a config write § 1.2's live
     /// spelling (`content = oblisk.mpris`, `computed({oblisk.audio}, f)`) against a capability,
-    /// since the engine resolves the inner signal and never sees the `Capability` wrapper.
+    /// since the engine resolves the inner signal and never sees the wrapper.
     pub fn signal(&self) -> Signal {
         self.signal.clone()
     }
 }
 
-/// The Rust-side half of one `oblisk.<name>` member: what a `StateSnapshot` writes into.
-///
-/// One handle rather than a `LiveSignalHandle` beside a revision cell, because
-/// `socket::RendererClient` holds one of these per capability and every caller wants both fields.
+/// The Rust-side half of one `oblisk.<name>` member: what a `StateSnapshot` writes into. One
+/// handle rather than a `LiveSignalHandle` beside a revision cell, because `socket::RendererClient`
+/// holds one per capability and every caller wants both fields.
 #[derive(Clone)]
 pub struct CapabilityHandle {
     signal: LiveSignalHandle,
@@ -171,9 +150,8 @@ pub struct CapabilityHandle {
 }
 
 impl CapabilityHandle {
-    /// Writes one `StateSnapshot` into the Lua-visible signal and records the revision it
-    /// arrived with. Revision first: the value write marks the scene dirty (ADR-0044 decision 2),
-    /// so it must happen last.
+    /// Writes one `StateSnapshot` into the Lua-visible signal and records its revision. Revision
+    /// first: the value write marks the scene dirty (ADR-0044 decision 2), so it goes last.
     pub fn hydrate(&self, value: Value, revision: u32) {
         self.revision.set(revision);
         self.signal.set(value);
@@ -182,18 +160,17 @@ impl CapabilityHandle {
 
 impl UserData for Capability {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        // `get`/`map` delegate rather than reimplement, so a capability reads exactly like the
-        // two bare `Signal` globals beside it in the `oblisk` table (`rescue` and `screens`).
+        // `get`/`map` delegate rather than reimplement, so a capability reads like the two bare
+        // `Signal` globals beside it in the `oblisk` table (`rescue` and `screens`).
         methods.add_method("get", |lua, this, ()| this.signal.get_value(lua));
         methods.add_method("map", |_, this, f: Function| Ok(this.signal.mapped(f)));
-        // No `set`: ADR-0044 decision 5 keeps capability state read-only to Lua. A config changes
-        // a capability by commanding it, which is `invoke`.
+        // No `set`: ADR-0044 decision 5 keeps capability state read-only; a config commands it via
+        // `invoke` instead.
         methods.add_method("invoke", |lua, this, (action, args): (String, MultiValue)| {
             let mut arguments = Vec::with_capacity(args.len());
             for (index, value) in args.into_iter().enumerate() {
-                // Fails here rather than silently dropping the slot: a command missing its third
-                // argument is worse to debug from the Supervisor's side than a config error
-                // naming the slot.
+                // Fails here rather than dropping the slot: a missing third argument is worse to
+                // debug from the Supervisor's side than a config error naming the slot.
                 let json = lua.from_value::<serde_json::Value>(value).map_err(|err| {
                     mlua::Error::runtime(format!(
                         "oblisk.{}:invoke(\"{action}\") could not marshal argument {}: {err}",
