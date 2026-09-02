@@ -82,7 +82,18 @@ local surface = popup {
     --
     -- Called with no arguments, so there is no telling which popup was dismissed; see
     -- `open_panel` in `lib/ui_state.lua` for what that costs.
-    on_dismiss = ui_state.close_panel,
+    --
+    -- The cancel is the second half of the same edge. A dismissal takes the network panel's
+    -- password prompt off screen without answering it, and the pending intent behind it lives in
+    -- the Supervisor (`network.password_ssid`), so nothing here could clear it -- leaving the shell
+    -- asking for a password with nowhere to type one, and the bar's keyboard claim standing until
+    -- the panel was reopened just to cancel. `network:cancel_connect` is a no-op when nothing is
+    -- pending, which is why it can be spent unconditionally rather than gated on a panel identity
+    -- `on_dismiss` does not carry.
+    on_dismiss = function()
+        ui_state.close_panel()
+        oblisk.network:invoke("cancel_connect")
+    end,
     child = panel_card(sections, {
         width = "Fill",
         height = "Fill",

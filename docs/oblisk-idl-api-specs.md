@@ -106,6 +106,9 @@ Read off UPower's `DisplayDevice`, the composite across every battery on the mac
 *   `network.wifi_enabled`: `boolean` (True if physical Wi-Fi radio is powered on)
 *   `network.networking_enabled`: `boolean` (True if global NetworkManager execution is active)
 *   `network.ethernet_enabled`: `boolean` (True if Ethernet link-carrier is active)
+*   `network.connecting_ssid`: `string` (SSID a `network:connect` is currently attempting, or `nil` when none is in flight)
+*   `network.connect_error`: `string` (Why the last `network:connect` failed, in words fit to draw, or `nil` when the last one worked)
+*   `network.password_ssid`: `string` (SSID whose `network:connect` is waiting on a password, or `nil` when none is. Set only for a secured network with no saved profile -- a saved or open one connects on the click. What a shell binds a `secure_submit` prompt, and its surface's `keyboard_interactivity`, to)
 *   `network.available_networks`: `table` (Array of scanned Wi-Fi access point structures):
     *   Access Point object:
         *   `ssid`: `string` (AP name)
@@ -278,6 +281,7 @@ All write actions serialize as JSON-RPC 2.0 payloads over the private Unix socke
 | `network:set_ethernet_enabled(en)` | `capability: "network", action: "set_ethernet_enabled", arguments: [en]`<br>**Validation**: `en` is boolean. |
 | `network:scan()` | `capability: "network", action: "scan", arguments: []`<br>**Validation**: Triggers asynchronous AP scanning. |
 | `network:connect(ssid, hidden)` | `capability: "network", action: "connect", arguments: [ssid, hidden]`<br>**Validation**: `ssid` is string. `hidden` is boolean (true for hidden). The password never travels as a Lua argument; it follows as a `secure_submit(network, connect)` (ADR-0005/ADR-0029), and an empty secret means an open network. |
+| `network:cancel_connect()` | `capability: "network", action: "cancel_connect", arguments: []`<br>**Validation**: Drops any pending connect intent and clears `password_ssid`/`connect_error`. The way out of a password prompt; does not abort an activation already in flight. |
 | `network:forget(ssid)` | `capability: "network", action: "forget", arguments: [ssid]`<br>**Validation**: Deletes NM profile. |
 | `bluetooth:set_enabled(en)` | `capability: "bluetooth", action: "set_enabled", arguments: [en]`<br>**Validation**: `en` is boolean. |
 | `bluetooth:start_discovery()` | `capability: "bluetooth", action: "start_discovery", arguments: []` |

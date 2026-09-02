@@ -57,6 +57,16 @@ MPRIS ownership lives in the long-lived Supervisor, not the Renderer, so media w
 
 Event-driven subscriptions to `org.freedesktop.NetworkManager`; zero polling.
 
+### 4.0 What is subscribed
+
+Every §2.5 field is re-derived from scratch on each event (ADR-0029), so the subscription set is what decides how stale a panel can get, and it has to cover the association and not only the scan (ADR-0082):
+
+* **`Device.Wireless`**: `AccessPointAdded`, `AccessPointRemoved`, `ActiveAccessPoint`, `LastScan`. The first two move the AP list, the third is the only one on this interface that moves when the radio joins or leaves a network, and the fourth ends a scan.
+* **`AccessPoint`**: `Strength`, on the associated access point only, re-targeted whenever `ActiveAccessPoint` moves. Every rebuild re-reads all strengths, so one subscription keeps the whole list fresh; subscribing to all of them costs three times the traffic for numbers that refresh anyway (ADR-0082).
+* **`Device`**: `State`, on the Wi-Fi device and every wired one. What `network.ethernet_enabled` reads, and how a Wi-Fi disconnect announces itself first.
+* **`NetworkManager`**: `WirelessEnabled`, `NetworkingEnabled`, `PrimaryConnection`. The two radio switches, plus whatever holds the default route — which can move between two devices that both stay activated, so no device subscription covers it.
+* **`Connection.Active`**: `StateChanged`, on one activation at a time and only while a `network:connect` is in flight. Where `network.connect_error` comes from: it is the only place NetworkManager says *why* a connection went down, and the activation call returns before the radio has tried anything (ADR-0084).
+
 ### 4.1 Master switches and radio controls
 
 * **Global networking**: `network:set_networking_enabled(bool)` calls NetworkManager's `Enable(bool)` method. `NetworkingEnabled` itself is a read-only property; only `WirelessEnabled`/`WwanEnabled`/`WimaxEnabled` have setters, so `Enable` is the actual toggle.
@@ -67,14 +77,17 @@ Event-driven subscriptions to `org.freedesktop.NetworkManager`; zero polling.
 
 * **Scan**: `network:scan()` dispatches `RequestScan({})` off-thread. `network.scanning` flips to `true` on initiation, `false` once `PropertiesChanged` on the wireless device reports completion.
 * **Band resolution**: an access point's `Frequency` property (MHz) maps to a `band` string: `[2400, 2500]` → `"2.4 GHz"`, `[4900, 5900]` → `"5 GHz"`, `[5925, 7125]` → `"6 GHz"`.
-* **Results**: duplicate SSIDs merge to the highest signal strength; the top 20 access points serialize into `network.available_networks`.
+* **Results**: duplicate SSIDs merge to the highest signal strength; the connected access point plus the strongest 19 serialize into `network.available_networks`, connected first, ties on strength broken by SSID so the order does not move between rebuilds (ADR-0083). Sorting `active` ahead of strength is what keeps the connected network inside the cut — `network.ssid`/`strength` are read off this list, so an association weaker than 20 neighbours would otherwise be truncated away and reported as no association at all (ADR-0082). `active` merges across the duplicates rather than riding on the strongest one: NetworkManager keeps more than one AP object per BSSID and `ActiveAccessPoint` routinely names the weaker, so carrying the flag with the winning object drops it (ADR-0082).
+* **Link state**: `network.connected` comes from `PrimaryConnection`, not from the AP list, and `network.ssid`/`strength`/`wifi_enabled`/`networking_enabled`/`ethernet_enabled` fill out §2.5 alongside it. The AP list cannot answer any of them: it has no wired entry, and a powered-down radio looks exactly like a powered one joined to nothing.
 
 ### 4.3 Hidden, secure, and open network associations
 
+* **Saved**: a profile already stored for the SSID is activated with `ActivateConnection`, not duplicated, and it completes without waiting for a password — a saved network has one already, so `network:connect` finishes on its own rather than stashing an intent for a `secure_submit` that will never arrive (ADR-0084). Only an SSID this machine has never joined reaches `AddAndActivateConnection2` — NetworkManager stores a new profile per call and accepts duplicates of both `id` and SSID, so creating unconditionally left one behind per re-join (ADR-0083).
 * **Open**: no password, builds a minimal connection dict and calls `AddAndActivateConnection2`.
-* **Secure**: populates `802-11-wireless-security` with `key-mgmt = "wpa-psk"` and the credential.
+* **Secure**: populates `802-11-wireless-security` with `key-mgmt = "wpa-psk"` and the credential. A password supplied for an SSID that is already saved is written back to that profile with `SettingsConnection.Update` before activating, so a stored key can be corrected from the panel; enterprise (`802-1x`) profiles are activated as-is instead, since `GetSettings` omits secrets and a rewrite would drop the stored 802.1X password (ADR-0083).
 * **Hidden**: `hidden = true` sets `hidden`/`scan-ssid` in the `802-11-wireless` dict to force active probe broadcasts.
-* **Forget**: `network:forget(ssid)` resolves the matching connection profile and calls `Delete()` on its object path.
+* **Forget**: `network:forget(ssid)` resolves every matching connection profile and calls `Delete()` on each one's object path.
+* **Outcome**: `AddAndActivateConnection2` and `ActivateConnection` both return an activation, not a verdict. `network.connecting_ssid` is set on the attempt and cleared when that activation reaches `ACTIVATED` or `DEACTIVATED`; the latter fills `network.connect_error` from the reason code, where `NO_SECRETS` is a wrong password (ADR-0084).
 
 ---
 

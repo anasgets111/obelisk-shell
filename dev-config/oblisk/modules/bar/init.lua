@@ -1,6 +1,7 @@
 -- Mirrors Bar.qml.
 --
 local theme = require("config.theme")
+local ui_state = require("lib.ui_state")
 local left = require("modules.bar.left_side")
 local center = require("modules.bar.center_side")
 local right = require("modules.bar.right_side")
@@ -48,23 +49,43 @@ return panel {
     -- Reserves screen area along the anchored edge, derived from the height the compositor
     -- actually configures, so it stays right if this changes.
     exclusive = true,
-    -- `"None"`, which is also the engine's default (`layout::node::parse_keyboard_interactivity`)
-    -- and is written out anyway because this line was `"OnDemand"` and the reason it changed is
-    -- worth keeping.
+    -- `"None"` until a bar panel is open, `"Exclusive"` for exactly as long as one is. Bound rather
+    -- than constant because `keyboard_interactivity` is one of the four `panel` fields layer-shell
+    -- permits changing on a mapped surface, so a `Signal` here resolves as a value change instead
+    -- of a generation swap (ADR-0044 decision 1, and `layout::node::parse_keyboard_interactivity`).
+    -- `Modules/Shell/MainScreen.qml` binds `WlrLayershell.keyboardFocus` to a panel-derived boolean
+    -- the same way, and for the same reason this one is not bound to something narrower.
     --
-    -- `"OnDemand"` was here to exercise Phase 21 item 2's focus path rather than leave it dark. The
-    -- comment claimed the cost was that *clicking* the bar takes focus off the window behind it.
-    -- That understated it: niri gives an `on_demand` layer surface keyboard focus when it maps, so
-    -- starting the shell took focus off whatever was focused, with no click involved. A bar that
-    -- eats the keyboard on startup does not exercise the engine harder, it makes the session it is
-    -- supposed to be exercised in unusable.
+    -- Bound, and not simply `"OnDemand"`, because of what niri does with that: it gives an
+    -- `on_demand` layer surface keyboard focus when the surface *maps*, with no click involved, so
+    -- this line spent a while as `"OnDemand"` taking focus off whatever was focused at startup and
+    -- making the session unusable. A surface that asks for the keyboard only while a panel is up
+    -- never maps in that state, which is why the same property is safe here in a form it was not
+    -- safe in as a constant.
     --
-    -- Nothing is lost. There is no `textfield` on the bar and no key this surface reads; the only
-    -- keyboard input this config takes is the lock screen's password field, and a `lock` surface
-    -- gets keyboard focus from `ext_session_lock_v1` rather than from this property. The two
-    -- `window` surfaces (`settings`, `launcher`) are `xdg_toplevel`s and are focused the way any
-    -- window is.
-    keyboard_interactivity = "None",
+    -- **Why `panel_open` and not `network.password_ssid`**, which is the thing that actually wants
+    -- the keyboard. Changing this on a *mapped* surface makes the compositor re-evaluate keyboard
+    -- focus, and that breaks `panel_host`'s popup grab: niri dismissed the panel in the same frame
+    -- the password field was armed, so the prompt appeared and vanished together. Bound to
+    -- `panel_open` the change lands on the pass that opens the popup instead -- the bar is earlier
+    -- in the surface list than `panel_host`, so `apply_spec_change` sends this before `show_popup`
+    -- takes the grab -- and nothing touches the layer surface again while the panel is up.
+    --
+    -- The cost is that any open panel takes the keyboard, not just the one asking for a password.
+    -- That is the honest trade rather than a shortcut: `panel_host` is a grabbing popup, so it
+    -- already swallows every pointer event and closes on the first click elsewhere. A surface that
+    -- owns the pointer and not the keyboard is the odder of the two.
+    --
+    -- `"Exclusive"` rather than `"OnDemand"`, because the field must be typable without first
+    -- clicking it: the engine arms the sole `secure_submit` field in reach when the compositor
+    -- hands this surface keyboard focus, and the field on `panel_host` is in reach because a shown
+    -- popup joins its parent's focus scope (`layout::secure_submit`'s `sole_secure_submit_in_scope`).
+    -- The keys arrive here; the entry belongs to the popup. The prompt appearing later, under a
+    -- focus that already arrived, is armed by `wayland::input`'s
+    -- `arm_secure_focus_if_the_scope_now_declares_one` -- there is no second `enter` to do it.
+    keyboard_interactivity = ui_state.panel_open:map(function(open)
+        return open and "Exclusive" or "None"
+    end),
     width = "Fill",
     height = theme.bar_height,
     -- Translucent, and vertically unpadded. Both are the mirror's, and both are load-bearing.

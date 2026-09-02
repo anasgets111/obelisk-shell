@@ -11,29 +11,23 @@ local network_panel = require("modules.bar.panels.network_panel")
 
 local SLOT = "network"
 
-local function active_ap(n)
-    for _, ap in ipairs((n or {}).available_networks or {}) do
-        if ap.active then
-            return ap
-        end
-    end
-    return nil
-end
-
 -- Four buckets, matching `NetworkService.getWifiIcon`'s own tiering of a 0..100 strength.
 local function network_glyph(n)
     if n == nil then
         return icons.wifi_none
     end
-    local ap = active_ap(n)
-    if ap == nil then
-        -- Disconnected, not radio-off: `NetworkState` in `supervisor/src/dbus/network/mod.rs`
-        -- carries `scanning` and the AP list and nothing else, so there is no `wifi_enabled` to
-        -- read and no way to tell an off radio from an on one with nothing joined. The mirror
-        -- draws `icons.wifi_off` for that case and this cannot.
+    if n.ssid == "Ethernet" then
+        return icons.ethernet
+    end
+    -- A dead radio and a live one joined to nothing are different pictures, and until
+    -- `NetworkState` carried `wifi_enabled` this could only draw the second one.
+    if not n.networking_enabled or not n.wifi_enabled then
+        return icons.wifi_off
+    end
+    if n.ssid == nil then
         return icons.wifi_none
     end
-    local tier = math.floor(((ap.strength or 0) / 100) * 3.999) + 1
+    local tier = math.floor(((n.strength or 0) / 100) * 3.999) + 1
     return icons.wifi[math.max(1, math.min(4, tier))]
 end
 
@@ -43,8 +37,10 @@ local network_module = icon_button(oblisk.network:map(network_glyph), function(r
 end, {
     slot = SLOT,
     selected = ui_state.panel_showing(network_panel.kind),
+    -- Lit for a link that carries the default route, not for a bare association: `connected` is
+    -- the question a glance at the bar is asking.
     foreground = oblisk.network:map(function(n)
-        return active_ap(n) ~= nil and theme.FG or theme.TEXT_OFF
+        return (n ~= nil and n.connected) and theme.FG or theme.TEXT_OFF
     end),
 })
 
@@ -55,11 +51,22 @@ local network_tooltip = tooltip({
     height = 60,
     children = {
         cell(oblisk.network:map(function(n)
-            local ap = active_ap(n)
-            if ap then
-                return string.format("%s (%d%%)", ap.ssid or "wi-fi", ap.strength or 0)
+            if n == nil then
+                return "disconnected"
             end
-            return (n ~= nil and n.scanning) and "scanning" or "disconnected"
+            if n.ssid == "Ethernet" then
+                return "ethernet"
+            end
+            if n.ssid then
+                return string.format("%s (%d%%)", n.ssid, n.strength or 0)
+            end
+            if not n.networking_enabled then
+                return "networking off"
+            end
+            if not n.wifi_enabled then
+                return "wi-fi off"
+            end
+            return n.scanning and "scanning" or "disconnected"
         end), theme.FG, theme.font.sm),
         cell(oblisk.network:map(function(n)
             return string.format("%d network(s) in range", #((n or {}).available_networks or {}))

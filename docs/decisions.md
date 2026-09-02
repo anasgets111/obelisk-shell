@@ -3598,3 +3598,239 @@ of type `like`, invisible because checking the config correctly found nothing wr
 `lua-meta`'s files declare everything they reference, which is what lets them stand alone as a
 workspace; single-return prose now uses `---@return T # ...`, LuaCATS' explicit comment marker.
 
+
+## 0082. `oblisk.network` is subscribed to the association, not just to the scan
+
+`NetworkState` carries the whole of docs/oblisk-idl-api-specs.md §2.5, and the forwarders watch the
+NetworkManager properties that move when a link comes up. ADR-0029 left "the exact `NetworkState`
+struct shape" open and the first implementation answered it with `scanning` plus the AP list; this
+is the rest of the answer, forced by a bug that shape could not avoid.
+
+1. **The AP list is not a connectivity source.** `available_networks[].active` was the only thing
+   saying whether the machine was online, and it is wrong for that job three ways: a wired link
+   never appears in it at all, a powered-down radio is indistinguishable from a powered one joined
+   to nothing, and an association that has not yet won the default route reads the same as a working
+   one. `connected` now comes from NetworkManager's `PrimaryConnection`, which names the active
+   connection holding the default route (`/` when nothing does) — §2.5's "default gateway interface
+   is active", read literally off the one property that means it.
+2. **The wake-ups were the bug, not the dedup.** The forwarder subscribed to `AccessPointAdded`,
+   `AccessPointRemoved`, and `LastScan`. None of the three moves when the radio joins or leaves a
+   network, and on a connected idle machine none of them fires at all: measured on this hardware,
+   90 seconds of an established association produced zero. Associating after the bar started left
+   `active` false until the next scan happened along, minutes later. `Wireless.ActiveAccessPoint`,
+   each device's `Device.State`, and the manager's `WirelessEnabled`/`NetworkingEnabled`/
+   `PrimaryConnection` are now subscribed too. This is what Quickshell's own NM backend binds
+   (`src/network/nm/`: `Network.connected` tracks the active connection's state, never AP identity),
+   and the same conclusion arrived at from the other end.
+3. **One `Changed` variant, not one per source.** Every added subscription ends in the same full
+   re-derive, since ADR-0029 item 6 already refuses to keep incremental state. `NetworkSignal`'s
+   `AccessPointsChanged` became `Changed` rather than growing five siblings that all mean the same
+   thing to `handle_signal`.
+4. **`ssid` names the association; `connected` answers the route.** `"Ethernet"` when the default
+   route is wired, the joined SSID otherwise, `nil` when nothing is joined — so a network still
+   negotiating DHCP has an `ssid` and a `connected` of `false`. Wired wins over a simultaneous Wi-Fi
+   association, because `ssid` has to name the link `connected` is about, and a docked laptop stays
+   joined to Wi-Fi the whole time it is on a cable.
+5. **`ethernet_enabled` is device state, not link carrier.** §2.5 words it as the carrier, but the
+   carrier is up whenever a cable is seated, which would leave `set_ethernet_enabled(false)` (ADR-
+   0029 item 5: `Device.Disconnect()`) looking like it did nothing. Reporting `ACTIVATED` is the
+   read-back the setter's own toggle needs, the same kind of deviation §4.1 already documents for
+   `NetworkingEnabled` being read-only and `Enable()` being the real switch.
+6. **No startup read.** zbus emits a property stream's current value once when the cache first
+   fills, so the forwarders prime the first snapshot on their own; a separate build-and-push at
+   construction would only duplicate it.
+7. **`AccessPoint.Strength` is watched on the associated AP only, and needs no debounce.** Measured
+   over 180 seconds on this hardware: the associated AP emitted 26 times, a 6-second poll that stays
+   quiet while the number holds, against 76 emissions across all 17 APs in range — one every 2.4
+   seconds, indefinitely, for percentages behind a panel that is closed almost always. A rebuild
+   re-reads every AP's strength regardless, so the association's own clock refreshes the whole list
+   at a third of the traffic. One rebuild per ~7s is also the answer to ADR-0029 item 6, which said
+   to reconsider debounce only against real numbers: these are the numbers, and they do not justify
+   it. The watch is re-targeted on every `ActiveAccessPoint` change and the previous task aborted —
+   an orphan would go on asking for rebuilds for an AP nothing is connected to.
+
+8. **Access-point proxies are kept warm; the connected AP is sorted ahead of the cut.** Two things
+   the rebuild got wrong once it started running every ~7 seconds rather than once a scan.
+
+   Binding a fresh `AccessPointProxy` per access point per rebuild made zbus set up a property
+   cache each time — a match rule, a `GetAll`, an unsubscribe — and throw it away at the end of the
+   loop body. Measured at 10 access points: 11.25ms a rebuild for fresh-and-cached, 9.51ms for
+   fresh-and-uncached, 0.84ms for proxies held across rebuilds. 13x, and it is spent inline in
+   `main.rs`'s `select!` arm where ADR-0028 already warns about unbounded awaits. The proxies now
+   live in the controller keyed by object path, pruned against the live path list each rebuild
+   rather than by watching `AccessPointRemoved` — the same signal that asks for the rebuild anyway.
+
+   Separately, `build_state` reads `ssid` and `strength` out of the deduplicated list *after* it is
+   cut to 20, so an association weaker than 20 neighbours was truncated away and a plainly-online
+   machine reported as joined to nothing. Dense apartment RF reaches 20 SSIDs easily. `active` now
+   sorts ahead of strength, which keeps the connected network inside the cut and also makes the
+   payload order the one a panel wants, so `network_panel.lua` no longer copies and re-sorts the
+   list to arrive back where it started.
+
+Not built: multi-adapter selection and hot-plugged device discovery, both still open from ADR-0029's
+module header.
+
+
+## 0083. `network:connect` reuses a saved profile, and the AP order is deterministic
+
+A second pass over the same two references ADR-0082 came from — the Quickshell `NetworkService.qml`
+this shell mirrors and quickshell-mirror's `src/network` backend — against the finished
+implementation. Two of the differences were real defects on our side.
+
+1. **Connecting created a profile every time, saved or not.** `connect_inner` called
+   `AddAndActivateConnection2` unconditionally. NetworkManager does not deduplicate: it accepts a
+   second profile with the same `id` *and* the same SSID without complaint, confirmed by adding
+   `oblisk-dup-test` twice and getting two UUIDs back. So every re-join from the panel left another
+   copy behind, and autoconnect could later pick a stale one over the good one. The QML does not
+   have this bug because it asks `wifiNetworkForSsid(target)` first and only creates for an SSID
+   the machine has never seen.
+
+   `activate_intent` now takes the same shape: a saved profile for the SSID gets
+   `ActivateConnection`, and only an unknown SSID reaches `AddAndActivateConnection2`.
+
+2. **A password typed for a saved network is written back, not dropped.** Reusing the profile
+   raises a question creating one never had: what a re-typed password means. Ignoring it would make
+   a profile saved with the wrong key unfixable from the panel — forget-then-rejoin would be the
+   only route — so it goes to `SettingsConnection.Update` first.
+
+   Via `Update` rather than delete-and-recreate because `Update` replaces the whole profile and
+   every other section survives it. The three Wi-Fi profiles on the development machine each carry
+   `ipv4.address-data`, `route-data` and `802-11-wireless-security.auth-alg`; recreating would drop
+   all of it to fix a typo.
+
+   ponytail: skipped for enterprise profiles. `GetSettings` omits secrets, so rebuilding an 802.1X
+   profile from its own read-back would drop the stored password with it. NM's copy is the better
+   bet until there is a secret agent to answer for one, which ADR-0029 leaves out of scope.
+
+3. **The AP sort had no tiebreak, over an input with no order.** `dedup_and_top20` sorted on
+   `(active, strength)` with a stable sort, and its input is a `HashMap` drain whose order moves as
+   access points come and go. Two APs at one strength swapped rows between rebuilds for no reason,
+   and a tie across the 20th place decided arbitrarily which one was cut. The QML's comparator ends
+   in `localeCompare(ssid)` for exactly this; ours now ends in the SSID too.
+
+4. **Tier-based ordering was measured and rejected.** The QML sorts on `signalTier`, not raw
+   signal, and says why: "scan-to-scan jitter cannot reshuffle the list under the cursor." Worth
+   copying on its face, since ADR-0082 took rebuilds from once-a-scan to every ~7 seconds. Reading
+   `AccessPoint.Strength` off the bus eight times over 56 seconds says otherwise: every neighbour
+   held a single value (swing 0) and only the associated AP moved (swing 3, 60..63), because
+   NetworkManager refreshes a non-associated AP's `Strength` only at scan boundaries. The one that
+   does move is pinned to row 0 by `active` already. Tiering would trade a real ordering signal for
+   a stability problem this backend does not have, and would widen exactly the ties item 3 is
+   about.
+
+Closed by ADR-0084: nothing reported a failed association, because `AddAndActivateConnection2`
+returns before the radio has tried.
+
+
+## 0084. A connect attempt reports its own outcome
+
+`network:connect` returned as soon as NetworkManager accepted the request, which is before the radio
+has tried anything. A wrong password was an `eprintln!` and a panel that showed nothing, which is
+ADR-0083's one remaining item. `NetworkService.qml` answers it with `connectError`/`connectingSsid`
+properties; this is the same answer over D-Bus.
+
+1. **Two fields, not a new channel.** `NetworkState` gains `connecting_ssid` and `connect_error`,
+   pushed on the snapshot the capability already sends. The pattern is `LockState`'s
+   `authenticating` + `error` and `UpdatesState`'s `installing` + `install_error`, down to the
+   naming and to `connect_error` holding prose rather than a machine code — "words fit to draw" is
+   already this codebase's convention for a failure a config has to render.
+
+   `connecting_ssid` names the network rather than being a bare flag because a list has to know
+   which row is in flight. Neither field is derivable from NetworkManager — they are a memory of an
+   attempt, not a reading of the stack — so `handle_signal` carries both across the full re-derive
+   exactly as it already carries `scanning`.
+
+2. **The verdict comes from `Connection.Active`'s `StateChanged(state, reason)`.** Both activation
+   calls hand back an activation object; `ACTIVATED` clears the attempt, `DEACTIVATED` maps its
+   reason through `connect_error_text`, and `NO_SECRETS` is the wrong password. Subscribing happens
+   after the call returned, so the current `State` is read once to close the gap. ponytail: a
+   failure landing inside that gap loses its reason and reports the generic line, since only the
+   signal carries one; success does not, which is the far likelier race.
+
+3. **`rusty_network_manager` 0.7.1's binding for that interface cannot work, so this one proxy is
+   hand-written.** The crate declares the signal `#[zbus(signal, name = "state_changed")]`, and zbus
+   takes an explicit `name` verbatim instead of PascalCasing it, so
+   `ActiveProxy::receive_active_state_changed` subscribes to a member NetworkManager never emits.
+   Found by measurement, not by reading: an activation that reached `ACTIVATED` in about a second
+   produced no signal in twenty. Its sibling `Device` proxy spells the same attribute
+   `name = "StateChanged"` and works, which makes it a typo upstream rather than a convention. The
+   local proxy declares only `StateChanged` and `State`, and ADR-0013's "go through the crate" rule
+   stands everywhere else.
+
+4. **No "one attempt at a time" refusal.** `lock:authenticate` and `updates:install` both refuse a
+   second while one runs, and the QML does the same. Here a verdict is simply dropped when its SSID
+   is no longer the one in flight, which fixes the same overlap — an older failure landing on a
+   newer attempt's spinner — without a rule that has to be explained to a config.
+
+5. **A saved network connects without a password.** Reaching any of the above needed the connect
+   path to be reachable at all, and it was not: `network:connect` only stashes an intent, the secret
+   that releases it can come only from a focused `secure_submit` field, and the bar cannot host one
+   — it is `keyboard_interactivity = "None"`, and a layer surface that takes focus on demand takes
+   it the moment it maps. So every click on a saved network stashed an intent nothing would ever
+   consume.
+
+   A profile that exists already has its key, so the intent completes itself. This is what
+   `NetworkService.qml` does for a `known` network too. An unknown SSID still waits for a password
+   and still has nowhere to type one; a prompt means giving a surface keyboard focus, which is a
+   surface-policy decision and not this ADR's.
+
+6. **The panel reports in its header, not per row.** A spinner on the row would mean mapping
+   `available_networks` into enriched items on every push, putting back the copy ADR-0082 removed
+   from this panel. `connecting_ssid` names the network in the header line instead, and
+   `connect_error` replaces it in `RED`, which is how `lock.lua` draws a failed attempt.
+
+Verified on real hardware, both branches: reusing the saved profile left the profile count at three
+and never dropped the link, and the activation reported `error=None` on success and
+`Some("device disconnected")` for an SSID that does not exist. The 45-second ceiling is a backstop
+for an activation object that stops answering, not the mechanism — NetworkManager reported both
+outcomes in seconds.
+
+## 0085. The Wi-Fi password prompt, and what it cost to give a popup the keyboard
+
+ADR-0084 decision 5 left this open on purpose: an unsaved secured network stashed an intent nothing
+would consume, because a prompt "means giving a surface keyboard focus, which is a surface-policy
+decision and not this ADR's". It turned out the mechanism already existed and the policy was the
+whole problem.
+
+1. **The Supervisor decides when to ask, not the config.** `NetworkState` gains `password_ssid`,
+   set by `resolve_connect_intent` for the one case that cannot proceed on the click alone: no saved
+   profile and the network is secured. A config could not derive it — whether a profile exists lives
+   in NetworkManager's settings (ADR-0037) — and the three branches are `NetworkPanel.qml`'s own.
+   An SSID that is hidden or out of range is treated as secured, the way `showPasswordInput`'s
+   `?? true` does, because nothing here can say otherwise. This also fixed a latent case the old
+   `connect_if_saved` never handled: an *open* unsaved network stashed an intent forever.
+
+2. **`network:cancel_connect` is the way out, and it is idempotent.** Escape inside a
+   `secure_submit` field clears the entry and stays in the field, so without a cancel a prompt
+   raised by a mis-click would hold the keyboard until something else took it. Being a no-op when
+   nothing is pending is what lets `panel_host`'s `on_dismiss` spend it unconditionally — closing
+   the panel answers the prompt — without every panel dismissal clearing `connect_error`.
+
+3. **Keyboard focus is a scope, not a surface.** The field lives on `panel_host`, an `xdg_popup`;
+   the compositor hands the keyboard to `bar`. niri gives a grabbing popup the keyboard only if its
+   parent held it when the popup mapped, which is never true here — the prompt is raised by a click
+   *inside* the already-open panel. So `wayland::input`'s `keyboard_focus_scope` is the focused
+   surface plus every popup shown under it, and `sole_secure_submit_in_scope` asks "exactly one"
+   across the whole scope. Before this the prompt was untypable until the panel was closed and
+   reopened, which worked by accident: the second map found the parent focused.
+
+4. **The bar claims the keyboard when a panel opens, not when the prompt appears.** Measured twice:
+   raising `keyboard_interactivity` on a *mapped* layer surface makes niri re-evaluate focus, which
+   breaks `panel_host`'s grab, and the panel is dismissed before the focus event even arrives — the
+   prompt appeared and vanished in the same frame. Bound to `panel_open` the change lands on the
+   pass that creates the popup instead, since `bar` precedes `panel_host` in the surface list. The
+   cost is that any open panel takes the keyboard; the alternatives were `grab = false` (which
+   retires ADR-0051's click-outside-to-close) or drawing the prompt outside the popup. A surface
+   that already owns every pointer event and closes on the first click elsewhere owning the keyboard
+   too is the smaller change.
+
+5. **A field that becomes visible under a focus that already arrived needs its own arming.**
+   Consequence of 4: there is no second `enter` when the prompt appears, so
+   `arm_secure_focus_if_the_scope_now_declares_one` runs once a turn beside the existing teardown
+   check. Only when nothing is armed, so it can never take a field from the press that chose one on
+   a surface declaring several — the guess ADR-0050 decision 4 refuses to make.
+
+Typed characters still never reach the Lua VM: `secure_submit` carries them from the Wayland thread
+to the capability and nowhere else (ADR-0005/ADR-0027), so the prompt has no `on_change` and no
+`on_submit`. It is the only such field on `panel_host` across all five panels, which decision 3's
+rule makes load-bearing rather than incidental.
