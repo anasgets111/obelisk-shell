@@ -47,6 +47,7 @@ local body = {
         scroll = SCROLL,
         spacing = theme.spacing.xs,
         source = oblisk.notifications:map(feed),
+        ---@param notification Notification
         itemfn = function(notification)
             return panel_row {
                 slot = "notification-" .. tostring(notification.id),
@@ -61,7 +62,15 @@ local body = {
                 art = (notification.icon_path ~= nil and notification.icon_path ~= "") and notification.icon_path
                     or "dialog-information",
                 title = notification.summary or "?",
-                subtitle = notification.body or notification.app_name or "",
+                -- `body` is a span array (§ 2.7), so it needs flattening rather than
+                -- `or`-ing: passed straight through it is a Lua table where `text.content` wants
+                -- a string, which fails the whole re-resolve and freezes the shell on the last
+                -- good scene for as long as that notification is in the feed.
+                -- `body` is a span array (§ 2.7), so it needs flattening rather than
+                -- `or`-ing: passed straight through it is a Lua table where `text.content` wants
+                -- a string, which fails the whole re-resolve and freezes the shell on the last
+                -- good scene for as long as that notification is in the feed.
+                subtitle = util.notification_body(notification.body),
                 -- Clicking dismisses, which is what the popup's whole surface already does.
                 -- Activating a notification's default action is not offered because the protocol
                 -- half is not built: § 2.7 carries no `actions` array and § 3.2 has only

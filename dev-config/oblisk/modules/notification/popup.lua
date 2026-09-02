@@ -98,7 +98,7 @@ return panel {
                     -- two-line body would need the shaper to return the line breaks layout measured
                     -- with. Until then one elided line beats no body at all.
                     cell(field(function(top)
-                        return top.body or ""
+                        return util.notification_body(top.body)
                     end), theme.TEXT_OFF, theme.font.sm, { width = "Fill" }),
                 },
             },

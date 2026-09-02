@@ -138,6 +138,25 @@ function util.truncate(value, limit)
     return s:sub(1, utf8.offset(s, limit + 1) - 1) .. "..."
 end
 
+-- `notification.body` is a span array, not a string: the freedesktop body is markup, and the
+-- Supervisor parses it once so no config has to (§ 2.7, ADR-0033). Both readers of it want a
+-- flat run back -- a `panel_row` subtitle and the OSD's one elided line -- because `text` carries
+-- one string and no rich runs, so a span per node would be paragraph layout neither caller has
+-- room for. The styling each span carries is dropped with it; drawing bold means a `text` node
+-- per span, which is the same change as wrapping.
+--
+-- Image spans contribute nothing rather than a placeholder: an inline `<img>` in a two-line row
+-- has nowhere to go, and "[image]" in the middle of a sentence reads worse than the gap.
+function util.notification_body(spans)
+    local parts = {}
+    for _, span in ipairs(spans or {}) do
+        if span.kind == "text" then
+            parts[#parts + 1] = span.text
+        end
+    end
+    return table.concat(parts)
+end
+
 function util.shown_when(signal, predicate)
     return signal:map(function(value)
         if value == nil then
