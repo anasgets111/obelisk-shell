@@ -3834,3 +3834,44 @@ Typed characters still never reach the Lua VM: `secure_submit` carries them from
 to the capability and nowhere else (ADR-0005/ADR-0027), so the prompt has no `on_change` and no
 `on_submit`. It is the only such field on `panel_host` across all five panels, which decision 3's
 rule makes load-bearing rather than incidental.
+
+## 0086. `lua-meta` types nothing unless a signal is `userdata`
+
+A notification's `body` is a `NotificationSpan[]` (ADR-0033) and two config sites read it as a
+string. The result was not a wrong label: `text.content` must be a string, so every re-resolve
+failed and the shell froze on its last good scene for as long as that notification was in the feed.
+The stub declared the field correctly and the language server said nothing, which is the part worth
+recording.
+
+1. **A `---@class` in a union accepts any table.** Measured against `lua-language-server` 3.19.1:
+   `string|Signal` accepts a `NotificationSpan[]`, and still does with a required `---@field` on the
+   class, and still does with `---@class Signal: userdata`. Only the built-in `userdata` refuses a
+   table. So every node property spelled `X|Signal` — all 46 of them — accepted every payload type
+   in the IDL. `Bound` is `---@alias Bound userdata`, and it is the honest spelling anyway:
+   `components/icon_button.lua`'s `is_signal` already tests `type(value) == "userdata"`.
+
+2. **`Signal<T>`, with its methods as `---@field`.** Written as `function Signal:map(fn)` with
+   `---@param fn fun(value: T)`, the class's own `T` does not bind and the annotation silently does
+   nothing — it reads correctly and checks nothing, which is worse than omitting it. As a
+   `---@field` it binds, so `oblisk.network:map(function(n) ... end)` types `n` and a misspelled
+   field is an `undefined-field`. `map` returns `Signal<any>` rather than the mapped type: a
+   `---@field` cannot introduce a second type parameter, so one hop is typed and a chain past it is
+   not. `computed`'s callback stays untyped for the same reason plus an overload per arity.
+
+3. **The diagnostics ship below the level anything reads them at.** `param-type-mismatch`,
+   `assign-type-mismatch` and friends carry **Hint** severity, and both `just types` and an editor's
+   default check run at `Warning`, so the whole IDL type-checked nothing regardless of 1 and 2.
+   `.luarc.json` promotes them, and `setup.rs`'s `luarc_json` writes the same promotion into every
+   config `oblisk init` creates.
+
+4. **`just types` had never run on the machine it was written on**, because `lua-language-server` is
+   not on `PATH` there — Zed's Lua extension downloads its own copy — and the recipe skips silently
+   when it is missing. It now falls back to that copy. It also printed nothing on failure: the
+   report block read a `check.json` that needs `--check_format=json`, which was never passed, so a
+   failure surfaced as `set -e` and a bare exit code. The human-readable output it was discarding is
+   better than the JSON anyway, because it carries the offending source line.
+
+What this does not buy: Lua is not Rust. `any` still flows out of any unannotated helper, a class
+stays permissive in the table direction, and `list`'s `itemfn` cannot infer its item type from
+`source`, so those five callbacks carry a hand-written `---@param`. The engine's own parsers remain
+the real gate; this moves the common mistakes to edit time.

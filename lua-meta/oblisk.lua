@@ -21,15 +21,17 @@
 -- default rather than failing the tree (ADR-0044). A JSON `null` arrives as an absent key rather
 -- than a sentinel (ADR-0057), so `if item.icon_path then` is the right guard for an optional field.
 
----@class Capability: Signal
+---@class Capability<T>: Signal<T>
 ---A capability is a signal you can also command. `:get()` and `:map()` read the pushed payload;
 ---`:invoke()` sends a command the supervisor dispatches. Read-only otherwise: `:set()` refuses it,
 ---or a config could overwrite the SSID the supervisor just pushed.
-local Capability = {}
-
----@param command string
----@param ... any
-function Capability:invoke(command, ...) end
+---
+---Generic over the payload, and inherited as `Capability<NetworkState>` and so on below, which is
+---what types the callback: the `n` in `oblisk.network:map(function(n) ... end)` is a `NetworkState`,
+---so a misspelled field is an `undefined-field` here rather than a `nil` at runtime. `get`/`map`
+---come from [`Signal`] and are not restated per capability; only `invoke` is, because each one
+---knows its own command names.
+---@field invoke fun(self: Capability<T>, command: string, ...: any)
 
 --- Payload types ------------------------------------------------------------------------------
 
@@ -281,11 +283,24 @@ function Capability:invoke(command, ...) end
 ---@field players PlayerState[] Every MPRIS player on the bus, longest-running first. A player that appears appends, and one pushing position updates does not move, so `players[1]` keeps meaning the same player. Empty when nothing is running, which is not an error.
 
 ---@class NetworkState
----`oblisk.network`'s live push state (ADR-0029). Scoped to §4.2's scanning status and
----deduplicated AP list, not the full §2.5 read schema (`connected`/`ssid`/`wifi_enabled`/etc.),
----which §4 doesn't ask this controller to track.
----@field available_networks AccessPointInfo[] Access points from the last completed scan: deduplicated by SSID, sorted strongest first, cut to 20, and kept as-is while [`NetworkState::scanning`] is true so a panel doesn't blank.
+---`oblisk.network`'s live push state: the whole §2.5 read schema, not just §4.2's scan results.
+---Every field is re-derived from NetworkManager on each [`NetworkSignal`] (ADR-0029: no debounce,
+---no incremental state).
+---
+---The link fields exist because the AP list cannot answer "am I online". It says nothing about a
+---wired link, and it cannot tell a powered-down radio from a powered one with nothing joined --
+---both are simply an absence of [`AccessPointInfo::active`].
+---@field available_networks AccessPointInfo[] Access points from the last completed scan: deduplicated by SSID, the connected one first and the rest strongest first, cut to 20, and kept as-is while [`NetworkState::scanning`] is true so a panel doesn't blank. The connected network leads by construction, so a list can be drawn in payload order without sorting it again.
+---@field connect_error? string Why the last `network:connect` failed, in words fit to draw, or `nil` when the last one worked or none has been tried. `AddAndActivateConnection2` returns before the radio has tried anything, so this is filled in later, from the activation's own `StateChanged(state, reason)`: a wrong password is only knowable there. Sticky until the next attempt, like `UpdatesState::check_error`: an error that cleared itself on the next scan would be gone before it was read.
+---@field connected boolean Something is carrying the default route, from NetworkManager's `PrimaryConnection`. That property names the active connection the default route belongs to, which is §2.5's "default gateway interface is active" exactly; `/` means none, and means offline.
+---@field connecting_ssid? string The SSID a `network:connect` is currently trying to join, or `nil` when none is in flight. What a spinner on one row reads, the same job `LockState::authenticating` does for the lock -- and it names the row rather than being a bare flag, because a list needs to know which one. Cleared when the attempt reaches a verdict, either way.
+---@field ethernet_enabled boolean A wired device is activated. §2.5 words this as the link carrier, but the carrier is up whenever a cable is seated, which would leave `network:set_ethernet_enabled(false)` looking like it did nothing; this is the read-back that the setter's own toggle needs.
+---@field networking_enabled boolean NetworkManager is managing networking at all, from `NetworkingEnabled`. `false` means every other field here is a report about a stack that has been switched off.
+---@field password_ssid? string The SSID whose `network:connect` is waiting on a password, or `nil` when nothing is. Set by [`resolve_connect_intent`](NetworkController::resolve_connect_intent) for the one case that cannot proceed without one, and cleared by the attempt that consumes it or by `network:cancel_connect`. Here rather than derived in the config, because the fact it reports -- this machine has no profile for that SSID -- lives in NetworkManager's settings, and a config could only guess at it (ADR-0037). It is also what the shell binds `keyboard_interactivity` to: a bar that takes the keyboard whenever it feels like it is a bar that steals it, so the surface claims focus exactly while this names a network and gives it back the moment it stops.
 ---@field scanning boolean A scan is in flight. Flipped to `true` the moment `network:scan()` is accepted rather than when NetworkManager confirms, so a spinner starts on the click, not a round trip later.
+---@field ssid? string The Wi-Fi SSID in use, or `"Ethernet"` when the default route is wired, or `nil` when nothing is joined. Wired wins when both are up, matching which one `connected` is about. It names an association, not a working route: a network still negotiating DHCP has an `ssid` and a `connected` of `false`, which is what makes those two fields worth having separately.
+---@field strength integer The associated AP's signal strength, `0` to `100`, or `0` with no Wi-Fi association. Read off the same merged entry the panel draws, so the bar and the list never disagree by a point.
+---@field wifi_enabled boolean The Wi-Fi radio is powered, from `WirelessEnabled`. What separates "radio off" from "radio on, joined to nothing", which the AP list alone cannot.
 
 ---@class NotificationsState
 ---`notifications.feed`/`notifications.dnd`'s `StateSnapshot` payload shape (ADR-0033).
@@ -346,183 +361,56 @@ function Capability:invoke(command, ...) end
 
 --- Capabilities -------------------------------------------------------------------------------
 
----@class ApplicationsCapability: Capability
-local ApplicationsCapability = {}
----@return ApplicationsState
-function ApplicationsCapability:get() end
----@param fn fun(value: ApplicationsState): any
----@return Signal
-function ApplicationsCapability:map(fn) end
----@param command "refresh"|"launch"
----@param ... any
-function ApplicationsCapability:invoke(command, ...) end
+---@class ApplicationsCapability: Capability<ApplicationsState>
+---@field invoke fun(self: ApplicationsCapability, command: "refresh"|"launch", ...: any)
 
----@class AudioCapability: Capability
-local AudioCapability = {}
----@return AudioState
-function AudioCapability:get() end
----@param fn fun(value: AudioState): any
----@return Signal
-function AudioCapability:map(fn) end
----@param command "set_volume"|"set_muted"|"toggle_mute"|"set_default_sink"|"set_default_source"|"set_app_volume"|"set_app_muted"
----@param ... any
-function AudioCapability:invoke(command, ...) end
+---@class AudioCapability: Capability<AudioState>
+---@field invoke fun(self: AudioCapability, command: "set_volume"|"set_muted"|"toggle_mute"|"set_default_sink"|"set_default_source"|"set_app_volume"|"set_app_muted", ...: any)
 
----@class BatteryCapability: Capability
+---@class BatteryCapability: Capability<BatteryState>
 local BatteryCapability = {}
----@return BatteryState
-function BatteryCapability:get() end
----@param fn fun(value: BatteryState): any
----@return Signal
-function BatteryCapability:map(fn) end
 
----@class BluetoothCapability: Capability
-local BluetoothCapability = {}
----@return BluetoothState
-function BluetoothCapability:get() end
----@param fn fun(value: BluetoothState): any
----@return Signal
-function BluetoothCapability:map(fn) end
----@param command "set_enabled"|"start_discovery"|"stop_discovery"|"pair"|"connect"|"disconnect"|"forget"
----@param ... any
-function BluetoothCapability:invoke(command, ...) end
+---@class BluetoothCapability: Capability<BluetoothState>
+---@field invoke fun(self: BluetoothCapability, command: "set_enabled"|"start_discovery"|"stop_discovery"|"pair"|"connect"|"disconnect"|"forget", ...: any)
 
----@class BrightnessCapability: Capability
-local BrightnessCapability = {}
----@return BrightnessState
-function BrightnessCapability:get() end
----@param fn fun(value: BrightnessState): any
----@return Signal
-function BrightnessCapability:map(fn) end
----@param command "set"
----@param ... any
-function BrightnessCapability:invoke(command, ...) end
+---@class BrightnessCapability: Capability<BrightnessState>
+---@field invoke fun(self: BrightnessCapability, command: "set", ...: any)
 
----@class KeyboardCapability: Capability
-local KeyboardCapability = {}
----@return KeyboardState
-function KeyboardCapability:get() end
----@param fn fun(value: KeyboardState): any
----@return Signal
-function KeyboardCapability:map(fn) end
----@param command "set_backlight"|"switch_layout"
----@param ... any
-function KeyboardCapability:invoke(command, ...) end
+---@class KeyboardCapability: Capability<KeyboardState>
+---@field invoke fun(self: KeyboardCapability, command: "set_backlight"|"switch_layout", ...: any)
 
----@class LockCapability: Capability
-local LockCapability = {}
----@return LockState
-function LockCapability:get() end
----@param fn fun(value: LockState): any
----@return Signal
-function LockCapability:map(fn) end
----@param command "lock"
----@param ... any
-function LockCapability:invoke(command, ...) end
+---@class LockCapability: Capability<LockState>
+---@field invoke fun(self: LockCapability, command: "lock", ...: any)
 
----@class MprisCapability: Capability
-local MprisCapability = {}
----@return MprisState
-function MprisCapability:get() end
----@param fn fun(value: MprisState): any
----@return Signal
-function MprisCapability:map(fn) end
----@param command "control"|"seek"|"seek_relative"
----@param ... any
-function MprisCapability:invoke(command, ...) end
+---@class MprisCapability: Capability<MprisState>
+---@field invoke fun(self: MprisCapability, command: "control"|"seek"|"seek_relative", ...: any)
 
----@class NetworkCapability: Capability
-local NetworkCapability = {}
----@return NetworkState
-function NetworkCapability:get() end
----@param fn fun(value: NetworkState): any
----@return Signal
-function NetworkCapability:map(fn) end
----@param command "set_networking_enabled"|"set_wifi_enabled"|"set_ethernet_enabled"|"scan"|"connect"|"forget"
----@param ... any
-function NetworkCapability:invoke(command, ...) end
+---@class NetworkCapability: Capability<NetworkState>
+---@field invoke fun(self: NetworkCapability, command: "set_networking_enabled"|"set_wifi_enabled"|"set_ethernet_enabled"|"scan"|"connect"|"cancel_connect"|"forget", ...: any)
 
----@class NotificationsCapability: Capability
-local NotificationsCapability = {}
----@return NotificationsState
-function NotificationsCapability:get() end
----@param fn fun(value: NotificationsState): any
----@return Signal
-function NotificationsCapability:map(fn) end
----@param command "dismiss"|"reply"|"set_sound"|"set_dnd"
----@param ... any
-function NotificationsCapability:invoke(command, ...) end
+---@class NotificationsCapability: Capability<NotificationsState>
+---@field invoke fun(self: NotificationsCapability, command: "dismiss"|"reply"|"set_sound"|"set_dnd", ...: any)
 
----@class PowerCapability: Capability
-local PowerCapability = {}
----@return PowerState
-function PowerCapability:get() end
----@param fn fun(value: PowerState): any
----@return Signal
-function PowerCapability:map(fn) end
----@param command "set_profile"
----@param ... any
-function PowerCapability:invoke(command, ...) end
+---@class PowerCapability: Capability<PowerState>
+---@field invoke fun(self: PowerCapability, command: "set_profile", ...: any)
 
----@class PrivacyCapability: Capability
+---@class PrivacyCapability: Capability<PrivacyState>
 local PrivacyCapability = {}
----@return PrivacyState
-function PrivacyCapability:get() end
----@param fn fun(value: PrivacyState): any
----@return Signal
-function PrivacyCapability:map(fn) end
 
----@class SysinfoCapability: Capability
-local SysinfoCapability = {}
----@return SysinfoState
-function SysinfoCapability:get() end
----@param fn fun(value: SysinfoState): any
----@return Signal
-function SysinfoCapability:map(fn) end
----@param command "configure"
----@param ... any
-function SysinfoCapability:invoke(command, ...) end
+---@class SysinfoCapability: Capability<SysinfoState>
+---@field invoke fun(self: SysinfoCapability, command: "configure", ...: any)
 
----@class SystemCapability: Capability
+---@class SystemCapability: Capability<SystemState>
 local SystemCapability = {}
----@return SystemState
-function SystemCapability:get() end
----@param fn fun(value: SystemState): any
----@return Signal
-function SystemCapability:map(fn) end
 
----@class TrayCapability: Capability
-local TrayCapability = {}
----@return TrayState
-function TrayCapability:get() end
----@param fn fun(value: TrayState): any
----@return Signal
-function TrayCapability:map(fn) end
----@param command "activate"|"secondary_activate"|"scroll"|"activate_menu_item"|"menu_will_show"
----@param ... any
-function TrayCapability:invoke(command, ...) end
+---@class TrayCapability: Capability<TrayState>
+---@field invoke fun(self: TrayCapability, command: "activate"|"secondary_activate"|"scroll"|"activate_menu_item"|"menu_will_show", ...: any)
 
----@class UpdatesCapability: Capability
-local UpdatesCapability = {}
----@return UpdatesState
-function UpdatesCapability:get() end
----@param fn fun(value: UpdatesState): any
----@return Signal
-function UpdatesCapability:map(fn) end
----@param command "configure"|"install"
----@param ... any
-function UpdatesCapability:invoke(command, ...) end
+---@class UpdatesCapability: Capability<UpdatesState>
+---@field invoke fun(self: UpdatesCapability, command: "configure"|"install", ...: any)
 
----@class WorkspacesCapability: Capability
-local WorkspacesCapability = {}
----@return WorkspacesState
-function WorkspacesCapability:get() end
----@param fn fun(value: WorkspacesState): any
----@return Signal
-function WorkspacesCapability:map(fn) end
----@param command "focus"
----@param ... any
-function WorkspacesCapability:invoke(command, ...) end
+---@class WorkspacesCapability: Capability<WorkspacesState>
+---@field invoke fun(self: WorkspacesCapability, command: "focus", ...: any)
 
 --- Off-roster members ---------------------------------------------------------------------------
 -- Not capabilities and not in `shared::Capability::ALL`, so they have no payload struct to derive
@@ -584,8 +472,8 @@ function Idle:release_inhibit() end
 ---@field power PowerCapability power-profiles-daemon's platform profiles, plus whether you are on mains and how many watts are moving.
 ---@field applications ApplicationsCapability The installed desktop entries, listed and indexed by the `app_id` a window reports.
 ---@field idle Idle Idle thresholds and the inhibit pair. Methods only, no state to read (ADR-0032).
----@field screens Signal A `Screen[]`. Renderer-sourced, seeded to an empty list, and the one signal with a value at first evaluation (ADR-0041).
----@field rescue Signal A `RescueState`. Renderer-sourced, no commands (ADR-0046).
+---@field screens Signal<Screen[]> Renderer-sourced, seeded to an empty list, and the one signal with a value at first evaluation (ADR-0041).
+---@field rescue Signal<RescueState> Renderer-sourced, no commands (ADR-0046).
 ---@field version ObliskVersion Three integers a config can compare. Not a signal.
 ---@field config_dir string The directory `shell.lua` was loaded from, so a config can name a file it ships beside itself. Not a signal.
 oblisk = {}

@@ -81,6 +81,14 @@ fn write_unless_present(path: &Path, contents: &str, force: bool) -> io::Result<
 /// must be known at init time. `runtime.path` mirrors the engine's own `package.path`, and
 /// `runtime.builtin` removes the libraries ADR-0048 cut, so the editor refuses `io.open` and
 /// `os.execute` like the VM does.
+/// The `.luarc.json` `oblisk init` writes beside a new config, pointing the language server at the
+/// installed stubs.
+///
+/// The two `diagnostics` blocks are not decoration. `param-type-mismatch` and its siblings carry
+/// **Hint** severity by default, so a `--check` run at `Warning` -- the level `just types` uses and
+/// the level an editor shows without being asked -- filters out every type error the stubs exist to
+/// produce, and the whole IDL types nothing. Promoting them is what makes a payload field landing
+/// in the wrong property a red squiggle instead of a frozen shell.
 fn luarc_json(stub_dir: &Path) -> String {
     format!(
         r#"{{
@@ -96,7 +104,21 @@ fn luarc_json(stub_dir: &Path) -> String {
     "ffi": "disable"
   }},
   "workspace.library": ["{}"],
-  "workspace.checkThirdParty": false
+  "workspace.checkThirdParty": false,
+  "diagnostics.severity": {{
+    "param-type-mismatch": "Warning",
+    "assign-type-mismatch": "Warning",
+    "return-type-mismatch": "Warning",
+    "cast-local-type": "Warning",
+    "undefined-field": "Warning"
+  }},
+  "diagnostics.neededFileStatus": {{
+    "param-type-mismatch": "Any",
+    "assign-type-mismatch": "Any",
+    "return-type-mismatch": "Any",
+    "cast-local-type": "Any",
+    "undefined-field": "Any"
+  }}
 }}
 "#,
         stub_dir.display()

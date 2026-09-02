@@ -488,7 +488,7 @@ mod meta_stub_tests {
     ///
     /// The other two tests here check *names*. This one checks the claims the names carry, which is
     /// the half nothing checked until ADR-0081: 21 properties declared a type that refused a
-    /// `Signal` the engine takes, and the stubs had said so for as long as they had existed.
+    /// binding the engine takes, and the stubs had said so for as long as they had existed.
     ///
     /// It runs in this direction only. A member the engine accepts and the stub omits is invisible
     /// here, and is what `just types` catches from the other side by checking `dev-config` against
@@ -521,21 +521,21 @@ mod meta_stub_tests {
                 let members: Vec<&str> =
                     if ty.contains(['(', '[', '{']) { vec![ty.as_str()] } else { ty.split('|').collect() };
                 for member in members {
-                    // A `Signal` is not a type of its own here, it is a carrier: the engine
-                    // resolves it and then applies the sibling member's rules to what came out. So
-                    // the probe wraps a sibling's sample rather than an arbitrary value, which is
-                    // the difference between testing `align_h = Signal` and testing
+                    // `Bound` is not a type of its own here, it is a carrier: the engine
+                    // resolves the handle and then applies the sibling member's rules to what came
+                    // out. So the probe wraps a sibling's sample rather than an arbitrary value,
+                    // which is the difference between testing `align_h = Bound` and testing
                     // `align_h = <a signal holding 8>`.
-                    // A `Signal` prefers to wrap a sibling, and only falls back to the field's own
+                    // `Bound` prefers to wrap a sibling, and only falls back to the field's own
                     // sample when it has none. The order matters both ways: `image.source` is
-                    // `string|Signal` and wants a signal holding a string, while `list.source` is
-                    // `Signal` alone and wants one holding an array. Keying on the field first would
+                    // `string|Bound` and wants a signal holding a string, while `list.source` is
+                    // `Bound` alone and wants one holding an array. Keying on the field first would
                     // give both the array; keying on the wrap first would give both the string.
-                    let literal = if member == "Signal" {
+                    let literal = if member == "Bound" {
                         // `ty.split` is safe here: a bracketed type never splits, so it never
-                        // reaches this branch with `member == "Signal"`.
+                        // reaches this branch with `member == "Bound"`.
                         ty.split('|')
-                            .filter(|m| *m != "Signal")
+                            .filter(|m| *m != "Bound")
                             .find_map(|m| sample(&field, m))
                             .map(|inner| format!("state(\"probe\", {inner})"))
                             .or_else(|| sample(&field, member))
@@ -590,10 +590,10 @@ mod meta_stub_tests {
             }
             // A callback: the parsers ask whether it is a function, not what its arity is. The two
             // a `list` calls during layout are the exception, since it uses what comes back.
-            // Typed `Signal` with nothing beside it: these three take the handle itself.
+            // Typed `Bound` with nothing beside it: these three take the handle itself.
             ("hover", _) => return Some("hover(\"probe\")".to_string()),
             ("scroll", _) => return Some("scroll(\"probe\")".to_string()),
-            ("source", "Signal") => return Some("SIGNAL_LIST".to_string()),
+            ("source", "Bound") => return Some("SIGNAL_LIST".to_string()),
             ("itemfn", _) => return Some("function(item) return rect {} end".to_string()),
             ("key", _) => return Some("function(item) return tostring(item) end".to_string()),
             (_, shape) if shape.starts_with("fun(") || shape.starts_with("fun()") => {
@@ -612,8 +612,8 @@ mod meta_stub_tests {
                 "Node" => "rect {}",
                 "Node[]" => "{ rect {} }",
                 "Align" => "\"Center\"",
-                // No row for a bare `Signal`: the caller wraps a sibling member's sample instead,
-                // and the three properties typed `Signal` alone are handled by field above. A row
+                // No row for a bare `Bound`: the caller wraps a sibling member's sample instead,
+                // and the three properties typed `Bound` alone are handled by field above. A row
                 // here would shadow both and probe every property with the same wrong payload.
                 "Rect" => "{ x = 0, y = 0, width = 1, height = 1 }",
                 "PopupAnchor" => "\"Top\"",

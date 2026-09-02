@@ -362,16 +362,17 @@ pub fn render() -> String {
         let class = capability_class(capability);
         let payload = payload_class(schema);
         let commands = actions.as_ref().map_or_else(Vec::new, action_names);
-        out.push_str(&format!("\n---@class {class}: Capability\nlocal {class} = {{}}\n"));
-        out.push_str(&format!("---@return {payload}\nfunction {class}:get() end\n"));
-        out.push_str(&format!(
-            "---@param fn fun(value: {payload}): any\n---@return Signal\nfunction {class}:map(fn) end\n"
-        ));
-        if !commands.is_empty() {
+        // `get`/`map` are inherited from `Capability<T>` rather than restated: written out per
+        // class they would have to name their own `self`, and a `---@field` that does not bind the
+        // payload back to `Signal<T>` is an annotation that reads right and checks nothing.
+        out.push_str(&format!("\n---@class {class}: Capability<{payload}>\n"));
+        if commands.is_empty() {
+            // No `invoke` line at all, so calling one is `undefined-field` rather than accepted
+            // against the base class's `string`.
+            out.push_str(&format!("local {class} = {{}}\n"));
+        } else {
             let union = commands.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join("|");
-            out.push_str(&format!(
-                "---@param command {union}\n---@param ... any\nfunction {class}:invoke(command, ...) end\n"
-            ));
+            out.push_str(&format!("---@field invoke fun(self: {class}, command: {union}, ...: any)\n"));
         }
     }
 
@@ -409,15 +410,17 @@ const GENERATED_HEADER: &str = r#"---@meta
 -- default rather than failing the tree (ADR-0044). A JSON `null` arrives as an absent key rather
 -- than a sentinel (ADR-0057), so `if item.icon_path then` is the right guard for an optional field.
 
----@class Capability: Signal
+---@class Capability<T>: Signal<T>
 ---A capability is a signal you can also command. `:get()` and `:map()` read the pushed payload;
 ---`:invoke()` sends a command the supervisor dispatches. Read-only otherwise: `:set()` refuses it,
 ---or a config could overwrite the SSID the supervisor just pushed.
-local Capability = {}
-
----@param command string
----@param ... any
-function Capability:invoke(command, ...) end
+---
+---Generic over the payload, and inherited as `Capability<NetworkState>` and so on below, which is
+---what types the callback: the `n` in `oblisk.network:map(function(n) ... end)` is a `NetworkState`,
+---so a misspelled field is an `undefined-field` here rather than a `nil` at runtime. `get`/`map`
+---come from [`Signal`] and are not restated per capability; only `invoke` is, because each one
+---knows its own command names.
+---@field invoke fun(self: Capability<T>, command: string, ...: any)
 "#;
 
 const RENDERER_SOURCED: &str = r#"
@@ -464,8 +467,8 @@ function Idle:release_inhibit() end
 "#;
 
 const OBLISK_TAIL: &str = r#"---@field idle Idle Idle thresholds and the inhibit pair. Methods only, no state to read (ADR-0032).
----@field screens Signal A `Screen[]`. Renderer-sourced, seeded to an empty list, and the one signal with a value at first evaluation (ADR-0041).
----@field rescue Signal A `RescueState`. Renderer-sourced, no commands (ADR-0046).
+---@field screens Signal<Screen[]> Renderer-sourced, seeded to an empty list, and the one signal with a value at first evaluation (ADR-0041).
+---@field rescue Signal<RescueState> Renderer-sourced, no commands (ADR-0046).
 ---@field version ObliskVersion Three integers a config can compare. Not a signal.
 ---@field config_dir string The directory `shell.lua` was loaded from, so a config can name a file it ships beside itself. Not a signal.
 oblisk = {}

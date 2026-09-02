@@ -24,6 +24,16 @@
 -- meant anyway, so setting both is right everywhere rather than merely harmless.
 local theme = require("config.theme")
 
+-- Annotated, unlike most of `components/`, because this is the last hop before `text.content`, a
+-- property the engine requires to be a string and fails the whole re-resolve over. `notification`
+-- payloads reach here through a `list`'s `itemfn`, which `lua-meta/nodes.lua` types as
+-- `fun(item: any)` because a `Signal` carries no element type, so `any` used to flow all the way
+-- down and a span array landed in `content` with nothing between the stub that got it right and
+-- the shell freezing on its last good scene.
+---@param content string|Bound
+---@param color? Color|Bound
+---@param size? integer
+---@param opts? { width?: integer|"Fill", align?: "Start"|"Center"|"End", align_v?: "Start"|"Center"|"End", visible?: boolean|Bound }
 return function(content, color, size, opts)
     opts = opts or {}
     return text {

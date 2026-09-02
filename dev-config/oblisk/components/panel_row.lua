@@ -11,6 +11,24 @@
 local theme = require("config.theme")
 local cell = require("components.cell")
 
+-- Annotated for the same reason `components/cell.lua` is: this is the hop where a payload field
+-- becomes text, and `title`/`subtitle` are handed straight to a `cell`. Without the shapes below
+-- an `any` from a `list`'s `itemfn` passes through untouched, which is how a notification's span
+-- array reached `text.content`.
+---@class PanelRowOpts
+---@field title string|Bound
+---@field subtitle? string|Bound
+---@field icon? string|Bound A glyph drawn as text and recoloured with the row.
+---@field art? string|Bound A theme name or absolute path drawn as an `icon`, never recoloured.
+---@field color? Color|Bound
+---@field icon_color? Color|Bound
+---@field height? integer
+---@field slot? string
+---@field visible? boolean|Bound
+---@field trailing? Node
+---@field on_activate? fun()
+
+---@param opts PanelRowOpts
 return function(opts)
     local title_lines = { cell(opts.title, opts.color or theme.FG, theme.font.sm, { width = "Fill" }) }
     if opts.subtitle then

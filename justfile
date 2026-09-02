@@ -76,10 +76,20 @@ docs:
 #
 # Optional, because `lua-language-server` is not a build dependency of this workspace and there is
 # no CI to install it into. Missing means skipped and said so, never a silent pass.
+#
+# The PATH lookup falls back to the copy Zed's Lua extension downloads for itself. Not cleverness
+# for its own sake: that is the only copy on the machine this was written on, so the check reported
+# "skipping" on every run for as long as it existed, and the hole `dev-config/oblisk/.luarc.json`'s
+# promoted diagnostics exist to close was open the whole time. Newest version wins; the glob is
+# there so a Zed update does not silently turn the check back off.
 types:
     #!/usr/bin/env bash
     set -euo pipefail
-    if ! command -v lua-language-server >/dev/null 2>&1; then
+    luals=$(command -v lua-language-server 2>/dev/null || true)
+    if [ -z "$luals" ]; then
+        luals=$(ls -d ~/.local/share/zed/extensions/work/lua/lua-language-server-*/bin/lua-language-server 2>/dev/null | sort -V | tail -1 || true)
+    fi
+    if [ -z "$luals" ]; then
         echo "no lua-language-server on PATH, skipping the config type check (pacman -S lua-language-server)"
         exit 0
     fi
@@ -90,18 +100,25 @@ types:
     # answer that init immediately overwrites. This is that file, with an absolute library path
     # because a relative one resolves against the workspace being checked, not against this config.
     printf '{"runtime.version":"Lua 5.4","workspace.library":["%s/lua-meta"],"workspace.checkThirdParty":false}\n' "$PWD" >"$log/starter.luarc.json"
+    # `--check` exits non-zero when it finds anything and prints the diagnostics -- file, line,
+    # column, the offending source line and a caret run -- to stdout, mixed in with a progress bar
+    # it redraws with carriage returns. So the output is captured rather than discarded, and
+    # replayed only on failure with the progress chunks filtered out.
+    #
+    # This used to read a `$log/check.json` that was never written: the JSON report needs
+    # `--check_format=json`, which was not passed, so the report block was dead and a failure
+    # surfaced as `set -e` alone -- a bare "recipe failed with exit code 1" and not one word about
+    # what was wrong. The human-readable form is better than the JSON here anyway, because it
+    # carries the source line.
     check() {
-        # Removed each round: a clean run writes no report at all, so a stale one from the previous
-        # directory would be read as this directory's failure.
-        rm -f "$log/check.json"
-        lua-language-server --check "$PWD/$1" --checklevel=Warning --logpath="$log" "${@:2}" >/dev/null
-        # An empty report is `{}` or `[]` depending on version, and no file at all when clean.
-        report=$(tr -d '[:space:]' <"$log/check.json" 2>/dev/null || true)
-        if [ -n "$report" ] && [ "$report" != "{}" ] && [ "$report" != "[]" ]; then
-            echo "$1 has type diagnostics:" >&2
-            cat "$log/check.json" >&2
-            exit 1
+        local out
+        if out=$("$luals" --check "$PWD/$1" --checklevel=Warning --logpath="$log" "${@:2}" 2>&1); then
+            return 0
         fi
+        echo "$1 has type diagnostics:" >&2
+        printf '%s' "$out" | tr '\r' '\n' |
+            sed -E '/^[[:space:]]*$/d; /^[[:space:]]*Initializing/d; /^[[:space:]]*[>=]+[[:space:]]*[0-9]+\/[0-9]+/d; /^[[:space:]]*Diagnosis complet/d' >&2
+        exit 1
     }
     # `dev-config/oblisk` has its own `.luarc.json`, which the language server finds on its own and
     # which also carries the `runtime.path` its `require`s need.
