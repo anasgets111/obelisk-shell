@@ -53,11 +53,12 @@ local body = {
                 slot = "notification-" .. tostring(notification.id),
                 -- `art`, not `icon`: this is the sending application's own artwork, which nobody
                 -- here chose and nothing should recolour (`components/panel_row.lua` has the split).
-                -- `icon_path` is a cached asset path or empty (§ 2.7), and `icon { name = ... }`
-                -- takes either a theme name or an absolute path (ADR-0054 decision 2), so the
-                -- one property covers both without this having to tell them apart.
-                art = (notification.icon_path ~= nil and notification.icon_path ~= "") and notification.icon_path
-                    or "dialog-information",
+                -- `image_path` is the picture the sender attached and `app_icon` is the sender
+                -- itself (§ 2.7, ADR-0091); the attachment wins because it is the more specific of
+                -- the two -- a chat notification's avatar says more than the messenger's logo.
+                -- `icon { name = ... }` takes a theme name or an absolute path (ADR-0054
+                -- decision 2), so one property carries either without this telling them apart.
+                art = notification.image_path or notification.app_icon or "dialog-information",
                 title = notification.summary or "?",
                 -- `body` is a span array (§ 2.7), so it needs flattening rather than
                 -- `or`-ing: passed straight through it is a Lua table where `text.content` wants

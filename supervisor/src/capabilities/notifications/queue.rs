@@ -106,9 +106,9 @@ pub(super) fn resolve_notification_id(replaces_id: u32, next_id: &mut u32) -> u3
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum QueueCleanup {
     /// Same id, old icon path now orphaned by a `replaces_id` update that changed/cleared the icon.
-    ReplacedIcon(String),
+    ReplacedImage(String),
     /// A different notification fell off the back of the queue entirely.
-    Evicted { id: u32, icon_path: Option<String> },
+    Evicted { id: u32, image_path: Option<String> },
 }
 
 /// Appends `notification` (a genuinely new arrival), evicting the oldest entry past
@@ -119,25 +119,25 @@ pub(super) enum QueueCleanup {
 fn push_new(queue: &mut VecDeque<Notification>, notification: Notification) -> Option<QueueCleanup> {
     queue.push_back(notification);
     if queue.len() > NOTIFICATION_QUEUE_CAP {
-        queue.pop_front().map(|evicted| QueueCleanup::Evicted { id: evicted.id, icon_path: evicted.icon_path })
+        queue.pop_front().map(|evicted| QueueCleanup::Evicted { id: evicted.id, image_path: evicted.image_path })
     } else {
         None
     }
 }
 
 /// A `replaces_id` update with no fresh image resolves to `(None, Some(old_path))` -- clears
-/// `icon_path` and marks the old file for deletion, "rather than leaving a stale image attached to
+/// `image_path` and marks the old file for deletion, "rather than leaving a stale image attached to
 /// new text" (ADR-0033). A fresh image that differs from the old path also marks the old file for
 /// deletion; the same path reused (rare, but not impossible) deletes nothing.
-fn resolve_replacement_icon(
-    previous_icon_path: Option<String>,
-    fresh_icon_path: Option<String>,
+fn resolve_replacement_image(
+    previous_image_path: Option<String>,
+    fresh_image_path: Option<String>,
 ) -> (Option<String>, Option<String>) {
-    match (&previous_icon_path, &fresh_icon_path) {
-        (Some(old), Some(new)) if old != new => (fresh_icon_path, previous_icon_path),
-        (Some(_), Some(_)) => (fresh_icon_path, None),
-        (Some(_), None) => (None, previous_icon_path),
-        (None, _) => (fresh_icon_path, None),
+    match (&previous_image_path, &fresh_image_path) {
+        (Some(old), Some(new)) if old != new => (fresh_image_path, previous_image_path),
+        (Some(_), Some(_)) => (fresh_image_path, None),
+        (Some(_), None) => (None, previous_image_path),
+        (None, _) => (fresh_image_path, None),
     }
 }
 
@@ -146,7 +146,7 @@ fn resolve_replacement_icon(
 /// falls back to [`push_new`] (the id was already dismissed/evicted, but `Notify`'s own id-reuse
 /// contract still applies regardless -- see [`resolve_notification_id`]). Returns what the caller
 /// needs to clean up ([`QueueCleanup`]) -- either the replaced entry's own old icon
-/// ([`resolve_replacement_icon`], never a signal) or, on the fallback path, whatever [`push_new`]
+/// ([`resolve_replacement_image`], never a signal) or, on the fallback path, whatever [`push_new`]
 /// itself evicted (icon deletion *and* a `NotificationClosed` signal).
 pub(super) fn replace_or_push(
     queue: &mut VecDeque<Notification>,
@@ -154,11 +154,11 @@ pub(super) fn replace_or_push(
 ) -> Option<QueueCleanup> {
     let target_id = notification.id;
     if let Some(existing) = queue.iter_mut().find(|entry| entry.id == target_id) {
-        let previous_icon = existing.icon_path.clone();
-        let (resolved_icon, to_delete) = resolve_replacement_icon(previous_icon, notification.icon_path.take());
-        notification.icon_path = resolved_icon;
+        let previous_icon = existing.image_path.clone();
+        let (resolved_icon, to_delete) = resolve_replacement_image(previous_icon, notification.image_path.take());
+        notification.image_path = resolved_icon;
         *existing = notification;
-        to_delete.map(QueueCleanup::ReplacedIcon)
+        to_delete.map(QueueCleanup::ReplacedImage)
     } else {
         push_new(queue, notification)
     }
@@ -305,13 +305,14 @@ mod tests {
     // ---- queue mutation: push_new / replace_or_push / remove_by_id / feed_view (TDD seam 7 +
     //      FIFO eviction) ----
 
-    fn sample_notification(id: u32, icon_path: Option<&str>) -> Notification {
+    fn sample_notification(id: u32, image_path: Option<&str>) -> Notification {
         Notification {
             id,
             app_name: "app".to_string(),
             summary: "summary".to_string(),
             body: vec![text("body", false, false, false, None)],
-            icon_path: icon_path.map(str::to_string),
+            image_path: image_path.map(str::to_string),
+            app_icon: None,
             urgency: Urgency::Normal,
             has_reply: false,
             actions: Vec::new(),
@@ -339,7 +340,7 @@ mod tests {
         // The 101st insert evicts the oldest (id 0, no icon) -- finding 3: the evicted *id* must
         // come back too (not just its icon path), so the caller can emit
         // NotificationClosed(0, reason=Evicted) even though there's no icon file to delete.
-        assert_eq!(evicted, Some(QueueCleanup::Evicted { id: 0, icon_path: None }));
+        assert_eq!(evicted, Some(QueueCleanup::Evicted { id: 0, image_path: None }));
         assert_eq!(queue.len(), NOTIFICATION_QUEUE_CAP);
         assert_eq!(queue.front().unwrap().id, 1, "the oldest entry (id 0) must have been evicted");
     }
@@ -352,12 +353,12 @@ mod tests {
             push_new(&mut queue, sample_notification(i, None));
         }
         let evicted = push_new(&mut queue, sample_notification(9999, None));
-        assert_eq!(evicted, Some(QueueCleanup::Evicted { id: 0, icon_path: Some("/tmp/oldest.png".to_string()) }));
+        assert_eq!(evicted, Some(QueueCleanup::Evicted { id: 0, image_path: Some("/tmp/oldest.png".to_string()) }));
     }
 
     #[test]
     fn resolve_replacement_icon_clears_and_deletes_the_old_icon_when_no_fresh_image_supplied() {
-        let (resolved, to_delete) = resolve_replacement_icon(Some("/tmp/old.png".to_string()), None);
+        let (resolved, to_delete) = resolve_replacement_image(Some("/tmp/old.png".to_string()), None);
         assert_eq!(resolved, None);
         assert_eq!(to_delete, Some("/tmp/old.png".to_string()));
     }
@@ -365,7 +366,7 @@ mod tests {
     #[test]
     fn resolve_replacement_icon_deletes_the_old_icon_when_a_different_fresh_image_is_supplied() {
         let (resolved, to_delete) =
-            resolve_replacement_icon(Some("/tmp/old.png".to_string()), Some("/tmp/new.png".to_string()));
+            resolve_replacement_image(Some("/tmp/old.png".to_string()), Some("/tmp/new.png".to_string()));
         assert_eq!(resolved, Some("/tmp/new.png".to_string()));
         assert_eq!(to_delete, Some("/tmp/old.png".to_string()));
     }
@@ -373,14 +374,14 @@ mod tests {
     #[test]
     fn resolve_replacement_icon_deletes_nothing_when_the_same_path_is_reused() {
         let (resolved, to_delete) =
-            resolve_replacement_icon(Some("/tmp/same.png".to_string()), Some("/tmp/same.png".to_string()));
+            resolve_replacement_image(Some("/tmp/same.png".to_string()), Some("/tmp/same.png".to_string()));
         assert_eq!(resolved, Some("/tmp/same.png".to_string()));
         assert_eq!(to_delete, None);
     }
 
     #[test]
     fn resolve_replacement_icon_no_previous_icon_just_uses_the_fresh_one() {
-        let (resolved, to_delete) = resolve_replacement_icon(None, Some("/tmp/new.png".to_string()));
+        let (resolved, to_delete) = resolve_replacement_image(None, Some("/tmp/new.png".to_string()));
         assert_eq!(resolved, Some("/tmp/new.png".to_string()));
         assert_eq!(to_delete, None);
     }
@@ -397,12 +398,12 @@ mod tests {
 
         assert_eq!(
             cleanup,
-            Some(QueueCleanup::ReplacedIcon("/tmp/old.png".to_string())),
+            Some(QueueCleanup::ReplacedImage("/tmp/old.png".to_string())),
             "a same-id replace must never report an Evicted cleanup"
         );
         assert_eq!(queue.len(), 2, "a replace must not grow the queue");
         assert_eq!(queue[0].summary, "updated");
-        assert_eq!(queue[0].icon_path, None);
+        assert_eq!(queue[0].image_path, None);
         assert_eq!(queue[1].id, 2, "the replace must not reorder other entries");
     }
 
@@ -427,7 +428,7 @@ mod tests {
         // id 9999 isn't queued, so this falls back to push_new -- which, at the cap, evicts the
         // oldest entry (id 0) and must report it the same way push_new itself would.
         let cleanup = replace_or_push(&mut queue, sample_notification(9999, None));
-        assert_eq!(cleanup, Some(QueueCleanup::Evicted { id: 0, icon_path: None }));
+        assert_eq!(cleanup, Some(QueueCleanup::Evicted { id: 0, image_path: None }));
     }
 
     #[test]

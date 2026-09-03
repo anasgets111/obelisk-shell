@@ -4112,3 +4112,42 @@ one action plus `has_default_action = true`; invoking `archive` makes `notify-se
 `archive` and exit; invoking a key the sender never offered prints nothing and logs the refusal;
 and the same notification sent with `resident` stays mapped across repeated invocations where the
 plain one is gone after the first.
+
+## 0091. The attached picture and the sending application's icon are two fields
+
+`Notify` offers four ways to say "here is a picture", and ADR-0033 collapsed all four into one
+`icon_path` on a single precedence chain: `image-data` > `image-path` > `app_icon` > `icon_data`.
+Three of those four are the same thing under the spellings the spec accumulated across 1.0, 1.1 and
+1.2. The fourth is not: `app_icon` is the *sending application's* icon, and it lost every race
+against a picture the sender attached.
+
+Worse, it lost the races it won. The whole chain terminated in `validate_trusted_path`, which
+requires an absolute path to an existing file under a small allowlist. `app_icon`'s documented and
+overwhelmingly common form is a bare theme name — `"firefox"`, `"org.telegram.desktop"` — which is
+not an absolute path, so it resolved to nothing. Every notification in the shell that did not ship
+raw pixel data drew the same generic fallback, and had since notifications existed.
+
+1. **`image_path` is the picture, `app_icon` is the sender.** `image-data`/`image_data` >
+   `image-path`/`image_path` > `icon_data` feed the first; the positional argument feeds the second.
+   A card can now show both, which is what the Qt shell this config mirrors does: the app's mark in
+   the header, the attachment beside the summary.
+
+2. **`app_icon` may be a theme name, and is carried as one.** `icon { name = ... }` resolves theme
+   names in the renderer (ADR-0054 decision 2), so there is nothing to validate and nothing to
+   spool — the value travels as text and the renderer's own icon lookup decides. A path still goes
+   through the trusted-root check every other client-supplied path does.
+
+3. **The two forms are told apart by a path separator, not by `is_absolute`.** A relative path is
+   neither: `"../../etc/passwd"` is not absolute, so an `is_absolute` split would hand it to the
+   renderer as a "theme name" and let the icon lookup take it from there. Anything containing a `/`
+   must be an absolute, trusted path or it is refused.
+
+4. **`icon_path` is renamed rather than kept as an alias.** It has always held the picture, and
+   keeping a name that says "icon" for the field that is not the icon is the mistake this ADR is
+   fixing, not a compatibility surface worth preserving. Nothing outside this repo consumes the
+   payload yet (there is no released version — see `Cargo.toml`'s versioning note), so the rename
+   costs one line in `notification_history.lua`.
+
+Not done here: `hints["desktop-entry"]`. It is the better grouping key than `app_name` and a decent
+third icon source, and it is additive whenever a config wants it. Adding a field for a consumer that
+does not exist yet is how §2.7 got four picture sources in the first place.

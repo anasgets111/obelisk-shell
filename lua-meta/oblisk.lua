@@ -19,7 +19,7 @@
 -- A capability reads `nil` until its first `StateSnapshot` arrives, which every config sees on
 -- every boot. A signal resolving to `nil` means the property is absent, so a bound node renders its
 -- default rather than failing the tree (ADR-0044). A JSON `null` arrives as an absent key rather
--- than a sentinel (ADR-0057), so `if item.icon_path then` is the right guard for an optional field.
+-- than a sentinel (ADR-0057), so `if item.app_icon then` is the right guard for an optional field.
 
 ---@class Capability<T>: Signal<T>
 ---A capability is a signal you can also command. `:get()` and `:map()` read the pushed payload;
@@ -142,12 +142,13 @@
 ---shape and the write commands need: `expire_timeout` and `replaces_id` are acted on and not
 ---carried, since neither is a thing a config draws or decides.
 ---@field actions NotificationAction[] The buttons the sender offered, in the order it listed them, minus the two keys that mean something other than a button. Empty for the great majority of notifications.
+---@field app_icon? string The sending application's own icon: a theme name like `"firefox"`, or an absolute path when it sent one that passed the trusted-root check. `nil` when it identified itself with neither. Feeds `icon { name = ... }`, which takes either form (ADR-0054 decision 2). A theme name is the overwhelmingly common case and used to be dropped on the floor: this value ran through the same absolute-path validator the attached picture does, and `"firefox"` is not an absolute path, so nearly every real notification arrived with no icon at all (ADR-0091).
 ---@field app_name string The sending application's name, truncated to 64 bytes on a character boundary.
 ---@field body NotificationSpan[] The message as a run of spans rather than one string, because the freedesktop body is markup. Truncated to 512 bytes before parsing. Each span is either text carrying its own bold/italic/underline/href, or an image whose path passed the trusted-root check, so a config draws the list in order and never has to parse markup itself.
 ---@field has_default_action boolean The sender offered a `"default"` action: the whole card is activatable, and clicking it should call `notifications:invoke_action(id, "default")`. Its own field rather than an entry in `actions`, because it is not a button and drawing it as one is wrong.
 ---@field has_reply boolean The sender offered an inline reply action, so `notifications:reply(id, text)` will be accepted. Calling it on a notification without one is refused, which is why this is carried rather than guessed.
----@field icon_path? string An absolute path to a decoded, bounds-checked image spooled to `/dev/shm`, or `nil` for a notification that sent no icon. Never a theme name: this is a file that exists.
 ---@field id integer The server-assigned id, counting up from `1`. What `notifications:dismiss`, `:reply` and `:invoke_action` take. Reused when an application replaces its own notification in place.
+---@field image_path? string The picture the sender attached -- album art, an avatar, a screenshot thumbnail -- as an absolute path to a file that exists: either a decoded, bounds-checked image spooled to `/dev/shm`, or a path it sent that passed the trusted-root check. `nil` when it attached none. Never a theme name (ADR-0091). Was called `icon_path` and held this *and* the sending application's icon, whichever arrived first. They are two different pictures with two different jobs, so they are now two fields; see [`Notification::app_icon`].
 ---@field summary string The title, truncated to 128 bytes on a character boundary. Plain text: any markup the application sent is parsed out, not rendered.
 ---@field urgency Urgency `"low"`, `"normal"` or `"critical"`. `"normal"` for a sender that set no urgency hint. Critical is the one that outlives do-not-disturb and never expires on its own.
 

@@ -9,7 +9,7 @@ use zbus::zvariant::Value;
 use crate::capabilities::shm_icons::{self, PngEncodeError};
 
 use super::markup::parse_markup;
-use super::{MAX_BODY_BYTES, MAX_IMAGE_DIMENSION, NotificationSpan, truncate_utf8_bytes};
+use super::{MAX_APP_ICON_NAME_BYTES, MAX_BODY_BYTES, MAX_IMAGE_DIMENSION, NotificationSpan, truncate_utf8_bytes};
 
 // -------------------------------------------------------------------------------------------
 // Path-trust validator (TDD seam 3): shared by `<img src>`, `image-path`, action-icon names, and
@@ -191,7 +191,7 @@ pub(super) fn write_icon_png(id: u32, png_bytes: &[u8]) -> std::io::Result<Strin
 /// under `spool_root` (also canonicalized), the same both-sides care [`validate_trusted_path`]
 /// takes. `false` if canonicalization fails or resolves outside `spool_root`.
 ///
-/// Finding 1: `Notification.icon_path` looks the same whether it's our own SHM spool copy or a
+/// Finding 1: `Notification.image_path` looks the same whether it's our own SHM spool copy or a
 /// client-supplied `image-path`/`app_icon` hint resolved to a real, externally-owned theme icon
 /// (`/usr/share/icons`, `~/.local/share/icons`, etc.); deleting must never touch the latter.
 fn path_is_within_spool_root(path: &str, spool_root: &Path) -> bool {
@@ -214,37 +214,62 @@ pub(super) fn delete_icon_file(path: &str) {
     }
 }
 
-/// `Notify`'s image hint precedence (docs/oblisk-supervisor-services-dbus.md §1;
-/// ADR-0033/base-spec convention): `image-data`/`image_data` > `image-path`/`image_path` >
-/// deprecated positional `app_icon` > deprecated `icon_data`.
+/// Where the attached *picture* came from, in the base spec's own precedence
+/// (docs/oblisk-supervisor-services-dbus.md §1): `image-data`/`image_data` >
+/// `image-path`/`image_path` > `icon_data`.
+///
+/// All three name the same thing under three spellings the spec accumulated across 1.0, 1.1 and
+/// 1.2. The positional `app_icon` argument used to sit in this chain between the second and the
+/// third, which is what made an application's own icon and the picture it attached compete for one
+/// field; it is [`resolve_app_icon`]'s now (ADR-0091).
 #[derive(Debug, Clone, PartialEq)]
-pub(super) enum IconInput {
+pub(super) enum ImageInput {
     ImageData(RawImageData),
     ImagePath(String),
-    AppIcon(String),
     IconData(RawImageData),
     None,
 }
 
-pub(super) fn resolve_icon_input(
+pub(super) fn resolve_image_input(
     image_data: Option<RawImageData>,
     image_path: Option<String>,
-    app_icon: Option<String>,
     icon_data: Option<RawImageData>,
-) -> IconInput {
+) -> ImageInput {
     if let Some(data) = image_data {
-        return IconInput::ImageData(data);
+        return ImageInput::ImageData(data);
     }
     if let Some(path) = image_path.filter(|p| !p.is_empty()) {
-        return IconInput::ImagePath(path);
-    }
-    if let Some(icon) = app_icon.filter(|a| !a.is_empty()) {
-        return IconInput::AppIcon(icon);
+        return ImageInput::ImagePath(path);
     }
     if let Some(data) = icon_data {
-        return IconInput::IconData(data);
+        return ImageInput::IconData(data);
     }
-    IconInput::None
+    ImageInput::None
+}
+
+/// `Notify`'s positional `app_icon` argument, as something a config can actually draw (ADR-0091).
+///
+/// Two forms, because senders send both: a theme name (`"firefox"`,
+/// `"org.telegram.desktop"`), which is what the base spec asks for and what the great majority
+/// send, and an absolute path or `file://` URI, which plenty send anyway. A name is carried as a
+/// name -- `icon { name = ... }` resolves theme names in the renderer (ADR-0054 decision 2), so
+/// there is nothing to validate and nothing to spool. A path goes through the same trusted-root
+/// check every other client-supplied path does.
+///
+/// The distinction is drawn on a path separator rather than on `is_absolute`, so a *relative* path
+/// like `../../etc/passwd` is rejected outright instead of being carried as a "theme name" the
+/// renderer would then try to resolve.
+///
+/// Before this, the whole value ran through [`validate_trusted_path`], which rejects anything that
+/// is not an absolute path -- so the common case, a bare theme name, resolved to no icon at all
+/// and nearly every notification in the shell drew the same generic fallback.
+pub(super) fn resolve_app_icon(app_icon: Option<String>, trusted_roots: &[PathBuf]) -> Option<String> {
+    let app_icon = app_icon.filter(|icon| !icon.is_empty())?;
+    let stripped = strip_file_uri(&app_icon);
+    if !stripped.contains('/') {
+        return Some(truncate_utf8_bytes(stripped, MAX_APP_ICON_NAME_BYTES));
+    }
+    validate_trusted_path(stripped, trusted_roots).map(|path| path.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
@@ -505,50 +530,78 @@ mod tests {
         assert_eq!(decode_raw_image_data(&value), None);
     }
 
-    // ---- resolve_icon_input ----
+    // ---- resolve_image_input ----
 
     fn tiny_image() -> RawImageData {
         valid_rgba_image(1, 1)
     }
 
     #[test]
-    fn resolve_icon_input_prefers_image_data_over_everything() {
-        let resolved = resolve_icon_input(
-            Some(tiny_image()),
-            Some("/path".to_string()),
-            Some("app-icon".to_string()),
-            Some(tiny_image()),
+    fn resolve_image_input_prefers_image_data_over_everything() {
+        let resolved = resolve_image_input(Some(tiny_image()), Some("/path".to_string()), Some(tiny_image()));
+        assert_eq!(resolved, ImageInput::ImageData(tiny_image()));
+    }
+
+    #[test]
+    fn resolve_image_input_prefers_image_path_over_icon_data() {
+        let resolved = resolve_image_input(None, Some("/path".to_string()), Some(tiny_image()));
+        assert_eq!(resolved, ImageInput::ImagePath("/path".to_string()));
+    }
+
+    #[test]
+    fn resolve_image_input_falls_back_to_icon_data() {
+        assert_eq!(resolve_image_input(None, None, Some(tiny_image())), ImageInput::IconData(tiny_image()));
+    }
+
+    #[test]
+    fn resolve_image_input_is_none_when_nothing_is_supplied() {
+        assert_eq!(resolve_image_input(None, None, None), ImageInput::None);
+    }
+
+    #[test]
+    fn resolve_image_input_treats_an_empty_image_path_as_absent() {
+        assert_eq!(resolve_image_input(None, Some(String::new()), None), ImageInput::None);
+    }
+
+    // ---- resolve_app_icon (ADR-0091) ----
+
+    /// The case that was silently broken: a bare theme name is what the base spec asks senders for
+    /// and what nearly all of them send, and it used to resolve to nothing.
+    #[test]
+    fn resolve_app_icon_carries_a_theme_name_through_untouched() {
+        assert_eq!(resolve_app_icon(Some("firefox".to_string()), &[]), Some("firefox".to_string()));
+        assert_eq!(
+            resolve_app_icon(Some("org.telegram.desktop".to_string()), &[]),
+            Some("org.telegram.desktop".to_string())
         );
-        assert_eq!(resolved, IconInput::ImageData(tiny_image()));
     }
 
     #[test]
-    fn resolve_icon_input_prefers_image_path_over_app_icon_and_icon_data() {
-        let resolved =
-            resolve_icon_input(None, Some("/path".to_string()), Some("app-icon".to_string()), Some(tiny_image()));
-        assert_eq!(resolved, IconInput::ImagePath("/path".to_string()));
+    fn resolve_app_icon_is_none_for_absent_or_empty() {
+        assert_eq!(resolve_app_icon(None, &[]), None);
+        assert_eq!(resolve_app_icon(Some(String::new()), &[]), None);
     }
 
+    /// A path still has to earn it, by the same rule every other client-supplied path follows.
     #[test]
-    fn resolve_icon_input_prefers_app_icon_over_icon_data() {
-        let resolved = resolve_icon_input(None, None, Some("app-icon".to_string()), Some(tiny_image()));
-        assert_eq!(resolved, IconInput::AppIcon("app-icon".to_string()));
+    fn resolve_app_icon_validates_a_path_and_accepts_a_file_uri() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let icon = root.path().join("app.png");
+        std::fs::write(&icon, b"not really a png").expect("write");
+        let roots = vec![root.path().to_path_buf()];
+
+        let canonical = icon.canonicalize().expect("canonicalize").to_string_lossy().into_owned();
+        assert_eq!(resolve_app_icon(Some(icon.to_string_lossy().into_owned()), &roots), Some(canonical.clone()));
+        assert_eq!(resolve_app_icon(Some(format!("file://{}", icon.display())), &roots), Some(canonical));
+
+        assert_eq!(resolve_app_icon(Some("/etc/passwd".to_string()), &roots), None, "outside every trusted root");
     }
 
+    /// A relative path is neither a theme name nor a validatable path, and must not slip through
+    /// as the former just because it is not absolute.
     #[test]
-    fn resolve_icon_input_falls_back_to_icon_data() {
-        let resolved = resolve_icon_input(None, None, None, Some(tiny_image()));
-        assert_eq!(resolved, IconInput::IconData(tiny_image()));
-    }
-
-    #[test]
-    fn resolve_icon_input_is_none_when_nothing_is_supplied() {
-        assert_eq!(resolve_icon_input(None, None, None, None), IconInput::None);
-    }
-
-    #[test]
-    fn resolve_icon_input_treats_an_empty_image_path_as_absent() {
-        let resolved = resolve_icon_input(None, Some(String::new()), Some("app-icon".to_string()), None);
-        assert_eq!(resolved, IconInput::AppIcon("app-icon".to_string()));
+    fn resolve_app_icon_refuses_a_relative_path_rather_than_calling_it_a_name() {
+        assert_eq!(resolve_app_icon(Some("../../etc/passwd".to_string()), &[]), None);
+        assert_eq!(resolve_app_icon(Some("icons/app.png".to_string()), &[]), None);
     }
 }

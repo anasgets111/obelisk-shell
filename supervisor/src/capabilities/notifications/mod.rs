@@ -110,6 +110,10 @@ const MAX_BODY_BYTES: usize = 512;
 const MAX_ACTIONS: usize = 8;
 const MAX_ACTION_LABEL_BYTES: usize = 64;
 
+/// A theme name carried out of `app_icon` (ADR-0091). Same cap as `app_name`, which is the same
+/// kind of value from the same untrusted sender: a short identifier, not prose.
+const MAX_APP_ICON_NAME_BYTES: usize = MAX_APP_NAME_BYTES;
+
 /// The backing FIFO's hard cap and `notifications.feed`'s truncated view size over it (ADR-0033).
 const NOTIFICATION_QUEUE_CAP: usize = 100;
 const NOTIFICATION_FEED_VIEW: usize = 20;
@@ -252,9 +256,24 @@ pub struct Notification {
     /// bold/italic/underline/href, or an image whose path passed the trusted-root check, so a
     /// config draws the list in order and never has to parse markup itself.
     pub body: Vec<NotificationSpan>,
-    /// An absolute path to a decoded, bounds-checked image spooled to `/dev/shm`, or `nil` for a
-    /// notification that sent no icon. Never a theme name: this is a file that exists.
-    pub icon_path: Option<String>,
+    /// The picture the sender attached -- album art, an avatar, a screenshot thumbnail -- as an
+    /// absolute path to a file that exists: either a decoded, bounds-checked image spooled to
+    /// `/dev/shm`, or a path it sent that passed the trusted-root check. `nil` when it attached
+    /// none. Never a theme name (ADR-0091).
+    ///
+    /// Was called `icon_path` and held this *and* the sending application's icon, whichever
+    /// arrived first. They are two different pictures with two different jobs, so they are now two
+    /// fields; see [`Notification::app_icon`].
+    pub image_path: Option<String>,
+    /// The sending application's own icon: a theme name like `"firefox"`, or an absolute path when
+    /// it sent one that passed the trusted-root check. `nil` when it identified itself with
+    /// neither. Feeds `icon { name = ... }`, which takes either form (ADR-0054 decision 2).
+    ///
+    /// A theme name is the overwhelmingly common case and used to be dropped on the floor: this
+    /// value ran through the same absolute-path validator the attached picture does, and
+    /// `"firefox"` is not an absolute path, so nearly every real notification arrived with no icon
+    /// at all (ADR-0091).
+    pub app_icon: Option<String>,
     /// `"low"`, `"normal"` or `"critical"`. `"normal"` for a sender that set no urgency hint.
     /// Critical is the one that outlives do-not-disturb and never expires on its own.
     pub urgency: Urgency,

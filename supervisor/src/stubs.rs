@@ -408,7 +408,7 @@ const GENERATED_HEADER: &str = r#"---@meta
 -- A capability reads `nil` until its first `StateSnapshot` arrives, which every config sees on
 -- every boot. A signal resolving to `nil` means the property is absent, so a bound node renders its
 -- default rather than failing the tree (ADR-0044). A JSON `null` arrives as an absent key rather
--- than a sentinel (ADR-0057), so `if item.icon_path then` is the right guard for an optional field.
+-- than a sentinel (ADR-0057), so `if item.app_icon then` is the right guard for an optional field.
 
 ---@class Capability<T>: Signal<T>
 ---A capability is a signal you can also command. `:get()` and `:map()` read the pushed payload;

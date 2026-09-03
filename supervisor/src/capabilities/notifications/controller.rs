@@ -11,9 +11,9 @@ use zbus::fdo::RequestNameFlags;
 use zbus::zvariant::Value;
 
 use super::icon::{
-    IconInput, RawImageData, decode_raw_image_data, default_trusted_icon_roots, delete_icon_file,
-    encode_image_data_to_png, image_data_is_valid, resolve_icon_input, sanitize_body, strip_file_uri,
-    validate_trusted_path, value_as_bool, value_as_str, value_as_u8, write_icon_png,
+    ImageInput, RawImageData, decode_raw_image_data, default_trusted_icon_roots, delete_icon_file,
+    encode_image_data_to_png, image_data_is_valid, resolve_app_icon, resolve_image_input, sanitize_body,
+    strip_file_uri, validate_trusted_path, value_as_bool, value_as_str, value_as_u8, write_icon_png,
 };
 use super::queue::{
     ExpiryPolicy, QueueCleanup, feed_view, find_expiring_entry, next_incarnation, remove_by_id, replace_or_push,
@@ -225,25 +225,25 @@ impl NotificationsController {
         }
     }
 
-    /// Resolves `Notify`'s icon precedence ([`resolve_icon_input`]) into a final, spooled/
-    /// validated `icon_path`. `image-data`/`icon_data` get bounds-checked and PNG-encoded/spooled
-    /// to SHM; `image-path`/`app_icon` run through the same [`validate_trusted_path`] boundary
-    /// body-markup images use.
-    async fn resolve_and_spool_icon(
+    /// Resolves `Notify`'s attached-picture precedence ([`resolve_image_input`]) into a final,
+    /// spooled/validated `image_path`. `image-data`/`icon_data` get bounds-checked and
+    /// PNG-encoded/spooled to SHM; `image-path` runs through the same [`validate_trusted_path`]
+    /// boundary body-markup images use.
+    ///
+    /// The positional `app_icon` argument is not in here any more: it is the application's own
+    /// icon rather than the picture it attached, and [`resolve_app_icon`] handles it (ADR-0091).
+    async fn resolve_and_spool_image(
         &self,
         id: u32,
         image_data: Option<RawImageData>,
         image_path: Option<String>,
-        app_icon: Option<String>,
         icon_data: Option<RawImageData>,
     ) -> Option<String> {
-        match resolve_icon_input(image_data, image_path, app_icon, icon_data) {
-            IconInput::ImageData(raw) | IconInput::IconData(raw) => spool_raw_image(id, &raw),
-            IconInput::ImagePath(path) | IconInput::AppIcon(path) => {
-                validate_trusted_path(strip_file_uri(&path), &self.trusted_roots)
-                    .map(|p| p.to_string_lossy().into_owned())
-            }
-            IconInput::None => None,
+        match resolve_image_input(image_data, image_path, icon_data) {
+            ImageInput::ImageData(raw) | ImageInput::IconData(raw) => spool_raw_image(id, &raw),
+            ImageInput::ImagePath(path) => validate_trusted_path(strip_file_uri(&path), &self.trusted_roots)
+                .map(|p| p.to_string_lossy().into_owned()),
+            ImageInput::None => None,
         }
     }
 
@@ -258,7 +258,7 @@ impl NotificationsController {
                 Some(index) => index,
                 None => return,
             };
-            state.queue.remove(index).and_then(|n| n.icon_path)
+            state.queue.remove(index).and_then(|n| n.image_path)
         };
         if let Some(path) = icon_to_delete {
             delete_icon_file(&path);
@@ -280,7 +280,7 @@ impl NotificationsController {
             eprintln!("notifications: dismiss({id}) ignored: no notification with that id is currently queued");
             return;
         };
-        if let Some(path) = removed.icon_path {
+        if let Some(path) = removed.image_path {
             delete_icon_file(&path);
         }
         self.emit_notification_closed(id, CloseReason::Dismissed).await;
@@ -310,7 +310,7 @@ impl NotificationsController {
             }
         };
         let Some(removed) = removed else { return };
-        if let Some(path) = removed.icon_path {
+        if let Some(path) = removed.image_path {
             delete_icon_file(&path);
         }
         self.emit_action_invoked(id, format_reply_action_key(&text)).await;
@@ -353,7 +353,7 @@ impl NotificationsController {
         let Some(removed) = outcome else { return };
         self.emit_action_invoked(id, key).await;
         if let Some(removed) = removed {
-            if let Some(path) = removed.icon_path {
+            if let Some(path) = removed.image_path {
                 delete_icon_file(&path);
             }
             self.emit_notification_closed(id, CloseReason::ClosedByMethod).await;
@@ -453,14 +453,16 @@ impl NotificationsController {
             let incarnation = next_incarnation(&mut state.next_incarnation);
             (id, incarnation)
         };
-        let icon_path = self.resolve_and_spool_icon(id, image_data, image_path, app_icon, icon_data).await;
+        let image_path = self.resolve_and_spool_image(id, image_data, image_path, icon_data).await;
+        let app_icon = resolve_app_icon(app_icon, &self.trusted_roots);
 
         let notification = Notification {
             id,
             app_name,
             summary,
             body: body_spans,
-            icon_path,
+            image_path,
+            app_icon,
             urgency,
             has_reply: parsed_actions.has_reply,
             actions: parsed_actions.actions,
@@ -474,9 +476,9 @@ impl NotificationsController {
             replace_or_push(&mut state.queue, notification)
         };
         match cleanup {
-            Some(QueueCleanup::ReplacedIcon(path)) => delete_icon_file(&path),
-            Some(QueueCleanup::Evicted { id: evicted_id, icon_path }) => {
-                if let Some(path) = icon_path {
+            Some(QueueCleanup::ReplacedImage(path)) => delete_icon_file(&path),
+            Some(QueueCleanup::Evicted { id: evicted_id, image_path }) => {
+                if let Some(path) = image_path {
                     delete_icon_file(&path);
                 }
                 // A FIFO eviction past NOTIFICATION_QUEUE_CAP is a real close, not just an
@@ -522,7 +524,7 @@ impl NotificationsController {
             remove_by_id(&mut state.queue, id)
         };
         if let Some(removed) = removed {
-            if let Some(path) = removed.icon_path {
+            if let Some(path) = removed.image_path {
                 delete_icon_file(&path);
             }
             self.emit_notification_closed(id, CloseReason::ClosedByMethod).await;
@@ -693,7 +695,8 @@ mod tests {
             app_name: "app".to_string(),
             summary: "s".to_string(),
             body: Vec::new(),
-            icon_path: None,
+            image_path: None,
+            app_icon: None,
             urgency: Urgency::Normal,
             has_reply: false,
             actions: vec![NotificationAction {
