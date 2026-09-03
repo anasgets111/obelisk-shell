@@ -51,8 +51,8 @@
 ---@class NodeBase
 ---@field width? Length|Bound Pixels, or `"Fill"` to take what the parent has left. Omitted means the node sizes to its content.
 ---@field height? Length|Bound The same, on the cross axis. `"Fill"` on both is how a background covers its parent.
----@field margin? Edges Outer spacing.
----@field padding? Edges Inner spacing.
+---@field margin? Edges|Bound Outer spacing.
+---@field padding? Edges|Bound Inner spacing.
 ---@field align_h? Align|Bound On a stacking parent this places the node in the content box; on a `row` it is read off the row itself as the main-axis distribution and ignored on the children.
 ---@field align_v? Align|Bound The same two jobs as `align_h`, swapped: main axis on a `column`, cross axis on a `row`.
 ---@field visible? boolean|Bound `false` keeps the node out of the constraint and paint passes, and out of its parent's spacing.

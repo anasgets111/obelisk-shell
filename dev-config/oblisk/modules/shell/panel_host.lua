@@ -1,19 +1,45 @@
--- Mirrors Modules/Shell/PanelHost.qml: one popup surface that every bar panel is shown in, rather
--- than one surface per panel.
+-- Mirrors Modules/Shell/PanelHost.qml: one surface that every bar panel is shown in, rather than
+-- one surface per panel.
 --
--- Not just economy. An `xdg_popup` takes a grab, and a grab is exclusive: two popups up at once is
--- not a state this protocol has, so a surface each would be five objects to keep mutually shut by
--- hand. One surface with a `kind` signal makes that impossible to get wrong -- whichever panel was
--- asked for last is the one on screen, because there is only one screen slot.
+-- Not just economy. Whichever panel was asked for last is the one on screen, because there is only
+-- one screen slot -- five surfaces would be five objects to keep mutually shut by hand, and a
+-- `kind` signal against one surface makes that impossible to get wrong.
 --
--- The cost is that every panel shares one size. A popup has no `Fill` (§ 6.3) and its width and
--- height are read once at declaration, so this is the largest body any panel carries rather than a
--- fit to the current one. A panel that needs its own geometry wants its own surface.
+-- ## Why this is a `panel` and not a `popup` (ADR-0087)
 --
--- That cost got much smaller. Every body now ends in a `list` with a `scroll` of its own
--- (ADR-0069), so the shared size bounds the *viewport* and a panel with more rows than fit
--- scrolls instead of being cut off. What still has to fit is the fixed rows above each list, which
--- is what `the_shipped_dev_configs_bar_zones_hold_their_modules_without_overflowing` measures.
+-- It was an `xdg_popup` with a grab until now, and the grab is what had to go. A grab is the
+-- compositor's, not ours: niri hands a grabbing popup the keyboard only if its parent already held
+-- it when the popup mapped, and re-evaluates focus -- dismissing the popup -- if the parent's
+-- `keyboard_interactivity` moves afterwards. So a password prompt that appears *while* the panel is
+-- open could not be given the keyboard by this surface at all. The bar had to claim it in advance,
+-- on the pass that opened the panel, which meant every open panel took the whole keyboard whether
+-- it wanted typing or not (ADR-0085 decision 4, now retired).
+--
+-- A layer surface has no grab and no such rule, so `keyboard_interactivity` below binds to the one
+-- fact that actually wants the keyboard, and the bar goes back to never asking for it.
+-- `Modules/Shell/MainScreen.qml` is the same shape and reached it the same way: it is one
+-- screen-tall `PanelWindow` holding the bar and the panel host together, with no `xdg_popup`
+-- anywhere, which is why its `WlrLayershell.keyboardFocus` can follow a per-panel
+-- `needsKeyboardFocus` the way this one follows `password_ssid`.
+--
+-- Three things come back for free and one is paid for:
+--
+--   * Click-outside-to-close is the catcher below rather than the compositor's `popup_done`, so it
+--     knows which panel it closed -- the ambiguity `lib/ui_state.lua`'s `open_panel` was written
+--     around.
+--   * Switching panels is one click. There is no grab to break and re-arm, so the click lands on
+--     the bar indicator directly.
+--   * `visible` is a map/unmap of a surface that already exists (§ 6.1), not a create that may only
+--     happen inside a click, so nothing here depends on an armed grab serial (ADR-0049).
+--   * Paid for: a popup got `constraint_adjustment` and a layer surface does not, so the
+--     horizontal clamp below is `"SlideX"` written out by hand.
+--
+-- The cost that stays is that every panel shares one size, which is now a choice rather than the
+-- protocol's: this is the largest body any panel carries. It is a small cost because every body
+-- ends in a `list` with a `scroll` of its own (ADR-0069), so the shared size bounds the *viewport*
+-- and a panel with more rows than fit scrolls. What still has to fit is the fixed rows above each
+-- list, which is what `the_shipped_dev_configs_bar_zones_hold_their_modules_without_overflowing`
+-- measures.
 local theme = require("config.theme")
 local panel_card = require("components.panel_card")
 local ui_state = require("lib.ui_state")
@@ -47,60 +73,109 @@ for _, panel in ipairs(panels) do
     table.insert(sections, panel_section(panel))
 end
 
-local surface = popup {
+-- Where the card sits, which an `xdg_popup` got from `anchor_rect` plus `gravity` and a layer
+-- surface has to be told. `popup_anchor` is the rect `on_click` handed back for the indicator that
+-- opened this (ADR-0050 decision 3), in the bar's logical coordinates; the bar is anchored left and
+-- full width and so is this surface, so its `x` needs no translation.
+--
+-- The `math.min` is `constraint_adjustment = { "SlideX" }` by hand: the clock and the tray sit near
+-- the right edge, and a 340px card hung off their left edge runs off a 1920px output by more than
+-- half its width. `"FlipY"` needs no equivalent, because this surface starts below the bar and
+-- extends down, so there is nothing to flip away from.
+--
+-- `screens[1]` on a hotplugged second head is a guess, and it is the same guess
+-- `config/theme.lua`'s `main_screen` already makes. Unlike that one this follows the signal, so a
+-- resolution change moves the clamp rather than stranding it at the boot value. An empty
+-- `oblisk.screens` -- the first evaluation, and `socket.rs`'s harness -- clamps nothing, which
+-- leaves the card exactly where the anchor asked.
+local card_margin = computed({ ui_state.popup_anchor, oblisk.screens }, function(anchor, screens)
+    local x = (anchor and anchor.x) or 0
+    local screen = screens and screens[1]
+    if screen and screen.width then
+        x = math.min(x, math.max(0, screen.width - theme.panel_width))
+    end
+    return { left = math.floor(x), top = theme.panel_gap }
+end)
+
+return panel {
     id = "panel_host",
-    -- The `id` of the surface this anchors to, not a node: the protocol roots a popup under a
-    -- parent surface at creation (§ 6.3).
-    parent = "bar",
-    -- Bound as a signal, which is the spelling § 6.3 and ADR-0050 decision 3 prescribe, so the
-    -- popup opens over whichever indicator was actually clicked.
-    anchor_rect = ui_state.popup_anchor,
-    -- Required and non-zero on both axes: a popup has no "Fill" (§ 6.3), because there is
-    -- nothing for it to fill.
-    -- Sized for the tallest panel, not the current one, because a popup's geometry is literal and
-    -- read once. `the_shipped_dev_configs_bar_zones_hold_their_modules_without_overflowing` in
-    -- renderer/src/socket.rs measures every panel against these two numbers -- the power menu
-    -- overran a 150px popup by 58px before it did.
-    --
-    -- A panel whose *list* is longer than this no longer has to fit, which is what changed: each
-    -- body ends in a `list` with a `scroll` of its own, so the popup bounds the viewport rather
-    -- than the content (ADR-0069). The fixed rows above each list still have to fit, and that
-    -- is what the test measures.
-    width = theme.panel_width,
-    height = theme.panel_height,
-    anchor = "BottomLeft",
-    gravity = "BottomRight",
-    constraint_adjustment = { "FlipY", "SlideX" },
-    offset = { x = 0, y = theme.panel_gap },
-    -- `visible` going true is what creates the `xdg_popup`, and it may only do so from inside a
-    -- click, because that is the only turn a grab serial is armed for (ADR-0049's amendment).
+    -- Under `Overlay`, where `modules/notification/popup.lua` and `modules/osd/popup.lua` live, so
+    -- a notification arriving while a panel is open still draws over it and still takes its own
+    -- clicks. Both of those cover a corner; this covers everything, so being the one that yields is
+    -- the only arrangement where all three work.
+    layer = "Top",
+    anchor = { top = true, bottom = true, left = true, right = true },
+    -- Deliberately not `"Ignore"`: reserving nothing while still respecting what the bar reserved
+    -- is what puts this surface's origin just under the bar, so the card's own offset is a gap
+    -- rather than a copy of `theme.bar_height` that would go stale the moment the bar resized.
+    -- niri configures this at 1920x1161 on a 1200px output with a 39px bar, which is the measured
+    -- version of that sentence. It also leaves the bar uncovered, which is why switching panels is
+    -- one click -- the click reaches the indicator instead of this surface's catcher.
+    exclusive = false,
+    width = "Fill",
+    height = "Fill",
     visible = ui_state.panel_open,
-    -- Fired when the compositor dismisses this, which for a grabbing popup is a click anywhere
-    -- outside it (§ 6.3). Writing the flag back is the config's half of ADR-0051 decision 2: the
-    -- engine has already destroyed the object and latched the declaration shut, and this false is
-    -- what unlatches it so the next click can reopen it.
+    -- The whole point of the rewrite. `password_ssid` names the network whose `network:connect` is
+    -- waiting on a password and is `nil` the rest of the time (§ 2.5), so this surface holds the
+    -- keyboard for exactly as long as there is something to type and gives it back the moment there
+    -- is not. Nothing else on the bar ever asks for it.
     --
-    -- Called with no arguments, so there is no telling which popup was dismissed; see
-    -- `open_panel` in `lib/ui_state.lua` for what that costs.
+    -- `"Exclusive"` rather than `"OnDemand"`, because the field must be typable without first
+    -- clicking it: the engine arms a focus scope's *sole* `secure_submit` field when the compositor
+    -- hands it keyboard focus (`layout::secure_submit`'s `sole_secure_submit_in_scope`), and
+    -- `network_panel.lua`'s prompt is that field. It is safe as a binding in a way it would not be
+    -- as a constant -- niri gives an `on_demand` or `exclusive` layer surface focus the moment it
+    -- *maps*, and this surface never maps while a password is pending, because the prompt is raised
+    -- by the Supervisor in answer to a click that only happens once a panel is already open.
     --
-    -- The cancel is the second half of the same edge. A dismissal takes the network panel's
-    -- password prompt off screen without answering it, and the pending intent behind it lives in
-    -- the Supervisor (`network.password_ssid`), so nothing here could clear it -- leaving the shell
-    -- asking for a password with nowhere to type one, and the bar's keyboard claim standing until
-    -- the panel was reopened just to cancel. `network:cancel_connect` is a no-op when nothing is
-    -- pending, which is why it can be spent unconditionally rather than gated on a panel identity
-    -- `on_dismiss` does not carry.
-    on_dismiss = function()
-        ui_state.close_panel()
-        oblisk.network:invoke("cancel_connect")
-    end,
-    child = panel_card(sections, {
+    -- Guarded for nil like every other bare `:map` on a capability: this resolves once before the
+    -- first push.
+    keyboard_interactivity = oblisk.network:map(function(n)
+        return (n and n.password_ssid) and "Exclusive" or "None"
+    end),
+    -- One surface, one root node (§ 6.1), so the catcher and the card share a `rect` rather than
+    -- being two children of the surface. Full-fill and visible, which is also what sets the input
+    -- region: `wl_surface::set_input_region` is built from the surface root's visible direct
+    -- children (ADR-0038 decision 5), so this claims the whole surface while it is mapped and none
+    -- of it while `visible` above is false and the surface is unmapped.
+    child = rect {
         width = "Fill",
         height = "Fill",
-        background = theme.GLASS,
-        border_width = theme.border_width,
-        border_color = theme.BORDER,
-    }),
+        children = {
+            -- Click-outside-to-close, declared first so the card paints over it. `hit::descend`
+            -- walks children in reverse and stops at the first that contains the point, so a click
+            -- landing on the card never reaches this button -- the card does not need a handler of
+            -- its own to shield itself.
+            --
+            -- The cancel is the second half of the same edge, and was `on_dismiss`'s before.
+            -- Closing takes the network panel's password prompt off screen without answering it,
+            -- and the pending intent behind it lives in the Supervisor, so nothing here could clear
+            -- it -- leaving the shell asking for a password with nowhere to type one.
+            -- `network:cancel_connect` is a no-op when nothing is pending, which is why it can be
+            -- spent unconditionally rather than gated on which panel was showing.
+            button {
+                width = "Fill",
+                height = "Fill",
+                on_click = function()
+                    ui_state.close_panel()
+                    oblisk.network:invoke("cancel_connect")
+                end,
+            },
+            -- Sized for the tallest panel, not the current one. `renderer/src/socket.rs`'s
+            -- `the_shipped_dev_configs_bar_zones_hold_their_modules_without_overflowing` measures
+            -- every panel against these two numbers -- the power menu overran a 150px card by 58px
+            -- before it did.
+            panel_card(sections, {
+                width = theme.panel_width,
+                height = theme.panel_height,
+                -- A stacking child sits at its parent's origin unless told otherwise
+                -- (`parse_align` defaults to `Start`), so the margin above is the whole of the
+                -- placement rather than a nudge to it.
+                margin = card_margin,
+                background = theme.GLASS,
+                border_width = theme.border_width,
+                border_color = theme.BORDER,
+            }),
+        },
+    },
 }
-
-return surface

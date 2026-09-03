@@ -567,7 +567,7 @@ mod meta_stub_tests {
             unsampled.len(),
             unsampled.join("\n")
         );
-        assert_eq!(probed, 408, "the number of declared type members moved; confirm the change is intended");
+        assert_eq!(probed, 434, "the number of declared type members moved; confirm the change is intended");
     }
 
     /// One Lua literal per declared type. `None` means "no sample", which skips rather than guesses.

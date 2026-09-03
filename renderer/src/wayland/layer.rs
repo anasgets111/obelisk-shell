@@ -94,6 +94,17 @@ struct SpecUpdate {
     /// [`exclusive_zone_for`]); this only reports whether the choice changed.
     exclusive: Option<node::Exclusive>,
 }
+impl SpecUpdate {
+    /// Whether this pass sent any layer-shell request at all, which is what decides whether
+    /// [`App::apply_spec_change`] has to commit. Every field here is double-buffered `wl_surface`
+    /// state, so "nothing moved" and "nothing needs a commit" are the same question.
+    fn moved_anything(&self) -> bool {
+        self.margin.is_some()
+            || self.keyboard_interactivity.is_some()
+            || self.size.is_some()
+            || self.exclusive.is_some()
+    }
+}
 fn spec_update(applied: &PanelSpec, fresh: &PanelSpec, output: layout::LogicalSize) -> SpecUpdate {
     // Compared as the pixel pair that goes on the wire, not the two `SizeMode`s: a percent and an
     // equivalent pixel count are the same request, and `Fill`/`Content` are both the protocol's
@@ -232,6 +243,25 @@ impl App {
 
     /// Diffs one surface's freshly resolved `panel` spec against the one its layer-shell state was
     /// last set from, and sends only what moved (see [`spec_update`] for which fields).
+    ///
+    /// Ends in its own commit when anything moved, which the surrounding comments say it should not
+    /// have to. `apply_resolved_state` stages and lets `paint_surface`'s `swap_buffers` carry the
+    /// whole pass in one commit -- except that `paint_surface` returns early when the display list
+    /// is byte-identical to the last one, which is most passes for most surfaces and the entire
+    /// point of that check. Every field here is double-buffered `wl_surface` state, so on those
+    /// passes the request was sent and then sat pending until some unrelated repaint happened to
+    /// flush it.
+    ///
+    /// Measured, not deduced. `panel_host` raised its `keyboard_interactivity` to `Exclusive` while
+    /// its card was already drawn and unchanged; niri never gave it the keyboard. Editing an
+    /// unrelated border width -- which changes the display list and so reaches `swap_buffers` --
+    /// delivered the focus change immediately. The bar never showed the bug because its clock
+    /// redraws it once a second, so it is never more than a second away from a commit.
+    ///
+    /// Guarded on `Mapped`, because a bufferless commit on an unmapped surface is the protocol's
+    /// re-map procedure (see [`App::unmap`]), and skipped for a PBA Candidate on the same terms as
+    /// [`App::apply_visibility`]: § 15.2 point 3 keeps a Candidate's surfaces invisible until
+    /// `ActivateDraw`.
     pub(super) fn apply_spec_change(&mut self, index: usize, mut fresh: PanelSpec) {
         let TrackedRole::Panel { layer, spec: applied, output_size } = &self.surfaces[index].role else {
             return;
@@ -276,6 +306,14 @@ impl App {
         }
         if update.exclusive.is_some() || update.size.is_some() {
             self.apply_exclusive_zone(index);
+        }
+        // After `apply_exclusive_zone`, so one pass is still one commit rather than two.
+        if update.moved_anything()
+            && self.surfaces[index].map_state == MapState::Mapped
+            && !self.is_pba_candidate
+            && let TrackedRole::Panel { layer, .. } = &self.surfaces[index].role
+        {
+            layer.commit();
         }
     }
 }

@@ -542,8 +542,8 @@ impl NetworkController {
     /// racing it costs a `Disconnect` that can land on a session that just came up.
     ///
     /// A no-op when there is nothing to cancel, and that is what makes it callable from a panel
-    /// dismissal (`modules/shell/panel_host.lua`'s `on_dismiss`) rather than only from the prompt's
-    /// own close button. Without the guard, every click that shut any panel would clear
+    /// close (`modules/shell/panel_host.lua`'s click-outside catcher) rather than only from the
+    /// prompt's own close button. Without the guard, every click that shut any panel would clear
     /// `connect_error` -- wiping the one line that says why the last attempt failed, at the moment
     /// the user closed the panel to go read it somewhere else -- and push a `Changed` for it.
     pub fn cancel_connect(&self) {

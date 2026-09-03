@@ -1078,7 +1078,7 @@ mod tests {
                 ("notification_area", "panel"),
                 ("osd", "panel"),
                 ("settings", "window"),
-                ("panel_host", "popup"),
+                ("panel_host", "panel"),
                 ("battery_tooltip", "popup"),
                 ("clock_tooltip", "popup"),
                 ("launcher_tooltip", "popup"),
@@ -1384,12 +1384,15 @@ mod tests {
             .collect();
         assert!(overflowing.is_empty(), "a bar zone will paint past its own edge -- {}", overflowing.join("; "));
 
-        // The popup has the same problem in the other axis and no percentage to hide it: § 6.3
-        // makes `width`/`height` literal and gives a popup no `Fill`, so a panel body taller than
-        // the surface it was declared for is simply cut off. Each panel is measured on its own,
-        // because only one is visible at a time.
-        let host = client.scene.surface("panel_host").expect("the panel host must resolve");
-        let card = &host.children[0];
+        // The panel host has the same problem in the other axis and no percentage to hide it: its
+        // card is one size for all five bodies, so a body taller than the card is simply cut off.
+        // Each panel is measured on its own, because only one is visible at a time.
+        //
+        // `children[0]` is the surface's one root node, holding the click-outside catcher and the
+        // card in that order (`modules/shell/panel_host.lua`); the card is the second so that it
+        // paints, and hit-tests, over the catcher.
+        let host = client.scene.surface("panel_host@TEST").expect("the panel host must resolve");
+        let card = &host.children[0].children[1];
         // The *fixed* rows, not the section. Every panel body is a `height = "Fill"` column ending
         // in a `list` with a `scroll` of its own (ADR-0069), so a section's own height is the
         // card's content height by construction and comparing it against the popup measures nothing.

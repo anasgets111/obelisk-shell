@@ -1,31 +1,38 @@
--- The anchor rect the `popup` hangs from. ADR-0049's amendment settles where it comes from: not off
--- the input-dispatch stack, but through the config, because `on_click` receives the button's own
--- rect (ADR-0050 decision 3) and writes it to a named `state` signal the popup reads back. The
--- initial is the button's declared size, because `anchor_rect` must be non-zero before anything has
--- ever been clicked or the whole evaluation fails (§ 6.3).
+-- The rect of the bar indicator the panel host hangs its card off. ADR-0049's amendment settles
+-- where it comes from: not off the input-dispatch stack, but through the config, because `on_click`
+-- receives the button's own rect (ADR-0050 decision 3) and writes it to a named `state` signal the
+-- surface reads back.
+--
+-- Only `x` is read now that `modules/shell/panel_host.lua` is a layer surface rather than a popup:
+-- it places the card itself, below the bar and clamped to the output, where `anchor_rect` plus
+-- `gravity` used to. The other three fields stay because this is still the shape `on_click` hands
+-- over, and narrowing it here would only move the destructuring somewhere less obvious. The initial
+-- is the indicator's declared size, which no longer has to be non-zero to keep the evaluation alive
+-- but is still the honest starting value.
 local popup_anchor = state("popup_anchor", { x = 0, y = 0, width = 70, height = 24 })
 local settings_open = state("settings_open", false)
 
--- `modules/shell/panel_host.lua`'s two signals: whether the shared popup is up, and which panel it
--- is showing. One surface for every bar panel rather than one surface each, which is what
--- Quickshell's own Modules/Shell/PanelHost.qml is for -- an `xdg_popup` costs a Wayland object and
--- a grab, and only one of these can be on screen at a time anyway.
+-- `modules/shell/panel_host.lua`'s two signals: whether the shared surface is up, and which panel
+-- it is showing. One surface for every bar panel rather than one surface each, which is what
+-- Quickshell's own Modules/Shell/PanelHost.qml is for -- only one of these can be on screen at a
+-- time anyway, and one slot makes that true by construction rather than by five files agreeing.
 local panel_open = state("panel_open", false)
 local panel_kind = state("panel_kind", "")
 
--- Opening sets, it never toggles, and the reason is measured rather than assumed. Under an
--- `xdg_popup` grab, niri still delivers a click on the opening button to us, because the bar is the
--- popup's own parent surface and so inside the grab's tree, so a toggle would close it. What a
--- toggle would also do is fight `on_dismiss` on every click landing elsewhere, since that path
--- already writes false. One writer per edge.
+-- Opening sets, it never toggles, and what that is worth changed when `panel_host` stopped being an
+-- `xdg_popup`.
 --
--- That leaves one case with no clean answer here: clicking the network indicator while the
--- bluetooth panel is up is both edges at once. The compositor breaks the grab and delivers the
--- click, and `on_dismiss` carries no token saying which popup it dismissed
--- (`xdg_shell.rs` calls it with no arguments), so this cannot tell "the popup I am replacing" from
--- "the popup I just opened". Set-then-close and close-then-set are both possible orders, so the
--- observable cost is that switching panels directly sometimes takes a second click. Never a wrong
--- panel, and never a popup stuck open, which is what picking the unconditional close buys.
+-- Under the grab it bought correctness. niri still delivered a click on the opening button to us,
+-- because the bar was the popup's own parent surface and so inside the grab's tree, so a toggle
+-- would have closed the panel it was opening; and it would have fought `on_dismiss` on every click
+-- landing elsewhere, since that path already wrote false. Worse, clicking the network indicator
+-- while the bluetooth panel was up was both edges at once, and `on_dismiss` carried no token saying
+-- which popup it dismissed -- so switching panels directly sometimes took a second click.
+--
+-- None of that is true of a layer surface. Nothing dismisses this behind our back, the click that
+-- switches panels reaches the indicator directly, and switching is one click. What remains is a
+-- deliberate choice rather than a workaround: clicking the open panel's own indicator leaves it
+-- open, and the way out is a click anywhere else, which `panel_host`'s catcher takes.
 local function open_panel(kind, rect)
     popup_anchor:set(rect)
     panel_kind:set(kind)
@@ -37,9 +44,9 @@ local function close_panel()
 end
 
 -- Whether `kind` is the panel currently on screen, which is `ShellUiState.isPanelOpen(kind)` in the
--- mirror and what every bar indicator binds its accent ring to. Both signals are needed: `panel_kind`
--- keeps its last value after a dismissal, so reading it alone leaves the indicator that opened the
--- popup ringed after the popup is gone.
+-- mirror and what every bar indicator binds its accent ring to. Both signals are needed:
+-- `panel_kind` keeps its last value after a close, so reading it alone leaves the indicator that
+-- opened the panel ringed after the panel is gone.
 local function panel_showing(kind)
     return computed({ panel_open, panel_kind }, function(open, current)
         return open and current == kind

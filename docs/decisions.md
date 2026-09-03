@@ -3803,10 +3803,12 @@ whole problem.
 2. **`network:cancel_connect` is the way out, and it is idempotent.** Escape inside a
    `secure_submit` field clears the entry and stays in the field, so without a cancel a prompt
    raised by a mis-click would hold the keyboard until something else took it. Being a no-op when
-   nothing is pending is what lets `panel_host`'s `on_dismiss` spend it unconditionally — closing
-   the panel answers the prompt — without every panel dismissal clearing `connect_error`.
+   nothing is pending is what lets `panel_host` spend it unconditionally on every close — closing
+   the panel answers the prompt — without every panel close clearing `connect_error`.
 
-3. **Keyboard focus is a scope, not a surface.** The field lives on `panel_host`, an `xdg_popup`;
+3. **Keyboard focus is a scope, not a surface.** *Still true, but no longer load-bearing for this
+   prompt: under ADR-0087 the field and the keyboard are on the same surface. The rule stays for
+   every other popup-hosted field.* The field lives on `panel_host`, an `xdg_popup`;
    the compositor hands the keyboard to `bar`. niri gives a grabbing popup the keyboard only if its
    parent held it when the popup mapped, which is never true here — the prompt is raised by a click
    *inside* the already-open panel. So `wayland::input`'s `keyboard_focus_scope` is the focused
@@ -3814,15 +3816,15 @@ whole problem.
    across the whole scope. Before this the prompt was untypable until the panel was closed and
    reopened, which worked by accident: the second map found the parent focused.
 
-4. **The bar claims the keyboard when a panel opens, not when the prompt appears.** Measured twice:
-   raising `keyboard_interactivity` on a *mapped* layer surface makes niri re-evaluate focus, which
-   breaks `panel_host`'s grab, and the panel is dismissed before the focus event even arrives — the
-   prompt appeared and vanished in the same frame. Bound to `panel_open` the change lands on the
-   pass that creates the popup instead, since `bar` precedes `panel_host` in the surface list. The
-   cost is that any open panel takes the keyboard; the alternatives were `grab = false` (which
-   retires ADR-0051's click-outside-to-close) or drawing the prompt outside the popup. A surface
-   that already owns every pointer event and closes on the first click elsewhere owning the keyboard
-   too is the smaller change.
+4. **The bar claims the keyboard when a panel opens, not when the prompt appears.**
+   *Superseded by ADR-0087, which retires the popup this worked around.* Measured twice: raising
+   `keyboard_interactivity` on a *mapped* layer surface makes niri re-evaluate focus, which breaks
+   `panel_host`'s grab, and the panel is dismissed before the focus event even arrives — the prompt
+   appeared and vanished in the same frame. Bound to `panel_open` the change lands on the pass that
+   creates the popup instead, since `bar` precedes `panel_host` in the surface list. The cost is
+   that any open panel takes the keyboard; the alternatives looked like `grab = false` (which
+   retires ADR-0051's click-outside-to-close) or drawing the prompt outside the popup. The third
+   alternative, not seen at the time, was to stop being a popup.
 
 5. **A field that becomes visible under a focus that already arrived needs its own arming.**
    Consequence of 4: there is no second `enter` when the prompt appears, so
@@ -3832,8 +3834,8 @@ whole problem.
 
 Typed characters still never reach the Lua VM: `secure_submit` carries them from the Wayland thread
 to the capability and nowhere else (ADR-0005/ADR-0027), so the prompt has no `on_change` and no
-`on_submit`. It is the only such field on `panel_host` across all five panels, which decision 3's
-rule makes load-bearing rather than incidental.
+`on_submit`. It is the only such field on `panel_host` across all five panels, which the "exactly
+one in scope" rule makes load-bearing rather than incidental.
 
 ## 0086. `lua-meta` types nothing unless a signal is `userdata`
 
@@ -3875,3 +3877,55 @@ What this does not buy: Lua is not Rust. `any` still flows out of any unannotate
 stays permissive in the table direction, and `list`'s `itemfn` cannot infer its item type from
 `source`, so those five callbacks carry a hand-written `---@param`. The engine's own parsers remain
 the real gate; this moves the common mistakes to edit time.
+
+## 0087. The panel host is a layer surface, and a staged layer request needs its own commit
+
+ADR-0085 decision 4 shipped a bar that took the whole keyboard for as long as any panel was open,
+to reach one password field. That was the honest cost of the design it was written under, and the
+design was the mistake: the constraint came entirely from `panel_host` being an `xdg_popup` with a
+grab, and the reference config this shell mirrors never took that path. `Modules/Shell/MainScreen.qml`
+is one screen-tall `PanelWindow` holding the bar and the panel host together with no `xdg_popup`
+anywhere, which is exactly why its `WlrLayershell.keyboardFocus` can follow a per-panel
+`needsKeyboardFocus` (`NetworkPanel.qml`'s is `showSsidInput || showPasswordInput || ...`).
+
+1. **`panel_host` becomes a `panel`.** Screen-tall under the bar, `visible` still bound to
+   `panel_open`, and its single root node holds a full-fill click-outside catcher with the panel
+   card stacked over it. `hit::descend` walks children in reverse and stops at the first that
+   contains the point, so the card shields itself from the catcher without a handler of its own.
+   Click-outside-to-close is now ours rather than the compositor's `popup_done`, which retires the
+   ambiguity `lib/ui_state.lua`'s `toggle_panel` was written around — `on_dismiss` carried no token
+   saying which popup it dismissed, so switching panels directly sometimes took a second click.
+   It is one click now, because the bar is left uncovered: `exclusive = false` reserves nothing but
+   still respects what the bar reserved, so niri configures this surface at 1920x1161 starting under
+   the bar rather than over it.
+
+2. **`keyboard_interactivity` binds to `network.password_ssid`, and the bar goes back to `"None"`.**
+   The whole point. There is no grab to break, so the claim can be as narrow as the fact that wants
+   it: this surface holds the keyboard exactly while a `network:connect` is waiting on a password,
+   and nothing else on the bar ever asks for it. `lua-meta/oblisk.lua`'s own field doc has said this
+   is what the shell binds focus to since ADR-0084; it is true now.
+
+3. **`constraint_adjustment` is the one thing paid for, and it is arithmetic.** A popup got
+   `"FlipY"` and `"SlideX"` from the compositor; a layer surface gets neither. `"FlipY"` needs no
+   equivalent, since this surface starts below the bar and extends down. `"SlideX"` is a `math.min`
+   against `oblisk.screens[1].width` in the `computed` that places the card — the same single-head
+   guess `config/theme.lua`'s `main_screen` already makes, except that this one follows the signal.
+
+4. **A staged layer-shell request needs its own commit, and did not have one.** Found while
+   measuring 2, and the reason the first attempt looked like a compositor refusal.
+   `apply_resolved_state` stages double-buffered `wl_surface` state and leaves the commit to
+   `paint_surface`'s `swap_buffers` — but `paint_surface` returns early when the display list is
+   byte-identical to the last one, which is the whole point of that check and true of most surfaces
+   on most passes. So `set_keyboard_interactivity` was sent and then sat pending: `panel_host`
+   raised itself to `Exclusive` over an already-drawn card and niri never gave it the keyboard,
+   while editing an unrelated border width delivered the focus change instantly. The bar never
+   showed the bug because its clock redraws it once a second. `apply_spec_change` now commits when
+   anything moved, guarded on `Mapped` (a bufferless commit on an unmapped surface is the protocol's
+   re-map) and skipped for a PBA Candidate. This was always a bug for `margin`, `size` and
+   `exclusive` too; nothing had bound them to a signal that moved without also changing the paint.
+
+Measured end to end on niri: a non-visual flip to `"Exclusive"` on the mapped surface now takes the
+keyboard and arms `network/connect` in the same turn, and the flip back releases it. The card lands
+at `bar_height + panel_gap` from the top and clamps to the output's right edge, both read off a
+pixel scan rather than believed.
+

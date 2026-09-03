@@ -886,6 +886,12 @@ impl App {
     /// whole scene, so which surfaces changed is not information this process has. Also the
     /// commit that carries everything [`App::apply_resolved_surface_state`] staged for each
     /// surface this poll turn: `paint_surface` ends in `swap_buffers`, a `wl_surface` commit.
+    ///
+    /// Only for a surface that actually repaints, which is the part that bit. `paint_surface`
+    /// returns before `swap_buffers` when the display list is unchanged, so a pass that moved
+    /// protocol state and nothing visual staged a request and never committed it -- see
+    /// [`App::apply_spec_change`], which now carries its own commit rather than relying on this
+    /// one.
     pub(super) fn repaint_mapped_surfaces(&mut self) {
         for index in 0..self.surfaces.len() {
             if self.surfaces[index].map_state != MapState::Mapped {
