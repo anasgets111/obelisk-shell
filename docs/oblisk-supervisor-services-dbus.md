@@ -28,6 +28,8 @@ A client requesting an inline reply (`x-kde-reply` hint or actions carrying an `
 
 `Notify`'s `actions` array is otherwise split into `actions[]` and `has_default_action` (ADR-0090). Each entry carries the opaque `key` the sender will receive back, a `label` to draw (the key itself when the sender sent an empty one), and, when `hints["action-icons"]` is set, an `icon_name` -- a *theme name*, refused if it holds a path separator, since `icon` also accepts absolute paths. The two keys with meanings of their own never appear as entries: `"default"` becomes `has_default_action`, `"inline-reply"` becomes `has_reply`. At most 8 actions are kept and a label is truncated to 64 bytes, on the same reasoning §1.1 caps the text properties.
 
+`notifications:hold_expiry(seconds)` stops every pending expiry countdown for that long (ADR-0094), which is what keeps a card from vanishing part-way through a reply. Time already served is banked, `0` releases, and the value is clamped to 300 seconds — it is a deadline rather than a paused/resumed flag precisely so a config that misses the release edge cannot pin the feed for the rest of the session.
+
 `notifications:invoke_action(id, key)` emits `ActionInvoked(id, key)` and then removes the notification, which is the base spec's default; `hints["resident"]` is the spec's own exception and keeps it in the queue instead. A removal here also emits `NotificationClosed(id, reason=3)`, because an action-invoked close is a close and a sender tracking its own ids needs to hear about it.
 
 ---

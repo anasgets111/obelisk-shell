@@ -31,7 +31,8 @@ pub mod queue;
 pub mod sound;
 
 pub use controller::{
-    NotificationsController, parse_dismiss_args, parse_invoke_action_args, parse_reply_args, parse_set_sound_args,
+    NotificationsController, parse_dismiss_args, parse_hold_expiry_args, parse_invoke_action_args, parse_reply_args,
+    parse_set_sound_args,
 };
 pub use sound::run_sound_player;
 
@@ -45,11 +46,12 @@ pub enum NotificationsAction {
     Reply,
     SetSound,
     SetDnd,
+    HoldExpiry,
 }
 
 /// `oblisk.notifications`'s action dispatch (ADR-0037): `dismiss`/`invoke_action`/`reply` emit
-/// D-Bus signals and get `tokio::spawn`ed (ADR-0029); `set_sound`/`set_dnd` only write Supervisor-held state under
-/// its lock (ADR-0033), so they run inline.
+/// D-Bus signals and get `tokio::spawn`ed (ADR-0029); `set_sound`/`set_dnd`/`hold_expiry` only write
+/// Supervisor-held state under its lock (ADR-0033), so they run inline.
 pub fn dispatch(controller: &NotificationsController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     let Some(action) = crate::parse_action::<NotificationsAction>(params) else { return };
@@ -87,6 +89,10 @@ pub fn dispatch(controller: &NotificationsController, envelope: &shared::Command
         },
         NotificationsAction::SetDnd => match crate::capabilities::parse_bool_arg(&params.arguments) {
             Some(enabled) => controller.set_dnd(enabled),
+            None => crate::log_malformed_command(params),
+        },
+        NotificationsAction::HoldExpiry => match parse_hold_expiry_args(&params.arguments) {
+            Some(seconds) => controller.hold_expiry(seconds),
             None => crate::log_malformed_command(params),
         },
     }

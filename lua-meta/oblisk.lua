@@ -407,7 +407,7 @@ local BatteryCapability = {}
 ---@field invoke fun(self: NetworkCapability, command: "set_networking_enabled"|"set_wifi_enabled"|"set_ethernet_enabled"|"scan"|"connect"|"cancel_connect"|"forget", ...: any)
 
 ---@class NotificationsCapability: Capability<NotificationsState>
----@field invoke fun(self: NotificationsCapability, command: "dismiss"|"invoke_action"|"reply"|"set_sound"|"set_dnd", ...: any)
+---@field invoke fun(self: NotificationsCapability, command: "dismiss"|"invoke_action"|"reply"|"set_sound"|"set_dnd"|"hold_expiry", ...: any)
 
 ---@class PowerCapability: Capability<PowerState>
 ---@field invoke fun(self: PowerCapability, command: "set_profile", ...: any)

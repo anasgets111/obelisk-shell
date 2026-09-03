@@ -4256,3 +4256,58 @@ Not done here: an expiry deadline alongside it. A card could draw a countdown ri
 `resolve_expiry`'s answer, and the Qt shell does, but that number is the supervisor's own timer and
 publishing it invites a config to believe it — see ADR-0094, which makes the timer pausable and so
 makes any published deadline a lie the moment a pointer enters the card.
+
+## 0094. Expiry is held off by a deadline, not paused by a flag
+
+A notification with an inline reply arrives with a 5-second timeout, and typing a reply takes
+longer than that. The card goes away mid-sentence and the reply goes nowhere. The Qt shell this
+config mirrors solves it with `pauseTimers`/`resumeTimers` on the card's hover.
+
+That shape does not survive being handed to a config. A paused/resumed pair needs both edges to
+arrive, and the config is a process that gets reloaded on every file save — a reload between the
+pause and the resume leaves the Supervisor paused with nobody left who knows it, and nothing can
+tell that state from a legitimately long one. The feed stops expiring for the rest of the session.
+
+1. **`hold_expiry(seconds)`, one call, self-releasing.** The config asserts "somebody is
+   interacting, don't expire anything for the next N seconds" and the assertion lapses on its own.
+   `0` releases early, so the both-edges shape is still available to a caller that has both edges;
+   it just is not required for correctness. The natural use is the opposite: re-place a short hold
+   from an event that is already repeating, which a reply field's `on_change` is — it fires per
+   keystroke (ADR-0092 decision 5), so typing holds expiry off for exactly as long as typing lasts
+   and no config state tracks it.
+
+2. **Clamped to five minutes.** The cap is what makes decision 1's guarantee real rather than
+   rhetorical: a config asking for a week gets five minutes. Five minutes of continuous
+   interaction with one notification is past anything real.
+
+3. **Global, not per-id.** A hold means "the user is looking at the shell", which is not a property
+   of one notification. Per-id would need the config to enumerate what is on screen and re-place a
+   hold per entry, and to do it again after every reload, which is the bookkeeping decision 1
+   exists to delete.
+
+4. **The clock stops; it does not restart, and it does not fire on release.** A notification held
+   at 2s of 5 has 3s left when the hold lapses. Restarting would make a passing pointer reset every
+   card in the stack. Expiring immediately is worse: the card would disappear at the instant the
+   pointer left it, which reads as the pointer having dismissed it.
+
+5. **The countdown stays one task per notification.** `Notify` already spawned a task that sleeps
+   and then re-checks; giving that sleep a `watch` receiver is the whole change. The alternative —
+   a deadline stored on the queue entry, decremented on hold and re-armed on release — adds shared
+   state and a second place that has to agree with `find_expiring_entry` about what is still
+   pending, to buy nothing.
+
+6. **Not readable from Lua.** `NotificationsState` gains no field. The config is the only writer
+   and already knows what it asked for; publishing it would invite a second reader to decide
+   things from a value that is stale the moment it is pushed. A transition is logged instead,
+   because a feed that has stopped expiring and a broken timer look identical from outside.
+
+7. **`tokio`'s clock, not `std`'s.** `tokio::time::pause` moves only the former, and the countdown
+   is the thing under test — the five tests here assert exact durations (5s served, 2 + 60 + 3,
+   an extension winning over the hold it replaced) and run in about ten milliseconds. Written
+   against `std::time::Instant` first, where they passed by sleeping through a real minute.
+
+Only half of what this unblocks is reachable today. A reply field can hold expiry off from
+`on_change`, which is the case where something is actually lost. Holding it off merely because the
+pointer is resting on a card needs a hover *callback*, and § 5.2 has only `hover(name)`, a
+read-only signal that a `computed` cannot act on — the same wall ADR-0093 hit. That is its own
+edit.

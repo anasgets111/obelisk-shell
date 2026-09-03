@@ -5,9 +5,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::watch;
+// `tokio`'s clock, not `std`'s: these are timer deadlines, and only this one moves with
+// `tokio::time::pause`, which is what makes the countdown testable without sleeping through it.
+use tokio::time::Instant;
 use zbus::fdo::RequestNameFlags;
 use zbus::zvariant::Value;
 
@@ -143,6 +147,11 @@ pub struct NotificationsController {
     events: UnboundedSender<NotificationsSignal>,
     sound_tx: SoundSender,
     trusted_roots: Arc<Vec<PathBuf>>,
+    /// The instant every pending expiry countdown is stopped until, or `None` when none is
+    /// (ADR-0094). A `watch` rather than a field in [`NotificationsQueueState`] because the
+    /// readers are the spawned countdowns, which need to be *woken* when it moves and not merely
+    /// to find the new value the next time they happen to look.
+    expiry_hold: Arc<watch::Sender<Option<Instant>>>,
 }
 
 impl NotificationsController {
@@ -177,7 +186,14 @@ impl NotificationsController {
             }
         };
 
-        let controller = Self { connection: live_connection.clone(), state, events, sound_tx, trusted_roots };
+        let controller = Self {
+            connection: live_connection.clone(),
+            state,
+            events,
+            sound_tx,
+            trusted_roots,
+            expiry_hold: Arc::new(watch::Sender::new(None)),
+        };
 
         if let Some(live_connection) = &live_connection
             && let Err(err) = live_connection.object_server().at(NOTIFICATIONS_OBJECT_PATH, controller.clone()).await
@@ -200,6 +216,7 @@ impl NotificationsController {
             events,
             sound_tx,
             trusted_roots: Arc::new(default_trusted_icon_roots()),
+            expiry_hold: Arc::new(watch::Sender::new(None)),
         }
     }
 
@@ -384,11 +401,82 @@ impl NotificationsController {
         let _ = self.events.send(NotificationsSignal::Changed);
     }
 
+    /// `notifications:hold_expiry(seconds)` (ADR-0094): stops every pending expiry countdown for
+    /// the next `seconds`, so a notification cannot vanish out from under someone reading it or
+    /// part-way through typing a reply into it. `0` releases the hold immediately.
+    ///
+    /// A deadline rather than a paused/resumed flag, and that is the whole point: a config that
+    /// pauses and never resumes -- because it reloaded, crashed, or simply missed an edge --
+    /// pins the feed for the rest of the session, and nothing in the Supervisor could tell that
+    /// state from a legitimately long one. A deadline lapses on its own, so the worst a bug can
+    /// do is bounded by [`MAX_EXPIRY_HOLD_SECS`], and the natural way to use it is to keep
+    /// re-placing a short one from an event that is already repeating (a reply field's
+    /// `on_change` fires per keystroke).
+    ///
+    /// Not in [`NotificationsState`]: the config is the only writer and already knows what it
+    /// asked for, and a readable one invites a second reader to make decisions from a value that
+    /// is stale the moment it is pushed.
+    pub fn hold_expiry(&self, seconds: u64) {
+        let until = (seconds > 0).then(|| Instant::now() + Duration::from_secs(seconds.min(MAX_EXPIRY_HOLD_SECS)));
+        // Worth a line each way. A feed that has stopped expiring looks identical to a broken
+        // timer from the outside, and this is the one thing that tells them apart.
+        match until {
+            Some(_) => eprintln!("notifications: expiry held for {}s", seconds.min(MAX_EXPIRY_HOLD_SECS)),
+            None => eprintln!("notifications: expiry hold released"),
+        }
+        self.expiry_hold.send_replace(until);
+    }
+
     /// Full re-derivation of `notifications.feed`/`notifications.dnd` from current state --
     /// synchronous, no D-Bus round trip needed.
     pub fn build_state(&self) -> NotificationsState {
         let state = self.state.lock().unwrap();
         NotificationsState { feed: feed_view(&state.queue), dnd: state.dnd }
+    }
+}
+
+/// The longest a single [`NotificationsController::hold_expiry`] call can stop the countdowns for.
+/// A hold asserts "somebody is interacting with this right now", and five minutes of continuous
+/// interaction with one notification is past anything real; the cap is what keeps a config that
+/// asks for a week from pinning the feed for the session.
+pub const MAX_EXPIRY_HOLD_SECS: u64 = 300;
+
+/// Sleeps out `remaining`, with the clock stopped for as long as a `hold_expiry` deadline is in
+/// force (ADR-0094).
+///
+/// The countdown lives here rather than as a deadline on the queue entry because that is all it
+/// is -- one task per expiring notification already existed, and giving it a pausable sleep costs
+/// no shared state, no re-arming on release, and no second place that has to agree with
+/// [`find_expiring_entry`] about what is still pending.
+///
+/// Time already served is banked across a hold: a notification held at 2s of 5 has 3s left when
+/// the hold lapses, not 0. Restarting it would be wrong and expiring it immediately would be
+/// worse -- the card would vanish at the instant the pointer left it, which reads as the pointer
+/// having dismissed it.
+async fn sleep_past_holds(mut holds: watch::Receiver<Option<Instant>>, mut remaining: Duration) {
+    loop {
+        let held_until = (*holds.borrow_and_update()).filter(|until| *until > Instant::now());
+        if let Some(until) = held_until {
+            // Stopped. Wake when the hold lapses, or sooner if one is placed or released, and
+            // decide again from the top rather than assuming which of the two happened.
+            let _ = tokio::time::timeout_at(until, holds.changed()).await;
+            continue;
+        }
+        let started = Instant::now();
+        match tokio::time::timeout(remaining, holds.changed()).await {
+            // The countdown ran out with nothing interrupting it: the time is served.
+            Err(_elapsed) => return,
+            Ok(moved) => {
+                remaining = remaining.saturating_sub(started.elapsed());
+                // The sender is gone, which in a live Supervisor means the controller itself is,
+                // so there will never be another hold: serve the rest in one sleep instead of
+                // spinning on a channel that can only keep erroring.
+                if moved.is_err() {
+                    tokio::time::sleep(remaining).await;
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -494,8 +582,9 @@ impl NotificationsController {
 
         if let ExpiryPolicy::After(duration) = resolve_expiry(urgency, expire_timeout) {
             let controller = self.clone();
+            let holds = self.expiry_hold.subscribe();
             tokio::spawn(async move {
-                tokio::time::sleep(duration).await;
+                sleep_past_holds(holds, duration).await;
                 controller.expire_if_still_present(id, incarnation).await;
             });
         }
@@ -579,6 +668,13 @@ pub fn parse_reply_args(arguments: &[serde_json::Value]) -> Option<(u32, String)
     let id = u32::try_from(arguments.first()?.as_u64()?).ok()?;
     let text = arguments.get(1)?.as_str()?.to_string();
     Some((id, text))
+}
+
+/// `notifications:hold_expiry(seconds)`'s `arguments: [seconds]`. A negative or fractional number
+/// is malformed rather than rounded: `-1` in an expiry argument means "never" everywhere else in
+/// this spec, and quietly reading it as `0` would release a hold a config meant to place.
+pub fn parse_hold_expiry_args(arguments: &[serde_json::Value]) -> Option<u64> {
+    arguments.first()?.as_u64()
 }
 
 /// `notifications:invoke_action(id, key)`'s `arguments: [id, key]`.
@@ -779,5 +875,106 @@ mod tests {
     #[test]
     fn parse_set_sound_args_rejects_an_invalid_urgency_string() {
         assert_eq!(parse_set_sound_args(&[serde_json::json!("urgent"), serde_json::json!("/path")]), None);
+    }
+
+    #[test]
+    fn parse_hold_expiry_args_reads_a_whole_number_of_seconds_and_nothing_else() {
+        assert_eq!(parse_hold_expiry_args(&[serde_json::json!(10)]), Some(10));
+        assert_eq!(parse_hold_expiry_args(&[serde_json::json!(0)]), Some(0), "0 is the release, not a malformed hold");
+        assert_eq!(parse_hold_expiry_args(&[serde_json::json!(-1)]), None, "not silently a release");
+        assert_eq!(parse_hold_expiry_args(&[serde_json::json!(1.5)]), None);
+        assert_eq!(parse_hold_expiry_args(&[]), None);
+    }
+
+    /// The countdown with nothing holding it: it serves its time and no more. `tokio::time::pause`
+    /// makes the clock jump to each timer rather than sleeping, so these run instantly and are
+    /// exact rather than timing-tolerant.
+    #[tokio::test(start_paused = true)]
+    async fn an_unheld_countdown_runs_for_exactly_its_duration() {
+        let holds = watch::Sender::new(None);
+        let started = Instant::now();
+        sleep_past_holds(holds.subscribe(), Duration::from_secs(5)).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+
+    /// The reason this is a stopped clock and not a restart or an immediate expiry: a hold placed
+    /// at 2s of 5 must leave 3s to serve, so the card outlives the pointer that was resting on it.
+    #[tokio::test(start_paused = true)]
+    async fn a_hold_stops_the_clock_and_the_time_already_served_is_banked() {
+        let holds = Arc::new(watch::Sender::new(None));
+        let started = Instant::now();
+
+        let placer = Arc::clone(&holds);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            placer.send_replace(Some(Instant::now() + Duration::from_secs(60)));
+        });
+
+        sleep_past_holds(holds.subscribe(), Duration::from_secs(5)).await;
+        // 2 served, 60 held, 3 left to serve.
+        assert_eq!(started.elapsed(), Duration::from_secs(65));
+    }
+
+    /// A hold released early ends the stop early: `hold_expiry(0)` is the config saying it is done,
+    /// and waiting out the original deadline anyway would make a release do nothing.
+    #[tokio::test(start_paused = true)]
+    async fn releasing_a_hold_resumes_the_countdown_at_once() {
+        let holds = Arc::new(watch::Sender::new(Some(Instant::now() + Duration::from_secs(600))));
+        let started = Instant::now();
+
+        let releaser = Arc::clone(&holds);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            releaser.send_replace(None);
+        });
+
+        sleep_past_holds(holds.subscribe(), Duration::from_secs(5)).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(9), "4 held, then the full 5 -- none was served first");
+    }
+
+    /// Re-placing a hold while one is already in force is the shape a repeating event uses (a
+    /// reply field's `on_change`, once per keystroke), so the later deadline has to win rather
+    /// than the countdown resuming when the first one lapses.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_hold_extends_the_first() {
+        let holds = Arc::new(watch::Sender::new(Some(Instant::now() + Duration::from_secs(10))));
+        let started = Instant::now();
+
+        let extender = Arc::clone(&holds);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            extender.send_replace(Some(Instant::now() + Duration::from_secs(10)));
+        });
+
+        sleep_past_holds(holds.subscribe(), Duration::from_secs(5)).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(23), "8 + 10 held, then the full 5");
+    }
+
+    /// A hold already lapsed by the time a countdown reads it is not a hold. Without the deadline
+    /// check the countdown would stop for a value nobody meant to still be in force.
+    #[tokio::test(start_paused = true)]
+    async fn a_lapsed_hold_does_not_stop_the_clock() {
+        let holds = watch::Sender::new(Some(Instant::now() + Duration::from_millis(1)));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let started = Instant::now();
+        sleep_past_holds(holds.subscribe(), Duration::from_secs(5)).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+
+    /// The cap is what bounds a config bug: an absurd hold is clamped rather than honoured, so the
+    /// worst case is five minutes of a pinned feed and not the rest of the session.
+    #[tokio::test(start_paused = true)]
+    async fn a_hold_longer_than_the_cap_is_clamped_to_it() {
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sound_tx, _sound_rx) = std::sync::mpsc::channel();
+        let controller = NotificationsController::inert(events, sound_tx);
+
+        let before = Instant::now();
+        controller.hold_expiry(u64::MAX);
+        let held = controller.expiry_hold.borrow().expect("a hold was placed");
+        assert_eq!(held, before + Duration::from_secs(MAX_EXPIRY_HOLD_SECS), "u64::MAX seconds is five minutes");
+
+        controller.hold_expiry(0);
+        assert_eq!(*controller.expiry_hold.borrow(), None, "0 releases");
     }
 }
