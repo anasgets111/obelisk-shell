@@ -325,6 +325,13 @@ theme.volume_expanded_width = s(120, 90)
 -- (`modules/shell/panel_host.lua`) and a surface has one size.
 theme.panel_width         = s(340, 280)
 theme.panel_height        = s(400, 300)
+-- The notification history is the one panel that is not a list of a dozen short rows: it holds the
+-- same cards the popup draws, at `notificationPanelWidth: 420` in the mirror, and a feed of them is
+-- taller than any other panel. The mirror sizes that panel to its content up to what the screen
+-- has; this engine has no content-with-a-ceiling height, so it is two steps -- the shared height
+-- for an empty feed, this one otherwise -- and the list inside scrolls past it.
+theme.notification_panel_width  = s(420, 340)
+theme.notification_panel_height = s(720, 540)
 theme.panel_gap           = 4
 theme.notification_width  = s(380, 300)
 -- The plate behind a card's application icon (`notificationAppIconSize`); the icon in it is an

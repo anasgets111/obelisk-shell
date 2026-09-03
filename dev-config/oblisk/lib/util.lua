@@ -147,7 +147,68 @@ end
 --
 -- Image spans are left out here and drawn by `util.notification_images`: a picture inside a line of
 -- text has nowhere to go, and `text` refuses a run with no `text` for exactly that reason.
+-- A web address written out in plain words becomes a link, as the mirror's `NotificationText`
+-- makes it (its `linkify` step): most senders do not mark their links up, they paste them, and a
+-- pasted address that cannot be pressed is the card telling you to retype it. Only text spans that
+-- are not already links are scanned, so an `<a href>` around different words keeps its target.
+-- Trailing sentence punctuation stays out of the address; a full stop after a URL is almost never
+-- part of it.
+local URL_PATTERNS = { "%f[%S]https?://[^%s<>'\"]+", "%f[%S]file://[^%s<>'\"]+" }
+
+local function linkified(spans)
+    local out = {}
+    for _, span in ipairs(spans or {}) do
+        local text = span.kind == "text" and (span.href == nil or span.href == "") and span.text or nil
+        if not text then
+            out[#out + 1] = span
+        else
+            local at = 1
+            while at <= #text do
+                local first, last
+                for _, pattern in ipairs(URL_PATTERNS) do
+                    local from, to = text:find(pattern, at)
+                    if from and (not first or from < first) then
+                        first, last = from, to
+                    end
+                end
+                if not first then
+                    break
+                end
+                local href = text:sub(first, last):gsub("[.,;:!?]+$", "")
+                last = first + #href - 1
+                if first > at then
+                    local plain = {}
+                    for key, value in pairs(span) do
+                        plain[key] = value
+                    end
+                    plain.text = text:sub(at, first - 1)
+                    out[#out + 1] = plain
+                end
+                local link = {}
+                for key, value in pairs(span) do
+                    link[key] = value
+                end
+                link.text, link.href = href, href
+                out[#out + 1] = link
+                at = last + 1
+            end
+            if at == 1 then
+                out[#out + 1] = span
+            elseif at <= #text then
+                local rest = {}
+                for key, value in pairs(span) do
+                    rest[key] = value
+                end
+                rest.text = text:sub(at)
+                out[#out + 1] = rest
+            end
+        end
+    end
+    return out
+end
+
 function util.notification_body(spans, link_color)
+    spans = linkified(spans)
     local runs = {}
     for _, span in ipairs(spans or {}) do
         if span.kind == "text" and span.text and span.text ~= "" then
@@ -181,7 +242,7 @@ end
 -- gets one button for it.
 function util.notification_links(spans)
     local links, seen = {}, {}
-    for _, span in ipairs(spans or {}) do
+    for _, span in ipairs(linkified(spans)) do
         local href = span.kind == "text" and span.href or nil
         if href and href ~= "" and not seen[href] then
             seen[href] = true

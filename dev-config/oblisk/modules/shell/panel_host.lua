@@ -88,11 +88,31 @@ end
 -- resolution change moves the clamp rather than stranding it at the boot value. An empty
 -- `oblisk.screens` -- the first evaluation, and `socket.rs`'s harness -- clamps nothing, which
 -- leaves the card exactly where the anchor asked.
-local card_margin = computed({ ui_state.popup_anchor, oblisk.screens }, function(anchor, screens)
+-- The card's size follows which panel is up. One size for all of them was the rule while every
+-- panel was a short list; the notification history is a column of cards and gets the mirror's
+-- wider `notificationPanelWidth` and a taller box, dropping back to the shared height while the
+-- feed is empty so a "nothing waiting" line does not sit in 700px of glass.
+local showing_notifications = ui_state.panel_showing(notification_history.kind)
+local card_width = showing_notifications:map(function(showing)
+    return showing and theme.notification_panel_width or theme.panel_width
+end)
+local card_height = computed({ showing_notifications, oblisk.notifications }, function(showing, n)
+    if not showing then
+        return theme.panel_height
+    end
+    for _, notification in ipairs((n and n.feed) or {}) do
+        if not notification.transient then
+            return theme.notification_panel_height
+        end
+    end
+    return theme.panel_height
+end)
+
+local card_margin = computed({ ui_state.popup_anchor, oblisk.screens, card_width }, function(anchor, screens, width)
     local x = (anchor and anchor.x) or 0
     local screen = screens and screens[1]
     if screen and screen.width then
-        x = math.min(x, math.max(0, screen.width - theme.panel_width))
+        x = math.min(x, math.max(0, screen.width - width))
     end
     return { left = math.floor(x), top = theme.panel_gap }
 end)
@@ -173,13 +193,14 @@ return panel {
                 height = "Fill",
                 on_click = ui_state.close_panel,
             },
-            -- Sized for the tallest panel, not the current one. `renderer/src/socket.rs`'s
+            -- `theme.panel_width` by `theme.panel_height` for every panel but the notification
+            -- history, see `card_width` above. `renderer/src/socket.rs`'s
             -- `the_shipped_dev_configs_bar_zones_hold_their_modules_without_overflowing` measures
-            -- every panel against these two numbers -- the power menu overran a 150px card by 58px
+            -- every panel against the shared pair -- the power menu overran a 150px card by 58px
             -- before it did.
             panel_card(sections, {
-                width = theme.panel_width,
-                height = theme.panel_height,
+                width = card_width,
+                height = card_height,
                 -- A stacking child sits at its parent's origin unless told otherwise
                 -- (`parse_align` defaults to `Start`), so the margin above is the whole of the
                 -- placement rather than a nudge to it.

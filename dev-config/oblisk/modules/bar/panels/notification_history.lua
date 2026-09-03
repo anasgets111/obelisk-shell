@@ -45,6 +45,35 @@ local function kept(n)
     return count
 end
 
+-- The header's second line, the mirror's `historySummary`: how many, from how many applications,
+-- and whether they are being silenced. A bare count said "5" and left the reader to guess five of
+-- what; the mirror's phrasing answers that in the same width.
+local function summary(n)
+    local count, apps, seen = 0, 0, {}
+    for _, notification in ipairs(feed(n)) do
+        if not notification.transient then
+            count = count + 1
+            local app = notification.app_name or ""
+            if not seen[app] then
+                seen[app] = true
+                apps = apps + 1
+            end
+        end
+    end
+    local dnd = n and n.dnd
+    if count == 0 then
+        return dnd and "silenced · history empty" or "history empty"
+    end
+    local parts = { string.format("%d in history", count) }
+    if apps > 1 then
+        parts[#parts + 1] = string.format("%d apps", apps)
+    end
+    if dnd then
+        parts[#parts + 1] = "silenced"
+    end
+    return table.concat(parts, " · ")
+end
+
 local body = {
     row {
         width = "Fill",
@@ -52,9 +81,7 @@ local body = {
         spacing = theme.spacing.sm,
         children = {
             section_header("notifications"),
-            cell(util.label(oblisk.notifications, function(n)
-                return string.format("%d", kept(n))
-            end), theme.TEXT_OFF, theme.font.xs, { width = "Fill", align = "End" }),
+            cell(util.label(oblisk.notifications, summary), theme.TEXT_OFF, theme.font.xs, { width = "Fill", align = "End" }),
             -- Do-not-disturb, the mirror's third bell state. The Supervisor's flag gates sound
             -- (ADR-0033); the popup reads the same flag and stands down for everything but a
             -- critical notification, so one toggle quiets both. Lit while on.
