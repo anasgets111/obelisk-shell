@@ -258,13 +258,22 @@ local function message(notification, ui, opts)
         end, string.format("notification-link-%d-%d", id, index))
     end
     if #buttons > 0 then
+        -- Pushed to the card's edges, not centred as the mirror's `Qt.AlignHCenter` has them: two
+        -- pills huddled in the middle of a card this wide looked stranded, and stretching them to
+        -- fill it made a bar of each. A `row` distributes `Start`/`Center`/`End` only, so the space
+        -- between is a filling spacer per gap; a lone button has no gap and sits centred.
+        local spread = {}
+        for index, control in ipairs(buttons) do
+            if index > 1 then
+                spread[#spread + 1] = rect { width = "Fill" }
+            end
+            spread[#spread + 1] = control
+        end
         lines[#lines + 1] = row {
             width = "Fill",
-            -- Centred under the message (the mirror's `Layout.alignment: Qt.AlignHCenter`); a
-            -- row's own `align_h` is its main-axis distribution.
             align_h = "Center",
             spacing = theme.spacing.sm,
-            children = buttons,
+            children = spread,
         }
     end
 
