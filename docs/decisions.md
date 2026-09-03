@@ -4668,3 +4668,36 @@ In the notification card, `on_cancel` is `ui.close_reply()`: the row goes, `repl
 zero, and the surface's `keyboard_interactivity` follows it to `"None"`, which is the same path the
 Send button already takes. Verified live: Reply, type, Escape -- the field and the Send button are
 gone, the popup no longer holds the keyboard, and nothing was sent.
+
+## 0103. `applications:open_url(url)`, so a link in a notification body can be opened
+
+A notification body's spans carry an `href` and the field's own doc said "carried as text, not
+opened: launching it is a config's decision". It was not a decision a config could make. Nothing in
+the Lua surface runs a program: `applications:launch` takes a desktop file id and nothing else
+(ADR-0061 decision 3, deliberately), and `process.run` pipes and holds a child the shell then owns.
+A link a config could draw but not follow is a link, and the reference config opens them with
+`Qt.openUrlExternally`.
+
+1. **On `applications`, not a new capability.** It is the capability for running things the user
+   asked for, and "open this in whatever handles it" is a launch with the desktop deciding the
+   program. `xdg-open`, detached in its own process group like `launch`, so a generation swap does
+   not reap the browser it started.
+
+2. **Allowlisted schemes: `http`, `https`, `mailto`.** Not `file:`. Every path a notification hands
+   this shell runs through a trusted-root check precisely because a body is untrusted text, and
+   "open this local file" is the one thing it must not be able to say -- the reference config's
+   `safeUrl` lets `file:` through, and that is the one place this does not follow it. Not
+   application schemes (`tg:`, `spotify:`, `steam:`) either: each names a program the URL's author
+   chooses, and a body should not choose programs. Extending the list is one constant, when a
+   specific scheme is wanted for a specific reason.
+
+3. **No whitespace or control character, and under 2048 bytes.** Nothing legitimate carries them,
+   and an argument holding a newline is how one log line becomes two. The cap is far above what a
+   512-byte body can hold and exists for a URL a config built itself.
+
+4. **Refused, not sanitised.** A URL that fails is logged with the reason and nothing runs. Fixing
+   it up -- prepending a scheme, stripping a space -- would be this shell guessing what the sender
+   meant, on the input it trusts least.
+
+The card side, where a link gets a button or an underlined run to press, is the config pass; this
+is what that pass presses.

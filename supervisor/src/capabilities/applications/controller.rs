@@ -35,6 +35,44 @@ pub enum ApplicationsSignal {
     Changed,
 }
 
+/// A URL `open_url` refuses to hand to the desktop opener, with the reason (ADR-0103).
+#[derive(Debug, PartialEq, Eq)]
+pub enum OpenUrlError {
+    Refused(&'static str),
+    Spawn(String),
+}
+
+/// `open_url`'s cap. Browsers accept far more; a notification body is capped at 512 bytes, so a
+/// URL that arrived through one cannot be longer than that anyway, and the cap is here for the
+/// `applications:open_url` a config might call with something it built itself.
+pub const MAX_URL_BYTES: usize = 2048;
+
+/// The schemes `open_url` will hand to the desktop opener (ADR-0103): a web page and a mail
+/// address, which are what a notification body links to. Not `file:`, on the same reasoning every
+/// notification path runs through a trusted-root check -- a body is untrusted text and "open this
+/// local file" is the one thing it must not be able to say. Not the application-specific schemes
+/// (`tg:`, `spotify:`, `steam:`) either: each is a program the URL's author chooses to run.
+const OPENABLE_SCHEMES: &[&str] = &["http", "https", "mailto"];
+
+/// Whether `url` is something `open_url` will spawn the opener on: an allowlisted scheme, no
+/// whitespace or control character anywhere (nothing legitimate carries one, and an argument
+/// holding a newline is how a log line becomes two), and under [`MAX_URL_BYTES`].
+pub fn openable_url(url: &str) -> Result<(), &'static str> {
+    if url.len() > MAX_URL_BYTES {
+        return Err("longer than 2048 bytes");
+    }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("holds whitespace or a control character");
+    }
+    let Some((scheme, _)) = url.split_once(':') else {
+        return Err("has no scheme");
+    };
+    if !OPENABLE_SCHEMES.iter().any(|allowed| scheme.eq_ignore_ascii_case(allowed)) {
+        return Err("scheme is not http, https or mailto");
+    }
+    Ok(())
+}
+
 /// What `launch` could not do, so the caller can log one line naming the reason rather than a
 /// generic failure.
 #[derive(Debug, PartialEq, Eq)]
@@ -152,11 +190,65 @@ impl ApplicationsController {
             Err(err) => Err(LaunchError::Spawn(err.to_string())),
         }
     }
+
+    /// Hands `url` to `xdg-open`, detached the way [`ApplicationsController::launch`] detaches,
+    /// after [`openable_url`] has agreed to it (ADR-0103). The one way a config can open a link,
+    /// and it is here rather than in `process.run` because a URL out of a notification body is
+    /// the sender's text: what runs on it has to be the user's own default handler, chosen by the
+    /// desktop and not by a string, and the scheme has to be one the shell is willing to act on.
+    ///
+    /// `xdg-open` rather than `gio open`: it is what every desktop ships and what the portal
+    /// falls back to, and a machine with a MIME database but no `xdg-utils` is not one this
+    /// shell has met. A missing binary is a spawn error, logged with the URL.
+    pub fn open_url(&self, url: &str) -> Result<(), OpenUrlError> {
+        openable_url(url).map_err(OpenUrlError::Refused)?;
+        match crate::process::spawn_group_leader("xdg-open", &[url.to_string()], &[]) {
+            Ok(_) => Ok(()),
+            Err(err) => Err(OpenUrlError::Spawn(err.to_string())),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- openable_url (ADR-0103) ----
+
+    #[test]
+    fn a_web_or_mail_url_is_openable_whatever_the_schemes_case() {
+        assert_eq!(openable_url("https://example.org/a?b=c#d"), Ok(()));
+        assert_eq!(openable_url("http://example.org"), Ok(()));
+        assert_eq!(openable_url("HTTPS://EXAMPLE.ORG"), Ok(()));
+        assert_eq!(openable_url("mailto:someone@example.org"), Ok(()));
+    }
+
+    #[test]
+    fn a_local_file_an_app_scheme_or_no_scheme_is_refused() {
+        assert!(openable_url("file:///etc/passwd").is_err());
+        assert!(openable_url("tg://resolve?domain=x").is_err());
+        assert!(openable_url("javascript:alert(1)").is_err());
+        assert!(openable_url("example.org").is_err());
+        assert!(openable_url("").is_err());
+    }
+
+    #[test]
+    fn whitespace_control_characters_and_length_are_refused() {
+        assert!(openable_url("https://example.org/a b").is_err());
+        assert!(openable_url("https://example.org/\n").is_err());
+        assert!(openable_url("https://example.org/\u{7f}").is_err());
+        assert!(openable_url(&format!("https://example.org/{}", "a".repeat(MAX_URL_BYTES))).is_err());
+    }
+
+    /// The refusal happens before anything is spawned, so a refused URL never reaches `xdg-open`.
+    #[tokio::test]
+    async fn open_url_refuses_before_spawning() {
+        let (controller, _dir) = controller_over(&[("thing.desktop", &runnable("Thing", "/bin/true"))]).await;
+        assert_eq!(
+            controller.open_url("file:///etc/passwd"),
+            Err(OpenUrlError::Refused("scheme is not http, https or mailto"))
+        );
+    }
 
     /// Builds a controller over one temporary applications directory and waits for its opening
     /// scan to land. `new` starts that scan in the background, so every test here would otherwise

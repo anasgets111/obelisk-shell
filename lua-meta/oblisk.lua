@@ -384,7 +384,7 @@
 --- Capabilities -------------------------------------------------------------------------------
 
 ---@class ApplicationsCapability: Capability<ApplicationsState>
----@field invoke fun(self: ApplicationsCapability, command: "refresh"|"launch", ...: any)
+---@field invoke fun(self: ApplicationsCapability, command: "refresh"|"launch"|"open_url", ...: any)
 
 ---@class AudioCapability: Capability<AudioState>
 ---@field invoke fun(self: AudioCapability, command: "set_volume"|"set_muted"|"toggle_mute"|"set_default_sink"|"set_default_source"|"set_app_volume"|"set_app_muted", ...: any)

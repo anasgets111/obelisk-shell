@@ -14,7 +14,7 @@ pub mod controller;
 pub mod entry;
 pub mod scan;
 
-pub use controller::{ApplicationsController, ApplicationsSignal, LaunchError};
+pub use controller::{ApplicationsController, ApplicationsSignal, LaunchError, OpenUrlError};
 pub use scan::application_dirs;
 
 /// Every action `oblisk.applications:invoke(...)` accepts. `dispatch` matches this rather than a string,
@@ -24,11 +24,12 @@ pub use scan::application_dirs;
 pub enum ApplicationsAction {
     Refresh,
     Launch,
+    OpenUrl,
 }
 
-/// `oblisk.applications`'s action dispatch (ADR-0037). Both actions are synchronous here:
-/// `refresh` hands the actual scan to `spawn_blocking` itself, and `launch` spawns a detached
-/// child without waiting for it.
+/// `oblisk.applications`'s action dispatch (ADR-0037). All three actions are synchronous here:
+/// `refresh` hands the actual scan to `spawn_blocking` itself, and `launch` and `open_url` spawn a
+/// detached child without waiting for it.
 pub fn dispatch(controller: &ApplicationsController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     let Some(action) = crate::parse_action::<ApplicationsAction>(params) else { return };
@@ -47,6 +48,18 @@ pub fn dispatch(controller: &ApplicationsController, envelope: &shared::CommandE
                         LaunchError::Spawn(message) => format!("spawning {id:?} failed: {message}"),
                     };
                     eprintln!("applications:launch: {reason}");
+                }
+            }
+            None => crate::log_malformed_command(params),
+        },
+        ApplicationsAction::OpenUrl => match params.arguments.first().and_then(serde_json::Value::as_str) {
+            Some(url) => {
+                if let Err(err) = controller.open_url(url) {
+                    let reason = match err {
+                        OpenUrlError::Refused(why) => format!("refused {url:?}: {why}"),
+                        OpenUrlError::Spawn(message) => format!("spawning xdg-open for {url:?} failed: {message}"),
+                    };
+                    eprintln!("applications:open_url: {reason}");
                 }
             }
             None => crate::log_malformed_command(params),
