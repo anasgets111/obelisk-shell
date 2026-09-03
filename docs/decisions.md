@@ -5307,3 +5307,26 @@ things fell out of switching it on.
     capability owns what is privileged and `process.run` already owns what is not. The log push
     rides the progress lines rather than every line: one `Changed` re-resolves every surface in the
     generation, and pacman writes a download meter.
+
+14. **`system:write_state`, and where a remembered value can and cannot come from.** The IDL row
+    existed and nothing implemented it. It stores one scalar under one key, rewrites `state.json`
+    through a temp file and a rename, and pushes so the config reads back what it stored. §3.2 says
+    a key is "alphanumeric", which forbids `updates.last_check` and would push every config with two
+    modules towards `updateslastcheck`; widened to allow `_`, `-` and `.`, since namespacing is the
+    actual use and none of the three is any less safe as a JSON object key. Values stay §3.2's three
+    scalars: a config wanting structure has `json.encode` and a string to put it in, and `state.json`
+    stays a file a person can hand-edit.
+
+    `updates:configure({ interval, checked_at })` takes the remembered time beside the interval, as
+    a seed and never an override -- a check this session ran is fresher than anything a config can
+    say, and this must not move `last_successful_check` backwards.
+
+    **The loop does not close yet, and the missing piece is a hook, not a field.** A config can only
+    cause a side effect from an input callback (ADR-0044: a config is a pure function of state), so
+    nothing can write `state.json` when a *check succeeds* -- there is no "on change". And the read
+    fails from the other end too: `configure` runs at module load, which is the first evaluation,
+    where `oblisk.system` is still nil and the remembered value cannot be read at all. Both halves
+    want the same thing, a way to run a side effect once after a capability's first push, and that is
+    a design decision about purity rather than a field to add, so it is not taken here. `write_state`
+    is useful today for what is already input-driven -- a launcher's frecency counter is written on a
+    click, which is exactly the shape that works.

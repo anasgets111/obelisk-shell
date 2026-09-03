@@ -355,7 +355,7 @@
 ---@class SystemState
 ---`oblisk.system`'s two Lua-visible fields (docs/oblisk-idl-api-specs.md §2.11). Field names
 ---are the `StateSnapshot` payload's JSON keys verbatim.
----@field state any The parsed contents of `state.json`, or an empty object -- see `state::load_state`. Read-only from Lua's side: `system:write_state` (§3.2) is a separate, unbuilt write path.
+---@field state any The parsed contents of `state.json`, or an empty object -- see `state::load_state`. Written a key at a time by `system:write_state` (§3.2), which rewrites the whole file and pushes, so a config reads back what it just stored on the next resolve.
 ---@field time integer Unix epoch seconds, not milliseconds -- §2.11 calls it "system time epoch" with no unit stated. `os.date` wants seconds, so a millis reading would be silently wrong by 1000x.
 
 ---@class TrayState
@@ -429,7 +429,7 @@ local PrivacyCapability = {}
 ---@field invoke fun(self: SysinfoCapability, command: "configure", ...: any)
 
 ---@class SystemCapability: Capability<SystemState>
-local SystemCapability = {}
+---@field invoke fun(self: SystemCapability, command: "write_state", ...: any)
 
 ---@class TrayCapability: Capability<TrayState>
 ---@field invoke fun(self: TrayCapability, command: "activate"|"secondary_activate"|"scroll"|"activate_menu_item"|"menu_will_show", ...: any)

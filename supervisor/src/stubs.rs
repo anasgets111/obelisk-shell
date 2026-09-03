@@ -86,7 +86,11 @@ fn capability_schemas() -> Vec<(&'static str, Schema, Option<Schema>)> {
             schema_for!(crate::capabilities::sysinfo::controller::SysinfoState),
             Some(schema_for!(crate::capabilities::sysinfo::SysinfoAction)),
         ),
-        ("system", schema_for!(crate::capabilities::system::controller::SystemState), None),
+        (
+            "system",
+            schema_for!(crate::capabilities::system::controller::SystemState),
+            Some(schema_for!(crate::capabilities::system::SystemAction)),
+        ),
         (
             "tray",
             schema_for!(crate::capabilities::tray::TrayState),

@@ -82,10 +82,28 @@ pub enum UpdatesSignal {
     Changed,
 }
 
-/// `updates:configure({interval})`'s `arguments: [{interval}]` -- a table argument (ADR-0034),
-/// even though there's only one field today.
-pub fn parse_configure_args(arguments: &[serde_json::Value]) -> Option<u64> {
-    arguments.first()?.as_object()?.get("interval")?.as_u64()
+/// What `updates:configure({ interval, checked_at })` carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdatesConfigure {
+    /// Seconds between scheduled checks. Zero is dormant: nothing checks until a `check` asks.
+    pub interval_secs: u64,
+    /// When the config remembers the last successful check happening, from wherever it keeps
+    /// that -- `system.state`, most likely. Optional, and a seed rather than an override: it is
+    /// taken only while this process has no check of its own, which is exactly the boot where the
+    /// question "has an hour passed?" would otherwise have no answer but "start over".
+    pub checked_at: Option<i64>,
+}
+
+/// `updates:configure({interval})`'s `arguments: [{...}]` -- a table argument (ADR-0034). A present
+/// key with the wrong type drops the whole call rather than half-applying it.
+pub fn parse_configure_args(arguments: &[serde_json::Value]) -> Option<UpdatesConfigure> {
+    let table = arguments.first()?.as_object()?;
+    let interval_secs = table.get("interval")?.as_u64()?;
+    let checked_at = match table.get("checked_at") {
+        Some(value) => Some(value.as_i64()?),
+        None => None,
+    };
+    Some(UpdatesConfigure { interval_secs, checked_at })
 }
 
 /// How many lines of [`UpdatesState::install_log`] survive. Enough to hold a failure and the lines
@@ -134,8 +152,24 @@ impl UpdatesController {
         Self { state, interval_tx, check_now_tx, events }
     }
 
-    pub fn configure(&self, interval_secs: u64) {
-        if self.interval_tx.send(Duration::from_secs(interval_secs)).is_err() {
+    /// Sets the schedule, and optionally seeds the last-check time the config remembered across a
+    /// restart (ADR-0113 amendment). The seed is taken only while this process has none of its own:
+    /// a check this session actually ran is fresher than anything a config can tell it, and this
+    /// must never move `last_successful_check` backwards.
+    ///
+    /// Seeding pushes, because the field is Lua-visible: a config that persisted the time and then
+    /// read `last_successful_check` back as `nil` for the next hour would be told its own answer is
+    /// unknown.
+    pub fn configure(&self, configure: UpdatesConfigure) {
+        if let Some(checked_at) = configure.checked_at {
+            let mut guard = self.state.lock().unwrap();
+            if guard.last_successful_check.is_none() {
+                guard.last_successful_check = Some(checked_at);
+                drop(guard);
+                let _ = self.events.send(UpdatesSignal::Changed);
+            }
+        }
+        if self.interval_tx.send(Duration::from_secs(configure.interval_secs)).is_err() {
             eprintln!("updates: configure called but the check task is gone; ignored");
         }
     }
@@ -468,7 +502,16 @@ mod tests {
     #[test]
     fn parse_configure_args_reads_the_interval_from_a_table() {
         let args = vec![serde_json::json!({"interval": 3600})];
-        assert_eq!(parse_configure_args(&args), Some(3600));
+        assert_eq!(parse_configure_args(&args), Some(UpdatesConfigure { interval_secs: 3600, checked_at: None }));
+    }
+
+    #[test]
+    fn parse_configure_args_reads_a_remembered_check_time_beside_the_interval() {
+        let args = vec![serde_json::json!({"interval": 3600, "checked_at": 1_800_000_000_i64})];
+        assert_eq!(
+            parse_configure_args(&args),
+            Some(UpdatesConfigure { interval_secs: 3600, checked_at: Some(1_800_000_000) })
+        );
     }
 
     #[test]
@@ -476,6 +519,27 @@ mod tests {
         assert_eq!(parse_configure_args(&[]), None);
         assert_eq!(parse_configure_args(&[serde_json::json!(3600)]), None);
         assert_eq!(parse_configure_args(&[serde_json::json!({"wrong_key": 3600})]), None);
+        assert_eq!(
+            parse_configure_args(&[serde_json::json!({"interval": 3600, "checked_at": "yesterday"})]),
+            None,
+            "a present key with the wrong type drops the call rather than half-applying it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remembered_check_time_seeds_an_empty_slot_and_never_overwrites_a_real_one() {
+        let (controller, mut events_rx, _db_root) = failing_controller().await;
+
+        controller.configure(UpdatesConfigure { interval_secs: 0, checked_at: Some(1_800_000_000) });
+        assert_eq!(controller.snapshot().last_successful_check, Some(1_800_000_000));
+        assert_eq!(events_rx.recv().await, Some(UpdatesSignal::Changed), "a seed is Lua-visible, so it pushes");
+
+        controller.configure(UpdatesConfigure { interval_secs: 0, checked_at: Some(1_700_000_000) });
+        assert_eq!(
+            controller.snapshot().last_successful_check,
+            Some(1_800_000_000),
+            "this must never move the last-check time backwards"
+        );
     }
 
     #[test]

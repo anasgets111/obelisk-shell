@@ -626,8 +626,8 @@ impl Capabilities {
     /// Routes one command to the capability it names (ADR-0037: each module owns its own
     /// action match, argument parse, and write-action spawn). Every arm but `lock` reads an
     /// `Option`, since a controller exists only once the config reads its member (ADR-0070),
-    /// see `log_unstarted`. `lock` is passed in since it's built at boot; `battery`, `system`
-    /// and `privacy` are read-only and have no `dispatch` at all.
+    /// see `log_unstarted`. `lock` is passed in since it's built at boot; `battery` and `privacy`
+    /// are read-only and have no `dispatch` at all.
     pub async fn dispatch(&mut self, capability: Capability, envelope: &CommandEnvelope, lock: &LockController) {
         macro_rules! to {
             ($held:expr, $dispatch:path) => {
@@ -651,9 +651,10 @@ impl Capabilities {
             Capability::Updates => to!(self.updates, updates::dispatch),
             Capability::Applications => to!(self.applications, applications::dispatch),
             Capability::Audio => to!(self.audio, audio::dispatch),
+            Capability::System => to!(self.system, system::dispatch),
             Capability::Lock => lock::dispatch(lock, envelope),
             // Read-only (§ 2): no action enum; a command naming one is a Renderer sending garbage.
-            Capability::Battery | Capability::System | Capability::Privacy => {
+            Capability::Battery | Capability::Privacy => {
                 eprintln!(
                     "{capability}: read-only capability received a command from generation {}; dropping",
                     envelope.params.generation_id

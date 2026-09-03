@@ -28,7 +28,7 @@ pub fn dispatch(controller: &UpdatesController, envelope: &shared::CommandEnvelo
     match action {
         UpdatesAction::Check => controller.check_now(),
         UpdatesAction::Configure => match parse_configure_args(&params.arguments) {
-            Some(interval_secs) => controller.configure(interval_secs),
+            Some(configure) => controller.configure(configure),
             None => crate::log_malformed_command(params),
         },
         UpdatesAction::Install => {
