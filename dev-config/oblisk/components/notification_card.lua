@@ -279,13 +279,19 @@ local function message(notification, ui, opts)
     -- notification, and `invoke_action` removes it afterwards on its own unless the sender asked
     -- to stay (ADR-0090), so the two paths agree on what the card does next.
     local hovered = hover("notification-message-" .. tostring(id))
+    -- An `if`, not `a and nil or b`: that idiom cannot produce nil, so every lone message wore the
+    -- group ground and drew a second box inside the card.
+    local ground = nil
+    if not opts.standalone then
+        ground = hovered:map(function(is_hovered)
+            return is_hovered and theme.GLASS_HOVER or theme.GLASS_CONTENT
+        end)
+    end
     return button {
         width = "Fill",
         hover = hovered,
         radius = theme.radius.sm,
-        background = opts.standalone and nil or hovered:map(function(is_hovered)
-            return is_hovered and theme.GLASS_HOVER or theme.GLASS_CONTENT
-        end),
+        background = ground,
         on_click = function(_, mouse_button)
             if mouse_button ~= "left" then
                 return
