@@ -616,8 +616,9 @@ impl App {
     /// reopened showing the last search would be a launcher whose first keystroke appends to a
     /// word the user has forgotten. ADR-0108's draft-keeping is for a field the user *left* and
     /// comes back to by hand; this is a field the engine hands over unasked, and it hands it over
-    /// empty. The config hears about the emptying through `on_change("")` when there was text,
-    /// so a `state` bound to the field does not keep saying "fire" over an empty box.
+    /// empty. `on_change("")` fires on every arm, text or no text: it is the one moment a config
+    /// can call "the field just opened", and a launcher resets its selection and scroll on it. A
+    /// `state` bound to the field also stops saying "fire" over an empty box.
     fn arm_autofocus_field(&mut self, scope: &[String]) {
         let trees: Vec<(&str, layout::ResolvedNode)> =
             scope.iter().filter_map(|id| self.client.scene().surface(id).map(|tree| (id.as_str(), tree))).collect();
@@ -635,11 +636,7 @@ impl App {
         if !self.surface_is_live(&surface_id) {
             return;
         }
-        let stale_text = self
-            .focused_text_field
-            .as_ref()
-            .filter(|field| field.id == id && !field.buffer.is_empty())
-            .and_then(|_| on_change.clone());
+        let opened = on_change.clone();
         eprintln!("[oblisk-renderer] {surface_id}'s `autofocus` textfield takes the keyboard");
         self.focus_text_field(Some(FocusedTextField {
             surface_id: surface_id.clone(),
@@ -651,7 +648,7 @@ impl App {
             on_cancel,
             on_navigate,
         }));
-        if let Some(on_change) = stale_text
+        if let Some(on_change) = opened
             && let Err(e) = on_change.call::<()>(String::new())
         {
             eprintln!("[oblisk-renderer] {surface_id}: on_change raised, ignoring it: {e}");
@@ -1054,7 +1051,25 @@ impl App {
         }
     }
 
-    fn sync_hover(&mut self, index: usize, position: Option<(f64, f64)>) {
+    /// Re-runs the hover writes at the pointer's last known position after a re-resolve, without
+    /// `on_hover` (ADR-0112 amendment). A `reveal` or a filter change moves rows under a pointer
+    /// that has not moved: the row that slid away must stop reading hovered and the one now under
+    /// the pointer must start, or a stale tint follows the old row off the viewport. No callback,
+    /// because nothing crossed anything -- the user did not move, the list did.
+    pub(super) fn refresh_hover_after_layout(&mut self) {
+        let Some((surface_id, position)) = self.pointer_at.clone() else {
+            return;
+        };
+        let Some(index) = self.surfaces.iter().position(|tracked| tracked.surface_id == surface_id) else {
+            return;
+        };
+        self.sync_hover(index, Some(position), false);
+    }
+
+    /// `fire` says whether a crossing this write reports also calls the node's `on_hover`: true
+    /// for a pointer that moved or left, false for an `Enter` with no motion and for a re-layout
+    /// under a still pointer, both cases where the tree changed and the user did nothing.
+    fn sync_hover(&mut self, index: usize, position: Option<(f64, f64)>, fire: bool) {
         // Before the tree is touched, because the tree is the expensive part: a config that never
         // called `hover(name)` has nothing to write and skips all of it.
         if !crate::lua::signal::any_hover_registered(self.client.lua()) {
@@ -1082,6 +1097,7 @@ impl App {
             // errors are logged and swallowed on `fire_on_click`'s terms -- a broken handler is a
             // config bug and must not take down a shell that is otherwise painting fine.
             if crossed
+                && fire
                 && let Some(on_hover) = &write.on_hover
                 && let Err(err) = on_hover.call::<()>(write.hovered)
             {
@@ -1363,14 +1379,22 @@ impl PointerHandler for App {
                 PointerEventKind::Leave { .. } => {
                     self.armed = None;
                     self.cursor_shown = None;
-                    self.sync_hover(index, None);
+                    self.pointer_at = None;
+                    self.sync_hover(index, None, true);
                 }
                 // A motion that leaves the armed rect deliberately does *not* disarm. Dragging back
                 // onto the button and releasing still clicks it, which is what every toolkit does.
                 // Both kinds carry a position and both update hover, because an `Enter` is the only
-                // event a pointer that appears already inside a surface sends.
+                // event a pointer that appears already inside a surface sends. Only `Motion` fires
+                // `on_hover` (ADR-0112 amendment): an `Enter` with no motion behind it is a surface
+                // that appeared under a resting pointer, which is the surface moving and not the
+                // user -- a launcher opened from a keybind must not hand its selection to whatever
+                // row the mouse happened to be parked over. A pointer that enters by actually
+                // moving sends a `Motion` a few milliseconds later, and that one fires.
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
-                    self.sync_hover(index, Some(event.position));
+                    let moved = matches!(event.kind, PointerEventKind::Motion { .. });
+                    self.pointer_at = Some((self.surfaces[index].surface_id.clone(), event.position));
+                    self.sync_hover(index, Some(event.position), moved);
                     self.sync_cursor(index, event.position);
                 }
                 // The wheel (ADR-0069). `Enter`/`Motion`/`Leave` above have already kept

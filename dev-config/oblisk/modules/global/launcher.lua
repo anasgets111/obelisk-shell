@@ -46,6 +46,9 @@ local WEB = " web"
 
 local query = state("launcher_query", "")
 local selected_id = state("launcher_selected", "")
+-- Plain locals, not state: what the field held a keystroke ago, for Escape's two stages below.
+local typed = ""
+local emptied_a_query = false
 
 local function entries_of(applications)
     return (applications and applications.entries) or {}
@@ -260,9 +263,9 @@ local function row_shell(id, slot, children, opts)
             return on and theme.ACCENT or "#00000000"
         end),
         -- The mirror arms hover-selection on pointer motion so a list scrolling under a still
-        -- pointer does not steal the ring from the keyboard. `on_hover` fires on the crossing,
-        -- which a wheel scroll also produces, so the ring can jump to the row that slid under the
-        -- pointer -- the cost of not having motion events, and small.
+        -- pointer, or opening under one, does not steal the ring from the keyboard. `on_hover`
+        -- fires only for a pointer that moved (ADR-0112 amendment), so the same holds here with no
+        -- arming flag: a row that slides under a parked mouse reads hovered and fires nothing.
         on_hover = function(inside)
             if inside then
                 selected_id:set(id)
@@ -354,11 +357,25 @@ local search = rect {
             font_size = theme.font.lg,
             foreground = theme.FG,
             on_change = function(text)
+                -- Escape empties the field before `on_cancel` runs, so this is where "was there
+                -- text" is remembered for it. The `autofocus` arm on open also lands here with
+                -- `""`, which is what resets the selection and the scroll every time it opens.
+                emptied_a_query = text == "" and typed ~= ""
+                typed = text
                 query:set(text)
                 select_first()
             end,
             on_submit = activate,
-            on_cancel = close,
+            -- `handleSearchKey`'s two-stage Escape: with text, clear it and stay; empty, close. The
+            -- engine has already cleared the field and let go of the keyboard by now; staying is
+            -- free because `autofocus` takes it straight back.
+            on_cancel = function()
+                if emptied_a_query then
+                    emptied_a_query = false
+                    return
+                end
+                close()
+            end,
             on_navigate = function(key)
                 if key == "up" or key == "backtab" then
                     move(-1)

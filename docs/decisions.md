@@ -5160,3 +5160,35 @@ one example for -- so the engine grew the primitives and the config then used th
    calculator and currency rows, since both end in "Enter to copy" and this engine has no
    clipboard; a result that can be read but not taken is half a feature. The web row is kept,
    `applications:open_url` being already there.
+
+**Amendment (same day), after checking the launcher against `AppLauncher.qml`'s pointer handling.**
+The mirror forwards every pointer motion to the launcher and lets hover move the selection only once
+a motion with a *different* position has arrived since the last open, keypress or query change
+(`hoverSelectionArmed`). Ours had no per-motion events by design (ADR-0062), and a live check showed
+the one case that mattered: opened from a keybind under a parked mouse, the row under the cursor took
+the ring before anything moved, because the compositor's pointer `Enter` on map was treated as a
+crossing. The same check found the launcher reopening on its old selection and scroll. Four changes:
+
+7. **`on_hover` fires for a pointer that moved, not for a tree that moved.** `sync_hover` takes a
+   `fire` flag: `Motion` and `Leave` fire, `Enter` does not, and neither does the new
+   `refresh_hover_after_layout`. An `Enter` with no motion behind it is a surface appearing under a
+   resting pointer; a pointer that enters by moving sends a `Motion` a few milliseconds later, and
+   that one fires. Hover *signals* still update on every one of them, so what is drawn as hovered is
+   always what is under the pointer. The notification stack's expiry hold stops arming when the popup
+   appears under a parked cursor, which is the right answer there too.
+
+8. **After a re-resolve, the hover signals are rewritten at the pointer's last position, silently.**
+   `App::pointer_at` remembers the surface and position from `Enter`/`Motion` and forgets on `Leave`;
+   `refresh_hover_after_layout` runs after each `re_resolve_if_dirty` that did work. A `reveal` or a
+   filter change slides rows under a still pointer, and without this the row that slid away kept its
+   tint off the viewport while the one now under the pointer had none. No callback, since nothing
+   crossed anything.
+
+9. **Every `autofocus` arm calls `on_change("")`,** not only when the field held text. It is the one
+   moment a config can call "the field just opened", and the launcher resets its selection and
+   scroll in it -- the mirror's `processInput("")` on `active`. A config-side reset had no other
+   hook: a launcher closed by a row click or the scrim never saw Escape's clear.
+
+10. **Two-stage Escape is the config's, and costs it two locals.** With text, Escape clears and
+    stays; empty, it closes. The engine already clears and lets go of the keyboard before
+    `on_cancel` runs, and the autofocus arm takes it straight back, so "stay" is free.

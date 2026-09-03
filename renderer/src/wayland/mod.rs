@@ -141,6 +141,11 @@ pub struct App {
     /// `None` between surfaces: `wp_cursor_shape_v1` wants the shape re-sent on every `enter`,
     /// so `Leave` clears this and the next `Enter` always sends.
     cursor_shown: Option<cursor_icon::CursorIcon>,
+    /// Where the pointer last was, and on which of this process's surfaces (ADR-0112 amendment):
+    /// set by `Enter` and `Motion`, cleared by `Leave`. What a re-resolve rewrites the hover signals
+    /// against, since a list that scrolled under a still pointer moved other rows under it and no
+    /// `Motion` is coming to say so.
+    pointer_at: Option<(String, (f64, f64))>,
     /// `wl_shm`, bound only so a compositor without `wp_cursor_shape_v1` can still be handed a
     /// cursor image from the XCursor theme. This process draws through EGL and puts nothing else
     /// in shared memory.
@@ -263,6 +268,7 @@ pub fn run(
         active_nonce: None,
         pointer: None,
         cursor_shown: None,
+        pointer_at: None,
         shm,
         keyboard: None,
         keyboard_focus: None,
@@ -446,6 +452,9 @@ pub fn run(
         let typed = std::mem::take(&mut app.field_input_changed);
         if re_resolved {
             app.apply_resolved_surface_state();
+            // The tree under the pointer may have moved without the pointer doing so: hover
+            // signals follow the layout, `on_hover` follows the pointer (ADR-0112 amendment).
+            app.refresh_hover_after_layout();
         }
         if re_resolved || typed {
             app.repaint_mapped_surfaces();
