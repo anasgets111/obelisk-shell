@@ -1,6 +1,7 @@
 mod capabilities;
 mod cli;
 mod compositor;
+mod control_client;
 mod generation;
 mod memory;
 mod pam_worker;
@@ -166,6 +167,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         cli::Command::Init { force } => setup::run(&shared::config_dir()?, force),
+        cli::Command::SetState(set) => control_client::send(set),
         cli::Command::Check => match setup::check(&shared::config_dir()?) {
             Ok(report) => {
                 print!("{report}");
@@ -359,6 +361,14 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                         ),
                     }
                 }
+                // ADR-0112: `oblisk set`/`oblisk toggle`, to whichever generation is on screen.
+                // The Renderer applies it or refuses it by name; this process only knows which
+                // generation is authoritative, which is the one thing the client cannot know.
+                RendererFrame::SetState(set) => send_frame_logged(
+                    &supervisor.registry,
+                    supervisor.authoritative.generation_id,
+                    &SupervisorFrame::SetState(set),
+                ),
                 // ADR-0041 decision 4: a wl_output appeared or disappeared.
                 RendererFrame::RequestReload => supervisor.begin_reload(),
                 RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence }) => {

@@ -177,9 +177,14 @@ async fn handle_connection(
     let generation_id = handshake.generation_id;
 
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let token = registry.register(generation_id, outbound_tx);
+    // A control client (ADR-0112) is a peer with no generation behind it: nothing is ever pushed
+    // to it, so it gets no registry entry and no snapshot replay. Its frames still flow inbound.
+    let control_client = generation_id == shared::CONTROL_CLIENT_GENERATION;
+    let token = (!control_client).then(|| registry.register(generation_id, outbound_tx));
     // Best-effort: a dropped receiver (mid-shutdown) just means no snapshot replay is needed.
-    let _ = connected_tx.send(generation_id);
+    if !control_client {
+        let _ = connected_tx.send(generation_id);
+    }
 
     let writer = tokio::spawn(async move {
         while let Some(payload) = outbound_rx.recv().await {
@@ -204,7 +209,9 @@ async fn handle_connection(
         }
     }
 
-    registry.unregister(generation_id, token);
+    if let Some(token) = token {
+        registry.unregister(generation_id, token);
+    }
     writer.abort();
     Ok(())
 }

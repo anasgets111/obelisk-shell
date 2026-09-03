@@ -126,6 +126,7 @@ struct PointerHit {
 /// What the innermost `textfield` under a press turns out to be (ADR-0092). The two kinds share
 /// the node kind and nothing else: one addresses a capability action and never lets its bytes near
 /// Lua (ADR-0005), the other hands every edit straight to a Lua callback.
+#[derive(Debug)]
 enum FieldTarget {
     Masked(node::SecureSubmitTarget),
     Plain {
@@ -135,6 +136,7 @@ enum FieldTarget {
         on_change: Option<Function>,
         on_submit: Option<Function>,
         on_cancel: Option<Function>,
+        on_navigate: Option<Function>,
     },
 }
 /// What the innermost `textfield` in a hit path is, if the press landed on one at all (ADR-0050
@@ -170,7 +172,33 @@ fn focused_field(path: &[&layout::ResolvedNode]) -> Option<FieldTarget> {
     if on_change.is_none() && on_submit.is_none() {
         return None;
     }
-    Some(FieldTarget::Plain { id: field.id, on_change, on_submit, on_cancel: function("on_cancel") })
+    Some(FieldTarget::Plain {
+        id: field.id,
+        on_change,
+        on_submit,
+        on_cancel: function("on_cancel"),
+        on_navigate: function("on_navigate"),
+    })
+}
+/// The plain field a keyboard-focus scope declares `autofocus = true` on, with the surface that
+/// declares it (ADR-0112). First in document order when several do: unlike two `secure_submit`
+/// fields, two search boxes on one surface is a config mistake and not a routing question, so a
+/// deterministic pick beats refusing both. A field that [`focused_field`] would not focus -- masked,
+/// or declaring no callback -- is skipped, since it could not take the keys anyway.
+fn autofocus_field_in_scope(scope: &[(&str, &layout::ResolvedNode)]) -> Option<(String, FieldTarget)> {
+    for (surface_id, tree) in scope {
+        let mut stack = vec![*tree];
+        while let Some(node) = stack.pop() {
+            if node.kind == "textfield"
+                && matches!(node.properties.get("autofocus"), Some(Value::Boolean(true)))
+                && let Some(target @ FieldTarget::Plain { .. }) = focused_field(&[node])
+            {
+                return Some((surface_id.to_string(), target));
+            }
+            stack.extend(node.children.iter().rev());
+        }
+    }
+    None
 }
 /// The focused plain `textfield`: where it lives, what has been typed into it, and who to tell
 /// (ADR-0092). The buffer is an ordinary `String` and deliberately so -- this is the half of § 5.2
@@ -193,6 +221,7 @@ pub(super) struct FocusedTextField {
     on_change: Option<Function>,
     on_submit: Option<Function>,
     on_cancel: Option<Function>,
+    on_navigate: Option<Function>,
 }
 
 /// What one key did to a plain field's buffer, before any callback runs (ADR-0092, ADR-0102).
@@ -205,6 +234,13 @@ struct PlainEdit {
     submitted: bool,
     /// Escape on a field that declared `on_cancel`: focus is dropped and `on_cancel` fires.
     cancelled: bool,
+    /// An arrow, Tab or paging key: the buffer is untouched and `on_navigate` hears the name.
+    navigated: Option<&'static str>,
+}
+
+impl PlainEdit {
+    /// The edit a key makes when it makes none, so [`App::apply_plain_key`] can return early.
+    const NONE: PlainEdit = PlainEdit { changed: false, submitted: false, cancelled: false, navigated: None };
 }
 
 /// Applies `action` to `buffer`. Escape clears the buffer either way; whether it also gives the
@@ -216,16 +252,17 @@ fn edit_plain_buffer(buffer: &mut String, action: KeyAction<'_>, cancels: bool) 
     match action {
         KeyAction::Append(text) => {
             buffer.push_str(text);
-            PlainEdit { changed: true, submitted: false, cancelled: false }
+            PlainEdit { changed: true, ..PlainEdit::NONE }
         }
-        KeyAction::Backspace => PlainEdit { changed: buffer.pop().is_some(), submitted: false, cancelled: false },
+        KeyAction::Backspace => PlainEdit { changed: buffer.pop().is_some(), ..PlainEdit::NONE },
         KeyAction::Clear => {
             let had = !buffer.is_empty();
             buffer.clear();
-            PlainEdit { changed: had, submitted: false, cancelled: cancels }
+            PlainEdit { changed: had, cancelled: cancels, ..PlainEdit::NONE }
         }
-        KeyAction::Submit => PlainEdit { changed: true, submitted: true, cancelled: false },
-        KeyAction::Ignore => PlainEdit { changed: false, submitted: false, cancelled: false },
+        KeyAction::Submit => PlainEdit { changed: true, submitted: true, ..PlainEdit::NONE },
+        KeyAction::Navigate(key) => PlainEdit { navigated: Some(key), ..PlainEdit::NONE },
+        KeyAction::Ignore => PlainEdit::NONE,
     }
 }
 /// The frame a completed `wp-text-input-v3` submit produces, or `None` when no focused `textfield`
@@ -328,6 +365,9 @@ enum KeyAction<'a> {
     /// Escape: throw the whole entry away and stay in the field.
     Clear,
     Submit,
+    /// A key that moves through whatever the field is searching rather than editing its text
+    /// (ADR-0112): the name a plain field's `on_navigate` receives. Nothing to a masked field.
+    Navigate(&'static str),
     Ignore,
 }
 /// One `wl_keyboard` key, as an edit to a focused `secure_submit` buffer. The keyboard, not
@@ -363,6 +403,14 @@ fn key_action<'a>(event: &'a KeyEvent, repeat: bool) -> KeyAction<'a> {
         // A wrong attempt is counted by PAM, so Backspace-per-character to abandon a mistyped
         // password would be costly. Every other password prompt clears on Escape; so does this one.
         Keysym::Escape => KeyAction::Clear,
+        // The keys a single-line field has no edit for. Before the `utf8` arm, since xkbcommon
+        // hands Tab back as `"\t"` and that arm would otherwise drop it as a control character.
+        Keysym::Up | Keysym::KP_Up => KeyAction::Navigate("up"),
+        Keysym::Down | Keysym::KP_Down => KeyAction::Navigate("down"),
+        Keysym::Page_Up | Keysym::KP_Page_Up => KeyAction::Navigate("page_up"),
+        Keysym::Page_Down | Keysym::KP_Page_Down => KeyAction::Navigate("page_down"),
+        Keysym::Tab | Keysym::KP_Tab => KeyAction::Navigate("tab"),
+        Keysym::ISO_Left_Tab => KeyAction::Navigate("backtab"),
         _ => match event.utf8.as_deref() {
             Some(text) if !text.is_empty() && !text.chars().any(char::is_control) => KeyAction::Append(text),
             _ => KeyAction::Ignore,
@@ -562,6 +610,86 @@ impl App {
         self.focus_secure_submit(Some(field));
     }
 
+    /// Gives the keys to the scope's `autofocus` field, fresh (ADR-0112).
+    ///
+    /// Fresh means an empty buffer, whatever draft the same field held before: a launcher that
+    /// reopened showing the last search would be a launcher whose first keystroke appends to a
+    /// word the user has forgotten. ADR-0108's draft-keeping is for a field the user *left* and
+    /// comes back to by hand; this is a field the engine hands over unasked, and it hands it over
+    /// empty. The config hears about the emptying through `on_change("")` when there was text,
+    /// so a `state` bound to the field does not keep saying "fire" over an empty box.
+    fn arm_autofocus_field(&mut self, scope: &[String]) {
+        let trees: Vec<(&str, layout::ResolvedNode)> =
+            scope.iter().filter_map(|id| self.client.scene().surface(id).map(|tree| (id.as_str(), tree))).collect();
+        let borrowed: Vec<(&str, &layout::ResolvedNode)> = trees.iter().map(|(id, tree)| (*id, tree)).collect();
+        let Some((surface_id, FieldTarget::Plain { id, on_change, on_submit, on_cancel, on_navigate })) =
+            autofocus_field_in_scope(&borrowed)
+        else {
+            return;
+        };
+        drop(trees);
+        // The surface has to exist as a `wl_surface`, the second clause [`focus_is_still_armed`]
+        // asks: a closed launcher keeps its tree in the scene and, with no `leave` owed for a
+        // destroyed surface, keeps the keyboard focus id too. Without this, every turn would arm
+        // a field on a surface that is gone and the next prune would drop it as gone, forever.
+        if !self.surface_is_live(&surface_id) {
+            return;
+        }
+        let stale_text = self
+            .focused_text_field
+            .as_ref()
+            .filter(|field| field.id == id && !field.buffer.is_empty())
+            .and_then(|_| on_change.clone());
+        eprintln!("[oblisk-renderer] {surface_id}'s `autofocus` textfield takes the keyboard");
+        self.focus_text_field(Some(FocusedTextField {
+            surface_id: surface_id.clone(),
+            id,
+            buffer: String::new(),
+            typing: true,
+            on_change,
+            on_submit,
+            on_cancel,
+            on_navigate,
+        }));
+        if let Some(on_change) = stale_text
+            && let Err(e) = on_change.call::<()>(String::new())
+        {
+            eprintln!("[oblisk-renderer] {surface_id}: on_change raised, ignoring it: {e}");
+        }
+    }
+
+    /// [`App::arm_secure_focus_if_the_scope_now_declares_one`]'s plain counterpart, for the same
+    /// moment: the trees changed under a keyboard focus that already arrived, so no `enter` is
+    /// coming to arm the `autofocus` field that just appeared (ADR-0112).
+    ///
+    /// Not while a field is typing, and not to re-arm the very field a press elsewhere on this
+    /// surface just stopped: that press was the user's answer, and a re-resolve on the next hover
+    /// must not overrule it. A *different* autofocus field appearing is new information, and takes
+    /// the keys. The masked rule wins outright, as it does on `enter`.
+    pub(super) fn arm_autofocus_if_nothing_is_typing(&mut self) {
+        if self.focused_secure_submit.is_some() || self.keyboard_focus.is_none() {
+            return;
+        }
+        self.prune_text_field_focus();
+        let scope = self.keyboard_focus_scope();
+        if let Some(field) = self.focused_text_field.as_ref() {
+            if field.typing {
+                return;
+            }
+            let trees: Vec<(&str, layout::ResolvedNode)> =
+                scope.iter().filter_map(|id| self.client.scene().surface(id).map(|tree| (id.as_str(), tree))).collect();
+            let borrowed: Vec<(&str, &layout::ResolvedNode)> = trees.iter().map(|(id, tree)| (*id, tree)).collect();
+            let same_field = matches!(
+                autofocus_field_in_scope(&borrowed),
+                Some((_, FieldTarget::Plain { id, .. })) if id == field.id
+            );
+            if same_field {
+                return;
+            }
+        }
+        self.arm_autofocus_field(&scope);
+    }
+
     /// Drops the focused field, and the half-typed secret with it, the moment
     /// [`focus_is_still_armed`] stops holding, through [`App::focus_secure_submit`] so the scrub is
     /// the same one every other transition gets. Called before every keystroke, so the rule is
@@ -653,7 +781,8 @@ impl App {
                 self.focus_secure_submit(field);
             }
             KeyAction::Submit => self.finish_secure_submit(),
-            KeyAction::Ignore => {}
+            // A password prompt has nothing to move through.
+            KeyAction::Navigate(_) | KeyAction::Ignore => {}
         }
     }
 
@@ -739,21 +868,32 @@ impl App {
             return;
         };
         let edit = edit_plain_buffer(&mut field.buffer, key_action(event, repeat), field.on_cancel.is_some());
-        if edit == (PlainEdit { changed: false, submitted: false, cancelled: false }) {
+        if edit == PlainEdit::NONE {
             return;
         }
         // Cloned out before any callback runs: a handler is free to write a signal that
         // re-resolves the scene, and holding a `&mut` into `self` across that is not on offer.
-        let (text, on_change, on_submit, on_cancel, surface_id) = {
+        let (text, on_change, on_submit, on_cancel, on_navigate, surface_id) = {
             let field = self.focused_text_field.as_ref().expect("the focus was Some a moment ago");
             (
                 field.buffer.clone(),
                 field.on_change.clone(),
                 field.on_submit.clone(),
                 field.on_cancel.clone(),
+                field.on_navigate.clone(),
                 field.surface_id.clone(),
             )
         };
+        // Nothing on the glass moved, so no repaint: a navigation key leaves the text and the
+        // caret where they were, and the handler is the whole of its effect.
+        if let Some(key) = edit.navigated {
+            if let Some(on_navigate) = on_navigate
+                && let Err(e) = on_navigate.call::<()>(key)
+            {
+                eprintln!("[oblisk-renderer] {surface_id}: on_navigate raised, ignoring it: {e}");
+            }
+            return;
+        }
         if edit.submitted {
             // Emptied before the call, not after: `on_submit` may open a popup or write a signal,
             // and the field it comes back to must be the empty one, not the text it just consumed.
@@ -1133,7 +1273,7 @@ impl PointerHandler for App {
                         // The same field pressed again keeps what was typed into it (ADR-0108):
                         // the press is how typing resumes after a press elsewhere, and a reply
                         // that emptied itself on every click back into it would be no reply box.
-                        Some(FieldTarget::Plain { id, on_change, on_submit, on_cancel }) => {
+                        Some(FieldTarget::Plain { id, on_change, on_submit, on_cancel, on_navigate }) => {
                             let buffer = self
                                 .focused_text_field
                                 .as_ref()
@@ -1150,6 +1290,7 @@ impl PointerHandler for App {
                                     on_change,
                                     on_submit,
                                     on_cancel,
+                                    on_navigate,
                                 }),
                             )
                         }
@@ -1298,7 +1439,16 @@ impl KeyboardHandler for App {
         // Unconditional: a case that arms nothing must still disarm, or `apply_secure_key` would
         // keep appending keystrokes to the previous surface's field and submitting to its
         // capability.
+        let secure_armed = next.is_some();
         self.focus_secure_submit(next);
+        // ADR-0112: with no masked field taking the keys and no plain field already typing where
+        // they land, the scope's `autofocus` field does. A field left typing keeps them, draft and
+        // all: under focus-follows-mouse this `enter` fires every time the pointer wanders back.
+        let typing_here =
+            self.focused_text_field.as_ref().is_some_and(|field| field.typing && scope.contains(&field.surface_id));
+        if !secure_armed && !typing_here {
+            self.arm_autofocus_field(&scope);
+        }
     }
 
     fn leave(
@@ -1670,8 +1820,9 @@ mod tests {
         let field = plain_textfield(&lua);
         let root = hit_node(&lua, "panel", (0.0, 0.0, 100.0, 32.0), false);
         match focused_field(&[&root, &field]) {
-            Some(FieldTarget::Plain { id, on_change, on_submit, on_cancel }) => {
+            Some(FieldTarget::Plain { id, on_change, on_submit, on_cancel, on_navigate }) => {
                 assert_eq!(id, field.id, "the field's own node, not the root it was reached through");
+                assert!(on_navigate.is_none());
                 assert!(on_change.is_none());
                 assert!(on_submit.is_some());
                 assert!(on_cancel.is_none());
@@ -1957,9 +2108,11 @@ mod tests {
     fn a_control_key_never_becomes_a_character_of_the_password() {
         // `utf8` is not empty for Escape, Tab or Return -- xkbcommon hands back the C0 control
         // character for each -- so an unfiltered append would silently put an ESC byte in the
-        // middle of a secret that PAM then rejects with no visible reason.
-        assert_eq!(key_action(&key(Keysym::Tab, Some("\t")), false), KeyAction::Ignore);
+        // middle of a secret that PAM then rejects with no visible reason. Tab is a navigation
+        // key now (ADR-0112); what matters here is that it is still not an `Append`.
+        assert_eq!(key_action(&key(Keysym::Tab, Some("\t")), false), KeyAction::Navigate("tab"));
         assert_eq!(key_action(&key(Keysym::Shift_L, None), false), KeyAction::Ignore);
+        assert_eq!(key_action(&key(Keysym::Control_L, Some("\u{1b}")), false), KeyAction::Ignore);
     }
 
     #[test]
@@ -1992,7 +2145,7 @@ mod tests {
     fn escape_on_a_plain_field_without_on_cancel_clears_and_keeps_the_focus() {
         let mut buffer = "on my wa".to_string();
         let edit = edit_plain_buffer(&mut buffer, KeyAction::Clear, false);
-        assert_eq!(edit, PlainEdit { changed: true, submitted: false, cancelled: false });
+        assert_eq!(edit, PlainEdit { changed: true, submitted: false, cancelled: false, navigated: None });
         assert!(buffer.is_empty());
     }
 
@@ -2000,7 +2153,7 @@ mod tests {
     fn escape_on_a_plain_field_with_on_cancel_clears_and_gives_the_field_up() {
         let mut buffer = "on my wa".to_string();
         let edit = edit_plain_buffer(&mut buffer, KeyAction::Clear, true);
-        assert_eq!(edit, PlainEdit { changed: true, submitted: false, cancelled: true });
+        assert_eq!(edit, PlainEdit { changed: true, submitted: false, cancelled: true, navigated: None });
         assert!(buffer.is_empty());
     }
 
@@ -2010,9 +2163,13 @@ mod tests {
     fn escape_on_an_empty_field_cancels_without_reporting_a_change() {
         let mut buffer = String::new();
         let edit = edit_plain_buffer(&mut buffer, KeyAction::Clear, true);
-        assert_eq!(edit, PlainEdit { changed: false, submitted: false, cancelled: true });
+        assert_eq!(edit, PlainEdit { changed: false, submitted: false, cancelled: true, navigated: None });
         let edit = edit_plain_buffer(&mut buffer, KeyAction::Clear, false);
-        assert_eq!(edit, PlainEdit { changed: false, submitted: false, cancelled: false }, "nothing at all to do");
+        assert_eq!(
+            edit,
+            PlainEdit { changed: false, submitted: false, cancelled: false, navigated: None },
+            "nothing at all to do"
+        );
     }
 
     #[test]
@@ -2020,11 +2177,11 @@ mod tests {
         let mut buffer = String::new();
         assert_eq!(
             edit_plain_buffer(&mut buffer, KeyAction::Append("a"), true),
-            PlainEdit { changed: true, submitted: false, cancelled: false }
+            PlainEdit { changed: true, submitted: false, cancelled: false, navigated: None }
         );
         assert_eq!(
             edit_plain_buffer(&mut buffer, KeyAction::Submit, true),
-            PlainEdit { changed: true, submitted: true, cancelled: false }
+            PlainEdit { changed: true, submitted: true, cancelled: false, navigated: None }
         );
         assert_eq!(buffer, "a", "the caller empties the buffer after the submit, not this");
     }
@@ -2037,6 +2194,56 @@ mod tests {
         assert_eq!(key_action(&key(Keysym::Return, Some("\r")), true), KeyAction::Ignore);
         assert_eq!(key_action(&key(Keysym::BackSpace, Some("\u{8}")), true), KeyAction::Backspace);
         assert_eq!(key_action(&key(Keysym::a, Some("a")), true), KeyAction::Append("a"));
+    }
+
+    /// ADR-0112: the keys a single-line field cannot edit with reach the config by name. Tab is the
+    /// one that has to be checked, since xkbcommon hands it back as `"\t"` and the `utf8` arm
+    /// below it would drop that as a control character.
+    #[test]
+    fn arrow_paging_and_tab_keys_navigate_instead_of_editing() {
+        assert_eq!(key_action(&key(Keysym::Up, None), false), KeyAction::Navigate("up"));
+        assert_eq!(key_action(&key(Keysym::Down, None), true), KeyAction::Navigate("down"), "held Down keeps moving");
+        assert_eq!(key_action(&key(Keysym::Page_Down, None), false), KeyAction::Navigate("page_down"));
+        assert_eq!(key_action(&key(Keysym::Tab, Some("\t")), false), KeyAction::Navigate("tab"));
+        assert_eq!(key_action(&key(Keysym::ISO_Left_Tab, None), false), KeyAction::Navigate("backtab"));
+
+        let mut buffer = "fire".to_string();
+        let edit = edit_plain_buffer(&mut buffer, KeyAction::Navigate("down"), true);
+        assert_eq!(edit, PlainEdit { navigated: Some("down"), ..PlainEdit::NONE });
+        assert_eq!(buffer, "fire", "moving through the results is not an edit");
+    }
+
+    fn autofocus_textfield(lua: &Lua) -> layout::ResolvedNode {
+        let mut node = plain_textfield(lua);
+        node.properties.insert("autofocus".to_string(), Value::Boolean(true));
+        node
+    }
+
+    /// ADR-0112: the field the keyboard is handed to unasked. Only a plain field that could take
+    /// keys qualifies, and with two the first in document order does, since two search boxes on one
+    /// surface is a mistake to pick through rather than a secret to refuse routing.
+    #[test]
+    fn the_first_plain_autofocus_field_in_the_scope_is_the_one_armed() {
+        let lua = Lua::new();
+        let first = autofocus_textfield(&lua);
+        let second = autofocus_textfield(&lua);
+        let (first_id, second_id) = (first.id, second.id);
+        let tree = tree_with(&lua, vec![plain_textfield(&lua), first, second]);
+        match autofocus_field_in_scope(&[("launcher@eDP-1", &tree)]) {
+            Some((surface, FieldTarget::Plain { id, .. })) => {
+                assert_eq!(surface, "launcher@eDP-1");
+                assert_eq!(id, first_id, "document order, not {second_id:?}");
+            }
+            other => panic!("expected the first autofocus field, got {other:?}"),
+        }
+
+        // Masked, or declaring nothing that could read the keys: not candidates, whatever they say.
+        let mut masked = textfield(&lua, Some(secure_submit_table(&lua, "lock", "authenticate")));
+        masked.properties.insert("autofocus".to_string(), Value::Boolean(true));
+        let mut mute = textfield(&lua, None);
+        mute.properties.insert("autofocus".to_string(), Value::Boolean(true));
+        let none = tree_with(&lua, vec![masked, mute, plain_textfield(&lua)]);
+        assert!(autofocus_field_in_scope(&[("launcher@eDP-1", &none)]).is_none());
     }
 
     #[test]

@@ -1085,6 +1085,11 @@ fn finish(
                 extent_along(&children, MainAxis::Vertical, style.spacing),
             ),
         };
+        let padding_start = match axis {
+            MainAxis::Horizontal => padding.left,
+            MainAxis::Vertical => padding.top,
+        };
+        reveal_child(&properties, &children, axis, padding_start, content_main);
         let offset = scroll_offset(&properties, content_main, total_main);
         if offset != 0.0 {
             for child in &mut children {
@@ -1238,6 +1243,46 @@ fn scroll_signal(properties: &HashMap<String, Value>) -> Option<crate::lua::sign
         return None;
     };
     crate::lua::signal::from_userdata(ud)
+}
+
+/// Honours a pending `signal:reveal(index)` on this container's scroll signal (ADR-0112): moves the
+/// asked offset the least distance that puts the `index`-th visible child's border box inside the
+/// viewport, or leaves it alone when the child is already in view. Written quietly, ahead of
+/// [`scroll_offset`], which then clamps it like any wheel ask -- so a reveal past the end lands on
+/// the end, and a reveal of a child that does not exist changes nothing. Children are still at
+/// their unscrolled positions here, which is what makes `rect` minus the leading padding the
+/// child's place in the content.
+fn reveal_child(
+    properties: &HashMap<String, Value>,
+    children: &[RetainedNode],
+    axis: MainAxis,
+    padding_start: f32,
+    content_main: f32,
+) {
+    let Some(signal) = scroll_signal(properties) else {
+        return;
+    };
+    let Some(index) = signal.take_reveal() else {
+        return;
+    };
+    let Some(child) = children.iter().filter(|c| c.style.visible).nth(index - 1) else {
+        return;
+    };
+    let (start, extent) = match axis {
+        MainAxis::Horizontal => (child.rect.x - padding_start, child.rect.width),
+        MainAxis::Vertical => (child.rect.y - padding_start, child.rect.height),
+    };
+    let asked = signal.scroll_offset().unwrap_or(0.0);
+    let wanted = if start < asked {
+        start
+    } else if start + extent > asked + content_main {
+        start + extent - content_main
+    } else {
+        return;
+    };
+    if let Some(handle) = signal.scroll_handle() {
+        handle.set_quiet(Value::Number(f64::from(wanted)));
+    }
 }
 
 /// How far this container is scrolled along its main axis, clamped to what there is to scroll, and
@@ -2189,6 +2234,45 @@ pub(super) mod tests {
     const SCROLLED_COLUMN: &str = r#"panel { id = "bar", child = column { width = 100, height = 100, scroll = scroll("s"), children = {
         rect { width = 10, height = 100 }, rect { width = 10, height = 100 }, rect { width = 10, height = 100 },
     } } }"#;
+
+    fn revealed(index: usize, offset: f32) -> (Vec<f32>, f32) {
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua.load(SCROLLED_COLUMN).eval().unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+        let signal: mlua::AnyUserData = lua.load(r#"return scroll("s")"#).eval().unwrap();
+        let signal = crate::lua::signal::from_userdata(&signal).unwrap();
+        signal.scroll_handle().unwrap().set_changed(mlua::Value::Number(f64::from(offset)));
+        assert!(signal.request_reveal(index));
+
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap();
+        let container = &scene.surface("bar@TEST").unwrap().children[0];
+        let ys = container.children.iter().map(|c| c.rect.y).collect();
+        assert!(signal.take_reveal().is_none(), "the pass consumed the ask");
+        (ys, signal.scroll_offset().unwrap())
+    }
+
+    /// ADR-0112: `signal:reveal(index)` moves the least distance that shows the child, and only
+    /// when it is out of view -- so a keyboard selection walking down a list scrolls it a row at a
+    /// time and a selection already on screen leaves the wheel's offset alone.
+    #[test]
+    fn a_reveal_scrolls_the_least_distance_that_shows_the_child() {
+        let (ys, used) = revealed(3, 0.0);
+        assert_eq!(used, 200.0, "the third 100px child in a 100px viewport: its bottom lands on the viewport's");
+        assert_eq!(ys, vec![-200.0, -100.0, 0.0]);
+
+        let (_, used) = revealed(1, 150.0);
+        assert_eq!(used, 0.0, "revealing upward puts the child's top at the viewport's top");
+
+        let (_, used) = revealed(2, 100.0);
+        assert_eq!(used, 100.0, "a child already in view moves nothing");
+
+        let (_, used) = revealed(9, 20.0);
+        assert_eq!(used, 20.0, "a child that does not exist reveals nothing");
+    }
 
     #[test]
     fn a_scroll_offset_moves_children_up_within_the_viewport() {

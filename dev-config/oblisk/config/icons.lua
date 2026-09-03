@@ -25,6 +25,7 @@ icons.shutdown    = "\u{23FB}"  -- IEC 5009 power symbol, not a Nerd Font glyph 
 icons.lock        = "\u{F033E}"
 icons.settings    = "\u{F0493}"
 icons.launcher    = "\u{F035C}"
+icons.web         = "\u{F059F}"  -- nf-md-web, the launcher's "open this as a link / search the web" row
 icons.wallpaper   = "\u{F02E9}"
 
 -- Updates, in the order `ArchChecker.qml` tests them.

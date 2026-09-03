@@ -465,6 +465,7 @@ pub fn run(
         // Its opposite, and also once a turn: a `secure_submit` field that became visible under a
         // keyboard focus that had already arrived gets no `enter` of its own to arm it.
         app.arm_secure_focus_if_the_scope_now_declares_one();
+        app.arm_autofocus_if_nothing_is_typing();
         for nonce in draw_nonces {
             app.activate_draw(nonce);
             if app.exit {

@@ -28,6 +28,11 @@ pub struct AppSummary {
     /// entry with no `Icon=` at all, so a config can tell "no icon" from an icon that failed to
     /// resolve.
     pub icon: Option<String>,
+    /// The unlocalized `Comment=`: the one-line description a launcher draws under the name and
+    /// matches a search against, `"Web Browser"` under `Firefox` (ADR-0112). `None` for an entry
+    /// with none, which is common, so a config hides the line rather than drawing an empty one.
+    /// Localized the way `name` is not, and for the same reason.
+    pub comment: Option<String>,
 }
 
 /// What `launch` needs and Lua never sees.
@@ -118,7 +123,12 @@ pub fn scan(dirs: &[PathBuf]) -> ScanResult {
             };
             launch.insert(id.clone(), LaunchTarget { command, args, terminal: flag(&group, "Terminal") });
             wm_classes.push((id.clone(), group.get("StartupWMClass").cloned()));
-            entries.push(AppSummary { id, name: name.clone(), icon: group.get("Icon").cloned() });
+            entries.push(AppSummary {
+                id,
+                name: name.clone(),
+                icon: group.get("Icon").cloned(),
+                comment: group.get("Comment").cloned(),
+            });
         }
     }
 

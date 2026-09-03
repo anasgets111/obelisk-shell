@@ -87,11 +87,13 @@ const NODE_PROPERTIES: &[(&str, &[&str])] = &[
     (
         "textfield",
         &[
+            "autofocus",
             "font_size",
             "foreground",
             "mask_character",
             "on_cancel",
             "on_change",
+            "on_navigate",
             "on_submit",
             "placeholder",
             "secure_submit",
@@ -584,7 +586,7 @@ mod meta_stub_tests {
             unsampled.len(),
             unsampled.join("\n")
         );
-        assert_eq!(probed, 533, "the number of declared type members moved; confirm the change is intended");
+        assert_eq!(probed, 535, "the number of declared type members moved; confirm the change is intended");
     }
 
     /// One Lua literal per declared type. `None` means "no sample", which skips rather than guesses.

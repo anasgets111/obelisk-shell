@@ -126,6 +126,35 @@ pub struct ConnectionHandshake {
     pub generation_id: u32,
 }
 
+/// The `generation_id` a control client -- `oblisk set`, `oblisk toggle` -- hands over in its
+/// [`ConnectionHandshake`] (ADR-0112). Not a generation: the Supervisor registers no outbound
+/// channel for it and replays no snapshots to it, since the peer sends one frame and hangs up.
+/// `u32::MAX` because generations count up from zero and a real one will never reach it.
+pub const CONTROL_CLIENT_GENERATION: u32 = u32::MAX;
+
+/// A write to one of the config's `state(name, initial)` signals from outside the shell (ADR-0112):
+/// what `oblisk set launcher_open true` becomes on the wire. Sent by a control client to the
+/// Supervisor as a [`RendererFrame`], forwarded to the authoritative generation as a
+/// [`SupervisorFrame`], and applied there exactly as the config's own `signal:set()` would be --
+/// marshal-checked, refused by name when no such state is declared. The one door a compositor
+/// keybind has into a running config, and deliberately no wider than the config's own write path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetState {
+    /// The `name` the config passed to `state(name, initial)`.
+    pub name: String,
+    pub write: StateWrite,
+}
+
+/// What a [`SetState`] does to the signal it names.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum StateWrite {
+    /// Store this value. Converted to a Lua value the way a capability payload is.
+    Set(serde_json::Value),
+    /// Flip a boolean. Refused on any other value, since a keybind cannot know the current one
+    /// and "toggle" means nothing else.
+    Toggle,
+}
+
 /// Supervisor -> Renderer: re-evaluate `shell.lua` now. `sequence` is echoed back on every
 /// response so a superseded round trip (a second file-change event before the first completes)
 /// can be told apart from the current one.
@@ -308,6 +337,9 @@ pub enum SupervisorFrame {
     ProcessExited(ProcessExited),
     IdleEvent(IdleEvent),
     SetSessionLock(SetSessionLock),
+    /// A control client's write to a `state` signal, forwarded to the authoritative generation
+    /// (ADR-0112).
+    SetState(SetState),
 }
 
 /// Every frame a Renderer connection can send to the Supervisor, tagged like [`SupervisorFrame`].
@@ -322,6 +354,11 @@ pub enum RendererFrame {
     PresentationEvidence(PresentationEvidence),
     SecureSubmit(SecureSubmit),
     LockReport(LockReport),
+    /// Not from a Renderer: `oblisk set`/`oblisk toggle` connects as
+    /// [`CONTROL_CLIENT_GENERATION`] and sends this one frame (ADR-0112). In this enum because the
+    /// listener decodes every peer's frames as one type, and a second peer type for one variant
+    /// would be a second decoder.
+    SetState(SetState),
     /// Asks the Supervisor to *start* a reload cycle: bump the sequence it owns and send the
     /// [`ReevaluateRequest`] carrying it (ADR-0041 decision 4). Carries no sequence itself: only
     /// the Supervisor holds `next_sequence`, and `is_current_reload` (`supervisor/src/main.rs`)

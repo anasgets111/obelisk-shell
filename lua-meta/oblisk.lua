@@ -71,6 +71,7 @@
 ---the argv never crosses into Lua, because `applications:launch(id)` is what runs it and a
 ---config that could rewrite a command line before it ran would be a config that could be made
 ---to run something else.
+---@field comment? string The unlocalized `Comment=`: the one-line description a launcher draws under the name and matches a search against, `"Web Browser"` under `Firefox` (ADR-0112). `None` for an entry with none, which is common, so a config hides the line rather than drawing an empty one. Localized the way `name` is not, and for the same reason.
 ---@field icon? string The `Icon=` key as written: a theme name, or an absolute path. `icon { name = ... }` takes either, which is exactly what ADR-0054 decision 2 built it for. `None` for an entry with no `Icon=` at all, so a config can tell "no icon" from an icon that failed to resolve.
 ---@field id string The desktop file id (`org.telegram.desktop`), and `launch`'s one argument.
 ---@field name string The unlocalized `Name=`. `Name[xx]` is deliberately not read (ADR-0061), so this is English on a localized system.

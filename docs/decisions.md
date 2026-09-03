@@ -5085,3 +5085,78 @@ that margin as its width.
    what it was told to build; the layout that is wrong in a session is the one it was not told
    about -- here the anchor, the output's scale, and a feed the Supervisor had by then. Reading the
    live answer took one relaunch; guessing at it took an hour.
+
+## 0112. A launcher's four missing primitives: `autofocus`, `on_navigate`, `scroll:reveal`, and `oblisk set`
+
+`modules/global/launcher.lua` was a scrolling list of every application, opened from one bar
+button. Against `Modules/Global/AppLauncher.qml` it lacked the half that makes a launcher: a
+search box that is typable the instant it opens, arrow keys that walk the results, a list that
+follows the selection, a subtitle under each name, and a way for a compositor keybind to open it.
+Each of those was blocked in the engine, not in the config, and this is a framework the config is
+one example for -- so the engine grew the primitives and the config then used them.
+
+1. **`textfield.autofocus = true` takes the keyboard without a press, and takes it empty.**
+   ADR-0092 decision 3 declined an arm-on-`enter` for plain fields because the notification card
+   has several and the sole-field rule cannot pick one. A property says which. It arms on
+   `KeyboardHandler::enter` when no masked field armed and no plain field is already typing in the
+   scope, and again from the once-a-turn hook beside `arm_secure_focus_if_the_scope_now_declares_one`
+   when the tree changed under a focus already held -- but never to re-take the very field a press
+   elsewhere just stopped, since that press was the answer. It arms only on a surface that is still
+   a live `wl_surface`: a closed launcher keeps its tree and, with no `leave` owed for a destroyed
+   surface, its focus id, and without the check every turn armed and the next prune dropped.
+   *Empty* is a deliberate exception to ADR-0108's draft-keeping: that rule is for a field the
+   user left and returns to by hand; a field the engine hands over unasked must not open on last
+   week's word. `on_change("")` fires when there was text, so a bound `state` follows.
+   Two `autofocus` fields on one surface: first in document order, since that is a config mistake
+   to pick through rather than a secret to refuse routing (`autofocus_field_in_scope`).
+
+2. **`textfield.on_navigate(key)`, for the keys a single-line field has no edit for.** `key_action`
+   now names Up, Down, Page Up, Page Down, Tab and Shift-Tab (`"up"`, `"down"`, `"page_up"`,
+   `"page_down"`, `"tab"`, `"backtab"`) as `KeyAction::Navigate`, ahead of the `utf8` arm that had
+   been dropping Tab as a control character. A plain field with the callback hears the name; the
+   buffer and caret do not move and `on_change` does not fire; repeats fire, so a held Down keeps
+   walking. A masked field ignores them, as before. This is still not `on_key` (§ 5.2, ADR-0050):
+   the set is closed, the keys carry no text, and a field has to be typing for any of them to
+   reach Lua. Tab meaning "down" is the config's call, not the engine's -- the mirror makes it, and
+   `launcher.lua` follows, in one line.
+
+3. **`scroll(name):reveal(index)` is the one thing a config may say to a scroll signal.** ADR-0069
+   decision 2 keeps the offset engine-owned because the config cannot clamp what it cannot measure,
+   and that still holds; what the config *can* know is which child it wants to see. `reveal` stores a
+   one-shot ask on the `Scroll` kind and marks the scene dirty; `finish` takes it on the pass that
+   positions the viewport, moves the asked offset the least distance that puts the `index`-th visible
+   child's border box inside `content_main`, writes it quietly, and lets `scroll_offset` clamp it as
+   it would a wheel ask. Already in view moves nothing; past the end lands on the end; no such child
+   changes nothing. One-shot, so the wheel is free the moment the pass is done -- a reveal that held
+   would snap the list back under a user scrolling away from the selection.
+   `a_reveal_scrolls_the_least_distance_that_shows_the_child` pins the four cases.
+
+4. **`AppSummary.comment`.** `Comment=` is the one-line description a launcher draws under a name
+   and matches against, and the scan was already holding the parsed group it lives in. `None` when
+   absent, which is common, so the config hides the line. Still unlocalized, on ADR-0061's terms.
+   `Keywords=` and `GenericName=` are not carried: the mirror matches name and comment, and nothing
+   here asked for more.
+
+5. **`oblisk set <name> <value>` and `oblisk toggle <name>` write a `state` from outside.** The
+   Supervisor's socket only knew Renderer generations, so the bar button was the launcher's one way
+   in and a keybind had none. The CLI connects with `CONTROL_CLIENT_GENERATION` (`u32::MAX`), which
+   `handle_connection` neither registers nor replays snapshots to, sends one
+   `RendererFrame::SetState` and hangs up; the Supervisor forwards it as `SupervisorFrame::SetState`
+   to the authoritative generation, the one fact the client cannot know; `lua::signal::write_state`
+   applies it through `Signal::reseed`, the same marshal check and dirty mark as `:set()`, and
+   refuses by name to stderr when no evaluation declared that state or a toggle finds no boolean.
+   `state(name, initial)` is already name-keyed and already the config's one writable signal
+   (ADR-0044 decision 5), so this adds no Lua surface at all: a keybind writes exactly what an
+   `on_click` may. A value is JSON when it parses and a string otherwise, so
+   `oblisk set panel_kind notifications` needs no quoting inside a compositor config. Rejected: an
+   `IpcHandler`-style table of named functions -- a function can do anything, a state write can do
+   only what the config already wired to that state.
+
+6. **The launcher is a layer surface, and the example of all five.** A screen-sized `panel` with a
+   scrim, a catcher, and `keyboard_interactivity` bound to `launcher_open`, so it takes the keyboard
+   on map and gives it back on unmap; the `window` it was is what niri tiled into the layout. The
+   ring is one `computed` over the chosen id and the results, which every row asks one `map` of,
+   so three hundred rows stay inside the graph's 5ms budget. Not carried from the mirror: the
+   calculator and currency rows, since both end in "Enter to copy" and this engine has no
+   clipboard; a result that can be read but not taken is half a feature. The web row is kept,
+   `applications:open_url` being already there.

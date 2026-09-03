@@ -219,6 +219,10 @@ theme.GLASS_BORDER        = theme.with_opacity(theme.FG, 0.18)
 theme.GLASS_BORDER_HOVER  = theme.with_opacity(theme.FG, 0.34)
 -- The alert ground `rescue` and `privacy` both hand-wrote. Same value, one name.
 theme.ALERT_BG       = "#45253aff"
+-- `modalScrimColor` at a fraction of the mirror's 0.88: what a modal lays over the desktop so the
+-- card reads as the one thing to look at. Lighter, because the desktop under it is a wallpaper and
+-- not a window's worth of text, and 0.88 over a wallpaper is a blackout.
+theme.SCRIM          = theme.with_opacity(theme.BG, 0.45)
 
 -- ## Opacity steps
 --
@@ -349,6 +353,14 @@ theme.notification_app_icon = s(40, 32)
 theme.notification_stack_height = s(560, 420)
 theme.osd_width           = s(260, 220)
 theme.osd_height          = s(44, 36)
-theme.launcher_row_height = s(30, 24)
+-- ## The launcher (`modules/global/launcher.lua`)
+--
+-- `launcherWindowWidth/Height` are 860x680 in the mirror, for a list of 64px rows with a 42px icon
+-- each. Narrower and shorter here: the rows carry a name and a one-line comment, not a paragraph,
+-- and a card that tall over a 1200px screen reads as a window rather than a prompt.
+theme.launcher_width      = s(720, 520)
+theme.launcher_height     = s(560, 420)
+theme.launcher_row_height = s(56, 44)
+theme.launcher_icon       = s(36, 28)
 
 return theme

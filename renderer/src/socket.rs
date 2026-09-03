@@ -463,6 +463,16 @@ impl RendererClient {
             SupervisorFrame::IdleEvent(IdleEvent { generation_id: _, threshold_sec, state }) => {
                 self.idle_registry.dispatch_event(threshold_sec, state);
             }
+            // ADR-0112: `oblisk set`/`oblisk toggle`. Refused by name to stderr, the only place a
+            // keybind's mistake can be reported; the write itself marks the scene dirty.
+            SupervisorFrame::SetState(set) => {
+                if let Err(why) = lua::signal::write_state(self.lua(), &set) {
+                    eprintln!(
+                        "control-socket client: `oblisk` asked to write state {:?} and was refused: {why}",
+                        set.name
+                    );
+                }
+            }
         }
         FrameOutcome::Handled
     }
@@ -688,6 +698,9 @@ fn frame_label(frame: &RendererFrame) -> &'static str {
         RendererFrame::LockReport(_) => "LockReport",
         RendererFrame::RequestReload => "RequestReload",
         RendererFrame::StartCapability { .. } => "StartCapability",
+        // Never sent by this process (ADR-0112), but the label costs nothing and a wildcard would
+        // let the next variant slip past unnamed.
+        RendererFrame::SetState(_) => "SetState",
     }
 }
 
@@ -1114,7 +1127,7 @@ mod tests {
                 ("launcher_tooltip", "popup"),
                 ("network_tooltip", "popup"),
                 ("bluetooth_tooltip", "popup"),
-                ("launcher", "window"),
+                ("launcher", "panel"),
                 ("lock_screen", "lock"),
             ]
         );

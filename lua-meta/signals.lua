@@ -54,6 +54,10 @@
 ---open across an unrelated save. Editing `initial` re-seeds it, because the edit is a later write
 ---than the `:set()` it lands on (ADR-0044 decision 5 and its amendment). A table `initial` is
 ---never an edit, since tables compare by identity and every evaluation builds a fresh one.
+---
+---The name is also what `oblisk set <name> <value>` and `oblisk toggle <name>` address from outside
+---the shell -- a compositor keybind's way in (ADR-0112). The write lands here exactly as `:set()`
+---would, and is refused by name when no evaluation declared the state.
 ---@generic T
 ---@param name string The identity. Two calls with one name are one signal.
 ---@param initial T The value on the first evaluation that names it, and what fixes the signal's type: `state("panel_open", false)` refuses a later `:set("open")`.
@@ -84,8 +88,14 @@ function hover(name) end
 ---@return Signal<Rect> # The region's absolute rect in its surface's logical coordinates.
 function hover_rect(name) end
 
+---@class ScrollSignal: Signal<number>
+---What `scroll(name)` returns. The offset is the engine's to write; what a config may say is which
+---child it wants to see.
+---@field reveal fun(self: ScrollSignal, index: integer) Asks the next layout pass to scroll the viewport so its `index`-th visible child (1-based, a `list`'s generated items counted in source order) is inside it, moving the least distance that does so and nothing at all when it already is. One-shot: the pass that honours it consumes it, and the wheel takes over again from there. Past the end lands on the end; an index with no child changes nothing. This is how a keyboard selection driven by `on_navigate` keeps its row in view (ADR-0112).
+
 ---How far a container has been scrolled along its main axis, in logical pixels. `0` at the top or
----left. Read-only: the wheel writes it and the layout pass clamps it (ADR-0069).
+---left. Read-only: the wheel writes it and the layout pass clamps it (ADR-0069); `:reveal(index)`
+---is the one ask a config can make of it.
 ---@param name string The slot. Naming it on a `row`, `column` or `list`'s `scroll` makes that node the viewport.
----@return Signal<number> # The offset along the viewport's main axis, in logical pixels.
+---@return ScrollSignal # The offset along the viewport's main axis, in logical pixels.
 function scroll(name) end

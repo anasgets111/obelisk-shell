@@ -138,6 +138,12 @@ enum SignalKind {
     Scroll {
         cell: Rc<RefCell<Value>>,
         dirty: DirtyFlag,
+        /// A one-shot ask from `signal:reveal(index)` (ADR-0112): the 1-based child the next
+        /// positioning pass of the viewport naming this signal must bring into view. Taken by that
+        /// pass, so a reveal is honoured once and the wheel is free again afterwards. Beside the
+        /// offset rather than in it, because the config cannot say it in pixels: where child
+        /// `index` sits and how tall the viewport is are both facts only the pass knows.
+        reveal: Rc<Cell<Option<usize>>>,
     },
     /// Lua-authored state (ADR-0044 decision 5): the one signal kind `Signal::set` accepts,
     /// built by the `state(name, initial)` global and written from a config's own `on_click`.
@@ -294,7 +300,35 @@ impl Signal {
     /// deliberately not published, since nothing draws one yet and the first config that does is
     /// the place to decide what shape it should arrive in.
     pub fn new_scroll(dirty: DirtyFlag) -> Self {
-        Signal(SignalKind::Scroll { cell: Rc::new(RefCell::new(Value::Number(0.0))), dirty })
+        Signal(SignalKind::Scroll {
+            cell: Rc::new(RefCell::new(Value::Number(0.0))),
+            dirty,
+            reveal: Rc::new(Cell::new(None)),
+        })
+    }
+
+    /// Asks the next positioning pass to scroll child `index` (1-based, counting visible children
+    /// of the viewport) into view, and marks the scene dirty so that pass happens (ADR-0112).
+    /// `false` for any other signal kind, which is the refusal `signal:reveal()` reports by name.
+    pub(crate) fn request_reveal(&self, index: usize) -> bool {
+        match &self.0 {
+            SignalKind::Scroll { reveal, dirty, .. } => {
+                reveal.set(Some(index));
+                dirty.mark();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The pending reveal, consumed: `layout::scene`'s positioning pass is the only caller, and it
+    /// takes the ask on the pass that honours it so the next wheel event is not fighting a reveal
+    /// that already happened.
+    pub(crate) fn take_reveal(&self) -> Option<usize> {
+        match &self.0 {
+            SignalKind::Scroll { reveal, .. } => reveal.take(),
+            _ => None,
+        }
     }
 
     /// The write end of a scroll signal, for the wheel handler and for the positioning pass that
@@ -302,7 +336,7 @@ impl Signal {
     /// off a capability signal.
     pub(crate) fn scroll_handle(&self) -> Option<LiveSignalHandle> {
         match &self.0 {
-            SignalKind::Scroll { cell, dirty } => Some(LiveSignalHandle(Rc::clone(cell), dirty.clone())),
+            SignalKind::Scroll { cell, dirty, .. } => Some(LiveSignalHandle(Rc::clone(cell), dirty.clone())),
             _ => None,
         }
     }
@@ -471,6 +505,22 @@ impl UserData for Signal {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("get", |lua, this, ()| this.get_value(lua));
         methods.add_method("map", |_, this, f: Function| Ok(this.mapped(f)));
+        // ADR-0112: the one thing a config may say to a scroll signal. Not a pixel offset -- the
+        // pass owns that (ADR-0069 decision 2) -- but which child it wants to see.
+        methods.add_method("reveal", |_, this, index: i64| {
+            let Some(index) = usize::try_from(index).ok().filter(|index| *index >= 1) else {
+                return Err(mlua::Error::runtime(format!(
+                    "signal:reveal() takes a 1-based child index, and {index} is not one"
+                )));
+            };
+            if !this.request_reveal(index) {
+                return Err(mlua::Error::runtime(format!(
+                    "signal:reveal() is only valid on a scroll(name) signal, and this is {} signal",
+                    this.0.describe()
+                )));
+            }
+            Ok(())
+        });
         // ADR-0044 decision 5's write path, and the only one Lua has. Every other kind is refused
         // by name rather than by a type error, so `network:set(...)` says *why* it refuses.
         methods.add_method("set", |_, this, value: Value| {
@@ -490,6 +540,29 @@ impl UserData for Signal {
             Ok(())
         });
     }
+}
+
+/// Applies an `oblisk set`/`oblisk toggle` to the `state(name, initial)` signal it names
+/// (ADR-0112), through the same checks the config's own `signal:set()` passes: the value is
+/// marshal-checked, and the scene is marked dirty. Refused, with the reason, when this config
+/// declared no such state, or when a toggle finds something other than a boolean -- the two ways a
+/// keybind can be out of step with the config it was written for.
+pub fn write_state(lua: &Lua, set: &shared::SetState) -> Result<(), String> {
+    let signal = lua
+        .app_data_ref::<StateRegistry>()
+        .and_then(|registry| registry.0.get(&set.name).map(|(signal, _)| signal.clone()))
+        .ok_or_else(|| format!("this config declares no state({:?}, ...)", set.name))?;
+    let value = match &set.write {
+        shared::StateWrite::Set(json) => {
+            crate::lua::json::to_lua(lua, json).map_err(|err| format!("the value does not convert to Lua: {err}"))?
+        }
+        shared::StateWrite::Toggle => match signal.get_value(lua) {
+            Ok(Value::Boolean(current)) => Value::Boolean(!current),
+            Ok(other) => return Err(format!("it holds {}, and only a boolean toggles", other.type_name())),
+            Err(err) => return Err(format!("its value could not be read: {err}")),
+        },
+    };
+    signal.reseed(value).map_err(|err| format!("refused at the marshalling boundary: {err}"))
 }
 
 /// Whether this VM's config ever called `hover(name)`. `crate::wayland`'s pointer handler asks
@@ -1184,6 +1257,34 @@ mod tests {
             .exec()
             .unwrap_err();
         assert!(err.to_string().contains("read-only"), "the refusal must name the read-only rule: {err}");
+    }
+
+    /// ADR-0112: a keybind's write lands on the config's own signal, and is refused by name when
+    /// the config declares no such state or the toggle finds no boolean.
+    #[test]
+    fn a_control_clients_write_reaches_a_declared_state_and_is_refused_otherwise() {
+        let lua = Lua::new();
+        let dirty = DirtyFlag::new();
+        register(&lua, dirty.clone()).unwrap();
+        lua.load(r#"OPEN = state("launcher_open", false); KIND = state("panel_kind", "none")"#).exec().unwrap();
+        dirty.take();
+
+        write_state(&lua, &shared::SetState { name: "launcher_open".into(), write: shared::StateWrite::Toggle })
+            .unwrap();
+        assert!(dirty.take(), "a write from outside re-resolves the scene like any other");
+        assert!(lua.load("return OPEN:get()").eval::<bool>().unwrap());
+
+        let set = shared::StateWrite::Set(serde_json::json!("notifications"));
+        write_state(&lua, &shared::SetState { name: "panel_kind".into(), write: set }).unwrap();
+        assert_eq!(lua.load("return KIND:get()").eval::<String>().unwrap(), "notifications");
+        dirty.take();
+
+        let missing = write_state(&lua, &shared::SetState { name: "nope".into(), write: shared::StateWrite::Toggle });
+        assert!(missing.unwrap_err().contains("declares no state"));
+        let not_bool =
+            write_state(&lua, &shared::SetState { name: "panel_kind".into(), write: shared::StateWrite::Toggle });
+        assert!(not_bool.unwrap_err().contains("only a boolean toggles"));
+        assert!(!dirty.take(), "a refused write changes nothing");
     }
 
     #[test]
