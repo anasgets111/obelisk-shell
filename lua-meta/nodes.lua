@@ -84,8 +84,20 @@
 ---@field children? Node[] Drawn in order. A hole in the array truncates it, since `#` is undefined on a sparse table.
 ---@field scroll? Bound The signal `scroll(name)` returned. Makes this a viewport its children move inside.
 
+---One stretch of a `text`'s content with its own look (ADR-0104). The shape of a notification body
+---span (`NotificationSpan`) minus `kind` and `href`, so a body's text spans can be handed over as
+---they arrive; an image span has no `text` and is refused -- leave it out. `bold` and `italic` draw
+---in the declared family's own bold and italic faces when fontconfig finds them, and in the regular
+---face when it does not.
+---@class TextRun
+---@field text string The run's text. An empty run is skipped.
+---@field bold? boolean
+---@field italic? boolean
+---@field underline? boolean A rule just under the baseline, in the run's colour.
+---@field color? Color This run's colour instead of the node's `foreground`. What a link is drawn in.
+
 ---@class TextProps: NodeBase
----@field content? string|Bound Default `""`, so a text bound to a capability renders empty until the first push rather than failing at boot.
+---@field content? string|TextRun[]|Bound One string, or an array of runs whose texts are joined and drawn in one paragraph, wrapping and eliding together (ADR-0104). Default `""`, so a text bound to a capability renders empty until the first push rather than failing at boot.
 ---@field font_size? integer|Bound Default `12`.
 ---@field foreground? Color|Bound Default opaque white.
 ---@field elide? "None"|"End"|Bound `"End"` drops trailing characters until the run plus an ellipsis fits. A no-op on a `Content`-sized box, which was measured from this same string. Default `"None"`. Under `wrap = "Word"` it applies to the last line kept rather than to the whole run.

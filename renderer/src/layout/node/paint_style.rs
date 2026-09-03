@@ -67,6 +67,9 @@ pub enum PaintStyle {
     /// are dead to `layout::paint`, which is why it destructures them away.
     Text {
         content: String,
+        /// The styled stretches of `content` (ADR-0104), remapped by `layout::scene` whenever it
+        /// rewrites `content` to fit. Empty for plain text.
+        runs: Vec<StyleRun>,
         font_size: f32,
         color: Rgba,
         align: TextAlign,
@@ -119,15 +122,19 @@ pub fn paint_style(kind: &str, properties: &HashMap<String, Value>) -> Result<Op
             widths: parse_border_width(properties)?,
             clip: parse_clip(properties)?,
         },
-        "text" => PaintStyle::Text {
-            content: parse_content(properties)?,
-            font_size: parse_font_size(properties)?,
-            color: parse_foreground(properties)?,
-            align: parse_text_align(properties)?,
-            elide: parse_elide(properties)?,
-            wrap: parse_wrap(properties)?,
-            max_lines: parse_max_lines(properties)?,
-        },
+        "text" => {
+            let (content, runs) = parse_content(properties)?;
+            PaintStyle::Text {
+                content,
+                runs,
+                font_size: parse_font_size(properties)?,
+                color: parse_foreground(properties)?,
+                align: parse_text_align(properties)?,
+                elide: parse_elide(properties)?,
+                wrap: parse_wrap(properties)?,
+                max_lines: parse_max_lines(properties)?,
+            }
+        }
         "icon" => {
             PaintStyle::Icon { name: parse_icon_name(properties)?, color: parse_optional_foreground(properties)? }
         }

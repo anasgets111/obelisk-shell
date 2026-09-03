@@ -72,6 +72,7 @@ pub fn resolve_chain(chain: &[&str]) -> ResolvedFonts {
         }
 
         if primary_family.is_none() {
+            load_variants(&mut db, name, &resolved_family, &mut loaded_paths);
             primary_family = Some(resolved_family);
         }
     }
@@ -79,6 +80,37 @@ pub fn resolve_chain(chain: &[&str]) -> ResolvedFonts {
     match primary_family {
         Some(primary_family) => ResolvedFonts { db, primary_family },
         None => system_fallback(chain),
+    }
+}
+
+/// Loads the primary family's bold, italic and bold-italic files, when fontconfig has them, so a
+/// styled run (ADR-0104) is shaped and painted in a real face rather than the regular one standing
+/// in. Only for the primary: a fallback entry is there for codepoint coverage and nothing asks it
+/// for a weight.
+///
+/// Three more `fc-match` calls at startup, each asking for `family:weight=bold` and the like. A
+/// family shipped as one `.ttc` resolves every variant to the file already loaded, and
+/// `loaded_paths` makes that free; one shipped as separate files loads each. fontconfig answers a
+/// variant the family does not have with the nearest face it does, which is the regular file again
+/// or a different family entirely -- the same family check `fc_match` applies everywhere rejects the
+/// latter, and the former is a duplicate path and skipped.
+fn load_variants(db: &mut Database, name: &str, resolved_family: &str, loaded_paths: &mut HashSet<PathBuf>) {
+    for (variant, pattern) in
+        [("bold", "weight=bold"), ("italic", "slant=italic"), ("bold italic", "weight=bold:slant=italic")]
+    {
+        let Some((path, family)) = fc_match(&format!("{name}:{pattern}")) else {
+            continue;
+        };
+        if !family.eq_ignore_ascii_case(resolved_family) || loaded_paths.contains(&path) {
+            continue;
+        }
+        match db.load_font_file(&path) {
+            Ok(()) => {
+                eprintln!("font chain: {name:?} {variant} -> {path:?}");
+                loaded_paths.insert(path);
+            }
+            Err(e) => eprintln!("font chain: {name:?} {variant} resolved to {path:?}, which failed to load: {e}"),
+        }
     }
 }
 
@@ -135,11 +167,14 @@ fn fc_match(name: &str) -> Option<(PathBuf, String)> {
         return None;
     }
 
-    let is_generic = GENERIC_ALIASES.iter().any(|generic| generic.eq_ignore_ascii_case(name));
+    // `Family:weight=bold` is fontconfig's own pattern syntax and the family is the part before
+    // the colon; a bare family name has no colon and is itself.
+    let family_asked = name.split(':').next().unwrap_or(name);
+    let is_generic = GENERIC_ALIASES.iter().any(|generic| generic.eq_ignore_ascii_case(family_asked));
     let resolved_family = if is_generic {
         families.split(',').next().unwrap_or(families).trim().to_string()
     } else {
-        let hit = families.split(',').find(|family| family.trim().eq_ignore_ascii_case(name))?;
+        let hit = families.split(',').find(|family| family.trim().eq_ignore_ascii_case(family_asked))?;
         hit.trim().to_string()
     };
 

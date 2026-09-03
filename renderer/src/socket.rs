@@ -2450,7 +2450,7 @@ mod tests {
             .surface("bar@TEST")
             .expect("a bare rostered signal on `content` must not stop the config applying");
         assert_eq!(
-            layout::node::parse_content(&bar.children[0].properties).unwrap(),
+            layout::node::parse_content(&bar.children[0].properties).unwrap().0,
             "",
             "`content = audio` with audio still nil must take parse_content's default"
         );

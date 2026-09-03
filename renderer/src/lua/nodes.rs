@@ -496,7 +496,7 @@ mod meta_stub_tests {
     /// these same declarations. Together they close the loop: this proves the stub does not promise
     /// what the engine refuses, and `just types` proves a config written to the stub compiles.
     ///
-    /// All 453 of them, with no skips: a type `sample` has no row for fails the test rather than
+    /// All 454 of them, with no skips: a type `sample` has no row for fails the test rather than
     /// passing quietly, so the table cannot rot into covering half the file.
     ///
     /// ponytail: this checks the types, it does not derive them. `lua-meta/nodes.lua` is still
@@ -518,9 +518,11 @@ mod meta_stub_tests {
             for (field, ty) in typed_fields(&classes, &class) {
                 // Split on `|` only when the spelling is a flat union. `constraint_adjustment` is
                 // `("SlideX"|"SlideY"|...)[]`, an array *of* a union, and splitting it yields
-                // fragments that are not types. Those go in the sample table whole, or not at all.
+                // fragments that are not types; an inline table shape holds `|` of its own. Those
+                // go in the sample table whole, or not at all. A bare `[]` suffix is fine to split
+                // around: `string|TextRun[]|Bound` is three types, one of them an array.
                 let members: Vec<&str> =
-                    if ty.contains(['(', '[', '{']) { vec![ty.as_str()] } else { ty.split('|').collect() };
+                    if ty.contains(['(', '{']) { vec![ty.as_str()] } else { ty.split('|').collect() };
                 for member in members {
                     // `Bound` is not a type of its own here, it is a carrier: the engine
                     // resolves the handle and then applies the sibling member's rules to what came
@@ -568,7 +570,7 @@ mod meta_stub_tests {
             unsampled.len(),
             unsampled.join("\n")
         );
-        assert_eq!(probed, 453, "the number of declared type members moved; confirm the change is intended");
+        assert_eq!(probed, 454, "the number of declared type members moved; confirm the change is intended");
     }
 
     /// One Lua literal per declared type. `None` means "no sample", which skips rather than guesses.
@@ -612,6 +614,7 @@ mod meta_stub_tests {
                 "Edges" => "{ top = 1 }",
                 "Node" => "rect {}",
                 "Node[]" => "{ rect {} }",
+                "TextRun[]" => "{ { text = \"x\", bold = true, underline = true, color = \"#112233\" } }",
                 "Align" => "\"Center\"",
                 // No row for a bare `Bound`: the caller wraps a sibling member's sample instead,
                 // and the three properties typed `Bound` alone are handled by field above. A row

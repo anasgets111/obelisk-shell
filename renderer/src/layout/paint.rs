@@ -23,9 +23,9 @@ use femtovg::renderer::OpenGl;
 use femtovg::{Canvas, Color, ImageFlags, ImageId, Paint, Path, PixelFormat, RenderTarget, Solidity};
 
 use crate::image::{self, Fit, ImageCache};
-use crate::layout::node::{self, BorderColor, ClipShape, EdgeInsets, PaintStyle, Rgba, TextAlign};
+use crate::layout::node::{self, BorderColor, ClipShape, EdgeInsets, PaintStyle, Rgba, StyleRun, TextAlign};
 use crate::layout::scene::{NodeId, ResolvedNode};
-use crate::text::atlas::TextPainter;
+use crate::text::atlas::{TextDraw, TextPainter};
 use crate::text::snap::{LogicalRect, PhysicalRect, snap_border_band, snap_to_physical};
 
 /// What one node actually draws, with every paint property already parsed. The four variants are
@@ -46,6 +46,8 @@ pub enum Draw {
     },
     Text {
         content: String,
+        /// Byte ranges of `content` drawn in another face, underlined or recoloured (ADR-0104).
+        runs: Vec<StyleRun>,
         font_size: f32,
         color: Rgba,
         align: TextAlign,
@@ -352,9 +354,11 @@ fn run(
                 }
                 paint_border(painter.canvas_mut(), rect, *radius, *colors, *widths, scale);
             }
-            Draw::Text { content, font_size, color, align } => {
-                painter.draw_text(content, rect, *font_size, scale, *color, *align)
-            }
+            Draw::Text { content, runs, font_size, color, align } => painter.draw_text(
+                TextDraw { text: content, runs, font_size: *font_size, color: *color, align: *align },
+                rect,
+                scale,
+            ),
             Draw::Icon { name, px, alpha, color } => {
                 // `u16` is `freedesktop-icons`'s own size type, and a theme has no directory above
                 // 512 anyway.
@@ -496,12 +500,18 @@ fn draw_for(
         // chain (single-face Noto Sans): `measure_text` agreed with cosmic-text's `shape()` to
         // within 0.0001px on a 53-character, 32px string, last lit pixel 3-4 physical pixels inside
         // the measured edge. No shaving observed today, but the clip is the safe direction.
-        PaintStyle::Text { content, font_size, color, align, elide: _, wrap: _, max_lines: _ } => Some(Draw::Text {
-            content: content.clone(),
-            font_size: *font_size,
-            color: fade(*color, opacity),
-            align: *align,
-        }),
+        PaintStyle::Text { content, runs, font_size, color, align, elide: _, wrap: _, max_lines: _ } => {
+            Some(Draw::Text {
+                content: content.clone(),
+                runs: runs
+                    .iter()
+                    .map(|run| StyleRun { color: run.color.map(|c| fade(c, opacity)), ..run.clone() })
+                    .collect(),
+                font_size: *font_size,
+                color: fade(*color, opacity),
+                align: *align,
+            })
+        }
 
         // `icon` (§ 5.2 item 5): the theme name, resolved to a file by [`execute`] (ADR-0054).
         // `Contain`, not `Cover`, with the *shorter* edge as the resolved size: `size` is § 5.2's
@@ -560,6 +570,7 @@ fn draw_for(
             };
             (!content.is_empty()).then_some(Draw::Text {
                 content,
+                runs: Vec::new(),
                 font_size: *font_size,
                 color: fade(*color, opacity),
                 align: *align,
@@ -1915,6 +1926,7 @@ mod tests {
             font_size: FONT_SIZE,
             line_height: crate::text::shaping::line_height(FONT_SIZE),
             max_width: None,
+            runs: Vec::new(),
         });
 
         let mut paint = Paint::color(Color::black());
@@ -1935,6 +1947,46 @@ mod tests {
             shaped.width,
             femtovg_width,
             (diff / shaped.width.max(femtovg_width)) * 100.0
+        );
+    }
+
+    /// The same agreement for a bold run (ADR-0104): cosmic-text shaping the run in the family's
+    /// bold face and femtovg painting it from the bold variant chain have to land on one width, or
+    /// a styled line's pieces drift apart from the box they were measured into.
+    #[test]
+    fn femtovg_and_cosmic_text_agree_on_a_bold_runs_width() {
+        let Some(instance) = init_headless_egl(400, 60) else { return };
+        let shaping = ShapingHandle::spawn();
+        if !shaping.font_chain_data().iter().any(|face| face.primary && face.bold) {
+            eprintln!("skip: the chain's family has no bold face installed");
+            return;
+        }
+        let Some(mut painter) = text_painter(&instance, &shaping, 400, 60) else { return };
+        assert_ne!(
+            painter.variant_fonts(true, false)[0],
+            painter.fonts()[0],
+            "the bold chain must lead with a face of its own"
+        );
+
+        const TEXT: &str = "Oblisk Shell Renderer";
+        const FONT_SIZE: f32 = 24.0;
+        let shaped = shaping.shape(ShapeRequest {
+            text: TEXT.into(),
+            font_size: FONT_SIZE,
+            line_height: crate::text::shaping::line_height(FONT_SIZE),
+            max_width: None,
+            runs: vec![crate::text::shaping::FontRun { range: 0..TEXT.len(), bold: true, italic: false }],
+        });
+        let mut paint = Paint::color(Color::black());
+        paint.set_font(painter.variant_fonts(true, false));
+        paint.set_font_size(FONT_SIZE);
+        let femtovg_width = painter.canvas_mut().measure_text(0.0, 0.0, TEXT, &paint).unwrap().width();
+        let diff = (shaped.width - femtovg_width).abs();
+        assert!(
+            diff <= shaped.width.max(femtovg_width) * 0.02,
+            "cosmic-text measured the bold run at {} but femtovg at {}",
+            shaped.width,
+            femtovg_width
         );
     }
 

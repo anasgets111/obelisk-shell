@@ -4701,3 +4701,71 @@ A link a config could draw but not follow is a link, and the reference config op
 
 The card side, where a link gets a button or an underlined run to press, is the config pass; this
 is what that pass presses.
+
+## 0104. `text.content` takes styled runs, drawn in the family's own bold and italic faces
+
+A notification body arrives as spans carrying `bold`, `italic`, `underline` and `href` (ADR-0033),
+and `text` took one string, so `util.notification_body` flattened them and every `<b>Alice</b>:
+hi` drew as `Alice: hi`. A link was a stretch of body text that looked like the rest. The reference
+config renders the body as Qt rich text and this was the largest gap left between the two.
+
+Node-level styling -- a `bold` on the whole `text` -- was considered and does nothing for the body:
+the mixing is inside one wrapping paragraph, and a paragraph cannot be a row of nodes because a
+`row` does not wrap. So the runs had to go through the pipeline, and the pipeline was a `String`
+end to end: parsed as one, measured as one, rewritten by wrap and elide as one, painted as one.
+
+1. **`content` accepts an array of runs beside the string it always took.** `{ text, bold?,
+   italic?, underline?, color? }` is a `NotificationSpan` minus `kind` and `href`, on purpose: a
+   body's text spans can be handed over as they arrive, with `href` mapped to an underline and a
+   colour by the config, which is where "what does a link look like" belongs. An image span has
+   no `text` and is refused with a message saying to leave it out, rather than drawn as nothing.
+
+2. **Internally the runs are byte ranges over one string, not a list of strings.** `StyleRun` is a
+   range plus the four style fields; `content` stays the joined `String`. Wrapping, eliding and
+   `\n`-joining were already string surgery in one place, `fit_text_to_box`, and a range is what
+   survives surgery: `Fitted` appends slices of the *source* and re-bases whichever runs overlap
+   each slice. `ShapeResult` grew `line_ranges`, parallel to `lines`, because cosmic-text hands back
+   a line's text and the ranges are what let a run follow it across the break. An ellipsis takes
+   the style of the character it replaced, so a truncated bold sentence ends in a bold ellipsis.
+
+3. **The shaper sees only the half that changes a measurement.** `FontRun` is range, bold, italic;
+   an underline or a colour never reaches the worker, so two contents differing only in colour
+   share one memo entry. Runs are part of the memo key for the same reason `line_height` is: a
+   bold prefix measures wider and a hit that ignored it would return another request's answer.
+
+4. **Real faces, resolved once, for the primary family only.** `fonts::resolve_chain` asks
+   fontconfig for `family:weight=bold`, `:slant=italic` and both, and loads each file that comes
+   back as the same family; a family shipped as one `.ttc` resolves every variant to the file
+   already loaded and costs nothing more. Fallback entries stay regular: they are there for
+   codepoint coverage, nothing asks CJK for a weight, and a `Noto Sans CJK` bold is another 16MB
+   mapping for no visible glyph. A variant the family does not ship draws in the regular face, on
+   both sides, so measurement and paint still agree.
+
+5. **`font_chain_data` is per face, not per file, and picks by weight.** femtovg was handed face 0
+   of every file; for a `.ttc` whose face 0 is a Thin, that was a latent disagreement with
+   cosmic-text's own weight-400 pick that no installed chain happened to trigger. The painter now
+   holds one chain per variant -- the primary's face for it, then every fallback -- so per-glyph
+   fallback works the same in bold as in regular. `fonts[0]` is still the regular face.
+
+6. **A styled line is painted piece by piece, advanced by femtovg's own measurement.** femtovg's
+   `set_text_align` can place one run; a line of several is anchored from its pieces' total width
+   instead, and each piece drawn `Align::Left` at the running x. An underline is a filled rect one
+   pixel or `font_size / 16` thick, whichever is more, just under the baseline. A plain line takes
+   exactly the path it always did.
+
+7. **Colour fades with `opacity` like the node's own.** A run's colour goes through the same `fade`
+   as `foreground`, so a card fading out does not leave its links at full strength.
+
+The stub probe learned to split `string|TextRun[]|Bound` into three members -- it treated any
+bracket as an unsplittable spelling, which was right for `("SlideX"|...)[]` and wrong for an
+array suffix -- so `TextRun[]` is probed like every other type rather than skipped.
+
+Tests: the parser's joins and refusals; `segments` splitting a line at run boundaries, including a
+run that crosses a wrap; runs following their text across a wrap and an elided bold prefix ending
+in a bold ellipsis, through the real `Scene`; `line_ranges` slicing the source to each line past an
+explicit newline; a bold run measuring wider than the same text regular; and cosmic-text and
+femtovg agreeing on a bold run's width to 2%, the same divergence test that guards the regular
+chain, with the bold chain confirmed to lead with a face of its own.
+
+Verified live in the config commit that follows: a body sent as `<b>Alice</b>: see <a
+href="https://example.org">this</a>` draws the name in bold and the link underlined in the accent.

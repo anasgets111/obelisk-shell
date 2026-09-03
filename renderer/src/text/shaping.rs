@@ -13,12 +13,24 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::ops::Range;
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 
-use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
+use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, Weight};
 
 use super::fonts::{self, ResolvedFonts};
+
+/// A byte range of a request's text shaped in a bold and/or italic face rather than the chain's
+/// regular one (ADR-0104). Only what changes a *measurement* is here: an underline and a colour
+/// are paint's business and never reach the worker, which is why this is not `layout`'s
+/// `StyleRun` but the half of it the shaper reads.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FontRun {
+    pub range: Range<usize>,
+    pub bold: bool,
+    pub italic: bool,
+}
 
 /// A shaping request: the text to measure and the metrics to shape it at.
 pub struct ShapeRequest {
@@ -28,6 +40,10 @@ pub struct ShapeRequest {
     /// Logical-pixel width to wrap at. `None` measures the text unconstrained, on one line, which
     /// is what every caller uses today.
     pub max_width: Option<f32>,
+    /// The parts of `text` in another face than the regular one, in order, non-overlapping, on
+    /// character boundaries -- `layout` builds them that way. Empty for plain text, which is every
+    /// request but a notification body's.
+    pub runs: Vec<FontRun>,
 }
 
 /// The measured result of shaping a request: its tight bounding box in logical pixels, plus the
@@ -48,6 +64,11 @@ pub struct ShapeResult {
     /// behind at the break. Never empty for non-empty text: a string that needs no break is one
     /// entry holding the whole string.
     pub lines: Arc<[String]>,
+    /// Where each of `lines` came from: the byte range of the request's text it is a slice of,
+    /// parallel to `lines` (`text[line_ranges[i]] == lines[i]`). What lets `layout` carry a
+    /// styled run through a wrap: the runs are ranges over the source, and a line that knows its
+    /// own range can say which runs it holds (ADR-0104).
+    pub line_ranges: Arc<[Range<usize>]>,
 }
 
 /// The multiplier every measurement and every paint derives a line height from.
@@ -71,6 +92,20 @@ pub fn line_height(font_size: f32) -> f32 {
 #[derive(Clone)]
 pub struct FontData(std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>);
 
+/// One face femtovg should load: its file's shared bytes, which face of the file, and what job it
+/// does in the chain (ADR-0104). `primary` faces are the declared family's own -- regular, and
+/// whichever of bold, italic and bold italic `fonts::resolve_chain` found -- and the painter picks
+/// among them per styled run; every other face is fallback coverage and takes part in every
+/// variant's chain unchanged.
+#[derive(Clone)]
+pub struct FontFace {
+    pub data: FontData,
+    pub index: u32,
+    pub primary: bool,
+    pub bold: bool,
+    pub italic: bool,
+}
+
 impl AsRef<[u8]> for FontData {
     fn as_ref(&self) -> &[u8] {
         (*self.0).as_ref()
@@ -79,7 +114,7 @@ impl AsRef<[u8]> for FontData {
 
 enum Request {
     Shape(ShapeRequest, mpsc::Sender<ShapeResult>),
-    FontChainData(mpsc::Sender<Vec<FontData>>),
+    FontChainData(mpsc::Sender<Vec<FontFace>>),
     /// Replace the chain this worker measures against, once the config has said what it wants
     /// (ADR-0043 decision 2). Replies once the new `FontSystem` is live, so the next
     /// `font_chain_data` call answers with the new faces.
@@ -111,6 +146,7 @@ struct ShapeKey {
     font_size: u32,
     line_height: u32,
     max_width: Option<u32>,
+    runs: Vec<FontRun>,
 }
 
 /// A handle to a dedicated shaping worker thread and its warm font cache. `Clone` clones only the
@@ -137,7 +173,7 @@ impl ShapingHandle {
                 let ResolvedFonts { mut db, mut primary_family } = fonts::resolve_chain(fonts::DEFAULT_CHAIN);
                 // Mapped once, before the `Database` reaches cosmic-text, so the mappings stay
                 // *in* the database instead of being mapped twice.
-                let mut chain_data = font_chain_data(&mut db);
+                let mut chain_data = font_chain_data(&mut db, &primary_family);
                 let mut font_system = FontSystem::new_with_locale_and_db(detect_locale(), db);
                 while let Ok(request) = rx.recv() {
                     match request {
@@ -154,7 +190,7 @@ impl ShapingHandle {
                             let borrowed: Vec<&str> = chain.iter().map(String::as_str).collect();
                             let ResolvedFonts { db: mut new_db, primary_family: new_primary } =
                                 fonts::resolve_chain(&borrowed);
-                            chain_data = font_chain_data(&mut new_db);
+                            chain_data = font_chain_data(&mut new_db, &new_primary);
                             font_system = FontSystem::new_with_locale_and_db(detect_locale(), new_db);
                             primary_family = new_primary;
                             let _ = reply.send(());
@@ -190,6 +226,7 @@ impl ShapingHandle {
             font_size: request.font_size.to_bits(),
             line_height: request.line_height.to_bits(),
             max_width: request.max_width.map(f32::to_bits),
+            runs: request.runs,
         };
         // A poisoned lock is recovered rather than propagated: this map is a pure memo, so no
         // invariant can break, and an unrelated thread's death shouldn't kill text measurement.
@@ -205,6 +242,7 @@ impl ShapingHandle {
                     font_size: f32::from_bits(key.font_size),
                     line_height: f32::from_bits(key.line_height),
                     max_width: key.max_width.map(f32::from_bits),
+                    runs: key.runs.clone(),
                 },
                 reply_tx,
             ))
@@ -257,7 +295,7 @@ impl ShapingHandle {
     /// discovery of its own; it loads these via `add_shared_font_with_index` so paint rasterizes
     /// with the exact chain cosmic-text shaped against (`text::atlas::TextPainter::new`). Cloning
     /// `FontData` clones an `Arc`, so repeated calls are cheap and copy no font file.
-    pub fn font_chain_data(&self) -> Vec<FontData> {
+    pub fn font_chain_data(&self) -> Vec<FontFace> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.requests.send(Request::FontChainData(reply_tx)).expect("oblisk-text-shaping worker thread died");
         reply_rx.recv().expect("oblisk-text-shaping worker thread died before replying")
@@ -278,11 +316,27 @@ fn shape(font_system: &mut FontSystem, primary_family: &str, request: &ShapeRequ
     let mut buffer = Buffer::new(font_system, metrics);
     buffer.set_size(request.max_width, None);
     let attrs = Attrs::new().family(Family::Name(primary_family));
-    buffer.set_text(&request.text, &attrs, Shaping::Advanced, None);
+    if request.runs.is_empty() {
+        buffer.set_text(&request.text, &attrs, Shaping::Advanced, None);
+    } else {
+        buffer.set_rich_text(rich_spans(&request.text, &request.runs, &attrs), &attrs, Shaping::Advanced, None);
+    }
     buffer.shape_until_scroll(font_system, false);
+
+    // Where each paragraph starts in the source. cosmic-text splits the text into one
+    // `BufferLine` per paragraph and a layout run's glyph offsets count from *its* paragraph, so
+    // turning them into offsets into the whole string means adding the paragraph's own start --
+    // its predecessors' text plus whichever line ending each of them was split on.
+    let mut paragraph_starts = Vec::with_capacity(buffer.lines.len());
+    let mut cursor = 0usize;
+    for line in &buffer.lines {
+        paragraph_starts.push(cursor);
+        cursor += line.text().len() + line.ending().as_str().len();
+    }
 
     let mut width = 0.0f32;
     let mut lines: Vec<String> = Vec::new();
+    let mut line_ranges: Vec<Range<usize>> = Vec::new();
     for run in buffer.layout_runs() {
         width = width.max(run.line_w);
         // `run.text` is cosmic-text's "original text line" -- the whole source paragraph, handed
@@ -290,29 +344,71 @@ fn shape(font_system: &mut FontSystem, primary_family: &str, request: &ShapeRequ
         // slice of it this run is. Read as min/max over the cluster indices rather than as the
         // first and last glyph's, because a bidi run's glyphs come in visual order and its byte
         // range is not theirs to be sorted by.
-        let slice = match (run.glyphs.iter().map(|g| g.start).min(), run.glyphs.iter().map(|g| g.end).max()) {
-            (Some(start), Some(end)) => &run.text[start..end],
+        let (start, slice) = match (run.glyphs.iter().map(|g| g.start).min(), run.glyphs.iter().map(|g| g.end).max()) {
+            (Some(start), Some(end)) => (start, &run.text[start..end]),
             // A blank line carries no glyphs and still takes up its height.
-            _ => "",
+            _ => (0, ""),
         };
         // Trailing whitespace only: a word wrap leaves the break's space on the line it broke, and
         // a trailing space shifts a centred or right-aligned line by its own advance. Leading
         // space is the author's own indentation and stays.
-        lines.push(slice.trim_end().to_string());
+        let trimmed = slice.trim_end();
+        let paragraph_start = paragraph_starts.get(run.line_i).copied().unwrap_or(0);
+        line_ranges.push(paragraph_start + start..paragraph_start + start + trimmed.len());
+        lines.push(trimmed.to_string());
     }
 
-    ShapeResult { width, height: lines.len() as f32 * metrics.line_height, lines: lines.into() }
+    ShapeResult {
+        width,
+        height: lines.len() as f32 * metrics.line_height,
+        lines: lines.into(),
+        line_ranges: line_ranges.into(),
+    }
 }
 
-/// One entry per unique source *file*, not one per face, in the database's own load/chain order:
-/// `db.faces()` yields one `FaceInfo` per face, a `.ttc` can hold many (Inter's own `Inter.ttc`
-/// here has 36), and a shared mapping covers the *whole file*, so without deduping by path Inter
-/// would appear 36 times. Maps rather than reads, the entire memory story here: `Noto Color Emoji`
-/// is an 11MB CBDT bitmap font, and the `data.to_vec()` this replaces held it three times over
-/// (worker `Vec<Vec<u8>>`, femtovg's `add_font_mem` copy, cosmic-text's own mapping); dropping it
-/// on an idle eleven-surface session cut the Renderer's private-dirty memory from 49.7MB to
-/// 22.7MB. `make_shared_face_data` rewrites every face sharing the path to `Source::SharedFile`,
-/// so this is also cosmic-text's map.
+/// `text` as the `(slice, attrs)` spans `Buffer::set_rich_text` takes: each run in a face of its
+/// own weight and style, and the text between runs in `base`. A run reaching past the end of the
+/// text, or one that would start before the previous ended, is clamped rather than refused: the
+/// ranges are built by `layout` from the same string, so neither happens, and a shaper that panics
+/// on a range is a worse outcome than one that measures a character in the wrong weight.
+fn rich_spans<'t, 'a>(text: &'t str, runs: &[FontRun], base: &Attrs<'a>) -> Vec<(&'t str, Attrs<'a>)> {
+    let mut spans = Vec::with_capacity(runs.len() * 2 + 1);
+    let mut cursor = 0usize;
+    for run in runs {
+        let start = run.range.start.clamp(cursor, text.len());
+        let end = run.range.end.clamp(start, text.len());
+        if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            continue;
+        }
+        if start > cursor {
+            spans.push((&text[cursor..start], base.clone()));
+        }
+        let mut attrs = base.clone();
+        attrs.weight = if run.bold { Weight::BOLD } else { Weight::NORMAL };
+        attrs.style = if run.italic { Style::Italic } else { Style::Normal };
+        spans.push((&text[start..end], attrs));
+        cursor = end;
+    }
+    if cursor < text.len() {
+        spans.push((&text[cursor..], base.clone()));
+    }
+    spans
+}
+
+/// The faces femtovg loads, in chain order (ADR-0043 decision 2, ADR-0104): the primary family's
+/// regular face and whichever bold, italic and bold-italic faces the database holds for it, then
+/// face 0 of every other file, one entry per file. `fonts::resolve_chain` is what puts the primary
+/// family's variant files in the database in the first place; a family shipped as one `.ttc`
+/// (Inter's holds 36 faces) has them all already, and this is what reaches past index 0 to find
+/// them. Fallback files still contribute only their first face: nothing selects a weight in CJK or
+/// emoji coverage, and a `Noto Sans CJK` bold is another 16MB mapping for no visible glyph.
+///
+/// Maps rather than reads, the entire memory story here: `Noto Color Emoji` is an 11MB CBDT bitmap
+/// font, and the `data.to_vec()` this replaces held it three times over (worker `Vec<Vec<u8>>`,
+/// femtovg's `add_font_mem` copy, cosmic-text's own mapping); dropping it on an idle eleven-surface
+/// session cut the Renderer's private-dirty memory from 49.7MB to 22.7MB. `make_shared_face_data`
+/// rewrites every face sharing the path to `Source::SharedFile`, so this is also cosmic-text's map,
+/// and asking it for two faces of one file maps the file once.
 ///
 /// SAFETY: `make_shared_face_data` is `unsafe` because a font file rewritten on disk changes
 /// under the mapping, which can fault or produce nonsense glyphs. That is the same bargain
@@ -321,37 +417,79 @@ fn shape(font_system: &mut FontSystem, primary_family: &str, request: &ShapeRequ
 ///
 /// A face whose mapping cannot be established is skipped rather than fatal, matching
 /// `resolve_chain`'s own treatment of an entry it can't honor: losing the emoji font is a missing
-/// glyph, not a dead shell, and `fonts[0]` is still the primary since chain order survives.
-/// ponytail: femtovg gets face index 0 of every file, leaving a `.ttc`'s other faces unreachable,
-/// costing nothing since nothing selects a weight or style today; `add_shared_font_with_index`
-/// already takes the index a fix would need.
-fn font_chain_data(db: &mut fontdb::Database) -> Vec<FontData> {
+/// glyph, not a dead shell.
+fn font_chain_data(db: &mut fontdb::Database, primary_family: &str) -> Vec<FontFace> {
+    struct Candidate {
+        id: fontdb::ID,
+        path: Option<std::path::PathBuf>,
+        primary: bool,
+        weight: u16,
+        italic: bool,
+    }
     // Collected first: `make_shared_face_data` needs `&mut db`, so nothing may be borrowing it.
-    let faces: Vec<(fontdb::ID, Option<std::path::PathBuf>)> = db
+    let faces: Vec<Candidate> = db
         .faces()
         .map(|face| {
             let path = match &face.source {
                 fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => Some(path.clone()),
                 fontdb::Source::Binary(_) => None,
             };
-            (face.id, path)
+            let primary = face.families.iter().any(|(family, _)| family.eq_ignore_ascii_case(primary_family));
+            Candidate { id: face.id, path, primary, weight: face.weight.0, italic: face.style != fontdb::Style::Normal }
         })
         .collect();
 
-    let mut seen_paths = std::collections::HashSet::new();
+    // The primary family's face for each of the four variants: the right slant, then the weight
+    // nearest the one asked for. A variant the family does not ship resolves to the same face as
+    // one it does (usually the regular), and is dropped as a duplicate below -- the painter falls
+    // back to the regular chain for a variant it was not given.
+    let mut chosen: Vec<(fontdb::ID, bool, bool)> = Vec::new();
+    for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+        let target_weight: u16 = if bold { 700 } else { 400 };
+        let best = faces
+            .iter()
+            .filter(|face| face.primary && face.italic == italic)
+            .min_by_key(|face| face.weight.abs_diff(target_weight))
+            .or_else(|| {
+                faces.iter().filter(|face| face.primary).min_by_key(|face| face.weight.abs_diff(target_weight))
+            });
+        if let Some(best) = best
+            && !chosen.iter().any(|(id, _, _)| *id == best.id)
+        {
+            chosen.push((best.id, bold, italic));
+        }
+    }
+
     let mut data = Vec::new();
-    for (id, path) in faces {
-        if path.is_some_and(|path| !seen_paths.insert(path)) {
+    let mut seen_paths = std::collections::HashSet::new();
+    for face in &faces {
+        let variant = chosen.iter().find(|(id, _, _)| *id == face.id).map(|(_, bold, italic)| (*bold, *italic));
+        let wanted = match (face.primary, variant) {
+            (true, Some(_)) => true,
+            (true, None) => false,
+            // Fallback coverage: the first face of each file, as it always was.
+            (false, _) => face.path.as_ref().is_none_or(|path| !seen_paths.contains(path)),
+        };
+        if !wanted {
             continue;
+        }
+        if let Some(path) = &face.path {
+            seen_paths.insert(path.clone());
         }
         // SAFETY: mapping a font file the process does not own, as the doc comment above spells
         // out. A rewrite in place changes the bytes under the mapping. Same bargain cosmic-text
         // already makes for every font it renders.
-        match unsafe { db.make_shared_face_data(id) } {
-            Some((bytes, _face_index)) => data.push(FontData(bytes)),
-            None => eprintln!("font chain: face {id:?} could not be mapped, skipped"),
+        match unsafe { db.make_shared_face_data(face.id) } {
+            Some((bytes, face_index)) => {
+                let (bold, italic) = variant.unwrap_or((false, false));
+                data.push(FontFace { data: FontData(bytes), index: face_index, primary: face.primary, bold, italic });
+            }
+            None => eprintln!("font chain: face {:?} could not be mapped, skipped", face.id),
         }
     }
+    // Primary faces first, regular ahead of its variants, so `fonts[0]` is still the face the
+    // chain was declared for and a painter given the list in order can rely on that.
+    data.sort_by_key(|face| (!face.primary, face.bold, face.italic));
     data
 }
 
@@ -379,7 +517,13 @@ mod tests {
     use super::*;
 
     fn req(text: &str, font_size: f32) -> ShapeRequest {
-        ShapeRequest { text: text.into(), font_size, line_height: line_height(font_size), max_width: None }
+        ShapeRequest {
+            text: text.into(),
+            font_size,
+            line_height: line_height(font_size),
+            max_width: None,
+            runs: Vec::new(),
+        }
     }
 
     /// The chain a config declares has to reach the worker, or `fonts { ... }` is a no-op that
@@ -406,16 +550,72 @@ mod tests {
     #[test]
     fn a_declared_chain_reaches_the_faces_femtovg_paints_with_too() {
         let handle = ShapingHandle::spawn();
-        let before: Vec<usize> = handle.font_chain_data().iter().map(|data| data.as_ref().len()).collect();
+        let before: Vec<usize> = handle.font_chain_data().iter().map(|data| data.data.as_ref().len()).collect();
         handle.set_chain(&["CaskaydiaCove Nerd Font Propo".to_string()]);
-        let after: Vec<usize> = handle.font_chain_data().iter().map(|data| data.as_ref().len()).collect();
+        let after: Vec<usize> = handle.font_chain_data().iter().map(|data| data.data.as_ref().len()).collect();
         if handle.resolved_primary_family() != "CaskaydiaCove Nerd Font Propo" {
             eprintln!("skip: the family is not installed, so nothing could change");
             return;
         }
-        assert_eq!(after.len(), 1, "a one-family chain loads one file");
+        // One family, but up to four faces of it: the regular and whichever of bold, italic and
+        // bold italic fontconfig found for it (ADR-0104). Every one of them is the primary's.
+        assert!(
+            !after.is_empty() && after.len() <= 4,
+            "a one-family chain loads that family's faces, got {}",
+            after.len()
+        );
+        assert!(handle.font_chain_data().iter().all(|face| face.primary), "and nothing but that family");
         assert_ne!(after, before, "the bytes femtovg would load must be the new font's, not the old chain's");
         assert!(after[0] > 0, "and they are real bytes, not an empty mapping");
+    }
+
+    // ---- styled runs (ADR-0104) ----
+
+    /// The chain's first face is the regular one, whatever else the family ships, since that is
+    /// what a plain `text` paints with and what a missing variant falls back to.
+    #[test]
+    fn the_chain_leads_with_the_primary_familys_regular_face() {
+        let handle = ShapingHandle::spawn();
+        let faces = handle.font_chain_data();
+        assert!(faces[0].primary && !faces[0].bold && !faces[0].italic, "first face must be the primary regular");
+        assert_eq!(faces.iter().filter(|face| face.primary && !face.bold && !face.italic).count(), 1);
+    }
+
+    #[test]
+    fn a_bold_run_measures_wider_than_the_same_text_regular() {
+        let handle = ShapingHandle::spawn();
+        if !handle.font_chain_data().iter().any(|face| face.primary && face.bold) {
+            eprintln!("skip: the default chain's family has no bold face installed");
+            return;
+        }
+        let plain = handle.shape(req("Oblisk Shell Renderer", 20.0));
+        let bold = handle.shape(ShapeRequest {
+            runs: vec![FontRun { range: 0..21, bold: true, italic: false }],
+            ..req("Oblisk Shell Renderer", 20.0)
+        });
+        assert!(bold.width > plain.width, "bold {} should be wider than regular {}", bold.width, plain.width);
+    }
+
+    /// The ranges are the whole point: a wrapped line has to say which bytes of the source it
+    /// holds so `layout` can carry the runs across the break, including past an explicit newline.
+    #[test]
+    fn each_line_range_slices_the_source_to_exactly_that_line() {
+        let handle = ShapingHandle::spawn();
+        let text = "first paragraph that wraps\nsecond";
+        let result = handle.shape(ShapeRequest {
+            text: text.into(),
+            font_size: 14.0,
+            line_height: line_height(14.0),
+            max_width: Some(90.0),
+            runs: Vec::new(),
+        });
+        assert_eq!(result.lines.len(), result.line_ranges.len());
+        assert!(result.lines.len() >= 3, "the first paragraph wraps and the second is its own line");
+        for (line, range) in result.lines.iter().zip(result.line_ranges.iter()) {
+            assert_eq!(&text[range.clone()], line.as_str(), "range {range:?} must slice to its line");
+        }
+        assert_eq!(result.lines.last().map(String::as_str), Some("second"));
+        assert_eq!(result.line_ranges.last().cloned(), Some(27..33));
     }
 
     #[test]
@@ -455,12 +655,45 @@ mod tests {
         let handle = ShapingHandle::spawn();
         handle.shape(req("abc", 13.0));
         for (label, request) in [
-            ("text", ShapeRequest { text: "abd".into(), font_size: 13.0, line_height: 15.6, max_width: None }),
-            ("font_size", ShapeRequest { text: "abc".into(), font_size: 26.0, line_height: 15.6, max_width: None }),
-            ("line_height", ShapeRequest { text: "abc".into(), font_size: 13.0, line_height: 40.0, max_width: None }),
+            (
+                "text",
+                ShapeRequest {
+                    text: "abd".into(),
+                    font_size: 13.0,
+                    line_height: 15.6,
+                    max_width: None,
+                    runs: Vec::new(),
+                },
+            ),
+            (
+                "font_size",
+                ShapeRequest {
+                    text: "abc".into(),
+                    font_size: 26.0,
+                    line_height: 15.6,
+                    max_width: None,
+                    runs: Vec::new(),
+                },
+            ),
+            (
+                "line_height",
+                ShapeRequest {
+                    text: "abc".into(),
+                    font_size: 13.0,
+                    line_height: 40.0,
+                    max_width: None,
+                    runs: Vec::new(),
+                },
+            ),
             (
                 "max_width",
-                ShapeRequest { text: "abc".into(), font_size: 13.0, line_height: 15.6, max_width: Some(10.0) },
+                ShapeRequest {
+                    text: "abc".into(),
+                    font_size: 13.0,
+                    line_height: 15.6,
+                    max_width: Some(10.0),
+                    runs: Vec::new(),
+                },
             ),
         ] {
             let before = handle.cached_len();
@@ -510,8 +743,13 @@ mod tests {
     #[test]
     fn shapes_nonempty_text_to_a_nonzero_box() {
         let handle = ShapingHandle::spawn();
-        let result =
-            handle.shape(ShapeRequest { text: "Oblisk".into(), font_size: 14.0, line_height: 18.0, max_width: None });
+        let result = handle.shape(ShapeRequest {
+            text: "Oblisk".into(),
+            font_size: 14.0,
+            line_height: 18.0,
+            max_width: None,
+            runs: Vec::new(),
+        });
         assert!(result.width > 0.0, "expected nonzero width, got {}", result.width);
         assert_eq!(result.height, 18.0);
     }
@@ -519,21 +757,32 @@ mod tests {
     #[test]
     fn empty_text_measures_to_zero_width() {
         let handle = ShapingHandle::spawn();
-        let result =
-            handle.shape(ShapeRequest { text: String::new(), font_size: 14.0, line_height: 18.0, max_width: None });
+        let result = handle.shape(ShapeRequest {
+            text: String::new(),
+            font_size: 14.0,
+            line_height: 18.0,
+            max_width: None,
+            runs: Vec::new(),
+        });
         assert_eq!(result.width, 0.0);
     }
 
     #[test]
     fn longer_text_measures_wider_than_shorter_text() {
         let handle = ShapingHandle::spawn();
-        let short =
-            handle.shape(ShapeRequest { text: "O".into(), font_size: 14.0, line_height: 18.0, max_width: None });
+        let short = handle.shape(ShapeRequest {
+            text: "O".into(),
+            font_size: 14.0,
+            line_height: 18.0,
+            max_width: None,
+            runs: Vec::new(),
+        });
         let long = handle.shape(ShapeRequest {
             text: "Oblisk Shell".into(),
             font_size: 14.0,
             line_height: 18.0,
             max_width: None,
+            runs: Vec::new(),
         });
         assert!(long.width > short.width);
     }
@@ -544,7 +793,8 @@ mod tests {
         let chain = handle.font_chain_data();
         assert!(!chain.is_empty(), "the default chain must resolve to at least one loaded face");
         for data in &chain {
-            ttf_parser::Face::parse(data.as_ref(), 0).expect("every chain entry's bytes should parse as a font face");
+            ttf_parser::Face::parse(data.data.as_ref(), 0)
+                .expect("every chain entry's bytes should parse as a font face");
         }
     }
 
@@ -560,8 +810,8 @@ mod tests {
         assert_eq!(first.len(), second.len());
         for (a, b) in first.iter().zip(second.iter()) {
             assert_eq!(
-                a.as_ref().as_ptr(),
-                b.as_ref().as_ptr(),
+                a.data.as_ref().as_ptr(),
+                b.data.as_ref().as_ptr(),
                 "each ask should share one mapping, not copy the file"
             );
         }
@@ -579,7 +829,7 @@ mod tests {
 
         let mut db = fontdb::Database::new();
         for data in handle.font_chain_data() {
-            db.load_font_data(data.as_ref().to_vec());
+            db.load_font_data(data.data.as_ref().to_vec());
         }
 
         let query = fontdb::Query { families: &[fontdb::Family::Name(&primary_family)], ..Default::default() };
@@ -608,8 +858,13 @@ mod tests {
         let ResolvedFonts { db, .. } = fonts::resolve_chain(&["Noto Sans", "Noto Sans Mono"]);
         let mut font_system = FontSystem::new_with_locale_and_db(detect_locale(), db);
 
-        let request =
-            ShapeRequest { text: "Oblisk Shell Renderer".into(), font_size: 24.0, line_height: 28.8, max_width: None };
+        let request = ShapeRequest {
+            text: "Oblisk Shell Renderer".into(),
+            font_size: 24.0,
+            line_height: 28.8,
+            max_width: None,
+            runs: Vec::new(),
+        };
         let proportional = shape(&mut font_system, "Noto Sans", &request);
         let monospace = shape(&mut font_system, "Noto Sans Mono", &request);
 
@@ -641,6 +896,7 @@ mod tests {
             font_size: 14.0,
             line_height: line_height(14.0),
             max_width: Some(unconstrained.width / 2.0),
+            runs: Vec::new(),
         });
         assert!(wrapped.lines.len() > 1, "expected a break, got {:?}", wrapped.lines);
         assert_eq!(
@@ -661,6 +917,7 @@ mod tests {
             font_size: 14.0,
             line_height: 18.0,
             max_width: Some(40.0),
+            runs: Vec::new(),
         });
         assert_eq!(result.height, result.lines.len() as f32 * 18.0);
     }
@@ -682,12 +939,14 @@ mod tests {
             font_size: 14.0,
             line_height: 18.0,
             max_width: None,
+            runs: Vec::new(),
         });
         let wrapped = handle.shape(ShapeRequest {
             text: "Oblisk Shell Renderer".into(),
             font_size: 14.0,
             line_height: 18.0,
             max_width: Some(unconstrained.width / 2.0),
+            runs: Vec::new(),
         });
         assert!(wrapped.height > unconstrained.height, "wrapping onto more lines must grow the measured height");
         assert!(wrapped.width <= unconstrained.width, "a wrapped line can't be wider than the unconstrained text");

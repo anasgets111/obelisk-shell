@@ -5,20 +5,121 @@
 //! for `namespace`, `title`, `app_id` and the like.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use mlua::Value;
 
 use crate::image::Fit;
+use crate::text::shaping::FontRun;
 
 use super::*;
 
+/// A stretch of a `text`'s content drawn differently from the rest (ADR-0104): in the chain's
+/// bold and/or italic face, underlined, or in its own colour. Ranges are bytes into the node's
+/// `content` string, in order and non-overlapping, and `layout::scene` remaps them when a wrap or
+/// an elide rewrites that string. A `text` whose content is one plain string has none.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StyleRun {
+    pub range: Range<usize>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub color: Option<Rgba>,
+}
+
+/// The half of `runs` the shaper needs -- the ones in another face -- in the shape it takes. An
+/// underlined or recoloured run in the regular face measures like plain text and is left out, so
+/// two contents that differ only in colour share one memo entry.
+pub fn font_runs(runs: &[StyleRun]) -> Vec<FontRun> {
+    runs.iter()
+        .filter(|run| run.bold || run.italic)
+        .map(|run| FontRun { range: run.range.clone(), bold: run.bold, italic: run.italic })
+        .collect()
+}
+
+/// `text.content`: one string, or an array of runs `{ text = ..., bold = ..., italic = ...,
+/// underline = ..., color = ... }` whose texts are joined into the string this returns and whose
+/// styles become the [`StyleRun`]s beside it (ADR-0104). The run shape is a notification body
+/// span's own (§ 2.7), minus `kind` and `href`, so a body's text spans can be handed over as they
+/// arrive; an image span has no `text` and is refused, since a picture inside a line of text is
+/// not something this node draws -- the caller filters those out.
+///
 /// Absent `content` defaults to the empty string (ADR-0044 decision 1's nil rule): a `text` bound
 /// to a not-yet-pushed capability signal reads `nil` until its first `StateSnapshot`, and
 /// `run_startup_evaluation` runs before the poll loop drains one. Rejecting that would boot a
 /// blank shell. Accepted cost: a misspelled `content` key renders an empty node instead of
 /// failing the whole tree; `oblisk.rescue` covers the failures that matter.
-pub fn parse_content(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
-    parse_optional_string(properties, "content")
+pub fn parse_content(properties: &HashMap<String, Value>) -> Result<(String, Vec<StyleRun>), LayoutError> {
+    let Some(value) = properties.get("content") else {
+        return Ok((String::new(), Vec::new()));
+    };
+    match value {
+        Value::String(s) => Ok((checked_string("content", s)?, Vec::new())),
+        Value::Table(runs) => parse_runs(runs),
+        other => {
+            Err(invalid("content", format!("expected a string or an array of runs, got {}", preview_for_error(other))))
+        }
+    }
+}
+
+fn parse_runs(runs: &mlua::Table) -> Result<(String, Vec<StyleRun>), LayoutError> {
+    let mut content = String::new();
+    let mut styles = Vec::new();
+    for (position, run) in runs.clone().sequence_values::<Value>().enumerate() {
+        let index = position + 1;
+        let run = run.map_err(|e| invalid("content", format!("run {index}: {e}")))?;
+        let Value::Table(run) = run else {
+            return Err(invalid("content", format!("run {index}: expected a table, got {}", preview_for_error(&run))));
+        };
+        let text = match run.get::<Value>("text") {
+            Ok(Value::String(s)) => checked_string("content", &s)?,
+            Ok(Value::Nil) => {
+                return Err(invalid(
+                    "content",
+                    format!("run {index} has no `text` -- an image span has no place in a line of text, leave it out"),
+                ));
+            }
+            Ok(other) => {
+                return Err(invalid(
+                    "content",
+                    format!("run {index}: expected `text` to be a string, got {}", preview_for_error(&other)),
+                ));
+            }
+            Err(e) => return Err(invalid("content", format!("run {index}: {e}"))),
+        };
+        let flag = |key: &str| -> Result<bool, LayoutError> {
+            match run.get::<Value>(key) {
+                Ok(Value::Nil) => Ok(false),
+                Ok(Value::Boolean(b)) => Ok(b),
+                Ok(other) => Err(invalid(
+                    "content",
+                    format!("run {index}: expected `{key}` to be a boolean, got {}", preview_for_error(&other)),
+                )),
+                Err(e) => Err(invalid("content", format!("run {index}: {e}"))),
+            }
+        };
+        let (bold, italic, underline) = (flag("bold")?, flag("italic")?, flag("underline")?);
+        let color = match run.get::<Value>("color") {
+            Ok(Value::Nil) => None,
+            Ok(Value::String(s)) => Some(parse_hex_color("content", &checked_string("content", &s)?)?),
+            Ok(other) => {
+                return Err(invalid(
+                    "content",
+                    format!("run {index}: expected `color` to be a hex string, got {}", preview_for_error(&other)),
+                ));
+            }
+            Err(e) => return Err(invalid("content", format!("run {index}: {e}"))),
+        };
+        if text.is_empty() {
+            continue;
+        }
+        let start = content.len();
+        content.push_str(&text);
+        if bold || italic || underline || color.is_some() {
+            styles.push(StyleRun { range: start..content.len(), bold, italic, underline, color });
+        }
+    }
+    Ok((content, styles))
 }
 
 /// `icon.name` (§ 5.2 item 5): a theme name or an absolute path, told apart by
@@ -316,7 +417,7 @@ mod tests {
     #[test]
     fn text_content_absent_defaults_to_the_empty_string() {
         let props = HashMap::new();
-        assert_eq!(parse_content(&props).unwrap(), "");
+        assert_eq!(parse_content(&props).unwrap().0, "");
     }
 
     #[test]
@@ -329,23 +430,19 @@ mod tests {
         table.set("kind", "text").unwrap();
         table.set("content", signal).unwrap();
         let node = deserialize_lua_table(&table).unwrap();
-        assert_eq!(parse_content(&resolve_properties(&node.properties, "text", &lua).unwrap()).unwrap(), "hello");
+        assert_eq!(parse_content(&resolve_properties(&node.properties, "text", &lua).unwrap()).unwrap().0, "hello");
     }
 
     #[test]
-    fn a_signal_resolving_to_a_table_reports_the_same_error_a_literal_table_would() {
+    fn a_signal_resolving_to_a_number_reports_the_same_error_a_literal_number_would() {
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
 
-        let literal_table: mlua::Table = lua.load(r#"return { kind = "text", content = {} }"#).eval().unwrap();
+        let literal_table: mlua::Table = lua.load(r#"return { kind = "text", content = 5 }"#).eval().unwrap();
         let literal_props = props_from_table(&literal_table);
         let literal_err = parse_content(&resolve_properties(&literal_props, "text", &lua).unwrap()).unwrap_err();
 
-        let signal = crate::lua::signal::Signal::new_live(
-            Value::Table(lua.create_table().unwrap()),
-            crate::lua::signal::DirtyFlag::new(),
-        )
-        .0;
+        let signal = crate::lua::signal::Signal::new_live(Value::Integer(5), crate::lua::signal::DirtyFlag::new()).0;
         let table = lua.create_table().unwrap();
         table.set("kind", "text").unwrap();
         table.set("content", signal).unwrap();
@@ -356,9 +453,75 @@ mod tests {
             assert!(matches!(
                 err,
                 LayoutError::InvalidProperty { property, detail }
-                    if property == "content" && detail.starts_with("expected a string")
+                    if property == "content" && detail.starts_with("expected a string or an array of runs")
             ));
         }
+    }
+
+    // ---- styled runs (ADR-0104) ----
+
+    fn runs_content(lua: &mlua::Lua, src: &str) -> Result<(String, Vec<StyleRun>), LayoutError> {
+        let table: mlua::Table = lua.load(format!(r#"return {{ kind = "text", content = {src} }}"#)).eval().unwrap();
+        parse_content(&props_from_table(&table))
+    }
+
+    #[test]
+    fn an_array_of_runs_joins_their_text_and_keeps_where_each_styled_one_lies() {
+        let lua = lua();
+        let (content, runs) = runs_content(
+            &lua,
+            r##"{ { text = "Alice" , bold = true }, { text = ": see " }, { text = "this", underline = true, color = "#ff0000" }, { text = "!" } }"##,
+        )
+        .unwrap();
+        assert_eq!(content, "Alice: see this!");
+        assert_eq!(runs.len(), 2, "plain runs are text with no style entry of their own");
+        assert_eq!(runs[0].range, 0..5);
+        assert!(runs[0].bold && !runs[0].italic && !runs[0].underline && runs[0].color.is_none());
+        assert_eq!(runs[1].range, 11..15);
+        assert!(runs[1].underline);
+        assert_eq!(runs[1].color, Some(Rgba { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }));
+    }
+
+    #[test]
+    fn an_empty_run_array_is_empty_content_and_an_empty_run_is_skipped() {
+        let lua = lua();
+        assert_eq!(runs_content(&lua, "{}").unwrap(), (String::new(), Vec::new()));
+        let (content, runs) = runs_content(&lua, r#"{ { text = "", bold = true }, { text = "a" } }"#).unwrap();
+        assert_eq!((content.as_str(), runs.len()), ("a", 0));
+    }
+
+    /// A notification body span of `kind = "image"` has no `text`. It is refused with a message
+    /// that says what to do about it, rather than drawn as nothing or as its path.
+    #[test]
+    fn a_run_without_text_is_refused_naming_the_run() {
+        let lua = lua();
+        let err = runs_content(&lua, r#"{ { text = "a" }, { kind = "image", image_path = "/x.png" } }"#).unwrap_err();
+        assert!(
+            matches!(&err, LayoutError::InvalidProperty { property, detail }
+            if property == "content" && detail.starts_with("run 2 has no `text`")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_run_with_a_mistyped_flag_or_colour_is_refused() {
+        let lua = lua();
+        assert!(runs_content(&lua, r#"{ { text = "a", bold = "yes" } }"#).is_err());
+        assert!(runs_content(&lua, r#"{ { text = "a", color = "red" } }"#).is_err());
+        assert!(runs_content(&lua, r#"{ "just a string" }"#).is_err());
+    }
+
+    #[test]
+    fn font_runs_keep_only_the_runs_the_shaper_can_see() {
+        let runs = vec![
+            StyleRun { range: 0..2, bold: false, italic: false, underline: true, color: None },
+            StyleRun { range: 2..4, bold: true, italic: false, underline: false, color: None },
+            StyleRun { range: 4..6, bold: false, italic: true, underline: true, color: None },
+        ];
+        let fonts = font_runs(&runs);
+        assert_eq!(fonts.len(), 2);
+        assert_eq!((fonts[0].range.clone(), fonts[0].bold, fonts[0].italic), (2..4, true, false));
+        assert_eq!((fonts[1].range.clone(), fonts[1].bold, fonts[1].italic), (4..6, false, true));
     }
 
     #[test]

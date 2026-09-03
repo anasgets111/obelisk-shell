@@ -10,11 +10,13 @@
 use std::error::Error;
 use std::ffi::c_void;
 
-use femtovg::renderer::OpenGl;
-use femtovg::{Align, Canvas, Color, FontId, Paint, TextContext};
+use std::ops::Range;
 
-use crate::layout::node::{Rgba, TextAlign};
-use crate::text::shaping::FontData;
+use femtovg::renderer::OpenGl;
+use femtovg::{Align, Canvas, Color, FontId, Paint, Path, TextContext};
+
+use crate::layout::node::{Rgba, StyleRun, TextAlign};
+use crate::text::shaping::FontFace;
 
 use super::snap::{LogicalRect, snap_to_physical};
 
@@ -22,7 +24,49 @@ use super::snap::{LogicalRect, snap_to_physical};
 /// font chain loaded and ready to draw with.
 pub struct TextPainter {
     canvas: Canvas<OpenGl>,
-    fonts: Vec<FontId>,
+    /// One chain per face variant, indexed by [`variant`]: the primary family's face for that
+    /// variant (or its regular face, for a variant it does not ship) followed by every fallback
+    /// face, so per-glyph fallback works the same in bold as in regular (ADR-0104).
+    fonts: [Vec<FontId>; 4],
+}
+
+/// What [`TextPainter::draw_text`] draws, apart from where: one `Draw::Text` command's worth,
+/// borrowed rather than cloned out of it.
+pub struct TextDraw<'a> {
+    pub text: &'a str,
+    pub runs: &'a [StyleRun],
+    pub font_size: f32,
+    pub color: Rgba,
+    pub align: TextAlign,
+}
+
+/// Which of the four chains a run draws with.
+fn variant(bold: bool, italic: bool) -> usize {
+    usize::from(bold) | (usize::from(italic) << 1)
+}
+
+/// One line of `text` cut at the points where its style changes: each piece is a byte range of
+/// the line and the run it falls in, or `None` for a plain stretch. Pure, so the split -- the part
+/// of a styled draw that can go wrong quietly -- is tested without a GL context.
+fn segments(line: Range<usize>, runs: &[StyleRun]) -> Vec<(Range<usize>, Option<&StyleRun>)> {
+    let mut pieces = Vec::new();
+    let mut cursor = line.start;
+    for run in runs {
+        let start = run.range.start.max(line.start);
+        let end = run.range.end.min(line.end);
+        if start >= end {
+            continue;
+        }
+        if start > cursor {
+            pieces.push((cursor..start, None));
+        }
+        pieces.push((start..end, Some(run)));
+        cursor = end;
+    }
+    if cursor < line.end || pieces.is_empty() {
+        pieces.push((cursor..line.end, None));
+    }
+    pieces
 }
 
 /// Which femtovg alignment to set, and what x to hand `fill_text` under it.
@@ -59,7 +103,7 @@ impl TextPainter {
         load_fn: impl FnMut(&str) -> *const c_void,
         width: u32,
         height: u32,
-        font_chain: &[FontData],
+        font_chain: &[FontFace],
     ) -> Result<Self, Box<dyn Error>> {
         if font_chain.is_empty() {
             return Err("TextPainter::new requires at least one loaded font".into());
@@ -72,10 +116,21 @@ impl TextPainter {
         let text_context = TextContext::default();
         let mut canvas = Canvas::new_with_text_context(renderer, text_context.clone())?;
         canvas.set_size(width, height, 1.0);
-        let fonts = font_chain
-            .iter()
-            .map(|data| text_context.add_shared_font_with_index(data.clone(), 0))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut primary: [Option<FontId>; 4] = [None; 4];
+        let mut fallbacks = Vec::new();
+        for face in font_chain {
+            let id = text_context.add_shared_font_with_index(face.data.clone(), face.index)?;
+            match face.primary {
+                true => primary[variant(face.bold, face.italic)] = Some(id),
+                false => fallbacks.push(id),
+            }
+        }
+        let fonts = std::array::from_fn(|which| {
+            let mut chain = Vec::with_capacity(fallbacks.len() + 1);
+            chain.extend(primary[which].or(primary[0]));
+            chain.extend(fallbacks.iter().copied());
+            chain
+        });
         Ok(Self { canvas, fonts })
     }
 
@@ -97,7 +152,14 @@ impl TextPainter {
     /// `draw_text` reaches `self.fonts` directly and has no need of this.
     #[cfg(test)]
     pub fn fonts(&self) -> &[FontId] {
-        &self.fonts
+        &self.fonts[0]
+    }
+
+    /// The chain for a bold and/or italic run -- the test seam for checking a variant chain leads
+    /// with a different face than the regular one when the family ships it.
+    #[cfg(test)]
+    pub fn variant_fonts(&self, bold: bool, italic: bool) -> &[FontId] {
+        &self.fonts[variant(bold, italic)]
     }
 
     /// Draws `text` with its snapped top-left corner at `rect`'s origin, in `color`, one
@@ -108,22 +170,21 @@ impl TextPainter {
     /// cosmic-text found. femtovg has no line breaker and draws `\n` as a glyph, so splitting here
     /// is not a convenience -- it is the only reason a wrapped `text` renders as more than one
     /// clipped line. A string with no newline in it takes exactly the path it always did.
-    pub fn draw_text(
-        &mut self,
-        text: &str,
-        rect: LogicalRect,
-        font_size: f32,
-        scale: f32,
-        color: Rgba,
-        align: TextAlign,
-    ) {
+    ///
+    /// `runs` are the styled stretches of `text` (ADR-0104), byte ranges into it. With none, each
+    /// line is one `fill_text` under femtovg's own alignment, the path this always took. With
+    /// some, a line is drawn piece by piece -- each piece in its run's face and colour, advanced
+    /// by femtovg's own measurement of it -- and the alignment is computed from the pieces' total,
+    /// since femtovg's `set_text_align` can only place one run.
+    pub fn draw_text(&mut self, line: TextDraw<'_>, rect: LogicalRect, scale: f32) {
+        let TextDraw { text, runs, font_size, color, align } = line;
         let physical = snap_to_physical(rect, scale);
         // `Rgba`'s four `f32` fields exist so `Color::rgbaf` takes them with no conversion.
         let mut paint = Paint::color(Color::rgbaf(color.r, color.g, color.b, color.a));
         // The whole chain, in chain order: FemtoVG's `set_font` does its own per-glyph fallback
         // across the slice it's given, the same way cosmic-text's shaping falls back across
         // `db`'s loaded faces.
-        paint.set_font(&self.fonts);
+        paint.set_font(&self.fonts[0]);
         paint.set_font_size(font_size);
         // fill_text's y is the text baseline, not the box top, so it belongs at the snapped top
         // edge plus the font's ascender -- not the snapped bottom edge, which would cut
@@ -146,9 +207,56 @@ impl TextPainter {
         // the font size here and let this follow it; only reachable with a HiDPI output to verify
         // against.
         let step = crate::text::shaping::line_height(font_size);
-        for (index, line) in text.lines().enumerate() {
+        if runs.is_empty() {
+            for (index, line) in text.lines().enumerate() {
+                let baseline_y = physical.y0 as f32 + ascender + index as f32 * step;
+                let _ = self.canvas.fill_text(anchor_x, baseline_y, line, &paint);
+            }
+            return;
+        }
+
+        // Styled: every piece is placed by hand from the left, so femtovg's alignment is turned
+        // off and the anchor is the line's own left edge under the requested alignment.
+        paint.set_text_align(Align::Left);
+        let mut line_start = 0usize;
+        for (index, line) in text.split('\n').enumerate() {
             let baseline_y = physical.y0 as f32 + ascender + index as f32 * step;
-            let _ = self.canvas.fill_text(anchor_x, baseline_y, line, &paint);
+            let pieces = segments(line_start..line_start + line.len(), runs);
+            let mut painted: Vec<(&str, Paint, Rgba, f32, Option<&StyleRun>)> = Vec::with_capacity(pieces.len());
+            for (range, run) in pieces {
+                let piece = &text[range];
+                let mut piece_paint = paint.clone();
+                let mut piece_color = color;
+                if let Some(run) = run {
+                    piece_paint.set_font(&self.fonts[variant(run.bold, run.italic)]);
+                    if let Some(c) = run.color {
+                        piece_color = c;
+                        piece_paint.set_color(Color::rgbaf(c.r, c.g, c.b, c.a));
+                    }
+                }
+                let width = self.canvas.measure_text(0.0, 0.0, piece, &piece_paint).map(|m| m.width()).unwrap_or(0.0);
+                painted.push((piece, piece_paint, piece_color, width, run));
+            }
+            let total: f32 = painted.iter().map(|(_, _, _, width, _)| width).sum();
+            let mut x = match align {
+                TextAlign::Start => physical.x0 as f32,
+                TextAlign::Center => (physical.x0 as f32 + physical.x1 as f32) / 2.0 - total / 2.0,
+                TextAlign::End => physical.x1 as f32 - total,
+            };
+            for (piece, piece_paint, piece_color, width, run) in painted {
+                let _ = self.canvas.fill_text(x, baseline_y, piece, &piece_paint);
+                if run.is_some_and(|run| run.underline) {
+                    // Just under the baseline, a stroke proportional to the size and never thinner
+                    // than a pixel: a 12px label gets a hairline, a 32px heading a 2px rule.
+                    let thickness = (font_size / 16.0).max(1.0).round();
+                    let mut path = Path::new();
+                    path.rect(x, (baseline_y + thickness).round(), width, thickness);
+                    let rule = Paint::color(Color::rgbaf(piece_color.r, piece_color.g, piece_color.b, piece_color.a));
+                    self.canvas.fill_path(&path, &rule);
+                }
+                x += width;
+            }
+            line_start += line.len() + 1;
         }
     }
 }
@@ -171,6 +279,56 @@ mod tests {
     #[test]
     fn an_odd_width_box_centres_on_its_true_middle() {
         assert_eq!(text_anchor(TextAlign::Center, 0, 15).1, 7.5);
+    }
+
+    fn run(range: Range<usize>) -> StyleRun {
+        StyleRun { range, bold: true, italic: false, underline: false, color: None }
+    }
+
+    // ---- segments (ADR-0104) ----
+
+    #[test]
+    fn a_line_with_no_run_in_it_is_one_plain_piece() {
+        let pieces = segments(0..5, &[]);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].0, 0..5);
+        assert!(pieces[0].1.is_none());
+        // A run entirely on another line leaves this one plain too.
+        assert_eq!(segments(0..5, &[run(6..9)]).len(), 1);
+    }
+
+    #[test]
+    fn a_run_inside_a_line_splits_it_into_plain_styled_plain() {
+        let runs = [run(2..4)];
+        let pieces: Vec<(Range<usize>, bool)> =
+            segments(0..6, &runs).into_iter().map(|(r, s)| (r, s.is_some())).collect();
+        assert_eq!(pieces, vec![(0..2, false), (2..4, true), (4..6, false)]);
+    }
+
+    /// A wrap can break a run across lines: the second line's slice of it starts at the line, not
+    /// at the run, and a run ending exactly at a line's end leaves no empty plain tail.
+    #[test]
+    fn a_run_crossing_a_line_boundary_is_clipped_to_the_line_on_each_side() {
+        let runs = [run(3..9)];
+        let first: Vec<_> = segments(0..5, &runs).into_iter().map(|(r, s)| (r, s.is_some())).collect();
+        assert_eq!(first, vec![(0..3, false), (3..5, true)]);
+        let second: Vec<_> = segments(6..10, &runs).into_iter().map(|(r, s)| (r, s.is_some())).collect();
+        assert_eq!(second, vec![(6..9, true), (9..10, false)]);
+    }
+
+    #[test]
+    fn adjacent_runs_touch_with_no_plain_piece_between_them() {
+        let runs = [run(0..2), run(2..4)];
+        let pieces: Vec<_> = segments(0..4, &runs).into_iter().map(|(r, s)| (r, s.is_some())).collect();
+        assert_eq!(pieces, vec![(0..2, true), (2..4, true)]);
+    }
+
+    #[test]
+    fn the_variant_index_is_bold_then_italic() {
+        assert_eq!(variant(false, false), 0);
+        assert_eq!(variant(true, false), 1);
+        assert_eq!(variant(false, true), 2);
+        assert_eq!(variant(true, true), 3);
     }
 
     /// A zero-width box is degenerate but reachable (a `Content`-sized node holding an empty

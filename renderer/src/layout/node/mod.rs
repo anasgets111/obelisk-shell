@@ -31,7 +31,9 @@ use content::{
 use spec::parse_secure_submit;
 use style::{parse_background, parse_border_color, parse_border_width, parse_clip, parse_radius};
 
-pub use content::{Elide, TextAlign, Wrap, parse_content, parse_icon_size, parse_node_id, parse_surface_id};
+pub use content::{
+    Elide, StyleRun, TextAlign, Wrap, font_runs, parse_content, parse_icon_size, parse_node_id, parse_surface_id,
+};
 pub use paint_style::{PaintStyle, paint_style};
 pub use spec::{
     SecureSubmitTarget, SurfaceFingerprint, SurfaceSpec, lock_spec, parse_children, parse_list_children,
@@ -489,7 +491,7 @@ mod tests {
         assert_eq!(parse_font_size(&props_with_nil_signal(&lua, "text", "font_size")).unwrap(), 12.0);
         assert!(parse_single_child(&props_with_nil_signal(&lua, "panel", "child"), "child").unwrap().is_none());
         assert!(parse_children(&props_with_nil_signal(&lua, "row", "children")).unwrap().is_empty());
-        assert_eq!(parse_content(&props_with_nil_signal(&lua, "text", "content")).unwrap(), "");
+        assert_eq!(parse_content(&props_with_nil_signal(&lua, "text", "content")).unwrap().0, "");
         assert_eq!(parse_icon_size(&props_with_nil_signal(&lua, "icon", "size")).unwrap(), 12.0);
         assert_eq!(parse_icon_name(&props_with_nil_signal(&lua, "icon", "name")).unwrap(), "");
         assert_eq!(parse_image_source(&props_with_nil_signal(&lua, "image", "source")).unwrap(), "");
