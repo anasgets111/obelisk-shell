@@ -95,6 +95,7 @@ enum FieldTarget {
         id: layout::scene::NodeId,
         on_change: Option<Function>,
         on_submit: Option<Function>,
+        on_cancel: Option<Function>,
     },
 }
 /// What the innermost `textfield` in a hit path is, if the press landed on one at all (ADR-0050
@@ -130,7 +131,7 @@ fn focused_field(path: &[&layout::ResolvedNode]) -> Option<FieldTarget> {
     if on_change.is_none() && on_submit.is_none() {
         return None;
     }
-    Some(FieldTarget::Plain { id: field.id, on_change, on_submit })
+    Some(FieldTarget::Plain { id: field.id, on_change, on_submit, on_cancel: function("on_cancel") })
 }
 /// The focused plain `textfield`: where it lives, what has been typed into it, and who to tell
 /// (ADR-0092). The buffer is an ordinary `String` and deliberately so -- this is the half of § 5.2
@@ -143,6 +144,41 @@ pub(super) struct FocusedTextField {
     buffer: String,
     on_change: Option<Function>,
     on_submit: Option<Function>,
+    on_cancel: Option<Function>,
+}
+
+/// What one key did to a plain field's buffer, before any callback runs (ADR-0092, ADR-0102).
+/// Split from [`App::apply_plain_key`] so the Escape rule can be tested without a Wayland seat.
+#[derive(Debug, PartialEq, Eq)]
+struct PlainEdit {
+    /// The buffer's text is different from before, so `on_change` has something to say.
+    changed: bool,
+    /// Enter: `on_submit` fires with the text and the buffer is emptied.
+    submitted: bool,
+    /// Escape on a field that declared `on_cancel`: focus is dropped and `on_cancel` fires.
+    cancelled: bool,
+}
+
+/// Applies `action` to `buffer`. Escape clears the buffer either way; whether it also gives the
+/// field up depends on `cancels` -- whether the field declared `on_cancel`. Without one, clearing
+/// and staying is the only honest answer, since the config could not be told the field stopped
+/// taking keys (ADR-0092 decision 6). With one, it can, so Escape means what it means everywhere
+/// else: leave.
+fn edit_plain_buffer(buffer: &mut String, action: KeyAction<'_>, cancels: bool) -> PlainEdit {
+    match action {
+        KeyAction::Append(text) => {
+            buffer.push_str(text);
+            PlainEdit { changed: true, submitted: false, cancelled: false }
+        }
+        KeyAction::Backspace => PlainEdit { changed: buffer.pop().is_some(), submitted: false, cancelled: false },
+        KeyAction::Clear => {
+            let had = !buffer.is_empty();
+            buffer.clear();
+            PlainEdit { changed: had, submitted: false, cancelled: cancels }
+        }
+        KeyAction::Submit => PlainEdit { changed: true, submitted: true, cancelled: false },
+        KeyAction::Ignore => PlainEdit { changed: false, submitted: false, cancelled: false },
+    }
 }
 /// The frame a completed `wp-text-input-v3` submit produces, or `None` when no focused `textfield`
 /// named a destination for it (ADR-0050 decision 4). `None` is the point: without it the submit
@@ -618,54 +654,60 @@ impl App {
     /// string from deltas is work every caller would repeat. `on_submit` leaves the field focused
     /// and empty, so a reply box takes the next message without another click.
     ///
-    /// Escape clears and stays, the same answer the masked half gives. Dropping focus instead
-    /// would be the more conventional one, and it is not available: a config cannot observe focus,
-    /// so a field that silently stopped taking keys would have no way to say so on the glass.
+    /// Escape clears, and on a field with no `on_cancel` it stays, the same answer the masked half
+    /// gives: a config cannot observe focus, so a field that silently stopped taking keys would
+    /// have no way to say so on the glass. A field that declared `on_cancel` *can* be told, so
+    /// there Escape also drops the focus and then says so (ADR-0102) -- the callback is the last
+    /// thing to run, after the field has already let go, since it will usually take the field or
+    /// its surface's keyboard away and must not find the focus still pointing at it.
     fn apply_plain_key(&mut self, event: &KeyEvent, repeat: bool) {
         let Some(field) = self.focused_text_field.as_mut() else {
             return;
         };
-        let (changed, submitted) = match key_action(event, repeat) {
-            KeyAction::Append(text) => {
-                field.buffer.push_str(text);
-                (true, false)
-            }
-            KeyAction::Backspace => (field.buffer.pop().is_some(), false),
-            KeyAction::Clear => {
-                let had = !field.buffer.is_empty();
-                field.buffer.clear();
-                (had, false)
-            }
-            KeyAction::Submit => (true, true),
-            KeyAction::Ignore => (false, false),
-        };
-        if !changed {
+        let edit = edit_plain_buffer(&mut field.buffer, key_action(event, repeat), field.on_cancel.is_some());
+        if edit == (PlainEdit { changed: false, submitted: false, cancelled: false }) {
             return;
         }
-        // Cloned out before either callback runs: a handler is free to write a signal that
+        // Cloned out before any callback runs: a handler is free to write a signal that
         // re-resolves the scene, and holding a `&mut` into `self` across that is not on offer.
-        let (text, on_change, on_submit, surface_id) = {
+        let (text, on_change, on_submit, on_cancel, surface_id) = {
             let field = self.focused_text_field.as_ref().expect("the focus was Some a moment ago");
-            (field.buffer.clone(), field.on_change.clone(), field.on_submit.clone(), field.surface_id.clone())
+            (
+                field.buffer.clone(),
+                field.on_change.clone(),
+                field.on_submit.clone(),
+                field.on_cancel.clone(),
+                field.surface_id.clone(),
+            )
         };
-        if submitted {
+        if edit.submitted {
             // Emptied before the call, not after: `on_submit` may open a popup or write a signal,
             // and the field it comes back to must be the empty one, not the text it just consumed.
             if let Some(field) = self.focused_text_field.as_mut() {
                 field.buffer.clear();
             }
         }
+        if edit.cancelled {
+            self.focus_text_field(None);
+        }
         self.field_input_changed = true;
-        if let Some(on_change) = on_change
-            && let Err(e) = on_change.call::<()>(if submitted { String::new() } else { text.clone() })
+        if edit.changed
+            && let Some(on_change) = on_change
+            && let Err(e) = on_change.call::<()>(if edit.submitted { String::new() } else { text.clone() })
         {
             eprintln!("[oblisk-renderer] {surface_id}: on_change raised, ignoring it: {e}");
         }
-        if submitted
+        if edit.submitted
             && let Some(on_submit) = on_submit
             && let Err(e) = on_submit.call::<()>(text)
         {
             eprintln!("[oblisk-renderer] {surface_id}: on_submit raised, ignoring it: {e}");
+        }
+        if edit.cancelled
+            && let Some(on_cancel) = on_cancel
+            && let Err(e) = on_cancel.call::<()>(())
+        {
+            eprintln!("[oblisk-renderer] {surface_id}: on_cancel raised, ignoring it: {e}");
         }
     }
 
@@ -972,7 +1014,7 @@ impl PointerHandler for App {
                         Some(FieldTarget::Masked(target)) => {
                             (Some(FocusedField { surface_id: instance_id.clone(), target }), None)
                         }
-                        Some(FieldTarget::Plain { id, on_change, on_submit }) => (
+                        Some(FieldTarget::Plain { id, on_change, on_submit, on_cancel }) => (
                             None,
                             Some(FocusedTextField {
                                 surface_id: instance_id.clone(),
@@ -980,6 +1022,7 @@ impl PointerHandler for App {
                                 buffer: String::new(),
                                 on_change,
                                 on_submit,
+                                on_cancel,
                             }),
                         ),
                         None => (None, None),
@@ -1474,10 +1517,11 @@ mod tests {
         let field = plain_textfield(&lua);
         let root = hit_node(&lua, "panel", (0.0, 0.0, 100.0, 32.0), false);
         match focused_field(&[&root, &field]) {
-            Some(FieldTarget::Plain { id, on_change, on_submit }) => {
+            Some(FieldTarget::Plain { id, on_change, on_submit, on_cancel }) => {
                 assert_eq!(id, field.id, "the field's own node, not the root it was reached through");
                 assert!(on_change.is_none());
                 assert!(on_submit.is_some());
+                assert!(on_cancel.is_none());
             }
             other => panic!("expected a plain field, got {}", if other.is_some() { "masked" } else { "nothing" }),
         }
@@ -1771,6 +1815,49 @@ mod tests {
         // Backspace per character as the only way to abandon a mistyped password -- on the surface
         // where a wrong guess costs a counted PAM attempt and a `pam_unix` failure delay.
         assert_eq!(key_action(&key(Keysym::Escape, Some("\u{1b}")), false), KeyAction::Clear);
+    }
+
+    // ---- edit_plain_buffer (ADR-0102) ----
+
+    #[test]
+    fn escape_on_a_plain_field_without_on_cancel_clears_and_keeps_the_focus() {
+        let mut buffer = "on my wa".to_string();
+        let edit = edit_plain_buffer(&mut buffer, KeyAction::Clear, false);
+        assert_eq!(edit, PlainEdit { changed: true, submitted: false, cancelled: false });
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn escape_on_a_plain_field_with_on_cancel_clears_and_gives_the_field_up() {
+        let mut buffer = "on my wa".to_string();
+        let edit = edit_plain_buffer(&mut buffer, KeyAction::Clear, true);
+        assert_eq!(edit, PlainEdit { changed: true, submitted: false, cancelled: true });
+        assert!(buffer.is_empty());
+    }
+
+    /// An empty field has nothing for `on_change` to report, but Escape is still a cancel: the
+    /// field was open and the user asked to leave it.
+    #[test]
+    fn escape_on_an_empty_field_cancels_without_reporting_a_change() {
+        let mut buffer = String::new();
+        let edit = edit_plain_buffer(&mut buffer, KeyAction::Clear, true);
+        assert_eq!(edit, PlainEdit { changed: false, submitted: false, cancelled: true });
+        let edit = edit_plain_buffer(&mut buffer, KeyAction::Clear, false);
+        assert_eq!(edit, PlainEdit { changed: false, submitted: false, cancelled: false }, "nothing at all to do");
+    }
+
+    #[test]
+    fn typing_and_submitting_a_plain_field_never_cancel() {
+        let mut buffer = String::new();
+        assert_eq!(
+            edit_plain_buffer(&mut buffer, KeyAction::Append("a"), true),
+            PlainEdit { changed: true, submitted: false, cancelled: false }
+        );
+        assert_eq!(
+            edit_plain_buffer(&mut buffer, KeyAction::Submit, true),
+            PlainEdit { changed: true, submitted: true, cancelled: false }
+        );
+        assert_eq!(buffer, "a", "the caller empties the buffer after the submit, not this");
     }
 
     #[test]

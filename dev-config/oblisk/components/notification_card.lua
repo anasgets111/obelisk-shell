@@ -146,7 +146,9 @@ local function message(notification, ui, opts)
                 textfield {
                     width = "Fill",
                     height = theme.control.md,
-                    placeholder = "Reply",
+                    -- The sender's own wording where it gave one -- "Reply to Alice" -- and
+                    -- ours where it did not (ADR-0101).
+                    placeholder = notification.reply_placeholder or "Reply",
                     font_size = theme.font.sm,
                     foreground = theme.FG,
                     -- Every keystroke does two things. It banks the text, since nothing else can
@@ -161,6 +163,12 @@ local function message(notification, ui, opts)
                     on_submit = function(text)
                         ui.reply_draft:set(text)
                         ui.send_reply(id)
+                    end,
+                    -- Escape: the field has already let go of the keyboard by the time this runs
+                    -- (ADR-0102), so closing the reply here -- which drops the surface's
+                    -- `keyboard_interactivity` with it -- takes nothing away from anyone.
+                    on_cancel = function()
+                        ui.close_reply()
                     end,
                 },
                 icon_button(icons.send, function()

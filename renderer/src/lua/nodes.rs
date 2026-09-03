@@ -76,6 +76,7 @@ const NODE_PROPERTIES: &[(&str, &[&str])] = &[
             "font_size",
             "foreground",
             "mask_character",
+            "on_cancel",
             "on_change",
             "on_submit",
             "placeholder",
@@ -495,7 +496,7 @@ mod meta_stub_tests {
     /// these same declarations. Together they close the loop: this proves the stub does not promise
     /// what the engine refuses, and `just types` proves a config written to the stub compiles.
     ///
-    /// All 452 of them, with no skips: a type `sample` has no row for fails the test rather than
+    /// All 453 of them, with no skips: a type `sample` has no row for fails the test rather than
     /// passing quietly, so the table cannot rot into covering half the file.
     ///
     /// ponytail: this checks the types, it does not derive them. `lua-meta/nodes.lua` is still
@@ -567,7 +568,7 @@ mod meta_stub_tests {
             unsampled.len(),
             unsampled.join("\n")
         );
-        assert_eq!(probed, 452, "the number of declared type members moved; confirm the change is intended");
+        assert_eq!(probed, 453, "the number of declared type members moved; confirm the change is intended");
     }
 
     /// One Lua literal per declared type. `None` means "no sample", which skips rather than guesses.

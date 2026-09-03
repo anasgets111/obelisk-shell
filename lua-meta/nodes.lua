@@ -132,6 +132,7 @@
 ---@field secure_submit? { capability: string, action: string } Only meaningful alongside `mask_character`; without it a masked field's value is unreadable from Lua entirely (ADR-0005, ADR-0027).
 ---@field on_change? fun(text: string) The whole text after each edit, not the delta. Per keystroke, since there is no input method to batch composition.
 ---@field on_submit? fun(text?: string) Enter. Takes the whole text and leaves the field focused and empty, so a reply box takes the next message without another click. Fires with no argument when both `mask_character` and `secure_submit` are set.
+---@field on_cancel? fun() Escape, on a plain field. The buffer is cleared (`on_change("")` fires first if there was text), the field gives up the keyboard, and then this runs -- so it is safe to remove the field or drop the surface's `keyboard_interactivity` in here. Without it Escape clears and *keeps* the focus, since a config that cannot be told the field let go must not have it let go silently (ADR-0092, ADR-0102).
 ---@field font_size? integer|Bound Default `12`. Applies to the placeholder and to the masked content alike.
 ---@field foreground? Color|Bound Default opaque white.
 ---@field text_align? "Start"|"Center"|"End"|Bound Where the run sits inside the field's own box.

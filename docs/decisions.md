@@ -4629,3 +4629,42 @@ Neither is validated further. A desktop id that names no installed application i
 misses in `by_app_id`, and the config falls back to `app_name` exactly as it does today; a
 placeholder is text drawn in a field. Both are `nil` for the great majority of `notify-send`
 callers, which set neither.
+
+## 0102. `textfield` gains `on_cancel`, and Escape gives the field up when it is declared
+
+ADR-0092 decision 6 made Escape clear a plain field and keep the focus, and gave the reason: a
+config cannot observe focus, so a field that silently stopped taking keys would have no way to say
+so on the glass. That reasoning is right and it is also exactly the gap. The reference config
+closes a reply on Escape (`Keys.onEscapePressed` on the `TextField`), and here Escape emptied the
+box and left the user in it, with the Reply button's row still open and the surface still holding
+the keyboard `Exclusive`ly -- so Escape, the key that means leave, left nothing.
+
+1. **`on_cancel: fun()` on a plain `textfield`.** Declared alongside `on_change`/`on_submit`; it
+   does not on its own make a field focusable, since a field nothing can read is still not worth
+   the keyboard. Nothing changes for a masked field, whose Escape is the lock screen's and is
+   settled (ADR-0092).
+
+2. **Escape on a field that declared it clears, drops the focus, and then calls it.** In that
+   order. The buffer is emptied and `on_change("")` fires if there was text, so a bound draft
+   resets; the focus is released; and `on_cancel` runs last, because what it will usually do is
+   remove the field or drop the surface's `keyboard_interactivity`, and it must not find the focus
+   still pointing at a node about to go. Escape on an empty open field is still a cancel -- the
+   field was open and the user asked to leave it -- with no `on_change`, since nothing changed.
+
+3. **Escape on a field without it behaves as before.** Clear and stay. ADR-0092's argument holds
+   unchanged for a field that cannot be told; this ADR only adds the way to be told.
+
+4. **Not a general key event.** The reference config also dismisses a bare popup card on Escape,
+   which needs a surface-level key handler and a keyboard-holding surface with no field in it.
+   Nothing here has asked for that and `keyboard_interactivity` is deliberately bound to "a reply
+   is open" (popup.lua), so a bare card never has the keyboard to receive an Escape on. Left for
+   whoever first needs a keyboard-driven surface that is not a text field.
+
+`edit_plain_buffer` is the pure half, split out so the rule is tested without a seat: the four
+outcomes -- clear-and-stay, clear-and-cancel, cancel-on-empty, and typing/submitting never
+cancelling.
+
+In the notification card, `on_cancel` is `ui.close_reply()`: the row goes, `reply_id` returns to
+zero, and the surface's `keyboard_interactivity` follows it to `"None"`, which is the same path the
+Send button already takes. Verified live: Reply, type, Escape -- the field and the Send button are
+gone, the popup no longer holds the keyboard, and nothing was sent.
