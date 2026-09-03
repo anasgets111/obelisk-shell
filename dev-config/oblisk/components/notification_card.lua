@@ -49,12 +49,12 @@ local function action_button(label, on_activate, slot, icon_name)
         children[#children + 1] = cell(label, theme.FG, theme.font.sm, { align = "Center", align_v = "Center" })
     end
     return button {
-        height = theme.control.sm,
+        height = theme.control.md,
         align_v = "Center",
-        radius = theme.radius.sm,
+        radius = theme.radius.md,
         hover = hovered,
         background = hovered:map(function(is_hovered)
-            return is_hovered and theme.ACCENT_MEDIUM or theme.ACCENT_SUBTLE
+            return is_hovered and theme.ACCENT_LIGHT or theme.ACCENT_SUBTLE
         end),
         border_width = theme.border_width,
         border_color = theme.ACCENT_MEDIUM,
@@ -116,12 +116,20 @@ local function message(notification, ui, opts)
     end
     heading[#heading + 1] = cell(summary, theme.FG, theme.font.md, {
         width = "Fill",
+        -- Centred on a card of one, left-aligned as one message of several: the mirror's
+        -- `horizontalAlignment` switch on `isMultipleItems`. A lone summary is the card's title; a
+        -- message in a list is an entry.
+        align = opts.standalone and "Center" or "Start",
         align_v = "Center",
         wrap = "Word",
         -- `0` is "no limit" (ADR-0089), so expanding is one property rather than two trees.
         max_lines = expanded and 0 or 2,
     })
-    heading[#heading + 1] = cell(opts.age, theme.TEXT_OFF, theme.font.xs, { align_v = "Center" })
+    -- Only where the caller asked for one (`showTimestamp`): the history, where a card is about
+    -- when. A popup is about now, and "now" beside every fresh summary said nothing.
+    if opts.age then
+        heading[#heading + 1] = cell(opts.age, theme.TEXT_OFF, theme.font.xs, { align_v = "Center" })
+    end
     -- Only when there is something hidden to show. A chevron on a one-line notification is a
     -- control that visibly does nothing, which is worse than no control.
     if expanded or #summary > 60 or body_length > 80 then
@@ -148,10 +156,12 @@ local function message(notification, ui, opts)
     } }
 
     if body_length > 0 then
-        lines[#lines + 1] = cell(body, theme.TEXT_OFF, theme.font.sm, {
+        -- `DIM`, the mirror's `textInactiveColor`, not `TEXT_OFF`: a body is secondary to its
+        -- summary, not switched off, and at 35% alpha it read as the latter.
+        lines[#lines + 1] = cell(body, theme.DIM, theme.font.sm, {
             width = "Fill",
             wrap = "Word",
-            max_lines = expanded and 0 or 3,
+            max_lines = expanded and 0 or 2,
             -- A press on an underlined run opens it and does not also fire the message's own
             -- click (ADR-0106); a press on the plain words still does. The link buttons below
             -- remain for a link the elide cut off before its words were drawn.
@@ -244,6 +254,9 @@ local function message(notification, ui, opts)
     if #buttons > 0 then
         lines[#lines + 1] = row {
             width = "Fill",
+            -- Centred under the message (the mirror's `Layout.alignment: Qt.AlignHCenter`); a
+            -- row's own `align_h` is its main-axis distribution.
+            align_h = "Center",
             spacing = theme.spacing.sm,
             children = buttons,
         }
@@ -251,7 +264,7 @@ local function message(notification, ui, opts)
 
     local content = column {
         width = "Fill",
-        spacing = theme.spacing.xs,
+        spacing = theme.spacing.sm,
         padding = not opts.standalone and {
             top = theme.spacing.sm,
             right = theme.spacing.sm,
@@ -296,37 +309,44 @@ end
 
 -- `group` is one entry of `util.group_notifications`; `ui` is `lib/ui_state`.
 --
--- `opts.background` and `opts.absolute_time` are what the two call sites disagree on: a popup
--- floats over whatever is behind it and wants the heavier glass and "5m", a card inside an
--- already-glassy panel wants the lighter one and "Wed 14:32", since a history is about when.
--- Everything else about the two is the same card, which is the point.
+-- `opts.background` and `opts.show_time` are what the two call sites disagree on: a popup floats
+-- over whatever is behind it and wants the heavier glass and no clock, since it is about now; a
+-- card inside an already-glassy panel wants the lighter one and "Wed 14:32", since a history is
+-- about when (the mirror's `showTimestamp`). Everything else about the two is the same card,
+-- which is the point.
 return function(group, ui, opts)
     opts = opts or {}
     local items = group.items or {}
     local expanded = (ui.expanded_groups:get() or {})[group.key] or false
     local is_group = #items > 1
-    -- The clock is read once per card rather than once per message: `oblisk.system` ticks a second
-    -- at a time (§ 2.11) and every message in a group is being aged against the same instant.
-    local now = (oblisk.system:get() or {}).time or 0
-    local function age(notification)
-        if opts.absolute_time then
-            return util.absolute_time(notification.timestamp)
-        end
-        return util.relative_time(now, notification.timestamp)
-    end
 
+    local title = is_group and string.format("%s (%d)", group.app_name, #items) or group.app_name
     local header = {
         -- The application's own icon, never recoloured, which is why it is an `icon` node and not a
         -- glyph `cell` (`components/panel_row.lua` draws the same distinction). `app_icon` is
         -- usually a theme name and occasionally an absolute path; `icon { name = ... }` takes
-        -- either (ADR-0054 decision 2).
-        icon {
-            name = group.app_icon or "dialog-information",
-            size = theme.icon.md,
+        -- either (ADR-0054 decision 2). On a plate of its own, as the mirror draws it: artwork
+        -- that arrives in any colour sits better on a ground than on the glass directly.
+        rect {
+            width = theme.notification_app_icon,
+            height = theme.notification_app_icon,
+            radius = theme.radius.sm,
+            background = theme.BG_SUBTLE,
+            border_width = theme.border_width,
+            border_color = theme.BORDER_SUBTLE,
             align_v = "Center",
+            children = { icon {
+                name = group.app_icon or "dialog-information",
+                size = theme.item_height,
+                align_h = "Center",
+                align_v = "Center",
+            } },
         },
-        cell(is_group and string.format("%s (%d)", group.app_name, #items) or group.app_name, theme.DIM, theme.font.xs, {
+        -- Bold and centred, the card's title rather than a caption. One `TextRun` because `bold`
+        -- lives on a run (ADR-0104), not on the node.
+        cell({ { text = title, bold = true } }, theme.FG, theme.font.md, {
             width = "Fill",
+            align = "Center",
             align_v = "Center",
         }),
     }
@@ -338,6 +358,8 @@ return function(group, ui, opts)
     -- Dismisses the whole group, one call per member: § 3.2 has no `dismiss_all` and no
     -- `dismiss_group`. Iterating `items` is safe because it is this pass's own array -- nothing
     -- pushes a new feed until this returns.
+    -- A ghost: no ground and no ring, the mirror's `variant: "ghost"`. The glyph is the control;
+    -- a filled circle beside a bold title was a second thing to look at.
     header[#header + 1] = icon_button(icons.close, function()
         for _, notification in ipairs(items) do
             oblisk.notifications:invoke("dismiss", notification.id)
@@ -345,7 +367,10 @@ return function(group, ui, opts)
     end, {
         size = theme.control.xs,
         icon_size = theme.icon.xs,
-        background = theme.BORDER_SUBTLE,
+        background = "#00000000",
+        background_hover = "#00000000",
+        border = false,
+        foreground = theme.FG,
         slot = "notification-group-close-" .. group.key,
     })
 
@@ -363,22 +388,22 @@ return function(group, ui, opts)
     for _, notification in ipairs(shown) do
         children[#children + 1] = message(notification, ui, {
             standalone = not is_group,
-            age = age(notification),
+            age = opts.show_time and util.absolute_time(notification.timestamp) or nil,
         })
     end
 
     return column {
         width = "Fill",
-        spacing = theme.spacing.xs,
+        spacing = theme.spacing.sm,
         padding = {
-            top = theme.spacing.sm,
+            top = theme.spacing.md,
             right = theme.spacing.md,
-            bottom = theme.spacing.sm,
+            bottom = theme.spacing.md,
             left = theme.spacing.md,
         },
         background = opts.background or theme.GLASS,
         radius = theme.radius.md,
-        border_width = theme.border_width,
+        border_width = theme.border_width_medium,
         border_color = BORDER_BY_URGENCY[group.urgency] or theme.BORDER,
         children = children,
     }

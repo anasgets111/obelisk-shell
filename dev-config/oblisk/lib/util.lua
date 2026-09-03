@@ -213,27 +213,6 @@ function util.link_label(href)
     return href:match("^mailto:(.+)$") or href
 end
 
--- A notification's age as the two or three characters a card has room for: "now", "5m", "3h",
--- "2d". `notification.timestamp` and `oblisk.system.time` are both Unix epoch seconds on the same
--- clock (ADR-0093), so this is a subtraction and not a reconciliation.
---
--- Coarse on purpose, and coarser the older it gets. A card shows this beside a summary it is
--- already competing with for width, and nobody reading a notification list needs to know an entry
--- is 2h14m old rather than 2h.
-function util.relative_time(now, timestamp)
-    local age = (now or 0) - (timestamp or 0)
-    -- A clock that stepped backwards, or a push that raced the second boundary. "now" is the
-    -- honest answer for both and is what the next tick will say anyway.
-    if age < 60 then
-        return "now"
-    elseif age < 3600 then
-        return string.format("%dm", age // 60)
-    elseif age < 86400 then
-        return string.format("%dh", age // 3600)
-    end
-    return string.format("%dd", age // 86400)
-end
-
 -- What identifies one notification's *content*, for the config's own bookkeeping about what it has
 -- already shown. Not the id on its own: `replaces_id` deliberately reuses an id to put new content
 -- at it, so an id-keyed note would suppress the replacement as though it were the thing it

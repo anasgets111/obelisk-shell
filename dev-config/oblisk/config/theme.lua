@@ -191,7 +191,11 @@ theme.GLASS          = "#181825ee"
 theme.GLASS_CONTENT  = theme.with_opacity(theme.ELEVATED, 0.46)
 theme.GLASS_HOVER    = theme.with_opacity(theme.ELEVATED_HOVER, 0.62)
 theme.ACCENT_SUBTLE  = theme.with_opacity(theme.ACCENT, 0.15)
+theme.ACCENT_LIGHT   = theme.with_opacity(theme.ACCENT, 0.25)
 theme.ACCENT_MEDIUM  = theme.with_opacity(theme.ACCENT, 0.35)
+-- The mirror's `bgSubtle`: the background at its subtle step, which is what sits behind an
+-- application icon on a notification card so the artwork has a plate of its own.
+theme.BG_SUBTLE      = theme.with_opacity(theme.BG, 0.15)
 
 -- ## The glass layer
 --
@@ -277,6 +281,9 @@ theme.control = {
 }
 
 theme.border_width = 1
+-- `borderWidthMedium`: the ring a notification card wears, twice the hairline everything else has,
+-- because a card floats over a wallpaper rather than sitting in a panel.
+theme.border_width_medium = 2
 
 -- ## Surface geometry
 --
@@ -320,6 +327,9 @@ theme.panel_width         = s(340, 280)
 theme.panel_height        = s(400, 300)
 theme.panel_gap           = 4
 theme.notification_width  = s(380, 300)
+-- The plate behind a card's application icon (`notificationAppIconSize`); the icon in it is an
+-- `item_height` square, so the plate is a few pixels of ground on each side.
+theme.notification_app_icon = s(40, 32)
 -- How tall the popup stack's surface may get. Not a card height: the surface holds up to four
 -- cards that each grow when a group or a body is expanded, and a layer surface is a fixed box that
 -- clips what does not fit. Generous rather than measured, because the column inside it sizes to its

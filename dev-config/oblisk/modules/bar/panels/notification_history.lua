@@ -104,8 +104,8 @@ local body = {
                     end
                     -- The lighter ground: this card sits inside a panel that is already glass, and
                     -- the popup's heavier one over a wallpaper would read as a second sheet here.
-                    -- And the clock reading rather than an age: a history is about when.
-                    return notification_card(item, ui, { background = theme.GLASS_CONTENT, absolute_time = true })
+                    -- And a clock reading, which the popup does not carry: a history is about when.
+                    return notification_card(item, ui, { background = theme.GLASS_CONTENT, show_time = true })
                 end,
                 key = function(item)
                     return item.key
