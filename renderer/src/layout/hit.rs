@@ -145,6 +145,13 @@ pub fn cursor_under(path: &[&ResolvedNode], point: LogicalPoint, shaping: &Shapi
         .unwrap_or(CursorIcon::Default)
 }
 
+/// Whether a node with `id` is still somewhere under `root`, visible or not. The question a held
+/// draft asks of the tree it was typed into (ADR-0108): identity, not geometry, so a field that
+/// moved is still found and one that was removed is not.
+pub fn contains_node(root: &ResolvedNode, id: crate::layout::scene::NodeId) -> bool {
+    root.id == id || root.children.iter().any(|child| contains_node(child, id))
+}
+
 /// The absolute (surface-local) rect of `path`'s last node, `None` for an empty path.
 ///
 /// Sums the parent-relative origins the walk descended through, which is the only place that sum

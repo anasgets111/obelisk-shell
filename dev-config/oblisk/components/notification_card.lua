@@ -281,6 +281,13 @@ local function message(notification, ui, opts)
             if mouse_button ~= "left" then
                 return
             end
+            -- Not while this message's reply is open (ADR-0108). The field is one row of a card
+            -- whose whole face otherwise dismisses, and a click that misses the field by a few
+            -- pixels took the card, the field and the half-typed reply with it. While the row is
+            -- open the body is inert; the X is still there for someone who meant it.
+            if ui.reply_id:get() == id then
+                return
+            end
             if notification.has_default_action then
                 oblisk.notifications:invoke("invoke_action", id, "default")
             else

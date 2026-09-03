@@ -136,16 +136,23 @@ return panel {
     -- password prompt does -- raised only once something has asked, never merely because a panel
     -- is showing.
     --
-    -- `reply_id` alone is not that ask. It is one signal for both places the card is drawn, so a
+    -- `reply_open` alone is not that ask. It is one signal for both places the card is drawn, so a
     -- reply opened in the *popup* would otherwise raise this surface too, and a panel showing
     -- something else entirely -- the network list, the calendar -- would take the keyboard because
     -- of a notification it is not displaying. Gated on the notifications panel actually being the
     -- one on screen, which is the condition that makes the open field one of ours.
     keyboard_interactivity = computed(
-        { oblisk.network, ui_state.reply_id, ui_state.panel_showing("notifications") },
-        function(n, reply_id, showing_notifications)
-            local wants_keyboard = (n and n.password_ssid) or (reply_id ~= 0 and showing_notifications)
-            return wants_keyboard and "Exclusive" or "None"
+        { oblisk.network, ui_state.reply_open, ui_state.panel_showing("notifications") },
+        function(n, reply_open, showing_notifications)
+            -- Two asks, two answers. A password prompt keeps `Exclusive`: it was raised by a
+            -- click on this panel and the click-outside catcher below is how it ends, so nothing
+            -- else can want a key meanwhile. A reply is `OnDemand` (ADR-0108): the keyboard
+            -- follows the pointer to other windows and back, the draft stays, and the click-outside
+            -- catcher below is what closes the panel and the reply together (`close_panel`).
+            if n and n.password_ssid then
+                return "Exclusive"
+            end
+            return (reply_open and showing_notifications) and "OnDemand" or "None"
         end
     ),
     -- One surface, one root node (§ 6.1), so the catcher and the card share a `rect` rather than

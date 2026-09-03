@@ -491,6 +491,7 @@ An IME-aware native input field mapped directly to Rust-owned `wp-text-input-v3`
 *   `placeholder`: `string`
 *   `mask_character`: `string` (Capped at 1 byte; if specified, hides typed input)
 *   `secure_submit`: `table` (`{ capability, action }`; see § 5's `textfield` glossary entry in `CONTEXT.md`. Only meaningful alongside `mask_character`, without it a masked field's value is unreadable from Lua entirely)
+*   The text typed into a plain field stays for as long as the node exists (ADR-0108): the keyboard leaving the surface, or a press elsewhere on it, stops the keys and hides the caret but keeps the draft; a press back into the same field resumes. Only Escape with `on_cancel`, a submit, or the node going away empties it.
 *   `on_change`: `function` (Lua callback carrying the field's whole text after each edit, not the delta. Per keystroke: this field reads `wl_keyboard` rather than `zwp_text_input_v3`, so there is no input method batching composition. ADR-0092)
 *   `on_submit`: `function` (Enter. Takes the whole text as its one argument and leaves the field focused and empty, so a reply box takes the next message without another click. Fires with *no* argument when both `mask_character` and `secure_submit` are set: the Renderer's IPC layer attaches the native input buffer directly to the named capability/action envelope instead, and no Lua value ever holds it. ADR-0005, ADR-0027, ADR-0092)
 

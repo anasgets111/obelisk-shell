@@ -4907,3 +4907,55 @@ say they are buttons reads as a picture of one.
 Cost: one `hit_path` walk per motion event on top of `hover_writes`'s, and a `link_under` shaping
 call only when the pointer is on a `text` that declares `on_link`. Not measured; nothing on the
 pointer path has needed to be yet.
+
+## 0108. A reply's keyboard is on demand, and a plain field keeps its draft while it exists
+
+Three reports from one afternoon of using the reply box, all one design: the popup's open reply
+held every key on the desktop until Escape or Send, clicking anywhere else changed nothing; the
+pointer drifting off the card emptied the field; and once a draft existed, the card's X stopped
+working. The first two were the design as written (ADR-0092's `Exclusive`, ADR-0050's clear on
+`leave`); the third was a bug this ADR's first cut introduced and its second removed.
+
+1. **`OnDemand`, not `Exclusive`, for a reply.** Exclusive is the lock screen's word: the compositor
+   keeps the keyboard on the surface whatever is clicked, and a 355-pixel popup has nowhere for a
+   click-outside to land, so nothing could ever release it. On demand, niri moves the keyboard with
+   the user -- to whatever is clicked, and under `focus-follows-mouse` to wherever the pointer goes.
+   That second half is the compositor's rule and applies to this surface as to any window: while the
+   pointer rests on the popup, keys go to it, and a card vanishing under a resting pointer
+   re-evaluates pointer focus the same way. Measured: the flip to `OnDemand` on a mapped surface is
+   honoured (the `enter` arrives on the same pass when niri chooses to give it), and a click into the
+   field takes the keyboard when it did not. The network password keeps `Exclusive`; it is raised by
+   a click on the panel and the panel's own click-outside catcher ends it.
+
+2. **A plain field holds its text for as long as its node exists.** `FocusedTextField` was the
+   field *receiving keys* and was dropped on the keyboard's `leave`, which made every pointer drift
+   a discard. It is now the field *holding the draft*, with a `typing` flag a press sets and a press
+   elsewhere clears; whether keys reach it is asked at the moment one arrives -- `typing`, and its
+   surface in the keyboard scope -- and the caret is drawn by the same question, so what looks live
+   is what a key would land in. Keys with the keyboard elsewhere go nowhere; the draft stays. A press
+   back into the same node keeps the buffer, a press into another field replaces it, and the draft
+   is dropped when the node is gone from the tree (`hit::contains_node`, checked before each key)
+   or its surface is dead. Escape with `on_cancel` still drops it, since that is what Escape means.
+   `keyboard_interactivity` moving no longer touches the field at all.
+
+3. **The press that arms no click is the one that landed on a field.** The first cut computed
+   "focused a field" from "a plain field is held after this press", which the held draft made true
+   for every press on the surface: the X, the Send button, the body. It is `hit.field.is_some()`,
+   read before the match consumes it. Verified by the bus: the X on a card with a draft dismisses it
+   (`NotificationClosed`, reason 2) where it did nothing a build earlier.
+
+4. **The keyboard is asked for while the field is on screen, not while an id is set.**
+   `ui.reply_open` is `reply_id` names a notification still in the feed; both surfaces bind to it.
+   `reply_id` goes stale by every door but the field's own -- the X, an action, the sender
+   withdrawing -- and a surface bound to the bare id mapped on the next notification asking for the
+   keyboard for a field it was not drawing. `close_panel` also closes the reply, so the panel's
+   click-outside catcher closes both, which is what a click outside a panel means.
+
+5. **The card's body is inert while its reply is open.** The field is one row of a card whose whole
+   face otherwise dismisses (or activates), and a click a few pixels off the field took the card and
+   the draft with it. The X is still there for someone who meant it.
+
+Not done: shrinking the popup's input region to its cards. The surface is `notification_stack_height`
+tall and its `column` fills it, so under focus-follows-mouse the empty space below the cards also
+takes the keyboard while a reply is open. The fix is the column sizing to its content and the list
+losing its scroll, which is a trade the mirror's popup also makes; deferred until it is felt.

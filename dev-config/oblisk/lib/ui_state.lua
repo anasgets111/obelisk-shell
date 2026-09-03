@@ -58,6 +58,9 @@ end
 -- Here rather than at its two callers -- `panel_host`'s click-outside catcher and the toggle below
 -- -- for the reason this file keeps repeating: one writer per edge. A capability call inside a
 -- module named `ui_state` is the price, and it is the smaller one.
+-- Forward declaration: defined with the reply section below, called here.
+local close_reply
+
 local function close_panel()
     -- Reading the history is seeing the notifications in it, so nothing in the feed is owed
     -- another turn as a popup once this closes. Marked on the way out rather than only on the way
@@ -67,6 +70,11 @@ local function close_panel()
     end
     panel_open:set(false)
     oblisk.network:invoke("cancel_connect")
+    -- And the reply, for the same reason as the password: a panel that is gone has no field in
+    -- it. Left set, `reply_id` made the next popup map asking for the keyboard, with the reply row
+    -- open on a card nobody had asked to answer (ADR-0108). `close_reply` is forward-declared
+    -- above the reply section and defined there.
+    close_reply()
 end
 
 -- Clicking an indicator opens its panel; clicking the same one again closes it. A toggle, which is
@@ -201,10 +209,28 @@ local function open_reply(id)
     reply_id:set(reply_id:get() == id and 0 or id)
 end
 
-local function close_reply()
+function close_reply()
     reply_draft:set("")
     reply_id:set(0)
 end
+
+-- Whether a reply field is actually on screen: `reply_id` names a notification that is still in
+-- the feed. This, and not `reply_id ~= 0`, is what a surface binds its `keyboard_interactivity` to
+-- (ADR-0108). The id goes stale whenever the notification leaves by any door but the field's own
+-- -- the X, the sender withdrawing it, an action -- and a surface that asked for the keyboard on
+-- a stale id took it the next time it mapped, for a field it was not drawing. Pure, so it can be
+-- a `computed`; the card draws the field under the same condition.
+local reply_open = computed({ reply_id, oblisk.notifications }, function(id, n)
+    if id == 0 then
+        return false
+    end
+    for _, notification in ipairs((n and n.feed) or {}) do
+        if notification.id == id then
+            return true
+        end
+    end
+    return false
+end)
 
 -- Sends what is in the draft and closes the field. A no-op on an empty draft rather than sending
 -- one: `notifications:reply` removes the notification whatever the text was, so an empty send is a
@@ -224,6 +250,7 @@ return {
     expanded_groups = expanded_groups,
     expanded_messages = expanded_messages,
     reply_id = reply_id,
+    reply_open = reply_open,
     reply_draft = reply_draft,
     toggle_group = toggle_group,
     toggle_message = toggle_message,

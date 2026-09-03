@@ -142,7 +142,10 @@
 ---running, which would make a reply box that silently swallows every keystroke on a bare session.
 ---
 ---A press is what focuses a plain field, so its surface must be able to take the keyboard when
----one is open -- see `keyboard_interactivity` on `panel`.
+---one is open -- see `keyboard_interactivity` on `panel`. The text typed into it stays for as long
+---as the node exists (ADR-0108): the keyboard leaving the surface, or a press elsewhere on it,
+---stops the keys and hides the caret but keeps the draft, and a press back into the same field
+---resumes. Only Escape (with `on_cancel`), a submit, or the node going away empties it.
 ---@field placeholder? string|Bound Drawn in the foreground colour while the field is empty. Not the value: submitting an untouched field submits an empty string. A focused plain field shows a caret instead, so that "empty" and "empty and typing into it" do not look alike.
 ---@field mask_character? string|Bound Capped at 1 byte. Hides typed input.
 ---@field secure_submit? { capability: string, action: string } Only meaningful alongside `mask_character`; without it a masked field's value is unreadable from Lua entirely (ADR-0005, ADR-0027).

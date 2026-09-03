@@ -81,12 +81,20 @@ return panel {
     -- notification arrives. A constant here would take the keyboard away from whatever you were
     -- typing in, every time anything notified you.
     --
+    -- `OnDemand`, not `Exclusive` (ADR-0108). Exclusive is the lock screen's word: the keyboard
+    -- stays here whatever is clicked, and a surface this small has nowhere for a click-outside to
+    -- land, so a reply left open held every key on the desktop until Escape or send. On demand,
+    -- niri gives this surface the keyboard when the binding flips (measured: the `enter` arrives on
+    -- the same pass) and moves it wherever the pointer goes next -- under focus-follows-mouse,
+    -- simply off the card. The field keeps its draft through that and takes keys again when the
+    -- keyboard is back; only Escape, Send and the X end the reply.
+    --
     -- Which is also why the reply field is opened by a button rather than by clicking the field
     -- itself: the click that focuses a `textfield` deliberately fires no `on_click` (ADR-0092
     -- decision 7), so there is no way for the field's own press to be what raises this. The Reply
     -- button is the ask, and this follows it.
-    keyboard_interactivity = ui.reply_id:map(function(id)
-        return id ~= 0 and "Exclusive" or "None"
+    keyboard_interactivity = ui.reply_open:map(function(open)
+        return open and "OnDemand" or "None"
     end),
     child = column {
         width = "Fill",

@@ -176,11 +176,20 @@ fn focused_field(path: &[&layout::ResolvedNode]) -> Option<FieldTarget> {
 /// (ADR-0092). The buffer is an ordinary `String` and deliberately so -- this is the half of § 5.2
 /// item 8 whose whole purpose is that a config can read the text, the opposite of
 /// [`FocusedField`].
+///
+/// Outlives the keyboard (ADR-0108): this is the field that *holds the draft*, and it holds it for
+/// as long as the node exists, not for as long as keys reach it. `typing` says whether a press has
+/// chosen it since the last press elsewhere; whether its surface has the keyboard is asked of
+/// `keyboard_focus` at the moment a key arrives or a caret is drawn, since that comes and goes with
+/// every `enter`/`leave` and under focus-follows-mouse that is every time the pointer wanders.
 #[derive(Debug, Clone)]
 pub(super) struct FocusedTextField {
     surface_id: String,
     id: layout::scene::NodeId,
     buffer: String,
+    /// A press chose this field and no press elsewhere has happened since. Off, the field keeps
+    /// its text and draws it without a caret, and keys go nowhere.
+    typing: bool,
     on_change: Option<Function>,
     on_submit: Option<Function>,
     on_cancel: Option<Function>,
@@ -585,7 +594,11 @@ impl App {
             });
         }
         let focused = self.focused_text_field.as_ref().filter(|f| f.surface_id == surface_id)?;
-        Some(layout::paint::FieldFocus::Plain { id: focused.id, text: &focused.buffer })
+        Some(layout::paint::FieldFocus::Plain {
+            id: focused.id,
+            text: &focused.buffer,
+            caret: self.text_field_takes_keys(focused),
+        })
     }
 
     /// The half of [`App::prune_secure_focus`] that does not wait for a keystroke: a field whose
@@ -680,14 +693,28 @@ impl App {
         let Some(field) = self.focused_text_field.as_ref() else {
             return;
         };
-        let scope = self.keyboard_focus_scope();
-        if self.surface_is_live(&field.surface_id) && scope.contains(&field.surface_id) {
+        // Liveness of the surface and of the node, not of the keyboard (ADR-0108): a field whose
+        // surface lost the keyboard keeps its draft and simply takes no keys until it is back
+        // ([`App::text_field_takes_keys`]). A field whose node is gone -- the reply was sent or
+        // closed and the row removed -- has nowhere to show a draft, and its callbacks belong to a
+        // card that no longer exists, so the next key is what finally lets it go.
+        let node_exists = self
+            .client
+            .scene()
+            .surface(&field.surface_id)
+            .is_some_and(|tree| layout::hit::contains_node(&tree, field.id));
+        if self.surface_is_live(&field.surface_id) && node_exists {
             return;
         }
-        eprintln!(
-            "[oblisk-renderer] the focused textfield is no longer the one receiving keys; dropping what was typed"
-        );
+        eprintln!("[oblisk-renderer] the focused textfield is gone; dropping what was typed");
         self.focus_text_field(None);
+    }
+
+    /// Whether a key arriving now belongs to `field`: a press chose it, and its surface is one the
+    /// keyboard is on (ADR-0108). The same question decides the caret, so what is drawn as live is
+    /// what a key would land in.
+    fn text_field_takes_keys(&self, field: &FocusedTextField) -> bool {
+        field.typing && self.keyboard_focus_scope().contains(&field.surface_id)
     }
 
     /// One key event applied to the focused plain `textfield` (ADR-0092), the mirror of
@@ -705,6 +732,9 @@ impl App {
     /// thing to run, after the field has already let go, since it will usually take the field or
     /// its surface's keyboard away and must not find the focus still pointing at it.
     fn apply_plain_key(&mut self, event: &KeyEvent, repeat: bool) {
+        if !self.focused_text_field.as_ref().is_some_and(|field| self.text_field_takes_keys(field)) {
+            return;
+        }
         let Some(field) = self.focused_text_field.as_mut() else {
             return;
         };
@@ -1092,26 +1122,47 @@ impl PointerHandler for App {
                     // Both halves are written on every press, including the clears, because the
                     // two are one focus: pressing into a reply box has to take the keyboard away
                     // from a password prompt, and vice versa.
+                    // Whether *this press* landed on a field, asked before the match consumes it:
+                    // a held draft (ADR-0108) is a plain field too, and it must not turn every
+                    // other press on the surface into "focused a field, arm no click".
+                    let pressed_a_field = hit.field.is_some();
                     let (masked, plain) = match hit.field {
                         Some(FieldTarget::Masked(target)) => {
                             (Some(FocusedField { surface_id: instance_id.clone(), target }), None)
                         }
-                        Some(FieldTarget::Plain { id, on_change, on_submit, on_cancel }) => (
+                        // The same field pressed again keeps what was typed into it (ADR-0108):
+                        // the press is how typing resumes after a press elsewhere, and a reply
+                        // that emptied itself on every click back into it would be no reply box.
+                        Some(FieldTarget::Plain { id, on_change, on_submit, on_cancel }) => {
+                            let buffer = self
+                                .focused_text_field
+                                .as_ref()
+                                .filter(|field| field.id == id)
+                                .map(|field| field.buffer.clone())
+                                .unwrap_or_default();
+                            (
+                                None,
+                                Some(FocusedTextField {
+                                    surface_id: instance_id.clone(),
+                                    id,
+                                    buffer,
+                                    typing: true,
+                                    on_change,
+                                    on_submit,
+                                    on_cancel,
+                                }),
+                            )
+                        }
+                        // A press elsewhere stops the typing and keeps the text (ADR-0108), which
+                        // is what every toolkit's text field does: the Send button beside a reply
+                        // is "elsewhere", and so is the card the field sits in.
+                        None => (
                             None,
-                            Some(FocusedTextField {
-                                surface_id: instance_id.clone(),
-                                id,
-                                buffer: String::new(),
-                                on_change,
-                                on_submit,
-                                on_cancel,
-                            }),
+                            self.focused_text_field.clone().map(|field| FocusedTextField { typing: false, ..field }),
                         ),
-                        None => (None, None),
                     };
                     // Through the seam: this site *reassigns* rather than clears, the A-to-B
                     // transition [`retarget_secure_submit`] exists for.
-                    let focused_a_field = masked.is_some() || plain.is_some();
                     self.focus_secure_submit(masked);
                     self.focus_text_field(plain);
                     // A press that focused a `textfield` arms no click, so the ancestor `button`
@@ -1120,7 +1171,7 @@ impl PointerHandler for App {
                     // clicking into a text field inside a clickable row is not a click on the row.
                     // The notification card is the case: its whole surface activates the sender's
                     // default action, and its reply box sits inside that.
-                    self.armed = hit.button.filter(|_| !focused_a_field).map(|clickable| ArmedClick {
+                    self.armed = hit.button.filter(|_| !pressed_a_field).map(|clickable| ArmedClick {
                         instance_id,
                         rect: clickable.rect,
                         link: clickable.link,
@@ -1220,6 +1271,8 @@ impl KeyboardHandler for App {
         // compositor sent it (a `visible` flip, an output change); that is the `None` below and it
         // is not an error.
         self.keyboard_focus = self.surface_id_for(surface).map(str::to_string);
+        // The caret of a field whose keyboard just came back (ADR-0108), see `leave`.
+        self.field_input_changed |= self.focused_text_field.is_some();
         // Not just the entering surface: the keys it is about to receive also reach the popups
         // shown under it, which is where a panel's password prompt lives (see
         // [`App::keyboard_focus_scope`]).
@@ -1264,7 +1317,13 @@ impl KeyboardHandler for App {
         // `textfield` stops owning the next secret and the armed press never sees its release, the
         // same answer `PointerEventKind::Leave` gives. Load-bearing: no submit is coming for these.
         self.focus_secure_submit(None);
-        self.focus_text_field(None);
+        // Not the plain field (ADR-0108). Its draft is not a secret and losing the keyboard is not
+        // leaving: under an `OnDemand` surface and focus-follows-mouse, the keyboard goes with the
+        // pointer and comes back with it, and a reply half-typed before the pointer drifted off the
+        // card is still wanted when it drifts back. The field stops taking keys and drawing a caret
+        // for exactly as long as the keyboard is elsewhere ([`App::text_field_takes_keys`]), which
+        // is why this is a repaint and not a clear.
+        self.field_input_changed |= self.focused_text_field.is_some();
         self.armed = None;
         eprintln!("[oblisk-renderer] keyboard focus left {left}");
     }
