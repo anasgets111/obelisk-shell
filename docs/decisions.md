@@ -4557,3 +4557,75 @@ Verified live, reproducing the original: a reply typed into a notification card,
 notification from another sender arriving above it. The card moves down and the field still reads
 `on my way|`, where before it reverted to `Reply`; Enter from the moved position emits
 `ActionInvoked(1, "inline-reply::on my way")`.
+
+## 0100. Expiry retires a notification from the popup; it no longer removes it
+
+The history panel showed what was still popped up, not what had happened. A notification that
+timed out unread was gone from `notifications.feed` five seconds after it arrived, so "what was
+that?" -- the question a history exists to answer -- had no answer. The reference config keeps a
+timed-out notification in its list until the user clears it, and so does every desktop that has a
+notification list at all; what the sender's timeout ends is the popup, not the record.
+
+A config could not paper over this. Nothing fires a callback on a feed change and a `computed` is
+pure (ADR-0021), so once the Supervisor dropped the entry there was nowhere to keep a copy. It had
+to change on the Rust side, and the change is small: `expire` used to remove the entry from the
+queue and now flips a flag on it.
+
+1. **`expired: bool` on the entry, rather than a second list.** One list and a flag is what
+   `ui.popup_seen` (ADR-0098) already reads like from the config's side, and it keeps `dismiss`,
+   `invoke_action`, `reply` and the FIFO cap addressing one queue by id. A separate `history`
+   array would have meant every id-taking command deciding which list to search first.
+
+2. **The sender still hears `NotificationClosed(id, reason=1)` at the moment of expiry.** From its
+   side the notification has closed: an `ActionInvoked` from a history card may or may not reach a
+   process that still remembers the id, and a `replaces_id` at that id will be treated as new
+   content. That is the base spec's contract and the reference config keeps it too, calling
+   `expire()` on the notification while keeping its own wrapper. Nothing about the wire changes.
+
+3. **`hints["transient"]` is honoured, and it is the only reason expiry still removes anything.**
+   The spec's meaning of transient is "show this and do not keep it", which was the old behaviour
+   for everything. It is carried as `transient` so a history can also leave a live one to the
+   popup; the reference config does the same, never storing a transient wrapper.
+
+4. **A repeated or stale expiry is a no-op, checked in the pure half.** `expire_entry` returns
+   `None` for an entry that already expired, so the close cannot be announced twice, and for an
+   incarnation that has moved on, as `find_expiring_entry` always did.
+
+5. **The queue's caps are unchanged.** One hundred deep with the feed a view of twenty (ADR-0033).
+   The feed fills faster now that entries stay, and the oldest falls off the back with
+   `NotificationClosed(id, reason=4)` as before; the reference config caps at a hundred stored
+   too. Raising the view is a one-constant change if twenty proves short for a history and is
+   not made here on no evidence.
+
+6. **A replacement resets the flag.** A `replaces_id` update builds a fresh `Notification` with
+   `expired = false` and its own timer, so an updated history entry pops up again -- which is what
+   "3 new messages" landing on a retired "1 new message" should do.
+
+The popup filters on `expired` from this commit, since without that a retired entry would pop up
+forever. Everything else a config can do with the flag -- an absolute time in the history, a
+dimmer card for a read entry, retiring on the X rather than dismissing -- is left to the config
+pass that follows.
+
+## 0101. `desktop_entry` and `reply_placeholder` are carried from their hints
+
+Two more `Notify` hints read and carried, each because a consumer now exists.
+
+1. **`hints["desktop-entry"]` becomes `desktop_entry: Option<String>`.** ADR-0091 left it unbuilt
+   for want of a consumer and `util.group_notifications` is that consumer: it groups on `app_name`
+   and says so is the wrong key. A desktop id is what `oblisk.applications`'s `by_app_id` is built
+   to be looked up by (ADR-0061), so a config can also draw the localised `Name=` and the `Icon=`
+   of the real application instead of trusting a sender's self-description. Carried as sent up to
+   `summary`'s 128-byte cap, and refused entirely when it holds a `/`: a desktop file id never
+   does -- the spec turns a subdirectory into a dash -- so one that does is not an id, and the only
+   thing it could do is aim a config's lookup at a path.
+
+2. **`hints["x-kde-reply-placeholder-text"]` becomes `reply_placeholder: Option<String>`.** KDE's
+   extension and the one Telegram, Fractal and friends actually send alongside `x-kde-reply`, which
+   `has_reply` already honours. Capped like a button label, which is roughly what it is. Empty is
+   carried as absent, since an empty placeholder is no placeholder and the config's own "Reply"
+   should win.
+
+Neither is validated further. A desktop id that names no installed application is a key that
+misses in `by_app_id`, and the config falls back to `app_name` exactly as it does today; a
+placeholder is text drawn in a field. Both are `nil` for the great majority of `notify-send`
+callers, which set neither.

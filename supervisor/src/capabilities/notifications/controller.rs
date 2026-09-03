@@ -22,14 +22,15 @@ use super::icon::{
     write_icon_png,
 };
 use super::queue::{
-    ExpiryPolicy, QueueCleanup, feed_view, find_expiring_entry, next_incarnation, remove_by_id, replace_or_push,
+    Expiry, ExpiryPolicy, QueueCleanup, expire_entry, feed_view, next_incarnation, remove_by_id, replace_or_push,
     resolve_expiry, resolve_notification_id, resolve_sound_path, should_play_sound,
 };
 use super::sound::SoundSender;
 use super::{
     MAX_ACTION_LABEL_BYTES, MAX_ACTIONS, MAX_APP_NAME_BYTES, MAX_SUMMARY_BYTES, NOTIFICATIONS_BUS_NAME,
     NOTIFICATIONS_CAPABILITIES, NOTIFICATIONS_OBJECT_PATH, Notification, NotificationAction, NotificationsSignal,
-    NotificationsState, Urgency, parse_urgency_str, truncate_utf8_bytes, urgency_from_hint_byte,
+    NotificationsState, Urgency, desktop_entry_from_hint, parse_urgency_str, reply_placeholder_from_hint,
+    truncate_utf8_bytes, urgency_from_hint_byte,
 };
 use crate::capabilities::system::controller::epoch_seconds;
 
@@ -269,18 +270,22 @@ impl NotificationsController {
 
     /// Fires once, at the end of the `Duration` a `notify()` call scheduled it for -- `id` and
     /// `incarnation` together identify which `Notify` call's content this timer is for.
-    /// [`find_expiring_entry`] is the recheck: if a `replaces_id` update already landed new
-    /// content at `id`, `incarnation` no longer matches and this is a silent no-op.
-    async fn expire_if_still_present(&self, id: u32, incarnation: u64) {
-        let icon_to_delete = {
+    /// [`expire_entry`] is the recheck: if a `replaces_id` update already landed new content at
+    /// `id`, `incarnation` no longer matches and this is a silent no-op.
+    ///
+    /// Retires rather than removes (ADR-0100): the entry stays in the queue with `expired` set,
+    /// so the history keeps showing what happened after the popup has gone, and `dismiss` is what
+    /// removes it. The sender is told the same thing it always was -- `NotificationClosed(id,
+    /// reason=1)` -- because from its side the notification *has* closed: it will get no
+    /// `ActionInvoked` it can rely on and should not try to update the entry in place. A
+    /// `transient` entry is the exception and is removed the way every expiry used to be.
+    async fn expire(&self, id: u32, incarnation: u64) {
+        let outcome = {
             let mut state = self.state.lock().unwrap();
-            let index = match find_expiring_entry(&state.queue, id, incarnation) {
-                Some(index) => index,
-                None => return,
-            };
-            state.queue.remove(index).and_then(|n| n.image_path)
+            expire_entry(&mut state.queue, id, incarnation)
         };
-        if let Some(path) = icon_to_delete {
+        let Some(outcome) = outcome else { return };
+        if let Expiry::Removed { image_path: Some(path) } = outcome {
             delete_icon_file(&path);
         }
         self.emit_notification_closed(id, CloseReason::Expired).await;
@@ -448,7 +453,7 @@ pub const MAX_EXPIRY_HOLD_SECS: u64 = 300;
 /// The countdown lives here rather than as a deadline on the queue entry because that is all it
 /// is -- one task per expiring notification already existed, and giving it a pausable sleep costs
 /// no shared state, no re-arming on release, and no second place that has to agree with
-/// [`find_expiring_entry`] about what is still pending.
+/// [`expire_entry`] about what is still pending.
 ///
 /// Time already served is banked across a hold: a notification held at 2s of 5 has 3s left when
 /// the hold lapses, not 0. Restarting it would be wrong and expiring it immediately would be
@@ -529,6 +534,10 @@ impl NotificationsController {
         let action_icons = hints.get("action-icons").and_then(value_as_bool).unwrap_or(false);
         let parsed_actions = parse_actions(&actions, action_icons);
         let resident = hints.get("resident").and_then(value_as_bool).unwrap_or(false);
+        let transient = hints.get("transient").and_then(value_as_bool).unwrap_or(false);
+        let desktop_entry = desktop_entry_from_hint(hints.get("desktop-entry").and_then(value_as_str));
+        let reply_placeholder =
+            reply_placeholder_from_hint(hints.get("x-kde-reply-placeholder-text").and_then(value_as_str));
 
         let image_data = hints.get("image-data").or_else(|| hints.get("image_data")).and_then(decode_raw_image_data);
         let image_path_hint =
@@ -559,7 +568,11 @@ impl NotificationsController {
             image_path,
             app_icon,
             urgency,
+            expired: false,
+            transient,
+            desktop_entry,
             has_reply: parsed_actions.has_reply,
+            reply_placeholder,
             actions: parsed_actions.actions,
             has_default_action: parsed_actions.has_default,
             resident,
@@ -589,7 +602,7 @@ impl NotificationsController {
             let holds = self.expiry_hold.subscribe();
             tokio::spawn(async move {
                 sleep_past_holds(holds, duration).await;
-                controller.expire_if_still_present(id, incarnation).await;
+                controller.expire(id, incarnation).await;
             });
         }
 
@@ -802,7 +815,11 @@ mod tests {
             image_path: None,
             app_icon: None,
             urgency: Urgency::Normal,
+            expired: false,
+            transient: false,
+            desktop_entry: None,
             has_reply: false,
+            reply_placeholder: None,
             actions: vec![NotificationAction {
                 key: "archive".to_string(),
                 label: "Archive".to_string(),

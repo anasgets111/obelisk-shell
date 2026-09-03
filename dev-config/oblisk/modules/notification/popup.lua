@@ -34,9 +34,13 @@ local visible_groups = computed(
         if in_history then
             return {}
         end
+        -- Two ways a notification has had its turn: its own timeout ran out (`expired`, set by
+        -- the Supervisor, ADR-0100), or the history was opened while it was up (`ui.popup_seen`,
+        -- this config's own note, ADR-0098). Either keeps it out of the stack; neither takes it
+        -- out of the history.
         local unseen = {}
         for _, notification in ipairs((n and n.feed) or {}) do
-            if not (seen or {})[util.notification_key(notification)] then
+            if not notification.expired and not (seen or {})[util.notification_key(notification)] then
                 unseen[#unseen + 1] = notification
             end
         end

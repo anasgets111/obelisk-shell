@@ -120,6 +120,13 @@ const MAX_ACTION_LABEL_BYTES: usize = 64;
 /// kind of value from the same untrusted sender: a short identifier, not prose.
 const MAX_APP_ICON_NAME_BYTES: usize = MAX_APP_NAME_BYTES;
 
+/// `hints["desktop-entry"]`'s cap (ADR-0101). A desktop file id is a reverse-DNS name and the
+/// longest real ones are around 40 bytes; this is `summary`'s cap, comfortably past that and short
+/// enough that a sender cannot use the field as a second body.
+const MAX_DESKTOP_ENTRY_BYTES: usize = MAX_SUMMARY_BYTES;
+/// `hints["x-kde-reply-placeholder-text"]`'s cap (ADR-0101): it is drawn where a label would be.
+const MAX_REPLY_PLACEHOLDER_BYTES: usize = MAX_ACTION_LABEL_BYTES;
+
 /// The backing FIFO's hard cap and `notifications.feed`'s truncated view size over it (ADR-0033).
 const NOTIFICATION_QUEUE_CAP: usize = 100;
 const NOTIFICATION_FEED_VIEW: usize = 20;
@@ -232,6 +239,22 @@ fn urgency_from_hint_byte(byte: Option<u8>) -> Urgency {
     }
 }
 
+/// `hints["desktop-entry"]` as carried (ADR-0101): the sender's value, or `None` for an absent or
+/// empty one, or one holding a path separator. A desktop file id never contains `/` -- the desktop
+/// entry spec turns a subdirectory into a dash -- so one that does is not an id, and the only
+/// thing carrying it could do is let a sender aim a config's `by_app_id` lookup at a path.
+fn desktop_entry_from_hint(value: Option<&str>) -> Option<String> {
+    let value = value.filter(|value| !value.is_empty() && !value.contains('/'))?;
+    Some(truncate_utf8_bytes(value, MAX_DESKTOP_ENTRY_BYTES))
+}
+
+/// `hints["x-kde-reply-placeholder-text"]` as carried (ADR-0101): the text, capped, or `None` for
+/// absent or empty, since an empty placeholder is no placeholder.
+fn reply_placeholder_from_hint(value: Option<&str>) -> Option<String> {
+    let value = value.filter(|value| !value.is_empty())?;
+    Some(truncate_utf8_bytes(value, MAX_REPLY_PLACEHOLDER_BYTES))
+}
+
 /// `notifications:set_sound(urgency, path)`'s `urgency` argument, one of the three wire strings.
 fn parse_urgency_str(value: &str) -> Option<Urgency> {
     match value {
@@ -295,10 +318,34 @@ pub struct Notification {
     /// `"low"`, `"normal"` or `"critical"`. `"normal"` for a sender that set no urgency hint.
     /// Critical is the one that outlives do-not-disturb and never expires on its own.
     pub urgency: Urgency,
+    /// The sender's timeout ran out. The notification is still here -- expiry *retires* an entry
+    /// from the popup and leaves it in the feed for the history to show (ADR-0100) -- so this is
+    /// what a popup filters on and a history ignores. `NotificationClosed(id, reason=1)` has
+    /// already gone to the sender by the time this reads `true`. A `replaces_id` replacement is
+    /// fresh content and reads `false` again. Never `true` on a critical notification or on one
+    /// sent with `expire_timeout = 0`, which never expire.
+    pub expired: bool,
+    /// `hints["transient"]`: the sender says this is worth a popup and nothing more (§1's base
+    /// spec). An expired transient is removed outright rather than retired, so a history never
+    /// has to filter it after the fact; while it is live, this is how a history knows to leave
+    /// it to the popup (ADR-0100).
+    pub transient: bool,
+    /// `hints["desktop-entry"]`: the sender's `.desktop` file id, e.g. `"org.telegram.desktop"`,
+    /// which is the key `oblisk.applications`'s `by_app_id` is built to be looked up by (§ 2.13)
+    /// and the grouping key `app_name` is only a stand-in for -- two applications can share a
+    /// display name and one can change its own. `nil` for a sender that set none, which is most
+    /// command-line senders and few desktop applications. Carried as sent, minus anything holding
+    /// a path separator, since a desktop id never does (ADR-0101).
+    pub desktop_entry: Option<String>,
     /// The sender offered an inline reply action, so `notifications:reply(id, text)` will be
     /// accepted. Calling it on a notification without one is refused, which is why this is
     /// carried rather than guessed.
     pub has_reply: bool,
+    /// `hints["x-kde-reply-placeholder-text"]`: what the sender wants an empty reply field to say
+    /// -- "Reply to Alice" rather than a generic "Reply". `nil` for a sender that set none, and
+    /// meaningless without [`Notification::has_reply`]. Truncated to 64 bytes like a button label,
+    /// which is roughly what it is (ADR-0101).
+    pub reply_placeholder: Option<String>,
     /// The buttons the sender offered, in the order it listed them, minus the two keys that mean
     /// something other than a button. Empty for the great majority of notifications.
     pub actions: Vec<NotificationAction>,
@@ -322,9 +369,10 @@ pub struct Notification {
 /// `notifications.feed`/`notifications.dnd`'s `StateSnapshot` payload shape (ADR-0033).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct NotificationsState {
-    /// The newest 20 live notifications, most recent first. A truncated view of a 100-deep queue
-    /// (ADR-0033), so a notification can leave this list while still being live and still
-    /// dismissable by id.
+    /// The newest 20 notifications, most recent first: the ones still popped up *and* the ones
+    /// that expired unread, which stay until dismissed (ADR-0100) -- `expired` tells them apart.
+    /// A truncated view of a 100-deep queue (ADR-0033), so a notification can leave this list
+    /// while still being present and still dismissable by id.
     pub feed: Vec<Notification>,
     /// Do-not-disturb, flipped by `notifications:set_dnd`. It gates exactly one thing in the
     /// Supervisor: a non-critical notification's sound does not play. Notifications are still
@@ -417,6 +465,26 @@ mod tests {
         assert_eq!(urgency_from_hint_byte(Some(0)), Urgency::Low);
         assert_eq!(urgency_from_hint_byte(Some(1)), Urgency::Normal);
         assert_eq!(urgency_from_hint_byte(Some(2)), Urgency::Critical);
+    }
+
+    // ---- desktop_entry_from_hint / reply_placeholder_from_hint (ADR-0101) ----
+
+    #[test]
+    fn a_desktop_entry_hint_is_carried_unless_it_is_empty_or_looks_like_a_path() {
+        assert_eq!(desktop_entry_from_hint(Some("org.telegram.desktop")), Some("org.telegram.desktop".to_string()));
+        assert_eq!(desktop_entry_from_hint(Some("")), None);
+        assert_eq!(desktop_entry_from_hint(Some("../../etc/passwd")), None);
+        assert_eq!(desktop_entry_from_hint(Some("/usr/share/applications/x.desktop")), None);
+        assert_eq!(desktop_entry_from_hint(None), None);
+        assert_eq!(desktop_entry_from_hint(Some(&"a".repeat(500))).unwrap().len(), MAX_DESKTOP_ENTRY_BYTES);
+    }
+
+    #[test]
+    fn a_reply_placeholder_hint_is_carried_capped_and_never_empty() {
+        assert_eq!(reply_placeholder_from_hint(Some("Reply to Alice")), Some("Reply to Alice".to_string()));
+        assert_eq!(reply_placeholder_from_hint(Some("")), None);
+        assert_eq!(reply_placeholder_from_hint(None), None);
+        assert_eq!(reply_placeholder_from_hint(Some(&"é".repeat(100))).unwrap().len(), MAX_REPLY_PLACEHOLDER_BYTES);
     }
 
     #[test]

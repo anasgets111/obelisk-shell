@@ -164,14 +164,41 @@ pub(super) fn replace_or_push(
     }
 }
 
-/// The pure decision half of [`NotificationsController::expire_if_still_present`] (finding 2):
-/// the index of the queue entry that a timer captured for `(id, incarnation)` should still expire,
+/// The index of the queue entry that a timer captured for `(id, incarnation)` should still expire,
 /// or `None` if there isn't one -- either no entry with that id exists at all, or one does but its
 /// `incarnation` has moved on, meaning a newer `Notify` call (a `replaces_id` update) already
 /// superseded this timer. Both cases collapse to the same "this timer does nothing" outcome; the
 /// newer timer that replace spawned handles expiry correctly on its own schedule instead.
 pub(super) fn find_expiring_entry(queue: &VecDeque<Notification>, id: u32, incarnation: u64) -> Option<usize> {
     queue.iter().position(|entry| entry.id == id && entry.incarnation == incarnation)
+}
+
+/// What an expiry did to the queue (ADR-0100).
+#[derive(Debug, PartialEq)]
+pub(super) enum Expiry {
+    /// The entry stays, now marked `expired`: out of the popup, still in the history.
+    Retired,
+    /// The entry is gone, because the sender marked it `transient` -- a popup and nothing more.
+    /// Carries the spooled image path, if any, so the caller can delete the file.
+    Removed { image_path: Option<String> },
+}
+
+/// The pure decision half of [`NotificationsController::expire`] (ADR-0100). Expiry used to remove
+/// the entry, which made the history panel a list of what was still popped up rather than of what
+/// had happened; now it flips `expired` and leaves the entry for `dismiss` to remove, except on a
+/// transient, whose sender asked for exactly the old behaviour. `None` when there is nothing left
+/// to expire ([`find_expiring_entry`]), and also when the entry has already expired, so a timer
+/// that somehow fires twice does not re-announce a close the sender already heard.
+pub(super) fn expire_entry(queue: &mut VecDeque<Notification>, id: u32, incarnation: u64) -> Option<Expiry> {
+    let index = find_expiring_entry(queue, id, incarnation)?;
+    if queue[index].expired {
+        return None;
+    }
+    if queue[index].transient {
+        return queue.remove(index).map(|removed| Expiry::Removed { image_path: removed.image_path });
+    }
+    queue[index].expired = true;
+    Some(Expiry::Retired)
 }
 
 /// `dismiss(id)`/`reply(id, ...)`/`CloseNotification(id)`'s shared removal: pulls the matching
@@ -315,12 +342,49 @@ mod tests {
             image_path: image_path.map(str::to_string),
             app_icon: None,
             urgency: Urgency::Normal,
+            expired: false,
+            transient: false,
+            desktop_entry: None,
             has_reply: false,
+            reply_placeholder: None,
             actions: Vec::new(),
             has_default_action: false,
             resident: false,
             incarnation: 0,
         }
+    }
+
+    // ---- expire_entry (ADR-0100) ----
+
+    #[test]
+    fn expiring_an_ordinary_notification_retires_it_and_keeps_it_in_the_queue() {
+        let mut queue = VecDeque::from([sample_notification(1, Some("/dev/shm/x/notif-1.png"))]);
+        assert_eq!(expire_entry(&mut queue, 1, 0), Some(Expiry::Retired));
+        assert_eq!(queue.len(), 1, "expiry is not removal any more");
+        assert!(queue[0].expired);
+        assert_eq!(queue[0].image_path.as_deref(), Some("/dev/shm/x/notif-1.png"), "the history still draws it");
+    }
+
+    #[test]
+    fn expiring_a_transient_notification_removes_it_outright() {
+        let mut transient = sample_notification(1, Some("/dev/shm/x/notif-1.png"));
+        transient.transient = true;
+        let mut queue = VecDeque::from([transient]);
+        assert_eq!(
+            expire_entry(&mut queue, 1, 0),
+            Some(Expiry::Removed { image_path: Some("/dev/shm/x/notif-1.png".to_string()) })
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn a_stale_or_repeated_expiry_does_nothing() {
+        let mut queue = VecDeque::from([sample_notification(1, None)]);
+        queue[0].incarnation = 5;
+        assert_eq!(expire_entry(&mut queue, 1, 4), None, "an older incarnation's timer");
+        assert_eq!(expire_entry(&mut queue, 1, 5), Some(Expiry::Retired));
+        assert_eq!(expire_entry(&mut queue, 1, 5), None, "already expired: nothing to announce twice");
+        assert_eq!(expire_entry(&mut queue, 2, 0), None, "no such id");
     }
 
     #[test]
