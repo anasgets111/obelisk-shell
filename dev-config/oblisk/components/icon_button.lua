@@ -140,8 +140,10 @@ return function(glyph, on_activate, opts)
         background = background,
         opacity = opts.opacity,
         visible = opts.visible,
-        border_width = opts.border == false and nil or theme.border_width,
-        border_color = opts.border == false and nil or border_color,
+        -- `opts.border == false` drops the ring. An `if`, because `x and nil or y` is always `y`,
+        -- which is how every caller that asked for no border got one anyway.
+        border_width = theme.border_width,
+        border_color = border_color,
         children = { text {
             content = glyph,
             foreground = foreground,
@@ -153,6 +155,11 @@ return function(glyph, on_activate, opts)
             align_v = "Center",
         } },
     }
+
+    if opts.border == false then
+        node.border_width = nil
+        node.border_color = nil
+    end
 
     if on_activate == nil and opts.on_button == nil then
         return row(node)
