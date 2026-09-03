@@ -58,9 +58,6 @@ end
 -- Here rather than at its two callers -- `panel_host`'s click-outside catcher and the toggle below
 -- -- for the reason this file keeps repeating: one writer per edge. A capability call inside a
 -- module named `ui_state` is the price, and it is the smaller one.
--- Forward declaration: defined with the reply section below, called here.
-local close_reply
-
 local function close_panel()
     -- Reading the history is seeing the notifications in it, so nothing in the feed is owed
     -- another turn as a popup once this closes. Marked on the way out rather than only on the way
@@ -70,11 +67,6 @@ local function close_panel()
     end
     panel_open:set(false)
     oblisk.network:invoke("cancel_connect")
-    -- And the reply, for the same reason as the password: a panel that is gone has no field in
-    -- it. Left set, `reply_id` made the next popup map asking for the keyboard, with the reply row
-    -- open on a card nobody had asked to answer (ADR-0108). `close_reply` is forward-declared
-    -- above the reply section and defined there.
-    close_reply()
 end
 
 -- Clicking an indicator opens its panel; clicking the same one again closes it. A toggle, which is
@@ -170,15 +162,13 @@ end
 local expanded_groups = state("notification_expanded_groups", {})
 local expanded_messages = state("notification_expanded_messages", {})
 
--- Which notification's reply field is open, by id, or `0` for none. Not a boolean, because the
--- popup draws several cards and only one field may be open at a time -- two open fields would both
--- be unfocused until clicked, and the second click would leave the first showing a caret it no
--- longer has.
-local reply_id = state("notification_reply_id", 0)
-
--- What has been typed into it. One slot, not one per notification, because [`reply_id`] already
--- says there is only ever one field: `textfield`'s `on_change` hands over the whole text per
--- keystroke (ADR-0092 decision 5), so this is the value a Send button reads back.
+-- The reply draft: which card it belongs to, by notification id (`0` for none), and its text.
+-- One slot, not one per card, and that is not a shortcut: the Renderer holds one plain-field
+-- buffer at a time, so there is only ever one live draft. The id is what keeps a Send button
+-- honest -- pressing Send on card A with a draft typed into card B sends nothing (ADR-0109).
+-- Every inline-reply card draws its field (the mirror's `Loader { active: hasInlineReply }`); there
+-- is no "open" state any more, and no Reply button to open it.
+local reply_draft_id = state("notification_reply_draft_id", 0)
 local reply_draft = state("notification_reply_draft", "")
 
 -- Toggling one key of a table signal. `set` compares by identity for a table, so a fresh copy is
@@ -201,27 +191,28 @@ local function toggle_message(id)
     toggle_key(expanded_messages, tostring(id))
 end
 
--- Opening a reply field clears whatever was typed into the last one. Leaving the draft behind
--- would put one notification's half-written reply in another's box, which is the one mistake in a
--- reply UI that cannot be taken back.
-local function open_reply(id)
-    reply_draft:set("")
-    reply_id:set(reply_id:get() == id and 0 or id)
+-- Every keystroke lands here (`textfield`'s `on_change`, ADR-0092 decision 5): the whole text,
+-- stamped with the card it was typed into.
+local function set_reply_draft(id, text)
+    reply_draft_id:set(id)
+    reply_draft:set(text or "")
 end
 
-function close_reply()
-    reply_draft:set("")
-    reply_id:set(0)
+-- Forgets the draft if it is `id`'s. Escape's `on_cancel` and a successful send both end here.
+local function clear_reply(id)
+    if reply_draft_id:get() == id then
+        reply_draft_id:set(0)
+        reply_draft:set("")
+    end
 end
 
--- Whether a reply field is actually on screen: `reply_id` names a notification that is still in
--- the feed. This, and not `reply_id ~= 0`, is what a surface binds its `keyboard_interactivity` to
--- (ADR-0108). The id goes stale whenever the notification leaves by any door but the field's own
--- -- the X, the sender withdrawing it, an action -- and a surface that asked for the keyboard on
--- a stale id took it the next time it mapped, for a field it was not drawing. Pure, so it can be
--- a `computed`; the card draws the field under the same condition.
-local reply_open = computed({ reply_id, oblisk.notifications }, function(id, n)
-    if id == 0 then
+-- Whether a draft is pending on a card still in the feed: non-empty text, typed into a
+-- notification that is still there. A surface binds its `keyboard_interactivity` to this
+-- alongside its own hover (ADR-0109): under a click-to-focus compositor the keyboard must not be
+-- dropped mid-sentence because the pointer wandered off the card, and a pending draft is the one
+-- signal that says a sentence is in progress. Pure, so it can be a `computed`.
+local reply_pending = computed({ reply_draft_id, reply_draft, oblisk.notifications }, function(id, text, n)
+    if id == 0 or text == nil or text == "" then
         return false
     end
     for _, notification in ipairs((n and n.feed) or {}) do
@@ -237,11 +228,11 @@ end)
 -- card the user loses and a message the sender gets nothing from.
 local function send_reply(id)
     local text = reply_draft:get()
-    if text == nil or text == "" then
+    if reply_draft_id:get() ~= id or text == nil or text == "" then
         return
     end
     oblisk.notifications:invoke("reply", id, text)
-    close_reply()
+    clear_reply(id)
 end
 
 return {
@@ -249,13 +240,13 @@ return {
     popup_seen = popup_seen,
     expanded_groups = expanded_groups,
     expanded_messages = expanded_messages,
-    reply_id = reply_id,
-    reply_open = reply_open,
+    reply_draft_id = reply_draft_id,
     reply_draft = reply_draft,
+    reply_pending = reply_pending,
     toggle_group = toggle_group,
     toggle_message = toggle_message,
-    open_reply = open_reply,
-    close_reply = close_reply,
+    set_reply_draft = set_reply_draft,
+    clear_reply = clear_reply,
     send_reply = send_reply,
     settings_open = settings_open,
     panel_open = panel_open,

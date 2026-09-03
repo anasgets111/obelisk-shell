@@ -355,7 +355,7 @@ Renderer (Lua VM)                          Renderer (Rust Engine)               
 1.  **Surface setup**: the Renderer evaluates `shell.lua`, reads the surface topology from the returned nodes, and registers one layer surface per `(surface, output)` pair with the compositor. Evaluation happens before binding, matching the Candidate's own ordering in `oblisk-supervisor-services-dbus.md` § 15.2.
 2.  **Input region manipulation**: applies to any surface whose visible content is smaller than the surface itself. Load-bearing for a fullscreen transparent surface, a no-op for a tightly-sized bar.
     *   A surface with no visible content has an empty input region; pointer clicks bypass it entirely and reach background application windows.
-    *   When the Lua config toggles a child's visibility (a volume OSD, a dropdown notification card), the Renderer recomputes the union of its visible children's absolute bounding boxes and calls `wl_surface::set_input_region` on that surface with only those bounds.
+    *   When the Lua config toggles a child's visibility (a volume OSD, a dropdown notification card), the Renderer recomputes the region and calls `wl_surface::set_input_region` on that surface with only those bounds. The region is what the tree draws and what it can click (ADR-0109): a visible node with a background, a border, or any text, icon, image or field claims its box, as does a `button` with an `on_click`; a transparent container claims nothing of its own and its children are scanned instead. So a full-surface transparent `column` holding two cards yields the two cards, and the space between them is click-through.
     *   Clicks inside the bounds route to Lua callbacks (`on_click`); clicks outside pass through.
 
 ---

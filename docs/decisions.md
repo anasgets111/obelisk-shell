@@ -4959,3 +4959,53 @@ Not done: shrinking the popup's input region to its cards. The surface is `notif
 tall and its `column` fills it, so under focus-follows-mouse the empty space below the cards also
 takes the keyboard while a reply is open. The fix is the column sizing to its content and the list
 losing its scroll, which is a trade the mirror's popup also makes; deferred until it is felt.
+
+## 0109. The reply field is always there, the keyboard is asked for on hover, and the input region is what is drawn
+
+ADR-0108 left two things: pressing Reply opened a field you then had to click into, and the popup's
+empty space below its cards took the keyboard under focus-follows-mouse. Both had one cause and the
+mirror had already avoided it.
+
+1. **Every inline-reply card draws its field. There is no Reply button.** `NotificationCard.qml`'s
+   `Loader { active: hasInlineReply }` is exactly this, and it removes the problem rather than
+   solving it: the one click the user makes is the click into the field, and that click is the one
+   that focuses it. `reply_id` and `open_reply`/`close_reply` are gone with the button. What remains
+   is the draft, stamped with the card it was typed into (`reply_draft_id`, `reply_draft`), so a
+   Send button on card A cannot send a sentence typed into card B. `send_reply(id)` checks the stamp.
+
+2. **The surface asks `OnDemand` while the pointer is on it, or while a draft is pending.** Measured
+   twice: niri does not hand the keyboard to a mapped layer surface on the flip to `OnDemand` (three
+   seconds, nothing), and drops it at once on the flip from `Exclusive` to `OnDemand`, so acquiring
+   through `Exclusive` is out. What niri does honour is a *click* on a surface that is already on
+   demand. So the popup's binding is its own hover signal, which is true before the click into the
+   field lands, plus `ui.reply_pending` (non-empty draft, card still in the feed), which keeps the
+   ask alive after the pointer leaves for a click-to-focus compositor that would otherwise drop the
+   keyboard mid-sentence; under focus-follows-mouse the keyboard has left with the pointer anyway.
+   The panel host asks on demand for as long as the notifications panel is showing, since the panel
+   itself is the thing hovered; the network password keeps `Exclusive`. A surface that is `OnDemand`
+   and not clicked takes nothing, which is why the hover binding is safe against the "a notification
+   arrived and stole my keyboard" case ADR-0108's comment guards.
+
+3. **The input region is what the tree draws and what it can click.** `overlay_input_regions` was
+   the root's visible direct children, which made a full-surface transparent `column` claim the
+   whole 523-pixel box. It now walks into a transparent container and claims a node's box when it
+   is solid: a background, a border, any text/icon/image/field, or a `button` with an `on_click`
+   (the panel host's catcher is invisible by design and must stay pressable). Everything else is
+   click-through, and under focus-follows-mouse focus-through, so the space below the cards no
+   longer takes the keyboard, and no longer holds expiry either -- the hover column is unchanged,
+   but pointer events simply stop arriving there. This is the docstring's own stated upgrade path,
+   and it is the mask the mirror sets (`maskItem: popupColumn`) expressed the way this engine
+   already computes regions. The scroll is kept: the list still fills the surface, only the region
+   shrank.
+
+4. **The body is inert while a draft is pending, not while a field is "open".** Same rule as
+   ADR-0108's, re-keyed to the draft since there is no open state left.
+
+Verified live on niri: a card arrives; the pointer parked in the empty box below it holds nothing
+and asks for nothing; on the card it holds expiry and flips to `OnDemand`; one click into the field
+brings `keyboard focus entered` and typing lands; the pointer leaving takes the keyboard and keeps
+the text; returning brings both back; Send removes the card.
+
+Not taken: a `focus` property on `textfield` for focusing a field the pass just created. It would
+have set the field typing without the surface having the keyboard, since on niri only the click
+brings that, and the click is now the one into the field.

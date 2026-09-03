@@ -132,34 +132,30 @@ return panel {
     -- first push.
     --
     -- Two facts want it now, not one. The notification history draws the same card the popup does,
-    -- so a reply field can be open in here too, and it needs the keyboard on the same terms the
-    -- password prompt does -- raised only once something has asked, never merely because a panel
-    -- is showing.
-    --
-    -- `reply_open` alone is not that ask. It is one signal for both places the card is drawn, so a
-    -- reply opened in the *popup* would otherwise raise this surface too, and a panel showing
-    -- something else entirely -- the network list, the calendar -- would take the keyboard because
-    -- of a notification it is not displaying. Gated on the notifications panel actually being the
-    -- one on screen, which is the condition that makes the open field one of ours.
+    -- with its reply field always present (ADR-0109), and a click into that field is what gives
+    -- this surface the keyboard -- on niri an `OnDemand` layer surface is focused on a click made
+    -- while it is already on demand, not on the flip. So the whole time the notifications panel is
+    -- showing, this asks on demand: a click anywhere on it takes the keyboard, a click on another
+    -- window gives it back, and the click-outside catcher below closes the panel. Gated on the
+    -- notifications panel actually being the one on screen, so the network list and the calendar
+    -- never ask for a keyboard they have no field for.
     keyboard_interactivity = computed(
-        { oblisk.network, ui_state.reply_open, ui_state.panel_showing("notifications") },
-        function(n, reply_open, showing_notifications)
-            -- Two asks, two answers. A password prompt keeps `Exclusive`: it was raised by a
-            -- click on this panel and the click-outside catcher below is how it ends, so nothing
-            -- else can want a key meanwhile. A reply is `OnDemand` (ADR-0108): the keyboard
-            -- follows the pointer to other windows and back, the draft stays, and the click-outside
-            -- catcher below is what closes the panel and the reply together (`close_panel`).
+        { oblisk.network, ui_state.panel_showing("notifications") },
+        function(n, showing_notifications)
+            -- The password keeps `Exclusive`: it was raised by a click on this panel and the
+            -- catcher is how it ends, so nothing else can want a key meanwhile.
             if n and n.password_ssid then
                 return "Exclusive"
             end
-            return (reply_open and showing_notifications) and "OnDemand" or "None"
+            return showing_notifications and "OnDemand" or "None"
         end
     ),
     -- One surface, one root node (§ 6.1), so the catcher and the card share a `rect` rather than
     -- being two children of the surface. Full-fill and visible, which is also what sets the input
-    -- region: `wl_surface::set_input_region` is built from the surface root's visible direct
-    -- children (ADR-0038 decision 5), so this claims the whole surface while it is mapped and none
-    -- of it while `visible` above is false and the surface is unmapped.
+    -- region: `wl_surface::set_input_region` is built from what the tree draws and what it can
+    -- click (ADR-0038 decision 5, ADR-0109); the catcher is a full-size `button` with a handler,
+    -- so this claims the whole surface while it is mapped and none of it while `visible` above is
+    -- false and the surface is unmapped.
     child = rect {
         width = "Fill",
         height = "Fill",

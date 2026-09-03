@@ -18,6 +18,7 @@ local notification_card = require("components.notification_card")
 local MAX_CARDS = 4
 
 local SCROLL = scroll("notification_stack")
+local HOVER = hover("notification_stack_region")
 
 -- The cards this surface should be showing: the newest few groups of everything live that has not
 -- already had its turn as a popup, and nothing at all while the history panel is up.
@@ -75,36 +76,34 @@ return panel {
     visible = visible_groups:map(function(shown)
         return #shown > 0
     end),
-    -- The keyboard, and only while a reply field is actually open. Bound rather than constant for
-    -- the reason `modules/shell/panel_host.lua` states at length: niri gives an `on_demand` or
-    -- `exclusive` layer surface focus the moment it *maps*, and this surface maps every time a
-    -- notification arrives. A constant here would take the keyboard away from whatever you were
-    -- typing in, every time anything notified you.
+    -- The keyboard, on demand, while the pointer is on the stack or a reply is half-typed
+    -- (ADR-0109). Bound rather than constant for the reason `modules/shell/panel_host.lua` states
+    -- at length: niri gives an `on_demand` or `exclusive` layer surface focus the moment it *maps*,
+    -- and this surface maps every time a notification arrives. A constant here would take the
+    -- keyboard away from whatever you were typing in, every time anything notified you.
     --
     -- `OnDemand`, not `Exclusive` (ADR-0108). Exclusive is the lock screen's word: the keyboard
     -- stays here whatever is clicked, and a surface this small has nowhere for a click-outside to
-    -- land, so a reply left open held every key on the desktop until Escape or send. On demand,
-    -- niri gives this surface the keyboard when the binding flips (measured: the `enter` arrives on
-    -- the same pass) and moves it wherever the pointer goes next -- under focus-follows-mouse,
-    -- simply off the card. The field keeps its draft through that and takes keys again when the
-    -- keyboard is back; only Escape, Send and the X end the reply.
-    --
-    -- Which is also why the reply field is opened by a button rather than by clicking the field
-    -- itself: the click that focuses a `textfield` deliberately fires no `on_click` (ADR-0092
-    -- decision 7), so there is no way for the field's own press to be what raises this. The Reply
-    -- button is the ask, and this follows it.
-    keyboard_interactivity = ui.reply_open:map(function(open)
-        return open and "OnDemand" or "None"
+    -- land. On demand, niri gives this surface the keyboard on a *click* while the mode is already
+    -- on demand -- not on the flip to it, measured -- which is why the hover is in the binding:
+    -- the pointer arrives before the click into the reply field, so the field's own click is the
+    -- one that brings the keyboard, and typing starts at once. The pending draft keeps the ask
+    -- alive after the pointer leaves, for a click-to-focus compositor that would otherwise drop the
+    -- keyboard mid-sentence; under focus-follows-mouse the keyboard has left with the pointer
+    -- anyway and comes back with it, and the field keeps its text through both.
+    keyboard_interactivity = computed({ HOVER, ui.reply_pending }, function(hovered, pending)
+        return (hovered or pending) and "OnDemand" or "None"
     end),
     child = column {
         width = "Fill",
         height = "Fill",
-        -- The pointer resting anywhere on the stack stops every countdown, and leaving releases it
-        -- (ADR-0094, ADR-0095). One region for the whole stack rather than one per card, and that
+        -- The pointer resting on a card stops every countdown, and leaving releases it (ADR-0094,
+        -- ADR-0095). On a card, not anywhere in this box: the input region is built from what is
+        -- drawn (ADR-0109), so the empty surface below the cards sends no pointer events at all. One region for the whole stack rather than one per card, and that
         -- is not just economy: sibling cards are written in tree order within a single pass, so a
         -- pointer moving from the second card to the first would fire the first's enter before the
         -- second's leave, and the leave would release the hold the enter had just placed.
-        hover = hover("notification_stack_region"),
+        hover = HOVER,
         on_hover = function(hovered)
             oblisk.notifications:invoke("hold_expiry", hovered and 300 or 0)
         end,

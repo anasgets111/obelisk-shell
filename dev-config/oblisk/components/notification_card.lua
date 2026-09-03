@@ -172,11 +172,14 @@ local function message(notification, ui, opts)
         lines[#lines + 1] = row { width = "Fill", spacing = theme.spacing.sm, children = pictures }
     end
 
-    -- The reply field, open only for the one notification `reply_id` names. It is inside the
+    -- The reply field, on every notification that takes one, always (ADR-0109): the mirror's
+    -- `Loader { active: hasInlineReply }`, with no Reply button in front of it. A click into the
+    -- field is what focuses it, and on niri that same click is what gives the surface the keyboard
+    -- (an `OnDemand` layer surface is focused on click, not on the mode flip). It is inside the
     -- message's own `button` and that is safe: a press that focuses a `textfield` arms no click
     -- (ADR-0092 decision 7), which is the rule that exists so replying to a notification does not
     -- fire the notification's default action and take the card away mid-sentence.
-    if notification.has_reply and ui.reply_id:get() == id then
+    if notification.has_reply then
         lines[#lines + 1] = row {
             width = "Fill",
             align_v = "Center",
@@ -196,18 +199,17 @@ local function message(notification, ui, opts)
                     -- card alive for exactly as long as typing lasts, and the hold lapses on its
                     -- own if the shell reloads mid-sentence.
                     on_change = function(text)
-                        ui.reply_draft:set(text)
+                        ui.set_reply_draft(id, text)
                         oblisk.notifications:invoke("hold_expiry", 60)
                     end,
                     on_submit = function(text)
-                        ui.reply_draft:set(text)
+                        ui.set_reply_draft(id, text)
                         ui.send_reply(id)
                     end,
-                    -- Escape: the field has already let go of the keyboard by the time this runs
-                    -- (ADR-0102), so closing the reply here -- which drops the surface's
-                    -- `keyboard_interactivity` with it -- takes nothing away from anyone.
+                    -- Escape: the field is emptied and lets go of the keyboard (ADR-0102); the
+                    -- draft it banked goes with it.
                     on_cancel = function()
-                        ui.close_reply()
+                        ui.clear_reply(id)
                     end,
                 },
                 icon_button(icons.send, function()
@@ -222,15 +224,9 @@ local function message(notification, ui, opts)
         }
     end
 
-    -- The sender's own buttons, plus ours to open the reply field. `has_reply` is not an entry in
-    -- `actions` -- the Supervisor lifts the `"inline-reply"` key out into its own flag (ADR-0090)
-    -- -- so the button that opens the field is drawn here rather than falling out of the loop.
+    -- The sender's own buttons. `has_reply` is not among them -- the Supervisor lifts the
+    -- `"inline-reply"` key out into its own flag (ADR-0090) and the field above is what it draws.
     local buttons = {}
-    if notification.has_reply then
-        buttons[#buttons + 1] = action_button("Reply", function()
-            ui.open_reply(id)
-        end, "notification-reply-" .. tostring(id))
-    end
     for index, action in ipairs(notification.actions or {}) do
         buttons[#buttons + 1] = action_button(action.label, function()
             oblisk.notifications:invoke("invoke_action", id, action.key)
@@ -281,11 +277,11 @@ local function message(notification, ui, opts)
             if mouse_button ~= "left" then
                 return
             end
-            -- Not while this message's reply is open (ADR-0108). The field is one row of a card
-            -- whose whole face otherwise dismisses, and a click that misses the field by a few
-            -- pixels took the card, the field and the half-typed reply with it. While the row is
-            -- open the body is inert; the X is still there for someone who meant it.
-            if ui.reply_id:get() == id then
+            -- Not while a reply to this message is half-typed (ADR-0108, ADR-0109). The field is
+            -- one row of a card whose whole face otherwise dismisses, and a click that misses the
+            -- field by a few pixels took the card and the draft with it. While a draft is pending
+            -- the body is inert; the X is still there for someone who meant it.
+            if ui.reply_draft_id:get() == id and (ui.reply_draft:get() or "") ~= "" then
                 return
             end
             if notification.has_default_action then

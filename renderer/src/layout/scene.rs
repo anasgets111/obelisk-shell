@@ -1459,25 +1459,55 @@ fn elide_cut(
     cuts[low]
 }
 
-/// § 4's input-region scan: `surface_root`'s direct, visible children, projected to physical
-/// pixels. Pure; the `wl_region`/`wl_surface::set_input_region` push it feeds lives in
-/// `crate::wayland::App::apply_input_region`, the only place a Wayland object exists to push to.
+/// § 4's input-region scan: what this surface draws and what it can click, as surface-local
+/// physical rects (ADR-0038 decision 5, ADR-0109). Pure; the `wl_region`/
+/// `wl_surface::set_input_region` push it feeds lives in `crate::wayland::App::apply_input_region`,
+/// the only place a Wayland object exists to push to.
 ///
-/// Per surface since ADR-0038 decision 5. Applies to any surface whose visible content is smaller
-/// than the surface itself: load-bearing for a fullscreen transparent panel, an empty region
-/// (clicks pass through) with nothing visible, a no-op for a tightly-sized bar whose child fills
-/// it.
+/// A visible node claims its whole box when it is *solid*: it paints something (a box with a
+/// background or a border, or any text, icon, image or field), or it is a `button` with an
+/// `on_click`, which is invisible by design and still has to be pressable (the panel host's
+/// click-outside catcher). A transparent container claims nothing of its own and is walked into,
+/// so a full-surface `column` holding two cards yields the two cards. Everything not claimed is
+/// click-through, and under focus-follows-mouse it is also focus-through: this is why the popup's
+/// empty space below its cards no longer takes the keyboard.
 ///
-/// ponytail: direct children only, not a recursive union over the visible subtree, so a panel
-/// whose child is a full-surface transparent container claims its whole box for input. Upgrade
-/// path: recurse into a child whose own `background` is absent or fully transparent.
+/// Applies to any surface whose visible content is smaller than the surface itself: an empty region
+/// (clicks pass through) with nothing visible, a no-op for a tightly-sized bar whose child fills it.
 pub fn overlay_input_regions(surface_root: &ResolvedNode, scale: f32) -> Vec<PhysicalRect> {
-    surface_root
-        .children
-        .iter()
-        .filter(|child| child.visible)
-        .map(|child| snap_to_physical(child.rect, scale))
-        .collect()
+    let mut regions = Vec::new();
+    for child in &surface_root.children {
+        collect_input_regions(child, 0.0, 0.0, scale, &mut regions);
+    }
+    regions
+}
+
+fn collect_input_regions(node: &ResolvedNode, origin_x: f32, origin_y: f32, scale: f32, out: &mut Vec<PhysicalRect>) {
+    if !node.visible {
+        return;
+    }
+    let rect = LogicalRect { x: origin_x + node.rect.x, y: origin_y + node.rect.y, ..node.rect };
+    if takes_input_as_a_box(node) {
+        out.push(snap_to_physical(rect, scale));
+        return;
+    }
+    for child in &node.children {
+        collect_input_regions(child, rect.x, rect.y, scale, out);
+    }
+}
+
+/// [`overlay_input_regions`]'s "solid" test. A `background` of `#00000000` counts: the IDL says it
+/// draws a transparent rectangle where an absent one draws nothing, and a config that wrote it
+/// asked for a box.
+fn takes_input_as_a_box(node: &ResolvedNode) -> bool {
+    let paints = match &node.paint {
+        Some(PaintStyle::Box { background, widths, .. }) => {
+            background.is_some() || [widths.top, widths.right, widths.bottom, widths.left].iter().any(|w| *w > 0.0)
+        }
+        Some(_) => true,
+        None => false,
+    };
+    paints || (node.kind == "button" && matches!(node.properties.get("on_click"), Some(Value::Function(_))))
 }
 
 #[cfg(test)]
@@ -3599,6 +3629,60 @@ pub(super) mod tests {
         assert!(!lua.globals().get::<bool>("ran").unwrap(), "a rejected child's property getters must not run");
     }
 
+    /// A `rect` with a background, the way the region scan sees one.
+    fn solid_paint() -> Option<PaintStyle> {
+        let lua = mlua::Lua::new();
+        let mut properties = HashMap::new();
+        properties.insert("background".to_string(), Value::String(lua.create_string("#112233").unwrap()));
+        node::paint_style("rect", &properties).unwrap()
+    }
+
+    fn region_node(
+        id: u64,
+        kind: &str,
+        rect: (f32, f32, f32, f32),
+        paint: Option<PaintStyle>,
+        children: Vec<ResolvedNode>,
+    ) -> ResolvedNode {
+        ResolvedNode {
+            id: NodeId::test(id),
+            kind: kind.to_string(),
+            rect: LogicalRect { x: rect.0, y: rect.1, width: rect.2, height: rect.3 },
+            visible: true,
+            opacity: 1.0,
+            properties: HashMap::new(),
+            paint,
+            children,
+        }
+    }
+
+    /// ADR-0109: a transparent container is walked into; a solid child claims its box; a `button`
+    /// with a handler claims its box with nothing painted; a transparent leaf claims nothing.
+    #[test]
+    fn overlay_input_regions_come_from_what_is_drawn_and_what_is_clickable() {
+        let lua = mlua::Lua::new();
+        let card_a = region_node(1, "rect", (0.0, 0.0, 100.0, 40.0), solid_paint(), Vec::new());
+        let card_b = region_node(2, "rect", (0.0, 50.0, 100.0, 40.0), solid_paint(), Vec::new());
+        let column = region_node(3, "column", (10.0, 10.0, 100.0, 500.0), None, vec![card_a, card_b]);
+        let root = region_node(4, "panel", (0.0, 0.0, 120.0, 520.0), None, vec![column]);
+        assert_eq!(
+            overlay_input_regions(&root, 1.0),
+            [PhysicalRect { x0: 10, y0: 10, x1: 110, y1: 50 }, PhysicalRect { x0: 10, y0: 60, x1: 110, y1: 100 }],
+            "the cards, at their surface-local positions, and not the column"
+        );
+
+        let mut catcher = region_node(5, "button", (0.0, 0.0, 120.0, 520.0), None, Vec::new());
+        catcher
+            .properties
+            .insert("on_click".to_string(), Value::Function(lua.create_function(|_, ()| Ok(())).unwrap()));
+        let root = region_node(6, "panel", (0.0, 0.0, 120.0, 520.0), None, vec![catcher]);
+        assert_eq!(overlay_input_regions(&root, 1.0), [PhysicalRect { x0: 0, y0: 0, x1: 120, y1: 520 }]);
+
+        let idle_button = region_node(7, "button", (0.0, 0.0, 120.0, 520.0), None, Vec::new());
+        let root = region_node(8, "panel", (0.0, 0.0, 120.0, 520.0), None, vec![idle_button]);
+        assert!(overlay_input_regions(&root, 1.0).is_empty(), "a button with no handler is as transparent as a rect");
+    }
+
     #[test]
     fn overlay_input_regions_includes_only_visible_direct_children() {
         let visible_child = ResolvedNode {
@@ -3608,7 +3692,7 @@ pub(super) mod tests {
             visible: true,
             opacity: 1.0,
             properties: HashMap::new(),
-            paint: None,
+            paint: solid_paint(),
             children: Vec::new(),
         };
         let hidden_child = ResolvedNode {
@@ -3682,7 +3766,7 @@ pub(super) mod tests {
                 visible: true,
                 opacity: 1.0,
                 properties: HashMap::new(),
-                paint: None,
+                paint: solid_paint(),
                 children: Vec::new(),
             }],
         };
