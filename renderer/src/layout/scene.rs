@@ -56,6 +56,16 @@ const MAX_TREE_DEPTH: u32 = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(u64);
 
+#[cfg(test)]
+impl NodeId {
+    /// A hand-picked id for a `ResolvedNode` built by hand in a test. Production ids come from
+    /// [`Scene::alloc_id`] and nothing else, which is what makes them unique; a test that builds a
+    /// tree without a `Scene` still has to say which nodes are the same node and which are not.
+    pub(crate) const fn test(raw: u64) -> Self {
+        NodeId(raw)
+    }
+}
+
 /// Every geometry property one node's layout reads, parsed exactly once per pass.
 ///
 /// The `Signal` behind `margin` is read once per node per pass; parsing the resolved value once is
@@ -128,6 +138,14 @@ impl LayoutStyle {
 /// third state, `Value::Nil` retained as "bound but unresolved".
 #[derive(Debug, Clone)]
 pub struct ResolvedNode {
+    /// The identity its retained counterpart was reconciled under, carried so a later reader can
+    /// say "this node, again" across passes. Stable by construction: `reconcile_node` keeps the
+    /// retained node's id and only allocates when there was nothing to match, so an id survives
+    /// the node moving, resizing, or gaining siblings ahead of it (ADR-0099).
+    ///
+    /// Not addressable from Lua and not the § 5.1 `id` property, which is a reconciliation *hint*
+    /// a config writes and this is the answer the engine reached.
+    pub id: NodeId,
     pub kind: String,
     pub rect: LogicalRect,
     pub visible: bool,
@@ -165,6 +183,7 @@ struct RetainedNode {
 impl RetainedNode {
     fn to_resolved(&self) -> ResolvedNode {
         ResolvedNode {
+            id: self.id,
             kind: self.kind.clone(),
             rect: self.rect,
             visible: self.style.visible,
@@ -3397,6 +3416,7 @@ pub(super) mod tests {
     #[test]
     fn overlay_input_regions_includes_only_visible_direct_children() {
         let visible_child = ResolvedNode {
+            id: NodeId::test(102),
             kind: "rect".to_string(),
             rect: LogicalRect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 },
             visible: true,
@@ -3406,6 +3426,7 @@ pub(super) mod tests {
             children: Vec::new(),
         };
         let hidden_child = ResolvedNode {
+            id: NodeId::test(103),
             kind: "rect".to_string(),
             rect: LogicalRect { x: 20.0, y: 20.0, width: 10.0, height: 10.0 },
             visible: false,
@@ -3415,6 +3436,7 @@ pub(super) mod tests {
             children: Vec::new(),
         };
         let root = ResolvedNode {
+            id: NodeId::test(104),
             kind: "panel".to_string(),
             rect: LogicalRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 },
             visible: true,
@@ -3432,6 +3454,7 @@ pub(super) mod tests {
     #[test]
     fn a_surface_with_nothing_visible_in_it_claims_no_input_at_all() {
         let hidden_child = ResolvedNode {
+            id: NodeId::test(105),
             kind: "rect".to_string(),
             rect: LogicalRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 },
             visible: false,
@@ -3441,6 +3464,7 @@ pub(super) mod tests {
             children: Vec::new(),
         };
         let mut root = ResolvedNode {
+            id: NodeId::test(106),
             kind: "panel".to_string(),
             rect: LogicalRect { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0 },
             visible: true,
@@ -3458,6 +3482,7 @@ pub(super) mod tests {
     #[test]
     fn a_child_that_fills_its_surface_claims_the_whole_surface() {
         let root = ResolvedNode {
+            id: NodeId::test(107),
             kind: "panel".to_string(),
             rect: LogicalRect { x: 0.0, y: 0.0, width: 1920.0, height: 32.0 },
             visible: true,
@@ -3465,6 +3490,7 @@ pub(super) mod tests {
             properties: HashMap::new(),
             paint: None,
             children: vec![ResolvedNode {
+                id: NodeId::test(120),
                 kind: "row".to_string(),
                 rect: LogicalRect { x: 0.0, y: 0.0, width: 1920.0, height: 32.0 },
                 visible: true,

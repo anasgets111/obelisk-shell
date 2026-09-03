@@ -24,7 +24,7 @@ use femtovg::{Canvas, Color, ImageFlags, ImageId, Paint, Path, PixelFormat, Rend
 
 use crate::image::{self, Fit, ImageCache};
 use crate::layout::node::{self, BorderColor, ClipShape, EdgeInsets, PaintStyle, Rgba, TextAlign};
-use crate::layout::scene::ResolvedNode;
+use crate::layout::scene::{NodeId, ResolvedNode};
 use crate::text::atlas::TextPainter;
 use crate::text::snap::{LogicalRect, PhysicalRect, snap_border_band, snap_to_physical};
 
@@ -132,11 +132,11 @@ fn is_empty(clip: PhysicalRect) -> bool {
 /// out of the Lua VM and a `Draw::Text` this process clones into `last_painted` is just as wrong.
 /// A plain field has no secret and no destination, so it is named by its box and carries its text.
 ///
-/// A box is a weak identity, and knowingly so: it is the same stand-in `wayland::input::ArmedClick`
-/// uses for the same missing thing, since `ResolvedNode` carries no `NodeId` (`to_resolved` drops
-/// it). A re-resolve that moves the focused field detaches the caret from it, which is what a real
-/// identity would also give for a field moved out from under the user. Upgrade path is the one
-/// `input::focused_field` names: put the `NodeId` on `ResolvedNode`.
+/// A plain field is named by its `NodeId`, which is a real identity rather than the box it used to
+/// be (ADR-0099). A box was wrong in both directions: a re-resolve that moved the field -- a
+/// notification arriving above the one being replied to, say -- detached the caret from it while
+/// the keystrokes kept landing in the buffer, and a different field that came to occupy the vacated
+/// box would have drawn text it never received.
 pub enum FieldFocus<'a> {
     Masked {
         target: &'a node::SecureSubmitTarget,
@@ -144,9 +144,9 @@ pub enum FieldFocus<'a> {
         filled: usize,
     },
     Plain {
-        /// The field's absolute rect in its surface, as `layout::hit::absolute_rect` gave it to
-        /// the press that focused it, which is the same space `build_node` computes here.
-        rect: LogicalRect,
+        /// The focused node, as the press that focused it read the id off the same tree this walk
+        /// is drawing. Survives the node moving, resizing and gaining siblings ahead of it.
+        id: NodeId,
         text: &'a str,
     },
 }
@@ -215,7 +215,7 @@ fn build_node(
     // intersects down it, baked in here rather than in `execute` since ADR-0063 skips a repaint on
     // an unchanged list, and a fade outside the list would go unnoticed.
     let opacity = inherited_opacity * node.opacity;
-    let draw = node.paint.as_ref().and_then(|style| draw_for(style, rect, scale, opacity, focus));
+    let draw = node.paint.as_ref().and_then(|style| draw_for(style, node.id, rect, scale, opacity, focus));
 
     let Some(radius) = rounded_clip(node) else {
         if let Some(draw) = draw {
@@ -468,6 +468,7 @@ fn fade_border(colors: BorderColor, opacity: f32) -> BorderColor {
 /// `node::paint_style`'s module doc comment).
 fn draw_for(
     style: &PaintStyle,
+    node_id: NodeId,
     rect: LogicalRect,
     scale: f32,
     opacity: f32,
@@ -547,12 +548,12 @@ fn draw_for(
                 // does *not* fall back to its placeholder: the two would be indistinguishable, and
                 // "am I typing into this?" is the question a plain field has to answer. There is no
                 // caret movement to place it anywhere but the end -- nothing handles arrow keys.
-                // `target.is_none()` is not redundant with the arm above: a plain focus and a
-                // *masked* node can coexist -- the focus is on one field, this draw is of another --
-                // and without the check a `secure_submit` field whose box matched would render the
-                // plaintext some other field is holding. The two focuses are mutually exclusive;
-                // the two node kinds on one surface are not.
-                Some(FieldFocus::Plain { rect: focused, text }) if *focused == rect && target.is_none() => {
+                // `target.is_none()` is kept alongside the id check rather than replaced by it. An
+                // id says which node this is; it does not say the node is still the *kind* of field
+                // the focus was taken on, and a `textfield` that gains a `secure_submit` between
+                // passes is the same node with a new job. Cheap, and it keeps the invariant that a
+                // masked field never draws plaintext local to the arm that would break it.
+                Some(FieldFocus::Plain { id, text }) if *id == node_id && target.is_none() => {
                     format!("{text}\u{2502}")
                 }
                 _ => placeholder.clone(),
@@ -1278,8 +1279,8 @@ mod tests {
         let tree = reply_surface(&lua);
         assert_eq!(drawn_text(&build(&tree, 1.0, None)), vec!["Reply".to_string()]);
 
-        let rect = tree.children[0].rect;
-        let typed = build(&tree, 1.0, Some(&FieldFocus::Plain { rect, text: "on my way" }));
+        let id = tree.children[0].id;
+        let typed = build(&tree, 1.0, Some(&FieldFocus::Plain { id, text: "on my way" }));
         assert_eq!(drawn_text(&typed), vec!["on my way\u{2502}".to_string()]);
     }
 
@@ -1289,21 +1290,65 @@ mod tests {
     fn a_focused_but_empty_plain_field_draws_a_caret_not_its_placeholder() {
         let lua = Lua::new();
         let tree = reply_surface(&lua);
-        let rect = tree.children[0].rect;
+        let id = tree.children[0].id;
         assert_eq!(
-            drawn_text(&build(&tree, 1.0, Some(&FieldFocus::Plain { rect, text: "" }))),
+            drawn_text(&build(&tree, 1.0, Some(&FieldFocus::Plain { id, text: "" }))),
             vec!["\u{2502}".to_string()]
         );
     }
 
-    /// Focus is addressed by box, so a focus naming some other box leaves this field alone. The
-    /// case it guards is two reply fields in one card: only the one clicked into fills.
+    /// Focus names one node, so a focus naming another leaves this field alone. The case it guards
+    /// is two reply fields in one card: only the one clicked into fills.
     #[test]
-    fn a_plain_field_whose_box_is_not_the_focused_one_keeps_its_placeholder() {
+    fn a_plain_field_that_is_not_the_focused_node_keeps_its_placeholder() {
         let lua = Lua::new();
         let tree = reply_surface(&lua);
-        let elsewhere = LogicalRect { x: 999.0, y: 999.0, width: 10.0, height: 10.0 };
-        let list = build(&tree, 1.0, Some(&FieldFocus::Plain { rect: elsewhere, text: "not mine" }));
+        let elsewhere = crate::layout::scene::NodeId::test(9999);
+        let list = build(&tree, 1.0, Some(&FieldFocus::Plain { id: elsewhere, text: "not mine" }));
+        assert_eq!(drawn_text(&list), vec!["Reply".to_string()]);
+    }
+
+    /// The bug the box stood in the way of (ADR-0099). A notification arriving above the card being
+    /// replied to re-lays the surface out and the field lands somewhere else, and under a
+    /// box-keyed focus paint stopped finding it -- the caret and the typed text vanished from a
+    /// field that was still receiving every keystroke. Here the same tree is drawn at two different
+    /// geometries and the focus follows the node.
+    #[test]
+    fn a_focused_plain_field_keeps_its_caret_when_the_layout_moves_it() {
+        let lua = Lua::new();
+        let tree = reply_surface(&lua);
+        let id = tree.children[0].id;
+        assert_eq!(
+            drawn_text(&build(&tree, 1.0, Some(&FieldFocus::Plain { id, text: "on my way" }))),
+            vec!["on my way\u{2502}".to_string()]
+        );
+
+        // The same node, pushed down and narrowed the way a re-resolve would. Kept inside the
+        // surface, since a node clipped out entirely draws nothing for reasons unrelated to focus.
+        let mut moved = tree.clone();
+        moved.children[0].rect.y += 6.0;
+        moved.children[0].rect.width -= 40.0;
+        assert_eq!(
+            drawn_text(&build(&moved, 1.0, Some(&FieldFocus::Plain { id, text: "on my way" }))),
+            vec!["on my way\u{2502}".to_string()],
+            "the caret follows the node, not the box it used to occupy"
+        );
+    }
+
+    /// The other direction, and the reason the id has to be the node's own rather than anything
+    /// positional: a *different* field that comes to sit where the focused one was must not
+    /// inherit its text.
+    #[test]
+    fn a_different_field_that_takes_the_focused_ones_box_draws_nothing_of_its_text() {
+        let lua = Lua::new();
+        let tree = reply_surface(&lua);
+        let vacated = tree.children[0].rect;
+
+        let mut other = tree.clone();
+        other.children[0].id = crate::layout::scene::NodeId::test(4242);
+        other.children[0].rect = vacated;
+
+        let list = build(&other, 1.0, Some(&FieldFocus::Plain { id: tree.children[0].id, text: "on my way" }));
         assert_eq!(drawn_text(&list), vec!["Reply".to_string()]);
     }
 
@@ -1313,8 +1358,8 @@ mod tests {
     fn a_masked_field_never_draws_a_plain_focuss_text() {
         let lua = Lua::new();
         let tree = password_surface(&lua);
-        let rect = tree.children[0].rect;
-        let list = build(&tree, 1.0, Some(&FieldFocus::Plain { rect, text: "hunter2" }));
+        let id = tree.children[0].id;
+        let list = build(&tree, 1.0, Some(&FieldFocus::Plain { id, text: "hunter2" }));
         assert_eq!(drawn_text(&list), vec!["password".to_string()]);
     }
 

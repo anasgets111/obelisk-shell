@@ -90,9 +90,9 @@ struct PointerHit {
 enum FieldTarget {
     Masked(node::SecureSubmitTarget),
     Plain {
-        /// The field's absolute rect, which is how paint finds it again; see
-        /// `layout::paint::FieldFocus` for why a box stands in for an identity here.
-        rect: LogicalRect,
+        /// The field's own node, which is how paint finds it again across passes that move it
+        /// (ADR-0099).
+        id: layout::scene::NodeId,
         on_change: Option<Function>,
         on_submit: Option<Function>,
     },
@@ -110,11 +110,12 @@ enum FieldTarget {
 /// submit, and plain with no callback has nobody to tell. Focusing either would take the keyboard
 /// away from a field that can use it, to buffer keystrokes nothing will ever read.
 ///
-/// ponytail: the plain half is identified by its rect because `ResolvedNode` has no `NodeId` --
-/// `to_resolved` drops it -- so this is the same stand-in [`ArmedClick`] uses. Upgrade: put the
-/// `NodeId` on `ResolvedNode` and key both halves on it.
+/// The plain half is identified by the node's `NodeId`, which `ResolvedNode` now carries
+/// (ADR-0099) -- stable across a pass that moves the field, which its rect was not. [`ArmedClick`]
+/// still uses a rect for the same job; a press and its release are one gesture and the tree rarely
+/// moves between them, so that stand-in has not cost anything yet.
 fn focused_field(path: &[&layout::ResolvedNode]) -> Option<FieldTarget> {
-    let (depth, field) = path.iter().enumerate().rev().find(|(_, node)| node.kind == "textfield")?;
+    let field = path.iter().rev().find(|node| node.kind == "textfield")?;
     let node::PaintStyle::TextField { target, .. } = field.paint.as_ref()? else {
         return None;
     };
@@ -129,7 +130,7 @@ fn focused_field(path: &[&layout::ResolvedNode]) -> Option<FieldTarget> {
     if on_change.is_none() && on_submit.is_none() {
         return None;
     }
-    Some(FieldTarget::Plain { rect: layout::hit::absolute_rect(&path[..=depth])?, on_change, on_submit })
+    Some(FieldTarget::Plain { id: field.id, on_change, on_submit })
 }
 /// The focused plain `textfield`: where it lives, what has been typed into it, and who to tell
 /// (ADR-0092). The buffer is an ordinary `String` and deliberately so -- this is the half of § 5.2
@@ -138,7 +139,7 @@ fn focused_field(path: &[&layout::ResolvedNode]) -> Option<FieldTarget> {
 #[derive(Debug, Clone)]
 pub(super) struct FocusedTextField {
     surface_id: String,
-    rect: LogicalRect,
+    id: layout::scene::NodeId,
     buffer: String,
     on_change: Option<Function>,
     on_submit: Option<Function>,
@@ -504,7 +505,7 @@ impl App {
             });
         }
         let focused = self.focused_text_field.as_ref().filter(|f| f.surface_id == surface_id)?;
-        Some(layout::paint::FieldFocus::Plain { rect: focused.rect, text: &focused.buffer })
+        Some(layout::paint::FieldFocus::Plain { id: focused.id, text: &focused.buffer })
     }
 
     /// The half of [`App::prune_secure_focus`] that does not wait for a keystroke: a field whose
@@ -971,11 +972,11 @@ impl PointerHandler for App {
                         Some(FieldTarget::Masked(target)) => {
                             (Some(FocusedField { surface_id: instance_id.clone(), target }), None)
                         }
-                        Some(FieldTarget::Plain { rect, on_change, on_submit }) => (
+                        Some(FieldTarget::Plain { id, on_change, on_submit }) => (
                             None,
                             Some(FocusedTextField {
                                 surface_id: instance_id.clone(),
-                                rect,
+                                id,
                                 buffer: String::new(),
                                 on_change,
                                 on_submit,
@@ -1189,6 +1190,12 @@ mod tests {
     use super::*;
     use crate::layout::secure_submit::sole_secure_submit;
     use crate::layout::secure_submit::tree_can_authenticate;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Hands each hand-built `ResolvedNode` its own id. A `Scene` allocates these in production and
+    /// these tests have no `Scene`; the only property that matters is that two nodes are never
+    /// accidentally the same node.
+    static NEXT_TEST_NODE_ID: AtomicU64 = AtomicU64::new(1);
 
     /// ADR-0069 decision 6. The rest of `scroll_at` needs a compositor to deliver a notch;
     /// this is the half that does not.
@@ -1259,6 +1266,9 @@ mod tests {
             properties.insert("on_click".to_string(), Value::Function(lua.create_function(|_, ()| Ok(())).unwrap()));
         }
         layout::ResolvedNode {
+            // Distinct per node, since `focused_field` now reads an identity off one of these and
+            // a shared id would make every hand-built field the same field.
+            id: layout::scene::NodeId::test(NEXT_TEST_NODE_ID.fetch_add(1, Ordering::Relaxed)),
             kind: kind.to_string(),
             paint: node::paint_style(kind, &properties).unwrap(),
             rect: LogicalRect { x, y, width, height },
@@ -1457,15 +1467,15 @@ mod tests {
     }
 
     /// The unmasked half of § 5.2 item 8 (ADR-0092): no `secure_submit`, a callback, so the press
-    /// focuses it as a plain field carrying the box paint will find it by.
+    /// focuses it as a plain field carrying the node identity paint will find it by (ADR-0099).
     #[test]
     fn a_textfield_with_a_callback_and_no_secure_submit_focuses_as_a_plain_field() {
         let lua = Lua::new();
         let field = plain_textfield(&lua);
         let root = hit_node(&lua, "panel", (0.0, 0.0, 100.0, 32.0), false);
         match focused_field(&[&root, &field]) {
-            Some(FieldTarget::Plain { rect, on_change, on_submit }) => {
-                assert_eq!(rect, field.rect, "a lone child sits at its parent's origin");
+            Some(FieldTarget::Plain { id, on_change, on_submit }) => {
+                assert_eq!(id, field.id, "the field's own node, not the root it was reached through");
                 assert!(on_change.is_none());
                 assert!(on_submit.is_some());
             }

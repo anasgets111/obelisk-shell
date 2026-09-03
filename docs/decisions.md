@@ -4507,3 +4507,53 @@ Verified live: with one notification popped up, opening the history panel destro
 `notification_area` and closing it does not bring it back; the notification is still in the panel;
 and a notification arriving afterwards pops up normally with the retired one staying out of the
 stack.
+
+## 0099. `ResolvedNode` carries its `NodeId`, and a plain field's focus is keyed on it
+
+`layout::paint::FieldFocus::Plain` named the focused `textfield` by its absolute rect, and
+`input::focused_field` and `paint::FieldFocus` both carried a `ponytail:` saying why -- `to_resolved`
+dropped the `NodeId`, so a box was the only handle either had -- and both named this as the fix.
+
+The bug it produces is narrower than "focus is lost" and worse than it sounds. `prune_text_field_focus`
+never checked the rect: it drops focus when the surface dies or leaves the keyboard scope, and
+neither happens here. So a re-resolve that moved the field left the focus, the buffer and the
+callbacks entirely intact, and only *paint* lost track -- the caret and the typed text disappeared
+and the field showed its placeholder again, while every keystroke kept landing in a buffer that
+`on_submit` would still have sent. In the notification card that is one notification arriving above
+the one being replied to. Found while testing the card, where the screenshots taken to check it were
+themselves posting the notification that triggered it.
+
+The other direction was already covered by a test and is the reason the arm also checks
+`target.is_none()`: a field that came to occupy the vacated box would have drawn text it never
+received.
+
+1. **`ResolvedNode` gains `pub id: NodeId`.** It is a `Copy` u64 and `to_resolved` already clones
+   far more than that per node, so the cost is nothing. `reconcile_node` keeps the retained node's
+   id and allocates only when there was nothing to match, which is what makes it a real identity:
+   it survives the node moving, resizing, and gaining siblings ahead of it -- the last being
+   exactly the notification case, since the `list` matches the card by its `key` and the subtree
+   below it reconciles by position within a card that did not change shape.
+
+2. **Not the § 5.1 `id` property.** That one is a reconciliation *hint* a config writes and is
+   documented as unique among siblings only; this is the answer the engine reached, unique across
+   the scene, and no config has to set anything for focus to work.
+
+3. **`target.is_none()` stays, alongside the id check.** An id says which node this is. It does not
+   say the node is still the kind of field the focus was taken on, and a `textfield` that gains a
+   `secure_submit` between passes is the same node with a new job. The check is free and it keeps
+   "a masked field never draws plaintext" local to the arm that would break it.
+
+4. **`ArmedClick` keeps its rect.** The same ponytail named it as the other user of the stand-in,
+   and it is not the same situation: a press and its release are one gesture, the tree rarely moves
+   between them, and the failure is a lost click rather than a sentence typed into a field that
+   stopped showing it. Left alone rather than changed alongside, because it is a well-covered path
+   and this ADR has no evidence against it.
+
+`NodeId::test` is `#[cfg(test)]`: production ids come from `Scene::alloc_id` and nothing else, which
+is what makes them unique, but a test that builds a `ResolvedNode` without a `Scene` still has to
+say which of its nodes are the same node.
+
+Verified live, reproducing the original: a reply typed into a notification card, then a second
+notification from another sender arriving above it. The card moves down and the field still reads
+`on my way|`, where before it reverted to `Reply`; Enter from the moved position emits
+`ActionInvoked(1, "inline-reply::on my way")`.
