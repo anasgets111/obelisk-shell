@@ -9,6 +9,10 @@
 -- over, and narrowing it here would only move the destructuring somewhere less obvious. The initial
 -- is the indicator's declared size, which no longer has to be non-zero to keep the evaluation alive
 -- but is still the honest starting value.
+-- The only `require` here, and it is one-way: `lib/util` is pure helpers with no node and no
+-- signal in it, so it cannot reach back and there is no cycle to worry about.
+local util = require("lib.util")
+
 local popup_anchor = state("popup_anchor", { x = 0, y = 0, width = 70, height = 24 })
 local settings_open = state("settings_open", false)
 
@@ -18,6 +22,31 @@ local settings_open = state("settings_open", false)
 -- time anyway, and one slot makes that true by construction rather than by five files agreeing.
 local panel_open = state("panel_open", false)
 local panel_kind = state("panel_kind", "")
+
+-- ## Which notifications have already had their turn as a popup
+--
+-- A popup and a history entry are two presentations of one notification, and only the Supervisor's
+-- feed says the notification exists: `dismiss` removes it from both, and there is no third state
+-- for "stop popping this up but keep it in the list". So the config keeps that state itself, and
+-- it is a view fact rather than a Supervisor one -- which of the live notifications this shell has
+-- already put in front of you.
+--
+-- Keyed on `util.notification_key`, id *and* timestamp, so a `replaces_id` update is a new thing
+-- that gets a new turn rather than inheriting the note left on the content it replaced.
+--
+-- Replaced wholesale rather than merged, which is what prunes it: the set becomes exactly the feed
+-- as it stands, so an entry that has since expired or been dismissed is forgotten and the table
+-- cannot outgrow the feed's own cap of twenty (§ 2.7).
+local popup_seen = state("notification_popup_seen", {})
+
+local function mark_popups_seen()
+    local seen = {}
+    local n = oblisk.notifications:get()
+    for _, notification in ipairs((n and n.feed) or {}) do
+        seen[util.notification_key(notification)] = true
+    end
+    popup_seen:set(seen)
+end
 
 -- The one place the panel host stops showing anything, and so the one place that answers a prompt
 -- it was showing. `network:connect` on an unsaved secured network parks an intent in the Supervisor
@@ -30,6 +59,12 @@ local panel_kind = state("panel_kind", "")
 -- -- for the reason this file keeps repeating: one writer per edge. A capability call inside a
 -- module named `ui_state` is the price, and it is the smaller one.
 local function close_panel()
+    -- Reading the history is seeing the notifications in it, so nothing in the feed is owed
+    -- another turn as a popup once this closes. Marked on the way out rather than only on the way
+    -- in, because anything that arrived while the panel was up was on screen the whole time.
+    if panel_open:get() and panel_kind:get() == "notifications" then
+        mark_popups_seen()
+    end
     panel_open:set(false)
     oblisk.network:invoke("cancel_connect")
 end
@@ -53,6 +88,9 @@ local function toggle_panel(kind, rect)
     if panel_open:get() and panel_kind:get() == kind then
         close_panel()
         return
+    end
+    if kind == "notifications" then
+        mark_popups_seen()
     end
     popup_anchor:set(rect)
     panel_kind:set(kind)
@@ -182,6 +220,7 @@ end
 
 return {
     popup_anchor = popup_anchor,
+    popup_seen = popup_seen,
     expanded_groups = expanded_groups,
     expanded_messages = expanded_messages,
     reply_id = reply_id,

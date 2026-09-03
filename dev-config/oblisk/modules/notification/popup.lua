@@ -19,14 +19,35 @@ local MAX_CARDS = 4
 
 local SCROLL = scroll("notification_stack")
 
-local function groups(n)
-    local all = util.group_notifications(n and n.feed)
-    local shown = {}
-    for index = 1, math.min(#all, MAX_CARDS) do
-        shown[index] = all[index]
+-- The cards this surface should be showing: the newest few groups of everything live that has not
+-- already had its turn as a popup, and nothing at all while the history panel is up.
+--
+-- One signal for two properties. `visible` used to ask "is the feed non-empty" and the list asked
+-- something else, which is how the surface came to map itself around an empty column; asking once
+-- and reading the answer twice makes the two agree by construction.
+local visible_groups = computed(
+    { oblisk.notifications, ui.popup_seen, ui.panel_showing("notifications") },
+    function(n, seen, in_history)
+        -- The panel draws the same cards from the same feed, and both anchor top-right. Standing
+        -- down is not the same as being retired, though: `ui.popup_seen` is what stops these
+        -- coming back when the panel closes.
+        if in_history then
+            return {}
+        end
+        local unseen = {}
+        for _, notification in ipairs((n and n.feed) or {}) do
+            if not (seen or {})[util.notification_key(notification)] then
+                unseen[#unseen + 1] = notification
+            end
+        end
+        local all = util.group_notifications(unseen)
+        local shown = {}
+        for index = 1, math.min(#all, MAX_CARDS) do
+            shown[index] = all[index]
+        end
+        return shown
     end
-    return shown
-end
+)
 
 return panel {
     id = "notification_area",
@@ -38,12 +59,8 @@ return panel {
     -- has to be able to hold them. A fixed `notification_height` was right when this showed one
     -- notification and is a clipping box now that it shows four that each grow when expanded.
     height = theme.notification_stack_height,
-    -- Up when there is something to show and the history panel is not already showing it. Both
-    -- surfaces anchor top-right, so without the second half the popup sits on top of the panel --
-    -- the same notification drawn twice, one card overlapping the other, and the copy underneath
-    -- is the one you opened the panel to read.
-    visible = computed({ oblisk.notifications, ui.panel_showing("notifications") }, function(n, in_history)
-        return not in_history and #((n and n.feed) or {}) > 0
+    visible = visible_groups:map(function(shown)
+        return #shown > 0
     end),
     -- The keyboard, and only while a reply field is actually open. Bound rather than constant for
     -- the reason `modules/shell/panel_host.lua` states at length: niri gives an `on_demand` or
@@ -76,7 +93,7 @@ return panel {
                 height = "Fill",
                 scroll = SCROLL,
                 spacing = theme.spacing.sm,
-                source = oblisk.notifications:map(groups),
+                source = visible_groups,
                 itemfn = function(group)
                     return notification_card(group, ui)
                 end,

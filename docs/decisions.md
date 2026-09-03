@@ -4460,3 +4460,50 @@ three; a body longer than three lines clips with the ellipsis on the last line a
 full six; `notify-send -i` icons and an attached picture both draw; a pointer resting on the stack
 logs `expiry held` and leaving logs `expiry hold released`; and Reply, click, type, Enter emits
 `ActionInvoked(10, "inline-reply::on my way")` and clears the card and the keyboard behind it.
+
+## 0098. A popup is retired, not hidden, and the config is what remembers
+
+ADR-0097 had the popup stand down while the history panel was showing, so the two would not draw
+the same notification twice on top of each other. That was the wrong shape and the bug was
+immediate: closing the panel brought the popup back. Something you had already read, in a panel you
+opened on purpose, returned to the corner of the screen as though it were new.
+
+The reason there was no better answer available is that the Supervisor has two states and needs
+three. A notification is live or it is gone -- `dismiss` and expiry both remove it from the feed
+entirely, which is also its removal from the history. There is no "stop popping this up, keep it in
+the list", and there should not be: which of the live notifications this shell has already put in
+front of you is a fact about the shell's own presentation, not about the notification.
+
+1. **The config keeps the seen-set.** `lib/ui_state`'s `popup_seen`, beside the expansion tables
+   for the same reason they are there -- a view fact, shared by the two places the card is drawn.
+   Nothing crosses the socket for this and nothing needs to.
+
+2. **Keyed on id *and* timestamp, not id.** `replaces_id` reuses an id deliberately to put new
+   content at it, so an id-keyed note would suppress the replacement as though it were the thing it
+   replaced -- a chat app editing "1 new message" into "3 new messages" would go silent.
+   `timestamp` moves on every `Notify` and stays put otherwise (ADR-0093), which is exactly the
+   distinction wanted, and is the second thing that field has turned out to be load-bearing for.
+
+3. **Marked on the panel's open *and* its close.** Opening it is the obvious edge; closing it is
+   the one that matters, because anything that arrived while the panel was up was on screen the
+   whole time and is owed no second showing.
+
+4. **Replaced wholesale rather than merged**, which is what prunes it: the set becomes exactly the
+   feed as it stands, so an entry that has since expired or been dismissed is forgotten, and the
+   table cannot outgrow the feed's own cap of twenty (§ 2.7). A merge would accumulate keys for
+   notifications that no longer exist, for the life of the session.
+
+ADR-0097's stand-down survives as one clause inside the same filter, because it is still true that
+both surfaces anchor top-right and the overlap is worth avoiding while the panel is up. It is no
+longer what stops the popup returning.
+
+Not changed here: the card's own close button still calls `dismiss`, which removes the notification
+from the history too. Most desktops keep a dismissed popup in the list, and the machinery to do
+that now exists -- it is one call site away. It is left alone because "the X means get rid of this"
+is a defensible reading and the alternative makes the feed grow until something clears it, which is
+a behaviour change worth asking about rather than assuming.
+
+Verified live: with one notification popped up, opening the history panel destroys
+`notification_area` and closing it does not bring it back; the notification is still in the panel;
+and a notification arriving afterwards pops up normally with the retired one staying out of the
+stack.

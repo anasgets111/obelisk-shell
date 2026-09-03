@@ -178,6 +178,15 @@ function util.relative_time(now, timestamp)
     return string.format("%dd", age // 86400)
 end
 
+-- What identifies one notification's *content*, for the config's own bookkeeping about what it has
+-- already shown. Not the id on its own: `replaces_id` deliberately reuses an id to put new content
+-- at it, so an id-keyed note would suppress the replacement as though it were the thing it
+-- replaced. `timestamp` moves on every `Notify` and stays put otherwise (ADR-0093), which is
+-- exactly the distinction wanted.
+function util.notification_key(notification)
+    return string.format("%d:%d", notification.id or 0, notification.timestamp or 0)
+end
+
 -- The feed as one entry per sending application rather than one per notification, which is what
 -- turns eight messages from one chat app into one card instead of eight (`NotificationCard.qml`'s
 -- `group`). Order is by each app's *newest* notification, since the feed arrives newest-first and
