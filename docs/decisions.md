@@ -4215,3 +4215,44 @@ A plain field's text lives in `App::focused_text_field`, outside the retained tr
 reason a masked field's bytes live in `secure_buffer`: typing marks no property dirty, so
 `field_input_changed` (renamed from `secure_input_changed`, since it is now both kinds) drives a
 repaint without a re-resolve.
+
+## 0093. A notification carries when it arrived, because nothing else can work it out
+
+The Qt shell this config mirrors draws a relative age on every card — "5m ago" — off a `timestampText`
+its own wrapper records. § 2.7 has no such field, and until now the answer was "a config can note
+the clock the first time it sees an id."
+
+It cannot. There is exactly one place in the Lua API that runs when the feed changes and does not
+need a click first, and that is a `computed`/`map` callback, which ADR-0021 requires to be
+side-effect-free and caps at 5ms across the whole graph. Recording arrival times there is writing
+to the world from inside a pure function, and a reload re-runs it against a feed that already has
+notifications in it, which would date all of them to the reload. So this is not a convenience field
+standing in for a workaround; there is no workaround.
+
+1. **Unix epoch seconds, matching `oblisk.system`'s `time` exactly.** Age is `system.time -
+   timestamp` and nothing has to reconcile two clocks or two units. § 2.11 already settled that
+   argument once — it calls its field "system time epoch" with no unit, and picked seconds because
+   `os.date` wants seconds and a millisecond reading is silently wrong by 1000×. A second field on
+   the same clock in a different unit would re-open it. `capabilities::system::controller::
+   epoch_seconds` is reused rather than reimplemented, which is what its own doc comment asks for.
+
+2. **Wall clock, not monotonic.** The consumer is a human-readable age rendered against
+   `system.time`, which is wall clock; a monotonic reading cannot be subtracted from it. The cost is
+   that stepping the system clock re-dates the feed, which is the same cost every "5 minutes ago" in
+   every application pays, and the alternative — carrying both — is a second field for a case
+   nobody has.
+
+3. **A replacement gets a fresh timestamp.** `replaces_id` reuses an id to put *new content* at it,
+   and the timestamp describes the content. "3 new messages" arriving now is not four minutes old
+   because "1 new message" was. This falls out of building a whole `Notification` per `Notify`
+   rather than patching the queued one, so it is a decision only in that it could have been
+   undone deliberately.
+
+4. **Set in `Notify`, not at push.** The two are microseconds apart and the difference is not
+   observable, but `Notify` is where the content is assembled and the field belongs with the content
+   it dates.
+
+Not done here: an expiry deadline alongside it. A card could draw a countdown ring from
+`resolve_expiry`'s answer, and the Qt shell does, but that number is the supervisor's own timer and
+publishing it invites a config to believe it — see ADR-0094, which makes the timer pausable and so
+makes any published deadline a lie the moment a pointer enters the card.

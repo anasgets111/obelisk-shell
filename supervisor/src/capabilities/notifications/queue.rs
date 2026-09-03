@@ -308,6 +308,7 @@ mod tests {
     fn sample_notification(id: u32, image_path: Option<&str>) -> Notification {
         Notification {
             id,
+            timestamp: 0,
             app_name: "app".to_string(),
             summary: "summary".to_string(),
             body: vec![text("body", false, false, false, None)],

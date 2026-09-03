@@ -20,6 +20,7 @@ The Supervisor claims and holds `org.freedesktop.Notifications` on the session b
 * **Plain-text sanitation**: strips scripts, style tags, and image elements with a non-backtracking regex parser before the body reaches Lua's notifications signal feed.
 * **Icon spooling**: `image-data`/`icon_data` hints are bounds-checked, PNG-encoded, and written off-thread to `/dev/shm/oblisk-$UID/notifications/notif-{id}.png`. Lua gets the path, never raw pixel bytes; a hint that fails the bounds check is dropped.
 * **Picture and app icon are separate fields** (ADR-0091). `image_path` is what the sender attached — `image-data`/`image_data` > `image-path`/`image_path` > `icon_data`, the three spellings the spec accumulated for one thing — always an absolute path to a file that exists. `app_icon` is the positional `app_icon` argument: a theme name carried as a name, or an absolute path (or `file://` URI) run through the trusted-root check. A value holding a path separator that is not absolute is refused rather than passed off as a theme name.
+* **Arrival time** (ADR-0093). Every entry carries `timestamp`, Unix epoch seconds on the same clock and in the same unit as `oblisk.system`'s `time`, so a card's relative age is one subtraction. A `replaces_id` replacement is new content and gets a new timestamp.
 
 ### 1.2 Interactive inline replies and actions
 

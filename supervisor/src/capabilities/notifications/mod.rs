@@ -246,6 +246,18 @@ pub struct Notification {
     /// The server-assigned id, counting up from `1`. What `notifications:dismiss`, `:reply` and
     /// `:invoke_action` take. Reused when an application replaces its own notification in place.
     pub id: u32,
+    /// When this content arrived, as Unix epoch seconds -- the same clock and the same unit as
+    /// `oblisk.system`'s `time` (§2.11), so a config's relative age is `system.time - timestamp`
+    /// and needs nothing else to line the two up.
+    ///
+    /// Set from the content, not from the id: a `replaces_id` replacement is a fresh `Notify` with
+    /// a fresh timestamp, because "3 new messages" arriving now is not four minutes old just
+    /// because "1 new message" was.
+    ///
+    /// Carried because a config cannot recover it. Nothing else in the feed says when anything
+    /// happened, and the obvious workaround -- noting the clock the first time an id is seen --
+    /// has to run inside a `computed`, which ADR-0021 requires to be side-effect-free.
+    pub timestamp: i64,
     /// The sending application's name, truncated to 64 bytes on a character boundary.
     pub app_name: String,
     /// The title, truncated to 128 bytes on a character boundary. Plain text: any markup the

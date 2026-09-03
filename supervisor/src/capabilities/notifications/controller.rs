@@ -5,6 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use tokio::sync::mpsc::UnboundedSender;
 use zbus::fdo::RequestNameFlags;
@@ -25,6 +26,7 @@ use super::{
     NOTIFICATIONS_CAPABILITIES, NOTIFICATIONS_OBJECT_PATH, Notification, NotificationAction, NotificationsSignal,
     NotificationsState, Urgency, parse_urgency_str, truncate_utf8_bytes, urgency_from_hint_byte,
 };
+use crate::capabilities::system::controller::epoch_seconds;
 
 // -------------------------------------------------------------------------------------------
 // ActionInvoked reply encoding (TDD seam 4).
@@ -458,6 +460,7 @@ impl NotificationsController {
 
         let notification = Notification {
             id,
+            timestamp: epoch_seconds(SystemTime::now()),
             app_name,
             summary,
             body: body_spans,
@@ -692,6 +695,7 @@ mod tests {
     fn declares_action_covers_the_buttons_and_the_default_activation() {
         let mut notification = Notification {
             id: 1,
+            timestamp: 0,
             app_name: "app".to_string(),
             summary: "s".to_string(),
             body: Vec::new(),
