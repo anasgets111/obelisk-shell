@@ -59,6 +59,7 @@
 ---@field opacity? number|Bound `[0, 1]`, default `1`. Inherited multiplicatively. Refused outside the range rather than clamped. A node at `0` still lays out and still takes pointer events.
 ---@field id? string Reconciliation hint, unique among siblings. Not addressable from Lua and has no effect on layout or paint (ADR-0045).
 ---@field hover? Bound The signal `hover(name)` returned. Marks this node's box as that slot's region.
+---@field on_hover? fun(hovered: boolean) Fires once when the pointer enters this node's box and once when it leaves, not per motion event. Requires a `hover` slot on the same node and is refused without one: that signal is what remembers whether the node was hovered last pass, so it is also what tells one node's crossings from another's. Read `hover_rect(name)` for where the crossing happened. This is the only way to *do* something on hover -- `hover(name)` alone changes what is drawn, and a `computed` may not have side effects.
 
 ---The fill and the border, taken by every kind that paints as a box: `rect`, `row`, `column`,
 ---`button`, and all four surface roles. `row` and `column` have no paint properties of their own

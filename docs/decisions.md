@@ -4311,3 +4311,48 @@ Only half of what this unblocks is reachable today. A reply field can hold expir
 pointer is resting on a card needs a hover *callback*, and § 5.2 has only `hover(name)`, a
 read-only signal that a `computed` cannot act on — the same wall ADR-0093 hit. That is its own
 edit.
+
+## 0095. `on_hover`, because a config could see a hover but not act on one
+
+ADR-0094 gave the Supervisor a way to hold a notification's expiry off, and then could only wire
+half of it: a reply field can hold expiry from `on_change`, but holding it merely because the
+pointer is resting on a card had nothing to fire from. `on_click` was the only pointer callback in
+§ 5.2. `hover(name)` is a read-only signal, and the one place a config runs code when a signal
+moves is a `computed`, which ADR-0021 requires to be side-effect-free — so a config could *draw*
+differently on hover and could not *do* anything: no capability call, no `state` write.
+
+1. **It fires on the crossing, not on the motion.** `wl_pointer` reports motion at device rate, so
+   a per-event callback would run a config handler a few hundred times for one pass across a
+   button. `sync_hover` already computes the exact edge — `set_changed` returns whether the value
+   moved (ADR-0062 decision 4) — so the callback rides on that answer and costs one branch.
+
+2. **It requires a `hover` slot on the same node, and is refused without one.** A callback has no
+   memory and a `ResolvedNode` has no identity to hang one off (`to_resolved` drops the `NodeId`),
+   so something has to remember whether this node was hovered last pass. The `hover` signal already
+   does, keyed by a name the config chose, which survives a reload and keeps working when a `list`
+   churns its cards underneath it. The alternatives were both worse: keying the memory by absolute
+   rect lets a new card inherit a dismissed card's state, and keying it by position in the walk
+   breaks the moment a notification leaves the middle of a stack.
+
+   Refused rather than left inert, in `resolve_properties` where the whole property map is in
+   reach. A silently unreachable handler is exactly the failure `deserialize_lua_table`'s
+   unknown-key rejection was added to end, and the message names the fix.
+
+3. **The argument is `hovered`, and nothing else.** `on_click` passes its rect because there is no
+   other way to get it; here there is — `hover_rect(name)`, which decision 2 already obliges the
+   config to have a slot for.
+
+4. **A raised error is logged and swallowed**, on `fire_on_click`'s terms: a broken handler is a
+   config bug and must not take down a shell that is otherwise painting fine. ADR-0046's rescue
+   path is for a failed evaluation, not a misbehaving callback.
+
+The pairing rule needed one seam in the type probe: `every_type_the_stubs_declare_is_accepted_by_
+the_engine` builds each property in isolation, so `on_hover` alone would have been testing decision
+2 rather than the type the stub declares. A per-field `companions` table supplies the slot, next to
+the per-kind `required` one that was already there.
+
+Verified live end to end, which also closed ADR-0094's open half: with `on_hover` holding expiry on
+a notification card, a 5-second notification that mapped under a resting pointer was still up at
+12 seconds, the log showed `expiry held for 60s`; moving the pointer off logged `expiry hold
+released` and the card went. Declaring `on_hover` without a slot fails the reload with the message
+from decision 2.

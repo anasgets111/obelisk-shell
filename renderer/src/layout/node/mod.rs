@@ -365,6 +365,17 @@ pub fn resolve_properties(
             }
         }
     }
+    // `on_hover` fires on the crossing its node's own `hover` signal reports, so that signal is
+    // where the "was it hovered last pass" memory lives and there is no second one (ADR-0095).
+    // Without a slot the callback is unreachable, and this is the kind of silence
+    // `deserialize_lua_table`'s unknown-key rejection exists to end: a config that declared it
+    // would watch a handler never fire with nothing anywhere saying why.
+    if resolved.contains_key("on_hover") && !resolved.contains_key("hover") {
+        return Err(invalid(
+            "on_hover",
+            "declared without a `hover` slot on the same node -- add `hover = hover(\"a-name\")`, which is what remembers whether this node was hovered last pass, and so what tells its crossings from another node's",
+        ));
+    }
     Ok(resolved)
 }
 
@@ -501,6 +512,38 @@ mod tests {
         assert!(
             matches!(parse_node_id(&resolved).unwrap_err(), LayoutError::UnsupportedSignalProperty(p) if p == "id")
         );
+    }
+
+    /// The pairing rule (ADR-0095). `on_hover` fires on the crossing its node's `hover` signal
+    /// reports, so without a slot the callback is unreachable -- refused, rather than left to be a
+    /// handler a config watches never fire.
+    #[test]
+    fn on_hover_without_a_hover_slot_is_refused() {
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table = lua.create_table().unwrap();
+        table.set("kind", "rect").unwrap();
+        table.set("on_hover", lua.create_function(|_, ()| Ok(())).unwrap()).unwrap();
+        let node = deserialize_lua_table(&table).unwrap();
+
+        assert!(matches!(resolve_properties(&node.properties, "rect", &lua).unwrap_err(),
+                LayoutError::InvalidProperty { property, .. } if property == "on_hover"));
+    }
+
+    #[test]
+    fn on_hover_alongside_a_hover_slot_resolves() {
+        let lua = lua();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let (over, _rect) = crate::lua::signal::Signal::new_hover(crate::lua::signal::DirtyFlag::new(), Value::Nil);
+        let table = lua.create_table().unwrap();
+        table.set("kind", "rect").unwrap();
+        table.set("hover", over).unwrap();
+        table.set("on_hover", lua.create_function(|_, ()| Ok(())).unwrap()).unwrap();
+        let node = deserialize_lua_table(&table).unwrap();
+
+        let resolved = resolve_properties(&node.properties, "rect", &lua).unwrap();
+        assert!(matches!(resolved.get("on_hover"), Some(Value::Function(_))), "a Function is not a Signal to resolve");
+        assert!(matches!(resolved.get("hover"), Some(Value::UserData(_))), "the slot stays the handle it was");
     }
 
     #[test]

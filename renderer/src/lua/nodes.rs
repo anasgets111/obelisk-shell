@@ -35,7 +35,7 @@ const NODE_KINDS: [&str; 13] = [
 /// The § 5.1 properties every kind takes, surface roles included: geometry, identity and the two
 /// flags. `layout::scene` reads these off any node it resolves without asking what kind it is.
 const COMMON_PROPERTIES: &[&str] =
-    &["align_h", "align_v", "height", "hover", "id", "margin", "opacity", "padding", "visible", "width"];
+    &["align_h", "align_v", "height", "hover", "id", "margin", "on_hover", "opacity", "padding", "visible", "width"];
 
 /// What every kind that paints as a box takes on top of [`COMMON_PROPERTIES`]: the fill, then the
 /// border. This is `node::paint_style`'s first match arm: `row`, `column` and `button` paint no
@@ -495,7 +495,7 @@ mod meta_stub_tests {
     /// these same declarations. Together they close the loop: this proves the stub does not promise
     /// what the engine refuses, and `just types` proves a config written to the stub compiles.
     ///
-    /// All 439 of them, with no skips: a type `sample` has no row for fails the test rather than
+    /// All 452 of them, with no skips: a type `sample` has no row for fails the test rather than
     /// passing quietly, so the table cannot rot into covering half the file.
     ///
     /// ponytail: this checks the types, it does not derive them. `lua-meta/nodes.lua` is still
@@ -567,7 +567,7 @@ mod meta_stub_tests {
             unsampled.len(),
             unsampled.join("\n")
         );
-        assert_eq!(probed, 439, "the number of declared type members moved; confirm the change is intended");
+        assert_eq!(probed, 452, "the number of declared type members moved; confirm the change is intended");
     }
 
     /// One Lua literal per declared type. `None` means "no sample", which skips rather than guesses.
@@ -644,11 +644,22 @@ mod meta_stub_tests {
         }
     }
 
+    /// What a *field* needs a sibling for, as opposed to what a [`required`] kind does. `on_hover`
+    /// is refused without a `hover` slot on the same node (ADR-0095), so probing it alone would be
+    /// testing the pairing rule rather than the type the stub declares for it.
+    fn companions(field: &str) -> &'static [(&'static str, &'static str)] {
+        match field {
+            "on_hover" => &[("hover", "hover(\"probe\")")],
+            _ => &[],
+        }
+    }
+
     /// `kind { field = literal }` through `Scene::apply`, which is what actually calls all 49
     /// parsers. A surface role is its own root; anything else hangs under a minimal `panel`.
     fn apply_one(kind: &str, field: &str, literal: &str) -> Result<(), String> {
         let mut props: Vec<String> = required(kind)
             .iter()
+            .chain(companions(field))
             .filter(|(name, _)| *name != field)
             .map(|(name, value)| format!("{name} = {value}"))
             .collect();

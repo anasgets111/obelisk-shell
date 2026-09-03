@@ -4,7 +4,7 @@
 //! reason: everything else on the pointer path needs a live `wl_pointer` and a live `wl_surface`,
 //! and this is the part that decides what a hover *means*.
 
-use mlua::Value;
+use mlua::{Function, Value};
 
 use super::hit::{self, LogicalPoint};
 use super::scene::ResolvedNode;
@@ -23,6 +23,11 @@ pub struct HoverWrite {
     pub signal: Signal,
     pub hovered: bool,
     pub rect: Option<LogicalRect>,
+    /// The node's `on_hover`, to be called on the crossing this write reports and not on every
+    /// motion event inside the node (ADR-0095). Rides on the same write as the signal because the
+    /// signal is what remembers the previous answer: a callback has no memory of its own, and a
+    /// `ResolvedNode` has no identity to hang one off.
+    pub on_hover: Option<Function>,
 }
 
 /// Every `hover` signal declared anywhere in `tree`, paired with whether the pointer is on its
@@ -65,7 +70,11 @@ fn collect(node: &ResolvedNode, path: &[&ResolvedNode], writes: &mut Vec<HoverWr
         // absolute one; `hit::absolute_rect` is the same recovery `on_click` makes for the same
         // reason (ADR-0050 decision 3).
         let rect = depth.and_then(|depth| hit::absolute_rect(&path[..=depth]));
-        writes.push(HoverWrite { signal, hovered: depth.is_some(), rect });
+        let on_hover = match node.properties.get("on_hover") {
+            Some(Value::Function(callback)) => Some(callback.clone()),
+            _ => None,
+        };
+        writes.push(HoverWrite { signal, hovered: depth.is_some(), rect, on_hover });
     }
     for child in &node.children {
         collect(child, path, writes);
@@ -102,9 +111,21 @@ mod tests {
     }
 
     fn node(rect: (f32, f32, f32, f32), hover: Option<Value>, children: Vec<ResolvedNode>) -> ResolvedNode {
+        node_with(rect, hover, None, children)
+    }
+
+    fn node_with(
+        rect: (f32, f32, f32, f32),
+        hover: Option<Value>,
+        on_hover: Option<Value>,
+        children: Vec<ResolvedNode>,
+    ) -> ResolvedNode {
         let mut properties = HashMap::new();
         if let Some(hover) = hover {
             properties.insert("hover".to_string(), hover);
+        }
+        if let Some(on_hover) = on_hover {
+            properties.insert("on_hover".to_string(), on_hover);
         }
         ResolvedNode {
             kind: "row".to_string(),
@@ -184,6 +205,35 @@ mod tests {
         tree.visible = false;
 
         assert_eq!(answers(&hover_writes(&tree, at(10.0, 10.0))), vec![false]);
+    }
+
+    /// `on_hover` rides on the same write as the signal, because the signal is the memory: the
+    /// caller fires the callback on the crossing `set_changed` reports and never on a motion event
+    /// inside the node (ADR-0095).
+    #[test]
+    fn a_nodes_on_hover_is_carried_on_its_hover_write() {
+        let lua = Lua::new();
+        let (_signal, hover) = hover_userdata(&lua);
+        let callback = lua.create_function(|_, ()| Ok(())).unwrap();
+        let tree = node_with((0.0, 0.0, 100.0, 20.0), Some(hover), Some(Value::Function(callback)), vec![]);
+
+        let writes = hover_writes(&tree, at(10.0, 10.0));
+        assert!(writes[0].on_hover.is_some(), "the callback reaches the caller that fires it");
+        assert!(writes[0].hovered);
+
+        // On the way out too: a leave is a crossing, and releasing whatever the enter took is the
+        // whole reason a config wants the edge rather than the signal.
+        let leaving = hover_writes(&tree, None);
+        assert!(leaving[0].on_hover.is_some());
+        assert!(!leaving[0].hovered);
+    }
+
+    #[test]
+    fn a_node_with_a_hover_slot_and_no_callback_carries_none() {
+        let lua = Lua::new();
+        let (_signal, hover) = hover_userdata(&lua);
+        let tree = node((0.0, 0.0, 100.0, 20.0), Some(hover), vec![]);
+        assert!(hover_writes(&tree, at(10.0, 10.0))[0].on_hover.is_none());
     }
 
     #[test]

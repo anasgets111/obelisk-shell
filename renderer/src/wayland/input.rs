@@ -790,8 +790,19 @@ impl App {
             let Some(handle) = write.signal.hover_handle() else {
                 continue;
             };
-            // The boolean gates the rect below, so it is checked first.
+            // The boolean gates the rect and the callback below, so it is checked first.
             let crossed = handle.set_changed(mlua::Value::Boolean(write.hovered));
+            // Only on the edge, which is the whole reason `on_hover` rides on the signal's write
+            // (ADR-0095): `wl_pointer` reports motion at device rate, so firing per event would
+            // call a config handler a few hundred times for one pass across a button. Raised
+            // errors are logged and swallowed on `fire_on_click`'s terms -- a broken handler is a
+            // config bug and must not take down a shell that is otherwise painting fine.
+            if crossed
+                && let Some(on_hover) = &write.on_hover
+                && let Err(err) = on_hover.call::<()>(write.hovered)
+            {
+                eprintln!("[oblisk-renderer] {}: on_hover handler raised: {err}", self.surfaces[index].surface_id);
+            }
             // Only on the edge into the node, and not just an optimisation: `set_changed` compares
             // with `PartialEq`, and two `mlua` tables holding identical numbers are not equal since
             // table equality is identity, so a freshly built rect table always counts as a change.
