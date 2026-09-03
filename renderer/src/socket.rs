@@ -1299,7 +1299,7 @@ mod tests {
         assert!(run_startup(&mut client), "the shipped dev config must resolve into a scene");
 
         let lock = client.scene.surface("lock_screen@TEST").expect("the lock screen resolves");
-        let masked = |focus: Option<&layout::paint::SecureField>| -> Vec<String> {
+        let masked = |focus: Option<&layout::paint::FieldFocus>| -> Vec<String> {
             layout::paint::build(&lock, 1.0, focus)
                 .commands
                 .iter()
@@ -1319,7 +1319,7 @@ mod tests {
         // The pair `lock.lua` declares, and the pair the Supervisor's unlock path answers.
         let target =
             layout::node::SecureSubmitTarget { capability: "lock".to_string(), action: "authenticate".to_string() };
-        let typed = masked(Some(&layout::paint::SecureField { target: &target, filled: 5 }));
+        let typed = masked(Some(&layout::paint::FieldFocus::Masked { target: &target, filled: 5 }));
         assert!(
             typed.iter().any(|drawn| drawn == "*****"),
             "five keystrokes must draw five of this config's `mask_character`: {typed:?}"

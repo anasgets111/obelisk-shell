@@ -57,7 +57,7 @@ mod output;
 mod surface;
 mod xdg_shell;
 
-use input::{ArmedClick, ArmedSerial, FocusedField};
+use input::{ArmedClick, ArmedSerial, FocusedField, FocusedTextField};
 use lock::{EXIT_SUPERVISOR_GONE, supervisor_gone_report};
 use output::{geometries_from, screens_payload};
 use surface::{TrackedSurface, log_bind_failure};
@@ -162,19 +162,28 @@ pub struct App {
     /// landing on a surface with a sole one (`input::sole_secure_submit`). `None` means no frame
     /// at all; see `input::submit_frame_for`. Written only through [`App::focus_secure_submit`].
     focused_secure_submit: Option<FocusedField>,
+    /// The focused *plain* `textfield` -- the unmasked half of § 5.2 item 8 -- and the text typed
+    /// into it so far (ADR-0092). Set only by a press landing on one (`input::focused_field`);
+    /// unlike the masked half there is no arm-on-`enter` fallback, because "the sole field in
+    /// scope" is a rule that cannot serve a list of reply boxes.
+    ///
+    /// Mutually exclusive with `focused_secure_submit` by construction: one press decides, and the
+    /// innermost `textfield` it lands on is one kind or the other.
+    focused_text_field: Option<FocusedTextField>,
     /// Accumulates the focused field's keystrokes until Enter completes them (ADR-0005/ADR-0009/
     /// ADR-0027), never surfaced to Lua. Lifetime belongs to `focused_secure_submit`: every write
     /// goes through [`App::focus_secure_submit`], which zeroizes this on any destination change;
     /// see `input::retarget_secure_submit` for the leak that rule closes.
     secure_buffer: shared::SecureBuffer,
-    /// A keystroke or focus change moved what the focused `secure_submit` field should draw, with
-    /// no capability push yet to mark the scene dirty. Typing changes no property in the retained
-    /// tree (bytes live in `secure_buffer`, outside the scene, ADR-0005), so `re_resolve_if_dirty`
-    /// misses it; otherwise the mask would appear only on an unrelated repaint, once a second on a
-    /// lock screen clock. A repaint, never a re-resolve: the tree is unchanged, only the display
-    /// list differs (`layout::paint::SecureField` is an input to `build`, not part of the tree),
+    /// A keystroke or focus change moved what the focused `textfield` should draw, with no
+    /// capability push yet to mark the scene dirty. Typing changes no property in the retained tree
+    /// -- a masked field's bytes live in `secure_buffer` and a plain one's in `focused_text_field`,
+    /// both outside the scene (ADR-0005, ADR-0092) -- so `re_resolve_if_dirty` misses it;
+    /// otherwise the mask or the caret would appear only on an unrelated repaint, once a second on
+    /// a lock screen clock. A repaint, never a re-resolve: the tree is unchanged, only the display
+    /// list differs (`layout::paint::FieldFocus` is an input to `build`, not part of the tree),
     /// narrowed by `App::paint_surface`'s comparison to the one surface holding the field.
-    secure_input_changed: bool,
+    field_input_changed: bool,
 }
 
 /// The Renderer's main thread: Wayland dispatch, EGL, and (since ADR-0039) the Lua VM, the
@@ -248,8 +257,9 @@ pub fn run(
         input_serial: None,
         pointer_input_count: 0,
         focused_secure_submit: None,
+        focused_text_field: None,
         secure_buffer: shared::SecureBuffer::new(),
-        secure_input_changed: false,
+        field_input_changed: false,
     };
 
     // Outputs (and the seat) arrive as a burst of registry + wl_seat/wl_output events after
@@ -420,7 +430,7 @@ pub fn run(
         // Taken unconditionally so a keystroke that arrived alongside a capability push does not
         // stay pending: the repaint below covers both, and leaving the flag set would repaint
         // again next turn for nothing.
-        let typed = std::mem::take(&mut app.secure_input_changed);
+        let typed = std::mem::take(&mut app.field_input_changed);
         if re_resolved {
             app.apply_resolved_surface_state();
         }

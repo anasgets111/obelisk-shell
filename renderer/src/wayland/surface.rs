@@ -804,10 +804,10 @@ impl App {
         // An absent tree gives an empty list, not an early return: a surface whose tree went away
         // should paint nothing over its old contents, and must reach the clear and swap below.
         let tree = self.client.scene().surface(&surface_id);
-        // Scoped so the immutable borrow `secure_field_for` holds ends before the painter is
+        // Scoped so the immutable borrow `field_focus_for` holds ends before the painter is
         // borrowed mutably below. Nothing in the list borrows it: `Draw::Text` owns its string.
         let list = {
-            let focus = self.secure_field_for(&surface_id);
+            let focus = self.field_focus_for(&surface_id);
             tree.as_ref().map(|tree| layout::paint::build(tree, 1.0, focus.as_ref())).unwrap_or_default()
         };
         if self.surfaces[index]

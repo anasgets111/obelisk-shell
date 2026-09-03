@@ -4151,3 +4151,67 @@ raw pixel data drew the same generic fallback, and had since notifications exist
 Not done here: `hints["desktop-entry"]`. It is the better grouping key than `app_name` and a decent
 third icon source, and it is additive whenever a config wants it. Adding a field for a consumer that
 does not exist yet is how §2.7 got four picture sources in the first place.
+
+## 0092. An ordinary `textfield` reads the keyboard too, because text-input-v3 types nothing
+
+ADR-0027 decision 3 said an ordinary `textfield` fires `on_submit` from `zwp_text_input_v3`'s
+protocol-native submit action, "IME-correct: it works with CJK composition, which raw keystroke
+detection does not." Its own amendment then found the flaw and applied it only to the masked half:
+text-input-v3 needs a compositor-side input method bound, and with none running `commit_string`
+never arrives, so no byte ever reaches the client.
+
+That is not a corner case. There is no input method on this session — no fcitx5, no ibus, no
+`XMODIFIERS` — which is the default state of a fresh Wayland desktop. A `textfield` built on
+text-input-v3 would take a click, draw a caret, and swallow every keystroke, and the config author
+would have no way to tell that from a bug in their own code.
+
+1. **Both field kinds read `wl_keyboard` and xkb.** The plain half now shares `key_action` with the
+   masked half, which already reads the keyboard for reasons of its own (a password must not route
+   through an input method — swaylock and hyprlock read xkb directly for the same reason). This
+   supersedes ADR-0027 decision 3.
+
+2. **What that costs is composition, and it is a real cost.** No CJK, no dead keys, no compose
+   sequences: `KeyEvent::utf8` is one character per key press. Latin text, including every accented
+   character a keyboard layout produces directly, works. The upgrade path is to bind text-input-v3
+   *alongside* this and let a `commit_string` win when an input method is actually present; that is
+   worth building when someone needs it, and it is strictly additive.
+
+3. **A press focuses a plain field; there is no arm-on-`enter` fallback.** The masked half has one,
+   because `sole_secure_submit_in_scope` can pick the single password prompt on a surface. A card
+   with one reply box per notification has no sole field, so that rule cannot serve this one, and
+   clicking into a text field is what every toolkit asks for anyway.
+
+4. **A plain focus is addressed by its box.** `ResolvedNode` carries no `NodeId` — `to_resolved`
+   drops it — so the field's absolute rect stands in, exactly as `input::ArmedClick` already does
+   for a press. A re-resolve that moves the field detaches the caret from it, which is what a real
+   identity would give for a field moved out from under the user. Upgrade: put the `NodeId` on
+   `ResolvedNode` and key both halves on it.
+
+   The rect is not sufficient on its own, and a test caught why: a plain focus and a *masked* node
+   can coexist on one surface, so paint's plain arm also requires the node to declare no
+   `secure_submit`. Without that, a password field whose box happened to match would have drawn
+   another field's plaintext.
+
+5. **Both callbacks carry the whole text, not the delta.** A config binding a `state` signal to a
+   reply box wants the value; reassembling a string from edits is work every caller would repeat.
+   `on_submit` leaves the field focused and empty, so a reply box takes the next message without
+   another click, and Escape clears and stays — the same answer the masked half gives. Dropping
+   focus on Escape is the more conventional behaviour and is not available: a config cannot observe
+   focus, so a field that silently stopped taking keys could not say so on the glass.
+
+6. **A field that can report nothing is never focused.** Masked with no destination has nowhere to
+   send a submit; plain with neither callback has nobody to tell. Focusing either takes the keyboard
+   away from a field that could have used it, in order to buffer keystrokes nothing will read.
+
+7. **A press that focuses a `textfield` arms no click.** `textfield` is a leaf -- § 5.2 gives it no
+   `children` -- so any `button` on the hit path is an ancestor of it, and clicking into a text
+   field inside a clickable row is not a click on the row. This is the notification card exactly:
+   its whole surface activates the sender's default action (ADR-0090) and its reply box sits inside
+   that, so without this rule every attempt to reply would fire the notification's default action
+   and take the card away. Found by trying it: the probe card dismissed itself on the click meant
+   to focus its field.
+
+A plain field's text lives in `App::focused_text_field`, outside the retained tree, for the same
+reason a masked field's bytes live in `secure_buffer`: typing marks no property dirty, so
+`field_input_changed` (renamed from `secure_input_changed`, since it is now both kinds) drives a
+repaint without a re-resolve.

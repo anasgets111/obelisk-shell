@@ -82,23 +82,66 @@ fn clickable_button<'a>(path: &[&'a layout::ResolvedNode]) -> Option<(LogicalRec
 /// re-resolve between them giving two answers to one event.
 struct PointerHit {
     button: Option<(LogicalRect, Function)>,
-    focus: Option<node::SecureSubmitTarget>,
+    field: Option<FieldTarget>,
 }
-/// The `secure_submit` destination the innermost `textfield` in a hit path names (ADR-0050 decision
-/// 4, § 5.2 item 8). `None` collapses two cases nothing downstream tells apart: no `textfield` on
-/// the path, and the innermost one declaring no `secure_submit`. Both mean the next completed
-/// submit has nowhere to go. There is no third, malformed case: `node::paint_style` parses the
-/// destination while `Scene::apply` resolves the node, so a `secure_submit` that fails to parse
-/// fails the whole pass. ponytail: focus is stored as its destination, not a node identity, so a
-/// focused field with no destination looks like no focus at all. Upgrade: carry the field's
-/// `NodeId` alongside the target once something must paint or address the field rather than its
-/// submit.
-fn focused_target(path: &[&layout::ResolvedNode]) -> Option<node::SecureSubmitTarget> {
-    let field = path.iter().rev().find(|node| node.kind == "textfield")?;
-    let Some(node::PaintStyle::TextField { target, .. }) = &field.paint else {
+/// What the innermost `textfield` under a press turns out to be (ADR-0092). The two kinds share
+/// the node kind and nothing else: one addresses a capability action and never lets its bytes near
+/// Lua (ADR-0005), the other hands every edit straight to a Lua callback.
+enum FieldTarget {
+    Masked(node::SecureSubmitTarget),
+    Plain {
+        /// The field's absolute rect, which is how paint finds it again; see
+        /// `layout::paint::FieldFocus` for why a box stands in for an identity here.
+        rect: LogicalRect,
+        on_change: Option<Function>,
+        on_submit: Option<Function>,
+    },
+}
+/// What the innermost `textfield` in a hit path is, if the press landed on one at all (ADR-0050
+/// decision 4, § 5.2 item 8, ADR-0092).
+///
+/// A `secure_submit` table makes it masked and the target is the whole identity, since that is
+/// where its bytes go. Without one it is a plain field, keyed by its box and carrying whichever of
+/// `on_change`/`on_submit` the config declared. There is no third, malformed case: `paint_style`
+/// parses the destination while `Scene::apply` resolves the node, so a `secure_submit` that fails
+/// to parse fails the whole pass.
+///
+/// `None` for a `textfield` that is neither: masked with no destination has nowhere to send a
+/// submit, and plain with no callback has nobody to tell. Focusing either would take the keyboard
+/// away from a field that can use it, to buffer keystrokes nothing will ever read.
+///
+/// ponytail: the plain half is identified by its rect because `ResolvedNode` has no `NodeId` --
+/// `to_resolved` drops it -- so this is the same stand-in [`ArmedClick`] uses. Upgrade: put the
+/// `NodeId` on `ResolvedNode` and key both halves on it.
+fn focused_field(path: &[&layout::ResolvedNode]) -> Option<FieldTarget> {
+    let (depth, field) = path.iter().enumerate().rev().find(|(_, node)| node.kind == "textfield")?;
+    let node::PaintStyle::TextField { target, .. } = field.paint.as_ref()? else {
         return None;
     };
-    target.clone()
+    if let Some(target) = target {
+        return Some(FieldTarget::Masked(target.clone()));
+    }
+    let function = |key: &str| match field.properties.get(key) {
+        Some(Value::Function(f)) => Some(f.clone()),
+        _ => None,
+    };
+    let (on_change, on_submit) = (function("on_change"), function("on_submit"));
+    if on_change.is_none() && on_submit.is_none() {
+        return None;
+    }
+    Some(FieldTarget::Plain { rect: layout::hit::absolute_rect(&path[..=depth])?, on_change, on_submit })
+}
+/// The focused plain `textfield`: where it lives, what has been typed into it, and who to tell
+/// (ADR-0092). The buffer is an ordinary `String` and deliberately so -- this is the half of § 5.2
+/// item 8 whose whole purpose is that a config can read the text, the opposite of
+/// [`FocusedField`].
+#[derive(Debug, Clone)]
+pub(super) struct FocusedTextField {
+    surface_id: String,
+    rect: LogicalRect,
+    buffer: String,
+    on_change: Option<Function>,
+    on_submit: Option<Function>,
 }
 /// The frame a completed `wp-text-input-v3` submit produces, or `None` when no focused `textfield`
 /// named a destination for it (ADR-0050 decision 4). `None` is the point: without it the submit
@@ -194,7 +237,7 @@ fn focus_is_still_armed(field: &FocusedField, scope: &[String], its_surface_is_l
 /// decision costs no allocation: the `String` only ever exists because SCTK already built one on
 /// the `KeyEvent`.
 #[derive(Debug, PartialEq, Eq)]
-enum SecureKeyAction<'a> {
+enum KeyAction<'a> {
     Append(&'a str),
     Backspace,
     /// Escape: throw the whole entry away and stay in the field.
@@ -215,29 +258,29 @@ enum SecureKeyAction<'a> {
 /// a native buffer and out to the Supervisor, the whole definition of a `secure_submit` field
 /// (ADR-0005); a key that misses is [`Ignore`d] (§ 5.2 still declares no `on_key`).
 ///
-/// [`Ignore`d]: SecureKeyAction::Ignore
+/// [`Ignore`d]: KeyAction::Ignore
 ///
 /// Control characters are filtered by their text, not a keysym allow-list: `utf8` is `Some` for
 /// Escape, Tab and Return alike (xkbcommon hands back the C0 control character), so an unfiltered
 /// append would bury an ESC byte in a secret, with PAM rejecting it for no visible reason. `repeat`
 /// exists so a held Enter cannot submit twice: a submit zeroizes the buffer as it reads it (see
 /// [`secure_submit_frame`]), so a repeat would send an empty password to PAM and spend an attempt.
-fn secure_key_action<'a>(event: &'a KeyEvent, repeat: bool) -> SecureKeyAction<'a> {
+fn key_action<'a>(event: &'a KeyEvent, repeat: bool) -> KeyAction<'a> {
     match event.keysym {
         Keysym::Return | Keysym::KP_Enter => {
             if repeat {
-                SecureKeyAction::Ignore
+                KeyAction::Ignore
             } else {
-                SecureKeyAction::Submit
+                KeyAction::Submit
             }
         }
-        Keysym::BackSpace => SecureKeyAction::Backspace,
+        Keysym::BackSpace => KeyAction::Backspace,
         // A wrong attempt is counted by PAM, so Backspace-per-character to abandon a mistyped
         // password would be costly. Every other password prompt clears on Escape; so does this one.
-        Keysym::Escape => SecureKeyAction::Clear,
+        Keysym::Escape => KeyAction::Clear,
         _ => match event.utf8.as_deref() {
-            Some(text) if !text.is_empty() && !text.chars().any(char::is_control) => SecureKeyAction::Append(text),
-            _ => SecureKeyAction::Ignore,
+            Some(text) if !text.is_empty() && !text.chars().any(char::is_control) => KeyAction::Append(text),
+            _ => KeyAction::Ignore,
         },
     }
 }
@@ -341,7 +384,7 @@ impl App {
         retarget_secure_submit(&mut self.focused_secure_submit, &mut self.secure_buffer, next);
         // A focus change zeroizes the buffer, so the field that had dots must be repainted without
         // them, the same reason a keystroke sets this.
-        self.secure_input_changed = true;
+        self.field_input_changed = true;
     }
 
     /// Whether `instance_id` is still a surface this process has a live `wl_surface` for.
@@ -448,16 +491,20 @@ impl App {
         }
     }
 
-    /// The focused `secure_submit` field's state, if the field lives on `surface_id`. Here rather
-    /// than in `wayland::surface`: this is the one place that knows a focus is a surface plus a `{
-    /// capability, action }` pair, and `paint` should not learn that shape to ask one question.
-    /// Hands back the count, never the bytes; see `layout::paint::SecureField`.
-    pub(super) fn secure_field_for(&self, surface_id: &str) -> Option<layout::paint::SecureField<'_>> {
-        let focused = self.focused_secure_submit.as_ref()?;
-        if focused.surface_id != surface_id {
-            return None;
+    /// Whichever `textfield` on `surface_id` has the keyboard, in the shape paint reads. Here
+    /// rather than in `wayland::surface`: this is the one place that knows a masked focus is a
+    /// surface plus a `{ capability, action }` pair and a plain one a surface plus a box, and
+    /// `paint` should not learn either shape to ask one question. The masked arm hands back the
+    /// count and never the bytes; see `layout::paint::FieldFocus`.
+    pub(super) fn field_focus_for(&self, surface_id: &str) -> Option<layout::paint::FieldFocus<'_>> {
+        if let Some(focused) = self.focused_secure_submit.as_ref().filter(|f| f.surface_id == surface_id) {
+            return Some(layout::paint::FieldFocus::Masked {
+                target: &focused.target,
+                filled: self.secure_buffer.char_count(),
+            });
         }
-        Some(layout::paint::SecureField { target: &focused.target, filled: self.secure_buffer.char_count() })
+        let focused = self.focused_text_field.as_ref().filter(|f| f.surface_id == surface_id)?;
+        Some(layout::paint::FieldFocus::Plain { rect: focused.rect, text: &focused.buffer })
     }
 
     /// The half of [`App::prune_secure_focus`] that does not wait for a keystroke: a field whose
@@ -479,40 +526,145 @@ impl App {
         }
     }
 
-    /// One key event applied to the focused `secure_submit` field, or nothing when no field is
-    /// focused (ADR-0005). The focus check is the gate: `focused_secure_submit` is `Some` only when
-    /// a field named a destination, so a keystroke that reaches the buffer already has somewhere to
-    /// be sent. A `textfield` with no `secure_submit` leaves it `None` (see [`focused_target`]),
-    /// and a key arriving then is dropped: buffering a password for a field that can never submit
-    /// it is a secret held for no reason. Nothing here touches Lua: the bytes go from the
-    /// `KeyEvent` into a native `shared::SecureBuffer` and out to the Supervisor.
+    /// One key event applied to the focused `secure_submit` field, or nothing when the focused
+    /// field is not one (ADR-0005). The focus check is the gate: `focused_secure_submit` is `Some`
+    /// only when a field named a destination, so a keystroke that reaches the buffer already has
+    /// somewhere to be sent. A masked `textfield` that names none is never focused at all (see
+    /// [`focused_field`]): buffering a password for a field that can never submit it is a secret
+    /// held for no reason. Nothing here touches Lua: the bytes go from the `KeyEvent` into a native
+    /// `shared::SecureBuffer` and out to the Supervisor -- which is the whole difference from
+    /// [`App::apply_plain_key`], where the text is the point.
+    ///
+    /// Pruning is [`App::apply_key`]'s, done once for both field kinds before either gate.
     fn apply_secure_key(&mut self, event: &KeyEvent, repeat: bool) {
-        // Before the gate: a focus whose surface is gone or no longer receiving keys is exactly the
-        // state this key must not be appended to (see [`focus_is_still_armed`]).
-        self.prune_secure_focus();
         if self.focused_secure_submit.is_none() {
             return;
         }
         // Every arm below moves what the field draws: two change the character count and the third
         // clears it. Set once here rather than in each.
-        self.secure_input_changed = true;
-        match secure_key_action(event, repeat) {
-            SecureKeyAction::Append(text) => self.secure_buffer.push_str(text),
+        self.field_input_changed = true;
+        match key_action(event, repeat) {
+            KeyAction::Append(text) => self.secure_buffer.push_str(text),
             // `pop_char` zeroizes the dropped bytes rather than only shortening the buffer, keeping
             // a corrected character from staying readable in this process's heap.
-            SecureKeyAction::Backspace => {
+            KeyAction::Backspace => {
                 self.secure_buffer.pop_char();
             }
             // Through the seam, not the buffer directly: the scrub Escape wants is the one
             // `retarget_secure_submit` performs on a transition, and re-arming the identical field
             // right after leaves the user still in it, free to retype.
-            SecureKeyAction::Clear => {
+            KeyAction::Clear => {
                 let field = self.focused_secure_submit.clone();
                 self.focus_secure_submit(None);
                 self.focus_secure_submit(field);
             }
-            SecureKeyAction::Submit => self.finish_secure_submit(),
-            SecureKeyAction::Ignore => {}
+            KeyAction::Submit => self.finish_secure_submit(),
+            KeyAction::Ignore => {}
+        }
+    }
+
+    /// One key event, to whichever field kind has the keyboard (ADR-0092).
+    ///
+    /// Pruning happens once, here, before either gate: a focus whose surface is gone or is no
+    /// longer receiving keys is exactly the state this key must not reach, and that is true of a
+    /// half-typed reply for the same reason it is true of a half-typed password (see
+    /// [`focus_is_still_armed`]). The two focuses are mutually exclusive, so the order of the
+    /// arms below decides nothing.
+    fn apply_key(&mut self, event: &KeyEvent, repeat: bool) {
+        self.prune_secure_focus();
+        self.prune_text_field_focus();
+        self.apply_secure_key(event, repeat);
+        self.apply_plain_key(event, repeat);
+    }
+
+    /// Every write to `focused_text_field`, funnelled the way [`App::focus_secure_submit`] is --
+    /// for repainting rather than for scrubbing. There is no secret here to zeroize; what the two
+    /// share is that the field they leave must stop drawing a caret and the field they arrive at
+    /// must start.
+    fn focus_text_field(&mut self, next: Option<FocusedTextField>) {
+        if self.focused_text_field.is_none() && next.is_none() {
+            return;
+        }
+        self.focused_text_field = next;
+        self.field_input_changed = true;
+    }
+
+    /// [`App::prune_secure_focus`]'s counterpart. The same two clauses -- the surface is still
+    /// alive, and it is still one the keyboard can reach -- because a plain field goes stale for
+    /// exactly the reasons a masked one does. What it does not share is the urgency: dropping a
+    /// half-typed reply loses a sentence, not a secret, so there is no once-a-turn sweep matching
+    /// [`App::drop_secure_focus_if_its_surface_is_gone`]; the check before each keystroke is
+    /// enough, and a `leave` clears it anyway.
+    fn prune_text_field_focus(&mut self) {
+        let Some(field) = self.focused_text_field.as_ref() else {
+            return;
+        };
+        let scope = self.keyboard_focus_scope();
+        if self.surface_is_live(&field.surface_id) && scope.contains(&field.surface_id) {
+            return;
+        }
+        eprintln!(
+            "[oblisk-renderer] the focused textfield is no longer the one receiving keys; dropping what was typed"
+        );
+        self.focus_text_field(None);
+    }
+
+    /// One key event applied to the focused plain `textfield` (ADR-0092), the mirror of
+    /// [`App::apply_secure_key`] for the half of § 5.2 item 8 whose text a config is meant to read.
+    ///
+    /// Every edit calls `on_change` and a submit calls `on_submit`, both with the whole text rather
+    /// than the delta: a config binding a `state` signal to it wants the value, and reassembling a
+    /// string from deltas is work every caller would repeat. `on_submit` leaves the field focused
+    /// and empty, so a reply box takes the next message without another click.
+    ///
+    /// Escape clears and stays, the same answer the masked half gives. Dropping focus instead
+    /// would be the more conventional one, and it is not available: a config cannot observe focus,
+    /// so a field that silently stopped taking keys would have no way to say so on the glass.
+    fn apply_plain_key(&mut self, event: &KeyEvent, repeat: bool) {
+        let Some(field) = self.focused_text_field.as_mut() else {
+            return;
+        };
+        let (changed, submitted) = match key_action(event, repeat) {
+            KeyAction::Append(text) => {
+                field.buffer.push_str(text);
+                (true, false)
+            }
+            KeyAction::Backspace => (field.buffer.pop().is_some(), false),
+            KeyAction::Clear => {
+                let had = !field.buffer.is_empty();
+                field.buffer.clear();
+                (had, false)
+            }
+            KeyAction::Submit => (true, true),
+            KeyAction::Ignore => (false, false),
+        };
+        if !changed {
+            return;
+        }
+        // Cloned out before either callback runs: a handler is free to write a signal that
+        // re-resolves the scene, and holding a `&mut` into `self` across that is not on offer.
+        let (text, on_change, on_submit, surface_id) = {
+            let field = self.focused_text_field.as_ref().expect("the focus was Some a moment ago");
+            (field.buffer.clone(), field.on_change.clone(), field.on_submit.clone(), field.surface_id.clone())
+        };
+        if submitted {
+            // Emptied before the call, not after: `on_submit` may open a popup or write a signal,
+            // and the field it comes back to must be the empty one, not the text it just consumed.
+            if let Some(field) = self.focused_text_field.as_mut() {
+                field.buffer.clear();
+            }
+        }
+        self.field_input_changed = true;
+        if let Some(on_change) = on_change
+            && let Err(e) = on_change.call::<()>(if submitted { String::new() } else { text.clone() })
+        {
+            eprintln!("[oblisk-renderer] {surface_id}: on_change raised, ignoring it: {e}");
+        }
+        if submitted
+            && let Some(on_submit) = on_submit
+            && let Err(e) = on_submit.call::<()>(text)
+        {
+            eprintln!("[oblisk-renderer] {surface_id}: on_submit raised, ignoring it: {e}");
         }
     }
 
@@ -547,13 +699,13 @@ impl App {
     /// both the `Function` and the target are cloned out before the local tree is dropped.
     fn hit_under(&self, index: usize, position: (f64, f64)) -> PointerHit {
         let Some(tree) = self.client.scene().surface(&self.surfaces[index].surface_id) else {
-            return PointerHit { button: None, focus: None };
+            return PointerHit { button: None, field: None };
         };
         let point = layout::hit::LogicalPoint { x: position.0 as f32, y: position.1 as f32 };
         let path = layout::hit::hit_path(&tree, point);
         PointerHit {
             button: clickable_button(&path).map(|(rect, on_click)| (rect, on_click.clone())),
-            focus: focused_target(&path),
+            field: focused_field(&path),
         }
     }
 
@@ -800,11 +952,42 @@ impl PointerHandler for App {
                     // The press decides focus, not the release (decision 4): a press whose path
                     // holds a `textfield` focuses it, a press landing anywhere else clears it.
                     // Bound to the surface the press landed on, per [`FocusedField`].
-                    let focus = hit.focus.map(|target| FocusedField { surface_id: instance_id.clone(), target });
+                    //
+                    // Both halves are written on every press, including the clears, because the
+                    // two are one focus: pressing into a reply box has to take the keyboard away
+                    // from a password prompt, and vice versa.
+                    let (masked, plain) = match hit.field {
+                        Some(FieldTarget::Masked(target)) => {
+                            (Some(FocusedField { surface_id: instance_id.clone(), target }), None)
+                        }
+                        Some(FieldTarget::Plain { rect, on_change, on_submit }) => (
+                            None,
+                            Some(FocusedTextField {
+                                surface_id: instance_id.clone(),
+                                rect,
+                                buffer: String::new(),
+                                on_change,
+                                on_submit,
+                            }),
+                        ),
+                        None => (None, None),
+                    };
                     // Through the seam: this site *reassigns* rather than clears, the A-to-B
                     // transition [`retarget_secure_submit`] exists for.
-                    self.focus_secure_submit(focus);
-                    self.armed = hit.button.map(|(rect, _)| ArmedClick { instance_id, rect, button });
+                    let focused_a_field = masked.is_some() || plain.is_some();
+                    self.focus_secure_submit(masked);
+                    self.focus_text_field(plain);
+                    // A press that focused a `textfield` arms no click, so the ancestor `button`
+                    // does not also fire on release (ADR-0092). `textfield` is a leaf -- § 5.2
+                    // gives it no `children` -- so any `button` on the path is above it, and
+                    // clicking into a text field inside a clickable row is not a click on the row.
+                    // The notification card is the case: its whole surface activates the sender's
+                    // default action, and its reply box sits inside that.
+                    self.armed = hit.button.filter(|_| !focused_a_field).map(|(rect, _)| ArmedClick {
+                        instance_id,
+                        rect,
+                        button,
+                    });
                 }
                 PointerEventKind::Release { button, serial, .. } => {
                     let Some(name) = pointer_button_name(button) else {
@@ -932,6 +1115,7 @@ impl KeyboardHandler for App {
         // `textfield` stops owning the next secret and the armed press never sees its release, the
         // same answer `PointerEventKind::Leave` gives. Load-bearing: no submit is coming for these.
         self.focus_secure_submit(None);
+        self.focus_text_field(None);
         self.armed = None;
         eprintln!("[oblisk-renderer] keyboard focus left {left}");
     }
@@ -940,7 +1124,7 @@ impl KeyboardHandler for App {
     // property, and ADR-0050's consequences say this ADR does not invent one. What it has is the
     // `secure_submit` field ADR-0005 defines: [`App::apply_secure_key`] pushes bytes into a native
     // `shared::SecureBuffer` and out to the Supervisor with no Lua value ever existing, adding no
-    // IDL surface. See [`secure_key_action`] for why this is the keyboard, not text-input.
+    // IDL surface. See [`key_action`] for why this is the keyboard, not text-input.
     fn press_key(
         &mut self,
         _conn: &Connection,
@@ -949,7 +1133,7 @@ impl KeyboardHandler for App {
         _serial: u32,
         event: KeyEvent,
     ) {
-        self.apply_secure_key(&event, false);
+        self.apply_key(&event, false);
     }
 
     fn repeat_key(
@@ -960,7 +1144,7 @@ impl KeyboardHandler for App {
         _serial: u32,
         event: KeyEvent,
     ) {
-        self.apply_secure_key(&event, true);
+        self.apply_key(&event, true);
     }
 
     // Genuinely empty, and the two below with it: a release carries no `utf8` at all (SCTK's own
@@ -1211,12 +1395,29 @@ mod tests {
         Value::Table(table)
     }
 
+    /// The masked destination [`focused_field`] found, or `None` for anything else. Most of these
+    /// tests only care about that half.
+    fn masked_target(path: &[&layout::ResolvedNode]) -> Option<node::SecureSubmitTarget> {
+        match focused_field(path)? {
+            FieldTarget::Masked(target) => Some(target),
+            FieldTarget::Plain { .. } => None,
+        }
+    }
+
+    /// A `textfield` carrying `on_submit`, the plain half's minimum for being worth focusing.
+    fn plain_textfield(lua: &Lua) -> layout::ResolvedNode {
+        let mut node = textfield(lua, None);
+        let on_submit = lua.create_function(|_, _text: String| Ok(())).unwrap();
+        node.properties.insert("on_submit".to_string(), Value::Function(on_submit));
+        node
+    }
+
     #[test]
     fn a_press_landing_on_no_textfield_leaves_no_destination_focused() {
         let lua = Lua::new();
         let button = hit_node(&lua, "button", (0.0, 0.0, 40.0, 24.0), true);
         let root = hit_node(&lua, "panel", (0.0, 0.0, 100.0, 32.0), false);
-        assert_eq!(focused_target(&[&root, &button]), None);
+        assert!(focused_field(&[&root, &button]).is_none());
     }
 
     #[test]
@@ -1229,17 +1430,49 @@ mod tests {
         let root = hit_node(&lua, "panel", (0.0, 0.0, 100.0, 32.0), false);
 
         assert_eq!(
-            focused_target(&[&root, &outer, &inner]),
+            masked_target(&[&root, &outer, &inner]),
             Some(node::SecureSubmitTarget { capability: "polkit".to_string(), action: "authenticate".to_string() })
         );
     }
 
+    /// Neither a destination nor a callback: nothing downstream could read a keystroke, so taking
+    /// the keyboard for it would only strand the user in a field that swallows keys (ADR-0092).
     #[test]
-    fn a_textfield_with_no_secure_submit_focuses_with_no_destination() {
+    fn a_textfield_that_can_report_nothing_is_not_worth_focusing() {
         let lua = Lua::new();
         let field = textfield(&lua, None);
         let root = hit_node(&lua, "panel", (0.0, 0.0, 100.0, 32.0), false);
-        assert_eq!(focused_target(&[&root, &field]), None);
+        assert!(focused_field(&[&root, &field]).is_none());
+    }
+
+    /// The unmasked half of § 5.2 item 8 (ADR-0092): no `secure_submit`, a callback, so the press
+    /// focuses it as a plain field carrying the box paint will find it by.
+    #[test]
+    fn a_textfield_with_a_callback_and_no_secure_submit_focuses_as_a_plain_field() {
+        let lua = Lua::new();
+        let field = plain_textfield(&lua);
+        let root = hit_node(&lua, "panel", (0.0, 0.0, 100.0, 32.0), false);
+        match focused_field(&[&root, &field]) {
+            Some(FieldTarget::Plain { rect, on_change, on_submit }) => {
+                assert_eq!(rect, field.rect, "a lone child sits at its parent's origin");
+                assert!(on_change.is_none());
+                assert!(on_submit.is_some());
+            }
+            other => panic!("expected a plain field, got {}", if other.is_some() { "masked" } else { "nothing" }),
+        }
+    }
+
+    /// A `secure_submit` beats a callback on the same node, and it has to: the masked path is the
+    /// one that keeps bytes out of the Lua VM (ADR-0005), so a field declaring both must not have
+    /// its keystrokes handed to a config.
+    #[test]
+    fn a_field_declaring_both_a_destination_and_a_callback_stays_masked() {
+        let lua = Lua::new();
+        let mut field = textfield(&lua, Some(secure_submit_table(&lua, "lock", "authenticate")));
+        let on_submit = lua.create_function(|_, _text: String| Ok(())).unwrap();
+        field.properties.insert("on_submit".to_string(), Value::Function(on_submit));
+        let root = hit_node(&lua, "panel", (0.0, 0.0, 100.0, 32.0), false);
+        assert!(matches!(focused_field(&[&root, &field]), Some(FieldTarget::Masked(_))));
     }
 
     #[test]
@@ -1496,10 +1729,10 @@ mod tests {
         // `zwp_text_input_v3` alone did not deliver this: it only produces a `commit_string` when
         // the compositor has an input method bound, so on a session with no IME not one byte
         // reached `SecureBuffer`.
-        assert_eq!(secure_key_action(&key(Keysym::a, Some("a")), false), SecureKeyAction::Append("a"));
-        assert_eq!(secure_key_action(&key(Keysym::Return, Some("\r")), false), SecureKeyAction::Submit);
-        assert_eq!(secure_key_action(&key(Keysym::KP_Enter, Some("\r")), false), SecureKeyAction::Submit);
-        assert_eq!(secure_key_action(&key(Keysym::BackSpace, Some("\u{8}")), false), SecureKeyAction::Backspace);
+        assert_eq!(key_action(&key(Keysym::a, Some("a")), false), KeyAction::Append("a"));
+        assert_eq!(key_action(&key(Keysym::Return, Some("\r")), false), KeyAction::Submit);
+        assert_eq!(key_action(&key(Keysym::KP_Enter, Some("\r")), false), KeyAction::Submit);
+        assert_eq!(key_action(&key(Keysym::BackSpace, Some("\u{8}")), false), KeyAction::Backspace);
     }
 
     #[test]
@@ -1507,8 +1740,8 @@ mod tests {
         // `utf8` is not empty for Escape, Tab or Return -- xkbcommon hands back the C0 control
         // character for each -- so an unfiltered append would silently put an ESC byte in the
         // middle of a secret that PAM then rejects with no visible reason.
-        assert_eq!(secure_key_action(&key(Keysym::Tab, Some("\t")), false), SecureKeyAction::Ignore);
-        assert_eq!(secure_key_action(&key(Keysym::Shift_L, None), false), SecureKeyAction::Ignore);
+        assert_eq!(key_action(&key(Keysym::Tab, Some("\t")), false), KeyAction::Ignore);
+        assert_eq!(key_action(&key(Keysym::Shift_L, None), false), KeyAction::Ignore);
     }
 
     #[test]
@@ -1516,7 +1749,7 @@ mod tests {
         // Escape used to reach the control-character filter above and be dropped, which left one
         // Backspace per character as the only way to abandon a mistyped password -- on the surface
         // where a wrong guess costs a counted PAM attempt and a `pam_unix` failure delay.
-        assert_eq!(secure_key_action(&key(Keysym::Escape, Some("\u{1b}")), false), SecureKeyAction::Clear);
+        assert_eq!(key_action(&key(Keysym::Escape, Some("\u{1b}")), false), KeyAction::Clear);
     }
 
     #[test]
@@ -1524,9 +1757,9 @@ mod tests {
         // A submit zeroizes the buffer as it reads it, so the second submit of a key repeat would
         // send an *empty* password to PAM and burn one of the user's attempts. Backspace and
         // ordinary characters repeat normally, which is what every text field does.
-        assert_eq!(secure_key_action(&key(Keysym::Return, Some("\r")), true), SecureKeyAction::Ignore);
-        assert_eq!(secure_key_action(&key(Keysym::BackSpace, Some("\u{8}")), true), SecureKeyAction::Backspace);
-        assert_eq!(secure_key_action(&key(Keysym::a, Some("a")), true), SecureKeyAction::Append("a"));
+        assert_eq!(key_action(&key(Keysym::Return, Some("\r")), true), KeyAction::Ignore);
+        assert_eq!(key_action(&key(Keysym::BackSpace, Some("\u{8}")), true), KeyAction::Backspace);
+        assert_eq!(key_action(&key(Keysym::a, Some("a")), true), KeyAction::Append("a"));
     }
 
     #[test]

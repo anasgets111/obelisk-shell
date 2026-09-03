@@ -123,25 +123,39 @@ fn is_empty(clip: PhysicalRect) -> bool {
     clip.x1 <= clip.x0 || clip.y1 <= clip.y0
 }
 
-/// The focused `secure_submit` field's state, as much of it as paint is allowed to know.
+/// Which `textfield` on this surface has the keyboard, and what it should draw.
 ///
-/// A count, never the bytes. `shared::SecureBuffer` has one sanctioned read (`expose_secret`, into
-/// an outgoing IPC envelope), deliberately not this one: ADR-0005 keeps a typed secret out of the
-/// Lua VM, and a `Draw::Text` this process clones and retains in `last_painted` is just as wrong.
+/// Two variants because the two field kinds are addressed differently, and that difference is not
+/// cosmetic. A masked field is named by the destination its submit routes to, and paint is told a
+/// *count* and never the bytes: `shared::SecureBuffer` has one sanctioned read (`expose_secret`,
+/// into an outgoing IPC envelope), deliberately not this one, since ADR-0005 keeps a typed secret
+/// out of the Lua VM and a `Draw::Text` this process clones into `last_painted` is just as wrong.
+/// A plain field has no secret and no destination, so it is named by its box and carries its text.
 ///
-/// `target`, not a node id: `wayland::input::FocusedField` names a surface and a
-/// `{ capability, action }` pair, and the node that declared that pair is the focused one.
-pub struct SecureField<'a> {
-    pub target: &'a node::SecureSubmitTarget,
-    /// `shared::SecureBuffer::char_count`, so one glyph is drawn per keystroke.
-    pub filled: usize,
+/// A box is a weak identity, and knowingly so: it is the same stand-in `wayland::input::ArmedClick`
+/// uses for the same missing thing, since `ResolvedNode` carries no `NodeId` (`to_resolved` drops
+/// it). A re-resolve that moves the focused field detaches the caret from it, which is what a real
+/// identity would also give for a field moved out from under the user. Upgrade path is the one
+/// `input::focused_field` names: put the `NodeId` on `ResolvedNode`.
+pub enum FieldFocus<'a> {
+    Masked {
+        target: &'a node::SecureSubmitTarget,
+        /// `shared::SecureBuffer::char_count`, so one glyph is drawn per keystroke.
+        filled: usize,
+    },
+    Plain {
+        /// The field's absolute rect in its surface, as `layout::hit::absolute_rect` gave it to
+        /// the press that focused it, which is the same space `build_node` computes here.
+        rect: LogicalRect,
+        text: &'a str,
+    },
 }
 
 /// Flattens `root` into the list of draws it would produce, touching no canvas and no GL context.
 ///
 /// Pure, so the whole paint stage is testable without EGL: every test below stands up a headless
 /// pbuffer and reads pixels back, and none of them can say "these two trees paint the same".
-pub fn build(root: &ResolvedNode, scale: f32, focus: Option<&SecureField>) -> DisplayList {
+pub fn build(root: &ResolvedNode, scale: f32, focus: Option<&FieldFocus>) -> DisplayList {
     let mut commands = Vec::new();
     build_node(root, 0.0, 0.0, scale, UNCLIPPED, 1.0, focus, &mut commands);
     DisplayList { commands }
@@ -161,7 +175,7 @@ fn build_node(
     scale: f32,
     clip: PhysicalRect,
     inherited_opacity: f32,
-    focus: Option<&SecureField>,
+    focus: Option<&FieldFocus>,
     out: &mut Vec<DrawCmd>,
 ) {
     if !node.visible {
@@ -457,7 +471,7 @@ fn draw_for(
     rect: LogicalRect,
     scale: f32,
     opacity: f32,
-    focus: Option<&SecureField>,
+    focus: Option<&FieldFocus>,
 ) -> Option<Draw> {
     match style {
         // The shared paint of `rect`/`row`/`column`/`button` and all four surface roles: background
@@ -520,10 +534,29 @@ fn draw_for(
         // `input::retarget_secure_submit` zeroizes the buffer whenever focus moves, so no typed
         // state survives anywhere else to represent.
         PaintStyle::TextField { target, placeholder, mask, font_size, color, align } => {
-            let filled = focus
-                .filter(|focus| target.as_ref().is_some_and(|declared| declared == focus.target))
-                .map_or(0, |focus| focus.filled);
-            let content = if filled == 0 { placeholder.clone() } else { mask.repeat(filled) };
+            let content = match focus {
+                // A masked field with nothing typed shows its placeholder, so an empty prompt reads
+                // as a prompt rather than as an empty box.
+                Some(FieldFocus::Masked { target: focused, filled }) if *filled > 0 => {
+                    match target.as_ref().is_some_and(|declared| declared == *focused) {
+                        true => mask.repeat(*filled),
+                        false => placeholder.clone(),
+                    }
+                }
+                // The caret is what says the field is live, and it is why an empty focused field
+                // does *not* fall back to its placeholder: the two would be indistinguishable, and
+                // "am I typing into this?" is the question a plain field has to answer. There is no
+                // caret movement to place it anywhere but the end -- nothing handles arrow keys.
+                // `target.is_none()` is not redundant with the arm above: a plain focus and a
+                // *masked* node can coexist -- the focus is on one field, this draw is of another --
+                // and without the check a `secure_submit` field whose box matched would render the
+                // plaintext some other field is holding. The two focuses are mutually exclusive;
+                // the two node kinds on one surface are not.
+                Some(FieldFocus::Plain { rect: focused, text }) if *focused == rect && target.is_none() => {
+                    format!("{text}\u{2502}")
+                }
+                _ => placeholder.clone(),
+            };
             (!content.is_empty()).then_some(Draw::Text {
                 content,
                 font_size: *font_size,
@@ -1230,6 +1263,61 @@ mod tests {
             .collect()
     }
 
+    fn reply_surface(lua: &Lua) -> ResolvedNode {
+        let src = r##"return panel { id = "bar", width = 200, height = 40,
+            child = textfield { width = "Fill", height = 28, placeholder = "Reply",
+                on_submit = function(text) end } }"##;
+        resolved_surface(lua, src, LogicalSize { width: 200.0, height: 40.0 })
+    }
+
+    /// The plain half of § 5.2 item 8 (ADR-0092). Unfocused it is a placeholder like any other
+    /// field; focused it shows what has been typed, with a caret after it.
+    #[test]
+    fn a_plain_textfield_shows_its_placeholder_until_it_is_focused() {
+        let lua = Lua::new();
+        let tree = reply_surface(&lua);
+        assert_eq!(drawn_text(&build(&tree, 1.0, None)), vec!["Reply".to_string()]);
+
+        let rect = tree.children[0].rect;
+        let typed = build(&tree, 1.0, Some(&FieldFocus::Plain { rect, text: "on my way" }));
+        assert_eq!(drawn_text(&typed), vec!["on my way\u{2502}".to_string()]);
+    }
+
+    /// An empty *focused* field draws the caret alone rather than the placeholder, because the two
+    /// would otherwise be indistinguishable and "is this taking my keys?" is the whole question.
+    #[test]
+    fn a_focused_but_empty_plain_field_draws_a_caret_not_its_placeholder() {
+        let lua = Lua::new();
+        let tree = reply_surface(&lua);
+        let rect = tree.children[0].rect;
+        assert_eq!(
+            drawn_text(&build(&tree, 1.0, Some(&FieldFocus::Plain { rect, text: "" }))),
+            vec!["\u{2502}".to_string()]
+        );
+    }
+
+    /// Focus is addressed by box, so a focus naming some other box leaves this field alone. The
+    /// case it guards is two reply fields in one card: only the one clicked into fills.
+    #[test]
+    fn a_plain_field_whose_box_is_not_the_focused_one_keeps_its_placeholder() {
+        let lua = Lua::new();
+        let tree = reply_surface(&lua);
+        let elsewhere = LogicalRect { x: 999.0, y: 999.0, width: 10.0, height: 10.0 };
+        let list = build(&tree, 1.0, Some(&FieldFocus::Plain { rect: elsewhere, text: "not mine" }));
+        assert_eq!(drawn_text(&list), vec!["Reply".to_string()]);
+    }
+
+    /// A masked field ignores a plain focus outright: the two are different kinds, and a
+    /// `secure_submit` field must never draw text a `FieldFocus::Plain` is carrying.
+    #[test]
+    fn a_masked_field_never_draws_a_plain_focuss_text() {
+        let lua = Lua::new();
+        let tree = password_surface(&lua);
+        let rect = tree.children[0].rect;
+        let list = build(&tree, 1.0, Some(&FieldFocus::Plain { rect, text: "hunter2" }));
+        assert_eq!(drawn_text(&list), vec!["password".to_string()]);
+    }
+
     #[test]
     fn an_unfocused_password_field_shows_its_placeholder() {
         let lua = Lua::new();
@@ -1242,7 +1330,7 @@ mod tests {
     fn a_focused_password_field_draws_one_mask_character_per_typed_character() {
         let lua = Lua::new();
         let target = lock_target();
-        let list = build(&password_surface(&lua), 1.0, Some(&SecureField { target: &target, filled: 4 }));
+        let list = build(&password_surface(&lua), 1.0, Some(&FieldFocus::Masked { target: &target, filled: 4 }));
         assert_eq!(drawn_text(&list), vec!["****".to_string()]);
     }
 
@@ -1250,7 +1338,7 @@ mod tests {
     fn a_focused_but_empty_password_field_still_shows_its_placeholder() {
         let lua = Lua::new();
         let target = lock_target();
-        let list = build(&password_surface(&lua), 1.0, Some(&SecureField { target: &target, filled: 0 }));
+        let list = build(&password_surface(&lua), 1.0, Some(&FieldFocus::Masked { target: &target, filled: 0 }));
         assert_eq!(drawn_text(&list), vec!["password".to_string()]);
     }
 
@@ -1261,7 +1349,7 @@ mod tests {
     fn a_field_addressed_to_another_capability_does_not_draw_the_focused_fields_characters() {
         let lua = Lua::new();
         let elsewhere = node::SecureSubmitTarget { capability: "network".to_string(), action: "connect".to_string() };
-        let list = build(&password_surface(&lua), 1.0, Some(&SecureField { target: &elsewhere, filled: 9 }));
+        let list = build(&password_surface(&lua), 1.0, Some(&FieldFocus::Masked { target: &elsewhere, filled: 9 }));
         assert_eq!(
             drawn_text(&list),
             vec!["password".to_string()],
@@ -1269,14 +1357,14 @@ mod tests {
         );
     }
 
-    /// The count is all paint ever gets (see [`SecureField`]), so there is no path by which a
+    /// The count is all paint ever gets (see [`FieldFocus`]), so there is no path by which a
     /// typed character reaches the list. Asserted because a display list is cloned, compared and
     /// retained in `last_painted` -- exactly the places ADR-0005 keeps a secret out of.
     #[test]
     fn a_masked_field_draws_only_the_mask_character() {
         let lua = Lua::new();
         let target = lock_target();
-        let list = build(&password_surface(&lua), 1.0, Some(&SecureField { target: &target, filled: 6 }));
+        let list = build(&password_surface(&lua), 1.0, Some(&FieldFocus::Masked { target: &target, filled: 6 }));
         let drawn = drawn_text(&list);
         assert_eq!(drawn, vec!["******".to_string()]);
         assert!(drawn[0].chars().all(|c| c == '*'), "nothing but the mask glyph may reach the list");
@@ -1292,7 +1380,7 @@ mod tests {
                 secure_submit = { capability = "lock", action = "authenticate" } } }"##;
         let tree = resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 });
         let target = lock_target();
-        let list = build(&tree, 1.0, Some(&SecureField { target: &target, filled: 3 }));
+        let list = build(&tree, 1.0, Some(&FieldFocus::Masked { target: &target, filled: 3 }));
         assert_eq!(drawn_text(&list), vec!["\u{2022}\u{2022}\u{2022}".to_string()]);
     }
 
@@ -1303,8 +1391,8 @@ mod tests {
         let lua = Lua::new();
         let tree = password_surface(&lua);
         let target = lock_target();
-        let three = build(&tree, 1.0, Some(&SecureField { target: &target, filled: 3 }));
-        let four = build(&tree, 1.0, Some(&SecureField { target: &target, filled: 4 }));
+        let three = build(&tree, 1.0, Some(&FieldFocus::Masked { target: &target, filled: 3 }));
+        let four = build(&tree, 1.0, Some(&FieldFocus::Masked { target: &target, filled: 4 }));
         assert_ne!(three, four);
     }
 

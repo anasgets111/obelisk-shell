@@ -114,14 +114,23 @@
 ---@field scroll? Bound The signal `scroll(name)` returned. Makes this a viewport its children move inside.
 
 ---@class TextfieldProps: NodeBase
----A `textfield` parses and lays out, but nothing delivers keystrokes to it yet: `zwp_text_input_v3`
----is unwired, so neither callback below has ever fired. The properties are typed to ADR-0027's
----settled wire shape so a config written against them keeps working when the protocol lands.
----@field placeholder? string|Bound Drawn in the foreground colour while the field is empty. Not the value: submitting an untouched field submits an empty string.
+---Two field kinds behind one node (ADR-0092). Declaring `secure_submit` makes it masked: its
+---keystrokes go into a native buffer and out to a capability, and no Lua value ever holds them
+---(ADR-0005). Declaring `on_change`/`on_submit` instead makes it plain: every edit is handed
+---straight to the callback. A field declaring both stays masked, and one declaring neither is
+---never focused, since nothing could read what was typed into it.
+---
+---Both read `wl_keyboard` directly rather than `zwp_text_input_v3`, so neither composes CJK or
+---dead keys: text-input-v3 produces nothing at all unless a compositor-side input method is
+---running, which would make a reply box that silently swallows every keystroke on a bare session.
+---
+---A press is what focuses a plain field, so its surface must be able to take the keyboard when
+---one is open -- see `keyboard_interactivity` on `panel`.
+---@field placeholder? string|Bound Drawn in the foreground colour while the field is empty. Not the value: submitting an untouched field submits an empty string. A focused plain field shows a caret instead, so that "empty" and "empty and typing into it" do not look alike.
 ---@field mask_character? string|Bound Capped at 1 byte. Hides typed input.
 ---@field secure_submit? { capability: string, action: string } Only meaningful alongside `mask_character`; without it a masked field's value is unreadable from Lua entirely (ADR-0005, ADR-0027).
----@field on_change? fun(text: string) Per committed edit batch from `wp-text-input-v3`, not per keystroke.
----@field on_submit? fun(text?: string) Takes the committed text, except when both `mask_character` and `secure_submit` are set, when it fires with no argument.
+---@field on_change? fun(text: string) The whole text after each edit, not the delta. Per keystroke, since there is no input method to batch composition.
+---@field on_submit? fun(text?: string) Enter. Takes the whole text and leaves the field focused and empty, so a reply box takes the next message without another click. Fires with no argument when both `mask_character` and `secure_submit` are set.
 ---@field font_size? integer|Bound Default `12`. Applies to the placeholder and to the masked content alike.
 ---@field foreground? Color|Bound Default opaque white.
 ---@field text_align? "Start"|"Center"|"End"|Bound Where the run sits inside the field's own box.

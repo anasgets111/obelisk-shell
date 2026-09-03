@@ -488,8 +488,10 @@ An IME-aware native input field mapped directly to Rust-owned `wp-text-input-v3`
 *   `placeholder`: `string`
 *   `mask_character`: `string` (Capped at 1 byte; if specified, hides typed input)
 *   `secure_submit`: `table` (`{ capability, action }`; see § 5's `textfield` glossary entry in `CONTEXT.md`. Only meaningful alongside `mask_character`, without it a masked field's value is unreadable from Lua entirely)
-*   `on_change`: `function` (Lua callback on each committed edit batch from `wp-text-input-v3`, not per keystroke; IME composition is not character-by-character. Key events are swallowed inside Rust's memory blocks during sensitive lock states)
-*   `on_submit`: `function` (Fires on `zwp_text_input_v3`'s protocol-native `submit` action, e.g. Enter, IME-correct rather than a raw keystroke check. Takes the committed text as its one argument, *except* when both `mask_character` and `secure_submit` are set: fires with no argument, since the Renderer's IPC layer attaches the native input buffer directly to the named capability/action envelope instead. ADR-0005, ADR-0027)
+*   `on_change`: `function` (Lua callback carrying the field's whole text after each edit, not the delta. Per keystroke: this field reads `wl_keyboard` rather than `zwp_text_input_v3`, so there is no input method batching composition. ADR-0092)
+*   `on_submit`: `function` (Enter. Takes the whole text as its one argument and leaves the field focused and empty, so a reply box takes the next message without another click. Fires with *no* argument when both `mask_character` and `secure_submit` are set: the Renderer's IPC layer attaches the native input buffer directly to the named capability/action envelope instead, and no Lua value ever holds it. ADR-0005, ADR-0027, ADR-0092)
+
+Declaring `secure_submit` makes a field masked and declaring `on_change`/`on_submit` makes it plain; a field declaring both stays masked, and one declaring neither is never focused, since nothing could read what was typed into it. A press is what focuses a plain field, so its surface has to be able to take the keyboard while one is open (`panel.keyboard_interactivity`). Neither kind composes CJK or dead keys — see ADR-0092.
 
 ## 6. Top-level surface nodes
 
