@@ -47,7 +47,7 @@ end
 -- second kind. `rescue` and `privacy` keep their filled grounds, because both are alerts that are
 -- absent until they are not.
 local power_button = icon_button(icons.shutdown, function(rect)
-    ui_state.open_panel(KIND, rect)
+    ui_state.toggle_panel(KIND, rect)
 end, {
     slot = "power",
     selected = ui_state.panel_showing(KIND),

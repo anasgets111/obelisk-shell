@@ -25,7 +25,7 @@
 -- Three things come back for free and one is paid for:
 --
 --   * Click-outside-to-close is the catcher below rather than the compositor's `popup_done`, so it
---     knows which panel it closed -- the ambiguity `lib/ui_state.lua`'s `open_panel` was written
+--     knows which panel it closed -- the ambiguity `lib/ui_state.lua`'s `toggle_panel` was written
 --     around.
 --   * Switching panels is one click. There is no grab to break and re-arm, so the click lands on
 --     the bar indicator directly.
@@ -147,19 +147,13 @@ return panel {
             -- landing on the card never reaches this button -- the card does not need a handler of
             -- its own to shield itself.
             --
-            -- The cancel is the second half of the same edge, and was `on_dismiss`'s before.
-            -- Closing takes the network panel's password prompt off screen without answering it,
-            -- and the pending intent behind it lives in the Supervisor, so nothing here could clear
-            -- it -- leaving the shell asking for a password with nowhere to type one.
-            -- `network:cancel_connect` is a no-op when nothing is pending, which is why it can be
-            -- spent unconditionally rather than gated on which panel was showing.
+            -- Answering a pending password prompt is `close_panel`'s job, not this one's: a click
+            -- out here and a second click on the open panel's own indicator are the same event,
+            -- and one writer per edge is what keeps them from drifting apart.
             button {
                 width = "Fill",
                 height = "Fill",
-                on_click = function()
-                    ui_state.close_panel()
-                    oblisk.network:invoke("cancel_connect")
-                end,
+                on_click = ui_state.close_panel,
             },
             -- Sized for the tallest panel, not the current one. `renderer/src/socket.rs`'s
             -- `the_shipped_dev_configs_bar_zones_hold_their_modules_without_overflowing` measures

@@ -3924,6 +3924,15 @@ anywhere, which is exactly why its `WlrLayershell.keyboardFocus` can follow a pe
    re-map) and skipped for a PBA Candidate. This was always a bug for `margin`, `size` and
    `exclusive` too; nothing had bound them to a signal that moved without also changing the paint.
 
+5. **A bar indicator is a toggle now.** `open_panel` became `toggle_panel`: clicking the indicator
+   of the panel already showing closes it, clicking a different one replaces it, clicking any of
+   them with the host closed opens it. Set-only was not a style choice before — under the grab a
+   toggle would have closed the panel it was opening, since niri delivers the opening click to the
+   bar as the popup's own parent, and it would have fought `on_dismiss`, which already wrote false
+   on every click landing elsewhere. With no grab there is no second writer to fight. The pending
+   password prompt is answered by `close_panel` rather than by its callers, so the click-outside
+   catcher and a toggle-close cannot drift apart.
+
 Measured end to end on niri: a non-visual flip to `"Exclusive"` on the mapped surface now takes the
 keyboard and arms `network/connect` in the same turn, and the flip back releases it. The card lands
 at `bar_height + panel_gap` from the top and clamps to the output's right edge, both read off a

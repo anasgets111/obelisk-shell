@@ -33,7 +33,7 @@ end
 
 local network_module = icon_button(oblisk.network:map(network_glyph), function(rect)
     oblisk.network:invoke("scan")
-    ui_state.open_panel(network_panel.kind, rect)
+    ui_state.toggle_panel(network_panel.kind, rect)
 end, {
     slot = SLOT,
     selected = ui_state.panel_showing(network_panel.kind),

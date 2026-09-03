@@ -31,6 +31,6 @@ return {
     kind = notification_history.kind,
     bell = bell,
     open = function(rect)
-        ui_state.open_panel(notification_history.kind, rect)
+        ui_state.toggle_panel(notification_history.kind, rect)
     end,
 }

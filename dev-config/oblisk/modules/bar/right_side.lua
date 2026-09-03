@@ -56,7 +56,7 @@ local clock_pill = row {
     children = {
         transparent_button(bell.bell, bell.open),
         transparent_button(date_time.clock, function(rect)
-            ui_state.open_panel(calendar_panel.kind, rect)
+            ui_state.toggle_panel(calendar_panel.kind, rect)
         end),
     },
 }

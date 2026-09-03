@@ -25,7 +25,7 @@ local bluetooth_module = icon_button(oblisk.bluetooth:map(function(b)
     end
     return #connected(b) > 0 and icons.bt_conn or icons.bt_on
 end), function(rect)
-    ui_state.open_panel(bluetooth_panel.kind, rect)
+    ui_state.toggle_panel(bluetooth_panel.kind, rect)
 end, {
     slot = SLOT,
     selected = ui_state.panel_showing(bluetooth_panel.kind),

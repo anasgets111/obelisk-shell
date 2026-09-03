@@ -19,28 +19,44 @@ local settings_open = state("settings_open", false)
 local panel_open = state("panel_open", false)
 local panel_kind = state("panel_kind", "")
 
--- Opening sets, it never toggles, and what that is worth changed when `panel_host` stopped being an
--- `xdg_popup`.
+-- The one place the panel host stops showing anything, and so the one place that answers a prompt
+-- it was showing. `network:connect` on an unsaved secured network parks an intent in the Supervisor
+-- and raises `password_ssid` (ADR-0085); closing takes the field off screen without answering it,
+-- and nothing in the config could clear that intent by itself. `cancel_connect` is a no-op when
+-- nothing is pending, which is what lets a generic close spend it unconditionally rather than every
+-- close also clearing `connect_error`.
 --
--- Under the grab it bought correctness. niri still delivered a click on the opening button to us,
--- because the bar was the popup's own parent surface and so inside the grab's tree, so a toggle
--- would have closed the panel it was opening; and it would have fought `on_dismiss` on every click
--- landing elsewhere, since that path already wrote false. Worse, clicking the network indicator
--- while the bluetooth panel was up was both edges at once, and `on_dismiss` carried no token saying
--- which popup it dismissed -- so switching panels directly sometimes took a second click.
+-- Here rather than at its two callers -- `panel_host`'s click-outside catcher and the toggle below
+-- -- for the reason this file keeps repeating: one writer per edge. A capability call inside a
+-- module named `ui_state` is the price, and it is the smaller one.
+local function close_panel()
+    panel_open:set(false)
+    oblisk.network:invoke("cancel_connect")
+end
+
+-- Clicking an indicator opens its panel; clicking the same one again closes it. A toggle, which is
+-- what the mirror does and what this could not do until `panel_host` stopped being an `xdg_popup`
+-- (ADR-0087).
 --
--- None of that is true of a layer surface. Nothing dismisses this behind our back, the click that
--- switches panels reaches the indicator directly, and switching is one click. What remains is a
--- deliberate choice rather than a workaround: clicking the open panel's own indicator leaves it
--- open, and the way out is a click anywhere else, which `panel_host`'s catcher takes.
-local function open_panel(kind, rect)
+-- Set-only was not a style choice under the grab. niri still delivered a click on the opening
+-- button to us, because the bar was the popup's own parent surface and so inside the grab's tree,
+-- so a toggle would have closed the panel it was opening; and it would have fought `on_dismiss` on
+-- every click landing elsewhere, since that path already wrote false. Worse, clicking the network
+-- indicator while the bluetooth panel was up was both edges at once, and `on_dismiss` carried no
+-- token saying which popup it dismissed, so switching panels directly sometimes took a second
+-- click.
+--
+-- None of that survives a layer surface. Nothing dismisses this behind our back and the click that
+-- switches panels reaches the indicator directly, so the three cases are just the three cases: the
+-- showing panel closes, a different one replaces it, and a closed host opens.
+local function toggle_panel(kind, rect)
+    if panel_open:get() and panel_kind:get() == kind then
+        close_panel()
+        return
+    end
     popup_anchor:set(rect)
     panel_kind:set(kind)
     panel_open:set(true)
-end
-
-local function close_panel()
-    panel_open:set(false)
 end
 
 -- Whether `kind` is the panel currently on screen, which is `ShellUiState.isPanelOpen(kind)` in the
@@ -96,7 +112,7 @@ return {
     settings_open = settings_open,
     panel_open = panel_open,
     panel_kind = panel_kind,
-    open_panel = open_panel,
+    toggle_panel = toggle_panel,
     close_panel = close_panel,
     panel_showing = panel_showing,
     osd_kind = osd_kind,
