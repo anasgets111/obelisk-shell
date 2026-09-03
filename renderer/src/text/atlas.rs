@@ -10,12 +10,10 @@
 use std::error::Error;
 use std::ffi::c_void;
 
-use std::ops::Range;
-
 use femtovg::renderer::OpenGl;
 use femtovg::{Align, Canvas, Color, FontId, Paint, Path, TextContext};
 
-use crate::layout::node::{Rgba, StyleRun, TextAlign};
+use crate::layout::node::{Rgba, StyleRun, TextAlign, segments};
 use crate::text::shaping::FontFace;
 
 use super::snap::{LogicalRect, snap_to_physical};
@@ -43,30 +41,6 @@ pub struct TextDraw<'a> {
 /// Which of the four chains a run draws with.
 fn variant(bold: bool, italic: bool) -> usize {
     usize::from(bold) | (usize::from(italic) << 1)
-}
-
-/// One line of `text` cut at the points where its style changes: each piece is a byte range of
-/// the line and the run it falls in, or `None` for a plain stretch. Pure, so the split -- the part
-/// of a styled draw that can go wrong quietly -- is tested without a GL context.
-fn segments(line: Range<usize>, runs: &[StyleRun]) -> Vec<(Range<usize>, Option<&StyleRun>)> {
-    let mut pieces = Vec::new();
-    let mut cursor = line.start;
-    for run in runs {
-        let start = run.range.start.max(line.start);
-        let end = run.range.end.min(line.end);
-        if start >= end {
-            continue;
-        }
-        if start > cursor {
-            pieces.push((cursor..start, None));
-        }
-        pieces.push((start..end, Some(run)));
-        cursor = end;
-    }
-    if cursor < line.end || pieces.is_empty() {
-        pieces.push((cursor..line.end, None));
-    }
-    pieces
 }
 
 /// Which femtovg alignment to set, and what x to hand `fill_text` under it.
@@ -279,48 +253,6 @@ mod tests {
     #[test]
     fn an_odd_width_box_centres_on_its_true_middle() {
         assert_eq!(text_anchor(TextAlign::Center, 0, 15).1, 7.5);
-    }
-
-    fn run(range: Range<usize>) -> StyleRun {
-        StyleRun { range, bold: true, italic: false, underline: false, color: None }
-    }
-
-    // ---- segments (ADR-0104) ----
-
-    #[test]
-    fn a_line_with_no_run_in_it_is_one_plain_piece() {
-        let pieces = segments(0..5, &[]);
-        assert_eq!(pieces.len(), 1);
-        assert_eq!(pieces[0].0, 0..5);
-        assert!(pieces[0].1.is_none());
-        // A run entirely on another line leaves this one plain too.
-        assert_eq!(segments(0..5, &[run(6..9)]).len(), 1);
-    }
-
-    #[test]
-    fn a_run_inside_a_line_splits_it_into_plain_styled_plain() {
-        let runs = [run(2..4)];
-        let pieces: Vec<(Range<usize>, bool)> =
-            segments(0..6, &runs).into_iter().map(|(r, s)| (r, s.is_some())).collect();
-        assert_eq!(pieces, vec![(0..2, false), (2..4, true), (4..6, false)]);
-    }
-
-    /// A wrap can break a run across lines: the second line's slice of it starts at the line, not
-    /// at the run, and a run ending exactly at a line's end leaves no empty plain tail.
-    #[test]
-    fn a_run_crossing_a_line_boundary_is_clipped_to_the_line_on_each_side() {
-        let runs = [run(3..9)];
-        let first: Vec<_> = segments(0..5, &runs).into_iter().map(|(r, s)| (r, s.is_some())).collect();
-        assert_eq!(first, vec![(0..3, false), (3..5, true)]);
-        let second: Vec<_> = segments(6..10, &runs).into_iter().map(|(r, s)| (r, s.is_some())).collect();
-        assert_eq!(second, vec![(6..9, true), (9..10, false)]);
-    }
-
-    #[test]
-    fn adjacent_runs_touch_with_no_plain_piece_between_them() {
-        let runs = [run(0..2), run(2..4)];
-        let pieces: Vec<_> = segments(0..4, &runs).into_iter().map(|(r, s)| (r, s.is_some())).collect();
-        assert_eq!(pieces, vec![(0..2, true), (2..4, true)]);
     }
 
     #[test]

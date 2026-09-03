@@ -152,6 +152,12 @@ local function message(notification, ui, opts)
             width = "Fill",
             wrap = "Word",
             max_lines = expanded and 0 or 3,
+            -- A press on an underlined run opens it and does not also fire the message's own
+            -- click (ADR-0106); a press on the plain words still does. The link buttons below
+            -- remain for a link the elide cut off before its words were drawn.
+            on_link = function(href)
+                oblisk.applications:invoke("open_url", href)
+            end,
         })
     end
 
@@ -231,9 +237,9 @@ local function message(notification, ui, opts)
         end, string.format("notification-action-%d-%d", id, index), action.icon_name)
     end
     -- One button per distinct link in the body, opened by the desktop's own handler
-    -- (`applications:open_url`, ADR-0103). A button rather than a tap on the underlined run: the
-    -- engine hit-tests nodes, not glyphs, and the whole message is already a button whose click is
-    -- the default action -- a link tap that also fired that would open the page and take the card.
+    -- (`applications:open_url`, ADR-0103). The underlined words open it too (ADR-0106); the button
+    -- is for a link whose words the three-line elide cut off, and is the one control that says
+    -- where the link goes before it is pressed.
     for index, href in ipairs(util.notification_links(notification.body)) do
         buttons[#buttons + 1] = action_button(util.link_label(href), function()
             oblisk.applications:invoke("open_url", href)

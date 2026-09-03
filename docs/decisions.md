@@ -4826,3 +4826,41 @@ with Zen's icon, a red border, "Alice" bold, "this page" underlined in the accen
 and Reply / Archive / example.org buttons; a low-urgency media notification with `action-icons`
 beneath it draws three glyph buttons and a dim border. The history shows both under "urgent" and
 "today" with clock readings.
+
+## 0106. A press on a link's own words opens it: `href` on a run, `on_link` on `text`
+
+ADR-0105 gave a body's links a button each and said why not the words themselves: the engine
+hit-tests nodes, not glyphs, and the message is already a button whose click is the default action.
+Then the words were underlined in the accent, which is the one affordance every reader knows, and
+pressing them dismissed the notification. An underline that does not open is worse than no
+underline; the button was right to exist and wrong to be the only way.
+
+1. **`href` is a field of a run, `on_link(href)` a property of the node.** The run shape is now a
+   notification span's exactly, `kind` aside, so `util.notification_body` copies `href` through and
+   nothing else changes. The engine carries the string and reports which run was pressed; what to
+   do with a URL stays the config's (`applications:open_url`, ADR-0103).
+
+2. **The run under a point is found by re-deriving paint's geometry with the shaper.** `\n` splits
+   the fitted content into lines a `line_height` apart, each line is cut at its run boundaries
+   (`segments`, moved out of the painter so both sides read one function), the pieces are measured
+   by the shaping worker and laid from the alignment's anchor. femtovg measures paint and cosmic-text
+   measures this; the two agree to 2% (the divergence tests), well inside the slack a press on a
+   word has. Measured with the worker rather than on the GL thread because input has no canvas, and
+   every measurement is a memo hit after the first frame anyway.
+
+3. **A link beats the buttons above it, a plain word does not.** The same rule as a `textfield`
+   press arming no click (ADR-0092 decision 7): a link inside a card whose whole face is the
+   default action opens the page and does not also take the card. A `text` with `on_link` whose
+   plain words were pressed is transparent, so the message still activates on a press to its body.
+
+4. **The release must land on the same link.** `ArmedClick` carries the `href` beside the rect: a
+   paragraph with two links is one rect, and pressing one then releasing over the other is not a
+   click on either. The handler takes the `href` and nothing else -- the rect is the paragraph's,
+   and a link is not a mouse button.
+
+The link buttons stay. A three-line elide can cut a link's words off before they are drawn, and the
+button is the one control that says where a link goes before it is pressed.
+
+Verified live: pressing "this page" in a body of `see <a href="https://example.org/some/page">this
+page</a> when you get a moment` opens the page in the running browser and the notification stays;
+pressing "when" beside it dismisses the card as before.

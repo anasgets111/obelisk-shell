@@ -141,8 +141,9 @@ end
 -- `notification.body` is a span array, not a string: the freedesktop body is markup, and the
 -- Supervisor parses it once so no config has to (§ 2.7, ADR-0033). `text.content` takes an array of
 -- runs of the same shape (ADR-0104), so this is a near pass-through: a text span becomes a run, and
--- a link becomes an underlined run in `link_color`, which is where "what does a link look like"
--- gets decided -- the engine draws runs and knows nothing about hrefs.
+-- a link becomes an underlined run in `link_color` carrying its `href`, which is where "what does a
+-- link look like" gets decided -- the engine draws runs and reports which was pressed, and knows
+-- nothing about URLs.
 --
 -- Image spans are left out here and drawn by `util.notification_images`: a picture inside a line of
 -- text has nowhere to go, and `text` refuses a run with no `text` for exactly that reason.
@@ -157,6 +158,9 @@ function util.notification_body(spans, link_color)
                 italic = span.italic or false,
                 underline = span.underline or is_link,
                 color = is_link and link_color or nil,
+                -- Carried through to the run so a press on these words reaches the node's
+                -- `on_link` (ADR-0106); the engine never opens it, the card does.
+                href = is_link and span.href or nil,
             }
         end
     end

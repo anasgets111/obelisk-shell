@@ -95,6 +95,7 @@
 ---@field italic? boolean
 ---@field underline? boolean A rule just under the baseline, in the run's colour.
 ---@field color? Color This run's colour instead of the node's `foreground`. What a link is drawn in.
+---@field href? string What a press on this run hands the node's `on_link` (ADR-0106). Carried, never opened by the engine; a body span's `href` goes straight here.
 
 ---@class TextProps: NodeBase
 ---@field content? string|TextRun[]|Bound One string, or an array of runs whose texts are joined and drawn in one paragraph, wrapping and eliding together (ADR-0104). Default `""`, so a text bound to a capability renders empty until the first push rather than failing at boot.
@@ -104,6 +105,7 @@
 ---@field wrap? "None"|"Word"|Bound `"Word"` breaks an over-wide run onto further lines, at a word boundary where there is one and mid-word for a word wider than the box. Default `"None"`, one line however long. A `Content`-sized box has no width to break against, so wrapping needs an explicit `width`, a `"Fill"`, or a stretched cross axis.
 ---@field max_lines? integer|Bound How many lines `wrap = "Word"` may use. `0` and absent both mean no limit, so an expander is `max_lines = expanded:map(function(e) return e and 0 or 2 end)`. Ignored without `wrap`, since an unwrapped run has one line to begin with.
 ---@field text_align? "Start"|"Center"|"End"|Bound Where the glyph run sits inside this node's own box, which is a different question from `align_h`. Only visible when the box is wider than the text. Default `"Start"`.
+---@field on_link? fun(href: string) A click on a run carrying an `href` (ADR-0106). Wins over any `button` above this node, so a link inside a clickable card opens the page and does not also fire the card; a click on the plain words falls through to the card as before.
 
 ---@class IconProps: NodeBase
 ---@field name? string|Bound A theme name, or an absolute path used as that path. Resolved in the renderer (ADR-0054).

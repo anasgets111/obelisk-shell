@@ -4,7 +4,9 @@
 //! `crate::wayland`: everything else on the pointer path needs a live `wl_pointer` and a live
 //! `wl_surface`, and this is the part that decides what a click means.
 
+use crate::layout::node::{PaintStyle, StyleRun, TextAlign, segments};
 use crate::layout::scene::ResolvedNode;
+use crate::text::shaping::{self, FontRun, ShapeRequest, ShapingHandle};
 use crate::text::snap::LogicalRect;
 
 /// A point in one surface's logical coordinates -- the space `wl_pointer`'s `position` already
@@ -44,6 +46,65 @@ pub fn hit_path(root: &ResolvedNode, point: LogicalPoint) -> Vec<&ResolvedNode> 
     let mut path = Vec::new();
     descend(root, point, 0.0, 0.0, &mut path);
     path
+}
+
+/// The `href` of the styled run under `point` in a `text` node, or `None` when the point is on
+/// plain text, past the end of a line, or below the last one (ADR-0106). `point` is in the node's
+/// own coordinates.
+///
+/// The geometry is paint's, re-derived: `\n` splits the fitted content into lines a `line_height`
+/// apart, each line is cut into pieces at its run boundaries, and the pieces are laid left to right
+/// from the alignment's anchor. The widths come from the shaping worker rather than femtovg, which
+/// is what paint measures with; the two agree to within 2% (`layout::paint`'s divergence tests),
+/// which is well inside the slack a press on a word has.
+pub fn link_under(node: &ResolvedNode, point: LogicalPoint, shaping: &ShapingHandle) -> Option<String> {
+    let Some(PaintStyle::Text { content, runs, font_size, align, .. }) = node.paint.as_ref() else {
+        return None;
+    };
+    if runs.iter().all(|run| run.href.is_none()) || point.y < 0.0 {
+        return None;
+    }
+    let line_height = shaping::line_height(*font_size);
+    let line_index = (point.y / line_height) as usize;
+    let mut line_start = 0usize;
+    let line = content.split('\n').enumerate().find_map(|(index, line)| {
+        let start = line_start;
+        line_start += line.len() + 1;
+        (index == line_index).then_some(start..start + line.len())
+    })?;
+    let measured: Vec<(f32, Option<&StyleRun>)> = segments(line.clone(), runs)
+        .into_iter()
+        .map(|(range, run)| {
+            let rebased = run.filter(|run| run.bold || run.italic).map(|run| FontRun {
+                range: 0..range.len(),
+                bold: run.bold,
+                italic: run.italic,
+            });
+            let width = shaping
+                .shape(ShapeRequest {
+                    text: content[range].to_string(),
+                    font_size: *font_size,
+                    line_height,
+                    max_width: None,
+                    runs: rebased.into_iter().collect(),
+                })
+                .width;
+            (width, run)
+        })
+        .collect();
+    let total: f32 = measured.iter().map(|(width, _)| width).sum();
+    let mut x = match align {
+        TextAlign::Start => 0.0,
+        TextAlign::Center => (node.rect.width - total) / 2.0,
+        TextAlign::End => node.rect.width - total,
+    };
+    for (width, run) in measured {
+        if point.x >= x && point.x < x + width {
+            return run.and_then(|run| run.href.clone());
+        }
+        x += width;
+    }
+    None
 }
 
 /// The absolute (surface-local) rect of `path`'s last node, `None` for an empty path.
@@ -111,6 +172,99 @@ mod tests {
             paint: None,
             children,
         }
+    }
+
+    // ---- link_under (ADR-0106) ----
+
+    fn styled_text(content: &str, runs: Vec<StyleRun>, align: TextAlign, width: f32) -> ResolvedNode {
+        let mut node = node("text", (0.0, 0.0, width, 60.0), Vec::new());
+        node.paint = Some(PaintStyle::Text {
+            content: content.to_string(),
+            runs,
+            font_size: 14.0,
+            color: crate::layout::node::Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+            align,
+            elide: crate::layout::node::Elide::None,
+            wrap: crate::layout::node::Wrap::None,
+            max_lines: None,
+        });
+        node
+    }
+
+    fn link(range: std::ops::Range<usize>, href: &str) -> StyleRun {
+        StyleRun { range, bold: false, italic: false, underline: true, color: None, href: Some(href.to_string()) }
+    }
+
+    fn width_of(shaping: &ShapingHandle, text: &str) -> f32 {
+        shaping
+            .shape(ShapeRequest {
+                text: text.to_string(),
+                font_size: 14.0,
+                line_height: shaping::line_height(14.0),
+                max_width: None,
+                runs: Vec::new(),
+            })
+            .width
+    }
+
+    #[test]
+    fn the_run_under_the_point_is_found_by_its_measured_width() {
+        let shaping = ShapingHandle::spawn();
+        let text = "see this page now";
+        let node = styled_text(text, vec![link(4..13, "https://a/")], TextAlign::Start, 300.0);
+        let before = width_of(&shaping, "see ");
+        let link_width = width_of(&shaping, "this page");
+        assert_eq!(link_under(&node, LogicalPoint { x: 2.0, y: 5.0 }, &shaping), None, "on 'see'");
+        assert_eq!(
+            link_under(&node, LogicalPoint { x: before + link_width / 2.0, y: 5.0 }, &shaping),
+            Some("https://a/".to_string())
+        );
+        assert_eq!(
+            link_under(&node, LogicalPoint { x: before + link_width + 4.0, y: 5.0 }, &shaping),
+            None,
+            "on 'now'"
+        );
+        assert_eq!(link_under(&node, LogicalPoint { x: 299.0, y: 5.0 }, &shaping), None, "past the end of the line");
+    }
+
+    #[test]
+    fn a_link_on_the_second_line_is_found_at_its_line_and_not_the_first() {
+        let shaping = ShapingHandle::spawn();
+        let text = "first line\nsee this";
+        let node = styled_text(text, vec![link(15..19, "https://b/")], TextAlign::Start, 300.0);
+        let x = width_of(&shaping, "see ") + width_of(&shaping, "this") / 2.0;
+        let step = shaping::line_height(14.0);
+        assert_eq!(link_under(&node, LogicalPoint { x, y: step / 2.0 }, &shaping), None, "first line, plain");
+        assert_eq!(link_under(&node, LogicalPoint { x, y: step * 1.5 }, &shaping), Some("https://b/".to_string()));
+        assert_eq!(link_under(&node, LogicalPoint { x, y: step * 2.5 }, &shaping), None, "below the last line");
+    }
+
+    /// Centred and right-aligned lines start where paint starts them, not at zero.
+    #[test]
+    fn alignment_moves_where_the_line_starts() {
+        let shaping = ShapingHandle::spawn();
+        let text = "go";
+        let node = styled_text(text, vec![link(0..2, "https://c/")], TextAlign::End, 200.0);
+        let w = width_of(&shaping, "go");
+        assert_eq!(link_under(&node, LogicalPoint { x: 1.0, y: 5.0 }, &shaping), None, "left edge is empty under End");
+        assert_eq!(
+            link_under(&node, LogicalPoint { x: 200.0 - w / 2.0, y: 5.0 }, &shaping),
+            Some("https://c/".to_string())
+        );
+    }
+
+    #[test]
+    fn a_text_with_no_href_anywhere_answers_nothing_without_measuring() {
+        let shaping = ShapingHandle::spawn();
+        let plain = styled_text("hello", Vec::new(), TextAlign::Start, 100.0);
+        assert_eq!(link_under(&plain, LogicalPoint { x: 3.0, y: 3.0 }, &shaping), None);
+        let bold_only = styled_text(
+            "hello",
+            vec![StyleRun { range: 0..5, bold: true, italic: false, underline: false, color: None, href: None }],
+            TextAlign::Start,
+            100.0,
+        );
+        assert_eq!(link_under(&bold_only, LogicalPoint { x: 3.0, y: 3.0 }, &shaping), None);
     }
 
     fn kinds(path: &[&ResolvedNode]) -> Vec<String> {

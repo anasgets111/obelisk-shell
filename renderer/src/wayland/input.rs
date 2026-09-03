@@ -36,6 +36,10 @@ fn wheel_delta(pixels: f64, steps: i32) -> f32 {
 pub(super) struct ArmedClick {
     instance_id: String,
     rect: LogicalRect,
+    /// The `href` under the press when it landed on a link inside a `text` (ADR-0106), so the
+    /// release must land on the same link and not merely the same node: a paragraph holding two
+    /// links is one rect.
+    link: Option<String>,
     /// The evdev code the press carried, so the release must be the same button, not merely a
     /// button (ADR-0050's second amendment). ponytail: one armed click, so chording drops both; a
     /// second press overwrites `armed`. Upgrade: key `armed` by button (an `ArrayVec` of three, or
@@ -76,12 +80,47 @@ fn clickable_button<'a>(path: &[&'a layout::ResolvedNode]) -> Option<(LogicalRec
         Some((layout::hit::absolute_rect(&path[..=depth])?, on_click))
     })
 }
+/// What a press or release lands on: the handler to call, the node's rect (the click's identity,
+/// see [`ArmedClick`]), and for a link the `href` the handler takes instead of the rect.
+#[derive(Clone)]
+struct Clickable {
+    rect: LogicalRect,
+    handler: Function,
+    link: Option<String>,
+}
+/// [`clickable_button`] with links ahead of it (ADR-0106): a `text` on the path that declares
+/// `on_link` and has a run with an `href` under `point` wins over every `button` above it, the
+/// same way a `textfield` press arms no click (ADR-0092 decision 7) -- a link inside a card whose
+/// whole face is the default action must open the page, not also take the card. A `text` with
+/// `on_link` whose plain words were pressed is transparent and the ancestor button fires, since a
+/// press on the body of a message is a press on the message.
+fn clickable(
+    path: &[&layout::ResolvedNode],
+    point: layout::hit::LogicalPoint,
+    shaping: &ShapingHandle,
+) -> Option<Clickable> {
+    let link = path.iter().enumerate().rev().find_map(|(depth, node)| {
+        if node.kind != "text" {
+            return None;
+        }
+        let Some(Value::Function(on_link)) = node.properties.get("on_link") else {
+            return None;
+        };
+        let rect = layout::hit::absolute_rect(&path[..=depth])?;
+        let local = layout::hit::LogicalPoint { x: point.x - rect.x, y: point.y - rect.y };
+        let href = layout::hit::link_under(node, local, shaping)?;
+        Some(Clickable { rect, handler: on_link.clone(), link: Some(href) })
+    });
+    link.or_else(|| {
+        clickable_button(path).map(|(rect, on_click)| Clickable { rect, handler: on_click.clone(), link: None })
+    })
+}
 /// Both answers one press wants out of decision 1's single traversal: the `button` that would fire,
 /// and the destination the innermost `textfield` addresses the next secret to. One struct, not two
 /// lookups: both come from one [`layout::hit::hit_path`] call, since walking twice risks a
 /// re-resolve between them giving two answers to one event.
 struct PointerHit {
-    button: Option<(LogicalRect, Function)>,
+    button: Option<Clickable>,
     field: Option<FieldTarget>,
 }
 /// What the innermost `textfield` under a press turns out to be (ADR-0092). The two kinds share
@@ -356,11 +395,16 @@ fn release_ends_press(armed: Option<&ArmedClick>, button: u32) -> bool {
 fn release_completes_click(
     armed: Option<&ArmedClick>,
     instance_id: &str,
-    released_on: Option<LogicalRect>,
+    released_on: Option<(LogicalRect, Option<&str>)>,
     button: u32,
 ) -> bool {
     match (armed, released_on) {
-        (Some(armed), Some(rect)) => armed.instance_id == instance_id && armed.rect == rect && armed.button == button,
+        (Some(armed), Some((rect, link))) => {
+            armed.instance_id == instance_id
+                && armed.rect == rect
+                && armed.link.as_deref() == link
+                && armed.button == button
+        }
         _ => false,
     }
 }
@@ -746,10 +790,7 @@ impl App {
         };
         let point = layout::hit::LogicalPoint { x: position.0 as f32, y: position.1 as f32 };
         let path = layout::hit::hit_path(&tree, point);
-        PointerHit {
-            button: clickable_button(&path).map(|(rect, on_click)| (rect, on_click.clone())),
-            field: focused_field(&path),
-        }
+        PointerHit { button: clickable(&path, point, &self.shaping), field: focused_field(&path) }
     }
 
     /// One notch or one swipe, applied to the innermost scrollable container under the pointer.
@@ -1038,9 +1079,10 @@ impl PointerHandler for App {
                     // clicking into a text field inside a clickable row is not a click on the row.
                     // The notification card is the case: its whole surface activates the sender's
                     // default action, and its reply box sits inside that.
-                    self.armed = hit.button.filter(|_| !focused_a_field).map(|(rect, _)| ArmedClick {
+                    self.armed = hit.button.filter(|_| !focused_a_field).map(|clickable| ArmedClick {
                         instance_id,
-                        rect,
+                        rect: clickable.rect,
+                        link: clickable.link,
                         button,
                     });
                 }
@@ -1060,7 +1102,7 @@ impl PointerHandler for App {
                     let fires = release_completes_click(
                         self.armed.as_ref(),
                         &instance_id,
-                        hit.as_ref().map(|(rect, _)| *rect),
+                        hit.as_ref().map(|clickable| (clickable.rect, clickable.link.as_deref())),
                         button,
                     );
                     // Before the call, so a handler that re-enters here cannot find its own press
@@ -1068,8 +1110,17 @@ impl PointerHandler for App {
                     if release_ends_press(self.armed.as_ref(), button) {
                         self.armed = None;
                     }
-                    if let Some((rect, on_click)) = hit.filter(|_| fires) {
-                        self.fire_on_click(&instance_id, rect, name, &on_click);
+                    if let Some(clickable) = hit.filter(|_| fires) {
+                        match clickable.link {
+                            // A link takes the `href` and nothing else: the rect is the paragraph's
+                            // and says nothing about which link, and a link is not a mouse button.
+                            Some(href) => {
+                                if let Err(e) = clickable.handler.call::<()>(href) {
+                                    eprintln!("[oblisk-renderer] {instance_id}: on_link raised, ignoring it: {e}");
+                                }
+                            }
+                            None => self.fire_on_click(&instance_id, clickable.rect, name, &clickable.handler),
+                        }
                     }
                 }
                 // The pointer left the surface, so the release (if it ever comes) lands somewhere
@@ -1374,17 +1425,17 @@ mod tests {
     fn a_release_fires_only_over_the_same_surface_and_the_same_rect_the_press_armed() {
         let rect = LogicalRect { x: 10.0, y: 4.0, width: 40.0, height: 24.0 };
         let moved = LogicalRect { x: 11.0, y: 4.0, width: 40.0, height: 24.0 };
-        let armed = ArmedClick { instance_id: "bar@eDP-1".to_string(), rect, button: BTN_LEFT };
+        let armed = ArmedClick { instance_id: "bar@eDP-1".to_string(), rect, link: None, button: BTN_LEFT };
 
-        assert!(release_completes_click(Some(&armed), "bar@eDP-1", Some(rect), BTN_LEFT));
+        assert!(release_completes_click(Some(&armed), "bar@eDP-1", Some((rect, None)), BTN_LEFT));
         // Dragged off the button, then released: the release hits no button at all.
         assert!(!release_completes_click(Some(&armed), "bar@eDP-1", None, BTN_LEFT));
         // Dragged onto a different button on the same surface.
-        assert!(!release_completes_click(Some(&armed), "bar@eDP-1", Some(moved), BTN_LEFT));
+        assert!(!release_completes_click(Some(&armed), "bar@eDP-1", Some((moved, None)), BTN_LEFT));
         // Same button geometry, different surface -- two panels can resolve identical rects.
-        assert!(!release_completes_click(Some(&armed), "notification_area@eDP-1", Some(rect), BTN_LEFT));
+        assert!(!release_completes_click(Some(&armed), "notification_area@eDP-1", Some((rect, None)), BTN_LEFT));
         // A release with nothing armed (a press that hit no button, or a `leave` in between).
-        assert!(!release_completes_click(None, "bar@eDP-1", Some(rect), BTN_LEFT));
+        assert!(!release_completes_click(None, "bar@eDP-1", Some((rect, None)), BTN_LEFT));
     }
 
     #[test]
@@ -1405,7 +1456,7 @@ mod tests {
         // on one node. If the left release clears the slot, the right press is thrown away with
         // it and the right click never fires despite being a complete pair.
         let rect = LogicalRect { x: 10.0, y: 4.0, width: 40.0, height: 24.0 };
-        let armed = ArmedClick { instance_id: "bar@eDP-1".to_string(), rect, button: BTN_RIGHT };
+        let armed = ArmedClick { instance_id: "bar@eDP-1".to_string(), rect, link: None, button: BTN_RIGHT };
 
         assert!(release_ends_press(Some(&armed), BTN_RIGHT));
         assert!(!release_ends_press(Some(&armed), BTN_LEFT));
@@ -1420,11 +1471,11 @@ mod tests {
         // neither completed. A mouse can hold more than one button down at a time, so this is a
         // real sequence rather than a hypothetical one.
         let rect = LogicalRect { x: 10.0, y: 4.0, width: 40.0, height: 24.0 };
-        let armed = ArmedClick { instance_id: "bar@eDP-1".to_string(), rect, button: BTN_RIGHT };
+        let armed = ArmedClick { instance_id: "bar@eDP-1".to_string(), rect, link: None, button: BTN_RIGHT };
 
-        assert!(release_completes_click(Some(&armed), "bar@eDP-1", Some(rect), BTN_RIGHT));
-        assert!(!release_completes_click(Some(&armed), "bar@eDP-1", Some(rect), BTN_LEFT));
-        assert!(!release_completes_click(Some(&armed), "bar@eDP-1", Some(rect), BTN_MIDDLE));
+        assert!(release_completes_click(Some(&armed), "bar@eDP-1", Some((rect, None)), BTN_RIGHT));
+        assert!(!release_completes_click(Some(&armed), "bar@eDP-1", Some((rect, None)), BTN_LEFT));
+        assert!(!release_completes_click(Some(&armed), "bar@eDP-1", Some((rect, None)), BTN_MIDDLE));
     }
 
     /// One `secure_submit` destination, as the parsers hand it back.
@@ -1818,6 +1869,22 @@ mod tests {
     }
 
     // ---- edit_plain_buffer (ADR-0102) ----
+
+    /// A paragraph holding two links is one rect (ADR-0106): pressing one and releasing over the
+    /// other is not a click on either, and a release on the plain words is not a click on the link.
+    #[test]
+    fn a_link_click_completes_only_on_the_same_link() {
+        let rect = LogicalRect { x: 10.0, y: 4.0, width: 200.0, height: 40.0 };
+        let armed = ArmedClick {
+            instance_id: "bar@eDP-1".to_string(),
+            rect,
+            link: Some("https://a/".to_string()),
+            button: BTN_LEFT,
+        };
+        assert!(release_completes_click(Some(&armed), "bar@eDP-1", Some((rect, Some("https://a/"))), BTN_LEFT));
+        assert!(!release_completes_click(Some(&armed), "bar@eDP-1", Some((rect, Some("https://b/"))), BTN_LEFT));
+        assert!(!release_completes_click(Some(&armed), "bar@eDP-1", Some((rect, None)), BTN_LEFT));
+    }
 
     #[test]
     fn escape_on_a_plain_field_without_on_cancel_clears_and_keeps_the_focus() {

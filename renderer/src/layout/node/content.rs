@@ -25,6 +25,34 @@ pub struct StyleRun {
     pub italic: bool,
     pub underline: bool,
     pub color: Option<Rgba>,
+    /// What a press on this run hands the node's `on_link` (ADR-0106). Carried, never opened: the
+    /// engine knows which run was pressed and nothing about URLs.
+    pub href: Option<String>,
+}
+
+/// One line of `text` cut at the points where its style changes: each piece is a byte range of
+/// the line and the run it falls in, or `None` for a plain stretch. What paint draws piece by piece
+/// and what a press walks to find the run under it (ADR-0104, ADR-0106). Pure, so the split -- the
+/// part of a styled draw that can go wrong quietly -- is tested without a GL context.
+pub fn segments(line: Range<usize>, runs: &[StyleRun]) -> Vec<(Range<usize>, Option<&StyleRun>)> {
+    let mut pieces = Vec::new();
+    let mut cursor = line.start;
+    for run in runs {
+        let start = run.range.start.max(line.start);
+        let end = run.range.end.min(line.end);
+        if start >= end {
+            continue;
+        }
+        if start > cursor {
+            pieces.push((cursor..start, None));
+        }
+        pieces.push((start..end, Some(run)));
+        cursor = end;
+    }
+    if cursor < line.end || pieces.is_empty() {
+        pieces.push((cursor..line.end, None));
+    }
+    pieces
 }
 
 /// The half of `runs` the shaper needs -- the ones in another face -- in the shape it takes. An
@@ -38,11 +66,11 @@ pub fn font_runs(runs: &[StyleRun]) -> Vec<FontRun> {
 }
 
 /// `text.content`: one string, or an array of runs `{ text = ..., bold = ..., italic = ...,
-/// underline = ..., color = ... }` whose texts are joined into the string this returns and whose
-/// styles become the [`StyleRun`]s beside it (ADR-0104). The run shape is a notification body
-/// span's own (§ 2.7), minus `kind` and `href`, so a body's text spans can be handed over as they
-/// arrive; an image span has no `text` and is refused, since a picture inside a line of text is
-/// not something this node draws -- the caller filters those out.
+/// underline = ..., color = ..., href = ... }` whose texts are joined into the string this returns
+/// and whose styles become the [`StyleRun`]s beside it (ADR-0104). The run shape is a notification
+/// body span's own (§ 2.7) minus `kind`, so a body's text spans can be handed over as they arrive;
+/// an image span has no `text` and is refused, since a picture inside a line of text is not
+/// something this node draws -- the caller filters those out.
 ///
 /// Absent `content` defaults to the empty string (ADR-0044 decision 1's nil rule): a `text` bound
 /// to a not-yet-pushed capability signal reads `nil` until its first `StateSnapshot`, and
@@ -110,13 +138,24 @@ fn parse_runs(runs: &mlua::Table) -> Result<(String, Vec<StyleRun>), LayoutError
             }
             Err(e) => return Err(invalid("content", format!("run {index}: {e}"))),
         };
+        let href = match run.get::<Value>("href") {
+            Ok(Value::Nil) => None,
+            Ok(Value::String(s)) => Some(checked_string("content", &s)?).filter(|href| !href.is_empty()),
+            Ok(other) => {
+                return Err(invalid(
+                    "content",
+                    format!("run {index}: expected `href` to be a string, got {}", preview_for_error(&other)),
+                ));
+            }
+            Err(e) => return Err(invalid("content", format!("run {index}: {e}"))),
+        };
         if text.is_empty() {
             continue;
         }
         let start = content.len();
         content.push_str(&text);
-        if bold || italic || underline || color.is_some() {
-            styles.push(StyleRun { range: start..content.len(), bold, italic, underline, color });
+        if bold || italic || underline || color.is_some() || href.is_some() {
+            styles.push(StyleRun { range: start..content.len(), bold, italic, underline, color, href });
         }
     }
     Ok((content, styles))
@@ -512,11 +551,66 @@ mod tests {
     }
 
     #[test]
+    fn a_run_with_an_href_is_a_styled_run_even_with_no_other_style() {
+        let lua = lua();
+        let (content, runs) =
+            runs_content(&lua, r#"{ { text = "see " }, { text = "this", href = "https://x.example/" } }"#).unwrap();
+        assert_eq!(content, "see this");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].href.as_deref(), Some("https://x.example/"));
+        assert_eq!(runs[0].range, 4..8);
+        let (_, none) = runs_content(&lua, r#"{ { text = "a", href = "" } }"#).unwrap();
+        assert!(none.is_empty(), "an empty href is no href");
+    }
+
+    fn run(range: Range<usize>) -> StyleRun {
+        StyleRun { range, bold: true, italic: false, underline: false, color: None, href: None }
+    }
+
+    // ---- segments (ADR-0104) ----
+
+    #[test]
+    fn a_line_with_no_run_in_it_is_one_plain_piece() {
+        let pieces = segments(0..5, &[]);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].0, 0..5);
+        assert!(pieces[0].1.is_none());
+        // A run entirely on another line leaves this one plain too.
+        assert_eq!(segments(0..5, &[run(6..9)]).len(), 1);
+    }
+
+    #[test]
+    fn a_run_inside_a_line_splits_it_into_plain_styled_plain() {
+        let runs = [run(2..4)];
+        let pieces: Vec<(Range<usize>, bool)> =
+            segments(0..6, &runs).into_iter().map(|(r, s)| (r, s.is_some())).collect();
+        assert_eq!(pieces, vec![(0..2, false), (2..4, true), (4..6, false)]);
+    }
+
+    /// A wrap can break a run across lines: the second line's slice of it starts at the line, not
+    /// at the run, and a run ending exactly at a line's end leaves no empty plain tail.
+    #[test]
+    fn a_run_crossing_a_line_boundary_is_clipped_to_the_line_on_each_side() {
+        let runs = [run(3..9)];
+        let first: Vec<_> = segments(0..5, &runs).into_iter().map(|(r, s)| (r, s.is_some())).collect();
+        assert_eq!(first, vec![(0..3, false), (3..5, true)]);
+        let second: Vec<_> = segments(6..10, &runs).into_iter().map(|(r, s)| (r, s.is_some())).collect();
+        assert_eq!(second, vec![(6..9, true), (9..10, false)]);
+    }
+
+    #[test]
+    fn adjacent_runs_touch_with_no_plain_piece_between_them() {
+        let runs = [run(0..2), run(2..4)];
+        let pieces: Vec<_> = segments(0..4, &runs).into_iter().map(|(r, s)| (r, s.is_some())).collect();
+        assert_eq!(pieces, vec![(0..2, true), (2..4, true)]);
+    }
+
+    #[test]
     fn font_runs_keep_only_the_runs_the_shaper_can_see() {
         let runs = vec![
-            StyleRun { range: 0..2, bold: false, italic: false, underline: true, color: None },
-            StyleRun { range: 2..4, bold: true, italic: false, underline: false, color: None },
-            StyleRun { range: 4..6, bold: false, italic: true, underline: true, color: None },
+            StyleRun { range: 0..2, bold: false, italic: false, underline: true, color: None, href: None },
+            StyleRun { range: 2..4, bold: true, italic: false, underline: false, color: None, href: None },
+            StyleRun { range: 4..6, bold: false, italic: true, underline: true, color: None, href: None },
         ];
         let fonts = font_runs(&runs);
         assert_eq!(fonts.len(), 2);

@@ -33,6 +33,7 @@ use style::{parse_background, parse_border_color, parse_border_width, parse_clip
 
 pub use content::{
     Elide, StyleRun, TextAlign, Wrap, font_runs, parse_content, parse_icon_size, parse_node_id, parse_surface_id,
+    segments,
 };
 pub use paint_style::{PaintStyle, paint_style};
 pub use spec::{
