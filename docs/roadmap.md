@@ -21,6 +21,7 @@ twenty binaries, and renders a 256-bar audio spectrum through a GLSL fragment sh
 | Capabilities, write | near complete | ahead in one place: that config reads the power profile, `power:set_profile` sets it |
 | Surface roles | complete | `panel` on four layers, `window`, `popup`, `lock`, all live-tested |
 | Pointer input | three of four events | click, hover and scroll are built; nothing reports the pointer's own shape |
+| Pointer input, acting on it | click only | `on_click` is the only pointer callback. `hover(name)` is a read-only signal and a `computed` may not have side effects (ADR-0021), so a config can *draw* differently on hover but cannot *do* anything -- no capability call, no `state` write. Found while building ADR-0094's expiry hold, whose reading-a-card half needs exactly this. |
 | Paint vocabulary | five operations | fill, radius, per-edge border, blit, rounded clip |
 | Animation | absent | Lua's fastest clock is `system.time` at 1 Hz |
 | Text and layout | sufficient | shaping, clipping, alignment, keyed reconciliation |
