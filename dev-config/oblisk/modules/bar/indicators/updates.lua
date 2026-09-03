@@ -17,23 +17,20 @@
 -- meaning is "no action available" is a control that never does anything, and it had the guard
 -- below to prove it: the idle click was already a no-op. Now it is a no-op with no pixels.
 --
--- A readout, not a button, which is `nil` where `icon_button` takes an `on_activate` (that returns a
--- `row` rather than a `button`, so there is no click to land). This *was* a button that invoked
--- `install` -- and the day the module was first switched on, one click on it launched a real
--- `pkexec pacman -Syu`. It got no further than "Error creating textual authentication agent", so
--- nothing was upgraded, but nothing about that was by design.
+-- The click opens the panel and nothing else. It briefly invoked `install` directly, and the day the
+-- module was first switched on, one click launched a real `pkexec pacman -Syu` -- it got no further
+-- than "Error creating textual authentication agent", so nothing was upgraded, but nothing about
+-- that was by design either. `ArchChecker.qml` never installs from the bar for the same reason:
+-- installing is a decision made in front of the package list, which is what the panel is.
 --
--- `ArchChecker.qml` never installs from the bar. A left click with nothing pending re-checks; a left
--- click with something pending, or a right click, opens `UpdatePanel.qml` -- the package list, the
--- download size, the last-check time, and an "Update" button under all of it. Installing is a
--- decision made in front of the list, which is the whole reason the panel exists.
---
--- Neither half is reachable from here yet. There is no `check` action to re-poll with (the
--- capability has `configure` and `install`, ADR-0034), and no panel to open. Until the panel exists,
--- a badge that says how many is the honest amount of this module.
+-- The mirror also re-checks on a click when nothing is pending. That needs the button to be there
+-- when nothing is pending, and this one is not (see above), so the re-check lives in the panel
+-- header where there is room to say what it does.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local icon_button = require("components.icon_button")
+local ui_state = require("lib.ui_state")
+local update_panel = require("modules.bar.panels.update_panel")
 
 -- Nothing checks for updates until a config names an interval (ADR-0034), so without this line the
 -- capability starts, stays dormant, and the indicator below is invisible forever -- `state_of` reads
@@ -73,9 +70,12 @@ return icon_button(status:map(function(s)
         return icons.updates
     end
     return icons.up_to_date
-end), nil, {
-    -- No `slot`, and so no hover ground: `icon_button` lights one up from the same option, and a
-    -- readout that brightens under the pointer and then does nothing is a button that is lying.
+end), function(rect)
+    ui_state.toggle_panel(update_panel.kind, rect)
+end, {
+    slot = "updates",
+    -- The accent ring every other indicator wears while its own panel is the one on screen.
+    selected = ui_state.panel_showing(update_panel.kind),
     visible = status:map(function(s)
         return s ~= "idle"
     end),

@@ -30,44 +30,7 @@ local icons = require("config.icons")
 local util = require("lib.util")
 local cell = require("components.cell")
 local icon_button = require("components.icon_button")
-
--- A labelled button rather than a glyph circle, which is what `icon_button` gives and what an
--- action is not: `["archive"] = "Archive"` is a word the sender chose and the whole point is that
--- the user reads it before pressing it. Local rather than a component, on this repo's own bar --
--- one call site is a local, two in agreement are a component.
---
--- `icon_name` is the theme icon a sender that set `action-icons` named through the key (ADR-0090),
--- drawn beside the label, or alone when the sender sent no label -- a media notification's
--- prev/play/next is three glyphs, not three words.
-local function action_button(label, on_activate, slot, icon_name)
-    local hovered = hover(slot)
-    local children = {}
-    if icon_name then
-        children[#children + 1] = icon { name = icon_name, size = theme.icon.sm, align_v = "Center" }
-    end
-    if label and label ~= "" then
-        children[#children + 1] = cell(label, theme.FG, theme.font.sm, { align = "Center", align_v = "Center" })
-    end
-    return button {
-        height = theme.control.md,
-        align_v = "Center",
-        radius = theme.radius.md,
-        hover = hovered,
-        background = hovered:map(function(is_hovered)
-            return is_hovered and theme.ACCENT_LIGHT or theme.ACCENT_SUBTLE
-        end),
-        border_width = theme.border_width,
-        border_color = theme.ACCENT_MEDIUM,
-        padding = { left = theme.spacing.md, right = theme.spacing.md },
-        on_click = function(_, mouse_button)
-            if mouse_button == "left" then
-                on_activate()
-            end
-        end,
-        -- A `button` stacks its children; the row is what puts a glyph beside a word.
-        children = { row { height = "Fill", align_v = "Center", spacing = theme.spacing.xs, children = children } },
-    }
-end
+local action_button = require("components.action_button")
 
 -- The card's border by urgency, the mirror's `_urgencyConfig` colours at its border opacity: a
 -- low-priority card fades into the glass, a normal one carries the accent, a critical one is red.
@@ -246,7 +209,7 @@ local function message(notification, ui, opts)
     for index, action in ipairs(notification.actions or {}) do
         buttons[#buttons + 1] = action_button(action.label, function()
             oblisk.notifications:invoke("invoke_action", id, action.key)
-        end, string.format("notification-action-%d-%d", id, index), action.icon_name)
+        end, string.format("notification-action-%d-%d", id, index), { icon = action.icon_name })
     end
     -- One button per distinct link in the body, opened by the desktop's own handler
     -- (`applications:open_url`, ADR-0103). The underlined words open it too (ADR-0106); the button

@@ -51,8 +51,9 @@ local network_panel = require("modules.bar.panels.network_panel")
 local bluetooth_panel = require("modules.bar.panels.bluetooth_panel")
 local calendar_panel = require("modules.bar.panels.minimal_calendar")
 local notification_history = require("modules.bar.panels.notification_history")
+local update_panel = require("modules.bar.panels.update_panel")
 
-local panels = { power_menu, network_panel, bluetooth_panel, calendar_panel, notification_history }
+local panels = { power_menu, network_panel, bluetooth_panel, calendar_panel, notification_history, update_panel }
 
 -- Every panel's body is built and handed to the card; only the one whose `kind` matches is
 -- visible. An invisible child contributes nothing to its parent's size (`resolve_sizes` in
@@ -74,10 +75,16 @@ for _, panel in ipairs(panels) do
     table.insert(sections, panel_section(panel))
 end
 
--- One width for every panel but the notification history, which is a column of cards and gets the
--- mirror's wider `notificationPanelWidth`.
-local card_width = ui_state.panel_showing(notification_history.kind):map(function(showing)
-    return showing and theme.notification_panel_width or theme.panel_width
+-- One width for every panel but the two that carry a list of rows rather than a column of controls:
+-- the notification history gets the mirror's wider `notificationPanelWidth`, and the update panel
+-- gets its own, because a package row is a name and two version strings.
+local PANEL_WIDTHS = {
+    [notification_history.kind] = theme.notification_panel_width,
+    [update_panel.kind] = theme.update_panel_width,
+}
+
+local card_width = ui_state.panel_kind:map(function(kind)
+    return PANEL_WIDTHS[kind] or theme.panel_width
 end)
 
 -- Where the card sits, which an `xdg_popup` got from `anchor_rect` plus `gravity` and a layer

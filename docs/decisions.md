@@ -5330,3 +5330,22 @@ things fell out of switching it on.
     a design decision about purity rather than a field to add, so it is not taken here. `write_state`
     is useful today for what is already input-driven -- a launcher's frecency counter is written on a
     click, which is exactly the shape that works.
+
+15. **The panel, and what it proved about the split.** `modules/bar/panels/update_panel.lua` is the
+    sixth panel in the host and is entirely wording, formatting and thresholds over facts the
+    capability publishes unchanged. The mirror's `_detectErrorMessage` is a table of eight phrases
+    matched against `install_log`; its `_failureCount >= 5` is one comparison; `dismissResult()` is a
+    Lua `state()`; the install duration is `install_finished_at` minus a start the *click* stamped,
+    which is the one moment a config is allowed to write anything at all (ADR-0044). None of that
+    needed a line of Rust, and none of it should have had one.
+
+    Two things the mirror has are absent rather than faked: a spinner, because nothing animates
+    without a per-frame property (ADR-0021), and a copy-the-log button, because there is no
+    clipboard primitive. The bar badge opens the panel and the panel header re-checks, which is
+    `ArchChecker.qml`'s split minus its click-to-recheck -- that one needs the button to exist while
+    nothing is pending, and this bar hides it (decision 12).
+
+    `components/action_button.lua` came out of `notification_card.lua`, whose own comment said one
+    call site is a local and two in agreement are a component. The second caller agreed about all of
+    it but the ground, so the component took one option: an action being offered is accent, and a
+    "close" that tidies away a result already read is quiet.

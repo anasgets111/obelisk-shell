@@ -340,6 +340,13 @@ theme.panel_list_height   = s(280, 210)
 -- most of the way down the screen before it scrolls, as the mirror's `maxAvailableHeight` lets it.
 theme.notification_panel_width = s(420, 340)
 theme.notification_list_height = s(640, 480)
+-- Wider than a bar panel and narrower than the notification one: a package row is a name and two
+-- versions, and 340px puts `ca-certificates-mozilla` and `3.128-1 -> 3.129-1` on top of each other.
+theme.update_panel_width = s(460, 360)
+theme.update_list_height = s(360, 260)
+-- Shorter than the package list on purpose. The log is where a failure explains itself, not
+-- something to read end to end; the last dozen lines are the ones that matter.
+theme.update_log_height = s(200, 150)
 -- `panelToggleCardHeight`: the tile a radio switch is drawn as, tall enough for a glyph over a word.
 theme.panel_toggle_height = s(56, 44)
 -- `PanelEmptyState`'s `Layout.minimumHeight`: an empty list still holds a glyph and a line, at a
