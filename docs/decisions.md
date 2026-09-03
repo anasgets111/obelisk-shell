@@ -5282,3 +5282,28 @@ things fell out of switching it on.
     `nil` where `icon_button` takes an `on_activate` returns a `row` instead of a `button`, so there
     is no click to land at all, and the `slot` goes with it -- a readout that lights up under the
     pointer is a button that is lying. The badge says how many; installing waits for the panel.
+
+13. **`check`, and the facts a panel needs.** Wiring the module up (decisions 11-12) left it with no
+    way to ask a question and no way to describe an answer, so: `updates:check()` runs one check
+    now, answered under a schedule *and* while dormant -- a config wanting the button and never the
+    timer is a shape to allow, not to work around. It is refused while a check is running, the way
+    `install` refuses a second transaction, and the ticker arm and the manual arm now share one
+    `run_one_check` that raises `checking` with a push before the sync and lowers it with another
+    after, because a "checking" that is only visible afterwards is not visible at all.
+
+    `install_error` used to be `"pkexec pacman exited with exit status: 1"`, which is the engine
+    writing English into a config-facing field: unreadable to a user, unrewordable by a config,
+    untranslatable. It is now two facts. `install_exit_code` is what pacman answered.
+    `install_log` is the last 200 lines of both streams, which is where pacman says *why*.
+    `install_error` keeps only the case where the Supervisor never got an answer at all -- it could
+    not spawn `pkexec`, or could not wait on it. The mirror's `_detectErrorMessage`, which maps
+    those lines to "Network error" / "Insufficient disk space" / "Authentication failed", is
+    wording, and stays in the config where it can be changed and translated.
+
+    The same line puts `consecutive_check_failures` here as a count and leaves "warn after five" in
+    the config; leaves "completed until dismissed" to a Lua `state()` rather than the service, which
+    is where `UpdateService.qml` keeps `dismissResult()` only because QML has no seam there; and
+    keeps `pkexec pacman -Syu` fixed rather than taking a command from the config, because the
+    capability owns what is privileged and `process.run` already owns what is not. The log push
+    rides the progress lines rather than every line: one `Changed` re-resolves every surface in the
+    generation, and pacman writes a download meter.

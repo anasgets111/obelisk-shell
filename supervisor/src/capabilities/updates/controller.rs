@@ -33,8 +33,15 @@ pub struct UpdatesState {
     /// throwaway copy of the pacman database, so this is a network or parse failure, never a
     /// half-applied change to the system.
     pub check_error: Option<String>,
-    /// An install is running. The four `install_*` fields below only mean anything while this is
-    /// true; `updates:install` refuses a second one.
+    /// A check is running right now. Rises before the sync starts and falls when the result is
+    /// written, with a push at both edges, so a config can draw a spinner and disable its own
+    /// refresh control. `updates:check` refuses a second one while this is true.
+    pub checking: bool,
+    /// How many checks in a row have failed, reset to `0` by the first success. The count only:
+    /// "warn after five" is a threshold somebody has an opinion about, so it lives in the config.
+    pub consecutive_check_failures: u32,
+    /// An install is running. The `install_*` fields above only describe a run that has started;
+    /// `updates:install` refuses a second one while this is true.
     pub installing: bool,
     /// Which package of the transaction pacman is on, its own 1-based `(2/5)` counter.
     /// `0` before the first line is parsed.
@@ -46,8 +53,23 @@ pub struct UpdatesState {
     /// The package name from the step line pacman is on. Empty string before the first one, not
     /// `nil`, because a name is always a string once the transaction is under way.
     pub install_current_package: String,
-    /// Why the last install failed, or `nil`. Unlike a check, this one ran as root against the
-    /// real database, so a failure here can leave packages partly upgraded.
+    /// What `pacman` itself answered on the last install: `0` for success, its own code for a
+    /// failure, `nil` if none has finished this session. The code and [`UpdatesState::install_log`]
+    /// are the two facts about a failure; what to *call* it -- a network error, a disk-space error,
+    /// a signature error -- is wording, and wording belongs in the config (ADR-0113 amendment).
+    pub install_exit_code: Option<i32>,
+    /// Unix seconds when the last install stopped, however it stopped. With an install's start held
+    /// by whatever asked for it, this is what a duration is measured against.
+    pub install_finished_at: Option<i64>,
+    /// The tail of the last install's output, newest last, both streams interleaved in arrival
+    /// order (they are read by two tasks, so the interleaving between them is not exact). Capped at
+    /// the last 200: a long upgrade writes thousands of lines and this is a payload pushed over a
+    /// socket, not a file. Cleared when an install starts.
+    pub install_log: Vec<String>,
+    /// Why the Supervisor never got an answer from `pacman` at all -- it could not spawn `pkexec`,
+    /// or could not wait on it. Distinct from [`UpdatesState::install_exit_code`], which is the
+    /// answer: this one means the question was never asked, and it is the Supervisor's own failure
+    /// rather than the package manager's.
     pub install_error: Option<String>,
     /// A `linux` or `linux-*` package was installed at some point this session. Sticky on purpose:
     /// once set it stays set through later installs that do not touch the kernel, because the
@@ -66,6 +88,11 @@ pub fn parse_configure_args(arguments: &[serde_json::Value]) -> Option<u64> {
     arguments.first()?.as_object()?.get("interval")?.as_u64()
 }
 
+/// How many lines of [`UpdatesState::install_log`] survive. Enough to hold a failure and the lines
+/// around it -- a config wanting the whole run of a 2,000-package upgrade wants a file, not a state
+/// payload that is re-serialized and pushed on every progress line.
+const LOG_TAIL_LINES: usize = 200;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PollMode {
     Dormant,
@@ -82,6 +109,9 @@ fn poll_mode(interval: Duration) -> PollMode {
 pub struct UpdatesController {
     state: Arc<Mutex<UpdatesState>>,
     interval_tx: watch::Sender<Duration>,
+    /// `updates:check`'s nudge to the scheduler. Capacity one and `try_send`, so a burst of
+    /// requests collapses into the single check they were all asking for.
+    check_now_tx: tokio::sync::mpsc::Sender<()>,
     events: UnboundedSender<UpdatesSignal>,
 }
 
@@ -92,13 +122,39 @@ impl UpdatesController {
     pub fn new(pacman_conf_path: PathBuf, pacman_db_root: PathBuf, events: UnboundedSender<UpdatesSignal>) -> Self {
         let state = Arc::new(Mutex::new(UpdatesState::default()));
         let (interval_tx, interval_rx) = watch::channel(Duration::ZERO);
-        tokio::spawn(run_check_task(pacman_conf_path, pacman_db_root, interval_rx, Arc::clone(&state), events.clone()));
-        Self { state, interval_tx, events }
+        let (check_now_tx, check_now_rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(run_check_task(
+            pacman_conf_path,
+            pacman_db_root,
+            interval_rx,
+            check_now_rx,
+            Arc::clone(&state),
+            events.clone(),
+        ));
+        Self { state, interval_tx, check_now_tx, events }
     }
 
     pub fn configure(&self, interval_secs: u64) {
         if self.interval_tx.send(Duration::from_secs(interval_secs)).is_err() {
             eprintln!("updates: configure called but the check task is gone; ignored");
+        }
+    }
+
+    /// `updates:check()`. Runs one check now, whatever the schedule says -- including when there is
+    /// no schedule at all, since a config may want the button and never the timer.
+    ///
+    /// Refused while a check is already running, the way [`UpdatesController::install`] refuses a
+    /// second transaction: the answer in flight is the answer being asked for, and a click during a
+    /// sync should not queue a second sync behind it.
+    pub fn check_now(&self) {
+        if self.state.lock().unwrap().checking {
+            eprintln!("updates: check() called while a check is already running; ignored");
+            return;
+        }
+        if self.check_now_tx.try_send(()).is_err() {
+            eprintln!(
+                "updates: check() could not be queued (one is already pending, or the check task is gone); ignored"
+            );
         }
     }
 
@@ -120,6 +176,9 @@ impl UpdatesController {
             guard.install_total_steps = 0;
             guard.install_current_package = String::new();
             guard.install_error = None;
+            guard.install_exit_code = None;
+            guard.install_finished_at = None;
+            guard.install_log.clear();
         }
         let _ = self.events.send(UpdatesSignal::Changed);
         run_install(Arc::clone(&self.state), self.events.clone()).await;
@@ -182,6 +241,7 @@ async fn run_check_task(
     pacman_conf_path: PathBuf,
     pacman_db_root: PathBuf,
     mut interval_rx: watch::Receiver<Duration>,
+    mut check_now_rx: tokio::sync::mpsc::Receiver<()>,
     state: Arc<Mutex<UpdatesState>>,
     events: UnboundedSender<UpdatesSignal>,
 ) {
@@ -189,8 +249,20 @@ async fn run_check_task(
         let interval = *interval_rx.borrow_and_update();
         match poll_mode(interval) {
             PollMode::Dormant => {
-                if interval_rx.changed().await.is_err() {
-                    return;
+                // `check_now` is answered here too, not only under a schedule: a config that never
+                // names an interval and only ever checks on a click is a shape this should allow.
+                tokio::select! {
+                    changed = interval_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    asked = check_now_rx.recv() => {
+                        if asked.is_none() {
+                            return;
+                        }
+                        run_one_check(&pacman_conf_path, &pacman_db_root, &state, &events).await;
+                    }
                 }
             }
             PollMode::Ticking(duration) => {
@@ -212,22 +284,13 @@ async fn run_check_task(
                 loop {
                     tokio::select! {
                         _ = ticker.tick() => {
-                            let conf_path = pacman_conf_path.clone();
-                            let db_root = pacman_db_root.clone();
-                            let result = tokio::task::spawn_blocking(move || check_against_a_throwaway_copy(&conf_path, &db_root)).await;
-                            let mut guard = state.lock().unwrap();
-                            match result {
-                                Ok(Ok(candidates)) => {
-                                    guard.count = candidates.len() as u32;
-                                    guard.packages = candidates;
-                                    guard.last_successful_check = Some(now_unix());
-                                    guard.check_error = None;
-                                }
-                                Ok(Err(err)) => guard.check_error = Some(err),
-                                Err(join_err) => guard.check_error = Some(format!("check task panicked: {join_err}")),
+                            run_one_check(&pacman_conf_path, &pacman_db_root, &state, &events).await;
+                        }
+                        asked = check_now_rx.recv() => {
+                            if asked.is_none() {
+                                return;
                             }
-                            drop(guard);
-                            let _ = events.send(UpdatesSignal::Changed);
+                            run_one_check(&pacman_conf_path, &pacman_db_root, &state, &events).await;
                         }
                         changed = interval_rx.changed() => {
                             if changed.is_err() {
@@ -240,6 +303,49 @@ async fn run_check_task(
             }
         }
     }
+}
+
+/// One check, from wherever it was asked for: the schedule's tick, or `updates:check`. Raises
+/// `checking` with a push before the sync so a config can say so, and lowers it with another once
+/// the answer is written -- two pushes, because "checking" that is only visible after the fact is
+/// not visible at all.
+///
+/// A failed check leaves `count`/`packages` on the last good answer (§ 2.14) and only writes
+/// `check_error`, so a mirror hiccup does not blank a list the user is reading.
+async fn run_one_check(
+    pacman_conf_path: &Path,
+    pacman_db_root: &Path,
+    state: &Arc<Mutex<UpdatesState>>,
+    events: &UnboundedSender<UpdatesSignal>,
+) {
+    state.lock().unwrap().checking = true;
+    let _ = events.send(UpdatesSignal::Changed);
+
+    let conf_path = pacman_conf_path.to_path_buf();
+    let db_root = pacman_db_root.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || check_against_a_throwaway_copy(&conf_path, &db_root)).await;
+
+    let mut guard = state.lock().unwrap();
+    guard.checking = false;
+    match result {
+        Ok(Ok(candidates)) => {
+            guard.count = candidates.len() as u32;
+            guard.packages = candidates;
+            guard.last_successful_check = Some(now_unix());
+            guard.check_error = None;
+            guard.consecutive_check_failures = 0;
+        }
+        Ok(Err(err)) => {
+            guard.check_error = Some(err);
+            guard.consecutive_check_failures = guard.consecutive_check_failures.saturating_add(1);
+        }
+        Err(join_err) => {
+            guard.check_error = Some(format!("check task panicked: {join_err}"));
+            guard.consecutive_check_failures = guard.consecutive_check_failures.saturating_add(1);
+        }
+    }
+    drop(guard);
+    let _ = events.send(UpdatesSignal::Changed);
 }
 
 /// Whether the tick `tokio::time::interval` fires the instant it is built should be spent on a
@@ -291,10 +397,12 @@ async fn run_install_with_child(
     // write enough stderr warnings to fill the pipe's ~64KiB kernel buffer, which blocks
     // pacman's single-threaded process and wedges `installing` at `true` forever. Logged, not discarded.
     if let Some(stderr) = child.stderr.take() {
+        let state = Arc::clone(&state);
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 eprintln!("updates: pkexec pacman stderr: {line}");
+                push_log_line(&mut state.lock().unwrap().install_log, line);
             }
         });
     }
@@ -305,32 +413,52 @@ async fn run_install_with_child(
     if let Some(stdout) = child.stdout.take() {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            if let Some(step) = parse_install_step(&line) {
-                let mut guard = state.lock().unwrap();
-                guard.install_current_step = step.current;
-                guard.install_total_steps = step.total;
-                guard.install_current_package = step.package.clone();
-                drop(guard);
-                installed_packages.push(step.package);
-                let _ = events.send(UpdatesSignal::Changed);
-            }
+            let step = parse_install_step(&line);
+            let mut guard = state.lock().unwrap();
+            push_log_line(&mut guard.install_log, line);
+            // The push rides the progress lines rather than every line. One `Changed` re-resolves
+            // every surface in the generation (ADR-0044 decision 2), and pacman writes a download
+            // meter; the lines in between are in `install_log` either way, they just arrive on
+            // screen with the next step rather than on their own frame.
+            let Some(step) = step else { continue };
+            guard.install_current_step = step.current;
+            guard.install_total_steps = step.total;
+            guard.install_current_package = step.package.clone();
+            drop(guard);
+            installed_packages.push(step.package);
+            let _ = events.send(UpdatesSignal::Changed);
         }
     }
 
     let status = child.wait().await;
     let mut guard = state.lock().unwrap();
     guard.installing = false;
+    guard.install_finished_at = Some(now_unix());
     match status {
-        Ok(status) if status.success() => {
-            // Accumulates (OR), never overwrites: a reboot owed from an earlier install must
-            // not be cleared just because this install didn't touch the kernel.
-            guard.reboot_required |= needs_reboot(&installed_packages);
+        Ok(status) => {
+            // `None` only for a process killed by a signal, which has no exit code to report.
+            guard.install_exit_code = status.code();
+            if status.success() {
+                // Accumulates (OR), never overwrites: a reboot owed from an earlier install must
+                // not be cleared just because this install didn't touch the kernel.
+                guard.reboot_required |= needs_reboot(&installed_packages);
+            }
         }
-        Ok(status) => guard.install_error = Some(format!("pkexec pacman exited with {status}")),
         Err(err) => guard.install_error = Some(format!("failed to wait on pkexec pacman: {err}")),
     }
     drop(guard);
     let _ = events.send(UpdatesSignal::Changed);
+}
+
+/// Appends one line to an install log, dropping the oldest once the tail is full. A `Vec` and a
+/// `remove(0)` rather than a `VecDeque`: this is serialized as a JSON array on every push, so it
+/// has to be one anyway, and [`LOG_TAIL_LINES`] shifts of a pointer-sized element are not the cost
+/// in a function that just parsed a line of subprocess output.
+fn push_log_line(log: &mut Vec<String>, line: String) {
+    if log.len() >= LOG_TAIL_LINES {
+        log.remove(0);
+    }
+    log.push(line);
 }
 
 #[cfg(test)]
@@ -354,6 +482,56 @@ mod tests {
     fn poll_mode_is_dormant_at_zero_and_ticking_otherwise() {
         assert_eq!(poll_mode(Duration::ZERO), PollMode::Dormant);
         assert_eq!(poll_mode(Duration::from_secs(1)), PollMode::Ticking(Duration::from_secs(1)));
+    }
+
+    /// A controller whose db root holds no `local/`, so every check fails at `link_local_db`
+    /// without touching the network. What is under test is the scheduler around the check, not
+    /// `alpm`: a real sync needs a real mirror and is verified live (see `check.rs`).
+    async fn failing_controller()
+    -> (UpdatesController, tokio::sync::mpsc::UnboundedReceiver<UpdatesSignal>, tempfile::TempDir) {
+        let db_root = tempfile::tempdir().unwrap();
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let controller =
+            UpdatesController::new(db_root.path().join("pacman.conf"), db_root.path().to_path_buf(), events_tx);
+        (controller, events_rx, db_root)
+    }
+
+    /// The two pushes one check makes: `checking` up, then the answer.
+    async fn await_one_check(events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<UpdatesSignal>) {
+        for _ in 0..2 {
+            events_rx.recv().await.expect("the check task must push at both edges of a check");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_manual_check_runs_with_no_schedule_configured_at_all() {
+        // The dormant arm answers `check_now` too: a config may want the button and never the timer.
+        let (controller, mut events_rx, _db_root) = failing_controller().await;
+
+        controller.check_now();
+        await_one_check(&mut events_rx).await;
+
+        let snapshot = controller.snapshot();
+        assert!(!snapshot.checking, "checking must fall again once the answer is written");
+        assert!(snapshot.check_error.is_some(), "a db root with no local/ cannot be checked");
+        assert_eq!(snapshot.consecutive_check_failures, 1);
+        assert_eq!(snapshot.last_successful_check, None);
+    }
+
+    #[tokio::test]
+    async fn failed_checks_count_up_and_leave_the_last_good_answer_alone() {
+        let (controller, mut events_rx, _db_root) = failing_controller().await;
+        // A count from an earlier good check, which a failure must not blank (§ 2.14).
+        controller.state.lock().unwrap().count = 3;
+
+        controller.check_now();
+        await_one_check(&mut events_rx).await;
+        controller.check_now();
+        await_one_check(&mut events_rx).await;
+
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.consecutive_check_failures, 2);
+        assert_eq!(snapshot.count, 3, "a failed check reports the failure, it does not clear the list");
     }
 
     #[test]
@@ -427,7 +605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_install_with_child_reports_a_nonzero_exit_as_an_install_error() {
+    async fn run_install_with_child_reports_pacmans_own_exit_code_rather_than_a_sentence() {
         let state = Arc::new(Mutex::new(UpdatesState::default()));
         let child = process::spawn_group_leader_piped("sh", &["-c".to_string(), "exit 1".to_string()], &[])
             .expect("spawn a failing stub");
@@ -437,7 +615,46 @@ mod tests {
 
         let snapshot = state.lock().unwrap().clone();
         assert!(!snapshot.installing);
-        assert!(snapshot.install_error.is_some());
+        assert_eq!(snapshot.install_exit_code, Some(1));
+        assert!(snapshot.install_finished_at.is_some());
+        assert_eq!(
+            snapshot.install_error, None,
+            "pacman answering with a failure is not the Supervisor failing to ask"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_install_log_keeps_both_streams_and_survives_a_line_that_is_not_progress() {
+        let state = Arc::new(Mutex::new(UpdatesState::default()));
+        let child = process::spawn_group_leader_piped(
+            "sh",
+            &["-c".to_string(), "echo ':: Synchronizing package databases...'; echo 'error: target not found' 1>&2; echo '(1/1) upgrading nss'; exit 0".to_string()],
+            &[],
+        )
+        .expect("spawn a chatty stub");
+
+        let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        run_install_with_child(Arc::clone(&state), events_tx, child).await;
+
+        let log = state.lock().unwrap().install_log.clone();
+        assert!(log.contains(&":: Synchronizing package databases...".to_string()), "{log:?}");
+        assert!(log.contains(&"(1/1) upgrading nss".to_string()), "{log:?}");
+        assert!(
+            log.contains(&"error: target not found".to_string()),
+            "stderr is where pacman says why it failed, so it has to be in the tail too: {log:?}"
+        );
+    }
+
+    #[test]
+    fn the_install_log_drops_the_oldest_line_once_it_is_full() {
+        let mut log: Vec<String> = Vec::new();
+        for index in 0..(LOG_TAIL_LINES + 5) {
+            push_log_line(&mut log, index.to_string());
+        }
+
+        assert_eq!(log.len(), LOG_TAIL_LINES);
+        assert_eq!(log.first().map(String::as_str), Some("5"), "the oldest five are the ones gone");
+        assert_eq!(log.last().map(String::as_str), Some((LOG_TAIL_LINES + 4).to_string().as_str()));
     }
 
     #[tokio::test]

@@ -366,12 +366,17 @@
 ---nothing's gone wrong, not a fabricated empty string. `install_total_steps == 0` while
 ---`installing` is true means the transaction size isn't known yet (pacman hasn't printed it).
 ---@field check_error? string Why the last check failed, or `nil` when the last one worked. A check runs against a throwaway copy of the pacman database, so this is a network or parse failure, never a half-applied change to the system.
+---@field checking boolean A check is running right now. Rises before the sync starts and falls when the result is written, with a push at both edges, so a config can draw a spinner and disable its own refresh control. `updates:check` refuses a second one while this is true.
+---@field consecutive_check_failures integer How many checks in a row have failed, reset to `0` by the first success. The count only: "warn after five" is a threshold somebody has an opinion about, so it lives in the config.
 ---@field count integer How many packages have a newer version in the synced repos. Always equal to `#packages`, and carried separately so a badge does not have to walk the list.
 ---@field install_current_package string The package name from the step line pacman is on. Empty string before the first one, not `nil`, because a name is always a string once the transaction is under way.
 ---@field install_current_step integer Which package of the transaction pacman is on, its own 1-based `(2/5)` counter. `0` before the first line is parsed.
----@field install_error? string Why the last install failed, or `nil`. Unlike a check, this one ran as root against the real database, so a failure here can leave packages partly upgraded.
+---@field install_error? string Why the Supervisor never got an answer from `pacman` at all -- it could not spawn `pkexec`, or could not wait on it. Distinct from [`UpdatesState::install_exit_code`], which is the answer: this one means the question was never asked, and it is the Supervisor's own failure rather than the package manager's.
+---@field install_exit_code? integer What `pacman` itself answered on the last install: `0` for success, its own code for a failure, `nil` if none has finished this session. The code and [`UpdatesState::install_log`] are the two facts about a failure; what to *call* it -- a network error, a disk-space error, a signature error -- is wording, and wording belongs in the config (ADR-0113 amendment).
+---@field install_finished_at? integer Unix seconds when the last install stopped, however it stopped. With an install's start held by whatever asked for it, this is what a duration is measured against.
+---@field install_log string[] The tail of the last install's output, newest last, both streams interleaved in arrival order (they are read by two tasks, so the interleaving between them is not exact). Capped at the last 200: a long upgrade writes thousands of lines and this is a payload pushed over a socket, not a file. Cleared when an install starts.
 ---@field install_total_steps integer How many packages the transaction has. `0` while [`UpdatesState::installing`] is true means pacman has not printed a step line yet, so a progress bar has no denominator: show it as indeterminate rather than dividing.
----@field installing boolean An install is running. The four `install_*` fields below only mean anything while this is true; `updates:install` refuses a second one.
+---@field installing boolean An install is running. The `install_*` fields above only describe a run that has started; `updates:install` refuses a second one while this is true.
 ---@field last_successful_check? integer Unix seconds at the end of the last check that completed without error, or `nil` if none has since this session started. A failed check leaves it on the older, still-true value.
 ---@field packages UpdateCandidate[] What would be upgraded, one entry each. A failed check leaves this and [`UpdatesState::count`] on the last good answer rather than clearing them, so a config keeps showing the count it knows while [`UpdatesState::check_error`] explains the gap.
 ---@field reboot_required boolean A `linux` or `linux-*` package was installed at some point this session. Sticky on purpose: once set it stays set through later installs that do not touch the kernel, because the running kernel is still the old one until the machine restarts.
@@ -430,7 +435,7 @@ local SystemCapability = {}
 ---@field invoke fun(self: TrayCapability, command: "activate"|"secondary_activate"|"scroll"|"activate_menu_item"|"menu_will_show", ...: any)
 
 ---@class UpdatesCapability: Capability<UpdatesState>
----@field invoke fun(self: UpdatesCapability, command: "configure"|"install", ...: any)
+---@field invoke fun(self: UpdatesCapability, command: "check"|"configure"|"install", ...: any)
 
 ---@class WorkspacesCapability: Capability<WorkspacesState>
 ---@field invoke fun(self: WorkspacesCapability, command: "focus", ...: any)
