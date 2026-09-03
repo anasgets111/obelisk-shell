@@ -84,9 +84,9 @@ local launcher_open = state("launcher_open", false)
 
 -- `process.run("sleep", ...)` is this engine's only timer -- there is no signal-change event a
 -- config can observe (a `:map` callback runs during scene resolution and must stay pure, since
--- ADR-0044's rollback-on-error means resolution can rerun on the same inputs) and no `on_hover` to
--- fake one with. So the auto-hide has to be armed by the same click that changes the level, not by
--- watching `oblisk.audio`/`oblisk.brightness` push.
+-- ADR-0044's rollback-on-error means resolution can rerun on the same inputs). `on_hover` exists
+-- now (ADR-0095) and does not help: it is an edge, not a clock. So the auto-hide has to be armed by
+-- the same click that changes the level, not by watching `oblisk.audio`/`oblisk.brightness` push.
 --
 -- `ProcessHandle:kill()` sends a kill command but does not cancel the queued `exit_cb`
 -- (`renderer/src/lua/process.rs`), so a second click while the first sleep is still running needs
@@ -107,8 +107,90 @@ local function arm_osd(kind)
     end)
 end
 
+-- ## The notification card's own state
+--
+-- Three signals, all of them "which of these is open", none of them anything the Supervisor knows
+-- or should: expansion is a view of the feed, not a fact about it. Here rather than in
+-- `components/notification_card.lua` for the reason every other block in this file is here -- the
+-- card is drawn in two places (`modules/notification/popup.lua` and
+-- `modules/bar/panels/notification_history.lua`) and a group left expanded in one should still be
+-- expanded in the other.
+--
+-- Tables rather than a signal per group, because a group's key is an application name and so is not
+-- known until a notification from it arrives: `state(name, initial)` is a registry keyed by name,
+-- and minting one per app at resolve time would grow it for the life of the session. A table
+-- `initial` also never counts as an edit on a reload (ADR-0044 decision 5), so what is open
+-- survives a config save, which is what you want while writing this file.
+local expanded_groups = state("notification_expanded_groups", {})
+local expanded_messages = state("notification_expanded_messages", {})
+
+-- Which notification's reply field is open, by id, or `0` for none. Not a boolean, because the
+-- popup draws several cards and only one field may be open at a time -- two open fields would both
+-- be unfocused until clicked, and the second click would leave the first showing a caret it no
+-- longer has.
+local reply_id = state("notification_reply_id", 0)
+
+-- What has been typed into it. One slot, not one per notification, because [`reply_id`] already
+-- says there is only ever one field: `textfield`'s `on_change` hands over the whole text per
+-- keystroke (ADR-0092 decision 5), so this is the value a Send button reads back.
+local reply_draft = state("notification_reply_draft", "")
+
+-- Toggling one key of a table signal. `set` compares by identity for a table, so a fresh copy is
+-- both what makes the change land and what keeps the previous value from being mutated under a
+-- resolve that may yet be rolled back.
+local function toggle_key(signal, key)
+    local next_open = {}
+    for k, open in pairs(signal:get() or {}) do
+        next_open[k] = open
+    end
+    next_open[key] = not next_open[key]
+    signal:set(next_open)
+end
+
+local function toggle_group(key)
+    toggle_key(expanded_groups, key)
+end
+
+local function toggle_message(id)
+    toggle_key(expanded_messages, tostring(id))
+end
+
+-- Opening a reply field clears whatever was typed into the last one. Leaving the draft behind
+-- would put one notification's half-written reply in another's box, which is the one mistake in a
+-- reply UI that cannot be taken back.
+local function open_reply(id)
+    reply_draft:set("")
+    reply_id:set(reply_id:get() == id and 0 or id)
+end
+
+local function close_reply()
+    reply_draft:set("")
+    reply_id:set(0)
+end
+
+-- Sends what is in the draft and closes the field. A no-op on an empty draft rather than sending
+-- one: `notifications:reply` removes the notification whatever the text was, so an empty send is a
+-- card the user loses and a message the sender gets nothing from.
+local function send_reply(id)
+    local text = reply_draft:get()
+    if text == nil or text == "" then
+        return
+    end
+    oblisk.notifications:invoke("reply", id, text)
+    close_reply()
+end
+
 return {
     popup_anchor = popup_anchor,
+    expanded_groups = expanded_groups,
+    expanded_messages = expanded_messages,
+    reply_id = reply_id,
+    reply_draft = reply_draft,
+    toggle_group = toggle_group,
+    toggle_message = toggle_message,
+    open_reply = open_reply,
+    close_reply = close_reply,
+    send_reply = send_reply,
     settings_open = settings_open,
     panel_open = panel_open,
     panel_kind = panel_kind,

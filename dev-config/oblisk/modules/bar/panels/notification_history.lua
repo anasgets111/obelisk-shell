@@ -1,24 +1,32 @@
--- The notification feed as a list, which is the half of § 2.7 nothing was reading. The popup in
--- `modules/notification/popup.lua` shows the newest one for as long as the Supervisor keeps it in
--- the feed (ADR-0033); this is where the rest of them are.
+-- The notification feed as a list, which is the half of § 2.7 the popup is not. The popup shows the
+-- newest few for as long as the Supervisor keeps them; this is where all of them are.
 --
 -- Needed a scrolling container to exist at all: a feed is however many notifications have arrived,
 -- so a fixed panel could show the first four and clip the rest with no way to reach them
 -- (ADR-0069).
+--
+-- The rows used to be `panel_row`s -- an icon, a title, a subtitle -- and are now the same
+-- `components/notification_card.lua` the popup draws, so an action button, a reply and an expanded
+-- body work here too. What is left in this file is the header and the list.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
+local ui = require("lib.ui_state")
 local cell = require("components.cell")
 local section_header = require("components.section_header")
-local panel_row = require("components.panel_row")
 local panel_empty_state = require("components.panel_empty_state")
 local icon_button = require("components.icon_button")
+local notification_card = require("components.notification_card")
 
 local KIND = "notifications"
 local SCROLL = scroll("notification_feed")
 
 local function feed(n)
     return (n and n.feed) or {}
+end
+
+local function groups(n)
+    return util.group_notifications(feed(n))
 end
 
 local body = {
@@ -41,43 +49,35 @@ local body = {
             end, { size = theme.control.xs, icon_size = theme.icon.xs }),
         },
     },
-    list {
+    column {
         width = "Fill",
         height = "Fill",
-        scroll = SCROLL,
-        spacing = theme.spacing.xs,
-        source = oblisk.notifications:map(feed),
-        ---@param notification Notification
-        itemfn = function(notification)
-            return panel_row {
-                slot = "notification-" .. tostring(notification.id),
-                -- `art`, not `icon`: this is the sending application's own artwork, which nobody
-                -- here chose and nothing should recolour (`components/panel_row.lua` has the split).
-                -- `image_path` is the picture the sender attached and `app_icon` is the sender
-                -- itself (§ 2.7, ADR-0091); the attachment wins because it is the more specific of
-                -- the two -- a chat notification's avatar says more than the messenger's logo.
-                -- `icon { name = ... }` takes a theme name or an absolute path (ADR-0054
-                -- decision 2), so one property carries either without this telling them apart.
-                art = notification.image_path or notification.app_icon or "dialog-information",
-                title = notification.summary or "?",
-                -- `body` is a span array (§ 2.7), so it needs flattening rather than
-                -- `or`-ing: passed straight through it is a Lua table where `text.content` wants
-                -- a string, which fails the whole re-resolve and freezes the shell on the last
-                -- good scene for as long as that notification is in the feed.
-                subtitle = util.notification_body(notification.body),
-                -- Clicking dismisses. § 2.7 now carries `actions` and `has_default_action`, and
-                -- § 3.2 has `invoke_action` (ADR-0090), so activating the sender's own default is
-                -- available here; it is not wired up until this panel draws the buttons too,
-                -- because a row that silently does something different from what it looks like it
-                -- does is worse than one that only dismisses.
-                on_activate = function()
-                    oblisk.notifications:invoke("dismiss", notification.id)
+        -- Same hold as the popup's stack and for the same reason (ADR-0094): a notification that
+        -- expired while you were reading the history of it would be the one place a list can
+        -- rearrange itself under a pointer with no input at all. A separate region from the
+        -- popup's, and the two never overlap -- they are different surfaces, so a pointer leaves
+        -- one before it enters the other.
+        hover = hover("notification_history_region"),
+        on_hover = function(hovered)
+            oblisk.notifications:invoke("hold_expiry", hovered and 300 or 0)
+        end,
+        children = {
+            list {
+                width = "Fill",
+                height = "Fill",
+                scroll = SCROLL,
+                spacing = theme.spacing.sm,
+                source = oblisk.notifications:map(groups),
+                itemfn = function(group)
+                    -- The lighter ground: this card sits inside a panel that is already glass, and
+                    -- the popup's heavier one over a wallpaper would read as a second sheet here.
+                    return notification_card(group, ui, { background = theme.GLASS_CONTENT })
                 end,
-            }
-        end,
-        key = function(notification)
-            return tostring(notification.id)
-        end,
+                key = function(group)
+                    return group.key
+                end,
+            },
+        },
     },
     panel_empty_state("nothing waiting", util.shown_when(oblisk.notifications, function(n)
         return #feed(n) == 0

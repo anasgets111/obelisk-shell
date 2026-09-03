@@ -247,6 +247,25 @@ pub(super) fn resolve_image_input(
     ImageInput::None
 }
 
+/// Splits the `image-path`/`image_path` hint into the two different things senders put in it:
+/// `(a picture to resolve, a theme name)` (ADR-0096).
+///
+/// §1.2 allows both -- "an URI (file:// is the only URI schema supported right now) or a name in a
+/// freedesktop.org-compliant icon theme" -- and they want opposite handling. A path is a picture
+/// and goes through [`validate_trusted_path`] like every other client-supplied path. A name has no
+/// path to validate, so leaving it in the picture chain drops it on the floor, which is exactly
+/// the bug ADR-0091 found in `app_icon`; it belongs with the application's icon instead.
+///
+/// Told apart by a path separator, on [`resolve_app_icon`]'s reasoning: `"../../etc/passwd"` is
+/// not absolute either, and an `is_absolute` split would hand it on as a "theme name" and let the
+/// renderer's icon lookup take it from there.
+pub(super) fn split_image_path_hint(hint: Option<String>) -> (Option<String>, Option<String>) {
+    match hint.filter(|hint| !hint.is_empty()) {
+        Some(hint) if !strip_file_uri(&hint).contains('/') => (None, Some(hint)),
+        hint => (hint, None),
+    }
+}
+
 /// `Notify`'s positional `app_icon` argument, as something a config can actually draw (ADR-0091).
 ///
 /// Two forms, because senders send both: a theme name (`"firefox"`,
@@ -534,6 +553,44 @@ mod tests {
 
     fn tiny_image() -> RawImageData {
         valid_rgba_image(1, 1)
+    }
+
+    /// The `notify-send -i firefox` case, which is how the overwhelming majority of notifications
+    /// on a desktop name their icon: the positional argument is empty and the theme name rides in
+    /// the hint that otherwise means a picture.
+    #[test]
+    fn a_bare_name_in_the_image_path_hint_is_a_theme_name_not_a_picture() {
+        assert_eq!(
+            split_image_path_hint(Some("firefox".to_string())),
+            (None, Some("firefox".to_string())),
+            "goes to `app_icon`, not into the picture chain that would validate it away"
+        );
+    }
+
+    #[test]
+    fn a_path_in_the_image_path_hint_is_still_a_picture() {
+        assert_eq!(split_image_path_hint(Some("/tmp/art.png".to_string())), (Some("/tmp/art.png".to_string()), None));
+        assert_eq!(
+            split_image_path_hint(Some("file:///tmp/art.png".to_string())),
+            (Some("file:///tmp/art.png".to_string()), None),
+            "the URI is stripped when the picture is resolved, not here"
+        );
+    }
+
+    /// A relative path is neither, and must not be passed off as a theme name for the renderer's
+    /// icon lookup to open -- `resolve_app_icon` refuses it on the same grounds.
+    #[test]
+    fn a_relative_path_in_the_image_path_hint_stays_in_the_picture_chain_to_be_refused() {
+        assert_eq!(
+            split_image_path_hint(Some("../../etc/passwd".to_string())),
+            (Some("../../etc/passwd".to_string()), None)
+        );
+    }
+
+    #[test]
+    fn an_absent_or_empty_image_path_hint_is_neither() {
+        assert_eq!(split_image_path_hint(None), (None, None));
+        assert_eq!(split_image_path_hint(Some(String::new())), (None, None));
     }
 
     #[test]

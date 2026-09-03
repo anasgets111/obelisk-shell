@@ -130,9 +130,24 @@ return panel {
     --
     -- Guarded for nil like every other bare `:map` on a capability: this resolves once before the
     -- first push.
-    keyboard_interactivity = oblisk.network:map(function(n)
-        return (n and n.password_ssid) and "Exclusive" or "None"
-    end),
+    --
+    -- Two facts want it now, not one. The notification history draws the same card the popup does,
+    -- so a reply field can be open in here too, and it needs the keyboard on the same terms the
+    -- password prompt does -- raised only once something has asked, never merely because a panel
+    -- is showing.
+    --
+    -- `reply_id` alone is not that ask. It is one signal for both places the card is drawn, so a
+    -- reply opened in the *popup* would otherwise raise this surface too, and a panel showing
+    -- something else entirely -- the network list, the calendar -- would take the keyboard because
+    -- of a notification it is not displaying. Gated on the notifications panel actually being the
+    -- one on screen, which is the condition that makes the open field one of ours.
+    keyboard_interactivity = computed(
+        { oblisk.network, ui_state.reply_id, ui_state.panel_showing("notifications") },
+        function(n, reply_id, showing_notifications)
+            local wants_keyboard = (n and n.password_ssid) or (reply_id ~= 0 and showing_notifications)
+            return wants_keyboard and "Exclusive" or "None"
+        end
+    ),
     -- One surface, one root node (§ 6.1), so the catcher and the card share a `rect` rather than
     -- being two children of the surface. Full-fill and visible, which is also what sets the input
     -- region: `wl_surface::set_input_region` is built from the surface root's visible direct

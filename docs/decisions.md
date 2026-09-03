@@ -4356,3 +4356,107 @@ a notification card, a 5-second notification that mapped under a resting pointer
 12 seconds, the log showed `expiry held for 60s`; moving the pointer off logged `expiry hold
 released` and the card went. Declaring `on_hover` without a slot fails the reload with the message
 from decision 2.
+
+## 0096. A theme name in `image-path` is the application's icon, not a picture
+
+ADR-0091 split the attached picture from the sending application's icon and routed
+`image-data` > `image-path` > `icon_data` into the first. `image-path` does not only carry
+pictures. §1.2 defines it as "an URI (file:// is the only URI schema supported right now) **or a
+name in a freedesktop.org-compliant icon theme**", and the picture chain ends in
+`validate_trusted_path`, which requires an absolute path to an existing file.
+
+So a theme name there was dropped on the floor. That is ADR-0091's own bug one field over, and it
+reaches far more notifications than the original did: `notify-send -i firefox` leaves the
+positional `app_icon` empty and puts `firefox` in this hint, which makes it the most common way
+anything on a desktop names a notification's icon. Found by building the card that draws it --
+every `notify-send -i` in testing came up with the generic fallback while a hand-written `Notify`
+carrying the same name in the positional argument drew correctly.
+
+1. **A bare name in the hint feeds `app_icon`, not `image_path`.** It is not an attachment. A
+   sender with a real picture sends `image-data` or an absolute path; a sender with a theme name is
+   saying what application this is, which is what `app_icon` means and where a card draws it -- the
+   small mark in the header rather than the large picture beside the summary.
+
+2. **`image_path`'s contract is unchanged**: still always an absolute path to a file that exists.
+   The alternative -- letting it hold either form, since `icon { name = ... }` accepts both -- would
+   put `notify-send -i firefox`'s icon in the picture slot, drawn at attachment size beside the
+   summary, which is not what the sender meant and would make the two fields mean the same thing
+   again.
+
+3. **The positional argument still wins.** A sender that sets both is making the specific statement
+   with `app_icon` and a fallback one with the hint.
+
+4. **Told apart by a path separator**, ADR-0091 decision 3's rule verbatim, and for its reason:
+   `"../../etc/passwd"` is not absolute either, and an `is_absolute` split would pass it off as a
+   theme name for the renderer's icon lookup to open. Anything holding a `/` stays in the picture
+   chain, where the trusted-root check refuses it.
+
+`split_image_path_hint` is a pure function beside `resolve_app_icon` rather than a match arm inside
+`Notify`, because `Notify` is a D-Bus method and nothing can call it in a test.
+
+Verified live, and it is the first time either half of ADR-0091 has been seen on the glass: a
+notification carrying `app_icon = "firefox"` and `image-path = <an absolute svg>` draws the Firefox
+mark in the card header and the attached picture beside the summary, and `notify-send -i telegram`
+now draws Telegram's icon where it drew a generic fallback.
+
+## 0097. The notification card, and the four things the config had to decide itself
+
+`components/notification_card.lua` is `Modules/Notification/NotificationCard.qml` in this engine's
+vocabulary: an application's notifications as one card, with a picture, an app mark, a wrapping
+summary and body that expand, an age, action buttons, an inline reply, and per-message and
+per-group dismissal. It is drawn in two places -- the popup stack and the history panel -- which is
+why it is a component and not two files that drift.
+
+Almost all of it is ADRs 0089-0096 arriving at once, and there is nothing to decide about using
+them. Four things were the config's own call.
+
+1. **Grouped on `app_name`, which is the only key § 2.7 carries.** `hints["desktop-entry"]` is the
+   better one -- two applications can share a name and one can change its own -- and ADR-0091 left
+   it unbuilt for want of a consumer. This is that consumer, and it still is not worth adding: the
+   grouping is not visibly wrong yet, and adding a field before it is is how § 2.7 got four picture
+   sources. Group order is by each app's newest notification, since the feed arrives newest-first
+   and an app that just spoke should not sit below one that spoke an hour ago.
+
+2. **One hover region for the whole stack, not one per card.** The expiry hold (ADR-0094) is placed
+   on enter and released on leave, and sibling cards are written in tree order within a single
+   `sync_hover` pass -- so a pointer moving from the second card to the first would fire the
+   first's *enter* before the second's *leave*, and the leave would release the hold the enter had
+   just placed. A region spanning every card has no interior crossings to get this wrong. Cards
+   still light up individually; that is a separate slot doing a job with no ordering hazard in it.
+
+3. **The reply field is opened by a button, not by clicking the field.** The surface must hold the
+   keyboard before a field in it can receive one, and it cannot hold it unconditionally: niri gives
+   an `on_demand` or `exclusive` layer surface focus the moment it *maps*, and this surface maps
+   every time anything notifies you -- a constant would take the keyboard away from whatever you
+   were typing in, on every notification. So `keyboard_interactivity` follows a signal, and that
+   signal needs an event. The field's own press cannot be it: a press that focuses a `textfield`
+   deliberately arms no click (ADR-0092 decision 7), which is the rule that stops a reply from
+   firing the notification's default action. A Reply button is the ask and the surface follows it.
+   The cost is one extra click, and it is the honest one.
+
+4. **Clicking a message activates the sender's default action where there is one, and dismisses
+   where there is not.** Both are what the freedesktop spec means by activating a notification, and
+   `invoke_action` removes it afterwards on its own unless the sender set `resident` (ADR-0090), so
+   the two paths agree about what happens next. The history panel used to only dismiss, with a
+   comment saying a row that quietly does something other than what it looks like is worse than one
+   that only dismisses -- that was right while the card drew no buttons, and the buttons are what
+   make the card's own click legible now.
+
+Two smaller ones. The popup stands down while the history panel is showing, because both anchor
+top-right and the overlap draws the same notification twice with the copy you opened the panel to
+read underneath. And expansion state lives in `lib/ui_state` as two tables rather than a signal per
+group, because a group's key is an application name and so is not known until it arrives:
+`state(name, initial)` is a name-keyed registry, and minting one per app at resolve time would grow
+it for the life of the session.
+
+What it does without, both waiting on Rust. The body's spans carry bold/italic/underline and an
+`href` and `text` has no weight, style or link, so `util.notification_body` still flattens them to
+one run. And there is no animation, so a group expands and a card leaves in one frame -- the
+roadmap's own first item, and the one thing that will keep this reading as static beside the Qt
+card it mirrors.
+
+Verified live, end to end: three notifications from one sender collapse to `Chat (3)` and expand to
+three; a body longer than three lines clips with the ellipsis on the last line and expands to its
+full six; `notify-send -i` icons and an attached picture both draw; a pointer resting on the stack
+logs `expiry held` and leaving logs `expiry hold released`; and Reply, click, type, Enter emits
+`ActionInvoked(10, "inline-reply::on my way")` and clears the card and the keyboard behind it.

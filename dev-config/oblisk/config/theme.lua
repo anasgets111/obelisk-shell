@@ -320,7 +320,11 @@ theme.panel_width         = s(340, 280)
 theme.panel_height        = s(400, 300)
 theme.panel_gap           = 4
 theme.notification_width  = s(380, 300)
-theme.notification_height = s(96, 80)
+-- How tall the popup stack's surface may get. Not a card height: the surface holds up to four
+-- cards that each grow when a group or a body is expanded, and a layer surface is a fixed box that
+-- clips what does not fit. Generous rather than measured, because the column inside it sizes to its
+-- content and the surface only has to be able to contain it.
+theme.notification_stack_height = s(560, 420)
 theme.osd_width           = s(260, 220)
 theme.osd_height          = s(44, 36)
 theme.launcher_row_height = s(30, 24)

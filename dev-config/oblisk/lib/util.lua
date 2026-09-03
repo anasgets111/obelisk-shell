@@ -157,6 +157,55 @@ function util.notification_body(spans)
     return table.concat(parts)
 end
 
+-- A notification's age as the two or three characters a card has room for: "now", "5m", "3h",
+-- "2d". `notification.timestamp` and `oblisk.system.time` are both Unix epoch seconds on the same
+-- clock (ADR-0093), so this is a subtraction and not a reconciliation.
+--
+-- Coarse on purpose, and coarser the older it gets. A card shows this beside a summary it is
+-- already competing with for width, and nobody reading a notification list needs to know an entry
+-- is 2h14m old rather than 2h.
+function util.relative_time(now, timestamp)
+    local age = (now or 0) - (timestamp or 0)
+    -- A clock that stepped backwards, or a push that raced the second boundary. "now" is the
+    -- honest answer for both and is what the next tick will say anyway.
+    if age < 60 then
+        return "now"
+    elseif age < 3600 then
+        return string.format("%dm", age // 60)
+    elseif age < 86400 then
+        return string.format("%dh", age // 3600)
+    end
+    return string.format("%dd", age // 86400)
+end
+
+-- The feed as one entry per sending application rather than one per notification, which is what
+-- turns eight messages from one chat app into one card instead of eight (`NotificationCard.qml`'s
+-- `group`). Order is by each app's *newest* notification, since the feed arrives newest-first and
+-- an app that just spoke should not sit below one that spoke an hour ago.
+--
+-- Keyed on `app_name`, which is the only grouping key § 2.7 carries. `hints["desktop-entry"]` is
+-- the better one -- two apps can share a name, and one app can change its -- and ADR-0091 left it
+-- unbuilt for want of a consumer. This is that consumer, so it is worth adding when the grouping
+-- here is visibly wrong; it is not worth adding before.
+--
+-- `app_icon` comes off the group's newest member rather than being searched for: every member is
+-- the same application, so they carry the same icon, and the newest is the one that would have
+-- been drawn had there been no grouping at all.
+function util.group_notifications(feed)
+    local groups, by_key = {}, {}
+    for _, notification in ipairs(feed or {}) do
+        local key = notification.app_name or "?"
+        local group = by_key[key]
+        if group == nil then
+            group = { key = key, app_name = key, app_icon = notification.app_icon, items = {} }
+            by_key[key] = group
+            groups[#groups + 1] = group
+        end
+        group.items[#group.items + 1] = notification
+    end
+    return groups
+end
+
 function util.shown_when(signal, predicate)
     return signal:map(function(value)
         if value == nil then

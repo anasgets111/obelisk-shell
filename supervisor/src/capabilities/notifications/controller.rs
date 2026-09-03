@@ -18,7 +18,8 @@ use zbus::zvariant::Value;
 use super::icon::{
     ImageInput, RawImageData, decode_raw_image_data, default_trusted_icon_roots, delete_icon_file,
     encode_image_data_to_png, image_data_is_valid, resolve_app_icon, resolve_image_input, sanitize_body,
-    strip_file_uri, validate_trusted_path, value_as_bool, value_as_str, value_as_u8, write_icon_png,
+    split_image_path_hint, strip_file_uri, validate_trusted_path, value_as_bool, value_as_str, value_as_u8,
+    write_icon_png,
 };
 use super::queue::{
     ExpiryPolicy, QueueCleanup, feed_view, find_expiring_entry, next_incarnation, remove_by_id, replace_or_push,
@@ -530,9 +531,12 @@ impl NotificationsController {
         let resident = hints.get("resident").and_then(value_as_bool).unwrap_or(false);
 
         let image_data = hints.get("image-data").or_else(|| hints.get("image_data")).and_then(decode_raw_image_data);
-        let image_path =
+        let image_path_hint =
             hints.get("image-path").or_else(|| hints.get("image_path")).and_then(value_as_str).map(str::to_string);
-        let app_icon = (!app_icon.is_empty()).then_some(app_icon);
+        let (image_path, image_name) = split_image_path_hint(image_path_hint);
+        // The positional argument wins where a sender set both: it says "this application's icon"
+        // and nothing else, where the hint is a fallback from a field that meant a picture.
+        let app_icon = (!app_icon.is_empty()).then_some(app_icon).or(image_name);
         let icon_data = hints.get("icon_data").and_then(decode_raw_image_data);
         let suppress_sound = hints.get("suppress-sound").and_then(value_as_bool).unwrap_or(false);
         let sound_file = hints.get("sound-file").and_then(value_as_str).map(str::to_string);

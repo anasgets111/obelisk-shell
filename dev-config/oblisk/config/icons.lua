@@ -96,6 +96,14 @@ icons.info        = "\u{F02FD}"
 -- Alerts.
 icons.warning     = "\u{F0026}"
 icons.close       = "\u{F0156}"
+
+-- A notification card's own controls: the two chevrons expand and collapse a group or a message,
+-- and `reply`/`send` are the two halves of an inline reply (the button that opens the field, and
+-- the one that sends what was typed into it).
+icons.chevron_up   = "\u{F0143}"
+icons.chevron_down = "\u{F0140}"
+icons.reply        = "\u{F0468}"
+icons.send         = "\u{F048A}"
 icons.plus        = "\u{F0415}"
 icons.minus       = "\u{F0374}"
 
