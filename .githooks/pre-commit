@@ -16,6 +16,13 @@
 # `check` was green on 71266cb and c83e79e while both carried unformatted files, because formatting
 # was not in it and nobody ran the recipe that was. A gate nothing runs is not a gate.
 #
+# A commit that touches nothing the compiler reads gets the short path: the Lua half of `check`
+# and the one test module that loads `dev-config`. Every recipe below compiles three crates under
+# three flag sets (test, clippy `--all-features`, doc), and a fix to a card's padding was paying for
+# all of it -- a minute of every core for a commit `cargo` could not have had an opinion on. The
+# short list is what the crates provably do not read: `share/starter/shell.lua` is `include_str!`'d
+# into the Supervisor and `packaging/` into its unit files, so both stay on the long path.
+#
 # Install with `just hooks`. Skip once with `git commit --no-verify`.
 set -euo pipefail
 
@@ -24,6 +31,28 @@ cd "$root"
 
 if ! command -v cargo >/dev/null 2>&1; then
     echo "pre-commit: no cargo on PATH, skipping the stub check" >&2
+    exit 0
+fi
+
+# `--diff-filter` leaves deletions in: removing a Lua file a component `require`s is exactly the
+# kind of commit the component tests below are for.
+if ! git diff --cached --name-only | grep -qvE '^(dev-config|docs)/|\.md$'; then
+    echo "pre-commit: nothing staged the crates read, running the Lua checks only" >&2
+    if ! command -v just >/dev/null 2>&1; then
+        echo "pre-commit: no just on PATH, skipping the Lua checks" >&2
+        exit 0
+    fi
+    if ! just lua types; then
+        echo "pre-commit: the Lua checks failed. Fix it, or commit with --no-verify and own that." >&2
+        exit 1
+    fi
+    # The component tests `require` the shipped `components/` and load `dev-config/oblisk/shell.lua`
+    # (`renderer/src/lua/mod.rs`). Nothing to recompile, so this is the Lua being run, not Rust
+    # being built.
+    if ! cargo test --quiet -p renderer lua::tests; then
+        echo "pre-commit: the renderer's dev-config tests failed." >&2
+        exit 1
+    fi
     exit 0
 fi
 
