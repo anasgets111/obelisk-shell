@@ -19,7 +19,7 @@ use mlua::{Lua, Value};
 use crate::layout::instance::SurfaceInstance;
 use crate::layout::node::{self, Align, EdgeInsets, LayoutError, PaintStyle, SizeMode};
 use crate::lua::nodes::VirtualNode;
-use crate::text::shaping::{ShapeRequest, ShapingHandle};
+use crate::text::shaping::{self, ShapeRequest, ShapingHandle};
 use crate::text::snap::{LogicalRect, PhysicalRect, snap_to_physical};
 use taffy::prelude::{length, line, span};
 
@@ -667,7 +667,12 @@ fn main_axis_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Optio
 /// and `icon`'s `size` is a property like any other that can be malformed.
 enum Measure {
     /// A `text` node's shaped extent, against the wrap width taffy offers.
-    Text { content: String, font_size: f32 },
+    ///
+    /// `wrap` and `max_lines` ride along because they change the extent, not just the paint: an
+    /// unwrapped run is one line however long, and a capped one is at most `max_lines` tall no
+    /// matter how many the shaper found. Measuring either wrong gives a box that disagrees with
+    /// what `Scene::finish` will put in it.
+    Text { content: String, font_size: f32, wrap: node::Wrap, max_lines: Option<usize> },
     /// § 5.1's `icon` `size`, the same number on both axes.
     Square(f32),
 }
@@ -921,10 +926,10 @@ fn prepare(
         // another kind here, so the arm is total, the same shape as `children_of`'s
         // `unreachable!`.
         "text" => {
-            let Some(PaintStyle::Text { content, font_size, .. }) = paint.as_ref() else {
+            let Some(PaintStyle::Text { content, font_size, wrap, max_lines, .. }) = paint.as_ref() else {
                 unreachable!("a `text` node always carries a `PaintStyle::Text`")
             };
-            Some(Measure::Text { content: content.clone(), font_size: *font_size })
+            Some(Measure::Text { content: content.clone(), font_size: *font_size, wrap: *wrap, max_lines: *max_lines })
         }
         "icon" => Some(Measure::Square(node::parse_icon_size(&properties)?)),
         // `image` has no intrinsic size, unlike `icon`: knowing a file's own dimensions means
@@ -1031,7 +1036,7 @@ fn finish(
 
     // After sizing, because the width it fits into is this node's own, and before the node is
     // built, because what it rewrites is the string the display list will carry.
-    elide_to_fit(&mut paint, (size.width - style.padding.horizontal()).max(0.0), shaping);
+    fit_text_to_box(&mut paint, (size.width - style.padding.horizontal()).max(0.0), shaping);
 
     Ok(RetainedNode {
         id,
@@ -1100,22 +1105,32 @@ fn solve(
                 };
                 match measure {
                     Measure::Square(size) => taffy::Size { width: *size, height: *size },
-                    Measure::Text { content, font_size } => {
+                    Measure::Text { content, font_size, wrap, max_lines } => {
                         // The wrap boundary: the width this box is already known to have, or the
                         // width on offer when it is not. `MaxContent`/`MinContent` mean taffy is
                         // asking what the string wants rather than offering it a box, and an
                         // unconstrained measurement is the honest answer to that.
-                        let max_width = known.width.or(match offered.width {
-                            taffy::AvailableSpace::Definite(width) => Some(width),
-                            taffy::AvailableSpace::MinContent | taffy::AvailableSpace::MaxContent => None,
-                        });
+                        //
+                        // `None` for a node that does not wrap, so it measures the one line it
+                        // will paint. Passing the box width regardless is what this used to do,
+                        // and it is why a fixed-width `text` reserved three lines of height to
+                        // draw one clipped one.
+                        let max_width = match wrap {
+                            node::Wrap::None => None,
+                            node::Wrap::Word => known.width.or(match offered.width {
+                                taffy::AvailableSpace::Definite(width) => Some(width),
+                                taffy::AvailableSpace::MinContent | taffy::AvailableSpace::MaxContent => None,
+                            }),
+                        };
+                        let line_height = shaping::line_height(*font_size);
                         let shaped = shaping.shape(ShapeRequest {
                             text: content.clone(),
                             font_size: *font_size,
-                            line_height: *font_size * 1.2,
+                            line_height,
                             max_width,
                         });
-                        taffy::Size { width: shaped.width, height: shaped.height }
+                        let lines = max_lines.map_or(shaped.lines.len(), |cap| shaped.lines.len().min(cap));
+                        taffy::Size { width: shaped.width, height: lines as f32 * line_height }
                     }
                 }
             },
@@ -1190,42 +1205,105 @@ fn scroll_offset(properties: &HashMap<String, Value>, content_main: f32, total_m
     used
 }
 
-/// Rewrites an over-wide `text` to the longest prefix that fits, finished with an ellipsis.
+/// Rewrites a `text`'s content to what its box can actually show, which is the one thing paint
+/// cannot work out for itself.
 ///
 /// Runs here rather than in `layout::paint`: the box width isn't known until this node has been
 /// sized, and the shaping worker isn't reachable from a display-list build, which is pure by
-/// design. Does nothing when the text already fits, or on a `Content`-sized node, whose box came
-/// from measuring this same string and so always fits it.
-///
-/// ponytail: cuts at a character boundary rather than a grapheme cluster, the real ceiling: an
-/// emoji with a skin-tone modifier can lose the modifier and change what it draws. Nothing in this
-/// shell's own strings does that yet; window titles arriving from outside it eventually will.
-/// Upgrade path: a `unicode-segmentation` pass over grapheme boundaries.
-fn elide_to_fit(paint: &mut Option<PaintStyle>, content_width: f32, shaping: &ShapingHandle) {
-    let Some(PaintStyle::Text { content, font_size, elide: node::Elide::End, .. }) = paint.as_mut() else {
+/// design. Does nothing for a run that neither wraps nor elides, and nothing on a `Content`-sized
+/// node under `elide` alone, whose box came from measuring this same string and so always fits it.
+fn fit_text_to_box(paint: &mut Option<PaintStyle>, content_width: f32, shaping: &ShapingHandle) {
+    let Some(PaintStyle::Text { content, font_size, elide, wrap, max_lines, .. }) = paint.as_mut() else {
         return;
     };
     if content.is_empty() || content_width <= 0.0 {
         return;
     }
-    let measure = |text: &str| {
-        shaping
-            .shape(ShapeRequest {
-                text: text.to_string(),
-                font_size: *font_size,
-                line_height: *font_size * 1.2,
-                max_width: None,
-            })
-            .width
-    };
-    if measure(content) <= content_width {
-        return;
+    match wrap {
+        // The measured-width check is the fast path, not politeness: most strings fit, and
+        // skipping the binary search below is the difference on a list of them.
+        node::Wrap::None => {
+            if *elide == node::Elide::End && measured_width(content, *font_size, shaping) > content_width {
+                *content = elide_to_width(content, *font_size, content_width, shaping);
+            }
+        }
+        node::Wrap::Word => {
+            let wrapped = wrapped_to_fit(content, *font_size, *elide, *max_lines, content_width, shaping);
+            *content = wrapped;
+        }
     }
+}
 
+/// `content` broken to `content_width` and capped to `max_lines`, joined by `\n` for
+/// `text::atlas::TextPainter::draw_text` to walk.
+///
+/// The cap and `elide` compose, which is the notification-body case: keep the lines allowed, and
+/// if an ellipsis was asked for, rebuild the last one out of everything that did not fit so it
+/// reads as truncated rather than as a sentence that happens to stop.
+///
+/// That remainder is the dropped lines joined back with single spaces rather than sliced out of
+/// the original string, because cosmic-text hands back a line's *text* and not its byte range into
+/// the source. The difference is a run of collapsed whitespace, inside text already being cut off.
+fn wrapped_to_fit(
+    content: &str,
+    font_size: f32,
+    elide: node::Elide,
+    max_lines: Option<usize>,
+    content_width: f32,
+    shaping: &ShapingHandle,
+) -> String {
+    let shaped = shaping.shape(ShapeRequest {
+        text: content.to_string(),
+        font_size,
+        line_height: shaping::line_height(font_size),
+        max_width: Some(content_width),
+    });
+    let Some(cap) = max_lines.filter(|cap| *cap < shaped.lines.len()) else {
+        return shaped.lines.join("\n");
+    };
+
+    let mut kept: Vec<String> = shaped.lines[..cap].to_vec();
+    if elide == node::Elide::End {
+        // `cap` is at least 1: `parse_max_lines` maps 0 to no cap at all, so a `Some` cap standing
+        // below a nonzero line count always leaves a line to rewrite.
+        let rest = shaped.lines[cap - 1..].join(" ");
+        let last = kept.last_mut().expect("a cap below the line count keeps at least one line");
+        *last = elide_to_width(&rest, font_size, content_width, shaping);
+    }
+    kept.join("\n")
+}
+
+/// One string's unconstrained width, the question `elide` is a search over.
+fn measured_width(text: &str, font_size: f32, shaping: &ShapingHandle) -> f32 {
+    shaping
+        .shape(ShapeRequest {
+            text: text.to_string(),
+            font_size,
+            line_height: shaping::line_height(font_size),
+            max_width: None,
+        })
+        .width
+}
+
+/// The longest prefix of `text` that still fits `width` once a single-character ellipsis is
+/// appended, ellipsis included.
+///
+/// Always ellipsizes, even for a `text` already narrow enough: the callers that want "leave it
+/// alone if it fits" ask [`measured_width`] first, and the one that doesn't is truncating a
+/// remainder, where the ellipsis is the whole point of the call.
+///
+/// ponytail: cuts at a character boundary rather than a grapheme cluster, the real ceiling: an
+/// emoji with a skin-tone modifier can lose the modifier and change what it draws. Nothing in this
+/// shell's own strings does that yet; window titles arriving from outside it eventually will.
+/// Upgrade path: a `unicode-segmentation` pass over grapheme boundaries.
+fn elide_to_width(text: &str, font_size: f32, width: f32, shaping: &ShapingHandle) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
     // Byte offsets a prefix may be cut at, so the search never lands inside a codepoint. The
-    // last entry is the start of the final character, the longest prefix worth trying: the whole
-    // string is already known not to fit.
-    let cuts: Vec<usize> = content.char_indices().map(|(index, _)| index).collect();
+    // last entry is the start of the final character, the longest prefix worth trying: appending
+    // an ellipsis to the whole string is never narrower than the string.
+    let cuts: Vec<usize> = text.char_indices().map(|(index, _)| index).collect();
     // Largest index into `cuts` whose prefix plus an ellipsis still fits. Zero is always admissible
     // and means the ellipsis alone, the honest answer for a box too narrow for even one character.
     let (mut low, mut high) = (0usize, cuts.len() - 1);
@@ -1233,13 +1311,13 @@ fn elide_to_fit(paint: &mut Option<PaintStyle>, content_width: f32, shaping: &Sh
         // Rounded up, so `mid` is always above `low` and the loop cannot stall; `high` is only ever
         // assigned `mid - 1`, and `mid` is at least 1 whenever this body runs.
         let mid = low + (high - low).div_ceil(2);
-        if measure(&format!("{}\u{2026}", &content[..cuts[mid]])) <= content_width {
+        if measured_width(&format!("{}\u{2026}", &text[..cuts[mid]]), font_size, shaping) <= width {
             low = mid;
         } else {
             high = mid - 1;
         }
     }
-    *content = format!("{}\u{2026}", &content[..cuts[low]]);
+    format!("{}\u{2026}", &text[..cuts[low]])
 }
 
 /// § 4's input-region scan: `surface_root`'s direct, visible children, projected to physical
@@ -2143,6 +2221,84 @@ pub(super) mod tests {
     }
 
     const LONG: &str = "a window title far too long for the box it was given";
+
+    /// The height half of the same round trip, and the behaviour change wrapping brought with it:
+    /// a fixed-width `text` that does not ask to wrap now *measures* the one line it paints.
+    /// Before, it measured every line cosmic-text would have broken the string onto and painted
+    /// one clipped run into a box several times too tall.
+    fn text_box(lua_src: &str) -> (String, f32) {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(lua_src);
+        apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
+        let node = &scene.surface("bar@TEST").unwrap().children[0];
+        (drawn_text(&scene), node.rect.height)
+    }
+
+    #[test]
+    fn a_narrow_text_that_does_not_wrap_is_one_line_tall() {
+        let (drawn, height) =
+            text_box(&format!(r#"panel {{ id = "bar", child = text {{ width = 80, content = "{LONG}" }} }}"#));
+        assert_eq!(height, 12.0 * 1.2, "an unwrapped run occupies one line however long it is");
+        assert!(!drawn.contains('\n'), "nothing broke it: {drawn:?}");
+    }
+
+    #[test]
+    fn a_narrow_text_that_wraps_is_broken_into_lines_and_measured_at_their_height() {
+        let (drawn, height) = text_box(&format!(
+            r#"panel {{ id = "bar", child = text {{ width = 80, content = "{LONG}", wrap = "Word" }} }}"#
+        ));
+        let lines: Vec<&str> = drawn.lines().collect();
+        assert!(lines.len() > 1, "80px cannot hold {LONG:?} on one line, got {drawn:?}");
+        assert_eq!(height, lines.len() as f32 * 12.0 * 1.2, "the box has to be as tall as the lines it holds");
+        // Whitespace is where the breaks landed, so the words survive and only the gaps moved.
+        assert_eq!(drawn.split_whitespace().collect::<Vec<_>>(), LONG.split_whitespace().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn max_lines_caps_both_what_is_drawn_and_the_height_reserved_for_it() {
+        let (drawn, height) = text_box(&format!(
+            r#"panel {{ id = "bar", child = text {{ width = 80, content = "{LONG}", wrap = "Word", max_lines = 2 }} }}"#
+        ));
+        assert_eq!(drawn.lines().count(), 2, "got {drawn:?}");
+        assert_eq!(height, 2.0 * 12.0 * 1.2, "a capped run reserves the lines it keeps, not the ones it dropped");
+    }
+
+    /// The notification-body case: fill the lines allowed, then say the rest was dropped. The
+    /// ellipsis has to land on the last kept line and nowhere else.
+    #[test]
+    fn a_capped_wrap_that_elides_finishes_its_last_line_with_an_ellipsis() {
+        let (drawn, _) = text_box(&format!(
+            r#"panel {{ id = "bar", child = text {{ width = 80, content = "{LONG}", wrap = "Word", max_lines = 2, elide = "End" }} }}"#
+        ));
+        let lines: Vec<&str> = drawn.lines().collect();
+        assert_eq!(lines.len(), 2, "got {drawn:?}");
+        assert!(lines[1].ends_with('\u{2026}'), "the last kept line must be ellipsized: {drawn:?}");
+        assert!(!lines[0].ends_with('\u{2026}'), "no earlier line may be: {drawn:?}");
+    }
+
+    /// A cap the text never reaches changes nothing, so a config can set `max_lines`
+    /// unconditionally and let the content decide.
+    #[test]
+    fn a_max_lines_above_the_line_count_leaves_the_run_alone() {
+        let (drawn, _) = text_box(&format!(
+            r#"panel {{ id = "bar", child = text {{ width = 80, content = "{LONG}", wrap = "Word", max_lines = 40, elide = "End" }} }}"#
+        ));
+        assert!(!drawn.contains('\u{2026}'), "nothing was dropped, so nothing should say it was: {drawn:?}");
+        assert_eq!(drawn.split_whitespace().collect::<Vec<_>>(), LONG.split_whitespace().collect::<Vec<_>>());
+    }
+
+    /// `max_lines = 0` is the uncapped spelling a `Bound` needs, since a signal cannot produce
+    /// "absent". It has to mean the same thing as leaving the property off.
+    #[test]
+    fn a_max_lines_of_zero_is_no_cap_at_all() {
+        let uncapped =
+            format!(r#"panel {{ id = "bar", child = text {{ width = 80, content = "{LONG}", wrap = "Word" }} }}"#);
+        let zero = format!(
+            r#"panel {{ id = "bar", child = text {{ width = 80, content = "{LONG}", wrap = "Word", max_lines = 0 }} }}"#
+        );
+        assert_eq!(text_box(&zero), text_box(&uncapped));
+    }
 
     #[test]
     fn a_text_too_wide_for_its_box_is_cut_short_and_finished_with_an_ellipsis() {

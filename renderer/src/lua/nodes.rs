@@ -61,7 +61,7 @@ const NODE_PROPERTIES: &[(&str, &[&str])] = &[
     ("rect", &["children"]),
     ("row", &["children", "scroll", "spacing"]),
     ("column", &["children", "scroll", "spacing"]),
-    ("text", &["content", "elide", "font_size", "foreground", "text_align"]),
+    ("text", &["content", "elide", "font_size", "foreground", "max_lines", "text_align", "wrap"]),
     // `foreground` means what CSS `color` means: what a `currentColor` fill in the resolved SVG
     // resolves to (ADR-0072). A full-colour icon names no `currentColor`, so this is always safe.
     ("icon", &["foreground", "name", "size"]),
@@ -495,7 +495,7 @@ mod meta_stub_tests {
     /// these same declarations. Together they close the loop: this proves the stub does not promise
     /// what the engine refuses, and `just types` proves a config written to the stub compiles.
     ///
-    /// All 408 of them, with no skips: a type `sample` has no row for fails the test rather than
+    /// All 439 of them, with no skips: a type `sample` has no row for fails the test rather than
     /// passing quietly, so the table cannot rot into covering half the file.
     ///
     /// ponytail: this checks the types, it does not derive them. `lua-meta/nodes.lua` is still
@@ -567,7 +567,7 @@ mod meta_stub_tests {
             unsampled.len(),
             unsampled.join("\n")
         );
-        assert_eq!(probed, 434, "the number of declared type members moved; confirm the change is intended");
+        assert_eq!(probed, 439, "the number of declared type members moved; confirm the change is intended");
     }
 
     /// One Lua literal per declared type. `None` means "no sample", which skips rather than guesses.

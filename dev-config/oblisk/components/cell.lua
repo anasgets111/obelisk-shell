@@ -3,10 +3,14 @@
 --
 -- `opts.width` is what makes the elide below do anything. `elide = "End"` is declared on every cell
 -- unconditionally and costs nothing on a cell that is content-sized, because such a node's box came
--- from measuring the very string in it and therefore always fits it (`layout::scene::elide_to_fit`
--- returns early). It bites only where a caller has bounded the box, which is the point: a module
--- says how much room it will take and the engine cuts the string to it, instead of every caller
--- guessing a character budget.
+-- from measuring the very string in it and therefore always fits it
+-- (`layout::scene::fit_text_to_box` measures before it searches). It bites only where a caller has
+-- bounded the box, which is the point: a module says how much room it will take and the engine cuts
+-- the string to it, instead of every caller guessing a character budget.
+--
+-- `opts.wrap` turns that one cut line into `opts.max_lines` of them, with the ellipsis moving to
+-- the last one (ADR-0089). Off by default: a bar cell is a fixed-height slot and a second line
+-- would grow it, so wrapping is for the cards that have room to grow.
 --
 -- This replaced a `util.truncate(s, limit)` that eight modules called, now deleted. It counted
 -- characters, which is the wrong unit: "WWWWWWWWWW" and "iiiiiiiiii" are the same ten characters
@@ -33,7 +37,7 @@ local theme = require("config.theme")
 ---@param content string|Bound
 ---@param color? Color|Bound
 ---@param size? integer
----@param opts? { width?: integer|"Fill", align?: "Start"|"Center"|"End", align_v?: "Start"|"Center"|"End", visible?: boolean|Bound }
+---@param opts? { width?: integer|"Fill", align?: "Start"|"Center"|"End", align_v?: "Start"|"Center"|"End", visible?: boolean|Bound, wrap?: "None"|"Word"|Bound, max_lines?: integer|Bound }
 return function(content, color, size, opts)
     opts = opts or {}
     return text {
@@ -46,5 +50,7 @@ return function(content, color, size, opts)
         visible = opts.visible,
         text_align = opts.align,
         elide = "End",
+        wrap = opts.wrap,
+        max_lines = opts.max_lines,
     }
 end

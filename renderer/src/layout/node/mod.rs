@@ -26,12 +26,12 @@ mod toplevel;
 // (ADR-0068, replacing `layout::paint` itself), reached via `super::*` in `paint_style.rs`.
 use content::{
     parse_elide, parse_fit, parse_font_size, parse_foreground, parse_icon_name, parse_image_source,
-    parse_mask_character, parse_optional_foreground, parse_placeholder, parse_text_align,
+    parse_mask_character, parse_max_lines, parse_optional_foreground, parse_placeholder, parse_text_align, parse_wrap,
 };
 use spec::parse_secure_submit;
 use style::{parse_background, parse_border_color, parse_border_width, parse_clip, parse_radius};
 
-pub use content::{Elide, TextAlign, parse_content, parse_icon_size, parse_node_id, parse_surface_id};
+pub use content::{Elide, TextAlign, Wrap, parse_content, parse_icon_size, parse_node_id, parse_surface_id};
 pub use paint_style::{PaintStyle, paint_style};
 pub use spec::{
     SecureSubmitTarget, SurfaceFingerprint, SurfaceSpec, lock_spec, parse_children, parse_list_children,

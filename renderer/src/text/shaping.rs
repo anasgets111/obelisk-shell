@@ -30,11 +30,36 @@ pub struct ShapeRequest {
     pub max_width: Option<f32>,
 }
 
-/// The measured result of shaping a request: its tight bounding box in logical pixels.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// The measured result of shaping a request: its tight bounding box in logical pixels, plus the
+/// lines the text was broken onto getting there.
+///
+/// `lines` is what makes a wrapped `text` drawable at all. femtovg paints one run per `fill_text`
+/// call and has no line breaker of its own, so paint has to be told where cosmic-text put the
+/// breaks; before this it was told only how tall the result came out, which is why a wrapped
+/// string measured three lines high and painted one.
+///
+/// Behind an `Arc` because [`ShapingHandle::shape`] hands a clone back on every memo hit, and a
+/// hit is the common case: `Scene::apply` re-measures every text node it resolves.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ShapeResult {
     pub width: f32,
     pub height: f32,
+    /// One entry per laid-out line, in order, each trimmed of the whitespace a word wrap leaves
+    /// behind at the break. Never empty for non-empty text: a string that needs no break is one
+    /// entry holding the whole string.
+    pub lines: Arc<[String]>,
+}
+
+/// The multiplier every measurement and every paint derives a line height from.
+///
+/// One constant rather than the four call sites that each spelled `font_size * 1.2`: paint has to
+/// advance a wrapped line by exactly the step the shaper measured with, and "exactly" is not
+/// something to maintain by hand in four places.
+pub const LINE_HEIGHT_RATIO: f32 = 1.2;
+
+/// [`LINE_HEIGHT_RATIO`] applied, for the callers that have a font size and want the step.
+pub fn line_height(font_size: f32) -> f32 {
+    font_size * LINE_HEIGHT_RATIO
 }
 
 /// One font file's bytes, held once and shared by every reader. The inner `Arc` is `fontdb`'s:
@@ -169,7 +194,7 @@ impl ShapingHandle {
         // A poisoned lock is recovered rather than propagated: this map is a pure memo, so no
         // invariant can break, and an unrelated thread's death shouldn't kill text measurement.
         if let Some(hit) = self.cache.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
-            return *hit;
+            return hit.clone();
         }
 
         let (reply_tx, reply_rx) = mpsc::channel();
@@ -195,7 +220,7 @@ impl ShapingHandle {
         if cache.len() >= SHAPE_CACHE_CAPACITY {
             cache.clear();
         }
-        cache.insert(key, result);
+        cache.insert(key, result.clone());
         result
     }
 
@@ -257,13 +282,26 @@ fn shape(font_system: &mut FontSystem, primary_family: &str, request: &ShapeRequ
     buffer.shape_until_scroll(font_system, false);
 
     let mut width = 0.0f32;
-    let mut line_count = 0u32;
+    let mut lines: Vec<String> = Vec::new();
     for run in buffer.layout_runs() {
         width = width.max(run.line_w);
-        line_count += 1;
+        // `run.text` is cosmic-text's "original text line" -- the whole source paragraph, handed
+        // back again for every visual line the wrap broke it into. The glyphs are what say which
+        // slice of it this run is. Read as min/max over the cluster indices rather than as the
+        // first and last glyph's, because a bidi run's glyphs come in visual order and its byte
+        // range is not theirs to be sorted by.
+        let slice = match (run.glyphs.iter().map(|g| g.start).min(), run.glyphs.iter().map(|g| g.end).max()) {
+            (Some(start), Some(end)) => &run.text[start..end],
+            // A blank line carries no glyphs and still takes up its height.
+            _ => "",
+        };
+        // Trailing whitespace only: a word wrap leaves the break's space on the line it broke, and
+        // a trailing space shifts a centred or right-aligned line by its own advance. Leading
+        // space is the author's own indentation and stays.
+        lines.push(slice.trim_end().to_string());
     }
 
-    ShapeResult { width, height: line_count as f32 * metrics.line_height }
+    ShapeResult { width, height: lines.len() as f32 * metrics.line_height, lines: lines.into() }
 }
 
 /// One entry per unique source *file*, not one per face, in the database's own load/chain order:
@@ -341,7 +379,7 @@ mod tests {
     use super::*;
 
     fn req(text: &str, font_size: f32) -> ShapeRequest {
-        ShapeRequest { text: text.into(), font_size, line_height: font_size * 1.2, max_width: None }
+        ShapeRequest { text: text.into(), font_size, line_height: line_height(font_size), max_width: None }
     }
 
     /// The chain a config declares has to reach the worker, or `fonts { ... }` is a no-op that
@@ -586,6 +624,54 @@ mod tests {
             proportional.width,
             monospace.width
         );
+    }
+
+    /// The trap `lines` was written into: cosmic-text's `LayoutRun::text` is the whole *source*
+    /// line, handed back once per visual line the wrap broke it into, so collecting it directly
+    /// yields the entire string N times over. Only the glyph cluster indices delimit a run.
+    #[test]
+    fn each_wrapped_line_is_its_own_slice_and_not_the_whole_string_again() {
+        const TEXT: &str = "Oblisk Shell Renderer";
+        let handle = ShapingHandle::spawn();
+        let unconstrained = handle.shape(req(TEXT, 14.0));
+        assert_eq!(&*unconstrained.lines, [TEXT], "an unwrapped string is one line holding all of it");
+
+        let wrapped = handle.shape(ShapeRequest {
+            text: TEXT.into(),
+            font_size: 14.0,
+            line_height: line_height(14.0),
+            max_width: Some(unconstrained.width / 2.0),
+        });
+        assert!(wrapped.lines.len() > 1, "expected a break, got {:?}", wrapped.lines);
+        assert_eq!(
+            wrapped.lines.join(" "),
+            TEXT,
+            "the lines have to rejoin to the source, not repeat it: {:?}",
+            wrapped.lines
+        );
+    }
+
+    /// Height is the line count times the step, so the two have to be derived from the same walk
+    /// rather than counted twice.
+    #[test]
+    fn the_measured_height_is_the_lines_it_reports() {
+        let handle = ShapingHandle::spawn();
+        let result = handle.shape(ShapeRequest {
+            text: "Oblisk Shell Renderer".into(),
+            font_size: 14.0,
+            line_height: 18.0,
+            max_width: Some(40.0),
+        });
+        assert_eq!(result.height, result.lines.len() as f32 * 18.0);
+    }
+
+    /// A hard newline is a break the shaper already honoured for measurement and paint ignored,
+    /// drawing the `\n` as a glyph. It arrives as two lines like any other break.
+    #[test]
+    fn an_explicit_newline_is_two_lines() {
+        let handle = ShapingHandle::spawn();
+        let result = handle.shape(req("first\nsecond", 14.0));
+        assert_eq!(&*result.lines, ["first", "second"]);
     }
 
     #[test]

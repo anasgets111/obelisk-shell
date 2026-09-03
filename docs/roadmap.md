@@ -24,7 +24,7 @@ twenty binaries, and renders a 256-bar audio spectrum through a GLSL fragment sh
 | Paint vocabulary | five operations | fill, radius, per-edge border, blit, rounded clip |
 | Animation | absent | Lua's fastest clock is `system.time` at 1 Hz |
 | Text and layout | sufficient | shaping, clipping, alignment, keyed reconciliation |
-| Text metrics | partly built | `text_align` and `elide` land; wrap and `max_lines` need line breaks the shaper does not return |
+| Text metrics | built | `text_align`, `elide`, `wrap` and `max_lines` all land (ADR-0089); no per-line alignment and no hyphenation |
 | Fonts | declared | `fonts { ... }` picks the chain; no per-node family, and none is needed while fallback is per glyph |
 
 The data layer is not the problem. Paint and animation are.

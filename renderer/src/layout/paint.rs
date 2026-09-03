@@ -2,7 +2,7 @@
 //!
 //! Split in two since the list existed: [`build`] walks a `layout::scene::ResolvedNode` tree into
 //! a [`DisplayList`] of plain Rust data, and [`execute`] turns that list into femtovg draw calls on
-//! `text::atlas::TextPainter`'s canvas (the one `draw_line` draws glyphs on). This lets
+//! `text::atlas::TextPainter`'s canvas (the one `draw_text` draws glyphs on). This lets
 //! `wayland::App::paint_surface` skip the draw plus `eglSwapBuffers` when a frame's list equals the
 //! last, and lets [`build`] be tested without an EGL context. Measured on an idle bar with a clock:
 //! a 1920x1200 wallpaper went from repainting twice a second to never, niri's CPU fell about a
@@ -172,13 +172,12 @@ fn build_node(
     let y = origin_y + node.rect.y;
     let rect = LogicalRect { x, y, width: node.rect.width, height: node.rect.height };
 
-    // Clipped to this box, snapped like `draw_line` snaps its glyph origin, and intersected with
+    // Clipped to this box, snapped like `draw_text` snaps its glyph origin, and intersected with
     // the ancestors' clip rather than replacing it, so a child can only shrink the region.
     //
-    // ponytail: clipping is the floor, not the finished behavior. `ShapeResult` gives only a
-    // bounding `width`/`height`, not the wrapped lines `layout::scene`'s measure callback found for
-    // a `Content`-sized `text` (§ 3.2), so this clip cuts an unwrapped `Draw::Text` off at line
-    // one's width. Upgrade path: paint should ask for the same wrapped line breaks layout measured.
+    // A `text` that asked to wrap arrives here already broken into lines by `layout::scene`'s
+    // `fit_text_to_box`, so this clip is a backstop rather than the thing deciding what shows. One
+    // that did not is a single run, and the clip cuts it at the box edge as it always has.
     //
     // Always rectangular, `radius` or not: a node that wants its children cut by its arc says
     // `clip = "Rounded"` and gets a `Draw::Clipped` group below. femtovg's
@@ -268,7 +267,7 @@ fn split_fill_and_border(draw: Option<Draw>) -> (Option<Draw>, Option<Draw>) {
 }
 
 /// Draws `root` and its whole subtree onto `painter`'s canvas, then flushes once. `scale` is the
-/// physical/logical pixel ratio `text::snap::snap_to_physical` and `TextPainter::draw_line` take
+/// physical/logical pixel ratio `text::snap::snap_to_physical` and `TextPainter::draw_text` take
 /// everywhere else in this crate: every call site in `wayland::mod` hardcodes `1.0` today.
 ///
 /// `crate::wayland::App::paint_surface` is the production caller: `socket.rs`'s `RendererClient`
@@ -340,7 +339,7 @@ fn run(
                 paint_border(painter.canvas_mut(), rect, *radius, *colors, *widths, scale);
             }
             Draw::Text { content, font_size, color, align } => {
-                painter.draw_line(content, rect, *font_size, scale, *color, *align)
+                painter.draw_text(content, rect, *font_size, scale, *color, *align)
             }
             Draw::Icon { name, px, alpha, color } => {
                 // `u16` is `freedesktop-icons`'s own size type, and a theme has no directory above
@@ -472,8 +471,9 @@ fn draw_for(
         }),
 
         // `text` (§ 5.2 item 4): `content` through `TextPainter`, at `rect`, coloured by
-        // `foreground`. `elide` is absent on purpose: `Scene::apply` already rewrote `content` to
-        // the string that fits, the only place the box width and shaping worker are both in reach.
+        // `foreground`. `elide`, `wrap` and `max_lines` are absent on purpose: `Scene::apply`
+        // already rewrote `content` to the string that fits -- ellipsized, or line-broken with
+        // `\n` -- in the only place the box width and the shaping worker are both in reach.
         //
         // ponytail: a `Content`-sized `text` box comes from cosmic-text's measurement
         // (`layout::scene`'s measure callback), so if femtovg ever renders wider than cosmic-text
@@ -481,7 +481,7 @@ fn draw_for(
         // chain (single-face Noto Sans): `measure_text` agreed with cosmic-text's `shape()` to
         // within 0.0001px on a 53-character, 32px string, last lit pixel 3-4 physical pixels inside
         // the measured edge. No shaving observed today, but the clip is the safe direction.
-        PaintStyle::Text { content, font_size, color, align, elide: _ } => Some(Draw::Text {
+        PaintStyle::Text { content, font_size, color, align, elide: _, wrap: _, max_lines: _ } => Some(Draw::Text {
             content: content.clone(),
             font_size: *font_size,
             color: fade(*color, opacity),
@@ -1589,7 +1589,7 @@ mod tests {
                 lit_pixels += 1;
                 assert!(
                     g > r && g > b,
-                    "a glyph pixel at ({x}, {y}) is {:?}, which is not the green `foreground` asked for -- white here means `foreground` never reached `draw_line`",
+                    "a glyph pixel at ({x}, {y}) is {:?}, which is not the green `foreground` asked for -- white here means `foreground` never reached `draw_text`",
                     (r, g, b)
                 );
             }
@@ -1780,7 +1780,7 @@ mod tests {
         let shaped = shaping.shape(ShapeRequest {
             text: TEXT.into(),
             font_size: FONT_SIZE,
-            line_height: FONT_SIZE * 1.2,
+            line_height: crate::text::shaping::line_height(FONT_SIZE),
             max_width: None,
         });
 

@@ -122,6 +122,65 @@ pub fn parse_elide(properties: &HashMap<String, Value>) -> Result<Elide, LayoutE
     }
 }
 
+/// Whether a run too wide for its box breaks onto another line, and where it may break.
+///
+/// Its own property rather than something `elide` implies: the two answer different questions and
+/// compose, `wrap = "Word"` with `elide = "End"` being the notification-body case -- fill the
+/// lines allowed, then ellipsize the last one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Wrap {
+    /// One line, however long. What every `text` did before wrapping existed.
+    #[default]
+    None,
+    /// Break at word boundaries, falling back to a glyph boundary for a word wider than the box,
+    /// which is cosmic-text's own `Wrap::WordOrGlyph` and the only sensible behaviour for a
+    /// 40-character German compound in a 120px card.
+    Word,
+}
+
+/// `wrap` (`oblisk-idl-api-specs.md` § 5.2 item 4). Absent is `None`, which is what every existing
+/// config gets and what the engine did before: a `text` stays on one line unless it asks not to.
+///
+/// Opt-in rather than always-on even though measurement already wrapped. Before this, a
+/// fixed-width `text` measured its full wrapped height and painted one clipped line, so its box
+/// was already too tall; making wrapping the default would have started *drawing* into that extra
+/// height everywhere at once. `"None"` now measures one line too, so the box and the paint agree
+/// in both modes -- which is the actual fix, and the reason this is not purely additive.
+pub fn parse_wrap(properties: &HashMap<String, Value>) -> Result<Wrap, LayoutError> {
+    let Some(value) = properties.get("wrap") else {
+        return Ok(Wrap::None);
+    };
+    let Value::String(s) = value else {
+        return Err(invalid("wrap", format!("must be a string, got {}", preview_for_error(value))));
+    };
+    match checked_string("wrap", s)?.as_str() {
+        "None" => Ok(Wrap::None),
+        "Word" => Ok(Wrap::Word),
+        other => Err(invalid("wrap", format!("must be \"None\" or \"Word\", got {other:?}"))),
+    }
+}
+
+/// `max_lines` (`oblisk-idl-api-specs.md` § 5.2 item 4). Absent, or `0`, is no cap.
+///
+/// Zero means uncapped rather than being refused as nonsense, because the property exists to be
+/// driven by a signal: an expander is `max_lines = expanded:map(function(e) return e and 0 or 2
+/// end)`, and a `Bound` has no way to spell "absent". A negative is still an error -- there is no
+/// reading of it, and silently clamping would hide a sign slip in a config's arithmetic.
+///
+/// Only consulted when [`parse_wrap`] said `Word`: capping the lines of a run that cannot make a
+/// second one is a no-op, not an error, so a config can set both unconditionally.
+pub fn parse_max_lines(properties: &HashMap<String, Value>) -> Result<Option<usize>, LayoutError> {
+    let Some(value) = properties.get("max_lines") else {
+        return Ok(None);
+    };
+    let n = value_as_f32("max_lines", value)?
+        .ok_or_else(|| invalid("max_lines", format!("expected a number, got {}", preview_for_error(value))))?;
+    if n < 0.0 {
+        return Err(invalid("max_lines", format!("must not be negative, got {n}")));
+    }
+    Ok((n >= 1.0).then_some(n as usize))
+}
+
 /// `text_align` (`oblisk-idl-api-specs.md` § 5.2 item 4). Absent is `Start`. A string, matching
 /// `fit`, `layer`, `align_h` and `on_click`'s button name at this boundary. `Start`/`End` rather
 /// than `Left`/`Right`, the names § 5.2 uses for the same axis elsewhere, as `align_h` does.
@@ -331,6 +390,44 @@ mod tests {
             parse_font_size(&props).unwrap_err(),
             LayoutError::InvalidProperty { property, .. } if property == "font_size"
         ));
+    }
+
+    #[test]
+    fn wrap_defaults_to_one_line_and_rejects_a_mode_that_does_not_exist() {
+        let lua = lua();
+        assert_eq!(parse_wrap(&HashMap::new()).unwrap(), Wrap::None);
+
+        let table: mlua::Table = lua.load(r#"return { kind = "text", wrap = "Word" }"#).eval().unwrap();
+        assert_eq!(parse_wrap(&props_from_table(&table)).unwrap(), Wrap::Word);
+
+        // "WordWrap" is the plausible typo, and QML spells this mode `Text.WordWrap`.
+        let table: mlua::Table = lua.load(r#"return { kind = "text", wrap = "WordWrap" }"#).eval().unwrap();
+        let err = parse_wrap(&props_from_table(&table)).unwrap_err();
+        assert!(format!("{err}").contains("Word"), "the error should name the modes that do exist, got {err}");
+    }
+
+    /// Zero is the uncapped spelling a `Bound` needs, since a signal has no way to be absent. A
+    /// negative has no reading at all, and clamping one would swallow a sign slip in a config's
+    /// own arithmetic.
+    #[test]
+    fn max_lines_treats_absent_and_zero_alike_and_refuses_a_negative() {
+        let lua = lua();
+        assert_eq!(parse_max_lines(&HashMap::new()).unwrap(), None);
+
+        let table: mlua::Table = lua.load(r#"return { kind = "text", max_lines = 0 }"#).eval().unwrap();
+        assert_eq!(parse_max_lines(&props_from_table(&table)).unwrap(), None);
+
+        let table: mlua::Table = lua.load(r#"return { kind = "text", max_lines = 2 }"#).eval().unwrap();
+        assert_eq!(parse_max_lines(&props_from_table(&table)).unwrap(), Some(2));
+
+        let table: mlua::Table = lua.load(r#"return { kind = "text", max_lines = -1 }"#).eval().unwrap();
+        assert!(matches!(
+            parse_max_lines(&props_from_table(&table)).unwrap_err(),
+            LayoutError::InvalidProperty { property, .. } if property == "max_lines"
+        ));
+
+        let table: mlua::Table = lua.load(r#"return { kind = "text", max_lines = "two" }"#).eval().unwrap();
+        assert!(parse_max_lines(&props_from_table(&table)).is_err());
     }
 
     #[test]

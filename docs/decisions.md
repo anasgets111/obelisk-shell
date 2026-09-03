@@ -4002,3 +4002,66 @@ and every one after it was invisible, because `notification_area` is unmapped be
 — nobody had noticed, because a shell is usually restarted more often than it is watched. ADR-0087
 made it constant rather than intermittent: opening and closing a bar panel is the most frequent
 hide/show in the shell, so the power menu opened once and never again.
+
+## 0089. A `text` can wrap, and an unwrapped one now measures the line it draws
+
+`text` shaped through cosmic-text, which wraps, and painted through femtovg, which does not. The
+measure callback handed the shaper the box width, counted the layout runs that came back, and
+returned `line_count * line_height` as the node's height. Paint then made one `fill_text` call with
+the whole string. So a fixed-width `text` reserved three lines of height and drew one clipped run
+into the top of it, and the two disagreed silently — the clip made it look like elision.
+
+Everything a notification card wants is downstream of fixing that: a body over two lines, a summary
+that expands, a group whose rows are readable. It is also the reason every panel in this shell is
+one elided line per field.
+
+1. **The shaper returns the lines, not just their count.** `ShapeResult` gains
+   `lines: Arc<[String]>`, filled from the same `layout_runs()` walk that already produced the
+   height. Behind an `Arc` because `ShapingHandle::shape`'s memo hands a clone back on every hit and
+   a hit is the common case, so a clone has to be a refcount bump rather than a `Vec` copy.
+
+   The trap this walks into, worth recording because the first implementation fell in it:
+   cosmic-text's `LayoutRun::text` is *the original text line* — the whole source paragraph, handed
+   back again for every visual line the wrap broke it into. Collecting it directly yields the entire
+   string N times over. Only the glyphs delimit a run, via the `start`/`end` cluster indices, read
+   as min/max rather than first/last because a bidi run's glyphs are in visual order.
+
+2. **`wrap` is opt-in, so `"None"` measures one line.** This is the part that is not purely
+   additive. Measurement already wrapped unconditionally, so making wrapping the default would have
+   started *drawing* into height every fixed-width `text` was already reserving, changing the whole
+   shell at once. `wrap = "None"` now passes the shaper no width at all, so it measures the single
+   line it will paint, and the box matches the paint in both modes. A config that never says `wrap`
+   sees no change to what is drawn, and shorter boxes where it was over-reserving.
+
+3. **`max_lines = 0` means uncapped, and so does absent.** Zero is refused nowhere and clamped
+   nowhere: the property exists to be driven by a signal, an expander is
+   `max_lines = expanded:map(function(e) return e and 0 or 2 end)`, and a `Bound` has no way to
+   spell "absent". A negative is still an error — there is no reading of it, and clamping would
+   swallow a sign slip in a config's own arithmetic.
+
+4. **`elide` under `wrap` applies to the last line kept, over the text that did not fit.** Keeping
+   the lines allowed and ellipsizing the last one *as it stands* would read as a sentence that
+   happens to stop; the last kept line is rebuilt from everything below the cap so it reads as
+   truncated. That remainder is the dropped lines joined back with single spaces rather than sliced
+   out of the source, because cosmic-text hands back a line's text and not its byte range into the
+   original. The difference is a run of collapsed whitespace, inside text that is already being cut
+   off.
+
+5. **Line breaking stays in `Scene::finish`, next to elision.** Paint is a pure display-list build
+   with no shaping worker in reach, and the box width is not known until the node is sized, so
+   `finish` is the only place both are available. `PaintStyle::Text::content` therefore carries `\n`
+   by the time it reaches the display list, and `TextPainter::draw_text` walks `lines()` making one
+   `fill_text` per line. femtovg draws a `\n` as a glyph and has no line breaker, so splitting there
+   is not a convenience.
+
+What this does not do: no per-line alignment (each line is aligned by the node's own `text_align`),
+no hyphenation, and no `wrap` at a character boundary as its own mode — cosmic-text's word wrap
+already falls back to a glyph boundary for a word wider than the box, which is the case that
+motivates one.
+
+Left alone, and noted here because line advance now depends on it: `TextPainter` hands femtovg the
+*logical* font size against a canvas whose dpi is 1.0, while every box around it is snapped to
+physical pixels. On a 2x output that draws every glyph in this shell at half size, and has since
+text existed. Lines advance by the same unscaled step, so they are spaced correctly around whatever
+size the glyphs come out — wrong together rather than wrong apart. The fix is to scale the font
+size, and it needs a HiDPI output to verify against.

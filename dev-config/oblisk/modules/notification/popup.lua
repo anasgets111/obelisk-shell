@@ -93,13 +93,12 @@ return panel {
                     cell(field(function(top)
                         return top.summary or "?"
                     end), theme.FG, theme.font.md, { width = "Fill" }),
-                    -- The body, which nothing was reading. One line, elided: `text` has no wrap yet
-                    -- (`Draw::Text` carries one string and paint makes one `fill_text` call), so a
-                    -- two-line body would need the shaper to return the line breaks layout measured
-                    -- with. Until then one elided line beats no body at all.
+                    -- Two lines, then an ellipsis over whatever is left (ADR-0089). A freedesktop
+                    -- body runs to 512 bytes and senders use them, so one elided line was showing
+                    -- the opening clause of a sentence and dropping the rest without saying so.
                     cell(field(function(top)
                         return util.notification_body(top.body)
-                    end), theme.TEXT_OFF, theme.font.sm, { width = "Fill" }),
+                    end), theme.TEXT_OFF, theme.font.sm, { width = "Fill", wrap = "Word", max_lines = 2 }),
                 },
             },
         },

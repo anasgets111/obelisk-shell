@@ -58,12 +58,21 @@ pub enum PaintStyle {
         widths: EdgeInsets,
         clip: ClipShape,
     },
+    /// `content` is the string as the config wrote it up to `Scene::finish`, which rewrites it to
+    /// what actually fits: an ellipsized prefix under `elide`, or the wrapped lines joined by
+    /// `\n` under `wrap`. So by display-list time this may hold newlines and
+    /// `text::atlas::TextPainter::draw_text` draws one run per line.
+    ///
+    /// `elide`, `wrap` and `max_lines` are carried past the parse for that rewriter's benefit and
+    /// are dead to `layout::paint`, which is why it destructures them away.
     Text {
         content: String,
         font_size: f32,
         color: Rgba,
         align: TextAlign,
         elide: Elide,
+        wrap: Wrap,
+        max_lines: Option<usize>,
     },
     /// The theme *name*, not the resolved path: `layout::paint::execute` does the
     /// `image::icons::resolve` lookup, so neither this pass nor the display-list build touches the
@@ -116,6 +125,8 @@ pub fn paint_style(kind: &str, properties: &HashMap<String, Value>) -> Result<Op
             color: parse_foreground(properties)?,
             align: parse_text_align(properties)?,
             elide: parse_elide(properties)?,
+            wrap: parse_wrap(properties)?,
+            max_lines: parse_max_lines(properties)?,
         },
         "icon" => {
             PaintStyle::Icon { name: parse_icon_name(properties)?, color: parse_optional_foreground(properties)? }

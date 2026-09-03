@@ -48,7 +48,7 @@ impl TextPainter {
     /// `font_chain` is `ShapingHandle::font_chain_data()`'s own output, in the same chain order
     /// cosmic-text shaped against, so measurement and paint resolve the one declared chain rather
     /// than two independently-discovered fonts that can disagree (ADR-0043 decision 2).
-    /// Errors if the slice is empty -- `draw_line` cannot fall back to a font it was never given.
+    /// Errors if the slice is empty -- `draw_text` cannot fall back to a font it was never given.
     ///
     /// Registers through a `TextContext` and `add_shared_font_with_index` rather than
     /// `Canvas::add_font_mem`, because `add_font_mem` is `data.to_owned()` inside femtovg: it
@@ -85,7 +85,7 @@ impl TextPainter {
         self.canvas.set_size(width, height, 1.0);
     }
 
-    /// The same canvas `draw_line` fills text onto, exposed so `layout::paint`'s tree walk can
+    /// The same canvas `draw_text` fills text onto, exposed so `layout::paint`'s tree walk can
     /// draw a node's background/border on it too (ADR-0023): one canvas per surface, shared by
     /// every paint operation, not one per property kind.
     pub fn canvas_mut(&mut self) -> &mut Canvas<OpenGl> {
@@ -94,16 +94,21 @@ impl TextPainter {
 
     /// The loaded chain's `FontId`s, in chain order -- the test seam `layout::paint`'s
     /// divergence test uses to compare femtovg's measurement against `ShapingHandle::shape`'s.
-    /// `draw_line` reaches `self.fonts` directly and has no need of this.
+    /// `draw_text` reaches `self.fonts` directly and has no need of this.
     #[cfg(test)]
     pub fn fonts(&self) -> &[FontId] {
         &self.fonts
     }
 
-    /// Draws `text` with its snapped top-left corner at `rect`'s origin, in `color`. Does not
-    /// flush or swap buffers: `layout::paint`'s tree walk draws a whole surface's worth of
-    /// nodes onto this same canvas and flushes once at the end.
-    pub fn draw_line(
+    /// Draws `text` with its snapped top-left corner at `rect`'s origin, in `color`, one
+    /// `fill_text` per line. Does not flush or swap buffers: `layout::paint`'s tree walk draws a
+    /// whole surface's worth of nodes onto this same canvas and flushes once at the end.
+    ///
+    /// Lines are `\n`-separated, put there by `layout::scene`'s `fit_text_to_box` from the breaks
+    /// cosmic-text found. femtovg has no line breaker and draws `\n` as a glyph, so splitting here
+    /// is not a convenience -- it is the only reason a wrapped `text` renders as more than one
+    /// clipped line. A string with no newline in it takes exactly the path it always did.
+    pub fn draw_text(
         &mut self,
         text: &str,
         rect: LogicalRect,
@@ -131,8 +136,20 @@ impl TextPainter {
         let (femto_align, anchor_x) = text_anchor(align, physical.x0, physical.x1);
         paint.set_text_align(femto_align);
         let ascender = self.canvas.measure_font(&paint).map(|m| m.ascender()).unwrap_or(font_size);
-        let baseline_y = physical.y0 as f32 + ascender;
-        let _ = self.canvas.fill_text(anchor_x, baseline_y, text, &paint);
+        // The same step `text::shaping` measured the box with, so the lines land where the height
+        // was reserved for them.
+        //
+        // ponytail: unscaled, matching `set_font_size` just above, which is handed the logical size
+        // against a canvas whose dpi is 1.0 -- so on a fractional or 2x output every glyph in this
+        // shell already draws at logical size in a physical-pixel canvas. Advancing by a scaled
+        // step would space correctly-spaced lines around wrong-sized glyphs. Upgrade path: scale
+        // the font size here and let this follow it; only reachable with a HiDPI output to verify
+        // against.
+        let step = crate::text::shaping::line_height(font_size);
+        for (index, line) in text.lines().enumerate() {
+            let baseline_y = physical.y0 as f32 + ascender + index as f32 * step;
+            let _ = self.canvas.fill_text(anchor_x, baseline_y, line, &paint);
+        }
     }
 }
 
