@@ -4,9 +4,6 @@
 //! what they all share.
 
 use super::*;
-use crate::wayland::layer::anchor_for;
-use crate::wayland::layer::keyboard_interactivity_for;
-use crate::wayland::layer::layer_extent_for;
 
 /// A window surface bound to the shared EGL context after its first configure. Field order
 /// matters: wayland-egl requires `WlEglSurface` to outlive the EGL surface built from it, and
@@ -23,17 +20,16 @@ pub(super) struct BoundSurface {
 pub(super) fn log_bind_failure(surface_id: &str, stage: &str, err: impl std::fmt::Display) {
     eprintln!("[oblisk-renderer] {surface_id}: {stage} failed: {err}");
 }
-/// § 6.1's `visible`, as the compositor currently sees it (ADR-0038 decision 2: within a live
-/// generation, `visible` maps and unmaps a surface without destroying it). Three states, not
-/// two: a re-map, like a first map, must commit with no buffer and wait for a configure before
-/// attaching one, so both share `AwaitingConfigure`.
+/// § 6.1's `visible`, as the compositor currently sees it. Three states, not two: a surface being
+/// shown must commit with no buffer and wait for a configure before attaching one, so the gap
+/// between asking and being allowed to draw needs a name of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MapState {
-    /// `visible` is false: no buffer was ever attached, or a null buffer unmapped one. Nothing
-    /// may be painted or committed here, since an empty commit is the re-map (see
-    /// [`App::unmap`]).
+    /// `visible` is false: either no buffer was ever attached, or the role object has been
+    /// destroyed (ADR-0088, ADR-0049 decision 1). Nothing may be painted here, and for a `panel`
+    /// there may be no `wl_surface` left to paint onto (see [`App::unmap`]).
     Unmapped,
-    /// The map (or re-map) commit is out and the compositor has not configured the surface yet.
+    /// The map commit is out and the compositor has not configured the surface yet.
     AwaitingConfigure,
     /// Configured: [`App::paint_surface`] may attach a buffer, and its `swap_buffers` is the
     /// commit every other staged request rides on.
@@ -49,12 +45,26 @@ impl MapState {
 /// The protocol object a tracked surface's `wl_surface` has been given a role by, plus the spec
 /// its state was last set from (§ 6, ADR-0040 decision 1). One enum, not a `Vec` per role: EGL
 /// binding, paint, input routing and PBA staging are identical across roles and all index one
-/// `App::surfaces`. Variants differ in how long the Wayland object lives (ADR-0049 decision 1):
-/// a `panel`'s lives for the generation, a `window`'s or `popup`'s only while shown, hence
-/// `Option`.
+/// `App::surfaces`. Every variant's Wayland object lives only while the surface is shown
+/// (ADR-0049 decision 1, ADR-0088), hence `Option` on all three.
 pub(super) enum TrackedRole {
     Panel {
-        layer: LayerSurface,
+        /// `None` once `visible` has gone false: the `zwlr_layer_surface_v1` and its `wl_surface`
+        /// are destroyed and the next show builds new ones (ADR-0088).
+        ///
+        /// This was a bare `LayerSurface` living for the whole generation, on ADR-0038 decision
+        /// 2's reasoning that `visible` should churn no Wayland objects. The protocol agrees --
+        /// `zwlr_layer_surface_v1` documents unmapping with a null buffer and re-mapping with a
+        /// bufferless commit -- but niri does not honour the second half. Measured on the wire:
+        /// the re-map commit, the answering `configure`, our `ack_configure` and the buffer attach
+        /// all go out in the order the spec prescribes, and the surface never comes back. So the
+        /// first notification of a session drew and every later one was invisible, and a bar panel
+        /// opened, closed and reopened stayed blank.
+        layer: Option<LayerSurface>,
+        /// The output this instance belongs to, kept because [`App::show_panel`] rebuilds the
+        /// surface from `spec` and needs the same one (ADR-0038 decision 3: the output is never
+        /// the compositor's to pick).
+        output: wl_output::WlOutput,
         /// The diff baseline `layer::spec_update` compares a fresh resolve against, so only fields
         /// that actually moved are pushed (ADR-0038 decision 2). Also the standing anchor/exclusive
         /// answer [`App::apply_exclusive_zone`] needs once `configure` reports a size.
@@ -113,7 +123,7 @@ impl TrackedRole {
     /// This surface's `wl_surface`, or `None` for a `window`/`popup` not currently shown.
     pub(super) fn wl_surface(&self) -> Option<&wl_surface::WlSurface> {
         match self {
-            TrackedRole::Panel { layer, .. } => Some(layer.wl_surface()),
+            TrackedRole::Panel { layer, .. } => layer.as_ref().map(LayerSurface::wl_surface),
             TrackedRole::Window { window, .. } => window.as_ref().map(WaylandSurface::wl_surface),
             TrackedRole::Popup { popup, .. } => popup.as_ref().map(WaylandSurface::wl_surface),
             TrackedRole::Lock { surface, .. } => surface.as_ref().map(SessionLockSurface::wl_surface),
@@ -125,7 +135,7 @@ impl TrackedRole {
     /// `None`, so the popup asking is not created either.
     pub(super) fn as_popup_parent(&self) -> Option<PopupParent> {
         match self {
-            TrackedRole::Panel { layer, .. } => Some(PopupParent::Layer(layer.clone())),
+            TrackedRole::Panel { layer, .. } => layer.as_ref().map(|layer| PopupParent::Layer(layer.clone())),
             TrackedRole::Window { window, .. } => window.as_ref().map(|w| PopupParent::Xdg(w.xdg_surface().clone())),
             TrackedRole::Popup { popup, .. } => popup.as_ref().map(|p| PopupParent::Xdg(p.xdg_surface().clone())),
             // `ext_session_lock_surface_v1` is neither an `xdg_surface` nor a
@@ -565,11 +575,10 @@ impl App {
         // its contents, so the object has no reason to outlive the request.
     }
 
-    /// Applies § 5.1's `visible` to a live surface, by whichever mechanism the role's lifetime
-    /// rule calls for (ADR-0038 decision 2, ADR-0049 decisions 1-2). The same Lua-facing property,
-    /// two different mechanics: a `panel`'s Wayland object outlives every flip, so `visible` is a
-    /// map or unmap commit; a `window`'s exists only while shown, so `visible` is a create or a
-    /// destroy.
+    /// Applies § 5.1's `visible` to a live surface: a create or a destroy, for every role
+    /// (ADR-0049 decision 1, ADR-0088). A `panel` used to be the exception, mapping and unmapping
+    /// an object that outlived the flip, until the layer-shell re-map that rested on turned out
+    /// not to be honoured -- see [`TrackedRole::Panel`]'s `layer`.
     /// Frozen for a PBA Candidate: this is the one line in this file where a mistake hangs the
     /// shell instead of failing a test. `maybe_send_ready_signal` announces the surfaces this
     /// process will present, and `activate_draw` draws exactly that set. § 15.2 point 2 hydrates a
@@ -584,7 +593,12 @@ impl App {
         }
         match &self.surfaces[index].role {
             TrackedRole::Panel { .. } => match (self.surfaces[index].map_state, visible) {
-                (MapState::Unmapped, true) => self.remap(index),
+                (MapState::Unmapped, true) => {
+                    // Cloned because `show_panel` takes `&mut self`; a `QueueHandle` is a cheap
+                    // refcounted handle, the same reason `show_window`'s arm below clones one.
+                    let qh = self.queue_handle.clone();
+                    self.show_panel(&qh, index);
+                }
                 (MapState::AwaitingConfigure | MapState::Mapped, false) => self.unmap(index),
                 _ => {}
             },
@@ -617,53 +631,35 @@ impl App {
     /// ADR-0038 decision 2: toggling a launcher costs this instead of a process spawn.
     /// This is the only commit an unmapped surface ever gets; the same description says "the
     /// client can re-map the surface by performing a commit without any buffer attached", so a
-    /// stray bookkeeping commit here would silently re-map it.
-    fn unmap(&mut self, index: usize) {
-        let TrackedRole::Panel { layer, .. } = &self.surfaces[index].role else {
-            return;
-        };
-        layer.wl_surface().attach(None, 0, 0);
-        layer.wl_surface().commit();
-        self.surfaces[index].map_state = MapState::Unmapped;
-        eprintln!("[oblisk-renderer] {} unmapped: visible = false", self.surfaces[index].surface_id);
-    }
-
-    /// The re-map half: "The client can re-map the surface by performing a commit without any
-    /// buffer attached, waiting for a configure event and handling it as usual."
-    /// Every layer-shell field is re-sent, since the same description says an unmapped surface
-    /// "returns to the state it had right after layer_shell.get_layer_surface" (`anchor` never
-    /// otherwise changes but can be reset out from under a live surface). The exclusive zone,
-    /// not a spec field, is not re-sent; the configure re-derives it from the granted size, and
-    /// `set_size` needs no `layer::ambiguous_zero_axis` guard since the applied spec's size
-    /// already passed it.
+    /// `visible = false` for a `panel`: destroy the layer surface outright (ADR-0088).
     ///
-    /// The two starting states this can be called from end in different `MapState`s: a panel
-    /// declared `visible = false` at startup was configured and acked but never attached a
-    /// buffer, so this commit changes nothing and goes straight to [`MapState::Mapped`]. A
-    /// surface that really was mapped and then null-buffered has been reset, so this is a fresh
-    /// initial commit that gets a configure back, waiting in [`MapState::AwaitingConfigure`] for
-    /// `bind_and_clear` (attaching a buffer before acking is what the protocol forbids).
-    /// `bound.is_some()` tells the two apart: an EGL surface exists only past a bind-and-paint.
-    fn remap(&mut self, index: usize) {
-        let was_mapped = self.surfaces[index].bound.is_some();
-        let TrackedRole::Panel { layer, spec, output_size } = &self.surfaces[index].role else {
+    /// This was a null-buffer unmap, which is what `zwlr_layer_surface_v1` documents and what
+    /// ADR-0038 decision 2 chose so a `visible` flip would churn no Wayland objects. niri does not
+    /// bring such a surface back -- see [`TrackedRole::Panel`]'s `layer` for the wire trace -- so
+    /// hiding now costs the object and showing builds a new one, which is what a `window` and a
+    /// `popup` have always done (ADR-0049 decision 1) and what the Qt shell this config mirrors
+    /// does for a `PanelWindow`.
+    ///
+    /// Order matters and is [`App::hide_window`]'s: child popups first, since one rooted under
+    /// this surface must not outlive its parent; then the EGL surface and `wl_egl_window`, which
+    /// point at a `wl_surface` that is about to go; then the role object, whose drop sends
+    /// `zwlr_layer_surface_v1.destroy` and destroys the `wl_surface` with it.
+    fn unmap(&mut self, index: usize) {
+        if !matches!(self.surfaces[index].role, TrackedRole::Panel { .. }) {
             return;
-        };
-        layer.set_anchor(anchor_for(spec.topology.anchor));
-        layer.set_size(
-            layer_extent_for(spec.width, output_size.width),
-            layer_extent_for(spec.height, output_size.height),
-        );
-        layer.set_keyboard_interactivity(keyboard_interactivity_for(spec.keyboard_interactivity));
-        layer.set_margin(
-            spec.margin.top as i32,
-            spec.margin.right as i32,
-            spec.margin.bottom as i32,
-            spec.margin.left as i32,
-        );
-        layer.wl_surface().commit();
-        self.surfaces[index].map_state = if was_mapped { MapState::AwaitingConfigure } else { MapState::Mapped };
-        eprintln!("[oblisk-renderer] {} mapping: visible = true", self.surfaces[index].surface_id);
+        }
+        self.drop_child_popups(index);
+        self.release_bound(index);
+        if let TrackedRole::Panel { layer, .. } = &mut self.surfaces[index].role {
+            drop(layer.take());
+        }
+        self.surfaces[index].map_state = MapState::Unmapped;
+        self.surfaces[index].null_buffered = false;
+        // Nothing is on the surface any more, and there is no surface: the record of what it last
+        // painted describes an object that no longer exists, and `paint_surface` compares against
+        // it to decide whether to attach a buffer at all.
+        self.surfaces[index].last_painted = None;
+        eprintln!("[oblisk-renderer] {} destroyed: visible = false", self.surfaces[index].surface_id);
     }
 
     /// Builds the process's one EGL display, config and context if nothing has yet, reporting

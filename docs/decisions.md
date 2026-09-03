@@ -1450,7 +1450,9 @@ amends decision 2: "created once, at startup" still holds for the `panel` and `l
 for the `popup`/`window` roles ADR-0040 added, since `xdg_popup` needs a real input-event serial for
 its grab and consumes its positioner at `get_popup` time; for those two roles `visible` creates and
 destroys the Wayland object rather than mapping and unmapping it. The declared set is still fixed
-for a generation's life, so ADR-0001's topology split is unchanged.
+for a generation's life, so ADR-0001's topology split is unchanged. ADR-0088 finishes that move:
+`visible` now creates and destroys a `panel`'s object too, because the layer-shell re-map the
+original decision rested on is not honoured in practice, so all three roles behave the same way.
 
 1. **The evaluated topology is the only source of Wayland surfaces.** `SurfaceRole` and the three
    `create_*` calls in `wayland::run` are deleted; `main_bar`/`overlay_canvas`/`wallpaper_layer`
@@ -1458,10 +1460,11 @@ for a generation's life, so ADR-0001's topology split is unchanged.
 2. **A generation creates exactly the surfaces its own evaluation declared, once, at startup.**
    Adding or removing a `surface`, or changing its `layer`/`anchor`/`monitor`/`namespace`, is a
    topology change: the Supervisor spawns a candidate that builds its own surface set from its own
-   evaluation. Within a live generation, two things move without a swap: `visible` maps and unmaps a
-   surface (toggling a launcher costs a commit, not a process spawn), and the fields layer-shell
-   lets a client change live (`margin`, exclusive zone, `keyboard_interactivity`, size) apply in
-   place. See the amendments above for the `popup`/`window` exception to "created once."
+   evaluation. Within a live generation, two things move without a swap: `visible` shows and hides a
+   surface, and the fields layer-shell lets a client change live (`margin`, exclusive zone,
+   `keyboard_interactivity`, size) apply in place. See the amendments above: "created once" is now
+   true only of a surface that has never been hidden, since ADR-0088 made hiding destroy the object
+   for every role.
 3. **A surface targeting multiple outputs produces one surface instance per output**, generalizing
    the `"{id}@{output}"` surface-id convention (already used for wallpaper) to every surface.
    Monitor hotplug adds and removes instances in place, no generation swap, since plugging in a
@@ -3938,3 +3941,64 @@ keyboard and arms `network/connect` in the same turn, and the flip back releases
 at `bar_height + panel_gap` from the top and clamps to the output's right edge, both read off a
 pixel scan rather than believed.
 
+## 0088. Hiding a `panel` destroys it, because the layer-shell re-map is not honoured
+
+ADR-0038 decision 2 made `visible` on a `panel` a map or unmap of an object that lives for the
+generation, on the reasoning that toggling a launcher should cost a commit rather than a Wayland
+object. `zwlr_layer_surface_v1` supports exactly that: attach a null buffer to unmap, and "the
+client can re-map the surface by performing a commit without any buffer attached, waiting for a
+configure event and handling it as usual." niri does not bring such a surface back.
+
+Measured on the wire with `WAYLAND_DEBUG=1`, and the trace is the whole argument, because every
+request is the one the specification asks for:
+
+```
+-> wl_surface#19.attach(nil, 0, 0)                     unmap
+-> wl_surface#19.commit()
+-> zwlr_layer_surface_v1#20.set_anchor(9)              re-map: state is reset, so re-send it
+-> zwlr_layer_surface_v1#20.set_size(355, 90)
+-> zwlr_layer_surface_v1#20.set_keyboard_interactivity(0)
+-> zwlr_layer_surface_v1#20.set_margin(50, 11, 0, 0)
+-> wl_surface#19.commit()                              the bufferless commit
+   zwlr_layer_surface_v1#20.configure(9255, 355, 90)   the compositor answers
+-> zwlr_layer_surface_v1#20.ack_configure(9255)
+-> wl_surface#19.attach(wl_buffer#57, 0, 0)            a fresh dmabuf
+-> wl_surface#19.damage_buffer(0, 0, INT_MAX, INT_MAX) full damage
+-> wl_surface#19.commit()
+```
+
+Nothing is on screen afterwards, and nothing later brings it back: further repaints attach further
+buffers to the same surface and none of them appear. Ruled out along the way: a stale display-list
+cache (`last_painted` is cleared on hide), a race (an 80ms delay before the swap changes nothing),
+and a missing commit for the staged layer-shell state (ADR-0087 decision 4, fixed separately and
+still needed).
+
+1. **`visible = false` destroys the `zwlr_layer_surface_v1` and its `wl_surface`; `visible = true`
+   builds new ones.** `TrackedRole::Panel::layer` becomes an `Option`, the role keeps the
+   `wl_output` so the rebuild targets the same one, and the teardown order is `hide_window`'s:
+   child popups, then the EGL surface and `wl_egl_window`, then the role object. This is what the
+   `window` and `popup` roles have always done (ADR-0049 decision 1) and what the Qt shell this
+   config mirrors does for a `PanelWindow`, so it is one rule for all three roles rather than a
+   fourth behaviour.
+
+2. **A panel declared `visible = false` at startup is still created.** It has never been mapped, so
+   there is no compositor state to fail to restore, and keeping it means PBA staging still sees
+   every declared surface (§ 15.2). `show_panel` tells the two cases apart by whether the role still
+   holds a `LayerSurface`: if it does, the surface goes straight to `Mapped` and the next paint's
+   first buffer maps it; if not, it is rebuilt and waits for its initial configure.
+
+3. **The size guard runs again on every show.** `width`/`height` are `Signal`-bindable, so a spec
+   that has since resolved to a `Fill` on a singly anchored axis would be a protocol error that
+   kills the connection. `create_panel` already refuses that; `show_panel` refuses it the same way
+   and leaves the surface hidden.
+
+What this cost: an EGL surface and a `wl_egl_window` are rebuilt per toggle rather than reused, and
+the first frame after a show waits for a configure round trip instead of going out immediately.
+Both are per-toggle, both are what the other two roles already pay, and neither is measurable
+against a surface that does not appear at all.
+
+How long it had been broken: since panels could be hidden. The first notification of a session drew
+and every one after it was invisible, because `notification_area` is unmapped between notifications
+— nobody had noticed, because a shell is usually restarted more often than it is watched. ADR-0087
+made it constant rather than intermittent: opening and closing a bar panel is the most frequent
+hide/show in the shell, so the power menu opened once and never again.

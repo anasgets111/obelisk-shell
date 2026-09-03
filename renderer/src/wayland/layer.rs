@@ -120,7 +120,7 @@ fn spec_update(applied: &PanelSpec, fresh: &PanelSpec, output: layout::LogicalSi
     }
 }
 /// Parameters for [`App::spawn_layer`], bundled to stay under clippy's argument-count limit.
-struct LayerSpec<'a> {
+pub(super) struct LayerSpec<'a> {
     layer_type: Layer,
     /// The compositor-visible namespace (§ 6.1, default `"oblisk-{id}"`), matched by `layerrule`.
     namespace: &'a str,
@@ -135,7 +135,7 @@ struct LayerSpec<'a> {
 
 impl App {
     /// Creates and configures (but does not commit) a layer-shell surface.
-    fn spawn_layer(&mut self, qh: &QueueHandle<App>, spec: LayerSpec) -> LayerSurface {
+    pub(super) fn spawn_layer(&mut self, qh: &QueueHandle<App>, spec: LayerSpec) -> LayerSurface {
         let surface = self.compositor_state.create_surface(qh);
         let layer = self.layer_shell.create_layer_surface(
             qh,
@@ -200,14 +200,21 @@ impl App {
         );
         layer.commit();
 
-        // § 6.1's `visible`. A panel declared `visible = false` is still created (ADR-0038
-        // decision 2: `visible` maps/unmaps, not creates/destroys) and gets the initial commit,
-        // required by `get_layer_surface` before any configure. No buffer is ever attached, and
-        // `MapState::Unmapped` keeps `paint_surface` from doing so. No unmap commit follows: on a
-        // bufferless surface that would be the protocol's re-map procedure, not an unmap (see
-        // [`App::remap`]).
+        // § 6.1's `visible`. A panel declared `visible = false` is still created here and gets the
+        // initial commit, required by `get_layer_surface` before any configure. No buffer is ever
+        // attached and `MapState::Unmapped` keeps `paint_surface` from doing so, so the object
+        // exists and nothing is on screen. That is not the state a *hidden* panel reaches under
+        // ADR-0088 -- [`App::unmap`] destroys the object outright -- and the difference is
+        // deliberate: this one has never been mapped, so there is nothing for a compositor to fail
+        // to bring back, and keeping it means PBA staging still sees every declared surface
+        // ([`App::maybe_send_ready_signal`]).
         self.surfaces.push(TrackedSurface {
-            role: TrackedRole::Panel { layer, spec: spec.clone(), output_size: instance.available },
+            role: TrackedRole::Panel {
+                layer: Some(layer),
+                output: output.clone(),
+                spec: spec.clone(),
+                output_size: instance.available,
+            },
             bound: None,
             surface_id: instance.instance_id.clone(),
             map_state: if visible { MapState::AwaitingConfigure } else { MapState::Unmapped },
@@ -215,6 +222,70 @@ impl App {
             configured_size: (0, 0),
             last_painted: None,
         });
+    }
+
+    /// `visible = true` for a `panel` (ADR-0088). Two starting states, told apart by whether the
+    /// role still holds a `LayerSurface`.
+    ///
+    /// **Never shown.** [`App::create_panel`] builds every declared panel, so one that started
+    /// `visible = false` already has a configured, acked, bufferless surface. Nothing needs
+    /// building or re-committing; the state goes straight to [`MapState::Mapped`] and the next
+    /// `paint_surface` attaches the first buffer, which is what maps it.
+    ///
+    /// **Hidden after being shown.** [`App::unmap`] destroyed the object, so this builds a fresh
+    /// one from the last applied spec and waits in [`MapState::AwaitingConfigure`] for
+    /// `bind_and_clear`; attaching a buffer before acking the initial configure is what the
+    /// protocol forbids, and niri says so by name.
+    ///
+    /// The size guard is [`App::create_panel`]'s, run again because `width`/`height` are
+    /// `Signal`-bindable: a spec that resolved to a `Fill` on a singly anchored axis since the
+    /// last create would be a protocol error that kills the connection.
+    pub(super) fn show_panel(&mut self, qh: &QueueHandle<App>, index: usize) {
+        let TrackedRole::Panel { layer, spec, output, output_size } = &self.surfaces[index].role else {
+            return;
+        };
+        if layer.is_some() {
+            self.surfaces[index].map_state = MapState::Mapped;
+            eprintln!("[oblisk-renderer] {} mapping: visible = true", self.surfaces[index].surface_id);
+            return;
+        }
+        let size = (layer_extent_for(spec.width, output_size.width), layer_extent_for(spec.height, output_size.height));
+        if let Some(axis) = ambiguous_zero_axis(size, spec.topology.anchor) {
+            eprintln!(
+                "[oblisk-renderer] surface {:?} resolved to a {axis} of 0 without anchoring both {axis} edges, \
+                 which layer-shell rejects as a protocol error; it stays hidden. Give it an explicit {axis}, or anchor both edges.",
+                self.surfaces[index].surface_id
+            );
+            return;
+        }
+        // Owned copies, because `spawn_layer` takes `&mut self` and a `LayerSpec` borrows from the
+        // role this index owns. A `wl_output` is a refcounted proxy, so its clone is a handle.
+        let (layer_type, namespace, anchor, margin, interactivity, output) = (
+            layer_for(spec.topology.layer),
+            spec.topology.namespace.clone(),
+            anchor_for(spec.topology.anchor),
+            spec.margin,
+            keyboard_interactivity_for(spec.keyboard_interactivity),
+            output.clone(),
+        );
+        let fresh = self.spawn_layer(
+            qh,
+            LayerSpec {
+                layer_type,
+                namespace: &namespace,
+                output: &output,
+                anchor,
+                size,
+                margin,
+                keyboard_interactivity: interactivity,
+            },
+        );
+        fresh.commit();
+        if let TrackedRole::Panel { layer, .. } = &mut self.surfaces[index].role {
+            *layer = Some(fresh);
+        }
+        self.surfaces[index].map_state = MapState::AwaitingConfigure;
+        eprintln!("[oblisk-renderer] {} created: visible = true", self.surfaces[index].surface_id);
     }
 
     /// `set_exclusive_zone`, one value per [`node::Exclusive`]: `Reserve` derives it from the
@@ -229,7 +300,7 @@ impl App {
     /// is what makes a surface a shell component, not a window.
     pub(super) fn apply_exclusive_zone(&mut self, index: usize) {
         let tracked = &self.surfaces[index];
-        let TrackedRole::Panel { layer, spec, .. } = &tracked.role else {
+        let TrackedRole::Panel { layer: Some(layer), spec, .. } = &tracked.role else {
             return;
         };
         let zone = match spec.exclusive {
@@ -263,7 +334,8 @@ impl App {
     /// [`App::apply_visibility`]: § 15.2 point 3 keeps a Candidate's surfaces invisible until
     /// `ActivateDraw`.
     pub(super) fn apply_spec_change(&mut self, index: usize, mut fresh: PanelSpec) {
-        let TrackedRole::Panel { layer, spec: applied, output_size } = &self.surfaces[index].role else {
+        let TrackedRole::Panel { layer: Some(layer), spec: applied, output_size, .. } = &self.surfaces[index].role
+        else {
             return;
         };
         let update = spec_update(applied, &fresh, *output_size);
@@ -311,7 +383,7 @@ impl App {
         if update.moved_anything()
             && self.surfaces[index].map_state == MapState::Mapped
             && !self.is_pba_candidate
-            && let TrackedRole::Panel { layer, .. } = &self.surfaces[index].role
+            && let TrackedRole::Panel { layer: Some(layer), .. } = &self.surfaces[index].role
         {
             layer.commit();
         }
