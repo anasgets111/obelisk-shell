@@ -285,10 +285,10 @@
 ---resolves. `active_layout` defaults to an empty string (IDL declares it non-nullable,
 ---ADR-0034), `active_layout_index`/`layout_count` default `0`.
 ---@field active_layout string The layout's display name, e.g. `"English (US)"`. Empty string before the compositor has answered once.
----@field active_layout_index integer The active layout's 0-based position in the configured list. What `keyboard:set_layout(index)` takes.
+---@field active_layout_index integer The active layout's 0-based position in the configured list. What `keyboard:invoke("switch_layout", index)` takes.
 ---@field backlight_pct integer Keyboard backlight, `0` to `100`, or `-1` on a machine with no backlight device. `-1` is an answer, not a failure: check for it before drawing a slider.
 ---@field caps_lock boolean Caps Lock is on.
----@field layout_count integer How many layouts are configured. `keyboard:cycle_layout` is a no-op below `2`, so this is the check for whether to draw a layout indicator at all.
+---@field layout_count integer How many layouts are configured. `switch_layout` has nothing to switch to below `2`, so this is the check for whether to draw a layout indicator at all.
 ---@field num_lock boolean Num Lock is on.
 ---@field scroll_lock boolean Scroll Lock is on.
 
@@ -464,7 +464,7 @@ function Idle:release_inhibit() end
 ---@field name string The connector name, e.g. `"eDP-1"`. What a surface's `monitor` takes, and what an `oblisk.workspaces` output entry is keyed by.
 ---@field width integer Logical pixels, already divided by `scale`. Not the mode's pixel count.
 ---@field height integer Logical pixels, on the same terms as `width`.
----@field scale number The fractional output scale, e.g. `1.25`. Divide by it once, or a 2x display gets scaled twice.
+---@field scale integer The compositor's integer scale factor for this output, `1` on an ordinary display and `2` on a HiDPI one. Not a divisor: `width` and `height` above are already logical. Read it to pick sizes, the way `theme.s(hidpi, normal)` does.
 ---@field refresh number Hz. `0` for an output with no current mode, such as a virtual one.
 
 ---@class RescueState

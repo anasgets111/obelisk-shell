@@ -57,12 +57,16 @@ local FALLBACK_HEIGHT = 1080
 
 local SCALE = (function()
     local screen = main_screen()
-    -- Logical height, not physical. Dividing by `scale` first is what stops a 2x 4K panel from
-    -- being read as a 2160px-tall desktop and scaled up twice, which is the note
-    -- `Config/Theme.qml`'s own `internal.dpr` carries.
+    -- `screen.height` straight, with no division by `screen.scale`. It is already logical --
+    -- `wayland/output.rs` divides once, and its own test spells it out: a 3840x2160 panel driven at
+    -- scale 2 arrives here as 1080. This used to divide again, on the strength of a stub comment
+    -- that called `scale` "the fractional output scale ... divide by it once"; the stub was wrong
+    -- (the field is an integer scale *factor*) and so was this. The cost was silent and only on the
+    -- machines it mattered for: that 4K panel read as a 540px-tall desktop, which floors `factor` at
+    -- 0.75, so every HiDPI session drew the whole shell at its smallest tokens.
     local logical_height = FALLBACK_HEIGHT
-    if screen ~= nil then
-        logical_height = screen.height / math.max(screen.scale or 1, 0.1)
+    if screen ~= nil and screen.height ~= nil then
+        logical_height = screen.height
     end
     local factor = 0.9 + ((logical_height - 1080) / 360) * 0.1
     return math.max(0.75, math.min(1.4, factor))

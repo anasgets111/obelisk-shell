@@ -45,17 +45,18 @@
 ---@alias Node table A node table, as one of the constructors below returns it.
 ---@alias Align "Start"|"Center"|"End"|"Stretch"
 ---@alias Cursor "default"|"pointer"|"text"|"not-allowed"|"grab"|"grabbing"|"move"|"crosshair"|"wait"|"progress"|"help"|"context-menu"|"cell"|"vertical-text"|"alias"|"copy"|"no-drop"|"zoom-in"|"zoom-out"|"all-scroll"|"col-resize"|"row-resize"|"n-resize"|"e-resize"|"s-resize"|"w-resize"|"ne-resize"|"nw-resize"|"se-resize"|"sw-resize"|"ew-resize"|"ns-resize"|"nesw-resize"|"nwse-resize" A pointer shape by its CSS name, which is also its `wp_cursor_shape_v1` name.
----@alias Edges { top?: integer, right?: integer, bottom?: integer, left?: integer }
+---@alias Edges { top?: integer, right?: integer, bottom?: integer, left?: integer } Per-edge pixels. A bare number in the same slot broadcasts to all four, which is why every field taking this also takes `integer`.
 ---@alias Length integer|"Fill" Pixels in `[0, 8192]`, or fill the available space.
 ---@alias Color string Hex `#RRGGBB` or `#RRGGBBAA`. Strict: no shorthand, no named colours.
+---@alias BorderColors { top?: Color, right?: Color, bottom?: Color, left?: Color } Per-edge colours, the one edge table whose values are strings rather than pixels. A signal in an edge is refused: bind `border_color` itself instead.
 
 ---@class NodeBase
 ---@field width? Length|Bound Pixels, or `"Fill"` to take what the parent has left. Omitted means the node sizes to its content.
 ---@field height? Length|Bound The same, on the cross axis. `"Fill"` on both is how a background covers its parent.
 ---@field max_width? integer|Bound A ceiling in pixels on a node whose `width` is omitted: it grows with its content up to here and stops. Past it the children overflow, which a `scroll` on the same node is what turns into scrolling. Ignored beside a fixed or `"Fill"` width, which already say how wide.
 ---@field max_height? integer|Bound The same, on the other axis.
----@field margin? Edges|Bound Outer spacing.
----@field padding? Edges|Bound Inner spacing.
+---@field margin? integer|Edges|Bound Outer spacing. A bare number is all four edges.
+---@field padding? integer|Edges|Bound Inner spacing. A bare number is all four edges.
 ---@field align_h? Align|Bound On a stacking parent this places the node in the content box; on a `row` it is read off the row itself as the main-axis distribution and ignored on the children.
 ---@field align_v? Align|Bound The same two jobs as `align_h`, swapped: main axis on a `column`, cross axis on a `row`.
 ---@field visible? boolean|Bound `false` keeps the node out of the constraint and paint passes, and out of its parent's spacing.
@@ -71,8 +72,8 @@
 ---@class BoxBase
 ---@field background? Color|Bound Omitted means no fill at all, which differs from `#00000000`: the first draws nothing, the second draws a transparent rectangle.
 ---@field radius? integer|Bound Corner rounding, default `0`.
----@field border_color? Color|Edges A bare string applies to all four edges. No default: an edge paints only where both a colour and a non-zero width say so.
----@field border_width? integer|Edges A bare number applies to all four edges. Default `0`.
+---@field border_color? Color|BorderColors|Bound A bare string applies to all four edges. No default: an edge paints only where both a colour and a non-zero width say so.
+---@field border_width? integer|Edges|Bound A bare number applies to all four edges. Default `0`.
 ---@field clip? "Box"|"Rounded"|Bound What this node cuts its children down to. Default `"Box"`, its rectangle with square corners, which is what a node has always done. `"Rounded"` uses `radius` instead, so a child overflowing a pill is cut by the same arc the pill's fill draws. Costs an offscreen pass, which is why `radius` alone does not imply it.
 
 ---@class RectProps: NodeBase, BoxBase
@@ -125,7 +126,7 @@
 ---@field on_click? fun(rect: Rect, button: "left"|"right"|"middle") Fires on the release, and only when the release lands on the same node and the same button the press armed. A handler declaring one parameter still works.
 
 ---@class ListProps: NodeBase
----@field source Bound Must wrap a flat array table.
+---@field source any[]|Bound A flat array table, or a signal wrapping one. A literal array is legal and stays fixed; the signal is what makes the list rebuild.
 ---@field itemfn fun(item: any): Node Built for every element.
 ---@field key? fun(item: any): string Maps an element to a stable string. Items reconcile by key, so inserting one rebuilds one. Duplicate keys are an error. Without it items match by index and an insertion rebuilds everything after it.
 ---@field direction? "Vertical"|"Horizontal"|Bound Default `"Vertical"`. Which way the generated items stack.

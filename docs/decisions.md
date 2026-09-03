@@ -5192,3 +5192,56 @@ crossing. The same check found the launcher reopening on its old selection and s
 10. **Two-stage Escape is the config's, and costs it two locals.** With text, Escape clears and
     stays; empty, it closes. The engine already clears and lets go of the keyboard before
     `on_cancel` runs, and the autofocus arm takes it straight back, so "stay" is free.
+
+## 0113. What a code review is worth: four fixes out of two hundred findings, and the two that were the review's own doc drift
+
+An outside pass over the whole tree (`reviews/pass1`, twelve files, roughly 240 findings) was
+verified finding by finding (`reviews/pass2_confirmed`). Most of it held up as description and
+almost none of it was worth acting on: the single largest category quotes a `ponytail:` comment and
+reports its content back as a discovery, which is what those comments are for. Its `[DEAD_CODE]`
+label was wrong three times in five, its one P0 self-heals in about a second, and one of its P3s
+was a few thousand file copies per update check. Four things came out of it worth doing, and two of
+them turned out to be one bug wearing two hats.
+
+1. **`updates` links the pacman `local/` db in, rather than copying it.** `checkupdates` itself is
+   `ln -s "${DBPath}/local" "$CHECKUPDATES_DB"`, because `syncdbs_mut().update()` only reads that
+   directory. The copy came from ADR-0034's own throwaway prototype -- the program written to prove
+   the sync needs no `fakeroot` copied `/var/lib/pacman` wholesale, and the copy shipped with the
+   answer. It walked ~1,500 package directories off disk on every scheduled check. What the copy
+   did buy is now stated where it was only implicit: a check reads the live directory, so a
+   concurrent real install can be seen mid-write, the same window `checkupdates` lives with. The
+   link is refused when `local/` is not a directory: a dangling link is not an error to `alpm`, it
+   is an empty installed set, and every package on the mirror would read as an update.
+
+2. **`sysinfo` is configured by the module that reads it.** All three pollers start dormant and
+   wait for an interval (ADR-0035), and no file in `dev-config` ever named one, so the settings
+   panel's two readouts sat at their pre-first-sample `0%` for the life of the process: wired,
+   started, and never asked for a number. The call goes in `system_info.lua`, not `shell.lua` --
+   the module that wants the samples is the one that says how often. `temp_interval` stays at zero
+   on purpose, since nothing reads `temp_cores` or `temp_gpu`. **`updates` has the identical gap**
+   and is deliberately left alone: starting periodic pacman network checks is a decision a config
+   author makes, not a default a framework example should smuggle in.
+
+3. **`lua-meta` stopped refusing code the engine accepts.** Six types were narrower than the parser:
+   `margin`/`padding` took `Edges` but not the bare number `parse_edge_insets` broadcasts;
+   `border_color` took `Edges`, which is integers, where the engine wants per-edge hex *strings*
+   (now `BorderColors`); `border_color`/`border_width` took no `Bound`; `list.source` took only
+   `Bound` where a literal array is legal; `PanelProps` redeclared `margin` and dropped both;
+   `PopupProps.offset` demanded both axes where each defaults to `0`. All latent, because
+   `dev-config` happens not to write any of those forms, so `lua-language-server --check` stayed
+   green over a stub that would have failed the next person to try one.
+
+4. **`Screen.scale` is an integer scale factor, and `theme.lua` believed the stub instead of the
+   engine.** The stub called it "the fractional output scale, e.g. `1.25`. Divide by it once", and
+   `dev-config/oblisk/config/theme.lua` dutifully divided -- by a `screen.height` that
+   `wayland/output.rs` had already divided, as its own test says in as many words ("a 3840x2160
+   panel driven at scale 2 is 1920x1080 of compositor space"). A 4K HiDPI panel therefore read as a
+   540px-tall desktop, which floors the responsive factor at `0.75`, so every HiDPI session drew the
+   entire shell at its smallest tokens. Invisible on the 1x display this is developed on. This is
+   the one finding in the whole review that was worth the exercise, and the review only got halfway
+   to it: it caught the wrong stub and not the config that had already acted on it.
+
+Also fixed: `share/starter/shell.lua` indexed `s.time` in a `map` closure that runs once against a
+nil `s`, so a new user's first boot printed a Lua error and "no scene was applied at startup;
+surfaces still bind, and paint nothing" before recovering a second later on the first `system`
+push. The file's own header already teaches the nil rule the body broke.

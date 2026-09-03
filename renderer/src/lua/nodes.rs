@@ -586,7 +586,7 @@ mod meta_stub_tests {
             unsampled.len(),
             unsampled.join("\n")
         );
-        assert_eq!(probed, 535, "the number of declared type members moved; confirm the change is intended");
+        assert_eq!(probed, 580, "the number of declared type members moved; confirm the change is intended");
     }
 
     /// One Lua literal per declared type. `None` means "no sample", which skips rather than guesses.
@@ -598,7 +598,7 @@ mod meta_stub_tests {
     fn sample(field: &str, ty: &str) -> Option<String> {
         match (field, ty) {
             ("opacity", _) => return Some("0.5".to_string()),
-            ("border_color", "Edges") => return Some("{ top = \"#112233\" }".to_string()),
+            ("border_color", "BorderColors") => return Some("{ top = \"#112233\" }".to_string()),
             ("constraint_adjustment", _) => return Some("{ \"SlideX\" }".to_string()),
             // The inline table shapes, which have no alias to key off.
             ("anchor", shape) if shape.starts_with('{') => return Some("{ top = true, left = true }".to_string()),
@@ -613,6 +613,9 @@ mod meta_stub_tests {
             ("hover", _) => return Some("hover(\"probe\")".to_string()),
             ("scroll", _) => return Some("scroll(\"probe\")".to_string()),
             ("source", "Bound") => return Some("SIGNAL_LIST".to_string()),
+            // The literal-array half of `list.source`: legal, and fixed for the life of the pass,
+            // which is why the signal beside it is what a real list uses (ADR-0113 decision 3).
+            ("source", "any[]") => return Some("{ 1, 2 }".to_string()),
             ("itemfn", _) => return Some("function(item) return rect {} end".to_string()),
             ("key", _) => return Some("function(item) return tostring(item) end".to_string()),
             (_, shape) if shape.starts_with("fun(") || shape.starts_with("fun()") => {

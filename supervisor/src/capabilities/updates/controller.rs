@@ -130,22 +130,26 @@ impl UpdatesController {
     }
 }
 
-/// Copies `pacman_db_root`'s `local/` subdirectory (the installed-package metadata `alpm`
-/// reads) into a fresh `tempfile::tempdir()`, then checks against that throwaway copy, never
-/// the real `pacman_db_root` (`checkupdates`'s approach, ADR-0034).
+/// Points a fresh `tempfile::tempdir()` at `pacman_db_root`'s `local/` with one symlink, then
+/// syncs and checks against that throwaway db root, never the real `pacman_db_root` (ADR-0034,
+/// amended ADR-0113). Only `sync/` is written, and it is written inside the temp dir.
 ///
-/// Known limitation: no coordination against a concurrently running real install mutating
-/// this same `local/` directory. An overlapping check can surface a spurious, transient
-/// `check_error` or copy an inconsistent snapshot -- self-heals on the next scheduled check.
+/// A symlink and not a copy, which is what `checkupdates` itself does (`ln -s "${DBPath}/local"
+/// "$CHECKUPDATES_DB"`): `local/` is the installed-package metadata, which `syncdbs_mut().update()`
+/// only reads. The copy this replaces walked ~1,500 package directories off disk on every single
+/// check, and ADR-0034's own note says where it came from -- the throwaway prototype that proved
+/// the sync needs no `fakeroot` copied the whole tree, and the copy came along with the answer.
+///
+/// Known limitation, now sharper than it was: with a copy, a check ran against a snapshot; with a
+/// symlink it reads the live directory, so a concurrent real install can be observed mid-write. The
+/// window is the same one `checkupdates` lives with, the result is a spurious transient
+/// `check_error`, and it self-heals on the next scheduled check.
 fn check_against_a_throwaway_copy(
     pacman_conf_path: &Path,
     pacman_db_root: &Path,
 ) -> Result<Vec<UpdateCandidate>, String> {
     let throwaway = tempfile::tempdir().map_err(|err| format!("failed to create a throwaway temp dir: {err}"))?;
-    let local_src = pacman_db_root.join("local");
-    let local_dst = throwaway.path().join("local");
-    copy_dir_recursive(&local_src, &local_dst)
-        .map_err(|err| format!("failed to copy {} to a throwaway dir: {err}", local_src.display()))?;
+    link_local_db(pacman_db_root, throwaway.path())?;
 
     let repos = resolve_repo_servers(pacman_conf_path);
     if repos.is_empty() {
@@ -155,17 +159,20 @@ fn check_against_a_throwaway_copy(
     check_for_updates(Path::new("/"), throwaway.path(), &repos).map_err(|err| err.to_string())
 }
 
-fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(to)?;
-    for entry in std::fs::read_dir(from)?.flatten() {
-        let dest = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir_recursive(&entry.path(), &dest)?;
-        } else {
-            std::fs::copy(entry.path(), dest)?;
-        }
+/// Links `pacman_db_root/local` in as `throwaway/local`, the one name `alpm` looks for when it
+/// reads installed packages out of a db root. Split out from
+/// [`check_against_a_throwaway_copy`] only so the name and the read-through are testable without
+/// a mirror: everything else that function does needs the network.
+fn link_local_db(pacman_db_root: &Path, throwaway: &Path) -> Result<(), String> {
+    let local_src = pacman_db_root.join("local");
+    // Checked, because `symlink` will happily point at nothing and a dangling `local/` is not an
+    // error to `alpm` -- it is an empty installed set, which reads as "every package on the
+    // mirror is an update". The copy this replaces failed loudly on a missing source; so does this.
+    if !local_src.is_dir() {
+        return Err(format!("{} is not a directory; cannot check updates against it", local_src.display()));
     }
-    Ok(())
+    std::os::unix::fs::symlink(&local_src, throwaway.join("local"))
+        .map_err(|err| format!("failed to link {} into a throwaway dir: {err}", local_src.display()))
 }
 
 /// Runs until every `UpdatesController` (and its `Clone`s) drops. `alpm`'s types aren't
@@ -428,26 +435,45 @@ mod tests {
         );
     }
 
-    // ---- copy_dir_recursive ----
+    // ---- link_local_db ----
 
     #[test]
-    fn copy_dir_recursive_copies_nested_files_and_directories() {
-        let src = tempfile::tempdir().unwrap();
-        std::fs::write(src.path().join("top.txt"), "top").unwrap();
-        std::fs::create_dir(src.path().join("nested")).unwrap();
-        std::fs::write(src.path().join("nested").join("inner.txt"), "inner").unwrap();
+    fn the_throwaway_db_root_reads_installed_packages_through_a_link_named_local() {
+        // The name matters as much as the read: `alpm` looks for `local/` under the db root it is
+        // given, so a link under any other name is an empty db and every package reads as new.
+        let real = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(real.path().join("local").join("bash-5.3-1")).unwrap();
+        std::fs::write(real.path().join("local").join("bash-5.3-1").join("desc"), "%NAME%\nbash\n").unwrap();
 
-        let dst = tempfile::tempdir().unwrap();
-        let dest_path = dst.path().join("copy");
-        copy_dir_recursive(src.path(), &dest_path).unwrap();
+        let throwaway = tempfile::tempdir().unwrap();
+        link_local_db(real.path(), throwaway.path()).unwrap();
 
-        assert_eq!(std::fs::read_to_string(dest_path.join("top.txt")).unwrap(), "top");
-        assert_eq!(std::fs::read_to_string(dest_path.join("nested").join("inner.txt")).unwrap(), "inner");
+        let linked = throwaway.path().join("local");
+        assert!(linked.symlink_metadata().unwrap().is_symlink(), "local must be a link, not a copied tree");
+        assert_eq!(
+            std::fs::read_to_string(linked.join("bash-5.3-1").join("desc")).unwrap(),
+            "%NAME%\nbash\n",
+            "the real package metadata must be readable through the link"
+        );
     }
 
     #[test]
-    fn copy_dir_recursive_errors_against_a_nonexistent_source() {
-        let dst = tempfile::tempdir().unwrap();
-        assert!(copy_dir_recursive(Path::new("/does/not/exist"), &dst.path().join("copy")).is_err());
+    fn linking_into_a_throwaway_root_that_already_holds_a_local_is_an_error_not_a_silent_reuse() {
+        // `symlink` refuses an existing destination. Surfacing that as a `check_error` beats
+        // checking against whatever was there: a reused temp dir would report stale packages.
+        let real = tempfile::tempdir().unwrap();
+        let throwaway = tempfile::tempdir().unwrap();
+        std::fs::create_dir(throwaway.path().join("local")).unwrap();
+
+        assert!(link_local_db(real.path(), throwaway.path()).is_err());
+    }
+
+    #[test]
+    fn a_db_root_with_no_local_directory_is_refused_rather_than_linked_to_nothing() {
+        let missing = tempfile::tempdir().unwrap();
+        let throwaway = tempfile::tempdir().unwrap();
+
+        assert!(link_local_db(&missing.path().join("no-such-root"), throwaway.path()).is_err());
+        assert!(!throwaway.path().join("local").exists());
     }
 }

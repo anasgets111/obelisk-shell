@@ -453,7 +453,7 @@ function Idle:release_inhibit() end
 ---@field name string The connector name, e.g. `"eDP-1"`. What a surface's `monitor` takes, and what an `oblisk.workspaces` output entry is keyed by.
 ---@field width integer Logical pixels, already divided by `scale`. Not the mode's pixel count.
 ---@field height integer Logical pixels, on the same terms as `width`.
----@field scale number The fractional output scale, e.g. `1.25`. Divide by it once, or a 2x display gets scaled twice.
+---@field scale integer The compositor's integer scale factor for this output, `1` on an ordinary display and `2` on a HiDPI one. Not a divisor: `width` and `height` above are already logical. Read it to pick sizes, the way `theme.s(hidpi, normal)` does.
 ---@field refresh number Hz. `0` for an output with no current mode, such as a virtual one.
 
 ---@class RescueState

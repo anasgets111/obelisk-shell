@@ -10,6 +10,17 @@ local util = require("lib.util")
 local cell = require("components.cell")
 local pill = require("components.pill")
 
+-- `sysinfo`'s three pollers start dormant and stay there until a config names an interval
+-- (ADR-0035), so without this line the two readouts below sit at their pre-first-sample `0%`
+-- forever -- the capability was wired, started, and never asked for a number. Here rather than in
+-- `shell.lua` because this is the only file that reads it: the module that wants the samples is the
+-- one that says how often.
+--
+-- Two seconds for CPU and five for RAM, which is the mirror's cadence and about as slow as a
+-- readout can tick before it reads as frozen. `temp_interval` is left at zero deliberately:
+-- `temp_cores` and `temp_gpu` have no reader in this config, and a dormant poller costs nothing.
+oblisk.sysinfo:invoke("configure", { cpu_interval = 2, ram_interval = 5 })
+
 local function readout(glyph, read)
     return row {
         align_v = "Center",

@@ -36,10 +36,10 @@ pub struct KeyboardState {
     /// answered once.
     pub active_layout: String,
     /// The active layout's 0-based position in the configured list. What
-    /// `keyboard:set_layout(index)` takes.
+    /// `keyboard:invoke("switch_layout", index)` takes.
     pub active_layout_index: u32,
-    /// How many layouts are configured. `keyboard:cycle_layout` is a no-op below `2`, so this is
-    /// the check for whether to draw a layout indicator at all.
+    /// How many layouts are configured. `switch_layout` has nothing to switch to below `2`, so
+    /// this is the check for whether to draw a layout indicator at all.
     pub layout_count: u32,
 }
 
