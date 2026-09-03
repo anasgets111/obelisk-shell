@@ -34,12 +34,14 @@
 --   * Paid for: a popup got `constraint_adjustment` and a layer surface does not, so the
 --     horizontal clamp below is `"SlideX"` written out by hand.
 --
--- The cost that stays is that every panel shares one size, which is now a choice rather than the
--- protocol's: this is the largest body any panel carries. It is a small cost because every body
--- ends in a `list` with a `scroll` of its own (ADR-0069), so the shared size bounds the *viewport*
--- and a panel with more rows than fit scrolls. What still has to fit is the fixed rows above each
--- list, which is what `the_shipped_dev_configs_bar_zones_hold_their_modules_without_overflowing`
--- measures.
+-- ## The card is as tall as the panel in it (ADR-0110)
+--
+-- Every panel shared one height until now, `theme.panel_height`, sized for the tallest body and
+-- worn by all of them: four networks sat over 200px of empty glass, and the notification history
+-- needed a second, taller number and a rule for when to use it. The mirror's `PanelHost` sizes its
+-- surface to `panelItem.preferredHeight`, and each panel's list is `Math.min(contentHeight, cap)`.
+-- The card below has no `height`, so it is its content; each panel's list carries a `max_height`,
+-- so the content stops growing where the mirror's does and the list scrolls from there.
 local theme = require("config.theme")
 local panel_card = require("components.panel_card")
 local ui_state = require("lib.ui_state")
@@ -55,11 +57,10 @@ local panels = { power_menu, network_panel, bluetooth_panel, calendar_panel, not
 -- Every panel's body is built and handed to the card; only the one whose `kind` matches is
 -- visible. An invisible child contributes nothing to its parent's size (`resolve_sizes` in
 -- scene.rs), so the stacked columns cost the height of whichever one is showing rather than the
--- sum of all of them.
+-- sum of all of them -- and that one height is what the card takes.
 local function panel_section(panel)
     return column {
         width = "Fill",
-        height = "Fill",
         spacing = theme.spacing.xs,
         visible = ui_state.panel_kind:map(function(kind)
             return kind == panel.kind
@@ -73,48 +74,39 @@ for _, panel in ipairs(panels) do
     table.insert(sections, panel_section(panel))
 end
 
+-- One width for every panel but the notification history, which is a column of cards and gets the
+-- mirror's wider `notificationPanelWidth`.
+local card_width = ui_state.panel_showing(notification_history.kind):map(function(showing)
+    return showing and theme.notification_panel_width or theme.panel_width
+end)
+
 -- Where the card sits, which an `xdg_popup` got from `anchor_rect` plus `gravity` and a layer
 -- surface has to be told. `popup_anchor` is the rect `on_click` handed back for the indicator that
 -- opened this (ADR-0050 decision 3), in the bar's logical coordinates; the bar is anchored left and
 -- full width and so is this surface, so its `x` needs no translation.
 --
--- The `math.min` is `constraint_adjustment = { "SlideX" }` by hand: the clock and the tray sit near
--- the right edge, and a 340px card hung off their left edge runs off a 1920px output by more than
--- half its width. `"FlipY"` needs no equivalent, because this surface starts below the bar and
--- extends down, so there is nothing to flip away from.
+-- Centred under the indicator, the mirror's `calculateX`: the card's midpoint over the button's,
+-- then clamped so it stays a `spacing.sm` inside either screen edge. Hung off the indicator's left
+-- edge, which is where it sat before, a card under a bar button read as belonging to the button
+-- to its right. The clamp is `constraint_adjustment = { "SlideX" }` by hand: the clock and the tray
+-- sit near the right edge, and a 340px card centred on them runs off a 1920px output by half its
+-- width. `"FlipY"` needs no equivalent, because this surface starts below the bar and extends
+-- down, so there is nothing to flip away from.
 --
 -- `screens[1]` on a hotplugged second head is a guess, and it is the same guess
 -- `config/theme.lua`'s `main_screen` already makes. Unlike that one this follows the signal, so a
 -- resolution change moves the clamp rather than stranding it at the boot value. An empty
--- `oblisk.screens` -- the first evaluation, and `socket.rs`'s harness -- clamps nothing, which
--- leaves the card exactly where the anchor asked.
--- The card's size follows which panel is up. One size for all of them was the rule while every
--- panel was a short list; the notification history is a column of cards and gets the mirror's
--- wider `notificationPanelWidth` and a taller box, dropping back to the shared height while the
--- feed is empty so a "nothing waiting" line does not sit in 700px of glass.
-local showing_notifications = ui_state.panel_showing(notification_history.kind)
-local card_width = showing_notifications:map(function(showing)
-    return showing and theme.notification_panel_width or theme.panel_width
-end)
-local card_height = computed({ showing_notifications, oblisk.notifications }, function(showing, n)
-    if not showing then
-        return theme.panel_height
-    end
-    for _, notification in ipairs((n and n.feed) or {}) do
-        if not notification.transient then
-            return theme.notification_panel_height
-        end
-    end
-    return theme.panel_height
-end)
-
+-- `oblisk.screens` -- the first evaluation, and `socket.rs`'s harness -- clamps only at zero.
 local card_margin = computed({ ui_state.popup_anchor, oblisk.screens, card_width }, function(anchor, screens, width)
-    local x = (anchor and anchor.x) or 0
+    local anchor_x = (anchor and anchor.x) or 0
+    local anchor_width = (anchor and anchor.width) or 0
+    local x = anchor_x + anchor_width / 2 - width / 2
     local screen = screens and screens[1]
     if screen and screen.width then
-        x = math.min(x, math.max(0, screen.width - width))
+        x = math.min(x, screen.width - width - theme.spacing.sm)
+        x = math.max(x, theme.spacing.sm)
     end
-    return { left = math.floor(x), top = theme.panel_gap }
+    return { left = math.floor(math.max(0, x)), top = theme.panel_gap }
 end)
 
 return panel {
@@ -193,14 +185,11 @@ return panel {
                 height = "Fill",
                 on_click = ui_state.close_panel,
             },
-            -- `theme.panel_width` by `theme.panel_height` for every panel but the notification
-            -- history, see `card_width` above. `renderer/src/socket.rs`'s
-            -- `the_shipped_dev_configs_bar_zones_hold_their_modules_without_overflowing` measures
-            -- every panel against the shared pair -- the power menu overran a 150px card by 58px
-            -- before it did.
+            -- No `height`: the card is its content, see the header comment. `renderer/src/socket.rs`'s
+            -- `the_shipped_dev_configs_bar_zones_hold_their_modules_without_overflowing` checks it
+            -- still fits under the bar.
             panel_card(sections, {
                 width = card_width,
-                height = card_height,
                 -- A stacking child sits at its parent's origin unless told otherwise
                 -- (`parse_align` defaults to `Start`), so the margin above is the whole of the
                 -- placement rather than a nudge to it.

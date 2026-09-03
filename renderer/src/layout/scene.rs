@@ -89,6 +89,11 @@ struct LayoutStyle {
     padding: EdgeInsets,
     width_mode: SizeMode,
     height_mode: SizeMode,
+    /// Ceilings on the two modes above, so a `Content` node can grow with its children up to here
+    /// and hand the rest to its `scroll`. The mirror's `Math.min(contentHeight, cap)`, as one
+    /// property per axis.
+    max_width: Option<f32>,
+    max_height: Option<f32>,
     align_h: Align,
     align_v: Align,
     spacing: f32,
@@ -108,6 +113,8 @@ impl LayoutStyle {
             padding: node::parse_edge_insets(properties, "padding")?,
             width_mode: node::parse_size_mode(properties, "width")?,
             height_mode: node::parse_size_mode(properties, "height")?,
+            max_width: node::parse_max_size(properties, "max_width")?,
+            max_height: node::parse_max_size(properties, "max_height")?,
             align_h: node::parse_align(properties, "align_h")?,
             align_v: node::parse_align(properties, "align_v")?,
             spacing: node::parse_spacing(properties)?,
@@ -778,8 +785,25 @@ fn taffy_style(
         // (`fixed_children_that_already_overflow_collapse_a_fill_sibling_to_nothing` pins it).
         // `min_size`: taffy's automatic minimum would floor a `Fill` item at its own content
         // instead of letting it collapse to zero, like the hand-written pass's budgets did.
+        //
+        // Zero on the axis the parent flows along and on both axes of a stacking cell, `auto` on a
+        // flex item's cross axis. CSS gives the cross axis no automatic minimum, so `auto` there
+        // is already zero -- and writing the zero out trips a bug in taffy 0.14's flexbox: when a
+        // container measures its children it adds *its own* margin to each child's minimum
+        // cross size (`constants.margin` where `child.margin` was meant, in
+        // `determine_flex_base_size` and `determine_container_main_size`). `Some(0) + margin` is
+        // a floor of the margin's size, `None + margin` is nothing. The panel card is a column with
+        // a left margin of most of the screen, and its body text was being measured 1521px wide
+        // and one line tall, then drawn 378px wide and two lines tall, so every card came out a
+        // line short (`a_containers_own_margin_does_not_widen_what_its_children_are_measured_at`).
         flex_shrink: 0.0,
-        min_size: taffy::Size { width: length(0.0), height: length(0.0) },
+        min_size: match parent_axis {
+            Some(MainAxis::Horizontal) => {
+                taffy::Size { width: length(0.0), height: taffy::LengthPercentageAuto::auto() }
+            }
+            Some(MainAxis::Vertical) => taffy::Size { width: taffy::LengthPercentageAuto::auto(), height: length(0.0) },
+            None => taffy::Size { width: length(0.0), height: length(0.0) },
+        },
         padding: taffy::Rect {
             left: length(style.padding.left),
             right: length(style.padding.right),
@@ -793,6 +817,15 @@ fn taffy_style(
             bottom: length(style.margin.bottom),
         },
         size: taffy::Size { width: taffy_dimension(style.width_mode), height: taffy_dimension(style.height_mode) },
+        // The ceiling is taffy's own `max-height`: the node's auto height is measured from its
+        // children and then capped, and the children keep the height they were given, which is
+        // what leaves `finish`'s `extent_along` a remainder for the scroll offset to be clamped to.
+        max_size: taffy::Size {
+            width: style.max_width.map_or_else(taffy::LengthPercentageAuto::auto, taffy::LengthPercentageAuto::length),
+            height: style
+                .max_height
+                .map_or_else(taffy::LengthPercentageAuto::auto, taffy::LengthPercentageAuto::length),
+        },
         ..taffy::Style::DEFAULT
     };
 
@@ -2196,6 +2229,30 @@ pub(super) mod tests {
         );
         assert_eq!(used, 0.0, "no remainder, so the offset is clamped away rather than erroring");
         assert_eq!(ys, vec![0.0, 100.0]);
+    }
+
+    /// `max_height` is what makes a content-sized container scrollable: below the cap it is exactly
+    /// its children, at the cap it stops and the rest is remainder.
+    #[test]
+    fn a_max_height_caps_a_content_sized_column_and_leaves_the_rest_to_scroll() {
+        let capped = r#"panel { id = "bar", child = column { width = 100, max_height = 150, scroll = scroll("s"), children = {
+            rect { width = 10, height = 100 }, rect { width = 10, height = 100 }, rect { width = 10, height = 100 },
+        } } }"#;
+        let (lua, ys, used) = scrolled(capped, 5_000.0);
+        assert_eq!(used, 150.0, "300 of children in a box capped at 150 leaves 150 to scroll");
+        assert_eq!(ys, vec![-150.0, -50.0, 50.0]);
+        drop(lua);
+
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"panel { id = "bar", child = column { width = 100, max_height = 150, children = {
+                rect { width = 10, height = 40 }, rect { width = 10, height = 40 },
+            } } }"#,
+        );
+        apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
+        let column = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!(column.rect.height, 80.0, "under the cap the box is the content, as with no cap at all");
     }
 
     /// Spacing counts toward the content extent, because a gap advances the cursor by
@@ -4114,6 +4171,38 @@ pub(super) mod tests {
             apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap_err(),
             LayoutError::UnsupportedNodeKind(k) if k == "dialog"
         ));
+    }
+
+    /// taffy 0.14 adds a flex container's own margin to its children's minimum cross size when it
+    /// measures them (see `taffy_style`'s `min_size`). The card here is the panel host's: a column
+    /// with a left margin of most of the output, holding a body that wraps at the card's width.
+    /// Its height has to be the wrapped body's, whatever the margin.
+    #[test]
+    fn a_containers_own_margin_does_not_widen_what_its_children_are_measured_at() {
+        let long = "have a look at this: https://github.com/anasgets111/oblisk-shell/pull/12 and tell me what you think about it all";
+        let heights = |margin: u32| {
+            let src = format!(
+                r#"panel {{ id = "bar", child = column {{ width = "Fill", height = "Fill", children = {{
+                column {{ width = 392, margin = {{ left = {margin}, top = 4 }}, padding = {{ top = 7, right = 7, bottom = 7, left = 7 }}, children = {{
+                    column {{ width = "Fill", children = {{
+                        text {{ content = "Anas", font_size = 14 }},
+                        text {{ content = "{long}", font_size = 12, wrap = "Word", width = "Fill" }},
+                    }} }},
+                }} }},
+            }} }} }}"#
+            );
+            let mut scene = Scene::new();
+            let shaping = ShapingHandle::spawn();
+            let (_lua, surface) = surface_from(&src);
+            apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
+            let card = &scene.surface("bar@TEST").unwrap().children[0].children[0];
+            let inner = &card.children[0];
+            (card.rect.height, inner.rect.height, inner.children[0].rect.height + inner.children[1].rect.height)
+        };
+        let (card, inner, lines) = heights(1521);
+        assert_eq!(inner, lines, "the column is as tall as its two texts, one of them wrapped");
+        assert_eq!(card, inner + 14.0, "and the card is that plus its padding");
+        assert_eq!((card, inner), (heights(0).0, heights(0).1), "the margin moves the card, it does not resize it");
     }
 }
 

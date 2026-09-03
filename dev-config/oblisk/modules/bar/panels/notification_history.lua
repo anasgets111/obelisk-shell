@@ -13,8 +13,8 @@ local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
 local ui = require("lib.ui_state")
-local cell = require("components.cell")
 local section_header = require("components.section_header")
+local panel_header = require("components.panel_header")
 local panel_empty_state = require("components.panel_empty_state")
 local icon_button = require("components.icon_button")
 local notification_card = require("components.notification_card")
@@ -75,13 +75,19 @@ local function summary(n)
 end
 
 local body = {
-    row {
-        width = "Fill",
-        align_v = "Center",
-        spacing = theme.spacing.sm,
-        children = {
-            section_header("notifications"),
-            cell(util.label(oblisk.notifications, summary), theme.TEXT_OFF, theme.font.xs, { width = "Fill", align = "End" }),
+    -- The same masthead the network and bluetooth panels open with: the bell on its plate, dim
+    -- while do-not-disturb has it silenced, the summary line under the title, and the two controls
+    -- at the edge.
+    panel_header {
+        title = "notifications",
+        icon = oblisk.notifications:map(function(n)
+            return (n and n.dnd) and icons.bell_off or icons.bell
+        end),
+        active = oblisk.notifications:map(function(n)
+            return not (n and n.dnd)
+        end),
+        subtitle = util.label(oblisk.notifications, summary),
+        trailing = {
             -- Do-not-disturb, the mirror's third bell state. The Supervisor's flag gates sound
             -- (ADR-0033); the popup reads the same flag and stands down for everything but a
             -- critical notification, so one toggle quiets both. Lit while on.
@@ -89,8 +95,8 @@ local body = {
                 local n = oblisk.notifications:get()
                 oblisk.notifications:invoke("set_dnd", not (n and n.dnd))
             end, {
-                size = theme.control.xs,
-                icon_size = theme.icon.xs,
+                size = theme.control.sm,
+                icon_size = theme.icon.sm,
                 background = oblisk.notifications:map(function(n)
                     return (n and n.dnd) and theme.ACCENT_MEDIUM or theme.GLASS_CONTROL
                 end),
@@ -103,12 +109,11 @@ local body = {
                 for _, notification in ipairs(feed(oblisk.notifications:get())) do
                     oblisk.notifications:invoke("dismiss", notification.id)
                 end
-            end, { size = theme.control.xs, icon_size = theme.icon.xs }),
+            end, { size = theme.control.sm, icon_size = theme.icon.sm }),
         },
     },
     column {
         width = "Fill",
-        height = "Fill",
         -- Same hold as the popup's stack and for the same reason (ADR-0094): a notification that
         -- expired while you were reading the history of it would be the one place a list can
         -- rearrange itself under a pointer with no input at all. A separate region from the
@@ -119,9 +124,11 @@ local body = {
             oblisk.notifications:invoke("hold_expiry", hovered and 300 or 0)
         end,
         children = {
+            -- As tall as its cards up to most of the screen, then a scrolling viewport (ADR-0110):
+            -- the mirror's `maxAvailableHeight`.
             list {
                 width = "Fill",
-                height = "Fill",
+                max_height = theme.notification_list_height,
                 scroll = SCROLL,
                 spacing = theme.spacing.sm,
                 source = sections,

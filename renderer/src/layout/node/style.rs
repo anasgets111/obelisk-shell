@@ -69,6 +69,22 @@ pub fn parse_size_mode(properties: &HashMap<String, Value>, property: &str) -> R
     ))
 }
 
+/// `max_width`/`max_height`: a ceiling on a `Content`-sized node, in pixels. What lets a panel be
+/// as tall as its rows and no taller until the rows outrun the screen, at which point the node
+/// stops growing and its `scroll` has a remainder to spend. `Content` and `Fill` had no way to say
+/// that: one is always the content, the other is always the box. Pixels only -- a percentage or
+/// `"Fill"` ceiling has no reading a fixed size would not already give.
+pub fn parse_max_size(properties: &HashMap<String, Value>, property: &str) -> Result<Option<f32>, LayoutError> {
+    let Some(value) = properties.get(property) else {
+        return Ok(None);
+    };
+    match value_as_f32(property, value)? {
+        Some(n) if (0.0..=8192.0).contains(&n) => Ok(Some(n)),
+        Some(n) => Err(invalid(property, format!("must be within [0, 8192], got {n}"))),
+        None => Err(invalid(property, format!("expected a number of pixels, got {}", preview_for_error(value)))),
+    }
+}
+
 /// One numeric field out of a table-valued property (`margin.top`, `anchor_rect.width`,
 /// `offset.x`, `min_size.height`). `Ok(None)` means the key is absent; callers differ on it:
 /// [`parse_edge_insets`] defaults an edge to 0, `toplevel::parse_anchor_rect` defaults an origin

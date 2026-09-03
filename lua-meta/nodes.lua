@@ -52,6 +52,8 @@
 ---@class NodeBase
 ---@field width? Length|Bound Pixels, or `"Fill"` to take what the parent has left. Omitted means the node sizes to its content.
 ---@field height? Length|Bound The same, on the cross axis. `"Fill"` on both is how a background covers its parent.
+---@field max_width? integer|Bound A ceiling in pixels on a node whose `width` is omitted: it grows with its content up to here and stops. Past it the children overflow, which a `scroll` on the same node is what turns into scrolling. Ignored beside a fixed or `"Fill"` width, which already say how wide.
+---@field max_height? integer|Bound The same, on the other axis.
 ---@field margin? Edges|Bound Outer spacing.
 ---@field padding? Edges|Bound Inner spacing.
 ---@field align_h? Align|Bound On a stacking parent this places the node in the content box; on a `row` it is read off the row itself as the main-axis distribution and ignored on the children.

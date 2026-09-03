@@ -5009,3 +5009,79 @@ the text; returning brings both back; Send removes the card.
 Not taken: a `focus` property on `textfield` for focusing a field the pass just created. It would
 have set the field typing without the surface having the keyboard, since on niri only the click
 brings that, and the click is now the one into the field.
+
+## 0110. A panel is as tall as its content, up to a cap: `max_width`/`max_height`, and the host card centres under its indicator
+
+Every bar panel shared one card height, `theme.panel_height`, sized for the tallest body and worn by
+all of them. Four networks in range sat over 200px of empty glass; the notification history needed
+a second, taller number and a rule in `panel_host.lua` for when to switch to it; and the two states
+of that rule were both wrong for a feed of one card. `PanelHost.qml` has none of this: its surface is
+`panelItem.preferredHeight`, and each panel's list is `Math.min(contentHeight, Theme.itemHeight * 7)`.
+The engine could not say that. `Content` is always the content and `Fill` is always the box, and a
+`Content` column holding a `Fill` list gave the list nothing (ADR-0077's one-pass reasoning).
+
+1. **`max_width` and `max_height` are base properties.** Pixels only, `[0, 8192]`, on any node; they
+   are taffy's own `max_size`, so a `Content` node measures its children and is then capped, while
+   the children keep the size they were given. That is what leaves `finish`'s `extent_along` a
+   remainder for `scroll_offset` to clamp to: a `list` with `max_height` and a `scroll` is exactly
+   the mirror's capped `ListView`. Beside a fixed or `Fill` size the cap is inert, which is the right
+   reading -- those already say how big. `a_max_height_caps_a_content_sized_column_and_leaves_the_rest_to_scroll`
+   pins both halves.
+
+2. **The host card has no `height`.** It is its content; every panel's list carries a `max_height`
+   (`theme.panel_list_height`, or `theme.notification_list_height` for the history), and the
+   `height = "Fill"` that every body and section wore is gone, because there is no box left to
+   fill. `theme.panel_height` and `theme.notification_panel_height` are deleted with the two-step
+   rule. `socket.rs`'s panel measurement now asks the one question that remains -- does the card end
+   above the bottom of the surface -- rather than comparing fixed rows against a card height that
+   the sections, all invisible at startup, never reached anyway.
+
+3. **The card is centred under the indicator that opened it,** the mirror's `calculateX`, then clamped
+   a `spacing.sm` inside either screen edge by hand (`SlideX`, since a layer surface has no
+   `constraint_adjustment`). It hung off the indicator's left edge before, which under a bar button
+   read as belonging to the button to its right.
+
+4. **The network and bluetooth panels are laid out as the mirror's.** A `panel_header` with the
+   radio's master switch (the glyph on a plate that goes dim when the radio is off), `panel_toggle_card`
+   as the mirror's tile rather than a settings row, `panel_row` with `selected` (accent ring and
+   ground) and a composed `leading`, `panel_action_icon` for a row's quiet red actions, and
+   `panel_empty_state` with a glyph. A network row draws what it used to spell: the glyph's bars are
+   the strength, a coloured "5G"/"2.4" is the band, a lock badge is the security, the ring is the
+   connection. A bluetooth device with an empty `name` is now titled by its address (`name or mac`
+   was the bug: `""` is true in Lua). Not carried over, each for a stated reason in the file: the
+   hidden-network row, the IP address, Saved/Available sections, the Visible tile, the codec picker.
+
+## 0111. A flex item's cross-axis minimum is `auto`, because taffy 0.14 adds the container's margin to it
+
+The first content-sized panel (ADR-0110) came up a line short: the last notification card in the
+history had its bottom border and the card's padding under it cut off, and only in a session.
+`socket.rs`'s harness built the same tree from the same config and measured it right. The difference
+was where the card sat. The harness anchors at `x = 0`; the session centres the card under the bell,
+a `margin.left` of 1521 on a 1920 output. `OBLISK_DUMP_LAYOUT` (below) showed the body column 13.2px
+shorter than its own children -- one line of `font.sm` -- and a probe on the measure callback showed
+why: the wrapped body was measured once at a known width of exactly 1521 (one line), and then laid
+out at 378 (two lines). The card's height was taken from the first answer.
+
+That is a taffy 0.14.0 bug, reproducible against taffy alone. In `determine_flex_base_size` and in
+`determine_container_main_size`, a flex container measuring its children clamps the cross space it
+offers each child to `child.min_size.cross + constants.margin.cross_axis_sum` -- the *container's*
+margin, where the child's was meant. With `min_size` written as `Some(0)` that is a floor equal to
+the margin; with `min_size` `None` the `maybe_add` is nothing. This engine wrote the zero on both
+axes, so that `Fill` items collapse instead of being floored at their content (the comment on
+`taffy_style`'s `min_size`), and so every stretched child of a column with a left margin was offered
+that margin as its width.
+
+1. **`min_size` is zero on the parent's main axis and on both axes of a stacking cell, `auto` on a
+   flex item's cross axis.** CSS gives the cross axis no automatic minimum, so `auto` there is the
+   zero that was being written out, and the bad sum has nothing to add to. The main-axis zero stays,
+   since that is the floor the comment exists to remove. Not a `[patch]` of taffy: one line of
+   mapping against a fork to carry. `a_containers_own_margin_does_not_widen_what_its_children_are_measured_at`
+   pins it at the margin that showed it, and
+   `the_shipped_dev_configs_history_card_is_as_tall_as_the_notifications_in_it` pins the panel that
+   showed it, anchored where the bell is, at the output the session ran on.
+
+2. **`OBLISK_DUMP_LAYOUT=<instance id>` prints that surface's resolved tree after every pass.** Kind,
+   rect and a `text`'s content per visible node, to stderr, off unless asked. The harness reproduces
+   what it was told to build; the layout that is wrong in a session is the one it was not told
+   about -- here the anchor, the output's scale, and a feed the Supervisor had by then. Reading the
+   live answer took one relaunch; guessing at it took an hour.

@@ -321,17 +321,22 @@ theme.battery_pill_width = s(80, 60)
 -- to go. Collapsed it is `item_width`.
 theme.volume_expanded_width = s(120, 90)
 -- `Theme.qml` gives each panel its own width (`networkPanelWidth: 340`, `bluetoothPanelWidth:
--- 360`). One number here, because this config puts every bar panel in one shared `popup`
--- (`modules/shell/panel_host.lua`) and a surface has one size.
+-- 360`). One number here, because this config puts every bar panel in one shared surface
+-- (`modules/shell/panel_host.lua`) and one card. Its height is not a token any more: the card is
+-- as tall as the panel in it (ADR-0110), and what is capped is each panel's *list*, the mirror's
+-- `Math.min(contentHeight, Theme.itemHeight * 7)`. Past the cap the list scrolls.
 theme.panel_width         = s(340, 280)
-theme.panel_height        = s(400, 300)
+theme.panel_list_height   = s(280, 210)
 -- The notification history is the one panel that is not a list of a dozen short rows: it holds the
--- same cards the popup draws, at `notificationPanelWidth: 420` in the mirror, and a feed of them is
--- taller than any other panel. The mirror sizes that panel to its content up to what the screen
--- has; this engine has no content-with-a-ceiling height, so it is two steps -- the shared height
--- for an empty feed, this one otherwise -- and the list inside scrolls past it.
-theme.notification_panel_width  = s(420, 340)
-theme.notification_panel_height = s(720, 540)
+-- same cards the popup draws, at `notificationPanelWidth: 420` in the mirror, and its list may run
+-- most of the way down the screen before it scrolls, as the mirror's `maxAvailableHeight` lets it.
+theme.notification_panel_width = s(420, 340)
+theme.notification_list_height = s(640, 480)
+-- `panelToggleCardHeight`: the tile a radio switch is drawn as, tall enough for a glyph over a word.
+theme.panel_toggle_height = s(56, 44)
+-- `PanelEmptyState`'s `Layout.minimumHeight`: an empty list still holds a glyph and a line, at a
+-- height that reads as a state rather than a gap.
+theme.panel_empty_height  = s(120, 90)
 theme.panel_gap           = 4
 theme.notification_width  = s(380, 300)
 -- The plate behind a card's application icon (`notificationAppIconSize`); the icon in it is an

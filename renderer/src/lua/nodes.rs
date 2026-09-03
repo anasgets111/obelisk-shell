@@ -35,7 +35,19 @@ const NODE_KINDS: [&str; 13] = [
 /// The § 5.1 properties every kind takes, surface roles included: geometry, identity and the two
 /// flags. `layout::scene` reads these off any node it resolves without asking what kind it is.
 const COMMON_PROPERTIES: &[&str] = &[
-    "align_h", "align_v", "cursor", "height", "hover", "id", "margin", "on_hover", "opacity", "padding", "visible",
+    "align_h",
+    "align_v",
+    "cursor",
+    "height",
+    "hover",
+    "id",
+    "margin",
+    "max_height",
+    "max_width",
+    "on_hover",
+    "opacity",
+    "padding",
+    "visible",
     "width",
 ];
 
@@ -572,7 +584,7 @@ mod meta_stub_tests {
             unsampled.len(),
             unsampled.join("\n")
         );
-        assert_eq!(probed, 481, "the number of declared type members moved; confirm the change is intended");
+        assert_eq!(probed, 533, "the number of declared type members moved; confirm the change is intended");
     }
 
     /// One Lua literal per declared type. `None` means "no sample", which skips rather than guesses.

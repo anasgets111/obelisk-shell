@@ -25,9 +25,12 @@ return window {
     -- `panel_card`'s own defaults are the popup shape (10px radius): this is an opaque toplevel
     -- with no edge to round against, so `radius = 0` overrides it.
     child = panel_card({
-        panel_header("oblisk settings", function()
-            ui_state.settings_open:set(false)
-        end),
+        panel_header {
+            title = "oblisk settings",
+            on_close = function()
+                ui_state.settings_open:set(false)
+            end,
+        },
         section_header("system"),
         cell(util.label(oblisk.system, function(s)
             return "up since " .. os.date("%H:%M:%S", s.time)

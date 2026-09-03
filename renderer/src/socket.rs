@@ -563,8 +563,37 @@ impl RendererClient {
         // The one apply site that leaks an undrained lease bag at cadence: a re-resolve that
         // shortens a `children` list retires the tail on every poll turn carrying a push.
         self.scene.release_all_retired();
+        dump_layout_if_asked(&self.scene);
         true
     }
+}
+
+/// `OBLISK_DUMP_LAYOUT=<instance id>`, e.g. `panel_host@eDP-1`: prints that surface's resolved
+/// tree -- every visible node's kind, rect and, for a `text`, its content -- after each pass.
+/// Diagnostic only, off unless asked. The one geometry question a screenshot cannot answer is
+/// which node came out the wrong size, and the layout that goes wrong in a session is the one
+/// the test harness did not think to build (a card placed where the bell is, at the output's
+/// scale, with a feed the Supervisor had by then), so this reads the live answer instead.
+fn dump_layout_if_asked(scene: &Scene) {
+    let Ok(wanted) = std::env::var("OBLISK_DUMP_LAYOUT") else { return };
+    let Some(surface) = scene.surface(&wanted) else { return };
+    fn walk(node: &crate::layout::ResolvedNode, depth: usize, out: &mut String) {
+        if !node.visible {
+            return;
+        }
+        let text = node
+            .properties
+            .get("content")
+            .map(|value| format!(" {}", crate::layout::node::preview_for_error(value)))
+            .unwrap_or_default();
+        out.push_str(&format!("{}{} {:?}{text}\n", "  ".repeat(depth), node.kind, node.rect));
+        for child in &node.children {
+            walk(child, depth + 1, out);
+        }
+    }
+    let mut out = format!("layout dump: {wanted}\n");
+    walk(&surface, 0, &mut out);
+    eprint!("{out}");
 }
 
 async fn run(
@@ -681,6 +710,7 @@ fn start_secure_submit_capabilities(scene: &Scene, instances: &[SurfaceInstance]
 /// Iterates instances, not declared surfaces: one declaration can be several instances at
 /// different sizes.
 fn log_applied_surfaces(scene: &Scene, instances: &[SurfaceInstance]) {
+    dump_layout_if_asked(scene);
     for instance in instances {
         match scene.surface(&instance.instance_id) {
             Some(r) => eprintln!(
@@ -1288,6 +1318,76 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_dev_configs_history_card_is_as_tall_as_the_notifications_in_it() {
+        // The last notification in the history was drawn with its bottom edge cut off by the panel
+        // card: the card's content-sized height (ADR-0110) came out one line of body text short.
+        // The trigger was position, not content -- taffy 0.14 adds a container's own margin to its
+        // children's minimum cross size while measuring them (`layout::scene::taffy_style` says
+        // how this engine sidesteps that), and the card's margin is what centres it under its
+        // indicator, most of the way across the output. So this places the anchor where the bell
+        // is and seeds the output the session ran on, and asks that every node in the card holds
+        // its children: the card its body, the body its list, the list its cards, a card its rows.
+        let shell_lua = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/shell.lua");
+        let (mut client, _outbound_rx) = test_client(&shell_lua);
+        client
+            .apply_state_snapshot(StateSnapshot {
+                capability: "system".to_string(),
+                revision: 1,
+                payload: serde_json::json!({ "time": 1_700_000_000 }),
+            })
+            .unwrap();
+        client
+            .apply_state_snapshot(StateSnapshot {
+                capability: "notifications".to_string(),
+                revision: 1,
+                payload: serde_json::json!({ "feed": [
+                    { "id": 7, "app_name": "notify-send", "summary": "backup finished", "timestamp": 1_699_999_000,
+                      "body": [{ "kind": "text", "text": "Oblisk · 1 · Backup" }] },
+                    { "id": 8, "app_name": "Telegram Desktop", "summary": "Anas", "timestamp": 1_699_998_000,
+                      "body": [{ "kind": "text", "text": "have a look at this: https://github.com/anasgets111/oblisk-shell/pull/12 and tell me what you think." }] }
+                ] }),
+            })
+            .unwrap();
+        client.set_screens(
+            serde_json::json!([{ "name": "TEST", "width": 1920, "height": 1200, "scale": 1.0, "refresh": 60000 }]),
+        );
+        let specs = client.run_startup_evaluation().expect("the shipped dev config must evaluate");
+        let outputs = vec![OutputGeometry {
+            name: "TEST".to_string(),
+            size: layout::LogicalSize { width: 1920.0, height: 1200.0 },
+        }];
+        client.set_instances(expand_instances(&specs, &outputs));
+        assert!(client.apply_instances(), "the shipped dev config must resolve into a scene");
+        client
+            .lua()
+            .load(
+                r#"state("popup_anchor"):set({ x = 1745, y = 0, width = 24, height = 24 })
+                   state("panel_kind"):set("notifications")
+                   state("panel_open"):set(true)"#,
+            )
+            .exec()
+            .unwrap();
+        assert!(client.re_resolve_if_dirty());
+
+        fn overflowing(node: &crate::layout::ResolvedNode, path: &str, out: &mut Vec<String>) {
+            for (index, child) in node.children.iter().filter(|child| child.visible).enumerate() {
+                let here = format!("{path}/{}[{index}]", child.kind);
+                let bottom = child.rect.y + child.rect.height;
+                if bottom > node.rect.height + 0.5 {
+                    out.push(format!("{here} ends {bottom:.1}px down a {:.1}px {}", node.rect.height, node.kind));
+                }
+                overflowing(child, &here, out);
+            }
+        }
+        let host = client.scene.surface("panel_host@TEST").expect("the panel host must resolve");
+        let card = &host.children[0].children[1];
+        assert!(card.visible, "the notification history is open");
+        let mut out = Vec::new();
+        overflowing(card, "card", &mut out);
+        assert!(out.is_empty(), "a node in the history card is taller than what holds it:\n{}", out.join("\n"));
+    }
+
+    #[test]
     fn the_shipped_dev_configs_lock_screen_draws_one_mask_glyph_per_typed_character() {
         // The lock screen is the one surface where drawing nothing is a lockout risk rather than a
         // cosmetic gap: typing blind makes a typo invisible, `pam_unix` answers a wrong password
@@ -1384,32 +1484,23 @@ mod tests {
             .collect();
         assert!(overflowing.is_empty(), "a bar zone will paint past its own edge -- {}", overflowing.join("; "));
 
-        // The panel host has the same problem in the other axis and no percentage to hide it: its
-        // card is one size for all five bodies, so a body taller than the card is simply cut off.
-        // Each panel is measured on its own, because only one is visible at a time.
+        // The panel host has the other axis to worry about. Its card is as tall as the panel in it
+        // (ADR-0110): each body's list is capped and scrolls, so what can still overflow is the
+        // card as a whole running off the bottom of the output, and the surface's own height is the
+        // room under the bar.
         //
         // `children[0]` is the surface's one root node, holding the click-outside catcher and the
         // card in that order (`modules/shell/panel_host.lua`); the card is the second so that it
         // paints, and hit-tests, over the catcher.
         let host = client.scene.surface("panel_host@TEST").expect("the panel host must resolve");
         let card = &host.children[0].children[1];
-        // The *fixed* rows, not the section. Every panel body is a `height = "Fill"` column ending
-        // in a `list` with a `scroll` of its own (ADR-0069), so a section's own height is the
-        // card's content height by construction and comparing it against the popup measures nothing.
-        // What can still overflow is the rows above the list, which are content-sized and have to
-        // leave the list somewhere to live.
-        let fixed_extent = |section: &crate::layout::ResolvedNode| -> f32 {
-            section.children.iter().filter(|row| row.visible && row.kind != "list").map(|row| row.rect.height).sum()
-        };
-        // Read off the card rather than hard-coded: `panel_card`'s padding is its own to change, and
-        // the first child's offset is that padding.
-        let content_height = card.rect.height - 2.0 * card.children.first().map_or(0.0, |first| first.rect.y);
-        let tallest = card.children.iter().map(fixed_extent).fold(0.0_f32, f32::max);
-        let widest = card.children.iter().map(|section| section.rect.width).fold(0.0_f32, f32::max);
+        let card_bottom = card.rect.y + card.rect.height;
         assert!(
-            tallest <= content_height,
-            "a bar panel's fixed rows are {tallest:.0}px in {content_height:.0}px of card; its list has no room left"
+            card_bottom <= host.rect.height,
+            "the panel card ends {card_bottom:.0}px down a {:.0}px surface; it runs off the output",
+            host.rect.height
         );
+        let widest = card.children.iter().map(|section| section.rect.width).fold(0.0_f32, f32::max);
         // Derived the same way and for the same reason: the hard-coded 24 assumed `spacing.md` was
         // 12px, and it is 11px once the responsive scale has been through it, so this compared a
         // `Fill` section against a card two pixels narrower than the one it was filling.

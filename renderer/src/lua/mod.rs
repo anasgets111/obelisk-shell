@@ -530,15 +530,19 @@ mod tests {
             .evaluate(
                 r#"local panel_header = require("components.panel_header")
                    closed = false
-                   return panel { id = "p", child = panel_header("hi", function() closed = true end) }"#,
+                   return panel { id = "p", child = panel_header { title = "hi", on_close = function() closed = true end } }"#,
             )
             .unwrap();
         let header = child_table(&output);
         assert_eq!(header.get::<String>("kind").unwrap(), "row");
         let children: Table = header.get("children").unwrap();
-        let title: Table = children.get(1).unwrap();
+        // No icon asked for, so the title column is first; its one line is the bold title run.
+        let title_column: Table = children.get(1).unwrap();
+        assert_eq!(title_column.get::<String>("kind").unwrap(), "column");
+        let title: Table = title_column.get::<Table>("children").unwrap().get(1).unwrap();
         assert_eq!(title.get::<String>("kind").unwrap(), "text");
-        assert_eq!(title.get::<String>("content").unwrap(), "hi");
+        let run: Table = title.get::<Table>("content").unwrap().get(1).unwrap();
+        assert_eq!(run.get::<String>("text").unwrap(), "hi");
         let close_button: Table = children.get(2).unwrap();
         assert_eq!(close_button.get::<String>("kind").unwrap(), "button");
 
@@ -615,28 +619,43 @@ mod tests {
         assert_eq!(changes, 0, "only a left click may flip a toggle");
     }
 
-    /// `modules/bar/panels/settings.lua`'s `bluetooth.enabled` row: a label beside a
-    /// `components/toggle.lua`, both driven by the same signal/read/on_change triple.
+    /// `modules/bar/panels/network_panel.lua`'s wi-fi tile: the whole tile is the button, and a
+    /// left click reads the signal through `read`, flips it, and hands the flip to `on_change`,
+    /// the same contract `components/toggle.lua` keeps.
     #[test]
-    fn panel_toggle_card_pairs_a_label_with_a_toggle_bound_to_the_same_signal() {
+    fn panel_toggle_card_is_one_button_that_flips_its_signal_through_on_change() {
+        use mlua::Function;
         let loader = dev_config_loader();
         let output = loader
             .evaluate(
                 r#"local card = require("components.panel_toggle_card")
                    local on = state("on", true)
-                   return panel { id = "p", child = card("enabled", on, function(v) return v end, function(new_value)
-                       on:set(new_value)
-                   end) }"#,
+                   changes, last_change = 0, nil
+                   return panel { id = "p", child = card {
+                       slot = "tile", icon = "x", label = "enabled", signal = on,
+                       read = function(v) return v end,
+                       on_change = function(new_value)
+                           changes, last_change = changes + 1, new_value
+                           on:set(new_value)
+                       end,
+                   } }"#,
             )
             .unwrap();
-        let row = child_table(&output);
-        assert_eq!(row.get::<String>("kind").unwrap(), "row");
-        let children: Table = row.get("children").unwrap();
-        let label: Table = children.get(1).unwrap();
-        assert_eq!(label.get::<String>("kind").unwrap(), "text");
+        let tile = child_table(&output);
+        assert_eq!(tile.get::<String>("kind").unwrap(), "button");
+        let stack: Table = tile.get::<Table>("children").unwrap().get(1).unwrap();
+        assert_eq!(stack.get::<String>("kind").unwrap(), "column");
+        let label: Table = stack.get::<Table>("children").unwrap().get(2).unwrap();
         assert_eq!(label.get::<String>("content").unwrap(), "enabled");
-        let toggle_node: Table = children.get(2).unwrap();
-        assert_eq!(toggle_node.get::<String>("kind").unwrap(), "button");
+
+        let on_click: Function = tile.get("on_click").unwrap();
+        let rect = loader.lua().create_table().unwrap();
+        on_click.call::<()>((rect.clone(), "right")).unwrap();
+        let changes: i64 = loader.lua().globals().get("changes").unwrap();
+        assert_eq!(changes, 0, "only a left click may flip the tile");
+        on_click.call::<()>((rect, "left")).unwrap();
+        let last_change: bool = loader.lua().globals().get("last_change").unwrap();
+        assert!(!last_change, "a left click flips the value read through `read` into `on_change`");
     }
 
     /// `forget_config_modules` runs before every evaluation and reads `package.loaded`, so a

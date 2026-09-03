@@ -93,6 +93,11 @@ icons.refresh     = "\u{F0450}"
 icons.clear_all   = "\u{F0234}"
 icons.info        = "\u{F02FD}"
 
+-- A list row's own actions, `PanelActionIcon`'s two glyphs in the mirror: drop a saved network or a
+-- paired device, and cut a live connection.
+icons.trash       = "\u{F0A7A}"
+icons.disconnect  = "\u{F1616}"
+
 -- Alerts.
 icons.warning     = "\u{F0026}"
 icons.close       = "\u{F0156}"

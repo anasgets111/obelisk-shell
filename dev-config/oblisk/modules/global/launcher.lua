@@ -82,9 +82,12 @@ return window {
     max_size = { width = 480, height = 640 },
     visible = ui_state.launcher_open,
     child = panel_card({
-        panel_header("launcher", function()
-            ui_state.launcher_open:set(false)
-        end),
+        panel_header {
+            title = "launcher",
+            on_close = function()
+                ui_state.launcher_open:set(false)
+            end,
+        },
         app_list,
         -- Shown only when the scan found nothing, which is a real state rather than a defensive
         -- one: `applications` is scanned once at startup and again on `refresh`, so a config error
