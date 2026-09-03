@@ -34,8 +34,10 @@ const NODE_KINDS: [&str; 13] = [
 
 /// The § 5.1 properties every kind takes, surface roles included: geometry, identity and the two
 /// flags. `layout::scene` reads these off any node it resolves without asking what kind it is.
-const COMMON_PROPERTIES: &[&str] =
-    &["align_h", "align_v", "height", "hover", "id", "margin", "on_hover", "opacity", "padding", "visible", "width"];
+const COMMON_PROPERTIES: &[&str] = &[
+    "align_h", "align_v", "cursor", "height", "hover", "id", "margin", "on_hover", "opacity", "padding", "visible",
+    "width",
+];
 
 /// What every kind that paints as a box takes on top of [`COMMON_PROPERTIES`]: the fill, then the
 /// border. This is `node::paint_style`'s first match arm: `row`, `column` and `button` paint no
@@ -570,7 +572,7 @@ mod meta_stub_tests {
             unsampled.len(),
             unsampled.join("\n")
         );
-        assert_eq!(probed, 455, "the number of declared type members moved; confirm the change is intended");
+        assert_eq!(probed, 481, "the number of declared type members moved; confirm the change is intended");
     }
 
     /// One Lua literal per declared type. `None` means "no sample", which skips rather than guesses.
@@ -618,6 +620,7 @@ mod meta_stub_tests {
                     "{ { text = \"x\", bold = true, underline = true, color = \"#112233\", href = \"https://x/\" } }"
                 }
                 "Align" => "\"Center\"",
+                "Cursor" => "\"pointer\"",
                 // No row for a bare `Bound`: the caller wraps a sibling member's sample instead,
                 // and the three properties typed `Bound` alone are handled by field above. A row
                 // here would shadow both and probe every property with the same wrong payload.

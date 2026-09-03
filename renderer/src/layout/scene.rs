@@ -100,6 +100,9 @@ impl LayoutStyle {
     /// The one parse of one node's geometry for one pass. `properties` must already be a
     /// [`node::resolve_properties`] result: this reads values, it does not resolve signals.
     fn parse(properties: &HashMap<String, Value>) -> Result<Self, LayoutError> {
+        // Validated and not kept: the pointer path reads the name back off `properties` when it
+        // needs it (`layout::hit::cursor_under`), and a pass is the place a misspelling fails.
+        node::parse_cursor(properties)?;
         Ok(Self {
             margin: node::parse_edge_insets(properties, "margin")?,
             padding: node::parse_edge_insets(properties, "padding")?,
@@ -2567,6 +2570,15 @@ pub(super) mod tests {
                 "`opacity = {bad}` must be refused by name, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_unknown_cursor_name_fails_the_pass() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(r#"panel { id = "bar", child = rect { cursor = "hand" } }"#);
+        let err = apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap_err();
+        assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "cursor"), "got {err:?}");
     }
 
     #[test]

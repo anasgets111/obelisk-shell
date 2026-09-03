@@ -854,6 +854,36 @@ impl App {
     /// deep-clones the retained subtree into a `ResolvedNode` on every motion event, a few hundred
     /// small `HashMap` clones per event on the dispatch thread. Upgrade: a borrowing accessor
     /// (`Scene` handing out `&RetainedNode`), once a profile demands it.
+    /// Gives the pointer the shape [`layout::hit::cursor_under`] picks for what is under it
+    /// (ADR-0107), and only when that differs from the last one sent: a motion event arrives per
+    /// pixel and a `set_shape` request per pixel is noise the compositor has to read. `Leave`
+    /// clears `cursor_shown`, so the first event after an `Enter` always sends, which is what the
+    /// protocol asks for since the shape is bound to the enter serial.
+    fn sync_cursor(&mut self, index: usize, position: (f64, f64)) {
+        let Some(pointer) = self.pointer.as_ref() else {
+            return;
+        };
+        let shape = match self.client.scene().surface(&self.surfaces[index].surface_id) {
+            Some(tree) => {
+                let point = layout::hit::LogicalPoint { x: position.0 as f32, y: position.1 as f32 };
+                layout::hit::cursor_under(&layout::hit::hit_path(&tree, point), point, &self.shaping)
+            }
+            None => cursor_icon::CursorIcon::Default,
+        };
+        if self.cursor_shown == Some(shape) {
+            return;
+        }
+        match pointer.set_cursor(&self.conn, shape) {
+            Ok(()) => self.cursor_shown = Some(shape),
+            // Once, not per pixel: a theme with no such cursor would otherwise say so on every
+            // motion. Remembering the shape as shown is what makes it once.
+            Err(err) => {
+                eprintln!("[oblisk-renderer] could not set the cursor to {}: {err}", shape.name());
+                self.cursor_shown = Some(shape);
+            }
+        }
+    }
+
     fn sync_hover(&mut self, index: usize, position: Option<(f64, f64)>) {
         // Before the tree is touched, because the tree is the expensive part: a config that never
         // called `hover(name)` has nothing to write and skips all of it.
@@ -946,14 +976,29 @@ impl SeatHandler for App {
         capability: Capability,
     ) {
         match capability {
-            Capability::Pointer if self.pointer.is_none() => match self.seat_state.get_pointer(qh, &seat) {
-                Ok(pointer) => self.pointer = Some(pointer),
-                // Not fatal: a shell with no pointer still paints, still reloads, and still takes
-                // `wp-text-input-v3` input. Only `on_click` stops working, which is what this says.
-                Err(e) => {
-                    eprintln!("[oblisk-renderer] wl_seat::get_pointer failed; no button's on_click will ever fire: {e}")
+            // Themed, not bare, so this process can say what shape the pointer takes over its
+            // surfaces (ADR-0107). SCTK speaks `wp_cursor_shape_v1` when the compositor has it
+            // and paints from the XCursor theme through `wl_shm` when it does not; either way
+            // the cursor surface it creates here is its own and dies with the pointer.
+            Capability::Pointer if self.pointer.is_none() => {
+                let cursor_surface = self.compositor_state.create_surface(qh);
+                match self.seat_state.get_pointer_with_theme::<Self, ()>(
+                    qh,
+                    &seat,
+                    self.shm.wl_shm(),
+                    cursor_surface,
+                    ThemeSpec::default(),
+                ) {
+                    Ok(pointer) => self.pointer = Some(pointer),
+                    // Not fatal: a shell with no pointer still paints, still reloads, and still takes
+                    // `wp-text-input-v3` input. Only `on_click` stops working, which is what this says.
+                    Err(e) => {
+                        eprintln!(
+                            "[oblisk-renderer] wl_seat::get_pointer failed; no button's on_click will ever fire: {e}"
+                        )
+                    }
                 }
-            },
+            }
             // `None` rmlvo: take the compositor's own keymap. This shell never interprets a keysym
             // (there is no `on_key` in § 5.2), so imposing a layout of its own would be policy
             // serving nothing.
@@ -981,14 +1026,10 @@ impl SeatHandler for App {
                 // A pointer that is gone will never send the `release` this press was waiting for,
                 // which is the same reason `leave` clears it (ADR-0050 decision 2).
                 self.armed = None;
-                if let Some(pointer) = self.pointer.take() {
-                    // `wl_pointer::release` is `since="3"`; below that dropping the proxy is the
-                    // whole cleanup. Same guard SCTK's own `ThemedPointer::drop` applies
-                    // (src/seat/pointer/mod.rs:572).
-                    if pointer.version() >= 3 {
-                        pointer.release();
-                    }
-                }
+                self.cursor_shown = None;
+                // `ThemedPointer::drop` releases the `wl_pointer` (guarded on `since="3"`),
+                // destroys the shape device and the cursor surface (src/seat/pointer/mod.rs:567).
+                self.pointer = None;
             }
             Capability::Keyboard => {
                 // No keyboard means nothing will ever report the user leaving, so the focus this
@@ -1129,6 +1170,7 @@ impl PointerHandler for App {
                 // arrive to say the pointer has gone, so a tooltip left open here stays open.
                 PointerEventKind::Leave { .. } => {
                     self.armed = None;
+                    self.cursor_shown = None;
                     self.sync_hover(index, None);
                 }
                 // A motion that leaves the armed rect deliberately does *not* disarm. Dragging back
@@ -1137,6 +1179,7 @@ impl PointerHandler for App {
                 // event a pointer that appears already inside a surface sends.
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
                     self.sync_hover(index, Some(event.position));
+                    self.sync_cursor(index, event.position);
                 }
                 // The wheel (ADR-0069). `Enter`/`Motion`/`Leave` above have already kept
                 // `sync_hover` fed, so the position this needs is the event's own.

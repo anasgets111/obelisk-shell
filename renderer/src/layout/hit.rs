@@ -4,6 +4,9 @@
 //! `crate::wayland`: everything else on the pointer path needs a live `wl_pointer` and a live
 //! `wl_surface`, and this is the part that decides what a click means.
 
+use cursor_icon::CursorIcon;
+use mlua::Value;
+
 use crate::layout::node::{PaintStyle, StyleRun, TextAlign, segments};
 use crate::layout::scene::ResolvedNode;
 use crate::text::shaping::{self, FontRun, ShapeRequest, ShapingHandle};
@@ -107,6 +110,41 @@ pub fn link_under(node: &ResolvedNode, point: LogicalPoint, shaping: &ShapingHan
     None
 }
 
+/// The shape the pointer should take over `path`'s deepest node (ADR-0107). Innermost wins, and
+/// at each node an explicit `cursor` property beats what the node is: a `text` with `on_link` over
+/// a link's own words is a `pointer`, a `textfield` is `text`, a `button` with an `on_click` is a
+/// `pointer`, and nothing else says anything, so the arrow is what is left. The same three
+/// questions `wayland::input` asks on a press, asked on motion, so what the cursor promises is what
+/// a click does: a `button` with no handler is transparent to both.
+///
+/// A `cursor` set on an ancestor still loses to a link inside it, since the walk meets the link
+/// first. That is the order a card with `cursor = "grab"` and a link in its body wants.
+pub fn cursor_under(path: &[&ResolvedNode], point: LogicalPoint, shaping: &ShapingHandle) -> CursorIcon {
+    path.iter()
+        .enumerate()
+        .rev()
+        .find_map(|(depth, node)| {
+            if let Some(Value::String(name)) = node.properties.get("cursor") {
+                // Validated by `node::parse_cursor` when the pass resolved the node, so a name
+                // that does not parse here is a bug, not a config error; the arrow is the fallback.
+                return Some(name.to_str().ok().and_then(|name| name.parse().ok()).unwrap_or(CursorIcon::Default));
+            }
+            match node.kind.as_str() {
+                "text" if matches!(node.properties.get("on_link"), Some(Value::Function(_))) => {
+                    let rect = absolute_rect(&path[..=depth])?;
+                    let local = LogicalPoint { x: point.x - rect.x, y: point.y - rect.y };
+                    link_under(node, local, shaping).map(|_| CursorIcon::Pointer)
+                }
+                "textfield" => Some(CursorIcon::Text),
+                "button" if matches!(node.properties.get("on_click"), Some(Value::Function(_))) => {
+                    Some(CursorIcon::Pointer)
+                }
+                _ => None,
+            }
+        })
+        .unwrap_or(CursorIcon::Default)
+}
+
 /// The absolute (surface-local) rect of `path`'s last node, `None` for an empty path.
 ///
 /// Sums the parent-relative origins the walk descended through, which is the only place that sum
@@ -172,6 +210,90 @@ mod tests {
             paint: None,
             children,
         }
+    }
+
+    // ---- cursor_under (ADR-0107) ----
+
+    fn with(mut node: ResolvedNode, lua: &mlua::Lua, key: &str, value: Value) -> ResolvedNode {
+        let _ = lua;
+        node.properties.insert(key.to_string(), value);
+        node
+    }
+
+    fn function(lua: &mlua::Lua) -> Value {
+        Value::Function(lua.create_function(|_, ()| Ok(())).unwrap())
+    }
+
+    #[test]
+    fn a_button_with_a_handler_is_a_pointer_and_one_without_is_the_arrow() {
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        let handled = node(
+            "row",
+            (0.0, 0.0, 100.0, 20.0),
+            vec![
+                with(
+                    node("button", (0.0, 0.0, 50.0, 20.0), vec![node("text", (0.0, 0.0, 30.0, 20.0), vec![])]),
+                    &lua,
+                    "on_click",
+                    function(&lua),
+                ),
+                node("button", (50.0, 0.0, 50.0, 20.0), vec![]),
+            ],
+        );
+        let point = LogicalPoint { x: 10.0, y: 10.0 };
+        assert_eq!(cursor_under(&hit_path(&handled, point), point, &shaping), CursorIcon::Pointer);
+        let point = LogicalPoint { x: 60.0, y: 10.0 };
+        assert_eq!(cursor_under(&hit_path(&handled, point), point, &shaping), CursorIcon::Default);
+        assert_eq!(cursor_under(&[], point, &shaping), CursorIcon::Default, "off every node");
+    }
+
+    #[test]
+    fn an_explicit_cursor_beats_what_the_node_is_and_the_innermost_one_wins() {
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        let disabled = with(
+            with(node("button", (0.0, 0.0, 50.0, 20.0), vec![]), &lua, "on_click", function(&lua)),
+            &lua,
+            "cursor",
+            Value::String(lua.create_string("not-allowed").unwrap()),
+        );
+        let field = node("textfield", (0.0, 0.0, 50.0, 20.0), vec![]);
+        let handle = with(
+            node("row", (0.0, 0.0, 100.0, 20.0), vec![disabled, node("row", (50.0, 0.0, 50.0, 20.0), vec![field])]),
+            &lua,
+            "cursor",
+            Value::String(lua.create_string("grab").unwrap()),
+        );
+        let point = LogicalPoint { x: 10.0, y: 10.0 };
+        assert_eq!(cursor_under(&hit_path(&handle, point), point, &shaping), CursorIcon::NotAllowed);
+        let point = LogicalPoint { x: 60.0, y: 10.0 };
+        assert_eq!(
+            cursor_under(&hit_path(&handle, point), point, &shaping),
+            CursorIcon::Text,
+            "a field inside a grab handle is still a field"
+        );
+    }
+
+    #[test]
+    fn a_link_word_is_a_pointer_and_the_plain_word_beside_it_falls_through_to_the_button() {
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        let text = with(
+            styled_text("see this page now", vec![link(4..13, "https://a/")], TextAlign::Start, 300.0),
+            &lua,
+            "on_link",
+            function(&lua),
+        );
+        let card = node("button", (0.0, 0.0, 300.0, 60.0), vec![text]);
+        let plain = LogicalPoint { x: 2.0, y: 5.0 };
+        assert_eq!(
+            cursor_under(&hit_path(&card, plain), plain, &shaping),
+            CursorIcon::Default,
+            "plain word, button has no handler"
+        );
+        let on_link = LogicalPoint { x: width_of(&shaping, "see ") + width_of(&shaping, "this page") / 2.0, y: 5.0 };
+        assert_eq!(cursor_under(&hit_path(&card, on_link), on_link, &shaping), CursorIcon::Pointer);
     }
 
     // ---- link_under (ADR-0106) ----

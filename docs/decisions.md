@@ -4864,3 +4864,46 @@ button is the one control that says where a link goes before it is pressed.
 Verified live: pressing "this page" in a body of `see <a href="https://example.org/some/page">this
 page</a> when you get a moment` opens the page in the running browser and the notification stays;
 pressing "when" beside it dismisses the card as before.
+
+## 0107. The pointer takes a shape over what it is on: `cursor` on every node, a default in Rust
+
+Nothing set a cursor before this. The Renderer bound a bare `wl_pointer` and never called
+`set_cursor`, so the pointer kept whatever shape the compositor was showing when it crossed onto a
+surface. The reference config gives every `MouseArea` a `cursorShape`, and a bar whose buttons never
+say they are buttons reads as a picture of one.
+
+1. **`cursor` is a § 5.1 property, on every kind, by CSS name.** `"pointer"`, `"text"`,
+   `"not-allowed"`, `"grab"`, the resize edges: `cursor_icon`'s names, which are also
+   `wp_cursor_shape_v1`'s, so the string a config writes is the string the compositor reads. An
+   unknown name fails the pass like any other property (`node::parse_cursor`, called from
+   `LayoutStyle::parse` and kept nowhere: the pointer path re-reads the name off `properties`).
+
+2. **The default lives in Rust, not in the Lua components.** The reference sets `cursorShape` on
+   each component because Qt's `MouseArea` has none of its own. Here the decision has to be made at
+   hit-test time anyway, on the pointer path, where only the Renderer knows which node the point is
+   on; and the three questions it asks on a press are the three that decide the shape. So
+   `layout::hit::cursor_under` walks the hit path innermost-first and at each node takes an explicit
+   `cursor` if there is one, else what the node is: a `text` with `on_link` whose link words are
+   under the point is `pointer`, a `textfield` is `text`, a `button` with a callable `on_click` is
+   `pointer`. Nothing else says anything and the arrow is what is left. A `button` with no handler
+   is transparent to the shape as it is to a press, so what the cursor promises is what a click does.
+   `dev-config` changes nothing: its components already build a `row` rather than a `button` when
+   there is nothing to click, so the default already covers them. The property is for the exceptions
+   that do not exist yet: a control that is off, a drag handle, something refused.
+
+3. **Innermost wins, explicit ahead of implied, at each node.** A `cursor = "grab"` on a card still
+   yields to a link in its body because the walk meets the link first; a `cursor = "not-allowed"` on
+   a `button` beats the button's own `pointer` because the explicit check runs before the kind
+   check at the same node.
+
+4. **`ThemedPointer` in place of the bare `wl_pointer`.** SCTK's type speaks `wp_cursor_shape_v1`
+   when the compositor advertises it (niri does) and paints from the XCursor theme through `wl_shm`
+   when it does not, so `wl_shm` is bound for the first time, for that fallback alone; this process
+   still draws through EGL. The shape is sent from the `Enter`/`Motion` arm beside `sync_hover`, and
+   only when it differs from the last one sent, since a motion arrives per pixel. `Leave` forgets
+   the last shape, so the first event after an `Enter` always sends, which is what the protocol
+   asks for: the shape is bound to the enter serial.
+
+Cost: one `hit_path` walk per motion event on top of `hover_writes`'s, and a `link_under` shaping
+call only when the pointer is on a `text` that declares `on_link`. Not measured; nothing on the
+pointer path has needed to be yet.

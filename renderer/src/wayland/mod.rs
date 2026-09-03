@@ -15,7 +15,7 @@ use smithay_client_toolkit::presentation_time::{PresentTime, PresentationTimeHan
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::seat::keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers};
 use smithay_client_toolkit::seat::pointer::{
-    BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, PointerEvent, PointerEventKind, PointerHandler,
+    BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, PointerEvent, PointerEventKind, PointerHandler, ThemeSpec, ThemedPointer,
 };
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::session_lock::{
@@ -30,6 +30,7 @@ use smithay_client_toolkit::shell::xdg::window::{
     DecorationMode, Window, WindowConfigure, WindowDecorations, WindowHandler,
 };
 use smithay_client_toolkit::shell::xdg::{XdgPositioner, XdgShell, XdgSurface};
+use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_registry, registry_handlers};
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface};
@@ -135,7 +136,15 @@ pub struct App {
     /// The seat's pointer, once advertised. Kept alive: dropping the proxy destroys the protocol
     /// object and every `enter`/`press`/`release` with it. One, not one per seat:
     /// [`SeatHandler::new_capability`] puts whichever seat announces the capability in this slot.
-    pointer: Option<wl_pointer::WlPointer>,
+    pointer: Option<ThemedPointer>,
+    /// The shape the pointer was last given over one of this process's surfaces (ADR-0107).
+    /// `None` between surfaces: `wp_cursor_shape_v1` wants the shape re-sent on every `enter`,
+    /// so `Leave` clears this and the next `Enter` always sends.
+    cursor_shown: Option<cursor_icon::CursorIcon>,
+    /// `wl_shm`, bound only so a compositor without `wp_cursor_shape_v1` can still be handed a
+    /// cursor image from the XCursor theme. This process draws through EGL and puts nothing else
+    /// in shared memory.
+    shm: Shm,
     /// The seat's keyboard, once advertised, kept alive and single-seat for the same reason as
     /// `pointer`. This shell reads no keys off it directly; it's bound only for `enter`/`leave`,
     /// the only way a client learns which surface `keyboard_interactivity` actually won focus for.
@@ -207,6 +216,8 @@ pub fn run(
         XdgShell::bind(&globals, &qh).inspect_err(|err| log_bind_failure("<xdg-shell>", "xdg_wm_base::bind", err)).ok();
     let output_state = OutputState::new(&globals, &qh);
     let seat_state = SeatState::new(&globals, &qh);
+    // Stable and mandatory: every compositor advertises `wl_shm`, so `?` here is right.
+    let shm = Shm::bind(&globals, &qh)?;
     // Not `?`, not logged: `SessionLockState::new` cannot fail. It stores a `GlobalProxy`, so a
     // missing `ext_session_lock_manager_v1` surfaces only when something asks for a lock
     // (ADR-0052 decision 4).
@@ -251,6 +262,8 @@ pub fn run(
         queue_handle: qh.clone(),
         active_nonce: None,
         pointer: None,
+        cursor_shown: None,
+        shm,
         keyboard: None,
         keyboard_focus: None,
         armed: None,
@@ -495,3 +508,9 @@ impl ProvidesRegistryState for App {
 // `delegate_session_lock!` call to match: none of those macros exist in this SCTK.
 delegate_registry!(App);
 smithay_client_toolkit::delegate_dispatch2!(App);
+
+impl ShmHandler for App {
+    fn shm_state(&mut self) -> &mut Shm {
+        &mut self.shm
+    }
+}

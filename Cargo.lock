@@ -1667,6 +1667,7 @@ name = "renderer"
 version = "0.1.0"
 dependencies = [
  "cosmic-text",
+ "cursor-icon",
  "femtovg",
  "fontdb",
  "freedesktop-icons",

@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use cursor_icon::CursorIcon;
 use mlua::Value;
 
 use super::*;
@@ -342,6 +343,25 @@ pub fn parse_visible(properties: &HashMap<String, Value>) -> Result<bool, Layout
         Value::Boolean(b) => Ok(*b),
         other => Err(invalid("visible", format!("expected a boolean, got {}", preview_for_error(other)))),
     }
+}
+
+/// § 5.1 `cursor`: the shape the pointer takes over this node, by its CSS name (`"pointer"`,
+/// `"text"`, `"not-allowed"`, `"grab"`, the resize edges), or `None` when the node leaves the choice
+/// to what it is (ADR-0107; `layout::hit::cursor_under` is the rule). Validated here so a typo
+/// fails the pass by name like every other property, rather than showing an arrow and saying
+/// nothing. The names are `cursor_icon`'s, which are also `wp_cursor_shape_v1`'s, so the string a
+/// config writes is the string the compositor reads.
+pub fn parse_cursor(properties: &HashMap<String, Value>) -> Result<Option<CursorIcon>, LayoutError> {
+    let Some(value) = properties.get("cursor") else {
+        return Ok(None);
+    };
+    let Value::String(name) = value else {
+        return Err(invalid("cursor", format!("must be a cursor name string, got {}", preview_for_error(value))));
+    };
+    let name = name.to_str().map_err(|_| invalid("cursor", "must be UTF-8"))?;
+    name.parse::<CursorIcon>()
+        .map(Some)
+        .map_err(|_| invalid("cursor", format!("unknown cursor name {name:?}; the names are CSS's, like \"pointer\"")))
 }
 
 pub fn parse_spacing(properties: &HashMap<String, Value>) -> Result<f32, LayoutError> {
