@@ -4065,3 +4065,50 @@ physical pixels. On a 2x output that draws every glyph in this shell at half siz
 text existed. Lines advance by the same unscaled step, so they are spaced correctly around whatever
 size the glyphs come out — wrong together rather than wrong apart. The fix is to scale the font
 size, and it needs a HiDPI output to verify against.
+
+## 0090. A notification's actions are kept, and a config can invoke one
+
+`Notify`'s `actions` array — the flat `[key1, label1, key2, label2, ...]` list every notification
+button in every shell comes from — was read by one predicate, `actions_have_reply`, and dropped on
+the floor. `GetCapabilities` advertised `actions` and `action-icons` and neither was true, and
+`Notification`'s own doc comment said the array "is never stored, only the `has_reply` bool it
+collapses into". A config could draw a notification and never offer Archive, Snooze, Mark as read,
+or Reply-by-button.
+
+1. **`actions` is a typed list, and the two keys that are not buttons are not in it.** `"default"`
+   is the whole notification's activation — clicking the card — and becomes `has_default_action`;
+   `"inline-reply"` becomes the `has_reply` that already existed. Both are real action keys on the
+   wire, and both draw as nonsense if a config repeats them in a button row, so the split happens
+   once here rather than in every config that renders a card.
+
+2. **An icon action carries a theme name, not a path.** Under `hints["action-icons"]` the base spec
+   says the key doubles as an icon name, so it is carried as one — but `icon` accepts an absolute
+   path as readily as a theme name (ADR-0054 decision 2), so a key holding a path separator is
+   refused as an icon rather than passed through. Without that, any application on the session bus
+   could name a file on this machine and have the shell draw its contents.
+
+3. **`invoke_action` checks the key against what the notification declared.** The same rule
+   `reply` already applies through `has_reply`, for the same reason: a key the sender never offered
+   means nothing to it, and forwarding one only produces a signal the application has to field and
+   ignore. An undeclared key is a logged no-op.
+
+4. **Invoking removes the notification unless the sender said otherwise.** That is the base spec's
+   default and matches what `reply` does. `hints["resident"]` is the spec's own exception and is
+   honoured, because a media notification whose prev/next buttons closed the card on first press
+   would be useless. A removal here also emits `NotificationClosed(id, reason=3)`: an action-invoked
+   close is a close, and a sender tracking its own ids has to hear about it.
+
+5. **Both caps are on the same footing as §1.1's text caps.** At most 8 actions, and a label
+   truncated to 64 bytes on a character boundary. The array arrives from an unprivileged sender and
+   a config draws every entry of it; eight is past anything real, and a label is a button rather
+   than a paragraph.
+
+Dropped from scope: `x-kde-reply-placeholder-text`. The placeholder is only worth carrying once
+something can type into the field it labels, and nothing can — `zwp_text_input_v3` is unwired, so
+the unmasked half of `textfield` has never received a keystroke. It belongs with that work.
+
+Verified against a live `Notify`: a notification declaring `default` and `archive` reaches Lua as
+one action plus `has_default_action = true`; invoking `archive` makes `notify-send -A` print
+`archive` and exit; invoking a key the sender never offered prints nothing and logs the refusal;
+and the same notification sent with `resident` stays mapped across repeated invocations where the
+plain one is gone after the first.

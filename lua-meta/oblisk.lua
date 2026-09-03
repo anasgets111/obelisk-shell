@@ -138,15 +138,31 @@
 ---@class Notification
 ---One queued notification -- `notifications.feed[]`'s object shape (docs/oblisk-idl-api-specs.md
 ---§2.7, ADR-0033's corrections: `body` is a span array not a flat string, `urgency`/`has_reply`
----are new fields). Trimmed to what the feed shape and write commands need -- the raw `actions`
----array is never stored, only the `has_reply` bool it collapses into.
+---are new fields; ADR-0090 adds `actions` and `has_default_action`). Trimmed to what the feed
+---shape and the write commands need: `expire_timeout` and `replaces_id` are acted on and not
+---carried, since neither is a thing a config draws or decides.
+---@field actions NotificationAction[] The buttons the sender offered, in the order it listed them, minus the two keys that mean something other than a button. Empty for the great majority of notifications.
 ---@field app_name string The sending application's name, truncated to 64 bytes on a character boundary.
 ---@field body NotificationSpan[] The message as a run of spans rather than one string, because the freedesktop body is markup. Truncated to 512 bytes before parsing. Each span is either text carrying its own bold/italic/underline/href, or an image whose path passed the trusted-root check, so a config draws the list in order and never has to parse markup itself.
+---@field has_default_action boolean The sender offered a `"default"` action: the whole card is activatable, and clicking it should call `notifications:invoke_action(id, "default")`. Its own field rather than an entry in `actions`, because it is not a button and drawing it as one is wrong.
 ---@field has_reply boolean The sender offered an inline reply action, so `notifications:reply(id, text)` will be accepted. Calling it on a notification without one is refused, which is why this is carried rather than guessed.
 ---@field icon_path? string An absolute path to a decoded, bounds-checked image spooled to `/dev/shm`, or `nil` for a notification that sent no icon. Never a theme name: this is a file that exists.
 ---@field id integer The server-assigned id, counting up from `1`. What `notifications:dismiss`, `:reply` and `:invoke_action` take. Reused when an application replaces its own notification in place.
 ---@field summary string The title, truncated to 128 bytes on a character boundary. Plain text: any markup the application sent is parsed out, not rendered.
 ---@field urgency Urgency `"low"`, `"normal"` or `"critical"`. `"normal"` for a sender that set no urgency hint. Critical is the one that outlives do-not-disturb and never expires on its own.
+
+---@class NotificationAction
+---One action button a sender offered (ADR-0090). `Notify` carries these as a flat
+---`[key1, label1, key2, label2, ...]` array, which was read for one bool and thrown away until
+---now -- so `GetCapabilities` advertised `actions` and `action-icons` and neither was true.
+---
+---The two keys with meanings of their own are not in here: `"default"` is the whole
+---notification's activation and becomes [`Notification::has_default_action`], and
+---`"inline-reply"` becomes [`Notification::has_reply`]. Both would otherwise draw as buttons
+---beside the ones a sender actually meant as buttons.
+---@field icon_name? string A *theme icon name*, present only when the sender set the `action-icons` hint, in which case the base spec says the key is that name. Not a path and never resolved here: `icon` takes a theme name directly (ADR-0054 decision 2), so there is nothing to spool. A key holding a path separator is refused as an icon rather than carried, because `icon` also accepts an absolute path -- without that check, a sender could name any file on this machine and have the shell draw it.
+---@field key string What `notifications:invoke_action(id, key)` takes, and what travels back to the sender as `ActionInvoked`'s `action_key`. Opaque: it means something to the application and nothing here.
+---@field label string What to draw on the button. The sender's own label, or the key when it sent an empty one and the action is not icon-only.
 
 ---@class NotificationSpan
 ---One allowlisted body-markup run (CONTEXT.md's "Notification body span"; ADR-0033). A text run
@@ -389,7 +405,7 @@ local BatteryCapability = {}
 ---@field invoke fun(self: NetworkCapability, command: "set_networking_enabled"|"set_wifi_enabled"|"set_ethernet_enabled"|"scan"|"connect"|"cancel_connect"|"forget", ...: any)
 
 ---@class NotificationsCapability: Capability<NotificationsState>
----@field invoke fun(self: NotificationsCapability, command: "dismiss"|"reply"|"set_sound"|"set_dnd", ...: any)
+---@field invoke fun(self: NotificationsCapability, command: "dismiss"|"invoke_action"|"reply"|"set_sound"|"set_dnd", ...: any)
 
 ---@class PowerCapability: Capability<PowerState>
 ---@field invoke fun(self: PowerCapability, command: "set_profile", ...: any)

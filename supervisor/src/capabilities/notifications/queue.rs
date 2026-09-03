@@ -314,6 +314,9 @@ mod tests {
             icon_path: icon_path.map(str::to_string),
             urgency: Urgency::Normal,
             has_reply: false,
+            actions: Vec::new(),
+            has_default_action: false,
+            resident: false,
             incarnation: 0,
         }
     }

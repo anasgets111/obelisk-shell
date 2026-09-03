@@ -21,9 +21,9 @@ use super::queue::{
 };
 use super::sound::SoundSender;
 use super::{
-    MAX_APP_NAME_BYTES, MAX_SUMMARY_BYTES, NOTIFICATIONS_BUS_NAME, NOTIFICATIONS_CAPABILITIES,
-    NOTIFICATIONS_OBJECT_PATH, Notification, NotificationsSignal, NotificationsState, Urgency, parse_urgency_str,
-    truncate_utf8_bytes, urgency_from_hint_byte,
+    MAX_ACTION_LABEL_BYTES, MAX_ACTIONS, MAX_APP_NAME_BYTES, MAX_SUMMARY_BYTES, NOTIFICATIONS_BUS_NAME,
+    NOTIFICATIONS_CAPABILITIES, NOTIFICATIONS_OBJECT_PATH, Notification, NotificationAction, NotificationsSignal,
+    NotificationsState, Urgency, parse_urgency_str, truncate_utf8_bytes, urgency_from_hint_byte,
 };
 
 // -------------------------------------------------------------------------------------------
@@ -35,11 +35,63 @@ fn format_reply_action_key(text: &str) -> String {
     format!("inline-reply::{text}")
 }
 
-/// Whether `Notify`'s `actions` array (flat `[key1, label1, key2, label2, ...]` pairs) declares
-/// the KDE inline-reply extension (§1.2's `x-kde-reply` convention rides on an `"inline-reply"`
-/// action key being present).
-fn actions_have_reply(actions: &[String]) -> bool {
-    actions.chunks(2).any(|pair| pair.first().is_some_and(|key| key == "inline-reply"))
+/// What `Notify`'s flat `[key1, label1, key2, label2, ...]` array splits into (ADR-0090). Three
+/// values that all come off one walk of the same array, returned together rather than as three
+/// passes each re-deciding what a key means.
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct ParsedActions {
+    pub actions: Vec<NotificationAction>,
+    /// A `"default"` key was present: the notification as a whole is activatable.
+    pub has_default: bool,
+    /// An `"inline-reply"` key was present -- §1.2's `x-kde-reply` convention rides on exactly
+    /// that key.
+    pub has_reply: bool,
+}
+
+/// Splits `Notify`'s `actions` into the buttons a config draws and the two keys that are not
+/// buttons (ADR-0090).
+///
+/// An odd-length array is a sender that sent a key with no label, which the base spec does not
+/// allow and which is not worth rejecting a whole notification over: the label reads as empty and
+/// the key stands in for it.
+///
+/// `action_icons` is the sender's hint that each key doubles as a theme icon name. An action is
+/// kept only if it can actually be drawn -- a label, or an icon to draw instead of one -- so a
+/// sender that offers `["", ""]` gets nothing rather than an unlabelled button that does something
+/// unguessable when pressed.
+pub(super) fn parse_actions(actions: &[String], action_icons: bool) -> ParsedActions {
+    let mut parsed = ParsedActions::default();
+    for pair in actions.chunks(2) {
+        let Some(key) = pair.first().filter(|key| !key.is_empty()) else { continue };
+        match key.as_str() {
+            "default" => {
+                parsed.has_default = true;
+                continue;
+            }
+            "inline-reply" => {
+                parsed.has_reply = true;
+                continue;
+            }
+            _ => {}
+        }
+        if parsed.actions.len() >= MAX_ACTIONS {
+            continue;
+        }
+        // A theme name, never a path: `icon` accepts an absolute path too, so without this a
+        // sender could name any readable file on the machine and have the shell draw it.
+        let icon_name = (action_icons && !key.contains('/')).then(|| key.clone());
+        let label = pair.get(1).map(String::as_str).unwrap_or_default().trim();
+        let label = if label.is_empty() && icon_name.is_none() { key.as_str() } else { label };
+        if label.is_empty() && icon_name.is_none() {
+            continue;
+        }
+        parsed.actions.push(NotificationAction {
+            key: key.clone(),
+            label: truncate_utf8_bytes(label, MAX_ACTION_LABEL_BYTES),
+            icon_name,
+        });
+    }
+    parsed
 }
 
 // -------------------------------------------------------------------------------------------
@@ -265,6 +317,50 @@ impl NotificationsController {
         let _ = self.events.send(NotificationsSignal::Changed);
     }
 
+    /// `notifications:invoke_action(id, key)` (ADR-0090): confirms the notification actually
+    /// declared `key`, emits `ActionInvoked(id, key)`, and then removes it unless the sender set
+    /// `hints["resident"]`.
+    ///
+    /// The key is checked rather than forwarded, for the same reason `reply` checks `has_reply`:
+    /// a key the sender never offered means nothing to it, and the round trip that discovers that
+    /// is a signal the application has to field and ignore. Logged no-ops for an unknown id or an
+    /// undeclared key.
+    ///
+    /// Removing afterwards is the base spec's default and `resident` is its own exception to it --
+    /// a media notification whose prev/next buttons closed the card on first press would be
+    /// useless. `NotificationClosed` is emitted alongside, because an action-invoked removal is a
+    /// close like any other and a sender tracking its own ids needs to hear about it.
+    pub async fn invoke_action(&self, id: u32, key: String) {
+        let outcome = {
+            let mut state = self.state.lock().unwrap();
+            match state.queue.iter().position(|n| n.id == id) {
+                Some(index) if !declares_action(&state.queue[index], &key) => {
+                    eprintln!(
+                        "notifications: invoke_action({id}, {key:?}) ignored: that notification declares no such action"
+                    );
+                    None
+                }
+                Some(index) if state.queue[index].resident => Some(None),
+                Some(_) => Some(remove_by_id(&mut state.queue, id)),
+                None => {
+                    eprintln!(
+                        "notifications: invoke_action({id}, {key:?}) ignored: no notification with that id is currently queued"
+                    );
+                    None
+                }
+            }
+        };
+        let Some(removed) = outcome else { return };
+        self.emit_action_invoked(id, key).await;
+        if let Some(removed) = removed {
+            if let Some(path) = removed.icon_path {
+                delete_icon_file(&path);
+            }
+            self.emit_notification_closed(id, CloseReason::ClosedByMethod).await;
+        }
+        let _ = self.events.send(NotificationsSignal::Changed);
+    }
+
     /// `notifications:set_sound(urgency, path)` (ADR-0033): registers `path` for `urgency`'s tier
     /// if it passes the same path-trust validator as icon references. An invalid/untrusted path
     /// is a logged no-op.
@@ -292,6 +388,12 @@ impl NotificationsController {
         let state = self.state.lock().unwrap();
         NotificationsState { feed: feed_view(&state.queue), dnd: state.dnd }
     }
+}
+
+/// Whether `notification` offered `key`, counting the `"default"` activation that
+/// [`parse_actions`] deliberately keeps out of the button list.
+fn declares_action(notification: &Notification, key: &str) -> bool {
+    (key == "default" && notification.has_default_action) || notification.actions.iter().any(|a| a.key == key)
 }
 
 fn spool_raw_image(id: u32, raw: &RawImageData) -> Option<String> {
@@ -333,7 +435,9 @@ impl NotificationsController {
         let summary = truncate_utf8_bytes(&summary, MAX_SUMMARY_BYTES);
         let body_spans = sanitize_body(&body, &self.trusted_roots);
         let urgency = urgency_from_hint_byte(hints.get("urgency").and_then(value_as_u8));
-        let has_reply = actions_have_reply(&actions);
+        let action_icons = hints.get("action-icons").and_then(value_as_bool).unwrap_or(false);
+        let parsed_actions = parse_actions(&actions, action_icons);
+        let resident = hints.get("resident").and_then(value_as_bool).unwrap_or(false);
 
         let image_data = hints.get("image-data").or_else(|| hints.get("image_data")).and_then(decode_raw_image_data);
         let image_path =
@@ -351,8 +455,19 @@ impl NotificationsController {
         };
         let icon_path = self.resolve_and_spool_icon(id, image_data, image_path, app_icon, icon_data).await;
 
-        let notification =
-            Notification { id, app_name, summary, body: body_spans, icon_path, urgency, has_reply, incarnation };
+        let notification = Notification {
+            id,
+            app_name,
+            summary,
+            body: body_spans,
+            icon_path,
+            urgency,
+            has_reply: parsed_actions.has_reply,
+            actions: parsed_actions.actions,
+            has_default_action: parsed_actions.has_default,
+            resident,
+            incarnation,
+        };
 
         let cleanup = {
             let mut state = self.state.lock().unwrap();
@@ -461,6 +576,13 @@ pub fn parse_reply_args(arguments: &[serde_json::Value]) -> Option<(u32, String)
     Some((id, text))
 }
 
+/// `notifications:invoke_action(id, key)`'s `arguments: [id, key]`.
+pub fn parse_invoke_action_args(arguments: &[serde_json::Value]) -> Option<(u32, String)> {
+    let id = u32::try_from(arguments.first()?.as_u64()?).ok()?;
+    let key = arguments.get(1)?.as_str().filter(|key| !key.is_empty())?.to_string();
+    Some((id, key))
+}
+
 /// `notifications:set_sound(urgency, path)`'s `arguments: [urgency, path]`.
 pub fn parse_set_sound_args(arguments: &[serde_json::Value]) -> Option<(Urgency, String)> {
     let urgency = parse_urgency_str(arguments.first()?.as_str()?)?;
@@ -479,15 +601,127 @@ mod tests {
         assert_eq!(format_reply_action_key("sounds good"), "inline-reply::sounds good");
     }
 
+    // ---- parse_actions (ADR-0090) ----
+
+    fn keys(actions: &[String], action_icons: bool) -> Vec<String> {
+        parse_actions(actions, action_icons).actions.into_iter().map(|a| a.key).collect()
+    }
+
+    fn flat(pairs: &[(&str, &str)]) -> Vec<String> {
+        pairs.iter().flat_map(|(key, label)| [key.to_string(), label.to_string()]).collect()
+    }
+
+    /// The two keys that are not buttons come out as their own flags and out of the list, because
+    /// drawing either as a button is wrong: `"default"` is the whole card, and `"inline-reply"`
+    /// is a text field.
     #[test]
-    fn actions_have_reply_detects_the_inline_reply_action_key() {
-        assert!(actions_have_reply(&["inline-reply".to_string(), "Reply".to_string()]));
+    fn default_and_inline_reply_become_flags_rather_than_buttons() {
+        let parsed =
+            parse_actions(&flat(&[("default", "Open"), ("inline-reply", "Reply"), ("archive", "Archive")]), false);
+        assert!(parsed.has_default);
+        assert!(parsed.has_reply);
+        assert_eq!(parsed.actions.len(), 1);
+        assert_eq!(parsed.actions[0].key, "archive");
+        assert_eq!(parsed.actions[0].label, "Archive");
     }
 
     #[test]
-    fn actions_have_reply_is_false_without_it() {
-        assert!(!actions_have_reply(&["default".to_string(), "Open".to_string()]));
-        assert!(!actions_have_reply(&[]));
+    fn an_array_with_neither_key_sets_neither_flag() {
+        let parsed = parse_actions(&flat(&[("archive", "Archive")]), false);
+        assert!(!parsed.has_default);
+        assert!(!parsed.has_reply);
+        assert_eq!(parse_actions(&[], false), ParsedActions::default());
+    }
+
+    /// Senders do send a key with no label. The key is what the button says rather than the
+    /// button vanishing, since the key is usually a word like "archive".
+    #[test]
+    fn an_empty_label_falls_back_to_the_key() {
+        let parsed = parse_actions(&flat(&[("archive", "")]), false);
+        assert_eq!(parsed.actions[0].label, "archive");
+    }
+
+    /// The base spec's odd case: a key with no label at all, which it does not allow and which is
+    /// not worth refusing the whole notification over.
+    #[test]
+    fn an_odd_length_array_still_yields_its_last_action() {
+        assert_eq!(keys(&["archive".to_string()], false), ["archive"]);
+    }
+
+    /// Under `action-icons` the key names a theme icon, so it is carried as one -- unless it holds
+    /// a path separator, because `icon` also takes absolute paths and a sender must not be able to
+    /// point the shell at an arbitrary file.
+    #[test]
+    fn action_icons_carries_the_key_as_an_icon_name_but_never_as_a_path() {
+        let parsed = parse_actions(&flat(&[("mail-archive", "")]), true);
+        assert_eq!(parsed.actions[0].icon_name.as_deref(), Some("mail-archive"));
+
+        let parsed = parse_actions(&flat(&[("/home/anas/.ssh/id_ed25519", "Archive")]), true);
+        assert_eq!(parsed.actions[0].icon_name, None, "a path must not be carried as an icon name");
+
+        let parsed = parse_actions(&flat(&[("mail-archive", "")]), false);
+        assert_eq!(parsed.actions[0].icon_name, None, "without the hint the key is not an icon");
+    }
+
+    /// An action that can be drawn neither as a label nor as an icon does nothing a user could
+    /// predict, so it is dropped rather than becoming a blank button.
+    #[test]
+    fn an_action_with_nothing_to_draw_is_dropped() {
+        let parsed = parse_actions(&flat(&[("", ""), ("", "Orphan label")]), true);
+        assert!(parsed.actions.is_empty(), "got {:?}", parsed.actions);
+    }
+
+    #[test]
+    fn the_action_count_and_label_length_are_both_capped() {
+        let many: Vec<(String, String)> = (0..20).map(|i| (format!("k{i}"), format!("l{i}"))).collect();
+        let flattened: Vec<String> = many.iter().flat_map(|(k, l)| [k.clone(), l.clone()]).collect();
+        assert_eq!(parse_actions(&flattened, false).actions.len(), MAX_ACTIONS);
+
+        let long = "x".repeat(1000);
+        let parsed = parse_actions(&["k".to_string(), long], false);
+        assert_eq!(parsed.actions[0].label.len(), MAX_ACTION_LABEL_BYTES);
+    }
+
+    // ---- declares_action ----
+
+    /// The guard that keeps a config from emitting an `ActionInvoked` the sending application
+    /// cannot interpret. `"default"` counts even though it is not in the button list.
+    #[test]
+    fn declares_action_covers_the_buttons_and_the_default_activation() {
+        let mut notification = Notification {
+            id: 1,
+            app_name: "app".to_string(),
+            summary: "s".to_string(),
+            body: Vec::new(),
+            icon_path: None,
+            urgency: Urgency::Normal,
+            has_reply: false,
+            actions: vec![NotificationAction {
+                key: "archive".to_string(),
+                label: "Archive".to_string(),
+                icon_name: None,
+            }],
+            has_default_action: false,
+            resident: false,
+            incarnation: 0,
+        };
+        assert!(declares_action(&notification, "archive"));
+        assert!(!declares_action(&notification, "delete"));
+        assert!(!declares_action(&notification, "default"));
+
+        notification.has_default_action = true;
+        assert!(declares_action(&notification, "default"));
+    }
+
+    // ---- parse_invoke_action_args ----
+
+    #[test]
+    fn parse_invoke_action_args_needs_an_id_and_a_nonempty_key() {
+        use serde_json::json;
+        assert_eq!(parse_invoke_action_args(&[json!(7), json!("archive")]), Some((7, "archive".to_string())));
+        assert_eq!(parse_invoke_action_args(&[json!(7), json!("")]), None);
+        assert_eq!(parse_invoke_action_args(&[json!(7)]), None);
+        assert_eq!(parse_invoke_action_args(&[json!("seven"), json!("archive")]), None);
     }
 
     // ---- CloseReason (finding 5) ----

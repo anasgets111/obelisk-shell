@@ -30,7 +30,9 @@ pub mod markup;
 pub mod queue;
 pub mod sound;
 
-pub use controller::{NotificationsController, parse_dismiss_args, parse_reply_args, parse_set_sound_args};
+pub use controller::{
+    NotificationsController, parse_dismiss_args, parse_invoke_action_args, parse_reply_args, parse_set_sound_args,
+};
 pub use sound::run_sound_player;
 
 /// Every action `oblisk.notifications:invoke(...)` accepts. `dispatch` matches this rather than a string,
@@ -39,13 +41,14 @@ pub use sound::run_sound_player;
 #[serde(rename_all = "snake_case")]
 pub enum NotificationsAction {
     Dismiss,
+    InvokeAction,
     Reply,
     SetSound,
     SetDnd,
 }
 
-/// `oblisk.notifications`'s action dispatch (ADR-0037): `dismiss`/`reply` emit D-Bus signals and
-/// get `tokio::spawn`ed (ADR-0029); `set_sound`/`set_dnd` only write Supervisor-held state under
+/// `oblisk.notifications`'s action dispatch (ADR-0037): `dismiss`/`invoke_action`/`reply` emit
+/// D-Bus signals and get `tokio::spawn`ed (ADR-0029); `set_sound`/`set_dnd` only write Supervisor-held state under
 /// its lock (ADR-0033), so they run inline.
 pub fn dispatch(controller: &NotificationsController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
@@ -56,6 +59,15 @@ pub fn dispatch(controller: &NotificationsController, envelope: &shared::Command
                 let controller = controller.clone();
                 tokio::spawn(async move {
                     controller.dismiss(id).await;
+                });
+            }
+            None => crate::log_malformed_command(params),
+        },
+        NotificationsAction::InvokeAction => match parse_invoke_action_args(&params.arguments) {
+            Some((id, key)) => {
+                let controller = controller.clone();
+                tokio::spawn(async move {
+                    controller.invoke_action(id, key).await;
                 });
             }
             None => crate::log_malformed_command(params),
@@ -90,6 +102,13 @@ pub const NOTIFICATIONS_OBJECT_PATH: &str = "/org/freedesktop/Notifications";
 const MAX_APP_NAME_BYTES: usize = 64;
 const MAX_SUMMARY_BYTES: usize = 128;
 const MAX_BODY_BYTES: usize = 512;
+
+/// `actions`' own caps (ADR-0090), on the same reasoning §1.1 caps the text properties: the array
+/// arrives from an unprivileged sender over the session bus and a config draws every entry. Eight
+/// is past anything a real notification offers -- the reference config's own busiest card has
+/// three -- and a label is a button, so it is capped tighter than a summary.
+const MAX_ACTIONS: usize = 8;
+const MAX_ACTION_LABEL_BYTES: usize = 64;
 
 /// The backing FIFO's hard cap and `notifications.feed`'s truncated view size over it (ADR-0033).
 const NOTIFICATION_QUEUE_CAP: usize = 100;
@@ -153,6 +172,33 @@ pub enum NotificationSpan {
     },
 }
 
+/// One action button a sender offered (ADR-0090). `Notify` carries these as a flat
+/// `[key1, label1, key2, label2, ...]` array, which was read for one bool and thrown away until
+/// now -- so `GetCapabilities` advertised `actions` and `action-icons` and neither was true.
+///
+/// The two keys with meanings of their own are not in here: `"default"` is the whole
+/// notification's activation and becomes [`Notification::has_default_action`], and
+/// `"inline-reply"` becomes [`Notification::has_reply`]. Both would otherwise draw as buttons
+/// beside the ones a sender actually meant as buttons.
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct NotificationAction {
+    /// What `notifications:invoke_action(id, key)` takes, and what travels back to the sender as
+    /// `ActionInvoked`'s `action_key`. Opaque: it means something to the application and nothing
+    /// here.
+    pub key: String,
+    /// What to draw on the button. The sender's own label, or the key when it sent an empty one
+    /// and the action is not icon-only.
+    pub label: String,
+    /// A *theme icon name*, present only when the sender set the `action-icons` hint, in which
+    /// case the base spec says the key is that name. Not a path and never resolved here: `icon`
+    /// takes a theme name directly (ADR-0054 decision 2), so there is nothing to spool.
+    ///
+    /// A key holding a path separator is refused as an icon rather than carried, because `icon`
+    /// also accepts an absolute path -- without that check, a sender could name any file on this
+    /// machine and have the shell draw it.
+    pub icon_name: Option<String>,
+}
+
 /// The `low`/`normal`/`critical` tier (CONTEXT.md's "Notification urgency"). `Hash`/`Eq` so it can
 /// key the sound registry directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, schemars::JsonSchema)]
@@ -188,8 +234,9 @@ fn parse_urgency_str(value: &str) -> Option<Urgency> {
 
 /// One queued notification -- `notifications.feed[]`'s object shape (docs/oblisk-idl-api-specs.md
 /// §2.7, ADR-0033's corrections: `body` is a span array not a flat string, `urgency`/`has_reply`
-/// are new fields). Trimmed to what the feed shape and write commands need -- the raw `actions`
-/// array is never stored, only the `has_reply` bool it collapses into.
+/// are new fields; ADR-0090 adds `actions` and `has_default_action`). Trimmed to what the feed
+/// shape and the write commands need: `expire_timeout` and `replaces_id` are acted on and not
+/// carried, since neither is a thing a config draws or decides.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct Notification {
     /// The server-assigned id, counting up from `1`. What `notifications:dismiss`, `:reply` and
@@ -215,6 +262,19 @@ pub struct Notification {
     /// accepted. Calling it on a notification without one is refused, which is why this is
     /// carried rather than guessed.
     pub has_reply: bool,
+    /// The buttons the sender offered, in the order it listed them, minus the two keys that mean
+    /// something other than a button. Empty for the great majority of notifications.
+    pub actions: Vec<NotificationAction>,
+    /// The sender offered a `"default"` action: the whole card is activatable, and clicking it
+    /// should call `notifications:invoke_action(id, "default")`. Its own field rather than an
+    /// entry in `actions`, because it is not a button and drawing it as one is wrong.
+    pub has_default_action: bool,
+    /// `hints["resident"]`: the sender wants the notification to survive an action being invoked,
+    /// which is what a media notification with prev/next buttons needs. Bookkeeping only,
+    /// `#[serde(skip)]` -- it decides what [`NotificationsController::invoke_action`] does next
+    /// and a config has no use for it.
+    #[serde(skip)]
+    pub resident: bool,
     /// Bookkeeping only, `#[serde(skip)]`. Bumped every time `Notify` places new content at this
     /// id. Lets a stale expiry timer spawned for an earlier incarnation tell it's been
     /// superseded before removing content it no longer describes (see [`find_expiring_entry`]).

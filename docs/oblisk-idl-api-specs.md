@@ -292,6 +292,7 @@ All write actions serialize as JSON-RPC 2.0 payloads over the private Unix socke
 | `bluetooth:forget(mac)` | `capability: "bluetooth", action: "forget", arguments: [mac]`<br>**Validation**: Removes pairing profile in BlueZ. |
 | `bluetooth:set_audio_codec(mac, c)` | `capability: "bluetooth", action: "set_audio_codec", arguments: [mac, c]`<br>**Validation**: `c` is `"LDAC"`, `"AAC"`, or `"SBC"`. |
 | `notifications:dismiss(id)` | `capability: "notifications", action: "dismiss", arguments: [id]`<br>**Validation**: `id` is integer. |
+| `notifications:invoke_action(id, key)` | `capability: "notifications", action: "invoke_action", arguments: [id, key]`<br>**Validation**: `id` is integer, `key` is a non-empty string the notification actually declared -- one of its `actions[].key`, or `"default"` when `has_default_action`. Emits `ActionInvoked(id, key)` and then removes the notification, unless the sender set `hints["resident"]`. An undeclared key is a logged no-op, since the sending application could not interpret it either. ADR-0090. |
 | `mpris:send_command(id, cmd)`| `capability: "mpris", action: "control", arguments: [id, cmd]`<br>**Validation**: `cmd` is `"play"`, `"pause"`, `"play_pause"`, `"next"`, `"previous"`. |
 | `mpris:seek(id, pos_us)` | `capability: "mpris", action: "seek", arguments: [id, pos_us]`<br>**Validation**: Sets track position to absolute microseconds. |
 | `mpris:seek_relative(id, off)`| `capability: "mpris", action: "seek_relative", arguments: [id, off]`<br>**Validation**: Shifts current playback by relative microseconds `off`. |

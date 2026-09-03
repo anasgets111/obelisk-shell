@@ -51,9 +51,6 @@ local body = {
         itemfn = function(notification)
             return panel_row {
                 slot = "notification-" .. tostring(notification.id),
-                -- `icon_path` is a cached asset path or empty (§ 2.7), and `icon { name = ... }`
-                -- takes either a theme name or an absolute path (ADR-0054 decision 2), so the
-                -- one property covers both without this having to tell them apart.
                 -- `art`, not `icon`: this is the sending application's own artwork, which nobody
                 -- here chose and nothing should recolour (`components/panel_row.lua` has the split).
                 -- `icon_path` is a cached asset path or empty (§ 2.7), and `icon { name = ... }`
@@ -66,15 +63,12 @@ local body = {
                 -- `or`-ing: passed straight through it is a Lua table where `text.content` wants
                 -- a string, which fails the whole re-resolve and freezes the shell on the last
                 -- good scene for as long as that notification is in the feed.
-                -- `body` is a span array (§ 2.7), so it needs flattening rather than
-                -- `or`-ing: passed straight through it is a Lua table where `text.content` wants
-                -- a string, which fails the whole re-resolve and freezes the shell on the last
-                -- good scene for as long as that notification is in the feed.
                 subtitle = util.notification_body(notification.body),
-                -- Clicking dismisses, which is what the popup's whole surface already does.
-                -- Activating a notification's default action is not offered because the protocol
-                -- half is not built: § 2.7 carries no `actions` array and § 3.2 has only
-                -- `dismiss(id)`.
+                -- Clicking dismisses. § 2.7 now carries `actions` and `has_default_action`, and
+                -- § 3.2 has `invoke_action` (ADR-0090), so activating the sender's own default is
+                -- available here; it is not wired up until this panel draws the buttons too,
+                -- because a row that silently does something different from what it looks like it
+                -- does is worse than one that only dismisses.
                 on_activate = function()
                     oblisk.notifications:invoke("dismiss", notification.id)
                 end,
