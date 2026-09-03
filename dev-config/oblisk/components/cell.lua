@@ -29,12 +29,14 @@
 local theme = require("config.theme")
 
 -- Annotated, unlike most of `components/`, because this is the last hop before `text.content`, a
--- property the engine requires to be a string and fails the whole re-resolve over. `notification`
+-- property the engine fails the whole re-resolve over when it is the wrong shape. `notification`
 -- payloads reach here through a `list`'s `itemfn`, which `lua-meta/nodes.lua` types as
 -- `fun(item: any)` because a `Signal` carries no element type, so `any` used to flow all the way
--- down and a span array landed in `content` with nothing between the stub that got it right and
--- the shell freezing on its last good scene.
----@param content string|Bound
+-- down and a raw span array landed in `content` with nothing between the stub that got it right
+-- and the shell freezing on its last good scene. A `TextRun[]` is accepted now (ADR-0104); a
+-- span array still is not, since an image span has no `text` -- `util.notification_body` is the
+-- step between.
+---@param content string|TextRun[]|Bound
 ---@param color? Color|Bound
 ---@param size? integer
 ---@param opts? { width?: integer|"Fill", align?: "Start"|"Center"|"End", align_v?: "Start"|"Center"|"End", visible?: boolean|Bound, wrap?: "None"|"Word"|Bound, max_lines?: integer|Bound }

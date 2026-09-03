@@ -139,22 +139,74 @@ function util.truncate(value, limit)
 end
 
 -- `notification.body` is a span array, not a string: the freedesktop body is markup, and the
--- Supervisor parses it once so no config has to (§ 2.7, ADR-0033). Both readers of it want a
--- flat run back -- a `panel_row` subtitle and the OSD's one elided line -- because `text` carries
--- one string and no rich runs, so a span per node would be paragraph layout neither caller has
--- room for. The styling each span carries is dropped with it; drawing bold means a `text` node
--- per span, which is the same change as wrapping.
+-- Supervisor parses it once so no config has to (§ 2.7, ADR-0033). `text.content` takes an array of
+-- runs of the same shape (ADR-0104), so this is a near pass-through: a text span becomes a run, and
+-- a link becomes an underlined run in `link_color`, which is where "what does a link look like"
+-- gets decided -- the engine draws runs and knows nothing about hrefs.
 --
--- Image spans contribute nothing rather than a placeholder: an inline `<img>` in a two-line row
--- has nowhere to go, and "[image]" in the middle of a sentence reads worse than the gap.
-function util.notification_body(spans)
-    local parts = {}
+-- Image spans are left out here and drawn by `util.notification_images`: a picture inside a line of
+-- text has nowhere to go, and `text` refuses a run with no `text` for exactly that reason.
+function util.notification_body(spans, link_color)
+    local runs = {}
     for _, span in ipairs(spans or {}) do
-        if span.kind == "text" then
-            parts[#parts + 1] = span.text
+        if span.kind == "text" and span.text and span.text ~= "" then
+            local is_link = span.href ~= nil and span.href ~= ""
+            runs[#runs + 1] = {
+                text = span.text,
+                bold = span.bold or false,
+                italic = span.italic or false,
+                underline = span.underline or is_link,
+                color = is_link and link_color or nil,
+            }
         end
     end
-    return table.concat(parts)
+    return runs
+end
+
+-- How many characters a run array holds, for the "is there enough here to be worth an expander"
+-- guess `components/notification_card.lua` makes before the engine has measured anything.
+function util.runs_length(runs)
+    local total = 0
+    for _, run in ipairs(runs or {}) do
+        total = total + utf8.len(run.text or "")
+    end
+    return total
+end
+
+-- The distinct link targets in a body, in first-seen order. A body that links the same page twice
+-- gets one button for it.
+function util.notification_links(spans)
+    local links, seen = {}, {}
+    for _, span in ipairs(spans or {}) do
+        local href = span.kind == "text" and span.href or nil
+        if href and href ~= "" and not seen[href] then
+            seen[href] = true
+            links[#links + 1] = href
+        end
+    end
+    return links
+end
+
+-- The pictures a body carried inline (`<img src>`), already validated against the trusted roots by
+-- the Supervisor. Drawn under the text rather than in it, see `util.notification_body`.
+function util.notification_images(spans)
+    local paths = {}
+    for _, span in ipairs(spans or {}) do
+        if span.kind == "image" and span.image_path then
+            paths[#paths + 1] = span.image_path
+        end
+    end
+    return paths
+end
+
+-- What a link button says: the host for a web address, the address for `mailto:`, and the URL
+-- itself for anything else. A full URL on a button is unreadable at any width that fits a card.
+function util.link_label(href)
+    local rest = href:match("^[%a][%w+.-]*://(.*)$")
+    if rest then
+        return (rest:match("^[^/?#]+") or rest):gsub("^www%.", "")
+    end
+    return href:match("^mailto:(.+)$") or href
 end
 
 -- A notification's age as the two or three characters a card has room for: "now", "5m", "3h",
@@ -189,30 +241,101 @@ end
 
 -- The feed as one entry per sending application rather than one per notification, which is what
 -- turns eight messages from one chat app into one card instead of eight (`NotificationCard.qml`'s
--- `group`). Order is by each app's *newest* notification, since the feed arrives newest-first and
--- an app that just spoke should not sit below one that spoke an hour ago.
+-- `group`).
 --
--- Keyed on `app_name`, which is the only grouping key § 2.7 carries. `hints["desktop-entry"]` is
--- the better one -- two apps can share a name, and one app can change its -- and ADR-0091 left it
--- unbuilt for want of a consumer. This is that consumer, so it is worth adding when the grouping
--- here is visibly wrong; it is not worth adding before.
+-- Keyed on `desktop_entry` where the sender set one (ADR-0101) and on `app_name` where it did
+-- not. The desktop id is the better key -- two apps can share a display name and one can change
+-- its own -- and it is also the key into `applications.by_app_id` (ADR-0061), so a group named
+-- by its desktop file gets the installed application's own `Name=` and `Icon=` rather than the
+-- sender's description of itself. `applications` is the `oblisk.applications` payload, or `nil`
+-- before its first push, in which case the sender's own name and icon stand in.
 --
--- `app_icon` comes off the group's newest member rather than being searched for: every member is
--- the same application, so they carry the same icon, and the newest is the one that would have
--- been drawn had there been no grouping at all.
-function util.group_notifications(feed)
+-- Ordered the way the mirror's `_compareGroups` orders: critical groups first, then by each
+-- group's *newest* notification, since the feed arrives newest-first and an app that just spoke
+-- should not sit below one that spoke an hour ago. The key is the tiebreak, so two groups with the
+-- same second do not swap places from one pass to the next.
+--
+-- `opts.skip_transient` leaves out notifications the sender marked `transient` (ADR-0100): the
+-- history never shows them, the popup does.
+function util.group_notifications(feed, applications, opts)
+    opts = opts or {}
     local groups, by_key = {}, {}
     for _, notification in ipairs(feed or {}) do
-        local key = notification.app_name or "?"
-        local group = by_key[key]
-        if group == nil then
-            group = { key = key, app_name = key, app_icon = notification.app_icon, items = {} }
-            by_key[key] = group
-            groups[#groups + 1] = group
+        if not (opts.skip_transient and notification.transient) then
+            local entry_id = notification.desktop_entry
+            local key = entry_id and string.lower(entry_id) or (notification.app_name or "?")
+            local group = by_key[key]
+            if group == nil then
+                local entry = util.app_entry(applications, entry_id)
+                group = {
+                    key = key,
+                    app_name = (entry and entry.name) or notification.app_name or "?",
+                    app_icon = (entry and entry.icon) or notification.app_icon,
+                    urgency = notification.urgency or "normal",
+                    latest = notification.timestamp or 0,
+                    items = {},
+                }
+                by_key[key] = group
+                groups[#groups + 1] = group
+            end
+            group.items[#group.items + 1] = notification
         end
-        group.items[#group.items + 1] = notification
     end
+    table.sort(groups, function(a, b)
+        local a_critical, b_critical = a.urgency == "critical", b.urgency == "critical"
+        if a_critical ~= b_critical then
+            return a_critical
+        end
+        if a.latest ~= b.latest then
+            return a.latest > b.latest
+        end
+        return a.key < b.key
+    end)
     return groups
+end
+
+-- The history's groups with a heading before each run of them: "urgent", "today", "yesterday",
+-- "earlier" (`NotificationService.qml`'s `bucketOrder`). One flat array, because a `list` draws one
+-- array and a heading is an item in it; `kind = "header"` is how the item function tells the two
+-- apart, and a heading's key cannot collide with a group's since no desktop id holds a colon.
+-- `now` is `oblisk.system.time`, and "today" starts at the local midnight before it.
+function util.notification_sections(groups, now)
+    local today = os.date("*t", now)
+    local today_start = os.time({ year = today.year, month = today.month, day = today.day, hour = 0 })
+    local buckets = {
+        { label = "urgent", items = {} },
+        { label = "today", items = {} },
+        { label = "yesterday", items = {} },
+        { label = "earlier", items = {} },
+    }
+    for _, group in ipairs(groups or {}) do
+        local index = 4
+        if group.urgency == "critical" then
+            index = 1
+        elseif group.latest >= today_start then
+            index = 2
+        elseif group.latest >= today_start - 86400 then
+            index = 3
+        end
+        local items = buckets[index].items
+        items[#items + 1] = group
+    end
+    local sections = {}
+    for _, bucket in ipairs(buckets) do
+        if #bucket.items > 0 then
+            sections[#sections + 1] = { kind = "header", key = "header:" .. bucket.label, label = bucket.label }
+            for _, group in ipairs(bucket.items) do
+                sections[#sections + 1] = group
+            end
+        end
+    end
+    return sections
+end
+
+-- A notification's arrival as a clock reading, "Wed 14:32", for the history, where "3h" is less
+-- useful than when. `%a` rather than a date: the sections above already say which day.
+function util.absolute_time(timestamp)
+    return os.date("%a %H:%M", timestamp or 0)
 end
 
 function util.shown_when(signal, predicate)

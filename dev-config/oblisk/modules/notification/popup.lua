@@ -26,25 +26,34 @@ local SCROLL = scroll("notification_stack")
 -- something else, which is how the surface came to map itself around an empty column; asking once
 -- and reading the answer twice makes the two agree by construction.
 local visible_groups = computed(
-    { oblisk.notifications, ui.popup_seen, ui.panel_showing("notifications") },
-    function(n, seen, in_history)
+    { oblisk.notifications, ui.popup_seen, ui.panel_showing("notifications"), oblisk.lock, oblisk.applications },
+    function(n, seen, in_history, lock, applications)
         -- The panel draws the same cards from the same feed, and both anchor top-right. Standing
         -- down is not the same as being retired, though: `ui.popup_seen` is what stops these
         -- coming back when the panel closes.
-        if in_history then
+        --
+        -- Nothing while the session is locked either (the mirror's `_popupsBlocked`): a popup
+        -- over the lock screen is a message readable without the password. Not marked seen, so
+        -- what arrived while locked pops up on unlock -- except what expired meanwhile, since the
+        -- Supervisor's countdowns keep running and a five-second notification is `expired` long
+        -- before the unlock. Which is the right split: a critical alert waits, a chat ping does not.
+        if in_history or (lock and lock.active) then
             return {}
         end
-        -- Two ways a notification has had its turn: its own timeout ran out (`expired`, set by
-        -- the Supervisor, ADR-0100), or the history was opened while it was up (`ui.popup_seen`,
-        -- this config's own note, ADR-0098). Either keeps it out of the stack; neither takes it
+        -- Three ways a notification has had its turn: its own timeout ran out (`expired`, set by
+        -- the Supervisor, ADR-0100); the history was opened while it was up (`ui.popup_seen`, this
+        -- config's own note, ADR-0098); or do-not-disturb is on and it is not critical, which is
+        -- the one urgency the mirror lets through DND. Each keeps it out of the stack; none takes it
         -- out of the history.
+        local dnd = n and n.dnd
         local unseen = {}
         for _, notification in ipairs((n and n.feed) or {}) do
-            if not notification.expired and not (seen or {})[util.notification_key(notification)] then
+            local quiet = dnd and notification.urgency ~= "critical"
+            if not notification.expired and not quiet and not (seen or {})[util.notification_key(notification)] then
                 unseen[#unseen + 1] = notification
             end
         end
-        local all = util.group_notifications(unseen)
+        local all = util.group_notifications(unseen, applications)
         local shown = {}
         for index = 1, math.min(#all, MAX_CARDS) do
             shown[index] = all[index]

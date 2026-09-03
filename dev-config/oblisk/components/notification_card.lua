@@ -22,9 +22,9 @@
 -- the keyboard (ADR-0092), `timestamp` for the age (ADR-0093), and `hold_expiry` plus `on_hover`
 -- so a card does not vanish while it is being read or replied to (ADR-0094, ADR-0095).
 --
--- Two things it still does without. The body's spans carry bold/italic/underline and an `href` and
--- `text` has no weight, style or link, so `util.notification_body` flattens them; and there is no
--- animation, so a group expands and a card leaves without one.
+-- The body's spans are drawn as they arrive -- bold, italic, underlined, a link in the accent
+-- (ADR-0104) -- with a button per link that opens it (ADR-0103). What it still does without is
+-- animation: a group expands and a card leaves without one.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -35,8 +35,19 @@ local icon_button = require("components.icon_button")
 -- action is not: `["archive"] = "Archive"` is a word the sender chose and the whole point is that
 -- the user reads it before pressing it. Local rather than a component, on this repo's own bar --
 -- one call site is a local, two in agreement are a component.
-local function action_button(label, on_activate, slot)
+--
+-- `icon_name` is the theme icon a sender that set `action-icons` named through the key (ADR-0090),
+-- drawn beside the label, or alone when the sender sent no label -- a media notification's
+-- prev/play/next is three glyphs, not three words.
+local function action_button(label, on_activate, slot, icon_name)
     local hovered = hover(slot)
+    local children = {}
+    if icon_name then
+        children[#children + 1] = icon { name = icon_name, size = theme.icon.sm, align_v = "Center" }
+    end
+    if label and label ~= "" then
+        children[#children + 1] = cell(label, theme.FG, theme.font.sm, { align = "Center", align_v = "Center" })
+    end
     return button {
         height = theme.control.sm,
         align_v = "Center",
@@ -53,9 +64,19 @@ local function action_button(label, on_activate, slot)
                 on_activate()
             end
         end,
-        children = { cell(label, theme.FG, theme.font.sm, { align = "Center", align_v = "Center" }) },
+        -- A `button` stacks its children; the row is what puts a glyph beside a word.
+        children = { row { height = "Fill", align_v = "Center", spacing = theme.spacing.xs, children = children } },
     }
 end
+
+-- The card's border by urgency, the mirror's `_urgencyConfig` colours at its border opacity: a
+-- low-priority card fades into the glass, a normal one carries the accent, a critical one is red.
+-- Read off the group's newest notification, which is the one the card leads with.
+local BORDER_BY_URGENCY = {
+    low = theme.BORDER,
+    normal = theme.ACCENT_MEDIUM,
+    critical = theme.with_opacity(theme.RED, 0.6),
+}
 
 -- The chevron that opens and closes something, pointing the way it will move. Two callers (a group
 -- and a message) and the same three properties, so it is one local rather than twice five lines.
@@ -77,7 +98,8 @@ end
 local function message(notification, ui, opts)
     local id = notification.id
     local expanded = (ui.expanded_messages:get() or {})[tostring(id)] or false
-    local body = util.notification_body(notification.body)
+    local body = util.notification_body(notification.body, theme.ACCENT)
+    local body_length = util.runs_length(body)
     local summary = notification.summary or ""
 
     -- The heading line: the sender's attached picture, the summary, the age, and the two controls.
@@ -102,7 +124,7 @@ local function message(notification, ui, opts)
     heading[#heading + 1] = cell(opts.age, theme.TEXT_OFF, theme.font.xs, { align_v = "Center" })
     -- Only when there is something hidden to show. A chevron on a one-line notification is a
     -- control that visibly does nothing, which is worse than no control.
-    if expanded or #summary > 60 or #body > 80 then
+    if expanded or #summary > 60 or body_length > 80 then
         heading[#heading + 1] = expander(expanded, function()
             ui.toggle_message(id)
         end, "notification-expand-" .. tostring(id))
@@ -125,12 +147,23 @@ local function message(notification, ui, opts)
         children = heading,
     } }
 
-    if body ~= "" then
+    if body_length > 0 then
         lines[#lines + 1] = cell(body, theme.TEXT_OFF, theme.font.sm, {
             width = "Fill",
             wrap = "Word",
             max_lines = expanded and 0 or 3,
         })
+    end
+
+    -- Pictures the body carried inline, under the text rather than in it (see
+    -- `util.notification_body`). Rare -- `notify-send` cannot send one -- and small when they come.
+    local images = util.notification_images(notification.body)
+    if #images > 0 then
+        local pictures = {}
+        for _, path in ipairs(images) do
+            pictures[#pictures + 1] = icon { name = path, size = theme.icon.xl }
+        end
+        lines[#lines + 1] = row { width = "Fill", spacing = theme.spacing.sm, children = pictures }
     end
 
     -- The reply field, open only for the one notification `reply_id` names. It is inside the
@@ -195,7 +228,16 @@ local function message(notification, ui, opts)
     for index, action in ipairs(notification.actions or {}) do
         buttons[#buttons + 1] = action_button(action.label, function()
             oblisk.notifications:invoke("invoke_action", id, action.key)
-        end, string.format("notification-action-%d-%d", id, index))
+        end, string.format("notification-action-%d-%d", id, index), action.icon_name)
+    end
+    -- One button per distinct link in the body, opened by the desktop's own handler
+    -- (`applications:open_url`, ADR-0103). A button rather than a tap on the underlined run: the
+    -- engine hit-tests nodes, not glyphs, and the whole message is already a button whose click is
+    -- the default action -- a link tap that also fired that would open the page and take the card.
+    for index, href in ipairs(util.notification_links(notification.body)) do
+        buttons[#buttons + 1] = action_button(util.link_label(href), function()
+            oblisk.applications:invoke("open_url", href)
+        end, string.format("notification-link-%d-%d", id, index))
     end
     if #buttons > 0 then
         lines[#lines + 1] = row {
@@ -245,9 +287,10 @@ end
 
 -- `group` is one entry of `util.group_notifications`; `ui` is `lib/ui_state`.
 --
--- `opts.background` is the one thing the two call sites disagree on: a popup floats over whatever
--- is behind it and wants the heavier glass, a card inside an already-glassy panel wants the lighter
--- one. Everything else about the two is the same card, which is the point.
+-- `opts.background` and `opts.absolute_time` are what the two call sites disagree on: a popup
+-- floats over whatever is behind it and wants the heavier glass and "5m", a card inside an
+-- already-glassy panel wants the lighter one and "Wed 14:32", since a history is about when.
+-- Everything else about the two is the same card, which is the point.
 return function(group, ui, opts)
     opts = opts or {}
     local items = group.items or {}
@@ -256,6 +299,12 @@ return function(group, ui, opts)
     -- The clock is read once per card rather than once per message: `oblisk.system` ticks a second
     -- at a time (§ 2.11) and every message in a group is being aged against the same instant.
     local now = (oblisk.system:get() or {}).time or 0
+    local function age(notification)
+        if opts.absolute_time then
+            return util.absolute_time(notification.timestamp)
+        end
+        return util.relative_time(now, notification.timestamp)
+    end
 
     local header = {
         -- The application's own icon, never recoloured, which is why it is an `icon` node and not a
@@ -305,7 +354,7 @@ return function(group, ui, opts)
     for _, notification in ipairs(shown) do
         children[#children + 1] = message(notification, ui, {
             standalone = not is_group,
-            age = util.relative_time(now, notification.timestamp),
+            age = age(notification),
         })
     end
 
@@ -321,7 +370,7 @@ return function(group, ui, opts)
         background = opts.background or theme.GLASS,
         radius = theme.radius.md,
         border_width = theme.border_width,
-        border_color = theme.BORDER,
+        border_color = BORDER_BY_URGENCY[group.urgency] or theme.BORDER,
         children = children,
     }
 end

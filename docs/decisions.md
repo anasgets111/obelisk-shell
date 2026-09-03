@@ -4769,3 +4769,60 @@ chain, with the bold chain confirmed to lead with a face of its own.
 
 Verified live in the config commit that follows: a body sent as `<b>Alice</b>: see <a
 href="https://example.org">this</a>` draws the name in bold and the link underlined in the accent.
+
+## 0105. The notification config pass: what the four Rust changes let the cards do
+
+ADR-0100 through ADR-0104 added `expired`, `transient`, `desktop_entry`, `reply_placeholder`,
+`on_cancel`, `open_url` and styled runs. This is the config pass that spends them, together with
+the things the payload already carried and the cards did not read: `urgency`, `actions[].icon_name`,
+`dnd`, `oblisk.lock`, and a timestamp that `os.date` can format. All Lua; nothing here changed the
+engine.
+
+1. **The body is drawn as it arrived.** `util.notification_body` maps text spans to `TextRun`s and
+   a link to an underlined run in the accent -- the config decides what a link looks like, the
+   engine draws runs. Each distinct `href` also gets a button labelled with its host, which calls
+   `applications:open_url`. A button rather than a tap on the underlined words, because the engine
+   hit-tests nodes and not glyphs, and the whole message is already a button whose click is the
+   sender's default action; a link tap that also fired that would open the page and take the card.
+   Inline images are drawn under the text, small.
+
+2. **Grouped by desktop id, named and iconed by the installed application.** `group_notifications`
+   keys on `desktop_entry` when the sender set one and falls back to `app_name`; the id is looked
+   up in `applications.by_app_id`, so a Telegram notification is headed "Telegram Desktop" with
+   Telegram's own icon rather than whatever string the sender chose. Transients are left out of the
+   history's grouping and kept in the popup's.
+
+3. **Critical first, then newest, then key.** The mirror's `_compareGroups`, and the tiebreak on
+   the key is not decoration: two groups with the same second would otherwise swap places from one
+   pass to the next, since `table.sort` is not stable.
+
+4. **The border says the urgency.** Low fades into the glass, normal carries the accent, critical is
+   red, read off the group's newest notification. The mirror's `_urgencyConfig`, at border opacity.
+
+5. **Icon-only actions.** A sender that set `action-icons` gets its glyphs drawn from the theme
+   beside, or instead of, the label -- a media notification's prev/pause/next is three glyphs.
+
+6. **Do-not-disturb is wired.** `set_dnd` exists since ADR-0033 and no config file called it. The
+   history panel's header has the toggle; the bell shows the off glyph while it is on; the popup
+   stands down for everything but a critical notification, which is the one urgency the mirror lets
+   through DND. The Supervisor's flag already muted the sound, so one toggle now quiets both.
+
+7. **No popups while locked.** `oblisk.lock.active` empties the stack. Not marked seen, so what
+   arrived while locked pops up on unlock -- except what expired meanwhile, since the Supervisor's
+   countdowns keep running and a five-second notification is `expired` long before the unlock.
+   That is the right split without any code deciding it: a critical alert waits, a chat ping does
+   not.
+
+8. **The history is sectioned and dated.** "urgent", "today", "yesterday", "earlier" -- the mirror's
+   buckets -- as heading items in the one array the `list` draws, since a heading is an item; and
+   each card shows "Thu 16:32" where the popup shows "5m", because a history is about when.
+
+Not changed: the card's X still dismisses rather than retires, awaiting an answer (ADR-0098); the
+popup does not stand down for an open launcher; and there is still no animation.
+
+Verified live: a critical notification with `desktop-entry: zen` and a body of `<b>Alice</b>: see
+<a href="https://example.org/some/page">this page</a> and <i>call me</i>` draws under "Zen Browser"
+with Zen's icon, a red border, "Alice" bold, "this page" underlined in the accent, "call me" italic,
+and Reply / Archive / example.org buttons; a low-urgency media notification with `action-icons`
+beneath it draws three glyph buttons and a dim border. The history shows both under "urgent" and
+"today" with clock readings.
