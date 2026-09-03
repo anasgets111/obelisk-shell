@@ -21,24 +21,29 @@ local SCROLL = scroll("notification_stack")
 local HOVER = hover("notification_stack_region")
 
 -- The cards this surface should be showing: the newest few groups of everything live that has not
--- already had its turn as a popup, and nothing at all while the history panel is up.
+-- already had its turn as a popup, and nothing at all while any bar panel is up.
 --
 -- One signal for two properties. `visible` used to ask "is the feed non-empty" and the list asked
 -- something else, which is how the surface came to map itself around an empty column; asking once
 -- and reading the answer twice makes the two agree by construction.
 local visible_groups = computed(
-    { oblisk.notifications, ui.popup_seen, ui.panel_showing("notifications"), oblisk.lock, oblisk.applications },
-    function(n, seen, in_history, lock, applications)
-        -- The panel draws the same cards from the same feed, and both anchor top-right. Standing
-        -- down is not the same as being retired, though: `ui.popup_seen` is what stops these
-        -- coming back when the panel closes.
+    { oblisk.notifications, ui.popup_seen, ui.panel_open, oblisk.lock, oblisk.applications },
+    function(n, seen, panel_open, lock, applications)
+        -- Any panel, not only the history: the mirror's `PanelHost` suspends popups on
+        -- `onOverlayOpen` and pumps them again on close, so a card never sits beside an open
+        -- panel (both anchor top-right, and the two surfaces would overlap). Standing down is not
+        -- the same as being retired: only the history marks the feed seen (`ui.popup_seen`, on
+        -- its open and its close), so what was up when the network panel opened comes back when
+        -- it closes -- unless its countdown ran out meanwhile, since the Supervisor keeps counting
+        -- (ADR-0100), in which case it is in the history and nowhere else, as the mirror's
+        -- expire-transients step leaves it.
         --
         -- Nothing while the session is locked either (the mirror's `_popupsBlocked`): a popup
         -- over the lock screen is a message readable without the password. Not marked seen, so
         -- what arrived while locked pops up on unlock -- except what expired meanwhile, since the
         -- Supervisor's countdowns keep running and a five-second notification is `expired` long
         -- before the unlock. Which is the right split: a critical alert waits, a chat ping does not.
-        if in_history or (lock and lock.active) then
+        if panel_open or (lock and lock.active) then
             return {}
         end
         -- Three ways a notification has had its turn: its own timeout ran out (`expired`, set by
