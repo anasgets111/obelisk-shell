@@ -5245,3 +5245,40 @@ Also fixed: `share/starter/shell.lua` indexed `s.time` in a `map` closure that r
 nil `s`, so a new user's first boot printed a Lua error and "no scene was applied at startup;
 surfaces still bind, and paint nothing" before recovering a second later on the first `system`
 push. The file's own header already teaches the nil rule the body broke.
+
+### Amendment, same day: `updates` is wired up, and the bar button stops installing
+
+Decision 2 left `updates` dormant on the argument that starting network checks is the config
+author's call. Asked for it, so: `updates.lua` invokes `configure({ interval = 3600 })`, and two
+things fell out of switching it on.
+
+11. **The first check runs when one is due, not one interval later.** `run_check_task` consumed
+    `tokio::time::interval`'s immediate first tick with the comment "consume it unused", copied from
+    the CPU sampler, where it is needed because a percentage is a delta between two reads. An update
+    check is a point query. Consuming it meant an hour of blindness after every login -- and worse,
+    because the controller outlives the generation that configured it, every config reload
+    reconfigured the interval and restarted that hour, so a day of editing never checked at all.
+    `first_check_is_due` now decides: nothing checked yet in this process, or the last success is at
+    least an interval old. A fresh boot checks now; a reload inside the hour does not re-sync. This
+    is `sysinfo`'s SYS-03 in another file, and the reason `sysinfo`'s own copies of that line stay
+    is that they are the same bug -- to be fixed when someone reads those numbers.
+
+12. **The bar button is a readout, because installing belongs in front of the package list.** It was
+    an `icon_button` whose click invoked `install`, guarded only by `count == 0` -- which is `false`
+    when `count` is nil, so the one case the guard existed for was the one it let through. That was
+    unreachable while the module was invisible. Switching the module on made it reachable, and the
+    first click on the new badge launched a real `pkexec pacman -Syu`; it died at "Error creating
+    textual authentication agent" with nothing upgraded, which is luck, not design.
+
+    `ArchChecker.qml` never installs from the bar: a left click with nothing pending re-checks, and a
+    left click with something pending -- or any right click -- opens `UpdatePanel.qml`, which lists
+    every package with its old and new version, the total download size, the last check time, and an
+    "Update" button under all of it. `UpdateService.qml` polls every 15 minutes, persists
+    `lastSuccessfulCheck` so a restart resumes the remainder rather than re-syncing, and notifies
+    only when a package appears that was not in the last set.
+
+    Neither of the mirror's two click paths is reachable here: the capability has `configure` and
+    `install` and no `check` (so nothing to re-poll with), and there is no panel to open. Passing
+    `nil` where `icon_button` takes an `on_activate` returns a `row` instead of a `button`, so there
+    is no click to land at all, and the `slot` goes with it -- a readout that lights up under the
+    pointer is a button that is lying. The badge says how many; installing waits for the panel.

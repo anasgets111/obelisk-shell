@@ -199,7 +199,16 @@ async fn run_check_task(
                 // network I/O); the default `Burst` behavior would then fire every missed tick
                 // back-to-back, hammering the mirrors -- `Delay` resumes ticking after the check finishes.
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                ticker.tick().await; // tokio::time::interval's first tick fires immediately; consume it unused
+                // `tokio::time::interval`'s first tick fires immediately, and here that is the
+                // point: a config that says "every hour" wants to know what is pending now, not in
+                // an hour (ADR-0113 amendment). It is consumed only when a check inside this
+                // process is still fresh, which is what makes a config reload cheap -- the
+                // controller outlives the generation that configured it, so every save would
+                // otherwise be another mirror sync, and under the old unconditional consume every
+                // save reset the hour and a day of editing never checked at all.
+                if !first_check_is_due(state.lock().unwrap().last_successful_check, now_unix(), duration) {
+                    ticker.tick().await;
+                }
                 loop {
                     tokio::select! {
                         _ = ticker.tick() => {
@@ -231,6 +240,15 @@ async fn run_check_task(
             }
         }
     }
+}
+
+/// Whether the tick `tokio::time::interval` fires the instant it is built should be spent on a
+/// real check, or consumed. Due when nothing has checked yet in this process, or when the last
+/// success is at least `interval` old -- the same question the ticker would ask a moment later,
+/// asked once up front so a fresh process answers "now" and a reconfigured one does not.
+fn first_check_is_due(last_successful_check: Option<i64>, now: i64, interval: Duration) -> bool {
+    let Some(last) = last_successful_check else { return true };
+    now.saturating_sub(last) >= interval.as_secs() as i64
 }
 
 fn now_unix() -> i64 {
@@ -336,6 +354,38 @@ mod tests {
     fn poll_mode_is_dormant_at_zero_and_ticking_otherwise() {
         assert_eq!(poll_mode(Duration::ZERO), PollMode::Dormant);
         assert_eq!(poll_mode(Duration::from_secs(1)), PollMode::Ticking(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn the_first_check_of_a_process_is_due_immediately() {
+        // The boot case, and the whole point of the change: a config asking for an hourly check
+        // wants to know what is pending now, not at the end of the first hour.
+        assert!(first_check_is_due(None, 1_800_000_000, Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn a_reconfigure_within_the_interval_waits_rather_than_syncing_again() {
+        // A config reload re-invokes `configure`, and the controller outlives the generation that
+        // did it. Without this, every save would be another sync against a mirror.
+        let last = 1_800_000_000;
+        assert!(!first_check_is_due(Some(last), last + 60, Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn a_check_older_than_the_interval_is_due_again() {
+        let last = 1_800_000_000;
+        let interval = Duration::from_secs(3600);
+        assert!(first_check_is_due(Some(last), last + 3600, interval), "exactly one interval old is due");
+        assert!(first_check_is_due(Some(last), last + 7200, interval));
+    }
+
+    #[test]
+    fn a_last_check_stamped_in_the_future_does_not_underflow_into_due() {
+        // A clock stepped backwards (an NTP correction, a suspend across a timezone fix) leaves a
+        // stamp ahead of `now`. Saturating, so that reads as "checked recently", not as a negative
+        // age that compares below the interval by accident.
+        let last = 1_800_000_000;
+        assert!(!first_check_is_due(Some(last), last - 5000, Duration::from_secs(3600)));
     }
 
     #[test]
