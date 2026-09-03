@@ -84,7 +84,10 @@ local function expander(is_open, on_activate, slot)
     return icon_button(is_open and icons.chevron_up or icons.chevron_down, on_activate, {
         size = theme.control.xs,
         icon_size = theme.icon.xs,
-        background = theme.BORDER_SUBTLE,
+        background = theme.GLASS_CONTENT,
+        background_hover = theme.GLASS_HOVER,
+        border = false,
+        foreground = theme.FG,
         slot = slot,
     })
 end
@@ -143,7 +146,10 @@ local function message(notification, ui, opts)
         end, {
             size = theme.control.xs,
             icon_size = theme.icon.xs,
-            background = theme.BORDER_SUBTLE,
+            background = "#00000000",
+            background_hover = "#00000000",
+            border = false,
+            foreground = theme.FG,
             slot = "notification-close-" .. tostring(id),
         })
     end
@@ -281,10 +287,16 @@ local function message(notification, ui, opts)
     local hovered = hover("notification-message-" .. tostring(id))
     -- An `if`, not `a and nil or b`: that idiom cannot produce nil, so every lone message wore the
     -- group ground and drew a second box inside the card.
-    local ground = nil
+    local ground, ring = nil, nil
     if not opts.standalone then
+        -- The mirror's message box: the subtle ground with a hairline, lifting to the accent under
+        -- the pointer. Not the content glass, which is the card's own ground in the history and
+        -- disappeared into it.
         ground = hovered:map(function(is_hovered)
-            return is_hovered and theme.GLASS_HOVER or theme.GLASS_CONTENT
+            return is_hovered and theme.ACCENT_SUBTLE or theme.BG_SUBTLE
+        end)
+        ring = hovered:map(function(is_hovered)
+            return is_hovered and theme.ACCENT_MEDIUM or theme.BORDER_SUBTLE
         end)
     end
     return button {
@@ -292,6 +304,8 @@ local function message(notification, ui, opts)
         hover = hovered,
         radius = theme.radius.sm,
         background = ground,
+        border_width = ring and theme.border_width or nil,
+        border_color = ring,
         on_click = function(_, mouse_button)
             if mouse_button ~= "left" then
                 return
@@ -393,7 +407,9 @@ return function(group, ui, opts)
     local shown = (is_group and not expanded) and { items[1] } or items
     for _, notification in ipairs(shown) do
         children[#children + 1] = message(notification, ui, {
-            standalone = not is_group,
+            -- By what is rendered, not by what the group holds (the mirror's `isMultipleItems`):
+            -- a collapsed group shows one message and it reads as the card, not as an entry in it.
+            standalone = #shown == 1,
             age = opts.show_time and util.absolute_time(notification.timestamp) or nil,
         })
     end
