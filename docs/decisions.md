@@ -6060,11 +6060,13 @@ against ours. What it has:
   *and* box, pins what a mapped surface shows, and bounds the rest by bytes (ADR-0123). Refcounting
   answers "is anyone using this"; a byte budget answers "how much may sleep here", and the second is
   the question a shell with a wallpaper picker actually has.
-- `CachedLayer`: render a subtree into an FBO and re-blit it while it is unchanged. **The one idea
-  here we do not have**, and it trades GPU memory for CPU -- which is the wrong direction for this
-  shell today, at 0.34% idle CPU against 51 MB of GPU. Remember it if a config ever animates enough
-  to need it.
-- `blur_cache`: nothing here blurs. If blur ever lands, it caches.
+- `CachedLayer`: an FBO plus a scratch FBO and a dirty flag, rendered through a callback and
+  re-blitted while it is unchanged. Read at a distance this looked like a general subtree cache and
+  ADR-0130's line-by-line pass corrected that: its only two callers are `blur_cache` and
+  `backdrop_surface`, so it is the blur pipeline's scratch buffer and not a way to skip re-painting
+  arbitrary subtrees.
+- `blur_cache`, its one real caller: nothing here blurs, so neither has anything to cache. The pair
+  is the shape to copy on the day `roadmap.md`'s backdrop-blur item lands, and nothing before then.
 - A shader program per primitive (rect, glyph, image, gradient, spinner, ring) instead of a general
   canvas. Leaner per draw than femtovg's path pipeline, and every primitive is yours to write. No
   evidence femtovg is a bottleneck at 0.34%; not a rewrite this tree has earned.
@@ -6080,3 +6082,100 @@ why it has stayed unmeasured -- an upgrade path, not a finding.
 
 **Consequences**: none in the tree. Nothing here says to change the renderer; two of the four ideas
 we already have in a stronger form, and the other two would spend what this shell is short of.
+
+## 0130. Noctalia read line by line: their animation model, and the two pieces of it this tree already has
+
+**Status**: accepted
+
+**Context**: ADR-0129 compared the two shells from the outside and skimmed four headers. This is
+the pass that cloned the tree (`noctalia-dev/noctalia`, shallow, 307k lines of C++ across 1,837
+files) and read the render, animation, scripting and reconcile layers against ours, prompted by
+`roadmap.md` ranking the animation model as the largest unbuilt item. Two of ADR-0129's claims did
+not survive the closer look and are corrected there.
+
+**Decision**: take the frame-loop shape and the wall-clock rule. Take nothing else yet.
+
+1. **Their animation system is 364 lines, and its core is a `float` setter closure.**
+   `animate(from, to, durationMs, easing, setter, onComplete, owner)` pushes an entry onto a
+   `std::vector`; `tick` walks it, interpolates, and calls each setter. Seven easings. No property
+   system, no binding graph, no interpolation of anything but a scalar -- a colour fade or a slide
+   is a scalar the setter spends. That is the whole model, and it is worth noticing how small the
+   thing at the top of our roadmap is when someone else builds it.
+
+2. **Progress comes from wall time, not from an accumulated delta.** `tick(deltaMs)` takes a delta
+   and deliberately ignores it, computing `now - startedAt` instead. Their comment gives the
+   reason: a Wayland compositor delivers `wl_surface.frame` sparsely right after a cold boot, so a
+   delta-accumulated animation runs visibly slow exactly when the shell is being watched hardest.
+   This is a correctness rule, not a preference, and it is the cheapest thing on this list to get
+   wrong. Adopted as written.
+
+3. **The frame loop stops when idle, and animating does not mean repainting.**
+   `queueRenderIfNeeded` splits two cases: something is dirty, so render; or nothing is dirty but
+   an animation is live, so `continueAnimationFrameLoop` commits *only* the frame-callback state
+   and retains the current buffer. The callback chain stays alive with no pixels drawn. Combined
+   with `hasActive()` gating whether the callback is re-armed at all, this is how a shell gets a
+   vsync clock without paying for one at rest.
+
+   This is the answer to the constraint `roadmap.md` already names -- "build the gate so a reason
+   can be added rather than replacing the condition". Ours is stricter than theirs to begin with:
+   `wayland::run` polls two fds with `PollTimeout::NONE` and has no time source anywhere in the
+   loop (ADR-0124), which is why idle costs 0.34% of a core. `CompositorHandler::frame` is a stub
+   in `wayland/output.rs`. So the animation clock is an addition to that loop and not a rewrite of
+   it: arm a frame callback while an animation is live, let `poll` keep blocking when none is, and
+   the idle number survives the feature.
+
+4. **Their declarative layer cannot animate, and ours would not have that excuse.** This is the
+   finding that matters most. `luau_host.cpp` and `ui_tree_reconciler.cpp` contain no reference to
+   animation at all: every `animate()` caller is imperative C++ inside a control (`toggle.cpp`,
+   `collapsible.cpp`, `button.cpp`) or a shell surface. A plugin author gets controls that happen
+   to animate themselves and no way to animate anything else. They sidestepped the hard question --
+   where an interpolated value lives when the tree that declared it is rebuilt -- by never letting
+   the declarative layer ask it. In this tree the config *is* the declarative layer, so that
+   sidestep is not available and the question has to be answered.
+
+5. **We already own the mechanism their answer would need.** Their reconciler matches children by
+   `(type, key)`, updates a match in place, and drops the subtree on a mismatch -- so a control's
+   `m_animId` survives a declarative update precisely because the C++ object does.
+   `Scene::apply`'s `pair_children_by_id_then_position` is the same mechanism and a stricter one:
+   an explicit `id` pairs only against that `id`, id-less children fall back to position
+   (ADR-0023, amended by ADR-0045), and an `id` appearing or vanishing is an honest change of
+   identity rather than a silent reuse. We built it to key GPU resources on `NodeId`; it is also
+   exactly the stable identity an animated value needs to be hung off. `CONTEXT.md`'s Lease, which
+   has had no caller since it was written, is the other half.
+
+**Rejected, with the measurement or the reading that rejects it**:
+
+- **`mallopt(M_ARENA_MAX, 2)`**, which they set unconditionally in `main`. Tested here before
+  reading their tree and it recovered 330 KiB, because the Renderer runs 11 threads and they run
+  many more. The knob is right in principle and does not pay at our thread count.
+- **jemalloc** (`background_thread:true,narenas:2,dirty_decay_ms:1000,muzzy_decay_ms:5000`), auto-on
+  for their glibc builds. It is the systematic form of what ADR-0127 does with one `malloc_trim`
+  call: a background thread returning pages on a decay schedule instead of one trim after one known
+  spike. Declined for now on two grounds -- our measured problem was a single transient the one
+  line already fixed, and a permanent background thread spends the idle CPU that is this shell's
+  best number against every peer.
+
+**What the read confirmed rather than changed**:
+
+- **They call `malloc_trim(0)` too**, as a named `allocator_trim` startup phase after the last
+  init phase, for the same reason ADR-0127 landed it after the update check: glibc keeps what a
+  transient spike touched. Two trees arriving at the same one-line fix from separate measurements
+  is the strongest evidence either has that the fix is the right one. (Theirs also covers startup;
+  ours does not yet, and their placement is worth copying if boot ever shows a spike.)
+- **Neither shell tracks damage.** Their `wl_surface_damage_buffer` calls are two one-pixel pokes
+  in an output probe and a click shield; nothing in their render path narrows a commit. ADR-0129's
+  note stands unchanged.
+
+**Consequences**: nothing changes in the tree today. `roadmap.md`'s item 1 gains a decided shape --
+scalar setters keyed on `NodeId`, wall-clock progress, a frame callback armed only while something
+is live -- so the work starts from a design rather than from a survey. ADR-0129's `CachedLayer`
+paragraph is corrected there: it is the blur pipeline's scratch buffer, its only callers being
+`blur_cache` and `backdrop_surface`, not the general subtree cache a distant reading suggested.
+
+**Not a claim about size**: their 11 MB binary and our 6.8 MB Renderer are not comparable numbers.
+`meson.build` names 39 shared dependencies -- pango, cairo, glib/gobject/gio, harfbuzz, freetype,
+librsvg, libjxl, libwebp, curl, libxml2, libical, polkit, pipewire, wireplumber, sdbus-c++ -- so
+their text stack, image codecs and D-Bus layer live in `.so` files outside that 11 MB. Our Renderer
+links ten shared objects, none of them a text stack, an image codec or a D-Bus library, and carries
+all three inside its own 6.8 MB. Per-binary we are already smaller; the interesting comparison was
+never the file size.

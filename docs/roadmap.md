@@ -37,6 +37,12 @@ The data layer is not the problem. Paint and animation are.
    feature it serves was never specified. One constraint binds now: frame gating is written as
    "repaint when the scene changed", and a running animation is a second, orthogonal reason to
    wake. Build the gate so a reason can be added rather than replacing the condition.
+   ADR-0130 gives the item a decided shape, read off Noctalia's 364-line implementation: scalar
+   setters hung off the `NodeId` `Scene::apply` already keeps stable, progress taken from wall
+   time rather than an accumulated frame delta, and a `wl_surface.frame` callback armed only while
+   something is live -- so `wayland::run` keeps blocking in `poll` at rest and ADR-0124's idle cost
+   survives the feature. It also records what their model cannot do that ours would have to: their
+   declarative layer has no animation at all, because in this tree the config *is* that layer.
    Quickshell's `Retainable` (refcounted `lock()`/`unlock()` plus a `dropped()` signal, so a config
    can say "not yet" while an exit transition runs) is the shape to copy on the day exit
    transitions exist.
