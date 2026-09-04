@@ -65,12 +65,14 @@ local osd = require("modules.osd.popup")
 local settings = require("modules.bar.panels.settings")
 local panel_host = require("modules.shell.panel_host")
 local launcher = require("modules.global.launcher")
+local wallpaper_picker = require("modules.global.wallpaper_picker")
 -- A tooltip is a surface of its own, so each is listed here rather than nested in the bar: a
 -- `popup` is an `xdg_popup` rooted under the bar, not a node inside it (§ 6.3, ADR-0062).
 -- They cost nothing until hovered -- a popup with `visible = false` creates no Wayland object.
 local battery_tooltip = require("modules.bar.indicators.battery").tooltip
 local clock_tooltip = require("modules.bar.indicators.date_time").tooltip
 local launcher_tooltip = require("modules.bar.indicators.launcher_button").tooltip
+local wallpaper_tooltip = require("modules.bar.indicators.wallpaper_button").tooltip
 -- New with the icon-only bar, and not decoration. A circle with a wifi glyph in it says how strong
 -- the signal is and nothing about which network, which is fine on the bar and useless without
 -- somewhere to read the rest -- so the two indicators that lost their labels grew a tooltip each.
@@ -92,9 +94,11 @@ return {
     battery_tooltip,
     clock_tooltip,
     launcher_tooltip,
+    wallpaper_tooltip,
     network_tooltip,
     bluetooth_tooltip,
     launcher,
+    wallpaper_picker,
     lock_screen,
     polkit_dialog,
 }

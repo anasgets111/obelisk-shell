@@ -1,14 +1,13 @@
--- The wallpaper, which is not a capability and never was (ADR-0055). Everything
--- `wallpaper:set(mon, path, fit, anim, dur)` was going to carry already had a home once ADR-0038
--- moved surface declaration here and Phase 21 built `state`: the monitor is `panel.monitor`, the
--- path is `image.source`, the fit is `image.fit`, and the two animation arguments need an animation
--- model this engine does not have. Changing it at runtime is `wallpaper:set(path)` on the signal
--- below, with no IPC anywhere in the path.
+-- The wallpaper, which is not a capability and never was (ADR-0055): a `Background` panel holding
+-- one `image`, and `lib/wallpaper.lua` saying which file. One declaration for every output, and
+-- `child` is a function of the output's name (ADR-0121), so each screen draws its own file at its
+-- own fit and a monitor plugged in later gets its instance without a reload.
 --
--- `oblisk.config_dir` is what lets this name a file it ships beside itself. It stays a `state`
--- signal rather than a constant so the runtime path is the one being exercised, not a literal that
--- happens to work at boot.
-local wallpaper = state("wallpaper", oblisk.config_dir .. "/wallpaper.svg")
+-- `async` is left off, deliberately: the file decodes inside the first frame, so the frame the
+-- candidate presents is whole (ADR-0122). A wallpaper change is a decode in the frame too, a
+-- stall of the frame it lands in rather than a flash of the ground under it; ADR-0002's crossfade
+-- is what would make it neither, and that waits on an animation model.
+local wallpaper = require("lib.wallpaper")
 
 -- All four edges anchored, so the compositor sizes both axes and this covers the output.
 --
@@ -28,10 +27,12 @@ return panel {
     -- than transparent, and the failure is visible instead of looking like a surface that never
     -- mapped.
     background = "#11111bff",
-    child = image {
-        source = wallpaper,
-        fit = "cover",
-        width = "Fill",
-        height = "Fill",
-    },
+    child = function(output)
+        return image {
+            source = wallpaper.path_of(output),
+            fit = wallpaper.fit_of(output),
+            width = "Fill",
+            height = "Fill",
+        }
+    end,
 }

@@ -113,6 +113,10 @@ end
 -- reason `settings_open` lives here instead of inside `settings.lua`.
 local launcher_open = state("launcher_open", false)
 
+-- Whether the wallpaper picker is up, on `launcher_open`'s terms: the bar button and the picker's
+-- own close both write it.
+local wallpaper_picker_open = state("wallpaper_picker_open", false)
+
 -- ## The notification card's own state
 --
 -- Three signals, all of them "which of these is open", none of them anything the Supervisor knows
@@ -223,4 +227,5 @@ return {
     close_panel = close_panel,
     panel_showing = panel_showing,
     launcher_open = launcher_open,
+    wallpaper_picker_open = wallpaper_picker_open,
 }

@@ -394,4 +394,14 @@ theme.launcher_height     = s(560, 420)
 theme.launcher_row_height = s(56, 44)
 theme.launcher_icon       = s(36, 28)
 
+-- ## The wallpaper picker (`modules/global/wallpaper_picker.lua`)
+--
+-- `wallpaperModalWidth/Height` and `wallpaperSidebarWidth`, as the mirror has them. Four columns
+-- rather than the mirror's "as many 230px tiles as fit": the card is a fixed width here, so the
+-- count is a constant and the tile is what the card's width leaves each of the four.
+theme.wallpaper_picker_width  = s(1180, 900)
+theme.wallpaper_picker_height = s(880, 660)
+theme.wallpaper_sidebar_width = s(250, 200)
+theme.wallpaper_columns       = 4
+
 return theme

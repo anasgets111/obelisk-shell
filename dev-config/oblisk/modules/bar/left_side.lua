@@ -1,6 +1,6 @@
 -- Mirrors LeftSide.qml, including the order: power menu first, then the status modules that config
--- keeps on the left, then the launcher opener, then the special workspaces (Hyprland only, absent
--- elsewhere) and the workspace strip last.
+-- keeps on the left, then the launcher opener and the wallpaper button, then the special workspaces
+-- (Hyprland only, absent elsewhere) and the workspace strip last.
 --
 -- `rescue` has no counterpart there and goes first anyway, because a config error is the one thing
 -- that must not be pushed off the edge by whatever is beside it. It occupies no width unless the
@@ -16,6 +16,7 @@ local updates_module = require("modules.bar.indicators.updates")
 local keyboard_module = require("modules.bar.indicators.keyboard_layout")
 local battery = require("modules.bar.indicators.battery")
 local launcher = require("modules.bar.indicators.launcher_button")
+local wallpaper_button = require("modules.bar.indicators.wallpaper_button")
 local special_workspaces = require("modules.bar.indicators.special_workspaces")
 local workspaces_module = require("modules.bar.indicators.workspace_strip")
 
@@ -36,6 +37,7 @@ return row {
         keyboard_module,
         battery.indicator,
         launcher.button,
+        wallpaper_button.button,
         special_workspaces,
         workspaces_module,
     },
