@@ -754,6 +754,23 @@ impl App {
             return false;
         }
 
+        // Non-blocking swap, set here because `EGL_SWAP_INTERVAL` belongs to the current
+        // context's draw surface and this is where each surface first becomes current. EGL
+        // defaults to 1, which makes `eglSwapBuffers` wait for the compositor to be done with the
+        // buffer -- and this is the thread that also dispatches Wayland, reads Supervisor frames
+        // and services input, so that wait stalls all of it, not just painting. Nothing is lost
+        // by dropping it: this loop paints only when `re_resolve_if_dirty` says the tree changed
+        // (`wayland/mod.rs`), so the pacing is the push, and there is no frame to run ahead of.
+        // Measured at 0.24-0.89ms per swap with five swaps in 25s, so today this changes nothing;
+        // it matters once ADR-0130's animation work paints every frame and the swaps contend.
+        // Not fatal on failure: a driver that refuses the hint leaves the blocking default, which
+        // is what we have now.
+        if let Err(e) = egl.instance.swap_interval(egl.display, 0) {
+            eprintln!(
+                "[oblisk-renderer] {surface_id}: eglSwapInterval(0) failed ({e}); swaps on this surface keep EGL's blocking default"
+            );
+        }
+
         // SAFETY: `glow::Context::from_loader_function`'s contract is that a GL context is
         // current on this thread for the lifetime of the returned `Context`, guaranteed here
         // by the `eglMakeCurrent` call directly above, on this same single-threaded dispatch

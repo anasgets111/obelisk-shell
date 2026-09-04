@@ -6264,3 +6264,95 @@ the image cache is byte-budgeted with pinning where theirs is refcounted; and
 2 and 4 are prerequisites filed against ADR-0130's animation work, and item 5 is filed against the
 500-row ceiling `text/shaping.rs` already names. The re-resolve figures are the baseline any of it
 should be measured against.
+
+## 0132. Checking ADR-0131's five items against the tree, and building the two that survived
+
+**Status**: accepted
+
+**Context**: ADR-0131 named five things worth taking from Noctalia and filed all five as future
+work without touching code. This is the verification pass: each item read against what this tree
+actually does, with the ones that survive built. One did not survive contact, and two measured out
+smaller than the survey implied. Measurements are on this machine, `dev-config`, one 1920x1200
+output, release build.
+
+**Item 4, alpha out of the text cache key: refuted.** femtovg already does structurally what their
+Cairo path needs a trick for. `femtovg-0.26.0/src/text.rs:88`'s `RenderedGlyphId` keys a rasterised
+glyph on `glyph_index`, `font_id`, `size`, `line_width`, `render_mode`, `subpixel_location` and
+`variation_hash`, and on nothing else: no colour, no alpha. A glyph rasterises once as coverage and
+the `Paint` tints it at draw time, so a fade over a string reuses one atlas entry per glyph with no
+work on our side. `ShapingHandle`'s own key is a measurement key with no colour in it either. The
+item existed because their renderer rasterises full-colour surfaces on the CPU; ours does not, so
+there is nothing here to take.
+
+**Item 5, an LRU on the shape memo: real, and still not worth it.** `ShapingHandle::shape` does
+clear wholesale at `SHAPE_CACHE_CAPACITY`, as ADR-0131 said. What that costs is one full re-shape
+of the live working set, and the working set is about twenty text nodes; the clock is what fills
+the map, at one dead entry a second, so the clear lands roughly hourly and costs on the order of
+the 6.64 ms `ShapingHandle::shape`'s own comment measures for 500 rows. An LRU trades that for
+recency bookkeeping on every hit, which is the path the memo exists to make cheap. The comment
+already names the condition that would change this -- a working set genuinely larger than the cap
+-- and it is not met. Left alone deliberately, not by omission.
+
+**Item 3, list virtualisation: real, but the cheap half of it is worth a fifth of what the survey
+implied.** ADR-0124 already froze hidden subtrees, so a closed picker costs nothing and only a
+visible list is in question. A fixture of fifty tiles (a `column` per tile, each holding a `rect`
+with an `image` and a `text`) re-resolves in 0.916 ms median. The same tree written as literal
+children, which is what a perfect memo of `itemfn` would leave behind, re-resolves in 0.783 ms:
+`itemfn` plus `deserialize_lua_table` is 19% of the pass, and `resolve_properties`, `LayoutStyle`,
+taffy node creation and text measurement are the other 81%. Adding two derived signals per tile
+takes the list to 1.153 ms and moves the split to roughly a third, since a `:map()` per tile
+allocates on both sides of it. So the fix `node/spec.rs`'s ponytail note describes -- compute keys
+first, skip `itemfn` for unchanged ones -- buys 20-30% of a visible list, not the bulk of it,
+because the signals behind every property must be re-read each pass whatever happens to `itemfn`.
+Viewport virtualisation is the item that takes the other 81%, by never resolving an off-screen row
+at all, and it needs the scroll offset to reach `prepare`, which today it does not. Filed as the
+real shape of this work; the memo alone is not worth building first.
+
+**Item 2, `eglSwapInterval(0)`: built.** `wayland/egl.rs` never called it, so every surface carried
+EGL's default of 1 and every `eglSwapBuffers` was free to wait on the compositor. This thread also
+dispatches Wayland, drains Supervisor frames and services input, so that wait is not confined to
+painting. Set once per surface in `bind_surface`, immediately after the `eglMakeCurrent` that first
+makes it current, because `EGL_SWAP_INTERVAL` is state on the current context's draw surface. A
+driver that refuses the hint logs and keeps the blocking default. Nothing paces the loop in its
+place because nothing needs to yet: it paints only when `re_resolve_if_dirty` reports a change, so
+the push is the pacing, and `wl_surface.frame` becomes the pacer when ADR-0130's animation work
+gives it frames to run ahead of. Measured today it changes nothing, as ADR-0131 predicted.
+
+**Item 1, an env-gated idle profiler: built**, as `wayland/idle_profile.rs` behind
+`OBLISK_PROFILE_IDLE=<seconds>`. It reports, per window: loop turns; turns that woke and did
+nothing; process and main-thread CPU as a percentage of one core, from `getrusage(RUSAGE_SELF)` and
+`RUSAGE_THREAD`, whose gap is the shaping worker, the socket thread and tokio; wakes attributed to
+the Wayland fd, the waker fd, both, or neither; and per-kind work counts. A `SPIN` marker is
+appended when most turns of a busy window did nothing, which since ADR-0124 is the only shape a
+runaway can take in a loop that polls without a timeout. Off costs two branch tests a turn and
+touches no clock. `render` is a pure function of one window's counters so its thresholds are tested
+rather than eyeballed in a log.
+
+Its first run answered a question nobody had asked. Three windows on an idle bar:
+
+```
+idle 10.1s: turns=34 idle=11 cpu proc=1.37% main=1.30% | wake wl=10 wake=20 both=2 none=0 | work dispatch=2 resolve=23 type=0 decode=0 draw=0 paint=23
+idle 10.4s: turns=18 idle=0  cpu proc=0.24% main=0.23% | wake wl=0  wake=18 both=0 none=0 | work dispatch=0 resolve=18 type=0 decode=0 draw=0 paint=18
+idle 10.0s: turns=18 idle=1  cpu proc=0.25% main=0.24% | wake wl=0  wake=18 both=0 none=0 | work dispatch=0 resolve=17 type=0 decode=0 draw=0 paint=17
+```
+
+Steady state is 18 turns per 10 s, not the 10 a 1 Hz clock would explain, and every one of them is a
+waker wake that re-resolves and repaints. The arithmetic is exact rather than mysterious:
+`system_info.lua` configures `cpu_interval = 2` and `ram_interval = 5`, so 10 clock plus 5 CPU plus
+2 RAM is 17 pushes per window against `resolve=17`. No spin, no bug -- but it makes the cost
+visible, because each of those 17 re-resolves the whole tree at ADR-0131's 1.38 ms median, and a
+CPU-percentage push re-resolves the clock, the battery and the workspaces along with it. That is
+`lua/signal.rs`'s missing dependency graph seen from the other end, and it corroborates ADR-0131's
+rule for animation from a direction that did not assume it. Idle CPU reads 0.24-0.25% of a core,
+consistent with the 0.34% measured by other means in ADR-0129.
+
+**Decision**: build items 1 and 2. Drop item 4 as already satisfied by femtovg. Leave item 5 where
+its own comment leaves it. Re-file item 3 as viewport virtualisation with the scroll offset reaching
+`prepare`, not as an `itemfn` memo, and record the 19/81 split as the reason.
+
+**Consequences**: `nix` gains the `resource` feature for `getrusage`, read only when the profile is
+on. The profiler is the instrument the next performance question gets answered with instead of a
+temporary `eprintln!`, and its per-window counters are the baseline for ADR-0130's animation work:
+turns should rise to the frame rate while `idle` stays at zero, and any `SPIN` line means the frame
+callback is re-arming without work to do. Live-verified: the bar renders under non-blocking swap
+with a correct clock.

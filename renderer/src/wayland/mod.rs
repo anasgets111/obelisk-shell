@@ -51,6 +51,7 @@ use crate::text::atlas::TextPainter;
 use crate::text::shaping::ShapingHandle;
 use crate::text::snap::LogicalRect;
 
+mod idle_profile;
 mod input;
 mod layer;
 mod lock;
@@ -354,6 +355,10 @@ pub fn run(
     // surfaces to reconcile against it (see `App::startup_complete`).
     app.startup_complete = true;
 
+    // `None` unless `OBLISK_PROFILE_IDLE` is set; see that module for what it answers and why
+    // this loop is the thing worth asking.
+    let mut profile = idle_profile::IdleProfile::from_env();
+
     // A real Wayland event might not arrive for long after `ActivateDraw` is sent, since nothing
     // else happens on these mostly-static surfaces once staged, so this loop checks `inbound_rx`
     // on bounded latency instead of blocking indefinitely on the connection's fd. Non-candidate
@@ -479,6 +484,18 @@ pub fn run(
         // focused surface's whole tree out of the scene to look for a field, which at sixty-six
         // turns a second on an open picker was most of what the process did.
         let active = dispatched || re_resolved || typed || !landed.is_empty() || !draw_nonces.is_empty();
+        if let Some(profile) = profile.as_mut() {
+            // Before the `draw_nonces` loop below consumes the `Vec`, and before any `break`, so a
+            // turn that exits still reports the work it did.
+            profile.turn(idle_profile::Turn {
+                dispatched,
+                re_resolved,
+                typed,
+                decoded: !landed.is_empty(),
+                draws: draw_nonces.len(),
+                painted: re_resolved || typed || !landed.is_empty(),
+            });
+        }
         // The disarm half of ADR-0049's amendment; must be here, not inside the `if` above.
         // `dispatch_pending` armed `input_serial` on a `BTN_LEFT` press or release this turn, and
         // `apply_resolved_surface_state` is the only reader, since it's the only thing that
@@ -516,8 +533,14 @@ pub fn run(
                 nix::poll::PollFd::new(fd, nix::poll::PollFlags::POLLIN),
                 nix::poll::PollFd::new(waker.fd(), nix::poll::PollFlags::POLLIN),
             ];
-            if matches!(nix::poll::poll(&mut fds, nix::poll::PollTimeout::NONE), Ok(n) if n > 0) {
-                if fds[0].any().unwrap_or(false) {
+            let woke = matches!(nix::poll::poll(&mut fds, nix::poll::PollTimeout::NONE), Ok(n) if n > 0);
+            let wayland_ready = woke && fds[0].any().unwrap_or(false);
+            if let Some(profile) = profile.as_mut() {
+                profile
+                    .wake(idle_profile::Wake { wayland: wayland_ready, waker: woke && fds[1].any().unwrap_or(false) });
+            }
+            if woke {
+                if wayland_ready {
                     guard.read()?;
                 }
                 // Before the turn, not after: a wake that lands while the turn runs must survive
