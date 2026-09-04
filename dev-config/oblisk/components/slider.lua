@@ -5,13 +5,14 @@
 --
 -- Two values are drawn from. While a drag is held the fill follows `pending`, a `state()` this
 -- component owns, so the track tracks the finger without a round trip through the Supervisor per
--- pixel. On release `pending` is cleared and `on_commit` is called once with where the drag ended,
--- which is `Slider.qml`'s `committed` and not a stream of writes. Until the capability's next
--- snapshot lands the fill reads the old value for a frame or two; the round trip through PipeWire
--- is milliseconds and the snap has not been visible.
+-- pixel. On release `on_commit` is called once with where the drag ended, which is `Slider.qml`'s
+-- `committed` and not a stream of writes. `pending` is kept until the capability's next snapshot
+-- carries the value, cleared from a single `on_change` per slider name: clearing it on release
+-- showed the old value for the frames the round trip through PipeWire takes, and a click flashed
+-- new, old, new. A signal without `on_change` (a plain `state`) clears on release instead.
 --
 -- `pending` is a number because `state()` fixes a signal's type from its initial value and `nil`
--- has none; `-1` is "no drag held", a fraction never is.
+-- has none; `-1` is "nothing held", a fraction never is.
 --
 -- `children` stack on top of the fill, so the volume pill is this component with its glyph and
 -- percentage laid over the track, the way `Volume.qml` fills the whole control.
@@ -19,7 +20,7 @@ local theme = require("config.theme")
 
 ---@class SliderOpts
 ---@field name string The `state()` name for the held drag. Unique per slider.
----@field signal Signal The capability or state the value is read from.
+---@field signal Signal|Capability<any> The capability or state the value is read from.
 ---@field read fun(payload: any): number The fraction, `0` to `1`, off one payload.
 ---@field on_commit fun(fraction: number) Called once per drag, on release, and once per wheel step.
 ---@field steps? integer How many positions the track has, `Slider.qml`'s `steps`: a drag lands on the nearest one and a wheel notch moves one. Default `20`, which is 5% steps over a `0` to `1` range; `0` is continuous.
@@ -62,10 +63,32 @@ local function fraction_of(read, payload)
     return clamp(value)
 end
 
+-- Slider names whose signal already has this component's `on_change`. A `list` rebuilds its rows,
+-- and each rebuild constructs the slider again; the `state()` behind a name is one signal, so one
+-- handler per name is enough and a second would only clear it twice.
+local watched = {}
+
 ---@param opts SliderOpts
 return function(opts)
     local pending = state(opts.name, -1)
     local steps = opts.steps or 20
+    local dragging = false
+
+    local on_change = opts.signal.on_change
+    if on_change and not watched[opts.name] then
+        watched[opts.name] = true
+        on_change(opts.signal, function(current, previous)
+            local held = pending:get()
+            if dragging or held < 0 then
+                return
+            end
+            local now = fraction_of(opts.read, current)
+            -- The commit landed, or someone else moved it; either way the snapshot is the truth again.
+            if quantize(now, steps) == held or now ~= fraction_of(opts.read, previous) then
+                pending:set(-1)
+            end
+        end)
+    end
 
     local fill = computed({ opts.signal, pending }, function(payload, held)
         if held >= 0 then
@@ -103,11 +126,10 @@ return function(opts)
         on_click = opts.on_click,
         on_drag = function(rect, pointer, phase)
             local fraction = quantize(pointer.x / rect.width, steps)
-            if phase == "end" then
-                pending:set(-1)
+            dragging = phase ~= "end"
+            pending:set(on_change and fraction or (dragging and fraction or -1))
+            if not dragging then
                 opts.on_commit(fraction)
-            else
-                pending:set(fraction)
             end
         end,
         on_wheel = function(_, notches)
@@ -117,7 +139,11 @@ return function(opts)
             local held = pending:get()
             local current = held >= 0 and held or fraction_of(opts.read, opts.signal:get())
             -- Onto the grid first, so a 79% set by another mixer steps to 80% and 85%, not 84%.
-            opts.on_commit(quantize(quantize(current, steps) + notches / steps, steps))
+            local next_fraction = quantize(quantize(current, steps) + notches / steps, steps)
+            if on_change then
+                pending:set(next_fraction)
+            end
+            opts.on_commit(next_fraction)
         end,
         children = children,
     }
