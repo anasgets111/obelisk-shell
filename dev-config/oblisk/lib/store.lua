@@ -28,24 +28,32 @@ return persistent_table {
         -- announced (`UpdateService.qml`'s `lastSuccessfulCheck` and `notifiedPackagesKey`).
         updates_checked_at = 0,
         updates_notified = "",
-        -- `Settings.data.idleService`, one level flatter. Two profiles keyed by what UPower says
-        -- about the mains, each holding three stages as an `<stage>_on`/`<stage>_sec` pair.
+        -- `Settings.data.idleService`, one level flatter, and on a different model. Two profiles
+        -- keyed by what UPower says about the mains, each holding a per-stage `<stage>_on` switch
+        -- and a `<stage>_sec` delay, plus one `order` both profiles share.
         --
-        -- `enabled` ships false, and that is deliberate rather than a copy of the mirror, which
-        -- ships true. These defaults are written into a real `state.json` on somebody's real
-        -- machine the first time this config runs, and the first thing a `true` here would do is
-        -- blank their screen while they were reading. The panel's master switch is one click and
-        -- says "automation paused" until it is thrown.
+        -- A stage's seconds are counted from when the stage above it fired, not from when the seat
+        -- went idle. "Blank after 5 minutes, then lock 10 minutes after that" is how anyone
+        -- describes this out loud, and it is the arrangement that survives editing: with absolute
+        -- times, lowering the blank timeout silently shortens the gap before the lock.
         --
-        -- Not carried over: the mirror's `lockAfterDpms`. It needs an order because its stages are
-        -- three independent monitors that each wait on the others; `modules/global/idle.lua` runs
-        -- one clock, so "lock at 900, blank at 300" already means blanking happens first and the
-        -- two numbers are the whole answer.
+        -- `order` is one list rather than one per profile. The order is a policy -- blank before
+        -- locking, or lock before blanking -- and it does not change because a cable came out; the
+        -- delays are what change, and those are per profile. It is validated on read, so an entry
+        -- hand-edited to a name that is not a stage is dropped and a stage missing from it is
+        -- appended rather than silently never running.
+        --
+        -- `enabled` ships false, deliberately, where the mirror ships true. These defaults are
+        -- written into a real `state.json` on somebody's real machine the first time this config
+        -- runs, and the first thing a `true` here would do is blank their screen while they were
+        -- reading. The modal's master switch is one click and says "automation paused" until it is
+        -- thrown.
         idle = {
             enabled = false,
             video_auto_inhibit = true,
-            ac = { dpms_on = true, dpms_sec = 300, lock_on = true, lock_sec = 900, suspend_on = false, suspend_sec = 1800 },
-            battery = { dpms_on = true, dpms_sec = 120, lock_on = true, lock_sec = 300, suspend_on = true, suspend_sec = 900 },
+            order = { "dpms", "lock", "suspend" },
+            ac = { dpms_on = true, dpms_sec = 300, lock_on = true, lock_sec = 600, suspend_on = false, suspend_sec = 1800 },
+            battery = { dpms_on = true, dpms_sec = 120, lock_on = true, lock_sec = 180, suspend_on = true, suspend_sec = 600 },
         },
     },
 }

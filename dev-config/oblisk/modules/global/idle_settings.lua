@@ -39,6 +39,7 @@ local toggle = require("components.toggle")
 local panel_card = require("components.panel_card")
 local panel_header = require("components.panel_header")
 local panel_row = require("components.panel_row")
+local panel_action_icon = require("components.panel_action_icon")
 local section_header = require("components.section_header")
 local ui_state = require("lib.ui_state")
 local idle = require("lib.idle")
@@ -247,10 +248,14 @@ local paused_banner = banner(
 )
 
 -- ## The matrix
+--
+-- One row per stage, in `order`, so the rows are the sequence: the chevrons on the left move a stage
+-- through it and the row moves with them. A `list` rather than three declared rows, because the
+-- order is a stored value and declared children cannot be reordered.
 
-local function setting(profile, stage, suffix)
+local function setting(profile, key, suffix)
     return settings:map(function(resolved)
-        return resolved[profile][stage.key .. suffix]
+        return resolved[profile][key .. suffix]
     end)
 end
 
@@ -289,7 +294,7 @@ local function duration_button(profile, stage)
                 spacing = theme.spacing.xs,
                 padding = { left = theme.spacing.sm, right = theme.spacing.xs },
                 children = {
-                    cell(setting(profile, stage, "_sec"):map(idle.format), theme.FG, theme.font.xs, {
+                    cell(setting(profile, stage.key, "_sec"):map(idle.format), theme.FG, theme.font.xs, {
                         width = "Fill",
                         align_v = "Center",
                     }),
@@ -300,9 +305,9 @@ local function duration_button(profile, stage)
     }
 end
 
--- One profile's cell of the matrix: the timeout and the switch that turns the stage on in it.
+-- One profile's cell of the matrix: the delay and the switch that turns the stage on in it.
 local function profile_control(profile, stage)
-    local on = setting(profile, stage, "_on")
+    local on = setting(profile, stage.key, "_on")
     return row {
         width = theme.idle_profile_column,
         align_v = "Center",
@@ -340,7 +345,7 @@ local matrix_heading = row {
     spacing = theme.spacing.sm,
     padding = { left = theme.spacing.sm, right = theme.spacing.sm },
     children = {
-        cell("action", theme.TEXT_OFF, theme.font.xs, { width = "Fill" }),
+        cell("action · in order", theme.TEXT_OFF, theme.font.xs, { width = "Fill" }),
         column_heading("ac", "ac power"),
         row {
             width = theme.idle_profile_column,
@@ -350,37 +355,91 @@ local matrix_heading = row {
     },
 }
 
-local function stage_row(stage)
+-- The two chevrons that move a stage through `order`. Hidden rather than disabled at the ends: a
+-- greyed-out arrow on the top row is a control asking to be clicked and then refusing, and
+-- `idle.move` already treats out of range as a no-op, so nothing depends on them being hidden.
+local function reorder(item)
+    return column {
+        align_v = "Center",
+        children = {
+            panel_action_icon(icons.chevron_up, function()
+                idle.move(item.key, -1)
+            end, { slot = "idle-up-" .. item.key, visible = not item.first }),
+            panel_action_icon(icons.chevron_down, function()
+                idle.move(item.key, 1)
+            end, { slot = "idle-down-" .. item.key, visible = not item.last }),
+        },
+    }
+end
+
+local function stage_row(item)
+    local stage = item.stage
     -- Accent while either profile will run this stage, `ActionSettingRow`'s `anyEnabled`: a row dim
     -- in both columns is a stage that never happens, whichever cable is in.
     local any = settings:map(function(resolved)
         for _, profile in ipairs({ "ac", "battery" }) do
-            if resolved[profile][stage.key .. "_on"] and resolved[profile][stage.key .. "_sec"] > 0 then
+            if resolved[profile][item.key .. "_on"] and resolved[profile][item.key .. "_sec"] > 0 then
                 return true
             end
         end
         return false
     end)
-    return panel_row {
-        icon = stage.icon,
+    local ink = any:map(function(enabled)
+        return enabled and theme.ACCENT or theme.TEXT_OFF
+    end)
+    local body = panel_row {
         title = stage.title,
+        -- The stage's own description, not "after <the row above>". That reading is only true when
+        -- the row above is switched on, and a row's switches are per profile -- blanking can be on
+        -- for AC and off for battery, which would make one label wrong in one column. The section's
+        -- own description says the rule once, the row order shows it, and the timeline prints the
+        -- running total it works out to.
         subtitle = stage.detail,
         height = theme.idle_row_height,
-        icon_color = any:map(function(enabled)
-            return enabled and theme.ACCENT or theme.TEXT_OFF
-        end),
+        leading = row {
+            align_v = "Center",
+            spacing = theme.spacing.xs,
+            children = { reorder(item), cell(stage.icon, ink, theme.icon.md, { align_v = "Center" }) },
+        },
         trailing = row {
             spacing = theme.spacing.sm,
             align_v = "Center",
             children = { profile_control("ac", stage), profile_control("battery", stage) },
         },
     }
+    if item.last then
+        return body
+    end
+    return column { width = "Fill", children = { body, row_rule } }
 end
 
-local stage_rows = {}
-for index, stage in ipairs(idle.STAGES) do
-    stage_rows[index] = stage_row(stage)
-end
+-- The descriptors the rows are built from: the stage, where it sits in the order, and the name of
+-- whatever runs before it. Rebuilt only when the stored settings change, so a reorder rebuilds
+-- three rows and a tick rebuilds none.
+local stage_source = settings:map(function(resolved)
+    local items = {}
+    for index, key in ipairs(resolved.order) do
+        local stage = idle.stage(key)
+        if stage then
+            items[#items + 1] = {
+                key = key,
+                stage = stage,
+                first = index == 1,
+                last = index == #resolved.order,
+            }
+        end
+    end
+    return items
+end)
+
+local stage_list = list {
+    width = "Fill",
+    source = stage_source,
+    key = function(item)
+        return item.key
+    end,
+    itemfn = stage_row,
+}
 
 -- ## Behaviour
 --
@@ -488,23 +547,18 @@ local function section(glyph, title, description, children)
     })
 end
 
-local automation_rows = { matrix_heading }
-for index, node in ipairs(stage_rows) do
-    automation_rows[#automation_rows + 1] = node
-    -- Indented past the icon, `ActionSettingRow`'s own separator: a rule running the full width
-    -- would cut the glyph column off from the rows it labels.
-    if index < #stage_rows then
-        automation_rows[#automation_rows + 1] = row_rule
-    end
-end
-
 local behaviour_children = { behaviour_rows[1], row_rule, behaviour_rows[2] }
 
 local card_children = {
     header,
     header_rule,
     flow_card,
-    section(icons.sleep, "automation", "ac power and battery, side by side", automation_rows),
+    section(
+        icons.sleep,
+        "automation",
+        "each stage waits for the one above it",
+        { matrix_heading, stage_list }
+    ),
     section(icons.settings, "behaviour", "what may keep the session awake", behaviour_children),
 }
 

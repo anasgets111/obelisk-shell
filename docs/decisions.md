@@ -6795,10 +6795,19 @@ them structurally rather than literally.
    and lock at five. With one registration the timeouts are plain Lua numbers a panel can edit, and
    the ordering between stages is the numbers instead of a condition lattice. It costs a one-second
    clock the bar's own readouts already run on.
-2. **The mirror's `lockAfterDpms` is dropped.** It exists because its three monitors are independent
-   and each has to wait on the others. One clock makes "lock at 900, blank at 300" already mean
-   blanking happens first, so the two numbers are the whole answer and an order combo would be a
-   second, contradictable one.
+2. **The stages are an ordered list of relative delays.** `lockAfterDpms` offers two orders of two
+   stages; `order` is every order of all of them, moved with a chevron per row. A stage's seconds
+   are counted from when the stage above it fired, not from when the seat went idle, which is both
+   how anyone describes this out loud and the arrangement that survives editing: with absolute
+   times, lowering the blank timeout silently shortens the gap before the lock, because both were
+   measured from the same zero. The first pass shipped absolute times with the order implied by
+   them, and it was wrong on both counts.
+   `order` is one list shared by both profiles, not one each: which stage precedes which is a
+   policy and does not change because a cable came out, and the delays are what change. It is
+   validated on read -- unknown names dropped, missing stages appended -- so a hand-edited
+   `state.json` cannot leave a stage that never runs.
+   The modal shows both readings and needs to: the matrix edits the delays, the timeline prints the
+   running total, which is the wall-clock answer to "when does my screen lock".
 3. **No `armed` guard anywhere in the config.** ADR-0139's gate means a held inhibitor -- ours, or
    `systemd-inhibit`'s -- stops the events and hands back a `Resumed`, so `idle.since` goes to zero
    on the way in and the clock handler returns on its first line. The manual toggle is an inhibitor,

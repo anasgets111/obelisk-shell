@@ -13,9 +13,20 @@
 --
 -- Not a stylistic preference. `oblisk.idle:register_threshold` has no counterpart that removes one
 -- (§ 3.2), so a panel that changes the lock timeout from five minutes to ten would leave both
--- registered and lock at five anyway. With one registration the timeouts are plain Lua numbers,
--- editable at runtime, and the ordering between stages is the numbers rather than a lattice of
--- `enabled` conditions -- which is why the mirror's `lockAfterDpms` is not here.
+-- registered and lock at five anyway. With one registration the timeouts are plain Lua numbers a
+-- panel can edit, and the stages are a list this file walks rather than a lattice of `enabled`
+-- conditions each waiting on the others.
+--
+-- ## The stages are an ordered list of delays
+--
+-- `order` is the sequence and a stage's seconds are counted from when the stage above it fired, not
+-- from when the seat went idle. That is the mirror's `lockAfterDpms` generalised: it offers two
+-- orders of two stages, this offers every order of all of them, and it drops the absolute times
+-- that made the two settings interfere -- lowering the blank timeout used to silently shorten the
+-- gap before the lock, because both were measured from the same zero.
+--
+-- The modal shows both readings, and needs to: the matrix edits the delays, and the timeline prints
+-- the running total, which is the wall-clock answer to "when does my screen lock".
 --
 -- What it costs: stages fire on a one-second clock that the bar's own readouts already run on, so
 -- the resolution is a second and the cost is nothing new. `oblisk.system` pushing is load-bearing;
@@ -71,15 +82,48 @@ idle.STAGES = {
     },
 }
 
+--- One stage by key, or `nil`. What validates an `order` entry read back off disk.
+--- @param key string
+--- @return table?
+function idle.stage(key)
+    for _, stage in ipairs(idle.STAGES) do
+        if stage.key == key then
+            return stage
+        end
+    end
+    return nil
+end
+
+local ORDER = { "dpms", "lock", "suspend" }
+
 -- Annotated because the table mixes booleans with profile tables, and without it inference calls
--- every value a `boolean|table` and then refuses both halves of the fold below.
+-- every value a `boolean|table` and then refuses both halves of the fold in `idle.read`.
 ---@type table<string, any>
 local DEFAULTS = {
     enabled = false,
     video_auto_inhibit = true,
-    ac = { dpms_on = true, dpms_sec = 300, lock_on = true, lock_sec = 900, suspend_on = false, suspend_sec = 1800 },
-    battery = { dpms_on = true, dpms_sec = 120, lock_on = true, lock_sec = 300, suspend_on = true, suspend_sec = 900 },
+    ac = { dpms_on = true, dpms_sec = 300, lock_on = true, lock_sec = 600, suspend_on = false, suspend_sec = 1800 },
+    battery = { dpms_on = true, dpms_sec = 120, lock_on = true, lock_sec = 180, suspend_on = true, suspend_sec = 600 },
 }
+
+-- Every stage exactly once, in the stored sequence: unknown names dropped, missing ones appended in
+-- declaration order. A hand-edited `state.json` that names a stage twice, or one written before a
+-- stage existed, would otherwise leave a stage that can never run and no way to find out why.
+local function resolve_order(stored)
+    local seen, out = {}, {}
+    for _, key in ipairs(type(stored) == "table" and stored or {}) do
+        if type(key) == "string" and not seen[key] and idle.stage(key) then
+            seen[key] = true
+            out[#out + 1] = key
+        end
+    end
+    for _, key in ipairs(ORDER) do
+        if not seen[key] then
+            out[#out + 1] = key
+        end
+    end
+    return out
+end
 
 --- Every key filled in, whatever the stored table is missing. `persistent_table`'s own `defaults`
 --- seed the top-level `idle` key once and never look inside it again, so a `state.json` written
@@ -92,6 +136,7 @@ function idle.read(stored)
     local out = {
         enabled = stored.enabled == true,
         video_auto_inhibit = stored.video_auto_inhibit ~= false,
+        order = resolve_order(stored.order),
     }
     for _, name in ipairs({ "ac", "battery" }) do
         local fallback = DEFAULTS[name]
@@ -295,39 +340,54 @@ function idle.set_manual(on)
     idle.sync_inhibit()
 end
 
---- The stages that will actually run, soonest first, each with the window it owns: `from` is when
---- the stage before it fired and `at` is when this one does. `share` is that window as a fraction
---- of the whole flow, which is the width of one chamber of the panel's timeline.
+--- The stages that will actually run, in order, each with the window it owns: `from` is when the
+--- stage before it fired, `at` is when this one does, and `delay` is the number the matrix edits.
+--- A disabled stage contributes nothing, so turning the blank off moves the lock earlier by exactly
+--- the blank's own delay rather than leaving a hole where it used to be.
 --- @param settings table the result of [`idle.read`]
 --- @param profile string `"ac"` or `"battery"`
 --- @return { list: table[], total: integer }
 function idle.plan(settings, profile)
     local numbers = settings[profile]
     local list = {}
-    for _, stage in ipairs(idle.STAGES) do
-        local sec = numbers[stage.key .. "_sec"]
-        if numbers[stage.key .. "_on"] and sec > 0 then
-            list[#list + 1] = { key = stage.key, icon = stage.icon, title = stage.title, at = sec }
+    local from = 0
+    for _, key in ipairs(settings.order) do
+        local stage = idle.stage(key)
+        local delay = stage and numbers[key .. "_sec"] or 0
+        if stage and numbers[key .. "_on"] and delay > 0 then
+            list[#list + 1] = {
+                key = key,
+                icon = stage.icon,
+                title = stage.title,
+                from = from,
+                at = from + delay,
+                delay = delay,
+            }
+            from = from + delay
         end
     end
-    table.sort(list, function(left, right)
-        return left.at < right.at
-    end)
-    local total = #list > 0 and list[#list].at or 0
-    local from = 0
-    for index, entry in ipairs(list) do
-        entry.from = from
-        entry.share = total > 0 and (entry.at - from) / total or 0
-        entry.last = index == #list
-        from = entry.at
-    end
-    return { list = list, total = total }
+    return { list = list, total = from }
 end
 
---- The master switch, on its own, for the several places that only need that one bit.
-idle.enabled = store.idle:map(function(stored)
-    return idle.read(stored).enabled
-end)
+--- Moves one stage `step` places through the order and stores the result. Out of range is a no-op,
+--- which is what lets the modal wire the two chevrons unconditionally and hide rather than guard.
+--- @param key string
+--- @param step integer `-1` earlier, `1` later
+function idle.move(key, step)
+    local order = idle.read(store.idle:get()).order
+    local at
+    for index, name in ipairs(order) do
+        if name == key then
+            at = index
+        end
+    end
+    local to = at and at + step
+    if to == nil or to < 1 or to > #order then
+        return
+    end
+    order[at], order[to] = order[to], order[at]
+    idle.write(nil, "order", order)
+end
 
 --- The plan in force right now.
 idle.schedule = computed({ store.idle, idle.active_profile }, function(stored, profile)
