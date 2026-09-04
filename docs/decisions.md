@@ -5982,3 +5982,41 @@ resident). Neither is worth chasing without an allocation profiler, and this mac
 
 **Consequences**: `memory.rs` acts as well as reports now, which its module doc says. Every
 future memory claim in this tree quotes PSS.
+
+## 0128. The camera scan runs when a camera opens, not when PipeWire renames one
+
+Cloudflare's DNS-cache write-up (`blog.cloudflare.com/dns-cache-memory-optimization-1111`) is mostly
+about shrinking a struct that exists ten million times over, which is not a shape this tree has --
+its per-entry techniques (`Box<[T]>` over `Vec<T>`, one list with offsets over three, boxing the
+big enum variant) buy bytes per instance, and the instances here are counted in hundreds. What does
+transfer is the first thing they did: they wrapped the allocator and measured, rather than guessing.
+
+Done both ways here, on the Renderer:
+
+- **A `GlobalAlloc` shim keeping a live-bytes histogram by size class.** The Renderer's live Rust
+  allocation is **3.2-4.7 MiB**, against 16 MB of `[heap]` in `/proc`. The shell's own data is a
+  fifth of its heap; the rest belongs to Mesa, LLVM and fontconfig, which allocate through the same
+  `malloc` and answer to nobody here. That closes ADR-0127's open question, and it closes the
+  Cloudflare-style question with it: there is no struct in this process worth 64 bytes a copy.
+- **DHAT** (`valgrind --tool=dhat --trace-children=yes`), which needs `CPU_CAP` raised to survive
+  emulation -- a 5 ms budget on an emulator that runs 20x slow refuses every `computed`, and the
+  scene never applies. Worth knowing before the next person tries. Under it, evaluating the whole
+  dev config allocates 2.36 MB with an 843 KiB peak, and the Renderer never reaches a steady frame
+  in four minutes, so the GL side stays unprofiled by this route.
+
+**What DHAT found, in the Supervisor**: `privacy::video::find_device_openers` was **58% of
+everything the Supervisor allocates during a boot** -- 19.4 MiB of `opendir` buffers and 37,364
+`readlink` calls, a `fuser`-equivalent walk of every process's every fd. The walk itself is right;
+it is how you learn who holds `/dev/videoN` without a kernel interface for the question. What was
+wrong is when it ran: the camera task rescanned on *every* arm of its `select!`, including the
+PipeWire one, and a `Video/Source` node appearing says an app registered with PipeWire, not that
+the set of processes holding the device changed. PipeWire's snapshot is used for one thing --
+turning a pid into a name -- so it was spending an 11,000-syscall scan to relabel a string.
+
+Split into `scan_camera_pids` (inotify's arm, and startup) and `name_camera_users` (both arms,
+against the pid set that stands). Openers still come from inotify `OPEN`/`CLOSE` on the device
+node, which is the only event that can change them, so nothing is detected later than before.
+
+**Consequences**: the Supervisor's boot allocation drops by roughly the PipeWire-triggered scans,
+which on this machine is the pair that fire as PipeWire enumerates its existing globals at startup.
+Idle is unaffected -- it was never scanning at idle, and this ADR is not a claim that it was.

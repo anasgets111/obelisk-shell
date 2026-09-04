@@ -34,17 +34,32 @@ pub enum PrivacySignal {
     Changed,
 }
 
-/// Combines a set of kernel-detected `/dev/videoN` opener pids with the latest PipeWire
-/// `Video/Source` enrichment snapshot into the `camera_users` list: PipeWire's `app_name` wins
-/// when a pid matches a tracked video-source node, else `/proc/{pid}/comm`, else a `pid {n}`
-/// placeholder so a real opener is never silently dropped. Pure and unit-testable.
-fn resolve_camera_users(proc_root: &Path, devices: &[PathBuf], pipewire: &[VideoSourceApp]) -> Vec<CameraUser> {
+/// Every pid holding one of `devices` open, deduped across devices: the `/proc/*/fd/*` scan, and
+/// the expensive half of answering `camera_users`. On this machine one pass is ~370 `opendir`s and
+/// ~11,000 `readlink`s, about 6 MiB of allocation -- 58% of everything the Supervisor allocates
+/// during a boot, measured under DHAT. Which is fine for what it answers, and the reason
+/// [`name_camera_users`] is a separate function: only a device open or close can change this set,
+/// so only inotify's event runs it.
+fn scan_camera_pids(proc_root: &Path, devices: &[PathBuf]) -> Vec<u32> {
     let mut pids: Vec<u32> =
         devices.iter().flat_map(|device| find_device_openers(proc_root, &device.to_string_lossy())).collect();
     pids.sort_unstable();
     pids.dedup();
+    pids
+}
 
-    pids.into_iter()
+/// Names an already-scanned set of opener pids against the latest PipeWire `Video/Source`
+/// enrichment snapshot: PipeWire's `app_name` wins when a pid matches a tracked video-source node,
+/// else `/proc/{pid}/comm`, else a `pid {n}` placeholder so a real opener is never silently
+/// dropped. Pure and unit-testable.
+///
+/// Takes `pids` rather than finding them, because a PipeWire snapshot renames openers it never
+/// discovers: a `Video/Source` node appearing says a camera app registered with PipeWire, not that
+/// the set of processes holding `/dev/videoN` changed. Answering one with a fresh scan spent that
+/// scan for a string.
+fn name_camera_users(proc_root: &Path, pids: &[u32], pipewire: &[VideoSourceApp]) -> Vec<CameraUser> {
+    pids.iter()
+        .copied()
         .map(|pid| {
             let app_name = pipewire
                 .iter()
@@ -55,6 +70,13 @@ fn resolve_camera_users(proc_root: &Path, devices: &[PathBuf], pipewire: &[Video
             CameraUser { app_name }
         })
         .collect()
+}
+
+/// A scan and a naming in one call. Test-only since the two halves went their separate ways: the
+/// startup path calls them in sequence and keeps the pid set, which is the whole point.
+#[cfg(test)]
+fn resolve_camera_users(proc_root: &Path, devices: &[PathBuf], pipewire: &[VideoSourceApp]) -> Vec<CameraUser> {
+    name_camera_users(proc_root, &scan_camera_pids(proc_root, devices), pipewire)
 }
 
 pub struct PrivacyController {
@@ -130,7 +152,8 @@ async fn run_camera_task(
 
     // Initial scan: a camera can already be open at Supervisor startup, not just from an event
     // seen afterward.
-    state.lock().unwrap().camera_users = resolve_camera_users(&proc_root, &devices, &pipewire_sources);
+    let mut opener_pids = scan_camera_pids(&proc_root, &devices);
+    state.lock().unwrap().camera_users = name_camera_users(&proc_root, &opener_pids, &pipewire_sources);
     if events.send(PrivacySignal::Changed).is_err() {
         return;
     }
@@ -139,7 +162,9 @@ async fn run_camera_task(
         tokio::select! {
             event = inotify_stream.next() => {
                 match event {
-                    Some(Ok(_)) => {}
+                    // An open or a close on a watched device, the one thing that can change who
+                    // holds it: the only arm that pays for a scan.
+                    Some(Ok(_)) => opener_pids = scan_camera_pids(&proc_root, &devices),
                     Some(Err(err)) => {
                         eprintln!("privacy: inotify read failed: {err}");
                         continue;
@@ -149,12 +174,13 @@ async fn run_camera_task(
             }
             sources = video_sources.recv() => {
                 match sources {
+                    // Names, not openers: the pid set stands, and `name_camera_users` says why.
                     Some(sources) => pipewire_sources = sources,
                     None => break, // the mixer thread is gone -- no more enrichment updates coming.
                 }
             }
         }
-        state.lock().unwrap().camera_users = resolve_camera_users(&proc_root, &devices, &pipewire_sources);
+        state.lock().unwrap().camera_users = name_camera_users(&proc_root, &opener_pids, &pipewire_sources);
         if events.send(PrivacySignal::Changed).is_err() {
             break;
         }
@@ -173,6 +199,25 @@ mod tests {
     fn resolve_camera_users_is_empty_when_nobody_has_a_device_open() {
         let root = tempfile::tempdir().unwrap();
         assert!(resolve_camera_users(root.path(), &[PathBuf::from("/dev/video0")], &[]).is_empty());
+    }
+
+    /// The reason the scan and the naming are two functions: a PipeWire snapshot is answered
+    /// without one. The root here holds no `/dev/video0` symlink at all, so a scan of it finds
+    /// nobody -- and naming the pid set the last scan produced still answers correctly.
+    #[test]
+    fn a_pipewire_snapshot_names_the_openers_already_found_rather_than_scanning_again() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("1234")).unwrap();
+        std::fs::write(root.path().join("1234").join("comm"), "raw-binary-name\n").unwrap();
+
+        assert_eq!(
+            name_camera_users(root.path(), &[1234], &[video_source(1234, "Cheese")]),
+            vec![CameraUser { app_name: "Cheese".to_string() }]
+        );
+        assert!(
+            resolve_camera_users(root.path(), &[PathBuf::from("/dev/video0")], &[]).is_empty(),
+            "a scan of the same root finds nobody, so the answer above came from the pid set"
+        );
     }
 
     #[test]
