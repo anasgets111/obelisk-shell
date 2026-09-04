@@ -43,6 +43,10 @@ The data layer is not the problem. Paint and animation are.
    something is live -- so `wayland::run` keeps blocking in `poll` at rest and ADR-0124's idle cost
    survives the feature. It also records what their model cannot do that ours would have to: their
    declarative layer has no animation at all, because in this tree the config *is* that layer.
+   ADR-0131 measures the constraint that follows: one re-resolve costs 1.38ms median and 3.38ms
+   at p95, so an animation that re-resolves per frame spends a tenth of a core before it paints.
+   It must interpolate on the retained tree instead. `eglSwapInterval(0)` becomes required in the
+   same breath -- the default blocking swap stalls this single-threaded loop once frames contend.
    Quickshell's `Retainable` (refcounted `lock()`/`unlock()` plus a `dropped()` signal, so a config
    can say "not yet" while an exit transition runs) is the shape to copy on the day exit
    transitions exist.

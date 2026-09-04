@@ -6179,3 +6179,88 @@ their text stack, image codecs and D-Bus layer live in `.so` files outside that 
 links ten shared objects, none of them a text stack, an image codec or a D-Bus library, and carries
 all three inside its own 6.8 MB. Per-binary we are already smaller; the interesting comparison was
 never the file size.
+
+## 0131. What Noctalia has that is worth taking for memory, CPU and latency, measured
+
+**Status**: accepted
+
+**Context**: ADR-0130 read their render and animation layers and concluded "nothing changes in the
+tree today", which answered the animation question and not the one that prompted the comparison.
+This is the sweep for memory, CPU and latency technique specifically, with the numbers that decide
+each item. Measurements are on this machine, `dev-config`, one 1920x1200 output, release build
+unless stated.
+
+**The measurement that reframes the animation work**: a temporary probe around
+`RendererClient::re_resolve_if_dirty` puts one re-resolve at **median 1.38 ms, p95 3.38 ms, max
+5.48 ms** (n=62, release; the same probe in debug reads 5.12/16.70/21.25). At the 1 Hz `system.time`
+push that is 0.17% of a core, which is most of the 0.34% idle this tree quotes, and it is fine.
+
+At 60 Hz it is not: 1.74 ms mean x 60 is **10.4% of a core spent re-resolving before anything is
+painted**, and p95 alone is a fifth of a 16.7 ms frame budget -- measured with the wallpaper picker
+*closed*. `lua/signal.rs` says why: `computed`/`map` recompute fresh on every `:get()`, with no
+memoization and no dependency-invalidation graph, so any push re-runs every `computed` in the tree.
+
+So the rule for ADR-0130's animation work is now a measured one rather than a matter of taste:
+**an animation must interpolate on the retained tree and repaint, never by re-resolving per frame.**
+Noctalia gets this for free -- a setter writes a float into a node and nothing reconciles -- and
+this tree does not, because here the config *is* the declarative layer. Routing animation through
+re-resolved Lua properties would spend a tenth of a core before drawing a pixel. Memoizing
+`computed` is the alternative and a much larger change; it is not needed for animation if the
+retained-tree rule holds, and it is worth revisiting only if a push cadence ever rises on its own.
+
+**Taken, in the order they are worth doing**:
+
+1. **An env-gated idle profiler in the poll loop.** Their `app/main_loop.cpp` reports, on an
+   interval: loop iterations, CPU split process/thread/background, poll wakeups by cause
+   (fd/timeout/immediate), per-source wake and dispatch counts with total and max dispatch time,
+   and a spin detector that names a source which "keeps voting timeout=0". Every number this
+   session cost a day of ad-hoc probes, scratch scripts and a DHAT run, and they read theirs off a
+   log line. Ours has two fds and no self-measurement. This is the highest-value item here and the
+   cheapest, and a spin detector becomes load-bearing the moment a frame callback can re-arm
+   itself forever.
+2. **`eglSwapInterval(0)`, on the day animation lands and not before.** EGL defaults to 1, which
+   blocks `eglSwapBuffers` until the compositor releases the buffer; this Renderer is
+   single-threaded, so a blocking swap stalls Wayland dispatch, Supervisor frames and input
+   together. Probed today it costs nothing -- swaps measured 0.24, 0.30, 0.37, 0.44, 0.89 ms, five
+   of them in 25 s, because a shell that paints this rarely never contends for a buffer. At 60 Hz
+   it contends every frame. Their comment gives the same reasoning and pairs it with pacing from
+   `wl_surface.frame`, which is ADR-0130's item 3.
+3. **List virtualisation.** `ui/controls/virtual_grid_view.h` materialises a pool sized to the
+   visible rows plus overscan and recycles tiles through `bindTile` as the data or scroll offset
+   moves. `wallpaper_picker.lua` builds every row for every file in the folder, and each tile
+   carries a `computed` that the 1 Hz push re-runs. Their header notes the adapter was shaped so a
+   script-side "tile template" callback could drive it, which is the same API this tree would need.
+4. **Alpha out of the text cache key.** They pack rgb into the top 24 bits and force alpha to
+   `0xFF`, applying the caller's alpha at draw time through `u_opacity`, explicitly so an opacity
+   animation on one string reuses one raster instead of allocating a fresh one per frame. A
+   fade-out at 60 Hz with alpha in the key churns 60 rasters a second. Worth knowing before the
+   first fade exists rather than after.
+5. **A real LRU on the shape memo.** Theirs is doubly bounded (entry count *and* bytes) with one
+   sharp detail: never evict the LRU front, or a single entry larger than the whole budget walks
+   the list, evicts everything including itself, and returns a dangling pointer.
+   `ShapingHandle::shape` clears the map wholesale at `SHAPE_CACHE_CAPACITY`, which its own comment
+   already flags as the thing to replace if lists grow past 500 rows.
+
+**Rejected, each with the reason**:
+
+- **`mallopt(M_ARENA_MAX, 2)`** (they set it unconditionally in `main`): measured 330 KiB here.
+  Right knob, wrong thread count -- the Renderer runs 11 threads and they run far more.
+- **jemalloc with `background_thread:true,dirty_decay_ms:1000`**: the systematic form of ADR-0127's
+  single `malloc_trim`. A permanent background thread spends the idle CPU that is this tree's best
+  number against every peer, to solve a transient one line already solves.
+- **Redundant-GL-state elimination**: they cache only blend mode, not program or texture binding,
+  so there is no technique here to take.
+- **A whole-run text raster cache**: theirs exists because Pango/Cairo rasterises on the CPU and
+  uploads. femtovg keeps glyphs in a GPU atlas and a draw is quads, so the same cache would buy
+  much less and cost a texture per unique string, size and colour.
+
+**Where this tree is already ahead, so the sweep is not one-directional**: capabilities start
+lazily on first config read, where their tray and polkit are merely staggered behind 500 ms and
+1000 ms timers; the emoji font is mapped shared rather than read (49.7 MB to 22.7 MB private-dirty);
+the image cache is byte-budgeted with pinning where theirs is refcounted; and
+`pair_children_by_id_then_position` is a stricter reconcile than matching on `(type, key)`.
+
+**Consequences**: no code changes in this commit. Items 1 and 3 are independently useful now; items
+2 and 4 are prerequisites filed against ADR-0130's animation work, and item 5 is filed against the
+500-row ceiling `text/shaping.rs` already names. The re-resolve figures are the baseline any of it
+should be measured against.
