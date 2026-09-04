@@ -24,10 +24,15 @@
 -- that will actually run, soonest first, each filling over its own window. So a glance answers "how
 -- close is the screen to going dark", which is the question a settings form cannot answer.
 --
--- Chambers are equal width rather than proportional to their timeouts. Proportional is the honest
--- picture right up until DPMS is 30 seconds and the lock is 15 minutes, at which point the first
--- chamber is 3% of the card and its glyph does not fit in it. Every chamber prints its timeout, so
--- the proportions are there to read; they are just not drawn to scale.
+-- Chambers are equal width rather than proportional to their delays. Proportional is the honest
+-- picture right up until one stage is 30 seconds and the next is 15 minutes, at which point the
+-- first chamber is 3% of the card and its glyph does not fit in it. Every chamber prints its delay,
+-- so the proportions are there to read; they are just not drawn to scale.
+--
+-- A chamber prints the stage's own delay, the same number the matrix row edits, not the running
+-- total it works out to. The first pass printed the total and it read as a bug: the row said "1m"
+-- and the chamber beside it said "1m 30s" for the same stage. The total is not lost -- the masthead
+-- counts down to the next stage in real time, which is the more useful form of it anyway.
 --
 -- It is replaced, not dimmed, in the two states with no countdown to show -- something is holding
 -- the session awake, or nothing is scheduled. A progress bar that can never fill is worse than a
@@ -58,8 +63,8 @@ end)
 -- ## Header
 
 local subtitle = computed(
-    { store.idle, idle.active_profile, idle.elapsed, idle.reasons },
-    function(stored, profile, elapsed, reasons)
+    { store.idle, idle.active_profile, idle.elapsed, idle.reasons, idle.arming },
+    function(stored, profile, elapsed, reasons, arming)
         if #reasons > 0 then
             return "held awake · " .. table.concat(reasons, ", ")
         end
@@ -76,13 +81,16 @@ local subtitle = computed(
             local first = plan.list[1]
             return string.format("%s · %s after %s", where, first.title, idle.format(first.at))
         end
+        -- Counts down the armed stage's own delay, not a position in a running total: a stage's
+        -- clock starts when the stage before it finished, so those are different numbers and only
+        -- this one answers "how long have I got".
         for _, entry in ipairs(plan.list) do
-            if elapsed < entry.at then
+            if entry.key == arming.key then
                 return string.format(
                     "idle %s · %s in %s",
                     idle.clock(elapsed),
                     entry.title,
-                    idle.clock(entry.at - elapsed)
+                    idle.clock(math.max(0, entry.delay - arming.elapsed))
                 )
             end
         end
@@ -142,21 +150,44 @@ local counting_down = computed({ settings, plan_now, idle.inhibited }, function(
     return resolved.enabled and plan.total > 0 and not held
 end)
 
-local function chamber(entry)
-    -- The stage's own window, `entry.from` to `entry.at`, as a percentage: a signal resolves before
-    -- `width` is parsed (ADR-0044), which is what `components/meter.lua` is built on too.
-    local fill = idle.elapsed:map(function(elapsed)
-        local span = entry.at - entry.from
-        if span <= 0 then
-            return "0%"
+-- A chamber's own three states, off `idle.arming` alone: the armed stage fills over its delay,
+-- every stage before it in the plan has already run and reads full, and every stage after it is
+-- waiting its turn and reads empty. Reading it off the plan's running total instead is what the
+-- first version did, and it drew a stage as part-done when its clock had not started.
+local function chamber_progress(entry)
+    return computed({ idle.arming, plan_now }, function(arming, plan)
+        local position, armed_position
+        for index, item in ipairs(plan.list) do
+            if item.key == entry.key then
+                position = index
+            end
+            if item.key == arming.key then
+                armed_position = index
+            end
         end
-        local fraction = math.max(0, math.min(1, (elapsed - entry.from) / span))
+        if position == nil or armed_position == nil then
+            return 0
+        end
+        if position < armed_position then
+            return 1
+        end
+        if position > armed_position then
+            return 0
+        end
+        return math.max(0, math.min(1, arming.elapsed / math.max(1, entry.delay)))
+    end)
+end
+
+local function chamber(entry)
+    local progress = chamber_progress(entry)
+    -- A signal resolves before `width` is parsed (ADR-0044), which is what `components/meter.lua`
+    -- is built on too.
+    local fill = progress:map(function(fraction)
         return string.format("%d%%", math.floor(fraction * 100 + 0.5))
     end)
-    -- Lit once the seat has been idle long enough to be in this chamber's window; dim while it is
-    -- still somebody else's turn.
-    local ink = idle.elapsed:map(function(elapsed)
-        return elapsed >= entry.from and theme.FG or theme.TEXT_OFF
+    -- Lit once this stage's own clock is running or has run; dim while it is somebody else's turn.
+    local ink = progress:map(function(fraction)
+        return fraction > 0 and theme.FG or theme.TEXT_OFF
     end)
     return rect {
         width = "Fill",
@@ -171,7 +202,7 @@ local function chamber(entry)
                 spacing = theme.spacing.xs,
                 children = {
                     cell(entry.icon, ink, theme.icon.sm, { align_v = "Center" }),
-                    cell(idle.format(entry.at), ink, theme.font.xs, { align_v = "Center" }),
+                    cell(idle.format(entry.delay), ink, theme.font.xs, { align_v = "Center" }),
                 },
             },
         },

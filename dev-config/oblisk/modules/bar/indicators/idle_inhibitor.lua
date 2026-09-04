@@ -55,19 +55,20 @@ local idle_tooltip = tooltip({
             return "held awake by " .. table.concat(reasons, ", ")
         end), theme.FG, theme.font.sm),
         cell(
-            computed({ idle.schedule, idle.elapsed, idle.inhibited, idle.enabled }, function(plan, elapsed, held, on)
+            computed({ idle.schedule, idle.arming, idle.inhibited, idle.enabled }, function(plan, arming, held, on)
                 if not on or plan.total == 0 then
                     return "click to hold · right-click for settings"
                 end
                 if held then
                     return "click to drop the manual hold"
                 end
+                -- The armed stage's own countdown, the same number the modal's masthead draws.
                 for _, entry in ipairs(plan.list) do
-                    if elapsed < entry.at then
-                        return string.format("%s in %s", entry.title, idle.clock(entry.at - elapsed))
+                    if entry.key == arming.key then
+                        return string.format("%s in %s", entry.title, idle.clock(math.max(0, entry.delay - arming.elapsed)))
                     end
                 end
-                return "every stage has run"
+                return "nothing is counting down"
             end),
             theme.DIM,
             theme.font.xs

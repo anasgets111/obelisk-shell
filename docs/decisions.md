@@ -6795,19 +6795,31 @@ them structurally rather than literally.
    and lock at five. With one registration the timeouts are plain Lua numbers a panel can edit, and
    the ordering between stages is the numbers instead of a condition lattice. It costs a one-second
    clock the bar's own readouts already run on.
-2. **The stages are an ordered list of relative delays.** `lockAfterDpms` offers two orders of two
-   stages; `order` is every order of all of them, moved with a chevron per row. A stage's seconds
-   are counted from when the stage above it fired, not from when the seat went idle, which is both
-   how anyone describes this out loud and the arrangement that survives editing: with absolute
-   times, lowering the blank timeout silently shortens the gap before the lock, because both were
-   measured from the same zero. The first pass shipped absolute times with the order implied by
-   them, and it was wrong on both counts.
-   `order` is one list shared by both profiles, not one each: which stage precedes which is a
-   policy and does not change because a cable came out, and the delays are what change. It is
-   validated on read -- unknown names dropped, missing stages appended -- so a hand-edited
-   `state.json` cannot leave a stage that never runs.
-   The modal shows both readings and needs to: the matrix edits the delays, the timeline prints the
-   running total, which is the wall-clock answer to "when does my screen lock".
+2. **A stage is armed by the one before it finishing, and its delay runs from there.** Two wrong
+   models shipped before this one, both of them a single clock with absolute times. The first
+   implied the order from the numbers; the second added an explicit `order` and relative delays but
+   still measured them off one running total. Both had the same fatal property: nothing could undo
+   a stage that had already fired, so locking at 30 seconds and then *unlocking* left the screen due
+   to blank a minute later regardless -- reported live as "I unlocked and it's continuing to count
+   toward dpms".
+   `IdleService.qml` does not have this failure mode, and reading it again is what found the fix.
+   Its stages are `IdleMonitor`s whose `enabled` is a gate on the stage before them (`_lockDone` is
+   `!lockActionEnabled || LockService.locked`), and a monitor's timer starts when `enabled` flips
+   true. So the chain is relative *and* it unwinds: unlocking makes `_lockDone` false, the pending
+   DPMS monitor is torn down, and the sequence starts over. Nothing handles the unlock; it falls out
+   of the gates.
+   So a stage carries a `done` predicate -- the lock's is `oblisk.lock.active`, DPMS's is whether
+   this module blanked the displays -- and `idle.armed` is `enabled` generalised to any `order`: the
+   first stage whose predecessors have all reported done. The clock handler stamps the moment a
+   stage arms, fires it its own delay after that stamp, and clears the stamp of every stage that is
+   not the armed one, which is what tears a timer down. A stage with no `done` is terminal and never
+   satisfies a successor, which is the safe default for any stage added later.
+   `order` is one list shared by both profiles, not one each: which stage precedes which is a policy
+   and does not change because a cable came out, and the delays are what change. It is validated on
+   read -- unknown names dropped, missing stages appended -- so a hand-edited `state.json` cannot
+   leave a stage that never runs.
+   `ACTIONS.lock` needs no "already locked?" guard as a result: `idle.armed` cannot hand back a
+   stage whose own `done` is true.
 3. **No `armed` guard anywhere in the config.** ADR-0139's gate means a held inhibitor -- ours, or
    `systemd-inhibit`'s -- stops the events and hands back a `Resumed`, so `idle.since` goes to zero
    on the way in and the clock handler returns on its first line. The manual toggle is an inhibitor,
@@ -6825,8 +6837,12 @@ them structurally rather than literally.
    are, at `Theme.idleModalWidth`'s own 820px, and the bar circle's right click opens it exactly as
    `IdleInhibitor.qml` opens its `OModal`.
 6. **The flow gets a timeline.** `FlowSummary` is a static line saying what you configured; this is
-   the same flow as a track that moves, one chamber per stage that will run, each filling over its
-   own window. Chambers are equal width rather than proportional: proportional is honest until DPMS
+   the same flow as a track that moves, one chamber per stage that will run. A chamber fills over
+   its own delay once that stage is the armed one, reads full once it has run, and empty while it is
+   somebody else's turn -- off `idle.arming` alone, never off a position in a running total, which
+   is what drew a stage as part-done before its clock had started. It prints its own delay, the same
+   number the matrix row edits, because printing the running total instead read as a bug: the row
+   said "1m" and the chamber beside it said "1m 30s" for the same stage. Chambers are equal width rather than proportional: proportional is honest until DPMS
    is 30 seconds against a 15-minute lock, at which point the first chamber is 3% of the card and
    its glyph does not fit. Every chamber prints its timeout, so the proportions are readable without
    being drawn to scale.

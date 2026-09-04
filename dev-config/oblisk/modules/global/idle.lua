@@ -49,14 +49,9 @@ local ACTIONS = {
     dpms = function()
         set_displays_powered(false)
     end,
-    -- Guarded, unlike the other two: `lock:invoke("lock")` on an already-locked session is a
-    -- second `ext_session_lock_v1` request, and the stage after this one can fire while the lock
-    -- is up. The other two actions are their own guard -- a suspended machine is not idle.
+    -- No "already locked?" guard, because `idle.armed` cannot hand this stage back while the lock
+    -- is up: that is the stage's own `done` predicate, and one answer to a question beats two.
     lock = function()
-        local l = oblisk.lock:get()
-        if l ~= nil and l.active then
-            return
-        end
         oblisk.lock:invoke("lock")
     end,
     suspend = function()
@@ -72,19 +67,27 @@ oblisk.idle:register_threshold(idle.TICK, function()
     -- Back-dated by the threshold itself, so "idle 0:42" means forty-two seconds since the last
     -- keystroke rather than since the notification about it.
     idle.since:set(((s and s.time) or 0) - idle.TICK)
-    idle.fired:set({})
 end, function()
     -- Any input at all, whatever else is true. The mirror's own wake monitor is
     -- `respectInhibitors: false` for exactly this: a screen that stays dark because something took
     -- an inhibitor while it was off is a machine that looks broken.
     set_displays_powered(true)
     idle.since:set(0)
-    idle.fired:set({})
+    idle.armed_at:set({})
 end)
 
--- One tick, one pass over the stages. `oblisk.system` pushes once a second whatever else is
--- happening -- the bar clock and `power_menu.lua`'s countdown both ride it -- so this costs a
--- comparison per second while idle and an early return the rest of the time.
+-- One tick, one pass. `oblisk.system` pushes once a second whatever else is happening -- the bar
+-- clock and `power_menu.lua`'s countdown both ride it -- so this costs a comparison per second
+-- while idle and an early return the rest of the time.
+--
+-- The shape is `IdleService.qml`'s, not a scheduler: work out which stage is armed *now*, stamp it
+-- the first time it arms, and fire it its own delay after that stamp. Every stage that is not the
+-- armed one has its stamp cleared, which is `IdleMonitor { enabled: false }` tearing a timer down.
+--
+-- That clearing is the whole reason the file is written this way. Unlocking makes the lock stage
+-- undone, so it becomes the armed stage again and the stage behind it loses its stamp: the screen
+-- stops being due to blank a minute after a lock the user has already answered. Nothing here
+-- watches for an unlock; it falls out of asking the question every second instead of latching it.
 oblisk.system:on_change(function(s)
     local since = idle.since:get()
     if since == 0 then
@@ -95,19 +98,22 @@ oblisk.system:on_change(function(s)
         return
     end
     local plan = idle.plan(settings, idle.profile_of(oblisk.power:get()))
-    local elapsed = s.time - since
-    local fired = idle.fired:get() or {}
-    for _, entry in ipairs(plan.list) do
-        if elapsed >= entry.at and not fired[entry.key] then
-            local next_fired = {}
-            for key, done in pairs(fired) do
-                next_fired[key] = done
-            end
-            next_fired[entry.key] = true
-            fired = next_fired
-            idle.fired:set(fired)
-            ACTIONS[entry.key]()
-        end
+    local armed = idle.armed(plan)
+
+    -- Rebuilt rather than mutated, `lib/ui_state.lua`'s rule: `set` compares a table by identity,
+    -- so a fresh one is both what makes the write land and what keeps the value under an unfinished
+    -- resolve from being mutated. One key at most survives, so this stays a two-entry table.
+    local stamps = idle.armed_at:get() or {}
+    local next_stamps = {}
+    if armed then
+        -- The stamp is the later of "when this armed" and "when the seat went idle": a stage armed
+        -- while the user was active must not count the time they were using the machine.
+        next_stamps[armed.key] = stamps[armed.key] or math.max(s.time, since)
+    end
+    idle.armed_at:set(next_stamps)
+
+    if armed and s.time - next_stamps[armed.key] >= armed.delay then
+        ACTIONS[armed.key]()
     end
 end)
 

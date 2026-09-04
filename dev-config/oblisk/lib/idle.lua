@@ -17,16 +17,25 @@
 -- panel can edit, and the stages are a list this file walks rather than a lattice of `enabled`
 -- conditions each waiting on the others.
 --
--- ## The stages are an ordered list of delays
+-- ## A stage is armed by the one before it finishing, not by a running total
 --
--- `order` is the sequence and a stage's seconds are counted from when the stage above it fired, not
--- from when the seat went idle. That is the mirror's `lockAfterDpms` generalised: it offers two
--- orders of two stages, this offers every order of all of them, and it drops the absolute times
--- that made the two settings interfere -- lowering the blank timeout used to silently shorten the
--- gap before the lock, because both were measured from the same zero.
+-- `IdleService.qml` is three `IdleMonitor`s whose `enabled` is a gate on the stage before them --
+-- `_lockDone` is `!lockActionEnabled || LockService.locked`, and the DPMS stage names it. A
+-- monitor's timer starts when `enabled` flips true, so the chain is a sequence of relative delays
+-- and, more importantly, it *unwinds*: unlocking makes `_lockDone` false again, the pending DPMS
+-- monitor is torn down, and the whole sequence starts over. That is the behaviour, and it falls out
+-- of the gates rather than being handled anywhere.
 --
--- The modal shows both readings, and needs to: the matrix edits the delays, and the timeline prints
--- the running total, which is the wall-clock answer to "when does my screen lock".
+-- So a stage here carries a `done` predicate, and `idle.eligible` is the same condition
+-- generalised to any `order`: a stage is armed once every enabled stage before it reports done.
+-- `modules/global/idle.lua` stamps the moment a stage arms and fires it that stage's own delay
+-- later, which is what makes the delays relative, and clears the stamp the moment it stops being
+-- armed, which is what makes an unlock undo the rest of the sequence.
+--
+-- Counting from one zero was the first two attempts and was wrong twice over: the two timeouts
+-- interfered (lowering the blank silently shortened the gap before the lock), and nothing could
+-- undo a stage that had already fired, so unlocking left the screen due to blank a minute later
+-- whatever you did next.
 --
 -- What it costs: stages fire on a one-second clock that the bar's own readouts already run on, so
 -- the resolution is a second and the cost is nothing new. `oblisk.system` pushing is load-bearing;
@@ -65,6 +74,10 @@ idle.STAGES = {
         detail = "until input comes back",
         icon = icons.display,
         options = { 30, 60, 120, 300, 600, 900 },
+        -- `_dpmsDone`. The stage after this one waits for it.
+        done = function()
+            return idle.blanked:get()
+        end,
     },
     {
         key = "lock",
@@ -72,6 +85,12 @@ idle.STAGES = {
         detail = "needs your password to come back",
         icon = icons.lock,
         options = { 30, 60, 120, 300, 600, 900, 1800 },
+        -- `_lockDone`, and the reason this whole mechanism is predicates rather than a running
+        -- total: unlocking makes this false again, which disarms every stage waiting behind it.
+        done = function()
+            local l = oblisk.lock:get()
+            return l ~= nil and l.active
+        end,
     },
     {
         key = "suspend",
@@ -79,6 +98,8 @@ idle.STAGES = {
         detail = "sleeps the machine",
         icon = icons.sleep,
         options = { 300, 600, 900, 1800, 3600, 7200 },
+        -- Terminal: nothing waits behind it, and a suspended machine is not idle. A stage with no
+        -- `done` never satisfies a successor, which is the safe answer for any stage added later.
     },
 }
 
@@ -238,8 +259,10 @@ end
 --- The `oblisk.system.time` the seat went idle, or `0` while it is awake.
 idle.since = state("idle_since", 0)
 
---- Which stages have already run this idle period, keyed by `stage.key`.
-idle.fired = state("idle_fired", {})
+--- When each stage armed, in `oblisk.system.time`, keyed by `stage.key`. A stage absent from this
+--- is not armed, which is `IdleMonitor { enabled: false }`: no timer is running for it. The stamp
+--- is what makes a delay relative, and clearing it is what makes an unlock undo the sequence.
+idle.armed_at = state("idle_armed_at", {})
 
 --- Whether the displays are off because `modules/global/idle.lua` turned them off.
 idle.blanked = state("idle_blanked", false)
@@ -340,10 +363,9 @@ function idle.set_manual(on)
     idle.sync_inhibit()
 end
 
---- The stages that will actually run, in order, each with the window it owns: `from` is when the
---- stage before it fired, `at` is when this one does, and `delay` is the number the matrix edits.
---- A disabled stage contributes nothing, so turning the blank off moves the lock earlier by exactly
---- the blank's own delay rather than leaving a hole where it used to be.
+--- The stages that will run, in order, with the delay each one waits once it is armed. `from` and
+--- `at` are the running total the delays add up to, for anything that wants to say "and then, and
+--- then"; nothing fires on them, because a stage's clock starts when it arms and not before.
 --- @param settings table the result of [`idle.read`]
 --- @param profile string `"ac"` or `"battery"`
 --- @return { list: table[], total: integer }
@@ -369,6 +391,29 @@ function idle.plan(settings, profile)
     return { list = list, total = from }
 end
 
+--- Which stage of `plan` is armed right now, or `nil` when none is.
+---
+--- `IdleStage`'s `enabled` generalised to any order: the first stage whose predecessors have all
+--- reported [`done`](idle.STAGES), skipping any that has already reported done itself. A stage with
+--- no `done` never satisfies a successor, so a terminal stage ends the chain rather than letting
+--- whatever follows it fire immediately.
+---
+--- Called every tick rather than latched, which is the point: `oblisk.lock`'s `active` going false
+--- makes the lock stage undone, and the stage behind it stops being the armed one on the very next
+--- tick. Nothing has to notice the unlock.
+--- @param plan table the result of [`idle.plan`]
+--- @return table? one entry of `plan.list`
+function idle.armed(plan)
+    for _, entry in ipairs(plan.list) do
+        local stage = idle.stage(entry.key)
+        local done = stage and stage.done ~= nil and stage.done() == true
+        if not done then
+            return entry
+        end
+    end
+    return nil
+end
+
 --- Moves one stage `step` places through the order and stores the result. Out of range is a no-op,
 --- which is what lets the modal wire the two chevrons unconditionally and hide rather than guard.
 --- @param key string
@@ -392,6 +437,15 @@ end
 --- The plan in force right now.
 idle.schedule = computed({ store.idle, idle.active_profile }, function(stored, profile)
     return idle.plan(idle.read(stored), profile)
+end)
+
+--- Which stage is armed and how long it has been, straight off the stamp
+--- `modules/global/idle.lua` writes. `key` is `""` and `elapsed` `0` when none is.
+idle.arming = computed({ oblisk.system, idle.armed_at }, function(s, stamps)
+    for key, at in pairs(stamps or {}) do
+        return { key = key, elapsed = math.max(0, ((s and s.time) or 0) - at) }
+    end
+    return { key = "", elapsed = 0 }
 end)
 
 --- How long the seat has been idle, in seconds, or `0` while it is not.
