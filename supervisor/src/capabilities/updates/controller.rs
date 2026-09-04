@@ -1,7 +1,6 @@
 //! [`UpdatesController`]: the `oblisk.updates` write-action dispatcher and state owner
 //! (ADR-0034). Split from `updates` -- see `updates/mod.rs` for the module-level doc.
 
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -9,16 +8,20 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::watch;
 
-use super::check::{UpdateCandidate, check_for_updates};
-use super::install::{needs_reboot, parse_install_step};
-use super::pacman_conf::resolve_repo_servers;
+use super::backend::{Backend, UpdateCandidate};
 use crate::process;
 
 /// `oblisk.updates`'s combined payload. `check_error`/`install_error` are `None` when
 /// nothing's gone wrong, not a fabricated empty string. `install_total_steps == 0` while
-/// `installing` is true means the transaction size isn't known yet (pacman hasn't printed it).
+/// `installing` is true means the transaction size isn't known yet (the package manager hasn't
+/// printed it).
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct UpdatesState {
+    /// Which package manager answered, or `nil` when this machine has none this Supervisor
+    /// speaks -- the one field a config can read before anything has been checked, and the one
+    /// that tells an indicator whether it has any business being on the bar at all (ADR-0134).
+    /// The name of the command: `"pacman"`.
+    pub package_manager: Option<String>,
     /// How many packages have a newer version in the synced repos. Always equal to
     /// `#packages`, and carried separately so a badge does not have to walk the list.
     pub count: u32,
@@ -29,8 +32,8 @@ pub struct UpdatesState {
     /// Unix seconds at the end of the last check that completed without error, or `nil` if none has
     /// since this session started. A failed check leaves it on the older, still-true value.
     pub last_successful_check: Option<i64>,
-    /// Why the last check failed, or `nil` when the last one worked. A check runs against a
-    /// throwaway copy of the pacman database, so this is a network or parse failure, never a
+    /// Why the last check failed, or `nil` when the last one worked. A check never modifies the
+    /// system (`Backend::check` promises that much), so this is a network or parse failure, never a
     /// half-applied change to the system.
     pub check_error: Option<String>,
     /// A check is running right now. Rises before the sync starts and falls when the result is
@@ -43,20 +46,21 @@ pub struct UpdatesState {
     /// An install is running. The `install_*` fields above only describe a run that has started;
     /// `updates:install` refuses a second one while this is true.
     pub installing: bool,
-    /// Which package of the transaction pacman is on, its own 1-based `(2/5)` counter.
-    /// `0` before the first line is parsed.
+    /// Which package of the transaction the package manager is on, its own 1-based `(2/5)`
+    /// counter. `0` before the first line is parsed.
     pub install_current_step: u32,
     /// How many packages the transaction has. `0` while [`UpdatesState::installing`] is true means
-    /// pacman has not printed a step line yet, so a progress bar has no denominator: show it
-    /// as indeterminate rather than dividing.
+    /// the package manager has not printed a step line yet, so a progress bar has no denominator:
+    /// show it as indeterminate rather than dividing.
     pub install_total_steps: u32,
-    /// The package name from the step line pacman is on. Empty string before the first one, not
-    /// `nil`, because a name is always a string once the transaction is under way.
+    /// The package name from the step line the package manager is on. Empty string before the
+    /// first one, not `nil`, because a name is always a string once the transaction is under way.
     pub install_current_package: String,
-    /// What `pacman` itself answered on the last install: `0` for success, its own code for a
-    /// failure, `nil` if none has finished this session. The code and [`UpdatesState::install_log`]
-    /// are the two facts about a failure; what to *call* it -- a network error, a disk-space error,
-    /// a signature error -- is wording, and wording belongs in the config (ADR-0113 amendment).
+    /// What the package manager itself answered on the last install: `0` for success, its own code
+    /// for a failure, `nil` if none has finished this session. The code and
+    /// [`UpdatesState::install_log`] are the two facts about a failure; what to *call* it -- a
+    /// network error, a disk-space error, a signature error -- is wording, and wording belongs in
+    /// the config (ADR-0113 amendment).
     pub install_exit_code: Option<i32>,
     /// Unix seconds when the last install stopped, however it stopped. With an install's start held
     /// by whatever asked for it, this is what a duration is measured against.
@@ -66,12 +70,13 @@ pub struct UpdatesState {
     /// the last 200: a long upgrade writes thousands of lines and this is a payload pushed over a
     /// socket, not a file. Cleared when an install starts.
     pub install_log: Vec<String>,
-    /// Why the Supervisor never got an answer from `pacman` at all -- it could not spawn `pkexec`,
-    /// or could not wait on it. Distinct from [`UpdatesState::install_exit_code`], which is the
-    /// answer: this one means the question was never asked, and it is the Supervisor's own failure
-    /// rather than the package manager's.
+    /// Why the Supervisor never got an answer from the package manager at all -- it could not spawn
+    /// the install command, or could not wait on it. Distinct from
+    /// [`UpdatesState::install_exit_code`], which is the answer: this one means the question was
+    /// never asked, and it is the Supervisor's own failure rather than the package manager's.
     pub install_error: Option<String>,
-    /// A `linux` or `linux-*` package was installed at some point this session. Sticky on purpose:
+    /// A kernel package was installed at some point this session, per `Backend::needs_reboot`.
+    /// Sticky on purpose:
     /// once set it stays set through later installs that do not touch the kernel, because the
     /// running kernel is still the old one until the machine restarts.
     pub reboot_required: bool,
@@ -125,6 +130,9 @@ fn poll_mode(interval: Duration) -> PollMode {
 /// `updates:install()`'s dispatch arm needs.
 #[derive(Clone)]
 pub struct UpdatesController {
+    /// The package manager this machine has. `None` is a real, supported state: every action
+    /// below then does nothing but say so, rather than failing a check to report it.
+    backend: Option<Arc<dyn Backend>>,
     state: Arc<Mutex<UpdatesState>>,
     interval_tx: watch::Sender<Duration>,
     /// `updates:check`'s nudge to the scheduler. Capacity one and `try_send`, so a burst of
@@ -134,22 +142,33 @@ pub struct UpdatesController {
 }
 
 impl UpdatesController {
-    /// `pacman_conf_path`/`pacman_db_root` (real defaults `/etc/pacman.conf`/`/var/lib/pacman`)
-    /// are injected, not hardcoded. Starts dormant (`Duration::ZERO`) -- nothing checks for
-    /// updates until Lua calls `updates:configure` at least once.
-    pub fn new(pacman_conf_path: PathBuf, pacman_db_root: PathBuf, events: UnboundedSender<UpdatesSignal>) -> Self {
-        let state = Arc::new(Mutex::new(UpdatesState::default()));
+    /// Detects this machine's package manager (`backend::detect`) and starts the scheduler
+    /// around it. Starts dormant (`Duration::ZERO`) -- nothing checks for updates until Lua calls
+    /// `updates:configure` at least once.
+    ///
+    /// Pushes once, immediately, which no other capability's constructor does: `package_manager`
+    /// is the answer to "should this indicator exist", and on a machine with no manager at all
+    /// there is no later event to carry it -- the scheduler would sit dormant forever and a config
+    /// would never learn why. On this machine it is also the first hour's difference between an
+    /// indicator that appears at login and one that appears whenever the first check lands.
+    pub fn new(events: UnboundedSender<UpdatesSignal>) -> Self {
+        Self::with_backend(super::backend::detect().map(Arc::from), events)
+    }
+
+    /// [`UpdatesController::new`] against a backend chosen by the caller rather than detected,
+    /// which is how the tests drive the scheduler without a real package manager underneath it.
+    fn with_backend(backend: Option<Arc<dyn Backend>>, events: UnboundedSender<UpdatesSignal>) -> Self {
+        let state = Arc::new(Mutex::new(UpdatesState {
+            package_manager: backend.as_ref().map(|backend| backend.name().to_string()),
+            ..UpdatesState::default()
+        }));
         let (interval_tx, interval_rx) = watch::channel(Duration::ZERO);
         let (check_now_tx, check_now_rx) = tokio::sync::mpsc::channel(1);
-        tokio::spawn(run_check_task(
-            pacman_conf_path,
-            pacman_db_root,
-            interval_rx,
-            check_now_rx,
-            Arc::clone(&state),
-            events.clone(),
-        ));
-        Self { state, interval_tx, check_now_tx, events }
+        if let Some(backend) = backend.clone() {
+            tokio::spawn(run_check_task(backend, interval_rx, check_now_rx, Arc::clone(&state), events.clone()));
+        }
+        let _ = events.send(UpdatesSignal::Changed);
+        Self { backend, state, interval_tx, check_now_tx, events }
     }
 
     /// Sets the schedule, and optionally seeds the last-check time the config remembered across a
@@ -161,6 +180,9 @@ impl UpdatesController {
     /// read `last_successful_check` back as `nil` for the next hour would be told its own answer is
     /// unknown.
     pub fn configure(&self, configure: UpdatesConfigure) {
+        if self.backend.is_none() {
+            return;
+        }
         if let Some(checked_at) = configure.checked_at {
             let mut guard = self.state.lock().unwrap();
             if guard.last_successful_check.is_none() {
@@ -181,6 +203,10 @@ impl UpdatesController {
     /// second transaction: the answer in flight is the answer being asked for, and a click during a
     /// sync should not queue a second sync behind it.
     pub fn check_now(&self) {
+        if self.backend.is_none() {
+            eprintln!("updates: check() called on a machine with no package manager this Supervisor speaks; ignored");
+            return;
+        }
         if self.state.lock().unwrap().checking {
             eprintln!("updates: check() called while a check is already running; ignored");
             return;
@@ -192,12 +218,17 @@ impl UpdatesController {
         }
     }
 
-    /// `updates:install()`. A no-op (logged) if an install is already running -- pacman doesn't
-    /// support two concurrent transactions against the same db lock. The check-and-set is one
-    /// atomic critical section under a single lock acquisition: two `install()` calls dispatched
-    /// close together could otherwise both observe `installing == false` and both launch
-    /// `pkexec pacman -Syu` concurrently against the same db.
+    /// `updates:install()`. A no-op (logged) if an install is already running, or if this machine
+    /// has no package manager at all -- no manager worth the name supports two concurrent
+    /// transactions against the same database lock. The check-and-set is one atomic critical section
+    /// under a single lock acquisition: two `install()` calls dispatched close together could
+    /// otherwise both observe `installing == false` and both launch a real upgrade against the same
+    /// database.
     pub async fn install(&self) {
+        let Some(backend) = self.backend.clone() else {
+            eprintln!("updates: install() called on a machine with no package manager this Supervisor speaks; ignored");
+            return;
+        };
         {
             let mut guard = self.state.lock().unwrap();
             if guard.installing {
@@ -215,7 +246,7 @@ impl UpdatesController {
             guard.install_log.clear();
         }
         let _ = self.events.send(UpdatesSignal::Changed);
-        run_install(Arc::clone(&self.state), self.events.clone()).await;
+        run_install(backend, Arc::clone(&self.state), self.events.clone()).await;
     }
 
     pub fn snapshot(&self) -> UpdatesState {
@@ -223,57 +254,12 @@ impl UpdatesController {
     }
 }
 
-/// Points a fresh `tempfile::tempdir()` at `pacman_db_root`'s `local/` with one symlink, then
-/// syncs and checks against that throwaway db root, never the real `pacman_db_root` (ADR-0034,
-/// amended ADR-0113). Only `sync/` is written, and it is written inside the temp dir.
-///
-/// A symlink and not a copy, which is what `checkupdates` itself does (`ln -s "${DBPath}/local"
-/// "$CHECKUPDATES_DB"`): `local/` is the installed-package metadata, which `syncdbs_mut().update()`
-/// only reads. The copy this replaces walked ~1,500 package directories off disk on every single
-/// check, and ADR-0034's own note says where it came from -- the throwaway prototype that proved
-/// the sync needs no `fakeroot` copied the whole tree, and the copy came along with the answer.
-///
-/// Known limitation, now sharper than it was: with a copy, a check ran against a snapshot; with a
-/// symlink it reads the live directory, so a concurrent real install can be observed mid-write. The
-/// window is the same one `checkupdates` lives with, the result is a spurious transient
-/// `check_error`, and it self-heals on the next scheduled check.
-fn check_against_a_throwaway_copy(
-    pacman_conf_path: &Path,
-    pacman_db_root: &Path,
-) -> Result<Vec<UpdateCandidate>, String> {
-    let throwaway = tempfile::tempdir().map_err(|err| format!("failed to create a throwaway temp dir: {err}"))?;
-    link_local_db(pacman_db_root, throwaway.path())?;
-
-    let repos = resolve_repo_servers(pacman_conf_path);
-    if repos.is_empty() {
-        return Err(format!("no repos resolved from {}", pacman_conf_path.display()));
-    }
-
-    check_for_updates(Path::new("/"), throwaway.path(), &repos).map_err(|err| err.to_string())
-}
-
-/// Links `pacman_db_root/local` in as `throwaway/local`, the one name `alpm` looks for when it
-/// reads installed packages out of a db root. Split out from
-/// [`check_against_a_throwaway_copy`] only so the name and the read-through are testable without
-/// a mirror: everything else that function does needs the network.
-fn link_local_db(pacman_db_root: &Path, throwaway: &Path) -> Result<(), String> {
-    let local_src = pacman_db_root.join("local");
-    // Checked, because `symlink` will happily point at nothing and a dangling `local/` is not an
-    // error to `alpm` -- it is an empty installed set, which reads as "every package on the
-    // mirror is an update". The copy this replaces failed loudly on a missing source; so does this.
-    if !local_src.is_dir() {
-        return Err(format!("{} is not a directory; cannot check updates against it", local_src.display()));
-    }
-    std::os::unix::fs::symlink(&local_src, throwaway.join("local"))
-        .map_err(|err| format!("failed to link {} into a throwaway dir: {err}", local_src.display()))
-}
-
-/// Runs until every `UpdatesController` (and its `Clone`s) drops. `alpm`'s types aren't
-/// `Send` and the sync is genuinely blocking network I/O, so each check runs inside
-/// `tokio::task::spawn_blocking`, never awaited inline.
+/// Runs until every `UpdatesController` (and its `Clone`s) drops. Spawned only when a backend was
+/// detected -- on a machine with no package manager there is no schedule to keep. Every check runs
+/// inside `tokio::task::spawn_blocking`, never awaited inline: `Backend::check` is blocking network
+/// I/O by contract, and `pacman`'s `alpm` types are not even `Send`.
 async fn run_check_task(
-    pacman_conf_path: PathBuf,
-    pacman_db_root: PathBuf,
+    backend: Arc<dyn Backend>,
     mut interval_rx: watch::Receiver<Duration>,
     mut check_now_rx: tokio::sync::mpsc::Receiver<()>,
     state: Arc<Mutex<UpdatesState>>,
@@ -295,7 +281,7 @@ async fn run_check_task(
                         if asked.is_none() {
                             return;
                         }
-                        run_one_check(&pacman_conf_path, &pacman_db_root, &state, &events).await;
+                        run_one_check(&backend, &state, &events).await;
                     }
                 }
             }
@@ -318,13 +304,13 @@ async fn run_check_task(
                 loop {
                     tokio::select! {
                         _ = ticker.tick() => {
-                            run_one_check(&pacman_conf_path, &pacman_db_root, &state, &events).await;
+                            run_one_check(&backend, &state, &events).await;
                         }
                         asked = check_now_rx.recv() => {
                             if asked.is_none() {
                                 return;
                             }
-                            run_one_check(&pacman_conf_path, &pacman_db_root, &state, &events).await;
+                            run_one_check(&backend, &state, &events).await;
                         }
                         changed = interval_rx.changed() => {
                             if changed.is_err() {
@@ -347,26 +333,15 @@ async fn run_check_task(
 /// A failed check leaves `count`/`packages` on the last good answer (§ 2.14) and only writes
 /// `check_error`, so a mirror hiccup does not blank a list the user is reading.
 async fn run_one_check(
-    pacman_conf_path: &Path,
-    pacman_db_root: &Path,
+    backend: &Arc<dyn Backend>,
     state: &Arc<Mutex<UpdatesState>>,
     events: &UnboundedSender<UpdatesSignal>,
 ) {
     state.lock().unwrap().checking = true;
     let _ = events.send(UpdatesSignal::Changed);
 
-    let conf_path = pacman_conf_path.to_path_buf();
-    let db_root = pacman_db_root.to_path_buf();
-    let result = tokio::task::spawn_blocking(move || {
-        let candidates = check_against_a_throwaway_copy(&conf_path, &db_root);
-        // On this thread, after the `alpm` handle is dropped and before its arena is left alone
-        // for the rest of the session: `libalpm`'s parse of the sync database is the largest
-        // allocation the Supervisor makes, and none of it is live by here
-        // (`memory::return_free_pages_to_the_kernel` carries the measurement).
-        crate::memory::return_free_pages_to_the_kernel();
-        candidates
-    })
-    .await;
+    let backend = Arc::clone(backend);
+    let result = tokio::task::spawn_blocking(move || backend.check()).await;
 
     let mut guard = state.lock().unwrap();
     guard.checking = false;
@@ -404,47 +379,49 @@ fn now_unix() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-/// The real, system-modifying install: `pkexec pacman -Syu --noconfirm` against the real
-/// `/etc/pacman.conf`/`/var/lib/pacman` as root, no throwaway copy. Streams stdout line by
-/// line, parsing progress via [`parse_install_step`] and writing it into `state` as it goes --
-/// Lua never sees raw subprocess output (ADR-0034). Assumes `state.installing` and its
-/// progress fields are already set by [`UpdatesController::install`]'s atomic check-and-set.
-async fn run_install(state: Arc<Mutex<UpdatesState>>, events: UnboundedSender<UpdatesSignal>) {
-    let child = match process::spawn_group_leader_piped(
-        "pkexec",
-        &["pacman".to_string(), "-Syu".to_string(), "--noconfirm".to_string()],
-        &[],
-    ) {
+/// The real, system-modifying install: whatever `Backend::install_command` names, run for real
+/// against the live system as root. Streams stdout line by line, reading progress through
+/// `Backend::parse_install_step` and writing it into `state` as it goes -- Lua never sees raw
+/// subprocess output (ADR-0034). Assumes `state.installing` and its progress fields are already
+/// set by [`UpdatesController::install`]'s atomic check-and-set.
+async fn run_install(
+    backend: Arc<dyn Backend>,
+    state: Arc<Mutex<UpdatesState>>,
+    events: UnboundedSender<UpdatesSignal>,
+) {
+    let command = backend.install_command();
+    let child = match process::spawn_group_leader_piped(&command.program, &command.arguments, &[]) {
         Ok(child) => child,
         Err(err) => {
             let mut guard = state.lock().unwrap();
             guard.installing = false;
-            guard.install_error = Some(format!("failed to spawn pkexec: {err}"));
+            guard.install_error = Some(format!("failed to spawn {}: {err}", command.program));
             drop(guard);
             let _ = events.send(UpdatesSignal::Changed);
             return;
         }
     };
-    run_install_with_child(state, events, child).await;
+    run_install_with_child(backend, state, events, child).await;
 }
 
 /// Split from [`run_install`] so the stdout-driven progress loop can be tested against a stub
-/// child process, without a real `pkexec`/`pacman`. Sends `UpdatesSignal::Changed` on every
+/// child process, without a real privileged upgrade. Sends `UpdatesSignal::Changed` on every
 /// parsed progress line (ADR-0034), not just at the end.
 async fn run_install_with_child(
+    backend: Arc<dyn Backend>,
     state: Arc<Mutex<UpdatesState>>,
     events: UnboundedSender<UpdatesSignal>,
     mut child: tokio::process::Child,
 ) {
-    // Drained concurrently on its own task, not left unread: a real `pacman -Syu` upgrade can
-    // write enough stderr warnings to fill the pipe's ~64KiB kernel buffer, which blocks
-    // pacman's single-threaded process and wedges `installing` at `true` forever. Logged, not discarded.
+    // Drained concurrently on its own task, not left unread: a real upgrade can write enough stderr
+    // warnings to fill the pipe's ~64KiB kernel buffer, which blocks the package manager's
+    // single-threaded process and wedges `installing` at `true` forever. Logged, not discarded.
     if let Some(stderr) = child.stderr.take() {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("updates: pkexec pacman stderr: {line}");
+                eprintln!("updates: install stderr: {line}");
                 push_log_line(&mut state.lock().unwrap().install_log, line);
             }
         });
@@ -456,12 +433,12 @@ async fn run_install_with_child(
     if let Some(stdout) = child.stdout.take() {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let step = parse_install_step(&line);
+            let step = backend.parse_install_step(&line);
             let mut guard = state.lock().unwrap();
             push_log_line(&mut guard.install_log, line);
             // The push rides the progress lines rather than every line. One `Changed` re-resolves
-            // every surface in the generation (ADR-0044 decision 2), and pacman writes a download
-            // meter; the lines in between are in `install_log` either way, they just arrive on
+            // every surface in the generation (ADR-0044 decision 2), and a package manager writes a
+            // download meter; the lines are in `install_log` either way, they just arrive on
             // screen with the next step rather than on their own frame.
             let Some(step) = step else { continue };
             guard.install_current_step = step.current;
@@ -484,10 +461,10 @@ async fn run_install_with_child(
             if status.success() {
                 // Accumulates (OR), never overwrites: a reboot owed from an earlier install must
                 // not be cleared just because this install didn't touch the kernel.
-                guard.reboot_required |= needs_reboot(&installed_packages);
+                guard.reboot_required |= backend.needs_reboot(&installed_packages);
             }
         }
-        Err(err) => guard.install_error = Some(format!("failed to wait on pkexec pacman: {err}")),
+        Err(err) => guard.install_error = Some(format!("failed to wait on the install command: {err}")),
     }
     drop(guard);
     let _ = events.send(UpdatesSignal::Changed);
@@ -507,6 +484,34 @@ fn push_log_line(log: &mut Vec<String>, line: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capabilities::updates::backend::{InstallCommand, InstallStep};
+
+    /// A backend whose check always fails without touching the network, and whose install-side
+    /// answers are `pacman`'s real ones. What is under test around it is the scheduler and the
+    /// stdout loop; the parsing has its own tests next to the parser.
+    struct StubBackend;
+
+    impl Backend for StubBackend {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+
+        fn check(&self) -> Result<Vec<UpdateCandidate>, String> {
+            Err("this stub cannot check anything".to_string())
+        }
+
+        fn install_command(&self) -> InstallCommand {
+            InstallCommand { program: "true".to_string(), arguments: Vec::new() }
+        }
+
+        fn parse_install_step(&self, line: &str) -> Option<InstallStep> {
+            crate::capabilities::updates::pacman::install::parse_install_step(line)
+        }
+
+        fn needs_reboot(&self, package_names: &[String]) -> bool {
+            crate::capabilities::updates::pacman::install::needs_reboot(package_names)
+        }
+    }
 
     #[test]
     fn parse_configure_args_reads_the_interval_from_a_table() {
@@ -537,7 +542,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_remembered_check_time_seeds_an_empty_slot_and_never_overwrites_a_real_one() {
-        let (controller, mut events_rx, _db_root) = failing_controller().await;
+        let (controller, mut events_rx) = failing_controller().await;
 
         controller.configure(UpdatesConfigure { interval_secs: 0, checked_at: Some(1_800_000_000) });
         assert_eq!(controller.snapshot().last_successful_check, Some(1_800_000_000));
@@ -557,16 +562,17 @@ mod tests {
         assert_eq!(poll_mode(Duration::from_secs(1)), PollMode::Ticking(Duration::from_secs(1)));
     }
 
-    /// A controller whose db root holds no `local/`, so every check fails at `link_local_db`
-    /// without touching the network. What is under test is the scheduler around the check, not
-    /// `alpm`: a real sync needs a real mirror and is verified live (see `check.rs`).
-    async fn failing_controller()
-    -> (UpdatesController, tokio::sync::mpsc::UnboundedReceiver<UpdatesSignal>, tempfile::TempDir) {
-        let db_root = tempfile::tempdir().unwrap();
-        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
-        let controller =
-            UpdatesController::new(db_root.path().join("pacman.conf"), db_root.path().to_path_buf(), events_tx);
-        (controller, events_rx, db_root)
+    /// A controller over [`StubBackend`], so every check fails without touching the network. What
+    /// is under test is the scheduler around the check, not any real package manager: a real sync
+    /// needs a real mirror and is verified live (see `pacman/check.rs`).
+    ///
+    /// The construction push is consumed here, so each test's own assertions start from the first
+    /// signal it actually caused.
+    async fn failing_controller() -> (UpdatesController, tokio::sync::mpsc::UnboundedReceiver<UpdatesSignal>) {
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let controller = UpdatesController::with_backend(Some(Arc::new(StubBackend)), events_tx);
+        assert_eq!(events_rx.recv().await, Some(UpdatesSignal::Changed), "construction pushes the backend's name");
+        (controller, events_rx)
     }
 
     /// The two pushes one check makes: `checking` up, then the answer.
@@ -579,7 +585,7 @@ mod tests {
     #[tokio::test]
     async fn a_manual_check_runs_with_no_schedule_configured_at_all() {
         // The dormant arm answers `check_now` too: a config may want the button and never the timer.
-        let (controller, mut events_rx, _db_root) = failing_controller().await;
+        let (controller, mut events_rx) = failing_controller().await;
 
         controller.check_now();
         await_one_check(&mut events_rx).await;
@@ -593,7 +599,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_checks_count_up_and_leave_the_last_good_answer_alone() {
-        let (controller, mut events_rx, _db_root) = failing_controller().await;
+        let (controller, mut events_rx) = failing_controller().await;
         // A count from an earlier good check, which a failure must not blank (§ 2.14).
         controller.state.lock().unwrap().count = 3;
 
@@ -639,9 +645,42 @@ mod tests {
         assert!(!first_check_is_due(Some(last), last - 5000, Duration::from_secs(3600)));
     }
 
+    #[tokio::test]
+    async fn a_machine_with_no_package_manager_says_so_once_and_then_refuses_every_action() {
+        // The whole point of the field: an indicator asks `package_manager` whether it belongs on
+        // the bar, and on a machine with no manager nothing else would ever push to tell it.
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let controller = UpdatesController::with_backend(None, events_tx);
+
+        assert_eq!(events_rx.recv().await, Some(UpdatesSignal::Changed));
+        assert_eq!(controller.snapshot().package_manager, None);
+
+        controller.configure(UpdatesConfigure { interval_secs: 3600, checked_at: Some(1_800_000_000) });
+        controller.check_now();
+        controller.install().await;
+
+        assert_eq!(
+            controller.snapshot(),
+            UpdatesState::default(),
+            "no action may write state on a machine there is no manager to act with"
+        );
+        assert_eq!(events_rx.try_recv().ok(), None, "and none of them may push");
+    }
+
+    #[tokio::test]
+    async fn a_detected_backend_names_itself_before_anything_has_been_checked() {
+        let (controller, _events_rx) = failing_controller().await;
+
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.package_manager.as_deref(), Some("stub"));
+        assert_eq!(snapshot.count, 0);
+        assert_eq!(snapshot.last_successful_check, None, "naming the manager is not a check");
+    }
+
     #[test]
     fn updates_state_default_has_no_updates_and_no_errors() {
         let state = UpdatesState::default();
+        assert_eq!(state.package_manager, None);
         assert_eq!(state.count, 0);
         assert!(state.packages.is_empty());
         assert_eq!(state.last_successful_check, None);
@@ -660,7 +699,7 @@ mod tests {
         .expect("spawn a stub install script");
 
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
-        run_install_with_child(Arc::clone(&state), events_tx, child).await;
+        run_install_with_child(Arc::new(StubBackend), Arc::clone(&state), events_tx, child).await;
 
         let snapshot = state.lock().unwrap().clone();
         assert!(!snapshot.installing);
@@ -684,7 +723,7 @@ mod tests {
             .expect("spawn a failing stub");
 
         let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-        run_install_with_child(Arc::clone(&state), events_tx, child).await;
+        run_install_with_child(Arc::new(StubBackend), Arc::clone(&state), events_tx, child).await;
 
         let snapshot = state.lock().unwrap().clone();
         assert!(!snapshot.installing);
@@ -692,7 +731,7 @@ mod tests {
         assert!(snapshot.install_finished_at.is_some());
         assert_eq!(
             snapshot.install_error, None,
-            "pacman answering with a failure is not the Supervisor failing to ask"
+            "the package manager answering with a failure is not the Supervisor failing to ask"
         );
     }
 
@@ -707,7 +746,7 @@ mod tests {
         .expect("spawn a chatty stub");
 
         let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-        run_install_with_child(Arc::clone(&state), events_tx, child).await;
+        run_install_with_child(Arc::new(StubBackend), Arc::clone(&state), events_tx, child).await;
 
         let log = state.lock().unwrap().install_log.clone();
         assert!(log.contains(&":: Synchronizing package databases...".to_string()), "{log:?}");
@@ -741,7 +780,7 @@ mod tests {
         .expect("spawn a stub install script");
 
         let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-        run_install_with_child(Arc::clone(&state), events_tx, child).await;
+        run_install_with_child(Arc::new(StubBackend), Arc::clone(&state), events_tx, child).await;
 
         assert!(state.lock().unwrap().reboot_required);
     }
@@ -757,7 +796,7 @@ mod tests {
         )
         .expect("spawn a stub install script");
         let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-        run_install_with_child(Arc::clone(&state), events_tx, kernel_child).await;
+        run_install_with_child(Arc::new(StubBackend), Arc::clone(&state), events_tx, kernel_child).await;
         assert!(state.lock().unwrap().reboot_required, "first install touched the kernel");
 
         let unrelated_child = process::spawn_group_leader_piped(
@@ -767,53 +806,11 @@ mod tests {
         )
         .expect("spawn a stub install script");
         let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-        run_install_with_child(Arc::clone(&state), events_tx, unrelated_child).await;
+        run_install_with_child(Arc::new(StubBackend), Arc::clone(&state), events_tx, unrelated_child).await;
 
         assert!(
             state.lock().unwrap().reboot_required,
             "a later install with no kernel package must not clear a still-pending reboot"
         );
-    }
-
-    // ---- link_local_db ----
-
-    #[test]
-    fn the_throwaway_db_root_reads_installed_packages_through_a_link_named_local() {
-        // The name matters as much as the read: `alpm` looks for `local/` under the db root it is
-        // given, so a link under any other name is an empty db and every package reads as new.
-        let real = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(real.path().join("local").join("bash-5.3-1")).unwrap();
-        std::fs::write(real.path().join("local").join("bash-5.3-1").join("desc"), "%NAME%\nbash\n").unwrap();
-
-        let throwaway = tempfile::tempdir().unwrap();
-        link_local_db(real.path(), throwaway.path()).unwrap();
-
-        let linked = throwaway.path().join("local");
-        assert!(linked.symlink_metadata().unwrap().is_symlink(), "local must be a link, not a copied tree");
-        assert_eq!(
-            std::fs::read_to_string(linked.join("bash-5.3-1").join("desc")).unwrap(),
-            "%NAME%\nbash\n",
-            "the real package metadata must be readable through the link"
-        );
-    }
-
-    #[test]
-    fn linking_into_a_throwaway_root_that_already_holds_a_local_is_an_error_not_a_silent_reuse() {
-        // `symlink` refuses an existing destination. Surfacing that as a `check_error` beats
-        // checking against whatever was there: a reused temp dir would report stale packages.
-        let real = tempfile::tempdir().unwrap();
-        let throwaway = tempfile::tempdir().unwrap();
-        std::fs::create_dir(throwaway.path().join("local")).unwrap();
-
-        assert!(link_local_db(real.path(), throwaway.path()).is_err());
-    }
-
-    #[test]
-    fn a_db_root_with_no_local_directory_is_refused_rather_than_linked_to_nothing() {
-        let missing = tempfile::tempdir().unwrap();
-        let throwaway = tempfile::tempdir().unwrap();
-
-        assert!(link_local_db(&missing.path().join("no-such-root"), throwaway.path()).is_err());
-        assert!(!throwaway.path().join("local").exists());
     }
 }

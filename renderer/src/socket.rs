@@ -1016,7 +1016,7 @@ mod tests {
             ("power", serde_json::json!({ "on_battery": true, "energy_rate": 22.5, "active_profile": "performance" })),
             (
                 "updates",
-                serde_json::json!({ "count": 0, "installing": true, "install_current_step": 128, "install_total_steps": 512 }),
+                serde_json::json!({ "package_manager": "pacman", "count": 0, "installing": true, "install_current_step": 128, "install_total_steps": 512 }),
             ),
             ("keyboard", serde_json::json!({ "active_layout": "English (US, intl.)", "caps_lock": true })),
             ("privacy", serde_json::json!({ "camera_users": [{ "app_name": "A Video Conferencing Application" }] })),

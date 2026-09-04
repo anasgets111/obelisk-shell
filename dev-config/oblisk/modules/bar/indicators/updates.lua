@@ -1,31 +1,35 @@
 -- Mirrors ArchChecker.qml: one glyph whose shape says what the updater is doing and whose ground
 -- says whether it wants attention.
 --
--- Four states, tested in the mirror's own order, because they overlap: an error that happened
--- during a check still has a stale count sitting behind it. First match wins and the order is what
+-- Five states, tested in the mirror's own order, because they overlap: an error that happened
+-- during a check still has a stale count sitting behind it, and a check running after one still
+-- reports the error rather than hiding it behind a spinner. First match wins and the order is what
 -- makes that right.
 --
--- The mirror has a fifth, "checking", and this does not: `UpdatesState` in
--- `supervisor/src/updates/controller.rs` carries no in-flight flag, so a check that is running and
--- one that has not started look identical from here.
+-- "checking" is the state this could not draw until ADR-0134: `UpdatesState` always carried the
+-- in-flight flag, and the panel header has been reading it all along -- this file was the one place
+-- still treating a check in flight and a check never run as the same thing.
 --
 -- The mirror spins the glyph while installing. Nothing here animates, so the state is carried by
 -- the glyph's colour alone; a rotation would need a per-frame property and there is no timer under
 -- ADR-0021's 5ms cap that would drive one.
 --
--- Absent when there is nothing to say, which the mirror is not. A permanent circle whose one
--- meaning is "no action available" is a control that never does anything, and it had the guard
--- below to prove it: the idle click was already a no-op. Now it is a no-op with no pixels.
+-- Present whenever this machine has a package manager at all, which is `ArchChecker.qml`'s own gate
+-- one layer down: `LeftSide.qml` wraps it in a `Loader` whose `active` is `UpdateService.ready`,
+-- and that is `MainService.isArchBased && command -v checkupdates`. `oblisk.updates` answers the
+-- same question in `package_manager`, and answers it at startup rather than after the first check.
 --
--- The click opens the panel and nothing else. It briefly invoked `install` directly, and the day the
--- module was first switched on, one click launched a real `pkexec pacman -Syu` -- it got no further
--- than "Error creating textual authentication agent", so nothing was upgraded, but nothing about
--- that was by design either. `ArchChecker.qml` never installs from the bar for the same reason:
--- installing is a decision made in front of the package list, which is what the panel is.
+-- This was absent whenever it had nothing to say, and the argument for that was sound as far as it
+-- went: a permanent circle whose one meaning is "no action available" is a control that never does
+-- anything, and the idle click was a no-op that proved it. The mirror has no such circle either --
+-- its idle click re-checks. So does this one now, which is what earns the pixels back. A bar whose
+-- update indicator vanishes when you are up to date is a bar with no way to ask.
 --
--- The mirror also re-checks on a click when nothing is pending. That needs the button to be there
--- when nothing is pending, and this one is not (see above), so the re-check lives in the panel
--- header where there is room to say what it does.
+-- The click never installs. It briefly invoked `install` directly, and the day the module was first
+-- switched on, one click launched a real `pkexec pacman -Syu` -- it got no further than "Error
+-- creating textual authentication agent", so nothing was upgraded, but nothing about that was by
+-- design either. `ArchChecker.qml` never installs from the bar for the same reason: installing is a
+-- decision made in front of the package list, which is what the panel is.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local icon_button = require("components.icon_button")
@@ -107,6 +111,9 @@ local function state_of(u)
     if u.check_error and u.check_error ~= "" then
         return "error"
     end
+    if u.checking then
+        return "checking"
+    end
     if (u.count or 0) > 0 then
         return "pending"
     end
@@ -120,20 +127,40 @@ return icon_button(status:map(function(s)
         return icons.updating
     elseif s == "error" then
         return icons.update_err
+    elseif s == "checking" then
+        return icons.checking
     elseif s == "pending" then
         return icons.updates
     end
     return icons.up_to_date
 end), function(rect)
+    -- Read at click time rather than off a captured value: `status` is a signal, and a handler
+    -- registered once has to ask what the state is now, not what it was when the config loaded.
+    if state_of(oblisk.updates:get()) == "idle" then
+        -- The mirror's idle click, and the reason this circle is allowed to exist while there is
+        -- nothing pending. A `check` while one is already running is refused by the Supervisor, so
+        -- the double-click case needs no guard here.
+        oblisk.updates:invoke("check")
+        return
+    end
     ui_state.toggle_panel(update_panel.kind, rect)
 end, {
     slot = "updates",
     -- The accent ring every other indicator wears while its own panel is the one on screen.
     selected = ui_state.panel_showing(update_panel.kind),
-    visible = status:map(function(s)
-        return s ~= "idle"
+    -- Nothing to check with means nothing to show: on a machine whose package manager this
+    -- Supervisor does not speak, `package_manager` is nil and stays nil, and an indicator that can
+    -- only ever report its own failure is worse than no indicator.
+    visible = oblisk.updates:map(function(u)
+        return u ~= nil and u.package_manager ~= nil
     end),
     foreground = status:map(function(s)
-        return s == "error" and theme.RED or theme.ACCENT
+        if s == "error" then
+            return theme.RED
+        end
+        -- Dim while there is nothing waiting, accent once there is: the same "wants attention"
+        -- split the ground carries in the mirror, applied to the glyph because this bar tints the
+        -- glyph and leaves the circle alone.
+        return s == "idle" and theme.DIM or theme.ACCENT
     end),
 })

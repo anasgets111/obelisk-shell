@@ -1,9 +1,12 @@
-//! `updates:install()` for `oblisk.updates` (ADR-0034): runs `pkexec pacman -Syu --noconfirm`
-//! via `process::spawn_group_leader_piped`, routing privilege elevation through Oblisk's
-//! already-registered polkit agent (`dbus::polkit`) -- `pkexec` itself talks to polkit and
-//! triggers our own agent's interactive prompt, not a manual `CheckAuthorization` call. Runs
-//! the real system `pacman` against the real `/etc/pacman.conf`/`/var/lib/pacman` as root, no
-//! throwaway copy (unlike `check.rs`'s read-only sync).
+//! `pacman`'s half of `updates:install()` (ADR-0034): the two things about `pkexec pacman -Syu
+//! --noconfirm` that belong to `pacman` and not to the scheduler -- how its output spells progress,
+//! and which package names owe a reboot. The command itself is named in
+//! `PacmanBackend::install_command` and run by `controller.rs` through
+//! `process::spawn_group_leader_piped`, which is where privilege elevation routes through Oblisk's
+//! own already-registered polkit agent (`dbus::polkit`): `pkexec` talks to polkit and triggers our
+//! agent's interactive prompt, rather than a manual `CheckAuthorization` call. That run is against
+//! the real `/etc/pacman.conf`/`/var/lib/pacman` as root, no throwaway copy (unlike `check.rs`'s
+//! read-only sync).
 //!
 //! Progress parsing (`parse_install_step`) is best-effort against pacman's well-known real
 //! stdout format (`"(2/5) installing nss (3.127-1 -> 3.128-1)"`), not independently verified
@@ -12,16 +15,12 @@
 //! misses a cosmetic UI update -- install success is read from the real process exit status,
 //! not the parsed lines.
 
-/// One parsed `(current/total) installing|upgrading|reinstalling <package> ...` line from
-/// `pacman`'s real install-phase output. `None` for every other line (database-sync messages,
-/// download progress bars, blank lines) -- the reader just leaves the previous progress in place.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstallStep {
-    pub current: u32,
-    pub total: u32,
-    pub package: String,
-}
+use super::super::backend::InstallStep;
 
+/// One `(current/total) installing|upgrading|reinstalling <package> ...` line from `pacman`'s real
+/// install-phase output, read as an [`InstallStep`]. `None` for every other line (database-sync
+/// messages, download progress bars, blank lines) -- the reader just leaves the previous progress
+/// in place.
 pub fn parse_install_step(line: &str) -> Option<InstallStep> {
     let rest = line.trim().strip_prefix('(')?;
     let (counts, rest) = rest.split_once(')')?;

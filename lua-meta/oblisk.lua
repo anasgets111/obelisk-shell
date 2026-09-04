@@ -247,12 +247,13 @@
 ---@field tooltip? string The item's tooltip title and text, flattened to one string. `nil` when it has none.
 
 ---@class UpdateCandidate
----One installed package with a newer version in some sync repo.
----@field download_size integer Bytes to fetch, from alpm's own `download_size`, which answers `0` for a package already sitting in the pacman cache.
+---One installed package with a newer version available. The shape every backend answers in,
+---which is also the shape Lua reads out of `updates.packages`.
+---@field download_size integer Bytes to fetch. `0` for a package already sitting in the manager's cache.
 ---@field installed_size integer Bytes the new version occupies once unpacked. Not a delta: subtracting the old version's size is the config's job if it wants one.
----@field name string The package name, as pacman spells it.
----@field new_version string The version the synced repo offers.
----@field old_version string The installed version, in pacman's `epoch:pkgver-pkgrel` spelling.
+---@field name string The package name, as the package manager spells it.
+---@field new_version string The version the synced repos offer.
+---@field old_version string The installed version, in the manager's own version spelling.
 
 ---@alias Urgency "low"|"normal"|"critical"
 ---The `low`/`normal`/`critical` tier (CONTEXT.md's "Notification urgency"). `Hash`/`Eq` so it can
@@ -412,22 +413,24 @@
 ---@class UpdatesState
 ---`oblisk.updates`'s combined payload. `check_error`/`install_error` are `None` when
 ---nothing's gone wrong, not a fabricated empty string. `install_total_steps == 0` while
----`installing` is true means the transaction size isn't known yet (pacman hasn't printed it).
----@field check_error? string Why the last check failed, or `nil` when the last one worked. A check runs against a throwaway copy of the pacman database, so this is a network or parse failure, never a half-applied change to the system.
+---`installing` is true means the transaction size isn't known yet (the package manager hasn't
+---printed it).
+---@field check_error? string Why the last check failed, or `nil` when the last one worked. A check never modifies the system (`Backend::check` promises that much), so this is a network or parse failure, never a half-applied change to the system.
 ---@field checking boolean A check is running right now. Rises before the sync starts and falls when the result is written, with a push at both edges, so a config can draw a spinner and disable its own refresh control. `updates:check` refuses a second one while this is true.
 ---@field consecutive_check_failures integer How many checks in a row have failed, reset to `0` by the first success. The count only: "warn after five" is a threshold somebody has an opinion about, so it lives in the config.
 ---@field count integer How many packages have a newer version in the synced repos. Always equal to `#packages`, and carried separately so a badge does not have to walk the list.
----@field install_current_package string The package name from the step line pacman is on. Empty string before the first one, not `nil`, because a name is always a string once the transaction is under way.
----@field install_current_step integer Which package of the transaction pacman is on, its own 1-based `(2/5)` counter. `0` before the first line is parsed.
----@field install_error? string Why the Supervisor never got an answer from `pacman` at all -- it could not spawn `pkexec`, or could not wait on it. Distinct from [`UpdatesState::install_exit_code`], which is the answer: this one means the question was never asked, and it is the Supervisor's own failure rather than the package manager's.
----@field install_exit_code? integer What `pacman` itself answered on the last install: `0` for success, its own code for a failure, `nil` if none has finished this session. The code and [`UpdatesState::install_log`] are the two facts about a failure; what to *call* it -- a network error, a disk-space error, a signature error -- is wording, and wording belongs in the config (ADR-0113 amendment).
+---@field install_current_package string The package name from the step line the package manager is on. Empty string before the first one, not `nil`, because a name is always a string once the transaction is under way.
+---@field install_current_step integer Which package of the transaction the package manager is on, its own 1-based `(2/5)` counter. `0` before the first line is parsed.
+---@field install_error? string Why the Supervisor never got an answer from the package manager at all -- it could not spawn the install command, or could not wait on it. Distinct from [`UpdatesState::install_exit_code`], which is the answer: this one means the question was never asked, and it is the Supervisor's own failure rather than the package manager's.
+---@field install_exit_code? integer What the package manager itself answered on the last install: `0` for success, its own code for a failure, `nil` if none has finished this session. The code and [`UpdatesState::install_log`] are the two facts about a failure; what to *call* it -- a network error, a disk-space error, a signature error -- is wording, and wording belongs in the config (ADR-0113 amendment).
 ---@field install_finished_at? integer Unix seconds when the last install stopped, however it stopped. With an install's start held by whatever asked for it, this is what a duration is measured against.
 ---@field install_log string[] The tail of the last install's output, newest last, both streams interleaved in arrival order (they are read by two tasks, so the interleaving between them is not exact). Capped at the last 200: a long upgrade writes thousands of lines and this is a payload pushed over a socket, not a file. Cleared when an install starts.
----@field install_total_steps integer How many packages the transaction has. `0` while [`UpdatesState::installing`] is true means pacman has not printed a step line yet, so a progress bar has no denominator: show it as indeterminate rather than dividing.
+---@field install_total_steps integer How many packages the transaction has. `0` while [`UpdatesState::installing`] is true means the package manager has not printed a step line yet, so a progress bar has no denominator: show it as indeterminate rather than dividing.
 ---@field installing boolean An install is running. The `install_*` fields above only describe a run that has started; `updates:install` refuses a second one while this is true.
 ---@field last_successful_check? integer Unix seconds at the end of the last check that completed without error, or `nil` if none has since this session started. A failed check leaves it on the older, still-true value.
+---@field package_manager? string Which package manager answered, or `nil` when this machine has none this Supervisor speaks -- the one field a config can read before anything has been checked, and the one that tells an indicator whether it has any business being on the bar at all (ADR-0134). The name of the command: `"pacman"`.
 ---@field packages UpdateCandidate[] What would be upgraded, one entry each. A failed check leaves this and [`UpdatesState::count`] on the last good answer rather than clearing them, so a config keeps showing the count it knows while [`UpdatesState::check_error`] explains the gap.
----@field reboot_required boolean A `linux` or `linux-*` package was installed at some point this session. Sticky on purpose: once set it stays set through later installs that do not touch the kernel, because the running kernel is still the old one until the machine restarts.
+---@field reboot_required boolean A kernel package was installed at some point this session, per `Backend::needs_reboot`. Sticky on purpose: once set it stays set through later installs that do not touch the kernel, because the running kernel is still the old one until the machine restarts.
 
 ---@class WorkspacesState
 ---`oblisk.workspaces`'s full payload (§ 2.9); field names are the JSON keys verbatim, and

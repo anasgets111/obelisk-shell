@@ -427,15 +427,13 @@ impl Capabilities {
                     }
                 }
             }
-            // alpm-based checking, separate from sysinfo's scheduler, dormant until Lua sets an
-            // interval (ADR-0034).
+            // Separate from sysinfo's scheduler, dormant until Lua sets an interval (ADR-0034).
+            // Detects this machine's package manager on the way up and pushes its name straight
+            // away, so a config learns there is nothing to check here without waiting for a
+            // failed check to tell it (ADR-0134).
             Capability::Updates => {
                 if self.updates.is_none() {
-                    self.updates = Some(UpdatesController::new(
-                        PathBuf::from("/etc/pacman.conf"),
-                        PathBuf::from("/var/lib/pacman"),
-                        self.senders.updates.clone(),
-                    ));
+                    self.updates = Some(UpdatesController::new(self.senders.updates.clone()));
                 }
             }
             // UPower's DisplayDevice, composite across every battery; no UPower means never

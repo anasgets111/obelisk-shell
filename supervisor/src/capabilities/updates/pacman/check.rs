@@ -3,33 +3,17 @@
 //! unit-testable (needs a real libalpm handle and real network I/O against real mirrors) --
 //! verified live instead: copy `/var/lib/pacman` to a user-owned temp dir, sync the real repos,
 //! diff against the real installed set. `alpm`'s types wrap raw C pointers and aren't `Send`,
-//! so every call here must run inside one `tokio::task::spawn_blocking` closure (see
-//! `controller.rs`'s scheduler), never awaited inline on the async runtime.
+//! so every call here must run inside one `tokio::task::spawn_blocking` closure (which is what
+//! `Backend::check` promises its caller), never awaited inline on the async runtime.
 
 use std::path::Path;
 
-use super::pacman_conf::RepoServers;
+use super::super::backend::UpdateCandidate;
+use super::conf::RepoServers;
 
-/// One installed package with a newer version in some sync repo.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
-pub struct UpdateCandidate {
-    /// The package name, as pacman spells it.
-    pub name: String,
-    /// The installed version, in pacman's `epoch:pkgver-pkgrel` spelling.
-    pub old_version: String,
-    /// The version the synced repo offers.
-    pub new_version: String,
-    /// Bytes to fetch, from alpm's own `download_size`, which answers `0` for a package already
-    /// sitting in the pacman cache.
-    pub download_size: i64,
-    /// Bytes the new version occupies once unpacked. Not a delta: subtracting the old version's
-    /// size is the config's job if it wants one.
-    pub installed_size: i64,
-}
-
-/// Registers every repo in `repos` against `db_path` (a throwaway copy of `/var/lib/pacman`,
-/// never the real system db -- `controller.rs`'s scheduler owns that copy), syncs them all
-/// (`force: true`, matching `checkupdates`'s own always-fresh-sync behavior -- no `fakeroot`
+/// Registers every repo in `repos` against `db_path` (a throwaway copy of `/var/lib/pacman`, never
+/// the real system db -- `mod.rs`'s `check_against_a_throwaway_copy` owns that copy), syncs them
+/// all (`force: true`, matching `checkupdates`'s own always-fresh-sync behavior -- no `fakeroot`
 /// requirement found against a user-owned temp dir), then diffs every package in `root`'s
 /// installed set against its matching sync-repo entry via `alpm`'s own `sync_new_version`.
 pub fn check_for_updates(

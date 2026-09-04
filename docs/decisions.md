@@ -6417,3 +6417,101 @@ signals and then re-reads a cached `StatusNotifierItemProxy` whose properties ar
 the custom signal and no `PropertiesChanged` would never refresh the cache at all, and the item's
 title and icon would be frozen at their first read. Unconfirmed against a real tray application, so
 it is recorded here rather than fixed blind.
+
+## ADR-0134: `oblisk.updates` is a schedule with a package manager behind a trait, and says which one
+
+**Status.** Accepted.
+
+**Context.** `updates` was written against `pacman` and never pretended otherwise. `UpdatesController::new`
+took `/etc/pacman.conf` and `/var/lib/pacman` as arguments; `run_install` hardcoded
+`pkexec pacman -Syu --noconfirm`; `run_one_check` called `check_against_a_throwaway_copy`, which
+symlinks `local/` and syncs through `libalpm`; `needs_reboot` matched `linux` and `linux-*`. That is
+four different places knowing which distribution this is, none of them next to each other, in a
+capability whose Lua-facing surface -- `check`, `configure`, `install`, a count and a package list --
+has nothing distribution-specific in it at all.
+
+The second problem was what a machine without `pacman` was told. Nothing detected one. `Capability::Updates`
+built the controller unconditionally; the first scheduled check then failed inside `link_local_db`
+with `/var/lib/pacman/local is not a directory`, and that sentence -- a path error, phrased as if
+something were broken -- was the whole of the answer. A config could not distinguish it from a
+mirror being down. `UpdatesState` had no field for "this machine has no package manager", the way
+`BatteryState` has `present`.
+
+That gap reached the bar. `dev-config`'s `updates.lua` hid itself whenever its state read `idle`,
+and `idle` covered three different situations: no updates pending, no check ever run, and no
+package manager at all. So did the argument written into the file for hiding it, which was sound as
+far as it went -- a permanent circle whose one meaning is "no action available" is a control that
+never does anything, and its idle click was a no-op that proved it.
+
+**The mirror.** `~/.config/quickshell` gates the whole module on the answer to this question and has
+from the start. `Services/MainService.qml` runs one shell probe at startup whose first line is
+`isArchBased "$(yn command -v pacman)"`. `UpdateService.ready` is `MainService.isArchBased &&
+_checkUpdatesAvailable && Settings.isStateLoaded`, where the middle term is a second probe,
+`command -v checkupdates`. `Modules/Bar/LeftSide.qml` then wraps `ArchChecker` in a
+`Loader { active: UpdateService.ready }`, which is the same shape it uses for
+`BatteryService.isLaptopBattery` -- a module that does not exist on a machine it does not apply to.
+`ArchChecker.qml` itself carries no such test, because by the time it is instantiated the question
+is settled.
+
+Two things follow from reading it. The detection is a binary probe, not `/etc/os-release` parsing --
+`ID=arch` was never consulted, because what the code needs is the command, not the distribution's
+name. And once the indicator is unconditionally present whenever the manager exists, its idle click
+has somewhere to go: `ArchChecker.qml`'s `onClicked` falls through to `UpdateService.doPoll()` when
+nothing is pending. That is the half this tree was missing, and the reason its own comment gave for
+hiding the button ("the idle click was already a no-op") was true only because the re-check had
+never been wired to it.
+
+**Decision.**
+
+1. **`backend::Backend`, a trait with five methods**: `name`, `check`, `install_command`,
+   `parse_install_step`, `needs_reboot`. Everything a package manager knows and the scheduler does
+   not. `controller.rs` holds `Option<Arc<dyn Backend>>` and no longer contains the strings
+   `pacman`, `alpm`, or `pkexec` outside prose.
+
+2. **`backend::detect()` picks the implementation, once, at capability start.** `command -v pacman`
+   without the shell: a walk of `PATH` looking for an executable file, which is the same question
+   the mirror asks and costs no subprocess on the path to the first frame. Ordered, so a second
+   entry is a line rather than a redesign.
+
+3. **`pacman/` is one backend, not the capability.** `check.rs`, `install.rs` and `pacman_conf.rs`
+   move under it (the last renamed `conf.rs`, since its parent now says which conf), and
+   `check_against_a_throwaway_copy` and `link_local_db` move out of `controller.rs` into it. The
+   `libalpm` arena release (`memory::return_free_pages_to_the_kernel`) goes with them: it is a fact
+   about `libalpm`'s allocation, not about checking for updates.
+
+4. **`UpdatesState.package_manager: Option<String>`**, the name of the command, `nil` when this
+   Supervisor speaks none of what is installed. A name rather than a boolean, because a config that
+   wants to say "pacman" in a panel header now can, and `nil` is a better "not here" than `false`.
+
+5. **The controller pushes once at construction**, which no other capability's does. On a machine
+   with no manager there is no later event to carry the answer -- the scheduler is not even spawned --
+   so a config would wait forever to be told it should not be drawing. `last_snapshots` seeds a
+   promoted PBA candidate, so the one push survives a reload rather than needing a resend.
+
+6. **Every action refuses with no backend.** `check_now` and `install` log and return;
+   `configure` returns silently, because a config naming an interval on a machine with no manager
+   has done nothing wrong and does not need a line per reload.
+
+7. **`updates.lua` is present whenever `package_manager` is**, and its idle click re-checks --
+   `ArchChecker.qml`'s own fallthrough. It also finally draws `checking`: `UpdatesState.checking`
+   has existed since ADR-0034 and `update_panel.lua` has read it all along; the indicator was the
+   one place still treating a check in flight and a check never run as the same thing.
+
+**Rejected.** *An enum over backends rather than a trait.* One variant today, and the dispatch would
+sit in `controller.rs` -- which is the file whose whole point here is not knowing. *Parsing
+`/etc/os-release`.* It answers a different question: `ID_LIKE=arch` on a derivative says nothing
+about whether `pacman` is the binary in `PATH`, and a container or a chroot can be Arch with no
+package manager reachable. The mirror never consulted it either. *Writing `apt` and `dnf` backends
+now.* Neither is testable on this machine, and a backend written blind against a package manager
+nobody here runs is a guess with tests that only assert the guess.
+
+**Consequences.** The updates indicator is now on the bar at all times on this machine, dim while
+there is nothing pending and accent once there is, and clicking it while idle runs a real check --
+which is the one interaction the mirror had that this did not. On a machine with no `pacman`, the
+capability starts, says `package_manager = nil`, spawns no scheduler, and the indicator is absent:
+the same outcome as before, reached deliberately and explained, rather than through a failed check
+reporting a missing directory.
+
+The trait is one implementation wide, and that is the honest state of it. What it buys today is not
+`apt` -- it is that the four places that knew about `pacman` are now one file, and that the
+capability can answer "not on this machine" as a fact rather than as an error.
