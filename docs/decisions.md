@@ -5621,3 +5621,51 @@ optional `special` list, `is_fullscreen` when known and a session-level `composi
 next ADR, since they are payload and display policy, not the adaptor. Until a capture replaces the
 fixtures, a Hyprland field rename is caught by the "reply did not parse" log line and nothing else.
 
+## ADR-0119: What one compositor has and the other does not is an absent key
+
+**Status**: Accepted (2026-09-04)
+
+**Context**: With two implementors (ADR-0118) the payload met the first features one compositor has
+and the other lacks: Hyprland's special workspaces and its fullscreen flag, niri's unbounded
+workspace count against Hyprland's create-on-focus numbering. The reference config answers these
+with capability flags on each backend (`supportsSpecialWorkspaces`, `fillsEmptyWorkspaceSlots`,
+`hasOverview`) and a service layer that pads display slots to ten when the flag says so. § 2.9
+already had a convention for a fact one compositor cannot state: `focused_workspace` is present only
+where it is true, `is_fullscreen` was left out rather than fabricated (ADR-0056 decisions 4 and 5).
+
+**Decision**:
+
+1. **A feature the compositor lacks is a key the payload lacks.** No flag table. `special` is
+   present on Hyprland, an empty list when none exist, and absent on niri, so `w.special == nil`
+   is the "has scratchpads" test and `#w.special == 0` is "none right now". `active_client.
+   is_fullscreen` is present when Hyprland says and absent on niri, which turns decision 5's
+   omission into "absent means unknown" without fabricating anything. The same shape a config
+   already reads `focused_workspace` by.
+2. **`special` is a top-level list keyed by name.** `{ name, populated, app_id?, shown_on? }`:
+   Hyprland addresses specials by name and gives them negative ids, so the name is the identity and
+   `toggle_special(name)` takes it. `shown_on` is the output currently showing it, since a special
+   is shown on one output at a time, and the payload's per-output structure is for what an output
+   *has*; a special belongs to none. `name` is the compositor's full `special:term`, and the
+   adaptor strips the prefix the dispatcher would double.
+3. **The payload names its compositor.** `compositor: "niri" | "hyprland"`, because one policy is
+   display, not state: a Hyprland strip pads empty slots to ten and a niri strip must not, and no
+   key carries "focusing a missing number creates it". The adaptor still fabricates nothing; the
+   padding is `workspace_strip.lua`'s, in Lua, keyed on this string, with the padded slot shaped as
+   an entry (`{ id = n, idx = n, populated = false }`) so the button reads it as one and
+   `focus(n)` is the click. niri's trailing empty workspace gives the same picture unpadded.
+4. **`toggle_special` is the second action**, dispatched to Hyprland and logged on niri, where a
+   config that checked `special` never calls it.
+5. **In `dev-config`**, `special_workspaces.lua` is the mirror's `SpecialWorkspaces.qml`: a circle
+   per special, accent while shown, the standing app's icon or the name's first two letters, the row
+   absent when there are none. No tooltip: one popup per dynamic special is more `shell.lua` than
+   two letters are worth.
+
+Not built: an overview action (niri only, nothing asks) and urgency (both have it, nothing draws
+it). Rejected: a `supports` table on the payload, because a config then has two things to check
+where the key's presence already answers; and padding in the adaptor, because the payload lists
+what exists and a strip's slot count is not the compositor's fact.
+
+**Consequences**: A config written against niri sees one new string field and nothing else changes.
+The Hyprland half is built to the documented IPC and not live-tested, as ADR-0118. § 2.9's "two
+gaps" note is now one, the window list.
+

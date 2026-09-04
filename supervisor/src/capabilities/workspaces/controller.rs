@@ -20,12 +20,41 @@ use super::{hyprland, niri};
 /// `active_client` (`Option`, § 2.9's "or `nil` if none focused") is omitted, not `null`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct WorkspacesState {
+    /// Which compositor these came from, `"niri"` or `"hyprland"` (ADR-0119). Display policy
+    /// differs by compositor where the state does not: Hyprland creates a numbered workspace on
+    /// focus, so a strip pads empty slots there and not on niri, which keeps its own trailing
+    /// empty workspace.
+    pub compositor: String,
     /// One entry per output, keyed by connector name; empty until the compositor first answers.
     pub outputs: Vec<OutputWorkspaces>,
     /// The focused toplevel, or `nil` if none. One window per session, not per output: there is
     /// no way to ask what is focused on an unfocused monitor (ADR-0056 decision 4).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_client: Option<ActiveClient>,
+    /// The compositor's special workspaces, Hyprland's scratchpads, ordered by name (ADR-0119).
+    /// Absent on a compositor that has none, so `special == nil` hides the control and an empty
+    /// list means none exist right now. Hyprland lists a special only while it holds a window or
+    /// is shown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub special: Option<Vec<SpecialWorkspace>>,
+}
+
+/// One special workspace (ADR-0119). Identified by `name`, which is what
+/// `workspaces:toggle_special(name)` takes, since Hyprland addresses them by name and their ids
+/// are negative.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct SpecialWorkspace {
+    /// The compositor's full name, `"special:scratch"` or the unnamed `"special"`.
+    pub name: String,
+    /// At least one window sits on it.
+    pub populated: bool,
+    /// The `app_id` of its standing window, chosen as [`WorkspaceEntry::app_id`] is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
+    /// The connector of the output currently showing it, absent while it is hidden. A special
+    /// shows on one output at a time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shown_on: Option<String>,
 }
 
 /// One output's workspace state; `workspaces` is ADR-0056 decision 3's addition to § 2.9.
@@ -69,8 +98,8 @@ pub struct WorkspaceEntry {
     pub app_id: Option<String>,
 }
 
-/// § 2.9's `active_client`, minus `is_fullscreen` (ADR-0056 decision 5: niri-ipc 26.4.0's `Window`
-/// has no such field, and a fabricated `false` would be wrong for fullscreen windows); `class` is
+/// § 2.9's `active_client`. `is_fullscreen` is present only from a compositor that reports it
+/// (ADR-0056 decision 5 refused to fabricate `false`, ADR-0119 lets Hyprland say); `class` is
 /// Wayland's `app_id`, since X11's `WM_CLASS` has no Wayland equivalent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct ActiveClient {
@@ -81,6 +110,10 @@ pub struct ActiveClient {
     pub class: String,
     /// The compositor has this window floating rather than tiled.
     pub is_floating: bool,
+    /// The window covers its whole output. Absent when the compositor does not say (niri-ipc has
+    /// no such field, ADR-0056 decision 5); Hyprland reports it (ADR-0119).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_fullscreen: Option<bool>,
 }
 
 /// One workspace as a compositor reports it, reduced to the fields [`derive_state`] reads.
@@ -115,6 +148,8 @@ pub struct FocusedWindow {
     /// Wayland's `app_id`, filling § 2.9's `class` (ADR-0056 decision 5).
     pub app_id: String,
     pub is_floating: bool,
+    /// `None` from a compositor that does not report it, and it stays absent in the payload.
+    pub is_fullscreen: Option<bool>,
 }
 
 /// One shared signal, `Changed` only.
@@ -159,9 +194,10 @@ pub fn derive_state(workspaces: &[WorkspaceRow], focused: Option<&FocusedWindow>
         title: window.title.clone(),
         class: window.app_id.clone(),
         is_floating: window.is_floating,
+        is_fullscreen: window.is_fullscreen,
     });
 
-    WorkspacesState { outputs, active_client }
+    WorkspacesState { compositor: String::new(), outputs, active_client, special: None }
 }
 
 /// The half of a compositor reader that isn't about the compositor: reduce, drop a no-op update,
@@ -170,20 +206,40 @@ pub fn derive_state(workspaces: &[WorkspaceRow], focused: Option<&FocusedWindow>
 pub struct StatePublisher {
     state: Arc<Mutex<WorkspacesState>>,
     events: UnboundedSender<WorkspacesSignal>,
+    compositor: CompositorKind,
     previous: WorkspacesState,
 }
 
 impl StatePublisher {
-    pub fn new(state: Arc<Mutex<WorkspacesState>>, events: UnboundedSender<WorkspacesSignal>) -> Self {
-        Self { state, events, previous: WorkspacesState::default() }
+    pub fn new(
+        state: Arc<Mutex<WorkspacesState>>,
+        events: UnboundedSender<WorkspacesSignal>,
+        compositor: CompositorKind,
+    ) -> Self {
+        Self { state, events, compositor, previous: WorkspacesState::default() }
     }
 
     /// `false` once nothing is listening, a reader loop's exit condition. Deliberately not
     /// debounced: a compositor replaying startup state as several events pushes several times,
     /// each real (niri sends workspaces and windows separately, so the first push predates any
     /// known window).
-    pub fn publish(&mut self, workspaces: &[WorkspaceRow], focused: Option<&FocusedWindow>) -> bool {
-        let current = derive_state(workspaces, focused);
+    ///
+    /// `special` is `None` from a compositor that has no such thing and `Some` (possibly empty)
+    /// from one that does; the key's presence is the feature test (ADR-0119). Sorted here by
+    /// name, since the adaptor's list comes in wire order.
+    pub fn publish(
+        &mut self,
+        workspaces: &[WorkspaceRow],
+        focused: Option<&FocusedWindow>,
+        special: Option<&[SpecialWorkspace]>,
+    ) -> bool {
+        let mut current = derive_state(workspaces, focused);
+        current.compositor = self.compositor.name().to_string();
+        current.special = special.map(|list| {
+            let mut list = list.to_vec();
+            list.sort_by(|a, b| a.name.cmp(&b.name));
+            list
+        });
         if current == self.previous {
             return true;
         }
@@ -197,6 +253,13 @@ impl StatePublisher {
 /// workspace that exists is the compositor's question, answered by doing nothing.
 pub fn parse_focus_args(arguments: &[serde_json::Value]) -> Option<u64> {
     arguments.first()?.as_u64()
+}
+
+/// `workspaces:toggle_special(name)`'s `arguments: [name]`: the `name` of a `special` entry. A
+/// name no special has is Hyprland's to refuse, and it creates one instead, which is how a
+/// scratchpad is first opened from a keybind too.
+pub fn parse_toggle_special_args(arguments: &[serde_json::Value]) -> Option<&str> {
+    arguments.first()?.as_str().filter(|name| !name.is_empty())
 }
 
 /// `Clone` is deliberately absent: nothing here is handed to a spawned future. The adaptor
@@ -214,10 +277,14 @@ impl WorkspacesController {
     pub fn new(events: UnboundedSender<WorkspacesSignal>) -> Self {
         let state = Arc::new(Mutex::new(WorkspacesState::default()));
         let compositor = detect_compositor();
-        let publisher = StatePublisher::new(Arc::clone(&state), events);
         match compositor {
-            Some(CompositorKind::Niri) => niri::spawn_reader(publisher),
-            Some(CompositorKind::Hyprland) => hyprland::spawn_reader(publisher),
+            Some(kind) => {
+                let publisher = StatePublisher::new(Arc::clone(&state), events, kind);
+                match kind {
+                    CompositorKind::Niri => niri::spawn_reader(publisher),
+                    CompositorKind::Hyprland => hyprland::spawn_reader(publisher),
+                }
+            }
             None => {
                 eprintln!("workspaces: {}; workspace reporting disabled for this run", unsupported_session_report())
             }
@@ -236,6 +303,19 @@ impl WorkspacesController {
             Some(CompositorKind::Niri) => niri::focus(id),
             Some(CompositorKind::Hyprland) => hyprland::focus(id),
             None => eprintln!("workspaces: focus({id}) called but this session has no workspace implementor; ignored"),
+        }
+    }
+
+    /// `workspaces:toggle_special(name)`. Only Hyprland has specials; on niri the payload has no
+    /// `special` key, so a config that checked it never calls this, and one that did not is told.
+    pub fn toggle_special(&self, name: &str) {
+        match self.compositor {
+            Some(CompositorKind::Hyprland) => hyprland::toggle_special(name),
+            Some(CompositorKind::Niri) | None => {
+                eprintln!(
+                    "workspaces: toggle_special({name:?}) called but this session's compositor has no special workspaces; ignored"
+                )
+            }
         }
     }
 }
@@ -258,7 +338,7 @@ mod tests {
     }
 
     fn window(title: &str, app_id: &str, is_floating: bool) -> FocusedWindow {
-        FocusedWindow { title: title.to_string(), app_id: app_id.to_string(), is_floating }
+        FocusedWindow { title: title.to_string(), app_id: app_id.to_string(), is_floating, is_fullscreen: None }
     }
 
     // ---- derive_state: grouping and ordering ----
@@ -373,14 +453,18 @@ mod tests {
     }
 
     #[test]
-    fn active_client_carries_no_is_fullscreen_key_at_all() {
-        // Pins ADR-0056 decision 5: if a later compositor gains `is_fullscreen`, this test
-        // says the omission was a decision.
+    fn active_client_carries_is_fullscreen_only_when_the_compositor_said() {
+        // ADR-0056 decision 5 kept the key out rather than fabricate `false`; ADR-0119 lets a
+        // compositor that knows say so. Absent, not `null`, when it does not.
         let json = serde_json::to_value(derive_state(&[], Some(&window("a title", "kitty", false)))).unwrap();
-
         let client = &json["active_client"];
         assert_eq!(client["title"], "a title");
         assert!(client.get("is_fullscreen").is_none());
+
+        let mut known = window("a title", "mpv", false);
+        known.is_fullscreen = Some(true);
+        let json = serde_json::to_value(derive_state(&[], Some(&known))).unwrap();
+        assert_eq!(json["active_client"]["is_fullscreen"], true);
     }
 
     #[test]
@@ -388,6 +472,7 @@ mod tests {
         let json = serde_json::to_value(WorkspacesState::default()).unwrap();
 
         assert!(json.get("active_client").is_none());
+        assert!(json.get("special").is_none());
         assert_eq!(json["outputs"], serde_json::json!([]));
     }
 
@@ -395,7 +480,16 @@ mod tests {
 
     fn publisher() -> (StatePublisher, tokio::sync::mpsc::UnboundedReceiver<WorkspacesSignal>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (StatePublisher::new(Arc::new(Mutex::new(WorkspacesState::default())), tx), rx)
+        (StatePublisher::new(Arc::new(Mutex::new(WorkspacesState::default())), tx, CompositorKind::Niri), rx)
+    }
+
+    fn special(name: &str, shown_on: Option<&str>) -> SpecialWorkspace {
+        SpecialWorkspace {
+            name: name.to_string(),
+            populated: true,
+            app_id: None,
+            shown_on: shown_on.map(str::to_string),
+        }
     }
 
     #[test]
@@ -403,9 +497,9 @@ mod tests {
         let (mut publisher, mut rx) = publisher();
         let workspaces = [workspace(5, 1, "eDP-1", true, true)];
 
-        assert!(publisher.publish(&workspaces, None));
-        assert!(publisher.publish(&workspaces, None), "an event that changes nothing is not a change");
-        assert!(publisher.publish(&workspaces, Some(&window("a title", "kitty", false))));
+        assert!(publisher.publish(&workspaces, None, None));
+        assert!(publisher.publish(&workspaces, None, None), "an event that changes nothing is not a change");
+        assert!(publisher.publish(&workspaces, Some(&window("a title", "kitty", false)), None));
 
         assert_eq!(publisher.state.lock().unwrap().active_client.as_ref().unwrap().class, "kitty");
         let signals = std::iter::from_fn(|| rx.try_recv().ok()).count();
@@ -417,7 +511,41 @@ mod tests {
         let (mut publisher, rx) = publisher();
         drop(rx);
 
-        assert!(!publisher.publish(&[workspace(5, 1, "eDP-1", true, true)], None));
+        assert!(!publisher.publish(&[workspace(5, 1, "eDP-1", true, true)], None, None));
+    }
+
+    #[test]
+    fn publish_stamps_the_compositor_and_sorts_specials_and_keeps_the_key_out_when_there_are_none_to_have() {
+        let (mut publisher, _rx) = publisher();
+        let workspaces = [workspace(5, 1, "eDP-1", true, true)];
+
+        assert!(publisher.publish(&workspaces, None, None));
+        let json = serde_json::to_value(publisher.state.lock().unwrap().clone()).unwrap();
+        assert_eq!(json["compositor"], "niri");
+        assert!(json.get("special").is_none(), "no key at all: `special == nil` is the feature test");
+
+        assert!(publisher.publish(
+            &workspaces,
+            None,
+            Some(&[special("special:term", Some("eDP-1")), special("special", None)])
+        ));
+        let json = serde_json::to_value(publisher.state.lock().unwrap().clone()).unwrap();
+        assert_eq!(json["special"][0]["name"], "special");
+        assert_eq!(json["special"][1]["name"], "special:term");
+        assert_eq!(json["special"][1]["shown_on"], "eDP-1");
+        assert!(json["special"][0].get("shown_on").is_none());
+
+        assert!(publisher.publish(&workspaces, None, Some(&[])));
+        let json = serde_json::to_value(publisher.state.lock().unwrap().clone()).unwrap();
+        assert_eq!(json["special"], serde_json::json!([]), "the compositor has specials and none exist right now");
+    }
+
+    #[test]
+    fn parse_toggle_special_args_takes_a_non_empty_name() {
+        assert_eq!(parse_toggle_special_args(&[serde_json::json!("special:term")]), Some("special:term"));
+        assert_eq!(parse_toggle_special_args(&[serde_json::json!("")]), None);
+        assert_eq!(parse_toggle_special_args(&[serde_json::json!(3)]), None);
+        assert_eq!(parse_toggle_special_args(&[]), None);
     }
 
     // ---- parse_focus_args ----

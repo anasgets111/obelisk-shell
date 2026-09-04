@@ -16,18 +16,44 @@
 -- every output has an active workspace and only one output holds focus, so a strip on the other
 -- monitor would otherwise collapse to nothing. On the focused output the two are the same.
 --
+-- On Hyprland the strip pads to ten slots (ADR-0119), `WorkspaceArrangement.qml`'s
+-- `fillEmptySlots`: Hyprland has no empty workspaces to list, a numbered one exists only while a
+-- window is on it, and focusing a number creates it. A padded slot is a dimmed number whose click
+-- focuses that number, which is what the strip shows on niri anyway, where the compositor keeps a
+-- trailing empty workspace of its own and nothing is padded. The payload carries only workspaces
+-- that exist; the padding is this strip's policy, keyed on `compositor`.
+--
 -- Not mirrored: the width animation and the opacity fade, which the engine has no way to draw.
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
 
+local PADDED_SLOTS = 10
+
 local function output_of(w)
     return w and (w.outputs or {})[1]
 end
 
+-- The listed workspaces, padded with `{ id = n, idx = n, populated = false }` up to
+-- `PADDED_SLOTS` or the highest number in use, on a compositor where `id` is the number and a
+-- focus on a missing one creates it. The padded entry has the shape a real one has, so the button
+-- below reads it the same way; its `id` is what `focus` sends.
 local function workspaces_of(w)
     local out = output_of(w)
-    return out and (out.workspaces or {}) or {}
+    local listed = out and (out.workspaces or {}) or {}
+    if not (w and w.compositor == "hyprland") then
+        return listed
+    end
+    local by_idx, highest = {}, PADDED_SLOTS
+    for _, ws in ipairs(listed) do
+        by_idx[ws.idx] = ws
+        highest = math.max(highest, ws.idx)
+    end
+    local padded = {}
+    for n = 1, highest do
+        padded[n] = by_idx[n] or { id = n, idx = n, populated = false }
+    end
+    return padded
 end
 
 local pill_hovered = hover("workspace-pill")

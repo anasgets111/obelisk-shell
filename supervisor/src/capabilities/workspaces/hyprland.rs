@@ -24,10 +24,14 @@
 //!   is ADR-0117's "focused, else first" with a real order behind "first".
 //! - The focused window is `activewindow`, which is `{}` while a layer surface holds focus.
 //!   `clients[].focusHistoryID == 0` would name the last toplevel instead, wrongly.
-//! - Workspaces with an id of zero or below are dropped: specials (`special:` names, ids from
-//!   -99 down) and named workspaces (the negatives above them). Neither fits a `u64` id or a
-//!   number-keyed focus, and neither is modelled yet (§ 2.9's second gap). While a special is
-//!   shown on the focused monitor the focused row is still that monitor's regular workspace.
+//! - Workspaces with an id of zero or below are not rows. Specials (`special` and `special:` names,
+//!   ids from -99 down) become the payload's `special` list (ADR-0119), identified by name, shown
+//!   on the monitor whose `specialWorkspace` names them; `toggle_special` is
+//!   `dispatch togglespecialworkspace <name without the prefix>`. Named workspaces (the negatives
+//!   above them) are dropped: they fit neither a `u64` id nor a number-keyed focus. While a special
+//!   is shown on the focused monitor the focused row is still that monitor's regular workspace.
+//! - `is_fullscreen` is `fullscreen` on the active window: an int since Hyprland 0.42 (`0` none,
+//!   `1` maximized, `2` fullscreen) and a bool before, and only the real thing counts.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -35,7 +39,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use super::controller::{FocusedWindow, StatePublisher, WorkspaceRow};
+use super::controller::{FocusedWindow, SpecialWorkspace, StatePublisher, WorkspaceRow};
 use crate::compositor::hyprland_socket_path;
 
 /// One entry of `j/workspaces`. `windows` is Hyprland's own count, so an empty workspace needs
@@ -57,14 +61,19 @@ struct HyprlandWorkspace {
 struct HyprlandMonitor {
     name: String,
     active_workspace: WorkspaceRef,
+    /// `{ "id": 0, "name": "" }` while no special is shown here.
+    #[serde(default)]
+    special_workspace: WorkspaceRef,
     #[serde(default)]
     focused: bool,
 }
 
 /// `{ "id": 3, "name": "3" }`, how a monitor and a client name the workspace they are on.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct WorkspaceRef {
     id: i64,
+    #[serde(default)]
+    name: String,
 }
 
 /// One entry of `j/clients`, and the whole of `j/activewindow`. `mapped` defaults to `true`
@@ -83,10 +92,30 @@ struct HyprlandClient {
     focus_history_id: i64,
     #[serde(default = "yes")]
     mapped: bool,
+    #[serde(default, deserialize_with = "fullscreen_flag")]
+    fullscreen: bool,
 }
 
 fn yes() -> bool {
     true
+}
+
+/// `fullscreen` as either wire shape (module doc): a bool as itself, an int as "is `2`".
+fn fullscreen_flag<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Bool(flag) => flag,
+        serde_json::Value::Number(mode) => mode.as_i64() == Some(2),
+        _ => false,
+    })
+}
+
+/// The client standing for a workspace: mapped, with a class, most recently focused.
+fn standing_app_id(clients: &[HyprlandClient], workspace_id: i64) -> Option<String> {
+    clients
+        .iter()
+        .filter(|client| client.mapped && client.workspace.id == workspace_id && !client.class.is_empty())
+        .min_by_key(|client| client.focus_history_id)
+        .map(|client| client.class.clone())
 }
 
 /// The three lists reduced to the reduction's input. See the module doc for each mapping.
@@ -102,11 +131,7 @@ fn workspace_rows(
             let monitor = monitors.iter().find(|monitor| monitor.name == workspace.monitor);
             let is_active = monitor.is_some_and(|monitor| monitor.active_workspace.id == workspace.id);
             let is_focused = is_active && monitor.is_some_and(|monitor| monitor.focused);
-            let app_id = clients
-                .iter()
-                .filter(|client| client.mapped && client.workspace.id == workspace.id && !client.class.is_empty())
-                .min_by_key(|client| client.focus_history_id)
-                .map(|client| client.class.clone());
+            let app_id = standing_app_id(clients, workspace.id);
             let number = workspace.id.to_string();
             WorkspaceRow {
                 // A `u64` in the payload because ids are; the filter above keeps this positive.
@@ -119,6 +144,28 @@ fn workspace_rows(
                 populated: workspace.windows > 0,
                 app_id,
             }
+        })
+        .collect()
+}
+
+/// The specials, by name. Hyprland's rule: a workspace is special when its name says so, and its
+/// id is then at or below -99; the name is the test since it is what everything else keys on.
+fn special_list(
+    workspaces: &[HyprlandWorkspace],
+    monitors: &[HyprlandMonitor],
+    clients: &[HyprlandClient],
+) -> Vec<SpecialWorkspace> {
+    workspaces
+        .iter()
+        .filter(|workspace| workspace.id <= 0 && workspace.name.starts_with("special"))
+        .map(|workspace| SpecialWorkspace {
+            name: workspace.name.clone(),
+            populated: workspace.windows > 0,
+            app_id: standing_app_id(clients, workspace.id),
+            shown_on: monitors
+                .iter()
+                .find(|monitor| monitor.special_workspace.name == workspace.name)
+                .map(|monitor| monitor.name.clone()),
         })
         .collect()
 }
@@ -138,7 +185,12 @@ fn focused_window(json: &str) -> Option<FocusedWindow> {
         return None;
     }
     match serde_json::from_value::<HyprlandClient>(value) {
-        Ok(client) => Some(FocusedWindow { title: client.title, app_id: client.class, is_floating: client.floating }),
+        Ok(client) => Some(FocusedWindow {
+            title: client.title,
+            app_id: client.class,
+            is_floating: client.floating,
+            is_fullscreen: Some(client.fullscreen),
+        }),
         Err(err) => {
             eprintln!(
                 "workspaces: Hyprland's activewindow reply has an unexpected shape; treating as no focused window: {err}"
@@ -187,7 +239,9 @@ fn request(socket_path: &PathBuf, command: &str) -> std::io::Result<String> {
 
 /// The four reads, parsed. `None` logs which one failed and leaves the previous publish standing,
 /// so one dropped request under a burst costs a stale frame, not the rest of the run.
-fn read_state(socket_path: &PathBuf) -> Option<(Vec<WorkspaceRow>, Option<FocusedWindow>)> {
+type State = (Vec<WorkspaceRow>, Option<FocusedWindow>, Vec<SpecialWorkspace>);
+
+fn read_state(socket_path: &PathBuf) -> Option<State> {
     fn read<T: for<'de> Deserialize<'de>>(socket_path: &PathBuf, name: &str) -> Option<T> {
         let reply = match request(socket_path, &format!("j/{name}")) {
             Ok(reply) => reply,
@@ -215,7 +269,11 @@ fn read_state(socket_path: &PathBuf) -> Option<(Vec<WorkspaceRow>, Option<Focuse
             return None;
         }
     };
-    Some((workspace_rows(&workspaces, &monitors, &clients), focused_window(&active)))
+    Some((
+        workspace_rows(&workspaces, &monitors, &clients),
+        focused_window(&active),
+        special_list(&workspaces, &monitors, &clients),
+    ))
 }
 
 fn signature() -> Option<String> {
@@ -247,8 +305,8 @@ pub fn spawn_reader(mut publisher: StatePublisher) {
     };
 
     std::thread::spawn(move || {
-        if let Some((rows, focused)) = read_state(&command_path)
-            && !publisher.publish(&rows, focused.as_ref())
+        if let Some((rows, focused, special)) = read_state(&command_path)
+            && !publisher.publish(&rows, focused.as_ref(), Some(&special))
         {
             return;
         }
@@ -260,8 +318,8 @@ pub fn spawn_reader(mut publisher: StatePublisher) {
             if !is_trigger(&line) {
                 continue;
             }
-            if let Some((rows, focused)) = read_state(&command_path)
-                && !publisher.publish(&rows, focused.as_ref())
+            if let Some((rows, focused, special)) = read_state(&command_path)
+                && !publisher.publish(&rows, focused.as_ref(), Some(&special))
             {
                 return;
             }
@@ -270,22 +328,42 @@ pub fn spawn_reader(mut publisher: StatePublisher) {
     });
 }
 
-/// `workspaces:focus(id)` as `dispatch workspace N`: the id is the number (module doc), and a
-/// number with no workspace yet makes one, which is how an empty slot a strip pads in is entered.
-/// Hyprland answers `ok`, or a sentence saying why not; anything but `ok` is printed.
-pub fn focus(id: u64) {
+/// One `dispatch` on its own thread. Hyprland answers `ok`, or a sentence saying why not, and
+/// anything but `ok` is printed with the command.
+fn dispatch(what: String) {
     let Some(signature) = signature() else {
-        eprintln!("workspaces: focus({id}) called but HYPRLAND_INSTANCE_SIGNATURE is unset; ignored");
+        eprintln!("workspaces: `dispatch {what}` requested but HYPRLAND_INSTANCE_SIGNATURE is unset; ignored");
         return;
     };
     std::thread::spawn(move || {
         let socket_path = hyprland_socket_path(&signature, ".socket.sock");
-        match request(&socket_path, &format!("dispatch workspace {id}")) {
+        match request(&socket_path, &format!("dispatch {what}")) {
             Ok(reply) if reply.trim() == "ok" => {}
-            Ok(reply) => eprintln!("workspaces: Hyprland refused `dispatch workspace {id}`: {}", reply.trim()),
-            Err(err) => eprintln!("workspaces: Hyprland `dispatch workspace {id}` request failed: {err}"),
+            Ok(reply) => eprintln!("workspaces: Hyprland refused `dispatch {what}`: {}", reply.trim()),
+            Err(err) => eprintln!("workspaces: Hyprland `dispatch {what}` request failed: {err}"),
         }
     });
+}
+
+/// `workspaces:focus(id)` as `dispatch workspace N`: the id is the number (module doc), and a
+/// number with no workspace yet makes one, which is how an empty slot a strip pads in is entered.
+pub fn focus(id: u64) {
+    dispatch(format!("workspace {id}"));
+}
+
+/// `workspaces:toggle_special(name)` as `dispatch togglespecialworkspace <arg>`, where the
+/// dispatcher's argument is the part after `special:` and nothing at all for the unnamed
+/// `special`: it prepends the prefix itself, so passing the full name would toggle
+/// `special:special:term`.
+pub fn toggle_special(name: &str) {
+    dispatch(match special_argument(name) {
+        "" => "togglespecialworkspace".to_string(),
+        argument => format!("togglespecialworkspace {argument}"),
+    })
+}
+
+fn special_argument(name: &str) -> &str {
+    name.strip_prefix("special:").unwrap_or(if name == "special" { "" } else { name })
 }
 
 #[cfg(test)]
@@ -323,6 +401,11 @@ mod tests {
             "specialWorkspace": { "id": 0, "name": "" },
             "focused": focused, "disabled": false
         })
+    }
+
+    fn showing_special(mut monitor: serde_json::Value, id: i64, name: &str) -> serde_json::Value {
+        monitor["specialWorkspace"] = serde_json::json!({ "id": id, "name": name });
+        monitor
     }
 
     fn client(class: &str, title: &str, workspace: i64, focus_history_id: i64, floating: bool) -> serde_json::Value {
@@ -454,7 +537,12 @@ mod tests {
         let focused = focused_window(&client("kitty", "~ - fish", 1, 0, true).to_string()).unwrap();
         assert_eq!(
             focused,
-            FocusedWindow { title: "~ - fish".to_string(), app_id: "kitty".to_string(), is_floating: true }
+            FocusedWindow {
+                title: "~ - fish".to_string(),
+                app_id: "kitty".to_string(),
+                is_floating: true,
+                is_fullscreen: Some(false)
+            }
         );
 
         assert_eq!(focused_window("{}"), None, "a layer surface holds focus");
@@ -470,5 +558,54 @@ mod tests {
         assert!(!is_trigger("activelayout>>at-translated-set-2-keyboard,English (US)"));
         assert!(!is_trigger("submap>>resize"));
         assert!(!is_trigger("urgent>>55d1c0a3b2c0"));
+    }
+
+    #[test]
+    fn is_fullscreen_reads_the_int_mode_and_the_older_bool_and_counts_only_real_fullscreen() {
+        let mut window = client("mpv", "film.mkv", 1, 0, false);
+        for (wire, expected) in [
+            (serde_json::json!(2), Some(true)),
+            (serde_json::json!(1), Some(false)),
+            (serde_json::json!(0), Some(false)),
+            (serde_json::json!(true), Some(true)),
+            (serde_json::json!(false), Some(false)),
+        ] {
+            window["fullscreen"] = wire.clone();
+            assert_eq!(focused_window(&window.to_string()).unwrap().is_fullscreen, expected, "{wire}");
+        }
+    }
+
+    #[test]
+    fn special_list_names_each_special_with_its_standing_app_and_the_monitor_showing_it() {
+        let specials = special_list(
+            &workspaces(serde_json::json!([
+                workspace(1, "1", "DP-1", 1),
+                workspace(-1, "notes", "DP-1", 1),
+                workspace(-99, "special:term", "DP-1", 2),
+                workspace(-98, "special", "HDMI-A-1", 0),
+            ])),
+            &monitors(serde_json::json!([
+                showing_special(monitor("DP-1", 1, true), -99, "special:term"),
+                monitor("HDMI-A-1", 2, false),
+            ])),
+            &clients(serde_json::json!([client("kitty", "~", -99, 0, true), client("btop", "btop", -99, 3, true)])),
+        );
+
+        assert_eq!(
+            specials.iter().map(|special| special.name.as_str()).collect::<Vec<_>>(),
+            ["special:term", "special"]
+        );
+        assert_eq!(specials[0].app_id.as_deref(), Some("kitty"));
+        assert!(specials[0].populated);
+        assert_eq!(specials[0].shown_on.as_deref(), Some("DP-1"));
+        assert!(!specials[1].populated);
+        assert_eq!(specials[1].shown_on, None, "exists but is hidden");
+    }
+
+    #[test]
+    fn the_toggle_argument_is_the_name_without_its_prefix_and_nothing_for_the_unnamed_special() {
+        assert_eq!(special_argument("special:term"), "term");
+        assert_eq!(special_argument("special"), "");
+        assert_eq!(special_argument("term"), "term", "a config passing the short name is not punished");
     }
 }

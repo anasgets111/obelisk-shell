@@ -52,7 +52,6 @@ The data layer is not the problem. Paint and animation are.
 | :--- | :--- | :--- |
 | An HTTP client | weather, IP geolocation, currency | `process.run curl` then `json.decode`. Fine as a subprocess; a capability would be scope creep. |
 | Per-workspace window lists | a window switcher per workspace | § 2.9 carries one global `active_client` plus, per workspace, `populated` and one `app_id` (ADR-0117): enough for a strip's icon, not for a list. ADR-0056 chose that shape, so this is a decision, not an oversight. |
-| Special workspaces | the special-workspaces pill | nothing in § 2.9 models them. Hyprland's scratchpads, which the Hyprland adaptor (ADR-0118) reads and drops; niri has none. The shape is planned as an optional top-level `special` list, absent on a compositor without them. |
 | KDE Connect | SMS, ring, mount, remote commands | none. Lua cannot speak D-Bus, and this needs a live signal stream rather than one-shot calls. The only entry arguing for a general D-Bus escape hatch. |
 | Monitor configuration | the display-settings arrangement editor | § 2.15 `screens` reads and nothing writes. Writing output config is compositor-specific, so ADR-0056's reasoning applies unchanged. |
 

@@ -53,11 +53,12 @@
 ---@field strength integer Signal strength, `0` to `100`.
 
 ---@class ActiveClient
----§ 2.9's `active_client`, minus `is_fullscreen` (ADR-0056 decision 5: niri-ipc 26.4.0's `Window`
----has no such field, and a fabricated `false` would be wrong for fullscreen windows); `class` is
+---§ 2.9's `active_client`. `is_fullscreen` is present only from a compositor that reports it
+---(ADR-0056 decision 5 refused to fabricate `false`, ADR-0119 lets Hyprland say); `class` is
 ---Wayland's `app_id`, since X11's `WM_CLASS` has no Wayland equivalent.
 ---@field class string The Wayland `app_id`, e.g. `"firefox"`. Named `class` for the X11 habit, but a Wayland toplevel has no `WM_CLASS`. The key `applications.by_app_id` is built to be looked up by.
 ---@field is_floating boolean The compositor has this window floating rather than tiled.
+---@field is_fullscreen? boolean The window covers its whole output. Absent when the compositor does not say (niri-ipc has no such field, ADR-0056 decision 5); Hyprland reports it (ADR-0119).
 ---@field title string The window title, e.g. `"src/main.rs - Neovim"`. Empty string for a window that sets none.
 
 ---@class AppStream
@@ -209,6 +210,15 @@
 ---@field position integer Playback offset in microseconds, correct as of [`PlayerState::position_updated_at`] and not after; nothing polls it while playing, so a progress bar must add elapsed time itself.
 ---@field position_updated_at integer `CLOCK_MONOTONIC` microseconds when [`PlayerState::position`] was read. Monotonic, not wall clock, so it survives a clock adjustment; subtract from a monotonic `now` for elapsed.
 ---@field title string `xesam:title`; empty when the player publishes no metadata, the normal state between tracks.
+
+---@class SpecialWorkspace
+---One special workspace (ADR-0119). Identified by `name`, which is what
+---`workspaces:toggle_special(name)` takes, since Hyprland addresses them by name and their ids
+---are negative.
+---@field app_id? string The `app_id` of its standing window, chosen as [`WorkspaceEntry::app_id`] is.
+---@field name string The compositor's full name, `"special:scratch"` or the unnamed `"special"`.
+---@field populated boolean At least one window sits on it.
+---@field shown_on? string The connector of the output currently showing it, absent while it is hidden. A special shows on one output at a time.
 
 ---@class TrayItem
 ---@field attention_icon_name? string The `NeedsAttention` artwork, resolved the same way as `icon_name`/`icon_path`. Draw these instead of the base pair while `status` is `"NeedsAttention"`. Both stay `nil` for an item that declares no attention icon, which is most of them.
@@ -406,7 +416,9 @@
 ---`oblisk.workspaces`'s full payload (§ 2.9); field names are the JSON keys verbatim, and
 ---`active_client` (`Option`, § 2.9's "or `nil` if none focused") is omitted, not `null`.
 ---@field active_client? ActiveClient The focused toplevel, or `nil` if none. One window per session, not per output: there is no way to ask what is focused on an unfocused monitor (ADR-0056 decision 4).
+---@field compositor string Which compositor these came from, `"niri"` or `"hyprland"` (ADR-0119). Display policy differs by compositor where the state does not: Hyprland creates a numbered workspace on focus, so a strip pads empty slots there and not on niri, which keeps its own trailing empty workspace.
 ---@field outputs OutputWorkspaces[] One entry per output, keyed by connector name; empty until the compositor first answers.
+---@field special? SpecialWorkspace[] The compositor's special workspaces, Hyprland's scratchpads, ordered by name (ADR-0119). Absent on a compositor that has none, so `special == nil` hides the control and an empty list means none exist right now. Hyprland lists a special only while it holds a window or is shown.
 
 --- Capabilities -------------------------------------------------------------------------------
 
@@ -462,7 +474,7 @@ local PrivacyCapability = {}
 ---@field invoke fun(self: UpdatesCapability, command: "check"|"configure"|"install", ...: any)
 
 ---@class WorkspacesCapability: Capability<WorkspacesState>
----@field invoke fun(self: WorkspacesCapability, command: "focus", ...: any)
+---@field invoke fun(self: WorkspacesCapability, command: "focus"|"toggle_special", ...: any)
 
 --- Off-roster members ---------------------------------------------------------------------------
 -- Not capabilities and not in `shared::Capability::ALL`, so they have no payload struct to derive

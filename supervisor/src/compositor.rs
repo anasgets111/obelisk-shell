@@ -23,6 +23,17 @@ pub enum CompositorKind {
     Niri,
 }
 
+impl CompositorKind {
+    /// The lowercase name a payload carries (`oblisk.workspaces.compositor`, ADR-0119), so a
+    /// config can pick display policy by compositor without a second detection of its own.
+    pub fn name(self) -> &'static str {
+        match self {
+            CompositorKind::Hyprland => "hyprland",
+            CompositorKind::Niri => "niri",
+        }
+    }
+}
+
 /// The env var each compositor sets for every process in its own session, in probe order.
 ///
 /// A table rather than the `if`/`else` chain this replaces, so a third compositor is a line of

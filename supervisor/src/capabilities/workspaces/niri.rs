@@ -56,6 +56,8 @@ fn focused_window(windows: &HashMap<u64, niri_ipc::Window>) -> Option<FocusedWin
         title: window.title.clone().unwrap_or_default(),
         app_id: window.app_id.clone().unwrap_or_default(),
         is_floating: window.is_floating,
+        // niri-ipc 26.4.0 has no fullscreen field (ADR-0056 decision 5); absent, not `false`.
+        is_fullscreen: None,
     })
 }
 
@@ -123,7 +125,7 @@ pub fn spawn_reader(mut publisher: StatePublisher) {
 
             let rows = workspace_rows(&niri_workspaces.workspaces, &niri_windows.windows);
             let focused = focused_window(&niri_windows.windows);
-            if !publisher.publish(&rows, focused.as_ref()) {
+            if !publisher.publish(&rows, focused.as_ref(), None) {
                 return;
             }
         }

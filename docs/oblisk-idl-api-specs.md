@@ -170,8 +170,11 @@ Workspace state only. Output geometry lives in `oblisk.screens` (§ 2.15), which
 
 > **Amended by ADR-0056**, built against niri. `focused_workspace` is present only on the output holding focus, since focus is one workspace across every output and this structure models it per output (decision 4). `is_fullscreen` is not reported: niri-ipc has no such field, and a fabricated `false` would be wrong for exactly the windows a fullscreen check exists to find (decision 5). Each output carries a `workspaces` array, added because the two ids below are opaque and nothing else names which workspaces exist, their names, or their order (decision 3).
 >
-> **Amended by ADR-0118**, which adds Hyprland. The shape is unchanged: on Hyprland `id` and `idx` are both the workspace number, `name` is present only for a workspace named something other than its number, and `workspaces:focus(id)` takes the number, so focusing one no workspace has yet creates it. Hyprland's special and named workspaces (its negative ids) are not listed. Built to Hyprland's documented IPC and not live-tested.
+> **Amended by ADR-0118**, which adds Hyprland. The shape is unchanged: on Hyprland `id` and `idx` are both the workspace number, `name` is present only for a workspace named something other than its number, and `workspaces:focus(id)` takes the number, so focusing one no workspace has yet creates it. Hyprland's named workspaces (its negative ids above the specials) are not listed. Built to Hyprland's documented IPC and not live-tested.
+>
+> **Amended by ADR-0119**, which adds what one compositor has and the other does not, as keys that are absent where the feature is: `compositor` names the session so a config can pick display policy; `special` lists Hyprland's scratchpads and is absent on niri; `is_fullscreen` is reported by Hyprland and absent on niri. `workspaces:toggle_special(name)` joins `focus`.
 
+*   `workspaces.compositor`: `string` (`"niri"` or `"hyprland"`, the session's compositor. For display policy the state does not settle: `dev-config`'s strip pads empty slots to ten on Hyprland, where focusing a number creates the workspace, and not on niri, which keeps a trailing empty workspace itself. ADR-0119)
 *   `workspaces.outputs`: `table` (Array of per-output workspace structures)
     *   Output structure:
         *   `name`: `string` (Connector name, e.g., `"eDP-1"`, matching an `oblisk.screens` entry)
@@ -188,9 +191,15 @@ Workspace state only. Output geometry lives in `oblisk.screens` (§ 2.15), which
     *   `title`: `string` (Active window title text, e.g. `"src/main.rs - Neovim"`)
     *   `class`: `string` (Active window application class name, e.g. `"Alacritty"` or `"firefox"`. A Wayland toplevel has an `app_id`, not a `WM_CLASS`, and that is what this carries)
     *   `is_floating`: `boolean` (True if marked floating/pinned by compositor)
-    *   `is_fullscreen`: `boolean` (True if window occupies entire display boundary. **Not reported**, per ADR-0056 decision 5)
+    *   `is_fullscreen`: `boolean` (True if window occupies entire display boundary. Absent when the compositor does not report it: niri-ipc has no such field and a fabricated `false` would be wrong for exactly the windows a check looks for (ADR-0056 decision 5); Hyprland reports it, and only its real fullscreen counts, not maximized (ADR-0119))
+*   `workspaces.special`: `table` (Array of the compositor's special workspaces, Hyprland's scratchpads, ordered by `name`. **Absent on a compositor without them**, so `special == nil` hides the control; an empty array means none exist right now. Hyprland lists a special only while it holds a window or is shown. ADR-0119)
+    *   Special workspace structure:
+        *   `name`: `string` (The compositor's full name, `"special:scratch"` or the unnamed `"special"`; what `workspaces:toggle_special(name)` takes)
+        *   `populated`: `boolean` (At least one window sits on it)
+        *   `app_id`: `string` (The `app_id` of its standing window, chosen as a workspace's is; absent when empty)
+        *   `shown_on`: `string` (Connector name of the output currently showing it; absent while hidden. A special shows on one output at a time)
 
-> **Two gaps.** No per-workspace window list: `populated` and `app_id` (ADR-0117) are the one window a strip draws, not the set, so a config cannot list what runs on a workspace. Special workspaces are not modelled at all, and on Hyprland the adaptor drops them (ADR-0118). Both listed in `roadmap.md`.
+> **One gap.** No per-workspace window list: `populated` and `app_id` (ADR-0117) are the one window a strip draws, not the set, so a config cannot list what runs on a workspace. Listed in `roadmap.md`.
 
 ### 2.10 Rescue mode and recovery state (`oblisk.rescue`)
 *   `rescue.is_rescue`: `boolean` (True if the user configuration is broken and Rescue Mode is active)
@@ -316,7 +325,8 @@ All write actions serialize as JSON-RPC 2.0 payloads over the private Unix socke
 | `oblisk.applications:launch(id)` | `capability: "applications", action: "launch", arguments: [id]`<br>**Validation**: `id` must be an `entries[].id` from the current snapshot; an unknown id is logged and nothing spawned. Runs the entry's own `Exec=`, detached and in its own process group, so a generation swap does not reap it and no pipe is held (unlike `process.run`, ADR-0026). `Terminal=true` wraps in `$TERMINAL -e`, refused with a log line if `$TERMINAL` is unset. |
 | `oblisk.applications:open_url(url)` | `capability: "applications", action: "open_url", arguments: [url]`<br>**Validation**: `url` is a string under 2048 bytes with no whitespace or control character, whose scheme is `http`, `https` or `mailto`; anything else is logged and nothing spawned -- `file:` in particular, since a URL out of a notification body is the sender's text. Hands it to `xdg-open`, detached like `launch`, so the user's own default handler opens it. ADR-0103. |
 | `wallpaper:set(mon, path, fit, anim, dur)` | **Superseded by ADR-0055. No `wallpaper` capability, none planned.** A wallpaper is an `image` node on a config-declared `Background` panel: `mon` is `panel.monitor`, `path` is `image.source`, `fit` is `image.fit`, and a runtime change writes the `state()` signal bound to `source`, no IPC involved. `anim` and `dur` have nowhere to go: the engine has no animation model (`roadmap.md`). |
-| `workspaces:focus(id)` | `capability: "workspaces", action: "focus", arguments: [id]`<br>**Validation**: `id` must be an integer. Focuses target workspace. |
+| `workspaces:focus(id)` | `capability: "workspaces", action: "focus", arguments: [id]`<br>**Validation**: `id` must be an integer. Focuses target workspace. On Hyprland `id` is the workspace number and a number no workspace has yet creates one (ADR-0118). |
+| `workspaces:toggle_special(name)` | `capability: "workspaces", action: "toggle_special", arguments: [name]`<br>**Validation**: `name` is a non-empty string, a `special[].name`. Shows the special workspace on the focused output, or hides it if shown; a name no special has creates one, which is how a scratchpad is first opened. Logged and ignored on a compositor whose payload has no `special` key (ADR-0119). |
 | `rescue:reload_config()` | `capability: "rescue", action: "reload_config", arguments: []`<br>**Validation**: Runs compiler pass on `shell.lua` and reloads Renderer if valid. |
 | `sysinfo:configure(cfg)` | `capability: "sysinfo", action: "configure", arguments: [cfg]`<br>**Validation**: `cfg` is dictionary containing integers `cpu_interval`, `ram_interval`, `temp_interval` in seconds. An interval of `0` suspends the matching monitor thread. |
 | `power:set_profile(p)` | `capability: "power", action: "set_profile", arguments: [p]`<br>**Validation**: `p` is string matching active host profiles. |
