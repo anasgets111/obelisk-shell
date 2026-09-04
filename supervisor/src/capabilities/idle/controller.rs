@@ -18,6 +18,7 @@ use super::notify::{
     NotifyState, cleanup_generation_thresholds, connect_wayland_idle, register_threshold_entry,
     spawn_idle_event_forwarder,
 };
+use super::state::{IdleState, foreign_idle_inhibitors};
 
 /// `idle:register_threshold(sec, on_idle, on_resume)`'s `arguments: [sec]`
 /// (docs/oblisk-supervisor-services-dbus.md §7.1; ADR-0032). The callbacks themselves stay
@@ -50,6 +51,10 @@ pub struct IdleController {
     /// constructing an `IdleController` never blocks on Wayland.
     notify: Arc<RwLock<NotifyState>>,
     inhibit: Arc<LiveInhibit>,
+    /// The last state [`watch_idle_inhibitors`] published, so `Capabilities::start` can hand a
+    /// config the current answer the moment it reads `oblisk.idle` rather than leaving it `nil`
+    /// until the next inhibitor appears (ADR-0141).
+    published: Arc<std::sync::Mutex<IdleState>>,
 }
 
 impl IdleController {
@@ -60,16 +65,28 @@ impl IdleController {
     /// running [`connect_wayland_idle`] inside `spawn_blocking`, bounded by
     /// [`IDLE_NOTIFY_SETUP_TIMEOUT`] -- its `roundtrip()` hung once live against niri with no
     /// timeout, and awaiting it directly here would wedge the whole Supervisor.
-    pub async fn new(system_bus: zbus::Connection, events_tx: UnboundedSender<shared::IdleEvent>) -> Self {
+    pub async fn new(
+        system_bus: zbus::Connection,
+        events_tx: UnboundedSender<shared::IdleEvent>,
+        state_tx: UnboundedSender<IdleState>,
+    ) -> Self {
         let notify = Arc::new(RwLock::new(NotifyState::Inert));
         // Watched on the system bus, which is always there, rather than alongside notify: a held
         // inhibitor is worth knowing about even on a run where the Wayland half degraded to inert,
         // and the watch is what makes `idle:inhibit` mean anything at all (ADR-0139).
         let gate = Arc::new(std::sync::Mutex::new(IdleGate::default()));
-        tokio::spawn(watch_idle_inhibitors(system_bus.clone(), gate.clone(), events_tx.clone()));
+        let published = Arc::new(std::sync::Mutex::new(IdleState::default()));
+        tokio::spawn(watch_idle_inhibitors(
+            system_bus.clone(),
+            gate.clone(),
+            events_tx.clone(),
+            state_tx,
+            published.clone(),
+        ));
 
         let controller = Self {
             notify: notify.clone(),
+            published,
             pending: Arc::new(std::sync::Mutex::new(Vec::new())),
             inhibit: Arc::new(LiveInhibit {
                 system_bus,
@@ -119,6 +136,14 @@ impl IdleController {
     /// Registers everything that arrived while notify was inert, oldest first. Drains under its
     /// own lock and registers outside it: `register_threshold` awaits, and holding a
     /// `std::sync::Mutex` across an await is the deadlock this codebase avoids everywhere else.
+    /// The current inhibitor state, for the push `Capabilities::start` makes when a config first
+    /// reads `oblisk.idle`. Without it the member reads `nil` until something takes or drops an
+    /// inhibitor, which on a quiet machine is never -- the "reads `nil` forever" failure ADR-0076
+    /// exists to prevent.
+    pub fn snapshot(&self) -> IdleState {
+        self.published.lock().unwrap().clone()
+    }
+
     async fn replay_pending_registrations(&self) {
         let queued: Vec<(u32, u64)> = std::mem::take(&mut *self.pending.lock().unwrap());
         if queued.is_empty() {
@@ -257,6 +282,8 @@ async fn watch_idle_inhibitors(
     system_bus: zbus::Connection,
     gate: Arc<std::sync::Mutex<IdleGate>>,
     events_tx: UnboundedSender<shared::IdleEvent>,
+    state_tx: UnboundedSender<IdleState>,
+    published: Arc<std::sync::Mutex<IdleState>>,
 ) {
     let proxy = match Login1ManagerProxy::new(&system_bus).await {
         Ok(proxy) => proxy,
@@ -272,19 +299,42 @@ async fn watch_idle_inhibitors(
         let Ok(what) = proxy.block_inhibited().await else { continue };
         let blocked = blocks_idle(&what);
         // `None` is "same answer as last time", which is most of them: `BlockInhibited` changes on
-        // every inhibitor of any kind, and almost none of them are idle.
-        let Some(owed) = gate.lock().unwrap().set_blocked(blocked) else { continue };
-        if blocked {
-            eprintln!(
-                "idle: logind reports an idle inhibitor ({what}); threshold events are held until it is released"
-            );
-        } else {
-            eprintln!("idle: no idle inhibitor is held any more; threshold events resume");
-        }
-        for event in owed {
-            if events_tx.send(event).is_err() {
-                return;
+        // every inhibitor of any kind, and almost none of them are idle. The gate only cares about
+        // the transition; the state below is published on every change, because the *list* moves
+        // without the answer moving -- mpv releasing while Firefox still holds one.
+        if let Some(owed) = gate.lock().unwrap().set_blocked(blocked) {
+            if blocked {
+                eprintln!(
+                    "idle: logind reports an idle inhibitor ({what}); threshold events are held until it is released"
+                );
+            } else {
+                eprintln!("idle: no idle inhibitor is held any more; threshold events resume");
             }
+            for event in owed {
+                if events_tx.send(event).is_err() {
+                    return;
+                }
+            }
+        }
+
+        // One `ListInhibitors` per change, never on a timer: ADR-0139 rejected polling this and
+        // still does. What changed is that there is a signalled edge to hang a single call off.
+        // Skipped entirely while nothing blocks idle, where the answer is empty by definition.
+        let inhibitors = if blocked {
+            proxy.list_inhibitors().await.map(foreign_idle_inhibitors).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let next_state = IdleState { inhibited: blocked, inhibitors };
+        {
+            let mut held = published.lock().unwrap();
+            if *held == next_state {
+                continue;
+            }
+            *held = next_state.clone();
+        }
+        if state_tx.send(next_state).is_err() {
+            return;
         }
     }
 }

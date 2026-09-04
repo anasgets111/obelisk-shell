@@ -62,6 +62,12 @@ pub(crate) trait Login1Manager {
     /// holding an idle inhibitor" for every holder including this shell's own (ADR-0139).
     #[zbus(property, name = "BlockInhibited")]
     fn block_inhibited(&self) -> zbus::Result<String>;
+
+    /// Every held inhibitor: `what`, `who`, `why`, `mode`, `uid`, `pid`. Called once per
+    /// `BlockInhibited` change, never on a timer -- ADR-0139 rejected polling this and still does;
+    /// what changed is that there is now a signalled edge to hang one call off (ADR-0141).
+    #[zbus(name = "ListInhibitors")]
+    fn list_inhibitors(&self) -> zbus::Result<Vec<super::state::InhibitorRow>>;
 }
 
 /// `what`/`who`/`mode` are fixed by ADR-0032: `mode = "block"` is the only mode that actually

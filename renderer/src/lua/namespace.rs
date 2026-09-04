@@ -51,17 +51,24 @@ pub(crate) fn build(
     let table = loader.create_table()?;
     let mut capabilities = HashMap::new();
     let pending = loader.create_table()?;
+    // `idle` is the one roster name whose member is not parked in `pending`: its three threshold
+    // methods take Lua callbacks that cannot cross the wire as an `:invoke`, so `lua::idle` wraps
+    // the member and that wrapper goes on the table directly (ADR-0141). The handle still lands in
+    // `capabilities`, so a `StateSnapshot` for `idle` hydrates the same signal the wrapper reads.
+    let mut idle_member = None;
     for capability in shared::Capability::ALL {
         let name = capability.as_str();
         let (member, handle) = Capability::new(name, dirty.clone(), commands.clone());
-        pending.set(name, member)?;
+        if *capability == shared::Capability::Idle {
+            idle_member = Some(member);
+        } else {
+            pending.set(name, member)?;
+        }
         capabilities.insert(name.to_string(), handle);
     }
     install_capability_index(loader, &table, pending, commands.clone())?;
-    // Off-roster like `rescue` and `screens`, but for the opposite reason: those are Renderer
-    // state the Supervisor never pushes, and idle is a Supervisor service that pushes nothing --
-    // its events are threshold crossings, not state. See `lua::idle`.
-    let idle = IdleRegistry::new(commands.clone());
+    let idle_state = idle_member.expect("shared::Capability::ALL must contain Idle");
+    let idle = IdleRegistry::new(commands.clone(), idle_state);
     table.set("idle", idle.member())?;
     loader.register_idle(idle.clone());
     let rescue = register_rescue_signal(loader, &table, dirty.clone())?;

@@ -19,8 +19,10 @@ pub mod controller;
 pub mod gate;
 pub mod inhibit;
 pub mod notify;
+pub mod state;
 
 pub use controller::{IdleController, parse_inhibit_args, parse_register_args};
+pub use state::IdleState;
 
 /// Every action `oblisk.idle:invoke(...)` accepts. `dispatch` matches this rather than a string,
 /// so a variant with no arm (or an arm with no variant) fails the build.

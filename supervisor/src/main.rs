@@ -23,9 +23,9 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use capabilities::Capabilities;
 use capabilities::lock::{self, LockController};
 use capabilities::network::NetworkController;
-use capabilities::{Capabilities, Startable};
 use generation::renderer_binary_path;
 use polkit::PolkitAgent;
 use shared::{Capability, ReevaluateReport, ReevaluateRequest, RendererFrame, SupervisorFrame, Zeroize};
@@ -324,12 +324,10 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                 }
                 RendererFrame::LockReport(report) => supervisor.record_lock_report(report),
                 RendererFrame::Command(envelope) => match envelope.params.capability.as_str() {
-                    // Three names reach dispatch that are not roster capabilities: `process`,
-                    // which is addressable but never started, `idle`, which is event-shaped
-                    // (ADR-0032), and anything else, which is a Renderer bug or a hand-written
-                    // frame. Everything else is one exhaustive match inside `Capabilities`.
+                    // One name reaches dispatch that is not a roster capability: `process`, which
+                    // is addressable but never started. `idle` joined the roster with ADR-0141 and
+                    // goes through the generic path below like everything else.
                     "process" => supervisor.dispatch_process_command(&envelope).await,
-                    "idle" => supervisor.capabilities.dispatch_idle(&envelope),
                     name => match Capability::from_name(name) {
                         Some(capability) => supervisor.dispatch_capability_command(capability, &envelope).await,
                         None => eprintln!("inbound command from generation {}: {:?}", inbound.generation_id, envelope),
@@ -348,12 +346,11 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     // process has. Awaited inline rather than spawned -- decision 4 says why.
                     // Re-entrant: decision 3 has every generation re-send every name it read, and
                     // each arm below is a no-op once its controller exists.
-                    match Startable::from_name(&capability) {
+                    match Capability::from_name(&capability) {
                         // Its controller is built at boot; starting it is registering the agent
                         // (ADR-0070 decision 5, ADR-0114).
-                        Some(Startable::Capability(Capability::Polkit)) => polkit_agent.register(&connection).await,
-                        Some(Startable::Capability(capability)) => supervisor.capabilities.start(capability).await,
-                        Some(Startable::Idle) => supervisor.capabilities.start_idle().await,
+                        Some(Capability::Polkit) => polkit_agent.register(&connection).await,
+                        Some(capability) => supervisor.capabilities.start(capability).await,
                         None => eprintln!(
                             "generation {} asked to start {capability:?}, which is not a capability this Supervisor builds",
                             inbound.generation_id

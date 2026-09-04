@@ -776,8 +776,10 @@ mod meta_stub_tests {
         // Split on the trailing newline too, or this matches `---@class ObliskVersion` first.
         let class = source.split("---@class Oblisk\n").nth(1).expect("oblisk.lua declares an Oblisk class");
         // The `oblisk` table's off-roster members, which have no `StateSnapshot` behind them and
-        // so no roster entry: see `lua::namespace::build` and `lua::idle`.
-        let off_roster = ["idle", "screens", "rescue", "version", "config_dir"];
+        // so no roster entry: see `lua::namespace::build`. `idle` left this list with ADR-0141 --
+        // it is a roster capability now, wrapped in its own userdata for the three methods whose
+        // callbacks cannot cross the wire.
+        let off_roster = ["screens", "rescue", "version", "config_dir"];
         let declared: BTreeSet<&str> = class
             .lines()
             .take_while(|line| line.starts_with("---@field"))

@@ -788,13 +788,19 @@ pub fn from_userdata(ud: &mlua::AnyUserData) -> Option<Signal> {
     if let Ok(signal) = ud.borrow::<Signal>() {
         return Some(signal.clone());
     }
-    Some(ud.borrow::<crate::lua::capability::Capability>().ok()?.signal())
+    if let Ok(capability) = ud.borrow::<crate::lua::capability::Capability>() {
+        return Some(capability.signal());
+    }
+    // `oblisk.idle` is a capability wrapped in its own userdata so the three threshold methods can
+    // sit beside `get`/`map` (ADR-0141). Without this arm `visible = oblisk.idle` is the one
+    // capability a config cannot bind directly.
+    Some(ud.borrow::<crate::lua::idle::IdleMember>().ok()?.signal())
 }
 
 /// [`from_userdata`] without the clone, for callers that only need the question answered. The
 /// two must agree on which types are signals, which `from_userdata_and_is_signal_agree` asserts.
 pub fn is_signal(ud: &mlua::AnyUserData) -> bool {
-    ud.is::<Signal>() || ud.is::<crate::lua::capability::Capability>()
+    ud.is::<Signal>() || ud.is::<crate::lua::capability::Capability>() || ud.is::<crate::lua::idle::IdleMember>()
 }
 
 /// Registers the `computed(dependencies, fn)` global (§ 1.2) and the `state(name, initial)`

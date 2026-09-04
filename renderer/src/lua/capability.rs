@@ -110,6 +110,11 @@ impl CommandSender {
 /// One member of the `oblisk` table: the capability's live state signal plus its write path.
 /// `name` is the `shared::Capability::ALL` roster name, both the Lua field it is registered under
 /// and the `capability` field of every envelope it sends.
+///
+/// `Clone` for exactly one caller: `lua::idle` wraps `oblisk.idle`'s roster member in its own
+/// userdata so the three threshold methods sit on the same object as `get`/`map`/`on_change`
+/// (ADR-0141). Cloning shares the signal and the handler list rather than copying them.
+#[derive(Clone)]
 pub struct Capability {
     name: String,
     signal: Signal,
@@ -139,6 +144,23 @@ impl Capability {
             handlers: Rc::clone(&handlers),
         };
         (capability, CapabilityHandle { name: name.to_string(), signal: signal_handle, revision, handlers })
+    }
+
+    /// Registers an `on_change` handler, for a wrapper that re-exports this capability's read half
+    /// under its own userdata (`lua::idle`). The method below does the same for the ordinary case.
+    pub fn add_handler(&self, handler: Function) {
+        self.handlers.borrow_mut().push(handler);
+    }
+
+    /// This capability's roster name, for a wrapper that must send the same `start_capability`
+    /// a read through `oblisk`'s `__index` would have sent.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The command sender, so a wrapper can announce a read the `__index` path never sees.
+    pub fn commands(&self) -> &CommandSender {
+        &self.commands
     }
 
     /// The wrapped read signal, for `signal::from_userdata`: lets a config write § 1.2's live

@@ -1154,8 +1154,10 @@ mod tests {
                 ("wallpaper_tooltip", "popup"),
                 ("network_tooltip", "popup"),
                 ("bluetooth_tooltip", "popup"),
+                ("idle_tooltip", "popup"),
                 ("launcher", "panel"),
                 ("wallpaper_picker", "panel"),
+                ("idle_settings", "panel"),
                 ("lock_screen", "lock"),
                 ("polkit_dialog", "panel"),
             ]

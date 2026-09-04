@@ -6863,3 +6863,52 @@ and filtering in the callback.* Same registration leak as decision 1, with a gua
 instead of none. *`fullscreenInhibitorActive`.* `oblisk.workspaces.active_client` carries no
 fullscreen flag on niri; a film in a fullscreen player is caught by the video rule or not at all.
 Marked as a TODO in `lib/idle.lua` where the reason list is built.
+
+## 0141. `oblisk.idle` joins the roster, because there is idle state worth reading after all
+
+Amends ADR-0032 and ADR-0139's rejection. Both said the same thing: a threshold crossing is an
+event, not state, so `oblisk.idle` is methods only and a roster entry would hand a config a signal
+reading `nil` forever. ADR-0139 added the gate that honours a logind idle inhibitor and kept the
+rejection, on the narrower ground that `register_threshold` takes Lua callbacks which cannot cross
+the wire as an `:invoke`, so the roster would buy only push machinery.
+
+Push machinery was the missing piece. Observed live with `systemd-inhibit --what=idle --who=mpv`:
+the Supervisor logged that it was holding every threshold event, the config's countdown stopped, and
+the bar drew "nothing is holding this awake" the whole time, because the one fact it needed was the
+one fact it could not reach. A shell that lies about why it is not doing something is worse than one
+that cannot see the reason at all.
+
+**Decisions.**
+
+1. **`Idle` is a roster capability with an `IdleState` payload.** `inhibited` is the gate's own
+   answer off `Manager.BlockInhibited`; `inhibitors` names the holders as `who`/`why`. Not
+   redundant: this shell's own hold is excluded, so `inhibited` true with an empty list means "the
+   only thing holding this awake is you", which the config already explains in better words than
+   the `why` it passed down.
+2. **One `ListInhibitors` per `BlockInhibited` change, never on a timer.** ADR-0139 rejected polling
+   and still does; what changed is that there is a signalled edge to hang a single call off. Skipped
+   entirely while nothing blocks idle, where the answer is empty by construction. The state is
+   published on every change rather than only on the `blocked` transition, because the list moves
+   without the answer moving -- mpv releasing while Firefox still holds one.
+3. **The three methods stay, on the same member.** `oblisk.idle` is a `Capability` wrapped in
+   `lua::idle`'s own userdata, which forwards `get`/`map`/`on_change` and adds
+   `register_threshold`/`inhibit`/`release_inhibit`. It is the one member that is both, and the only
+   one not parked behind `oblisk`'s `__index`, so each method sends `start_capability` by hand --
+   including the read methods, or a config that only ever `:map`s it would get a capability the
+   Supervisor never started.
+4. **This deletes machinery rather than adding it.** `Startable`, `Capabilities::start_idle` and
+   `Capabilities::dispatch_idle` existed only to name the one capability off the roster, and all
+   three are gone; `main.rs`'s command match loses its `"idle"` arm. The stub generator grew one
+   `hand_written_methods` hook, for the three signatures no action schema can describe.
+5. **The lazy start pushes the current state.** The watch only speaks when something changes, and on
+   a quiet machine that is never, so `Capabilities::start` sends the controller's last published
+   value the moment a config first reads the member. Without it the member reads `nil` until the
+   next inhibitor appears, which is the "reads `nil` forever" failure ADR-0076 exists to prevent.
+
+**Rejected.** *A bare `inhibited` boolean with no list.* It fixes the lie but not the question:
+"something is keeping this awake" and "mpv is keeping this awake" are different amounts of use, and
+`ListInhibitors` already has the second for one call. *Publishing our own hold in the list too.* The
+config's own reasons are richer than the joined string it passed to logind, and counting it would
+double-report every manual toggle. *Leaving `idle` off the roster and adding a second
+Renderer-sourced signal beside `screens` and `rescue`.* Those two are Renderer state; this is
+Supervisor state arriving as a `StateSnapshot`, which is exactly what a roster entry is.

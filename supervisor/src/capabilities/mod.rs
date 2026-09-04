@@ -33,7 +33,7 @@ use battery::{BatteryController, BatterySignal};
 use bluetooth::{BluetoothController, BluetoothSignal};
 use brightness::{BrightnessController, BrightnessSignal};
 use files::{FilesController, FilesSignal};
-use idle::IdleController;
+use idle::{IdleController, IdleState};
 use keyboard::{KeyboardController, KeyboardSignal};
 use lock::LockController;
 use mpris::{MprisController, MprisSignal};
@@ -86,23 +86,6 @@ pub fn parse_bool_arg(arguments: &[serde_json::Value]) -> Option<bool> {
     arguments.first()?.as_bool()
 }
 
-/// Every name a Renderer can ask this Supervisor to start: the roster, plus the one not on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Startable {
-    Capability(Capability),
-    /// Event-shaped (ADR-0032), off the roster; a config read starts it, and it takes commands.
-    Idle,
-}
-
-impl Startable {
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "idle" => Some(Startable::Idle),
-            other => Capability::from_name(other).map(Startable::Capability),
-        }
-    }
-}
-
 /// One capability signal, received but not yet acted on. The split from [`Capabilities::push`]
 /// keeps the main loop correct: [`Signals::next`] only ever awaits `recv()`, so losing the
 /// `tokio::select!` race drops nothing but an unstarted read, and the signal is acted on in the
@@ -129,6 +112,9 @@ pub enum Signal {
     System,
     Privacy,
     Updates,
+    /// Carries its payload for `Signal::Audio`'s reason: the logind inhibitor watch sends state,
+    /// and there is no controller here to read it back off (ADR-0141).
+    Idle(IdleState),
 }
 
 /// Declares every capability channel once, deriving the receiving half ([`Signals`]), the sending
@@ -227,6 +213,9 @@ capability_channels! {
             Some(ApplicationsSignal::Changed) => Signal::Applications;
         Files => files: FilesSignal, Some(FilesSignal::Changed) => Signal::Files;
         Storage => storage: StorageSignal, Some(StorageSignal::Changed) => Signal::Storage;
+        // Payload signal, like `Audio`: the inhibitor watch in `idle/controller.rs` owns the state
+        // and sends it, rather than a controller this struct could read it off (ADR-0141).
+        Idle => idle: IdleState, Some(state) => Signal::Idle(state);
     }
     // `lock` has no signal channel, deliberately: built at boot in `main.rs` since the relock
     // path commands it before any config reads (ADR-0060); it reports through `LockOutcome`
@@ -507,17 +496,24 @@ impl Capabilities {
                 }
             }
             Capability::Audio => self.ensure_mixer_thread(),
+            // On the roster since ADR-0141, so its start is here rather than in a `start_idle` of
+            // its own. The push is what the lazy start owes a config that has just read the member:
+            // the inhibitor watch only speaks when something changes, and on a quiet machine that
+            // is never.
+            Capability::Idle => {
+                if self.idle.is_none() {
+                    self.idle = Some(
+                        IdleController::new(self.connection.clone(), self.idle_tx.clone(), self.senders.idle.clone())
+                            .await,
+                    );
+                }
+                if let Some(idle) = &self.idle {
+                    let _ = self.senders.idle.send(idle.snapshot());
+                }
+            }
             // Not owned here: `LockController` is built at boot in `main.rs` (ADR-0060), so this
             // read is free. `polkit`'s start is its agent registration, in `main.rs`'s arm.
             Capability::Lock | Capability::Polkit => {}
-        }
-    }
-
-    /// `idle`'s start, off [`Capabilities::start`] since it isn't a roster variant (ADR-0032);
-    /// reached only once a Renderer connects, so notify setup's `spawn_blocking` task can't block.
-    pub async fn start_idle(&mut self) {
-        if self.idle.is_none() {
-            self.idle = Some(IdleController::new(self.connection.clone(), self.idle_tx.clone()).await);
         }
     }
 
@@ -650,6 +646,9 @@ impl Capabilities {
                     push!(Capability::Updates, &updates.snapshot());
                 }
             }
+            // Carries its own payload, like `Audio`: the inhibitor watch sends state rather than
+            // poking a controller this struct would read it back off.
+            Signal::Idle(state) => push!(Capability::Idle, &state),
         }
     }
 
@@ -683,6 +682,7 @@ impl Capabilities {
             Capability::Files => to!(self.files, files::dispatch),
             Capability::Storage => to!(self.storage, storage::dispatch),
             Capability::Audio => to!(self.audio, audio::dispatch),
+            Capability::Idle => to!(self.idle, idle::dispatch),
             Capability::Lock => lock::dispatch(lock, envelope),
             // Answered in `Supervisor::dispatch_capability_command` before this is reached: its
             // controller lives there, beside the state push a cancel needs.
@@ -696,14 +696,6 @@ impl Capabilities {
             }
         }
     }
-
-    /// `idle`'s dispatch, off [`Capabilities::dispatch`] for the same reason its start is.
-    pub fn dispatch_idle(&self, envelope: &CommandEnvelope) {
-        match &self.idle {
-            Some(idle) => idle::dispatch(idle, envelope),
-            None => log_unstarted(envelope),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -711,18 +703,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn startable_resolves_the_roster_plus_the_one_name_deliberately_off_it() {
-        assert_eq!(Startable::from_name("audio"), Some(Startable::Capability(Capability::Audio)));
-        assert_eq!(Startable::from_name("polkit"), Some(Startable::Capability(Capability::Polkit)));
-        assert_eq!(Startable::from_name("idle"), Some(Startable::Idle), "event-shaped, so off the roster (ADR-0032)");
+    fn from_name_resolves_every_roster_entry_and_nothing_else() {
+        assert_eq!(Capability::from_name("audio"), Some(Capability::Audio));
+        assert_eq!(Capability::from_name("polkit"), Some(Capability::Polkit));
+        assert_eq!(Capability::from_name("idle"), Some(Capability::Idle), "on the roster since ADR-0141");
     }
 
     #[test]
     fn startable_rejects_a_name_this_supervisor_builds_nothing_for() {
         // `process` is addressable by commands but is never started, so it must miss here rather
         // than resolve to something that would silently accept a start.
-        assert_eq!(Startable::from_name("process"), None);
-        assert_eq!(Startable::from_name("screens"), None);
-        assert_eq!(Startable::from_name(""), None);
+        assert_eq!(Capability::from_name("process"), None);
+        assert_eq!(Capability::from_name("screens"), None);
+        assert_eq!(Capability::from_name(""), None);
     }
 }

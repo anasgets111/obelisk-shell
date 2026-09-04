@@ -292,11 +292,19 @@ idle.active_profile = oblisk.power:map(idle.profile_of)
 --- @param mpris table? `oblisk.mpris`'s payload
 --- @param settings table the result of [`idle.read`]
 --- @param manual boolean
+--- @param foreign table? `oblisk.idle`'s payload, whose `inhibitors` are the holders that are not us
 --- @return string[]
-function idle.reasons_from(privacy, mpris, settings, manual)
+function idle.reasons_from(privacy, mpris, settings, manual, foreign)
     local reasons = {}
     if manual then
         reasons[#reasons + 1] = "manual"
+    end
+    -- Everything else here is a hold this config took and can explain. These are the ones it did
+    -- not: `systemd-inhibit --what=idle`, or a browser during a call. The framework has honoured
+    -- them since ADR-0139 and only started saying so with ADR-0141, which is why this shell used to
+    -- draw "nothing is holding this awake" while holding every threshold event.
+    for _, inhibitor in ipairs((foreign or {}).inhibitors or {}) do
+        reasons[#reasons + 1] = inhibitor.who ~= "" and inhibitor.who or "another application"
     end
     -- `automaticInhibitorActive`: a video playing, or anything reading a camera, a microphone or
     -- the screen. Named one by one rather than as "media", because "why is my laptop not sleeping"
@@ -322,13 +330,19 @@ function idle.reasons_from(privacy, mpris, settings, manual)
 end
 
 --- [`idle.reasons_from`] over the live payloads, for anything that draws them.
-idle.reasons = computed({ oblisk.privacy, oblisk.mpris, store.idle, idle.manual }, function(p, m, stored, manual)
-    return idle.reasons_from(p, m, idle.read(stored), manual)
-end)
+idle.reasons = computed(
+    { oblisk.privacy, oblisk.mpris, store.idle, idle.manual, oblisk.idle },
+    function(p, m, stored, manual, foreign)
+        return idle.reasons_from(p, m, idle.read(stored), manual, foreign)
+    end
+)
 
---- Whether anything is holding the session awake.
-idle.inhibited = idle.reasons:map(function(reasons)
-    return #reasons > 0
+--- Whether anything is holding the session awake, including a holder this config cannot name.
+--- `oblisk.idle`'s own `inhibited` is the authority -- it is the same `BlockInhibited` the gate
+--- acts on -- so a hold with an unreadable `who` still stops the countdown rather than leaving the
+--- modal drawing a bar that can never fill.
+idle.inhibited = computed({ idle.reasons, oblisk.idle }, function(reasons, foreign)
+    return #reasons > 0 or (foreign ~= nil and foreign.inhibited == true)
 end)
 
 --- Takes or drops the logind hold so it matches [`idle.reasons`], and does nothing when it already
@@ -338,11 +352,15 @@ end)
 --- already does and for the same reason: the alternative is three callers each remembering to
 --- take, drop and count, and one of them eventually not.
 function idle.sync_inhibit()
+    -- Our own hold is not counted here: `oblisk.idle`'s `inhibitors` exclude it by construction
+    -- (`foreign_idle_inhibitors`), so reading it back cannot make this function think it already
+    -- holds one and refuse to take it.
     local reasons = idle.reasons_from(
         oblisk.privacy:get(),
         oblisk.mpris:get(),
         idle.read(store.idle:get()),
-        idle.manual:get()
+        idle.manual:get(),
+        oblisk.idle:get()
     )
     local want = #reasons > 0
     if want == idle.holding:get() then

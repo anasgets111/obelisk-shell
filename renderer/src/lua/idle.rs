@@ -1,12 +1,19 @@
 //! `oblisk.idle`: idle-notify thresholds and the logind inhibit pair (ADR-0032,
 //! docs/oblisk-supervisor-services-dbus.md § 7).
 //!
-//! **Not a capability**, and deliberately outside `shared::Capability::ALL` for the same reason
-//! `screens` and `rescue` are outside it, from the other direction: every roster name is a signal
-//! the Supervisor pushes a `StateSnapshot` for, and idle pushes none. `ext_idle_notifier_v1`
-//! reports that a threshold a config asked for was crossed; there is no idle *state* to read. A
-//! capability member here would hand a config a signal that reads `nil` forever and a `:map` that
-//! never fires. So `oblisk.idle` is methods and nothing else.
+//! **A roster capability with three extra methods**, which no other member is. It was methods and
+//! nothing else until ADR-0141, on the argument that a threshold crossing is an event and there is
+//! no idle *state* to read. That argument was wrong in one specific way: whether anything is
+//! holding the session awake, and which application it is, is state, the Supervisor already knew it
+//! (ADR-0139's gate acts on it), and a config drawing "nothing is holding this awake" while every
+//! threshold event was being held is a lie on screen with no way to do better.
+//!
+//! So `oblisk.idle` is now a `Capability` -- `get`, `map`, `on_change`, `invoke`, hydrated by a
+//! `StateSnapshot` like any other -- wrapped in the userdata below, which adds the three methods
+//! whose Lua callbacks cannot cross the wire as an `:invoke`. The wrapper is why `oblisk.idle` sits
+//! on the `oblisk` table directly rather than behind its `__index`, and therefore why every method
+//! here sends `start_capability` by hand: the read that would normally announce the capability
+//! never passes through the index.
 //!
 //! The Supervisor creates one Wayland listener per distinct duration and fans its events out
 //! (`hardware::idle::register_threshold_entry`), so `shared::IdleEvent` names the threshold rather
@@ -25,7 +32,7 @@ use std::rc::Rc;
 
 use mlua::{Function, UserData, UserDataMethods};
 
-use crate::lua::capability::CommandSender;
+use crate::lua::capability::{Capability, CommandSender};
 
 /// What one `register_threshold` call left behind.
 struct Threshold {
@@ -37,7 +44,12 @@ struct Threshold {
 /// rather than `Arc<Mutex<_>>`: confined to the Wayland dispatch thread with the Lua VM, the same
 /// confinement `lua::process` documents.
 #[derive(Clone)]
-pub struct IdleRegistry(Rc<RefCell<Inner>>);
+pub struct IdleRegistry {
+    inner: Rc<RefCell<Inner>>,
+    /// The roster member this wraps: the read half of `oblisk.idle`, hydrated by `StateSnapshot`
+    /// pushes like every other capability's.
+    state: Capability,
+}
 
 struct Inner {
     /// Keyed by the threshold in seconds, which is the only thing `shared::IdleEvent` carries to
@@ -47,8 +59,13 @@ struct Inner {
 }
 
 impl IdleRegistry {
-    pub fn new(commands: CommandSender) -> Self {
-        IdleRegistry(Rc::new(RefCell::new(Inner { thresholds: HashMap::new(), commands })))
+    pub fn new(commands: CommandSender, state: Capability) -> Self {
+        IdleRegistry { inner: Rc::new(RefCell::new(Inner { thresholds: HashMap::new(), commands })), state }
+    }
+
+    /// The read half, for the wrapper's `get`/`map` and for `signal::from_userdata`.
+    pub fn state(&self) -> &Capability {
+        &self.state
     }
 
     /// `idle:register_threshold(sec, on_idle, on_resume)` (§ 7.1). Sends the start ahead of the
@@ -62,7 +79,7 @@ impl IdleRegistry {
     /// notify half (no `ext_idle_notifier_v1`, ADR-0032) is a listener that never fires, which
     /// reads exactly like a user who never went idle.
     fn register_threshold(&self, sec: u64, on_idle: Function, on_resume: Function) {
-        let mut inner = self.0.borrow_mut();
+        let mut inner = self.inner.borrow_mut();
         inner.thresholds.entry(sec).or_default().push(Threshold { on_idle, on_resume });
         inner.commands.start_capability("idle");
         inner.commands.send("idle", "register", vec![serde_json::json!(sec)], 0);
@@ -71,14 +88,14 @@ impl IdleRegistry {
     /// `idle:inhibit(reason)` (ADR-0032). The count is the Supervisor's, per generation, so two
     /// callers here hold two references to one logind fd and neither release kills the other.
     fn inhibit(&self, reason: String) {
-        let inner = self.0.borrow();
+        let inner = self.inner.borrow();
         inner.commands.start_capability("idle");
         inner.commands.send("idle", "inhibit", vec![serde_json::json!(reason)], 0);
     }
 
     /// `idle:release_inhibit()`. Releases one hold, not every hold: see [`Self::inhibit`].
     fn release_inhibit(&self) {
-        let inner = self.0.borrow();
+        let inner = self.inner.borrow();
         inner.commands.start_capability("idle");
         inner.commands.send("idle", "release_inhibit", Vec::new(), 0);
     }
@@ -91,7 +108,7 @@ impl IdleRegistry {
     /// `register_threshold` (or raises) cannot invalidate the borrow the loop is walking.
     pub fn dispatch_event(&self, threshold_sec: u64, state: shared::IdleState) {
         let callbacks: Vec<Function> = {
-            let inner = self.0.borrow();
+            let inner = self.inner.borrow();
             let Some(entries) = inner.thresholds.get(&threshold_sec) else { return };
             entries
                 .iter()
@@ -114,7 +131,7 @@ impl IdleRegistry {
 
     /// Drops every registration, run before each evaluation. See the module doc comment.
     pub fn forget_thresholds(&self) {
-        self.0.borrow_mut().thresholds.clear();
+        self.inner.borrow_mut().thresholds.clear();
     }
 
     /// The `oblisk.idle` member itself.
@@ -128,8 +145,40 @@ impl IdleRegistry {
 /// ignore the table Lua passes as argument one.
 pub struct IdleMember(IdleRegistry);
 
+impl IdleMember {
+    /// The wrapped capability's read signal, for `signal::from_userdata`.
+    pub fn signal(&self) -> crate::lua::signal::Signal {
+        self.0.state().signal()
+    }
+}
+
+impl IdleMember {
+    /// The read that `oblisk`'s `__index` would have announced. This member is set on the table
+    /// directly, so nothing else does it, and a config that only ever `:map`s `oblisk.idle` would
+    /// otherwise get a capability the Supervisor never started -- a signal reading `nil` forever.
+    fn announce(&self) {
+        let state = self.0.state();
+        state.commands().start_capability(state.name());
+    }
+}
+
 impl UserData for IdleMember {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        // The read half, delegating to the wrapped roster member so `oblisk.idle` reads exactly
+        // like `oblisk.privacy` beside it (ADR-0141).
+        methods.add_method("get", |lua, this, ()| {
+            this.announce();
+            this.0.state().signal().get_value(lua)
+        });
+        methods.add_method("map", |_, this, f: Function| {
+            this.announce();
+            Ok(this.0.state().signal().mapped(f))
+        });
+        methods.add_method("on_change", |_, this, f: Function| {
+            this.announce();
+            this.0.state().add_handler(f);
+            Ok(())
+        });
         methods.add_method("register_threshold", |_, this, (sec, on_idle, on_resume): (u64, Function, Function)| {
             this.0.register_threshold(sec, on_idle, on_resume);
             Ok(())
@@ -156,7 +205,11 @@ mod tests {
     fn lua_with_idle(generation_id: u32) -> (Lua, IdleRegistry, mpsc::UnboundedReceiver<RendererFrame>) {
         let lua = Lua::new();
         let (tx, rx) = mpsc::unbounded_channel();
-        let registry = IdleRegistry::new(CommandSender::new(generation_id, tx));
+        let commands = CommandSender::new(generation_id, tx);
+        // The roster half `oblisk.idle` wraps (ADR-0141); these tests exercise the method half, so
+        // the handle it hydrates through is dropped.
+        let (state, _handle) = Capability::new("idle", crate::lua::signal::DirtyFlag::new(), commands.clone());
+        let registry = IdleRegistry::new(commands, state);
         lua.globals().set("idle", registry.member()).unwrap();
         (lua, registry, rx)
     }

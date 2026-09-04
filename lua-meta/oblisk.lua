@@ -140,6 +140,11 @@
 ---@field error? string Why the last listing produced nothing, in words fit to draw (`"No such file or directory"`), or absent when it succeeded. Set alongside `ready = true`, so a picker tells a missing folder from an empty one.
 ---@field ready boolean `false` between `watch` and the first listing landing, which is the "loading" a picker draws a spinner for. `true` afterwards, even when `entries` is empty or `error` is set.
 
+---@class IdleInhibitor
+---One logind inhibitor blocking idle, as a config would draw it.
+---@field who string The `who` the holder passed to `Inhibit`, e.g. `"mpv"`. Free text chosen by that program, so it is a label to draw and never something to match on.
+---@field why string The `why` the holder passed, e.g. `"Playing video"`. Also free text, and often empty.
+
 ---@class MenuItem
 ---One node of a DBusMenu layout tree, already resolved into what `tray.items[].menu` needs
 ---(docs/oblisk-idl-api-specs.md §2.14).
@@ -304,6 +309,11 @@
 ---@field time_to_empty? integer Seconds until flat, or `nil`. UPower reports `0` both while charging and while it has not yet estimated, and neither is a duration, so both are the absent case here.
 ---@field time_to_full? integer Seconds until full, or `nil`, on the same terms as `time_to_empty`.
 
+---@class IdleState
+---`oblisk.idle`'s payload (ADR-0141).
+---@field inhibited boolean Anything at all is holding an idle inhibitor, this shell included. While true no threshold event reaches the config, so a config's own countdown has to stop here rather than keep running against events that will never arrive.
+---@field inhibitors IdleInhibitor[] The holders that are not this shell.
+
 ---@class BluetoothState
 ---@field connected_devices ConnectedDevice[] Paired devices currently connected. In BlueZ's own object order, which is not sorted.
 ---@field discovered_devices DiscoveredDevice[] Unpaired devices seen by the running scan. Empties when discovery stops.
@@ -460,6 +470,12 @@
 ---@class BatteryCapability: Capability<BatteryState>
 local BatteryCapability = {}
 
+---@class IdleCapability: Capability<IdleState>
+---@field invoke fun(self: IdleCapability, command: "register"|"inhibit"|"release_inhibit", ...: any)
+---@field register_threshold fun(self: IdleCapability, seconds: integer, on_idle: fun(), on_resume: fun()) Runs `on_idle` after `seconds` without input on the seat, and `on_resume` when input returns. Registrations do not survive a config reload, so register at the top level rather than inside a callback that fires more than once.
+             ---@field inhibit fun(self: IdleCapability, reason: string) Holds off idle actions system-wide (logind `Inhibit`, `what="idle"`) until a matching `release_inhibit`. Counted, so two holders need two releases. While any hold is out -- this one or another application's -- no threshold fires and `inhibited` says so.
+             ---@field release_inhibit fun(self: IdleCapability) Releases one `inhibit` hold. A release with no matching `inhibit` is a no-op.
+
 ---@class BluetoothCapability: Capability<BluetoothState>
 ---@field invoke fun(self: BluetoothCapability, command: "set_enabled"|"start_discovery"|"stop_discovery"|"pair"|"connect"|"disconnect"|"forget", ...: any)
 
@@ -513,28 +529,14 @@ local SystemCapability = {}
 
 --- Off-roster members ---------------------------------------------------------------------------
 -- Not capabilities and not in `shared::Capability::ALL`, so they have no payload struct to derive
--- from and are written by hand. `Screen` and `RescueState` come from the renderer's own state.
--- `Idle` is the other direction: a supervisor service that pushes no state at all, because an idle
--- threshold crossing is an event, not something to read (ADR-0032).
-
----@class Idle
-local Idle = {}
-
----Runs `on_idle` after `seconds` without input on the seat, and `on_resume` when input returns.
----Registrations do not survive a config reload, which re-runs `shell.lua` and drops them, so
----register at the top level rather than inside a callback that fires more than once.
----@param seconds integer
----@param on_idle fun()
----@param on_resume fun()
-function Idle:register_threshold(seconds, on_idle, on_resume) end
-
----Holds off idle actions system-wide (logind `Inhibit`, `what="idle"`) until a matching
----`release_inhibit`. Counted, so two holders need two releases and neither cancels the other.
----@param reason string Shown by `loginctl list-inhibitors`.
-function Idle:inhibit(reason) end
-
----Releases one `inhibit` hold.
-function Idle:release_inhibit() end
+-- from and are written by hand: `Screen` and `RescueState` come from the renderer's own state.
+--
+-- `oblisk.idle` used to be here too. It joined the roster with ADR-0141, because there turned out
+-- to be idle state worth reading after all -- whether anything is holding the session awake, and
+-- which application it is. It is the one member that is both: `IdleCapability` above is generated
+-- from `IdleState` like any other, and the three methods below are declared onto it by hand,
+-- because their callbacks are Lua values that never cross the wire and so have no action schema to
+-- derive from.
 
 ---@class Screen
 ---@field name string The connector name, e.g. `"eDP-1"`. What a surface's `monitor` takes, and what an `oblisk.workspaces` output entry is keyed by.
@@ -573,7 +575,7 @@ function Idle:release_inhibit() end
 ---@field applications ApplicationsCapability The installed desktop entries, listed and indexed by the `app_id` a window reports.
 ---@field files FilesCapability The files in each folder a config asked to watch, kept current through inotify.
 ---@field storage StorageCapability Every JSON file a config declared with `persistent_table`, keyed by its absolute path.
----@field idle Idle Idle thresholds and the inhibit pair. Methods only, no state to read (ADR-0032).
+---@field idle IdleCapability Whether anything is holding the session awake, and which application it is. Its thresholds and the inhibit pair are methods on the same member.
 ---@field screens Signal<Screen[]> Renderer-sourced, seeded to an empty list, and the one signal with a value at first evaluation (ADR-0041).
 ---@field rescue Signal<RescueState> Renderer-sourced, no commands (ADR-0046).
 ---@field version ObliskVersion Three integers a config can compare. Not a signal.

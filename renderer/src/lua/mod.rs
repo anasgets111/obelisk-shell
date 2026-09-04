@@ -396,7 +396,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let loader = Loader::new(signal::DirtyFlag::new(), dir.path()).unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let registry = idle::IdleRegistry::new(capability::CommandSender::new(0, tx));
+        let commands = capability::CommandSender::new(0, tx);
+        let (idle_state, _idle_handle) =
+            capability::Capability::new("idle", signal::DirtyFlag::new(), commands.clone());
+        let registry = idle::IdleRegistry::new(commands, idle_state);
         loader.set_global("idle", registry.member()).unwrap();
         loader.register_idle(registry.clone());
         let source = r#"

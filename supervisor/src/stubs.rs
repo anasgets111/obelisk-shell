@@ -41,6 +41,11 @@ fn capability_schemas() -> Vec<(&'static str, Schema, Option<Schema>)> {
         ),
         ("battery", schema_for!(crate::capabilities::battery::controller::BatteryState), None),
         (
+            "idle",
+            schema_for!(crate::capabilities::idle::IdleState),
+            Some(schema_for!(crate::capabilities::idle::IdleAction)),
+        ),
+        (
             "bluetooth",
             schema_for!(crate::capabilities::bluetooth::BluetoothState),
             Some(schema_for!(crate::capabilities::bluetooth::BluetoothAction)),
@@ -389,6 +394,7 @@ pub fn render() -> String {
             let union = commands.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join("|");
             out.push_str(&format!("---@field invoke fun(self: {class}, command: {union}, ...: any)\n"));
         }
+        out.push_str(hand_written_methods(capability));
     }
 
     out.push_str(RENDERER_SOURCED);
@@ -445,31 +451,34 @@ const GENERATED_HEADER: &str = r#"---@meta
 ---@field on_change fun(self: Capability<T>, handler: fun(current: T, previous: T?))
 "#;
 
+/// Methods a capability carries that no action schema can describe, appended to its generated
+/// class. Exactly one capability has any: `idle`'s three take Lua callbacks, which never cross the
+/// wire and so have no `IdleAction` variant to derive a signature from (ADR-0032, ADR-0141).
+///
+/// `---@field` lines rather than `function IdleCapability:...` definitions, because a class that
+/// emits `---@field invoke` has no `local` binding its name, so a later `function` on it attaches
+/// to nothing and every call site reads `undefined-field` -- which is exactly what the first
+/// version of this did, caught by `just types`.
+fn hand_written_methods(capability: &str) -> &'static str {
+    match capability {
+        "idle" => {
+            "---@field register_threshold fun(self: IdleCapability, seconds: integer, on_idle: fun(), on_resume: fun()) Runs `on_idle` after `seconds` without input on the seat, and `on_resume` when input returns. Registrations do not survive a config reload, so register at the top level rather than inside a callback that fires more than once.\n             ---@field inhibit fun(self: IdleCapability, reason: string) Holds off idle actions system-wide (logind `Inhibit`, `what=\"idle\"`) until a matching `release_inhibit`. Counted, so two holders need two releases. While any hold is out -- this one or another application's -- no threshold fires and `inhibited` says so.\n             ---@field release_inhibit fun(self: IdleCapability) Releases one `inhibit` hold. A release with no matching `inhibit` is a no-op.\n"
+        }
+        _ => "",
+    }
+}
+
 const RENDERER_SOURCED: &str = r#"
 --- Off-roster members ---------------------------------------------------------------------------
 -- Not capabilities and not in `shared::Capability::ALL`, so they have no payload struct to derive
--- from and are written by hand. `Screen` and `RescueState` come from the renderer's own state.
--- `Idle` is the other direction: a supervisor service that pushes no state at all, because an idle
--- threshold crossing is an event, not something to read (ADR-0032).
-
----@class Idle
-local Idle = {}
-
----Runs `on_idle` after `seconds` without input on the seat, and `on_resume` when input returns.
----Registrations do not survive a config reload, which re-runs `shell.lua` and drops them, so
----register at the top level rather than inside a callback that fires more than once.
----@param seconds integer
----@param on_idle fun()
----@param on_resume fun()
-function Idle:register_threshold(seconds, on_idle, on_resume) end
-
----Holds off idle actions system-wide (logind `Inhibit`, `what="idle"`) until a matching
----`release_inhibit`. Counted, so two holders need two releases and neither cancels the other.
----@param reason string Shown by `loginctl list-inhibitors`.
-function Idle:inhibit(reason) end
-
----Releases one `inhibit` hold.
-function Idle:release_inhibit() end
+-- from and are written by hand: `Screen` and `RescueState` come from the renderer's own state.
+--
+-- `oblisk.idle` used to be here too. It joined the roster with ADR-0141, because there turned out
+-- to be idle state worth reading after all -- whether anything is holding the session awake, and
+-- which application it is. It is the one member that is both: `IdleCapability` above is generated
+-- from `IdleState` like any other, and the three methods below are declared onto it by hand,
+-- because their callbacks are Lua values that never cross the wire and so have no action schema to
+-- derive from.
 
 ---@class Screen
 ---@field name string The connector name, e.g. `"eDP-1"`. What a surface's `monitor` takes, and what an `oblisk.workspaces` output entry is keyed by.
@@ -488,8 +497,7 @@ function Idle:release_inhibit() end
 ---@field patch integer Everything else. Never affects what a config may use.
 "#;
 
-const OBLISK_TAIL: &str = r#"---@field idle Idle Idle thresholds and the inhibit pair. Methods only, no state to read (ADR-0032).
----@field screens Signal<Screen[]> Renderer-sourced, seeded to an empty list, and the one signal with a value at first evaluation (ADR-0041).
+const OBLISK_TAIL: &str = r#"---@field screens Signal<Screen[]> Renderer-sourced, seeded to an empty list, and the one signal with a value at first evaluation (ADR-0041).
 ---@field rescue Signal<RescueState> Renderer-sourced, no commands (ADR-0046).
 ---@field version ObliskVersion Three integers a config can compare. Not a signal.
 ---@field config_dir string The directory `shell.lua` was loaded from, so a config can name a file it ships beside itself. Not a signal.
