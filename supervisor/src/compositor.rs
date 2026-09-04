@@ -7,9 +7,12 @@
 //! already scoped that trait to "what keyboard layout needs today", so the probe was squatting
 //! in a module that disclaimed owning it.
 //!
-//! Detection only, and no adaptor: ADR-0056 decision 1 settled that `workspaces` gets no trait
-//! and `CompositorLink` does not grow one, and that what the two capabilities genuinely share is
-//! this probe and nothing else. That is what moved here, unchanged in behaviour.
+//! Detection and Hyprland's socket paths, and no adaptor: ADR-0056 decision 1 settled that
+//! `workspaces` gets no trait and `CompositorLink` does not grow one. What the two capabilities
+//! genuinely share is this probe and, since `workspaces::hyprland` (ADR-0118), where Hyprland's
+//! two sockets live; both moved here unchanged in behaviour.
+
+use std::path::PathBuf;
 
 /// A compositor this codebase has an implementor for, which is narrower than "a compositor that
 /// exists": a session running anything else is [`detect_compositor`]'s `None`, and the
@@ -55,6 +58,24 @@ pub fn unsupported_session_report() -> String {
     }
 }
 
+/// A socket in Hyprland's per-instance directory, `$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/`:
+/// `"socket2.sock"` pushes newline-terminated `event>>payload` lines, `"socket.sock"` answers one
+/// plain-text command per connection (`j/workspaces` for JSON, `dispatch ...` for a write). Here
+/// rather than in either caller because `keyboard` and `workspaces` both open the same two files,
+/// and a session-level path is the probe module's kind of fact.
+pub fn hyprland_socket_path(signature: &str, name: &str) -> PathBuf {
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    hyprland_socket_path_in(&runtime_dir, signature, name)
+}
+
+/// The `join` half of [`hyprland_socket_path`], split off the `$XDG_RUNTIME_DIR` lookup so the
+/// test does not have to `set_var`. `setenv` rewrites the process-wide `environ` block, so it
+/// races every concurrent `getenv` in the test binary whatever variable either one names -- not
+/// just another reader of this one.
+fn hyprland_socket_path_in(runtime_dir: &str, signature: &str, name: &str) -> PathBuf {
+    PathBuf::from(runtime_dir).join("hypr").join(signature).join(name)
+}
+
 fn session_desktop() -> Option<String> {
     let value = std::env::var("XDG_CURRENT_DESKTOP").ok()?;
     desktop_name(&value).map(str::to_string)
@@ -85,6 +106,25 @@ mod tests {
             assert_eq!(PROBES.iter().find(|(probe, _)| *probe == kind).map(|(_, v)| *v), Some(var), "{kind:?}");
         }
         assert_eq!(PROBES.len(), 2, "a PROBES entry for a kind the loop above does not list");
+    }
+
+    #[test]
+    fn hyprland_socket_path_joins_runtime_dir_hypr_signature_and_name() {
+        assert_eq!(
+            hyprland_socket_path_in("/run/user/1000", "abc123", "socket2.sock"),
+            PathBuf::from("/run/user/1000/hypr/abc123/socket2.sock")
+        );
+    }
+
+    /// The fallback the previous version of this test could not reach: it had to set
+    /// `$XDG_RUNTIME_DIR` to run at all, so the one branch that fires when the variable is
+    /// missing went unasserted.
+    #[test]
+    fn a_missing_runtime_dir_falls_back_to_tmp() {
+        assert_eq!(
+            hyprland_socket_path_in("/tmp", "abc123", "socket2.sock"),
+            PathBuf::from("/tmp/hypr/abc123/socket2.sock")
+        );
     }
 
     #[test]

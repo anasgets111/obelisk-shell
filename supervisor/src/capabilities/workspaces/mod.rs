@@ -1,21 +1,23 @@
 //! `oblisk.workspaces` capability: per-output workspace state and the focused window
-//! (`docs/oblisk-idl-api-specs.md` § 2.9), read off niri's IPC event stream (ADR-0056).
+//! (`docs/oblisk-idl-api-specs.md` § 2.9), read off niri's IPC event stream (ADR-0056) or
+//! Hyprland's event socket plus its command socket (ADR-0118).
 //!
-//! A top-level module rather than a tenant of `hardware/` or `dbus/`: it is one compositor's
+//! A top-level module rather than a tenant of `hardware/` or `dbus/`: it is a compositor's
 //! Unix socket, not a device or a D-Bus interface.
 //!
-//! One compositor, no trait (ADR-0056 decision 1): a trait with one implementor is
-//! speculative generality. A session that is not niri never pushes, so `oblisk.workspaces`
-//! stays `nil` -- § 2.9 has no absence sentinel, and an empty `outputs` array would read as
-//! "no workspaces" rather than "nobody asked".
+//! Two compositors, still no trait (ADR-0056 decision 1, ADR-0075 decision 4, ADR-0118): the
+//! second implementor is built to its protocol and not live-tested, and the seam it plugs into
+//! is `StatePublisher` for reads and two exhaustive-match arms for writes, which is all a trait
+//! would give. A session with neither compositor never pushes, so `oblisk.workspaces` stays
+//! `nil` -- § 2.9 has no absence sentinel, and an empty `outputs` array would read as "no
+//! workspaces" rather than "nobody asked".
 //!
-//! The two halves are split by file rather than by trait. `controller` holds § 2.9's payload,
-//! the reduction onto it, and the publish contract, all in terms of its own row types; `niri`
-//! holds everything that names `niri_ipc`. That is where a trait would eventually go, and until
-//! a second implementor is live-tested it is a module boundary instead -- which keeps ADR-0056's
-//! decision while making its own stated upgrade path cheap.
+//! The halves are split by file. `controller` holds § 2.9's payload, the reduction onto it, and
+//! the publish contract, all in terms of its own row types; `niri` holds everything that names
+//! `niri_ipc`, `hyprland` everything that names Hyprland's JSON.
 
 pub mod controller;
+pub mod hyprland;
 pub mod niri;
 
 pub use controller::{WorkspacesController, WorkspacesSignal, parse_focus_args};

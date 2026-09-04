@@ -10,13 +10,12 @@
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::compositor::CompositorKind;
+use crate::compositor::{CompositorKind, hyprland_socket_path};
 
 use super::controller::{KeyboardSignal, KeyboardState};
 
@@ -262,7 +261,7 @@ impl HyprlandLink {
     pub fn new(signature: String, state: Arc<Mutex<KeyboardState>>, events: UnboundedSender<KeyboardSignal>) -> Self {
         let device_name: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let sequence = Arc::new(ResyncSequence::new());
-        let socket_path = hyprland_socket_path(&signature, "socket2.sock");
+        let socket_path = hyprland_socket_path(&signature, ".socket2.sock");
         let initial_state = Arc::clone(&state);
         let initial_device_name = Arc::clone(&device_name);
         let initial_sequence = Arc::clone(&sequence);
@@ -312,19 +311,6 @@ impl HyprlandLink {
     }
 }
 
-fn hyprland_socket_path(signature: &str, name: &str) -> PathBuf {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    hyprland_socket_path_in(&runtime_dir, signature, name)
-}
-
-/// The `join` half of [`hyprland_socket_path`], split off the `$XDG_RUNTIME_DIR` lookup so the
-/// test does not have to `set_var`. `setenv` rewrites the process-wide `environ` block, so it
-/// races every concurrent `getenv` in the test binary whatever variable either one names -- not
-/// just another reader of this one.
-fn hyprland_socket_path_in(runtime_dir: &str, signature: &str, name: &str) -> PathBuf {
-    PathBuf::from(runtime_dir).join("hypr").join(signature).join(name)
-}
-
 impl CompositorLink for HyprlandLink {
     fn kind(&self) -> CompositorKind {
         CompositorKind::Hyprland
@@ -337,7 +323,7 @@ impl CompositorLink for HyprlandLink {
             );
             return;
         };
-        let socket_path = hyprland_socket_path(&self.signature, "socket.sock");
+        let socket_path = hyprland_socket_path(&self.signature, ".socket.sock");
         tokio::spawn(async move {
             let mut stream = match tokio::net::UnixStream::connect(&socket_path).await {
                 Ok(stream) => stream,
@@ -421,24 +407,5 @@ mod tests {
         let fresh = sequence.ticket();
         assert!(sequence.claim(fresh));
         assert!(!sequence.claim(stale));
-    }
-
-    #[test]
-    fn hyprland_socket_path_joins_runtime_dir_hypr_signature_and_name() {
-        assert_eq!(
-            hyprland_socket_path_in("/run/user/1000", "abc123", "socket2.sock"),
-            PathBuf::from("/run/user/1000/hypr/abc123/socket2.sock")
-        );
-    }
-
-    /// The fallback the previous version of this test could not reach: it had to set
-    /// `$XDG_RUNTIME_DIR` to run at all, so the one branch that fires when the variable is
-    /// missing went unasserted.
-    #[test]
-    fn a_missing_runtime_dir_falls_back_to_tmp() {
-        assert_eq!(
-            hyprland_socket_path_in("/tmp", "abc123", "socket2.sock"),
-            PathBuf::from("/tmp/hypr/abc123/socket2.sock")
-        );
     }
 }

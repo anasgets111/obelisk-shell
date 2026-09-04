@@ -169,6 +169,8 @@ Read off UPower's `DisplayDevice`, the composite across every battery on the mac
 Workspace state only. Output geometry lives in `oblisk.screens` (§ 2.15), which reads it from `wl_output` rather than from a compositor adaptor; this section refers to screens by `name` instead of restating their dimensions (ADR-0041).
 
 > **Amended by ADR-0056**, built against niri. `focused_workspace` is present only on the output holding focus, since focus is one workspace across every output and this structure models it per output (decision 4). `is_fullscreen` is not reported: niri-ipc has no such field, and a fabricated `false` would be wrong for exactly the windows a fullscreen check exists to find (decision 5). Each output carries a `workspaces` array, added because the two ids below are opaque and nothing else names which workspaces exist, their names, or their order (decision 3).
+>
+> **Amended by ADR-0118**, which adds Hyprland. The shape is unchanged: on Hyprland `id` and `idx` are both the workspace number, `name` is present only for a workspace named something other than its number, and `workspaces:focus(id)` takes the number, so focusing one no workspace has yet creates it. Hyprland's special and named workspaces (its negative ids) are not listed. Built to Hyprland's documented IPC and not live-tested.
 
 *   `workspaces.outputs`: `table` (Array of per-output workspace structures)
     *   Output structure:
@@ -188,7 +190,7 @@ Workspace state only. Output geometry lives in `oblisk.screens` (§ 2.15), which
     *   `is_floating`: `boolean` (True if marked floating/pinned by compositor)
     *   `is_fullscreen`: `boolean` (True if window occupies entire display boundary. **Not reported**, per ADR-0056 decision 5)
 
-> **Two gaps.** No per-workspace window list: `populated` and `app_id` (ADR-0117) are the one window a strip draws, not the set, so a config cannot list what runs on a workspace. Special workspaces are not modelled at all. Both listed in `roadmap.md`.
+> **Two gaps.** No per-workspace window list: `populated` and `app_id` (ADR-0117) are the one window a strip draws, not the set, so a config cannot list what runs on a workspace. Special workspaces are not modelled at all, and on Hyprland the adaptor drops them (ADR-0118). Both listed in `roadmap.md`.
 
 ### 2.10 Rescue mode and recovery state (`oblisk.rescue`)
 *   `rescue.is_rescue`: `boolean` (True if the user configuration is broken and Rescue Mode is active)

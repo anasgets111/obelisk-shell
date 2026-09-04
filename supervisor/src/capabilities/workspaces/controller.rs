@@ -3,8 +3,8 @@
 //! for the module-level doc.
 //!
 //! Nothing here names a compositor's own type: [`derive_state`] takes [`WorkspaceRow`]s and a
-//! [`FocusedWindow`], the shape any compositor's IPC reduces to; `workspaces::niri` does the
-//! reducing today.
+//! [`FocusedWindow`], the shape any compositor's IPC reduces to; `workspaces::niri` and
+//! `workspaces::hyprland` do the reducing.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -14,7 +14,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::compositor::{CompositorKind, detect_compositor, unsupported_session_report};
 
-use super::niri;
+use super::{hyprland, niri};
 
 /// `oblisk.workspaces`'s full payload (§ 2.9); field names are the JSON keys verbatim, and
 /// `active_client` (`Option`, § 2.9's "or `nil` if none focused") is omitted, not `null`.
@@ -214,11 +214,10 @@ impl WorkspacesController {
     pub fn new(events: UnboundedSender<WorkspacesSignal>) -> Self {
         let state = Arc::new(Mutex::new(WorkspacesState::default()));
         let compositor = detect_compositor();
+        let publisher = StatePublisher::new(Arc::clone(&state), events);
         match compositor {
-            Some(CompositorKind::Niri) => niri::spawn_reader(StatePublisher::new(Arc::clone(&state), events)),
-            Some(CompositorKind::Hyprland) => eprintln!(
-                "workspaces: this session is Hyprland, which has no implementor yet (ADR-0056 decision 1); workspace reporting disabled for this run"
-            ),
+            Some(CompositorKind::Niri) => niri::spawn_reader(publisher),
+            Some(CompositorKind::Hyprland) => hyprland::spawn_reader(publisher),
             None => {
                 eprintln!("workspaces: {}; workspace reporting disabled for this run", unsupported_session_report())
             }
@@ -235,9 +234,8 @@ impl WorkspacesController {
     pub fn focus(&self, id: u64) {
         match self.compositor {
             Some(CompositorKind::Niri) => niri::focus(id),
-            Some(CompositorKind::Hyprland) | None => {
-                eprintln!("workspaces: focus({id}) called but this session has no workspace implementor; ignored")
-            }
+            Some(CompositorKind::Hyprland) => hyprland::focus(id),
+            None => eprintln!("workspaces: focus({id}) called but this session has no workspace implementor; ignored"),
         }
     }
 }

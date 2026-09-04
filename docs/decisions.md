@@ -5569,3 +5569,55 @@ circles never leaves the row.
 adaptor's wire-JSON fixtures. A workspace whose only window has no `app_id` is populated with no
 icon, drawn as its number at full strength, which is what the mirror does too. No width animation
 and no opacity fade; the engine has neither.
+
+## ADR-0118: `workspaces` speaks Hyprland, as a module behind the same publisher
+
+**Status**: Accepted (2026-09-04)
+
+**Context**: `oblisk.workspaces` was niri-only (ADR-0056 decision 1), and on a Hyprland session
+printed "no implementor yet" and never pushed. ADR-0075 had already moved the reduction onto
+compositor-neutral rows and named the line a second implementor would sit on: a sibling module plus
+two match arms. The reference config's `Impl/Hyprland/WorkspaceImpl.qml` shows the whole of what
+Hyprland needs: no state on its event socket, so re-read `hyprctl -j`'s three lists on every event;
+the workspace number as the id; a `windows` count for populated; the activated toplevel's class.
+`keyboard` already had a `HyprlandLink` over the same two sockets, built to the protocol without a
+Hyprland machine to test on, which is the position this ADR is in too.
+
+**Decision**:
+
+1. **`workspaces::hyprland` is the second implementor, and there is still no trait.** It plugs
+   into `StatePublisher` for reads and two exhaustive-match arms for writes, which is everything a
+   trait would give two implementors, and ADR-0075 decision 4 tied the trait to a *live-tested*
+   second compositor. This one is built to Hyprland's documented IPC with hand-written fixtures in
+   `hyprctl -j`'s shape; replacing them with a capture is the first job on a Hyprland machine.
+2. **The loop is re-read on trigger.** `.socket2.sock` is listened to on one blocking OS thread,
+   like niri's reader; a line whose event name (before `>>`, `v2` suffix dropped) is in a `TRIGGERS`
+   table causes `workspaces`, `monitors`, `clients` and `activewindow` to be read over
+   `.socket.sock` as `j/<name>`, one connection per request, then reduced and published. No
+   `hyprctl` subprocess, unlike `keyboard`'s link: the socket takes the same command and spawning
+   four processes per window event is the wrong cost. A burst re-reads once per event and the
+   publisher drops the equal results; coalescing waits for a measurement.
+3. **The number is both `id` and `idx`; `name` only when it is not the number.** Hyprland has no
+   per-monitor position, and the number is what a keybind and `dispatch workspace N` mean, so
+   `focus(id)` keeps § 2.9's meaning and focusing a number with no workspace creates one. Workspaces
+   with a non-positive id, specials and Hyprland's named ones, are dropped: neither fits a `u64` id
+   or a number-keyed focus, and neither is modelled. A special showing on the focused monitor
+   leaves that monitor's regular active workspace the focused row.
+4. **Active is the monitor's `activeWorkspace`, focused is that of the monitor with `focused`,
+   the focused window is `activewindow`.** The first two are niri's per-output/global split by
+   another name. `activewindow` rather than `clients[].focusHistoryID == 0`, because the history
+   still names the last toplevel while a layer surface holds focus and the reply is `{}` then.
+   `app_id` is the class of the lowest `focusHistoryID` on the workspace, ADR-0117's "focused, else
+   first" with a real order behind "first".
+5. **`hyprland_socket_path` moves to `compositor.rs`**, the one thing beyond the probe both
+   capabilities genuinely share; ADR-0075's "detection only" widens to "detection and where
+   Hyprland's sockets are". Moving it found the names wrong: the link opened `socket2.sock` and
+   `socket.sock`, and Hyprland's files are `.socket2.sock` and `.socket.sock`, so `keyboard`'s
+   Hyprland layout reporting could never have connected. Fixed in both callers.
+
+**Consequences**: A Hyprland session now pushes `oblisk.workspaces` and the shipped strip draws it
+sparse, one circle per existing workspace, with numbers as labels. Padding empty slots to ten, the
+optional `special` list, `is_fullscreen` when known and a session-level `compositor` field are the
+next ADR, since they are payload and display policy, not the adaptor. Until a capture replaces the
+fixtures, a Hyprland field rename is caught by the "reply did not parse" log line and nothing else.
+
