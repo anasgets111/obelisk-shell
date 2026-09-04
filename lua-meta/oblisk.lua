@@ -116,11 +116,6 @@
 ---Serialized by name, so Lua compares `b.state == "PendingCharge"`. The same shape
 ---`mpris`'s `play_state` already uses at this boundary.
 
----@class CameraUser
----One active camera user (ADR-0034: `privacy.camera_users: table`, array of `{app_name}`,
----empty = inactive).
----@field app_name string The holding process's name, from its PipeWire node when it has one, then `/proc/<pid>/comm`, falling back to `"pid 1234"`. Always something drawable, never empty.
-
 ---@class ConnectedDevice
 ---@field battery integer `-1` if unsupported/unknown (no `Battery1` interface on this device, or its `Percentage` property failed to read) -- per the IDL comment, not a sentinel invented here.
 ---@field category string A drawing hint from the device's class of device: `"keyboard"`, `"mouse"`, `"headphones"`, `"headset"`, `"phone"`, `"computer"`, or `"generic"` for anything the class bits do not place. Pick an icon from it; do not treat it as a capability.
@@ -215,6 +210,7 @@
 ---@class PlayerState
 ---@field album_art_path string An absolute path to the artwork, or empty. `mpris:artUrl` counts only as a `file://` URL that canonicalizes to an existing file, so a remote or stale URL both arrive empty rather than a path that fails to load; held across a same-track update so the cover doesn't blink.
 ---@field artist string `xesam:artist`, joined with `", "` when there is more than one. Empty when absent.
+---@field desktop_entry string `MediaPlayer2.DesktopEntry`, the basename of the player's `.desktop` file, e.g. `"mpv"` or `"firefox"`. Empty when the player does not publish one, which several do not. The stable name for a player. `identity` is a display string a player may localise or decorate; this is what an app-matching rule should be written against.
 ---@field id string Bus name with `org.mpris.MediaPlayer2.` stripped, e.g. `"spotify"`; what `mpris:` commands use to name a player.
 ---@field identity string `MediaPlayer2.Identity`, the player's display name, e.g. `"Spotify"`; empty if unanswered.
 ---@field length integer `-1` when `mpris:length` is absent or malformed: a live stream, or a player that simply doesn't report it. A genuine unavailable, not a fabricated zero (ADR-0036).
@@ -222,6 +218,14 @@
 ---@field position integer Playback offset in microseconds, correct as of [`PlayerState::position_updated_at`] and not after; nothing polls it while playing, so a progress bar must add elapsed time itself.
 ---@field position_updated_at integer `CLOCK_MONOTONIC` microseconds when [`PlayerState::position`] was read. Monotonic, not wall clock, so it survives a clock adjustment; subtract from a monotonic `now` for elapsed.
 ---@field title string `xesam:title`; empty when the player publishes no metadata, the normal state between tracks.
+---@field url string `xesam:url`, the track's own location: a `file://` path for a local file, an `https://` page for a browser. Empty when the player publishes none, which is normal for a stream. Carried for ADR-0137: telling a video from a song is a list of video sites, a list of music sites and a list of file extensions, and every one of those is taste. This is the fact underneath, which a config cannot reach any other way.
+
+---@class PrivacyUser
+---One app using one of the three things this capability watches (ADR-0034's
+---`privacy.camera_users: table`, array of `{app_name}`; extended to microphone and screencast by
+---ADR-0137). One type for all three because all three answer the same question, "who", and a
+---second identical struct would only make the three lists look like they differ.
+---@field app_name string The using process's name, from its PipeWire node when it has one, then `/proc/<pid>/comm`, falling back to `"pid 1234"`. Always something drawable, never empty.
 
 ---@class SpecialWorkspace
 ---One special workspace (ADR-0119). Identified by `name`, which is what
@@ -380,7 +384,9 @@
 ---@field profiles? string[] Every profile this hardware offers, in the daemon's own order, e.g. `{"performance", "balanced", "power-saver"}`. `nil` when the daemon is absent. Drive a selector off this rather than off a hardcoded list: not every machine has all three.
 
 ---@class PrivacyState
----@field camera_users CameraUser[] Every process holding a camera open. Empty means no camera is in use, which is the whole signal: a config draws an indicator when this is non-empty.
+---@field camera_users PrivacyUser[] Every process holding a camera open. Empty means no camera is in use, which is the whole signal: a config draws an indicator when this is non-empty.
+---@field microphone_users PrivacyUser[] Every app PipeWire reports as reading a microphone right now (ADR-0137). A stream that is open but idle is not here, so this is "something is listening", not "something could". Not the same question as `oblisk.audio`'s `source_muted`, which is a device setting: a muted microphone with a running capture stream appears in both.
+---@field screencast_users PrivacyUser[] Every app producing a screen-capture stream into PipeWire (ADR-0137). The name is best-effort and may be the portal rather than the app that asked it, since a portal-created node carries the portal's identity. Screen recorders on wlr-screencopy (`wf-recorder`, `grim`) never reach PipeWire and never appear here.
 
 ---@class SysinfoState
 ---`oblisk.sysinfo`'s five Lua-visible fields (docs/oblisk-idl-api-specs.md §2.12). Field

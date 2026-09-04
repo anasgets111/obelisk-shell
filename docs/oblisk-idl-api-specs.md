@@ -164,6 +164,12 @@ Read off UPower's `DisplayDevice`, the composite across every battery on the mac
         *   `position`: `integer` (Playback offset in microseconds *at the timestamp of last update*)
         *   `position_updated_at`: `integer` (Monotonic clock timestamp in microseconds matching the exact instant the position was recorded)
         *   `length`: `integer` (Total track duration in microseconds)
+        *   `url`: `string` (`xesam:url`, the track's own location; empty when the player publishes none. ADR-0137)
+        *   `desktop_entry`: `string` (`MediaPlayer2.DesktopEntry`, the player's `.desktop` basename; empty when unpublished. The stable name to match an app rule against, where `identity` is a display string. ADR-0137)
+
+### 2.8.1 Telling a video from a song
+
+Not answered here. `url` and `desktop_entry` are the facts; the lists of video applications, video hostnames, music hostnames and file extensions that turn them into a verdict are taste, and live in the config (ADR-0137). `dev-config/oblisk/lib/media.lua` is this repository's own set.
 
 ### 2.9 Workspace state (`oblisk.workspaces`)
 Workspace state only. Output geometry lives in `oblisk.screens` (§ 2.15), which reads it from `wl_output` rather than from a compositor adaptor; this section refers to screens by `name` instead of restating their dimensions (ADR-0041).
@@ -287,6 +293,16 @@ Every file a config declared with `persistent_table` (§ 5.2), keyed by the abso
 > **Read it through the store, not through here.** `store.<key>` (§ 5.2) is a signal over one key of one file. `oblisk.storage` itself is the whole map, useful for `on_change` and little else.
 
 ---
+
+### 2.19 Capture in progress (`oblisk.privacy`) (ADR-0034, ADR-0137)
+
+Who is using a camera, a microphone, or the screen. Read-only; every list is empty when nothing is in use, which is the whole signal.
+
+*   `privacy.camera_users`: `table` (array of `{ app_name: string }`). Processes holding a `/dev/videoN` open, found by an inotify watch plus a `/proc` fd scan, and named from PipeWire's `Video/Source` nodes where one matches.
+*   `privacy.microphone_users`: `table` (same shape). Apps PipeWire reports as *running* a `Stream/Input/Audio` node. A stream that is open but idle is not here. A monitor capture (`stream.capture.sink`, which is what a visualiser does) is never here.
+*   `privacy.screencast_users`: `table` (same shape). Apps producing a `Stream/Output/Video` node. The name may be the portal rather than the app that asked, and screen recorders on wlr-screencopy never appear at all.
+
+`microphone_users` is not `oblisk.audio`'s `source_muted`: that is a device setting, this is use. A muted microphone with a running capture stream appears in both.
 
 ## 3. Command execution protocol (write path)
 

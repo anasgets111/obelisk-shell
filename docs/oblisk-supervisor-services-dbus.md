@@ -136,6 +136,15 @@ Registers callbacks on the PipeWire registry (`pw_registry`).
 
 Tracks every playback node of class `Stream/Output/Audio`, exposed as `audio.apps`. `audio:set_app_volume(id, volume)`/`set_app_muted(id, bool)` target one node's PipeWire id without touching global volume.
 
+### 6.3 Capture detection for `oblisk.privacy` (ADR-0137)
+
+The same registry listener, one connection, serving a second capability. Two more node classes are tracked and published on the channel that already carried camera name-enrichment:
+
+* `Stream/Input/Audio` -> `privacy.microphone_users`. A stream reading a sink's monitor (`stream.capture.sink`, what a visualiser does) is excluded by that property, not by an app-name list.
+* `Stream/Output/Video` -> `privacy.screencast_users`. A camera is a `Video/Source` *device*; nothing else pushes a video *stream* into PipeWire, so this identifies screen capture without matching the portal or the compositor by name.
+
+Only a node PipeWire reports as `Running` is published. A browser tab holds a capture stream open between calls, and an indicator lit by mere existence would be lit permanently.
+
 ---
 
 ## 7. Durable idle capability (`ext-idle-notifier-v1`)
@@ -158,6 +167,16 @@ Oblisk has no hardcoded inactivity timeouts; the config sets its own.
 * logind closes the fd if the holding process dies, so a Supervisor crash cannot leak a stuck inhibit.
 * Notify degrading to inert (no `ext_idle_notifier_v1`, a failed dedicated connection, a setup timeout) does not disable inhibit. The two halves share a controller, not a transport.
 
+
+### 7.3 logind session lock (ADR-0138)
+
+`loginctl lock-session` is how the platform asks whoever owns the screen to lock it: it calls `org.freedesktop.login1.Manager.LockSession`, and logind emits a `Lock` signal on this session's own object. The Supervisor subscribes to that signal on the system bus it already holds, resolving its session from `$XDG_SESSION_ID` and falling back to logind's `"auto"`. A `Lock` takes the same path a `lock:invoke("lock")` from the bar takes. There is no `systemctl --user lock`: `systemctl` manages units.
+
+`Session.SetLockedHint` is published back on every confirmed lock change, off the same `LockOutcome` the `$XDG_RUNTIME_DIR` marker is written from, so `loginctl show-session`'s `LockedHint` and the marker cannot disagree.
+
+`Unlock` is logged and refused. ADR-0042 makes a successful PAM authentication the only thing that lifts a lock, and honouring the signal would turn anyone who can reach the bus into an unlock.
+
+Both halves degrade to inert, logged once: a shell that cannot reach logind still locks from its own bar.
 ---
 
 ## 8. High-performance wallpaper transition engine

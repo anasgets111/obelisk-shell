@@ -15,6 +15,10 @@ use zbus::zvariant::{ObjectPath, OwnedValue};
 pub(super) trait MprisRoot {
     #[zbus(property, name = "Identity")]
     fn identity(&self) -> zbus::Result<String>;
+    /// Optional in the real spec: several players publish no `.desktop` file name at all, so this
+    /// erroring is an answer rather than a failure (ADR-0137).
+    #[zbus(property, name = "DesktopEntry")]
+    fn desktop_entry(&self) -> zbus::Result<String>;
 }
 
 #[zbus::proxy(interface = "org.mpris.MediaPlayer2.Player", default_path = "/org/mpris/MediaPlayer2")]

@@ -225,6 +225,11 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     // controller must not cache the authoritative generation id -- a swap reassigns it.
     let (lock_command_tx, mut lock_commands) = tokio::sync::mpsc::unbounded_channel::<shared::SetSessionLock>();
     let lock = LockController::new(lock_command_tx);
+    // `loginctl lock-session` in, `LockedHint` out (ADR-0138). Built here rather than lazily
+    // because the signal has to be subscribed before anyone presses the key, not after a config
+    // happens to read a member.
+    let (logind_lock_tx, mut logind_lock_requests) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let session_bridge = lock::logind::SessionBridge::new(connection.clone(), logind_lock_tx).await;
     let (pam_outcome_tx, mut pam_outcomes) = tokio::sync::mpsc::unbounded_channel::<(u64, shared::PamOutcome)>();
     let (process_done_tx, mut process_done) = tokio::sync::mpsc::unbounded_channel::<(u32, u64)>();
 
@@ -248,6 +253,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
         capabilities,
         lock,
         lock::SessionLockedFlag::at(shared::session_locked_flag_path()?),
+        session_bridge,
         pam_outcome_tx.clone(),
         polkit_outcome_tx,
         process_done_tx,
@@ -298,6 +304,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                 send_frame_logged(&supervisor.registry, event.generation_id, &SupervisorFrame::IdleEvent(event));
             }
             Some(command) = lock_commands.recv() => supervisor.send_lock_command(command),
+            Some(()) = logind_lock_requests.recv() => supervisor.lock_requested_by_logind(),
             // The other half of the secure_submit(lock, authenticate) arm below -- the one place a
             // Success becomes an unlock order (ADR-0042).
             Some((acquisition, outcome)) = pam_outcomes.recv() => supervisor.record_pam_outcome(acquisition, outcome),

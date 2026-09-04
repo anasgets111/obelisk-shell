@@ -43,6 +43,19 @@ pub struct PlayerState {
     /// `-1` when `mpris:length` is absent or malformed: a live stream, or a player that simply
     /// doesn't report it. A genuine unavailable, not a fabricated zero (ADR-0036).
     pub length: i64,
+    /// `xesam:url`, the track's own location: a `file://` path for a local file, an `https://`
+    /// page for a browser. Empty when the player publishes none, which is normal for a stream.
+    ///
+    /// Carried for ADR-0137: telling a video from a song is a list of video sites, a list of music
+    /// sites and a list of file extensions, and every one of those is taste. This is the fact
+    /// underneath, which a config cannot reach any other way.
+    pub url: String,
+    /// `MediaPlayer2.DesktopEntry`, the basename of the player's `.desktop` file, e.g. `"mpv"` or
+    /// `"firefox"`. Empty when the player does not publish one, which several do not.
+    ///
+    /// The stable name for a player. `identity` is a display string a player may localise or
+    /// decorate; this is what an app-matching rule should be written against.
+    pub desktop_entry: String,
 }
 
 /// Hands out [`PlayerEntry::registered`], on the same terms as the tray's own counter.
@@ -120,6 +133,9 @@ async fn resync(
     // `player_identity` is `MediaPlayer2.Identity`, unrelated to `TrackIdentity`
     // (`identity`/`new_identity` below), the composite key this function tracks.
     let player_identity = root.identity().await.unwrap_or_default();
+    // Optional in the real spec and genuinely absent on several players, so an error here is the
+    // player answering "I have none", not a failure worth keeping a previous value for.
+    let desktop_entry = root.desktop_entry().await.unwrap_or_default();
     let position = player.position().await.unwrap_or(0);
 
     // A full Metadata read failure (GetAll erroring, not one key absent) means metadata-derived
@@ -138,6 +154,8 @@ async fn resync(
             position,
             position_updated_at: monotonic_micros(),
             length: previous.as_ref().map(|p| p.state.length).unwrap_or(-1),
+            url: previous.as_ref().map(|p| p.state.url.clone()).unwrap_or_default(),
+            desktop_entry,
         };
         let identity = previous.as_ref().map(|p| p.identity.clone()).unwrap_or_default();
         let trackid = previous.as_ref().and_then(|p| p.trackid.clone());
@@ -170,6 +188,14 @@ async fn resync(
         position,
         position_updated_at: monotonic_micros(),
         length,
+        // Held across a same-track update for `album_art_path`'s reason: players are observed to
+        // drop metadata keys on later updates for a track they already described in full.
+        url: match parsed.url {
+            Some(url) => url,
+            None if same_track => previous.as_ref().map(|p| p.state.url.clone()).unwrap_or_default(),
+            None => String::new(),
+        },
+        desktop_entry,
     };
     Resynced { state, identity: new_identity, trackid }
 }

@@ -6644,3 +6644,84 @@ anything else: the control socket and session-lock flag under `$XDG_RUNTIME_DIR`
 data), the config directory itself (`-c`, `$OBLISK_CONFIG_DIR`, `$XDG_CONFIG_HOME/oblisk`, `$HOME`,
 since something has to find the Lua before any Lua runs), and the thumbnail cache, which is a
 freedesktop location other applications read and write.
+
+## 0137. Privacy reports every capture; telling a video from a song stays in Lua
+
+`oblisk.privacy` answered one question, "is a camera open", and `oblisk.mpris` could not tell a film
+from an album. Both are wanted by an idle module that must not blank the screen during a call.
+
+**Decisions.**
+
+1. **`PrivacyState` gains `microphone_users` and `screencast_users`,** alongside `camera_users`,
+   each a `PrivacyUser` list. `CameraUser` is renamed to `PrivacyUser` and shared by all three: they
+   answer the same question, "who", and three identical structs would only suggest they differ.
+2. **Both come off `media.class` on the PipeWire connection `oblisk.audio` already holds.**
+   `Stream/Input/Audio` is an app reading a microphone. `Stream/Output/Video` is an app pushing
+   video into PipeWire, which on a desktop is screen capture, because a camera is a `Video/Source`
+   *device* rather than a stream. No second connection, no new thread.
+3. **Only a node PipeWire reports as `Running` is published.** A browser tab holds a capture stream
+   open between calls; an indicator lit by mere existence would be lit permanently. The node's
+   `state` field is on every `info` event, so this costs nothing beyond reading it.
+4. **A monitor capture is not a microphone.** PipeWire sets `stream.capture.sink` on a stream
+   reading a sink's monitor, which is what cava and every other visualiser does. Filtering on that
+   property rather than on a name list is the difference between a rule and a growing list of
+   exceptions.
+5. **One channel from the mixer thread, carrying all three lists as `PrivacySources`.** Three
+   senders would only add orderings where one list is a push behind the other two, and a config
+   draws them together.
+6. **The camera watch became optional and the task did not.** A desktop with no `/dev/videoN` used
+   to return from the task outright, which was right when a camera was all this answered and would
+   now take microphone detection down with it. A missing device, a failed `Inotify`, and a stream
+   that ends all now leave `camera_users` empty and keep serving the other two.
+7. **`PlayerState` gains `url` (`xesam:url`) and `desktop_entry` (`MediaPlayer2.DesktopEntry`).**
+   `url` was already parsed for `TrackIdentity` and simply not published. These are the facts a
+   config cannot reach; what it does with them is its own.
+
+**Rejected.** *A `mpris.is_video` or `privacy.video_playing` field.* The mirror's answer is a list of
+video applications, a list of video hostnames, a list of music hostnames and a list of file
+extensions. Every one of those is taste, every one of them goes stale, and the correct list for one
+user is wrong for another. Rust publishes `url` and `desktop_entry`; `dev-config/oblisk/lib/media.lua`
+holds the lists, where the rest of this user's taste already lives (ADR-0037). *Link-based detection,
+which is what `PrivacyService.qml` does.* It needs every PipeWire link group bound and tracked to
+answer a question the node's own `state` already answers, on a listener that is already attached.
+*Matching screencast nodes by name against a regex of portals and compositors, also from the mirror.*
+`media.class` separates a produced video stream from a camera device without naming anyone, and a
+list containing `niri` is a list that is wrong on the next machine.
+
+**Consequences.** `screencast_users` names the portal rather than the requesting app when the portal
+created the node, since that is whose identity the node carries. Screen recorders on wlr-screencopy
+(`wf-recorder`, `grim`) never reach PipeWire and never appear; catching those needs the compositor
+to report its own screencopy clients, which niri-ipc does not. `microphone_users` is not
+`oblisk.audio`'s `source_muted`, which is a device setting: a muted microphone with a running
+capture stream appears in both, and that is the honest answer.
+
+## 0138. `loginctl lock-session` locks the screen; `loginctl unlock-session` does not unlock it
+
+A shell holding `ext_session_lock_v1` and ignoring logind's `Lock` signal breaks
+`systemd-lock-handler`, `xdg-desktop-portal`, `swayidle -l`, and every keybind anyone has bound to
+`loginctl lock-session`. This is protocol compliance, not policy, so it is not a config's choice.
+
+**Decisions.**
+
+1. **The Supervisor subscribes to `org.freedesktop.login1.Session`'s `Lock` signal** on this
+   process's own session, resolved from `$XDG_SESSION_ID` and falling back to logind's `"auto"`.
+   A `Lock` takes the same path `lock:invoke("lock")` takes, guard included. There is no
+   `systemctl --user lock`: `systemctl` manages units, and the lock request is a logind call.
+2. **`Unlock` is logged and refused.** ADR-0042 makes a successful PAM authentication the only
+   thing that lifts a lock, and `LockController::unlock` bypasses PAM entirely, so honouring the
+   signal would turn anyone who can reach the bus into an unlock. The way back in stays the prompt
+   or a VT switch.
+3. **`Session.SetLockedHint` is published on every confirmed lock change,** off the same
+   `LockOutcome` the `$XDG_RUNTIME_DIR` marker is written from, so `loginctl show-session` and the
+   marker cannot disagree. Serialized on one task: two calls in flight could land out of order.
+4. **Built at boot, not lazily.** The signal has to be subscribed before anyone presses the key,
+   not after a config happens to read a member (ADR-0070 does not apply: this is not a capability).
+5. **Both halves degrade to inert, logged once.** A shell that cannot reach logind still locks from
+   its own bar.
+
+**Rejected.** *Exposing the `Lock` signal to Lua as an event to be handled.* A shell that ignores
+`lock-session` is broken, not configurable, and a config that forgot to wire it would be a shell
+whose lock key silently does nothing. *`Inhibit(what="sleep", mode="delay")` to lock before suspend.*
+Real, and separate: without it a lid close reaches the screen before the lock does. Deferred until
+something asks for it, because it needs a held fd, a bounded window and a `PrepareForSleep`
+subscription, none of which the `Lock` path needs.

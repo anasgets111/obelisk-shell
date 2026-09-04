@@ -9,6 +9,8 @@ use std::sync::Mutex;
 
 use tokio::sync::mpsc::UnboundedSender;
 
+pub mod logind;
+
 /// `oblisk.lock`'s payload (ADR-0052 decision 4). `attempts` counts failed authentications since
 /// acquisition; Lua can't rebuild it because state is sampled at layout time (ADR-0044), not
 /// evented, so two identical consecutive failures are one unchanged `error` string. `error`'s

@@ -79,6 +79,9 @@ pub(crate) struct Supervisor {
 
     /// `$XDG_RUNTIME_DIR`'s "the session is locked" marker, which outlives this process (ADR-0060).
     locked_flag: lock::SessionLockedFlag,
+    /// logind's half of the same fact (ADR-0138): what `loginctl show-session` reports as
+    /// `LockedHint`, published whenever the flag above changes.
+    session_bridge: lock::logind::SessionBridge,
     /// Every capability's state-version counter, keyed by name (ADR-0004).
     revisions: HashMap<String, u32>,
     /// The last StateSnapshot pushed per capability, keyed by name: hydrates a fresh Candidate's
@@ -117,6 +120,7 @@ impl Supervisor {
         capabilities: Capabilities,
         lock: LockController,
         locked_flag: lock::SessionLockedFlag,
+        session_bridge: lock::logind::SessionBridge,
         pam_outcome_tx: tokio::sync::mpsc::UnboundedSender<(u64, shared::PamOutcome)>,
         polkit_outcome_tx: tokio::sync::mpsc::UnboundedSender<(String, shared::PamOutcome)>,
         process_done_tx: tokio::sync::mpsc::UnboundedSender<(u32, u64)>,
@@ -138,6 +142,7 @@ impl Supervisor {
             polkit: PolkitController::default(),
             polkit_outcome_tx,
             locked_flag,
+            session_bridge,
             revisions: HashMap::new(),
             last_snapshots: HashMap::new(),
             next_sequence: 0,
@@ -365,6 +370,15 @@ impl Supervisor {
     /// PAM answer outlives the lock it answers for: about a second normally, up to
     /// PAM_EXCHANGE_TIMEOUT's thirty when wedged, and in that window the compositor can end the
     /// lock or an idle timer can take a new one; `record_authentication` refuses a stale answer.
+    /// `loginctl lock-session`, arriving as logind's `Lock` signal (ADR-0138). Nothing here is
+    /// special-cased: it takes the same path a `lock:invoke("lock")` from the bar takes, including
+    /// the already-locked guard inside [`LockController::lock`].
+    pub(crate) fn lock_requested_by_logind(&mut self) {
+        eprintln!("lock: logind asked for a lock (loginctl lock-session)");
+        self.lock.lock();
+        self.push_lock_state();
+    }
+
     pub(crate) fn record_pam_outcome(&mut self, acquisition: u64, outcome: shared::PamOutcome) {
         let succeeded = outcome == shared::PamOutcome::Success;
         if !self.lock.record_authentication(acquisition, outcome) {
@@ -401,7 +415,15 @@ impl Supervisor {
         }
         // Before record, off the outcome rather than LockState: the marker keeps saying "locked"
         // through a RendererLost that clears active (ADR-0060).
-        self.locked_flag.apply(lock::compositor_lock_change(&report.outcome));
+        let change = lock::compositor_lock_change(&report.outcome);
+        self.locked_flag.apply(change);
+        // The same change, told to logind. Off the outcome for the same reason, so `LockedHint`
+        // and the runtime marker can never disagree about what is on the glass (ADR-0138).
+        match change {
+            lock::SessionLock::Taken => self.session_bridge.publish_locked_hint(true),
+            lock::SessionLock::Released => self.session_bridge.publish_locked_hint(false),
+            lock::SessionLock::Unchanged => {}
+        }
         self.lock.record(lock::LockEvent::Reported(report.outcome));
         self.push_lock_state();
         if !self.lock.defers_swap() && std::mem::take(&mut self.swap_owed_on_unlock) {

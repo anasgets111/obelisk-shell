@@ -53,7 +53,7 @@ mod state;
 mod write;
 
 pub use registry::{AudioCommandSender, command_channel, run};
-pub use state::{AudioCommand, VideoSourceApp};
+pub use state::{AudioCommand, CaptureApp, PrivacySources, VideoSourceApp};
 // `main.rs` names this on `ensure_mixer_thread`'s sender parameter, which is what the lazy start
 // (ADR-0070) cost: the channel outlives the thread's construction, so its item type can no
 // longer be inferred from `run`'s own signature at the one call site.

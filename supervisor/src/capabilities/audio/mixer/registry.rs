@@ -19,31 +19,33 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::capabilities::audio::master;
 
 use super::state::{
-    AudioApps, AudioCommand, AudioState, DEFAULT_AUDIO_SINK_KEY, DEFAULT_AUDIO_SOURCE_KEY, DefaultDevice, DeviceEntry,
-    DeviceRoute, MixerState, NodeKind, PropsLookup, VideoSourceApp, VideoSourceApps, apply_info_event,
-    apply_video_info_event, classify, device_names,
+    AudioApps, AudioCommand, AudioState, CaptureApps, DEFAULT_AUDIO_SINK_KEY, DEFAULT_AUDIO_SOURCE_KEY, DefaultDevice,
+    DeviceEntry, DeviceRoute, MixerState, NodeKind, PrivacySources, PropsLookup, VideoSourceApps,
+    apply_capture_info_event, apply_info_event, apply_video_info_event, classify, device_names,
 };
 use super::write::apply_command;
 
 /// Runs the PipeWire registry listener until the process exits, sending an updated [`AudioState`]
 /// (per-app streams plus § 2.4 master volume/mute) over `updates` on every relevant
 /// node-added/-properties-changed/-removed/param-changed event, and a snapshot of
-/// [`VideoSourceApp`]s over `video_updates` on the equivalent video events (ADR-0034): one
-/// PipeWire connection serving two capabilities, each publishing only on its own changes. Blocks
+/// [`PrivacySources`] over `privacy_updates` on the equivalent camera/microphone/screencast
+/// events (ADR-0034, ADR-0137): one PipeWire connection serving two capabilities, each
+/// publishing only on its own changes. Blocks
 /// the calling thread (`pipewire-rs`'s event loop and the `Rc`-based listener state here are
 /// single-threaded and non-`Send`), so call from `std::thread::spawn`, never async.
 ///
-/// `updates` only reaches a log line in `main()`, not Lua yet (ADR-0017); `video_updates` feeds
-/// `privacy::PrivacyController`'s name-enrichment (ADR-0034). ponytail: no shutdown path, since
+/// `updates` only reaches a log line in `main()`, not Lua yet (ADR-0017); `privacy_updates` feeds
+/// `privacy::PrivacyController` (name-enrichment for cameras per ADR-0034, and the whole answer
+/// for microphones and screencasts per ADR-0137). ponytail: no shutdown path, since
 /// `main_loop.run()` returns only at process exit and nothing yet needs Phase 7/8's reload
 /// orchestrator to add a `quit()` trigger. Logs and returns rather than panicking if PipeWire is
 /// unreachable: one optional subsystem, not a reason to take down the supervisor.
 pub fn run(
     updates: UnboundedSender<AudioState>,
-    video_updates: UnboundedSender<Vec<VideoSourceApp>>,
+    privacy_updates: UnboundedSender<PrivacySources>,
     commands: AudioCommandReceiver,
 ) {
-    if let Err(err) = run_inner(updates, video_updates, commands) {
+    if let Err(err) = run_inner(updates, privacy_updates, commands) {
         eprintln!("pipewire registry listener stopped: {err}");
     }
 }
@@ -61,7 +63,7 @@ pub fn command_channel() -> (AudioCommandSender, AudioCommandReceiver) {
 
 fn run_inner(
     updates: UnboundedSender<AudioState>,
-    video_updates: UnboundedSender<Vec<VideoSourceApp>>,
+    privacy_updates: UnboundedSender<PrivacySources>,
     commands: AudioCommandReceiver,
 ) -> Result<(), pw::Error> {
     pw::init();
@@ -74,9 +76,11 @@ fn run_inner(
     let state = Rc::new(RefCell::new(MixerState {
         apps: AudioApps::new(),
         video_sources: VideoSourceApps::new(),
+        microphones: CaptureApps::new(),
+        screencasts: CaptureApps::new(),
         nodes: HashMap::new(),
         updates,
-        video_updates,
+        privacy_updates,
         sinks: HashMap::new(),
         sink_nodes: HashMap::new(),
         sources: HashMap::new(),
@@ -123,13 +127,18 @@ fn run_inner(
                 state.default_source_name = None;
             }
             // Audio publishes unconditionally on every removal (ADR-0034 scopes this as
-            // name-enrichment, not a cadence change); video only when `id` was a tracked video
-            // source (see VideoSourceApps::remove). Sink/metadata cleanup is unconditional too,
-            // since publish_audio recomputes master state from what's left each call.
+            // name-enrichment, not a cadence change); privacy only when `id` was one of the three
+            // node kinds it tracks. Sink/metadata cleanup is unconditional too, since
+            // publish_audio recomputes master state from what's left each call.
             state.apps.remove(id);
             state.publish_audio();
-            if state.video_sources.remove(id) {
-                state.publish_video();
+            // All three run before the check, not inside it: `||` would stop at the first hit and
+            // leave the other two maps holding a node PipeWire has already taken away.
+            let was_camera = state.video_sources.remove(id);
+            let was_microphone = state.microphones.remove(id);
+            let was_screencast = state.screencasts.remove(id);
+            if was_camera || was_microphone || was_screencast {
+                state.publish_privacy();
             }
         })
         .register();
@@ -206,7 +215,16 @@ fn on_node_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Regi
                 }
                 NodeKind::Video => {
                     apply_video_info_event(&mut state_mut.video_sources, node_id, has_props_change, info.props());
-                    state_mut.publish_video();
+                    state_mut.publish_privacy();
+                }
+                NodeKind::Microphone | NodeKind::Screencast => {
+                    let running = matches!(info.state(), pw::node::NodeState::Running);
+                    let apps = match kind {
+                        NodeKind::Microphone => &mut state_mut.microphones,
+                        _ => &mut state_mut.screencasts,
+                    };
+                    apply_capture_info_event(apps, node_id, kind, has_props_change, info.props(), running);
+                    state_mut.publish_privacy();
                 }
             }
         })

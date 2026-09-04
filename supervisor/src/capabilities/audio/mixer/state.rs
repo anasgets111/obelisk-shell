@@ -23,6 +23,27 @@ const STREAM_OUTPUT_AUDIO: &str = "Stream/Output/Audio";
 /// portal-routed subset, so this supplements that capability's own kernel-level detection.
 const VIDEO_SOURCE: &str = "Video/Source";
 
+/// `media.class` value an app capturing audio carries (ADR-0137). What separates "a microphone is
+/// being read" from `oblisk.audio`'s `source_volume`, which is a device setting and says nothing
+/// about whether anything is listening.
+const STREAM_INPUT_AUDIO: &str = "Stream/Input/Audio";
+
+/// `media.class` value a screen-capture producer carries (ADR-0137). A camera is a `Video/Source`
+/// *device*; nothing else on a desktop pushes a video *stream* into PipeWire, so this is screen
+/// capture without having to match the portal or the compositor by name.
+///
+/// ponytail: `wf-recorder`, `grim` and anything else on wlr-screencopy never reach PipeWire and so
+/// never appear here. Catching those needs the compositor to report its own screencopy clients,
+/// which niri-ipc does not.
+const STREAM_OUTPUT_VIDEO: &str = "Stream/Output/Video";
+
+/// PipeWire's own marker for a capture stream reading a sink's monitor instead of a real input
+/// device (`PW_KEY_STREAM_CAPTURE_SINK`). cava and every other visualiser sets it, and reporting
+/// those as microphone users lights a privacy indicator for a spectrum analyser. The mirror's
+/// `PrivacyService.qml` excludes cava by name; this excludes the whole class by the property
+/// PipeWire already publishes.
+const STREAM_CAPTURE_SINK: &str = "stream.capture.sink";
+
 /// One playback stream node PipeWire has advertised, filtered to
 /// `media.class == "Stream/Output/Audio"` and resolved to its owning process. `main.rs` puts
 /// this as-is in a `StateSnapshot`'s `payload`. Field names match § 2.4's spelling (`id`, `name`,
@@ -83,6 +104,21 @@ fn is_stream_output_audio(props: &impl PropsLookup) -> bool {
 pub(super) enum NodeKind {
     Audio,
     Video,
+    Microphone,
+    Screencast,
+}
+
+impl NodeKind {
+    /// The one `media.class` this kind is. Both directions live here so [`classify`] and the
+    /// re-check inside [`parse_capture_props`] cannot drift apart.
+    fn media_class(self) -> &'static str {
+        match self {
+            NodeKind::Audio => STREAM_OUTPUT_AUDIO,
+            NodeKind::Video => VIDEO_SOURCE,
+            NodeKind::Microphone => STREAM_INPUT_AUDIO,
+            NodeKind::Screencast => STREAM_OUTPUT_VIDEO,
+        }
+    }
 }
 
 /// Classifies a `global` event's properties by `media.class`, or `None` for anything neither
@@ -91,6 +127,8 @@ pub(super) fn classify(props: &impl PropsLookup) -> Option<NodeKind> {
     match props.get_prop(*keys::MEDIA_CLASS) {
         Some(STREAM_OUTPUT_AUDIO) => Some(NodeKind::Audio),
         Some(VIDEO_SOURCE) => Some(NodeKind::Video),
+        Some(STREAM_INPUT_AUDIO) => Some(NodeKind::Microphone),
+        Some(STREAM_OUTPUT_VIDEO) => Some(NodeKind::Screencast),
         _ => None,
     }
 }
@@ -393,6 +431,117 @@ impl VideoSourceApps {
     }
 }
 
+/// One app capturing something: a microphone stream or a screen-capture stream (ADR-0137). Which
+/// of the two is decided by the [`CaptureApps`] holding it, not by a field here, because nothing
+/// reads the two lists together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct CaptureApp {
+    /// PipeWire registry id of the stream node: the key [`CaptureApps`] tracks entries by.
+    pub node_id: u32,
+    /// `application.process.id` when PipeWire recorded one, which a portal-created stream may not
+    /// carry -- its owner is the portal, not the app that asked. A naming hint, never an identity.
+    pub pid: Option<i32>,
+    /// `application.name`, if the client set one.
+    pub app_name: Option<String>,
+    /// PipeWire reports the node as `Running`. A stream that exists but sits `Idle` or
+    /// `Suspended` is an app holding the device open without reading from it, which is exactly
+    /// what a browser tab does between calls, and is not capture.
+    pub running: bool,
+}
+
+/// Parses `props` into a [`CaptureApp`] if they belong to `kind`. `pid` is optional here where
+/// [`parse_video_source_props`] requires one: a camera user is cross-referenced against
+/// `/dev/videoN` openers by pid, while these two lists have PipeWire as their only source, so
+/// dropping a pid-less node would drop the capture itself.
+fn parse_capture_props(node_id: u32, kind: NodeKind, props: &impl PropsLookup) -> Option<CaptureApp> {
+    if props.get_prop(*keys::MEDIA_CLASS) != Some(kind.media_class()) {
+        return None;
+    }
+    if kind == NodeKind::Microphone && props.get_prop(STREAM_CAPTURE_SINK) == Some("true") {
+        return None;
+    }
+    Some(CaptureApp {
+        node_id,
+        pid: props.get_prop(*keys::APP_PROCESS_ID).and_then(|pid| pid.parse().ok()),
+        app_name: props.get_prop(*keys::APP_NAME).map(str::to_string),
+        // Set by the caller from the same `info` event, immediately below.
+        running: false,
+    })
+}
+
+/// One `info` event for a capture node. Props are gated on the PROPS change bit for the reason
+/// `mixer`'s module doc gives at length: any other kind of event carries a non-null but empty
+/// dict. `running` is not gated, because `pw_node_info::state` is a plain field every event
+/// carries in full -- the STATE bit only says whether it moved since the last one.
+pub(super) fn apply_capture_info_event(
+    apps: &mut CaptureApps,
+    node_id: u32,
+    kind: NodeKind,
+    has_props_change: bool,
+    props: Option<&impl PropsLookup>,
+    running: bool,
+) {
+    if has_props_change {
+        match props.and_then(|props| parse_capture_props(node_id, kind, props)) {
+            Some(app) => apps.upsert(app),
+            None => {
+                apps.remove(node_id);
+            }
+        }
+    }
+    apps.set_running(node_id, running);
+}
+
+/// Live capture-stream list for one kind, keyed by PipeWire node id. Mirrors [`VideoSourceApps`]'s
+/// shape, duplicated rather than made generic for the same reason it is: this codebase keeps small
+/// near-identical collections boring and separate.
+#[derive(Debug, Default)]
+pub struct CaptureApps {
+    apps: HashMap<u32, CaptureApp>,
+}
+
+impl CaptureApps {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn upsert(&mut self, app: CaptureApp) {
+        self.apps.insert(app.node_id, app);
+    }
+
+    /// A node nothing tracks is ignored rather than inserted: a state event for a stream whose
+    /// props never parsed (a monitor capture, say) must not resurrect it as a microphone.
+    pub fn set_running(&mut self, node_id: u32, running: bool) {
+        if let Some(app) = self.apps.get_mut(&node_id) {
+            app.running = running;
+        }
+    }
+
+    /// Whether an entry was actually present and removed, on the same terms as
+    /// [`VideoSourceApps::remove`].
+    pub fn remove(&mut self, node_id: u32) -> bool {
+        self.apps.remove(&node_id).is_some()
+    }
+
+    /// Only the running entries, which is the whole question `oblisk.privacy` asks. An idle
+    /// stream is tracked here so its later `Running` needs no re-parse, and published nowhere.
+    pub fn snapshot(&self) -> Vec<CaptureApp> {
+        let mut apps: Vec<CaptureApp> = self.apps.values().filter(|app| app.running).cloned().collect();
+        apps.sort_by_key(|app| app.node_id);
+        apps
+    }
+}
+
+/// Everything `oblisk.privacy` reads off PipeWire, in one snapshot (ADR-0137). One channel rather
+/// than three: all three lists change on the same registry events and a config draws them
+/// together, so separate senders would only add orderings where one list is a push behind.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrivacySources {
+    pub cameras: Vec<VideoSourceApp>,
+    pub microphones: Vec<CaptureApp>,
+    pub screencasts: Vec<CaptureApp>,
+}
+
 /// One § 3.2 audio write, crossing from the tokio runtime into the PipeWire loop. A channel,
 /// not a method call: every proxy here is `!Send`, dispatched only by the thread's own blocking
 /// `main_loop.run()`. `pipewire::channel` hands the loop an eventfd to poll beside its own
@@ -426,9 +575,13 @@ pub enum AudioCommand {
 pub(super) struct MixerState {
     pub(super) apps: AudioApps,
     pub(super) video_sources: VideoSourceApps,
+    /// Running `Stream/Input/Audio` nodes (ADR-0137), the microphone half of `oblisk.privacy`.
+    pub(super) microphones: CaptureApps,
+    /// Running `Stream/Output/Video` nodes (ADR-0137), the screen-capture half of the same.
+    pub(super) screencasts: CaptureApps,
     pub(super) nodes: HashMap<u32, (pw::node::Node, pw::node::NodeListener)>,
     pub(super) updates: UnboundedSender<AudioState>,
-    pub(super) video_updates: UnboundedSender<Vec<VideoSourceApp>>,
+    pub(super) privacy_updates: UnboundedSender<PrivacySources>,
     /// `Audio/Sink` node id -> everything tracked about that sink (`info` isn't needed here the
     /// way it is for stream nodes; see `registry::bind_device_node`).
     pub(super) sinks: HashMap<u32, DeviceEntry>,
@@ -529,8 +682,14 @@ impl MixerState {
         let _ = self.updates.send(state);
     }
 
-    pub(super) fn publish_video(&self) {
-        let _ = self.video_updates.send(self.video_sources.snapshot());
+    /// All three `oblisk.privacy` lists at once (ADR-0137). Called by every event that could
+    /// change any of them, since recomputing the two it did not touch is three map walks.
+    pub(super) fn publish_privacy(&self) {
+        let _ = self.privacy_updates.send(PrivacySources {
+            cameras: self.video_sources.snapshot(),
+            microphones: self.microphones.snapshot(),
+            screencasts: self.screencasts.snapshot(),
+        });
     }
 }
 
@@ -618,6 +777,125 @@ mod tests {
         sources.upsert(VideoSourceApp { node_id: 1, pid: 42, app_name: None });
         assert!(sources.remove(1));
         assert!(!sources.remove(1), "already removed -- nothing left to remove");
+    }
+
+    // ---- capture nodes (ADR-0137) ----
+
+    fn capture_props(media_class: &str) -> HashMap<String, String> {
+        HashMap::from([
+            ("media.class".to_string(), media_class.to_string()),
+            ("application.name".to_string(), "Firefox".to_string()),
+            ("application.process.id".to_string(), "42".to_string()),
+        ])
+    }
+
+    #[test]
+    fn classify_tells_the_four_node_kinds_apart_by_media_class() {
+        for (media_class, expected) in [
+            ("Stream/Output/Audio", NodeKind::Audio),
+            ("Video/Source", NodeKind::Video),
+            ("Stream/Input/Audio", NodeKind::Microphone),
+            ("Stream/Output/Video", NodeKind::Screencast),
+        ] {
+            let props = HashMap::from([("media.class".to_string(), media_class.to_string())]);
+            assert_eq!(classify(&props), Some(expected), "{media_class}");
+        }
+        let props = HashMap::from([("media.class".to_string(), "Audio/Sink".to_string())]);
+        assert_eq!(classify(&props), None, "a sink is bound by the device path, not this one");
+    }
+
+    /// The whole point of tracking node state: a browser tab holds a capture stream open between
+    /// calls, and a privacy indicator lit by that would be lit permanently.
+    #[test]
+    fn an_idle_capture_stream_is_tracked_but_not_published() {
+        let mut apps = CaptureApps::new();
+        apply_capture_info_event(
+            &mut apps,
+            1,
+            NodeKind::Microphone,
+            true,
+            Some(&capture_props("Stream/Input/Audio")),
+            false,
+        );
+        assert!(apps.snapshot().is_empty(), "an idle stream is not capture");
+
+        let empty: HashMap<String, String> = HashMap::new();
+        apply_capture_info_event(&mut apps, 1, NodeKind::Microphone, false, Some(&empty), true);
+        assert_eq!(apps.snapshot().len(), 1, "the same node going Running must publish without a re-parse");
+    }
+
+    /// The state-only event that follows carries an empty props dict; re-parsing it would drop
+    /// the entry, which is the same trap `apply_video_info_event_ignores_a_state_only_event` names.
+    #[test]
+    fn a_running_capture_stream_survives_a_state_only_event() {
+        let mut apps = CaptureApps::new();
+        apply_capture_info_event(
+            &mut apps,
+            1,
+            NodeKind::Microphone,
+            true,
+            Some(&capture_props("Stream/Input/Audio")),
+            true,
+        );
+        let empty: HashMap<String, String> = HashMap::new();
+        apply_capture_info_event(&mut apps, 1, NodeKind::Microphone, false, Some(&empty), true);
+
+        assert_eq!(apps.snapshot().len(), 1);
+    }
+
+    /// cava reads the sink monitor, not a microphone. `stream.capture.sink` is PipeWire's own
+    /// marker for that, which is why this filters on the property rather than on a name list.
+    #[test]
+    fn a_monitor_capture_is_not_a_microphone_user() {
+        let mut props = capture_props("Stream/Input/Audio");
+        props.insert("stream.capture.sink".to_string(), "true".to_string());
+
+        let mut apps = CaptureApps::new();
+        apply_capture_info_event(&mut apps, 1, NodeKind::Microphone, true, Some(&props), true);
+
+        assert!(apps.snapshot().is_empty(), "a visualiser reading the monitor must not light a microphone indicator");
+    }
+
+    /// A node whose props never parsed must stay untracked: a later state event alone cannot make
+    /// a monitor capture into a microphone.
+    #[test]
+    fn a_state_event_cannot_resurrect_a_node_whose_props_were_rejected() {
+        let mut props = capture_props("Stream/Input/Audio");
+        props.insert("stream.capture.sink".to_string(), "true".to_string());
+
+        let mut apps = CaptureApps::new();
+        apply_capture_info_event(&mut apps, 1, NodeKind::Microphone, true, Some(&props), true);
+        let empty: HashMap<String, String> = HashMap::new();
+        apply_capture_info_event(&mut apps, 1, NodeKind::Microphone, false, Some(&empty), true);
+
+        assert!(apps.snapshot().is_empty());
+    }
+
+    /// A portal stream publishes no pid. Dropping it would drop the screencast itself, which the
+    /// camera path can afford to do (it cross-references openers by pid) and this one cannot.
+    #[test]
+    fn a_capture_stream_without_a_pid_is_still_tracked() {
+        let props = HashMap::from([("media.class".to_string(), "Stream/Output/Video".to_string())]);
+
+        let mut apps = CaptureApps::new();
+        apply_capture_info_event(&mut apps, 1, NodeKind::Screencast, true, Some(&props), true);
+
+        assert_eq!(apps.snapshot(), vec![CaptureApp { node_id: 1, pid: None, app_name: None, running: true }]);
+    }
+
+    #[test]
+    fn a_node_of_the_wrong_class_for_its_kind_is_dropped() {
+        let mut apps = CaptureApps::new();
+        apply_capture_info_event(
+            &mut apps,
+            1,
+            NodeKind::Screencast,
+            true,
+            Some(&capture_props("Stream/Input/Audio")),
+            true,
+        );
+
+        assert!(apps.snapshot().is_empty());
     }
 
     // ---- apply_video_info_event ----
@@ -1025,14 +1303,16 @@ mod tests {
     /// test, and the rest is noise.
     fn mixer_state(
         updates: UnboundedSender<AudioState>,
-        video_updates: UnboundedSender<Vec<VideoSourceApp>>,
+        privacy_updates: UnboundedSender<PrivacySources>,
     ) -> MixerState {
         MixerState {
             apps: AudioApps::new(),
             video_sources: VideoSourceApps::new(),
+            microphones: CaptureApps::new(),
+            screencasts: CaptureApps::new(),
             nodes: HashMap::new(),
             updates,
-            video_updates,
+            privacy_updates,
             sinks: HashMap::new(),
             sink_nodes: HashMap::new(),
             sources: HashMap::new(),
@@ -1050,8 +1330,8 @@ mod tests {
     #[test]
     fn publish_audio_combines_master_volume_and_app_snapshot() {
         let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (video_updates, _video_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut state = mixer_state(updates, video_updates);
+        let (privacy_updates, _privacy_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = mixer_state(updates, privacy_updates);
         state.sinks =
             HashMap::from([(59, sink_at("alsa_output.pci-...analog-stereo", None, Some(props_at(0.3, false))))]);
         state.default_sink_name = Some("alsa_output.pci-...analog-stereo".to_string());
@@ -1068,8 +1348,8 @@ mod tests {
     #[test]
     fn publish_audio_reports_the_master_volume_default_with_no_sink_tracked() {
         let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (video_updates, _video_rx) = tokio::sync::mpsc::unbounded_channel();
-        let state = mixer_state(updates, video_updates);
+        let (privacy_updates, _privacy_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = mixer_state(updates, privacy_updates);
 
         state.publish_audio();
 
@@ -1086,8 +1366,8 @@ mod tests {
         // A stream's identity comes from an info event and its volume from a param event; this
         // is the one place the two are joined.
         let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (video_updates, _video_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut state = mixer_state(updates, video_updates);
+        let (privacy_updates, _privacy_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = mixer_state(updates, privacy_updates);
         state.apps.upsert(sample_stream(1));
         state.app_props = HashMap::from([(1, props_at(0.42, true))]);
 
@@ -1101,8 +1381,8 @@ mod tests {
     #[test]
     fn publish_audio_leaves_a_stream_whose_props_have_not_arrived_at_pipewires_own_untouched_values() {
         let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (video_updates, _video_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut state = mixer_state(updates, video_updates);
+        let (privacy_updates, _privacy_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = mixer_state(updates, privacy_updates);
         state.apps.upsert(sample_stream(1));
         state.app_props = HashMap::from([(99, props_at(0.42, true))]);
 
@@ -1116,8 +1396,8 @@ mod tests {
     #[test]
     fn publish_audio_reports_sinks_and_sources_with_their_own_active_flags() {
         let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (video_updates, _video_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut state = mixer_state(updates, video_updates);
+        let (privacy_updates, _privacy_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = mixer_state(updates, privacy_updates);
         state.sinks = HashMap::from([
             (59, sink_at("alsa_output.analog", Some("Built-in Audio Analog Stereo"), None)),
             (70, sink_at("bluez_output.headset", Some("WH-1000XM4"), None)),

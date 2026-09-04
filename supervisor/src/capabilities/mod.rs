@@ -28,7 +28,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::snapshot::push_snapshot;
 use crate::{log_unstarted, socket};
 use applications::{ApplicationsController, ApplicationsSignal};
-use audio::mixer::{AudioState, VideoSourceApp};
+use audio::mixer::{AudioState, PrivacySources};
 use battery::{BatteryController, BatterySignal};
 use bluetooth::{BluetoothController, BluetoothSignal};
 use brightness::{BrightnessController, BrightnessSignal};
@@ -268,10 +268,11 @@ pub struct Capabilities {
     /// session-bus capabilities open their own.
     connection: zbus::Connection,
     sound_tx: std::sync::mpsc::Sender<PathBuf>,
-    /// The mixer thread's video half (ADR-0034), in `Option`s because starting either `audio`
-    /// or `privacy` moves one end: the mixer thread owns the sender, `privacy` the receiver.
-    video_tx: Option<UnboundedSender<Vec<VideoSourceApp>>>,
-    video_sources: Option<UnboundedReceiver<Vec<VideoSourceApp>>>,
+    /// The mixer thread's privacy half (ADR-0034, ADR-0137), in `Option`s because starting either
+    /// `audio` or `privacy` moves one end: the mixer thread owns the sender, `privacy` the
+    /// receiver.
+    privacy_tx: Option<UnboundedSender<PrivacySources>>,
+    privacy_sources: Option<UnboundedReceiver<PrivacySources>>,
 }
 
 impl Capabilities {
@@ -283,7 +284,7 @@ impl Capabilities {
         idle_tx: UnboundedSender<shared::IdleEvent>,
     ) -> (Self, Signals) {
         let (senders, signals) = Senders::channels();
-        let (video_tx, video_sources) = unbounded_channel();
+        let (privacy_tx, privacy_sources) = unbounded_channel();
 
         let capabilities = Self {
             network: None,
@@ -309,8 +310,8 @@ impl Capabilities {
             idle_tx,
             connection,
             sound_tx,
-            video_tx: Some(video_tx),
-            video_sources: Some(video_sources),
+            privacy_tx: Some(privacy_tx),
+            privacy_sources: Some(privacy_sources),
         };
         (capabilities, signals)
     }
@@ -418,16 +419,17 @@ impl Capabilities {
                     );
                 }
             }
-            // /dev/videoN open/close via inotify plus a /proc fd-scan, enriched by video_sources
-            // (ADR-0034).
+            // /dev/videoN open/close via inotify plus a /proc fd-scan for the camera, enriched by
+            // privacy_sources (ADR-0034); microphone and screencast come off that same channel and
+            // have no second source (ADR-0137).
             Capability::Privacy => {
                 if self.privacy.is_none() {
                     self.ensure_mixer_thread();
-                    if let Some(video_sources) = self.video_sources.take() {
+                    if let Some(privacy_sources) = self.privacy_sources.take() {
                         self.privacy = Some(PrivacyController::new(
                             PathBuf::from("/proc"),
                             &PathBuf::from("/sys/class/video4linux"),
-                            video_sources,
+                            privacy_sources,
                             self.senders.privacy.clone(),
                         ));
                     }
@@ -524,10 +526,10 @@ impl Capabilities {
         if self.audio.is_some() {
             return;
         }
-        let Some(video_tx) = self.video_tx.take() else { return };
+        let Some(privacy_tx) = self.privacy_tx.take() else { return };
         let (command_tx, command_rx) = audio::mixer::command_channel();
         let audio_tx = self.senders.audio.clone();
-        std::thread::spawn(move || audio::mixer::run(audio_tx, video_tx, command_rx));
+        std::thread::spawn(move || audio::mixer::run(audio_tx, privacy_tx, command_rx));
         self.audio = Some(command_tx);
     }
 
