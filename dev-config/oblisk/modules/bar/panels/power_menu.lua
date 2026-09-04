@@ -108,7 +108,7 @@ end
 -- three -- log out, restart, power off -- and narrows back when the pointer leaves. `hover` on the
 -- row holding the three, not on each circle, since a hover region answers containment and a
 -- pointer crossing the gap between two circles never leaves the row. That is what the mirror's
--- collapse timer exists to paper over, and why `workspace_strip.lua` thought a pill needed one.
+-- collapse timer exists to paper over, and what `workspace_strip.lua` now builds on too.
 -- No width animation; the engine has none, and the volume pill snaps open the same way.
 --
 -- While an action counts down the pill holds itself open and the three circles change roles, the

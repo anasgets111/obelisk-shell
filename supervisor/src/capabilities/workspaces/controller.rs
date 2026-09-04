@@ -59,6 +59,14 @@ pub struct WorkspaceEntry {
     /// The compositor's own name for the workspace, or `nil` when it has none. Most do not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// At least one window sits on this workspace (ADR-0117). What a strip dims an empty
+    /// workspace by.
+    pub populated: bool,
+    /// The Wayland `app_id` of the window that stands for this workspace: the focused one when
+    /// focus is here, else the compositor's first. Absent when the workspace is empty or its
+    /// windows report no id, so `nil` and "draw the number" are the same test.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
 }
 
 /// § 2.9's `active_client`, minus `is_fullscreen` (ADR-0056 decision 5: niri-ipc 26.4.0's `Window`
@@ -75,7 +83,7 @@ pub struct ActiveClient {
     pub is_floating: bool,
 }
 
-/// One workspace as a compositor reports it, reduced to the six fields [`derive_state`] reads.
+/// One workspace as a compositor reports it, reduced to the fields [`derive_state`] reads.
 /// The input type of the reduction, so the reduction and its tests belong to no compositor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceRow {
@@ -90,6 +98,10 @@ pub struct WorkspaceRow {
     /// The workspace holding keyboard focus. Global: exactly one across the whole session, which
     /// is what makes `OutputWorkspaces::focused_workspace` optional (ADR-0056 decision 4).
     pub is_focused: bool,
+    /// Whether any window sits here, and which one stands for the workspace (ADR-0117). Picked by
+    /// the adaptor, which holds the window list this module never sees; an empty id is `None`.
+    pub populated: bool,
+    pub app_id: Option<String>,
 }
 
 /// The focused toplevel, reduced to the three fields § 2.9's `active_client` carries.
@@ -130,7 +142,13 @@ pub fn derive_state(workspaces: &[WorkspaceRow], focused: Option<&FocusedWindow>
             let focused_workspace = group.iter().find(|workspace| workspace.is_focused).map(|workspace| workspace.id);
             let workspaces = group
                 .into_iter()
-                .map(|workspace| WorkspaceEntry { id: workspace.id, idx: workspace.idx, name: workspace.name.clone() })
+                .map(|workspace| WorkspaceEntry {
+                    id: workspace.id,
+                    idx: workspace.idx,
+                    name: workspace.name.clone(),
+                    populated: workspace.populated,
+                    app_id: workspace.app_id.clone(),
+                })
                 .collect();
             Some(OutputWorkspaces { name: name.to_string(), active_workspace, focused_workspace, workspaces })
         })
@@ -229,7 +247,16 @@ mod tests {
     use super::*;
 
     fn workspace(id: u64, idx: u8, output: &str, is_active: bool, is_focused: bool) -> WorkspaceRow {
-        WorkspaceRow { id, idx, name: None, output: Some(output.to_string()), is_active, is_focused }
+        WorkspaceRow {
+            id,
+            idx,
+            name: None,
+            output: Some(output.to_string()),
+            is_active,
+            is_focused,
+            populated: false,
+            app_id: None,
+        }
     }
 
     fn window(title: &str, app_id: &str, is_floating: bool) -> FocusedWindow {
@@ -254,6 +281,24 @@ mod tests {
         let edp = &state.outputs[1];
         assert_eq!(edp.workspaces.iter().map(|entry| entry.idx).collect::<Vec<_>>(), [1, 2, 3]);
         assert_eq!(edp.workspaces.iter().map(|entry| entry.id).collect::<Vec<_>>(), [5, 7, 9]);
+    }
+
+    #[test]
+    fn derive_state_carries_populated_and_app_id_through_and_omits_an_absent_app_id() {
+        let mut busy = workspace(5, 1, "eDP-1", true, true);
+        busy.populated = true;
+        busy.app_id = Some("firefox".to_string());
+        let workspaces = [busy, workspace(7, 2, "eDP-1", false, false)];
+
+        let state = derive_state(&workspaces, None);
+        let entries = &state.outputs[0].workspaces;
+
+        assert!(entries[0].populated);
+        assert_eq!(entries[0].app_id.as_deref(), Some("firefox"));
+        assert!(!entries[1].populated);
+        let json = serde_json::to_value(&entries[1]).unwrap();
+        assert!(json.get("app_id").is_none(), "an empty workspace has no app_id key: {json}");
+        assert_eq!(json["populated"], false);
     }
 
     #[test]

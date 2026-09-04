@@ -240,9 +240,11 @@
 ---`id` is the compositor's stable, monitor-independent identity: what `active_workspace`/
 ---`focused_workspace` refer to and what `workspaces:focus(id)` takes. `idx` is the 1-based
 ---position on that output (what a keybind/button label means), not stable across a reorder.
+---@field app_id? string The Wayland `app_id` of the window that stands for this workspace: the focused one when focus is here, else the compositor's first. Absent when the workspace is empty or its windows report no id, so `nil` and "draw the number" are the same test.
 ---@field id integer Stable identity, independent of which output the workspace sits on. What the two ids on [`OutputWorkspaces`] refer to and what `workspaces:focus(id)` takes.
 ---@field idx integer 1-based position on this output. Not stable: a reorder renumbers it, which is why it is the thing to draw and [`WorkspaceEntry::id`] is the thing to send.
 ---@field name? string The compositor's own name for the workspace, or `nil` when it has none. Most do not.
+---@field populated boolean At least one window sits on this workspace (ADR-0117). What a strip dims an empty workspace by.
 
 ---@class ApplicationsState
 ---`oblisk.applications`'s payload (ADR-0061 decision 2).

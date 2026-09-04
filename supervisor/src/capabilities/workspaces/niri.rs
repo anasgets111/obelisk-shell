@@ -16,16 +16,30 @@ use super::controller::{FocusedWindow, StatePublisher, WorkspaceRow};
 
 /// niri's workspaces reduced to the reduction's input. `name` and `output` are cloned per event;
 /// a session has a handful of workspaces, so this is not the place to avoid an allocation.
-fn workspace_rows(workspaces: &HashMap<u64, niri_ipc::Workspace>) -> Vec<WorkspaceRow> {
+///
+/// `populated`/`app_id` (ADR-0117) come from `Window.workspace_id`: the focused window's id when
+/// focus is on that workspace, else the window with the lowest id, since the map has no order and
+/// the tile the compositor calls first is not on the wire. An empty `app_id` is `None`.
+fn workspace_rows(
+    workspaces: &HashMap<u64, niri_ipc::Workspace>,
+    windows: &HashMap<u64, niri_ipc::Window>,
+) -> Vec<WorkspaceRow> {
     workspaces
         .values()
-        .map(|workspace| WorkspaceRow {
-            id: workspace.id,
-            idx: workspace.idx,
-            name: workspace.name.clone(),
-            output: workspace.output.clone(),
-            is_active: workspace.is_active,
-            is_focused: workspace.is_focused,
+        .map(|workspace| {
+            let mut here: Vec<&niri_ipc::Window> =
+                windows.values().filter(|window| window.workspace_id == Some(workspace.id)).collect();
+            here.sort_by_key(|window| (!window.is_focused, window.id));
+            WorkspaceRow {
+                id: workspace.id,
+                idx: workspace.idx,
+                name: workspace.name.clone(),
+                output: workspace.output.clone(),
+                is_active: workspace.is_active,
+                is_focused: workspace.is_focused,
+                populated: !here.is_empty(),
+                app_id: here.first().and_then(|window| window.app_id.clone()).filter(|id| !id.is_empty()),
+            }
         })
         .collect()
 }
@@ -107,7 +121,7 @@ pub fn spawn_reader(mut publisher: StatePublisher) {
                 niri_windows.apply(event);
             }
 
-            let rows = workspace_rows(&niri_workspaces.workspaces);
+            let rows = workspace_rows(&niri_workspaces.workspaces, &niri_windows.windows);
             let focused = focused_window(&niri_windows.windows);
             if !publisher.publish(&rows, focused.as_ref()) {
                 return;
@@ -156,7 +170,7 @@ mod tests {
 
     fn window(id: u64, title: &str, app_id: &str, is_focused: bool, is_floating: bool) -> niri_ipc::Window {
         serde_json::from_value(serde_json::json!({
-            "id": id, "title": title, "app_id": app_id, "pid": 1481, "workspace_id": 3,
+            "id": id, "title": title, "app_id": app_id, "pid": 1481, "workspace_id": 5,
             "is_focused": is_focused, "is_floating": is_floating, "is_urgent": false,
             "layout": {
                 "pos_in_scrolling_layout": [3, 1], "tile_size": [1920.0, 1200.0], "window_size": [1920, 1200],
@@ -173,7 +187,10 @@ mod tests {
 
     #[test]
     fn workspace_rows_carry_every_field_the_reduction_reads() {
-        let rows = workspace_rows(&map(vec![(5, workspace(5, 2, "eDP-1", true, true))]));
+        let rows = workspace_rows(
+            &map(vec![(5, workspace(5, 2, "eDP-1", true, true))]),
+            &map(vec![(2, window(2, "src/main.rs - Neovim", "kitty", true, true))]),
+        );
 
         assert_eq!(
             rows,
@@ -183,9 +200,53 @@ mod tests {
                 name: None,
                 output: Some("eDP-1".to_string()),
                 is_active: true,
-                is_focused: true
+                is_focused: true,
+                populated: true,
+                app_id: Some("kitty".to_string()),
             }]
         );
+    }
+
+    #[test]
+    fn workspace_rows_stand_a_workspace_in_by_its_focused_window_else_its_lowest_id() {
+        let workspaces =
+            map(vec![(5, workspace(5, 1, "eDP-1", true, true)), (6, workspace(6, 2, "eDP-1", false, false))]);
+        let mut elsewhere = window(30, "Sign in | Slack", "slack", false, false);
+        elsewhere.workspace_id = Some(6);
+        let windows = map(vec![
+            (14, window(14, "Inbox", "thunderbird", false, false)),
+            (2, window(2, "src/main.rs - Neovim", "kitty", true, true)),
+            (30, elsewhere),
+        ]);
+
+        let rows = workspace_rows(&workspaces, &windows);
+        let app_of = |id: u64| rows.iter().find(|row| row.id == id).unwrap().app_id.clone();
+
+        assert_eq!(app_of(5).as_deref(), Some("kitty"), "focus wins over a lower id");
+        assert_eq!(app_of(6).as_deref(), Some("slack"));
+
+        let mut unfocused = windows.clone();
+        unfocused.get_mut(&2).unwrap().is_focused = false;
+        let rows = workspace_rows(&workspaces, &unfocused);
+        assert_eq!(rows.iter().find(|row| row.id == 5).unwrap().app_id.as_deref(), Some("kitty"), "lowest id");
+    }
+
+    #[test]
+    fn workspace_rows_mark_an_empty_workspace_unpopulated_with_no_app_id() {
+        let mut nameless = window(2, "", "", false, false);
+        nameless.app_id = None;
+        let rows = workspace_rows(
+            &map(vec![(5, workspace(5, 1, "eDP-1", true, true)), (6, workspace(6, 2, "eDP-1", false, false))]),
+            &map(vec![(2, nameless)]),
+        );
+        let row_of = |id: u64| rows.iter().find(|row| row.id == id).unwrap();
+
+        assert_eq!(
+            (row_of(5).populated, row_of(5).app_id.as_deref()),
+            (true, None),
+            "a window with no id still populates"
+        );
+        assert_eq!((row_of(6).populated, row_of(6).app_id.as_deref()), (false, None));
     }
 
     #[test]
@@ -195,7 +256,7 @@ mod tests {
         let mut orphan = workspace(1, 1, "eDP-1", true, true);
         orphan.output = None;
 
-        assert_eq!(workspace_rows(&map(vec![(1, orphan)]))[0].output, None);
+        assert_eq!(workspace_rows(&map(vec![(1, orphan)]), &HashMap::new())[0].output, None);
     }
 
     #[test]

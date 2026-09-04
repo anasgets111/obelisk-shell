@@ -1,83 +1,127 @@
--- Mirrors WorkspaceStrip.qml: one circular button per workspace, laid out horizontally, with the
--- focused one filled accent.
+-- Mirrors `WorkspaceStrip.qml`: the mirror's `ExpandingPill` of workspaces. Collapsed it is one
+-- circle, the active workspace; under the pointer it widens into one circle per workspace, each
+-- drawing the icon of what runs there or its number when nothing does, and narrows back when the
+-- pointer leaves. The same pattern as `modules/bar/panels/power_menu.lua`: `hover` on the row
+-- holding the circles, since a hover region answers containment and a pointer crossing the gap
+-- between two circles never leaves the row. An earlier strip here was twelve always-open dots on
+-- the belief that collapsing needed a timer; it needed the row.
 --
--- Dots at `workspace_size`, not controls at `item_height`. Twelve full-size bordered circles was
--- 416px of a 1920px bar and the widest thing on the left by a factor of five, which is the wrong
--- shape for the one module here that carries a single digit. Smaller, unbordered, and dimmed unless
--- focused: the strip reads as a strip rather than as twelve more controls.
+-- The ground says what a workspace holds (ADR-0117): accent when active, glass when populated,
+-- `DISABLED` at half opacity when empty, `IconButton.qml`'s colours through
+-- `computeWorkspaceColor`. The glyph is the standing window's icon when `oblisk.applications`
+-- knows its `app_id`, else `idx`, never `name`: a named workspace elided into a circle draws three
+-- dots and no information, and the number is what the keybind uses anyway.
 --
--- The label is `idx`, never `name`. A named workspace elided into a circle draws "sta...", which is
--- three dots and no information; the name has nowhere to go on a bar this size and the number is
--- what the keybind uses anyway.
+-- The collapsed slot is the first output's `active_workspace` rather than the mirror's focused one:
+-- every output has an active workspace and only one output holds focus, so a strip on the other
+-- monitor would otherwise collapse to nothing. On the focused output the two are the same.
 --
--- ponytail: the mirror pays that back with `ExpandingPill`, which collapses to just the focused
--- workspace and expands on hover. That needs a per-slot `visible` driven by one hover region, which
--- this engine can express (`hover` is a signal, ADR-0062) but which also needs the collapse to
--- be delayed past the pointer leaving one circle for the next, and nothing here has a timer that
--- short (ADR-0021's 5ms cap is the ceiling). Until then the strip is always open.
+-- Not mirrored: the width animation and the opacity fade, which the engine has no way to draw.
 local theme = require("config.theme")
+local util = require("lib.util")
 local cell = require("components.cell")
 
--- Fully transparent rather than an absent `background`. A signal that resolves to nil omits the
--- property, and "omitted" and "clear" are the same pixel only until something else sets a default.
-local CLEAR = theme.with_opacity(theme.BG, 0)
+local function output_of(w)
+    return w and (w.outputs or {})[1]
+end
 
 local function workspaces_of(w)
-    local out = w and (w.outputs or {})[1]
+    local out = output_of(w)
     return out and (out.workspaces or {}) or {}
 end
 
-local function is_active(w, id)
-    local out = w and (w.outputs or {})[1]
-    return out ~= nil and out.active_workspace == id
-end
+local pill_hovered = hover("workspace-pill")
 
 local function workspace_button(ws)
-    local hovered = hover("workspace-" .. tostring(ws.id))
-    local active = computed({ oblisk.workspaces, hovered }, function(w, is_hovered)
-        return is_active(w, ws.id) or is_hovered
+    local id = ws.id
+    -- Read off the snapshot rather than the `ws` this was built from: the list reconciles by
+    -- key, so a workspace whose windows come and go keeps its button and this is what changes.
+    local entry = oblisk.workspaces:map(function(w)
+        for _, candidate in ipairs(workspaces_of(w)) do
+            if candidate.id == id then
+                return candidate
+            end
+        end
+        return ws
+    end)
+    local is_active = oblisk.workspaces:map(function(w)
+        local out = output_of(w)
+        return out ~= nil and out.active_workspace == id
+    end)
+    local slot_hovered = hover("workspace-" .. tostring(id))
+    local ground = computed({ is_active, slot_hovered, entry }, function(active, is_hovered, current)
+        if active then
+            return theme.ACCENT
+        elseif is_hovered then
+            return theme.GLASS_CONTROL_HOVER
+        end
+        return current.populated and theme.GLASS_CONTROL or theme.DISABLED
+    end)
+    local icon_name = computed({ oblisk.applications, entry }, function(applications, current)
+        local app = util.app_entry(applications, current.app_id)
+        return (app and app.icon) or ""
+    end)
+    local has_icon = icon_name:map(function(name)
+        return name ~= ""
     end)
     return button {
-        hover = hovered,
-        width = theme.workspace_size,
-        height = theme.workspace_size,
+        width = theme.item_width,
+        height = theme.item_height,
         align_v = "Center",
-        radius = theme.workspace_size / 2,
-        -- Filled only when focused or under the pointer. An unfocused workspace has no ground at
-        -- all: twelve glass discs in a row is twelve objects to look at, and only one of them is
-        -- ever the answer to the question the strip is asked.
-        background = active:map(function(on)
-            return on and theme.ACCENT or CLEAR
+        radius = theme.item_radius,
+        hover = slot_hovered,
+        background = ground,
+        border_width = theme.border_width,
+        border_color = slot_hovered:map(function(is_hovered)
+            return is_hovered and theme.GLASS_BORDER_HOVER or theme.GLASS_BORDER
         end),
-        -- The mirror dims a workspace with nothing on it. `WorkspaceEntry` in
-        -- `supervisor/src/workspaces/controller.rs` is `id`, `idx` and `name`, so there is no
-        -- populated flag to read and every dot is drawn at the same strength.
+        opacity = entry:map(function(current)
+            return current.populated and 1 or theme.opacity.disabled
+        end),
+        visible = computed({ pill_hovered, is_active }, function(open, active)
+            return open or active
+        end),
         children = {
-            cell(tostring(ws.idx), active:map(function(on)
-                return on and theme.text_contrast(theme.ACCENT) or theme.DIM
-            end), theme.font.xs, {
+            icon {
+                name = icon_name,
+                size = theme.icon.md,
+                align_h = "Center",
+                align_v = "Center",
+                visible = has_icon,
+            },
+            cell(tostring(ws.idx), ground:map(theme.text_contrast), theme.font.sm, {
                 align = "Center",
                 align_v = "Center",
+                visible = has_icon:map(function(shown)
+                    return not shown
+                end),
             }),
         },
         on_click = function(_, mouse_button)
-            if mouse_button ~= "left" then
+            if mouse_button ~= "left" or is_active:get() then
                 return
             end
-            oblisk.workspaces:invoke("focus", ws.id)
+            oblisk.workspaces:invoke("focus", id)
         end,
     }
 end
 
--- No pill around it. The mirror's strip sits on the bar itself, and wrapping a row of circles in a
--- second rounded ground draws a box around them that nothing in the reference has.
-return list {
-    direction = "Horizontal",
-    spacing = theme.spacing.xs,
+-- The row is the pill: it carries the hover and nothing else, no ground of its own, since the
+-- mirror's circles sit straight on the bar.
+return row {
+    height = theme.item_height,
     align_v = "Center",
-    source = oblisk.workspaces:map(workspaces_of),
-    itemfn = workspace_button,
-    key = function(ws)
-        return tostring(ws.id)
-    end,
+    hover = pill_hovered,
+    children = {
+        list {
+            direction = "Horizontal",
+            spacing = theme.spacing.sm,
+            align_v = "Center",
+            source = oblisk.workspaces:map(workspaces_of),
+            itemfn = workspace_button,
+            key = function(ws)
+                return tostring(ws.id)
+            end,
+        },
+    },
 }

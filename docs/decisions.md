@@ -5533,3 +5533,39 @@ between a drag's commit and the capability's next snapshot the fill reads the ol
 or two; the PipeWire round trip is milliseconds and it has not been visible. Not built: a
 `source_volume` OSD line (the OSD service could add one in three lines when wanted) and the mixer
 stream's desktop-entry icon lookup beyond `oblisk.applications`' `app_id` heuristics.
+
+## ADR-0117: A workspace knows whether it is empty and what runs on it
+
+**Status**: Accepted (2026-09-04)
+
+**Context**: Reviewing `WorkspaceStrip.qml` against the bar's strip. The mirror is an `ExpandingPill`
+of full-size circles, collapsed to the focused workspace and widened on hover, each circle drawing
+the app icon of what runs on that workspace, or its number when nothing does, and dimmed when
+empty. § 2.9's `WorkspaceEntry` was `{ id, idx, name }`, which draws numbers and nothing else;
+ADR-0056 had kept window lists out on purpose and the spec noted `Window.workspace_id` as the
+additive path. The strip itself had been written as always-open dots, with a note that a pill
+needed a collapse timer the engine lacks; the power menu (`f38051b`) since showed it does not,
+because a `hover` region on the row answers containment and a pointer crossing the gap between two
+circles never leaves the row.
+
+**Decision**:
+
+1. **`WorkspaceEntry` gains `populated: bool` and `app_id: string?`.** One window, not the list:
+   the window that stands for the workspace is the focused one when focus is there, else the one
+   with the lowest window id, since niri's map has no order and "first tile" is not on the wire. An
+   empty `app_id` on the wire becomes an absent key, so `entry.app_id == nil` and "draw the number"
+   are one test. The reduction stays compositor-neutral: `WorkspaceRow` carries the two fields and
+   `workspaces::niri` fills them from `Window.workspace_id`.
+2. **Still no per-workspace window list.** The roadmap row narrows to what it is now for: a window
+   switcher. A strip has one circle per workspace and one icon fits in it.
+3. **In `dev-config`**, `workspace_strip.lua` becomes the mirror's pill: `item_width` circles on the
+   power menu's pattern, a `hover` on the row, every circle but the active one `visible` only while
+   hovered, the focused ground accent, a populated one glass and an empty one `DISABLED` at
+   `opacity.disabled`, an `icon` from `oblisk.applications` over the number when the `app_id` maps
+   to a desktop entry. The old strip's reasons for small dots (twelve bordered circles too wide)
+   are answered by the collapse, which is what the mirror answers them with.
+
+**Consequences**: A third field a niri upgrade could rename (`workspace_id`), covered by the
+adaptor's wire-JSON fixtures. A workspace whose only window has no `app_id` is populated with no
+icon, drawn as its number at full strength, which is what the mirror does too. No width animation
+and no opacity fade; the engine has neither.

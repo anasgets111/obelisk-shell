@@ -180,13 +180,15 @@ Workspace state only. Output geometry lives in `oblisk.screens` (§ 2.15), which
                 *   `id`: `integer` (Stable, monitor-independent identity; what the two ids above refer to and what `workspaces:focus(id)` takes)
                 *   `idx`: `integer` (1-based position on this output; not stable across a reorder)
                 *   `name`: `string` (The compositor's own name for the workspace, absent when unnamed)
+                *   `populated`: `boolean` (At least one window sits on this workspace; added by ADR-0117)
+                *   `app_id`: `string` (The `app_id` of the window standing for this workspace, the focused one when focus is here and otherwise the compositor's first; absent when the workspace is empty or its windows report none. Added by ADR-0117)
 *   `workspaces.active_client`: `table` (Focused top-level Wayland client window parameters, or `nil` if none focused):
     *   `title`: `string` (Active window title text, e.g. `"src/main.rs - Neovim"`)
     *   `class`: `string` (Active window application class name, e.g. `"Alacritty"` or `"firefox"`. A Wayland toplevel has an `app_id`, not a `WM_CLASS`, and that is what this carries)
     *   `is_floating`: `boolean` (True if marked floating/pinned by compositor)
     *   `is_fullscreen`: `boolean` (True if window occupies entire display boundary. **Not reported**, per ADR-0056 decision 5)
 
-> **Two gaps.** No per-workspace window list: a config can name and focus a workspace but not draw the icon of what runs on it (`niri-ipc`'s `Window.workspace_id` would make this an additive field). Special workspaces are not modelled at all. Both listed in `roadmap.md`.
+> **Two gaps.** No per-workspace window list: `populated` and `app_id` (ADR-0117) are the one window a strip draws, not the set, so a config cannot list what runs on a workspace. Special workspaces are not modelled at all. Both listed in `roadmap.md`.
 
 ### 2.10 Rescue mode and recovery state (`oblisk.rescue`)
 *   `rescue.is_rescue`: `boolean` (True if the user configuration is broken and Rescue Mode is active)
