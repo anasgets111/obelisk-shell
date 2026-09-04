@@ -35,7 +35,6 @@ local function step_brightness(delta)
         stepped = 100
     end
     oblisk.brightness:invoke("set", stepped)
-    ui_state.arm_osd("brightness")
 end
 
 -- Left zone, first module, which is where Quickshell's LeftSide.qml puts it. A glass circle like

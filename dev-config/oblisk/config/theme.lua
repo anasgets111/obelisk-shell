@@ -372,8 +372,11 @@ theme.notification_app_icon = s(40, 32)
 -- clips what does not fit. Generous rather than measured, because the column inside it sizes to its
 -- content and the surface only has to be able to contain it.
 theme.notification_stack_height = s(560, 420)
-theme.osd_width           = s(260, 220)
-theme.osd_height          = s(44, 36)
+-- `OSDCard.qml`'s `osdSliderWidth`/`osdCardHeight`/`osdToggleIconContainerSize`/`osdSliderTrackHeight`.
+theme.osd_width           = s(300, 240)
+theme.osd_height          = s(80, 60)
+theme.osd_tile            = s(48, 36)
+theme.osd_track           = s(12, 8)
 -- `dialogWidth`: the polkit prompt's card (`modules/global/polkit.lua`). Narrower than the launcher
 -- because it holds one sentence, one field and two buttons.
 theme.dialog_width        = s(450, 360)

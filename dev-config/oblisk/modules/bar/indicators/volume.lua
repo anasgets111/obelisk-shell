@@ -12,7 +12,6 @@ local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
 local cell = require("components.cell")
-local ui_state = require("lib.ui_state")
 
 local SLOT = "volume"
 local hovered = hover(SLOT)
@@ -64,7 +63,6 @@ return button {
             return
         end
         oblisk.audio:invoke("toggle_mute")
-        ui_state.arm_osd("volume")
     end,
     children = { row {
         width = "Fill",

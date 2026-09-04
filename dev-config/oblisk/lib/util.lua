@@ -108,6 +108,24 @@ end
 -- pulled out once a second real call site made it a duplicate rather than a one-off
 -- (`components/pill.lua`'s own bar for a shared file). Takes the raw `oblisk.audio` payload, not a
 -- signal, so a caller decides for itself whether `nil` gets its own branch or an empty icon name.
+-- The same five steps as `volume_icon_name`, as nerd-font glyphs, for the OSD, which draws its
+-- icon in the accent colour and a themed icon cannot be tinted.
+function util.volume_glyph(a)
+    local icons = require("config.icons")
+    if a == nil or a.muted then
+        return icons.vol_muted
+    end
+    local percent = (a.volume or 0) * 100
+    if percent == 0 then
+        return icons.vol_zero
+    elseif percent < 34 then
+        return icons.vol_low
+    elseif percent < 67 then
+        return icons.vol_mid
+    end
+    return icons.vol_high
+end
+
 function util.volume_icon_name(a)
     if a == nil then
         return ""

@@ -1,98 +1,83 @@
--- Volume, brightness and battery OSD: a corner overlay that flashes what just changed and hides
--- itself after, the shape VolumeOSD.qml/BrightnessOSD.qml and OSDService.qml's battery events are,
--- minus their animation.
+-- The OSD card, `OSDCard.qml` minus its animation: a glass card at the bottom centre, with the two
+-- layouts that file has, switched by whether the entry carries a level. What to show and when is
+-- `modules/osd/service.lua`'s; this file only draws the entry it holds.
 --
--- Armed by `lib/ui_state.lua`'s `arm_osd`, never by this file watching a capability: the volume
--- and brightness rows are armed by the bar click that changed the level, the battery row by
--- `modules/global/power_events.lua`'s `on_change` handlers (ADR-0115). This file only reads the
--- `state` signals that call leaves behind.
---
--- One `panel`, three stacked rows switched by `visible`, rather than three panels: § 6.1 gives every
--- surface its own compositor identity, and a volume change while the brightness OSD is still fading
--- out (if this engine ever grows a fade) would otherwise be two overlapping corner surfaces
--- fighting over the same screen position instead of one replacing the other.
+-- One `panel`, two stacked rows switched by `visible`, rather than two panels: § 6.1 gives every
+-- surface its own compositor identity, and a volume change while a toggle card is still up would
+-- otherwise be two overlapping surfaces fighting over one screen position instead of one replacing
+-- the other.
 local theme = require("config.theme")
-local util = require("lib.util")
-local ui_state = require("lib.ui_state")
+local cell = require("components.cell")
 local meter = require("components.meter")
+local osd = require("modules.osd.service")
 
-local volume_row = row {
+local function read(field)
+    return osd.entry:map(function(e)
+        return e[field]
+    end)
+end
+
+local function bold(field)
+    return osd.entry:map(function(e)
+        return { { text = e[field] or "", bold = true } }
+    end)
+end
+
+-- The slider layout: glyph in the accent colour, a track that fills, a bold readout.
+local level_row = row {
     width = "Fill",
     height = "Fill",
     align_v = "Center",
-    spacing = theme.spacing.md,
-    padding = { left = theme.spacing.lg, right = theme.spacing.lg },
-    visible = ui_state.osd_kind:map(function(kind)
-        return kind == "volume"
+    spacing = theme.spacing.lg,
+    padding = { left = theme.spacing.xl, right = theme.spacing.xl },
+    visible = osd.entry:map(function(e)
+        return e.level ~= nil
     end),
     children = {
-        icon { name = oblisk.audio:map(util.volume_icon_name), size = theme.icon.lg },
-        meter(oblisk.audio, function(a)
-            return a.muted and 0 or a.volume * 100
-        end, theme.MAUVE, "Fill"),
+        cell(read("glyph"), theme.ACCENT, theme.font.xxl, { align_v = "Center" }),
+        meter(osd.entry, function(e)
+            return e.level or 0
+        end, osd.entry:map(function(e)
+            return e.color or theme.ACCENT
+        end), "Fill", theme.osd_track),
         text {
-            content = util.label(oblisk.audio, function(a)
-                return a.muted and "muted" or string.format("%d%%", math.floor(a.volume * 100 + 0.5))
-            end),
+            content = bold("text"),
             foreground = theme.FG,
-            font_size = theme.font.sm,
-            width = theme.s(44, 34),
+            font_size = theme.font.lg,
+            width = theme.s(52, 40),
             text_align = "End",
+            align_v = "Center",
         },
     },
 }
 
-local brightness_row = row {
+-- The toggle layout: the glyph in an accent-tinted tile, a bold line beside it, the pair centred.
+local fact_row = row {
     width = "Fill",
     height = "Fill",
+    align_h = "Center",
     align_v = "Center",
-    spacing = theme.spacing.md,
-    padding = { left = theme.spacing.lg, right = theme.spacing.lg },
-    visible = ui_state.osd_kind:map(function(kind)
-        return kind == "brightness"
+    spacing = theme.spacing.lg,
+    visible = osd.entry:map(function(e)
+        return e.level == nil
     end),
     children = {
-        icon { name = "display-brightness", size = theme.icon.md },
-        meter(oblisk.brightness, function(b)
-            return b.percent
-        end, theme.YELLOW, "Fill"),
-        text {
-            content = util.label(oblisk.brightness, function(b)
-                return string.format("%d%%", b.percent)
-            end),
-            foreground = theme.FG,
-            font_size = theme.font.sm,
-            width = theme.s(44, 34),
-            text_align = "End",
-        },
-    },
-}
-
--- No meter: a charger event is a fact, not a level. The glyph and the line both come from
--- `osd_message`, so this row knows nothing about batteries.
-local battery_row = row {
-    width = "Fill",
-    height = "Fill",
-    align_v = "Center",
-    spacing = theme.spacing.md,
-    padding = { left = theme.spacing.lg, right = theme.spacing.lg },
-    visible = ui_state.osd_kind:map(function(kind)
-        return kind == "battery"
-    end),
-    children = {
-        text {
-            content = ui_state.osd_message:map(function(m)
-                return m.glyph
-            end),
-            foreground = theme.FG,
-            font_size = theme.icon.lg,
+        column {
+            width = theme.osd_tile,
+            height = theme.osd_tile,
+            align_h = "Center",
+            align_v = "Center",
+            background = theme.ACCENT_LIGHT,
+            border_width = theme.border_width,
+            border_color = theme.ACCENT_MEDIUM,
+            radius = theme.radius.md,
+            children = { cell(read("glyph"), theme.ACCENT, theme.font.xl, { align_v = "Center" }) },
         },
         text {
-            content = ui_state.osd_message:map(function(m)
-                return m.text
-            end),
+            content = bold("text"),
             foreground = theme.FG,
-            font_size = theme.font.sm,
+            font_size = theme.font.lg,
+            align_v = "Center",
         },
     },
 }
@@ -105,10 +90,10 @@ return panel {
     -- protocol centers an axis with neither of its edges anchored. Explicit `width`/`height` are
     -- required because `bottom` alone doesn't anchor both edges of either axis.
     anchor = { bottom = true },
-    margin = { bottom = theme.s(56, 40) },
+    margin = { bottom = theme.s(132, 90) },
     width = theme.osd_width,
     height = theme.osd_height,
-    visible = ui_state.osd_visible,
+    visible = osd.visible,
     child = column {
         width = "Fill",
         height = "Fill",
@@ -116,6 +101,6 @@ return panel {
         radius = theme.radius.md,
         border_width = theme.border_width,
         border_color = theme.BORDER,
-        children = { volume_row, brightness_row, battery_row },
+        children = { level_row, fact_row },
     },
 }

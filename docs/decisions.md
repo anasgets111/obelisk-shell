@@ -5440,8 +5440,7 @@ declined to take it there; this takes it.
 5. **What it unblocked, all in `dev-config`.** `modules/global/power_events.lua` (new): the charger
    OSD off `oblisk.power`'s `on_battery` edge plus the mirror's 10/100 brightness step, the charge
    limit and fully charged OSD lines, the low and critical `notify-send`s, and `systemctl suspend`
-   at 8%. The OSD grew a third row and `arm_osd` a message argument for it, since a charger event
-   has no meter. `modules/bar/indicators/updates.lua`: `configure` moves from load time to
+   at 8%. `modules/bar/indicators/updates.lua`: `configure` moves from load time to
    `oblisk.system`'s first push, which is what carries `state.json`, so `checked_at` is finally read
    back and a restart inside the hour does not re-check (verified: a second start touched neither the
    file nor the network); the time of a successful check is written when it differs from the file's;
@@ -5456,7 +5455,19 @@ declined to take it there; this takes it.
    percent when a zero arrives with the battery not draining after a non-zero reading; on battery a
    zero passes through, as it does there.
 
+8. **The OSD is push-driven, and is the mirror's card.** `modules/osd/service.lua` replaces
+   `ui_state.arm_osd`: the card used to be armed by the bar click that changed a level, so a volume
+   key or a `wpctl` in a terminal showed nothing, and the bar button showed you your own click. Now
+   `on_change` handlers on audio, brightness, network, bluetooth, notifications and keyboard call
+   `osd.show(kind, entry)`, and `power_events.lua` does for the charger. Two layouts decided by
+   whether the entry carries a `level`, `OSDCard.qml`'s slider and toggle rows at its sizes (80 tall,
+   300 wide, a 48 tile, a 12 track). Not the mirror's queue: a card that arrives while a more
+   important one is up is dropped, one as important or more replaces it, which is what its suppress
+   list was for (the brightness step the charger edge triggers, under "charger connected"). Verified
+   live: a terminal `wpctl` and a layout switch each raised the right card, centred, for two seconds.
+
 Not mirrored: keyboard backlight on the charger edge (no capability), the `--wait -A` actionable
 update notification (a config could read the action from `process.run`'s stdout callback; not worth
-it until someone wants the button), and the mirror's 15-second notification dedupe, which an edge
-does not need.
+it until someone wants the button), the mirror's 15-second notification dedupe, which an edge does
+not need, and three OSD kinds with no fact to read: the Wi-Fi radio toggle (`NetworkState` has no
+`wifi_enabled`), microphone mute (`AudioDevice` has no `muted`) and screen recording.

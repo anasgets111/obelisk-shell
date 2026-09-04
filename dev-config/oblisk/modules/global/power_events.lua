@@ -1,7 +1,7 @@
 -- What the reference shell does *about* the battery, as opposed to drawing it: the OSD lines
 -- OSDService.qml raises on a charger event, BatteryService.qml's two `notify-send`s, and
 -- PowerManagementService.qml's automatic suspend and brightness step. No surface here; this file is
--- four `on_change` handlers (ADR-0115) and `shell.lua` requires it for its side effects.
+-- two `on_change` handlers (ADR-0115) and `shell.lua` requires it for its side effects.
 --
 -- Every handler compares the pushed payload against the one it replaced and acts on the crossing,
 -- which is what the mirror's `onIsLowAndNotChargingChanged`-style signals are: an edge, fired once.
@@ -9,7 +9,7 @@
 -- an `initialized` flag for the same reason.
 local icons = require("config.icons")
 local util = require("lib.util")
-local ui_state = require("lib.ui_state")
+local osd = require("modules.osd.service")
 
 local thresholds = util.battery_thresholds
 
@@ -30,7 +30,7 @@ oblisk.power:on_change(function(p, previous)
         return
     end
     -- `onIsACPoweredChanged`: the plug for connected, the bolt-through-battery for disconnected.
-    ui_state.arm_osd("battery", {
+    osd.show("battery", {
         glyph = p.on_battery and icons.battery_levels[2] or icons.battery_ac,
         text = p.on_battery and "charger disconnected" or "charger connected",
     })
@@ -45,9 +45,9 @@ oblisk.battery:on_change(function(b, previous)
     end
     -- OSDService.qml's two charge events. Both states imply mains, so no `isACPowered` guard.
     if b.state == "PendingCharge" and previous.state ~= "PendingCharge" then
-        ui_state.arm_osd("battery", { glyph = icons.battery_ac, text = "charge limit reached" })
+        osd.show("battery", { glyph = icons.battery_ac, text = "charge limit reached" })
     elseif previous.state == "Charging" and b.state ~= "Charging" and (b.state == "FullyCharged" or b.percent >= 100) then
-        ui_state.arm_osd("battery", { glyph = icons.battery_ac, text = "fully charged" })
+        osd.show("battery", { glyph = icons.battery_ac, text = "fully charged" })
     end
     -- The three draining thresholds, each on its own downward crossing. Plugging in and unplugging
     -- at 15% crosses `low` again, and says so again, which is what the mirror does too.

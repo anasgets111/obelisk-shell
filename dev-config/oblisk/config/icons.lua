@@ -41,6 +41,16 @@ icons.battery_ac      = "\u{F1E6}"
 icons.battery_pending = "\u{F0084}"
 icons.battery_levels  = { "\u{F244}", "\u{F243}", "\u{F242}", "\u{F241}", "\u{F240}" }
 
+-- The OSD's glyphs, where the bar uses themed icons: the OSD draws its icon in the accent colour,
+-- and a themed icon cannot be tinted.
+icons.brightness  = "\u{F00DE}"
+icons.keyboard    = "\u{F030C}"
+icons.caps_lock   = "\u{F0A9B}"
+icons.num_lock    = "\u{F03A0}"
+icons.lan         = "\u{F0317}"
+icons.lan_off     = "\u{F0318}"
+icons.speaker     = "\u{F04C3}"
+
 -- Audio, by loudness, plus the muted glyph the mute toggle swaps in.
 icons.vol_muted   = "\u{F075F}"
 icons.vol_zero    = "\u{F0581}"

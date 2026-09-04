@@ -107,46 +107,11 @@ local function panel_showing(kind)
     end)
 end
 
--- The volume/brightness OSD's state: which reading `modules/osd/popup.lua` shows, and whether the
--- corner overlay is up at all. Lives here rather than in that file because arming it is a write a
--- bar button issues, and `modules/bar/indicators/volume.lua` and `modules/bar/panels/power_menu.lua`
--- cannot `require` a module that itself `require`s them without a cycle.
-local osd_kind = state("osd_kind", "")
-local osd_visible = state("osd_visible", false)
--- What the `battery` OSD says, since that one has no meter to read: a glyph and a short line,
--- handed in by `arm_osd`'s second argument. The volume and brightness rows ignore it.
-local osd_message = state("osd_message", { glyph = "", text = "" })
-
 -- Whether the app launcher window is up. A `state` signal rather than a bar-button toggle inline
 -- (`settings_open`'s own shape): `modules/global/launcher.lua`'s close button and
 -- `modules/bar/indicators/launcher_button.lua`'s open button both need to write it, the same
 -- reason `settings_open` lives here instead of inside `settings.lua`.
 local launcher_open = state("launcher_open", false)
-
--- `process.run("sleep", ...)` is this engine's only timer (a `:map` callback runs during scene
--- resolution and must stay pure, since ADR-0044's rollback-on-error means resolution can rerun on
--- the same inputs). So the auto-hide is armed by whatever changed the level: a bar click, or for the
--- battery an `on_change` handler in `modules/global/power_events.lua` (ADR-0115).
---
--- `ProcessHandle:kill()` sends a kill command but does not cancel the queued `exit_cb`
--- (`renderer/src/lua/process.rs`), so a second click while the first sleep is still running needs
--- `modules/bar/indicators/active_window.lua`'s own `claim_title_request` guard, not a kill, or the
--- first timer's expiry would hide the OSD out from under the newer one.
-local OSD_SECONDS = "2"
-local osd_hide_request = 0
-
-local function arm_osd(kind, message)
-    osd_kind:set(kind)
-    osd_message:set(message or { glyph = "", text = "" })
-    osd_visible:set(true)
-    osd_hide_request = osd_hide_request + 1
-    local this_request = osd_hide_request
-    process.run("sleep", { OSD_SECONDS }, function() end, function()
-        if this_request == osd_hide_request then
-            osd_visible:set(false)
-        end
-    end)
-end
 
 -- ## The notification card's own state
 --
@@ -257,9 +222,5 @@ return {
     toggle_panel = toggle_panel,
     close_panel = close_panel,
     panel_showing = panel_showing,
-    osd_kind = osd_kind,
-    osd_visible = osd_visible,
-    osd_message = osd_message,
-    arm_osd = arm_osd,
     launcher_open = launcher_open,
 }
