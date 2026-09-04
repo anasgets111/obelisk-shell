@@ -357,7 +357,16 @@ async fn run_one_check(
 
     let conf_path = pacman_conf_path.to_path_buf();
     let db_root = pacman_db_root.to_path_buf();
-    let result = tokio::task::spawn_blocking(move || check_against_a_throwaway_copy(&conf_path, &db_root)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        let candidates = check_against_a_throwaway_copy(&conf_path, &db_root);
+        // On this thread, after the `alpm` handle is dropped and before its arena is left alone
+        // for the rest of the session: `libalpm`'s parse of the sync database is the largest
+        // allocation the Supervisor makes, and none of it is live by here
+        // (`memory::return_free_pages_to_the_kernel` carries the measurement).
+        crate::memory::return_free_pages_to_the_kernel();
+        candidates
+    })
+    .await;
 
     let mut guard = state.lock().unwrap();
     guard.checking = false;

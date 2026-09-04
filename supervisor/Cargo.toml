@@ -19,6 +19,8 @@ evdev = { version = "0.13.2", features = ["tokio"] }
 futures-util = "0.3.34"
 hound = "3.5.1"
 inotify = "0.11.5"
+# One `malloc_trim` call after the update check (`memory.rs`). Already in the tree through `nix`.
+libc = "0.2"
 niri-ipc = "26.4.0"
 nix = { version = "0.31.3", features = ["process", "signal", "time", "user"] }
 nonstick = "0.1.2"

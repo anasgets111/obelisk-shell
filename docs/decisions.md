@@ -5934,3 +5934,51 @@ libraries. Half of it is Mesa's, and the shell's own share is the heap and the b
 **Consequences**: none in the tree. The release profile was already tuned (`lto`,
 `codegen-units = 1`, `panic = "abort"`, `strip`, `overflow-checks`); this is the measurement that
 says to use it.
+
+## 0127. The update check hands its pages back, and the rest of the memory is where it should be
+
+ADR-0126 measured the release build and stopped at RSS. RSS is the wrong number to stop at: it
+counts a shared page in full in every process that maps it, and half the Renderer's is Mesa's
+`libLLVM` and `libgallium`, mapped by the compositor and every other GL client on the machine.
+By PSS, which divides a shared page among its mappers, the release shell at rest is **33.7 MiB
+Renderer plus 13.3 MiB Supervisor**, against RSS's 69 and 23 -- inside ADR-0043's 50
+MiB-per-monitor budget rather than doubling it. Mesa's 33 MB of Renderer RSS is 6.8 MB of PSS.
+Read PSS here; RSS is the number to quote at a stranger who wants to know how big the process
+looks, not the number that says what the shell costs the machine.
+
+**The one real find, and the change**: the hourly `updates` check runs `libalpm` against a
+throwaway copy of the pacman database inside `spawn_blocking`, and parsing the whole sync set
+costs about 52 MB. All of it is dead the moment the diff is built, and none of it came back:
+the Supervisor sat at its 84 MB peak until tokio reaped the idle blocking thread ten-odd seconds
+later, and settled 10 MB above where it started. glibc had it, not us -- a per-thread arena is
+never trimmed on its own. One `malloc_trim(0)` at the end of the blocking closure, which is
+`memory::return_free_pages_to_the_kernel`:
+
+| after the check | before | after |
+| --- | --- | --- |
+| Supervisor RSS while the check runs | 84 MB | 84 MB |
+| ... 3 s after it finishes | 84 MB | 32 MB |
+| ... steady state | 33.4 MB | 31.9 MB |
+
+The peak is `libalpm`'s and stays: it holds the parsed database while it diffs, and that is the
+work. What goes is the plateau after it, which was the peak held for no reason at all.
+
+**Measured and rejected**, all three on the Renderer:
+
+- *A full Lua GC after every evaluation.* The whole dev config's VM is **675 KiB** and a
+  `gc_collect` recovers 93 of them. The 16 MB heap is not Lua, so there was nothing to collect.
+- *`M_ARENA_MAX = 2`*, to stop the eleven threads spreading slack across eleven arenas: 330 KiB
+  of anonymous memory, 380 KiB of PSS. Noise, for a non-obvious allocator knob.
+- *A smaller texture budget.* Not measured against, because the number it would trade against is
+  ADR-0123's, and the picker's thumbnails are the thing it exists to keep.
+
+**Where the rest of it is**, so the next person does not re-derive it: the wallpaper is **27.5 MB
+of the Renderer's 41 MB of GPU memory** -- one fullscreen `Background` surface, its swapchain and
+its texture, measured by booting the same config with the wallpaper declaration removed (13.9 MB
+left). That is what a wallpaper costs, not a defect. The Renderer's 16 MB heap is femtovg,
+cosmic-text and the retained scene, and no single allocation in it; the fonts are `mmap`ed by
+`fontdb`, not on the heap (NotoColorEmoji alone is a 10 MB file and almost none of it is
+resident). Neither is worth chasing without an allocation profiler, and this machine has none.
+
+**Consequences**: `memory.rs` acts as well as reports now, which its module doc says. Every
+future memory claim in this tree quotes PSS.

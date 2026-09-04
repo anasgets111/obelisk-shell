@@ -1,9 +1,12 @@
 //! Memory measurement harness (ADR-0043 decision 1): reads `/proc/[pid]/smaps_rollup` for PSS/USS
-//! and `/proc/[pid]/fdinfo/*` for DRM (GPU) residency, one log line per sample. It only answers
-//! "where is the memory", deciding and evicting nothing. Three numbers, per the ADR's three
+//! and `/proc/[pid]/fdinfo/*` for DRM (GPU) residency, one log line per sample. It answers "where
+//! is the memory" and evicts nothing of the shell's own. Three numbers, per the ADR's three
 //! items: total PSS across the supervisor and every live renderer (item 1, vs. the 50
 //! MiB-per-monitor budget), per-renderer USS (item 2), and GPU residency from DRM fdinfo, never
 //! folded into PSS (not in any `smaps` number under a real driver).
+//!
+//! [`return_free_pages_to_the_kernel`] is the one thing here that acts rather than reports, and it
+//! is the allocator's pages it hands back, never the shell's own state.
 
 use std::collections::HashMap;
 use std::io;
@@ -75,6 +78,26 @@ pub(crate) fn parse_rollup(text: &str) -> Option<Rollup> {
         }
     }
     Some(Rollup { pss: pss?, uss: private_clean + private_dirty })
+}
+
+/// Hands glibc's already-free pages back to the kernel, across every arena.
+///
+/// Freeing does not shrink the process. glibc keeps freed chunks on its own free lists, and the
+/// per-thread arena a `spawn_blocking` job allocated in is never trimmed on its own, so a job that
+/// allocates a lot once raises the supervisor's floor for the rest of the session. The update
+/// check is that job: `libalpm` parses the whole sync database, tens of MiB of small allocations
+/// that are all dead a moment later. Measured before this existed: 31 MiB before the first check,
+/// 84 MiB the moment it finished, still 84 MiB minutes later -- ADR-0043's whole 50 MiB-per-monitor
+/// budget, spent on work that had already ended.
+///
+/// For a job on that scale and never in a loop: it walks every arena's free lists and takes each
+/// arena's lock to do it, so it belongs at the end of the blocking job itself, not on a timer.
+pub(crate) fn return_free_pages_to_the_kernel() {
+    // SAFETY: a plain FFI call with one integer. `malloc_trim` takes the arena locks itself, is
+    // safe from any thread at any time, and only `madvise`s pages the allocator already holds free.
+    unsafe {
+        libc::malloc_trim(0);
+    }
 }
 
 /// `smaps_rollup`'s value column is always `<number> kB` (the kernel's long-standing, if

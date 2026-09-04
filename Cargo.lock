@@ -2145,6 +2145,7 @@ dependencies = [
  "futures-util",
  "hound",
  "inotify",
+ "libc",
  "niri-ipc",
  "nix 0.31.3",
  "nonstick",
