@@ -207,9 +207,10 @@ Workspace state only. Output geometry lives in `oblisk.screens` (§ 2.15), which
 
 Covers **reload** failures only: the pre-edit scene stays on screen and the still-running config renders its own error banner. It cannot cover a **startup** failure, since a config that fails its first evaluation has no surfaces and `is_rescue` has nobody to read it; that case runs through a separate Supervisor-spawned process instead (ADR-0046), with no config code involved.
 
-### 2.11 Persistent user state and storage paths (`oblisk.system`)
-*   `system.state`: `table` (A reactive, read-only dictionary of persistent states loaded from `$XDG_STATE_HOME/oblisk/state.json`)
+### 2.11 System clock (`oblisk.system`)
 *   `system.time`: `integer` (Reactive system time epoch, updated at 1-second intervals)
+
+> **Persistence moved out (ADR-0136).** `system.state` was a dictionary loaded from a hardcoded `$XDG_STATE_HOME/oblisk/state.json`. A config now declares its own files with `persistent_table` (§ 5.2) and reads them through `oblisk.storage` (§ 2.18), so the path, the file name, the defaults and the number of files are all the config's.
 
 ### 2.12 System hardware diagnostics (`oblisk.sysinfo`)
 *   `sysinfo.cpu_percent`: `integer` (`0` to `100` total CPU core utilization, updated per configurable interval)
@@ -279,6 +280,12 @@ The files in every folder a config asked to follow with `files:watch(path, exten
             *   `modified`: `integer` (Unix epoch seconds of the last modification, `0` when unknown)
         *   `error`: `string` (Why the last listing produced nothing, or `nil` when it succeeded, so a missing folder reads differently from an empty one)
 
+### 2.18 Declared JSON files (`oblisk.storage`) (ADR-0136)
+Every file a config declared with `persistent_table` (§ 5.2), keyed by the absolute path that declaration joined. The config VM has no `io` (ADR-0048), so this is how a config keeps anything across a restart. Nothing here is hardcoded: `oblisk.config_dir` and `os.getenv` are what a config builds a path from, and two declarations are two files.
+*   `files`: `table` (Map from the absolute file path to the table stored in it. Absent until a `persistent_table` declared it)
+
+> **Read it through the store, not through here.** `store.<key>` (§ 5.2) is a signal over one key of one file. `oblisk.storage` itself is the whole map, useful for `on_change` and little else.
+
 ---
 
 ## 3. Command execution protocol (write path)
@@ -292,7 +299,8 @@ All write actions serialize as JSON-RPC 2.0 payloads over the private Unix socke
 
 | Module method | IPC command JSON payload details |
 | :--- | :--- |
-| `system:write_state(key, val)` | `capability: "system", action: "write_state", arguments: [key, val]`<br>**Validation**: `key` must be alphanumeric. `val` must be string, number, or boolean. |
+| `store:set(key, val)` | `capability: "storage", action: "set", arguments: [path, key, val]`<br>**Validation**: `path` is absolute and was opened by a `persistent_table`; `key` is a non-empty string; `val` is any JSON value, tables included, and `nil` deletes the key. Written 1 second after the last write to that file, pushed immediately (ADR-0136). Replaces `system:write_state`. |
+| `persistent_table { path, name, defaults }` | `capability: "storage", action: "open", arguments: [path, defaults]`<br>**Validation**: `path` is an absolute directory, `name` one file name with no separator, `defaults` a table. Sent by every evaluation; `defaults` fills only keys the file lacks. |
 | `system:find_icon(app_id, name, fallback_name)` | **Not built, not planned as written (ADR-0054 decision 5).** Would return a `string` path via synchronous internal Rust lookup, but the control socket carries only one-way commands and snapshots, with no request/response shape to return a path over. The theme-name half of this lookup lives in the Renderer, reached through `icon.name` (§ 5.2 item 5); the `app_id`-to-`.desktop`-to-`Icon=` half had no caller until an application launcher needed enumeration, not a per-`app_id` lookup. **Built instead as `oblisk.applications`** (§ 2.16, ADR-0061), leaving this signature with no caller and no plan. |
 | `audio:set_volume(vol)` | `capability: "audio", action: "set_volume", arguments: [vol]`<br>**Validation**: `vol` must be a float in range `[0.0, 1.0]`. |
 | `audio:set_muted(bool)` | `capability: "audio", action: "set_muted", arguments: [bool]`<br>**Validation**: `bool` is boolean. |
@@ -337,7 +345,7 @@ All write actions serialize as JSON-RPC 2.0 payloads over the private Unix socke
 | `oblisk.applications:open_url(url)` | `capability: "applications", action: "open_url", arguments: [url]`<br>**Validation**: `url` is a string under 2048 bytes with no whitespace or control character, whose scheme is `http`, `https` or `mailto`; anything else is logged and nothing spawned -- `file:` in particular, since a URL out of a notification body is the sender's text. Hands it to `xdg-open`, detached like `launch`, so the user's own default handler opens it. ADR-0103. |
 | `oblisk.files:watch(path, extensions?)` | `capability: "files", action: "watch", arguments: [path, extensions?]`<br>**Validation**: `path` is an absolute folder path; `extensions`, when given, is an array of strings without the dot, matched case-insensitively (`{ "jpg", "png" }`), and absent means every file. Lists the folder and follows it through inotify until `unwatch` (ADR-0120). A repeat call with the same filter re-pushes the held listing; a different filter starts over. |
 | `oblisk.files:unwatch(path)` | `capability: "files", action: "unwatch", arguments: [path]`<br>**Validation**: `path` is an absolute folder path. Stops following it and drops it from `folders`; a path never watched is a no-op. |
-| `wallpaper:set(mon, path, fit, anim, dur)` | **Superseded by ADR-0055. No `wallpaper` capability, none planned.** A wallpaper is an `image` node on a config-declared `Background` panel: `mon` is the output name `child = function(output)` hands the panel per instance (ADR-0121), `path` is `image.source`, `fit` is `image.fit`, and a runtime change is `system:write_state` on a per-output key the source reads back, which is what makes it persist. `anim` and `dur` have nowhere to go: the engine has no animation model (`roadmap.md`). |
+| `wallpaper:set(mon, path, fit, anim, dur)` | **Superseded by ADR-0055. No `wallpaper` capability, none planned.** A wallpaper is an `image` node on a config-declared `Background` panel: `mon` is the output name `child = function(output)` hands the panel per instance (ADR-0121), `path` is `image.source`, `fit` is `image.fit`, and a runtime change is `store:set` on a key the source reads back, which is what makes it persist (ADR-0136). `anim` and `dur` have nowhere to go: the engine has no animation model (`roadmap.md`). |
 | `workspaces:focus(id)` | `capability: "workspaces", action: "focus", arguments: [id]`<br>**Validation**: `id` must be an integer. Focuses target workspace. On Hyprland `id` is the workspace number and a number no workspace has yet creates one (ADR-0118). |
 | `workspaces:toggle_special(name)` | `capability: "workspaces", action: "toggle_special", arguments: [name]`<br>**Validation**: `name` is a non-empty string, a `special[].name`. Shows the special workspace on the focused output, or hides it if shown; a name no special has creates one, which is how a scratchpad is first opened. Logged and ignored on a compositor whose payload has no `special` key (ADR-0119). |
 | `rescue:reload_config()` | `capability: "rescue", action: "reload_config", arguments: []`<br>**Validation**: Runs compiler pass on `shell.lua` and reloads Renderer if valid. |
@@ -500,6 +508,18 @@ The one signal a config writes. Reactive state the config owns, keyed by a name 
     *   `initial`: `any` (The value on the first evaluation naming it. Marshal-checked at § 1.1's boundary, the same check `:set()` applies)
 
 > **An edit to `initial` wins; a reload alone does not.** A re-declaration whose `initial` differs from the seed re-seeds the signal, since editing the file is a later write than the `:set()` it lands on; one whose `initial` is unchanged keeps the live value, which is what leaves a dropdown open across an unrelated save (ADR-0044 decision 5's amendment). A table `initial` is never treated as an edit: tables compare by identity and every evaluation builds a fresh one. Numbers compare across integer/float the way Lua's `==` does; two scalars of different types are an edit. `state("t", os.time())` re-seeds on every reload, since the rule reads intent off the value and cannot detect a non-constant. Dies on a generation swap, since the map lives in the process being reaped.
+
+#### Persisted tables (`persistent_table { path, name, defaults }`)
+A JSON file the config names, read as signals and written a key at a time (ADR-0136). The framework has no default location and no store exists until a config declares one.
+
+*   `persistent_table(spec)` -> `PersistentTable` (Global. Two declarations of one file are one table, so a required module and `shell.lua` may both declare it and a reload re-declares it)
+    *   `spec.path`: `string` (An absolute directory. Refused if relative, since a relative path resolves against the Supervisor's working directory, which nothing sets)
+    *   `spec.name`: `string` (One file name. Refused if empty or if it contains `/`)
+    *   `spec.defaults`: `table` (Optional. Keys to seed the file with, filling only what it does not already have, so adding one is a new key rather than a reset. Also what creates the file on a first run)
+*   `store.<key>` -> `Signal` (Read-only, `nil` until the first push and `nil` for a key the file does not hold, so a property falls back to its documented default per § 3.1)
+*   `store:set(key, value)` (Any JSON value including a table; `nil` deletes the key. `set` is therefore the one key name a config cannot store)
+
+> **The file is the identity.** `path` and `name` are joined once, in the Renderer, and that string is what `oblisk.storage.files` is keyed by and what every write names. Saved 1 second after the last write, through a temporary file and a rename; a save still inside that window when the session ends is lost.
 
 #### Hover (`hover`, `hover(name)`, `hover_rect(name)`)
 A **hover slot** is engine-written reactive state naming one region of one surface: whether the pointer is inside it, and where. Declared on any node, read from anywhere (ADR-0062).

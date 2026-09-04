@@ -41,6 +41,7 @@ use network::{NetworkController, NetworkSignal};
 use notifications::{NotificationsController, NotificationsSignal};
 use power::{PowerController, PowerSignal};
 use privacy::{PrivacyController, PrivacySignal};
+use storage::{StorageController, StorageSignal};
 use sysinfo::{SysinfoController, SysinfoSignal};
 use system::{SystemController, SystemSignal};
 use tray::{TrayController, TraySignal};
@@ -64,6 +65,7 @@ pub mod power;
 pub mod privacy;
 pub mod scale;
 mod shm_icons;
+pub mod storage;
 pub mod sysinfo;
 pub mod system;
 #[cfg(test)]
@@ -123,6 +125,7 @@ pub enum Signal {
     Power,
     Applications,
     Files,
+    Storage,
     System,
     Privacy,
     Updates,
@@ -223,6 +226,7 @@ capability_channels! {
         Applications => applications: ApplicationsSignal,
             Some(ApplicationsSignal::Changed) => Signal::Applications;
         Files => files: FilesSignal, Some(FilesSignal::Changed) => Signal::Files;
+        Storage => storage: StorageSignal, Some(StorageSignal::Changed) => Signal::Storage;
     }
     // `lock` has no signal channel, deliberately: built at boot in `main.rs` since the relock
     // path commands it before any config reads (ADR-0060); it reports through `LockOutcome`
@@ -252,6 +256,7 @@ pub struct Capabilities {
     system: Option<SystemController>,
     applications: Option<ApplicationsController>,
     files: Option<FilesController>,
+    storage: Option<StorageController>,
     audio: Option<audio::mixer::AudioCommandSender>,
     idle: Option<IdleController>,
 
@@ -297,6 +302,7 @@ impl Capabilities {
             system: None,
             applications: None,
             files: None,
+            storage: None,
             audio: None,
             idle: None,
             senders,
@@ -467,14 +473,10 @@ impl Capabilities {
                     self.power = Some(PowerController::new(self.connection.clone(), self.senders.power.clone()));
                 }
             }
-            // The 1 Hz clock plus persisted state.json (ADR-0053, § 2.11).
+            // The 1 Hz clock, and nothing else since ADR-0136 (§ 2.11, ADR-0053).
             Capability::System => {
                 if self.system.is_none() {
-                    self.system = Some(SystemController::new(
-                        PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| std::ffi::OsString::from("/"))),
-                        std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
-                        self.senders.system.clone(),
-                    ));
+                    self.system = Some(SystemController::new(self.senders.system.clone()));
                 }
             }
             // The installed `.desktop` entries; scans in background, returns before parsing starts.
@@ -494,6 +496,12 @@ impl Capabilities {
             Capability::Files => {
                 if self.files.is_none() {
                     self.files = Some(FilesController::new(self.senders.files.clone()));
+                }
+            }
+            // Nothing is open until a config declares one: `persistent_table` is what starts work.
+            Capability::Storage => {
+                if self.storage.is_none() {
+                    self.storage = Some(StorageController::new(self.senders.storage.clone()));
                 }
             }
             Capability::Audio => self.ensure_mixer_thread(),
@@ -616,6 +624,12 @@ impl Capabilities {
                     push!(Capability::Files, &files.snapshot());
                 }
             }
+            // Fires on every `open` and every `set`, ahead of the debounced save (ADR-0136).
+            Signal::Storage => {
+                if let Some(storage) = &self.storage {
+                    push!(Capability::Storage, &storage.snapshot());
+                }
+            }
             // The only capability pushing on a timer, once per wall-clock second, emitted only
             // when the epoch second actually changed (ADR-0053 decision 2).
             Signal::System => {
@@ -665,14 +679,14 @@ impl Capabilities {
             Capability::Updates => to!(self.updates, updates::dispatch),
             Capability::Applications => to!(self.applications, applications::dispatch),
             Capability::Files => to!(self.files, files::dispatch),
+            Capability::Storage => to!(self.storage, storage::dispatch),
             Capability::Audio => to!(self.audio, audio::dispatch),
-            Capability::System => to!(self.system, system::dispatch),
             Capability::Lock => lock::dispatch(lock, envelope),
             // Answered in `Supervisor::dispatch_capability_command` before this is reached: its
             // controller lives there, beside the state push a cancel needs.
             Capability::Polkit => {}
             // Read-only (§ 2): no action enum; a command naming one is a Renderer sending garbage.
-            Capability::Battery | Capability::Privacy => {
+            Capability::Battery | Capability::Privacy | Capability::System => {
                 eprintln!(
                     "{capability}: read-only capability received a command from generation {}; dropping",
                     envelope.params.generation_id

@@ -393,10 +393,13 @@
 ---@field temp_gpu integer GPU temperature in Celsius, or `-1` when no GPU sensor was found. Read from the same hwmon pass as [`SysinfoState::temp_cores`], so it is never newer or older than they are.
 
 ---@class SystemState
----`oblisk.system`'s two Lua-visible fields (docs/oblisk-idl-api-specs.md §2.11). Field names
----are the `StateSnapshot` payload's JSON keys verbatim.
----@field state any The parsed contents of `state.json`, or an empty object -- see `state::load_state`. Written a key at a time by `system:write_state` (§3.2), which rewrites the whole file and pushes, so a config reads back what it just stored on the next resolve.
+---`oblisk.system`'s one Lua-visible field (docs/oblisk-idl-api-specs.md §2.11). The field name
+---is the `StateSnapshot` payload's JSON key verbatim.
 ---@field time integer Unix epoch seconds, not milliseconds -- §2.11 calls it "system time epoch" with no unit stated. `os.date` wants seconds, so a millis reading would be silently wrong by 1000x.
+
+---@class StorageState
+---`oblisk.storage`'s payload (ADR-0136).
+---@field files table<string, any> One entry per `persistent_table` a config declared, keyed by the absolute path it joined from `path` and `name`. Absent until that declaration is seen, so a config reads `nil` rather than an empty table for a file nobody opened.
 
 ---@class PolkitState
 ---`oblisk.polkit`'s payload. Everything but `active` is empty while it is false.
@@ -485,7 +488,10 @@ local PrivacyCapability = {}
 ---@field invoke fun(self: SysinfoCapability, command: "configure", ...: any)
 
 ---@class SystemCapability: Capability<SystemState>
----@field invoke fun(self: SystemCapability, command: "write_state", ...: any)
+local SystemCapability = {}
+
+---@class StorageCapability: Capability<StorageState>
+---@field invoke fun(self: StorageCapability, command: "open"|"set", ...: any)
 
 ---@class PolkitCapability: Capability<PolkitState>
 ---@field invoke fun(self: PolkitCapability, command: "cancel", ...: any)
@@ -554,12 +560,13 @@ function Idle:release_inhibit() end
 ---@field lock LockCapability The session lock: whether it is held, whether a password is with PAM, and why the last attempt failed.
 ---@field polkit PolkitCapability The authentication request polkitd is waiting on: what for, whether a password is with PAM, and why the last attempt failed.
 ---@field battery BatteryCapability UPower's display device: charge, what the battery is doing, and the time estimates when it has them.
----@field system SystemCapability The persisted state dictionary and a clock that ticks once a second.
+---@field system SystemCapability A clock that ticks once a second.
 ---@field brightness BrightnessCapability The screen backlight, as a percentage.
 ---@field workspaces WorkspacesCapability The compositor's workspaces per output, and the focused toplevel window.
 ---@field power PowerCapability power-profiles-daemon's platform profiles, plus whether you are on mains and how many watts are moving.
 ---@field applications ApplicationsCapability The installed desktop entries, listed and indexed by the `app_id` a window reports.
 ---@field files FilesCapability The files in each folder a config asked to watch, kept current through inotify.
+---@field storage StorageCapability Every JSON file a config declared with `persistent_table`, keyed by its absolute path.
 ---@field idle Idle Idle thresholds and the inhibit pair. Methods only, no state to read (ADR-0032).
 ---@field screens Signal<Screen[]> Renderer-sourced, seeded to an empty list, and the one signal with a value at first evaluation (ADR-0041).
 ---@field rescue Signal<RescueState> Renderer-sourced, no commands (ADR-0046).

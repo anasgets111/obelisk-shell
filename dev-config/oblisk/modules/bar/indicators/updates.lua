@@ -35,6 +35,7 @@ local icons = require("config.icons")
 local icon_button = require("components.icon_button")
 local ui_state = require("lib.ui_state")
 local update_panel = require("modules.bar.panels.update_panel")
+local store = require("lib.store")
 
 -- Nothing checks for updates until a config names an interval (ADR-0034), so without this line the
 -- capability starts, stays dormant, and the indicator below is invisible forever -- `state_of` reads
@@ -45,36 +46,37 @@ local update_panel = require("modules.bar.panels.update_panel")
 -- check is a real `-Sy` against a mirror; anything much shorter is bandwidth spent on a number that
 -- changes a few times a day. A config reload inside the hour does not re-run it (ADR-0113 amendment).
 --
--- Sent on `oblisk.system`'s first push rather than at load, because that push is what carries
--- `state.json` (ADR-0115): the time of the last check that succeeded is remembered there, below, so
--- a shell restart inside the hour does not re-run the check either. `previous == nil` is that first
--- push and nothing else; a reload re-registers this handler, but the payload it would compare
--- against is already there, so the seed is sent exactly once per process.
+-- Sent on `oblisk.storage`'s first push rather than at load, because that push is what carries the
+-- file `lib/store.lua` declared (ADR-0115, ADR-0136): the time of the last check that succeeded is
+-- remembered there, below, so a shell restart inside the hour does not re-run the check either.
+-- `previous == nil` is that first push and nothing else; a reload re-registers this handler, but
+-- the payload it would compare against is already there, so the seed is sent exactly once per
+-- process.
 local UPDATE_INTERVAL = 3600
-oblisk.system:on_change(function(s, previous)
+oblisk.storage:on_change(function(_, previous)
     if previous == nil then
-        oblisk.updates:invoke("configure", { interval = UPDATE_INTERVAL, checked_at = s.state.updates_checked_at })
+        local checked_at = store.updates_checked_at:get()
+        oblisk.updates:invoke("configure", { interval = UPDATE_INTERVAL, checked_at = checked_at })
     end
 end)
 
 -- The two things the reference `UpdateService.qml` does when a check comes back, neither of which
 -- had a place to run before `on_change`: remember when, and say what is new.
 --
--- "New" is against the names already announced, kept in `state.json` as the mirror keeps
+-- "New" is against the names already announced, kept in the store as the mirror keeps
 -- `notifiedPackagesKey`, so a restart does not re-announce the same twelve packages, and a package
 -- that got upgraded elsewhere falls out of the key when the next check no longer lists it.
 oblisk.updates:on_change(function(u, previous)
-    local remembered = (oblisk.system:get() or {}).state or {}
     -- Against the file, not the previous push: the first push after a restart carries the time this
-    -- file seeded, and writing it back would touch `state.json` on every start for nothing.
-    if u.last_successful_check and u.last_successful_check ~= remembered.updates_checked_at then
-        oblisk.system:invoke("write_state", "updates_checked_at", u.last_successful_check)
+    -- file seeded, and writing it back would touch the store on every start for nothing.
+    if u.last_successful_check and u.last_successful_check ~= store.updates_checked_at:get() then
+        store:set("updates_checked_at", u.last_successful_check)
     end
     if u.checking or previous == nil or previous.checking ~= true then
         -- Only the push that ends a check, which is the one whose list is fresh.
         return
     end
-    local announced = remembered.updates_notified or ""
+    local announced = store.updates_notified:get() or ""
     local names = {}
     for _, package in ipairs(u.packages) do
         names[#names + 1] = package.name
@@ -84,7 +86,7 @@ oblisk.updates:on_change(function(u, previous)
     if key == announced then
         return
     end
-    oblisk.system:invoke("write_state", "updates_notified", key)
+    store:set("updates_notified", key)
     local fresh = 0
     for _, name in ipairs(names) do
         if not announced:find(name, 1, true) then

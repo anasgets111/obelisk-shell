@@ -1727,6 +1727,107 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_declared_store_opens_the_file_the_config_named_and_nothing_else() {
+        // ADR-0136: the path, the file name and the defaults are all the config's, so the
+        // envelope must carry exactly what `shell.lua` wrote and no directory this crate chose.
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (client, mut outbound_rx) = test_client(&missing);
+
+        client
+            .loader
+            .lua()
+            .load(r#"store = persistent_table { path = "/tmp/bar/", name = "settings.json", defaults = { theme = "mocha" } }"#)
+            .exec()
+            .unwrap();
+
+        let RendererFrame::Command(envelope) = queued_frame(&mut outbound_rx) else {
+            panic!("declaring a store must queue a RendererFrame::Command");
+        };
+        assert_eq!(envelope.params.capability, "storage");
+        assert_eq!(envelope.params.action, "open");
+        assert_eq!(
+            envelope.params.arguments,
+            vec![serde_json::json!("/tmp/bar/settings.json"), serde_json::json!({ "theme": "mocha" })],
+            "the joined path is the key both sides use, so it is built once, here"
+        );
+    }
+
+    #[test]
+    fn a_stores_key_reads_the_value_the_supervisor_pushed_for_that_file() {
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (client, _outbound_rx) = test_client(&missing);
+        client
+            .loader
+            .lua()
+            .load(r#"store = persistent_table { path = "/tmp/bar", name = "state.json" }"#)
+            .exec()
+            .unwrap();
+
+        client
+            .apply_state_snapshot(StateSnapshot {
+                capability: "storage".to_string(),
+                revision: 1,
+                payload: serde_json::json!({
+                    "files": { "/tmp/bar/state.json": { "theme": "latte", "wallpaper": { "fit": "cover" } } }
+                }),
+            })
+            .unwrap();
+
+        let setup = r#"
+            theme = store.theme:get()
+            fit = store.wallpaper:get().fit
+            unset = store.nothing_here:get()
+        "#;
+        assert_eq!(probe::<String>(&client.loader, setup, "theme"), "latte");
+        assert_eq!(probe::<String>(&client.loader, setup, "fit"), "cover", "a table value is stored whole");
+        assert_eq!(
+            probe::<Option<String>>(&client.loader, setup, "unset"),
+            None,
+            "a key the file does not have reads nil, so a property falls back to its documented default"
+        );
+    }
+
+    #[test]
+    fn a_stores_write_names_the_same_file_the_declaration_did() {
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (client, mut outbound_rx) = test_client(&missing);
+        client
+            .loader
+            .lua()
+            .load(r#"store = persistent_table { path = "/tmp/bar", name = "state.json" }"#)
+            .exec()
+            .unwrap();
+        let _open = queued_frame(&mut outbound_rx);
+
+        client.loader.lua().load(r#"store:set("theme", "latte")"#).exec().unwrap();
+
+        let RendererFrame::Command(envelope) = queued_frame(&mut outbound_rx) else {
+            panic!("a store write must be queued as RendererFrame::Command");
+        };
+        assert_eq!(envelope.params.action, "set");
+        assert_eq!(
+            envelope.params.arguments,
+            vec![serde_json::json!("/tmp/bar/state.json"), serde_json::json!("theme"), serde_json::json!("latte")]
+        );
+    }
+
+    #[test]
+    fn two_declarations_of_one_file_are_one_table() {
+        // A reusable module and `shell.lua` can both declare the same store, and an in-place
+        // reload re-runs every declaration: all three must land on one table with one signal per
+        // key, or a `:set()` through one would leave the other reading a stale signal.
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (client, _outbound_rx) = test_client(&missing);
+
+        let setup = r#"
+            first = persistent_table { path = "/tmp/bar", name = "state.json" }
+            second = persistent_table { path = "/tmp/bar/", name = "state.json" }
+            same = rawequal(first, second)
+        "#;
+        assert!(probe::<bool>(&client.loader, setup, "same"), "the joined path is the identity");
+    }
+
     /// The write half of the same object: a config's own `on_click` calling the lock action puts
     /// a real § 7.2 envelope on the outbound channel.
     #[test]

@@ -6571,3 +6571,76 @@ the question "which one am I typing into?" has a recent answer.
 If it does bite, the fix is a placeholder colour on `PaintStyle::TextField` -- a real gap, since a
 placeholder is currently indistinguishable from typed text in every field including the masked ones
 -- and not a return to a caret that hides three prompts to disambiguate a fourth.
+
+## 0136. Persistence is a JSON file the config names, and the framework names no path
+
+`oblisk.system.state` was the whole of persistence: one file at
+`$XDG_STATE_HOME/oblisk/state.json`, a flat map of string to scalar, read once at
+`SystemController::new` and rewritten whole by every `system:write_state`. Four things about it
+lived in Rust that are not Rust's to decide. The directory (`system/paths.rs`). The file name. The
+schema, since a value had to be a string, a number or a boolean, which is what made
+`lib/wallpaper.lua` flatten structure into key names (`wallpaper.<output>`, `wallpaper_fit.<output>`)
+instead of storing a table. And the category itself: the framework decided this was *state*, so a
+config that wanted a settings file, a cache, or two of either had nowhere to put them.
+
+The config mirrored here does not work that way. `Config/Settings.qml` declares its own paths
+(`Quickshell.env("OBELISK_SETTINGS_FILE")` with an XDG fallback), declares its own defaults inside a
+`JsonAdapter`, and gets two files because it asked for two. Nothing in Quickshell knows what
+"settings" means.
+
+Everything needed to do the same here already exists. `oblisk.config_dir` is on the namespace
+(`lua::namespace::build`) and `os.getenv` is one of the four `os` calls ADR-0048 kept, so a config
+can compute any path it likes without a new Rust helper.
+
+1. **`persistent_table { path, name, defaults }`, all three declared in Lua.** `path` is an absolute
+   directory, `name` a file name, `defaults` a table. The framework has no default for any of them
+   and no store exists until a config declares one. A config wanting the old location writes it out;
+   a config wanting `$XDG_CACHE_HOME`, or a file beside `shell.lua`, or three files, writes that
+   instead. `path` and `name` stay two arguments rather than one joined string because that is how
+   the mirror spells it and because the directory is the part a config computes.
+2. **Reads are signals, writes are debounced.** `store.theme` is a signal over that key, so it
+   resolves in a node property like any capability field, and `store:set(key, value)` queues a
+   command. The Supervisor updates memory, pushes immediately so the config sees its own write on
+   the next resolve, and saves 1 second after the last write. Without the debounce a scroll offset
+   or a search draft is one serialize, one write and one rename per keystroke, plus a full snapshot
+   push. The mirror debounces at the same interval and for the same reason.
+3. **One new capability, `oblisk.storage`, keyed by absolute path.** `storage.files[path]` is the
+   whole table. Not a field on `system`: `system` is a clock, and hanging a file registry off it is
+   what produced the hardcoded path in the first place. Keyed by the joined absolute path so two
+   declarations of one file are one store, which is also what makes the store survive a generation
+   swap: the map lives in the Supervisor, which outlives the Renderer being reaped.
+4. **`defaults` fills missing keys and never overwrites.** A key present on disk wins, so adding a
+   default to a config that has already run is a new key and not a reset. A key removed from
+   `defaults` stays in the file until something deletes it, which is the same trade
+   `state(name, initial)` makes.
+5. **Any JSON value, and `nil` deletes.** Nested tables are the point of decision 1's `defaults`, so
+   the scalar rule goes. `store:set(key, nil)` removes the key, which the old store could not do at
+   all.
+6. **Any absolute path the user can write.** No sandbox to `$HOME`, no extension check. This is the
+   user's own config running as the user, and a shell that refuses to write where its author said is
+   a shell with a worse `process.run` bolted on. The path must be absolute, because a relative one
+   resolves against the Supervisor's working directory, which nothing sets.
+7. **`system:write_state` and `system.state` are deleted**, with `system/paths.rs` and
+   `system/state.rs`. `oblisk.system` keeps `time` and nothing else. § 2.11 loses its first bullet
+   and § 3.2 loses its row.
+
+**Rejected.** *TOML.* The file is machine-written and rewritten whole, so the one thing TOML offers
+over JSON, comments, is deleted by the first write. The hand-authored layer here is Lua, which beats
+TOML at comments, expressions and hot reload (ADR-0047). Machine-written is JSON, human-written is
+Lua, and there is no third format. *A framework settings/state split like the mirror's two files.*
+Decision 1 makes it a config's choice: two `persistent_table` calls, two files, no opinion from here
+about which is a cache. *A `FileView` equivalent that reads arbitrary file content.* Of the fourteen
+`FileView` declarations in the mirror, eleven read sysfs, procfs or a `/run` marker
+(`/proc/meminfo`, `platform_profile`, `scaling_governor`, `/sys/class/leds/*/brightness`), all of
+which are native capabilities here and one of which reaches power-profiles-daemon over D-Bus rather
+than polling a file; one reads a colour scheme inside its own config directory, which is `require`
+here; two are the pair this ADR replaces. Copying `FileView` would trade signals for polls. ADR-0048
+still names `oblisk.read_file` as the fix for reading a file the config did not author, and it still
+has no caller.
+
+**Consequences.** `shared::Capability` gains `Storage`. `lib/wallpaper.lua` stores one table per
+output rather than two flattened key families. What stays hardcoded in Rust is what cannot be
+anything else: the control socket and session-lock flag under `$XDG_RUNTIME_DIR` (protocol, not user
+data), the config directory itself (`-c`, `$OBLISK_CONFIG_DIR`, `$XDG_CONFIG_HOME/oblisk`, `$HOME`,
+since something has to find the Lua before any Lua runs), and the thumbnail cache, which is a
+freedesktop location other applications read and write.

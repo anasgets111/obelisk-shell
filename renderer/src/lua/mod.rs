@@ -12,6 +12,7 @@ pub mod namespace;
 pub mod nodes;
 pub mod process;
 pub mod signal;
+pub mod store;
 pub mod surfaces;
 
 pub use nodes::VirtualNode;
@@ -138,6 +139,7 @@ impl Loader {
         json::register(&lua)?;
         fonts::register(&lua)?;
         signal::register(&lua, dirty)?;
+        store::register(&lua)?;
         let standard_modules = loaded_module_names(&lua)?;
         Ok(Loader { lua, standard_modules, idle: RefCell::new(None) })
     }

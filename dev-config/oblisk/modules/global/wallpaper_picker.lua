@@ -133,21 +133,21 @@ local function common(values)
     return first
 end
 
-local current_path = computed({ oblisk.system, oblisk.screens, effective_monitor }, function(s, screens, chosen)
+local current_path = computed({ wallpaper.all(), oblisk.screens, effective_monitor }, function(w, screens, chosen)
     local paths = {}
     for _, screen in ipairs(screens or {}) do
         if chosen == ALL or chosen == screen.name then
-            paths[#paths + 1] = wallpaper.path_in(s, screen.name)
+            paths[#paths + 1] = wallpaper.path_in(w, screen.name)
         end
     end
     return common(paths)
 end)
 
-local current_fit = computed({ oblisk.system, oblisk.screens, effective_monitor }, function(s, screens, chosen)
+local current_fit = computed({ wallpaper.all(), oblisk.screens, effective_monitor }, function(w, screens, chosen)
     local fits = {}
     for _, screen in ipairs(screens or {}) do
         if chosen == ALL or chosen == screen.name then
-            fits[#fits + 1] = wallpaper.fit_in(s, screen.name)
+            fits[#fits + 1] = wallpaper.fit_in(w, screen.name)
         end
     end
     return common(fits)

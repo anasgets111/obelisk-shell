@@ -1,29 +1,22 @@
-//! `SystemController`: one wall-clock-aligned ticking task feeding `oblisk.system`'s two fields
-//! (docs/oblisk-idl-api-specs.md §2.11) -- `time`, refreshed every second, and `state`, the
-//! parsed `state.json` dictionary, read once at construction and never again (see `state.rs`'s
-//! doc comment for why).
+//! `SystemController`: one wall-clock-aligned ticking task feeding `oblisk.system`'s one field
+//! (docs/oblisk-idl-api-specs.md §2.11), `time`, refreshed every second.
 //!
 //! No `poll_mode`/dormant-vs-ticking split: §2.11 names no interval argument, so the task just
 //! ticks, unconditionally, from construction to shutdown, aligned to the wall-clock second
 //! boundary ([`time_until_next_second`]) so a clock reading doesn't visibly lag on screen.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc::UnboundedSender;
 
-/// `oblisk.system`'s two Lua-visible fields (docs/oblisk-idl-api-specs.md §2.11). Field names
-/// are the `StateSnapshot` payload's JSON keys verbatim.
+/// `oblisk.system`'s one Lua-visible field (docs/oblisk-idl-api-specs.md §2.11). The field name
+/// is the `StateSnapshot` payload's JSON key verbatim.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct SystemState {
     /// Unix epoch seconds, not milliseconds -- §2.11 calls it "system time epoch" with no unit
     /// stated. `os.date` wants seconds, so a millis reading would be silently wrong by 1000x.
     pub time: i64,
-    /// The parsed contents of `state.json`, or an empty object -- see `state::load_state`.
-    /// Written a key at a time by `system:write_state` (§3.2), which rewrites the whole file and
-    /// pushes, so a config reads back what it just stored on the next resolve.
-    pub state: serde_json::Value,
 }
 
 /// Wakes `main.rs`'s `select!` to push a fresh `StateSnapshot`.
@@ -67,74 +60,18 @@ pub fn time_until_next_second(elapsed_since_epoch: Duration) -> Duration {
 
 pub struct SystemController {
     state: Arc<Mutex<SystemState>>,
-    /// Resolved once in [`SystemController::new`], kept because `write_state` needs the same
-    /// path the load came from -- re-resolving it per write would read the environment twice and
-    /// could disagree with itself if `$XDG_STATE_HOME` moved under the process.
-    path: PathBuf,
-    signal_tx: UnboundedSender<SystemSignal>,
 }
 
 impl SystemController {
-    /// `home`/`xdg_state_home` are the caller's already-resolved roots (real defaults: `$HOME`
-    /// and `$XDG_STATE_HOME`) -- this module never calls `std::env` itself, so it can be
-    /// constructed against a fixture in a test. `state.json` is read synchronously, here, once,
-    /// before the ticking task is spawned (see `state.rs`'s doc comment for why). `time` is
-    /// seeded to the current second immediately, so an early client never sees a stale zero.
-    pub fn new(home: PathBuf, xdg_state_home: Option<PathBuf>, signal_tx: UnboundedSender<SystemSignal>) -> Self {
-        let path = super::paths::resolve_state_path(&home, xdg_state_home.as_deref());
-        let loaded = super::state::load_state(&path);
+    /// `time` is seeded to the current second immediately, so an early client never sees a stale
+    /// zero, and the ticking task takes over from there.
+    pub fn new(signal_tx: UnboundedSender<SystemSignal>) -> Self {
         let now = epoch_seconds(SystemTime::now());
-        let state = Arc::new(Mutex::new(SystemState { time: now, state: loaded }));
+        let state = Arc::new(Mutex::new(SystemState { time: now }));
 
-        tokio::spawn(run_clock_task(Arc::clone(&state), signal_tx.clone(), now));
+        tokio::spawn(run_clock_task(Arc::clone(&state), signal_tx, now));
 
-        Self { state, path, signal_tx }
-    }
-
-    /// `system:write_state(key, val)` (§3.2): stores one scalar under one key, rewrites
-    /// `state.json`, and pushes so the config sees its own write.
-    ///
-    /// Refuses a key or a value the spec does not allow rather than storing something a later read
-    /// cannot round-trip -- see `state::key_is_writable` and `state::value_is_writable`.
-    ///
-    /// A failed disk write is logged and *keeps* the in-memory value: the session that asked for it
-    /// carries on seeing what it stored, and only the persistence across a restart is lost. Rolling
-    /// back instead would hand a config a value that silently reverts under it, which is the harder
-    /// of the two failures to notice.
-    ///
-    /// Synchronous, on the Supervisor's own loop: this file is a handful of keys, and the write is
-    /// one `create_dir_all`, one small `write` and one `rename`. A config writing on every keystroke
-    /// is the case that would change that, and the answer then is a debounce in the config, not a
-    /// thread here.
-    pub fn write_state(&self, key: &str, value: serde_json::Value) {
-        if !super::state::key_is_writable(key) {
-            eprintln!("system: write_state({key:?}) refused; a key is alphanumeric plus `_`, `-` and `.`");
-            return;
-        }
-        if !super::state::value_is_writable(&value) {
-            eprintln!("system: write_state({key:?}) refused; a value is a string, a number or a boolean");
-            return;
-        }
-
-        let snapshot = {
-            let mut guard = self.state.lock().expect("system state mutex poisoned");
-            match guard.state.as_object_mut() {
-                Some(map) => {
-                    map.insert(key.to_string(), value);
-                }
-                // `load_state` only ever yields an object, so this is unreachable short of a bug
-                // above; replacing rather than dropping the write keeps the field's promise.
-                None => {
-                    guard.state = serde_json::json!({ key: value });
-                }
-            }
-            guard.state.clone()
-        };
-
-        if let Err(err) = super::state::save_state(&self.path, &snapshot) {
-            eprintln!("system: write_state({key:?}) could not be saved to {}: {err}", self.path.display());
-        }
-        let _ = self.signal_tx.send(SystemSignal::Changed);
+        Self { state }
     }
 
     /// The current combined state -- what `main.rs`'s signal-channel `select!` arm clones and
@@ -172,57 +109,6 @@ async fn run_clock_task(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn a_written_key_is_readable_in_the_snapshot_and_on_disk() {
-        let home = tempfile::tempdir().unwrap();
-        let (signal_tx, mut signal_rx) = tokio::sync::mpsc::unbounded_channel();
-        let controller = SystemController::new(home.path().to_path_buf(), None, signal_tx);
-
-        controller.write_state("updates.last_check", serde_json::json!(1_800_000_000_i64));
-
-        assert_eq!(
-            controller.snapshot().state,
-            serde_json::json!({ "updates.last_check": 1_800_000_000_i64 }),
-            "a config must read back what it just stored"
-        );
-        assert_eq!(
-            signal_rx.recv().await,
-            Some(SystemSignal::Changed),
-            "the write pushes, or the config would not see it until the next second"
-        );
-        let path = super::super::paths::resolve_state_path(home.path(), None);
-        assert_eq!(
-            super::super::state::load_state(&path),
-            serde_json::json!({ "updates.last_check": 1_800_000_000_i64 })
-        );
-    }
-
-    #[tokio::test]
-    async fn a_refused_write_changes_neither_memory_nor_disk() {
-        let home = tempfile::tempdir().unwrap();
-        let (signal_tx, _signal_rx) = tokio::sync::mpsc::unbounded_channel();
-        let controller = SystemController::new(home.path().to_path_buf(), None, signal_tx);
-
-        controller.write_state("ok", serde_json::json!("kept"));
-        controller.write_state("../escape", serde_json::json!("bad key"));
-        controller.write_state("nested", serde_json::json!({ "no": true }));
-
-        assert_eq!(controller.snapshot().state, serde_json::json!({ "ok": "kept" }));
-    }
-
-    #[tokio::test]
-    async fn a_second_write_keeps_the_first_and_a_repeat_replaces_it() {
-        let home = tempfile::tempdir().unwrap();
-        let (signal_tx, _signal_rx) = tokio::sync::mpsc::unbounded_channel();
-        let controller = SystemController::new(home.path().to_path_buf(), None, signal_tx);
-
-        controller.write_state("theme", serde_json::json!("dark"));
-        controller.write_state("count", serde_json::json!(1));
-        controller.write_state("count", serde_json::json!(2));
-
-        assert_eq!(controller.snapshot().state, serde_json::json!({ "theme": "dark", "count": 2 }));
-    }
 
     #[test]
     fn should_emit_is_false_for_the_same_second_fed_twice() {
@@ -266,30 +152,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_seeds_time_and_state_synchronously_before_any_tick_fires() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("oblisk")).unwrap();
-        std::fs::write(dir.path().join("oblisk").join("state.json"), r#"{"theme": "dark"}"#).unwrap();
+    async fn new_seeds_time_synchronously_before_any_tick_fires() {
+        // The clock task's first tick is a second away; a client connecting inside that second
+        // must read a real epoch, not a zero.
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let controller = SystemController::new(tx);
 
-        let controller = SystemController::new(PathBuf::from("/nonexistent-home"), Some(dir.path().to_path_buf()), tx);
-        let snapshot = controller.snapshot();
-
-        assert_eq!(snapshot.state, serde_json::json!({"theme": "dark"}));
-        let now = epoch_seconds(SystemTime::now());
-        assert!(
-            (now - 2..=now).contains(&snapshot.time),
-            "seeded time must be the real current second, not a stale zero"
-        );
-    }
-
-    #[tokio::test]
-    async fn new_degrades_to_an_empty_state_object_when_no_state_json_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let controller = SystemController::new(dir.path().to_path_buf(), None, tx);
-
-        assert_eq!(controller.snapshot().state, serde_json::json!({}));
+        assert!(controller.snapshot().time > 1_700_000_000, "seeded from the real clock, not defaulted");
     }
 }

@@ -220,12 +220,16 @@ Two unrelated sources under one capability: **UPower** (`org.freedesktop.UPower`
 | Path | XDG baseline | Write state | Content |
 | :--- | :--- | :--- | :--- |
 | `~/.config/oblisk/` | `$XDG_CONFIG_HOME` | Read-only to engine | `shell.lua` and every `.lua` file it `require`s (ADR-0047). |
-| `~/.local/state/oblisk/` | `$XDG_STATE_HOME` | Read-only today | Flat state file (`state.json`). |
+| Wherever a config says | none | Read-write | Every file a `persistent_table` declared (ADR-0136). |
 | `/dev/shm/oblisk-$UID/` | RAM memory-disk | Read-write (RAM) | Decoded notification images and icons. |
 
-### 14.1 `state.json`: read path only
+### 14.1 Declared files: the config picks the path
 
-`state.json` loads once at construction, at `$XDG_STATE_HOME/oblisk/state.json` (falling back to `~/.local/state/oblisk/state.json`); a missing file is the ordinary first-run case, not a fault. `system:write_state(key, val)` is a separate, **unbuilt** IDL row (§ 3.2). There is no write path from Lua yet, so no atomic-rename contract exists to describe.
+The Supervisor holds no state path of its own (ADR-0136). A config declares a file with `persistent_table { path, name, defaults }` and the Supervisor opens exactly that, keyed by the joined absolute path; `oblisk.storage` (§ 2.18) is every such file. A missing file is the ordinary first-run case, not a fault: it loads as an empty table, the declaration's `defaults` fill it, and the first save creates it.
+
+Writes land 1 second after the last one to that file, through a temporary file in the same directory and a rename, which is atomic on any single filesystem: a config writing on every keystroke must not be able to leave a half-written file behind a crash, since the next boot reads whatever is there. A save still inside that window when the session ends is lost, since nothing flushes on the way out.
+
+The one XDG path left is the config directory itself, which cannot be config-declared: something has to find `shell.lua` before any Lua runs. `-c <dir>`, then `$OBLISK_CONFIG_DIR`, then `$XDG_CONFIG_HOME/oblisk`, then `~/.config/oblisk`.
 
 ---
 

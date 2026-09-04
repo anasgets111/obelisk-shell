@@ -5,11 +5,11 @@
 --
 -- ## Where the choice lives
 --
--- In `state.json`, through `system:write_state`, one key per output: `wallpaper.<output>` is the
--- path and `wallpaper_fit.<output>` the fit. Scalars, because that is what `write_state` takes
--- (§ 3.2), and per output rather than one table because a table is not a scalar. So the choice
--- survives a reload and a reboot, which ADR-0055 decision 2 called the open hole: a `state()`
--- signal held it before, and a reload forgot it.
+-- Under one `wallpapers` key in `lib/store.lua`, a table of `{ path, fit }` per output, which is
+-- `Settings.data.wallpapers` verbatim. So the choice survives a reload and a reboot, which
+-- ADR-0055 decision 2 called the open hole: a `state()` signal held it before, and a reload forgot
+-- it. Two flattened key families held it until ADR-0136, because the store it lived in took
+-- scalars and nothing else.
 --
 -- ## Where the files come from
 --
@@ -17,6 +17,8 @@
 -- inotify, so a file dropped into the folder is in the picker before it is opened. Watched from
 -- here, at evaluation, because the folder is a setting and not a state: the picker reads the list
 -- when it opens and the bar's right-click needs it without the picker ever having opened.
+local store = require("lib.store")
+
 local wallpaper = {}
 
 -- `Settings.data.wallpaperFolder`'s default, verbatim.
@@ -34,14 +36,6 @@ wallpaper.DEFAULT_FIT = "cover"
 -- `Settings.defaultWallpaper`: the file shipped beside `shell.lua` (ADR-0055 decision 5).
 wallpaper.DEFAULT = oblisk.config_dir .. "/wallpaper.svg"
 
-local function path_key(output)
-    return "wallpaper." .. output
-end
-
-local function fit_key(output)
-    return "wallpaper_fit." .. output
-end
-
 local function is_fit(value)
     for _, fit in ipairs(wallpaper.FITS) do
         if fit.value == value then
@@ -51,64 +45,91 @@ local function is_fit(value)
     return false
 end
 
----The file `output` shows, read off one `oblisk.system` payload. Pure, so the picker can ask the
+---The file `output` shows, read off one stored `wallpapers` table. Pure, so the picker can ask the
 ---same question of every screen inside one `computed`.
----@param s SystemState|nil
+---@param w table|nil The `wallpapers` table, or `nil` before the first push.
 ---@param output string
 ---@return string
-function wallpaper.path_in(s, output)
-    local stored = s and s.state and s.state[path_key(output)]
+function wallpaper.path_in(w, output)
+    local stored = w and w[output] and w[output].path
     if type(stored) == "string" and stored ~= "" then
         return stored
     end
     return wallpaper.DEFAULT
 end
 
----@param s SystemState|nil
+---@param w table|nil
 ---@param output string
 ---@return string
-function wallpaper.fit_in(s, output)
-    local stored = s and s.state and s.state[fit_key(output)]
+function wallpaper.fit_in(w, output)
+    local stored = w and w[output] and w[output].fit
     if type(stored) == "string" and is_fit(stored) then
         return stored
     end
     return wallpaper.DEFAULT_FIT
 end
 
+---The stored table itself, for a caller building its own `computed` over several outputs.
+function wallpaper.all()
+    return store.wallpapers
+end
+
 ---A signal of `path_in` for one output, for the panel's `image.source`.
 ---@param output string
 function wallpaper.path_of(output)
-    return oblisk.system:map(function(s)
-        return wallpaper.path_in(s, output)
+    return store.wallpapers:map(function(w)
+        return wallpaper.path_in(w, output)
     end)
 end
 
 ---@param output string
 function wallpaper.fit_of(output)
-    return oblisk.system:map(function(s)
-        return wallpaper.fit_in(s, output)
+    return store.wallpapers:map(function(w)
+        return wallpaper.fit_in(w, output)
     end)
 end
 
----`WallpaperService.setWallpaper`: a write only when it changes something, since every
----`write_state` rewrites the file and pushes.
+---Merges `changes` into one output's entry and stores the whole table back. Copied rather than
+---mutated in place: the signal holds the table the last push built, and writing through it would
+---change what a `computed` reads without anything marking the scene dirty.
+---@param output string
+---@param changes table
+local function write(output, changes)
+    local stored = store.wallpapers:get() or {}
+    local merged = {}
+    for name, entry in pairs(stored) do
+        merged[name] = entry
+    end
+    local entry = {}
+    for key, value in pairs(merged[output] or {}) do
+        entry[key] = value
+    end
+    for key, value in pairs(changes) do
+        entry[key] = value
+    end
+    merged[output] = entry
+    store:set("wallpapers", merged)
+end
+
+---`WallpaperService.setWallpaper`: a write only when it changes something, since every write
+---pushes.
 ---@param output string
 ---@param path string
 function wallpaper.set(output, path)
-    if path == "" or wallpaper.path_in(oblisk.system:get(), output) == path then
+    if path == "" or wallpaper.path_in(store.wallpapers:get(), output) == path then
         return
     end
-    oblisk.system:invoke("write_state", path_key(output), path)
+    write(output, { path = path })
 end
 
 ---`WallpaperService.setModePref`.
 ---@param output string
 ---@param fit string
 function wallpaper.set_fit(output, fit)
-    if not is_fit(fit) or wallpaper.fit_in(oblisk.system:get(), output) == fit then
+    if not is_fit(fit) or wallpaper.fit_in(store.wallpapers:get(), output) == fit then
         return
     end
-    oblisk.system:invoke("write_state", fit_key(output), fit)
+    write(output, { fit = fit })
 end
 
 ---The watched folder as `oblisk.files` last pushed it, or `nil` before the first push.

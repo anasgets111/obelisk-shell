@@ -64,6 +64,25 @@
 ---@return StateSignal<T> # The same signal on every evaluation that names it, so a handle captured last reload is still the live one.
 function state(name, initial) end
 
+---@class PersistentTable
+---A JSON file the config named. Every key but `set` reads as a signal over that key's stored
+---value, `nil` until the first push and `nil` for a key the file does not have.
+---@field set fun(self: PersistentTable, key: string, value: any) Stores one key and saves the file a second after the last write. Any JSON value, tables included. `nil` deletes the key.
+---@field [string] Signal<any>
+
+---A persisted table: a JSON file at a path the config names, read as signals.
+---
+---Nothing about the location is the framework's (ADR-0136). Build `path` from `oblisk.config_dir`,
+---`os.getenv("XDG_STATE_HOME")` or anything else; declare two stores if a settings file and a cache
+---should be two files. The file is created on the first save.
+---
+---Re-declaring the same file is one table: an in-place reload re-runs the call, and `defaults`
+---fills only keys the file does not already have, so adding a default is a new key rather than a
+---reset of what the user changed.
+---@param spec { path: string, name: string, defaults?: table } `path` is an absolute directory, `name` one file name, `defaults` the keys to seed it with.
+---@return PersistentTable # The same table for every declaration of one file.
+function persistent_table(spec) end
+
 ---A signal recomputed from several dependencies. `fn` must be side-effect-free, and its CPU time
 ---is capped at 5ms across the whole dependency graph (ADR-0021).
 ---ponytail: `fn`'s parameters are untyped, unlike `map`'s. One type parameter per dependency
