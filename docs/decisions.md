@@ -5873,3 +5873,64 @@ this one does not.
 `ImageCache::with_waker`; `wayland::run`'s poll has no timeout; `supervisor/src/main.rs` builds
 its runtime by hand.
 
+## 0125. A panel shown in the turn that created it waits for its first configure
+
+The dev config's `osd` shows itself during boot, and roughly one boot in four died there: niri
+answered the first buffer with `zwlr_layer_surface_v1: must ack the initial configure before
+attaching buffer`, which takes the connection down, and the next `eglCreateWindowSurface` failed
+with no EGL error for `khronos-egl` to report, so it panicked on its own `get_error().unwrap()`.
+The Supervisor restarted the generation and the shell came up, which is why this read as a slow
+boot rather than a crash.
+
+`App::show_panel` had two paths and the wrong one ran. A panel hidden after being shown rebuilds
+its `zwlr_layer_surface_v1` and waits in `MapState::AwaitingConfigure`; a panel that never showed
+still holds the object `create_panel` made and went straight to `MapState::Mapped`, on the
+reasoning that a surface committed at startup has long since been configured. True for a panel
+shown by a click, and false for one shown in the same dispatch turn it was created in.
+
+**Decision**: which state a kept layer surface goes to is read from `configured_size`, in
+`map_state_for_kept_layer`. `bind_and_clear` is the only writer of a real one and runs on the ack,
+`unbind` resets it, and no configure carries a zero on both axes, so `(0, 0)` is exactly "not
+acked yet". Waiting costs nothing: the configure is already on its way and `bind_and_clear`
+finishes the show when it lands. Fourteen consecutive boots clean afterwards, against three
+crashes in the twelve logged before it; the `osd` now comes up at its configured 280x75 instead
+of the 1x1 an unconfigured surface binds at.
+
+**Not changed**: the panic itself. `khronos-egl` unwrapping an absent error is its bug, and the
+only way to reach it is a connection already dead, which is not a state to keep running in.
+
+**Consequences**: `map_state_for_kept_layer` in `wayland/layer.rs`, read by `show_panel`.
+
+## 0126. The release build is the optimisation, and `target-cpu=native` is not
+
+ADR-0124 left the bar's 4 ms re-resolve as the remaining cost and said a release build would make
+it a fraction of a millisecond. Measured on the dev config, one 1920x1200 output, the same commit
+built both ways:
+
+| | debug | release |
+| --- | --- | --- |
+| launch to the bar's first frame | 799 ms | 198 ms |
+| CPU to boot (Renderer) | 0.91 s | 0.12 s |
+| CPU to open the picker, 54 tiles | 0.73 s | 0.13 s |
+| idle, both processes | 1.6% of a core | 0.4% |
+| Renderer RSS at rest | 82.7 MB | 69.4 MB |
+| Supervisor RSS | 38.2 MB | 23.3 MB |
+| binary, each | 238 MB | 7 MB |
+
+Four to seven times on every axis of speed, and 28 MB across the two processes. Nothing in the
+tree changed to get it.
+
+**Measured and rejected**: `-C target-cpu=native`, built into its own `--target-dir` (hence
+`/target-*` in `.gitignore`). Boot 198 ms against 198 ms, 12 ticks of boot CPU against 13, the
+picker 11 against 14, memory identical -- inside the noise of a two-tick counter, for a binary
+that only runs on the machine that built it. Also `malloc_trim(0)` after an eviction, for the
+3.6 MB the picker leaves on the heap: it returned nothing, so that memory is fragmentation below
+the top of the heap rather than free pages waiting to be handed back.
+
+**Where the Renderer's 69 MB is**, by mapping, after a picker cycle: 19 MB heap, 19 MB
+`libLLVM`, 15 MB `libgallium`, 7 MB the binary, 6 MB anonymous, the rest fonts and small
+libraries. Half of it is Mesa's, and the shell's own share is the heap and the binary.
+
+**Consequences**: none in the tree. The release profile was already tuned (`lto`,
+`codegen-units = 1`, `panic = "abort"`, `strip`, `overflow-checks`); this is the measurement that
+says to use it.

@@ -60,6 +60,22 @@ fn ambiguous_zero_axis(size: (u32, u32), anchor: node::Anchor) -> Option<&'stati
     }
     None
 }
+/// Where a panel that still holds its `zwlr_layer_surface_v1` goes when `visible` turns true,
+/// from whether the configure answering its create has been acked. `configured_size` is that
+/// record: [`App::bind_and_clear`] is its only real writer and runs on the ack, `App::unbind`
+/// puts it back to `(0, 0)`, and no configure carries a zero on both axes.
+///
+/// A hidden panel is created and committed at startup, so by the time anything shows it the
+/// configure has almost always been read and [`MapState::Mapped`] is right. Almost: a panel shown
+/// in the same dispatch turn that created it -- an `osd` popping up mid-boot -- reaches here with
+/// nothing acked, and attaching a buffer then is the protocol error niri names by hand ("must ack
+/// the initial configure before attaching buffer"), which takes the connection down with it.
+/// Measured on this machine as a boot crash in roughly one run in four, each costing a generation
+/// restart. Waiting instead costs nothing: the configure is already on its way, and
+/// [`App::bind_and_clear`] finishes the show when it lands.
+fn map_state_for_kept_layer(configured_size: (u32, u32)) -> MapState {
+    if configured_size == (0, 0) { MapState::AwaitingConfigure } else { MapState::Mapped }
+}
 /// The exclusive zone for a surface marked `exclusive`, derived from the size the compositor
 /// actually configured, not guessed at creation (a `"Fill"`-sized bar has no height yet). Anchored
 /// top or bottom but not both reserves that height; left or right but not both reserves that
@@ -228,9 +244,10 @@ impl App {
     /// role still holds a `LayerSurface`.
     ///
     /// **Never shown.** [`App::create_panel`] builds every declared panel, so one that started
-    /// `visible = false` already has a configured, acked, bufferless surface. Nothing needs
-    /// building or re-committing; the state goes straight to [`MapState::Mapped`] and the next
-    /// `paint_surface` attaches the first buffer, which is what maps it.
+    /// `visible = false` already has a bufferless surface. Nothing needs building or
+    /// re-committing, and the next `paint_surface` attaches the first buffer, which is what maps
+    /// it -- but only once the configure answering that create has been acked, which is what
+    /// [`map_state_for_kept_layer`] reads.
     ///
     /// **Hidden after being shown.** [`App::unmap`] destroyed the object, so this builds a fresh
     /// one from the last applied spec and waits in [`MapState::AwaitingConfigure`] for
@@ -245,7 +262,7 @@ impl App {
             return;
         };
         if layer.is_some() {
-            self.surfaces[index].map_state = MapState::Mapped;
+            self.surfaces[index].map_state = map_state_for_kept_layer(self.surfaces[index].configured_size);
             eprintln!("[oblisk-renderer] {} mapping: visible = true", self.surfaces[index].surface_id);
             return;
         }
@@ -457,6 +474,20 @@ mod tests {
         assert_eq!(
             keyboard_interactivity_for(node::KeyboardInteractivity::Exclusive),
             KeyboardInteractivity::Exclusive
+        );
+    }
+
+    #[test]
+    fn a_panel_shown_before_its_first_configure_waits_for_the_ack_instead_of_attaching() {
+        assert_eq!(
+            map_state_for_kept_layer((0, 0)),
+            MapState::AwaitingConfigure,
+            "nothing acked yet, so painting here would be the protocol error that kills the connection"
+        );
+        assert_eq!(
+            map_state_for_kept_layer((1920, 39)),
+            MapState::Mapped,
+            "the ordinary case: created hidden at startup, configured long before anything showed it"
         );
     }
 
