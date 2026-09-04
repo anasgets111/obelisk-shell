@@ -1332,8 +1332,13 @@ impl PointerHandler for App {
                         // A press elsewhere stops the typing and keeps the text (ADR-0108), which
                         // is what every toolkit's text field does: the Send button beside a reply
                         // is "elsewhere", and so is the card the field sits in.
+                        // Except a `submit` button, which is the masked field's own Enter
+                        // (ADR-0114): scrubbing the buffer on its press would leave its release
+                        // nothing to send.
                         None => (
-                            None,
+                            self.focused_secure_submit
+                                .clone()
+                                .filter(|_| hit.button.as_ref().is_some_and(|b| b.submit)),
                             self.focused_text_field.clone().map(|field| FocusedTextField { typing: false, ..field }),
                         ),
                     };
