@@ -192,6 +192,7 @@ return panel {
             button {
                 width = "Fill",
                 height = "Fill",
+                cursor = "default",
                 on_click = ui_state.close_panel,
             },
             -- No `height`: the card is its content, see the header comment. `renderer/src/socket.rs`'s

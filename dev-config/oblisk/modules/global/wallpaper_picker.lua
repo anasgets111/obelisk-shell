@@ -564,6 +564,7 @@ return panel {
             button {
                 width = "Fill",
                 height = "Fill",
+                cursor = "default",
                 background = theme.SCRIM,
                 on_click = close,
             },
