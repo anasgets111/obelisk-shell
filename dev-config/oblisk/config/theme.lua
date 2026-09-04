@@ -349,6 +349,9 @@ theme.notification_list_height = s(640, 480)
 -- The two version columns below are fixed, so the panel's width is what the *name* gets, and 460
 -- left about 130px of it -- `gpu-screen-recorder-git` elided in a panel with room to spare.
 theme.update_panel_width = s(520, 400)
+
+-- `Theme.audioPanelWidth`: two sliders with a name beside each and a mixer under them.
+theme.audio_panel_width = s(380, 300)
 theme.update_list_height = s(360, 260)
 -- `updateOldVersionColumnWidth`. A column rather than a content-sized cell because the point of a
 -- table is that the eye runs down it: ragged versions are five separate two-word sentences, and a

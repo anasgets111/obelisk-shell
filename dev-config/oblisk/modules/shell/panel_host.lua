@@ -52,8 +52,9 @@ local bluetooth_panel = require("modules.bar.panels.bluetooth_panel")
 local calendar_panel = require("modules.bar.panels.minimal_calendar")
 local notification_history = require("modules.bar.panels.notification_history")
 local update_panel = require("modules.bar.panels.update_panel")
+local audio_panel = require("modules.bar.panels.audio_panel")
 
-local panels = { power_menu, network_panel, bluetooth_panel, calendar_panel, notification_history, update_panel }
+local panels = { power_menu, network_panel, bluetooth_panel, calendar_panel, notification_history, update_panel, audio_panel }
 
 -- Every panel's body is built and handed to the card; only the one whose `kind` matches is
 -- visible. An invisible child contributes nothing to its parent's size (`resolve_sizes` in
@@ -75,12 +76,13 @@ for _, panel in ipairs(panels) do
     table.insert(sections, panel_section(panel))
 end
 
--- One width for every panel but the two that carry a list of rows rather than a column of controls:
--- the notification history gets the mirror's wider `notificationPanelWidth`, and the update panel
--- gets its own, because a package row is a name and two version strings.
+-- One width for every panel but the three the mirror sizes on their own: the notification history
+-- gets `notificationPanelWidth`, the update panel its own, because a package row is a name and two
+-- version strings, and the audio panel `audioPanelWidth`, so a slider has a length worth dragging.
 local PANEL_WIDTHS = {
     [notification_history.kind] = theme.notification_panel_width,
     [update_panel.kind] = theme.update_panel_width,
+    [audio_panel.kind] = theme.audio_panel_width,
 }
 
 local card_width = ui_state.panel_kind:map(function(kind)

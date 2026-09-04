@@ -50,6 +50,12 @@ icons.num_lock    = "\u{F03A0}"
 icons.lan         = "\u{F0317}"
 icons.lan_off     = "\u{F0318}"
 icons.speaker     = "\u{F04C3}"
+icons.check       = "\u{F012C}"
+icons.mixer       = "\u{F04E1}"
+icons.music_note  = "\u{F075A}"
+icons.headphones  = "\u{F02CB}"
+icons.headset     = "\u{F02CE}"
+icons.phone       = "\u{F03F2}"
 
 -- Audio, by loudness, plus the muted glyph the mute toggle swaps in.
 icons.vol_muted   = "\u{F075F}"

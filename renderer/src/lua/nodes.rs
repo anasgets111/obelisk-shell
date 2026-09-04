@@ -80,7 +80,7 @@ const NODE_PROPERTIES: &[(&str, &[&str])] = &[
     // resolves to (ADR-0072). A full-colour icon names no `currentColor`, so this is always safe.
     ("icon", &["foreground", "name", "size"]),
     ("image", &["fit", "source"]),
-    ("button", &["children", "on_click", "submit"]),
+    ("button", &["children", "on_click", "on_drag", "on_wheel", "submit"]),
     ("list", &["direction", "itemfn", "key", "scroll", "source", "spacing"]),
     // `font_size`, `foreground` and `text_align` are the text half `node::paint_style` reads off a
     // `textfield` too: it draws either its placeholder or its masked content.
@@ -586,7 +586,7 @@ mod meta_stub_tests {
             unsampled.len(),
             unsampled.join("\n")
         );
-        assert_eq!(probed, 581, "the number of declared type members moved; confirm the change is intended");
+        assert_eq!(probed, 583, "the number of declared type members moved; confirm the change is intended");
     }
 
     /// One Lua literal per declared type. `None` means "no sample", which skips rather than guesses.

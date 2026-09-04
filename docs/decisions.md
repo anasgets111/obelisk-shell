@@ -5471,3 +5471,65 @@ update notification (a config could read the action from `process.run`'s stdout 
 it until someone wants the button), the mirror's 15-second notification dedupe, which an edge does
 not need, and three OSD kinds with no fact to read: the Wi-Fi radio toggle (`NetworkState` has no
 `wifi_enabled`), microphone mute (`AudioDevice` has no `muted`) and screen recording.
+
+## ADR-0116: Pointer drags and wheels on a button, and the microphone's volume
+
+**Status**: Accepted (2026-09-04)
+
+**Context**: Reviewing `Volume.qml`/`AudioPanel.qml` against the bar's volume pill found the mirror
+is mostly a slider: drag the pill to set the volume, roll the wheel over it to step, and a panel of
+four more sliders (output, microphone, one per stream) with device pickers. None of it could be
+written. The pointer model (ADR-0050) hands a config a click's rect and button name and nothing
+else; the wheel (ADR-0069) writes `scroll()` signals and reaches no handler. On the Supervisor side
+`AudioState` carried the default sink's volume and mute and nothing of the default source's, a hole
+§ 3.2 had noted beside `set_muted` since ADR-0053, and an `AudioDevice` had no way to say it is a
+headset.
+
+**Decision**:
+
+1. **`button` takes `on_drag(rect, pointer, phase)`.** A left press on the innermost `button`
+   declaring it holds the drag until the release or a `Leave`; every `Motion` while held calls the
+   handler with `"move"`, the press with `"start"`, the release with `"end"`. `pointer` is `{ x, y }`
+   in the button's own coordinates and unclamped, since every handler divides by the rect and the
+   config's own `min`/`max` is the clamp; a drag past the end stays pinned at the end because the
+   handler keeps hearing about it. Left only: a drag is one gesture and carries no button name, and
+   the other two buttons stay free for a click on the same control, which is what the pill wants
+   (middle mutes, right opens the panel). A press that focused a `textfield` drags nothing, as it
+   clicks nothing (ADR-0092). The left `on_click` still fires on a release inside the rect, after the
+   drag's `"end"`, so a control taking both sees its value committed first. Not a `slider` node: the
+   same two hooks are a seek bar, a colour pad or a resize handle, and a kind per shape is what a
+   general engine must not grow.
+2. **`button` takes `on_wheel(rect, steps)`.** `steps` in notches, positive away from the user, the
+   direction every volume and brightness control reads as "more" and the opposite of Wayland's axis
+   sign; a touchpad swipe arrives as fractions of a notch through the same `wheel_delta` a scroll
+   uses. Vertical axis only. Against a scrollable container the innermost of the two under the
+   pointer wins and nothing chains, ADR-0069's rule extended to a second kind of taker. The
+   "no `scroll()` registered" early-out is gone with it: the wheel handler now walks the tree
+   unconditionally, since a button's handler is not in any registry, and a wheel event is rare
+   beside a motion event.
+3. **A button with either handler is solid to input** (`takes_input_as_a_box`), as one with
+   `on_click` is: invisible by design and still has to be pressable.
+4. **`AudioState` gains `source_volume` and `source_muted`, and three actions.** An `Audio/Source`
+   node is bound exactly as an `Audio/Sink` is, `Props` param and `device.id`/`card.profile.device`
+   route, since PipeWire gives it the same shape (this machine's mic is device 51 route 0 beside the
+   speaker's route 7); `SinkEntry` became `DeviceEntry` and the write path takes a direction.
+   `set_source_volume(vol)`, `set_source_muted(bool)`, `toggle_source_mute()` mirror their sink
+   twins through one `set_default_volume`/`set_default_muted` pair. Verified live: the panel's
+   microphone card read 15% off the source's own `Props`.
+5. **`AudioDevice` gains `icon`**, the node's `device.icon-name` as PipeWire spells it, absent when
+   the node carries none. A hint for a glyph (`AudioService.deviceIconFor`'s `headset`/`headphone`
+   words), not an icon lookup this side performs.
+6. **No headroom.** The mirror allows 150% with a marker at 100%; `set_volume` keeps its `[0, 1]`
+   clamp. It complicates every meter for a feature few use, and can be lifted in one place.
+7. **In `dev-config`**: `components/slider.lua` (a `button` with the two hooks over a `"NN%"`-wide
+   fill; a held drag draws from a `pending` `state()` and commits once on release, `Slider.qml`'s
+   `committed`; drags and notches quantise to `steps`, default 20, the mirror's 5%), the volume pill
+   rebuilt on it with the mirror's bindings, and `panels/audio_panel.lua`: output and microphone
+   cards with device pickers, and the application mixer. Verified live by hand on the pill and by
+   screenshot on the panel.
+
+**Consequences**: A config can build any drag-set control without an engine change. Snap-back:
+between a drag's commit and the capability's next snapshot the fill reads the old value for a frame
+or two; the PipeWire round trip is milliseconds and it has not been visible. Not built: a
+`source_volume` OSD line (the OSD service could add one in three lines when wanted) and the mixer
+stream's desktop-entry icon lookup beyond `oblisk.applications`' `app_id` heuristics.

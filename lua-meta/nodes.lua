@@ -125,6 +125,8 @@
 ---@field children? Node[] Drawn in order. A hole in the array truncates it, since `#` is undefined on a sparse table.
 ---@field submit? boolean A click also sends the surface's armed `secure_submit` field, as Enter would (ADR-0114). The one way a button reaches a password, since no callback may; clickable with or without `on_click`.
 ---@field on_click? fun(rect: Rect, button: "left"|"right"|"middle") Fires on the release, and only when the release lands on the same node and the same button the press armed. A handler declaring one parameter still works.
+---@field on_drag? fun(rect: Rect, pointer: { x: number, y: number }, phase: "start"|"move"|"end") A left press on this button holds the drag until its release (ADR-0116). `"start"` on the press, `"move"` on every motion while held, wherever the pointer has gone, `"end"` on the release or when the pointer leaves the surface. `pointer` is in the button's own coordinates and unclamped, so `pointer.x / rect.width` is the fraction along a horizontal track and `math.min(1, math.max(0, ...))` is the config's own clamp. The left click still fires on release inside the rect, so a control can take both.
+---@field on_wheel? fun(rect: Rect, steps: number) One wheel event over this button, innermost against any scrollable container above or below it (ADR-0116). `steps` is in notches, positive away from the user; a touchpad swipe arrives as fractions of a notch. Vertical axis only.
 
 ---@class ListProps: NodeBase
 ---@field source any[]|Bound A flat array table, or a signal wrapping one. A literal array is legal and stays fixed; the signal is what makes the list rebuild.

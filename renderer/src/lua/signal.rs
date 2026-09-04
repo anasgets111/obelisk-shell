@@ -579,12 +579,6 @@ pub fn any_hover_registered(lua: &Lua) -> bool {
     lua.app_data_ref::<HoverRegistry>().is_some_and(|registry| !registry.0.is_empty())
 }
 
-/// Whether this config ever called `scroll(name)`, so the wheel handler can skip walking a tree
-/// that has nothing to write. Same early-out [`any_hover_registered`] exists for.
-pub fn any_scroll_registered(lua: &Lua) -> bool {
-    lua.app_data_ref::<ScrollRegistry>().is_some_and(|registry| !registry.0.is_empty())
-}
-
 /// The `name -> (Signal, literal)` map ADR-0044 decision 5 hangs `state` off: the name is the
 /// identity, so an in-place reload finds the signal built last time, still holding the user's
 /// last click, and an open dropdown stays open across a config edit. The second half is decision

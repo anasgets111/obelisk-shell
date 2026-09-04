@@ -2,8 +2,9 @@
 //! `mixer` tracks the registry and every list § 2.4 names; `master`
 //! holds the pure parsing/resolution logic `mixer` wires PipeWire events through.
 //!
-//! § 3.2's audio write actions live here too, in [`dispatch`]. Seven of the nine are built; see
-//! that function's own doc comment for the two that are not.
+//! § 3.2's audio write actions live here too, in [`dispatch`], plus the three source-side ones
+//! (`set_source_volume`, `set_source_muted`, `toggle_source_mute`) that filled the hole § 3.2 had
+//! noted beside `set_muted`. See that function's own doc comment for the two still not built.
 //!
 //! BlueZ codec control (§6) is later work and belongs to `bluetooth` rather than here.
 
@@ -22,6 +23,9 @@ pub enum AudioAction {
     ToggleMute,
     SetDefaultSink,
     SetDefaultSource,
+    SetSourceVolume,
+    SetSourceMuted,
+    ToggleSourceMute,
     SetAppVolume,
     SetAppMuted,
 }
@@ -45,6 +49,11 @@ pub fn dispatch(commands: &AudioCommandSender, envelope: &shared::CommandEnvelop
         AudioAction::ToggleMute => Some(AudioCommand::ToggleMasterMute),
         AudioAction::SetDefaultSink => parse_id_arg(&params.arguments).map(AudioCommand::SetDefaultSink),
         AudioAction::SetDefaultSource => parse_id_arg(&params.arguments).map(AudioCommand::SetDefaultSource),
+        AudioAction::SetSourceVolume => parse_volume_arg(&params.arguments).map(AudioCommand::SetSourceVolume),
+        AudioAction::SetSourceMuted => {
+            crate::capabilities::parse_bool_arg(&params.arguments).map(AudioCommand::SetSourceMuted)
+        }
+        AudioAction::ToggleSourceMute => Some(AudioCommand::ToggleSourceMute),
         AudioAction::SetAppVolume => {
             parse_id_and_volume_args(&params.arguments).map(|(id, volume)| AudioCommand::SetAppVolume { id, volume })
         }

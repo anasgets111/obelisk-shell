@@ -83,16 +83,20 @@ Read off UPower's `DisplayDevice`, the composite across every battery on the mac
 ### 2.4 Audio state (`oblisk.audio`) (PipeWire only)
 *   `audio.volume`: `number` (Float representing master output volume, range `[0.0, 1.0]`)
 *   `audio.muted`: `boolean` (Muted = `true`, Unmuted = `false`)
+*   `audio.source_volume`: `number` (The default input device's volume, range `[0.0, 1.0]`, derived as `volume` is; ADR-0116)
+*   `audio.source_muted`: `boolean` (The default input device's mute; ADR-0116)
 *   `audio.sinks`: `table` (Array of output playback audio devices):
     *   Sink object:
         *   `id`: `integer` (WirePlumber node ID)
         *   `name`: `string` (User-friendly description, e.g. `"Built-in Audio Analog Stereo"`)
         *   `active`: `boolean` (True if this is the active default output route)
+        *   `icon`: `string?` (The node's `device.icon-name` as PipeWire spells it, `"audio-headset-bluetooth"`; a hint for a glyph, absent when the node carries none; ADR-0116)
 *   `audio.sources`: `table` (Array of input recording audio devices):
     *   Source object:
         *   `id`: `integer` (WirePlumber node ID)
         *   `name`: `string` (User-friendly description, e.g. `"Built-in Microphone"`)
         *   `active`: `boolean` (True if this is the active default input route)
+        *   `icon`: `string?` (As the sink's)
 *   `audio.apps`: `table` (Array of per-application volume mixer playback streams):
     *   App stream object:
         *   `id`: `integer` (WirePlumber client playback node ID)
@@ -271,7 +275,9 @@ All write actions serialize as JSON-RPC 2.0 payloads over the private Unix socke
 | `audio:toggle_mute()` | `capability: "audio", action: "toggle_mute", arguments: []` |
 | `audio:set_default_sink(id)` | `capability: "audio", action: "set_default_sink", arguments: [id]`<br>**Validation**: `id` must be an active Sink Node ID. |
 | `audio:set_default_source(id)` | `capability: "audio", action: "set_default_source", arguments: [id]`<br>**Validation**: `id` must be an active Source Node ID. |
-| `audio:set_source_muted(bool)` | **Not specified: a hole, not a decision.** Would mirror `set_muted` as `capability: "audio", action: "set_source_muted", arguments: [bool]`. A microphone-mute toggle is the click target of every privacy indicator, and the default sink has a mute with no counterpart for the default source. The mixer already writes node props, so this needs a dispatch arm and a row, not a mechanism. Listed in `roadmap.md`. |
+| `audio:set_source_volume(vol)` | `capability: "audio", action: "set_source_volume", arguments: [vol]`<br>**Validation**: `vol` must be a float in range `[0.0, 1.0]`. The default source, on `set_volume`'s terms (ADR-0116). |
+| `audio:set_source_muted(bool)` | `capability: "audio", action: "set_source_muted", arguments: [bool]`<br>**Validation**: `bool` is boolean. Was a noted hole beside `set_muted`; filled by ADR-0116. |
+| `audio:toggle_source_mute()` | `capability: "audio", action: "toggle_source_mute", arguments: []` |
 | `audio:set_app_volume(id, vol)` | `capability: "audio", action: "set_app_volume", arguments: [id, vol]`<br>**Validation**: `id` is application node ID, `vol` float `[0.0, 1.0]`. |
 | `audio:set_app_muted(id, bool)` | `capability: "audio", action: "set_app_muted", arguments: [id, bool]`<br>**Validation**: `id` is application node ID, `bool` is boolean. |
 | `audio:play_sound(sound)` | `capability: "audio", action: "play_sound", arguments: [sound]`<br>**Validation**: `sound` must be string path or system theme icon name. |
@@ -439,6 +445,14 @@ Receives input focus and pointer events.
     *   `button`: `string` (`"left"`, `"right"`, or `"middle"`; any other evdev code arms and fires nothing. Added by ADR-0050's second amendment, which also covers why back/forward are excluded and why this is a name rather than a code)
 
 > A handler declaring one parameter still works, since Lua drops undeclared arguments; it now also runs on a right or middle click, where those events previously did nothing. `if button ~= "left" then return end` restores the old behavior.
+
+*   `on_drag`: `function(rect, pointer, phase)` (ADR-0116. A left press on this button holds a drag until its release. `"start"` on the press, `"move"` on every pointer motion while held, wherever the pointer has gone, `"end"` on the release or when the pointer leaves the surface. Left button only; a press that focused a `textfield` drags nothing, as it clicks nothing. The left `on_click` still fires on a release inside the rect, after the drag's `"end"`)
+    *   `rect`: `table` (The button's absolute rect, as `on_click`'s)
+    *   `pointer`: `table` (`{ x, y }` in the button's own coordinates, unclamped: past the right edge `x` exceeds `rect.width`, so `math.min(1, math.max(0, pointer.x / rect.width))` is a slider's fraction and the config owns the clamp)
+    *   `phase`: `string` (`"start"`, `"move"` or `"end"`)
+*   `on_wheel`: `function(rect, steps)` (ADR-0116. One wheel event over this button. `steps` is in notches, positive away from the user, so `value + steps * 0.05` is a control stepping up on a wheel up; a touchpad's swipe arrives as fractions of a notch. Vertical axis only. Innermost wins against a scrollable container: a wheel over a slider inside a scrolling list moves the slider, over the list beside it scrolls the list)
+
+> **What a slider is.** Not a node kind. `on_drag` plus `on_wheel` on a `button` holding a `rect` whose `width` is a `"NN%"` signal is the whole of one (`dev-config/oblisk/components/slider.lua`), and the same two hooks are a colour picker's pad, a seek bar, or a resize handle, which a `slider` node would each have needed its own kind for.
 
 > **The pointer model is complete.** The frame handler in `renderer/src/wayland/input.rs` matches `Press`/`Release`/`Leave` for clicks, `Enter`/`Motion`/`Leave` for hover (`hover` below), and `Axis` for the wheel (`scroll` below); the match over `PointerEventKind` is exhaustive, with no swallowing `_ => {}` arm left. What a scrollable container *is* was ADR-0069's decision.
 

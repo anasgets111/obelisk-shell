@@ -11,7 +11,7 @@ use pipewire as pw;
 use crate::capabilities::audio::master;
 
 use super::state::{
-    AudioCommand, DEFAULT_AUDIO_SINK_KEY, DEFAULT_AUDIO_SOURCE_KEY, DefaultDevice, MixerState, SinkRoute,
+    AudioCommand, DEFAULT_AUDIO_SINK_KEY, DEFAULT_AUDIO_SOURCE_KEY, DefaultDevice, DeviceRoute, MixerState,
 };
 
 /// The `type_` a `default.audio.*` metadata value carries. Read straight off `pw-metadata`'s own
@@ -28,34 +28,12 @@ const METADATA_JSON_TYPE: &str = "Spa:String:JSON";
 /// changed by `wpctl` or a headset button look identical to one this shell asked for.
 pub(super) fn apply_command(state: &Rc<RefCell<MixerState>>, command: AudioCommand) {
     match command {
-        AudioCommand::SetMasterVolume(volume) => {
-            let Some((node_id, current)) = resolve_master(state) else {
-                eprintln!("audio: set_volume({volume}) has no resolved default sink to write to; ignored");
-                return;
-            };
-            let Some(channel_volumes) = master::cubed_channel_volumes(volume, current.channel_volumes.len()) else {
-                eprintln!("audio: set_volume({volume}) resolved to sink {node_id}, which reports no channels; ignored");
-                return;
-            };
-            write_master(state, node_id, Some(channel_volumes), None);
-        }
-        AudioCommand::SetMasterMuted(muted) => {
-            // Only the node id is needed: a mute write carries no channelVolumes, so unlike
-            // SetMasterVolume it does not need to know how many channels the sink has.
-            let Some((node_id, _)) = resolve_master(state) else {
-                eprintln!("audio: set_muted({muted}) has no resolved default sink to write to; ignored");
-                return;
-            };
-            write_master(state, node_id, None, Some(muted));
-        }
-        AudioCommand::ToggleMasterMute => {
-            let Some((node_id, current)) = resolve_master(state) else {
-                eprintln!("audio: toggle_mute has no resolved default sink to write to; ignored");
-                return;
-            };
-            let muted = !current.mute;
-            write_master(state, node_id, None, Some(muted));
-        }
+        AudioCommand::SetMasterVolume(volume) => set_default_volume(state, DefaultDevice::Sink, volume),
+        AudioCommand::SetMasterMuted(muted) => set_default_muted(state, DefaultDevice::Sink, Some(muted)),
+        AudioCommand::ToggleMasterMute => set_default_muted(state, DefaultDevice::Sink, None),
+        AudioCommand::SetSourceVolume(volume) => set_default_volume(state, DefaultDevice::Source, volume),
+        AudioCommand::SetSourceMuted(muted) => set_default_muted(state, DefaultDevice::Source, Some(muted)),
+        AudioCommand::ToggleSourceMute => set_default_muted(state, DefaultDevice::Source, None),
         AudioCommand::SetAppVolume { id, volume } => {
             let Some(current) = state.borrow().app_props.get(&id).cloned() else {
                 eprintln!("audio: set_app_volume({id}, {volume}) names a stream with no known Props; ignored");
@@ -75,20 +53,47 @@ pub(super) fn apply_command(state: &Rc<RefCell<MixerState>>, command: AudioComma
     }
 }
 
-/// The default sink's node id and its last-read `Props`, or `None` when no sink has resolved yet
-/// (the same window `master::compute_master` falls back over). Cloned out from behind the
+/// `set_volume`/`set_source_volume`: the default device of one direction takes a new level.
+fn set_default_volume(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice, volume: f32) {
+    let Some((node_id, current)) = resolve_default(state, kind) else {
+        eprintln!("audio: a {kind:?} volume of {volume} has no resolved default device to write to; ignored");
+        return;
+    };
+    let Some(channel_volumes) = master::cubed_channel_volumes(volume, current.channel_volumes.len()) else {
+        eprintln!(
+            "audio: a {kind:?} volume of {volume} resolved to node {node_id}, which reports no channels; ignored"
+        );
+        return;
+    };
+    write_device_volume(state, kind, node_id, Some(channel_volumes), None);
+}
+
+/// `set_muted`/`toggle_mute` and their source twins. `None` toggles: a toggle needs the current
+/// mute, which the resolved `Props` carry; a set needs only the node, since a mute write carries
+/// no `channelVolumes` and so no channel count.
+fn set_default_muted(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice, muted: Option<bool>) {
+    let Some((node_id, current)) = resolve_default(state, kind) else {
+        eprintln!("audio: a {kind:?} mute has no resolved default device to write to; ignored");
+        return;
+    };
+    write_device_volume(state, kind, node_id, None, Some(muted.unwrap_or(!current.mute)));
+}
+
+/// One direction's default node id and its last-read `Props`, or `None` when none has resolved
+/// yet (the same window `master::compute_master` falls back over). Cloned out from behind the
 /// `RefCell`, not held across the write, because the write borrows the same state again.
-fn resolve_master(state: &Rc<RefCell<MixerState>>) -> Option<(u32, master::RawSinkProps)> {
+fn resolve_default(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice) -> Option<(u32, master::RawSinkProps)> {
     let state = state.borrow();
+    let entries = state.device_entries(kind);
     let node_id = master::resolve_default_device(
-        state.default_sink_name.as_deref(),
-        state.sinks.iter().map(|(&id, sink)| (id, sink.names.node_name.as_str())),
+        state.default_name(kind),
+        entries.iter().map(|(&id, entry)| (id, entry.names.node_name.as_str())),
     )?;
-    let current = state.sinks.get(&node_id)?.props.clone()?;
+    let current = entries.get(&node_id)?.props.clone()?;
     Some((node_id, current))
 }
 
-/// Writes the master sink's volume and mute, through whichever object actually owns them.
+/// Writes a sink's or source's volume and mute, through whichever object actually owns them.
 ///
 /// **A sink backed by hardware does not own its own volume, and writing its node's `Props`
 /// succeeds and does nothing.** Found by running it, not by reading: `pw-cli set-param 59 Props
@@ -100,8 +105,14 @@ fn resolve_master(state: &Rc<RefCell<MixerState>>) -> Option<(u32, master::RawSi
 ///
 /// So the route path is used whenever one is known, and the node path is the fallback for a sink
 /// with no device behind it (a virtual or null sink), where the node really is the owner.
-fn write_master(state: &Rc<RefCell<MixerState>>, node_id: u32, channel_volumes: Option<Vec<f32>>, muted: Option<bool>) {
-    let route = state.borrow().sinks.get(&node_id).and_then(|sink| sink.route);
+fn write_device_volume(
+    state: &Rc<RefCell<MixerState>>,
+    kind: DefaultDevice,
+    node_id: u32,
+    channel_volumes: Option<Vec<f32>>,
+    muted: Option<bool>,
+) {
+    let route = state.borrow().device_entries(kind).get(&node_id).and_then(|entry| entry.route);
     match route {
         Some(route) => write_device_route(state, node_id, route, channel_volumes, muted),
         None => write_node_props(state, node_id, channel_volumes, muted),
@@ -118,7 +129,7 @@ fn write_master(state: &Rc<RefCell<MixerState>>, node_id: u32, channel_volumes: 
 fn write_device_route(
     state: &Rc<RefCell<MixerState>>,
     node_id: u32,
-    route: SinkRoute,
+    route: DeviceRoute,
     channel_volumes: Option<Vec<f32>>,
     muted: Option<bool>,
 ) {
@@ -148,7 +159,7 @@ fn write_device_route(
 }
 
 /// Sends one `SPA_PARAM_Props` object to a node. The write that works for a stream, and the
-/// fallback for a sink with no hardware device behind it (see [`write_master`]).
+/// fallback for a sink or source with no hardware device behind it (see [`write_device_volume`]).
 ///
 /// The serialized bytes are held in a local for the whole call: `Pod::from_bytes` borrows them,
 /// and `set_param` reads through that borrow into C, so letting the `Vec` drop early would hand
@@ -168,7 +179,12 @@ fn write_node_props(
         return;
     };
     let state = state.borrow();
-    let Some((node, _listener)) = state.sink_nodes.get(&node_id).or_else(|| state.nodes.get(&node_id)) else {
+    let Some((node, _listener)) = state
+        .sink_nodes
+        .get(&node_id)
+        .or_else(|| state.source_nodes.get(&node_id))
+        .or_else(|| state.nodes.get(&node_id))
+    else {
         eprintln!("audio: no bound node {node_id} to write Props to; ignored");
         return;
     };
@@ -183,7 +199,7 @@ fn write_default_device(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice, id
     let state = state.borrow();
     let node_name = match kind {
         DefaultDevice::Sink => state.sinks.get(&id).map(|sink| sink.names.node_name.clone()),
-        DefaultDevice::Source => state.sources.get(&id).map(|names| names.node_name.clone()),
+        DefaultDevice::Source => state.sources.get(&id).map(|source| source.names.node_name.clone()),
     };
     let Some(node_name) = node_name else {
         eprintln!("audio: no tracked {kind:?} with registry id {id}; ignored");

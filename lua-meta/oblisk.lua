@@ -90,6 +90,7 @@
 ---not the routing `node.name` (`"alsa_output.pci-0000_00_1f.3.analog-stereo"`). Both exist on
 ---every device this machine advertises; only one is meant for a person.
 ---@field active boolean Whether this is the device the `default.audio.sink`/`default.audio.source` metadata key currently routes to.
+---@field icon? string The node's `device.icon-name`, as PipeWire spells it: `"audio-card-analog"`, `"audio-headset-bluetooth"`, `"audio-headphones"`. A hint for choosing a glyph, not an icon-theme lookup this side performs; `None` when the node carries none, which a virtual sink does.
 ---@field id integer PipeWire registry id, which is what `audio:set_default_sink(id)` takes.
 ---@field name string The device description, e.g. `"Built-in Audio Analog Stereo"`. Not stable across a reboot; [`AudioDevice::id`] is not either.
 
@@ -259,6 +260,8 @@
 ---@field apps AppStream[] One entry per app playing audio right now; empty is normal, not an error.
 ---@field muted boolean Master output mute.
 ---@field sinks AudioDevice[] Every output device. `audio:set_default_sink(id)` takes one's [`AudioDevice::id`].
+---@field source_muted boolean The default input device's mute. The microphone-mute every privacy indicator wants as its click target, which § 3.2 had left as a hole beside `muted`.
+---@field source_volume number The default input device's volume, range `[0.0, 1.0]`, derived exactly as [`AudioState::volume`] is: a source cubes its `channelVolumes` the way a sink does (`pw-cli enum-params <source> Props` shows the same shape). `0.0` before the default source's first `Props` param arrives, or on a machine with no input at all.
 ---@field sources AudioDevice[] Every input device, on the same terms as [`AudioState::sinks`].
 ---@field volume number Master output volume, range `[0.0, 1.0]`; see [`master`]'s module doc comment for how this is derived from the default sink's `channelVolumes`.
 
@@ -409,7 +412,7 @@
 ---@field invoke fun(self: ApplicationsCapability, command: "refresh"|"launch"|"open_url", ...: any)
 
 ---@class AudioCapability: Capability<AudioState>
----@field invoke fun(self: AudioCapability, command: "set_volume"|"set_muted"|"toggle_mute"|"set_default_sink"|"set_default_source"|"set_app_volume"|"set_app_muted", ...: any)
+---@field invoke fun(self: AudioCapability, command: "set_volume"|"set_muted"|"toggle_mute"|"set_default_sink"|"set_default_source"|"set_source_volume"|"set_source_muted"|"toggle_source_mute"|"set_app_volume"|"set_app_muted", ...: any)
 
 ---@class BatteryCapability: Capability<BatteryState>
 local BatteryCapability = {}

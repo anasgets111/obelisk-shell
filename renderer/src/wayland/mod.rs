@@ -163,6 +163,9 @@ pub struct App {
     keyboard_focus: Option<String>,
     /// The press waiting for its release, if any (ADR-0050 decision 2, [`ArmedClick`]).
     armed: Option<ArmedClick>,
+    /// The left press held on an `on_drag` button, if any (ADR-0116 decision 1,
+    /// [`input::ActiveDrag`]). Every `Motion` reports to it until the release or a `Leave`.
+    drag: Option<input::ActiveDrag>,
     /// The serial `xdg_popup.grab` needs, for the length of one poll turn (ADR-0049's
     /// amendment, [`ArmedSerial`]).
     input_serial: Option<ArmedSerial>,
@@ -273,6 +276,7 @@ pub fn run(
         keyboard: None,
         keyboard_focus: None,
         armed: None,
+        drag: None,
         input_serial: None,
         pointer_input_count: 0,
         focused_secure_submit: None,

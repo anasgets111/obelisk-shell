@@ -43,7 +43,8 @@
 //! Master output volume/mute (§ 2.4, ADR-0053 decision 3) is a second, mostly independent
 //! tracking job on the same registry listener: `Audio/Sink` nodes' `SPA_PARAM_Props` param (via
 //! `param` events, not `info`) and the `default` `Metadata` object's `default.audio.sink` key
-//! (which names the master sink by `node.name`). This file only wires the PipeWire event
+//! (which names the master sink by `node.name`). `Audio/Source` nodes are tracked the same way
+//! for `source_volume`/`source_muted`, off `default.audio.source`. This file only wires the PipeWire event
 //! plumbing; [`super::master`] holds the pure parsing and resolution logic, including the linear/cubic
 //! volume conversion.
 

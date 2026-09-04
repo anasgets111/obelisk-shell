@@ -194,6 +194,14 @@ pub struct AudioState {
     pub volume: f32,
     /// Master output mute.
     pub muted: bool,
+    /// The default input device's volume, range `[0.0, 1.0]`, derived exactly as
+    /// [`AudioState::volume`] is: a source cubes its `channelVolumes` the way a sink does
+    /// (`pw-cli enum-params <source> Props` shows the same shape). `0.0` before the default
+    /// source's first `Props` param arrives, or on a machine with no input at all.
+    pub source_volume: f32,
+    /// The default input device's mute. The microphone-mute every privacy indicator wants as its
+    /// click target, which § 3.2 had left as a hole beside `muted`.
+    pub source_muted: bool,
     /// Every output device. `audio:set_default_sink(id)` takes one's [`AudioDevice::id`].
     pub sinks: Vec<AudioDevice>,
     /// Every input device, on the same terms as [`AudioState::sinks`].
@@ -217,6 +225,12 @@ pub struct AudioDevice {
     /// Whether this is the device the `default.audio.sink`/`default.audio.source` metadata key
     /// currently routes to.
     pub active: bool,
+    /// The node's `device.icon-name`, as PipeWire spells it: `"audio-card-analog"`,
+    /// `"audio-headset-bluetooth"`, `"audio-headphones"`. A hint for choosing a glyph, not an
+    /// icon-theme lookup this side performs; `None` when the node carries none, which a virtual
+    /// sink does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 /// The two names every tracked device carries, one per purpose. `node_name` is what the
@@ -225,6 +239,8 @@ pub struct AudioDevice {
 pub(super) struct DeviceNames {
     pub(super) node_name: String,
     pub(super) description: Option<String>,
+    /// [`AudioDevice::icon`], read once off the `global` event beside the two names.
+    pub(super) icon: Option<String>,
 }
 
 impl DeviceNames {
@@ -235,26 +251,29 @@ impl DeviceNames {
     }
 }
 
-/// One tracked `Audio/Sink`, as data. Everything the read path publishes and the write path
-/// needs to find the hardware, with no PipeWire handle in it: the bound proxies live beside
-/// this in `sink_nodes`, keeping this struct constructible in a test.
+/// One tracked `Audio/Sink` or `Audio/Source`, as data. Everything the read path publishes and
+/// the write path needs to find the hardware, with no PipeWire handle in it: the bound proxies
+/// live beside this in `sink_nodes`/`source_nodes`, keeping this struct constructible in a test.
+/// One shape for both directions because PipeWire gives them one: a source carries the same
+/// `Props` param and the same `device.id`/`card.profile.device` pair (this machine's internal
+/// mic is `device.id = 51`, `card.profile.device = 0`, beside the speaker's `7`).
 #[derive(Debug, Clone, Default)]
-pub(super) struct SinkEntry {
+pub(super) struct DeviceEntry {
     pub(super) names: DeviceNames,
     /// The raw `Props` last read off this node, or `None` before its first `param` event. Raw,
     /// not [`master::MasterVolume`]: the write path needs the channel count and mute the caller
     /// isn't changing.
     pub(super) props: Option<master::RawSinkProps>,
-    /// The hardware device behind this sink, for sinks that have one. `None` for a virtual or
-    /// null sink, whose volume really does live on the node.
-    pub(super) route: Option<SinkRoute>,
+    /// The hardware device behind this node, for nodes that have one. `None` for a virtual or
+    /// null device, whose volume really does live on the node.
+    pub(super) route: Option<DeviceRoute>,
 }
 
-/// Where an ALSA-backed sink's volume actually lives. `device_id` is the PipeWire `Device` global
+/// Where an ALSA-backed sink's or source's volume actually lives. `device_id` is the PipeWire `Device` global
 /// the sink node's own `device.id` property names; `profile_device` is its `card.profile.device`,
 /// which is what a `Route` object's `device` field matches on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct SinkRoute {
+pub(super) struct DeviceRoute {
     pub(super) device_id: u32,
     pub(super) profile_device: i32,
 }
@@ -267,8 +286,14 @@ fn device_list<'a>(
 ) -> Vec<AudioDevice> {
     let active =
         master::resolve_default_device(default_name, devices.clone().map(|(id, names)| (id, names.node_name.as_str())));
-    let mut list: Vec<AudioDevice> =
-        devices.map(|(id, names)| AudioDevice { id, name: names.display(), active: active == Some(id) }).collect();
+    let mut list: Vec<AudioDevice> = devices
+        .map(|(id, names)| AudioDevice {
+            id,
+            name: names.display(),
+            active: active == Some(id),
+            icon: names.icon.clone(),
+        })
+        .collect();
     list.sort_by_key(|device| device.id);
     list
 }
@@ -283,6 +308,16 @@ pub(super) fn device_display_name(props: &impl PropsLookup) -> Option<String> {
         .or_else(|| props.get_prop(*keys::NODE_NICK))
         .or_else(|| props.get_prop(*keys::NODE_NAME))
         .map(str::to_string)
+}
+
+/// Everything [`DeviceNames`] holds, off one device node's `global` props, or `None` for a node
+/// with no `node.name`, which nothing here could route to or write.
+pub(super) fn device_names(props: &impl PropsLookup) -> Option<DeviceNames> {
+    Some(DeviceNames {
+        node_name: props.get_prop(*keys::NODE_NAME)?.to_string(),
+        description: device_display_name(props),
+        icon: props.get_prop(*keys::DEVICE_ICON_NAME).map(str::to_string),
+    })
 }
 
 /// One `Video/Source` node PipeWire has advertised, resolved just enough for `oblisk.privacy`'s
@@ -374,6 +409,9 @@ pub enum AudioCommand {
     ToggleMasterMute,
     SetDefaultSink(u32),
     SetDefaultSource(u32),
+    SetSourceVolume(f32),
+    SetSourceMuted(bool),
+    ToggleSourceMute,
     SetAppVolume { id: u32, volume: f32 },
     SetAppMuted { id: u32, muted: bool },
 }
@@ -392,17 +430,19 @@ pub(super) struct MixerState {
     pub(super) updates: UnboundedSender<AudioState>,
     pub(super) video_updates: UnboundedSender<Vec<VideoSourceApp>>,
     /// `Audio/Sink` node id -> everything tracked about that sink (`info` isn't needed here the
-    /// way it is for stream nodes; see `registry::bind_sink`).
-    pub(super) sinks: HashMap<u32, SinkEntry>,
+    /// way it is for stream nodes; see `registry::bind_device_node`).
+    pub(super) sinks: HashMap<u32, DeviceEntry>,
     /// Bound sink proxies and their `param` listeners, kept alive like `nodes` keeps
     /// stream/video-source proxies. Separate from `sinks` so that struct stays plain test data.
     pub(super) sink_nodes: HashMap<u32, (pw::node::Node, pw::node::NodeListener)>,
-    /// `Audio/Source` node id -> its two names. No proxy or listener: § 2.4's source object
-    /// needs nothing a `global` event doesn't already carry (see `registry::AUDIO_SOURCE`).
-    pub(super) sources: HashMap<u32, DeviceNames>,
+    /// `Audio/Source` node id -> the same entry a sink gets, on the same terms: § 2.4's
+    /// `source_volume`/`source_muted` live on the source's `Props` param exactly as the master's
+    /// do on the sink's.
+    pub(super) sources: HashMap<u32, DeviceEntry>,
+    pub(super) source_nodes: HashMap<u32, (pw::node::Node, pw::node::NodeListener)>,
     /// Bound ALSA `Device` proxies and their `param` listeners. Bound only for the write path:
     /// a hardware sink's volume lives on its device's `Route` param, not on the node, so without
-    /// these a `set_volume` is accepted and silently discarded (see `write::write_master`).
+    /// these a `set_volume` is accepted and silently discarded (see `write::write_device_volume`).
     pub(super) devices: HashMap<u32, (pw::device::Device, pw::device::DeviceListener)>,
     /// `(device global id, card.profile.device)` -> the `Route` index currently active for it.
     /// A write needs the index, and only the device's own `Route` param reports it.
@@ -422,6 +462,30 @@ pub(super) struct MixerState {
 }
 
 impl MixerState {
+    /// The entry map for one direction, so the code binding a device node and the code writing
+    /// its volume are each written once and told which side they are on.
+    pub(super) fn device_entries_mut(&mut self, kind: DefaultDevice) -> &mut HashMap<u32, DeviceEntry> {
+        match kind {
+            DefaultDevice::Sink => &mut self.sinks,
+            DefaultDevice::Source => &mut self.sources,
+        }
+    }
+
+    pub(super) fn device_entries(&self, kind: DefaultDevice) -> &HashMap<u32, DeviceEntry> {
+        match kind {
+            DefaultDevice::Sink => &self.sinks,
+            DefaultDevice::Source => &self.sources,
+        }
+    }
+
+    /// The `node.name` the `default` metadata currently names for one direction.
+    pub(super) fn default_name(&self, kind: DefaultDevice) -> Option<&str> {
+        match kind {
+            DefaultDevice::Sink => self.default_sink_name.as_deref(),
+            DefaultDevice::Source => self.default_source_name.as_deref(),
+        }
+    }
+
     /// A dropped receiver means nothing is draining yet, or the process is mid-shutdown: not a
     /// reason to stop tracking streams.
     pub(super) fn publish_audio(&self) {
@@ -429,6 +493,11 @@ impl MixerState {
             self.default_sink_name.as_deref(),
             self.sinks.iter().map(|(&id, sink)| (id, sink.names.node_name.as_str())),
             |id| self.sinks.get(&id).and_then(|sink| sink.props.clone()),
+        );
+        let source = master::compute_master(
+            self.default_source_name.as_deref(),
+            self.sources.iter().map(|(&id, source)| (id, source.names.node_name.as_str())),
+            |id| self.sources.get(&id).and_then(|source| source.props.clone()),
         );
         // Applied here, not inside AudioApps: identity and volume arrive on two different
         // PipeWire events (info, param) with no ordering, so folding volume in at info time
@@ -445,12 +514,14 @@ impl MixerState {
         let state = AudioState {
             volume: master.volume,
             muted: master.muted,
+            source_volume: source.volume,
+            source_muted: source.muted,
             sinks: device_list(
                 self.sinks.iter().map(|(&id, sink)| (id, &sink.names)),
                 self.default_sink_name.as_deref(),
             ),
             sources: device_list(
-                self.sources.iter().map(|(&id, names)| (id, names)),
+                self.sources.iter().map(|(&id, source)| (id, &source.names)),
                 self.default_source_name.as_deref(),
             ),
             apps,
@@ -808,23 +879,50 @@ mod tests {
         assert_eq!(device_display_name(&props), None);
     }
 
-    /// One tracked sink, from the three things a test ever cares to vary about it.
-    fn sink_at(node_name: &str, description: Option<&str>, props: Option<master::RawSinkProps>) -> SinkEntry {
-        SinkEntry {
-            names: DeviceNames { node_name: node_name.to_string(), description: description.map(str::to_string) },
+    /// One tracked sink or source, from the three things a test ever cares to vary about it.
+    fn sink_at(node_name: &str, description: Option<&str>, props: Option<master::RawSinkProps>) -> DeviceEntry {
+        DeviceEntry {
+            names: DeviceNames {
+                node_name: node_name.to_string(),
+                description: description.map(str::to_string),
+                icon: None,
+            },
             props,
             route: None,
         }
     }
 
-    /// `id -> DeviceNames` the way `MixerState` holds it, from pairs a test can read at a glance.
+    /// `id -> DeviceNames` the way `device_list` reads it, from pairs a test can read at a glance.
     fn tracked(entries: &[(u32, &str, Option<&str>)]) -> HashMap<u32, DeviceNames> {
         entries
             .iter()
             .map(|(id, node_name, description)| {
-                (*id, DeviceNames { node_name: node_name.to_string(), description: description.map(str::to_string) })
+                (
+                    *id,
+                    DeviceNames {
+                        node_name: node_name.to_string(),
+                        description: description.map(str::to_string),
+                        icon: None,
+                    },
+                )
             })
             .collect()
+    }
+
+    #[test]
+    fn device_names_reads_the_icon_hint_beside_the_two_names_and_needs_only_the_node_name() {
+        let props = HashMap::from([
+            ("node.name".to_string(), "alsa_input.pci-0000_00_1f.3.analog-stereo".to_string()),
+            ("node.description".to_string(), "Built-in Audio Analog Stereo".to_string()),
+            ("device.icon-name".to_string(), "audio-card-analog".to_string()),
+        ]);
+        let names = device_names(&props).expect("a node with a name is trackable");
+        assert_eq!(names.description.as_deref(), Some("Built-in Audio Analog Stereo"));
+        assert_eq!(names.icon.as_deref(), Some("audio-card-analog"));
+
+        let bare = HashMap::from([("node.name".to_string(), "null-sink".to_string())]);
+        assert_eq!(device_names(&bare).map(|names| names.icon), Some(None), "no icon is an answer, not a failure");
+        assert!(device_names(&HashMap::new()).is_none());
     }
 
     #[test]
@@ -839,8 +937,8 @@ mod tests {
         assert_eq!(
             devices,
             vec![
-                AudioDevice { id: 59, name: "Built-in Audio Analog Stereo".to_string(), active: false },
-                AudioDevice { id: 70, name: "WH-1000XM4".to_string(), active: true },
+                AudioDevice { id: 59, name: "Built-in Audio Analog Stereo".to_string(), active: false, icon: None },
+                AudioDevice { id: 70, name: "WH-1000XM4".to_string(), active: true, icon: None },
             ]
         );
     }
@@ -851,7 +949,10 @@ mod tests {
 
         let devices = device_list(names.iter().map(|(&id, names)| (id, names)), None);
 
-        assert_eq!(devices, vec![AudioDevice { id: 59, name: "alsa_output.analog".to_string(), active: true }]);
+        assert_eq!(
+            devices,
+            vec![AudioDevice { id: 59, name: "alsa_output.analog".to_string(), active: true, icon: None }]
+        );
     }
 
     #[test]
@@ -870,8 +971,20 @@ mod tests {
         let state = AudioState {
             volume: 0.5,
             muted: false,
-            sinks: vec![AudioDevice { id: 59, name: "Built-in Audio Analog Stereo".to_string(), active: true }],
-            sources: vec![AudioDevice { id: 60, name: "Built-in Audio Analog Stereo".to_string(), active: true }],
+            source_volume: 0.25,
+            source_muted: true,
+            sinks: vec![AudioDevice {
+                id: 59,
+                name: "Built-in Audio Analog Stereo".to_string(),
+                active: true,
+                icon: Some("audio-card-analog".to_string()),
+            }],
+            sources: vec![AudioDevice {
+                id: 60,
+                name: "Built-in Audio Analog Stereo".to_string(),
+                active: true,
+                icon: None,
+            }],
             apps: vec![stream.clone()],
         };
         let json = serde_json::to_value(&state).unwrap();
@@ -880,7 +993,9 @@ mod tests {
             serde_json::json!({
                 "volume": 0.5,
                 "muted": false,
-                "sinks": [{ "id": 59, "name": "Built-in Audio Analog Stereo", "active": true }],
+                "source_volume": 0.25,
+                "source_muted": true,
+                "sinks": [{ "id": 59, "name": "Built-in Audio Analog Stereo", "active": true, "icon": "audio-card-analog" }],
                 "sources": [{ "id": 60, "name": "Built-in Audio Analog Stereo", "active": true }],
                 "apps": [{
                     "id": stream.id,
@@ -921,6 +1036,7 @@ mod tests {
             sinks: HashMap::new(),
             sink_nodes: HashMap::new(),
             sources: HashMap::new(),
+            source_nodes: HashMap::new(),
             devices: HashMap::new(),
             device_routes: HashMap::new(),
             app_props: HashMap::new(),
@@ -1007,7 +1123,8 @@ mod tests {
             (70, sink_at("bluez_output.headset", Some("WH-1000XM4"), None)),
         ]);
         state.default_sink_name = Some("bluez_output.headset".to_string());
-        state.sources = tracked(&[(60, "alsa_input.analog", Some("Built-in Microphone"))]);
+        state.sources =
+            HashMap::from([(60, sink_at("alsa_input.analog", Some("Built-in Microphone"), Some(props_at(0.6, true))))]);
         state.default_source_name = Some("alsa_input.analog".to_string());
 
         state.publish_audio();
@@ -1017,7 +1134,10 @@ mod tests {
         assert_eq!(published.sinks[1].name, "WH-1000XM4");
         assert_eq!(
             published.sources,
-            vec![AudioDevice { id: 60, name: "Built-in Microphone".to_string(), active: true }]
+            vec![AudioDevice { id: 60, name: "Built-in Microphone".to_string(), active: true, icon: None }]
         );
+        // The source's own Props, through the same cube root the master takes.
+        assert!((published.source_volume - 0.6).abs() < 1e-6, "expected ~0.6, got {}", published.source_volume);
+        assert!(published.source_muted);
     }
 }

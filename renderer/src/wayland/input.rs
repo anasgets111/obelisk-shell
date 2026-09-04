@@ -1,4 +1,4 @@
-//! Pointer input (`on_click`, ADR-0050) and keyboard focus, including `secure_submit` accumulation:
+//! Pointer input (`on_click`, ADR-0050; `on_drag`/`on_wheel`, ADR-0116) and keyboard focus, including `secure_submit` accumulation:
 //! keystrokes become a `SecureSubmit` frame with no Lua value ever holding the plaintext
 //! (ADR-0005/ADR-0027). `SeatHandler`, `PointerHandler` and `KeyboardHandler` live here, beside the
 //! pure helpers they call: which button armed a click, which `textfield` a press or `enter`
@@ -24,6 +24,15 @@ fn wheel_delta(pixels: f64, steps: i32) -> f32 {
         return pixels as f32;
     }
     steps as f32 / 120.0 * WHEEL_STEP_PIXELS
+}
+
+/// What `on_wheel` is handed for one wheel event (ADR-0116 decision 2): notches, positive away
+/// from the user, which is the direction every volume and brightness control reads as "more". The
+/// same [`wheel_delta`] a scroll takes, divided back into steps and negated, since Wayland's axis
+/// values are positive towards the user. A touchpad's pixels become fractions of a notch, so a
+/// slider under a two-finger swipe moves smoothly instead of in jumps.
+fn wheel_steps(pixels: f64, steps: i32) -> f32 {
+    -wheel_delta(pixels, steps) / WHEEL_STEP_PIXELS
 }
 
 /// One press waiting for its release (ADR-0050 decision 2): a click is a press and a release on the
@@ -85,6 +94,42 @@ fn clickable_button<'a>(path: &[&'a layout::ResolvedNode]) -> Option<(LogicalRec
         Some((layout::hit::absolute_rect(&path[..=depth])?, on_click, submit))
     })
 }
+/// The innermost `button` on the path carrying a callable `on_drag` (ADR-0116 decision 1), on
+/// [`clickable_button`]'s terms: a button without one is transparent, so a drag handle inside a
+/// draggable track still lets the track take the drag.
+fn draggable_button<'a>(path: &[&'a layout::ResolvedNode]) -> Option<(LogicalRect, &'a Function)> {
+    path.iter().enumerate().rev().find_map(|(depth, node)| {
+        if node.kind != "button" {
+            return None;
+        }
+        let Some(Value::Function(on_drag)) = node.properties.get("on_drag") else {
+            return None;
+        };
+        Some((layout::hit::absolute_rect(&path[..=depth])?, on_drag))
+    })
+}
+/// The innermost `button` on the path carrying a callable `on_wheel` (ADR-0116 decision 2).
+fn wheel_button<'a>(path: &[&'a layout::ResolvedNode]) -> Option<(usize, LogicalRect, &'a Function)> {
+    path.iter().enumerate().rev().find_map(|(depth, node)| {
+        if node.kind != "button" {
+            return None;
+        }
+        let Some(Value::Function(on_wheel)) = node.properties.get("on_wheel") else {
+            return None;
+        };
+        Some((depth, layout::hit::absolute_rect(&path[..=depth])?, on_wheel))
+    })
+}
+/// A left press that landed on a `button` with `on_drag`, held until its release (ADR-0116
+/// decision 1). Every `Motion` while this is set calls the handler, wherever the pointer has gone:
+/// a slider dragged past its end stays pinned at the end, which is what a config clamping the
+/// local coordinate gives, and what a drag that stopped reporting at the edge would not.
+#[derive(Clone)]
+pub(super) struct ActiveDrag {
+    instance_id: String,
+    rect: LogicalRect,
+    handler: Function,
+}
 /// What a press or release lands on: the handler to call, the node's rect (the click's identity,
 /// see [`ArmedClick`]), and for a link the `href` the handler takes instead of the rect.
 #[derive(Clone)]
@@ -135,6 +180,8 @@ fn clickable(
 struct PointerHit {
     button: Option<Clickable>,
     field: Option<FieldTarget>,
+    /// The `on_drag` button under the press, if any, with its rect (ADR-0116 decision 1).
+    drag: Option<(LogicalRect, Function)>,
 }
 /// What the innermost `textfield` under a press turns out to be (ADR-0092). The two kinds share
 /// the node kind and nothing else: one addresses a capability action and never lets its bytes near
@@ -493,6 +540,24 @@ fn call_on_click(
 ) -> Result<(), (&'static str, mlua::Error)> {
     let argument = rect_table(lua, rect).map_err(|e| ("could not build on_click's rect argument", e))?;
     on_click.call::<()>((argument, button)).map_err(|e| ("on_click raised, ignoring it", e))
+}
+/// Calls one `on_drag` with the button's rect, the pointer in the button's own coordinates, and
+/// which edge of the gesture this is (ADR-0116 decision 1). Local rather than surface coordinates
+/// because every drag handler divides by the rect's width or height, and the subtraction is the
+/// step every one of them would otherwise write. Unclamped: a pointer past the end reads as a
+/// negative or over-wide coordinate, and the config's own `min`/`max` is the clamp.
+fn call_on_drag(
+    lua: &Lua,
+    on_drag: &Function,
+    rect: LogicalRect,
+    position: (f64, f64),
+    phase: &str,
+) -> Result<(), (&'static str, mlua::Error)> {
+    let rect_argument = rect_table(lua, rect).map_err(|e| ("could not build on_drag's rect argument", e))?;
+    let pointer = lua.create_table().map_err(|e| ("could not build on_drag's pointer argument", e))?;
+    pointer.set("x", position.0 as f32 - rect.x).map_err(|e| ("could not build on_drag's pointer argument", e))?;
+    pointer.set("y", position.1 as f32 - rect.y).map_err(|e| ("could not build on_drag's pointer argument", e))?;
+    on_drag.call::<()>((rect_argument, pointer, phase)).map_err(|e| ("on_drag raised, ignoring it", e))
 }
 /// `on_click`'s first argument: the button's rect as `{ x, y, width, height }` in its surface's
 /// logical coordinates (ADR-0050 decision 3).
@@ -972,22 +1037,43 @@ impl App {
     /// both the `Function` and the target are cloned out before the local tree is dropped.
     fn hit_under(&self, index: usize, position: (f64, f64)) -> PointerHit {
         let Some(tree) = self.client.scene().surface(&self.surfaces[index].surface_id) else {
-            return PointerHit { button: None, field: None };
+            return PointerHit { button: None, field: None, drag: None };
         };
         let point = layout::hit::LogicalPoint { x: position.0 as f32, y: position.1 as f32 };
         let path = layout::hit::hit_path(&tree, point);
-        PointerHit { button: clickable(&path, point, &self.shaping), field: focused_field(&path) }
+        PointerHit {
+            button: clickable(&path, point, &self.shaping),
+            field: focused_field(&path),
+            drag: draggable_button(&path).map(|(rect, handler)| (rect, handler.clone())),
+        }
     }
 
-    /// One notch or one swipe, applied to the innermost scrollable container under the pointer.
-    /// **Pixels when sent, a step otherwise** (ADR-0069 decision 6): a touchpad reports `absolute`
-    /// in logical pixels, a notched wheel only `value120` (120 per logical step); `discrete` is
-    /// ignored as deprecated, since every compositor still sending it sends `value120` too.
-    /// **Innermost wins and nothing chains**: a wheel over a list inside a scrollable panel moves
-    /// the list and moves nothing once it hits its end, unlike a browser's chaining to the parent,
-    /// a rule with edge cases no config here has asked for. The offset written is unclamped:
-    /// `layout::scene`'s positioning pass owns the bound, the only place that knows the content
-    /// extent, and writes back what it used.
+    /// One edge or step of the held drag, if there is one on `instance_id` (ADR-0116 decision 1).
+    /// `end` also drops it, before the call, so a handler that re-enters here finds nothing held.
+    /// Raises are logged and swallowed on [`Self::fire_on_click`]'s terms.
+    fn fire_on_drag(&mut self, instance_id: &str, position: (f64, f64), phase: &str) {
+        let Some(drag) = self.drag.as_ref().filter(|drag| drag.instance_id == instance_id).cloned() else {
+            return;
+        };
+        if phase == "end" {
+            self.drag = None;
+        }
+        if let Err((what, e)) = call_on_drag(self.client.lua(), &drag.handler, drag.rect, position, phase) {
+            eprintln!("[oblisk-renderer] {instance_id}: {what}: {e}");
+        }
+    }
+
+    /// One notch or one swipe, applied to the innermost scrollable container or `on_wheel` button
+    /// under the pointer, whichever is deeper (ADR-0116 decision 2). **Pixels when sent, a step
+    /// otherwise** (ADR-0069 decision 6): a touchpad reports `absolute` in logical pixels, a
+    /// notched wheel only `value120` (120 per logical step); `discrete` is ignored as deprecated,
+    /// since every compositor still sending it sends `value120` too. **Innermost wins and nothing
+    /// chains**: a wheel over a list inside a scrollable panel moves the list and moves nothing
+    /// once it hits its end, unlike a browser's chaining to the parent, a rule with edge cases no
+    /// config here has asked for. The offset written is unclamped: `layout::scene`'s positioning
+    /// pass owns the bound, the only place that knows the content extent, and writes back what it
+    /// used. A button's `on_wheel` takes the vertical axis only: a wheel has one, and a slider
+    /// under a two-finger swipe wants the swipe's up-and-down, not its drift.
     fn scroll_at(
         &mut self,
         index: usize,
@@ -997,21 +1083,39 @@ impl App {
         vertical_px: f64,
         vertical_steps: i32,
     ) {
-        if !crate::lua::signal::any_scroll_registered(self.client.lua()) {
-            return;
-        }
-        let surface_id = &self.surfaces[index].surface_id;
-        let Some(tree) = self.client.scene().surface(surface_id) else {
+        let surface_id = self.surfaces[index].surface_id.clone();
+        let Some(tree) = self.client.scene().surface(&surface_id) else {
             return;
         };
         let point = layout::hit::LogicalPoint { x: position.0 as f32, y: position.1 as f32 };
         let path = layout::hit::hit_path(&tree, point);
         // Innermost first, so the deepest scrollable container under the pointer takes it.
-        let Some((signal, axis)) = path.iter().rev().find_map(|node| {
+        let scrollable = path.iter().enumerate().rev().find_map(|(depth, node)| {
             let signal = layout::scene::scroll_signal_of(node)?;
             let axis = layout::scene::scrolling_axis(&node.kind, &node.properties).ok()??;
-            Some((signal, axis))
-        }) else {
+            Some((depth, signal, axis))
+        });
+        let wheel = wheel_button(&path);
+        if let Some((depth, rect, on_wheel)) = wheel
+            && scrollable.as_ref().is_none_or(|(scroll_depth, ..)| depth > *scroll_depth)
+        {
+            let steps = wheel_steps(vertical_px, vertical_steps);
+            if steps == 0.0 {
+                return;
+            }
+            let on_wheel = on_wheel.clone();
+            drop(path);
+            match rect_table(self.client.lua(), rect) {
+                Ok(rect) => {
+                    if let Err(e) = on_wheel.call::<()>((rect, steps)) {
+                        eprintln!("[oblisk-renderer] {surface_id}: on_wheel raised, ignoring it: {e}");
+                    }
+                }
+                Err(e) => eprintln!("[oblisk-renderer] {surface_id}: could not build on_wheel's rect argument: {e}"),
+            }
+            return;
+        }
+        let Some((_, signal, axis)) = scrollable else {
             return;
         };
         let (pixels, steps) = match axis {
@@ -1351,11 +1455,23 @@ impl PointerHandler for App {
                     // The notification card is the case: its whole surface activates the sender's
                     // default action, and its reply box sits inside that.
                     self.armed = hit.button.filter(|_| !pressed_a_field).map(|clickable| ArmedClick {
-                        instance_id,
+                        instance_id: instance_id.clone(),
                         rect: clickable.rect,
                         link: clickable.link,
                         button,
                     });
+                    // A left press on an `on_drag` button holds the drag until its release
+                    // (ADR-0116 decision 1). Left only: a drag is one gesture and carries no
+                    // button name, and the other two buttons stay free for a click on the same
+                    // control. A press into a field drags nothing, for the reason it clicks
+                    // nothing.
+                    if button == BTN_LEFT
+                        && !pressed_a_field
+                        && let Some((rect, handler)) = hit.drag
+                    {
+                        self.drag = Some(ActiveDrag { instance_id: instance_id.clone(), rect, handler });
+                        self.fire_on_drag(&instance_id, event.position, "start");
+                    }
                 }
                 PointerEventKind::Release { button, serial, .. } => {
                     let Some(name) = pointer_button_name(button) else {
@@ -1369,6 +1485,11 @@ impl PointerHandler for App {
                     self.pointer_input_count += 1;
                     // Focus is untouched here. The press already decided it, and a release that
                     // drags off a `textfield` must not un-focus the field the user is typing into.
+                    // The drag ends before the click fires, so a control with both sees its value
+                    // committed before its click handler runs.
+                    if button == BTN_LEFT {
+                        self.fire_on_drag(&instance_id, event.position, "end");
+                    }
                     let hit = self.hit_under(index, event.position).button;
                     let fires = release_completes_click(
                         self.armed.as_ref(),
@@ -1407,6 +1528,12 @@ impl PointerHandler for App {
                 // position turns every hover in this surface off (ADR-0062): no `Motion` will
                 // arrive to say the pointer has gone, so a tooltip left open here stays open.
                 PointerEventKind::Leave { .. } => {
+                    // A held drag ends where the pointer last was: no release will reach this
+                    // surface, and a slider left mid-drag would otherwise never commit.
+                    if let Some((_, position)) = self.pointer_at.clone() {
+                        let instance_id = self.surfaces[index].surface_id.clone();
+                        self.fire_on_drag(&instance_id, position, "end");
+                    }
                     self.armed = None;
                     self.cursor_shown = None;
                     self.pointer_at = None;
@@ -1423,7 +1550,11 @@ impl PointerHandler for App {
                 // moving sends a `Motion` a few milliseconds later, and that one fires.
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
                     let moved = matches!(event.kind, PointerEventKind::Motion { .. });
-                    self.pointer_at = Some((self.surfaces[index].surface_id.clone(), event.position));
+                    let instance_id = self.surfaces[index].surface_id.clone();
+                    self.pointer_at = Some((instance_id.clone(), event.position));
+                    if moved {
+                        self.fire_on_drag(&instance_id, event.position, "move");
+                    }
                     self.sync_hover(index, Some(event.position), moved);
                     self.sync_cursor(index, event.position);
                 }
@@ -1613,6 +1744,53 @@ mod tests {
     #[test]
     fn a_step_count_is_ignored_when_a_distance_came_with_it() {
         assert_eq!(wheel_delta(17.5, 120), 17.5);
+    }
+
+    #[test]
+    fn wheel_steps_are_notches_positive_away_from_the_user() {
+        assert_eq!(wheel_steps(0.0, -120), 1.0, "one notch up is +1");
+        assert_eq!(wheel_steps(0.0, 240), -2.0, "two notches down are -2");
+        assert_eq!(wheel_steps(-WHEEL_STEP_PIXELS as f64 / 2.0, 0), 0.5, "a touchpad swipe is a fraction of a notch");
+        assert_eq!(wheel_steps(0.0, 0), 0.0);
+    }
+
+    #[test]
+    fn the_innermost_on_drag_button_is_the_one_that_takes_the_drag_and_a_bare_button_is_transparent() {
+        let lua = Lua::new();
+        let inner = hit_node(&lua, "button", (5.0, 2.0, 20.0, 20.0), true);
+        let mut track = hit_node(&lua, "button", (10.0, 4.0, 40.0, 24.0), false);
+        track.properties.insert("on_drag".to_string(), Value::Function(lua.create_function(|_, ()| Ok(())).unwrap()));
+        track.children.push(inner);
+        let mut root = hit_node(&lua, "panel", (0.0, 0.0, 100.0, 32.0), false);
+        root.children.push(track);
+
+        let path = layout::hit::hit_path(&root, layout::hit::LogicalPoint { x: 20.0, y: 12.0 });
+        let (rect, _) = draggable_button(&path).expect("the track carries the on_drag");
+        assert_eq!(rect, LogicalRect { x: 10.0, y: 4.0, width: 40.0, height: 24.0 });
+        assert!(wheel_button(&path).is_none(), "nothing on this path declares on_wheel");
+    }
+
+    #[test]
+    fn on_drag_is_handed_the_pointer_in_the_buttons_own_coordinates() {
+        let lua = Lua::new();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = std::rc::Rc::clone(&seen);
+        let handler = lua
+            .create_function(move |_, (rect, pointer, phase): (Table, Table, String)| {
+                sink.borrow_mut().push((
+                    rect.get::<f32>("width").unwrap(),
+                    pointer.get::<f32>("x").unwrap(),
+                    pointer.get::<f32>("y").unwrap(),
+                    phase,
+                ));
+                Ok(())
+            })
+            .unwrap();
+        let rect = LogicalRect { x: 10.0, y: 4.0, width: 40.0, height: 24.0 };
+        call_on_drag(&lua, &handler, rect, (30.0, 10.0), "start").unwrap();
+        // Past the right edge: unclamped, so the config's own clamp is what pins the slider.
+        call_on_drag(&lua, &handler, rect, (60.0, 10.0), "end").unwrap();
+        assert_eq!(*seen.borrow(), vec![(40.0, 20.0, 6.0, "start".to_string()), (40.0, 50.0, 6.0, "end".to_string())]);
     }
 
     #[test]

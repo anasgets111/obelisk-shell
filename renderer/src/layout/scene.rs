@@ -1543,9 +1543,9 @@ fn elide_cut(
 /// the only place a Wayland object exists to push to.
 ///
 /// A visible node claims its whole box when it is *solid*: it paints something (a box with a
-/// background or a border, or any text, icon, image or field), or it is a `button` with an
-/// `on_click`, which is invisible by design and still has to be pressable (the panel host's
-/// click-outside catcher). A transparent container claims nothing of its own and is walked into,
+/// background or a border, or any text, icon, image or field), or it is a `button` with a pointer
+/// handler (`on_click`, `on_drag`, `on_wheel`), which is invisible by design and still has to be
+/// pressable (the panel host's click-outside catcher). A transparent container claims nothing of its own and is walked into,
 /// so a full-surface `column` holding two cards yields the two cards. Everything not claimed is
 /// click-through, and under focus-follows-mouse it is also focus-through: this is why the popup's
 /// empty space below its cards no longer takes the keyboard.
@@ -1585,7 +1585,11 @@ fn takes_input_as_a_box(node: &ResolvedNode) -> bool {
         Some(_) => true,
         None => false,
     };
-    paints || (node.kind == "button" && matches!(node.properties.get("on_click"), Some(Value::Function(_))))
+    paints
+        || (node.kind == "button"
+            && ["on_click", "on_drag", "on_wheel"]
+                .iter()
+                .any(|handler| matches!(node.properties.get(*handler), Some(Value::Function(_)))))
 }
 
 #[cfg(test)]

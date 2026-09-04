@@ -19,9 +19,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::capabilities::audio::master;
 
 use super::state::{
-    AudioApps, AudioCommand, AudioState, DEFAULT_AUDIO_SINK_KEY, DEFAULT_AUDIO_SOURCE_KEY, DefaultDevice, DeviceNames,
-    MixerState, NodeKind, PropsLookup, SinkEntry, SinkRoute, VideoSourceApp, VideoSourceApps, apply_info_event,
-    apply_video_info_event, classify, device_display_name,
+    AudioApps, AudioCommand, AudioState, DEFAULT_AUDIO_SINK_KEY, DEFAULT_AUDIO_SOURCE_KEY, DefaultDevice, DeviceEntry,
+    DeviceRoute, MixerState, NodeKind, PropsLookup, VideoSourceApp, VideoSourceApps, apply_info_event,
+    apply_video_info_event, classify, device_names,
 };
 use super::write::apply_command;
 
@@ -80,6 +80,7 @@ fn run_inner(
         sinks: HashMap::new(),
         sink_nodes: HashMap::new(),
         sources: HashMap::new(),
+        source_nodes: HashMap::new(),
         devices: HashMap::new(),
         device_routes: HashMap::new(),
         app_props: HashMap::new(),
@@ -108,6 +109,7 @@ fn run_inner(
             state.sinks.remove(&id);
             state.sink_nodes.remove(&id);
             state.sources.remove(&id);
+            state.source_nodes.remove(&id);
             state.app_props.remove(&id);
             if state.devices.remove(&id).is_some() {
                 // A removed device takes every route index it published with it, keyed by its
@@ -143,7 +145,7 @@ fn run_inner(
 }
 
 /// Handles one registry `global` event: routes `Node` globals to [`on_node_global`] (audio
-/// stream, video source, or `Audio/Sink`; see [`classify`], [`bind_sink`]) and the `default`
+/// stream, video source, or `Audio/Sink`; see [`classify`], [`bind_device_node`]) and the `default`
 /// `Metadata` global to [`bind_default_metadata`] (§ 2.4's routing); everything else is ignored.
 fn on_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryRc, obj: &GlobalObject<&DictRef>) {
     match obj.type_ {
@@ -158,10 +160,9 @@ fn on_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryR
 /// not on any `Stream/Output/Audio` node); verified against real `pw-dump` output (see [`master`]).
 const AUDIO_SINK: &str = "Audio/Sink";
 
-/// `media.class` value an input capture device node carries (§ 2.4's `sources`). Unlike
-/// [`AUDIO_SINK`], a source is never bound: its `id`/`name`/`active` are answerable straight from
-/// the `global` event's own props plus the default-source metadata key. No monitor filter is
-/// applied, deliberately: PulseAudio synthesizes a `.monitor` source per sink, but native
+/// `media.class` value an input capture device node carries (§ 2.4's `sources`, and
+/// `source_volume`/`source_muted`, which is why a source is bound exactly as a sink is). No monitor
+/// filter is applied, deliberately: PulseAudio synthesizes a `.monitor` source per sink, but native
 /// PipeWire does not, and `pw-dump` here lists exactly one `Audio/Source` beside one `Audio/Sink`.
 const AUDIO_SOURCE: &str = "Audio/Source";
 
@@ -171,19 +172,16 @@ const AUDIO_SOURCE: &str = "Audio/Source";
 const METADATA_NAME: &str = "metadata.name";
 
 /// Handles one `Node` `global` event: classifies it by `media.class` (audio stream, video
-/// source, `Audio/Sink`, or neither; see [`classify`]). `Audio/Sink` goes to [`bind_sink`]
+/// source, `Audio/Sink`, or neither; see [`classify`]). `Audio/Sink` goes to [`bind_device_node`]
 /// instead of [`classify`]'s [`NodeKind`], since a sink needs a `param` listener (§ 2.4's master
 /// volume), not the `info` listener every [`NodeKind`] variant uses. The stream/video-source path
 /// binds the node so its `info` event, gated to props-change calls, extracts the pid;
 /// `application.process.id` can still be missing at `global` time and arrive later instead.
 fn on_node_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryRc, obj: &GlobalObject<&DictRef>) {
-    if obj.props.and_then(|props| props.get_prop(*keys::MEDIA_CLASS)) == Some(AUDIO_SINK) {
-        bind_sink(state, registry, obj);
-        return;
-    }
-    if obj.props.and_then(|props| props.get_prop(*keys::MEDIA_CLASS)) == Some(AUDIO_SOURCE) {
-        track_source(state, obj);
-        return;
+    match obj.props.and_then(|props| props.get_prop(*keys::MEDIA_CLASS)) {
+        Some(AUDIO_SINK) => return bind_device_node(state, registry, obj, DefaultDevice::Sink),
+        Some(AUDIO_SOURCE) => return bind_device_node(state, registry, obj, DefaultDevice::Source),
+        _ => {}
     }
     let Some(kind) = obj.props.and_then(classify) else {
         return;
@@ -212,7 +210,7 @@ fn on_node_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Regi
                 }
             }
         })
-        // § 2.4's per-app volume/muted: the same pod, parse, and cube root bind_sink runs for the
+        // § 2.4's per-app volume/muted: the same pod, parse, and cube root bind_device_node runs for the
         // master sink, on a node that's a stream (verified live: it carries channelVolumes and
         // mute like a sink). A video source has no Props param worth reading, so this never fires.
         .param(move |_seq, param_type, _index, _next, param| {
@@ -242,20 +240,23 @@ fn on_node_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Regi
     state.borrow_mut().nodes.insert(node_id, (node, listener));
 }
 
-/// Binds an `Audio/Sink` node (§ 2.4's master volume) and subscribes to its `Props` param,
-/// where PipeWire keeps volume/mute, not the `info` props dict the stream/video-source path reads
-/// (see [`master`]). `node.name` is read once from the `global` event's own props: checked live,
-/// it's present from the sink's very first `global` event, unlike a stream's
-/// `application.process.id`, so no `info` listener is needed, only `param`.
+/// Binds an `Audio/Sink` or `Audio/Source` node (§ 2.4's master and source volume) and subscribes
+/// to its `Props` param, where PipeWire keeps volume/mute, not the `info` props dict the
+/// stream/video-source path reads (see [`master`]). `node.name` is read once from the `global`
+/// event's own props: checked live, it's present from the node's very first `global` event, unlike
+/// a stream's `application.process.id`.
 ///
 /// The `param` callback relies on [`master::extract_sink_props`] returning `None` for a
 /// non-mixer `Props` event: a sink delivers two separate `Props` objects per change (mixer, then
 /// unrelated ALSA settings), and writing the second's absence as zero was a real shipped bug.
-fn bind_sink(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryRc, obj: &GlobalObject<&DictRef>) {
+fn bind_device_node(
+    state: &Rc<RefCell<MixerState>>,
+    registry: &pw::registry::RegistryRc,
+    obj: &GlobalObject<&DictRef>,
+    kind: DefaultDevice,
+) {
     let node_id = obj.id;
-    let Some(props) = obj.props else { return };
-    let Some(node_name) = props.get_prop(*keys::NODE_NAME) else { return };
-    let names = DeviceNames { node_name: node_name.to_string(), description: device_display_name(props) };
+    let Some(names) = obj.props.and_then(device_names) else { return };
 
     // Bound before anything is recorded: a sink whose bind fails never gets a Props subscription
     // or a volume, so recording its name first would let resolve_default_device pick a node
@@ -264,7 +265,7 @@ fn bind_sink(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryR
     let node: pw::node::Node = match registry.bind(obj) {
         Ok(node) => node,
         Err(err) => {
-            eprintln!("audio: failed to bind Audio/Sink node {node_id}: {err}");
+            eprintln!("audio: failed to bind {kind:?} node {node_id}: {err}");
             return;
         }
     };
@@ -285,22 +286,22 @@ fn bind_sink(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryR
                 return;
             };
             let mut state_mut = state_for_param.borrow_mut();
-            if let Some(sink) = state_mut.sinks.get_mut(&node_id) {
-                sink.props = Some(raw);
+            if let Some(entry) = state_mut.device_entries_mut(kind).get_mut(&node_id) {
+                entry.props = Some(raw);
             }
             state_mut.publish_audio();
         })
         // The route comes from info, not the global event, deliberately: global props carry
         // media.class and node.name but not device.id or card.profile.device, present only in
-        // full info props. Reading them at global time returns None, so write_master silently
+        // full info props. Reading them at global time returns None, so write_device_volume silently
         // discards the write.
         .info(move |info| {
             if !info.change_mask().contains(pw::node::NodeChangeMask::PROPS) {
                 return;
             }
-            let Some(route) = info.props().and_then(parse_sink_route) else { return };
-            if let Some(sink) = state_for_info.borrow_mut().sinks.get_mut(&node_id) {
-                sink.route = Some(route);
+            let Some(route) = info.props().and_then(parse_device_route) else { return };
+            if let Some(entry) = state_for_info.borrow_mut().device_entries_mut(kind).get_mut(&node_id) {
+                entry.route = Some(route);
             }
         })
         .register();
@@ -310,38 +311,28 @@ fn bind_sink(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryR
     node.subscribe_params(&[pw::spa::param::ParamType::Props]);
 
     let mut state_mut = state.borrow_mut();
-    state_mut.sinks.insert(node_id, SinkEntry { names, props: None, route: None });
-    state_mut.sink_nodes.insert(node_id, (node, listener));
+    state_mut.device_entries_mut(kind).insert(node_id, DeviceEntry { names, props: None, route: None });
+    match kind {
+        DefaultDevice::Sink => state_mut.sink_nodes.insert(node_id, (node, listener)),
+        DefaultDevice::Source => state_mut.source_nodes.insert(node_id, (node, listener)),
+    };
     state_mut.publish_audio();
 }
 
-/// The hardware device behind a sink, from the sink node's own `global` props. Both keys are
-/// present together or not at all (this machine's analog output carries `device.id = 49` and
-/// `card.profile.device = 7`); `None` means the volume really does live on the sink's own node.
-fn parse_sink_route(props: &impl PropsLookup) -> Option<SinkRoute> {
+/// The hardware device behind a sink or source, from the node's own props. Both keys are present
+/// together or not at all (this machine's analog output carries `device.id = 51` and
+/// `card.profile.device = 7`, its internal mic the same device and `0`); `None` means the volume
+/// really does live on the node itself.
+fn parse_device_route(props: &impl PropsLookup) -> Option<DeviceRoute> {
     let device_id = props.get_prop(*keys::DEVICE_ID)?.parse().ok()?;
     let profile_device = props.get_prop(CARD_PROFILE_DEVICE)?.parse().ok()?;
-    Some(SinkRoute { device_id, profile_device })
+    Some(DeviceRoute { device_id, profile_device })
 }
 
 /// The sink node property naming which of its device's routes it plays through. Not in
 /// `pipewire-rs`'s `keys` module, so spelled out here: read live off `pw-dump`, this machine's
 /// analog output carries `card.profile.device = 7`, matching `device: 7` on device 49's Route.
 const CARD_PROFILE_DEVICE: &str = "card.profile.device";
-
-/// Records an `Audio/Source` node's two names. No `registry.bind`, no proxy, no listener: § 2.4's
-/// source object is `id`/`name`/`active`, the first two from the `global` event and the third
-/// from `default.audio.source`. Unlike [`bind_sink`]: a sink is bound because § 2.4 needs
-/// `volume`/`muted`, found only on its `Props` param, which a source lacks.
-fn track_source(state: &Rc<RefCell<MixerState>>, obj: &GlobalObject<&DictRef>) {
-    let Some(props) = obj.props else { return };
-    let Some(node_name) = props.get_prop(*keys::NODE_NAME) else { return };
-    let mut state_mut = state.borrow_mut();
-    state_mut
-        .sources
-        .insert(obj.id, DeviceNames { node_name: node_name.to_string(), description: device_display_name(props) });
-    state_mut.publish_audio();
-}
 
 /// Binds the one `Metadata` global whose `metadata.name` is `"default"`: the object that
 /// publishes `default.audio.sink` (§ 2.4's routing), among other `default.*` keys this capability

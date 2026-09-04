@@ -74,6 +74,8 @@ Shared language for renderer generations, reloads, retained scenes, and capabili
 
 **Change handler**: A function a config registers with `oblisk.<capability>:on_change(fn)`, run once per pushed snapshot with the new payload and the one it replaced, outside any layout pass and under a `map` callback's CPU budget. The one place a config acts on a push rather than rendering it; the handler computes the edge it wants by comparing the two payloads, so the engine carries no thresholds. Cleared and re-registered by every evaluation (ADR-0115). _Avoid_: watcher, subscription, signal listener (a `map` is not one of these either), event (a push is state, not an event)
 
+**Drag**: A left press on a `button` declaring `on_drag`, held until its release or until the pointer leaves the surface. The handler is called with the pointer in the button's own coordinates on the press, on every motion while held, and once more on the release, each call labelled with its phase; the config turns the coordinate into a value and commits on the last call. A slider is a drag plus a wheel handler over a percentage-wide `rect`, not a node kind (ADR-0116). _Avoid_: gesture (implies recognition), slider node, grab (the Wayland grab is the compositor's, not this)
+
 **Frame gating**: The rule that a surface instance repaints only when the compositor has returned its frame callback and the retained scene has actually changed since the last paint. Keeps an idle shell at zero redraws rather than repainting on a timer. _Avoid_: vsync, throttling, damage (a different mechanism: which region changed, not whether to paint)
 
 ## Ownership
