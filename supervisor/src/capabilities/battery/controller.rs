@@ -197,13 +197,28 @@ async fn run_battery_task(
     state: Arc<Mutex<BatteryState>>,
     events: UnboundedSender<BatterySignal>,
 ) {
-    let device = match DisplayDeviceProxy::new(&system_bus).await {
-        Ok(proxy) => proxy,
-        Err(err) => {
-            eprintln!("battery: no UPower DisplayDevice reachable ({err}); battery will not be reported this run");
-            return;
-        }
-    };
+    // Uncached, and it has to be. zbus caches properties by default and refreshes that cache from
+    // a task of its own listening to the very `PropertiesChanged` this task waits on below. Two
+    // independent readers, one broadcast message, no ordering between them: when our stream wins
+    // the race, `read_state` reads the cache as it stood *before* the change and reports the old
+    // state. It then compares equal to `previous` and pushes nothing, so a charger plugged in
+    // still read `Discharging` until some later property moved and dragged the real state along
+    // behind it. Uncached, each read is a real `Get`: five round trips on an event that fires a
+    // few times an hour, which is the cheap side of this trade.
+    //
+    // `power::controller` needs no such thing. It wakes on `receive_*_changed`, which zbus drives
+    // off the cache entry itself, so by the time that stream yields the cache already holds the
+    // new value. That difference is why the charger OSD was instant and correct while the bar's
+    // own glyph sat a full change behind it.
+    let device =
+        match DisplayDeviceProxy::builder(&system_bus).cache_properties(zbus::proxy::CacheProperties::No).build().await
+        {
+            Ok(proxy) => proxy,
+            Err(err) => {
+                eprintln!("battery: no UPower DisplayDevice reachable ({err}); battery will not be reported this run");
+                return;
+            }
+        };
 
     // Subscribed before the first read, for `power::controller`'s reason: each subscription is
     // its own round trip, and a cable pulled during that window would land between a read and a

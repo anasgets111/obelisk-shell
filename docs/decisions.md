@@ -6356,3 +6356,64 @@ temporary `eprintln!`, and its per-window counters are the baseline for ADR-0130
 turns should rise to the frame rate while `idle` stays at zero, and any `SPIN` line means the frame
 callback is re-arming without work to do. Live-verified: the bar renders under non-blocking swap
 with a correct clock.
+
+## ADR-0133: `oblisk.battery` reads UPower uncached, because its wake-up races zbus's cache
+
+**Status**: accepted
+
+**Context**: the battery glyph showed `Discharging` with the charger physically connected, while
+`upower -i` on the same device already read `pending-charge`. It then corrected itself minutes
+later, with no cable event in between.
+
+The first explanation offered for this was hardware: EC charge qualification, the fuel gauge's ADC
+sample window, and `drivers/acpi/battery.c`'s `cache_time` (which is indeed `1000` on this machine).
+That explanation reads the Lua and the controller correctly and is wrong about the cause. It
+predicts a *slow* reading. What we had was a *stale* one, and the difference is the whole bug.
+
+`battery::controller` woke on a `zbus::fdo::PropertiesProxy` signal stream and then re-read the
+payload off `DisplayDeviceProxy`. zbus caches proxy properties by default (`CacheProperties::Lazily`
+-- see `zbus-5.19.0/src/proxy/builder.rs`), and refreshes that cache from a task of its own
+listening to the very same `PropertiesChanged`. Two independent consumers, one broadcast message,
+and no ordering between them: when our stream won the race, `read_state` read the cache as it stood
+*before* the change and returned the old state.
+
+The lost push is the part that makes it last. `run_battery_task` only pushes when
+`current != previous`, so a stale re-read compares equal and pushes *nothing*. The reading then
+stands until the next `PropertiesChanged` drags it along one change behind. On a battery parked at
+its charge limit there may not be one for minutes: a 40-second `dbus-monitor` capture of every
+UPower `PropertiesChanged` on this machine, at `pending-charge` and 0 W, caught zero signals.
+
+`power::controller` never had this, and the asymmetry is the proof. It wakes on
+`receive_on_battery_changed()`, and zbus drives a `PropertyStream` off an `EventListener` on the
+cache entry itself (`proxy/mod.rs:225`), so by the time that stream yields, the cache already holds
+the new value -- ordered by construction. That is exactly why the charger OSD in
+`modules/global/power_events.lua` was instant and correct while the bar's own glyph sat behind it,
+and why the symptom looked like two different subsystems disagreeing about the same cable.
+
+`mpris/proxies.rs:48` already carries a note about this caching hazard for `Position`, so the tree
+knew the shape of it in one place and not the other.
+
+**Decision**: build the `DisplayDeviceProxy` with `CacheProperties::No`. Each `read_state` is then a
+real `Get`, which is what the function's own doc comment always claimed it was. Five round trips on
+an event that fires a few times an hour is the cheap side of this trade, and it keeps the single
+whole-object subscription the wake-up was written around rather than splitting into five property
+streams the way `power::controller` did.
+
+The alternative -- wake on `receive_state_changed()` and friends -- is also correct and is the
+in-tree precedent, but it trades one subscription for five and gives up the property that
+`org.freedesktop.DBus.Properties` batches a device's simultaneous changes into one message.
+
+**Consequences**: verified live by physically unplugging and reconnecting the adapter; the glyph now
+tracks the cable, and the pill reads `69%` against UPower's `Percentage=69, State=5`.
+
+Everything the hardware explanation said about *latency* remains true and unmeasured -- once the
+state does change, some of the delay to the fuel gauge is real. It was simply never the reason the
+icon was wrong.
+
+One sibling is unfixed and deliberately left so. `tray/registry.rs`'s
+`spawn_item_signal_forwarder` wakes on StatusNotifierItem's custom `NewTitle`/`NewIcon`/`NewStatus`
+signals and then re-reads a cached `StatusNotifierItemProxy` whose properties are declared plain
+`#[zbus(property)]`. That is the same race in a worse form: an SNI implementation that emits only
+the custom signal and no `PropertiesChanged` would never refresh the cache at all, and the item's
+title and icon would be frozen at their first read. Unconfirmed against a real tray application, so
+it is recorded here rather than fixed blind.
