@@ -13,25 +13,52 @@
 local theme = require("config.theme")
 local cell = require("components.cell")
 
+-- `solid` is the mirror's `variant: "primary"`, and it is the only opaque ground here. The other two
+-- are tints, which is right for a row of equal choices on a notification card and wrong for the one
+-- control a panel is open for: at 15% alpha over a glass card you read the window behind the shell
+-- through the word "update". It picks its own foreground, because a control that chooses its own
+-- background has to choose the text on it or every caller has to remember to do both.
 local GROUND = {
     accent = { rest = theme.ACCENT_SUBTLE, hover = theme.ACCENT_LIGHT, border = theme.ACCENT_MEDIUM },
     quiet = { rest = theme.GLASS_CONTROL, hover = theme.GLASS_CONTROL_HOVER, border = theme.GLASS_BORDER },
+    solid = {
+        rest = theme.ACCENT,
+        hover = theme.ACCENT_HOVER,
+        border = theme.ACCENT,
+        text = theme.text_contrast(theme.ACCENT),
+    },
 }
 
 ---@param label string|Bound
 ---@param on_activate fun()
 ---@param slot string A `hover` slot unique to this button; two buttons sharing one light up together.
----@param opts? { icon?: string, tone?: "accent"|"quiet", width?: integer|"Fill", visible?: boolean|Bound }
+---@param opts? { icon?: string, tone?: "accent"|"quiet"|"solid", width?: integer|"Fill", visible?: boolean|Bound }
 return function(label, on_activate, slot, opts)
     opts = opts or {}
     local ground = GROUND[opts.tone or "accent"]
     local hovered = hover(slot)
+    -- A `button` stacks, so its one child is placed by `align_h`; a `row` does not, so its children
+    -- sit at its start. That is fine on a content-sized button, whose row is exactly as wide as the
+    -- word in it, and wrong on a filling one, where the row inherits nothing and leaves the label
+    -- against the left padding -- which is where "update" sat across the whole width of the update
+    -- panel. Filling the row and the label both is what puts the word back in the middle, and
+    -- `cell`'s `text_align` is what centres it inside the box the fill just gave it.
+    local fill = opts.width == "Fill" and "Fill" or nil
     local children = {}
     if opts.icon then
-        children[#children + 1] = icon { name = opts.icon, size = theme.icon.sm, align_v = "Center" }
+        children[#children + 1] = icon {
+            name = opts.icon,
+            size = theme.icon.sm,
+            align_v = "Center",
+            foreground = ground.text,
+        }
     end
     if label and label ~= "" then
-        children[#children + 1] = cell(label, theme.FG, theme.font.sm, { align = "Center", align_v = "Center" })
+        children[#children + 1] = cell(label, ground.text or theme.FG, theme.font.sm, {
+            align = "Center",
+            align_v = "Center",
+            width = fill,
+        })
     end
     return button {
         width = opts.width,
@@ -51,7 +78,7 @@ return function(label, on_activate, slot, opts)
                 on_activate()
             end
         end,
-        -- A `button` stacks its children; the row is what puts a glyph beside a word.
-        children = { row { height = "Fill", align_v = "Center", spacing = theme.spacing.xs, children = children } },
+        -- The row is what puts a glyph beside a word, rather than on top of one.
+        children = { row { width = fill, height = "Fill", align_v = "Center", spacing = theme.spacing.xs, children = children } },
     }
 end

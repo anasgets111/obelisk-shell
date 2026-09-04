@@ -197,6 +197,10 @@ theme.GLASS_HOVER    = theme.with_opacity(theme.ELEVATED_HOVER, 0.62)
 theme.ACCENT_SUBTLE  = theme.with_opacity(theme.ACCENT, 0.15)
 theme.ACCENT_LIGHT   = theme.with_opacity(theme.ACCENT, 0.25)
 theme.ACCENT_MEDIUM  = theme.with_opacity(theme.ACCENT, 0.35)
+-- The hover of a control whose ground is `ACCENT` itself, which the three tints above cannot be:
+-- lifting a tint means raising its alpha, and there is no alpha left over an opaque one. `OButton`'s
+-- primary variant in the mirror lightens the same way.
+theme.ACCENT_HOVER   = lighten(theme.ACCENT, 0.16)
 -- The mirror's `bgSubtle`: the background at its subtle step, which is what sits behind an
 -- application icon on a notification card so the artwork has a plate of its own.
 theme.BG_SUBTLE      = theme.with_opacity(theme.BG, 0.15)
@@ -342,8 +346,14 @@ theme.notification_panel_width = s(420, 340)
 theme.notification_list_height = s(640, 480)
 -- Wider than a bar panel and narrower than the notification one: a package row is a name and two
 -- versions, and 340px puts `ca-certificates-mozilla` and `3.128-1 -> 3.129-1` on top of each other.
-theme.update_panel_width = s(460, 360)
+-- The two version columns below are fixed, so the panel's width is what the *name* gets, and 460
+-- left about 130px of it -- `gpu-screen-recorder-git` elided in a panel with room to spare.
+theme.update_panel_width = s(520, 400)
 theme.update_list_height = s(360, 260)
+-- `updateOldVersionColumnWidth`. A column rather than a content-sized cell because the point of a
+-- table is that the eye runs down it: ragged versions are five separate two-word sentences, and a
+-- column is one list read once. Wide enough for a git package's `6.1.0.r4.gc8f50c4-1`.
+theme.update_version_width = s(116, 88)
 -- Shorter than the package list on purpose. The log is where a failure explains itself, not
 -- something to read end to end; the last dozen lines are the ones that matter.
 theme.update_log_height = s(200, 150)

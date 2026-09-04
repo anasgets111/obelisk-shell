@@ -167,11 +167,19 @@ local function detail_line(u)
     return "nothing pending"
 end
 
+-- The day as well, once the check is not today's. "checked 07:08" under a shell that has been up
+-- since Tuesday reads as this morning, and a check going stale is the one thing this line exists to
+-- show. The mirror prints the date unconditionally; here it earns its room only when it says
+-- something the time alone does not.
 local function last_check_line(u)
     if u == nil or u.last_successful_check == nil then
         return "never checked"
     end
-    return "checked " .. os.date("%H:%M", u.last_successful_check)
+    local at = u.last_successful_check
+    if os.date("%Y-%m-%d", at) == os.date("%Y-%m-%d") then
+        return "checked " .. os.date("%H:%M", at)
+    end
+    return "checked " .. os.date("%b %d, %H:%M", at)
 end
 
 -- Sorted by name, which is the order a list of package names is read in. The capability hands them
@@ -280,45 +288,69 @@ local body = {
             },
         },
     }, { background = theme.GLASS_CONTENT, width = "Fill", spacing = theme.spacing.xs }),
-    -- The list: name on the left, the version move on the right, which is the mirror's three
+    -- The list: name on the left, the version move in two fixed columns, which is the mirror's three
     -- columns minus its own headings. A heading row over three words is a table of contents for a
-    -- table of contents.
-    list {
-        width = "Fill",
-        max_height = theme.update_list_height,
-        scroll = PACKAGE_SCROLL,
-        spacing = theme.spacing.xs,
-        visible = packages_showing,
-        source = sorted_packages,
-        itemfn = function(package)
-            return row {
-                width = "Fill",
-                height = theme.control.sm,
-                align_v = "Center",
-                spacing = theme.spacing.sm,
-                children = {
-                    cell(package.name or "?", theme.FG, theme.font.sm, { width = "Fill", align_v = "Center" }),
-                    cell(package.old_version or "", theme.TEXT_OFF, theme.font.xs, { align_v = "Center" }),
-                    cell("→", theme.TEXT_OFF, theme.font.xs, { align_v = "Center" }),
-                    cell(package.new_version or "", theme.ACCENT, theme.font.xs, { align_v = "Center" }),
-                },
-            }
-        end,
-        key = function(package)
-            return package.name or "?"
-        end,
-    },
-    -- Pacman's own words, which is where a failure explains itself past the one line above it.
-    list {
-        width = "Fill",
-        max_height = theme.update_log_height,
-        scroll = LOG_SCROLL,
-        visible = log_showing,
-        source = log_lines,
-        itemfn = function(line)
-            return cell(line, log_colour(line), theme.font.xs, { width = "Fill", wrap = "Word", max_lines = 3 })
-        end,
-    },
+    -- table of contents, and the arrow between the two versions says which way they read.
+    --
+    -- Fixed columns rather than content-sized cells, and that is the whole difference between a
+    -- table and five separate two-word sentences: ragged versions have to be read row by row, a
+    -- column is read down. The name takes what is left and elides, since a name is what you scan
+    -- for and a version is what you check.
+    --
+    -- In a card of its own, like every section the mirror draws. Not decoration: this panel's ground
+    -- is glass, so a list laid straight onto it is a column of package names floating over whichever
+    -- window happens to be behind the shell, which is what it looked like.
+    panel_card({
+        list {
+            width = "Fill",
+            max_height = theme.update_list_height,
+            scroll = PACKAGE_SCROLL,
+            spacing = theme.spacing.xs,
+            source = sorted_packages,
+            itemfn = function(package)
+                return row {
+                    width = "Fill",
+                    height = theme.control.sm,
+                    align_v = "Center",
+                    spacing = theme.spacing.sm,
+                    children = {
+                        cell(package.name or "?", theme.FG, theme.font.sm, { width = "Fill", align_v = "Center" }),
+                        -- The old version ends at the arrow and the new one starts from it, so the
+                        -- pair sits nose to nose whatever length either happens to be. `DIM` rather
+                        -- than the `TEXT_OFF` this had: that is the wash a disabled control wears,
+                        -- and a version you are being asked to compare against is not disabled.
+                        cell(package.old_version or "", theme.DIM, theme.font.xs, {
+                            width = theme.update_version_width,
+                            align = "End",
+                            align_v = "Center",
+                        }),
+                        cell("→", theme.TEXT_OFF, theme.font.xs, { align_v = "Center" }),
+                        cell(package.new_version or "", theme.ACCENT, theme.font.xs, {
+                            width = theme.update_version_width,
+                            align_v = "Center",
+                        }),
+                    },
+                }
+            end,
+            key = function(package)
+                return package.name or "?"
+            end,
+        },
+    }, { background = theme.GLASS_CONTENT, width = "Fill", visible = packages_showing }),
+    -- Pacman's own words, which is where a failure explains itself past the one line above it. In a
+    -- card for the reason the list is, and the reason is louder here: two hundred lines of output
+    -- over a live wallpaper is unreadable however good the colours are.
+    panel_card({
+        list {
+            width = "Fill",
+            max_height = theme.update_log_height,
+            scroll = LOG_SCROLL,
+            source = log_lines,
+            itemfn = function(line)
+                return cell(line, log_colour(line), theme.font.xs, { width = "Fill", wrap = "Word", max_lines = 3 })
+            end,
+        },
+    }, { background = theme.GLASS_CONTENT, width = "Fill", visible = log_showing }),
     panel_empty_state("nothing to update", util.shown_when(oblisk.updates, function(u)
         return not u.installing and not u.checking and (u.count or 0) == 0 and u.install_finished_at == nil
     end), { icon = icons.up_to_date }),
@@ -341,6 +373,8 @@ local body = {
                 end,
                 "updates-install",
                 {
+                    -- The one thing this panel is open for, so the one solid control in the config.
+                    tone = "solid",
                     width = "Fill",
                     visible = oblisk.updates:map(function(u)
                         return u ~= nil and not u.installing and (u.count or 0) > 0
