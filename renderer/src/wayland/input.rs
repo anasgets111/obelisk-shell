@@ -1291,7 +1291,7 @@ impl PointerHandler for App {
                     self.pointer_input_count += 1;
                     let hit = self.hit_under(index, event.position);
                     // The press decides focus, not the release (decision 4): a press whose path
-                    // holds a `textfield` focuses it, a press landing anywhere else clears it.
+                    // holds a `textfield` focuses it, a press landing anywhere else leaves it.
                     // Bound to the surface the press landed on, per [`FocusedField`].
                     //
                     // Both halves are written on every press, including the clears, because the
@@ -1331,14 +1331,12 @@ impl PointerHandler for App {
                         }
                         // A press elsewhere stops the typing and keeps the text (ADR-0108), which
                         // is what every toolkit's text field does: the Send button beside a reply
-                        // is "elsewhere", and so is the card the field sits in.
-                        // Except a `submit` button, which is the masked field's own Enter
-                        // (ADR-0114): scrubbing the buffer on its press would leave its release
-                        // nothing to send.
+                        // is "elsewhere", and so is the card the field sits in. The masked field
+                        // keeps its focus too (ADR-0114 decision 8): only another field can take
+                        // it, so the scrim, the card and the Authenticate button are all no-ops
+                        // for the secret, and a `submit` release still has something to send.
                         None => (
-                            self.focused_secure_submit
-                                .clone()
-                                .filter(|_| hit.button.as_ref().is_some_and(|b| b.submit)),
+                            self.focused_secure_submit.clone(),
                             self.focused_text_field.clone().map(|field| FocusedTextField { typing: false, ..field }),
                         ),
                     };

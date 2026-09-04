@@ -5393,6 +5393,13 @@ through this agent, and nothing in Lua could have drawn the prompt: there was no
    tree still declared its field, and every pass re-armed the field and pruned it again -- a log
    line and a scrub per frame. `unmap` clears the focus; arming also refuses a surface that is not
    live. A `textfield`'s one line is drawn in the middle of its box while here, which it was not.
+8. **Only a field takes a masked field's focus.** ADR-0050 decision 4 had a press anywhere but
+   the field clear it, which scrubbed the buffer, so a click on the dialog's scrim or card threw the
+   password away, and the Authenticate button first needed a carve-out. QtQuick moves focus only to
+   something focusable, and the prompt has three controls: the field and two buttons. A press on
+   no field now leaves the masked focus alone; the field still draws its dots, so nothing is hidden,
+   and a secret still cannot reach another field without the scrub the A-to-B retarget does. The
+   `leave` and `unmap` clears stand: those are the user demonstrably elsewhere.
 
 Not mirrored from `PolkitDialog.qml`: Escape-to-cancel (a masked field's Escape clears and stays,
 ADR-0092; the Cancel button is the way out) and the `●` mask (`mask_character` is one byte).
