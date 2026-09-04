@@ -113,6 +113,9 @@ end
 -- cannot `require` a module that itself `require`s them without a cycle.
 local osd_kind = state("osd_kind", "")
 local osd_visible = state("osd_visible", false)
+-- What the `battery` OSD says, since that one has no meter to read: a glyph and a short line,
+-- handed in by `arm_osd`'s second argument. The volume and brightness rows ignore it.
+local osd_message = state("osd_message", { glyph = "", text = "" })
 
 -- Whether the app launcher window is up. A `state` signal rather than a bar-button toggle inline
 -- (`settings_open`'s own shape): `modules/global/launcher.lua`'s close button and
@@ -120,11 +123,10 @@ local osd_visible = state("osd_visible", false)
 -- reason `settings_open` lives here instead of inside `settings.lua`.
 local launcher_open = state("launcher_open", false)
 
--- `process.run("sleep", ...)` is this engine's only timer -- there is no signal-change event a
--- config can observe (a `:map` callback runs during scene resolution and must stay pure, since
--- ADR-0044's rollback-on-error means resolution can rerun on the same inputs). `on_hover` exists
--- now (ADR-0095) and does not help: it is an edge, not a clock. So the auto-hide has to be armed by
--- the same click that changes the level, not by watching `oblisk.audio`/`oblisk.brightness` push.
+-- `process.run("sleep", ...)` is this engine's only timer (a `:map` callback runs during scene
+-- resolution and must stay pure, since ADR-0044's rollback-on-error means resolution can rerun on
+-- the same inputs). So the auto-hide is armed by whatever changed the level: a bar click, or for the
+-- battery an `on_change` handler in `modules/global/power_events.lua` (ADR-0115).
 --
 -- `ProcessHandle:kill()` sends a kill command but does not cancel the queued `exit_cb`
 -- (`renderer/src/lua/process.rs`), so a second click while the first sleep is still running needs
@@ -133,8 +135,9 @@ local launcher_open = state("launcher_open", false)
 local OSD_SECONDS = "2"
 local osd_hide_request = 0
 
-local function arm_osd(kind)
+local function arm_osd(kind, message)
     osd_kind:set(kind)
+    osd_message:set(message or { glyph = "", text = "" })
     osd_visible:set(true)
     osd_hide_request = osd_hide_request + 1
     local this_request = osd_hide_request
@@ -256,6 +259,7 @@ return {
     panel_showing = panel_showing,
     osd_kind = osd_kind,
     osd_visible = osd_visible,
+    osd_message = osd_message,
     arm_osd = arm_osd,
     launcher_open = launcher_open,
 }

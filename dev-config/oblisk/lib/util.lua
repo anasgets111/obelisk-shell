@@ -69,6 +69,17 @@ function util.battery_is_draining(state)
     return state == "Discharging" or state == "Empty"
 end
 
+-- Percent marks, `BatteryService.qml`'s `lowThreshold`/`criticalThreshold`/`suspendThreshold` as
+-- whole numbers. One table so the pill's colour, the two notifications and the automatic suspend
+-- agree on where "low" starts.
+util.battery_thresholds = { low = 20, critical = 10, suspend = 8 }
+
+-- Whether `b` is draining at or under `percent`. Every threshold above is read through this, so
+-- red at 14% with the charger in cannot happen: the reference gates on `isOnBattery` too.
+function util.battery_at_most(b, percent)
+    return b ~= nil and b.present and util.battery_is_draining(b.state) and b.percent <= percent
+end
+
 function util.count(list)
     return list and #list or 0
 end

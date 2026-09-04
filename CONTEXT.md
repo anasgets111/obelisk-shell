@@ -72,6 +72,8 @@ Shared language for renderer generations, reloads, retained scenes, and capabili
 
 **Dirty scene**: The flag a live signal's write sets, meaning the retained scene must re-resolve before the next paint. Re-resolving re-runs layout against the last evaluation's node tree and reads current signal values through it; it does not re-run `shell.lua`. One flag covers the whole scene, so any write re-resolves every surface (ADR-0044). _Avoid_: damage (a paint-region mechanism, not this), invalidation (implies a dependency graph, which there isn't), stale scene
 
+**Change handler**: A function a config registers with `oblisk.<capability>:on_change(fn)`, run once per pushed snapshot with the new payload and the one it replaced, outside any layout pass and under a `map` callback's CPU budget. The one place a config acts on a push rather than rendering it; the handler computes the edge it wants by comparing the two payloads, so the engine carries no thresholds. Cleared and re-registered by every evaluation (ADR-0115). _Avoid_: watcher, subscription, signal listener (a `map` is not one of these either), event (a push is state, not an event)
+
 **Frame gating**: The rule that a surface instance repaints only when the compositor has returned its frame callback and the retained scene has actually changed since the last paint. Keeps an idle shell at zero redraws rather than repainting on a timer. _Avoid_: vsync, throttling, damage (a different mechanism: which region changed, not whether to paint)
 
 ## Ownership

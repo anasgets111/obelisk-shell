@@ -428,6 +428,12 @@ impl Signal {
 pub struct LiveSignalHandle(Rc<RefCell<Value>>, DirtyFlag);
 
 impl LiveSignalHandle {
+    /// The value last written, for `capability::CapabilityHandle::hydrate` to hand an `on_change`
+    /// handler what the push replaced.
+    pub fn get(&self) -> Value {
+        self.0.borrow().clone()
+    }
+
     /// Writes `value` and marks the shared scene dirty (ADR-0044 decision 2): every push has to
     /// make the next poll turn re-resolve the whole scene, since decision 3 rejects a per-signal
     /// dependency graph that could narrow that down.
@@ -622,7 +628,7 @@ struct ScrollRegistry(HashMap<String, Signal>);
 /// own push, so the stack is non-decreasing, and `first()`'s O(1) beats `min()`'s walk of up to
 /// [`MAX_SIGNAL_NESTING_DEPTH`] entries on every [`CHECK_EVERY_N_INSTRUCTIONS`] hook fire. Never
 /// "fix" it to `last()`, the per-level reset this avoids.
-struct CpuBudget<'lua> {
+pub(crate) struct CpuBudget<'lua> {
     lua: &'lua Lua,
 }
 
@@ -724,7 +730,7 @@ impl<'lua> CpuBudget<'lua> {
     /// first would strand an entry the depth-1 branch never revisits, silently disabling the cap
     /// for the VM's life. No Lua runs between install and push, and the hook tolerates an empty
     /// stack.
-    fn enter(lua: &'lua Lua) -> mlua::Result<Self> {
+    pub(crate) fn enter(lua: &'lua Lua) -> mlua::Result<Self> {
         if lua.app_data_ref::<Vec<Deadline>>().is_none() {
             lua.set_app_data(Vec::<Deadline>::new());
         }
@@ -749,7 +755,7 @@ impl<'lua> CpuBudget<'lua> {
     /// ponytail: runs only when the call returns; a body that swallows the hook error and never
     /// returns still spins until a fire lands outside the `pcall`. Needs preemption this VM can't
     /// offer; upgrade path is the generation-swap process boundary (ADR-0039).
-    fn check_not_exceeded(&self) -> mlua::Result<()> {
+    pub(crate) fn check_not_exceeded(&self) -> mlua::Result<()> {
         match expired_budget(self.lua) {
             Some(message) => Err(mlua::Error::runtime(message)),
             None => Ok(()),

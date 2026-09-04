@@ -28,13 +28,10 @@ local function battery_color(b)
     -- Only a battery that is actually running down gets a warning colour. Red at 14% while the
     -- charger is in says the wrong thing, and it is the reference service's own rule:
     -- `isLowAndNotCharging` gates its threshold on `isOnBattery` for exactly this.
-    if not util.battery_is_draining(b.state) then
-        return theme.GREEN
-    end
-    if b.percent < 15 then
+    if util.battery_at_most(b, util.battery_thresholds.critical) then
         return theme.RED
     end
-    if b.percent < 30 then
+    if util.battery_at_most(b, util.battery_thresholds.low) then
         return theme.PEACH
     end
     return theme.GREEN

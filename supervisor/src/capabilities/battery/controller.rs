@@ -178,6 +178,20 @@ async fn read_state(device: &DisplayDeviceProxy<'static>) -> BatteryState {
 /// plug and nothing else: `capacity` fell 69 to 65 with zero `power_supply` uevents delivered.
 /// UPower polls the hardware itself and emits on every refresh, so the polling moves to the one
 /// process already doing it for every other client on the system.
+/// UPower occasionally reports a spurious `Percentage` of 0 while the machine is on mains, one
+/// push long, and the pill emptied for it. The reference config holds the last reading in that
+/// case (`BatteryService.qml`'s `_ingestPercentage`), and so does this: a zero that arrives with the
+/// battery not draining, right after a non-zero reading, keeps the previous percent. On battery a
+/// genuine zero is indistinguishable from the glitch, so it passes through there, as it does there.
+fn hold_through_glitch(previous: BatteryState, current: BatteryState) -> BatteryState {
+    let draining = matches!(current.state, BatteryStatus::Discharging | BatteryStatus::Empty);
+    if current.present && !draining && current.percent == 0 && previous.percent > 0 {
+        BatteryState { percent: previous.percent, ..current }
+    } else {
+        current
+    }
+}
+
 async fn run_battery_task(
     system_bus: zbus::Connection,
     state: Arc<Mutex<BatteryState>>,
@@ -224,7 +238,7 @@ async fn run_battery_task(
     // Ends when UPower goes away, which drops the proxies and their connection references. There
     // is nothing else to wake this task, so parking on a dead stream would leak it.
     while changed.next().await.is_some() {
-        let current = read_state(&device).await;
+        let current = hold_through_glitch(previous, read_state(&device).await);
         if current != previous {
             *state.lock().expect("battery state mutex poisoned") = current;
             previous = current;
@@ -279,6 +293,22 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json, r#"{"present":true,"percent":70,"state":"PendingCharge"}"#);
+    }
+
+    // ---- hold_through_glitch ----
+
+    #[test]
+    fn a_zero_on_mains_right_after_a_reading_keeps_the_reading() {
+        let previous =
+            BatteryState { present: true, percent: 70, state: BatteryStatus::PendingCharge, ..Default::default() };
+        let glitch = BatteryState { percent: 0, ..previous };
+        assert_eq!(hold_through_glitch(previous, glitch).percent, 70);
+        let drained = BatteryState { percent: 0, state: BatteryStatus::Discharging, ..previous };
+        assert_eq!(hold_through_glitch(previous, drained).percent, 0, "on battery a zero is a zero");
+        assert!(
+            !hold_through_glitch(previous, BatteryState::default()).present,
+            "a battery going away is not a glitch"
+        );
     }
 
     // ---- seconds ----

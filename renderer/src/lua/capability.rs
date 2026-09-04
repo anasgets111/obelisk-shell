@@ -20,11 +20,11 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use mlua::{Function, LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value};
+use mlua::{Function, Lua, LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value};
 use shared::{CommandEnvelope, CommandParams, RendererFrame};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::lua::signal::{DirtyFlag, LiveSignalHandle, Signal};
+use crate::lua::signal::{CpuBudget, DirtyFlag, LiveSignalHandle, Signal};
 
 /// Builds § 7.2's generation-guarded envelope and queues it for the socket thread. One per
 /// generation, cloned into every [`Capability`] on the `oblisk` table.
@@ -117,6 +117,8 @@ pub struct Capability {
     /// revision of the snapshot the config could last have read; see [`CommandSender::send`].
     revision: Rc<Cell<u32>>,
     commands: CommandSender,
+    /// `on_change` handlers, run by [`CapabilityHandle::notify_change`] after each push (ADR-0115).
+    handlers: Rc<RefCell<Vec<Function>>>,
 }
 
 impl Capability {
@@ -128,8 +130,15 @@ impl Capability {
         // push can produce.
         let (signal, signal_handle) = Signal::new_live(Value::Nil, dirty);
         let revision = Rc::new(Cell::new(0));
-        let capability = Capability { name: name.to_string(), signal, revision: Rc::clone(&revision), commands };
-        (capability, CapabilityHandle { signal: signal_handle, revision })
+        let handlers = Rc::new(RefCell::new(Vec::new()));
+        let capability = Capability {
+            name: name.to_string(),
+            signal,
+            revision: Rc::clone(&revision),
+            commands,
+            handlers: Rc::clone(&handlers),
+        };
+        (capability, CapabilityHandle { name: name.to_string(), signal: signal_handle, revision, handlers })
     }
 
     /// The wrapped read signal, for `signal::from_userdata`: lets a config write § 1.2's live
@@ -145,16 +154,49 @@ impl Capability {
 /// holds one per capability and every caller wants both fields.
 #[derive(Clone)]
 pub struct CapabilityHandle {
+    name: String,
     signal: LiveSignalHandle,
     revision: Rc<Cell<u32>>,
+    handlers: Rc<RefCell<Vec<Function>>>,
 }
 
 impl CapabilityHandle {
     /// Writes one `StateSnapshot` into the Lua-visible signal and records its revision. Revision
-    /// first: the value write marks the scene dirty (ADR-0044 decision 2), so it goes last.
-    pub fn hydrate(&self, value: Value, revision: u32) {
+    /// first: the value write marks the scene dirty (ADR-0044 decision 2), so it goes last. Returns
+    /// what the push replaced, for [`Self::notify_change`].
+    pub fn hydrate(&self, value: Value, revision: u32) -> Value {
         self.revision.set(revision);
+        let previous = self.signal.get();
         self.signal.set(value);
+        previous
+    }
+
+    /// Runs every `on_change` handler with `(current, previous)` (ADR-0115). Each call is under
+    /// its own 5ms CPU budget, the one a `map` callback gets, and a handler that raises is logged
+    /// and skipped: the push has already landed, and one config mistake must not stop the others.
+    /// Handlers are called on a copy of the list, so one that registers another does not deadlock
+    /// on the `RefCell`.
+    pub fn notify_change(&self, lua: &Lua, previous: Value) {
+        let handlers = self.handlers.borrow().clone();
+        if handlers.is_empty() {
+            return;
+        }
+        let current = self.signal.get();
+        for handler in handlers {
+            let outcome = CpuBudget::enter(lua).and_then(|budget| {
+                handler.call::<()>((current.clone(), previous.clone()))?;
+                budget.check_not_exceeded()
+            });
+            if let Err(err) = outcome {
+                eprintln!("oblisk.{}:on_change handler raised, ignoring it: {err}", self.name);
+            }
+        }
+    }
+
+    /// Forgets every handler, for the client to call before it re-evaluates `shell.lua`: the
+    /// evaluation registers them again, and without this a reload would double every side effect.
+    pub fn clear_handlers(&self) {
+        self.handlers.borrow_mut().clear();
     }
 }
 
@@ -164,6 +206,13 @@ impl UserData for Capability {
         // `Signal` globals beside it in the `oblisk` table (`rescue` and `screens`).
         methods.add_method("get", |lua, this, ()| this.signal.get_value(lua));
         methods.add_method("map", |_, this, f: Function| Ok(this.signal.mapped(f)));
+        // The one place a config reacts to a push rather than rendering it (ADR-0115): the handler
+        // runs once per `StateSnapshot`, outside any layout pass, with the new and old payloads, and
+        // may do what an input callback may do -- `invoke`, `process.run`, write a `state` signal.
+        methods.add_method("on_change", |_, this, f: Function| {
+            this.handlers.borrow_mut().push(f);
+            Ok(())
+        });
         // No `set`: ADR-0044 decision 5 keeps capability state read-only; a config commands it via
         // `invoke` instead.
         methods.add_method("invoke", |lua, this, (action, args): (String, MultiValue)| {
@@ -270,6 +319,66 @@ mod tests {
 
         assert!(err.to_string().contains("argument 2"), "the error must name the offending slot: {err}");
         assert!(rx.try_recv().is_err(), "a refused argument must not queue a half-built command");
+    }
+
+    #[test]
+    fn on_change_runs_after_a_push_with_the_new_and_the_replaced_payload() {
+        let (lua, handle, _rx) = lua_with_capability(1);
+        lua.load(
+            r#"
+            seen = {}
+            oblisk.probe:on_change(function(current, previous)
+                seen[#seen + 1] = { current = current, previous = previous }
+            end)
+        "#,
+        )
+        .exec()
+        .unwrap();
+
+        let previous = handle.hydrate(Value::Integer(1), 1);
+        handle.notify_change(&lua, previous);
+        let previous = handle.hydrate(Value::Integer(2), 2);
+        handle.notify_change(&lua, previous);
+
+        let seen: mlua::Table = lua.globals().get("seen").unwrap();
+        assert_eq!(seen.len().unwrap(), 2);
+        let first: mlua::Table = seen.get(1).unwrap();
+        assert_eq!(first.get::<i64>("current").unwrap(), 1);
+        assert_eq!(first.get::<Value>("previous").unwrap(), Value::Nil, "the first push replaces nil");
+        let second: mlua::Table = seen.get(2).unwrap();
+        assert_eq!(second.get::<i64>("current").unwrap(), 2);
+        assert_eq!(second.get::<i64>("previous").unwrap(), 1);
+    }
+
+    #[test]
+    fn a_raising_handler_does_not_stop_the_next_one_or_the_push() {
+        let (lua, handle, _rx) = lua_with_capability(1);
+        lua.load(
+            r#"
+            ran = false
+            oblisk.probe:on_change(function() error("first handler broke") end)
+            oblisk.probe:on_change(function() ran = true end)
+        "#,
+        )
+        .exec()
+        .unwrap();
+
+        let previous = handle.hydrate(Value::Integer(5), 1);
+        handle.notify_change(&lua, previous);
+
+        assert!(lua.globals().get::<bool>("ran").unwrap());
+        let read: i64 = lua.load("return oblisk.probe:get()").eval().unwrap();
+        assert_eq!(read, 5);
+    }
+
+    #[test]
+    fn clear_handlers_forgets_what_the_last_evaluation_registered() {
+        let (lua, handle, _rx) = lua_with_capability(1);
+        lua.load("count = 0; oblisk.probe:on_change(function() count = count + 1 end)").exec().unwrap();
+        handle.clear_handlers();
+        let previous = handle.hydrate(Value::Integer(1), 1);
+        handle.notify_change(&lua, previous);
+        assert_eq!(lua.globals().get::<i64>("count").unwrap(), 0);
     }
 
     #[test]

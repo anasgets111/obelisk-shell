@@ -1,13 +1,13 @@
--- Volume and brightness OSD: a corner overlay that flashes the level a click just changed and
--- hides itself after, the shape VolumeOSD.qml/BrightnessOSD.qml both are, minus their animation.
+-- Volume, brightness and battery OSD: a corner overlay that flashes what just changed and hides
+-- itself after, the shape VolumeOSD.qml/BrightnessOSD.qml and OSDService.qml's battery events are,
+-- minus their animation.
 --
--- Armed by a click, not by watching `oblisk.audio`/`oblisk.brightness` push: `lib/ui_state.lua`'s
--- own comment on `arm_osd` has the reason (no signal-change event a config can observe, no
--- `on_hover`, no `on_scroll`). `modules/bar/indicators/volume.lua` and `.../brightness.lua`'s own
--- `on_click` handlers call it; this file only reads the two `state` signals that call leaves
--- behind.
+-- Armed by `lib/ui_state.lua`'s `arm_osd`, never by this file watching a capability: the volume
+-- and brightness rows are armed by the bar click that changed the level, the battery row by
+-- `modules/global/power_events.lua`'s `on_change` handlers (ADR-0115). This file only reads the
+-- `state` signals that call leaves behind.
 --
--- One `panel`, two stacked rows switched by `visible`, rather than two panels: § 6.1 gives every
+-- One `panel`, three stacked rows switched by `visible`, rather than three panels: § 6.1 gives every
 -- surface its own compositor identity, and a volume change while the brightness OSD is still fading
 -- out (if this engine ever grows a fade) would otherwise be two overlapping corner surfaces
 -- fighting over the same screen position instead of one replacing the other.
@@ -68,6 +68,35 @@ local brightness_row = row {
     },
 }
 
+-- No meter: a charger event is a fact, not a level. The glyph and the line both come from
+-- `osd_message`, so this row knows nothing about batteries.
+local battery_row = row {
+    width = "Fill",
+    height = "Fill",
+    align_v = "Center",
+    spacing = theme.spacing.md,
+    padding = { left = theme.spacing.lg, right = theme.spacing.lg },
+    visible = ui_state.osd_kind:map(function(kind)
+        return kind == "battery"
+    end),
+    children = {
+        text {
+            content = ui_state.osd_message:map(function(m)
+                return m.glyph
+            end),
+            foreground = theme.FG,
+            font_size = theme.icon.lg,
+        },
+        text {
+            content = ui_state.osd_message:map(function(m)
+                return m.text
+            end),
+            foreground = theme.FG,
+            font_size = theme.font.sm,
+        },
+    },
+}
+
 return panel {
     id = "osd",
     layer = "Overlay",
@@ -87,6 +116,6 @@ return panel {
         radius = theme.radius.md,
         border_width = theme.border_width,
         border_color = theme.BORDER,
-        children = { volume_row, brightness_row },
+        children = { volume_row, brightness_row, battery_row },
     },
 }

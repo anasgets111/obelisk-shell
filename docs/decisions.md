@@ -5405,3 +5405,58 @@ Not mirrored from `PolkitDialog.qml`: Escape-to-cancel (a masked field's Escape 
 ADR-0092; the Cancel button is the way out) and the `●` mask (`mask_character` is one byte).
 `isResponseRequired`/`inputPrompt` have no equivalent under ADR-0028's one-shot protocol, where a
 password is always the answer.
+
+## 0115. A capability push can run a handler: `on_change`, and the five things it unblocked
+
+ADR-0044 made a config a pure function of pushed state: a `map` callback runs during scene
+resolution, may rerun on the same inputs after a rollback, and so may not act. Input callbacks
+(`on_click`, `on_hover`, `on_submit`) were the only place a side effect could start. That left a class
+of thing the reference shell does that no amount of Lua here could: BatteryService.qml's low-battery
+`notify-send`, OSDService.qml's "charger connected", PowerManagementService.qml's suspend at 8%,
+UpdateService.qml's "Updates Available", and the `state.json` write ADR-0113 decision 14 stopped short
+of. All five wait for a *push*, not a click. ADR-0113 named the gap ("a hook, not a field") and
+declined to take it there; this takes it.
+
+1. **`oblisk.<capability>:on_change(fn)`.** The handler runs once per `StateSnapshot`, from
+   `apply_state_snapshot` right after the value lands and before any layout pass, with
+   `(current, previous)`. `previous` is `nil` on the first push and nothing else. It is not a `map`:
+   it is not called during resolution, cannot be rolled back, and so may do what an input callback may
+   do, `invoke`, `process.run`, write a `state` signal. Purity in the tree is untouched; side effects
+   moved from "on input" to "on input or on push", which is where they already lived in the mirror.
+2. **Every push, no filtering; the config finds its edge.** The engine hands over each snapshot and
+   the one it replaced, and Lua compares them. A threshold ("low is 20%") is an opinion, and ADR-0113
+   decision 15 already put opinions in the config. `util.battery_at_most(b, percent)` is the
+   comparison the four battery edges share; `previous == nil` is the mirror's `initialized` guard.
+3. **Each evaluation re-registers, so each evaluation first clears.** `shell.lua`'s module-level
+   code registers the handlers, and an in-place reload re-runs it on the same VM (ADR-0044 decision
+   4). Without a clear, one config save would double every notification. `clear_change_handlers` runs
+   before both `evaluate_and_specs` calls. Known cost: an evaluation whose topology changed leaves the
+   new config's handlers in the old generation until the swap, so a push in that window fires in
+   both processes. Short, and a duplicate OSD line is the worst of it.
+4. **A handler runs under a `map` callback's 5ms budget and cannot break the push.** `CpuBudget`
+   wraps each call; a raise or an overrun is logged with the capability's name and the next handler
+   still runs. The value is already in the signal by then, so the screen is right whatever the
+   handler did.
+5. **What it unblocked, all in `dev-config`.** `modules/global/power_events.lua` (new): the charger
+   OSD off `oblisk.power`'s `on_battery` edge plus the mirror's 10/100 brightness step, the charge
+   limit and fully charged OSD lines, the low and critical `notify-send`s, and `systemctl suspend`
+   at 8%. The OSD grew a third row and `arm_osd` a message argument for it, since a charger event
+   has no meter. `modules/bar/indicators/updates.lua`: `configure` moves from load time to
+   `oblisk.system`'s first push, which is what carries `state.json`, so `checked_at` is finally read
+   back and a restart inside the hour does not re-check (verified: a second start touched neither the
+   file nor the network); the time of a successful check is written when it differs from the file's;
+   and "Updates Available" fires for names not in the remembered `updates_notified` key, the
+   mirror's `notifiedPackagesKey` (verified: six new packages announced once, not again on restart).
+6. **The pill's thresholds moved to match.** The bar coloured at 30/15 while the notifications
+   would have fired at 20/10. `util.battery_thresholds` is now the one table both read, at the
+   mirror's values.
+7. **UPower's zero-percent glitch is held in Rust.** Unrelated to the hook and found on the same
+   review: UPower reports a spurious `Percentage` of 0 on mains for one push, and only
+   BatteryService.qml, not Quickshell's C++ layer, guards it. `hold_through_glitch` keeps the previous
+   percent when a zero arrives with the battery not draining after a non-zero reading; on battery a
+   zero passes through, as it does there.
+
+Not mirrored: keyboard backlight on the charger edge (no capability), the `--wait -A` actionable
+update notification (a config could read the action from `process.run`'s stdout callback; not worth
+it until someone wants the button), and the mirror's 15-second notification dedupe, which an edge
+does not need.

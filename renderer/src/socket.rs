@@ -4,7 +4,8 @@
 //! Two threads, two channels (ADR-0039): the socket thread only does framed I/O ([`pump`]); Lua
 //! state lives on the *Wayland* thread instead, since `mlua::Lua` is `!Send` and the paint pass
 //! owns the GL context. A `StateSnapshot` only hydrates a capability's signal and dirties the scene
-//! (ADR-0044 decision 2); only `Reevaluate` triggers a Lua evaluation, classified as `Unchanged`,
+//! (ADR-0044 decision 2), then runs the config's `on_change` handlers for that capability
+//! (ADR-0115); only `Reevaluate` triggers a Lua evaluation, classified as `Unchanged`,
 //! `TopologyChanged` or `Failed` against `applied_topology`, `None` meaning "safe to apply", not
 //! "empty topology" (misclassifying a startup failure would blank the shell). A dropped
 //! connection is not reconnected (ADR-0059 decision 1): the Supervisor holds every capability,
@@ -248,8 +249,21 @@ impl RendererClient {
     fn apply_state_snapshot(&self, snapshot: StateSnapshot) -> mlua::Result<()> {
         let value = self.loader.to_lua_value(&snapshot.payload)?;
         // The revision is what a later `oblisk.<name>:invoke(...)` stamps for § 7.3's guard.
-        self.capability_handle(&snapshot.capability)?.hydrate(value, snapshot.revision);
+        let handle = self.capability_handle(&snapshot.capability)?;
+        let previous = handle.hydrate(value, snapshot.revision);
+        // The `on_change` handlers (ADR-0115) run here, after the value landed and before any
+        // layout pass: the only Lua a push runs, and not an evaluation of `shell.lua`.
+        handle.notify_change(self.loader.lua(), previous);
         Ok(())
+    }
+
+    /// Before every evaluation of `shell.lua`: the evaluation registers its `on_change` handlers
+    /// afresh, so the previous evaluation's must go, or a config save would double every side
+    /// effect (ADR-0115).
+    fn clear_change_handlers(&self) {
+        for handle in self.capabilities.borrow().values() {
+            handle.clear_handlers();
+        }
     }
 
     /// Looks up `capability`'s handle, adding a fresh `oblisk.<capability>` member (`nil`,
@@ -279,6 +293,7 @@ impl RendererClient {
     /// Runs before any layer surface is bound (§ 15.2's order), split so the caller can expand
     /// the returned [`SurfaceSpec`](layout::node::SurfaceSpec)s via [`Self::apply_instances`].
     pub fn run_startup_evaluation(&mut self) -> Option<Vec<SurfaceSpec>> {
+        self.clear_change_handlers();
         match evaluate_and_specs(&self.loader, &self.shell_lua_path) {
             Ok((output, specs)) => {
                 self.state.applied_topology = Some(specs.iter().map(SurfaceSpec::fingerprint).collect());
@@ -485,6 +500,7 @@ impl RendererClient {
     /// edit is accepted on a live object, so it reports `Unchanged` and reloads in place, not the
     /// generation swap comparing whole specs would trigger.
     fn handle_reevaluate(&mut self, request: ReevaluateRequest) {
+        self.clear_change_handlers();
         let report = match evaluate_and_specs(&self.loader, &self.shell_lua_path) {
             Ok((output, specs)) => {
                 let topology: Vec<SurfaceFingerprint> = specs.iter().map(SurfaceSpec::fingerprint).collect();

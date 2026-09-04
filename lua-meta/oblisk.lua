@@ -31,7 +31,14 @@
 ---so a misspelled field is an `undefined-field` here rather than a `nil` at runtime. `get`/`map`
 ---come from [`Signal`] and are not restated per capability; only `invoke` is, because each one
 ---knows its own command names.
+---
+---`:on_change(handler)` is the one place a config reacts to a push instead of rendering it
+---(ADR-0115): the handler runs once per pushed snapshot with the new payload and the one it
+---replaced (`nil` on the first push), outside any layout pass, under a `map` callback's 5ms CPU
+---budget. It may do what an input callback may do: `invoke`, `process.run`, write a `state`
+---signal. Compare the two payloads to find the edge you want; the engine hands over every push.
 ---@field invoke fun(self: Capability<T>, command: string, ...: any)
+---@field on_change fun(self: Capability<T>, handler: fun(current: T, previous: T?))
 
 --- Payload types ------------------------------------------------------------------------------
 

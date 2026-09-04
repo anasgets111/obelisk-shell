@@ -34,6 +34,7 @@ Signals reach Lua as read-only or read-write userdata primitives.
 *   **Read-only methods**:
     *   `signal:get()`: current unwrapped primitive value.
     *   `signal:map(fn)`: new `Computed` signal from applying Lua `fn` to the parent value.
+    *   `capability:on_change(fn)` (capabilities only): runs `fn(current, previous)` once per pushed `StateSnapshot`, outside any layout pass, with `previous = nil` on the first push. The one place a config reacts to a push rather than rendering it; `fn` may do what an input callback may do (`invoke`, `process.run`, write a `state`). Handlers are re-registered by each evaluation, so a reload does not double them (ADR-0115).
 *   **Computed signals**:
     *   `computed(dependencies, fn)`: multi-dependency computed signal. `dependencies` must be an array of `Signal`/`Computed` handles.
     *   `fn` must be side-effect-free. CPU runtime capped at 5ms per evaluation.

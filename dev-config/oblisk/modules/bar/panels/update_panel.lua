@@ -8,10 +8,10 @@
 -- this file is where a non-zero code and a line saying "failed retrieving file" become "check your
 -- connection". A number is the same in every language; that sentence is not.
 --
--- Three things the mirror has that are not reachable yet and are not faked here: a spinner (nothing
--- animates without a per-frame property, ADR-0021), a copy-the-log button (no clipboard primitive),
--- and a check that resumes its interval across a restart (`system:write_state` exists, but nothing
--- can call it when a check *succeeds* -- see ADR-0113 decision 14).
+-- Two things the mirror has that are not reachable yet and are not faked here: a spinner (nothing
+-- animates without a per-frame property, ADR-0021) and a copy-the-log button (no clipboard
+-- primitive). The check that resumes its interval across a restart lives in
+-- `modules/bar/indicators/updates.lua` now that a config can act when a check succeeds (ADR-0115).
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")

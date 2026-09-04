@@ -78,6 +78,9 @@ local network_tooltip = require("modules.bar.indicators.network").tooltip
 local bluetooth_tooltip = require("modules.bar.indicators.bluetooth").tooltip
 local lock_screen = require("modules.global.lock")
 local polkit_dialog = require("modules.global.polkit")
+-- Not a surface: the battery's side effects (OSD lines, low-battery notifications, suspend), which
+-- only need to be registered once. Required for that, and returns nothing to list below.
+require("modules.global.power_events")
 
 return {
     wallpaper,
