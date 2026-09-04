@@ -23,6 +23,7 @@ icons.power       = "\u{EAD2}"  -- nf-cod-debug_restart_frame, the reference's r
 icons.logout      = "\u{F0343}"
 icons.shutdown    = "\u{23FB}"  -- IEC 5009 power symbol, not a Nerd Font glyph in the mirror either
 icons.lock        = "\u{F033E}"
+icons.sleep       = "\u{F04B2}"  -- nf-md-power_sleep
 icons.settings    = "\u{F0493}"
 icons.launcher    = "\u{F035C}"
 icons.web         = "\u{F059F}"  -- nf-md-web, the launcher's "open this as a link / search the web" row

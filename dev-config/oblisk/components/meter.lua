@@ -3,8 +3,9 @@
 -- signal that maps to "45%" is a live-width rect with no engine support for progress bars at all.
 local theme = require("config.theme")
 
-return function(signal, read, color, width, height)
+return function(signal, read, color, width, height, visible)
     return row {
+        visible = visible,
         width = width or theme.s(40, 30),
         height = height or theme.s(6, 4),
         align_v = "Center",
