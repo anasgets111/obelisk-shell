@@ -352,6 +352,17 @@ theme.update_panel_width = s(520, 400)
 
 -- `Theme.audioPanelWidth`: two sliders with a name beside each and a mixer under them.
 theme.audio_panel_width = s(380, 300)
+-- The idle modal. Wide enough for the mirror's own shape: an action per row, AC and battery as two
+-- columns beside it, each column a timeout and a switch.
+-- `Theme.idleModalWidth` verbatim. It is a matrix in a modal, not a card on a bar, and the first
+-- two passes at 640 and 700 both read as a cramped version of the thing rather than the thing.
+theme.idle_modal_width = s(820, 640)
+-- Wide enough for `idleTimeoutControlWidth` plus the switch beside it.
+theme.idle_profile_column = s(190, 150)
+theme.idle_row_height = s(60, 46)
+-- Its timeline: one track the width of the card, tall enough to hold a glyph and a duration per
+-- stage rather than the 6px `components/meter.lua` draws for a bare percentage.
+theme.idle_track_height = s(36, 28)
 theme.update_list_height = s(360, 260)
 -- `updateOldVersionColumnWidth`. A column rather than a content-sized cell because the point of a
 -- table is that the eye runs down it: ragged versions are five separate two-word sentences, and a

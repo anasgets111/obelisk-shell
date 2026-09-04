@@ -78,11 +78,19 @@ local wallpaper_tooltip = require("modules.bar.indicators.wallpaper_button").too
 -- somewhere to read the rest -- so the two indicators that lost their labels grew a tooltip each.
 local network_tooltip = require("modules.bar.indicators.network").tooltip
 local bluetooth_tooltip = require("modules.bar.indicators.bluetooth").tooltip
+-- The idle circle's own, and the one tooltip here that is not just a name: it counts down to
+-- whatever the next stage is, which the bar itself has no room to say.
+local idle_tooltip = require("modules.bar.indicators.idle_inhibitor").tooltip
+local idle_settings = require("modules.global.idle_settings")
 local lock_screen = require("modules.global.lock")
 local polkit_dialog = require("modules.global.polkit")
 -- Not a surface: the battery's side effects (OSD lines, low-battery notifications, suspend), which
 -- only need to be registered once. Required for that, and returns nothing to list below.
 require("modules.global.power_events")
+-- Also not a surface: the idle clock. One `register_threshold`, one handler on `oblisk.system`, and
+-- the three actions a seat left alone eventually gets. `lib/idle.lua` holds everything it acts on,
+-- so the bar reads the same facts without requiring this.
+require("modules.global.idle")
 
 return {
     wallpaper,
@@ -97,8 +105,10 @@ return {
     wallpaper_tooltip,
     network_tooltip,
     bluetooth_tooltip,
+    idle_tooltip,
     launcher,
     wallpaper_picker,
+    idle_settings,
     lock_screen,
     polkit_dialog,
 }

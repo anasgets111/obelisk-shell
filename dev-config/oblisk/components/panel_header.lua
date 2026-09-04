@@ -27,6 +27,10 @@ local icon_button = require("components.icon_button")
 ---@field active? boolean|Bound Accent while true, dim while false. Default true.
 ---@field trailing? Node[] Controls at the far edge, in order.
 ---@field on_close? fun() Adds a close button after `trailing`.
+---@field title_size? integer The title's font size. Default `theme.font.lg`, which is a bar panel's masthead; a modal's is bigger, and so is a section header inside one.
+---@field subtitle_color? Color|Bound The state line's colour. Default `theme.TEXT_OFF`.
+---@field subtitle_size? integer The state line's font size. Default `theme.font.xs`, which is right under a bar panel's 16px title and unreadably small under a modal's 28px one.
+---@field plate? integer The icon plate's side. Default `theme.control.lg`, and it tracks `title_size` in the mirror rather than being set on its own.
 
 ---@param opts PanelHeaderOpts
 return function(opts)
@@ -51,23 +55,26 @@ return function(opts)
         plate = active and theme.ACCENT_SUBTLE or theme.GLASS_CONTENT
     end
 
+    local title_size = opts.title_size or theme.font.lg
+    local plate_size = opts.plate or theme.control.lg
+
     local children = {}
     if opts.icon then
         children[#children + 1] = rect {
-            width = theme.control.lg,
-            height = theme.control.lg,
+            width = plate_size,
+            height = plate_size,
             radius = theme.radius.md,
             background = plate,
             align_v = "Center",
-            children = { cell(opts.icon, accent, theme.icon.lg, { align = "Center", align_v = "Center" }) },
+            children = { cell(opts.icon, accent, math.floor(plate_size * 0.55), { align = "Center", align_v = "Center" }) },
         }
     end
 
     -- Bold, as the mirror's `titleBold`; a run rather than a property because weight lives on the
     -- `TextRun` (`lua-meta/nodes.lua`), and a title is a plain string here.
-    local lines = { cell({ { text = opts.title, bold = true } }, theme.FG, theme.font.lg, { width = "Fill" }) }
+    local lines = { cell({ { text = opts.title, bold = true } }, theme.FG, title_size, { width = "Fill" }) }
     if opts.subtitle then
-        lines[#lines + 1] = cell(opts.subtitle, theme.TEXT_OFF, theme.font.xs, { width = "Fill" })
+        lines[#lines + 1] = cell(opts.subtitle, opts.subtitle_color or theme.TEXT_OFF, opts.subtitle_size or theme.font.xs, { width = "Fill" })
     end
     children[#children + 1] = column { width = "Fill", align_v = "Center", children = lines }
 

@@ -81,15 +81,21 @@ function media.is_video(player)
     return extension ~= nil and VIDEO_EXTENSIONS[extension] == true
 end
 
---- A signal that is true while any player is playing a video. What an idle module reads to decide
---- whether the screen may blank.
-media.video_playing = oblisk.mpris:map(function(m)
+--- Whether any player in one `oblisk.mpris` payload is playing a video. Pure, and it takes the
+--- payload rather than reading it, so `lib/idle.lua` can call it with what an `on_change` handed
+--- over instead of trusting a `computed` to be current inside a callback.
+--- @param m table? `oblisk.mpris`'s payload
+--- @return boolean
+function media.is_playing_video(m)
     for _, player in ipairs((m or {}).players or {}) do
         if player.play_state == "Playing" and media.is_video(player) then
             return true
         end
     end
     return false
-end)
+end
+
+--- The same question as a signal, for anything that draws it.
+media.video_playing = oblisk.mpris:map(media.is_playing_video)
 
 return media

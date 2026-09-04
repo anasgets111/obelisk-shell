@@ -107,6 +107,14 @@ icons.device = {
     generic     = "\u{F00AF}",
 }
 
+-- Idle. `idle` is the mirror's "nothing is holding this awake" glyph and `awake` its coffee cup,
+-- swapped on the bar the moment a manual hold is taken. `display` is the monitor the DPMS stage
+-- powers down; the suspend stage reuses `sleep` above rather than adding the mirror's second,
+-- near-identical power-sleep glyph.
+icons.idle        = "\u{F0FAA}"
+icons.awake       = "\u{F0176}"
+icons.display     = "\u{F0379}"
+
 icons.refresh     = "\u{F0450}"
 icons.clear_all   = "\u{F0234}"
 icons.info        = "\u{F02FD}"

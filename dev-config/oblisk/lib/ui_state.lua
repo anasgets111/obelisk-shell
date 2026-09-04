@@ -117,6 +117,10 @@ local launcher_open = state("launcher_open", false)
 -- own close both write it.
 local wallpaper_picker_open = state("wallpaper_picker_open", false)
 
+-- Whether the idle settings modal is up. Same shape again: the bar circle's right click opens it
+-- and the modal's own header closes it, so neither can own the flag.
+local idle_settings_open = state("idle_settings_open", false)
+
 -- ## The notification card's own state
 --
 -- Three signals, all of them "which of these is open", none of them anything the Supervisor knows
@@ -228,4 +232,5 @@ return {
     panel_showing = panel_showing,
     launcher_open = launcher_open,
     wallpaper_picker_open = wallpaper_picker_open,
+    idle_settings_open = idle_settings_open,
 }

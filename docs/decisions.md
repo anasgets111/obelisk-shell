@@ -6779,3 +6779,62 @@ reciprocal of ADR-0138's `SetLockedHint`.* Correct and unclaimed here (`IdleHint
 `IdleSinceHint=0`, nothing publishes it), but nothing on this machine reads it either, and which
 threshold means "the session is idle" is a config's decision, not this module's. Deferred until a
 config asks, as `idle:set_idle_hint(bool)`.
+
+## 0140. The config's idle module runs one threshold and a clock, and its settings are a modal
+
+The Lua half of ADR-0139, and the first module to use `oblisk.idle` for anything. `IdleService.qml`,
+`IdleInhibitor.qml` and `IdleSettingsPanel.qml` are the prior art; all three are mirrored, two of
+them structurally rather than literally.
+
+**Decisions.**
+
+1. **One threshold, at one second, and every stage is arithmetic on `oblisk.system.time`.** The
+   mirror is three `IdleMonitor`s with a lattice of `enabled` bindings keeping them in order. The
+   forcing constraint is that `register_threshold` has no counterpart that removes one (§ 3.2), so a
+   settings panel that changes the lock timeout from five to ten minutes would leave both registered
+   and lock at five. With one registration the timeouts are plain Lua numbers a panel can edit, and
+   the ordering between stages is the numbers instead of a condition lattice. It costs a one-second
+   clock the bar's own readouts already run on.
+2. **The mirror's `lockAfterDpms` is dropped.** It exists because its three monitors are independent
+   and each has to wait on the others. One clock makes "lock at 900, blank at 300" already mean
+   blanking happens first, so the two numbers are the whole answer and an order combo would be a
+   second, contradictable one.
+3. **No `armed` guard anywhere in the config.** ADR-0139's gate means a held inhibitor -- ours, or
+   `systemd-inhibit`'s -- stops the events and hands back a `Resumed`, so `idle.since` goes to zero
+   on the way in and the clock handler returns on its first line. The manual toggle is an inhibitor,
+   not a flag the handler re-reads. The one thing the framework cannot know is the master switch,
+   which is the one thing checked.
+4. **Split `lib/idle.lua` (facts and settings) from `modules/global/idle.lua` (the clock).** The bar
+   circle and the modal read the first without pulling in a file whose whole purpose is side
+   effects, which is `lib/media.lua`'s shape. `sync_inhibit` is a capability call inside `lib/`, for
+   `lib/ui_state.lua`'s stated reason: one writer per edge beats three callers each remembering to
+   count `inhibit`/`release_inhibit` correctly.
+5. **The settings are a modal, not a bar panel.** Built as a panel first, and it was wrong: the panel
+   host's card is 340px and this is a matrix -- three actions down, AC and battery across -- so
+   fitting it there cost the ability to see both profiles at once, which is the mirror's own best
+   idea. It is now the surface `modules/global/launcher.lua` and `modules/global/wallpaper_picker.lua`
+   are, at `Theme.idleModalWidth`'s own 820px, and the bar circle's right click opens it exactly as
+   `IdleInhibitor.qml` opens its `OModal`.
+6. **The flow gets a timeline.** `FlowSummary` is a static line saying what you configured; this is
+   the same flow as a track that moves, one chamber per stage that will run, each filling over its
+   own window. Chambers are equal width rather than proportional: proportional is honest until DPMS
+   is 30 seconds against a 15-minute lock, at which point the first chamber is 3% of the card and
+   its glyph does not fit. Every chamber prints its timeout, so the proportions are readable without
+   being drawn to scale.
+7. **Settings live in `lib/store.lua` with `enabled` shipping `false`.** The mirror ships `true`.
+   These defaults are written into a real `state.json` on a real machine the first time the config
+   runs, and the first thing a `true` would do is blank somebody's screen while they were reading.
+   The modal's master switch is one click and says so until it is thrown.
+8. **A timeout is a plate that cycles its option list, with a chevron.** `OComboBox` has no
+   counterpart here and one list of seven values is not enough to justify building one. The chevron
+   is a small lie about the mechanism -- it advances rather than dropping down -- and the truth about
+   the affordance, which is the half that has to be legible: without it the plate is a number nobody
+   knows is a control.
+
+**Rejected.** *A "respect inhibitors" switch.* The mirror has one; here the Supervisor honours a
+foreign inhibitor unconditionally (ADR-0139), so the switch would be one that ignores
+`systemd-inhibit`, which is not a preference worth offering. *Registering each configured threshold
+and filtering in the callback.* Same registration leak as decision 1, with a guard in every callback
+instead of none. *`fullscreenInhibitorActive`.* `oblisk.workspaces.active_client` carries no
+fullscreen flag on niri; a film in a fullscreen player is caught by the video rule or not at all.
+Marked as a TODO in `lib/idle.lua` where the reason list is built.

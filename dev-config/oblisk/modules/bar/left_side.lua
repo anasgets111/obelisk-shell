@@ -13,6 +13,7 @@ local rescue_cell = require("modules.bar.indicators.rescue")
 local privacy_module = require("modules.bar.indicators.privacy")
 local power_menu = require("modules.bar.panels.power_menu")
 local updates_module = require("modules.bar.indicators.updates")
+local idle_inhibitor = require("modules.bar.indicators.idle_inhibitor")
 local keyboard_module = require("modules.bar.indicators.keyboard_layout")
 local battery = require("modules.bar.indicators.battery")
 local launcher = require("modules.bar.indicators.launcher_button")
@@ -34,6 +35,7 @@ return row {
         privacy_module,
         power_menu.button,
         updates_module,
+        idle_inhibitor.indicator,
         keyboard_module,
         battery.indicator,
         launcher.button,
