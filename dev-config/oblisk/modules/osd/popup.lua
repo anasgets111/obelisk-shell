@@ -62,16 +62,23 @@ local fact_row = row {
         return e.level == nil
     end),
     children = {
-        column {
+        -- A box's `align_*` place the box in its parent, not its child in it, so the glyph is centred
+        -- by a filling row inside the tile, the battery pill's own arrangement.
+        rect {
             width = theme.osd_tile,
             height = theme.osd_tile,
-            align_h = "Center",
             align_v = "Center",
             background = theme.ACCENT_LIGHT,
             border_width = theme.border_width,
             border_color = theme.ACCENT_MEDIUM,
             radius = theme.radius.md,
-            children = { cell(read("glyph"), theme.ACCENT, theme.font.xl, { align_v = "Center" }) },
+            children = { row {
+                width = "Fill",
+                height = "Fill",
+                align_h = "Center",
+                align_v = "Center",
+                children = { cell(read("glyph"), theme.ACCENT, theme.font.xl, { align_v = "Center" }) },
+            } },
         },
         text {
             content = bold("text"),
