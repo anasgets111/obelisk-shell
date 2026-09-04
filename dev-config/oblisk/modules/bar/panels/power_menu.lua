@@ -2,17 +2,18 @@
 -- the bar. That button existed to prove Phase 21's input path and nothing else: it counted its own
 -- clicks, opened the settings window and the popup at once, and had no counterpart in any real bar.
 --
--- Quickshell's PowerMenu offers log out, restart and power off, each behind a ten-second countdown
--- that a second click skips and a right click or the cancel slot stops. Those three are here, the
--- same way the mirror does them: `PowerManagementService` shells out to `systemctl` and to the
--- compositor, and `process.run` is that. Lock and sleep are here too, straight through, since
--- neither loses unsaved work; sleep is the mirror service's `suspend()`, which its menu never shows
--- and a laptop wants.
+-- Quickshell's PowerMenu is a pill on the bar: log out, restart and power off, each behind a
+-- ten-second countdown that a second click skips and a right click or the cancel slot stops. The
+-- pill is `power_button` below, built the same way the mirror does it: `PowerManagementService`
+-- shells out to `systemctl` and to the compositor, and `process.run` is that.
+--
+-- The panel under it has no counterpart in the mirror. Lock, sleep and settings are its rows and
+-- brightness its slider; settings has no other door, and lock and sleep lose nothing and so need
+-- no countdown. Sleep is the mirror service's `suspend()`, which its menu never shows.
 --
 -- The countdown is a deadline in `oblisk.system.time`, not a timer: `system` pushes once a second,
 -- so "seconds left" is a `computed` off it and the commit is one `on_change` (ADR-0115) watching
--- the clock pass the deadline. It keeps running with the panel closed, the way the mirror's pill
--- holds itself open, and the bar button counts down in its place so it stays in view.
+-- the clock pass the deadline.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -84,41 +85,6 @@ oblisk.system:on_change(function(s)
     end
 end)
 
--- One session action as a row. Clicking it starts the countdown; clicking it while it counts is
--- the mirror's "execute now"; the cancel button beside it is the mirror's cancel slot. The other
--- two rows dim while one counts, since a click on them would do nothing.
-local function action_row(action)
-    local is_this = pending:map(function(key)
-        return key == action.key
-    end)
-    return panel_row {
-        slot = "power-" .. action.key,
-        icon = action.icon,
-        title = action.title,
-        color = theme.RED,
-        subtitle = computed({ is_this, seconds_left }, function(mine, left)
-            return mine and string.format("in %ds, click to %s now", left, action.title) or nil
-        end),
-        opacity = computed({ counting, is_this }, function(any, mine)
-            return (any and not mine) and theme.opacity.muted or nil
-        end),
-        trailing = icon_button(icons.close, cancel_countdown, {
-            slot = "power-cancel-" .. action.key,
-            size = theme.control.xs,
-            icon_size = theme.icon.xs,
-            visible = is_this,
-        }),
-        on_activate = function()
-            local key = pending:get()
-            if key == action.key then
-                commit_pending()
-            elseif key == "" then
-                start_countdown(action.key)
-            end
-        end,
-    }
-end
-
 -- Wraps rather than clamping, and it stops at `BRIGHTNESS_STEP` rather than 0. A control that can
 -- black the panel out with one stray click is a control nobody clicks twice, and
 -- `brightness:set(0)` on an `intel_backlight` does exactly that.
@@ -138,34 +104,140 @@ local function step_brightness(delta)
     oblisk.brightness:invoke("set", stepped)
 end
 
--- Left zone, first module, which is where Quickshell's LeftSide.qml puts it. A glass circle like
--- every other control, with a red glyph.
+-- The mirror's `ExpandingPill`: one circle on the bar, the power off, that widens on hover into
+-- three -- log out, restart, power off -- and narrows back when the pointer leaves. `hover` on the
+-- row holding the three, not on each circle, since a hover region answers containment and a
+-- pointer crossing the gap between two circles never leaves the row. That is what the mirror's
+-- collapse timer exists to paper over, and why `workspace_strip.lua` thought a pill needed one.
+-- No width animation; the engine has none, and the volume pill snaps open the same way.
 --
--- The red was the ground until now, and a solid #f38ba8 disc was the loudest thing on a bar whose
--- whole point is that nothing on it is opaque. One rule everywhere on this bar: a filled ground
--- means "this is on", a coloured glyph means "this is what it does". Ending the session is the
--- second kind. `rescue` and `privacy` keep their filled grounds, because both are alerts that are
--- absent until they are not.
+-- While an action counts down the pill holds itself open and the three circles change roles, the
+-- mirror's three slots: the chosen action keeps its glyph under an accent ring, the circle next to
+-- it shows the seconds left over a fill that grows as they pass, and the third is a cancel. A left
+-- click on the chosen action runs it now, a click on the cancel or a right click anywhere stops it.
 --
--- While an action counts down the circle shows the seconds left on a red ground, which is the
--- mirror's countdown slot, so a closed panel does not hide a pending power off.
-local power_button = icon_button(computed({ counting, seconds_left }, function(any, left)
-    return any and tostring(left) or icons.shutdown
-end), function(rect)
-    ui_state.toggle_panel(KIND, rect)
-end, {
-    slot = "power",
-    selected = ui_state.panel_showing(KIND),
-    foreground = counting:map(function(any)
-        return any and theme.BG or theme.RED
-    end),
-    background = counting:map(function(any)
-        return any and theme.RED or theme.GLASS_CONTROL
-    end),
-    background_hover = counting:map(function(any)
-        return any and theme.RED or theme.GLASS_CONTROL_HOVER
-    end),
-})
+-- A right click while nothing counts opens the panel below, which the mirror does not have: lock,
+-- sleep, settings and brightness live there, and settings has no other door.
+local SLOT_COUNT = #ACTIONS
+local pill_hovered = hover("power-pill")
+local expanded = computed({ pill_hovered, counting }, function(is_hovered, any)
+    return is_hovered or any
+end)
+
+-- Which circle carries the countdown: the last, unless the last is the chosen action.
+local function countdown_index(key)
+    if key == ACTIONS[SLOT_COUNT].key then
+        return SLOT_COUNT - 1
+    end
+    return SLOT_COUNT
+end
+
+local function slot(index)
+    local action = ACTIONS[index]
+    -- `"action"`, `"countdown"` or `"cancel"`, off the pending key alone.
+    local role = pending:map(function(key)
+        if key == "" or key == action.key then
+            return "action"
+        elseif countdown_index(key) == index then
+            return "countdown"
+        end
+        return "cancel"
+    end)
+    local is_chosen = pending:map(function(key)
+        return key == action.key
+    end)
+    local slot_hovered = hover("power-" .. action.key)
+    local ground = computed({ slot_hovered, role }, function(is_hovered, what)
+        if what == "countdown" then
+            return theme.GLASS_CONTROL
+        end
+        return is_hovered and theme.GLASS_CONTROL_HOVER or theme.GLASS_CONTROL
+    end)
+    return button {
+        width = theme.item_width,
+        height = theme.item_height,
+        align_h = "Center",
+        align_v = "Center",
+        hover = slot_hovered,
+        radius = theme.item_radius,
+        background = ground,
+        border_width = theme.border_width,
+        border_color = computed({ is_chosen, slot_hovered }, function(chosen, is_hovered)
+            if chosen then
+                return theme.ACCENT
+            end
+            return is_hovered and theme.GLASS_BORDER_HOVER or theme.GLASS_BORDER
+        end),
+        visible = expanded:map(function(open)
+            return open or index == SLOT_COUNT
+        end),
+        children = {
+            -- The mirror's `FillBar` on the countdown slot: the seconds gone, as a ground that grows
+            -- from the left under the number.
+            rect {
+                width = computed({ role, seconds_left }, function(what, left)
+                    if what ~= "countdown" then
+                        return "0%"
+                    end
+                    local gone = math.max(0, math.min(COUNTDOWN, COUNTDOWN - left))
+                    return string.format("%d%%", math.floor(gone * 100 / COUNTDOWN + 0.5))
+                end),
+                height = "Fill",
+                radius = theme.item_radius,
+                background = theme.ON_HOVER,
+            },
+            text {
+                content = computed({ role, seconds_left }, function(what, left)
+                    if what == "countdown" then
+                        return tostring(left)
+                    elseif what == "cancel" then
+                        return icons.close
+                    end
+                    return action.icon
+                end),
+                foreground = role:map(function(what)
+                    return what == "action" and theme.RED or theme.FG
+                end),
+                font_size = role:map(function(what)
+                    return what == "countdown" and theme.font.sm or theme.icon.lg
+                end),
+                align_h = "Center",
+                align_v = "Center",
+            },
+        },
+        on_click = function(rect, mouse_button)
+            local key = pending:get()
+            if mouse_button == "right" then
+                if key ~= "" then
+                    cancel_countdown()
+                else
+                    ui_state.toggle_panel(KIND, rect)
+                end
+            elseif mouse_button == "left" then
+                if key == "" then
+                    start_countdown(action.key)
+                elseif key == action.key then
+                    commit_pending()
+                elseif countdown_index(key) ~= index then
+                    cancel_countdown()
+                end
+            end
+        end,
+    }
+end
+
+local slots = {}
+for index = 1, SLOT_COUNT do
+    slots[index] = slot(index)
+end
+
+local power_button = row {
+    height = theme.item_height,
+    align_v = "Center",
+    spacing = theme.spacing.sm,
+    hover = pill_hovered,
+    children = slots,
+}
 
 local body = {
     section_header("session"),
@@ -203,14 +275,6 @@ local body = {
             ui_state.settings_open:set(true)
         end,
     },
-    section_header("power"),
-    action_row(ACTIONS[1]),
-    action_row(ACTIONS[2]),
-    action_row(ACTIONS[3]),
-    -- The mirror's `FillBar` on the countdown slot: how much of the ten seconds has gone.
-    meter(seconds_left, function(left)
-        return (COUNTDOWN - left) * 100 / COUNTDOWN
-    end, theme.RED, "Fill", nil, counting),
     section_header("brightness"),
     -- The bar has no brightness module -- Quickshell's does not either -- so § 3.2's one command
     -- with an argument in it is driven from here (Phase 25 item 2). Two buttons rather than one
