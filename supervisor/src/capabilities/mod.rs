@@ -32,6 +32,7 @@ use audio::mixer::{AudioState, VideoSourceApp};
 use battery::{BatteryController, BatterySignal};
 use bluetooth::{BluetoothController, BluetoothSignal};
 use brightness::{BrightnessController, BrightnessSignal};
+use files::{FilesController, FilesSignal};
 use idle::IdleController;
 use keyboard::{KeyboardController, KeyboardSignal};
 use lock::LockController;
@@ -51,6 +52,7 @@ pub mod audio;
 pub mod battery;
 pub mod bluetooth;
 pub mod brightness;
+pub mod files;
 pub mod idle;
 pub mod keyboard;
 pub mod lock;
@@ -120,6 +122,7 @@ pub enum Signal {
     Workspaces,
     Power,
     Applications,
+    Files,
     System,
     Privacy,
     Updates,
@@ -219,6 +222,7 @@ capability_channels! {
         Power => power: PowerSignal, Some(PowerSignal::Changed) => Signal::Power;
         Applications => applications: ApplicationsSignal,
             Some(ApplicationsSignal::Changed) => Signal::Applications;
+        Files => files: FilesSignal, Some(FilesSignal::Changed) => Signal::Files;
     }
     // `lock` has no signal channel, deliberately: built at boot in `main.rs` since the relock
     // path commands it before any config reads (ADR-0060); it reports through `LockOutcome`
@@ -247,6 +251,7 @@ pub struct Capabilities {
     power: Option<PowerController>,
     system: Option<SystemController>,
     applications: Option<ApplicationsController>,
+    files: Option<FilesController>,
     audio: Option<audio::mixer::AudioCommandSender>,
     idle: Option<IdleController>,
 
@@ -291,6 +296,7 @@ impl Capabilities {
             power: None,
             system: None,
             applications: None,
+            files: None,
             audio: None,
             idle: None,
             senders,
@@ -486,6 +492,12 @@ impl Capabilities {
                     ));
                 }
             }
+            // Nothing to list until a config names a folder: `files:watch` is what starts work.
+            Capability::Files => {
+                if self.files.is_none() {
+                    self.files = Some(FilesController::new(self.senders.files.clone()));
+                }
+            }
             Capability::Audio => self.ensure_mixer_thread(),
             // Not owned here: `LockController` is built at boot in `main.rs` (ADR-0060), so this
             // read is free. `polkit`'s start is its agent registration, in `main.rs`'s arm.
@@ -600,6 +612,12 @@ impl Capabilities {
                     push!(Capability::Applications, &applications.snapshot());
                 }
             }
+            // Fires on `watch`/`unwatch` and after every settled burst of folder changes.
+            Signal::Files => {
+                if let Some(files) = &self.files {
+                    push!(Capability::Files, &files.snapshot());
+                }
+            }
             // The only capability pushing on a timer, once per wall-clock second, emitted only
             // when the epoch second actually changed (ADR-0053 decision 2).
             Signal::System => {
@@ -648,6 +666,7 @@ impl Capabilities {
             Capability::Power => to!(self.power, power::dispatch),
             Capability::Updates => to!(self.updates, updates::dispatch),
             Capability::Applications => to!(self.applications, applications::dispatch),
+            Capability::Files => to!(self.files, files::dispatch),
             Capability::Audio => to!(self.audio, audio::dispatch),
             Capability::System => to!(self.system, system::dispatch),
             Capability::Lock => lock::dispatch(lock, envelope),

@@ -23,7 +23,7 @@ use schemars::{Schema, schema_for};
 
 /// The one place a capability name is tied to the type it pushes and to the enum of actions it
 /// accepts. Neither mapping exists anywhere else in the tree: `push_snapshot` takes
-/// `&impl Serialize`, so the payload type is inferred at each of the 17 call sites, and an action
+/// `&impl Serialize`, so the payload type is inferred at each of the 18 call sites, and an action
 /// enum is named only by its own `dispatch`. `every_capability_has_a_schema` keeps this honest
 /// against `shared::Capability::ALL`. `None` is a read-only capability, which gets the plain `invoke`
 /// it inherits from `Capability`.
@@ -49,6 +49,11 @@ fn capability_schemas() -> Vec<(&'static str, Schema, Option<Schema>)> {
             "brightness",
             schema_for!(crate::capabilities::brightness::controller::BrightnessState),
             Some(schema_for!(crate::capabilities::brightness::BrightnessAction)),
+        ),
+        (
+            "files",
+            schema_for!(crate::capabilities::files::controller::FilesState),
+            Some(schema_for!(crate::capabilities::files::FilesAction)),
         ),
         (
             "keyboard",

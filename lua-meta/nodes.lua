@@ -120,6 +120,7 @@
 ---@class ImageProps: NodeBase
 ---@field source? string|Bound An absolute path. Never a theme name; that is `icon`'s job.
 ---@field fit? "cover"|"contain"|"stretch"|Bound Default `"cover"`. An image has no intrinsic size and takes the box `width`/`height` give it.
+---@field async? boolean|Bound Default `false`, which decodes the file inside the frame that first draws it, so the frame is whole: right for a wallpaper, whose first paint is what the swap waits on. `true` decodes on a worker pool and draws nothing until the pixels land, then repaints (ADR-0122): for a grid of thumbnails, where forty inline decodes would freeze the shell for a second. Either way a raster is stored scaled down to cover its box, so a 4K file drawn as a tile costs a tile's worth of texture.
 
 ---@class ButtonProps: NodeBase, BoxBase
 ---@field children? Node[] Drawn in order. A hole in the array truncates it, since `#` is undefined on a sparse table.

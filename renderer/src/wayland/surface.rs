@@ -895,6 +895,17 @@ impl App {
     /// protocol state and nothing visual staged a request and never committed it -- see
     /// [`App::apply_spec_change`], which now carries its own commit rather than relying on this
     /// one.
+    /// Clears `last_painted` on every surface whose last list draws one of `files`, so the next
+    /// [`App::repaint_mapped_surfaces`] paints it rather than declining an identical list
+    /// (ADR-0122: a background decode landing is a new texture behind an unchanged list).
+    pub(super) fn forget_painted_lists_drawing(&mut self, files: &[std::path::PathBuf]) {
+        for surface in &mut self.surfaces {
+            if surface.last_painted.as_ref().is_some_and(|(_, list)| list.draws_any_of(files)) {
+                surface.last_painted = None;
+            }
+        }
+    }
+
     pub(super) fn repaint_mapped_surfaces(&mut self) {
         for index in 0..self.surfaces.len() {
             if self.surfaces[index].map_state != MapState::Mapped {

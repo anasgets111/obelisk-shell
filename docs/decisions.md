@@ -5669,3 +5669,115 @@ what exists and a strip's slot count is not the compositor's fact.
 The Hyprland half is built to the documented IPC and not live-tested, as ADR-0118. § 2.9's "two
 gaps" note is now one, the window list.
 
+
+## 0120. A watched folder is a capability, `oblisk.files`
+
+A config that wants a folder's contents asks the Supervisor to follow it: `files:watch(path,
+extensions?)` lists it once and re-lists it after every settled burst of inotify events, and
+`oblisk.files.folders[path]` is the result. The first caller is the wallpaper picker; the shape
+is a folder watcher, not a wallpaper scanner.
+
+1. **Supervisor-side, through inotify, not a Lua read.** ADR-0048 took `io` out of the config VM
+   so no evaluation can block Wayland dispatch on a filesystem, and `process.run("ls")` would put
+   a line parser in the config for a listing the Supervisor can hand over as a table. `watcher.rs`
+   already follows the config directory the same way; this is that shape for a folder the config
+   names.
+2. **Keyed by the path the config wrote**, trailing slashes stripped, so `folders[folder]` reads
+   back with the string that went in. `ready` is false until the first listing lands, `error`
+   carries a listing failure in words, and both are on the folder rather than the capability,
+   since two folders can be in two states.
+3. **One level, files only, hidden skipped, sorted by name folded**, filtered to the extensions
+   `watch` named so a `Downloads` folder does not ship five thousand entries per push. A
+   subfolder is not listed and not descended; a picker that wants a tree has not been asked for.
+4. **A repeat `watch` with the same filter re-pushes and starts nothing.** A generation swap
+   re-evaluates the config, which calls `watch` again, and the new generation reads the snapshot
+   it already has. A different filter replaces the watch, since the held listing was made under
+   the old one. `unwatch` aborts the task and drops the key.
+5. **`MODIFY` is not in the mask.** A copy in progress fires it per chunk; `CLOSE_WRITE` marks the
+   end and the 200ms debounce folds a forty-file copy into one listing. `DELETE_SELF`/`MOVE_SELF`
+   list once more (recording the error) and stop; watching the parent for the folder to reappear
+   is the upgrade, unasked for.
+
+Rejected: a `system:list_dir` returning through `system.state` (a listing is not user state, and
+it would not follow changes); a per-file `stat` payload with size and permissions (the picker
+reads name, path and mtime; the rest waits for a caller).
+
+**Consequences**: `shared::Capability` gains `Files`, the stubs gain `FilesState`, `Folder` and
+`FileEntry`, § 2.17 and two § 3.2 rows describe it. `applications` still scans on `refresh`
+rather than watching, per ADR-0061 decision 4; nothing here changes that.
+
+## 0121. A `panel` or `lock` may build its child per output
+
+`child` on a `panel` or `lock` may be a function of the output's connector name. `Scene::apply`
+calls it once per surface instance, per pass, and the node table it returns takes `child`'s
+place before the walk begins. A `window` or `popup` has one instance wherever the compositor
+places it and no output to hand over, so a function there is refused.
+
+1. **Per instance, where the instance is known.** ADR-0038 decision 3 made one `monitor =
+   "All"` declaration one surface per output, all resolving the same tree against their own
+   `available`. Nothing in that tree could tell which output it was on, so a wallpaper that
+   differs per screen had to be one `panel` per screen, declared from `oblisk.screens` at
+   evaluation, and a monitor plugged in later got nothing until a reload. The function is called
+   in `apply_one_instance`, the one place the instance id, the output and the tree meet.
+2. **Per pass, on `list.itemfn`'s terms.** The function runs on every apply, and its return is
+   reconciled by id and position like any child. A `state("wallpaper_" .. output)` inside it is
+   registry-stable by name (ADR-0044), so the retained tree survives; the cost is the same
+   rebuild-and-throw-away `itemfn` already pays (§ 5.2's "fast-reconciling virtual repeater").
+3. **`nil` maps the instance empty**, the same as no `child`, so a function may decline an output.
+4. **The eval-time probe calls it with `"PROBE"`.** `lua::nodes`' validation applies every surface
+   once against a single fake output, and a function child is validated on that output's return.
+
+Rejected: an `oblisk.output` signal resolved per instance (a signal is one value; resolution
+reads it once per property with no instance in scope); a `child` table keyed by output name (a
+function is the general form and a table is one line of Lua inside it).
+
+**Consequences**: `lua-meta/surfaces.lua` types `child` as `Node|fun(output: string): Node?` on
+`panel` and `lock`; § 6.1 and § 6.4 say so. `dev-config`'s wallpaper is one panel again, with
+per-output source and fit, and its choice persists through `system:write_state`, which closes
+ADR-0055 decision 2's "does not persist".
+
+## 0122. Images decode to their box, and off the frame through the thumbnail cache when asked
+
+Three changes to the Renderer's image path, for a grid of files where the old path was a second
+of frozen shell and a gigabyte of textures.
+
+1. **A raster is stored scaled down to cover its box, never up**, and the cache key carries the
+   box in physical pixels for every file, where before it did for SVG alone (ADR-0054 decision
+   4's key). A 4K file drawn as a 230px tile is a 230px texture; the same file drawn full-screen
+   is a screen's worth. The `image` crate's `thumbnail` (a triangle filter) does the scale. The
+   same rule for every `fit`: `contain` could go smaller, but one rule keeps one slot per box.
+2. **`image.async = true` decodes on a pool and draws nothing until it lands.** The pool is
+   `available_parallelism` capped at four threads, fed from one queue, answering on one channel.
+   The main loop polls it once per turn (the same drain-then-act turn as ADR-0044 decision 2's
+   dirty flag) and repaints; the texture is created at the start of the next paint, where
+   `release_evicted` already runs, since only the Wayland thread holds the context (ADR-0039).
+   The default stays inline, since a wallpaper's first frame must be whole for the candidate's
+   presentation evidence (ADR-0003) and an icon's decode is microseconds. A landing changes no
+   display list, since a list names the file and not the texture, so the landing names its files
+   and only the surfaces whose last list draws one forget it: `DisplayList::draws_any_of` is what
+   keeps the wallpaper from repainting for a tile.
+3. **A pool decode goes through the freedesktop thumbnail cache.** For a box a spec size covers
+   (`normal` 128, `large` 256, `x-large` 512, `xx-large` 1024 on the longest edge), a current
+   thumbnail at `$XDG_CACHE_HOME/thumbnails/<size>/<md5 of the file URI>.png` is decoded instead
+   of the file, current meaning its `Thumb::MTime` is the source's mtime and its `Thumb::URI`,
+   if present, is this file. A file decoded in full leaves a thumbnail behind when it was larger
+   than one, written the spec's way (temp file beside the final name, `0600`, directory `0700`,
+   rename). Nautilus and every GTK file chooser keep the same cache, so a folder the file manager
+   has shown opens with no full decode, and one the picker decoded shows in the file manager
+   likewise. The URI is escaped as GLib escapes it, since GLib hashed what is already there.
+4. **WebP decodes**, one feature flag on the `image` crate, because a wallpaper folder is full of it.
+
+Not built: the spec's `fail/` directory (a file that does not decode is `Slot::Failed` for the
+generation); `Thumb::Size`; the shared repository under `/usr/share/thumbnails`; a byte budget
+for the cache (ADR-0054's entry count stands, and an entry is now at most its box); a crossfade
+when an inline `source` changes (ADR-0002's transition branch, still waiting on an animation
+model, so a wallpaper change is a stalled frame rather than a flash of the ground).
+
+Rejected: thumbnails for inline decodes too (a tray pixmap in `/dev/shm` or a notification image
+is not a user file, and would litter the cache); a separate `thumbnail = true` property beside
+`async` (nothing wants one without the other, and QML's `asynchronous` is the one switch a
+picker sets).
+
+**Consequences**: `Draw::Image` and the cache key carry a box, `ImageCache::image` takes a `Load`,
+`renderer/src/image/thumbnails.rs` is new, `md-5` and `png` are direct dependencies. § 5a gains
+`async`; `CONTEXT.md`'s Image cache term says what the key is now.

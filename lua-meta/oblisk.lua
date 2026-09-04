@@ -133,6 +133,18 @@
 ---@field name string The advertised name. Often empty for a device that broadcasts only an address.
 ---@field paired boolean Always `false` -- per the IDL comment, every entry in this pool is by definition unpaired.
 
+---@class FileEntry
+---One file in a watched folder.
+---@field modified integer Unix epoch seconds of the last modification, for a "newest first" sort. `0` when the filesystem does not say.
+---@field name string The file name alone, `sunrise.jpg`, for drawing and for matching a search against.
+---@field path string The absolute path, what `image { source = ... }` takes and what a config stores.
+
+---@class Folder
+---One watched folder as the config sees it.
+---@field entries FileEntry[] The plain files directly inside the folder, hidden ones (a leading dot) skipped, filtered to the extensions `watch` named, sorted by name case-insensitively. Not recursive: a subfolder is not listed and nothing inside it is. Replaced wholesale on every change inotify reports, debounced, so a copy in progress lands as one update.
+---@field error? string Why the last listing produced nothing, in words fit to draw (`"No such file or directory"`), or absent when it succeeded. Set alongside `ready = true`, so a picker tells a missing folder from an empty one.
+---@field ready boolean `false` between `watch` and the first listing landing, which is the "loading" a picker draws a spinner for. `true` afterwards, even when `entries` is empty or `error` is set.
+
 ---@class MenuItem
 ---One node of a DBusMenu layout tree, already resolved into what `tray.items[].menu` needs
 ---(docs/oblisk-idl-api-specs.md §2.14).
@@ -300,6 +312,11 @@
 ---was found, since no signal is sent in that case (see `brightness/mod.rs`).
 ---@field percent integer Screen backlight, `0` to `100`. Read from sysfs `brightness`, the last requested value, rather than `actual_brightness`, so it matches what was asked for instead of lagging through a hardware fade.
 
+---@class FilesState
+---`oblisk.files`'s payload (ADR-0120): every watched folder, keyed by the path `watch` was
+---given, so a config reads back `oblisk.files.folders[folder]` with the string it wrote.
+---@field folders table<string, Folder> One entry per `files:watch(path)` still in force, keyed by that path with trailing slashes stripped. Absent until the first `watch`, so a config draws nothing rather than an empty list for a folder it never asked about.
+
 ---@class KeyboardState
 ---`oblisk.keyboard`'s combined payload. `backlight_pct` is `-1` when this machine has no
 ---keyboard-backlight hardware. `caps_lock`/`num_lock`/`scroll_lock` have no sentinel (bare
@@ -437,6 +454,9 @@ local BatteryCapability = {}
 ---@class BrightnessCapability: Capability<BrightnessState>
 ---@field invoke fun(self: BrightnessCapability, command: "set", ...: any)
 
+---@class FilesCapability: Capability<FilesState>
+---@field invoke fun(self: FilesCapability, command: "watch"|"unwatch", ...: any)
+
 ---@class KeyboardCapability: Capability<KeyboardState>
 ---@field invoke fun(self: KeyboardCapability, command: "set_backlight"|"switch_layout", ...: any)
 
@@ -536,6 +556,7 @@ function Idle:release_inhibit() end
 ---@field workspaces WorkspacesCapability The compositor's workspaces per output, and the focused toplevel window.
 ---@field power PowerCapability power-profiles-daemon's platform profiles, plus whether you are on mains and how many watts are moving.
 ---@field applications ApplicationsCapability The installed desktop entries, listed and indexed by the `app_id` a window reports.
+---@field files FilesCapability The files in each folder a config asked to watch, kept current through inotify.
 ---@field idle Idle Idle thresholds and the inhibit pair. Methods only, no state to read (ADR-0032).
 ---@field screens Signal<Screen[]> Renderer-sourced, seeded to an empty list, and the one signal with a value at first evaluation (ADR-0041).
 ---@field rescue Signal<RescueState> Renderer-sourced, no commands (ADR-0046).

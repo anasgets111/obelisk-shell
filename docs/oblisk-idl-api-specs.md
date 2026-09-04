@@ -268,6 +268,17 @@ The capability ADR-0054 decision 5 deferred until a caller appeared: enumeration
 
 > **No `Exec` field, deliberately.** The parsed command line stays in the Supervisor, reached only through `applications:launch(id)` (ADR-0061 decision 3): a config that could read an argv could assemble a different one before handing it back to run.
 
+### 2.17 Watched folders (`oblisk.files`) (ADR-0120)
+The files in every folder a config asked to follow with `files:watch(path, extensions?)`, listed once and re-listed after each settled burst of inotify events. The config VM has no `io` (ADR-0048), so this is how a picker, a download shelf or a screenshot tray reads a folder. One level, plain files only, hidden entries skipped, sorted by name case-insensitively.
+*   `folders`: `table` (Map from the watched path, trailing slashes stripped, to a folder structure. Absent until the first `watch`)
+    *   Folder structure:
+        *   `ready`: `boolean` (`false` between `watch` and the first listing landing; `true` afterwards, even when `entries` is empty or `error` is set)
+        *   `entries`: `table` (Array of file structures, filtered to the extensions `watch` named)
+            *   `name`: `string` (The file name alone)
+            *   `path`: `string` (The absolute path, what `image.source` takes)
+            *   `modified`: `integer` (Unix epoch seconds of the last modification, `0` when unknown)
+        *   `error`: `string` (Why the last listing produced nothing, or `nil` when it succeeded, so a missing folder reads differently from an empty one)
+
 ---
 
 ## 3. Command execution protocol (write path)
@@ -324,7 +335,9 @@ All write actions serialize as JSON-RPC 2.0 payloads over the private Unix socke
 | `oblisk.applications:refresh()` | `capability: "applications", action: "refresh", arguments: []`<br>**Validation**: None. Rescans the applications directories off-thread and pushes a new `StateSnapshot` only if the result differs. Cheap to call on every launcher open, which `dev-config` does instead of watching the directories (ADR-0061 decision 4). |
 | `oblisk.applications:launch(id)` | `capability: "applications", action: "launch", arguments: [id]`<br>**Validation**: `id` must be an `entries[].id` from the current snapshot; an unknown id is logged and nothing spawned. Runs the entry's own `Exec=`, detached and in its own process group, so a generation swap does not reap it and no pipe is held (unlike `process.run`, ADR-0026). `Terminal=true` wraps in `$TERMINAL -e`, refused with a log line if `$TERMINAL` is unset. |
 | `oblisk.applications:open_url(url)` | `capability: "applications", action: "open_url", arguments: [url]`<br>**Validation**: `url` is a string under 2048 bytes with no whitespace or control character, whose scheme is `http`, `https` or `mailto`; anything else is logged and nothing spawned -- `file:` in particular, since a URL out of a notification body is the sender's text. Hands it to `xdg-open`, detached like `launch`, so the user's own default handler opens it. ADR-0103. |
-| `wallpaper:set(mon, path, fit, anim, dur)` | **Superseded by ADR-0055. No `wallpaper` capability, none planned.** A wallpaper is an `image` node on a config-declared `Background` panel: `mon` is `panel.monitor`, `path` is `image.source`, `fit` is `image.fit`, and a runtime change writes the `state()` signal bound to `source`, no IPC involved. `anim` and `dur` have nowhere to go: the engine has no animation model (`roadmap.md`). |
+| `oblisk.files:watch(path, extensions?)` | `capability: "files", action: "watch", arguments: [path, extensions?]`<br>**Validation**: `path` is an absolute folder path; `extensions`, when given, is an array of strings without the dot, matched case-insensitively (`{ "jpg", "png" }`), and absent means every file. Lists the folder and follows it through inotify until `unwatch` (ADR-0120). A repeat call with the same filter re-pushes the held listing; a different filter starts over. |
+| `oblisk.files:unwatch(path)` | `capability: "files", action: "unwatch", arguments: [path]`<br>**Validation**: `path` is an absolute folder path. Stops following it and drops it from `folders`; a path never watched is a no-op. |
+| `wallpaper:set(mon, path, fit, anim, dur)` | **Superseded by ADR-0055. No `wallpaper` capability, none planned.** A wallpaper is an `image` node on a config-declared `Background` panel: `mon` is the output name `child = function(output)` hands the panel per instance (ADR-0121), `path` is `image.source`, `fit` is `image.fit`, and a runtime change is `system:write_state` on a per-output key the source reads back, which is what makes it persist. `anim` and `dur` have nowhere to go: the engine has no animation model (`roadmap.md`). |
 | `workspaces:focus(id)` | `capability: "workspaces", action: "focus", arguments: [id]`<br>**Validation**: `id` must be an integer. Focuses target workspace. On Hyprland `id` is the workspace number and a number no workspace has yet creates one (ADR-0118). |
 | `workspaces:toggle_special(name)` | `capability: "workspaces", action: "toggle_special", arguments: [name]`<br>**Validation**: `name` is a non-empty string, a `special[].name`. Shows the special workspace on the focused output, or hides it if shown; a name no special has creates one, which is how a scratchpad is first opened. Logged and ignored on a compositor whose payload has no `special` key (ADR-0119). |
 | `rescue:reload_config()` | `capability: "rescue", action: "reload_config", arguments: []`<br>**Validation**: Runs compiler pass on `shell.lua` and reloads Renderer if valid. |
@@ -448,8 +461,9 @@ Draws a system SVG/PNG icon.
 Draws a file. Added by ADR-0054 decision 3: album art has an aspect ratio and a wallpaper is not an icon by any reading.
 *   `source`: `string` / `Signal` (Absolute path. Never a theme name; that is `icon`'s job)
 *   `fit`: `string` (`"cover"` scales to fill and crops, `"contain"` fits inside, `"stretch"` ignores aspect ratio. Defaults to `"cover"`)
+*   `async`: `boolean` / `Signal` (Default `false`: the file decodes inside the frame that first draws it, so that frame is whole. `true` decodes on a worker pool and draws nothing until the pixels land, then repaints, going through the freedesktop thumbnail cache on the way, reading a current thumbnail instead of the file and leaving one behind after a full decode, ADR-0122. For a grid of files, not for a wallpaper)
 
-An `image` has no intrinsic size and takes the box § 5.1's `width`/`height` give it, unlike `icon`: knowing a file's own dimensions requires decoding it, and the layout pass has no canvas to decode against.
+An `image` has no intrinsic size and takes the box § 5.1's `width`/`height` give it, unlike `icon`: knowing a file's own dimensions requires decoding it, and the layout pass has no canvas to decode against. Whatever the file's size, the texture is at most the box's: a raster is stored scaled down to cover it and never up (ADR-0122).
 
 #### 6. `button`
 Receives input focus and pointer events.
@@ -552,7 +566,7 @@ A layer-shell surface container (`zwlr_layer_surface_v1`). Formerly named `surfa
 *   `namespace`: `string` (The layer-shell namespace the compositor sees; compositor rules match on it, e.g. Hyprland's `layerrule` for blur and animations. Defaults to `"oblisk-{id}"`)
 *   `keyboard_interactivity`: `string` (`"None"` (default), `"OnDemand"`, or `"Exclusive"`, mapping to layer-shell's own field. A launcher or any surface accepting typed input needs `"OnDemand"` or `"Exclusive"`; `"None"` never receives key events)
 *   `visible`: `boolean` / `Signal` (Unmaps the surface when false, without destroying it. How a config shows and hides a panel without churning Wayland objects)
-*   `child`: `node` (The root visual primitive node inside this window)
+*   `child`: `node` / `function(output)` (The root visual primitive node inside this window. A function is called once per output instance with that output's connector name, per pass, and its return takes the child's place, so one `monitor = "All"` panel can show a different tree per screen; `nil` maps that instance empty. ADR-0121)
 
 ### 6.2 `window`
 A standard toplevel window (`xdg_toplevel`), the kind the compositor tiles, stacks, and lists in a task switcher. For a settings window or standalone dialog, where a `panel` would be wrong.
@@ -586,7 +600,7 @@ A popup may only open in response to real user input, so `grab = true` outside a
 ### 6.4 `lock`
 A session-lock surface (`ext_session_lock_surface_v1`). One per output, created when the session locks and destroyed on unlock. While locked the compositor shows only these, so a `panel` cannot be part of a lock screen (ADR-0042).
 *   `id`: `string` (Unique identifier)
-*   `child`: `node` (The lock screen's node tree, authored like any other)
+*   `child`: `node` / `function(output)` (The lock screen's node tree, authored like any other. A function is called per output as a `panel`'s is, ADR-0121)
 
 No `visible`, `monitor`, `anchor`, or size: a lock surface covers its output, exists on every output, and its lifetime is the lock's, not the config's. Authentication runs through a `textfield` with `secure_submit` (§ 5.2 item 8), so the password reaches the Supervisor's PAM worker without entering the Lua VM (ADR-0005, ADR-0028, ADR-0042). Locking is triggered by the Supervisor, not by returning this node; declaring it says what the lock screen looks like, not when it appears.
 

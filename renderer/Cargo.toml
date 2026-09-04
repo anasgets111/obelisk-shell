@@ -25,8 +25,9 @@ freedesktop-icons = "0.4.0"
 glow = "0.18.0"
 # femtovg declares `image` with `default-features = false` and turns no format on, so its own
 # `load_image_file` answers every PNG with `Unsupported(Exact(Png))`. `image::decode_raster` calls
-# the crate directly instead, and this is where the formats it accepts are named.
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+# the crate directly instead, and this is where the formats it accepts are named. `webp` because a
+# wallpaper folder is full of them (ADR-0122).
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 cursor-icon = "1.2.0"
 khronos-egl = { version = "6.0.0", features = ["static"] }
 mlua = { version = "0.12.0", features = ["lua54", "vendored", "serde"] }
@@ -42,6 +43,8 @@ wayland-client = "0.31.15"
 wayland-egl = "0.32.11"
 wayland-protocols = { version = "0.32.13", features = ["client", "unstable"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+md-5 = "0.10"
+png = "0.18"
 
 [dev-dependencies]
 tempfile = "3.27.0"

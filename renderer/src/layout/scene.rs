@@ -366,6 +366,7 @@ impl Scene {
         // that needs its `margin` before it can recurse.
         ensure_node_admissible(&fresh.kind, 0)?;
         let properties = node::resolve_properties(&fresh.properties, &fresh.kind, lua)?;
+        let properties = build_child_for_output(properties, &fresh.kind, &instance.output)?;
         // The root's one parse for this pass. Every other node's is done by its parent's child
         // loop; a surface root has no parent, so this is where the once-per-node-per-pass parse
         // guarantee runs out of frames one level up.
@@ -562,6 +563,51 @@ fn children_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Vec<Vi
         "text" | "icon" | "image" | "textfield" => Ok(Vec::new()),
         other => unreachable!("ensure_supported_kind already rejected `{other}`"),
     }
+}
+
+/// `child = function(output)` on a `panel` or `lock` (ADR-0121): the one place a node tree can
+/// depend on which output its surface instance is on. Called here, per instance and per pass,
+/// with the instance's output name, and the node table it returns takes `child`'s place before
+/// the walk begins, so everything below sees an ordinary child. Per pass rather than once, on
+/// `list.itemfn`'s terms: the function is the config's, and a `state("wallpaper_" .. output)`
+/// inside it is registry-stable by name, so the retained tree reconciles as it would under a
+/// literal child. A `window` or `popup` has one instance wherever the compositor puts it and no
+/// output name to hand over, so a function there is refused rather than called with `""`.
+fn build_child_for_output(
+    mut properties: HashMap<String, Value>,
+    kind: &str,
+    output: &str,
+) -> Result<HashMap<String, Value>, LayoutError> {
+    let Some(Value::Function(builder)) = properties.get("child") else {
+        return Ok(properties);
+    };
+    if !matches!(kind, "panel" | "lock") {
+        return Err(node::invalid(
+            "child",
+            format!(
+                "a function child is for a `panel` or `lock`, which have one instance per output to hand it; \
+                 a `{kind}` has one instance wherever the compositor places it"
+            ),
+        ));
+    }
+    let built = builder.call::<Value>(output).map_err(|e| node::invalid("child", e.to_string()))?;
+    match built {
+        Value::Table(_) => {
+            properties.insert("child".to_string(), built);
+        }
+        // The function declining to draw on this output: the surface maps empty, as it would with
+        // no `child` at all.
+        Value::Nil => {
+            properties.remove("child");
+        }
+        other => {
+            return Err(node::invalid(
+                "child",
+                format!("expected the function to return a node table, got {}", node::preview_for_error(&other)),
+            ));
+        }
+    }
+    Ok(properties)
 }
 
 /// A surface root's own size, and nothing else's. Every node below one gets its size from the
@@ -1683,6 +1729,98 @@ pub(super) mod tests {
             })
             .collect();
         scene.apply(surfaces, &instances, shaping, lua)
+    }
+
+    /// Two outputs, `"LEFT"` and `"RIGHT"`, for the per-output child fixtures (ADR-0121).
+    fn apply_on_two_outputs(
+        scene: &mut Scene,
+        surface: &VirtualNode,
+        shaping: &ShapingHandle,
+        lua: &Lua,
+    ) -> Result<(), LayoutError> {
+        let declared_id = node::parse_surface_id(&surface.properties).expect("the fixture declares an `id`");
+        let instances: Vec<SurfaceInstance> = ["LEFT", "RIGHT"]
+            .into_iter()
+            .map(|output| SurfaceInstance {
+                instance_id: format!("{declared_id}@{output}"),
+                declared_id: declared_id.clone(),
+                output: output.to_string(),
+                available: full(),
+            })
+            .collect();
+        scene.apply(std::slice::from_ref(surface), &instances, shaping, lua)
+    }
+
+    #[test]
+    fn a_function_child_is_built_once_per_output_with_that_outputs_name() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua
+            .load(
+                r#"return panel {
+                    id = "wall",
+                    child = function(output)
+                        return rect { width = output == "LEFT" and 10 or 20, height = 5 }
+                    end,
+                }"#,
+            )
+            .eval()
+            .unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+
+        apply_on_two_outputs(&mut scene, &surface, &shaping, &lua).unwrap();
+
+        assert_eq!(scene.surface("wall@LEFT").unwrap().children[0].rect.width, 10.0);
+        assert_eq!(scene.surface("wall@RIGHT").unwrap().children[0].rect.width, 20.0);
+    }
+
+    #[test]
+    fn a_function_child_returning_nil_maps_the_instance_empty() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua
+            .load(
+                r#"return panel {
+                    id = "wall",
+                    child = function(output)
+                        if output == "LEFT" then return rect { width = 10, height = 5 } end
+                    end,
+                }"#,
+            )
+            .eval()
+            .unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+
+        apply_on_two_outputs(&mut scene, &surface, &shaping, &lua).unwrap();
+
+        assert_eq!(scene.surface("wall@LEFT").unwrap().children.len(), 1);
+        assert!(scene.surface("wall@RIGHT").unwrap().children.is_empty());
+    }
+
+    #[test]
+    fn a_function_child_on_a_window_is_refused_and_a_non_node_return_names_child() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table =
+            lua.load(r#"return window { id = "w", child = function() return rect {} end }"#).eval().unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+        let err = apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap_err().to_string();
+        assert!(err.contains("child") && err.contains("window"), "{err}");
+
+        let table: mlua::Table =
+            lua.load(r#"return panel { id = "p", child = function() return 4 end }"#).eval().unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+        let err = apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap_err().to_string();
+        assert!(err.contains("child") && err.contains("node table"), "{err}");
     }
 
     #[test]

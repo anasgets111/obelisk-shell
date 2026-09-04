@@ -22,7 +22,7 @@ use std::f32::consts::{FRAC_PI_2, PI};
 use femtovg::renderer::OpenGl;
 use femtovg::{Canvas, Color, ImageFlags, ImageId, Paint, Path, PixelFormat, RenderTarget, Solidity};
 
-use crate::image::{self, Fit, ImageCache};
+use crate::image::{self, Fit, ImageCache, Load};
 use crate::layout::node::{self, BorderColor, ClipShape, EdgeInsets, PaintStyle, Rgba, StyleRun, TextAlign};
 use crate::layout::scene::{NodeId, ResolvedNode};
 use crate::text::atlas::{TextDraw, TextPainter};
@@ -38,12 +38,7 @@ use crate::text::snap::{LogicalRect, PhysicalRect, snap_border_band, snap_to_phy
 #[derive(Debug, Clone, PartialEq)]
 pub enum Draw {
     /// `rect`/`row`/`column`/`button` and all four surface roles: the fill, then the border.
-    Box {
-        background: Option<Rgba>,
-        radius: f32,
-        colors: BorderColor,
-        widths: EdgeInsets,
-    },
+    Box { background: Option<Rgba>, radius: f32, colors: BorderColor, widths: EdgeInsets },
     Text {
         content: String,
         /// Byte ranges of `content` drawn in another face, underlined or recoloured (ADR-0104).
@@ -67,22 +62,16 @@ pub enum Draw {
         /// on it, so the same file tinted two ways is two textures.
         color: Option<Rgba>,
     },
-    Image {
-        source: String,
-        fit: Fit,
-        px: u32,
-        alpha: f32,
-    },
+    /// `box_px` is the node's box in physical pixels, both edges: `ImageCache` keys on it and
+    /// downscales a raster to cover it (ADR-0122), where an icon's one `px` is its shorter edge.
+    Image { source: String, fit: Fit, box_px: (u32, u32), alpha: f32, load: Load },
     /// A whole subtree drawn through the arc of the node that declared `clip = "Rounded"`, rather
     /// than its bounding rectangle. `radius` is that node's own; the carrying [`DrawCmd`]'s `rect`
     /// is the box the arc is built on. The one recursive variant: every other clip here is
     /// axis-aligned and flattened into one `clip` per [`DrawCmd`], but a rounded shape does not
     /// intersect into a rectangle, so its subtree stays grouped for [`execute`] to mask as a whole.
     /// `Vec<DrawCmd>`, not `DisplayList`: that is one surface's finished output.
-    Clipped {
-        radius: f32,
-        commands: Vec<DrawCmd>,
-    },
+    Clipped { radius: f32, commands: Vec<DrawCmd> },
 }
 
 /// One drawable node: what, where, and the clip it draws under.
@@ -110,6 +99,22 @@ pub struct DrawCmd {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DisplayList {
     pub commands: Vec<DrawCmd>,
+}
+
+impl DisplayList {
+    /// Whether any `image` in this list draws one of `files` (ADR-0122). A background decode
+    /// landing changes no list, since a list names the file and not the texture, so this is how
+    /// `wayland::App` tells which surfaces' skipped repaint is now stale.
+    pub fn draws_any_of(&self, files: &[std::path::PathBuf]) -> bool {
+        fn walk(commands: &[DrawCmd], files: &[std::path::PathBuf]) -> bool {
+            commands.iter().any(|command| match &command.draw {
+                Draw::Image { source, .. } => files.iter().any(|file| file.as_os_str() == source.as_str()),
+                Draw::Clipped { commands, .. } => walk(commands, files),
+                _ => false,
+            })
+        }
+        walk(&self.commands, files)
+    }
 }
 
 /// A clip that excludes nothing, which is what the canvas starts with before any scissor is
@@ -311,6 +316,8 @@ pub fn execute(painter: &mut TextPainter, images: &mut ImageCache, list: &Displa
     // nothing yet, the only point deleting a texture cannot pull it from under a queued draw call
     // (`ImageCache::release_evicted`).
     images.release_evicted(painter.canvas_mut());
+    // Same point, same reason: a texture created here is bound before any draw names it.
+    images.upload_landed(painter.canvas_mut());
     let mut scratch = Vec::new();
     run(painter, images, &list.commands, scale, RenderTarget::Screen, &mut scratch);
     painter.canvas_mut().reset_scissor();
@@ -373,12 +380,19 @@ fn run(
                 // `u16` is `freedesktop-icons`'s own size type, and a theme has no directory above
                 // 512 anyway.
                 if let Some(path) = image::icons::resolve(name, (*px).min(512) as u16) {
-                    let draw = FileDraw { fit: Fit::Contain, rect, px: *px, alpha: *alpha, tint: *color };
+                    let draw = FileDraw {
+                        fit: Fit::Contain,
+                        rect,
+                        box_px: (*px, *px),
+                        alpha: *alpha,
+                        tint: *color,
+                        load: Load::Inline,
+                    };
                     draw_file(painter.canvas_mut(), images, &path, draw);
                 }
             }
-            Draw::Image { source, fit, px, alpha } => {
-                let draw = FileDraw { fit: *fit, rect, px: *px, alpha: *alpha, tint: None };
+            Draw::Image { source, fit, box_px, alpha, load } => {
+                let draw = FileDraw { fit: *fit, rect, box_px: *box_px, alpha: *alpha, tint: None, load: *load };
                 draw_file(painter.canvas_mut(), images, std::path::Path::new(source), draw)
             }
             Draw::Clipped { radius, commands } => {
@@ -537,14 +551,16 @@ fn draw_for(
 
         // `image` (ADR-0054 decision 3): the file at `source`, fitted by `fit`. An empty `source`
         // is the absent-key default, so it draws nothing rather than reaching the cache with a path
-        // of "". The *longer* edge, unlike an icon's: `Cover` scales the image up until it covers
-        // the box, so rasterizing against the shorter edge would upload below the resolution `fit`
-        // is about to scale past.
-        PaintStyle::Image { source, fit } => (!source.is_empty()).then(|| Draw::Image {
+        // of "". Both edges, unlike an icon's one: the cache scales a raster down to cover exactly
+        // this box (ADR-0122), and an SVG takes the longer of the two, since `Cover` scales up
+        // until it covers the box and rasterizing against the shorter edge would upload below the
+        // resolution `fit` is about to scale past.
+        PaintStyle::Image { source, fit, load } => (!source.is_empty()).then(|| Draw::Image {
             source: source.clone(),
             fit: *fit,
-            px: physical_edge(rect.width.max(rect.height), scale),
+            box_px: (physical_edge(rect.width, scale), physical_edge(rect.height, scale)),
             alpha: opacity,
+            load: *load,
         }),
 
         // `textfield` (§ 5.2 item 8): the placeholder while empty, one `mask_character` per typed
@@ -601,10 +617,11 @@ fn draw_for(
 struct FileDraw {
     fit: Fit,
     rect: LogicalRect,
-    px: u32,
+    box_px: (u32, u32),
     alpha: f32,
     /// `None` for an `image`, which names a file the config chose rather than a themed icon.
     tint: Option<Rgba>,
+    load: Load,
 }
 
 /// The shared half of [`Draw::Icon`] and [`Draw::Image`]: cache lookup, then one `fill_path` over
@@ -613,8 +630,8 @@ struct FileDraw {
 /// smear the image's outermost pixel row across the letterbox. `Cover`'s fitted rect is larger than
 /// the box, and `run`'s scissor crops it.
 fn draw_file(canvas: &mut Canvas<OpenGl>, images: &mut ImageCache, file: &std::path::Path, draw: FileDraw) {
-    let FileDraw { fit, rect, px, alpha, tint } = draw;
-    let Some(id) = images.image(canvas, file, px, tint) else {
+    let FileDraw { fit, rect, box_px, alpha, tint, load } = draw;
+    let Some(id) = images.image(canvas, file, box_px, tint, load) else {
         return;
     };
     let Ok((width, height)) = canvas.image_size(id) else {
@@ -992,6 +1009,19 @@ mod tests {
                 _ => None,
             })
             .expect("expected a text draw")
+    }
+
+    #[test]
+    fn a_list_knows_which_files_it_draws_through_a_rounded_clip_too() {
+        let lua = Lua::new();
+        let src = r##"return panel { id = "bar", width = 200, height = 40,
+            child = rect { width = 100, height = 40, radius = 8, clip = "Rounded",
+                children = { image { source = "/tmp/a.png", async = true, width = "Fill", height = "Fill" } } } }"##;
+        let tree = resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 });
+        let list = build(&tree, 1.0, None);
+        assert!(list.draws_any_of(&[std::path::PathBuf::from("/tmp/a.png")]));
+        assert!(!list.draws_any_of(&[std::path::PathBuf::from("/tmp/b.png")]));
+        assert!(!list.draws_any_of(&[]));
     }
 
     #[test]

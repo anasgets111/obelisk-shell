@@ -9,7 +9,7 @@ use std::ops::Range;
 
 use mlua::Value;
 
-use crate::image::Fit;
+use crate::image::{Fit, Load};
 use crate::text::shaping::FontRun;
 
 use super::*;
@@ -204,6 +204,17 @@ pub fn parse_fit(properties: &HashMap<String, Value>) -> Result<Fit, LayoutError
     };
     let s = checked_string("fit", s)?;
     Fit::from_str(&s).ok_or_else(|| invalid("fit", format!("expected `cover`, `contain` or `stretch`, got {s:?}")))
+}
+
+/// `image.async` (ADR-0122). Absent and `false` decode in the frame; `true` hands the decode to
+/// the pool and draws nothing until it lands. A boolean or nothing, since a signal resolving to
+/// `nil` arrives as an absent key.
+pub fn parse_load(properties: &HashMap<String, Value>) -> Result<Load, LayoutError> {
+    match properties.get("async") {
+        None | Some(Value::Boolean(false)) => Ok(Load::Inline),
+        Some(Value::Boolean(true)) => Ok(Load::Background),
+        Some(other) => Err(invalid("async", format!("expected a boolean, got {}", preview_for_error(other)))),
+    }
 }
 
 /// The shared shape behind every § 5.2 string property that defaults to empty when absent.

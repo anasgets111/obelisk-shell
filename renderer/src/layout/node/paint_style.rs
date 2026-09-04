@@ -31,7 +31,7 @@ use std::collections::HashMap;
 
 use mlua::Value;
 
-use crate::image::Fit;
+use crate::image::{Fit, Load};
 
 use super::*;
 
@@ -51,13 +51,7 @@ pub enum PaintStyle {
     /// `clip` is here with `radius` rather than off in `LayoutStyle` because it is the property
     /// that decides what `radius` means to everything underneath this node, and the two are read
     /// together. It draws nothing itself: `layout::paint::build_node` is its only reader.
-    Box {
-        background: Option<Rgba>,
-        radius: f32,
-        colors: BorderColor,
-        widths: EdgeInsets,
-        clip: ClipShape,
-    },
+    Box { background: Option<Rgba>, radius: f32, colors: BorderColor, widths: EdgeInsets, clip: ClipShape },
     /// `content` is the string as the config wrote it up to `Scene::finish`, which rewrites it to
     /// what actually fits: an ellipsized prefix under `elide`, or the wrapped lines joined by
     /// `\n` under `wrap`. So by display-list time this may hold newlines and
@@ -90,6 +84,8 @@ pub enum PaintStyle {
     Image {
         source: String,
         fit: Fit,
+        /// `async = true` (ADR-0122): decode on the pool and draw nothing until it lands.
+        load: Load,
     },
     /// `target` is `None` when the field declares no `secure_submit` at all. A malformed one is an
     /// error now, unlike before: `layout::secure_submit::secure_submit_targets` used to skip it
@@ -138,7 +134,11 @@ pub fn paint_style(kind: &str, properties: &HashMap<String, Value>) -> Result<Op
         "icon" => {
             PaintStyle::Icon { name: parse_icon_name(properties)?, color: parse_optional_foreground(properties)? }
         }
-        "image" => PaintStyle::Image { source: parse_image_source(properties)?, fit: parse_fit(properties)? },
+        "image" => PaintStyle::Image {
+            source: parse_image_source(properties)?,
+            fit: parse_fit(properties)?,
+            load: parse_load(properties)?,
+        },
         "textfield" => PaintStyle::TextField {
             target: parse_secure_submit(properties)?,
             placeholder: parse_placeholder(properties)?,

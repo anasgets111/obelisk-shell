@@ -79,7 +79,7 @@ const NODE_PROPERTIES: &[(&str, &[&str])] = &[
     // `foreground` means what CSS `color` means: what a `currentColor` fill in the resolved SVG
     // resolves to (ADR-0072). A full-colour icon names no `currentColor`, so this is always safe.
     ("icon", &["foreground", "name", "size"]),
-    ("image", &["fit", "source"]),
+    ("image", &["async", "fit", "source"]),
     ("button", &["children", "on_click", "on_drag", "on_wheel", "submit"]),
     ("list", &["direction", "itemfn", "key", "scroll", "source", "spacing"]),
     // `font_size`, `foreground` and `text_align` are the text half `node::paint_style` reads off a
@@ -586,7 +586,7 @@ mod meta_stub_tests {
             unsampled.len(),
             unsampled.join("\n")
         );
-        assert_eq!(probed, 583, "the number of declared type members moved; confirm the change is intended");
+        assert_eq!(probed, 585, "the number of declared type members moved; confirm the change is intended");
     }
 
     /// One Lua literal per declared type. `None` means "no sample", which skips rather than guesses.
@@ -617,6 +617,10 @@ mod meta_stub_tests {
             // which is why the signal beside it is what a real list uses (ADR-0113 decision 3).
             ("source", "any[]") => return Some("{ 1, 2 }".to_string()),
             ("itemfn", _) => return Some("function(item) return rect {} end".to_string()),
+            // `panel`/`lock`'s per-output builder (ADR-0121): the probe calls it with `"PROBE"`.
+            ("child", shape) if shape.contains("fun(") => {
+                return Some("function(output) return rect {} end".to_string());
+            }
             ("key", _) => return Some("function(item) return tostring(item) end".to_string()),
             (_, shape) if shape.starts_with("fun(") || shape.starts_with("fun()") => {
                 return Some("function() end".to_string());

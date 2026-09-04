@@ -454,13 +454,21 @@ pub fn run(
         // stay pending: the repaint below covers both, and leaving the flag set would repaint
         // again next turn for nothing.
         let typed = std::mem::take(&mut app.field_input_changed);
+        // A background decode landing changes no property in the retained tree and no display
+        // list either, since a list names the file and not the texture, so it is its own repaint
+        // cue and its own invalidation (ADR-0122): the surfaces whose last list draws a landed
+        // file forget that list, and the repaint below stops skipping them.
+        let landed = app.image_cache.poll();
+        if !landed.is_empty() {
+            app.forget_painted_lists_drawing(&landed);
+        }
         if re_resolved {
             app.apply_resolved_surface_state();
             // The tree under the pointer may have moved without the pointer doing so: hover
             // signals follow the layout, `on_hover` follows the pointer (ADR-0112 amendment).
             app.refresh_hover_after_layout();
         }
-        if re_resolved || typed {
+        if re_resolved || typed || !landed.is_empty() {
             app.repaint_mapped_surfaces();
         }
         // The disarm half of ADR-0049's amendment; must be here, not inside the `if` above.

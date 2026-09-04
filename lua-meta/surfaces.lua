@@ -26,7 +26,7 @@
 ---@field namespace? string What the compositor sees, for rules like Hyprland's `layerrule`. Defaults to `"oblisk-{id}"`.
 ---@field keyboard_interactivity? "None"|"OnDemand"|"Exclusive"|Bound Default `"None"`. Note that niri gives an `on_demand` layer surface focus the moment it maps, with no click involved.
 ---@field visible? boolean|Bound Unmaps without destroying. Toggling this churns no Wayland objects.
----@field child? Node The one root node. A surface holds exactly one; use a `row` or `column` for more.
+---@field child? Node|fun(output: string): Node? The one root node. A surface holds exactly one; use a `row` or `column` for more. A function is called once per output instance with that output's connector name and its return takes the child's place, so one `monitor = "All"` panel can show a different file per screen (ADR-0121); `nil` maps that instance empty. The eval-time probe calls it with `"PROBE"`.
 
 ---@class WindowProps: NodeBase, BoxBase
 ---@field id string Unique across the surface set. Structural: read once per evaluation to decide in-place update against generation swap, so it rejects a `Signal`.
@@ -55,7 +55,7 @@
 
 ---@class LockProps: NodeBase, BoxBase
 ---@field id string Unique across the surface set. Structural, on the same terms as a `window`'s.
----@field child? Node The one root node. A surface holds exactly one; use a `row` or `column` for more.
+---@field child? Node|fun(output: string): Node? The one root node. A surface holds exactly one; use a `row` or `column` for more. A function is called per output the way a `panel`'s is, since a lock surface is one per output too.
 
 ---A layer surface (`zwlr_layer_surface_v1`). Bar, dock, wallpaper, OSD, launcher.
 ---@param props PanelProps

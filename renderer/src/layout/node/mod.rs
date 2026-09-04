@@ -25,7 +25,7 @@ mod toplevel;
 // The paint-only parsers are imported, not re-exported: [`paint_style`] is now their only caller
 // (ADR-0068, replacing `layout::paint` itself), reached via `super::*` in `paint_style.rs`.
 use content::{
-    parse_elide, parse_fit, parse_font_size, parse_foreground, parse_icon_name, parse_image_source,
+    parse_elide, parse_fit, parse_font_size, parse_foreground, parse_icon_name, parse_image_source, parse_load,
     parse_mask_character, parse_max_lines, parse_optional_foreground, parse_placeholder, parse_text_align, parse_wrap,
 };
 use spec::parse_secure_submit;

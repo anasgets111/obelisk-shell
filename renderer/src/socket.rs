@@ -1141,9 +1141,11 @@ mod tests {
                 ("battery_tooltip", "popup"),
                 ("clock_tooltip", "popup"),
                 ("launcher_tooltip", "popup"),
+                ("wallpaper_tooltip", "popup"),
                 ("network_tooltip", "popup"),
                 ("bluetooth_tooltip", "popup"),
                 ("launcher", "panel"),
+                ("wallpaper_picker", "panel"),
                 ("lock_screen", "lock"),
                 ("polkit_dialog", "panel"),
             ]

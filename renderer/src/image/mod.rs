@@ -1,19 +1,31 @@
-//! Decodes a file into a GPU texture, caches it, and fits it into a box (ADR-0054). PNG and JPEG
-//! decode through the `image` crate ([`decode_raster`]); SVG decodes through `resvg`, needed
+//! Decodes a file into a GPU texture, caches it, and fits it into a box (ADR-0054). PNG, JPEG and
+//! WebP decode through the `image` crate ([`decode_raster`]); SVG decodes through `resvg`, needed
 //! because Adwaita ships scalable SVG icons.
 //!
-//! The cache key is the path plus, for SVG only, the rasterized pixel size: a raster file decodes
-//! once regardless of the box, but a vector rasterized for a 12px box would look blurry served to
-//! a 24px box under a path-only key. It also carries the file's mtime and length (ADR-0031), so
-//! the tray overwriting a path in place still gets a fresh texture. Failures are cached too, as
-//! `None`, so an unreadable file or `.svgz` (see [`rasterize_svg`]) isn't retried every frame from
+//! The cache key is the path plus the box in physical pixels: a vector rasterized for a 12px box
+//! would look blurry served to a 24px box under a path-only key, and a raster is downscaled to
+//! cover its box (ADR-0122), so a 4K wallpaper drawn as a 230px thumbnail is a 230px texture
+//! rather than a 32MB one. It also carries the file's mtime and length (ADR-0031), so the tray
+//! overwriting a path in place still gets a fresh texture. Failures are cached too, as `Failed`,
+//! so an unreadable file or `.svgz` (see [`rasterize_svg`]) isn't retried every frame from
 //! `layout::paint`'s draw loop; a *missing* file still retries since its key changes on appearing.
+//!
+//! Decoding runs inline in the frame by default and on a worker pool when the node asked for
+//! `async = true` (ADR-0122): the slot is `Pending` from the first draw until [`ImageCache::poll`]
+//! finds the pixels landed and [`ImageCache::upload_landed`] turns them into a texture at the
+//! start of the next paint. The pool decodes; only this thread, the one the canvas is current on
+//! (ADR-0039), ever uploads. A pool decode also goes through the freedesktop thumbnail cache
+//! ([`thumbnails`]): a current thumbnail is read instead of the file, and a file decoded in full
+//! leaves one behind for the next open and for every other program that keeps that cache.
 
 pub mod icons;
+pub mod thumbnails;
 
 use crate::layout::node::Rgba;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 
 use femtovg::renderer::OpenGl;
 use femtovg::rgb::FromSlice;
@@ -25,15 +37,21 @@ use crate::text::snap::LogicalRect;
 /// `oblisk-supervisor-services-dbus.md` § 9.2 asks for, so a wallpaper loaded once at startup is
 /// evicted before a tray icon loaded forty times. Evicting by bytes (ADR-0043's budget: one 4K
 /// wallpaper is 32 MB, 127 tray icons are not) matters more than LRU, and neither is worth
-/// building before there is a cache to measure.
+/// building before there is a cache to measure. Since ADR-0122 a texture is at most its box, so
+/// a screen of thumbnails is a screen's worth of pixels however many files it shows.
 const CACHE_CAPACITY: usize = 128;
 
-/// One cache slot. `raster_px` is the longest edge the SVG was rasterized for, or `0` for a file
-/// decoded at its own native size (see this module's doc comment).
+/// How many decode workers the pool runs: the machine's parallelism, capped so a folder of forty
+/// wallpapers landing at once does not take every core from the compositor drawing them.
+const MAX_DECODE_WORKERS: usize = 4;
+
+/// One cache slot. `box_px` is the box the texture was made for, in physical pixels: an SVG
+/// rasterizes to its longest edge, a raster downscales to cover it (see this module's doc
+/// comment).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CacheKey {
     path: PathBuf,
-    raster_px: u32,
+    box_px: (u32, u32),
     version: FileVersion,
     /// The `currentColor` value this texture was rasterized with, packed `0x00RRGGBB` (ADR-0072).
     /// `None` for a raster file and an untinted SVG. Part of the key because one theme file drawn
@@ -94,14 +112,98 @@ impl Fit {
     }
 }
 
+/// Whether a draw may wait for its pixels (ADR-0122). `Inline` is the default and what every
+/// icon and the wallpaper use: the file decodes in the frame that first asks, so the first paint
+/// is complete, which is what the candidate's presentation evidence promises (ADR-0003).
+/// `Background` hands the decode to the pool and draws nothing until it lands, for a grid of
+/// thumbnails where forty inline decodes would be a second of frozen shell.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Load {
+    #[default]
+    Inline,
+    Background,
+}
+
+/// Pixels ready to upload, from either decoder, on the way to a texture.
+struct Decoded {
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+    /// tiny-skia's `Pixmap` is premultiplied RGBA8 and the `image` crate's is straight, and
+    /// femtovg samples a texture wrongly under the other flag: a dark halo around every
+    /// anti-aliased icon edge, not an outright failure.
+    premultiplied: bool,
+}
+
+/// One slot's state. `Pending` is a background decode in flight, which draws nothing and enqueues
+/// nothing more: the first draw sent the job, and every draw until it lands finds this.
+enum Slot {
+    Pending,
+    Ready(ImageId),
+    Failed,
+}
+
+/// One decode the pool owes: the key it was asked under, so the result lands in the right slot
+/// even if the box or file changed meanwhile, and the tint the key packed away.
+struct Job {
+    key: CacheKey,
+    tint: Option<Rgba>,
+}
+
+/// The decode pool: a shared job queue and a result channel, `MAX_DECODE_WORKERS` threads at
+/// most. Spawned with the cache, before any Lua has read anything, so a thread that fails to
+/// start is a startup failure rather than a blank tile later.
+struct Pool {
+    jobs: Sender<Job>,
+    results: Receiver<(CacheKey, Result<Decoded, String>)>,
+}
+
+impl Pool {
+    fn spawn() -> Self {
+        let (jobs, job_rx) = std::sync::mpsc::channel::<Job>();
+        let job_rx = Arc::new(Mutex::new(job_rx));
+        let (result_tx, results) = std::sync::mpsc::channel();
+        let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, MAX_DECODE_WORKERS);
+        let cache_root = thumbnails::cache_dir();
+        for index in 0..workers {
+            let job_rx = Arc::clone(&job_rx);
+            let result_tx = result_tx.clone();
+            let cache_root = cache_root.clone();
+            std::thread::Builder::new()
+                .name(format!("oblisk-image-decode-{index}"))
+                .spawn(move || {
+                    loop {
+                        // The lock is held only to take a job, never through the decode, so the
+                        // other workers keep draining while this one works.
+                        let job = match job_rx.lock() {
+                            Ok(rx) => rx.recv(),
+                            Err(_) => return,
+                        };
+                        let Ok(job) = job else { return };
+                        let result = decode(&job.key.path, job.key.box_px, job.tint, cache_root.as_deref());
+                        if result_tx.send((job.key, result)).is_err() {
+                            return;
+                        }
+                    }
+                })
+                .expect("failed to spawn an oblisk-image-decode thread");
+        }
+        Pool { jobs, results }
+    }
+}
+
 /// Path-and-size to uploaded texture, for one generation (`CONTEXT.md`, **Image cache**). Not
 /// shared with the Supervisor and not persisted: the Renderer is swapped as an OS process on
 /// every reload, so this is cold again after each config edit (ADR-0054).
 pub struct ImageCache {
-    entries: HashMap<CacheKey, Option<ImageId>>,
+    entries: HashMap<CacheKey, Slot>,
     order: VecDeque<CacheKey>,
     /// Evicted since the last [`ImageCache::release_evicted`], not yet freed.
     evicted: Vec<ImageId>,
+    pool: Pool,
+    /// Decodes [`ImageCache::poll`] took off the pool and [`ImageCache::upload_landed`] has not
+    /// yet turned into textures: `poll` runs where there is no canvas, in the main loop's turn.
+    landed: Vec<(CacheKey, Result<Decoded, String>)>,
 }
 
 impl Default for ImageCache {
@@ -112,7 +214,13 @@ impl Default for ImageCache {
 
 impl ImageCache {
     pub fn new() -> Self {
-        ImageCache { entries: HashMap::new(), order: VecDeque::new(), evicted: Vec::new() }
+        ImageCache {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            evicted: Vec::new(),
+            pool: Pool::spawn(),
+            landed: Vec::new(),
+        }
     }
 
     /// Frees textures evicted last frame; `layout::paint::paint_tree` calls this before walking
@@ -124,61 +232,127 @@ impl ImageCache {
         }
     }
 
-    /// The uploaded texture for `path`, decoding and uploading on the first ask. `box_px`, the
-    /// longest edge of the box in physical pixels, is what an SVG rasterizes against; a raster
-    /// file ignores it. `None` for anything that did not decode, logged once, not once per frame.
-    /// The canvas must be current on the calling thread, the only one that paints since ADR-0039.
-    /// Stats the file on every call, including a hit, since the key carries its revision (see
-    /// [`FileVersion`]): one `stat` per node per frame, six hundred a second for ten icons at 60Hz.
+    /// Takes every finished background decode off the pool and names the files that landed,
+    /// which is the main loop's cue to repaint whatever draws them. No canvas here: the loop's
+    /// turn has none current, so the pixels wait in `landed` for the paint that follows.
+    pub fn poll(&mut self) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        loop {
+            match self.pool.results.try_recv() {
+                Ok(result) => {
+                    files.push(result.0.path.clone());
+                    self.landed.push(result);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    eprintln!("[oblisk-renderer] image: every decode worker is gone; background images will not load");
+                    break;
+                }
+            }
+        }
+        files
+    }
+
+    /// Uploads what [`ImageCache::poll`] collected, at the start of a paint alongside
+    /// [`ImageCache::release_evicted`]. A result whose slot was evicted while it decoded is
+    /// dropped: the next draw of that file finds no slot and sends the job again.
+    pub fn upload_landed(&mut self, canvas: &mut Canvas<OpenGl>) {
+        for (key, result) in self.landed.drain(..) {
+            if !matches!(self.entries.get(&key), Some(Slot::Pending)) {
+                continue;
+            }
+            self.entries.insert(key.clone(), upload_or_log(canvas, &key.path, result));
+        }
+    }
+
+    /// The uploaded texture for `path`, or `None` for anything that did not decode (logged once,
+    /// not once per frame) or has not yet (`Load::Background` and still pending). `box_px` is the
+    /// box in physical pixels: an SVG rasterizes to its longest edge, a raster downscales to
+    /// cover it and never scales up. The canvas must be current on the calling thread, the only
+    /// one that paints since ADR-0039. Stats the file on every call, including a hit, since the
+    /// key carries its revision (see [`FileVersion`]): one `stat` per node per frame, six
+    /// hundred a second for ten icons at 60Hz.
     ///
-    /// ponytail: a miss reads the file, and for an SVG rasterizes it, inside the frame, which is
-    /// also the Wayland dispatch thread and the config VM's thread (ADR-0039). Upgrade path: the
-    /// shape `text::shaping` already has, a worker plus a dirty flag on upload (ADR-0044 decision
-    /// 2), meeting `oblisk-supervisor-services-dbus.md` § 9.2's "off-thread".
+    /// `Load::Inline` reads the file, and for an SVG rasterizes it, inside the frame, which is
+    /// also the Wayland dispatch thread and the config VM's thread (ADR-0039). That is the point
+    /// for a wallpaper, whose first frame must be whole; a grid of files asks for
+    /// `Load::Background` instead (ADR-0122).
     pub fn image(
         &mut self,
         canvas: &mut Canvas<OpenGl>,
         path: &Path,
-        box_px: u32,
+        box_px: (u32, u32),
         tint: Option<Rgba>,
+        load: Load,
     ) -> Option<ImageId> {
         let vector = is_vector(path);
+        let box_px = (box_px.0.max(1), box_px.1.max(1));
         let key = CacheKey {
             path: path.to_path_buf(),
-            raster_px: if vector { box_px.max(1) } else { 0 },
+            // A vector's texture is its longest edge either way, so the key says so and a 24x30
+            // box shares the 30x30 one's slot.
+            box_px: if vector { (box_px.0.max(box_px.1), box_px.0.max(box_px.1)) } else { box_px },
             version: FileVersion::read(path),
             // Only a vector can carry `currentColor`; a PNG's tint is dropped rather than
             // splitting its cache slot per colour it will never use.
             tint: if vector { tint.map(packed_rgb) } else { None },
         };
         if let Some(cached) = self.entries.get(&key) {
-            return *cached;
+            return match cached {
+                Slot::Ready(id) => Some(*id),
+                Slot::Pending | Slot::Failed => None,
+            };
         }
-        let loaded = match load(canvas, &key.path, key.raster_px, tint) {
-            Ok(id) => Some(id),
-            Err(err) => {
-                eprintln!("[oblisk-renderer] image: {}: {err}", key.path.display());
+        match load {
+            Load::Inline => {
+                let slot = upload_or_log(canvas, &key.path, decode(&key.path, key.box_px, tint, None));
+                let id = match slot {
+                    Slot::Ready(id) => Some(id),
+                    _ => None,
+                };
+                self.insert(key, slot);
+                id
+            }
+            Load::Background => {
+                if self.pool.jobs.send(Job { key: key.clone(), tint }).is_err() {
+                    eprintln!("[oblisk-renderer] image: {}: no decode worker left to take it", key.path.display());
+                    self.insert(key, Slot::Failed);
+                    return None;
+                }
+                self.insert(key, Slot::Pending);
                 None
             }
-        };
-        self.insert(key, loaded);
-        loaded
+        }
     }
 
     /// Evicts before inserting, so the map never exceeds [`CACHE_CAPACITY`]. Queues the evicted
     /// texture for [`ImageCache::release_evicted`] rather than deleting it here: femtovg frees
     /// nothing by `ImageId` until told to, so losing the id leaks the GPU allocation for good.
-    fn insert(&mut self, key: CacheKey, value: Option<ImageId>) {
+    fn insert(&mut self, key: CacheKey, value: Slot) {
         while self.order.len() >= CACHE_CAPACITY {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };
-            if let Some(Some(id)) = self.entries.remove(&oldest) {
+            if let Some(Slot::Ready(id)) = self.entries.remove(&oldest) {
                 self.evicted.push(id);
             }
         }
         self.order.push_back(key.clone());
         self.entries.insert(key, value);
+    }
+}
+
+/// Uploads a decode, or logs why there is nothing to upload. Each failure is logged once here,
+/// at the moment its slot is filled, and the `Failed` slot is what stops the next frame asking
+/// again.
+fn upload_or_log(canvas: &mut Canvas<OpenGl>, path: &Path, decoded: Result<Decoded, String>) -> Slot {
+    let result = decoded.and_then(|decoded| upload(canvas, decoded));
+    match result {
+        Ok(id) => Slot::Ready(id),
+        Err(err) => {
+            eprintln!("[oblisk-renderer] image: {}: {err}", path.display());
+            Slot::Failed
+        }
     }
 }
 
@@ -188,20 +362,24 @@ fn is_vector(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
 }
 
-fn load(canvas: &mut Canvas<OpenGl>, path: &Path, raster_px: u32, tint: Option<Rgba>) -> Result<ImageId, String> {
-    if raster_px == 0 {
-        let (pixels, width, height) = decode_raster(path)?;
-        // Straight alpha, what the `image` crate produces, so no flag: `PREMULTIPLIED` below is
-        // the SVG path's answer to tiny-skia, not a house default.
-        let source = ImageSource::from(femtovg::imgref::Img::new(pixels.as_rgba(), width as usize, height as usize));
-        return canvas.create_image(source, ImageFlags::empty()).map_err(femtovg_error);
+/// The half of a load that needs no canvas, so it can run on a pool thread: a raster decoded and
+/// downscaled to cover `box_px`, through the thumbnail cache under `thumbnails` when there is
+/// one, or an SVG rasterized at `box_px`'s longest edge.
+fn decode(path: &Path, box_px: (u32, u32), tint: Option<Rgba>, thumbnails: Option<&Path>) -> Result<Decoded, String> {
+    if is_vector(path) {
+        let (pixels, width, height) = rasterize_svg(path, box_px.0.max(box_px.1), tint)?;
+        return Ok(Decoded { pixels, width, height, premultiplied: true });
     }
-    let (pixels, width, height) = rasterize_svg(path, raster_px, tint)?;
-    // `PREMULTIPLIED` because tiny-skia's `Pixmap` is premultiplied RGBA8 and femtovg samples a
-    // texture without this flag as straight alpha: getting it wrong shows as a dark halo around
-    // every anti-aliased icon edge, not an outright failure.
+    let (pixels, width, height) = decode_raster(path, box_px, thumbnails)?;
+    Ok(Decoded { pixels, width, height, premultiplied: false })
+}
+
+/// The half of a load that needs the canvas: one texture from one decode.
+fn upload(canvas: &mut Canvas<OpenGl>, decoded: Decoded) -> Result<ImageId, String> {
+    let Decoded { pixels, width, height, premultiplied } = decoded;
     let source = ImageSource::from(femtovg::imgref::Img::new(pixels.as_rgba(), width as usize, height as usize));
-    canvas.create_image(source, ImageFlags::PREMULTIPLIED).map_err(femtovg_error)
+    let flags = if premultiplied { ImageFlags::PREMULTIPLIED } else { ImageFlags::empty() };
+    canvas.create_image(source, flags).map_err(femtovg_error)
 }
 
 /// femtovg's `ErrorKind` writes the literal string `"canvas error"` for every one of its
@@ -210,14 +388,65 @@ fn femtovg_error(err: ErrorKind) -> String {
     format!("{err:?}")
 }
 
-/// Decodes a PNG or JPEG to straight-alpha RGBA8, the reason `image` is a direct dependency
-/// (`renderer/Cargo.toml`). femtovg's `Canvas::load_image_file` cannot decode anything: it
-/// declares `image` with `default-features = false` and no format, so every PNG came back
-/// `Unsupported(Exact(Png))`, taking the tray's and notification daemon's spooled pixmaps
-/// (ADR-0031) with it. `into_rgba8` also covers the grayscale-plus-alpha and 16-bit variants
-/// femtovg's own conversion refuses, at no cost since every theme icon already decodes to RGBA8.
-fn decode_raster(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
+/// The size a `width`x`height` raster is stored at for a `box_px` box (ADR-0122): scaled down by
+/// the larger of the two ratios, so it still covers the box the way `Fit::Cover` will crop it,
+/// and never scaled up, since a small file has no more pixels to give. The same for every `Fit`:
+/// `Contain` could go smaller, but one rule keeps one slot per box.
+fn stored_size(width: u32, height: u32, box_px: (u32, u32)) -> (u32, u32) {
+    if width == 0 || height == 0 || (width <= box_px.0 && height <= box_px.1) {
+        return (width, height);
+    }
+    let scale = (box_px.0 as f64 / width as f64).max(box_px.1 as f64 / height as f64);
+    if scale >= 1.0 {
+        return (width, height);
+    }
+    (((width as f64 * scale).ceil() as u32).max(1), ((height as f64 * scale).ceil() as u32).max(1))
+}
+
+/// Decodes a PNG, JPEG or WebP to straight-alpha RGBA8 at [`stored_size`], the reason `image`
+/// is a direct dependency (`renderer/Cargo.toml`). femtovg's `Canvas::load_image_file` cannot
+/// decode anything: it declares `image` with `default-features = false` and no format, so every
+/// PNG came back `Unsupported(Exact(Png))`, taking the tray's and notification daemon's spooled
+/// pixmaps (ADR-0031) with it. `into_rgba8` also covers the grayscale-plus-alpha and 16-bit
+/// variants femtovg's own conversion refuses, at no cost since every theme icon already decodes
+/// to RGBA8. `thumbnail` is the `image` crate's fast triangle-filter downscale, which for a 4K
+/// file to a tile is the difference between a decode and a decode plus a Lanczos pass.
+///
+/// With a `thumbnails` root and a box a thumbnail covers, a current thumbnail is decoded instead
+/// of the file, and a file decoded in full leaves a thumbnail behind when it was larger than one
+/// (a 32px tray icon is never thumbnailed). A thumbnail that cannot be written is one log line
+/// and the texture it would have saved is made anyway.
+fn decode_raster(path: &Path, box_px: (u32, u32), thumbnails: Option<&Path>) -> Result<(Vec<u8>, u32, u32), String> {
+    let slot = thumbnails.and_then(|root| thumbnails::Slot::for_file(root, path, box_px));
+    if let Some(slot) = &slot
+        && let Some((pixels, width, height)) = slot.read_valid()
+    {
+        let (stored_width, stored_height) = stored_size(width, height, box_px);
+        if (stored_width, stored_height) == (width, height) {
+            return Ok((pixels, width, height));
+        }
+        let image = ::image::RgbaImage::from_raw(width, height, pixels).ok_or("thumbnail pixel count is off")?;
+        let scaled = ::image::DynamicImage::ImageRgba8(image).thumbnail(stored_width, stored_height).into_rgba8();
+        let (width, height) = scaled.dimensions();
+        return Ok((scaled.into_raw(), width, height));
+    }
     let decoded = ::image::open(path).map_err(|err| err.to_string())?;
+    let (width, height) = (decoded.width(), decoded.height());
+    if let Some(slot) = &slot
+        && width.max(height) > slot.px
+    {
+        let thumb = decoded.thumbnail(slot.px, slot.px).into_rgba8();
+        let (thumb_width, thumb_height) = thumb.dimensions();
+        if let Err(err) = slot.write(thumb.as_raw(), thumb_width, thumb_height) {
+            eprintln!("[oblisk-renderer] image: {}: thumbnail not written: {err}", path.display());
+        }
+    }
+    let (stored_width, stored_height) = stored_size(width, height, box_px);
+    let decoded = if (stored_width, stored_height) == (width, height) {
+        decoded
+    } else {
+        decoded.thumbnail(stored_width, stored_height)
+    };
     let rgba = decoded.into_rgba8();
     let (width, height) = rgba.dimensions();
     Ok((rgba.into_raw(), width, height))
@@ -440,7 +669,7 @@ mod tests {
         // icon on the bar and the same icon dimmed in a popup would be one texture.
         let a = CacheKey {
             path: PathBuf::from("/x.svg"),
-            raster_px: 18,
+            box_px: (18, 18),
             version: FileVersion::default(),
             tint: Some(0xffffff),
         };
@@ -508,7 +737,7 @@ mod tests {
         let png = dir.path().join("fixture.png");
         std::fs::write(&png, PIL_2X2_RGBA_PNG).unwrap();
 
-        let (pixels, width, height) = decode_raster(&png).expect("a PNG decoder must be compiled in");
+        let (pixels, width, height) = decode_raster(&png, (2, 2), None).expect("a PNG decoder must be compiled in");
         assert_eq!((width, height), (2, 2));
         // Straight alpha, in the order Pillow was handed them: the half-transparent green stays
         // 0x00ff00 rather than arriving premultiplied to 0x008000.
@@ -520,7 +749,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("not-really.png");
         std::fs::write(&fake, b"<svg/>").unwrap();
-        assert!(decode_raster(&fake).is_err());
+        assert!(decode_raster(&fake, (8, 8), None).is_err());
     }
 
     #[test]
@@ -528,7 +757,7 @@ mod tests {
         // Negative entries only: `ImageId` has no public constructor.
         let mut cache = ImageCache::new();
         for n in 0..(CACHE_CAPACITY * 2) {
-            cache.insert(key(&format!("/tmp/{n}.png"), 0, FileVersion::default()), None);
+            cache.insert(key(&format!("/tmp/{n}.png"), 0, FileVersion::default()), Slot::Failed);
         }
         assert_eq!(cache.entries.len(), CACHE_CAPACITY);
         assert_eq!(cache.order.len(), CACHE_CAPACITY);
@@ -539,19 +768,92 @@ mod tests {
     }
 
     fn key(path: &str, px: u32, version: FileVersion) -> CacheKey {
-        CacheKey {
-            path: PathBuf::from(path),
-            raster_px: if is_vector(Path::new(path)) { px } else { 0 },
-            version,
-            tint: None,
-        }
+        CacheKey { path: PathBuf::from(path), box_px: (px, px), version, tint: None }
     }
 
     #[test]
-    fn a_vector_and_a_raster_of_the_same_name_do_not_share_a_slot() {
+    fn a_vector_and_a_raster_alike_take_one_slot_per_box() {
         let v = FileVersion::default();
-        assert_eq!(key("/tmp/a.png", 12, v), key("/tmp/a.png", 24, v));
+        assert_ne!(key("/tmp/a.png", 12, v), key("/tmp/a.png", 24, v));
         assert_ne!(key("/tmp/a.svg", 12, v), key("/tmp/a.svg", 24, v));
+        assert_ne!(key("/tmp/a.svg", 12, v), key("/tmp/a.png", 12, v));
+    }
+
+    #[test]
+    fn a_raster_is_stored_scaled_down_to_cover_its_box_and_never_up() {
+        // 4K into a 16:9 tile: both ratios agree.
+        assert_eq!(stored_size(3840, 2160, (230, 130)), (232, 130));
+        // Portrait into a landscape tile: the width ratio is the larger, so the width covers.
+        assert_eq!(stored_size(1080, 1920, (230, 130)), (230, 409));
+        // Already smaller than the box on both edges: untouched.
+        assert_eq!(stored_size(16, 16, (24, 24)), (16, 16));
+        // Larger on one edge only: still scaled by the larger ratio, which is under one.
+        assert_eq!(stored_size(300, 10, (100, 100)), (300, 10));
+        assert_eq!(stored_size(0, 0, (100, 100)), (0, 0));
+    }
+
+    #[test]
+    fn a_large_png_decodes_to_its_box_and_a_small_one_to_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big.png");
+        ::image::RgbaImage::from_pixel(400, 200, ::image::Rgba([10, 20, 30, 255])).save(&big).unwrap();
+        let (_, width, height) = decode_raster(&big, (100, 100), None).unwrap();
+        assert_eq!((width, height), (200, 100));
+        let (_, width, height) = decode_raster(&big, (1000, 1000), None).unwrap();
+        assert_eq!((width, height), (400, 200));
+    }
+
+    #[test]
+    fn a_pool_decode_leaves_a_thumbnail_behind_and_the_next_one_reads_it_instead_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big.png");
+        ::image::RgbaImage::from_pixel(400, 200, ::image::Rgba([10, 20, 30, 255])).save(&big).unwrap();
+        let cache = dir.path().join("cache");
+
+        let (_, width, height) = decode_raster(&big, (100, 100), Some(&cache)).unwrap();
+        assert_eq!((width, height), (200, 100), "the texture is the box's, whatever the thumbnail is");
+        let slot = thumbnails::Slot::for_file(&cache, &big, (100, 100)).unwrap();
+        let (_, thumb_width, thumb_height) = slot.read_valid().expect("a `normal` thumbnail was written");
+        assert_eq!((thumb_width, thumb_height), (128, 64));
+
+        // The source is gone: only the thumbnail can answer now, and it does.
+        std::fs::remove_file(&big).unwrap();
+        assert!(decode_raster(&big, (100, 100), Some(&cache)).is_err(), "no source, no mtime, no slot");
+    }
+
+    #[test]
+    fn a_file_no_larger_than_a_thumbnail_is_not_thumbnailed() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("icon.png");
+        ::image::RgbaImage::from_pixel(32, 32, ::image::Rgba([10, 20, 30, 255])).save(&small).unwrap();
+        let cache = dir.path().join("cache");
+        decode_raster(&small, (24, 24), Some(&cache)).unwrap();
+        assert!(!cache.exists(), "a 32px file has nothing to gain from a 128px thumbnail");
+    }
+
+    #[test]
+    fn the_pool_decodes_a_job_off_thread_and_poll_reports_it_landed() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("fixture.png");
+        std::fs::write(&png, PIL_2X2_RGBA_PNG).unwrap();
+        let mut cache = ImageCache::new();
+        let key = CacheKey { path: png.clone(), box_px: (8, 8), version: FileVersion::read(&png), tint: None };
+        cache.insert(key.clone(), Slot::Pending);
+        cache.pool.jobs.send(Job { key: key.clone(), tint: None }).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut files = cache.poll();
+        while files.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the decode never landed");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            files = cache.poll();
+        }
+        assert_eq!(files, vec![png.clone()]);
+        let (landed_key, result) = &cache.landed[0];
+        assert_eq!(*landed_key, key);
+        let decoded = result.as_ref().expect("a 2x2 PNG decodes");
+        assert_eq!((decoded.width, decoded.height), (2, 2));
+        assert!(!decoded.premultiplied);
+        assert!(matches!(cache.entries.get(&key), Some(Slot::Pending)), "no canvas, so nothing uploaded yet");
     }
 
     #[test]

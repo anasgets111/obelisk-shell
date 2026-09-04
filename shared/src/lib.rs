@@ -76,6 +76,7 @@ roster! {
     Workspaces => "workspaces", "The compositor's workspaces per output, and the focused toplevel window.",
     Power => "power", "power-profiles-daemon's platform profiles, plus whether you are on mains and how many watts are moving.",
     Applications => "applications", "The installed desktop entries, listed and indexed by the `app_id` a window reports.",
+    Files => "files", "The files in each folder a config asked to watch, kept current through inotify.",
 }
 
 impl Capability {
@@ -709,7 +710,7 @@ mod capability_tests {
         // `ALL` and `as_str` come from one `roster!` list, so this cannot catch a variant missing
         // from one of them -- there is no way to write that. What it does pin is `from_name`
         // agreeing with `as_str`, which is what the two wire-facing matches depend on.
-        assert_eq!(Capability::ALL.len(), 18, "a variant was added or removed; check every iterator over ALL");
+        assert_eq!(Capability::ALL.len(), 19, "a variant was added or removed; check every iterator over ALL");
         for capability in Capability::ALL {
             assert_eq!(Capability::from_name(capability.as_str()), Some(*capability));
         }
