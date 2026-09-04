@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc::UnboundedSender;
 
+use super::gate::{IdleGate, blocks_idle};
 use super::inhibit::{
     INHIBIT_MODE, INHIBIT_WHAT, INHIBIT_WHO, InhibitState, LiveInhibit, Login1ManagerProxy, apply_inhibit,
     apply_release_inhibit, cleanup_generation_inhibit,
@@ -38,6 +39,12 @@ const IDLE_NOTIFY_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct IdleController {
+    /// Registrations that arrived while notify was still [`NotifyState::Inert`], replayed the
+    /// moment it goes `Live` (ADR-0139). A config registers its thresholds during evaluation,
+    /// which reliably beats the Wayland setup this constructor spawns, so without this every
+    /// threshold a config asks for at boot is dropped -- observed live as
+    /// `register_threshold(generation 0, 20s) ignored` on every single start.
+    pending: Arc<std::sync::Mutex<Vec<(u32, u64)>>>,
     /// `tokio::sync::RwLock`, not a bare `Arc<NotifyState>`: starts `Inert` and is swapped to
     /// `Live` in place by the background setup task [`IdleController::new`] spawns, so
     /// constructing an `IdleController` never blocks on Wayland.
@@ -55,19 +62,38 @@ impl IdleController {
     /// timeout, and awaiting it directly here would wedge the whole Supervisor.
     pub async fn new(system_bus: zbus::Connection, events_tx: UnboundedSender<shared::IdleEvent>) -> Self {
         let notify = Arc::new(RwLock::new(NotifyState::Inert));
+        // Watched on the system bus, which is always there, rather than alongside notify: a held
+        // inhibitor is worth knowing about even on a run where the Wayland half degraded to inert,
+        // and the watch is what makes `idle:inhibit` mean anything at all (ADR-0139).
+        let gate = Arc::new(std::sync::Mutex::new(IdleGate::default()));
+        tokio::spawn(watch_idle_inhibitors(system_bus.clone(), gate.clone(), events_tx.clone()));
+
+        let controller = Self {
+            notify: notify.clone(),
+            pending: Arc::new(std::sync::Mutex::new(Vec::new())),
+            inhibit: Arc::new(LiveInhibit {
+                system_bus,
+                state: tokio::sync::Mutex::new(InhibitState { counts: HashMap::new(), fd: None }),
+            }),
+        };
 
         let notify_for_task = notify.clone();
+        let gate_for_task = gate.clone();
+        let controller_for_task = controller.clone();
         tokio::spawn(async move {
             let outcome =
                 tokio::time::timeout(IDLE_NOTIFY_SETUP_TIMEOUT, tokio::task::spawn_blocking(connect_wayland_idle))
                     .await;
             match outcome {
                 Ok(Ok(Ok((live, raw_events_rx)))) => {
-                    spawn_idle_event_forwarder(live.registry.clone(), raw_events_rx, events_tx);
+                    spawn_idle_event_forwarder(live.registry.clone(), gate_for_task, raw_events_rx, events_tx);
                     *notify_for_task.write().await = NotifyState::Live(live);
                     eprintln!(
                         "idle: dedicated Wayland connection for ext_idle_notifier_v1 established; notify live for this run"
                     );
+                    // After the swap, never before: `register_threshold` reads `notify` and would
+                    // find it still inert and queue the replay right back onto the list.
+                    controller_for_task.replay_pending_registrations().await;
                 }
                 Ok(Ok(Err(err))) => {
                     eprintln!(
@@ -87,12 +113,20 @@ impl IdleController {
             }
         });
 
-        Self {
-            notify,
-            inhibit: Arc::new(LiveInhibit {
-                system_bus,
-                state: tokio::sync::Mutex::new(InhibitState { counts: HashMap::new(), fd: None }),
-            }),
+        controller
+    }
+
+    /// Registers everything that arrived while notify was inert, oldest first. Drains under its
+    /// own lock and registers outside it: `register_threshold` awaits, and holding a
+    /// `std::sync::Mutex` across an await is the deadlock this codebase avoids everywhere else.
+    async fn replay_pending_registrations(&self) {
+        let queued: Vec<(u32, u64)> = std::mem::take(&mut *self.pending.lock().unwrap());
+        if queued.is_empty() {
+            return;
+        }
+        eprintln!("idle: notify is live; registering {} threshold(s) that arrived before it was", queued.len());
+        for (generation_id, sec) in queued {
+            self.register_threshold(generation_id, sec).await;
         }
     }
 
@@ -104,9 +138,12 @@ impl IdleController {
     pub async fn register_threshold(&self, generation_id: u32, sec: u64) {
         let notify = self.notify.read().await;
         let NotifyState::Live(live) = &*notify else {
-            eprintln!(
-                "idle: register_threshold(generation {generation_id}, {sec}s) ignored: notify is inert for this run"
-            );
+            // Queued, not dropped: inert here means "degraded" *or* "still setting up", and the
+            // two are indistinguishable from this side. A run where setup ultimately fails leaves
+            // the queue holding entries nothing will ever register, which costs a `(u32, u64)`
+            // each and is the right trade against losing every boot-time registration.
+            self.pending.lock().unwrap().push((generation_id, sec));
+            eprintln!("idle: register_threshold(generation {generation_id}, {sec}s) queued: notify is not live yet");
             return;
         };
 
@@ -188,6 +225,9 @@ impl IdleController {
     /// [`IdleController::inhibit`]/[`IdleController::release_inhibit`] use, so a reload or
     /// crash racing either is serialized.
     pub async fn reset_registrations(&self, generation_id: u32) {
+        // Queued registrations go too, and before the live ones: a reload that replaced the tree
+        // owning those callbacks must not have them registered later by the replay (ADR-0139).
+        self.pending.lock().unwrap().retain(|&(queued_generation, _)| queued_generation != generation_id);
         {
             let notify = self.notify.read().await;
             if let NotifyState::Live(live) = &*notify {
@@ -199,6 +239,52 @@ impl IdleController {
         let mut state = self.inhibit.state.lock().await;
         if cleanup_generation_inhibit(&mut state.counts, generation_id).should_close_fd {
             state.fd = None;
+        }
+    }
+}
+
+/// Follows `Manager.BlockInhibited` and keeps [`IdleGate`] in step with it (ADR-0139).
+///
+/// A property watch, not a poll of `ListInhibitors`: logind emits `PropertiesChanged` for this
+/// one, so a `systemd-inhibit --what=idle` anywhere on the system reaches the gate in a round trip
+/// and costs nothing while nothing changes.
+///
+/// Reads the current value before subscribing would be a race; zbus's property stream replays the
+/// cached value on subscribe, so the first item is the state at startup and no separate seed read
+/// is needed. Degrades to a permanently open gate, logged once: a shell that cannot see inhibitors
+/// behaves exactly as it did before this existed.
+async fn watch_idle_inhibitors(
+    system_bus: zbus::Connection,
+    gate: Arc<std::sync::Mutex<IdleGate>>,
+    events_tx: UnboundedSender<shared::IdleEvent>,
+) {
+    let proxy = match Login1ManagerProxy::new(&system_bus).await {
+        Ok(proxy) => proxy,
+        Err(err) => {
+            eprintln!("idle: cannot reach logind to watch idle inhibitors; nothing will hold off idle actions: {err}");
+            return;
+        }
+    };
+    let mut changes = proxy.receive_block_inhibited_changed().await;
+    while futures_util::StreamExt::next(&mut changes).await.is_some() {
+        // Read back through the proxy rather than off the change item: zbus caches the property,
+        // so this is the same value without having to name the stream item's borrowed type.
+        let Ok(what) = proxy.block_inhibited().await else { continue };
+        let blocked = blocks_idle(&what);
+        // `None` is "same answer as last time", which is most of them: `BlockInhibited` changes on
+        // every inhibitor of any kind, and almost none of them are idle.
+        let Some(owed) = gate.lock().unwrap().set_blocked(blocked) else { continue };
+        if blocked {
+            eprintln!(
+                "idle: logind reports an idle inhibitor ({what}); threshold events are held until it is released"
+            );
+        } else {
+            eprintln!("idle: no idle inhibitor is held any more; threshold events resume");
+        }
+        for event in owed {
+            if events_tx.send(event).is_err() {
+                return;
+            }
         }
     }
 }

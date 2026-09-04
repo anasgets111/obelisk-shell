@@ -56,6 +56,12 @@ pub fn cleanup_generation_inhibit(counts: &mut HashMap<u32, u32>, generation_id:
 pub(crate) trait Login1Manager {
     #[zbus(name = "Inhibit")]
     fn inhibit(&self, what: &str, who: &str, why: &str, mode: &str) -> zbus::Result<zbus::zvariant::OwnedFd>;
+
+    /// Everything currently held in `block` mode, colon-separated, e.g. `"idle:handle-power-key"`.
+    /// A real property with change notification, which is what lets one watch answer "is anything
+    /// holding an idle inhibitor" for every holder including this shell's own (ADR-0139).
+    #[zbus(property, name = "BlockInhibited")]
+    fn block_inhibited(&self) -> zbus::Result<String>;
 }
 
 /// `what`/`who`/`mode` are fixed by ADR-0032: `mode = "block"` is the only mode that actually

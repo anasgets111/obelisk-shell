@@ -66,7 +66,7 @@ roster! {
     Mpris => "mpris", "MPRIS: every media player on the bus, with track metadata, playback state and a position to extrapolate from.",
     Sysinfo => "sysinfo", "CPU, memory and swap load, plus hwmon temperatures. Sampled on a timer this capability owns.",
     Keyboard => "keyboard", "Lock-key state, the active layout, and the keyboard backlight where the machine has one.",
-    Privacy => "privacy", "Who is holding the camera open right now. Empty means nobody is.",
+    Privacy => "privacy", "Who is using the camera, the microphone, or the screen right now. Empty means nobody is.",
     Updates => "updates", "Pending pacman upgrades, the progress of an install in flight, and whether the kernel changed under you.",
     Lock => "lock", "The session lock: whether it is held, whether a password is with PAM, and why the last attempt failed.",
     Polkit => "polkit", "The authentication request polkitd is waiting on: what for, whether a password is with PAM, and why the last attempt failed.",

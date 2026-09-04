@@ -6725,3 +6725,57 @@ whose lock key silently does nothing. *`Inhibit(what="sleep", mode="delay")` to 
 Real, and separate: without it a lid close reaches the screen before the lock does. Deferred until
 something asks for it, because it needs a held fd, a bounded window and a `PrepareForSleep`
 subscription, none of which the `Lock` path needs.
+
+## 0139. A held logind idle inhibitor stops idle events, because Oblisk is the idle daemon
+
+Amends ADR-0032, which gave `oblisk.idle` a write half and no read half. The capability could ask
+logind not to let the session idle and then get the `on_idle` that dims the screen anyway, because
+nothing was reading the inhibitor back. `systemd-inhibit --what=idle mpv film.mkv` from any other
+application had the same problem from the outside.
+
+This machine's `logind.conf` has `IdleAction=ignore`, which is the usual configuration for a session
+running its own idle daemon: nothing but this shell acts on idleness. That is what makes honouring
+an inhibitor this shell's job rather than logind's, and what makes ignoring one a bug rather than a
+division of labour.
+
+**Decisions.**
+
+1. **The Supervisor watches `Manager.BlockInhibited`.** A colon-separated list of everything held in
+   `block` mode, with change notification, so one property watch answers "is anything holding an
+   idle inhibitor" for every holder at once, including this shell's own `idle:inhibit`. `"idle"`
+   must match a whole entry: a substring test reads `handle-lid-switch` as an idle block.
+2. **While it names `idle`, no threshold event is forwarded.** `idle:inhibit(reason)` becomes the
+   mechanism it always read like rather than a flag set and then ignored, and a config's manual
+   inhibit toggle needs no guard inside its own `on_idle`.
+3. **An arriving inhibitor takes back every `Idled` it had announced.** The gate tracks which
+   `(generation, threshold)` pairs are open and emits their `Resumed`, so a screen dimmed at 30
+   seconds undims when a film starts rather than staying dim until the keyboard is touched. Sorted,
+   because they reach Lua callbacks and a `HashSet` drain order is arbitrary.
+4. **Nothing is replayed on release.** `ext-idle-notifier-v1` has no call for "is the seat idle
+   now", and re-creating the notifications would restart every threshold from zero rather than from
+   when the user actually stopped. A seat still idle when the inhibitor goes stays awake until the
+   next idle period, which is the safe direction to fail and is marked as such in `idle/gate.rs`.
+5. **Watched on the system bus, independently of notify.** A held inhibitor is worth knowing about
+   on a run where the Wayland half degraded to inert, and the watch is cheap. Failure to reach
+   logind leaves the gate permanently open, logged once: the behaviour this replaces.
+
+6. **A registration that arrives before notify is live is queued, not dropped.** Found by the live
+   probe for this ADR: a config registers its thresholds during evaluation, which reliably beats
+   the Wayland setup `IdleController::new` spawns, so `register_threshold(generation 0, 20s)
+   ignored: notify is inert for this run` was printed on *every* start and every threshold a config
+   asked for at boot was silently lost. The queue replays the moment notify goes `Live`, and
+   `reset_registrations` drops a generation's queued entries along with its live ones so a reload
+   cannot resurrect callbacks belonging to a replaced tree.
+
+**Rejected.** *Promoting `oblisk.idle` to a roster capability so a config could read the inhibitor
+list.* ADR-0032's structural claim still holds: `register_threshold` takes Lua callbacks, which
+cannot cross the wire as an `:invoke`, so `oblisk.idle` stays a bespoke member either way and the
+roster would buy only the push machinery. The reasons a config wants for a tooltip are its own
+(`manual`, `fullscreen`, `video` are all config-side state in the mirror too); the only thing it
+cannot see is a foreign application's inhibitor, and the framework now acts on that without being
+asked to draw it. Revisit when something wants to draw it. *Polling `ListInhibitors`.* The property
+is signalled; a poll would cost a round trip per tick to learn nothing. *`Session.SetIdleHint`, the
+reciprocal of ADR-0138's `SetLockedHint`.* Correct and unclaimed here (`IdleHint=false`,
+`IdleSinceHint=0`, nothing publishes it), but nothing on this machine reads it either, and which
+threshold means "the session is idle" is a config's decision, not this module's. Deferred until a
+config asks, as `idle:set_idle_hint(bool)`.

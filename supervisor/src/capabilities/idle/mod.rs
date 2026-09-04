@@ -16,6 +16,7 @@
 //! by thin async/Wayland-touching methods on [`IdleController`].
 
 pub mod controller;
+pub mod gate;
 pub mod inhibit;
 pub mod notify;
 

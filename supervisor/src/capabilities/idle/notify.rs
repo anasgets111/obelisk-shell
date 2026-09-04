@@ -189,6 +189,7 @@ pub(crate) fn connect_wayland_idle()
 /// fan-out), forwarding each to `events_tx` (drained by `main.rs`'s `select!` loop).
 pub(crate) fn spawn_idle_event_forwarder(
     registry: Arc<Mutex<NotifyRegistry>>,
+    gate: Arc<Mutex<super::gate::IdleGate>>,
     mut raw_events_rx: RawIdleEventReceiver,
     events_tx: UnboundedSender<shared::IdleEvent>,
 ) -> JoinHandle<()> {
@@ -197,6 +198,10 @@ pub(crate) fn spawn_idle_event_forwarder(
             let generation_ids = registry.lock().unwrap().fanout.get(&duration).cloned().unwrap_or_default();
             for generation_id in generation_ids {
                 let event = shared::IdleEvent { generation_id, threshold_sec: duration.as_secs(), state };
+                // Every threshold event passes the gate, which drops it while logind reports an
+                // idle inhibitor (ADR-0139). Here rather than at the listener, because the gate
+                // has to see the fanned-out event to know which pairs it owes a resume to.
+                let Some(event) = gate.lock().unwrap().observe(event) else { continue };
                 if events_tx.send(event).is_err() {
                     return;
                 }

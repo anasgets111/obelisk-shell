@@ -561,7 +561,7 @@ function Idle:release_inhibit() end
 ---@field mpris MprisCapability MPRIS: every media player on the bus, with track metadata, playback state and a position to extrapolate from.
 ---@field sysinfo SysinfoCapability CPU, memory and swap load, plus hwmon temperatures. Sampled on a timer this capability owns.
 ---@field keyboard KeyboardCapability Lock-key state, the active layout, and the keyboard backlight where the machine has one.
----@field privacy PrivacyCapability Who is holding the camera open right now. Empty means nobody is.
+---@field privacy PrivacyCapability Who is using the camera, the microphone, or the screen right now. Empty means nobody is.
 ---@field updates UpdatesCapability Pending pacman upgrades, the progress of an install in flight, and whether the kernel changed under you.
 ---@field lock LockCapability The session lock: whether it is held, whether a password is with PAM, and why the last attempt failed.
 ---@field polkit PolkitCapability The authentication request polkitd is waiting on: what for, whether a password is with PAM, and why the last attempt failed.

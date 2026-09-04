@@ -157,6 +157,7 @@ Oblisk has no hardcoded inactivity timeouts; the config sets its own.
 * `idle:register_threshold(seconds, on_idle, on_resume)` from Lua dispatches a registration packet over the IPC; the Supervisor allocates a distinct `ext_idle_notification_v1` listener for that duration.
 * **Handoff loop**: on `ext_idle_notification_v1::idled`, the Supervisor pushes the matched threshold duration to the Renderer, which runs `on_idle()`; `resumed` runs `on_resume()`.
 * Lua can register unlimited custom thresholds (dim at 30s, lock at 5m, DPMS sleep at 10m) with zero active timers.
+* A registration arriving before the Wayland setup finishes is queued and replayed when it completes, not dropped (ADR-0139). Config evaluation reliably beats that setup, so without the queue every threshold registered at boot is lost.
 * Registrations do not outlive an evaluation: re-running `shell.lua` drops every callback the old tree registered, since the Supervisor's listener persists and re-registering the same duration is a no-op there.
 * Two registrations for the same duration are one Wayland listener and two callbacks; the Supervisor allocates per distinct duration and fans out, since the event names the threshold, not the registration.
 
@@ -166,6 +167,16 @@ Oblisk has no hardcoded inactivity timeouts; the config sets its own.
 * The hold is a counted, per-generation reference on one logind fd: it opens on the 0-to-1 transition and closes on 1-to-0, so a media player and a presentation mode can both hold it without either release killing the other.
 * logind closes the fd if the holding process dies, so a Supervisor crash cannot leak a stuck inhibit.
 * Notify degrading to inert (no `ext_idle_notifier_v1`, a failed dedicated connection, a setup timeout) does not disable inhibit. The two halves share a controller, not a transport.
+
+### 7.2.1 A held inhibitor stops the events (ADR-0139)
+
+Oblisk is the idle daemon: with `IdleAction=ignore`, nothing but this shell acts on idleness, so honouring an inhibitor is this shell's job. The Supervisor watches `Manager.BlockInhibited`, a colon-separated list of everything held in `block` mode with change notification, and while it names `idle` no threshold event is forwarded to any generation.
+
+That covers every holder at once: this shell's own `idle:inhibit(reason)`, and a `systemd-inhibit --what=idle` from anywhere else on the system. A config's manual inhibit toggle therefore needs no guard inside its own `on_idle`.
+
+An arriving inhibitor emits the `Resumed` for every threshold that had been told the session went idle, so a screen dimmed at 30 seconds undims when a film starts. Nothing is replayed on release: `ext-idle-notifier-v1` cannot be asked whether the seat is idle now, so a seat still idle when the inhibitor goes stays awake until the next idle period.
+
+Wayland surface inhibitors need none of this. §7.1's listeners use `get_idle_notification`, which already respects them, and this is the logind half of the same idea.
 
 
 ### 7.3 logind session lock (ADR-0138)
