@@ -160,6 +160,8 @@ local function slot(index)
         align_v = "Center",
         hover = slot_hovered,
         radius = theme.item_radius,
+        -- The fill below is a plain bar cut by the circle's own arc, `FillBar.qml` under a clip.
+        clip = "Rounded",
         background = ground,
         border_width = theme.border_width,
         border_color = computed({ is_chosen, slot_hovered }, function(chosen, is_hovered)
@@ -183,7 +185,6 @@ local function slot(index)
                     return string.format("%d%%", math.floor(gone * 100 / COUNTDOWN + 0.5))
                 end),
                 height = "Fill",
-                radius = theme.item_radius,
                 background = theme.ON_HOVER,
             },
             text {
