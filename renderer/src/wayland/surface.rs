@@ -659,6 +659,13 @@ impl App {
         // painted describes an object that no longer exists, and `paint_surface` compares against
         // it to decide whether to attach a buffer at all.
         self.surfaces[index].last_painted = None;
+        // The compositor sends no `leave` for a surface its client destroyed, so a focus it held is
+        // stale from here on; keeping it re-armed the scope's field every pass and pruned it again
+        // on the next, one scrub-and-rearm loop per frame after a polkit prompt closed.
+        if self.keyboard_focus.as_deref() == Some(self.surfaces[index].surface_id.as_str()) {
+            self.keyboard_focus = None;
+            self.focus_secure_submit(None);
+        }
         eprintln!("[oblisk-renderer] {} destroyed: visible = false", self.surfaces[index].surface_id);
     }
 

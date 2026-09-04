@@ -2,9 +2,9 @@
 -- authorised (ADR-0114). Reading `oblisk.polkit` is what registers this shell as the session's
 -- authentication agent (ADR-0070).
 --
--- Not mirrored: the Authenticate button, because a click cannot reach the password -- it lives in
--- a native buffer only Enter sends (ADR-0005); Escape-to-cancel, because a masked field's Escape
--- clears and stays (ADR-0092); and the `●` mask, because `mask_character` is one byte.
+-- Not mirrored: Escape-to-cancel, because a masked field's Escape clears and stays (ADR-0092), and
+-- the `●` mask, because `mask_character` is one byte. The Authenticate button is `submit = true`:
+-- the password lives in a native buffer no callback may read, so the button *is* Enter.
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
@@ -78,7 +78,7 @@ return panel {
                         textfield {
                             width = "Fill",
                             height = theme.control.md,
-                            placeholder = "then Enter",
+                            placeholder = "password",
                             mask_character = "*",
                             secure_submit = { capability = "polkit", action = "authenticate" },
                             font_size = theme.font.sm,
@@ -89,8 +89,8 @@ return panel {
                 -- screen's words. Nothing animates, so "checking" is the line a spinner would be.
                 cell(read(function(p)
                     return p.authenticating and "checking..." or p.error
-                end), read(function(p)
-                    return p.authenticating and theme.DIM or theme.RED
+                end), oblisk.polkit:map(function(p)
+                    return (p and p.authenticating) and theme.DIM or theme.RED
                 end), theme.font.sm, {
                     width = "Fill",
                     visible = util.shown_when(oblisk.polkit, function(p)
@@ -100,10 +100,12 @@ return panel {
                 row {
                     width = "Fill",
                     align_h = "End",
+                    spacing = theme.spacing.sm,
                     children = {
                         action_button("cancel", function()
                             oblisk.polkit:invoke("cancel")
                         end, "polkit-cancel", { tone = "quiet" }),
+                        action_button("authenticate", nil, "polkit-authenticate", { tone = "solid", submit = true }),
                     },
                 },
             }, {

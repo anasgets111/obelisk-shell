@@ -51,6 +51,9 @@ pub enum Draw {
         font_size: f32,
         color: Rgba,
         align: TextAlign,
+        /// A `textfield`'s one line sits in the middle of its box; a `text` node's box is its
+        /// content, so its lines start at the top.
+        centered: bool,
     },
     /// The theme *name*, not the resolved path: [`execute`] resolves it via
     /// `image::icons::resolve`, keeping the filesystem hit out of [`build`]. `alpha`, not a tinted
@@ -355,11 +358,17 @@ fn run(
                 }
                 paint_border(painter.canvas_mut(), rect, *radius, *colors, *widths, scale);
             }
-            Draw::Text { content, runs, font_size, color, align } => painter.draw_text(
-                TextDraw { text: content, runs, font_size: *font_size, color: *color, align: *align },
-                rect,
-                scale,
-            ),
+            Draw::Text { content, runs, font_size, color, align, centered } => {
+                let mut rect = rect;
+                if *centered {
+                    rect.y += ((rect.height - crate::text::shaping::line_height(*font_size)) / 2.0).max(0.0);
+                }
+                painter.draw_text(
+                    TextDraw { text: content, runs, font_size: *font_size, color: *color, align: *align },
+                    rect,
+                    scale,
+                )
+            }
             Draw::Icon { name, px, alpha, color } => {
                 // `u16` is `freedesktop-icons`'s own size type, and a theme has no directory above
                 // 512 anyway.
@@ -511,6 +520,7 @@ fn draw_for(
                 font_size: *font_size,
                 color: fade(*color, opacity),
                 align: *align,
+                centered: false,
             })
         }
 
@@ -579,6 +589,7 @@ fn draw_for(
                 font_size: *font_size,
                 color: fade(*color, opacity),
                 align: *align,
+                centered: true,
             })
         }
     }

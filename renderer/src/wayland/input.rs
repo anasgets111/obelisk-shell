@@ -69,15 +69,20 @@ pub(super) struct ArmedSerial {
 /// handled one still lets the outer one fire. `on_click` must be a `Value::Function`; anything else
 /// is not a click handler, and this is the only place that checks, since `layout::node` has no
 /// parser for the key (§ 5.2 leaves it opaque).
-fn clickable_button<'a>(path: &[&'a layout::ResolvedNode]) -> Option<(LogicalRect, &'a Function)> {
+fn clickable_button<'a>(path: &[&'a layout::ResolvedNode]) -> Option<(LogicalRect, Option<&'a Function>, bool)> {
     path.iter().enumerate().rev().find_map(|(depth, node)| {
         if node.kind != "button" {
             return None;
         }
-        let Some(Value::Function(on_click)) = node.properties.get("on_click") else {
-            return None;
+        let on_click = match node.properties.get("on_click") {
+            Some(Value::Function(f)) => Some(f),
+            _ => None,
         };
-        Some((layout::hit::absolute_rect(&path[..=depth])?, on_click))
+        let submit = matches!(node.properties.get("submit"), Some(Value::Boolean(true)));
+        if on_click.is_none() && !submit {
+            return None;
+        }
+        Some((layout::hit::absolute_rect(&path[..=depth])?, on_click, submit))
     })
 }
 /// What a press or release lands on: the handler to call, the node's rect (the click's identity,
@@ -85,8 +90,11 @@ fn clickable_button<'a>(path: &[&'a layout::ResolvedNode]) -> Option<(LogicalRec
 #[derive(Clone)]
 struct Clickable {
     rect: LogicalRect,
-    handler: Function,
+    handler: Option<Function>,
     link: Option<String>,
+    /// `submit = true`: the release also sends the scope's armed `secure_submit` field, as Enter
+    /// would (ADR-0114). The only way a button reaches a password, which no Lua callback may.
+    submit: bool,
 }
 /// [`clickable_button`] with links ahead of it (ADR-0106): a `text` on the path that declares
 /// `on_link` and has a run with an `href` under `point` wins over every `button` above it, the
@@ -109,10 +117,15 @@ fn clickable(
         let rect = layout::hit::absolute_rect(&path[..=depth])?;
         let local = layout::hit::LogicalPoint { x: point.x - rect.x, y: point.y - rect.y };
         let href = layout::hit::link_under(node, local, shaping)?;
-        Some(Clickable { rect, handler: on_link.clone(), link: Some(href) })
+        Some(Clickable { rect, handler: Some(on_link.clone()), link: Some(href), submit: false })
     });
     link.or_else(|| {
-        clickable_button(path).map(|(rect, on_click)| Clickable { rect, handler: on_click.clone(), link: None })
+        clickable_button(path).map(|(rect, on_click, submit)| Clickable {
+            rect,
+            handler: on_click.cloned(),
+            link: None,
+            submit,
+        })
     })
 }
 /// Both answers one press wants out of decision 1's single traversal: the `button` that would fire,
@@ -518,7 +531,7 @@ impl App {
     /// Every write to `focused_secure_submit` in this file, funnelled so [`retarget_secure_submit`]
     /// enforces the buffer's lifetime; assigning the field directly anywhere else reopens the leak
     /// that function closes.
-    fn focus_secure_submit(&mut self, next: Option<FocusedField>) {
+    pub(super) fn focus_secure_submit(&mut self, next: Option<FocusedField>) {
         retarget_secure_submit(&mut self.focused_secure_submit, &mut self.secure_buffer, next);
         // A focus change zeroizes the buffer, so the field that had dots must be repainted without
         // them, the same reason a keystroke sets this.
@@ -603,6 +616,12 @@ impl App {
         let Some(field) = self.field_the_scope_declares(&scope, None) else {
             return;
         };
+        // A tree can declare a field on a surface this process has destroyed: the compositor sends
+        // no `leave` for it, so `keyboard_focus` may still name it. Arming there would only be
+        // pruned again on the next pass, a scrub-and-rearm loop per frame.
+        if !self.surface_is_live(&field.surface_id) {
+            return;
+        }
         eprintln!(
             "[oblisk-renderer] {}'s `secure_submit` field ({}/{}) became typable under the keyboard focus already held",
             field.surface_id, field.target.capability, field.target.action
@@ -1360,15 +1379,23 @@ impl PointerHandler for App {
                         self.armed = None;
                     }
                     if let Some(clickable) = hit.filter(|_| fires) {
-                        match clickable.link {
+                        match (clickable.link, clickable.handler) {
                             // A link takes the `href` and nothing else: the rect is the paragraph's
                             // and says nothing about which link, and a link is not a mouse button.
-                            Some(href) => {
-                                if let Err(e) = clickable.handler.call::<()>(href) {
+                            (Some(href), Some(handler)) => {
+                                if let Err(e) = handler.call::<()>(href) {
                                     eprintln!("[oblisk-renderer] {instance_id}: on_link raised, ignoring it: {e}");
                                 }
                             }
-                            None => self.fire_on_click(&instance_id, clickable.rect, name, &clickable.handler),
+                            (_, handler) => {
+                                if clickable.submit {
+                                    self.prune_secure_focus();
+                                    self.finish_secure_submit();
+                                }
+                                if let Some(handler) = handler {
+                                    self.fire_on_click(&instance_id, clickable.rect, name, &handler);
+                                }
+                            }
                         }
                     }
                 }
@@ -1662,7 +1689,7 @@ mod tests {
         root.children.push(row);
 
         let path = layout::hit::hit_path(&root, layout::hit::LogicalPoint { x: 20.0, y: 12.0 });
-        let (rect, _) = clickable_button(&path).expect("the button carries an on_click");
+        let (rect, ..) = clickable_button(&path).expect("the button carries an on_click");
         assert_eq!(rect, LogicalRect { x: 10.0, y: 4.0, width: 40.0, height: 24.0 });
     }
 
@@ -1679,7 +1706,7 @@ mod tests {
 
         let path = layout::hit::hit_path(&root, layout::hit::LogicalPoint { x: 20.0, y: 12.0 });
         assert_eq!(path.len(), 3, "the inner button is still on the path");
-        let (rect, _) = clickable_button(&path).expect("the outer button carries the on_click");
+        let (rect, ..) = clickable_button(&path).expect("the outer button carries the on_click");
         assert_eq!(rect, LogicalRect { x: 10.0, y: 4.0, width: 40.0, height: 24.0 });
     }
 

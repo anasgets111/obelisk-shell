@@ -30,9 +30,9 @@ local GROUND = {
 }
 
 ---@param label string|Bound
----@param on_activate fun()
+---@param on_activate? fun() Absent on a `submit` button, whose click is the field's Enter.
 ---@param slot string A `hover` slot unique to this button; two buttons sharing one light up together.
----@param opts? { icon?: string, tone?: "accent"|"quiet"|"solid", width?: integer|"Fill", visible?: boolean|Bound }
+---@param opts? { icon?: string, tone?: "accent"|"quiet"|"solid", width?: integer|"Fill", visible?: boolean|Bound, submit?: boolean }
 return function(label, on_activate, slot, opts)
     opts = opts or {}
     local ground = GROUND[opts.tone or "accent"]
@@ -61,6 +61,7 @@ return function(label, on_activate, slot, opts)
         })
     end
     return button {
+        submit = opts.submit,
         width = opts.width,
         height = theme.control.md,
         align_v = "Center",
@@ -75,7 +76,9 @@ return function(label, on_activate, slot, opts)
         padding = { left = theme.spacing.md, right = theme.spacing.md },
         on_click = function(_, mouse_button)
             if mouse_button == "left" then
-                on_activate()
+                if on_activate then
+                    on_activate()
+                end
             end
         end,
         -- The row is what puts a glyph beside a word, rather than on top of one.

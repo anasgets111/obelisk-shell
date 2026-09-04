@@ -5385,7 +5385,16 @@ through this agent, and nothing in Lua could have drawn the prompt: there was no
    `pam_unix`'s delay. The Supervisor no longer needs polkitd's Authority proxy for anything but
    registration. The re-exec'd worker stays for `oblisk.lock`, which has no polkitd to satisfy.
 
-Not mirrored from `PolkitDialog.qml`: an Authenticate button (a click cannot submit a masked
-field; Enter does, ADR-0005) and Escape-to-cancel (a masked field's Escape clears and stays,
-ADR-0092; the Cancel button is the way out). `isResponseRequired`/`inputPrompt` have no equivalent
-under ADR-0028's one-shot protocol, where a password is always the answer.
+6. **`button { submit = true }`.** The mirror's Authenticate button. A click cannot hand a password
+   to Lua (ADR-0005), so the button does what Enter does: the release sends the scope's armed
+   `secure_submit` field. Clickable with or without `on_click`.
+7. **A destroyed surface gives up the keyboard focus it held.** The compositor sends no `leave` for
+   a surface its client destroyed, so after the prompt closed `keyboard_focus` still named it, the
+   tree still declared its field, and every pass re-armed the field and pruned it again -- a log
+   line and a scrub per frame. `unmap` clears the focus; arming also refuses a surface that is not
+   live. A `textfield`'s one line is drawn in the middle of its box while here, which it was not.
+
+Not mirrored from `PolkitDialog.qml`: Escape-to-cancel (a masked field's Escape clears and stays,
+ADR-0092; the Cancel button is the way out) and the `●` mask (`mask_character` is one byte).
+`isResponseRequired`/`inputPrompt` have no equivalent under ADR-0028's one-shot protocol, where a
+password is always the answer.
