@@ -1740,6 +1740,7 @@ dependencies = [
  "glow",
  "image",
  "khronos-egl",
+ "libc",
  "md-5",
  "mlua",
  "nix 0.31.3",

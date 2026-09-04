@@ -17,6 +17,12 @@
 //! (ADR-0039), ever uploads. A pool decode also goes through the freedesktop thumbnail cache
 //! ([`thumbnails`]): a current thumbnail is read instead of the file, and a file decoded in full
 //! leaves one behind for the next open and for every other program that keeps that cache.
+//!
+//! Eviction is by two bounds (ADR-0123): [`CACHE_CAPACITY`] entries, oldest insert first, and
+//! [`TEXTURE_BUDGET`] bytes of textures no mapped surface is showing, least recently asked-for
+//! first, which `wayland::App` triggers after each paint with the pins its surfaces' last lists
+//! name. A texture is freed at the start of the next paint, never mid-frame (see
+//! [`ImageCache::release_evicted`]).
 
 pub mod icons;
 pub mod thumbnails;
@@ -33,13 +39,20 @@ use femtovg::{Canvas, ErrorKind, ImageFlags, ImageId, ImageSource};
 
 use crate::text::snap::LogicalRect;
 
-/// Entries, not bytes. ponytail: oldest-out FIFO, not the LRU
-/// `oblisk-supervisor-services-dbus.md` § 9.2 asks for, so a wallpaper loaded once at startup is
-/// evicted before a tray icon loaded forty times. Evicting by bytes (ADR-0043's budget: one 4K
-/// wallpaper is 32 MB, 127 tray icons are not) matters more than LRU, and neither is worth
-/// building before there is a cache to measure. Since ADR-0122 a texture is at most its box, so
-/// a screen of thumbnails is a screen's worth of pixels however many files it shows.
+/// Entries, the ceiling on how many slots the map holds, `Failed` and `Pending` included. The
+/// bytes are bounded separately by [`TEXTURE_BUDGET`]; this is what keeps a config cycling through
+/// a thousand distinct failing paths from growing the map without bound.
 const CACHE_CAPACITY: usize = 128;
+
+/// Bytes of texture kept beyond what any mapped surface is showing (ADR-0123). Textures a surface
+/// last painted are never evicted, whatever the total, so a working set larger than this is simply
+/// over budget rather than thrashing through inline decodes; this bounds the *idle* part: the
+/// wallpapers a user has moved on from (12 MB each on a 1920x1200 output, and before this every
+/// one of them stayed for the next 128 inserts), the picker's tiles after it closed. 16 MB keeps
+/// a closed picker's tiles (54 files, 6.5 MB) and the wallpaper just left on a 1920x1200 output,
+/// and returns the rest to the GPU; on a 4K output a wallpaper left behind is 33 MB and goes at
+/// once.
+const TEXTURE_BUDGET: usize = 16 << 20;
 
 /// How many decode workers the pool runs: the machine's parallelism, capped so a folder of forty
 /// wallpapers landing at once does not take every core from the compositor drawing them.
@@ -136,11 +149,20 @@ struct Decoded {
 }
 
 /// One slot's state. `Pending` is a background decode in flight, which draws nothing and enqueues
-/// nothing more: the first draw sent the job, and every draw until it lands finds this.
+/// nothing more: the first draw sent the job, and every draw until it lands finds this. `Ready`
+/// carries the texture's size in bytes (RGBA8, so width times height times four), what
+/// [`TEXTURE_BUDGET`] counts.
 enum Slot {
     Pending,
-    Ready(ImageId),
+    Ready(ImageId, usize),
     Failed,
+}
+
+/// A slot and when it was last asked for, on the [`ImageCache::tick`] clock, which is what
+/// [`ImageCache::trim`] orders its victims by.
+struct Entry {
+    slot: Slot,
+    last_hit: u64,
 }
 
 /// One decode the pool owes: the key it was asked under, so the result lands in the right slot
@@ -196,10 +218,17 @@ impl Pool {
 /// shared with the Supervisor and not persisted: the Renderer is swapped as an OS process on
 /// every reload, so this is cold again after each config edit (ADR-0054).
 pub struct ImageCache {
-    entries: HashMap<CacheKey, Slot>,
+    entries: HashMap<CacheKey, Entry>,
+    /// Insertion order, what [`CACHE_CAPACITY`] evicts by.
     order: VecDeque<CacheKey>,
     /// Evicted since the last [`ImageCache::release_evicted`], not yet freed.
     evicted: Vec<ImageId>,
+    /// Bytes across every `Ready` slot, kept in step by [`ImageCache::insert`] and
+    /// [`ImageCache::evict`].
+    resident_bytes: usize,
+    /// One more per [`ImageCache::image`] call: a Lamport clock, so "least recently asked for"
+    /// needs no `Instant` and no frame notion this module does not have.
+    tick: u64,
     pool: Pool,
     /// Decodes [`ImageCache::poll`] took off the pool and [`ImageCache::upload_landed`] has not
     /// yet turned into textures: `poll` runs where there is no canvas, in the main loop's turn.
@@ -218,6 +247,8 @@ impl ImageCache {
             entries: HashMap::new(),
             order: VecDeque::new(),
             evicted: Vec::new(),
+            resident_bytes: 0,
+            tick: 0,
             pool: Pool::spawn(),
             landed: Vec::new(),
         }
@@ -257,11 +288,37 @@ impl ImageCache {
     /// [`ImageCache::release_evicted`]. A result whose slot was evicted while it decoded is
     /// dropped: the next draw of that file finds no slot and sends the job again.
     pub fn upload_landed(&mut self, canvas: &mut Canvas<OpenGl>) {
-        for (key, result) in self.landed.drain(..) {
-            if !matches!(self.entries.get(&key), Some(Slot::Pending)) {
+        for (key, result) in std::mem::take(&mut self.landed) {
+            if !matches!(self.entries.get(&key).map(|entry| &entry.slot), Some(Slot::Pending)) {
                 continue;
             }
-            self.entries.insert(key.clone(), upload_or_log(canvas, &key.path, result));
+            let slot = upload_or_log(canvas, &key.path, result);
+            if let Slot::Ready(_, bytes) = slot {
+                self.resident_bytes += bytes;
+            }
+            if let Some(entry) = self.entries.get_mut(&key) {
+                entry.slot = slot;
+            }
+        }
+    }
+
+    /// Evicts idle textures until the total is back under [`TEXTURE_BUDGET`], oldest ask first
+    /// (ADR-0123). `pinned` names what may not go: every `(path, box)` some mapped surface's last
+    /// display list draws, which `wayland::App` collects from its surfaces after each paint. Asked
+    /// for lazily, since walking every list is only worth it when there is something to evict.
+    /// Icons are not pinned: a list carries a theme name where the cache has a path, an icon is a
+    /// few kilobytes, and one evicted is one inline re-raster on its next paint.
+    pub fn trim(&mut self, pinned: impl FnOnce() -> Vec<(PathBuf, (u32, u32))>) {
+        if self.resident_bytes <= TEXTURE_BUDGET {
+            return;
+        }
+        let pinned = pinned();
+        let candidates = self.entries.iter().filter_map(|(key, entry)| match entry.slot {
+            Slot::Ready(_, bytes) => Some((key.clone(), bytes, entry.last_hit)),
+            Slot::Pending | Slot::Failed => None,
+        });
+        for key in victims(candidates, self.resident_bytes, TEXTURE_BUDGET, &pinned) {
+            self.evict(&key);
         }
     }
 
@@ -297,9 +354,11 @@ impl ImageCache {
             // splitting its cache slot per colour it will never use.
             tint: if vector { tint.map(packed_rgb) } else { None },
         };
-        if let Some(cached) = self.entries.get(&key) {
-            return match cached {
-                Slot::Ready(id) => Some(*id),
+        self.tick += 1;
+        if let Some(cached) = self.entries.get_mut(&key) {
+            cached.last_hit = self.tick;
+            return match cached.slot {
+                Slot::Ready(id, _) => Some(id),
                 Slot::Pending | Slot::Failed => None,
             };
         }
@@ -307,7 +366,7 @@ impl ImageCache {
             Load::Inline => {
                 let slot = upload_or_log(canvas, &key.path, decode(&key.path, key.box_px, tint, None));
                 let id = match slot {
-                    Slot::Ready(id) => Some(id),
+                    Slot::Ready(id, _) => Some(id),
                     _ => None,
                 };
                 self.insert(key, slot);
@@ -328,27 +387,72 @@ impl ImageCache {
     /// Evicts before inserting, so the map never exceeds [`CACHE_CAPACITY`]. Queues the evicted
     /// texture for [`ImageCache::release_evicted`] rather than deleting it here: femtovg frees
     /// nothing by `ImageId` until told to, so losing the id leaks the GPU allocation for good.
-    fn insert(&mut self, key: CacheKey, value: Slot) {
+    fn insert(&mut self, key: CacheKey, slot: Slot) {
         while self.order.len() >= CACHE_CAPACITY {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };
-            if let Some(Slot::Ready(id)) = self.entries.remove(&oldest) {
-                self.evicted.push(id);
-            }
+            self.evict(&oldest);
+        }
+        if let Slot::Ready(_, bytes) = slot {
+            self.resident_bytes += bytes;
         }
         self.order.push_back(key.clone());
-        self.entries.insert(key, value);
+        self.entries.insert(key, Entry { slot, last_hit: self.tick });
     }
+
+    /// Drops one entry, queueing its texture for [`ImageCache::release_evicted`] and taking its
+    /// bytes off the total. `order` is scanned, which is the [`CACHE_CAPACITY`]-bounded cost of
+    /// an eviction and nothing a frame pays.
+    fn evict(&mut self, key: &CacheKey) {
+        if let Some(entry) = self.entries.remove(key) {
+            if let Slot::Ready(id, bytes) = entry.slot {
+                self.evicted.push(id);
+                self.resident_bytes -= bytes;
+            }
+            if let Some(at) = self.order.iter().position(|k| k == key) {
+                self.order.remove(at);
+            }
+        }
+    }
+}
+
+/// Which of `candidates` (`(key, bytes, last_hit)`) to evict to bring `resident` under `budget`:
+/// least recently asked for first, skipping anything `pinned` names by path and box, stopping
+/// once under budget or out of unpinned candidates. Pure, so the policy is testable without an
+/// `ImageId`, which femtovg gives no way to make outside a canvas.
+fn victims(
+    candidates: impl Iterator<Item = (CacheKey, usize, u64)>,
+    resident: usize,
+    budget: usize,
+    pinned: &[(PathBuf, (u32, u32))],
+) -> Vec<CacheKey> {
+    let mut idle: Vec<(CacheKey, usize, u64)> = candidates
+        .filter(|(key, _, _)| !pinned.iter().any(|(path, box_px)| *path == key.path && *box_px == key.box_px))
+        .collect();
+    idle.sort_by_key(|(_, _, last_hit)| *last_hit);
+    let mut resident = resident;
+    let mut out = Vec::new();
+    for (key, bytes, _) in idle {
+        if resident <= budget {
+            break;
+        }
+        resident -= bytes;
+        out.push(key);
+    }
+    out
 }
 
 /// Uploads a decode, or logs why there is nothing to upload. Each failure is logged once here,
 /// at the moment its slot is filled, and the `Failed` slot is what stops the next frame asking
 /// again.
 fn upload_or_log(canvas: &mut Canvas<OpenGl>, path: &Path, decoded: Result<Decoded, String>) -> Slot {
-    let result = decoded.and_then(|decoded| upload(canvas, decoded));
+    let result = decoded.and_then(|decoded| {
+        let bytes = decoded.pixels.len();
+        upload(canvas, decoded).map(|id| (id, bytes))
+    });
     match result {
-        Ok(id) => Slot::Ready(id),
+        Ok((id, bytes)) => Slot::Ready(id, bytes),
         Err(err) => {
             eprintln!("[oblisk-renderer] image: {}: {err}", path.display());
             Slot::Failed
@@ -772,6 +876,51 @@ mod tests {
     }
 
     #[test]
+    fn the_budget_evicts_the_least_recently_asked_for_idle_texture_and_never_a_pinned_one() {
+        // Three wallpapers of 12 MB and a screen of tiles: the one on screen is pinned, the tiles
+        // were asked for after the older wallpaper, so the older wallpaper goes first and the
+        // budget is met without touching the tiles.
+        let mb = 1 << 20;
+        let v = FileVersion::default();
+        let old = key("/w/old.jpg", 1920, v);
+        let older = key("/w/older.jpg", 1920, v);
+        let shown = key("/w/shown.jpg", 1920, v);
+        let tiles = key("/w/tiles.png", 232, v);
+        let candidates = vec![
+            (older.clone(), 12 * mb, 1),
+            (old.clone(), 12 * mb, 2),
+            (tiles.clone(), 7 * mb, 3),
+            (shown.clone(), 12 * mb, 4),
+        ];
+        let pinned = vec![(PathBuf::from("/w/shown.jpg"), (1920, 1920))];
+        let out = victims(candidates.clone().into_iter(), 43 * mb, 31 * mb, &pinned);
+        assert_eq!(out, vec![older.clone()]);
+        // A tighter budget takes the next-oldest, then stops at the pinned one even though it is
+        // still over: a working set larger than the budget is over budget, not thrashing.
+        let out = victims(candidates.clone().into_iter(), 43 * mb, 10 * mb, &pinned);
+        assert_eq!(out, vec![older, old, tiles]);
+        // Under budget, nothing moves.
+        assert!(victims(candidates.into_iter(), 43 * mb, 43 * mb, &pinned).is_empty());
+    }
+
+    #[test]
+    fn a_pin_is_by_path_and_box_so_a_tile_of_the_shown_file_is_still_idle() {
+        let v = FileVersion::default();
+        let full = key("/w/a.jpg", 1920, v);
+        let tile = key("/w/a.jpg", 232, v);
+        let pinned = vec![(PathBuf::from("/w/a.jpg"), (1920, 1920))];
+        let out = victims(vec![(full.clone(), 10, 1), (tile.clone(), 10, 2)].into_iter(), 20, 15, &pinned);
+        assert_eq!(out, vec![tile]);
+    }
+
+    #[test]
+    fn trim_under_budget_never_asks_for_the_pins() {
+        let mut cache = ImageCache::new();
+        cache.trim(|| unreachable!("nothing resident, nothing to walk"));
+        assert_eq!(cache.resident_bytes, 0);
+    }
+
+    #[test]
     fn a_vector_and_a_raster_alike_take_one_slot_per_box() {
         let v = FileVersion::default();
         assert_ne!(key("/tmp/a.png", 12, v), key("/tmp/a.png", 24, v));
@@ -853,7 +1002,10 @@ mod tests {
         let decoded = result.as_ref().expect("a 2x2 PNG decodes");
         assert_eq!((decoded.width, decoded.height), (2, 2));
         assert!(!decoded.premultiplied);
-        assert!(matches!(cache.entries.get(&key), Some(Slot::Pending)), "no canvas, so nothing uploaded yet");
+        assert!(
+            matches!(cache.entries.get(&key).map(|e| &e.slot), Some(Slot::Pending)),
+            "no canvas, so nothing uploaded yet"
+        );
     }
 
     #[test]

@@ -5781,3 +5781,45 @@ picker sets).
 **Consequences**: `Draw::Image` and the cache key carry a box, `ImageCache::image` takes a `Load`,
 `renderer/src/image/thumbnails.rs` is new, `md-5` and `png` are direct dependencies. § 5a gains
 `async`; `CONTEXT.md`'s Image cache term says what the key is now.
+
+## 0123. Idle textures have a byte budget, and the allocator's mmap threshold is pinned
+
+Measured after ADR-0122, on the 1920x1200 laptop output, debug build: the Renderer booted at 89
+MB resident and reached 132 MB after six wallpaper changes, with 123 MB of GPU memory charged to
+the process by then (`drm-total-system0` in the DRM fd's `fdinfo`) and climbing 12 MB per change.
+Two causes, two changes.
+
+1. **A texture no mapped surface is showing is evicted once the idle total passes 16 MB.**
+   ADR-0054's cache evicted by entry count alone, oldest insert first, so every wallpaper a user
+   left behind stayed for the next 128 inserts: 12 MB each here, 33 MB on a 4K output, invisible
+   to `ps` because a GEM buffer is not in the process's RSS and is system RAM all the same. Now
+   each `Ready` slot carries its byte size and the tick of its last ask; after every paint
+   `wayland::App` hands the cache the `(path, box)` pairs its surfaces' last display lists draw
+   (`DisplayList::drawn_images`, the walk `draws_any_of` already does), and `ImageCache::trim`
+   evicts the least recently asked-for unpinned textures until under budget. Pinned means shown:
+   a texture some mapped surface last painted is never evicted, whatever the total, so a working
+   set larger than the budget is over budget rather than thrashing through inline decodes. 16 MB
+   holds a closed picker's tiles (54 files at a tile's size, 6.5 MB) and the last wallpaper on
+   this output, and nothing older. Measured: the same six changes end at 79 MB of GPU memory
+   instead of 123 and no longer climb. Icons are not pinned, since a list carries a theme name
+   where the cache has a path; one is a few kilobytes and, evicted, one inline re-raster.
+2. **`mallopt(M_MMAP_THRESHOLD, 1 MB)` at Renderer startup.** glibc serves an allocation over
+   the threshold from its own mapping, returned to the kernel on free, and one under it from
+   the heap, which shrinks only from the top. The threshold is dynamic by default: freeing a
+   mapped 10 MB decode buffer raises it to 10 MB, so the next change's buffers (the decoded file,
+   the cover-sized copy, the RGBA copy) land on the heap and stay resident after they are freed,
+   trapped under whatever small allocation came after. The six changes grew the heap from 22 MB
+   to 64 MB that way; with the threshold pinned it stays at 23 MB, and the process at 90 MB
+   resident. The cost is one `mmap` per allocation over a megabyte, which nothing here does per
+   frame. `libc` becomes a direct dependency for the one call.
+
+Not changed: the wallpaper's texture size, which is already the cover of its output (2133x1200
+here, 10 MB) and the least that draws sharp; the decode's transient peak, which is the whole
+file at once (a 6024x3401 PNG is 82 MB of RGBA for the second it takes) because the `image`
+crate decodes whole and downscales after, so a row-streaming decode that scales as it reads is
+the next step if that peak matters; the Supervisor's allocator; ADR-0043's 50 MB per-monitor
+figure, which this is the first measurement against.
+
+**Consequences**: `Slot::Ready` carries bytes, `ImageCache::trim` and `DisplayList::drawn_images`
+are new, `App::paint_surface` calls `trim` after recording its list, `main.rs` opens with the
+`mallopt`. `CONTEXT.md`'s Image cache term says what is evicted when.

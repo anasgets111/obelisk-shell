@@ -115,6 +115,22 @@ impl DisplayList {
         }
         walk(&self.commands, files)
     }
+
+    /// Every `image` this list draws, as the `(path, box)` pair `ImageCache` keys on, for
+    /// `ImageCache::trim`'s pins (ADR-0123): what a mapped surface last painted is what it is
+    /// still showing, and must not be evicted from under it.
+    pub fn drawn_images(&self, out: &mut Vec<(std::path::PathBuf, (u32, u32))>) {
+        fn walk(commands: &[DrawCmd], out: &mut Vec<(std::path::PathBuf, (u32, u32))>) {
+            for command in commands {
+                match &command.draw {
+                    Draw::Image { source, box_px, .. } => out.push((std::path::PathBuf::from(source), *box_px)),
+                    Draw::Clipped { commands, .. } => walk(commands, out),
+                    _ => {}
+                }
+            }
+        }
+        walk(&self.commands, out)
+    }
 }
 
 /// A clip that excludes nothing, which is what the canvas starts with before any scissor is
@@ -1022,6 +1038,11 @@ mod tests {
         assert!(list.draws_any_of(&[std::path::PathBuf::from("/tmp/a.png")]));
         assert!(!list.draws_any_of(&[std::path::PathBuf::from("/tmp/b.png")]));
         assert!(!list.draws_any_of(&[]));
+        // The same walk names the pin `ImageCache::trim` keeps: the path with the box the image
+        // was keyed on, the 100x40 rect it fills.
+        let mut pinned = Vec::new();
+        list.drawn_images(&mut pinned);
+        assert_eq!(pinned, vec![(std::path::PathBuf::from("/tmp/a.png"), (100, 40))]);
     }
 
     #[test]

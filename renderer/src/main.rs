@@ -19,6 +19,20 @@ mod wayland;
 ///   `UnboundedSender::send` is synchronous and non-blocking, so the Wayland thread can call it
 ///   directly without bridging.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Before any allocation worth the name (ADR-0123). glibc serves an allocation above its mmap
+    // threshold from a fresh mapping, returned to the kernel on free, and everything under it
+    // from the heap, which only shrinks from the top. The threshold is dynamic by default: freeing
+    // a mapped 10 MB decode buffer raises it to 10 MB, so the *next* decode's buffers land on the
+    // heap and stay resident after they are freed, under whatever small allocation came after.
+    // Six wallpaper changes measured 22 MB to 64 MB of heap that way. Pinning the threshold
+    // turns the dynamic behaviour off, so every image decode, SVG raster and the like is a
+    // mapping that comes and goes; the cost is one `mmap` per allocation over a megabyte, which
+    // nothing here does per frame.
+    //
+    // SAFETY: a plain FFI call with two integers, before any thread exists.
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
+    }
     // `oblisk check` re-execs this binary rather than duplicating the loader in the Supervisor,
     // which has no `mlua`. Before any Wayland connection, because the point is that it needs none.
     if std::env::var_os(shared::CHECK_ENV).is_some() {
