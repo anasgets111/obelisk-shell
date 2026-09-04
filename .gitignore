@@ -1,1 +1,5 @@
 /target
+# Any second build directory, which is how an experiment that changes the flags every crate is
+# built with (`--target-dir target-native` for a `-C target-cpu=native` measurement) keeps from
+# invalidating the ordinary one. Scratch by definition: nothing here is ever an input.
+/target-*
