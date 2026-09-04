@@ -374,6 +374,10 @@ theme.notification_app_icon = s(40, 32)
 theme.notification_stack_height = s(560, 420)
 theme.osd_width           = s(260, 220)
 theme.osd_height          = s(44, 36)
+-- `dialogWidth`: the polkit prompt's card (`modules/global/polkit.lua`). Narrower than the launcher
+-- because it holds one sentence, one field and two buttons.
+theme.dialog_width        = s(450, 360)
+
 -- ## The launcher (`modules/global/launcher.lua`)
 --
 -- `launcherWindowWidth/Height` are 860x680 in the mirror, for a list of 64px rows with a 42px icon

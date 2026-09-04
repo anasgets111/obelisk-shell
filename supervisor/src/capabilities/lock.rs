@@ -236,8 +236,9 @@ pub fn accepts_outcome(state: &LockState, acquisition: u64) -> bool {
 
 /// The line a lock screen renders for a failed authentication, not `oblisk.rescue`: rescue is
 /// drawn by the config's ordinary surfaces, exactly what the lock is hiding (ADR-0052
-/// decision 4). `Success` is not a failure and [`apply`] never asks for its message.
-fn error_for_outcome(outcome: &shared::PamOutcome) -> String {
+/// decision 4). `Success` is not a failure and [`apply`] never asks for its message. The polkit
+/// prompt reads the same words, so one PAM answer is one sentence everywhere.
+pub(crate) fn error_for_outcome(outcome: &shared::PamOutcome) -> String {
     match outcome {
         shared::PamOutcome::Success => String::new(),
         shared::PamOutcome::AuthFailed => "authentication failed".to_string(),

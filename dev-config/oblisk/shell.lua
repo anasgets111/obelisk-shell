@@ -77,6 +77,7 @@ local launcher_tooltip = require("modules.bar.indicators.launcher_button").toolt
 local network_tooltip = require("modules.bar.indicators.network").tooltip
 local bluetooth_tooltip = require("modules.bar.indicators.bluetooth").tooltip
 local lock_screen = require("modules.global.lock")
+local polkit_dialog = require("modules.global.polkit")
 
 return {
     wallpaper,
@@ -92,4 +93,5 @@ return {
     bluetooth_tooltip,
     launcher,
     lock_screen,
+    polkit_dialog,
 }

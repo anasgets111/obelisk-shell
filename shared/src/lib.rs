@@ -17,8 +17,8 @@ pub use zeroize::{Zeroize, Zeroizing};
 /// spelling for all three, so a config reading `oblisk.audio` cannot write to something else.
 /// First read of `oblisk.<name>` starts that capability's controller on the Supervisor (ADR-0070);
 /// the member reads `nil` until the first `StateSnapshot`, so an unread name costs nothing.
-/// `idle` is absent (event-shaped, not snapshot state, ADR-0032), and so is `polkit` (reached via
-/// `secure_submit`, ADR-0070 decision 5); the Supervisor's `Startable` covers both.
+/// `idle` is absent (event-shaped, not snapshot state, ADR-0032); the Supervisor's `Startable`
+/// covers it. `polkit` is on it (ADR-0114), and a `secure_submit` naming it starts it too.
 ///
 /// An enum, not the `&[&str]` this replaces (ADR-0076): matched in the two places deciding whether
 /// a capability starts and whether its commands dispatch, where strings once silently accepted an
@@ -69,6 +69,7 @@ roster! {
     Privacy => "privacy", "Who is holding the camera open right now. Empty means nobody is.",
     Updates => "updates", "Pending pacman upgrades, the progress of an install in flight, and whether the kernel changed under you.",
     Lock => "lock", "The session lock: whether it is held, whether a password is with PAM, and why the last attempt failed.",
+    Polkit => "polkit", "The authentication request polkitd is waiting on: what for, whether a password is with PAM, and why the last attempt failed.",
     Battery => "battery", "UPower's display device: charge, what the battery is doing, and the time estimates when it has them.",
     System => "system", "The persisted state dictionary and a clock that ticks once a second.",
     Brightness => "brightness", "The screen backlight, as a percentage.",
@@ -708,7 +709,7 @@ mod capability_tests {
         // `ALL` and `as_str` come from one `roster!` list, so this cannot catch a variant missing
         // from one of them -- there is no way to write that. What it does pin is `from_name`
         // agreeing with `as_str`, which is what the two wire-facing matches depend on.
-        assert_eq!(Capability::ALL.len(), 17, "a variant was added or removed; check every iterator over ALL");
+        assert_eq!(Capability::ALL.len(), 18, "a variant was added or removed; check every iterator over ALL");
         for capability in Capability::ALL {
             assert_eq!(Capability::from_name(capability.as_str()), Some(*capability));
         }
@@ -735,9 +736,8 @@ mod capability_tests {
 
     #[test]
     fn a_name_that_is_not_on_the_roster_resolves_to_nothing() {
-        // `idle` and `polkit` are startable but deliberately off the roster; both must miss here.
+        // `idle` is startable but deliberately off the roster; it must miss here.
         assert_eq!(Capability::from_name("idle"), None);
-        assert_eq!(Capability::from_name("polkit"), None);
         assert_eq!(Capability::from_name(""), None);
         assert_eq!(Capability::from_name("Audio"), None);
     }

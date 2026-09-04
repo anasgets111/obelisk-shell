@@ -13,9 +13,30 @@
 use std::collections::HashMap;
 
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
 use zbus::interface;
 use zbus::zvariant::{OwnedValue, Value};
 pub use zbus_polkit::policykit1::{AuthorityProxy, Subject};
+
+/// The one error the agent side of the protocol returns. polkit's docs: "If the user dismisses
+/// the authentication dialog, the authentication agent should return the
+/// org.freedesktop.PolicyKit1.Error.Cancelled error."
+#[derive(Debug, zbus::DBusError)]
+#[zbus(prefix = "org.freedesktop.PolicyKit1.Error")]
+pub enum AgentError {
+    Cancelled,
+}
+
+/// What polkitd asked of the agent, forwarded to `main.rs`'s loop, which owns the answer.
+///
+/// `Begin` carries the reply: the docs say the agent "should not return until after authentication
+/// is complete", and polkitd reads an early return as a finished, failed authentication -- so
+/// `begin_authentication` below awaits this sender's answer and only then returns to the bus.
+/// Dropping the sender without answering cancels.
+pub enum AgentRequest {
+    Begin { call: BeginAuthenticationCall, reply: oneshot::Sender<Result<(), AgentError>> },
+    Cancel { cookie: String },
+}
 
 /// Object path this agent is exported at on our own unique connection name. Any path under
 /// our control is valid: the spec's `object_path` argument is caller-chosen, not fixed.
@@ -76,16 +97,17 @@ pub fn first_unix_user_uid(identities: &[(String, HashMap<String, OwnedValue>)])
 /// `org.freedesktop.PolicyKit1.AuthenticationAgent`, the interface polkitd calls back into once
 /// this process registers via [`register_agent`].
 ///
-/// `begin_authentication` only forwards the parsed challenge over a channel; PAM itself runs in
-/// `main.rs`, triggered by a `secure_submit("polkit", "authenticate")` frame and handed to
-/// [`crate::pam_worker::drive_pam_and_respond`] (ADR-0015, ADR-0028).
+/// Only forwards: the challenge becomes `oblisk.polkit`'s state, polkit's setuid helper runs PAM
+/// once a `secure_submit("polkit", "authenticate")` frame arrives, and `main.rs` ends this method's
+/// held reply when the helper has answered (ADR-0114). zbus dispatches each call on its own task, so a
+/// `CancelAuthentication` is delivered while a `BeginAuthentication` is still waiting.
 pub struct AuthenticationAgent {
-    challenges: UnboundedSender<BeginAuthenticationCall>,
+    requests: UnboundedSender<AgentRequest>,
 }
 
 impl AuthenticationAgent {
-    pub fn new(challenges: UnboundedSender<BeginAuthenticationCall>) -> Self {
-        Self { challenges }
+    pub fn new(requests: UnboundedSender<AgentRequest>) -> Self {
+        Self { requests }
     }
 }
 
@@ -99,26 +121,22 @@ impl AuthenticationAgent {
         details: HashMap<String, String>,
         cookie: String,
         identities: Vec<(String, HashMap<String, OwnedValue>)>,
-    ) {
-        // A dropped receiver just means nobody is listening (e.g. mid-shutdown); not a reason to fail the D-Bus call.
-        let _ = self.challenges.send(BeginAuthenticationCall {
-            action_id,
-            message,
-            icon_name,
-            details,
-            cookie,
-            identities,
-        });
+    ) -> Result<(), AgentError> {
+        let (reply, answer) = oneshot::channel();
+        let call = BeginAuthenticationCall { action_id, message, icon_name, details, cookie, identities };
+        // A dropped receiver means nobody is listening (mid-shutdown); the sender below is gone
+        // with it, and `answer` reads that as a cancel.
+        let _ = self.requests.send(AgentRequest::Begin { call, reply });
+        answer.await.unwrap_or(Err(AgentError::Cancelled))
     }
 
-    async fn cancel_authentication(&self, _cookie: String) {
-        // ponytail: nothing tracks in-flight challenges yet to cancel; see the struct doc
-        // comment. A real implementation cancels the matching PAM conversation.
+    async fn cancel_authentication(&self, cookie: String) {
+        let _ = self.requests.send(AgentRequest::Cancel { cookie });
     }
 }
 
-/// The authentication agent, held unregistered until a config declares a `secure_submit` that
-/// names polkit (ADR-0070 decisions 5 and 6).
+/// The authentication agent, held unregistered until a config reads `oblisk.polkit` or declares a
+/// `secure_submit` that names it (ADR-0070 decisions 5 and 6, ADR-0114).
 ///
 /// A registration failure is logged, not propagated with `?`, since "An authentication agent
 /// already exists for the given subject" is normal elsewhere and must not stop the shell.
@@ -129,8 +147,8 @@ pub struct PolkitAgent {
 }
 
 impl PolkitAgent {
-    pub fn new(challenges: UnboundedSender<BeginAuthenticationCall>) -> Self {
-        PolkitAgent { agent: Some(AuthenticationAgent::new(challenges)) }
+    pub fn new(requests: UnboundedSender<AgentRequest>) -> Self {
+        PolkitAgent { agent: Some(AuthenticationAgent::new(requests)) }
     }
 
     /// Registers with polkitd, once. Every failure logs and leaves this process without an agent,
@@ -286,7 +304,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn begin_authentication_forwards_the_parsed_challenge() {
+    async fn begin_authentication_forwards_the_parsed_challenge_and_returns_only_once_answered() {
         let (agent_side, caller_side) = p2p_pair().await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         agent_side
@@ -311,22 +329,30 @@ mod tests {
         let identity_details: HashMap<String, OwnedValue> =
             HashMap::from([("uid".to_string(), OwnedValue::try_from(Value::from(1000u32)).unwrap())]);
         let identities: Vec<(String, HashMap<String, OwnedValue>)> = vec![("unix-user".to_string(), identity_details)];
-        proxy
-            .call_method(
-                "BeginAuthentication",
-                &(
-                    "org.oblisk.test.action",
-                    "Authenticate to do the thing",
-                    "dialog-password",
-                    details,
-                    "cookie-123",
-                    identities,
-                ),
-            )
-            .await
-            .expect("BeginAuthentication call should succeed");
+        let call = tokio::spawn(async move {
+            proxy
+                .call_method(
+                    "BeginAuthentication",
+                    &(
+                        "org.oblisk.test.action",
+                        "Authenticate to do the thing",
+                        "dialog-password",
+                        details,
+                        "cookie-123",
+                        identities,
+                    ),
+                )
+                .await
+        });
 
-        let received = rx.recv().await.expect("BeginAuthentication was never forwarded over the channel");
+        let Some(AgentRequest::Begin { call: received, reply }) = rx.recv().await else {
+            panic!("BeginAuthentication was never forwarded over the channel");
+        };
+        assert!(!call.is_finished(), "the D-Bus call must stay open until the flow answers it");
+        reply.send(Err(AgentError::Cancelled)).expect("the agent is waiting on this reply");
+        let err = call.await.unwrap().expect_err("a Cancelled reply must reach the caller as a D-Bus error");
+        let zbus::Error::MethodError(name, _, _) = err else { panic!("expected a method error, got {err:?}") };
+        assert_eq!(name.as_str(), "org.freedesktop.PolicyKit1.Error.Cancelled");
         assert_eq!(received.action_id, "org.oblisk.test.action");
         assert_eq!(received.message, "Authenticate to do the thing");
         assert_eq!(received.icon_name, "dialog-password");
@@ -340,9 +366,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_authentication_dispatches_without_error() {
+    async fn cancel_authentication_forwards_the_cookie() {
         let (agent_side, caller_side) = p2p_pair().await;
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         agent_side
             .object_server()
             .at(AGENT_OBJECT_PATH, AuthenticationAgent::new(tx))
@@ -364,6 +390,7 @@ mod tests {
             .call_method("CancelAuthentication", &("cookie-123",))
             .await
             .expect("CancelAuthentication call should succeed");
+        assert!(matches!(rx.recv().await, Some(AgentRequest::Cancel { cookie }) if cookie == "cookie-123"));
     }
 
     fn unix_user_identity(uid: u32) -> (String, HashMap<String, OwnedValue>) {

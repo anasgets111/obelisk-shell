@@ -358,6 +358,15 @@
 ---@field state any The parsed contents of `state.json`, or an empty object -- see `state::load_state`. Written a key at a time by `system:write_state` (§3.2), which rewrites the whole file and pushes, so a config reads back what it just stored on the next resolve.
 ---@field time integer Unix epoch seconds, not milliseconds -- §2.11 calls it "system time epoch" with no unit stated. `os.date` wants seconds, so a millis reading would be silently wrong by 1000x.
 
+---@class PolkitState
+---`oblisk.polkit`'s payload. Everything but `active` is empty while it is false.
+---@field action_id string The action being authorised, e.g. `org.freedesktop.systemd1.manage-units`.
+---@field active boolean polkitd is waiting on the user for the request the fields below describe.
+---@field authenticating boolean A password is with PAM and no answer has come back. `pam_unix` takes about a second, so this is what a "checking" line reads. A second submit is refused while it is true.
+---@field error string Why the last attempt failed, in words fit to draw, e.g. `"authentication failed"`. Empty until an attempt fails; the prompt stays open for another try, and this clears with it.
+---@field icon_name string A themed icon name for the action, or empty when the caller set none.
+---@field message string What polkitd wants shown, already translated: "Authentication is required to ...".
+
 ---@class TrayState
 ---@field items TrayItem[] Every registered `StatusNotifierItem`, oldest registration first. A new item appends and an item updating a property does not move, so a strip can be drawn straight from this without sorting. Registration order rather than id order because [`TrayItem::id`] is a D-Bus unique name like `"1.234"`: sorting it lexicographically puts `1.100` before `1.20` and drops a newly started application into the middle of the strip.
 
@@ -431,6 +440,9 @@ local PrivacyCapability = {}
 ---@class SystemCapability: Capability<SystemState>
 ---@field invoke fun(self: SystemCapability, command: "write_state", ...: any)
 
+---@class PolkitCapability: Capability<PolkitState>
+---@field invoke fun(self: PolkitCapability, command: "cancel", ...: any)
+
 ---@class TrayCapability: Capability<TrayState>
 ---@field invoke fun(self: TrayCapability, command: "activate"|"secondary_activate"|"scroll"|"activate_menu_item"|"menu_will_show", ...: any)
 
@@ -493,6 +505,7 @@ function Idle:release_inhibit() end
 ---@field privacy PrivacyCapability Who is holding the camera open right now. Empty means nobody is.
 ---@field updates UpdatesCapability Pending pacman upgrades, the progress of an install in flight, and whether the kernel changed under you.
 ---@field lock LockCapability The session lock: whether it is held, whether a password is with PAM, and why the last attempt failed.
+---@field polkit PolkitCapability The authentication request polkitd is waiting on: what for, whether a password is with PAM, and why the last attempt failed.
 ---@field battery BatteryCapability UPower's display device: charge, what the battery is doing, and the time estimates when it has them.
 ---@field system SystemCapability The persisted state dictionary and a clock that ticks once a second.
 ---@field brightness BrightnessCapability The screen backlight, as a percentage.

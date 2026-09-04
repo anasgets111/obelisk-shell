@@ -92,6 +92,11 @@ fn capability_schemas() -> Vec<(&'static str, Schema, Option<Schema>)> {
             Some(schema_for!(crate::capabilities::system::SystemAction)),
         ),
         (
+            "polkit",
+            schema_for!(crate::capabilities::polkit::PolkitState),
+            Some(schema_for!(crate::capabilities::polkit::PolkitAction)),
+        ),
+        (
             "tray",
             schema_for!(crate::capabilities::tray::TrayState),
             Some(schema_for!(crate::capabilities::tray::TrayAction)),

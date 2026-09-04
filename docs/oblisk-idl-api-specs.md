@@ -61,7 +61,7 @@ The active Renderer populates the global `oblisk` state tree with the schema bel
 
 Two consequences: a capability reads `nil` until its first `StateSnapshot` (this now includes the window between the starting read and the controller's first push, so `:map` must handle `nil`), and a start is one-way, an edit removing the last reader does not stop it until the session ends.
 
-`oblisk.idle` has no member to index; its own methods (`register_threshold`, `inhibit`, `release_inhibit`) send the start. `polkit` has no member either; a `textfield` naming it in `secure_submit` (§ 5.2 item 8) registers the authentication agent.
+`oblisk.idle` has no member to index; its own methods (`register_threshold`, `inhibit`, `release_inhibit`) send the start. `oblisk.polkit` is on the roster (ADR-0114); reading it, or a `textfield` naming it in `secure_submit` (§ 5.2 item 8), registers the authentication agent.
 
 ### 2.1 Keyboard modifier and layout state (`oblisk.keyboard`)
 *   `keyboard.caps_lock`: `boolean` (Active = `true`, inactive = `false`)

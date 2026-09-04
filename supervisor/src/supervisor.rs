@@ -16,10 +16,13 @@ use std::collections::HashMap;
 use shared::{ApplyPendingReload, Capability, SupervisorFrame};
 
 use crate::capabilities::lock::{self, LockController};
+use crate::capabilities::polkit::{self, Answer, PolkitController};
 use crate::capabilities::{Capabilities, Signal};
 use crate::generation::{
     Authoritative, RESTART_LIMIT, RESTART_WINDOW, RendererDeparture, RestartBrake, classify_departure, departure_report,
 };
+use crate::pam_worker;
+use crate::polkit::AgentRequest;
 use crate::process::registry::{LiveProcesses, reap_all_processes, take_exited_process, wait_and_report_exit};
 use crate::reload_link::SocketCandidateLink;
 use crate::snapshot::push_snapshot;
@@ -69,6 +72,10 @@ pub(crate) struct Supervisor {
     /// Kept alive for the whole run so the channel never closes; each outcome carries the
     /// acquisition it answers for (see `lock::accepts_outcome`).
     pub(crate) pam_outcome_tx: tokio::sync::mpsc::UnboundedSender<(u64, shared::PamOutcome)>,
+    /// The polkit challenge on screen, built here like `lock` (ADR-0114).
+    polkit: PolkitController,
+    /// The polkit sibling of `pam_outcome_tx`, tagged with the challenge's cookie.
+    polkit_outcome_tx: tokio::sync::mpsc::UnboundedSender<(String, shared::PamOutcome)>,
 
     /// `$XDG_RUNTIME_DIR`'s "the session is locked" marker, which outlives this process (ADR-0060).
     locked_flag: lock::SessionLockedFlag,
@@ -111,6 +118,7 @@ impl Supervisor {
         lock: LockController,
         locked_flag: lock::SessionLockedFlag,
         pam_outcome_tx: tokio::sync::mpsc::UnboundedSender<(u64, shared::PamOutcome)>,
+        polkit_outcome_tx: tokio::sync::mpsc::UnboundedSender<(String, shared::PamOutcome)>,
         process_done_tx: tokio::sync::mpsc::UnboundedSender<(u32, u64)>,
     ) -> Self {
         // Read once, here: reading later would race the boot Renderer's registration.
@@ -127,6 +135,8 @@ impl Supervisor {
             capabilities,
             lock,
             pam_outcome_tx,
+            polkit: PolkitController::default(),
+            polkit_outcome_tx,
             locked_flag,
             revisions: HashMap::new(),
             last_snapshots: HashMap::new(),
@@ -161,6 +171,62 @@ impl Supervisor {
             Capability::Lock,
             &self.lock.snapshot(),
         );
+    }
+
+    fn push_polkit_state(&mut self) {
+        push_snapshot(
+            &self.registry,
+            self.authoritative.generation_id,
+            &mut self.revisions,
+            &mut self.last_snapshots,
+            Capability::Polkit,
+            &self.polkit.snapshot(),
+        );
+    }
+
+    /// polkitd asked for a challenge or withdrew one (ADR-0114).
+    pub(crate) fn handle_polkit_request(&mut self, request: AgentRequest) {
+        let changed = match request {
+            AgentRequest::Begin { call, reply } => self.polkit.begin(call, reply),
+            AgentRequest::Cancel { cookie } => self.polkit.cancel(Some(&cookie)),
+        };
+        if changed {
+            self.push_polkit_state();
+        }
+    }
+
+    /// `secure_submit(polkit, authenticate)`: one helper conversation for the challenge on screen,
+    /// spawned for the reason the lock's is. `secret` is zeroized on the refusing path here and by
+    /// the helper task on the other.
+    pub(crate) fn begin_polkit_authentication(&mut self, mut secret: Vec<u8>, generation_id: u32) {
+        match self.polkit.try_begin_authentication() {
+            Some((uid, cookie)) => {
+                self.push_polkit_state();
+                let outcome_tx = self.polkit_outcome_tx.clone();
+                tokio::spawn(pam_worker::run_polkit_helper(uid, cookie, shared::Zeroizing::new(secret), outcome_tx));
+            }
+            None => {
+                eprintln!(
+                    "generation {generation_id}'s secure_submit(polkit, authenticate) arrived with no challenge on screen, or with an attempt already in flight; dropping"
+                );
+                shared::Zeroize::zeroize(&mut secret);
+            }
+        }
+    }
+
+    /// The helper's answer for a polkit challenge. On success the helper has already told polkitd,
+    /// so ending the held `BeginAuthentication` is all that is left, in the order its docs require.
+    pub(crate) fn record_polkit_outcome(&mut self, cookie: String, outcome: shared::PamOutcome) {
+        match self.polkit.record_outcome(&cookie, outcome) {
+            Answer::Stale => {
+                eprintln!("polkit: dropping an outcome for {cookie:?}, which is no longer the challenge on screen")
+            }
+            Answer::Failed => self.push_polkit_state(),
+            Answer::Succeeded { reply } => {
+                self.push_polkit_state();
+                let _ = reply.send(Ok(()));
+            }
+        }
     }
 
     /// One roster capability's signal, straight back out as a snapshot (ADR-0076).
@@ -401,6 +467,13 @@ impl Supervisor {
         capability: Capability,
         envelope: &shared::CommandEnvelope,
     ) {
+        // Here rather than in `Capabilities`, beside the push a cancel needs (ADR-0114).
+        if capability == Capability::Polkit {
+            if polkit::dispatch(&mut self.polkit, envelope) {
+                self.push_polkit_state();
+            }
+            return;
+        }
         self.capabilities.dispatch(capability, envelope, &self.lock).await;
     }
 

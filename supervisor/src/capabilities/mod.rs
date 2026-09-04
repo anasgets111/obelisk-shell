@@ -57,6 +57,7 @@ pub mod lock;
 pub mod mpris;
 pub mod network;
 pub mod notifications;
+pub mod polkit;
 pub mod power;
 pub mod privacy;
 pub mod scale;
@@ -81,21 +82,18 @@ pub fn parse_bool_arg(arguments: &[serde_json::Value]) -> Option<bool> {
     arguments.first()?.as_bool()
 }
 
-/// Every name a Renderer can ask this Supervisor to start: the roster, plus the two not on it.
+/// Every name a Renderer can ask this Supervisor to start: the roster, plus the one not on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Startable {
     Capability(Capability),
     /// Event-shaped (ADR-0032), off the roster; a config read starts it, and it takes commands.
     Idle,
-    /// From secure_submit, not a capability read (ADR-0070 decision 5); start only, no commands.
-    Polkit,
 }
 
 impl Startable {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "idle" => Some(Startable::Idle),
-            "polkit" => Some(Startable::Polkit),
             other => Capability::from_name(other).map(Startable::Capability),
         }
     }
@@ -225,7 +223,7 @@ capability_channels! {
     // `lock` has no signal channel, deliberately: built at boot in `main.rs` since the relock
     // path commands it before any config reads (ADR-0060); it reports through `LockOutcome`
     // frames `main.rs` already handles, not a `StateSnapshot` here (ADR-0052 decision 4).
-    without_channel { Lock }
+    without_channel { Lock, Polkit }
 }
 
 /// Every controller that starts on demand, plus what starting one needs. `audio` has no
@@ -490,8 +488,8 @@ impl Capabilities {
             }
             Capability::Audio => self.ensure_mixer_thread(),
             // Not owned here: `LockController` is built at boot in `main.rs` (ADR-0060), so this
-            // read is free.
-            Capability::Lock => {}
+            // read is free. `polkit`'s start is its agent registration, in `main.rs`'s arm.
+            Capability::Lock | Capability::Polkit => {}
         }
     }
 
@@ -653,6 +651,9 @@ impl Capabilities {
             Capability::Audio => to!(self.audio, audio::dispatch),
             Capability::System => to!(self.system, system::dispatch),
             Capability::Lock => lock::dispatch(lock, envelope),
+            // Answered in `Supervisor::dispatch_capability_command` before this is reached: its
+            // controller lives there, beside the state push a cancel needs.
+            Capability::Polkit => {}
             // Read-only (§ 2): no action enum; a command naming one is a Renderer sending garbage.
             Capability::Battery | Capability::Privacy => {
                 eprintln!(
@@ -677,15 +678,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn startable_resolves_the_roster_plus_the_two_names_deliberately_off_it() {
+    fn startable_resolves_the_roster_plus_the_one_name_deliberately_off_it() {
         assert_eq!(Startable::from_name("audio"), Some(Startable::Capability(Capability::Audio)));
-        assert_eq!(Startable::from_name("workspaces"), Some(Startable::Capability(Capability::Workspaces)));
+        assert_eq!(Startable::from_name("polkit"), Some(Startable::Capability(Capability::Polkit)));
         assert_eq!(Startable::from_name("idle"), Some(Startable::Idle), "event-shaped, so off the roster (ADR-0032)");
-        assert_eq!(
-            Startable::from_name("polkit"),
-            Some(Startable::Polkit),
-            "arrives from a secure_submit, not a read (ADR-0070 decision 5)"
-        );
     }
 
     #[test]

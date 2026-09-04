@@ -190,21 +190,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     let connection = zbus::Connection::system().await?;
 
-    let (tx, mut challenges) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut agent_requests) = tokio::sync::mpsc::unbounded_channel();
     let mut polkit_agent = PolkitAgent::new(tx);
-    // Long-lived proxy for the polkit reply once a challenge's PAM conversation finishes
-    // (ADR-0028) -- built once here, not per-challenge. Kept out of `Session` with
-    // `pending_challenge` below: the polkit agent answers a D-Bus caller and touches no
-    // generation state, so it is the one path through this loop that needs none of it.
-    let authority = match zbus_polkit::policykit1::AuthorityProxy::new(&connection).await {
-        Ok(authority) => Some(authority),
-        Err(err) => {
-            eprintln!("polkit: failed to bind the Authority proxy; authentication agent disabled for this run: {err}");
-            None
-        }
-    };
-    // No multi-challenge queue, so keeping only the latest is correct.
-    let mut pending_challenge: Option<polkit::BeginAuthenticationCall> = None;
+    let (polkit_outcome_tx, mut polkit_outcomes) =
+        tokio::sync::mpsc::unbounded_channel::<(String, shared::PamOutcome)>();
 
     // Notifications' sound player (ADR-0033). The thread is one `std::sync::mpsc` recv loop with
     // no connection behind it, so it stays eager -- there is nothing for a config to gate.
@@ -256,6 +245,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
         lock,
         lock::SessionLockedFlag::at(shared::session_locked_flag_path()?),
         pam_outcome_tx.clone(),
+        polkit_outcome_tx,
         process_done_tx,
     );
 
@@ -288,10 +278,8 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
             Some(_) = memory::tick_sampler(&mut memory_sampler) => {
                 memory::log_sample("steady state", &[(supervisor.authoritative.generation_id, &supervisor.authoritative.child)]);
             }
-            Some(challenge) = challenges.recv() => {
-                eprintln!("polkit authentication challenge received: {challenge:?}");
-                pending_challenge = Some(challenge);
-            }
+            Some(request) = agent_requests.recv() => supervisor.handle_polkit_request(request),
+            Some((cookie, outcome)) = polkit_outcomes.recv() => supervisor.record_polkit_outcome(cookie, outcome),
             Some(generation_id) = connected.recv() => supervisor.hydrate(generation_id),
             // One arm for every snapshot capability (ADR-0076). `Signals::next` is the
             // cancel-safe half -- bare `recv()`s -- and `Capabilities::push` runs here in the
@@ -350,11 +338,11 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     // Re-entrant: decision 3 has every generation re-send every name it read, and
                     // each arm below is a no-op once its controller exists.
                     match Startable::from_name(&capability) {
+                        // Its controller is built at boot; starting it is registering the agent
+                        // (ADR-0070 decision 5, ADR-0114).
+                        Some(Startable::Capability(Capability::Polkit)) => polkit_agent.register(&connection).await,
                         Some(Startable::Capability(capability)) => supervisor.capabilities.start(capability).await,
                         Some(Startable::Idle) => supervisor.capabilities.start_idle().await,
-                        // ADR-0070 decision 5: the only name that arrives from a `secure_submit`
-                        // rather than from a capability read.
-                        Some(Startable::Polkit) => polkit_agent.register(&connection).await,
                         None => eprintln!(
                             "generation {} asked to start {capability:?}, which is not a capability this Supervisor builds",
                             inbound.generation_id
@@ -389,28 +377,16 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     eprintln!("generation {}'s shell.lua re-evaluation (sequence {sequence}) failed: {error}", inbound.generation_id);
                 }
                 RendererFrame::SecureSubmit(mut submit) if submit.capability == "polkit" && submit.action == "authenticate" => {
-                    // ADR-0028: the polkit-routed case. Must come before the catch-all
-                    // SecureSubmit arm below -- match arms are tried in order.
-                    match pending_challenge.take().zip(authority.as_ref()) {
-                        Some((challenge, authority)) => {
-                            // mem::take moves the plaintext out for drive_pam_and_respond to own
-                            // and zeroize on every return path -- nothing left in submit to zeroize.
-                            let secret = std::mem::take(&mut submit.secret);
-                            pam_worker::drive_pam_and_respond(authority, challenge, secret).await;
-                        }
-                        None => {
-                            eprintln!(
-                                "generation {}'s secure_submit(polkit, authenticate) arrived with no pending polkit challenge; dropping",
-                                submit.generation_id
-                            );
-                            submit.secret.zeroize();
-                        }
-                    }
+                    // ADR-0028, ADR-0114. Must come before the catch-all SecureSubmit arm below --
+                    // match arms are tried in order. mem::take moves the plaintext out for the
+                    // worker to own and zeroize on every return path.
+                    let secret = std::mem::take(&mut submit.secret);
+                    supervisor.begin_polkit_authentication(secret, submit.generation_id);
                 }
                 RendererFrame::SecureSubmit(mut submit) if submit.capability == "network" && submit.action == "connect" => {
-                    // ADR-0029, mirroring the polkit arm above: an empty secret means an open
-                    // network, a non-empty one becomes the wpa-psk password. Must come before the
-                    // catch-all arm below, same ordering reason.
+                    // ADR-0029: an empty secret means an open network, a non-empty one becomes
+                    // the wpa-psk password. Must come before the catch-all arm below, same
+                    // ordering reason as the polkit arm above.
                     match supervisor.capabilities.network().and_then(NetworkController::take_connect_intent) {
                         Some(pending) => {
                             // mem::take moves the plaintext out for NetworkController::connect to
@@ -461,17 +437,20 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     // this lock's answer from the one before it.
                     if let Some(acquisition) = supervisor.lock.try_begin_authentication() {
                         supervisor.push_lock_state();
-                        // mem::take moves the plaintext out for run_lock_authentication to own and
+                        // mem::take moves the plaintext out for run_authentication to own and
                         // zeroize on every exit path, including a panic or shutdown cancellation.
+                        // Spawned, not awaited inline: a lock screen's Enter key is neither
+                        // bounded nor rare, and pam_unix's ~2s failure delay would stall every
+                        // LockReport, reload, and process reap behind it. The user is this
+                        // process's own owner, since the Supervisor runs as the session user.
                         let secret = std::mem::take(&mut submit.secret);
-                        // Spawned, not awaited inline like the polkit arm: a lock screen's Enter
-                        // key is neither bounded nor rare. Blocking this loop for pam_unix's ~2s
-                        // failure delay (or PAM_EXCHANGE_TIMEOUT's 30s on a wedged worker) would
-                        // stall every LockReport, reload, and process reap behind it.
-                        // run_lock_authentication, not authenticate_current_user directly, so
-                        // outcome_tx gets a PamOutcome even if this task panics or is dropped.
                         let outcome_tx = supervisor.pam_outcome_tx.clone();
-                        tokio::spawn(pam_worker::run_lock_authentication(shared::Zeroizing::new(secret), acquisition, outcome_tx));
+                        tokio::spawn(pam_worker::run_authentication(
+                            nix::unistd::Uid::current().as_raw(),
+                            shared::Zeroizing::new(secret),
+                            acquisition,
+                            outcome_tx,
+                        ));
                     } else {
                         eprintln!(
                             "generation {}'s secure_submit(lock, authenticate) arrived with no lock held, or with an attempt already in flight; dropping",

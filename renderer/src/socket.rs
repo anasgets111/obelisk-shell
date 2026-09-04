@@ -705,7 +705,7 @@ fn frame_label(frame: &RendererFrame) -> &'static str {
 }
 
 /// Starts every capability an applied tree names in a `textfield`'s `secure_submit` (ADR-0070
-/// decision 5): the only way to ask for `polkit`, unrostered for `__index` to catch.
+/// decision 5), so a password prompt registers its agent even if nothing reads the member.
 /// Deduplicated by `CommandSender::start_capability`.
 ///
 /// ponytail: not called from `re_resolve_if_dirty` (`Scene::surface` deep-clones every repaint).
@@ -1129,6 +1129,7 @@ mod tests {
                 ("bluetooth_tooltip", "popup"),
                 ("launcher", "panel"),
                 ("lock_screen", "lock"),
+                ("polkit_dialog", "panel"),
             ]
         );
     }

@@ -5,7 +5,7 @@ This spec defines the D-Bus interfaces and system services the long-lived **Obli
 
 **Nothing is built until a config asks for it** (ADR-0070). The Renderer sends a `StartCapability` frame the first time an evaluation reads `oblisk.<name>`; that frame constructs the controller each section below describes. A config that reads nothing leaves the process idle after startup: connected to the system bus, control socket bound, Renderer spawned, no bus name claimed, no D-Bus subscription, no poll task, no authentication agent.
 
-Registering the polkit authentication agent is gated on a `textfield` declaring `secure_submit = { capability = "polkit", ... }`, since polkit has no capability member to read. Every registration failure logs rather than stopping the process; "An authentication agent already exists for the given subject" is the normal answer beside any other desktop.
+Registering the polkit authentication agent is gated on a config reading `oblisk.polkit` or declaring a `textfield` with `secure_submit = { capability = "polkit", ... }` (ADR-0114). Every registration failure logs rather than stopping the process; "An authentication agent already exists for the given subject" is the normal answer beside any other desktop.
 
 ---
 

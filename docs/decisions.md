@@ -5349,3 +5349,43 @@ things fell out of switching it on.
     call site is a local and two in agreement are a component. The second caller agreed about all of
     it but the ground, so the component took one option: an action being offered is accent, and a
     "close" that tidies away a result already read is quiet.
+
+## 0114. `polkit` joins the roster, and the agent holds its reply until the prompt is answered
+
+The polkit agent registered, received `BeginAuthentication`, and returned from it at once, forwarding
+the challenge to a log line. polkit's own docs for that method say the agent "should not return
+until after authentication is complete" and must return `org.freedesktop.PolicyKit1.Error.Cancelled`
+when the user dismisses the dialog; polkitd reads an early return with no
+`AuthenticationAgentResponse2` as a finished, failed authentication. Nothing could have authorised
+through this agent, and nothing in Lua could have drawn the prompt: there was no `oblisk.polkit`.
+
+1. **`polkit` is a roster capability.** `PolkitState { active, message, action_id, icon_name,
+   authenticating, error }` and one action, `cancel`. ADR-0070 decision 5 kept it off the roster
+   because it pushed nothing; now it pushes what a dialog is made of, and the roster is what gives it
+   a Lua member, stubs, a schema and hydration for free. The `secure_submit` start path stays, so a
+   prompt registers the agent whether or not the config reads the member. Built in `main.rs` and
+   pushed from its loop like `lock` (`without_channel`), since all three of its inputs land there.
+2. **The reply is held.** `begin_authentication` awaits a `oneshot` the controller answers: `Ok(())`
+   on a success, `Err(Cancelled)` on the dialog's cancel or polkitd's `CancelAuthentication`. zbus
+   spawns a task per method call, so the cancel is delivered while the begin is still waiting.
+3. **One challenge at a time.** A second `BeginAuthentication` while one is open is answered
+   `Cancelled` on the spot; one password field cannot be typing for two callers, and the refused
+   caller retries or fails on its own. ponytail: a queue is the upgrade if two mechanisms ask at once
+   in practice.
+4. **A failed password keeps the prompt open.** `error` carries the lock screen's words for the same
+   `PamOutcome`, the field stays, polkitd keeps waiting. Cancel is the way out; there is no attempt
+   cap here because `pam_faillock` already has one.
+5. **PAM runs in polkit's setuid helper, not this crate's worker.** The first cut ran
+   `pam_worker`'s re-exec'd worker and then called `AuthenticationAgentResponse2` itself; polkitd
+   answered "Only uid 0 may invoke this method". That is the whole reason libpolkit-agent ships
+   `/usr/lib/polkit-1/polkit-agent-helper-1`: it runs PAM as root and makes that call before printing
+   `SUCCESS`. `pam_worker::run_polkit_helper` speaks its line protocol (cookie in, every
+   `PAM_PROMPT_*` answered with the one password, `SUCCESS`/`FAILURE` out), spawned like the lock's
+   worker with the same `Drop` backstop, so a wrong password no longer stalls the loop for
+   `pam_unix`'s delay. The Supervisor no longer needs polkitd's Authority proxy for anything but
+   registration. The re-exec'd worker stays for `oblisk.lock`, which has no polkitd to satisfy.
+
+Not mirrored from `PolkitDialog.qml`: an Authenticate button (a click cannot submit a masked
+field; Enter does, ADR-0005) and Escape-to-cancel (a masked field's Escape clears and stays,
+ADR-0092; the Cancel button is the way out). `isResponseRequired`/`inputPrompt` have no equivalent
+under ADR-0028's one-shot protocol, where a password is always the answer.

@@ -8,11 +8,12 @@
 -- wants `radius = 0` (an opaque toplevel has no edge to round against) and its own padding, and
 -- passes both explicitly.
 --
--- `margin` and `visible` are the two properties here that are not a look, and both are passed
--- through for the same reason: they are facts about where the card is, not about how it is drawn.
--- The panel host places its card by hand, because a layer surface has no `anchor_rect` to hang from
--- and the offset from the indicator that opened it is an outer margin on this node (see that file's
--- `card_margin`). `modules/bar/panels/update_panel.lua` shows and hides two whole cards -- the
+-- `margin`, `align_h`, `align_v` and `visible` are the properties here that are not a look, and all
+-- are passed through for the same reason: they are facts about where the card is, not about how it
+-- is drawn. The panel host places its card by hand, because a layer surface has no `anchor_rect` to
+-- hang from and the offset from the indicator that opened it is an outer margin on this node (see
+-- that file's `card_margin`); the polkit prompt is content-sized and centres itself in its surface
+-- with the two aligns. `modules/bar/panels/update_panel.lua` shows and hides two whole cards -- the
 -- package table and the log -- and hiding a card by hiding each of its children leaves its ground
 -- and its padding behind, which is a rounded empty rectangle where nothing is happening.
 local theme = require("config.theme")
@@ -29,6 +30,8 @@ return function(children, opts)
             left = theme.spacing.md,
         },
         margin = opts.margin,
+        align_h = opts.align_h,
+        align_v = opts.align_v,
         visible = opts.visible,
         spacing = opts.spacing or theme.spacing.xs,
         background = opts.background or theme.BG,
