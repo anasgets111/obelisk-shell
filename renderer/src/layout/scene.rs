@@ -766,6 +766,10 @@ struct PreparedNode {
     paint: Option<PaintStyle>,
     taffy: taffy::NodeId,
     children: Vec<PreparedNode>,
+    /// The retained children of a node that is not `visible` this pass, carried through untouched
+    /// (ADR-0124): not rebuilt, not laid out, not retired. `children` is empty whenever this is
+    /// not.
+    frozen: Vec<RetainedNode>,
 }
 
 /// `Content` is the one mode with no answer until the children are known, which is exactly
@@ -1047,12 +1051,32 @@ fn prepare(
         _ => None,
     };
 
-    let fresh_children = children_of(kind, &properties)?;
-    let matched_candidates = pair_children_by_id_then_position(scene, &fresh_children, old_children)?;
-    let own_axis = main_axis_of(kind, &properties)?;
     // Before the children, so their ids attach afterwards, and so the `taffy::Style` behind it is
     // gone from the stack by the time this frame recurses (see `new_solver_node`).
     let taffy_id = new_solver_node(tree, kind, &properties, &style, parent_axis, measure)?;
+
+    // A hidden node's subtree is frozen, not rebuilt (ADR-0124): the children it had keep their
+    // ids, properties and last geometry, and none of their signals is read, no `list` item
+    // function called, no text measured, until the node is visible again. `taffy_style` already
+    // gave the node `Display::None`, so nothing below it could have reached the layout anyway,
+    // and `paint`, `hit` and `overlay_input_regions` stop at a hidden node. Before this, a closed
+    // picker of fifty tiles was rebuilt on every push of every capability, the clock's included.
+    if !style.visible {
+        return Ok(PreparedNode {
+            id,
+            kind: kind.to_string(),
+            style,
+            properties,
+            paint,
+            taffy: taffy_id,
+            children: Vec::new(),
+            frozen: old_children,
+        });
+    }
+
+    let fresh_children = children_of(kind, &properties)?;
+    let matched_candidates = pair_children_by_id_then_position(scene, &fresh_children, old_children)?;
+    let own_axis = main_axis_of(kind, &properties)?;
 
     let mut children = Vec::with_capacity(fresh_children.len());
     for (fresh_child, candidate) in fresh_children.iter().zip(matched_candidates) {
@@ -1092,7 +1116,16 @@ fn prepare(
     let child_ids: Vec<taffy::NodeId> = children.iter().map(|child| child.taffy).collect();
     tree.set_children(taffy_id, &child_ids).map_err(taffy_failed)?;
 
-    Ok(PreparedNode { id, kind: kind.to_string(), style, properties, paint, taffy: taffy_id, children })
+    Ok(PreparedNode {
+        id,
+        kind: kind.to_string(),
+        style,
+        properties,
+        paint,
+        taffy: taffy_id,
+        children,
+        frozen: Vec::new(),
+    })
 }
 
 /// The second walk: solved geometry back out of the tree and into retained nodes.
@@ -1107,9 +1140,23 @@ fn finish(
     prepared: PreparedNode,
     shaping: &ShapingHandle,
 ) -> Result<RetainedNode, LayoutError> {
-    let PreparedNode { id, kind, style, properties, mut paint, taffy: taffy_id, children } = prepared;
+    let PreparedNode { id, kind, style, properties, mut paint, taffy: taffy_id, children, frozen } = prepared;
     let layout = tree.layout(taffy_id).map_err(taffy_failed)?;
     let size = LogicalSize { width: layout.size.width, height: layout.size.height };
+
+    // Frozen children come back as they were (see `prepare`): no scroll offset applied again to
+    // rects that already carry one, no text refitted to a box that was not laid out.
+    if !style.visible {
+        return Ok(RetainedNode {
+            id,
+            kind,
+            rect: LogicalRect { x: layout.location.x, y: layout.location.y, width: size.width, height: size.height },
+            style,
+            properties,
+            paint,
+            children: frozen,
+        });
+    }
 
     let mut children: Vec<RetainedNode> =
         children.into_iter().map(|child| finish(tree, child, shaping)).collect::<Result<_, _>>()?;
@@ -1868,6 +1915,54 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn a_hidden_subtree_is_frozen_rather_than_rebuilt_and_thaws_with_its_ids() {
+        // The closed picker case (ADR-0124): while `visible` is false no item function runs and
+        // the retained children stay, ids included, so showing it again pairs against them.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua
+            .load(
+                r#"
+                built = 0
+                return panel { id = "bar", child = column { visible = state("open", true),
+                    children = { list { source = state("items", { "a", "b" }), itemfn = function(name)
+                        built = built + 1
+                        return rect { width = 10, height = 10 }
+                    end } } } }"#,
+            )
+            .eval()
+            .unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+        let built = || lua.globals().get::<i64>("built").unwrap();
+
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let shown = scene.surface("bar@TEST").unwrap();
+        let ids_before: Vec<NodeId> = shown.children[0].children[0].children.iter().map(|c| c.id).collect();
+        assert_eq!(ids_before.len(), 2);
+        assert_eq!(built(), 2);
+
+        lua.load(r#"state("open", true):set(false)"#).exec().unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let hidden = scene.surface("bar@TEST").unwrap();
+        assert!(!hidden.children[0].visible);
+        let frozen: Vec<NodeId> = hidden.children[0].children[0].children.iter().map(|c| c.id).collect();
+        assert_eq!(frozen, ids_before, "the hidden subtree keeps what it had");
+        assert_eq!(built(), 2, "no item function ran for a hidden list");
+        assert!(scene.retiring_ids().is_empty(), "nothing was retired");
+
+        lua.load(r#"state("open", true):set(true)"#).exec().unwrap();
+        apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap();
+        let thawed = scene.surface("bar@TEST").unwrap();
+        let ids_after: Vec<NodeId> = thawed.children[0].children[0].children.iter().map(|c| c.id).collect();
+        assert_eq!(ids_after, ids_before, "showing it again pairs the fresh items with the frozen nodes");
+        assert_eq!(built(), 4);
+        assert_eq!(thawed.children[0].children[0].children[1].rect.y, 10.0, "and lays them out again");
+    }
+
+    #[test]
     fn a_pixels_sized_rect_resolves_to_its_explicit_size() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
@@ -2045,11 +2140,9 @@ pub(super) mod tests {
         apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
         let hidden = &scene.surface("bar@TEST").unwrap().children[0];
         assert_eq!((hidden.rect.width, hidden.rect.height), (0.0, 0.0), "the hidden node itself");
-        assert_eq!(
-            (hidden.children[0].rect.width, hidden.children[0].rect.height),
-            (0.0, 0.0),
-            "and everything under it"
-        );
+        // A subtree hidden from the start was never built (ADR-0124): there is nothing under it
+        // to have geometry until it is shown.
+        assert!(hidden.children.is_empty(), "and nothing under it yet");
         assert_eq!(
             hidden.properties.get("width").map(|w| w.to_string().unwrap()),
             Some("40".to_string()),

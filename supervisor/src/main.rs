@@ -182,7 +182,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             // std::process::exit, not return: the exit code is the point of `Shutdown`, and
             // `main`'s `Result` can only produce 0 or 1 (ADR-0059 decision 3). Every teardown
             // `run_supervisor` owns has already run by the time it returns.
-            let shutdown = tokio::runtime::Runtime::new()?.block_on(run_supervisor())?;
+            // Two workers, not one per core (ADR-0124): every task here waits on a socket, a
+            // D-Bus signal, an inotify event or a timer, and the blocking pool is separate. On a
+            // twenty-core laptop the default was twenty threads to serve a bar.
+            let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+            let shutdown = runtime.block_on(run_supervisor())?;
             std::process::exit(shutdown.exit_code());
         }
     }

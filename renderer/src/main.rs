@@ -4,6 +4,7 @@ mod layout;
 mod lua;
 mod socket;
 mod text;
+mod wake;
 mod wayland;
 
 /// Two OS threads, two channels (ADR-0039). `wayland::run` owns the
@@ -13,7 +14,8 @@ mod wayland;
 /// its own current-thread tokio runtime and does nothing but framed I/O with the Supervisor's
 /// control socket:
 /// - inbound: every decoded `SupervisorFrame` is forwarded over a `std::sync::mpsc` channel and
-///   drained by `wayland::run`'s poll loop on a bounded 15ms latency.
+///   drained by `wayland::run`'s loop, which the socket thread wakes through `wake::Waker`'s
+///   eventfd after each frame (ADR-0124).
 /// - outbound: every `RendererFrame` the Wayland thread produces is queued on a
 ///   `tokio::sync::mpsc` channel and written to the wire by the socket thread.
 ///   `UnboundedSender::send` is synchronous and non-blocking, so the Wayland thread can call it
@@ -72,6 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // outbound `CommandEnvelope`/`SecureSubmit`.
     let generation_id = socket::generation_id_from_env();
 
-    socket::spawn_client(generation_id, inbound_tx, outbound_rx);
-    wayland::run(generation_id, inbound_rx, outbound_tx)
+    let waker = wake::Waker::new()?;
+    socket::spawn_client(generation_id, inbound_tx, outbound_rx, waker.clone());
+    wayland::run(generation_id, inbound_rx, outbound_tx, waker)
 }

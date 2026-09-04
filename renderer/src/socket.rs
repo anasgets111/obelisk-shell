@@ -60,8 +60,13 @@ pub fn spawn_client(
     generation_id: u32,
     inbound_tx: std::sync::mpsc::Sender<SupervisorFrame>,
     outbound_rx: mpsc::UnboundedReceiver<RendererFrame>,
+    waker: crate::wake::Waker,
 ) {
     std::thread::spawn(move || {
+        // Held for the thread's life, so however it ends (connection closed, runtime refused, a
+        // panic) the Wayland thread wakes to find `inbound_rx` disconnected rather than blocking
+        // on a poll nothing will ever satisfy (ADR-0124).
+        let _wake_on_exit = crate::wake::WakeOnDrop(waker.clone());
         let runtime = match tokio::runtime::Builder::new_current_thread().enable_io().build() {
             Ok(runtime) => runtime,
             Err(err) => {
@@ -69,7 +74,7 @@ pub fn spawn_client(
                 return;
             }
         };
-        runtime.block_on(run(generation_id, inbound_tx, outbound_rx));
+        runtime.block_on(run(generation_id, inbound_tx, outbound_rx, waker));
     });
 }
 
@@ -626,6 +631,7 @@ async fn run(
     generation_id: u32,
     inbound_tx: std::sync::mpsc::Sender<SupervisorFrame>,
     mut outbound_rx: mpsc::UnboundedReceiver<RendererFrame>,
+    waker: crate::wake::Waker,
 ) {
     let path = match shared::control_socket_path() {
         Ok(path) => path,
@@ -644,7 +650,7 @@ async fn run(
     };
 
     let (mut read_half, mut write_half) = stream.into_split();
-    pump(&mut read_half, &mut write_half, &inbound_tx, &mut outbound_rx).await;
+    pump(&mut read_half, &mut write_half, &inbound_tx, &mut outbound_rx, Some(&waker)).await;
 }
 
 /// The socket thread's entire job after the handshake: forward every decoded `SupervisorFrame`
@@ -660,6 +666,7 @@ async fn pump<R, W>(
     write_half: &mut W,
     inbound_tx: &std::sync::mpsc::Sender<SupervisorFrame>,
     outbound_rx: &mut mpsc::UnboundedReceiver<RendererFrame>,
+    waker: Option<&crate::wake::Waker>,
 ) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -671,6 +678,9 @@ async fn pump<R, W>(
                     if let Err(err) = inbound_tx.send(frame) {
                         eprintln!("control-socket client: the Wayland thread is gone; stopping the socket loop: {err}");
                         break;
+                    }
+                    if let Some(waker) = waker {
+                        waker.wake();
                     }
                 }
                 Err(err) => {
@@ -1540,7 +1550,14 @@ mod tests {
         //
         // `children[0]` is the surface's one root node, holding the click-outside catcher and the
         // card in that order (`modules/shell/panel_host.lua`); the card is the second so that it
-        // paints, and hit-tests, over the catcher.
+        // paints, and hit-tests, over the catcher. Opened first: a closed panel host is a frozen
+        // root with nothing under it (ADR-0124), so the card exists only once a kind is showing.
+        client
+            .lua()
+            .load(r#"state("panel_open", false):set(true) state("panel_kind", ""):set("notifications")"#)
+            .exec()
+            .expect("the dev config declares both panel states");
+        assert!(client.re_resolve_if_dirty(), "opening the panel host is a re-resolve");
         let host = client.scene.surface("panel_host@TEST").expect("the panel host must resolve");
         let card = &host.children[0].children[1];
         let card_bottom = card.rect.y + card.rect.height;
@@ -2998,7 +3015,7 @@ mod tests {
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
         outbound_tx.send(frame).unwrap();
 
-        let pumping = pump(&mut server_read, &mut server_write, &inbound_tx, &mut outbound_rx);
+        let pumping = pump(&mut server_read, &mut server_write, &inbound_tx, &mut outbound_rx, None);
         let read_response = read_json_frame::<_, RendererFrame>(&mut wire);
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             tokio::select! {
@@ -3085,7 +3102,7 @@ mod tests {
         let (inbound_tx, inbound_rx) = std::sync::mpsc::channel();
         let (_outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
 
-        pump(&mut server_read, &mut server_write, &inbound_tx, &mut outbound_rx).await;
+        pump(&mut server_read, &mut server_write, &inbound_tx, &mut outbound_rx, None).await;
 
         assert_eq!(inbound_rx.try_recv(), Ok(SupervisorFrame::ActivateDraw(ActivateDraw { nonce: 42 })));
     }
@@ -3126,7 +3143,7 @@ mod tests {
         let split_at = wire_bytes.len() / 2;
         assert!(split_at > 4, "the split point must land inside the payload, not the length prefix");
 
-        let pumping = pump(&mut server_read, &mut server_write, &inbound_tx, &mut outbound_rx);
+        let pumping = pump(&mut server_read, &mut server_write, &inbound_tx, &mut outbound_rx, None);
         tokio::pin!(pumping);
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {

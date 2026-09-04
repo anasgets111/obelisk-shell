@@ -181,7 +181,7 @@ struct Pool {
 }
 
 impl Pool {
-    fn spawn() -> Self {
+    fn spawn(waker: Option<crate::wake::Waker>) -> Self {
         let (jobs, job_rx) = std::sync::mpsc::channel::<Job>();
         let job_rx = Arc::new(Mutex::new(job_rx));
         let (result_tx, results) = std::sync::mpsc::channel();
@@ -191,6 +191,7 @@ impl Pool {
             let job_rx = Arc::clone(&job_rx);
             let result_tx = result_tx.clone();
             let cache_root = cache_root.clone();
+            let waker = waker.clone();
             std::thread::Builder::new()
                 .name(format!("oblisk-image-decode-{index}"))
                 .spawn(move || {
@@ -205,6 +206,10 @@ impl Pool {
                         let result = decode(&job.key.path, job.key.box_px, job.tint, cache_root.as_deref());
                         if result_tx.send((job.key, result)).is_err() {
                             return;
+                        }
+                        // After the send, so the loop it wakes finds the result in `poll`.
+                        if let Some(waker) = &waker {
+                            waker.wake();
                         }
                     }
                 })
@@ -242,14 +247,24 @@ impl Default for ImageCache {
 }
 
 impl ImageCache {
+    /// A cache whose pool wakes nobody: the tests', which poll for a landing themselves.
     pub fn new() -> Self {
+        Self::build(None)
+    }
+
+    /// The Renderer's: a landing wakes the Wayland thread's poll (ADR-0124).
+    pub fn with_waker(waker: crate::wake::Waker) -> Self {
+        Self::build(Some(waker))
+    }
+
+    fn build(waker: Option<crate::wake::Waker>) -> Self {
         ImageCache {
             entries: HashMap::new(),
             order: VecDeque::new(),
             evicted: Vec::new(),
             resident_bytes: 0,
             tick: 0,
-            pool: Pool::spawn(),
+            pool: Pool::spawn(waker),
             landed: Vec::new(),
         }
     }

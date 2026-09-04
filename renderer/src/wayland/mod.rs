@@ -210,6 +210,7 @@ pub fn run(
     generation_id: u32,
     inbound_rx: std::sync::mpsc::Receiver<SupervisorFrame>,
     outbound_tx: tokio::sync::mpsc::UnboundedSender<RendererFrame>,
+    waker: crate::wake::Waker,
 ) -> Result<(), Box<dyn Error>> {
     let conn = Connection::connect_to_env()?;
     let (globals, mut event_queue) = registry_queue_init::<App>(&conn)?;
@@ -257,7 +258,7 @@ pub fn run(
         conn: conn.clone(),
         shaping,
         text_painter: None,
-        image_cache: ImageCache::new(),
+        image_cache: ImageCache::with_waker(waker.clone()),
         client,
         surfaces: Vec::new(),
         exit: false,
@@ -359,15 +360,15 @@ pub fn run(
     // mode's immediate draw on first configure is unaffected: still synchronous inside
     // `dispatch_pending`'s `configure` handler.
     loop {
-        event_queue.dispatch_pending(&mut app)?;
+        let dispatched = event_queue.dispatch_pending(&mut app)? > 0;
         if app.exit {
             break;
         }
         // Drain, not one-per-pass: every `SupervisorFrame` reaches this thread through this
-        // channel (ADR-0039), so a burst of `StateSnapshot` pushes must not spread one per 15ms
-        // poll tick. `Disconnected` is a separate answer from `Empty` (ADR-0059 decision 1):
-        // treating a dead socket thread as idle would spin this process's 15ms poll forever at
-        // 17.8% of a core, with no capability data and no way to reach one. An `ActivateDraw`
+        // channel (ADR-0039), so a burst of `StateSnapshot` pushes must not spread one per
+        // wakeup. `Disconnected` is a separate answer from `Empty` (ADR-0059 decision 1):
+        // treating a dead socket thread as idle would leave this process blocked in `poll` with
+        // no capability data and no way to reach one. An `ActivateDraw`
         // nonce is collected here, not serviced in place, since drawing inside the loop body
         // would paint the pre-push layout when a `StateSnapshot` and `ActivateDraw` share a
         // drain; a `Vec`, not one nonce, since two `ActivateDraw`s in one drain each owe their
@@ -444,7 +445,8 @@ pub fn run(
         // (ADR-0044 decision 2): `DirtyFlag::take` only reports the flag once, coalescing a burst
         // of `StateSnapshot` pushes into one `Scene::apply` per turn. Not frame-pending gating
         // (`wl_surface::frame()`, blocks the loop when idle instead of waking on the 15ms poll):
-        // this carries a capability push to the screen instead of stopping at a resolved tree.
+        // this carries a capability push to the screen instead of stopping at a resolved tree,
+        // and since ADR-0124 the push itself is the wakeup.
         // Two statements, the two halves of one commit: the first stages what the re-resolve
         // changed (layer-shell fields, the input region, whether mapped, ADR-0038 decision 2),
         // double-buffered `wl_surface` state the second statement's `swap_buffers` commits;
@@ -471,6 +473,12 @@ pub fn run(
         if re_resolved || typed || !landed.is_empty() {
             app.repaint_mapped_surfaces();
         }
+        // Whether anything at all happened this turn. A turn with no Wayland event, no frame, no
+        // keystroke and no landed decode changed nothing the three checks below read, so they are
+        // skipped (ADR-0124): `arm_autofocus_if_nothing_is_typing` in particular copies the
+        // focused surface's whole tree out of the scene to look for a field, which at sixty-six
+        // turns a second on an open picker was most of what the process did.
+        let active = dispatched || re_resolved || typed || !landed.is_empty() || !draw_nonces.is_empty();
         // The disarm half of ADR-0049's amendment; must be here, not inside the `if` above.
         // `dispatch_pending` armed `input_serial` on a `BTN_LEFT` press or release this turn, and
         // `apply_resolved_surface_state` is the only reader, since it's the only thing that
@@ -482,11 +490,13 @@ pub fn run(
         // lock screen the compositor `finished`, a `window` whose `visible` went false) doesn't
         // sit holding a half-typed password until a later keystroke notices. The load-bearing
         // check is in `App::apply_secure_key`; this is the narrower residency ceiling.
-        app.drop_secure_focus_if_its_surface_is_gone();
-        // Its opposite, and also once a turn: a `secure_submit` field that became visible under a
-        // keyboard focus that had already arrived gets no `enter` of its own to arm it.
-        app.arm_secure_focus_if_the_scope_now_declares_one();
-        app.arm_autofocus_if_nothing_is_typing();
+        if active {
+            app.drop_secure_focus_if_its_surface_is_gone();
+            // Its opposite: a `secure_submit` field that became visible under a keyboard focus
+            // that had already arrived gets no `enter` of its own to arm it.
+            app.arm_secure_focus_if_the_scope_now_declares_one();
+            app.arm_autofocus_if_nothing_is_typing();
+        }
         for nonce in draw_nonces {
             app.activate_draw(nonce);
             if app.exit {
@@ -499,11 +509,20 @@ pub fn run(
         event_queue.flush()?;
         if let Some(guard) = event_queue.prepare_read() {
             let fd = guard.connection_fd();
-            let mut fds = [nix::poll::PollFd::new(fd, nix::poll::PollFlags::POLLIN)];
-            // 15ms: bounded latency for inbound_rx, irrelevant next to PBA's second-scale
-            // ready/evidence timeouts (supervisor/src/main.rs's `PBA_TIMINGS`).
-            if matches!(nix::poll::poll(&mut fds, nix::poll::PollTimeout::from(15u16)), Ok(n) if n > 0) {
-                guard.read()?;
+            // No timeout (ADR-0124): everything that gives this loop work arrives on one of these
+            // two fds. Wayland events on the connection; a Supervisor frame, a landed decode or
+            // the socket thread's exit through the waker. Nothing in the loop body keeps time.
+            let mut fds = [
+                nix::poll::PollFd::new(fd, nix::poll::PollFlags::POLLIN),
+                nix::poll::PollFd::new(waker.fd(), nix::poll::PollFlags::POLLIN),
+            ];
+            if matches!(nix::poll::poll(&mut fds, nix::poll::PollTimeout::NONE), Ok(n) if n > 0) {
+                if fds[0].any().unwrap_or(false) {
+                    guard.read()?;
+                }
+                // Before the turn, not after: a wake that lands while the turn runs must survive
+                // it, and the eventfd's count does once this one is cleared.
+                waker.drain();
             }
             // guard drops here either way; if nothing was read, dispatch_pending above simply
             // finds nothing new next iteration.

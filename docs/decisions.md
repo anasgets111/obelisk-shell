@@ -5823,3 +5823,53 @@ figure, which this is the first measurement against.
 **Consequences**: `Slot::Ready` carries bytes, `ImageCache::trim` and `DisplayList::drawn_images`
 are new, `App::paint_surface` calls `trim` after recording its list, `main.rs` opens with the
 `mallopt`. `CONTEXT.md`'s Image cache term says what is evicted when.
+
+## 0124. A hidden subtree is frozen, the loop wakes on an fd, and an idle turn does nothing
+
+Measured on the dev config, debug build, one 1920x1200 output, nothing open: the Renderer's main
+thread used 8% of a core and woke 64 times a second. Two pushes a second reach it (`system`'s
+clock tick every second, `sysinfo` every second and a half), and each cost a 45 ms re-resolve of
+the whole scene, 37 ms of it in three surfaces that were closed: the wallpaper picker (17 ms,
+fifty-four tiles), the panel host (11 ms) and the launcher (9 ms). The rest of the wakeups were
+the 15 ms poll finding nothing to do, and on an open picker each of those turns copied the
+focused surface's whole tree out of the scene to look for an `autofocus` field.
+
+1. **A node that is not `visible` keeps its subtree frozen.** `prepare` stops at it: no child
+   resolved, no signal read, no `list` item function called, no text measured. The retained
+   children it had come through `finish` untouched, ids and last geometry included, so showing it
+   again pairs the fresh children against them the way ADR-0001's reconciliation always did. Not
+   retired: retiring would free the ids and rebuild from nothing on every open. Nothing outside
+   `layout` ever read a hidden subtree's geometry (`taffy_style` already gave it `Display::None`;
+   `paint`, `hit` and `overlay_input_regions` stop at a hidden node), and `hover_writes` still
+   walks the frozen nodes, so a slot under a closed panel is written false the way it was. The
+   three closed surfaces now cost 20 µs each; a push is a 5 ms re-resolve, all of it the bar.
+2. **The loop blocks in `poll` with no timeout, on the connection fd and one eventfd.** The
+   socket thread writes the eventfd after every frame it hands over (`wake::Waker`), a decode
+   worker after every result, and a guard on the socket thread writes it when the thread ends
+   however it ends, so a dead Supervisor is still read as `Disconnected` (ADR-0059) and not
+   waited for forever. Nothing in the loop body keeps time: every check it makes reads state that
+   only a Wayland event, a frame, a keystroke or a landed decode can change. Sixty-four wakeups a
+   second become two, the pushes.
+3. **An idle turn skips the focus housekeeping.** The three once-a-turn checks (a secure field
+   whose surface went, a secure field that became typable under a held focus, an `autofocus`
+   field to arm) run only on a turn that dispatched an event, drained a frame, took a keystroke
+   or landed a decode. With decision 2 there are no idle turns left, but a Wayland event that
+   changed nothing is still most turns, and `arm_autofocus_if_nothing_is_typing` copies a tree.
+4. **The Supervisor's runtime has two worker threads.** `Runtime::new` gave it one per core,
+   twenty here, for tasks that every one wait on a socket, a D-Bus signal, inotify or a timer;
+   the blocking pool is separate. Twenty-six threads become eight.
+
+Measured after: 1.3% of a core and two wakeups a second, the same debug build. What remains is
+the bar's 4 ms per push, which a release build makes a fraction of a millisecond.
+
+Not built: per-surface dirtiness (a push re-resolves every visible surface, and only the bar
+reads what `sysinfo` pushes), which needs each surface to record the signals its resolve read
+and the clock's fresh `map` on every resolve defeats until computeds compare values; a
+row-streaming image decode (ADR-0123). Both wait on a measurement that says they matter, which
+this one does not.
+
+**Consequences**: `PreparedNode` carries `frozen`, `renderer/src/wake.rs` is new and
+`main.rs` threads its `Waker` into `socket::spawn_client`, `wayland::run` and
+`ImageCache::with_waker`; `wayland::run`'s poll has no timeout; `supervisor/src/main.rs` builds
+its runtime by hand.
+
