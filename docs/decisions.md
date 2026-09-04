@@ -6020,3 +6020,63 @@ node, which is the only event that can change them, so nothing is detected later
 **Consequences**: the Supervisor's boot allocation drops by roughly the PipeWire-triggered scans,
 which on this machine is the pair that fire as PipeWire enumerates its existing globals at startup.
 Idle is unaffected -- it was never scanning at idle, and this ADR is not a claim that it was.
+
+## 0129. Measured against the mirror and against Noctalia, and what their renderer has that this one does not
+
+Two comparisons, both asked for and both worth writing down before the numbers rot.
+
+**The mirror.** `~/.config/quickshell` is the QML config this tree's `dev-config` is written from, so
+Quickshell running it is the closest thing to a like-for-like there is. Same machine, same
+1920x1200 output, both shells at rest, PSS (ADR-0127's rule) and one 35.5 s window for idle CPU:
+
+| | Quickshell + the QML config | oblisk + `dev-config` |
+| --- | --- | --- |
+| PSS | 169.0 MB, plus 9.8 MB of helpers | 11.0 MB Supervisor + 36.5 MB Renderer |
+| RSS | 243.6 MB, plus 24.1 MB | 21.2 MB + 72.7 MB |
+| GPU (DRM resident) | 214.2 MB | 51.5 MB |
+| threads | 34, plus 6 | 8 + 11 |
+| idle CPU | 4.65%, plus 1.30% for `cava` | 0.34% |
+| helper processes at rest | `inotifywait`, `bluetoothctl`, `cava` | none |
+
+Roughly a quarter of the memory, a quarter of the GPU, a fifteenth of the idle CPU. **Not
+feature-identical**, and the gap is not all architecture: the QML config runs an audio visualiser,
+which is real animation work nothing here does, and its `cava` is a process this shell has no
+equivalent of. Both shells were up together during the CPU window, which taxes both. The honest
+claim is the order of magnitude, not the digits.
+
+**Noctalia** (`github.com/noctalia-dev/noctalia`) is no longer a Quickshell config: it is 11.8 MB of
+C++ on Wayland and OpenGL ES with no Qt or GTK, configured in TOML. That makes it a peer of this
+tree rather than of the mirror, and its `src/render/` is the first outside renderer worth reading
+against ours. What it has:
+
+- `GlSharedContext`: a root surfaceless `EGLContext` that is the share parent of every other
+  context, so a texture uploaded in one is usable in all -- their lock screen reuses the wallpaper
+  already in VRAM. **We have the stronger form by construction**: `wayland::egl::init` builds one
+  context for the whole Renderer and every window surface is made current against it, so the glyph
+  atlas and the image cache are shared without a share group, and the lock surface is in the same
+  process. Their machinery exists because they run several renderers; the process boundary is where
+  this tree splits instead (ADR-0006).
+- `SharedTextureCache`: path-keyed and refcounted, decoded and uploaded once. Ours is keyed on path
+  *and* box, pins what a mapped surface shows, and bounds the rest by bytes (ADR-0123). Refcounting
+  answers "is anyone using this"; a byte budget answers "how much may sleep here", and the second is
+  the question a shell with a wallpaper picker actually has.
+- `CachedLayer`: render a subtree into an FBO and re-blit it while it is unchanged. **The one idea
+  here we do not have**, and it trades GPU memory for CPU -- which is the wrong direction for this
+  shell today, at 0.34% idle CPU against 51 MB of GPU. Remember it if a config ever animates enough
+  to need it.
+- `blur_cache`: nothing here blurs. If blur ever lands, it caches.
+- A shader program per primitive (rect, glyph, image, gradient, spinner, ring) instead of a general
+  canvas. Leaner per draw than femtovg's path pipeline, and every primitive is yours to write. No
+  evidence femtovg is a bottleneck at 0.34%; not a rewrite this tree has earned.
+- Context-loss handling (`resetNotificationEnabled`, `videoMemoryPurgeNotificationEnabled`,
+  `abandonGpuResources`, `recreateRootContext`): the in-process answer to a GPU reset or a
+  suspend-time VRAM purge. Ours is a generation that dies and a Supervisor that swaps a fresh one
+  in, which is the same recovery without the bookkeeping.
+
+**An idea neither shell appears to use**: real damage regions. Both post the whole surface every
+paint, so a compositor re-composites a full-width bar for one clock digit.
+`eglSwapBuffersWithDamageKHR` would narrow it. It spends the *compositor's* GPU, not ours, which is
+why it has stayed unmeasured -- an upgrade path, not a finding.
+
+**Consequences**: none in the tree. Nothing here says to change the renderer; two of the four ideas
+we already have in a stronger form, and the other two would spend what this shell is short of.
