@@ -1150,6 +1150,10 @@ mod tests {
         );
     }
 
+    fn contains(rect: crate::text::snap::LogicalRect, point: layout::hit::LogicalPoint) -> bool {
+        point.x >= rect.x && point.x < rect.x + rect.width && point.y >= rect.y && point.y < rect.y + rect.height
+    }
+
     /// The absolute centre of every node in `node` declaring a `hover` property, accumulating the
     /// parent-relative origins on the way down the way `layout::hit` does.
     fn hover_region_centres(
@@ -1186,14 +1190,21 @@ mod tests {
         hover_region_centres(&bar, 0.0, 0.0, &mut centres);
         assert!(centres.len() >= 2, "the bar declares more than one hover region, got {}", centres.len());
 
+        // Regions nest: a pill's row declares one so its circles can hide when the pointer is
+        // off the whole pill, and each circle declares its own, so a point on a circle lights two.
+        // What must hold is that a lit region contains the point and an unlit one does not, since
+        // `hover_writes` answers containment for every region and not innermost-only.
         for centre in &centres {
             let writes = layout::hover::hover_writes(&bar, Some(*centre));
             let lit: Vec<bool> = writes.iter().map(|write| write.hovered).collect();
-            assert_eq!(
-                lit.iter().filter(|hovered| **hovered).count(),
-                1,
-                "a point inside one region must light that region and no other, at {centre:?} got {lit:?}"
-            );
+            assert!(lit.iter().any(|hovered| *hovered), "a region's own centre must light it, at {centre:?}");
+            for write in &writes {
+                assert_eq!(
+                    write.hovered,
+                    write.rect.is_some_and(|rect| contains(rect, *centre)),
+                    "a region lights exactly when it contains the point, at {centre:?} got {lit:?}"
+                );
+            }
         }
 
         // Distinct slots, not one signal shared by every region. A slot name copy-pasted between
@@ -1274,10 +1285,16 @@ mod tests {
         let mut opened_by = 0;
         for centre in centres {
             let writes = layout::hover::hover_writes(&bar, Some(centre));
-            // A point inside one region is outside the rest. Every write is applied the way
-            // `App::sync_hover` applies them, because turning the others *off* is half of what the
-            // walk is for.
-            assert_eq!(writes.iter().filter(|write| write.hovered).count(), 1, "a point is inside exactly one region");
+            // A point inside one region is outside every region that does not enclose it. Every
+            // write is applied the way `App::sync_hover` applies them, because turning the others
+            // *off* is half of what the walk is for.
+            for write in &writes {
+                assert_eq!(
+                    write.hovered,
+                    write.rect.is_some_and(|rect| contains(rect, centre)),
+                    "a region lights exactly when it contains the point"
+                );
+            }
             for write in writes {
                 write.signal.hover_handle().unwrap().set_changed(mlua::Value::Boolean(write.hovered));
                 let Some(rect) = write.rect else {
