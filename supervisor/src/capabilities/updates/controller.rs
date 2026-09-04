@@ -416,7 +416,12 @@ async fn run_install_with_child(
     // Drained concurrently on its own task, not left unread: a real upgrade can write enough stderr
     // warnings to fill the pipe's ~64KiB kernel buffer, which blocks the package manager's
     // single-threaded process and wedges `installing` at `true` forever. Logged, not discarded.
-    if let Some(stderr) = child.stderr.take() {
+    //
+    // The handle is kept and awaited below rather than detached. Detached, the task races the exit:
+    // `child.wait()` returns as soon as the process is gone, while the last stderr lines can still
+    // be sitting in the pipe unread, so `installing` could fall with the log missing exactly the
+    // lines that say why the install failed.
+    let stderr_drain = child.stderr.take().map(|stderr| {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
@@ -424,8 +429,8 @@ async fn run_install_with_child(
                 eprintln!("updates: install stderr: {line}");
                 push_log_line(&mut state.lock().unwrap().install_log, line);
             }
-        });
-    }
+        })
+    });
 
     // Plain local `Vec`, not `Arc<Mutex<_>>`: every read/write happens sequentially within
     // this loop, never shared with another task -- unlike `state`.
@@ -451,6 +456,11 @@ async fn run_install_with_child(
     }
 
     let status = child.wait().await;
+    // After the wait, never before: the pipe closes when the process ends, which is what lets the
+    // drain finish rather than blocking here on a stream nothing is going to close.
+    if let Some(drain) = stderr_drain {
+        let _ = drain.await;
+    }
     let mut guard = state.lock().unwrap();
     guard.installing = false;
     guard.install_finished_at = Some(now_unix());
@@ -753,7 +763,8 @@ mod tests {
         assert!(log.contains(&"(1/1) upgrading nss".to_string()), "{log:?}");
         assert!(
             log.contains(&"error: target not found".to_string()),
-            "stderr is where pacman says why it failed, so it has to be in the tail too: {log:?}"
+            "stderr is where a package manager says why it failed, so it has to be in the tail by \
+             the time the install is reported finished: {log:?}"
         );
     }
 

@@ -6515,3 +6515,59 @@ reporting a missing directory.
 The trait is one implementation wide, and that is the honest state of it. What it buys today is not
 `apt` -- it is that the four places that knew about `pacman` are now one file, and that the
 capability can answer "not on this machine" as a fact rather than as an error.
+
+## ADR-0135: an empty `textfield` shows its placeholder even with the keyboard, because `autofocus` made the alternative unreachable
+
+**Status.** Accepted. Amends ADR-0092's plain-field drawing and supersedes the reasoning recorded in
+`paint.rs`'s `PaintStyle::TextField` arm.
+
+**Context.** `textfield` has a `placeholder` property and two arms that decide when it is drawn. The
+masked arm draws it whenever nothing has been typed, focused or not -- its guard is `filled > 0`, so
+a focused, empty password field falls through to the placeholder, which is what `lock.lua` and
+`polkit.lua` show. The plain arm did the opposite: focused with the keyboard, an empty field drew
+`format!("{text}\u{2502}")`, and with `text` empty that is a bare caret and nothing else.
+
+That asymmetry was deliberate and argued in a comment: the caret is what says a field is live, an
+empty focused field showing the same prompt as an idle one answers "am I typing into this?" with
+nothing, and a plain field has to answer it. A unit test asserted the behaviour by name.
+
+The argument had a hole, and `autofocus` is the whole of it. `caret` is not a blink -- it is
+`input::text_field_takes_keys(focused)`, whether this surface actually holds the Wayland keyboard.
+`launcher.lua:355` and `wallpaper_picker.lua:375` both declare `autofocus = true`, so their fields
+take the keyboard on the frame they open and hold it until the surface closes. `caret` is therefore
+true from the first frame to the last, `text` is empty until the user types, and the branch that
+draws the placeholder was never reached. `placeholder = "Search apps, or type a link"` and
+`placeholder = "Search wallpapers…"` were text the engine could not display. The only path to
+`caret == false` is the keyboard leaving, and for the launcher `on_cancel` closes the surface
+instead.
+
+So the property was live in three plain fields, dead in the two that most obviously wanted it, and
+the state the comment was protecting against confusion with -- an idle empty field -- is a state
+those two surfaces do not have.
+
+**Decision.** An empty plain field draws its placeholder whether or not it has the keyboard, exactly
+as the masked arm already does. The caret alone remains the fallback for a field that declared no
+placeholder, so a field with nothing to say still says it is live. A non-empty field is unchanged:
+caret after the text with the keyboard, the bare draft without it (ADR-0108).
+
+**Rejected.** *Fixing it in `dev-config` with a layered `cell` under the field and manual signal
+wiring.* Three call sites would each grow the same overlay boilerplate to work around a property
+that exists, and the fourth would be written wrong. *Drawing placeholder and caret together
+(`"Reply\u{2502}"` or `"\u{2502}Reply"`).* It keeps the liveness cue, and it is worse:
+`PaintStyle::TextField` carries one `color`, so a placeholder is drawn in the same ink as typed
+text. Today that is harmless because nothing next to it claims otherwise; put a caret beside it and
+the field reads as though somebody typed the prompt.
+
+**Consequences.** The launcher and the wallpaper picker show their prompts on open, which is what
+every search field in the mirror does and what these two were written to do.
+
+The cost lands in one place and is real: `notification_card.lua` puts a reply field on every
+notification that takes one, always (ADR-0109), so a stack of chat notifications now shows several
+identical "Reply" prompts with nothing marking which one holds the keyboard. Previously the caret
+marked it. This is accepted rather than solved, because the click that focuses a reply field is the
+user's own and a moment old (ADR-0092 decision 7 keeps that press from firing the card's action), so
+the question "which one am I typing into?" has a recent answer.
+
+If it does bite, the fix is a placeholder colour on `PaintStyle::TextField` -- a real gap, since a
+placeholder is currently indistinguishable from typed text in every field including the masked ones
+-- and not a return to a caret that hides three prompts to disambiguate a fourth.

@@ -597,22 +597,42 @@ fn draw_for(
                         false => placeholder.clone(),
                     }
                 }
-                // The caret is what says the field is live, and it is why an empty focused field
-                // does *not* fall back to its placeholder: the two would be indistinguishable, and
-                // "am I typing into this?" is the question a plain field has to answer. There is no
-                // caret movement to place it anywhere but the end -- nothing handles arrow keys.
-                // `target.is_none()` is kept alongside the id check rather than replaced by it. An
-                // id says which node this is; it does not say the node is still the *kind* of field
-                // the focus was taken on, and a `textfield` that gains a `secure_submit` between
-                // passes is the same node with a new job. Cheap, and it keeps the invariant that a
-                // masked field never draws plaintext local to the arm that would break it.
-                Some(FieldFocus::Plain { id, text, caret }) if *id == node_id && target.is_none() => match caret {
-                    true => format!("{text}\u{2502}"),
-                    // The draft without the caret (ADR-0108): still this field's text, just not
-                    // where the next key goes. Empty, it shows its placeholder like any idle field.
-                    false if text.is_empty() => placeholder.clone(),
-                    false => text.to_string(),
-                },
+                // An empty field shows its placeholder whether or not it has the keyboard, which is
+                // what the masked arm above has always done and what this arm used to refuse
+                // (ADR-0135). The caret alone is the fallback for a field that declared no
+                // placeholder, not the answer for every empty one.
+                //
+                // The refusal was argued -- the caret is what says a field is live, and an empty
+                // focused field showing the same prompt as an idle one answers "am I typing into
+                // this?" with nothing. What it missed is that `autofocus` makes the two states one:
+                // `launcher.lua` and `wallpaper_picker.lua` take the keyboard on open and never let
+                // go, so `caret` is true from the first frame and their placeholders were
+                // unreachable text. A prompt nobody can read is a worse trade than a liveness cue
+                // that is redundant on a surface holding one field.
+                //
+                // There is no caret movement to place it anywhere but the end -- nothing handles
+                // arrow keys. `target.is_none()` is kept alongside the id check rather than
+                // replaced by it. An id says which node this is; it does not say the node is still
+                // the *kind* of field the focus was taken on, and a `textfield` that gains a
+                // `secure_submit` between passes is the same node with a new job. Cheap, and it
+                // keeps the invariant that a masked field never draws plaintext local to the arm
+                // that would break it.
+                Some(FieldFocus::Plain { id, text, caret }) if *id == node_id && target.is_none() => {
+                    if !text.is_empty() {
+                        // The draft without the caret (ADR-0108) is still this field's text, just
+                        // not where the next key goes.
+                        match caret {
+                            true => format!("{text}\u{2502}"),
+                            false => text.to_string(),
+                        }
+                    } else if !placeholder.is_empty() {
+                        placeholder.clone()
+                    } else if *caret {
+                        "\u{2502}".to_string()
+                    } else {
+                        String::new()
+                    }
+                }
                 _ => placeholder.clone(),
             };
             (!content.is_empty()).then_some(Draw::Text {
@@ -1362,16 +1382,38 @@ mod tests {
         assert_eq!(drawn_text(&typed), vec!["on my way\u{2502}".to_string()]);
     }
 
-    /// An empty *focused* field draws the caret alone rather than the placeholder, because the two
-    /// would otherwise be indistinguishable and "is this taking my keys?" is the whole question.
+    /// An empty focused field shows its placeholder, the same as an empty idle one and the same as
+    /// an empty masked one (ADR-0135). This asserted the opposite until `autofocus` proved the
+    /// distinction unreachable: a field that holds the keyboard from its first frame has no idle
+    /// state to be confused with, and the placeholder was text nothing could ever display.
     #[test]
-    fn a_focused_but_empty_plain_field_draws_a_caret_not_its_placeholder() {
+    fn a_focused_but_empty_plain_field_still_shows_its_placeholder() {
         let lua = Lua::new();
         let tree = reply_surface(&lua);
         let id = tree.children[0].id;
         assert_eq!(
             drawn_text(&build(&tree, 1.0, Some(&FieldFocus::Plain { id, text: "", caret: true }))),
+            vec!["Reply".to_string()]
+        );
+    }
+
+    /// The caret alone is what a field with no placeholder to show falls back to, which is the one
+    /// case left where an empty focused field still says it is live by drawing something.
+    #[test]
+    fn a_focused_empty_field_that_declared_no_placeholder_draws_the_caret_alone() {
+        let lua = Lua::new();
+        let src = r##"return panel { id = "bar", width = 200, height = 40,
+            child = textfield { width = "Fill", height = 28, on_submit = function(text) end } }"##;
+        let tree = resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 });
+        let id = tree.children[0].id;
+
+        assert_eq!(
+            drawn_text(&build(&tree, 1.0, Some(&FieldFocus::Plain { id, text: "", caret: true }))),
             vec!["\u{2502}".to_string()]
+        );
+        assert!(
+            drawn_text(&build(&tree, 1.0, Some(&FieldFocus::Plain { id, text: "", caret: false }))).is_empty(),
+            "with no keyboard and nothing to say, an empty field draws nothing at all"
         );
     }
 
