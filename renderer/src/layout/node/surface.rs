@@ -1,6 +1,6 @@
 //! Layer-shell topology: `layer`, `anchor`, `monitor`, `namespace`, `keyboard_interactivity`,
 //! `exclusive`, and the [`PanelSpec`] that bundles them with a panel's margin and size, built in
-//! one pass by `panel_spec` (§ 6.1). `layer`, `anchor`, `monitor` and `namespace` are the
+//! one pass by `panel_spec` (§ 6). `layer`, `anchor`, `monitor` and `namespace` are the
 //! structural carve-outs [`is_structural_property`] names: `get_layer_surface` fixes all five at
 //! creation, so a `Signal` in one is rejected outright rather than resolved.
 
@@ -11,7 +11,7 @@ use mlua::Value;
 use super::content::parse_string_property;
 use super::*;
 
-/// § 6.1's `layer`, the layer-shell stacking level a `panel` is created on. `layout`'s own enum,
+/// § 6's `layer`, the layer-shell stacking level a `panel` is created on. `layout`'s own enum,
 /// not smithay-client-toolkit's `Layer` (same reason as [`KeyboardInteractivity`] below): this
 /// module stays free of Wayland types; `crate::wayland` maps it at the one call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +22,7 @@ pub enum LayerKind {
     Overlay,
 }
 
-/// § 6.1's `layer` (`"Background"`/`"Bottom"`/`"Top"`/`"Overlay"`). Required, same shape as
+/// § 6's `layer` (`"Background"`/`"Bottom"`/`"Top"`/`"Overlay"`). Required, same shape as
 /// [`parse_surface_id`]. Validated, not passed through raw (ADR-0038 decision 1): `create_panel`
 /// creates one layer surface per instance from this value, so a typo'd `layer = "Toop"` must
 /// error, not silently fall to `Background`, since nothing on screen says why.
@@ -39,7 +39,7 @@ pub fn parse_layer(properties: &HashMap<String, Value>) -> Result<LayerKind, Lay
     }
 }
 
-/// § 6.1's `anchor` table (`{ top, bottom, left, right }` edge booleans). Same default-to-zero
+/// § 6's `anchor` table (`{ top, bottom, left, right }` edge booleans). Same default-to-zero
 /// shape as [`EdgeInsets`], booleans instead of floats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Anchor {
@@ -68,13 +68,13 @@ pub fn parse_anchor(properties: &HashMap<String, Value>) -> Result<Anchor, Layou
     Ok(Anchor { top: edge("top")?, right: edge("right")?, bottom: edge("bottom")?, left: edge("left")? })
 }
 
-/// § 6.1's `monitor` (a specific output EDID, or `"All"`). Absent defaults to `"All"`, matching
+/// § 6's `monitor` (a specific output EDID, or `"All"`). Absent defaults to `"All"`, matching
 /// the IDL's own documented meaning for that value rather than treating the property as required.
 pub fn parse_monitor(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     parse_string_property(properties, "monitor", Some("All"))
 }
 
-/// § 6.1's `namespace`: the layer-shell namespace string the compositor sees, and the key
+/// § 6's `namespace`: the layer-shell namespace string the compositor sees, and the key
 /// Hyprland's `layerrule` matches on for blur and animations. Defaults to `"oblisk-{id}"`, so every
 /// `panel` is addressable without the author naming one. A [`SurfaceTopology`] field:
 /// `get_layer_surface` takes it at creation with no request to change it afterwards, so an edit is
@@ -84,19 +84,19 @@ pub fn parse_namespace(properties: &HashMap<String, Value>, id: &str) -> Result<
     parse_string_property(properties, "namespace", Some(&default))
 }
 
-/// § 6.1's `keyboard_interactivity`, mapping one-for-one onto layer-shell's own field.
+/// § 6's `keyboard_interactivity`, mapping one-for-one onto layer-shell's own field.
 /// `layout`-owned, not smithay-client-toolkit's identical enum, keeping this module free of
 /// Wayland types; `crate::wayland::keyboard_interactivity_for` maps it at the one call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KeyboardInteractivity {
-    /// § 6.1's default: the surface never receives key events.
+    /// § 6's default: the surface never receives key events.
     #[default]
     None,
     OnDemand,
     Exclusive,
 }
 
-/// § 6.1's `keyboard_interactivity` (`"None"` (default) / `"OnDemand"` / `"Exclusive"`). An
+/// § 6's `keyboard_interactivity` (`"None"` (default) / `"OnDemand"` / `"Exclusive"`). An
 /// in-place field, deliberately outside [`SurfaceTopology`] and [`is_structural_property`]'s
 /// carve-out: `zwlr_layer_surface_v1::set_keyboard_interactivity` is valid on a live surface, so a
 /// `Signal` here resolves (ADR-0044 decision 1) as a value change, not a swap.
@@ -123,7 +123,7 @@ pub fn parse_keyboard_interactivity(properties: &HashMap<String, Value>) -> Resu
     }
 }
 
-/// What § 6.1's `exclusive` asks for: three answers, not the two a boolean carries. Each maps to
+/// What § 6's `exclusive` asks for: three answers, not the two a boolean carries. Each maps to
 /// one `zwlr_layer_surface_v1::set_exclusive_zone` value: positive reserves that much, `0` reserves
 /// nothing but still sits inside what everyone else reserved, and `-1` ignores every other
 /// surface's zone and covers the output. The third answer exists for a wallpaper:
@@ -137,7 +137,7 @@ pub fn parse_keyboard_interactivity(properties: &HashMap<String, Value>) -> Resu
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exclusive {
     /// Reserve screen area along the anchored edge, derived from the size the compositor
-    /// configured. § 6.1's "Reserves physical screen area for bar if true".
+    /// configured. § 6's "Reserves physical screen area for bar if true".
     Reserve,
     /// Reserve nothing, and stay inside the area other surfaces reserved. The default, and the
     /// protocol's `0`.
@@ -147,9 +147,9 @@ pub enum Exclusive {
     Ignore,
 }
 
-/// § 6.1's `exclusive`. Default [`Exclusive::Respect`], so an undeclared panel floats over whatever
+/// § 6's `exclusive`. Default [`Exclusive::Respect`], so an undeclared panel floats over whatever
 /// is behind it rather than pushing windows aside or covering them. `boolean / string`, the same
-/// shape § 6.1 gives `width`/`height` (`integer / "Fill"`): `true` and `false` keep their meanings
+/// shape § 6 gives `width`/`height` (`integer / "Fill"`): `true` and `false` keep their meanings
 /// and `"Ignore"` is the value neither could express, additive so every config written before this
 /// one still means what it meant. In-place, same as [`parse_keyboard_interactivity`]:
 /// `set_exclusive_zone` is valid on a live surface, and the *zone* itself is computed by
@@ -204,7 +204,7 @@ pub fn surface_topology(properties: &HashMap<String, Value>) -> Result<SurfaceTo
 }
 
 /// Everything one `zwlr_layer_surface_v1` needs, read off a `panel` node's properties in one pass
-/// (§ 6.1). `crate::socket`'s `surface_specs` builds one per declared `panel`;
+/// (§ 6). `crate::socket`'s `surface_specs` builds one per declared `panel`;
 /// `layout::instance::expand_instances` turns them into per-output instances, and
 /// `crate::wayland::App::create_panel` binds them. `renderer/src/socket.rs`'s `handle_reevaluate`
 /// diffs *only* `topology`, so a `margin` reloads in place while a `layer` respawns the process.
@@ -214,13 +214,13 @@ pub struct PanelSpec {
     pub topology: SurfaceTopology,
     pub keyboard_interactivity: KeyboardInteractivity,
     pub exclusive: Exclusive,
-    /// § 6.1's `margin`, which on a `panel` root is the layer-shell **anchor offset** (how far the
+    /// § 6's `margin`, which on a `panel` root is the layer-shell **anchor offset** (how far the
     /// surface sits from the edges it is anchored to), not layout spacing between root and child:
     /// `layout::scene`'s `Scene::apply_one_surface` passes `None` for both parent-margin arguments
     /// when resolving a root, so a root's `margin` is consumed only by this field; below a root it
     /// stays ordinary layout margin, parsed by the same [`parse_edge_insets`].
     pub margin: EdgeInsets,
-    /// § 6.1's `width`/`height`, which become the layer-shell `set_size` request rather than a
+    /// § 6's `width`/`height`, which become the layer-shell `set_size` request rather than a
     /// layout constraint of their own. `SizeMode::Fill` is the protocol's `0` ("the anchors
     /// decide"); a percent resolves against the output, at the one call site that knows it.
     pub width: SizeMode,

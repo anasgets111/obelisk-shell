@@ -4,7 +4,7 @@ local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
 
--- § 6.4 routes authentication through a `textfield` with `secure_submit`, and that pair is what
+-- § 6 routes authentication through a `textfield` with `secure_submit`, and that pair is what
 -- keeps the password out of this VM entirely: with both `mask_character` and `secure_submit` set,
 -- keystrokes go into a native buffer on the Renderer's Wayland thread and leave as a
 -- `("lock", "authenticate")` envelope, never as a Lua value (§ 5.2 item 8, ADR-0005/ADR-0027). So
@@ -48,7 +48,7 @@ local lock_clock = cell(util.label(oblisk.system, function(s)
     return os.date("%H:%M", s.time)
 end), theme.FG, theme.font.hero)
 
--- Declared, not open. § 6.4 gives a `lock` an `id` and a `child` and nothing else: no `visible`,
+-- Declared, not open. § 6 gives a `lock` an `id` and a `child` and nothing else: no `visible`,
 -- no `monitor`, no size, because the compositor decides when these surfaces exist and the
 -- protocol requires one on every output while they do. Returning this costs one retained node
 -- and zero Wayland objects until `oblisk.lock:invoke("lock")` is clicked, the same

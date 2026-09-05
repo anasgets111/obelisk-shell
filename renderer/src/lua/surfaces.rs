@@ -10,12 +10,12 @@ use std::path::Path;
 use crate::layout::{self, node::SurfaceSpec};
 use crate::lua::{LoadOutput, Loader, LoaderError};
 
-/// Parses **every** declared surface by its own role and returns the whole roster (§ 6.1-6.4).
+/// Parses **every** declared surface by its own role and returns the whole roster (§ 6).
 /// A surface whose fields don't type-check fails with [`LoaderError::InvalidTopology`], a distinct
 /// message from a top-level-return shape error.
 ///
 /// **Parsing every role here is the point, even for properties nothing on this path sends.**
-/// § 6.2/6.3's properties become requests that raise protocol errors -- a zero `anchor_rect`
+/// § 6's properties become requests that raise protocol errors -- a zero `anchor_rect`
 /// answers `invalid_positioner`, a `max_size` under a `min_size` answers `invalid_size` -- and a
 /// protocol error kills the whole connection. A config typo must be a `layout::node::LayoutError`
 /// at evaluation instead, landing in `rescue`'s `error_log` (§ 2.10, ADR-0046).
@@ -31,7 +31,7 @@ use crate::lua::{LoadOutput, Loader, LoaderError};
 /// [`RendererClient::applied_surface_specs`](crate::socket::RendererClient::applied_surface_specs).
 ///
 /// What *is* authoritative here is the roster and the fingerprint: which surfaces were declared,
-/// in what order, with what role. **§ 6.4's `lock` is authoritative here in full, and it is the
+/// in what order, with what role. **§ 6's `lock` is authoritative here in full, and it is the
 /// only role that is** (ADR-0052 decision 2): `id` is structural and `child` is the scene's
 /// to walk, so [`lock_spec`](layout::node::lock_spec) consults `is_deferred_signal` nowhere.
 pub(crate) fn surface_specs(output: &LoadOutput) -> Result<Vec<SurfaceSpec>, LoaderError> {
@@ -62,7 +62,7 @@ pub(crate) fn surface_specs(output: &LoadOutput) -> Result<Vec<SurfaceSpec>, Loa
     // compositor disconnects the client and does not unlock the session, leaving the user with a
     // VT switch as the only way back in.
     //
-    // There is also nothing coherent to admit: § 6.4 gives a `lock` no `monitor` and exactly one
+    // There is also nothing coherent to admit: § 6 gives a `lock` no `monitor` and exactly one
     // surface per output, so "two lock screens" names no arrangement a compositor could show.
     let locks = specs.iter().filter(|spec| matches!(spec, SurfaceSpec::Lock(_))).count();
     if locks > 1 {

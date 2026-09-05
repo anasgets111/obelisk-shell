@@ -1,4 +1,4 @@
-//! Node constructors (`oblisk-idl-api-specs.md` § 5.2/§ 6.1) and `VirtualNode`, the loader's
+//! Node constructors (`oblisk-idl-api-specs.md` § 5.2/§ 6) and `VirtualNode`, the loader's
 //! shallow, unvalidated table-to-Rust conversion.
 //!
 //! ponytail: shallow by design. `deserialize_lua_table` reads `kind`, copies every other key
@@ -10,8 +10,8 @@ use std::collections::HashMap;
 
 use mlua::{Lua, Table, Value};
 
-/// § 5.2's eight geometric nodes plus all four top-level surface roles a config declares: § 6.1's
-/// `panel`, § 6.2's `window`, § 6.3's `popup` and § 6.4's `lock` (ADR-0040: surface *roles*;
+/// § 5.2's eight geometric nodes plus all four top-level surface roles a config declares under § 6:
+/// `panel`, `window`, `popup` and `lock` (ADR-0040: surface *roles*;
 /// "surface" is the umbrella term). `lock` joined under ADR-0052 decision 2: a constructor only
 /// decides where a declaration is *written*, separate (ADR-0049) from when the Wayland object
 /// exists. `window`/`popup` own no `xdg_toplevel`/`xdg_popup` until `visible`; `lock`'s trigger
@@ -246,7 +246,7 @@ mod tests {
         assert!(err.contains("align_v"), "and the ones it accepts, so the typo is visible: {err}");
     }
 
-    /// The per-kind half. `layer` is real § 6.1 topology, and meaningless on a `rect`.
+    /// The per-kind half. `layer` is real § 6 topology, and meaningless on a `rect`.
     #[test]
     fn a_property_of_another_kind_is_refused_too() {
         let lua = lua_with_constructors();

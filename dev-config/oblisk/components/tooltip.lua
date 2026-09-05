@@ -7,7 +7,7 @@
 --
 -- `grab = false`, and it is not optional. A grabbing popup takes the pointer, so the first thing it
 -- would do on opening is take the pointer off the node whose hover opened it, which reads as a
--- tooltip that flickers forever. It also means this needs no armed input serial (§ 6.3), which is
+-- tooltip that flickers forever. It also means this needs no armed input serial (§ 6), which is
 -- what lets a hover open it at all: there is no click to carry one.
 --
 -- The 4px offset is doing the same job from the other side. This opens *below* its anchor, so the
@@ -27,7 +27,7 @@ return function(opts)
         visible = hover(opts.slot),
         width = opts.width,
         height = opts.height,
-        -- Not a default worth inheriting: § 6.3's `grab` is `true` unless a popup says otherwise,
+        -- Not a default worth inheriting: § 6's `grab` is `true` unless a popup says otherwise,
         -- and a grabbing popup needs an armed input serial, which a hover has no way to produce.
         -- Leaving this line out is a tooltip that resolves `visible = true` and is then refused on
         -- every re-resolve, which is exactly what the first live run did.

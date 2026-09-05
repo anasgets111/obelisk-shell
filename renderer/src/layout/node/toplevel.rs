@@ -1,5 +1,5 @@
-//! `xdg_toplevel` and `xdg_positioner` specs: [`WindowSpec`] (§ 6.2,
-//! title/app_id/min_size/max_size) and [`PopupSpec`] (§ 6.3,
+//! `xdg_toplevel` and `xdg_positioner` specs: [`WindowSpec`] (§ 6,
+//! title/app_id/min_size/max_size) and [`PopupSpec`] (§ 6,
 //! anchor/gravity/constraint_adjustment/offset/grab), plus every parser building one field of
 //! either: both describe a live, positioned `xdg_shell` object, not a layer-shell surface or the
 //! session lock. `parse_size_hint`, `check_max_size_above_min`, `DEFERRED_POPUP_EXTENT` and
@@ -15,11 +15,11 @@ use super::content::parse_string_property;
 use super::style::table_number;
 use super::*;
 
-/// § 6.2's `title`, shown in a task bar or window list. Absent is the empty string, what a toplevel
-/// that never sends `set_title` has: § 6.2 documents no default, and substituting `id` would put an
+/// § 6's `title`, shown in a task bar or window list. Absent is the empty string, what a toplevel
+/// that never sends `set_title` has: § 6 documents no default, and substituting `id` would put an
 /// internal identifier in the task switcher. In-place, deliberately outside
 /// [`is_structural_property`]'s carve-out: `set_title` is a request on a live toplevel, so a
-/// `Signal` resolves like any other property (ADR-0044 decision 1, § 6.2 spells the
+/// `Signal` resolves like any other property (ADR-0044 decision 1, § 6 spells the
 /// `string`/`Signal` union out) and the next pass sends the new title.
 pub fn parse_title(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     // Deferred, not rejected, on the evaluation-time pass ([`is_deferred_signal`]): `title`'s
@@ -31,7 +31,7 @@ pub fn parse_title(properties: &HashMap<String, Value>) -> Result<String, Layout
     parse_string_property(properties, "title", Some(""))
 }
 
-/// § 6.2's `app_id`, matched against a compositor's window rules. Defaults to `"oblisk-{id}"` for
+/// § 6's `app_id`, matched against a compositor's window rules. Defaults to `"oblisk-{id}"` for
 /// the reason `surface::parse_namespace` defaults the same way: without it nobody could write a
 /// `windowrule` against their own window without naming one by hand. **Not** an
 /// [`is_structural_property`] carve-out; the protocol decides that: `xdg-shell.xml`'s `set_app_id`
@@ -49,7 +49,7 @@ pub fn parse_app_id(properties: &HashMap<String, Value>, id: &str) -> Result<Str
     parse_string_property(properties, "app_id", Some(&default))
 }
 
-/// § 6.2's `min_size`/`max_size` value, `{ width, height }`. Advisory: "The client should not rely
+/// § 6's `min_size`/`max_size` value, `{ width, height }`. Advisory: "The client should not rely
 /// on the compositor to obey the maximum size." So nothing in `layout` clamps a resolved tree
 /// against these; they are only ever carried to `set_min_size`/`set_max_size`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -119,7 +119,7 @@ fn check_max_size_above_min(min: Option<SizeHint>, max: Option<SizeHint>) -> Res
     Ok(())
 }
 
-/// Everything one `xdg_toplevel` needs, read off a `window` node's properties in one pass (§ 6.2),
+/// Everything one `xdg_toplevel` needs, read off a `window` node's properties in one pass (§ 6),
 /// as [`PanelSpec`] does for a layer surface. A `window` is a **top-level** node from `shell.lua`,
 /// a sibling of `panel`, not nested inside a panel's child tree (ADR-0040 decision 1). **No
 /// `WindowTopology`**: [`PanelSpec`] carries one because five panel fields are fixed at
@@ -127,7 +127,7 @@ fn check_max_size_above_min(min: Option<SizeHint>, max: Option<SizeHint>) -> Res
 /// and `set_max_size` are all requests on a live toplevel, and `visible` creates and destroys the
 /// object rather than swapping the generation (ADR-0049 decisions 1-3). What is left is `id`: an
 /// `id` change adds one declaration and removes another, which ADR-0001 and ADR-0049 decision 3
-/// already route to a swap on the *declared set*. § 6.2 also gives a `window` no `monitor`, so one
+/// already route to a swap on the *declared set*. § 6 also gives a `window` no `monitor`, so one
 /// declaration is one Wayland object, never one per output like a `panel` (ADR-0038 decision 3).
 /// `on_close` and `visible` are absent for the reasons [`PanelSpec`] omits their equivalents: a
 /// callback rides in `layout::scene::RetainedNode::properties` like `button`'s `on_click`
@@ -138,7 +138,7 @@ pub struct WindowSpec {
     pub id: String,
     pub title: String,
     pub app_id: String,
-    /// Advisory (§ 6.2): parsed and carried, never enforced against the resolved tree.
+    /// Advisory (§ 6): parsed and carried, never enforced against the resolved tree.
     pub min_size: Option<SizeHint>,
     pub max_size: Option<SizeHint>,
 }
@@ -152,13 +152,13 @@ pub fn window_spec(properties: &HashMap<String, Value>) -> Result<WindowSpec, La
     Ok(WindowSpec { id, title: parse_title(properties)?, app_id, min_size, max_size })
 }
 
-/// § 6.3's `anchor` and `gravity`, which share one value set. `layout`'s own enum, not
+/// § 6's `anchor` and `gravity`, which share one value set. `layout`'s own enum, not
 /// `xdg_positioner`'s `Anchor`/`Gravity`: the same boundary [`LayerKind`] and
 /// [`KeyboardInteractivity`] hold, since `crate::wayland` maps at the single call site that builds
 /// a positioner. `Center` has no entry in the protocol enums, which run `none`(0) / `top` /
 /// `bottom` / `left` / `right` and the four corners. It maps to `none`: with no edge specified the
 /// anchor point is "in the center of the anchor rectangle", and a gravity of `none` centers the
-/// surface "over the anchor point on any axis that had no gravity specified": § 6.3's `"Center"`
+/// surface "over the anchor point on any axis that had no gravity specified": § 6's `"Center"`
 /// under a name a config author can guess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PopupAnchor {
@@ -175,10 +175,10 @@ pub enum PopupAnchor {
     BottomRight,
 }
 
-/// One parser, two callers: § 6.3 gives `anchor` and `gravity` the same value set and identical
+/// One parser, two callers: § 6 gives `anchor` and `gravity` the same value set and identical
 /// protocol enums, so `property` exists only to name which one a config got wrong. Absent defaults
 /// to [`PopupAnchor::Center`], the protocol's own default, unlike [`parse_constraint_adjustment`]
-/// where § 6.3 departs from it on purpose.
+/// where § 6 departs from it on purpose.
 pub fn parse_popup_anchor(properties: &HashMap<String, Value>, property: &str) -> Result<PopupAnchor, LayoutError> {
     if is_deferred_signal(properties, property) {
         return Ok(PopupAnchor::Center);
@@ -208,11 +208,11 @@ pub fn parse_popup_anchor(properties: &HashMap<String, Value>, property: &str) -
     }
 }
 
-/// § 6.3's `constraint_adjustment`, as six independent permissions rather than the array a config
+/// § 6's `constraint_adjustment`, as six independent permissions rather than the array a config
 /// writes it as. Array *order* carries no meaning: the XML fixes precedence inside the compositor
 /// ("The adjustments can be combined, according to a defined precedence: 1) Flip, 2) Slide, 3)
 /// Resize") and the request takes a bitmask, so `{ "SlideX", "FlipY" }` and `{ "FlipY", "SlideX" }`
-/// are one value, unlike a `Vec`. [`Default`] is § 6.3's `{ "FlipY", "SlideX" }`, dropdown
+/// are one value, unlike a `Vec`. [`Default`] is § 6's `{ "FlipY", "SlideX" }`, dropdown
 /// behaviour, deliberately **not** the protocol's own no-adjustment default (ADR-0040 decision 3);
 /// an empty array asks for [`ConstraintAdjustment::NONE`] instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,7 +283,7 @@ pub fn parse_constraint_adjustment(properties: &HashMap<String, Value>) -> Resul
     Ok(adjustment)
 }
 
-/// § 6.3's `offset`, the pixel nudge applied after anchor and gravity. Signed on purpose: the XML's
+/// § 6's `offset`, the pixel nudge applied after anchor and gravity. Signed on purpose: the XML's
 /// worked example adds the offset to the derived anchor point, so pulling a dropdown up or left
 /// needs a negative and `set_offset` refuses neither sign.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -306,9 +306,9 @@ pub fn parse_popup_offset(properties: &HashMap<String, Value>) -> Result<PopupOf
     Ok(PopupOffset { x: axis("x")?, y: axis("y")? })
 }
 
-/// § 6.3's `anchor_rect`, in the parent surface's logical coordinates. [`LogicalRect`] rather than
+/// § 6's `anchor_rect`, in the parent surface's logical coordinates. [`LogicalRect`] rather than
 /// a type of its own: `crate::wayland`'s `rect_table` builds `on_click`'s single argument out of
-/// one (ADR-0050 decision 3), and § 6.3 says this property is "normally passed straight from the
+/// one (ADR-0050 decision 3), and § 6 says this property is "normally passed straight from the
 /// rect `button`'s `on_click` hands back", so the rect round-trips back into the type it left as.
 /// Required. `x`/`y` default to 0 (the parent's top-left corner is a legitimate origin), but
 /// `width`/`height` do not: a zero size is the failure this parser exists to catch. Two protocol
@@ -361,12 +361,12 @@ pub fn parse_anchor_rect(properties: &HashMap<String, Value>) -> Result<LogicalR
     Ok(LogicalRect { x: origin("x")?, y: origin("y")?, width: extent("width")?, height: extent("height")? })
 }
 
-/// § 6.3's `width`/`height`. **Not** [`parse_size_mode`]: a popup has no `"Fill"` since there is
+/// § 6's `width`/`height`. **Not** [`parse_size_mode`]: a popup has no `"Fill"` since there is
 /// nothing for it to fill. An `xdg_popup` is sized by `xdg_positioner::set_size`, which takes a
 /// concrete int and "If a zero or negative size is set the invalid_input error is raised", so
 /// `"Fill"`, a percent, a `0`, and an omitted axis are four config typos that would otherwise reach
 /// the compositor as a protocol error rather than a rejected config. `f32` rather than `i32` even
-/// though § 6.3 and the request say integer: this is the popup's logical size and its child's
+/// though § 6 and the request say integer: this is the popup's logical size and its child's
 /// layout budget, `LogicalSize`'s `f32` like every other budget here. It quantizes once, at the
 /// `set_size` call site that also knows the output scale, the same split [`PanelSpec`]'s `width`
 /// documents for layer-shell.
@@ -389,7 +389,7 @@ fn parse_popup_extent(properties: &HashMap<String, Value>, property: &str) -> Re
     Ok(n)
 }
 
-/// § 6.3's `grab`, defaulting to `true`. A dropdown that cannot be dismissed by clicking outside it
+/// § 6's `grab`, defaulting to `true`. A dropdown that cannot be dismissed by clicking outside it
 /// is why ADR-0040 decision 2 reached for a real `xdg_popup` over a second `panel`, so the default
 /// is what a config author expects, not the protocol's "only if you ask". Whether the grab can be
 /// taken is not decided here: it needs a serial from a real input event, which exists only for one
@@ -409,7 +409,7 @@ pub fn parse_grab(properties: &HashMap<String, Value>) -> Result<bool, LayoutErr
 }
 
 /// Everything one `xdg_popup` and its `xdg_positioner` need, read off a `popup` node's properties
-/// in one pass (§ 6.3). A `popup` is a **top-level** node returned from `shell.lua`, a sibling of
+/// in one pass (§ 6). A `popup` is a **top-level** node returned from `shell.lua`, a sibling of
 /// `panel`, naming its parent surface by id through `parent` rather than sitting inside that
 /// surface's child tree: the protocol roots a popup under a parent at creation
 /// (`xdg_surface.get_popup`, or `zwlr_layer_surface_v1.get_popup` for a layer-shell parent), and

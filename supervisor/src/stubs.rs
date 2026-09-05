@@ -15,7 +15,7 @@
 //!
 //! ponytail: argument types stay `...`. The upgrade is a payload enum (`Set(u32)`) carrying its
 //! parsed arguments, deleting all 19 `parse_*_args` functions, but that costs an IDL change to
-//! named arguments (docs/oblisk-idl-api-specs.md § 7.2), not a derive.
+//! named arguments (docs/oblisk-idl-api-specs.md § 7), not a derive.
 
 use std::collections::BTreeMap;
 

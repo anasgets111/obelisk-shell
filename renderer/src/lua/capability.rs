@@ -26,12 +26,12 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::lua::signal::{CpuBudget, DirtyFlag, LiveSignalHandle, Signal};
 
-/// Builds § 7.2's generation-guarded envelope and queues it for the socket thread. One per
+/// Builds § 7's generation-guarded envelope and queues it for the socket thread. One per
 /// generation, cloned into every [`Capability`] on the `oblisk` table.
 #[derive(Clone)]
 pub struct CommandSender {
     generation_id: u32,
-    /// JSON-RPC's request id (§ 7.2's `"id": 105`), shared across [`Capability`] clones so two
+    /// JSON-RPC's request id (§ 7's `"id": 105`), shared across [`Capability`] clones so two
     /// capabilities never hand out the same id. `Rc<Cell<_>>`: single-threaded.
     next_id: Rc<Cell<u64>>,
     /// Capabilities this generation already asked the Supervisor to start, so a second reader of
@@ -72,7 +72,7 @@ impl CommandSender {
         self.outbound_tx.clone()
     }
 
-    /// § 7.2's envelope, queued rather than written: see the module doc comment.
+    /// § 7's envelope, queued rather than written: see the module doc comment.
     /// `expected_revision` is the revision of the last `StateSnapshot` hydrated, § 7.3's staleness
     /// half ([`CapabilityHandle`] keeps it current). `0` is not a revision any push can produce
     /// (`bump_revision` starts at `1`), so it means "never hydrated": honest before the first

@@ -109,8 +109,8 @@ pub fn paint_style(kind: &str, properties: &HashMap<String, Value>) -> Result<Op
     let style = match kind {
         // row/column/button have no paint properties of their own beyond the base `rect` ones
         // (`oblisk-idl-api-specs.md` § 5.2), and a surface root paints exactly like a rect. All
-        // four surface roles, not just `panel`: § 6.2, § 6.3 and § 6.4 give a `window`, a `popup`
-        // and a `lock` the same § 5.1 base properties § 6.1 gives a `panel`.
+        // four surface roles, not just `panel`: § 6 gives a `window`, a `popup`
+        // and a `lock` the same § 5.1 base properties as a `panel`.
         "rect" | "row" | "column" | "button" | "panel" | "window" | "popup" | "lock" => PaintStyle::Box {
             background: parse_background(properties)?,
             radius: parse_radius(properties)?,

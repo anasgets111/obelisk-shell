@@ -2,7 +2,7 @@
 -- layouts that file has, switched by whether the entry carries a level. What to show and when is
 -- `modules/osd/service.lua`'s; this file only draws the entry it holds.
 --
--- One `panel`, two stacked rows switched by `visible`, rather than two panels: § 6.1 gives every
+-- One `panel`, two stacked rows switched by `visible`, rather than two panels: § 6 gives every
 -- surface its own compositor identity, and a volume change while a toggle card is still up would
 -- otherwise be two overlapping surfaces fighting over one screen position instead of one replacing
 -- the other.
@@ -92,7 +92,7 @@ local fact_row = row {
 return panel {
     id = "osd",
     layer = "Overlay",
-    -- No `left`/`right`: § 6.1's anchor booleans pass straight through to `zwlr_layer_surface_v1`
+    -- No `left`/`right`: § 6's anchor booleans pass straight through to `zwlr_layer_surface_v1`
     -- (`renderer/src/wayland/layer.rs`'s `anchor_for` is a bare bitflag map, nothing more), and the
     -- protocol centers an axis with neither of its edges anchored. Explicit `width`/`height` are
     -- required because `bottom` alone doesn't anchor both edges of either axis.

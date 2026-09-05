@@ -307,7 +307,7 @@ pub fn run(
     //
     // ponytail: runs inside the PBA ready window (Supervisor `ready_timeout` 2s,
     // `supervisor/src/main.rs`'s `PBA_TIMINGS`); the first `text` node's shaping blocks on
-    // `FontSystem::new()`, eating into that budget. Accepted cost: § 15.2 requires
+    // `FontSystem::new()`, eating into that budget. Accepted cost: § 14.2 requires
     // evaluate-before-bind regardless.
     //
     // `screens` is seeded before the evaluation, not after (ADR-0041 decision 2): a config's
@@ -325,7 +325,7 @@ pub fn run(
     let instances = expand_instances(&specs, &outputs);
     for spec in &specs {
         let SurfaceSpec::Panel(panel) = spec else {
-            // Only a `panel` names a monitor (§ 6.2, § 6.3): the compositor places a toplevel and a
+            // Only a `panel` names a monitor (§ 6): the compositor places a toplevel and a
             // popup positions against its parent, so neither can miss one.
             continue;
         };

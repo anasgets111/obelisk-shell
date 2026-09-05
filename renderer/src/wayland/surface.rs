@@ -20,7 +20,7 @@ pub(super) struct BoundSurface {
 pub(super) fn log_bind_failure(surface_id: &str, stage: &str, err: impl std::fmt::Display) {
     eprintln!("[oblisk-renderer] {surface_id}: {stage} failed: {err}");
 }
-/// § 6.1's `visible`, as the compositor currently sees it. Three states, not two: a surface being
+/// § 6's `visible`, as the compositor currently sees it. Three states, not two: a surface being
 /// shown must commit with no buffer and wait for a configure before attaching one, so the gap
 /// between asking and being allowed to draw needs a name of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +73,7 @@ pub(super) enum TrackedRole {
         /// Kept per surface rather than read from `SurfaceInstance::available`: `set_instance_size`
         /// overwrites `available` with the compositor-granted size after the first configure, so
         /// resolving a percent against it later would shrink the surface on every push. Panel-only:
-        /// a `window` has no `width`/`height` to resolve (§ 6.2).
+        /// a `window` has no `width`/`height` to resolve (§ 6).
         output_size: layout::LogicalSize,
     },
     Window {
@@ -109,7 +109,7 @@ pub(super) enum TrackedRole {
     },
     Lock {
         /// The output this lock surface covers, held from instance expansion rather than
-        /// looked up when the lock is taken: § 6.4 gives a `lock` no `monitor` to name one with.
+        /// looked up when the lock is taken: § 6 gives a `lock` no `monitor` to name one with.
         output: wl_output::WlOutput,
         /// `None` until this process holds the lock (ADR-0052 decision 2). Dropping this handle
         /// is the teardown: `SessionLockSurfaceInner::Drop` sends
@@ -131,7 +131,7 @@ impl TrackedRole {
     }
 
     /// This surface as something an `xdg_popup` can be rooted under, or `None` if it cannot be one
-    /// (§ 6.3's `parent`, ADR-0051 decision 1). A `window`/`popup` not currently shown answers
+    /// (§ 6's `parent`, ADR-0051 decision 1). A `window`/`popup` not currently shown answers
     /// `None`, so the popup asking is not created either.
     pub(super) fn as_popup_parent(&self) -> Option<PopupParent> {
         match self {
@@ -154,7 +154,7 @@ pub(super) enum PopupRefusal {
     Unarmed,
     /// `grab = true` and the compositor advertises no seat to take the grab on.
     Seatless,
-    /// § 6.3's `parent` names no surface that is currently shown, which is the ordinary state of a
+    /// § 6's `parent` names no surface that is currently shown, which is the ordinary state of a
     /// popup parented to a `window` whose own `visible` is false.
     HiddenParent,
 }
@@ -198,7 +198,7 @@ pub(super) struct TrackedSurface {
 /// `Scene::apply` restores its pre-call state on error): a `panel` (ADR-0038 decision 2) treats
 /// it as visible ("keep the shell up"), painting nothing until the next re-resolve; `window`/
 /// `popup` have create-and-destroy semantics (ADR-0049 decision 1), so it is not `visible = true`;
-/// a `lock` has no `visible` property (§ 6.4, ADR-0042), and `false` stays correct regardless.
+/// a `lock` has no `visible` property (§ 6, ADR-0042), and `false` stays correct regardless.
 fn starting_visible(resolved: Option<bool>, roster: &SurfaceSpec) -> bool {
     resolved.unwrap_or(match roster {
         SurfaceSpec::Panel(_) => true,
@@ -479,7 +479,7 @@ impl App {
     /// This is where a `window`'s authoritative [`WindowSpec`] is derived; "resolved" is the whole
     /// point (ADR-0049's second amendment). `crate::socket::surface_specs` parses the unresolved
     /// properties, right for a `panel`'s topology fields since they reject a `Signal` on purpose
-    /// (`get_layer_surface` fixes them at creation), but wrong for a `window`'s `title`: § 6.2
+    /// (`get_layer_surface` fixes them at creation), but wrong for a `window`'s `title`: § 6
     /// spells it `string`/`Signal` precisely so it can move, and parsing at evaluation time would
     /// freeze it at whatever the file last saw.
     /// All three pushes are double-buffered `wl_surface` state, staged here rather than committed:
@@ -529,7 +529,7 @@ impl App {
                     "[oblisk-renderer] {surface_id}: re-resolved popup properties are invalid, keeping the last applied ones: {err}"
                 ),
             },
-            // Nothing to push, and § 6.4 is why, not an omission: a lock surface has no protocol
+            // Nothing to push, and § 6 is why, not an omission: a lock surface has no protocol
             // field a config could set (`ext_session_lock_surface_v1` has exactly one request,
             // `ack_configure`, and the size arrives in the configure rather than being asked for).
             // The create path calls `node::lock_spec`, through [`resolved_surface_spec`], only to

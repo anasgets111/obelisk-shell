@@ -13,7 +13,7 @@
 //! `layout::scene::MAX_TREE_DEPTH` caps that and raises [`LayoutError::TreeTooDeep`].
 //! [`SurfaceTopology`]'s five fields and every node's optional `id` (ADR-0045 decision 1) still
 //! reject a `Signal` outright; see [`reject_signal_in_structural_field`]. A `panel`'s remaining
-//! § 6.1 properties are not carve-outs, since layer-shell accepts each on a live surface.
+//! § 6 properties are not carve-outs, since layer-shell accepts each on a live surface.
 
 mod content;
 mod paint_style;
@@ -273,7 +273,7 @@ fn parse_hex_color(property: &str, s: &str) -> Result<Rgba, LayoutError> {
 /// `popup` and `lock` add nothing, by the same live-object test: a `window`'s
 /// `set_title`/`set_app_id`/`set_min_size`/`set_max_size` are all valid requests on a mapped
 /// toplevel; a `popup`'s whole `xdg_positioner` is rebuilt on every open (ADR-0049 decision 1), so
-/// `parent`/`anchor_rect`/`anchor`/`gravity` are meant to carry a `Signal`; a `lock`'s § 6.4
+/// `parent`/`anchor_rect`/`anchor`/`gravity` are meant to carry a `Signal`; a `lock`'s § 6
 /// property list is only `id` and `child`, already the universal arm's as a reconcile identity
 /// rather than a protocol field. `hover` joins it there on any kind (ADR-0062 decision 3): it
 /// names the signal the pointer handler writes, and a resolved `hover` would arrive as the

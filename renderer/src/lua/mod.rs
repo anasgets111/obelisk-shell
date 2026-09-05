@@ -97,7 +97,7 @@ pub enum LoaderError {
     #[error("shell.lua failed to evaluate: {0}")]
     Eval(#[from] mlua::Error),
     /// The script evaluated cleanly, but its top-level return wasn't a surface node or an array of
-    /// them (§ 6.1). An empty array, or no return, is fine: a config may declare no surfaces
+    /// them (§ 6). An empty array, or no return, is fine: a config may declare no surfaces
     /// (ADR-0070 decision 7).
     #[error("shell.lua's top-level return must be a `panel` node or an array of them: {0}")]
     InvalidTopLevelReturn(String),
@@ -105,7 +105,7 @@ pub enum LoaderError {
     #[error("failed to read shell.lua: {0}")]
     Io(#[from] std::io::Error),
     /// A surface had a valid top-level shape but a topology field (`id`/`layer`/`anchor`/`monitor`,
-    /// § 6.1) didn't type-check; distinct from [`Self::InvalidTopLevelReturn`], whose message
+    /// § 6) didn't type-check; distinct from [`Self::InvalidTopLevelReturn`], whose message
     /// describes the top-level *shape*, wrong for a field error in an otherwise-valid surface.
     #[error("shell.lua's surface topology is invalid: {0}")]
     InvalidTopology(String),
@@ -118,7 +118,7 @@ impl From<nodes::DeserializeError> for LoaderError {
 }
 
 /// What one `Loader::evaluate` call produces: the top-level `panel` node(s), each carrying its
-/// own topology fields (`id`/`layer`/`anchor`/`monitor`/`exclusive`, § 6.1) directly in
+/// own topology fields (`id`/`layer`/`anchor`/`monitor`/`exclusive`, § 6) directly in
 /// `properties`, readable without walking into `child`: the cheap-to-diff output the Watcher
 /// compares across reloads.
 #[derive(Debug)]
@@ -299,7 +299,7 @@ fn collect_surfaces(value: Value) -> Result<Vec<VirtualNode>, LoaderError> {
 /// decision 2 treats "where the declaration lives" and "when the Wayland object exists" as
 /// separate questions, the split ADR-0049 already made for `window` (owns no `xdg_toplevel` until
 /// `visible` resolves true) and `popup`. A `lock` owns no `ext_session_lock_surface_v1` until the
-/// compositor sends `locked`; refusing it here would leave § 6.4's `child`, the whole authored
+/// compositor sends `locked`; refusing it here would leave § 6's `child`, the whole authored
 /// lock screen, with no legal place to write.
 fn require_surface(node: &VirtualNode) -> Result<(), LoaderError> {
     match node.kind.as_str() {

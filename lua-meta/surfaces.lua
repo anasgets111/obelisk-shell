@@ -15,7 +15,7 @@
 ---@alias PopupAnchor "Top"|"Bottom"|"Left"|"Right"|"TopLeft"|"TopRight"|"BottomLeft"|"BottomRight"|"Center"
 
 ---A surface root takes every `NodeBase` property a `rect` does and paints like one, on top of its
----own § 6.1 topology.
+---own § 6 topology.
 ---@class PanelProps: NodeBase, BoxBase
 ---@field id string Unique. A surface targeting several outputs is one Wayland surface per output, addressed as `"{id}@{output}"`.
 ---@field layer "Background"|"Bottom"|"Top"|"Overlay" Required, no default: a typo'd layer that quietly stacked a bar on `Background` would be worse than an error.

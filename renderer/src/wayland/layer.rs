@@ -1,4 +1,4 @@
-//! The `panel` role: `zwlr_layer_surface_v1` (§ 6.1). Covers protocol-value mappings, the
+//! The `panel` role: `zwlr_layer_surface_v1` (§ 6). Covers protocol-value mappings, the
 //! per-field diff `apply_spec_change` sends, and exclusive-zone computation. Creation, spec
 //! updates and configure/closed callbacks live here; bind/paint/(un)map logic lives in `surface`.
 
@@ -16,7 +16,7 @@ fn layer_for(kind: LayerKind) -> Layer {
         LayerKind::Overlay => Layer::Overlay,
     }
 }
-/// § 6.1's four `anchor` edge booleans to the protocol's bitflags.
+/// § 6's four `anchor` edge booleans to the protocol's bitflags.
 pub(super) fn anchor_for(anchor: node::Anchor) -> Anchor {
     let mut flags = Anchor::empty();
     flags.set(Anchor::TOP, anchor.top);
@@ -25,7 +25,7 @@ pub(super) fn anchor_for(anchor: node::Anchor) -> Anchor {
     flags.set(Anchor::RIGHT, anchor.right);
     flags
 }
-/// § 6.1's `keyboard_interactivity` to the protocol's own field. Before ADR-0038 every surface
+/// § 6's `keyboard_interactivity` to the protocol's own field. Before ADR-0038 every surface
 /// had a hardcoded mode per role, so `Exclusive` and `None` surfaces could not coexist.
 pub(super) fn keyboard_interactivity_for(mode: node::KeyboardInteractivity) -> KeyboardInteractivity {
     match mode {
@@ -92,7 +92,7 @@ fn exclusive_zone_for(anchor: node::Anchor, configured_size: (u32, u32)) -> i32 
 }
 /// The layer-shell requests one live surface needs after a re-resolve changed its `panel`
 /// properties: `margin`, `keyboard_interactivity`, size, and `exclusive` (ADR-0038 decision 2,
-/// § 6.1). `None` per field means "unchanged, send nothing", since these are double-buffered.
+/// § 6). `None` per field means "unchanged, send nothing", since these are double-buffered.
 /// [`SurfaceTopology`](node::SurfaceTopology)'s five fields (`id`, `layer`, `anchor`, `monitor`,
 /// `namespace`) are absent: the protocol can't change namespace or output at all
 /// (`get_layer_surface` consumes both), and an edit to any is a topology change
@@ -106,7 +106,7 @@ struct SpecUpdate {
     margin: Option<node::EdgeInsets>,
     keyboard_interactivity: Option<node::KeyboardInteractivity>,
     size: Option<(u32, u32)>,
-    /// § 6.1's `exclusive` mode. Not the zone itself: `Reserve` derives it (see
+    /// § 6's `exclusive` mode. Not the zone itself: `Reserve` derives it (see
     /// [`exclusive_zone_for`]); this only reports whether the choice changed.
     exclusive: Option<node::Exclusive>,
 }
@@ -138,7 +138,7 @@ fn spec_update(applied: &PanelSpec, fresh: &PanelSpec, output: layout::LogicalSi
 /// Parameters for [`App::spawn_layer`], bundled to stay under clippy's argument-count limit.
 pub(super) struct LayerSpec<'a> {
     layer_type: Layer,
-    /// The compositor-visible namespace (§ 6.1, default `"oblisk-{id}"`), matched by `layerrule`.
+    /// The compositor-visible namespace (§ 6, default `"oblisk-{id}"`), matched by `layerrule`.
     namespace: &'a str,
     /// Always `Some` (ADR-0038 decision 3): one surface per `(surface, output)` pair, so the
     /// output is never the compositor's to pick.
@@ -216,7 +216,7 @@ impl App {
         );
         layer.commit();
 
-        // § 6.1's `visible`. A panel declared `visible = false` is still created here and gets the
+        // § 6's `visible`. A panel declared `visible = false` is still created here and gets the
         // initial commit, required by `get_layer_surface` before any configure. No buffer is ever
         // attached and `MapState::Unmapped` keeps `paint_surface` from doing so, so the object
         // exists and nothing is on screen. That is not the state a *hidden* panel reaches under
@@ -313,7 +313,7 @@ impl App {
     /// help once a real value has been sent. `-1` needs the same explicit push.
     /// Stages only, since the caller commits; committing here would split one update across
     /// several commits, and on an unmapped surface a bufferless commit is the protocol's re-map
-    /// procedure (see [`App::unmap`]). Also a no-op on a `window` (§ 6.1, § 6.2): reserving space
+    /// procedure (see [`App::unmap`]). Also a no-op on a `window` (§ 6): reserving space
     /// is what makes a surface a shell component, not a window.
     pub(super) fn apply_exclusive_zone(&mut self, index: usize) {
         let tracked = &self.surfaces[index];

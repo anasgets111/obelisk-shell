@@ -3,8 +3,8 @@
 //! `panel` with `monitor = "All"` targets every connected output, each with its own
 //! `zwlr_layer_surface_v1` and size, why the retained scene keys by instance id, not declared id.
 //! Pure: no Wayland types, the testable seam with no headless harness. Per-output resolves to
-//! three answers per role: § 6.2 gives a `window` no `monitor` (one instance regardless of
-//! monitor count); § 6.4 gives a `lock` no `monitor` for the opposite reason (always every
+//! three answers per role: § 6 gives a `window` no `monitor` (one instance regardless of
+//! monitor count); § 6 gives a `lock` no `monitor` for the opposite reason (always every
 //! monitor); only a `panel` expands per output.
 
 use crate::layout::node::SurfaceSpec;
@@ -21,7 +21,7 @@ pub struct SurfaceInstance {
     pub instance_id: String,
     /// `"bar"`: what `node::parse_surface_id` reads off the node, pairing it to its `VirtualNode`.
     pub declared_id: String,
-    /// The output this instance lives on, or empty for a `window` (§ 6.2 gives a toplevel no
+    /// The output this instance lives on, or empty for a `window` (§ 6 gives a toplevel no
     /// `monitor`; the compositor places it).
     pub output: String,
     /// The size this instance resolves its tree against. Seeded from the output's logical size at
@@ -42,7 +42,7 @@ pub struct OutputGeometry {
 /// Every instance `specs` declares against the currently connected `outputs`, per role
 /// (ADR-0038 decision 3, ADR-0049 decision 1).
 ///
-/// **`panel`**: expands per output. `monitor = "All"` (§ 6.1 default) yields one instance per
+/// **`panel`**: expands per output. `monitor = "All"` (§ 6 default) yields one instance per
 /// output, in `outputs` order; other values match the named output, else none. The
 /// `"{id}@{output}"` id form stays uniform even for a single match (`"DP-1"` yields `"bar@DP-1"`).
 ///
@@ -55,11 +55,11 @@ pub struct OutputGeometry {
 /// **`popup`**: one instance on its bare declared id, for a `window`'s reason and one more
 /// (ADR-0051 decision 1): expanding per parent would open a dropdown on every monitor from one
 /// `visible` signal (its parent is chosen at creation instead). `available` seeds from the popup's
-/// own § 6.3 `width`/`height` (both required, no `"Fill"`), `xdg_positioner::set_size`'s argument.
+/// own § 6 `width`/`height` (both required, no `"Fill"`), `xdg_positioner::set_size`'s argument.
 ///
 /// **`lock`**: expands per output like a `panel`, with no filter (ADR-0052 decision 2):
 /// `ext-session-lock-v1` requires "lock surfaces for all outputs currently present" and rejects a
-/// second surface on one output with `duplicate_output`, leaving § 6.4 no choice. Surfaces appear
+/// second surface on one output with `duplicate_output`, leaving § 6 no choice. Surfaces appear
 /// when outputs do, via a re-expansion of this function (ADR-0042).
 pub fn expand_instances(specs: &[SurfaceSpec], outputs: &[OutputGeometry]) -> Vec<SurfaceInstance> {
     let mut instances = Vec::new();
@@ -108,8 +108,8 @@ pub fn expand_instances(specs: &[SurfaceSpec], outputs: &[OutputGeometry]) -> Ve
 /// Whether `instance_id` names an instance of the surface declared as `declared_id`: the inverse
 /// of the `"{id}@{output}"` rule [`expand_instances`] applies. One caller:
 /// `crate::wayland::App`'s popup parent lookup (ADR-0051 decision 1), pairing a declared `parent`
-/// (§ 6.3) against instances across both spellings: `"bar@eDP-1"` for a panel, bare `"settings"`
-/// for a window. A prefix test, not a split on `'@'`: § 6.1 puts no character restriction on `id`,
+/// (§ 6) against instances across both spellings: `"bar@eDP-1"` for a panel, bare `"settings"`
+/// for a window. A prefix test, not a split on `'@'`: § 6 puts no character restriction on `id`,
 /// so `"a@b"` on output `"DP-1"` must match both `"a@b"` and `"a@b@DP-1"`, which splitting on the
 /// first `'@'` gets wrong.
 ///

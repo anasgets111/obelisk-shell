@@ -9,7 +9,7 @@ local section_header = require("components.section_header")
 
 -- A real `xdg_toplevel`, opened from `power_menu.lua`'s settings row and, since `panel_header`
 -- joined this file, closable from inside itself too. The compositor places and sizes this, not the
--- config: § 6.2 gives a `window` no `monitor`, no `anchor` and no size, so `niri msg windows` is
+-- config: § 6 gives a `window` no `monitor`, no `anchor` and no size, so `niri msg windows` is
 -- where you check that the title and app_id arrived.
 --
 -- What is left here is the readouts with no indicator of their own. The bluetooth section moved to

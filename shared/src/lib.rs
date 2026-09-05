@@ -95,7 +95,7 @@ impl std::fmt::Display for Capability {
     }
 }
 /// Guarded JSON-RPC 2.0 envelope wrapping a Lua write action. See docs/oblisk-idl-api-specs.md
-/// §7.2.
+/// § 7.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CommandEnvelope {
     pub jsonrpc: String,
@@ -367,7 +367,7 @@ pub enum SupervisorFrame {
 }
 
 /// Every frame a Renderer connection can send to the Supervisor, tagged like [`SupervisorFrame`].
-/// `Command` is § 7.2's Lua-write-action envelope; `ReevaluateReport` is the reload verdict;
+/// `Command` is § 7's Lua-write-action envelope; `ReevaluateReport` is the reload verdict;
 /// `ReadySignal`/`PresentationEvidence` are the PBA handshake reports.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", content = "data")]
@@ -437,7 +437,7 @@ mod tests {
 
     #[test]
     fn command_envelope_matches_idl_wire_format() {
-        // Exact example from docs/oblisk-idl-api-specs.md §7.2.
+        // Exact example from docs/oblisk-idl-api-specs.md § 7.
         let wire = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "ExecuteCommand",

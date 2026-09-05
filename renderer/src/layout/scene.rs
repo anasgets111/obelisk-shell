@@ -372,7 +372,7 @@ impl Scene {
         // guarantee runs out of frames one level up.
         let style = LayoutStyle::parse(&properties)?;
         // **An unsized `window` or `lock` root is its surface.** A `panel` root sizes itself from
-        // § 6.1's `width`/`height`; § 6.2 gives a `window` neither, since a toplevel's size is the
+        // § 6's `width`/`height`; § 6 gives a `window` neither, since a toplevel's size is the
         // compositor's, arriving as an `xdg_toplevel` configure `set_instance_size` already turned
         // into this `available`. Without this the root fell to `parse_size_mode`'s `Content`
         // default, handing its children a budget of zero, so `child = column { width = "Fill" }`
@@ -380,11 +380,11 @@ impl Scene {
         // niri, which configured the window at its 1920x1168 tile and had a 0x0 tree painted into
         // it.
         //
-        // § 6.4's `lock` is the same case and worse: it has no `width` or `height` at all
+        // § 6's `lock` is the same case and worse: it has no `width` or `height` at all
         // (`layout::node::lock_spec` refuses both), so it always fell to `Content` and filled the
         // whole output with a transparent buffer over a locked session, the black screen with no
         // password field ADR-0052 decision 3 refuses the lock to avoid. Only the `Content` default
-        // is overridden, per axis: a `window` writing a `width` writes a property § 6.2 doesn't
+        // is overridden, per axis: a `window` writing a `width` writes a property § 6 doesn't
         // define, and honouring it is right. A `lock` can't reach that branch, already rejected by
         // the spec parser.
         let forced = if matches!(fresh.kind.as_str(), "window" | "lock") {
@@ -539,10 +539,10 @@ fn ensure_node_admissible(kind: &str, depth: u32) -> Result<(), LayoutError> {
 /// Dispatches to the right raw property (`child` for the four surface roles, `children` for the
 /// container kinds, none for leaves). Only called after [`ensure_supported_kind`] already
 /// validated `node.kind`, so the fallback arm is unreachable, not a silent default. `window`,
-/// `popup` and `lock` share `panel`'s arm: § 6.2, § 6.3 and § 6.4 each give exactly one `child`,
-/// same as § 6.1, since a surface holds one root visual node and the four roles differ only in
-/// which protocol assigns it. § 6.4 is shortest: `child` is one of only two properties a `lock`
-/// has, `layout::node::lock_spec` taking the other.
+/// `popup` and `lock` share `panel`'s arm: § 6 gives each role exactly one `child`, since a
+/// surface holds one root visual node and the four roles differ only in which protocol assigns
+/// it. § 6's `lock` is shortest: `child` is one of only two properties a `lock` has,
+/// `layout::node::lock_spec` taking the other.
 ///
 /// `textfield` (`oblisk-idl-api-specs.md` § 5.2 item 8) is a leaf like `text`/`icon`, never taking
 /// `children`. Its own properties (`mask_character`, `secure_submit`, `on_change`, `on_submit`)

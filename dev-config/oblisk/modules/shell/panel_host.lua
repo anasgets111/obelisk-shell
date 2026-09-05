@@ -29,7 +29,7 @@
 --     around.
 --   * Switching panels is one click. There is no grab to break and re-arm, so the click lands on
 --     the bar indicator directly.
---   * `visible` is a map/unmap of a surface that already exists (§ 6.1), not a create that may only
+--   * `visible` is a map/unmap of a surface that already exists (§ 6), not a create that may only
 --     happen inside a click, so nothing here depends on an armed grab serial (ADR-0049).
 --   * Paid for: a popup got `constraint_adjustment` and a layer surface does not, so the
 --     horizontal clamp below is `"SlideX"` written out by hand.
@@ -171,7 +171,7 @@ return panel {
             return showing_notifications and "OnDemand" or "None"
         end
     ),
-    -- One surface, one root node (§ 6.1), so the catcher and the card share a `rect` rather than
+    -- One surface, one root node (§ 6), so the catcher and the card share a `rect` rather than
     -- being two children of the surface. Full-fill and visible, which is also what sets the input
     -- region: `wl_surface::set_input_region` is built from what the tree draws and what it can
     -- click (ADR-0038 decision 5, ADR-0109); the catcher is a full-size `button` with a handler,

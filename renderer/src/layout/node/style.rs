@@ -34,7 +34,7 @@ fn parse_percent(s: &str) -> Option<f32> {
 /// below: an absent key covers both an omitted property and a signal that read `nil`, so no
 /// parser needs a `&Lua` or `Value::Nil` arm.
 pub fn parse_size_mode(properties: &HashMap<String, Value>, property: &str) -> Result<SizeMode, LayoutError> {
-    // Deferred on the evaluation-time pass ([`is_deferred_signal`]): § 6.1's `width`/`height` are a
+    // Deferred on the evaluation-time pass ([`is_deferred_signal`]): § 6's `width`/`height` are a
     // layer-shell `set_size`, valid on a live surface per ADR-0038 decision 2, so
     // `crate::wayland::App::apply_spec_change` re-derives both every pass (same placeholder an
     // absent property gets); cannot fire below a surface root, where `resolve_properties` already

@@ -153,7 +153,7 @@ impl App {
         }
         // A surviving panel's `output_size` is what `SizeMode::Percent` resolves against, so a
         // resize must move it: `fresh` has the output's current logical size, the instance set the
-        // size the compositor configured (see `reconcile_instances`). `window` has none: § 6.2.
+        // size the compositor configured (see `reconcile_instances`). `window` has none: § 6.
         for instance in &fresh {
             if let Some(TrackedRole::Panel { output_size, .. }) =
                 self.surfaces.iter_mut().find(|s| s.surface_id == instance.instance_id).map(|s| &mut s.role)

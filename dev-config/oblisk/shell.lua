@@ -66,7 +66,7 @@ local panel_host = require("modules.shell.panel_host")
 local launcher = require("modules.global.launcher")
 local wallpaper_picker = require("modules.global.wallpaper_picker")
 -- A tooltip is a surface of its own, so each is listed here rather than nested in the bar: a
--- `popup` is an `xdg_popup` rooted under the bar, not a node inside it (§ 6.3, ADR-0062).
+-- `popup` is an `xdg_popup` rooted under the bar, not a node inside it (§ 6, ADR-0062).
 -- They cost nothing until hovered -- a popup with `visible = false` creates no Wayland object.
 local battery_tooltip = require("modules.bar.indicators.battery").tooltip
 local clock_tooltip = require("modules.bar.indicators.date_time").tooltip

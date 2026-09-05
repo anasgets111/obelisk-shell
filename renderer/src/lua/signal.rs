@@ -278,7 +278,7 @@ impl Signal {
     /// [`Self::hover_handle`] answers `None` for every other kind. Starts `false`, not nil: a
     /// config binds this straight to `visible`, and nil would mean the property absent (ADR-0044
     /// decision 1's amendment), not "no pointer yet."
-    /// `initial_rect` isn't optional for the same reason: § 6.3 requires the `anchor_rect` a
+    /// `initial_rect` isn't optional for the same reason: § 6 requires the `anchor_rect` a
     /// tooltip binds non-zero, and the popup resolves from the first frame, before any pointer has
     /// been near it, so a nil rect would refuse it until something hovers. The caller passes a
     /// real 1x1 rect since a `Value::Table` needs a `Lua` this constructor doesn't have.
@@ -927,7 +927,7 @@ fn hover_slot(lua: &Lua, dirty: &DirtyFlag, name: String) -> mlua::Result<(Signa
 }
 
 /// What `hover_rect(name)` reads before the pointer has ever been on its node: a 1x1 rect at the
-/// origin. Non-zero on both axes because § 6.3 refuses a zero `anchor_rect`; a real table, not
+/// origin. Non-zero on both axes because § 6 refuses a zero `anchor_rect`; a real table, not
 /// nil, since a nil property is absent. A tooltip bound to this sits invisibly at the origin
 /// (`visible = hover(name)` is false) until the same event replaces this with the real rect.
 fn unhovered_rect(lua: &Lua) -> mlua::Result<mlua::Table> {
@@ -993,7 +993,7 @@ mod tests {
     fn hover_rect_reads_a_real_non_zero_rect_before_anything_has_been_hovered() {
         // Found on a live session, not here: the rect half started nil, a signal resolving to nil
         // means the property is *absent* (ADR-0044 decision 1's amendment), and a tooltip's
-        // `anchor_rect` is required and non-zero (§ 6.3). So every re-resolve refused the popup
+        // `anchor_rect` is required and non-zero (§ 6). So every re-resolve refused the popup
         // until something hovered -- once per capability push, from the first frame.
         let (lua, _dirty) = lua_with_state();
         let rect: mlua::Table = lua.load(r#"return hover_rect("volume"):get()"#).eval().unwrap();

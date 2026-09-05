@@ -1264,7 +1264,7 @@ mod tests {
         // Both of this slice's live bugs were in the state *before* anything is hovered, which the
         // rest of this test walks straight past, so they are pinned here.
         //
-        // `grab` is § 6.3's default `true` unless a popup says otherwise, and a grabbing popup
+        // `grab` is § 6's default `true` unless a popup says otherwise, and a grabbing popup
         // needs an armed input serial that a hover cannot produce -- the tooltip resolved
         // `visible = true` on a real pointer and the compositor refused it on every re-resolve.
         // `anchor_rect` is required and non-zero, and the rect signal started nil, which reads as
@@ -1317,7 +1317,7 @@ mod tests {
                     continue;
                 };
                 // Built here rather than reached for through `crate::wayland::input`, which is
-                // private: the shape is § 6.3's `anchor_rect`, and a wrong one fails the re-resolve
+                // private: the shape is § 6's `anchor_rect`, and a wrong one fails the re-resolve
                 // asserted just below rather than passing quietly.
                 let table = client.lua().create_table().unwrap();
                 table.set("x", rect.x).unwrap();
@@ -1334,7 +1334,7 @@ mod tests {
         assert_eq!(opened_by, 1, "exactly one hover region on the bar opens the battery tooltip");
 
         // And closes again. `anchor_rect` keeps the rect it was last given rather than clearing,
-        // which is what stops § 6.3's non-zero rule failing the evaluation on the way out.
+        // which is what stops § 6's non-zero rule failing the evaluation on the way out.
         let bar = client.scene.surface("bar@TEST").unwrap();
         for write in layout::hover::hover_writes(&bar, None) {
             write.signal.hover_handle().unwrap().set_changed(mlua::Value::Boolean(false));
@@ -1607,7 +1607,7 @@ mod tests {
         let (client, _outbound_rx) = test_client(&missing);
 
         for capability in shared::Capability::ALL.iter().map(|c| c.as_str()) {
-            // `lock` is excluded: § 6.4's node constructor legitimately owns that global.
+            // `lock` is excluded: § 6's node constructor legitimately owns that global.
             if capability == "lock" {
                 continue;
             }
@@ -1679,7 +1679,7 @@ mod tests {
         assert_eq!(dir, "/opt/oblisk-config");
     }
 
-    /// `RendererClient::new` seeds the roster *after* `Loader::new` registered § 6.4's node
+    /// `RendererClient::new` seeds the roster *after* `Loader::new` registered § 6's node
     /// constructors, so seeding `lock` as a bare global would overwrite the constructor -- and a
     /// `set` over an existing global is silent, so the failure would surface as "attempt to call
     /// a userdata value" from the config's own `lock { ... }` line, pointing at the config rather
@@ -1711,7 +1711,7 @@ mod tests {
 
         assert!(run_startup(&mut client), "a config declaring a lock screen must build a scene");
 
-        // The constructor survived: a `lock { ... }` at the root still produced a § 6.4 surface.
+        // The constructor survived: a `lock { ... }` at the root still produced a § 6 surface.
         let setup = r#"
             lock_kind = lock { id = "screen" }.kind
             capability_type = type(oblisk.lock)
@@ -1833,7 +1833,7 @@ mod tests {
     }
 
     /// The write half of the same object: a config's own `on_click` calling the lock action puts
-    /// a real § 7.2 envelope on the outbound channel.
+    /// a real § 7 envelope on the outbound channel.
     #[test]
     fn a_config_calling_the_lock_action_queues_a_command_for_the_supervisor() {
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
@@ -1938,7 +1938,7 @@ mod tests {
         assert!(client.state.pending.is_none());
     }
 
-    /// A lock screen whose `child` holds the one `secure_submit` field § 6.4 needs.
+    /// A lock screen whose `child` holds the one `secure_submit` field § 6 needs.
     fn lock_config(background: &str) -> String {
         format!(
             r##"return {{
@@ -2151,7 +2151,7 @@ mod tests {
 
     #[test]
     fn a_popup_with_a_zero_anchor_rect_fails_the_evaluation_and_names_the_property_in_rescue() {
-        // § 6.3's `anchor_rect` feeds `xdg_positioner::set_anchor_rect`, and a zero size leaves
+        // § 6's `anchor_rect` feeds `xdg_positioner::set_anchor_rect`, and a zero size leaves
         // the positioner incomplete, raising `invalid_positioner` at `get_popup` and killing the
         // whole Wayland connection. A config typo must be a `LayoutError` at evaluation, never a
         // protocol error at runtime, landing in `rescue`'s `error_log` with the property named.

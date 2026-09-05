@@ -1,4 +1,4 @@
-//! The surface-spec envelope: [`LockSpec`] (§ 6.4), the [`SurfaceSpec`] enum every surface role
+//! The surface-spec envelope: [`LockSpec`] (§ 6), the [`SurfaceSpec`] enum every surface role
 //! resolves to and its [`SurfaceFingerprint`] (swap-detection key), the generic child-list parsers
 //! (`parse_single_child`/`parse_children`/`parse_list_children`), and the masked
 //! [`SecureSubmitTarget`] (§ 5.2 item 8). `parse_children`/`parse_list_children` are where a
@@ -13,11 +13,11 @@ use crate::lua::nodes::{VirtualNode, deserialize_lua_table};
 
 use super::*;
 
-/// § 6.4's `lock`: `id` and `child` are its whole property list (ADR-0052 decision 2). `child`
+/// § 6's `lock`: `id` and `child` are its whole property list (ADR-0052 decision 2). `child`
 /// is not a field here for the same reason it is not one on the other three roles:
 /// `layout::scene::children_of` walks it into the retained tree, and a spec carries what Wayland
 /// needs told, not what layout reads. Stays a struct rather than `SurfaceSpec::Lock(String)`:
-/// [`lock_spec`] hangs § 6.4's four refusals off it, which a bare `String` variant could not.
+/// [`lock_spec`] hangs § 6's four refusals off it, which a bare `String` variant could not.
 ///
 /// **No `LockTopology`, for a stronger reason than [`PopupSpec`] has:** a lock surface has *no*
 /// protocol field a config could set. `ext_session_lock_surface_v1` has one request,
@@ -28,7 +28,7 @@ pub struct LockSpec {
     pub id: String,
 }
 
-/// § 6.4's parser: refuses the properties a `lock` does not have, then reads the one it does.
+/// § 6's parser: refuses the properties a `lock` does not have, then reads the one it does.
 ///
 /// Refusing rather than ignoring is the real decision. `visible = false` implies the config
 /// decides when the lock is up, but the compositor creates and destroys lock surfaces itself, at
@@ -43,7 +43,7 @@ pub struct LockSpec {
 /// no-op is still worse than a reported one. The refusals run before `id` is read, so a `lock`
 /// missing both leads with the problem about the role, not the merely missing `id`.
 /// [`is_deferred_signal`] is never consulted either: a refusal tests the *key*, so a `Signal`
-/// under it is refused like a literal, since § 6.4 leaves `lock` no movable property for
+/// under it is refused like a literal, since § 6 leaves `lock` no movable property for
 /// ADR-0049's second amendment to apply to.
 pub fn lock_spec(properties: &HashMap<String, Value>) -> Result<LockSpec, LayoutError> {
     for property in ["visible", "monitor", "anchor", "width", "height"] {
@@ -107,7 +107,7 @@ impl SurfaceSpec {
 /// object (`set_title`, `set_app_id`, the two size hints, see [`WindowSpec`]'s "no
 /// `WindowTopology`" note) or rebuilt per open (`xdg_positioner`, ADR-0049 decision 1), so none of
 /// it can strand a live object the way a changed `namespace` would; a `lock` lands on the same
-/// one field because § 6.4 gives it only `id` and `child` to begin with.
+/// one field because § 6 gives it only `id` and `child` to begin with.
 ///
 /// The three `id` arms still catch ADR-0049 decision 3: adding or removing a declaration is a
 /// topology change for every role, even one whose Wayland object comes and goes inside a
@@ -470,7 +470,7 @@ mod tests {
         }
     }
 
-    /// The other half of the § 6.4 denial, one layer up. A name a `lock` has no row for cannot
+    /// The other half of the § 6 denial, one layer up. A name a `lock` has no row for cannot
     /// reach `lock_spec` at all, so the refusal a config author sees is the property gate's.
     #[test]
     fn a_lock_property_that_is_not_even_on_the_kind_is_refused_before_lock_spec_sees_it() {

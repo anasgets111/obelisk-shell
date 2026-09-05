@@ -39,7 +39,7 @@ pub(crate) struct Namespace {
 /// to cost a D-Bus subscription. The unrostered lazy path in `crate::socket` is unrelated: it is
 /// reached from a `StateSnapshot` rather than from here.
 ///
-/// **One table, so a typo is a Lua error rather than silence.** § 6.4's `lock` node constructor
+/// **One table, so a typo is a Lua error rather than silence.** § 6's `lock` node constructor
 /// owns the global `lock`, and a bare `lock` signal used to silently overwrite it and break every
 /// `lock { ... }` declaration (ADR-0052 decision 1).
 pub(crate) fn build(
