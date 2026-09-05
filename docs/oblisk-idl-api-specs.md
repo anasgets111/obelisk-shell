@@ -1,673 +1,280 @@
-# Oblisk IDL and API specification
-## The Rust-Lua boundary and interface contract
+# Lua API
 
-The strict binary and type boundary between the Rust platform layers (Supervisor and Renderer) and the Lua config environment. Compiler-validated contract for type marshalling, reactive signals, command schemas, and window surface registration.
+This is the config-author reference. [Services](oblisk-supervisor-services-dbus.md) owns backend
+behavior and reload lifetimes; [roadmap](roadmap.md) owns gaps and proposed work;
+[CONTEXT](../CONTEXT.md) owns terminology; [decisions](decisions.md) owns history.
 
----
+Exact capability fields and action names come from Rust types through
+[generated editor stubs](../supervisor/src/stubs.rs), installed by `oblisk init`.
+Keep schema inventories there rather than maintaining a second copy in Markdown.
 
-## 1. Rust-Lua marshalling and type mapping
+## 1. Values and signals
 
-All data crossing the boundary (`mlua` hosting PUC Lua 5.4) maps per the strict, non-coercive rules below. A mismatch fails immediately at construction/execution time; it never degrades silently or panics.
+### 1.1 Config VM
 
-**What the config VM contains.** "Lua 5.4" no longer describes it alone. `coroutine`, `table`, `string`, `utf8`, `math`, and `package` are present in full. `debug` and `ffi` are absent, and `package.loadlib` raises, per mlua's safe mode. `io` is absent and `os` is cut to `time`, `date`, `clock`, and `getenv`: every other call in either library blocks the Wayland event thread, so `process.run` is the non-blocking way to run a command (ADR-0048). A `json` global with a single `decode` function sits on top of the standard set, since a subprocess's output is otherwise a string Lua cannot read (ADR-0057). `package.path` resolves inside the config directory only, as `?.lua` and `?/init.lua`, replacing Lua's default rather than prepending to it, so no system module can shadow the config's own (ADR-0047). A config's own modules drop from `package.loaded` before every re-evaluation, so editing a required file changes what the next reload sees.
+Lua 5.4 provides `coroutine`, `table`, `string`, `utf8`, `math`, and config-local
+`require`. `os` exposes `time`, `date`, `clock`, and `getenv`.
+There is no `io`, `debug`, FFI or native module loading.
+Config modules reload on re-evaluation.
 
-Lua 5.4 detail: `require` returns two values (module, file path) where 5.3 returned one. A call in a table constructor's last position expands to all its values, so `return { require(a), require(b) }` returns three surfaces, the last a string. Bind each `require` to a local first.
+`json.decode(text)` returns a value, or nil and an error string. JSON null maps to Lua nil.
+There is no `json.encode`. Lua 5.4 `require` can return loader data as a second result:
+bind modules to locals before returning a surface array.
 
-### 1.1 Fundamental type mapping table
+Lua-authored scalar signals reject nonfinite numbers, integers outside `[-(2^53-1), 2^53-1]`, and strings
+over 64 KiB. These are scalar checks, not recursive validation of every table.
+Node properties and command arguments have their own parsers.
+See [VM setup](../renderer/src/lua/mod.rs), [JSON conversion](../renderer/src/lua/json.rs),
+[scalar checks](../renderer/src/lua/marshal.rs) and [signal validation](../renderer/src/lua/signal.rs).
 
-| Rust Type | Lua Type | Boundary Mapping Rules & Constraints |
-| :--- | :--- | :--- |
-| `f64` | `number` | Double-precision float. NaN and Inf are rejected. |
-| `i64` / `u64` | `integer` / `number` | Mapped to Lua integer if within `[-2^53 + 1, 2^53 - 1]`. |
-| `String` | `string` | UTF-8 encoded, byte-length limited string (max 64KB). |
-| `bool` | `boolean` | Clean mapping. No type coercion. |
-| `Option<T>` | `T` or `nil` | Maps to its inner type `T` on `Some(T)`, or to Lua `nil` on `None`. |
-| `Vec<T>` | `table` (array) | 1-indexed dense Lua table. Sparse or mixed-type tables are rejected. |
-| `HashMap<String, T>`| `table` (dictionary) | Key-value associative table. Numeric keys in dictionaries are rejected. |
-| `Box<Signal<T>>` | `userdata` (`Signal`) | Opaque C-userdata reference containing a stable pointer to the Rust-owned signal. |
-| `OpaqueHandle` | `userdata` (`ProcessHandle`) | Non-blocking process control handle returning buffered streams and terminating safely. |
+### 1.2 Reactivity
 
-### 1.2 The reactive signal sentinel (`Signal`)
+| Expression | Meaning |
+| :--- | :--- |
+| `signal:get()` | Current value; storing this result does not create a live property |
+| `signal:map(fn)` | Derived signal; keep the callback free of side effects |
+| `computed({signals...}, fn)` | Derived signal with explicit dependencies |
+| `state(name, initial)` | Writable signal; `:set(value)` marks the scene dirty |
+| `oblisk.<capability>:on_change(fn)` | Runs `fn(current, previous)` per pushed snapshot; may invoke actions or write state |
 
-Signals reach Lua as read-only or read-write userdata primitives.
-
-*   **Read-only methods**:
-    *   `signal:get()`: current unwrapped primitive value.
-    *   `signal:map(fn)`: new `Computed` signal from applying Lua `fn` to the parent value.
-    *   `capability:on_change(fn)` (capabilities only): runs `fn(current, previous)` once per pushed `StateSnapshot`, outside any layout pass, with `previous = nil` on the first push. The one place a config reacts to a push rather than rendering it; `fn` may do what an input callback may do (`invoke`, `process.run`, write a `state`). Handlers are re-registered by each evaluation, so a reload does not double them (ADR-0115).
-*   **Computed signals**:
-    *   `computed(dependencies, fn)`: multi-dependency computed signal. `dependencies` must be an array of `Signal`/`Computed` handles.
-    *   `fn` must be side-effect-free. CPU runtime capped at 5ms per evaluation.
-
-**Handles are live; `:get()` results are not.** Wherever a property below accepts `T / Signal`, both spellings are valid Lua and mean different things:
+Pass the signal itself to a node property to keep it live:
 
 ```lua
-text { content = oblisk.mpris.title }         -- live: re-reads whenever the value changes
-text { content = oblisk.mpris.title:get() }   -- frozen: the value at evaluation time, forever
+text { content = oblisk.keyboard.active_layout }
 ```
 
-A handle left in a property resolves at layout time on every pass, so the node follows the signal. A `:get()` result is a plain string indistinguishable from a literal; nothing updates it until the next config edit. Every Supervisor-pushed signal is read-only to Lua, and `signal:set()` names the kind it refused. `state(name, initial)` (§ 5.2) is the one writable kind a config constructs (ADR-0044).
+A capability reads nil until hydrated; maps must handle it. A property resolving to nil uses its
+default. Derived callbacks have a 5 ms CPU budget. Any dirty signal currently triggers scene-wide
+resolution; there is no dependency-based layout invalidation.
 
-**A signal resolving to `nil` means the property is absent**, so the documented default applies rather than the resolution failing. Every capability signal reads `nil` until its first `StateSnapshot`, a state a config sees on every boot, so `content = oblisk.mpris.title` renders the `content` default until the first push. This keeps the two spellings consistent too: a Lua table cannot store `nil`, so `content = nil` is already indistinguishable from omitting `content`.
+Named state survives an in-place reload when its seed is unchanged. Changing a comparable scalar
+seed resets it; fresh table identities do not. It dies with the generation.
+Capability change handlers are cleared and registered again on evaluation.
 
-**Structural properties reject a `Signal` outright**, because they are identities rather than values and an identity does not resolve; `node::resolve_properties` copies them through raw. They are `id`, `hover`, and `scroll` on any kind, and `layer`, `anchor`, `monitor`, `namespace` on a `panel`. The `panel` four are read once per evaluation to decide whether a reload is an in-place update or a generation swap (ADR-0001); a value changing after that decision would move a surface between layers or monitors inside a live generation. `hover`/`scroll` name the signal a handler writes into, so a resolved one would arrive as the value instead of the handle (ADR-0062 decision 3, ADR-0069 decision 4). A `panel`'s other live fields, `keyboard_interactivity`, `exclusive`, `margin`, `width`, `height`, are deliberately not structural: layer-shell permits changing each on a mapped surface.
+## 2. Capability state
 
----
+Read state through `oblisk.<name>`; reading requests backend startup. Started backends remain
+for the Supervisor's lifetime. These links lead to the actual serialized state definitions.
 
-## 2. Core engine signals (read-only state schema)
-
-The active Renderer populates the global `oblisk` state tree with the schema below. No other properties exist in the global space. Every field returns a `Signal` wrapping the indicated inner type.
-
-**Reading a capability is what starts it** (ADR-0070). Nothing runs behind `oblisk.bluetooth` until a config indexes that name: the first read hands back the member and tells the Supervisor to build the controller; every read after is an ordinary table lookup. A config that never mentions a capability never pays for its D-Bus subscription, poll task, or bus-name claim; `return {}` starts nothing.
-
-Two consequences: a capability reads `nil` until its first `StateSnapshot` (this now includes the window between the starting read and the controller's first push, so `:map` must handle `nil`), and a start is one-way, an edit removing the last reader does not stop it until the session ends.
-
-`oblisk.idle` has no member to index; its own methods (`register_threshold`, `inhibit`, `release_inhibit`) send the start. `oblisk.polkit` is on the roster (ADR-0114); reading it, or a `textfield` naming it in `secure_submit` (§ 5.2 item 8), registers the authentication agent.
-
-### 2.1 Keyboard modifier and layout state (`oblisk.keyboard`)
-*   `keyboard.caps_lock`: `boolean` (Active = `true`, inactive = `false`)
-*   `keyboard.active_layout`: `string` (User-friendly active layout name, e.g. `"English (US)"`)
-
-### 2.2 Battery status (`oblisk.battery`)
-Read off UPower's `DisplayDevice`, the composite across every battery on the machine (ADR-0080). No UPower means no report, same as § 2.13's missing power-profiles-daemon.
-
-*   `battery.present`: `boolean` (True if the display device is a battery and reports present. False on a desktop, an answer rather than an absence)
-*   `battery.percent`: `integer` (`0` to `100`, rounded)
-*   `battery.state`: `string` (One of `"Unknown"`, `"Charging"`, `"Discharging"`, `"Empty"`, `"FullyCharged"`, `"PendingCharge"`, `"PendingDischarge"`, UPower's own seven `Device.State` values by name. Replaces a `charging: boolean`, which could not distinguish a held charge limit (`"PendingCharge"`) from running on battery (`"Discharging"`) or from draining to a limit with the cable in (`"PendingDischarge"`); a laptop with `charge_control_end_threshold` set sits in the first most of the day)
-*   `battery.time_to_empty`: `integer` (Seconds until flat, or `nil`. UPower reports `0` while charging and before it has estimated; neither is a duration, so both arrive as `nil`)
-*   `battery.time_to_full`: `integer` (Seconds until full, or `nil`, on the same terms)
-
-### 2.3 Brightness state (`oblisk.brightness`)
-*   `brightness.percent`: `integer` (`0` to `100` percent)
-
-### 2.4 Audio state (`oblisk.audio`) (PipeWire only)
-*   `audio.volume`: `number` (Float representing master output volume, range `[0.0, 1.0]`)
-*   `audio.muted`: `boolean` (Muted = `true`, Unmuted = `false`)
-*   `audio.source_volume`: `number` (The default input device's volume, range `[0.0, 1.0]`, derived as `volume` is; ADR-0116)
-*   `audio.source_muted`: `boolean` (The default input device's mute; ADR-0116)
-*   `audio.sinks`: `table` (Array of output playback audio devices):
-    *   Sink object:
-        *   `id`: `integer` (WirePlumber node ID)
-        *   `name`: `string` (User-friendly description, e.g. `"Built-in Audio Analog Stereo"`)
-        *   `active`: `boolean` (True if this is the active default output route)
-        *   `icon`: `string?` (The node's `device.icon-name` as PipeWire spells it, `"audio-headset-bluetooth"`; a hint for a glyph, absent when the node carries none; ADR-0116)
-*   `audio.sources`: `table` (Array of input recording audio devices):
-    *   Source object:
-        *   `id`: `integer` (WirePlumber node ID)
-        *   `name`: `string` (User-friendly description, e.g. `"Built-in Microphone"`)
-        *   `active`: `boolean` (True if this is the active default input route)
-        *   `icon`: `string?` (As the sink's)
-*   `audio.apps`: `table` (Array of per-application volume mixer playback streams):
-    *   App stream object:
-        *   `id`: `integer` (WirePlumber client playback node ID)
-        *   `name`: `string` (Process/Application name, e.g. `"spotify"` or `"chromium"`)
-        *   `volume`: `number` (Volume level, range `[0.0, 1.0]`)
-        *   `muted`: `boolean` (True if application stream is muted)
-
-### 2.5 Network state (`oblisk.network`) (NetworkManager only)
-*   `network.connected`: `boolean` (True if default gateway interface is active and online)
-*   `network.ssid`: `string` (Connected Wi-Fi SSID, or `"Ethernet"` if wired, or `nil` if offline)
-*   `network.strength`: `integer` (Connected Wi-Fi signal strength percent `[0, 100]`, or `0` if offline)
-*   `network.wifi_enabled`: `boolean` (True if physical Wi-Fi radio is powered on)
-*   `network.networking_enabled`: `boolean` (True if global NetworkManager execution is active)
-*   `network.ethernet_enabled`: `boolean` (True if Ethernet link-carrier is active)
-*   `network.connecting_ssid`: `string` (SSID a `network:connect` is currently attempting, or `nil` when none is in flight)
-*   `network.connect_error`: `string` (Why the last `network:connect` failed, in words fit to draw, or `nil` when the last one worked)
-*   `network.password_ssid`: `string` (SSID whose `network:connect` is waiting on a password, or `nil` when none is. Set only for a secured network with no saved profile -- a saved or open one connects on the click. What a shell binds a `secure_submit` prompt, and its surface's `keyboard_interactivity`, to)
-*   `network.available_networks`: `table` (Array of scanned Wi-Fi access point structures):
-    *   Access Point object:
-        *   `ssid`: `string` (AP name)
-        *   `strength`: `integer` (Signal percentage `[0, 100]`)
-        *   `secure`: `boolean` (True if security key is required)
-        *   `band`: `string` (Frequency group identifier: `"2.4 GHz"`, `"5 GHz"`, or `"6 GHz"`)
-        *   `active`: `boolean` (True if currently associated/active)
-*   `network.connection_details`: `table` (Active IP configurations or `nil`):
-    *   `ip_address`: `string` (e.g. `"192.168.1.15"`)
-    *   `interface`: `string` (e.g. `"wlan0"`)
-    *   `gateway`: `string` (e.g. `"192.168.1.1"`)
-    *   `dns`: `table` (Array of DNS server IP strings)
-
-### 2.6 Bluetooth state (`oblisk.bluetooth`) (BlueZ only)
-*   `bluetooth.enabled`: `boolean` (True if Bluetooth adapter is powered on)
-*   `bluetooth.discovering`: `boolean` (True if background discovery scan is active)
-*   `bluetooth.connected_devices`: `table` (Array of active paired & connected accessories):
-    *   Connected Device object:
-        *   `mac`: `string` (Canonical MAC address, e.g. `"00:1A:7D:DA:71:11"`)
-        *   `name`: `string` (Device name)
-        *   `battery`: `integer` (Device battery percent `[0, 100]`, or `-1` if unsupported/unknown)
-        *   `codec`: `string` (Active negotiated PipeWire audio codec: `"LDAC"`, `"AAC"`, `"SBC"`, or `nil`)
-        *   `category`: `string` (Visual category identifier: `"keyboard"`, `"mouse"`, `"headphones"`, `"headset"`, `"phone"`, `"computer"`, `"generic"`)
-*   `bluetooth.discovered_devices`: `table` (Array of un-paired discovered accessories):
-    *   Discovered Device object:
-        *   `mac`: `string`
-        *   `name`: `string`
-        *   `paired`: `boolean` (Always false for items in this scan pool)
-
-### 2.7 Notifications state (`oblisk.notifications`)
-*   `notifications.feed`: `table` (Array of active notifications received over the D-Bus, capped at 20 entries)
-    *   Notification object structure:
-        *   `id`: `integer` (Unique notification identifier)
-        *   `app_name`: `string` (Calling application name, sanitized/stripped)
-        *   `summary`: `string` (Title, sanitized)
-        *   `body`: `string` (Main message text, sanitized plain text)
-        *   `icon_path`: `string` (Asset path to cached image, or empty)
-
-### 2.8 Media players (`oblisk.mpris`)
-*   `mpris.players`: `table` (Array of active MPRIS playback targets):
-    *   Player object structure:
-        *   `id`: `string` (Unique bus name suffix identifier)
-        *   `identity`: `string` (e.g. `"Spotify"`)
-        *   `play_state`: `string` (`"Playing"`, `"Paused"`, `"Stopped"`)
-        *   `title`: `string` (Track title)
-        *   `artist`: `string` (Track artist)
-        *   `album_art_path`: `string` (Filepath URI pointing to cached image in `/dev/shm`)
-        *   `position`: `integer` (Playback offset in microseconds *at the timestamp of last update*)
-        *   `position_updated_at`: `integer` (Monotonic clock timestamp in microseconds matching the exact instant the position was recorded)
-        *   `length`: `integer` (Total track duration in microseconds)
-        *   `url`: `string` (`xesam:url`, the track's own location; empty when the player publishes none. ADR-0137)
-        *   `desktop_entry`: `string` (`MediaPlayer2.DesktopEntry`, the player's `.desktop` basename; empty when unpublished. The stable name to match an app rule against, where `identity` is a display string. ADR-0137)
-
-### 2.8.1 Telling a video from a song
-
-Not answered here. `url` and `desktop_entry` are the facts; the lists of video applications, video hostnames, music hostnames and file extensions that turn them into a verdict are taste, and live in the config (ADR-0137). `dev-config/oblisk/lib/media.lua` is this repository's own set.
-
-### 2.9 Workspace state (`oblisk.workspaces`)
-Workspace state only. Output geometry lives in `oblisk.screens` (§ 2.15), which reads it from `wl_output` rather than from a compositor adaptor; this section refers to screens by `name` instead of restating their dimensions (ADR-0041).
-
-> **Amended by ADR-0056**, built against niri. `focused_workspace` is present only on the output holding focus, since focus is one workspace across every output and this structure models it per output (decision 4). `is_fullscreen` is not reported: niri-ipc has no such field, and a fabricated `false` would be wrong for exactly the windows a fullscreen check exists to find (decision 5). Each output carries a `workspaces` array, added because the two ids below are opaque and nothing else names which workspaces exist, their names, or their order (decision 3).
->
-> **Amended by ADR-0118**, which adds Hyprland. The shape is unchanged: on Hyprland `id` and `idx` are both the workspace number, `name` is present only for a workspace named something other than its number, and `workspaces:focus(id)` takes the number, so focusing one no workspace has yet creates it. Hyprland's named workspaces (its negative ids above the specials) are not listed. Built to Hyprland's documented IPC and not live-tested.
->
-> **Amended by ADR-0119**, which adds what one compositor has and the other does not, as keys that are absent where the feature is: `compositor` names the session so a config can pick display policy; `special` lists Hyprland's scratchpads and is absent on niri; `is_fullscreen` is reported by Hyprland and absent on niri. `workspaces:toggle_special(name)` joins `focus`.
-
-*   `workspaces.compositor`: `string` (`"niri"` or `"hyprland"`, the session's compositor. For display policy the state does not settle: `dev-config`'s strip pads empty slots to ten on Hyprland, where focusing a number creates the workspace, and not on niri, which keeps a trailing empty workspace itself. ADR-0119)
-*   `workspaces.outputs`: `table` (Array of per-output workspace structures)
-    *   Output structure:
-        *   `name`: `string` (Connector name, e.g., `"eDP-1"`, matching an `oblisk.screens` entry)
-        *   `active_workspace`: `integer` (ID of the workspace currently visible)
-        *   `focused_workspace`: `integer` (ID of the workspace that currently has keyboard focus; absent on every output that does not hold focus, per ADR-0056)
-        *   `workspaces`: `table` (Array of the workspaces on this output, ordered by `idx`; added by ADR-0056)
-            *   Workspace structure:
-                *   `id`: `integer` (Stable, monitor-independent identity; what the two ids above refer to and what `workspaces:focus(id)` takes)
-                *   `idx`: `integer` (1-based position on this output; not stable across a reorder)
-                *   `name`: `string` (The compositor's own name for the workspace, absent when unnamed)
-                *   `populated`: `boolean` (At least one window sits on this workspace; added by ADR-0117)
-                *   `app_id`: `string` (The `app_id` of the window standing for this workspace, the focused one when focus is here and otherwise the compositor's first; absent when the workspace is empty or its windows report none. Added by ADR-0117)
-*   `workspaces.active_client`: `table` (Focused top-level Wayland client window parameters, or `nil` if none focused):
-    *   `title`: `string` (Active window title text, e.g. `"src/main.rs - Neovim"`)
-    *   `class`: `string` (Active window application class name, e.g. `"Alacritty"` or `"firefox"`. A Wayland toplevel has an `app_id`, not a `WM_CLASS`, and that is what this carries)
-    *   `is_floating`: `boolean` (True if marked floating/pinned by compositor)
-    *   `is_fullscreen`: `boolean` (True if window occupies entire display boundary. Absent when the compositor does not report it: niri-ipc has no such field and a fabricated `false` would be wrong for exactly the windows a check looks for (ADR-0056 decision 5); Hyprland reports it, and only its real fullscreen counts, not maximized (ADR-0119))
-*   `workspaces.special`: `table` (Array of the compositor's special workspaces, Hyprland's scratchpads, ordered by `name`. **Absent on a compositor without them**, so `special == nil` hides the control; an empty array means none exist right now. Hyprland lists a special only while it holds a window or is shown. ADR-0119)
-    *   Special workspace structure:
-        *   `name`: `string` (The compositor's full name, `"special:scratch"` or the unnamed `"special"`; what `workspaces:toggle_special(name)` takes)
-        *   `populated`: `boolean` (At least one window sits on it)
-        *   `app_id`: `string` (The `app_id` of its standing window, chosen as a workspace's is; absent when empty)
-        *   `shown_on`: `string` (Connector name of the output currently showing it; absent while hidden. A special shows on one output at a time)
-
-> **One gap.** No per-workspace window list: `populated` and `app_id` (ADR-0117) are the one window a strip draws, not the set, so a config cannot list what runs on a workspace. Listed in `roadmap.md`.
-
-### 2.10 Rescue mode and recovery state (`oblisk.rescue`)
-*   `rescue.is_rescue`: `boolean` (True if the user configuration is broken and Rescue Mode is active)
-*   `rescue.error_log`: `string` (The compiled Lua syntax error or backtrace message)
-
-Covers **reload** failures only: the pre-edit scene stays on screen and the still-running config renders its own error banner. It cannot cover a **startup** failure, since a config that fails its first evaluation has no surfaces and `is_rescue` has nobody to read it; that case runs through a separate Supervisor-spawned process instead (ADR-0046), with no config code involved.
-
-### 2.11 System clock (`oblisk.system`)
-*   `system.time`: `integer` (Reactive system time epoch, updated at 1-second intervals)
-
-> **Persistence moved out (ADR-0136).** `system.state` was a dictionary loaded from a hardcoded `$XDG_STATE_HOME/oblisk/state.json`. A config now declares its own files with `persistent_table` (§ 5.2) and reads them through `oblisk.storage` (§ 2.18), so the path, the file name, the defaults and the number of files are all the config's.
-
-### 2.12 System hardware diagnostics (`oblisk.sysinfo`)
-*   `sysinfo.cpu_percent`: `integer` (`0` to `100` total CPU core utilization, updated per configurable interval)
-*   `sysinfo.ram_percent`: `integer` (`0` to `100` physical memory footprint)
-*   `sysinfo.swap_percent`: `integer` (`0` to `100` swap partition usage)
-*   `sysinfo.temp_cores`: `table` (Array of core temperatures in Celsius, parsed from `/sys/class/hwmon/`)
-*   `sysinfo.temp_gpu`: `integer` (Active GPU temperature in Celsius, `-1` if undetected)
-
-### 2.13 Power profiles and thermals (`oblisk.power`)
-*   `power.active_profile`: `string` (Active scaling profile: `"performance"`, `"balanced"`, `"power-saver"`)
-*   `power.profiles`: `table` (Array of strings representing all hardware profiles supported on host)
-*   `power.on_battery`: `boolean` (True if running on battery power)
-*   `power.energy_rate`: `number` (Active battery discharge or charge rate in Watts, floating-point)
-
-### 2.14 Tray state (`oblisk.tray`) (ADR-0031)
-*   `tray.items`: `table` (Array of registered `StatusNotifierItem` tray icons):
-    *   Tray Item object:
-        *   `id`: `string` (Stable id, the sanitized D-Bus unique name of the registering process, e.g. `"1.234"`)
-        *   `name`: `string` (Display name: `Title`, falling back to `Id` when empty)
-        *   `icon_name`: `string` (Theme icon name, or `nil` if `icon_path` is set instead; exactly one of the two is ever populated)
-        *   `icon_path`: `string` (Asset path to a decoded, bounds-checked PNG spooled to `/dev/shm`, or `nil` if `icon_name` is set instead)
-        *   `tooltip`: `string` (Flattened tooltip title+text, or `nil` if the item has none)
-        *   `status`: `string` (SNI status string, e.g. `"Active"`, `"Passive"`, `"NeedsAttention"`)
-        *   `item_is_menu`: `boolean` (True if this item must show its menu instead of activating on click)
-        *   `menu`: `table` (Array of top-level Menu Item objects, or `nil` if this item has no `com.canonical.dbusmenu` menu):
-            *   Menu Item object:
-                *   `id`: `integer` (DBusMenu-assigned item id, needed for `tray:activate_menu_item`/`tray:menu_will_show`)
-                *   `menu_type`: `string` (`"standard"` or `"separator"`)
-                *   `label`: `string` (Menu entry text, or `nil`)
-                *   `enabled`: `boolean`
-                *   `icon_name`: `string` (Theme icon name, or `nil`)
-                *   `toggle_type`: `string` (`"checkmark"`, `"radio"`, or `nil` if not a toggle entry)
-                *   `toggle_state`: `integer` (DBusMenu's own `-1`/`0`/`1`, or `nil` if not a toggle entry)
-                *   `children`: `table` (Array of nested Menu Item objects, recursive, empty if none)
-
-### 2.15 Screens (`oblisk.screens`) (ADR-0041)
-The connected outputs, read from `wl_output` in the Renderer rather than pushed by the Supervisor. The one signal in § 2 that is not a Supervisor-owned capability: it does not appear in `shared::CAPABILITIES`, needs no compositor adaptor, and is available from a generation's first evaluation. Iterating it is how a config declares one panel per monitor (ADR-0041); it updates on monitor hotplug.
-*   `screens`: `table` (Array of connected output structures)
-    *   Screen structure:
-        *   `name`: `string` (Connector name, e.g. `"eDP-1"`. The value a `panel`'s `monitor` property takes, and the key `oblisk.workspaces` entries refer to)
-        *   `width`: `integer` (Physical pixel width)
-        *   `height`: `integer` (Physical pixel height)
-        *   `scale`: `number` (Fractional scaling factor, e.g. `1.25`)
-        *   `refresh`: `number` (Refresh rate in Hz, or `nil` if the compositor does not report one)
-
-### 2.16 Installed applications (`oblisk.applications`) (ADR-0061)
-The installed `.desktop` entries, enumerated from `$XDG_DATA_HOME/applications` and each `$XDG_DATA_DIRS/applications` in precedence order, first occurrence of a desktop file id wins, so a user's own copy overrides the system one. Entries that are `NoDisplay`, `Hidden`, not `Type=Application`, or missing `Name`/`Exec` are omitted. Scanned once at startup and again on `applications:refresh()`; nothing watches the directories (ADR-0061 decision 4), and a rescan finding no change pushes nothing.
-
-The capability ADR-0054 decision 5 deferred until a caller appeared: enumeration rather than that decision's per-`app_id` lookup, because the launcher that wanted it wants the whole list, and a synchronous lookup has no reply shape on the control socket.
-*   `entries`: `table` (Array of application structures, sorted by `name`)
-    *   Application structure:
-        *   `id`: `string` (Desktop file id, e.g. `"org.gnome.Nautilus"`; a subdirectory becomes a dash, per the desktop entry spec. `launch`'s one argument)
-        *   `name`: `string` (Unlocalized `Name=`. `Name[xx]` is deliberately not read; see ADR-0061's costs)
-        *   `icon`: `string` (The `Icon=` key as written: a theme name or an absolute path. `icon { name = ... }` takes either, ADR-0054 decision 2. `nil` if no `Icon=`)
-*   `by_app_id`: `table` (Map from a toplevel's `app_id` to the same application structure, for a caller holding a window's `app_id` rather than a desktop file id, `workspaces.active_client.class` or a tray item's `Id`. Keyed by exact `StartupWMClass` and exact desktop file id first, then case-folded spellings and the last dot-segment of a reverse-DNS id; an exact key is never displaced by a folded one)
-
-> **No `Exec` field, deliberately.** The parsed command line stays in the Supervisor, reached only through `applications:launch(id)` (ADR-0061 decision 3): a config that could read an argv could assemble a different one before handing it back to run.
-
-### 2.17 Watched folders (`oblisk.files`) (ADR-0120)
-The files in every folder a config asked to follow with `files:watch(path, extensions?)`, listed once and re-listed after each settled burst of inotify events. The config VM has no `io` (ADR-0048), so this is how a picker, a download shelf or a screenshot tray reads a folder. One level, plain files only, hidden entries skipped, sorted by name case-insensitively.
-*   `folders`: `table` (Map from the watched path, trailing slashes stripped, to a folder structure. Absent until the first `watch`)
-    *   Folder structure:
-        *   `ready`: `boolean` (`false` between `watch` and the first listing landing; `true` afterwards, even when `entries` is empty or `error` is set)
-        *   `entries`: `table` (Array of file structures, filtered to the extensions `watch` named)
-            *   `name`: `string` (The file name alone)
-            *   `path`: `string` (The absolute path, what `image.source` takes)
-            *   `modified`: `integer` (Unix epoch seconds of the last modification, `0` when unknown)
-        *   `error`: `string` (Why the last listing produced nothing, or `nil` when it succeeded, so a missing folder reads differently from an empty one)
-
-### 2.18 Declared JSON files (`oblisk.storage`) (ADR-0136)
-Every file a config declared with `persistent_table` (§ 5.2), keyed by the absolute path that declaration joined. The config VM has no `io` (ADR-0048), so this is how a config keeps anything across a restart. Nothing here is hardcoded: `oblisk.config_dir` and `os.getenv` are what a config builds a path from, and two declarations are two files.
-*   `files`: `table` (Map from the absolute file path to the table stored in it. Absent until a `persistent_table` declared it)
-
-> **Read it through the store, not through here.** `store.<key>` (§ 5.2) is a signal over one key of one file. `oblisk.storage` itself is the whole map, useful for `on_change` and little else.
-
----
-
-### 2.19 Capture in progress (`oblisk.privacy`) (ADR-0034, ADR-0137)
-
-Who is using a camera, a microphone, or the screen. Read-only; every list is empty when nothing is in use, which is the whole signal.
-
-*   `privacy.camera_users`: `table` (array of `{ app_name: string }`). Processes holding a `/dev/videoN` open, found by an inotify watch plus a `/proc` fd scan, and named from PipeWire's `Video/Source` nodes where one matches.
-*   `privacy.microphone_users`: `table` (same shape). Apps PipeWire reports as *running* a `Stream/Input/Audio` node. A stream that is open but idle is not here. A monitor capture (`stream.capture.sink`, which is what a visualiser does) is never here.
-*   `privacy.screencast_users`: `table` (same shape). Apps producing a `Stream/Output/Video` node. The name may be the portal rather than the app that asked, and screen recorders on wlr-screencopy never appear at all.
-
-`microphone_users` is not `oblisk.audio`'s `source_muted`: that is a device setting, this is use. A muted microphone with a running capture stream appears in both.
-
-## 3. Command execution protocol (write path)
-
-All state mutations and system actions traverse the private IPC command channel back to the Supervisor. Lua configs invoke these through method calls on imported modules.
-
-### 3.1 Serialization format
-All write actions serialize as JSON-RPC 2.0 payloads over the private Unix socket.
-
-### 3.2 Target command protocols and validations
-
-| Module method | IPC command JSON payload details |
+| Capability | State definition |
 | :--- | :--- |
-| `store:set(key, val)` | `capability: "storage", action: "set", arguments: [path, key, val]`<br>**Validation**: `path` is absolute and was opened by a `persistent_table`; `key` is a non-empty string; `val` is any JSON value, tables included, and `nil` deletes the key. Written 1 second after the last write to that file, pushed immediately (ADR-0136). Replaces `system:write_state`. |
-| `persistent_table { path, name, defaults }` | `capability: "storage", action: "open", arguments: [path, defaults]`<br>**Validation**: `path` is an absolute directory, `name` one file name with no separator, `defaults` a table. Sent by every evaluation; `defaults` fills only keys the file lacks. |
-| `system:find_icon(app_id, name, fallback_name)` | **Not built, not planned as written (ADR-0054 decision 5).** Would return a `string` path via synchronous internal Rust lookup, but the control socket carries only one-way commands and snapshots, with no request/response shape to return a path over. The theme-name half of this lookup lives in the Renderer, reached through `icon.name` (§ 5.2 item 5); the `app_id`-to-`.desktop`-to-`Icon=` half had no caller until an application launcher needed enumeration, not a per-`app_id` lookup. **Built instead as `oblisk.applications`** (§ 2.16, ADR-0061), leaving this signature with no caller and no plan. |
-| `audio:set_volume(vol)` | `capability: "audio", action: "set_volume", arguments: [vol]`<br>**Validation**: `vol` must be a float in range `[0.0, 1.0]`. |
-| `audio:set_muted(bool)` | `capability: "audio", action: "set_muted", arguments: [bool]`<br>**Validation**: `bool` is boolean. |
-| `audio:toggle_mute()` | `capability: "audio", action: "toggle_mute", arguments: []` |
-| `audio:set_default_sink(id)` | `capability: "audio", action: "set_default_sink", arguments: [id]`<br>**Validation**: `id` must be an active Sink Node ID. |
-| `audio:set_default_source(id)` | `capability: "audio", action: "set_default_source", arguments: [id]`<br>**Validation**: `id` must be an active Source Node ID. |
-| `audio:set_source_volume(vol)` | `capability: "audio", action: "set_source_volume", arguments: [vol]`<br>**Validation**: `vol` must be a float in range `[0.0, 1.0]`. The default source, on `set_volume`'s terms (ADR-0116). |
-| `audio:set_source_muted(bool)` | `capability: "audio", action: "set_source_muted", arguments: [bool]`<br>**Validation**: `bool` is boolean. Was a noted hole beside `set_muted`; filled by ADR-0116. |
-| `audio:toggle_source_mute()` | `capability: "audio", action: "toggle_source_mute", arguments: []` |
-| `audio:set_app_volume(id, vol)` | `capability: "audio", action: "set_app_volume", arguments: [id, vol]`<br>**Validation**: `id` is application node ID, `vol` float `[0.0, 1.0]`. |
-| `audio:set_app_muted(id, bool)` | `capability: "audio", action: "set_app_muted", arguments: [id, bool]`<br>**Validation**: `id` is application node ID, `bool` is boolean. |
-| `audio:play_sound(sound)` | `capability: "audio", action: "play_sound", arguments: [sound]`<br>**Validation**: `sound` must be string path or system theme icon name. |
-| `audio:set_event_sounds_enabled(en)` | `capability: "audio", action: "set_event_sounds_enabled", arguments: [en]`<br>**Validation**: `en` must be boolean. |
-| `brightness:set(pct)` | `capability: "brightness", action: "set", arguments: [pct]`<br>**Validation**: `pct` must be an integer in range `[0, 100]`. |
-| `network:set_networking_enabled(en)` | `capability: "network", action: "set_networking_enabled", arguments: [en]`<br>**Validation**: `en` is boolean. |
-| `network:set_wifi_enabled(en)` | `capability: "network", action: "set_wifi_enabled", arguments: [en]`<br>**Validation**: `en` is boolean. |
-| `network:set_ethernet_enabled(en)` | `capability: "network", action: "set_ethernet_enabled", arguments: [en]`<br>**Validation**: `en` is boolean. |
-| `network:scan()` | `capability: "network", action: "scan", arguments: []`<br>**Validation**: Triggers asynchronous AP scanning. |
-| `network:connect(ssid, hidden)` | `capability: "network", action: "connect", arguments: [ssid, hidden]`<br>**Validation**: `ssid` is string. `hidden` is boolean (true for hidden). The password never travels as a Lua argument; it follows as a `secure_submit(network, connect)` (ADR-0005/ADR-0029), and an empty secret means an open network. |
-| `network:cancel_connect()` | `capability: "network", action: "cancel_connect", arguments: []`<br>**Validation**: Drops any pending connect intent and clears `password_ssid`/`connect_error`. The way out of a password prompt; does not abort an activation already in flight. |
-| `network:forget(ssid)` | `capability: "network", action: "forget", arguments: [ssid]`<br>**Validation**: Deletes NM profile. |
-| `bluetooth:set_enabled(en)` | `capability: "bluetooth", action: "set_enabled", arguments: [en]`<br>**Validation**: `en` is boolean. |
-| `bluetooth:start_discovery()` | `capability: "bluetooth", action: "start_discovery", arguments: []` |
-| `bluetooth:stop_discovery()` | `capability: "bluetooth", action: "stop_discovery", arguments: []` |
-| `bluetooth:pair(mac)` | `capability: "bluetooth", action: "pair", arguments: [mac]`<br>**Validation**: `mac` is string. |
-| `bluetooth:connect(mac)` | `capability: "bluetooth", action: "connect", arguments: [mac]`<br>**Validation**: `mac` is string. |
-| `bluetooth:disconnect(mac)` | `capability: "bluetooth", action: "disconnect", arguments: [mac]`<br>**Validation**: `mac` is string. |
-| `bluetooth:forget(mac)` | `capability: "bluetooth", action: "forget", arguments: [mac]`<br>**Validation**: Removes pairing profile in BlueZ. |
-| `bluetooth:set_audio_codec(mac, c)` | `capability: "bluetooth", action: "set_audio_codec", arguments: [mac, c]`<br>**Validation**: `c` is `"LDAC"`, `"AAC"`, or `"SBC"`. |
-| `notifications:dismiss(id)` | `capability: "notifications", action: "dismiss", arguments: [id]`<br>**Validation**: `id` is integer. |
-| `notifications:invoke_action(id, key)` | `capability: "notifications", action: "invoke_action", arguments: [id, key]`<br>**Validation**: `id` is integer, `key` is a non-empty string the notification actually declared -- one of its `actions[].key`, or `"default"` when `has_default_action`. Emits `ActionInvoked(id, key)` and then removes the notification, unless the sender set `hints["resident"]`. An undeclared key is a logged no-op, since the sending application could not interpret it either. ADR-0090. |
-| `notifications:hold_expiry(seconds)` | `capability: "notifications", action: "hold_expiry", arguments: [seconds]`<br>**Validation**: `seconds` is a non-negative integer, clamped to 300. Stops every pending expiry countdown for that long, so nothing vanishes while it is being read or replied to; `0` releases the hold at once. Time already served is banked, so a notification held at 2s of 5 has 3s left when the hold lapses. A deadline rather than a paused/resumed flag, so a config that never releases one cannot pin the feed for the session. ADR-0094. |
-| `mpris:send_command(id, cmd)`| `capability: "mpris", action: "control", arguments: [id, cmd]`<br>**Validation**: `cmd` is `"play"`, `"pause"`, `"play_pause"`, `"next"`, `"previous"`. |
-| `mpris:seek(id, pos_us)` | `capability: "mpris", action: "seek", arguments: [id, pos_us]`<br>**Validation**: Sets track position to absolute microseconds. |
-| `mpris:seek_relative(id, off)`| `capability: "mpris", action: "seek_relative", arguments: [id, off]`<br>**Validation**: Shifts current playback by relative microseconds `off`. |
-| `oblisk.idle:register_threshold(sec, on_idle, on_resume)` | `capability: "idle", action: "register", arguments: [sec]`<br>**Validation**: `sec` is integer, both callbacks are Lua functions taking no arguments. The Renderer holds the callbacks and matches an inbound `IdleEvent` by `threshold_sec`. Dropped on every re-evaluation of `shell.lua`, so register at the top level, not inside a repeatedly-firing callback. `oblisk.idle` is methods only, no signal: a threshold crossing is an event, not state (ADR-0032). |
-| `oblisk.idle:inhibit(reason)` | `capability: "idle", action: "inhibit", arguments: [reason]`<br>**Validation**: `reason` is a string, shown by `loginctl list-inhibitors`. Counted per generation; two holders need two releases. |
-| `oblisk.idle:release_inhibit()` | `capability: "idle", action: "release_inhibit", arguments: []`<br>**Validation**: None. Releases one hold, not every hold. A release with no matching `inhibit` is a no-op. |
-| `oblisk.lock:lock()` | `capability: "lock", action: "lock", arguments: []`<br>**Validation**: None. Asks the Supervisor to lock the session; it commands the Renderer, which holds `ext_session_lock_v1` (ADR-0042). Refused if the config declares no § 6.4 `lock` surface, reported through `rescue` (ADR-0052). **Deliberately no `unlock` action**: the lock screen's own tree is Lua running while it is the only thing on the glass, so one would be a click-through past PAM; the only unlock is the Supervisor's, on a successful `secure_submit(lock, authenticate)`. Spelled `oblisk.lock:invoke("lock")` for now, the `capability:action(...)` sugar this table uses elsewhere is not yet built. |
-| `oblisk.applications:refresh()` | `capability: "applications", action: "refresh", arguments: []`<br>**Validation**: None. Rescans the applications directories off-thread and pushes a new `StateSnapshot` only if the result differs. Cheap to call on every launcher open, which `dev-config` does instead of watching the directories (ADR-0061 decision 4). |
-| `oblisk.applications:launch(id)` | `capability: "applications", action: "launch", arguments: [id]`<br>**Validation**: `id` must be an `entries[].id` from the current snapshot; an unknown id is logged and nothing spawned. Runs the entry's own `Exec=`, detached and in its own process group, so a generation swap does not reap it and no pipe is held (unlike `process.run`, ADR-0026). `Terminal=true` wraps in `$TERMINAL -e`, refused with a log line if `$TERMINAL` is unset. |
-| `oblisk.applications:open_url(url)` | `capability: "applications", action: "open_url", arguments: [url]`<br>**Validation**: `url` is a string under 2048 bytes with no whitespace or control character, whose scheme is `http`, `https` or `mailto`; anything else is logged and nothing spawned -- `file:` in particular, since a URL out of a notification body is the sender's text. Hands it to `xdg-open`, detached like `launch`, so the user's own default handler opens it. ADR-0103. |
-| `oblisk.files:watch(path, extensions?)` | `capability: "files", action: "watch", arguments: [path, extensions?]`<br>**Validation**: `path` is an absolute folder path; `extensions`, when given, is an array of strings without the dot, matched case-insensitively (`{ "jpg", "png" }`), and absent means every file. Lists the folder and follows it through inotify until `unwatch` (ADR-0120). A repeat call with the same filter re-pushes the held listing; a different filter starts over. |
-| `oblisk.files:unwatch(path)` | `capability: "files", action: "unwatch", arguments: [path]`<br>**Validation**: `path` is an absolute folder path. Stops following it and drops it from `folders`; a path never watched is a no-op. |
-| `wallpaper:set(mon, path, fit, anim, dur)` | **Superseded by ADR-0055. No `wallpaper` capability, none planned.** A wallpaper is an `image` node on a config-declared `Background` panel: `mon` is the output name `child = function(output)` hands the panel per instance (ADR-0121), `path` is `image.source`, `fit` is `image.fit`, and a runtime change is `store:set` on a key the source reads back, which is what makes it persist (ADR-0136). `anim` and `dur` have nowhere to go: the engine has no animation model (`roadmap.md`). |
-| `workspaces:focus(id)` | `capability: "workspaces", action: "focus", arguments: [id]`<br>**Validation**: `id` must be an integer. Focuses target workspace. On Hyprland `id` is the workspace number and a number no workspace has yet creates one (ADR-0118). |
-| `workspaces:toggle_special(name)` | `capability: "workspaces", action: "toggle_special", arguments: [name]`<br>**Validation**: `name` is a non-empty string, a `special[].name`. Shows the special workspace on the focused output, or hides it if shown; a name no special has creates one, which is how a scratchpad is first opened. Logged and ignored on a compositor whose payload has no `special` key (ADR-0119). |
-| `rescue:reload_config()` | `capability: "rescue", action: "reload_config", arguments: []`<br>**Validation**: Runs compiler pass on `shell.lua` and reloads Renderer if valid. |
-| `sysinfo:configure(cfg)` | `capability: "sysinfo", action: "configure", arguments: [cfg]`<br>**Validation**: `cfg` is dictionary containing integers `cpu_interval`, `ram_interval`, `temp_interval` in seconds. An interval of `0` suspends the matching monitor thread. |
-| `power:set_profile(p)` | `capability: "power", action: "set_profile", arguments: [p]`<br>**Validation**: `p` is string matching active host profiles. |
-| `process.run(cmd, args, out_cb, exit_cb)`| *Internal non-blocking shell fork* returning `ProcessHandle`. <br>**Validation**: `cmd` is string, `args` array table of strings, callbacks are Lua functions. <br>**Callbacks**: `out_cb(line, stream)` where `stream` is `"stdout"` or `"stderr"`, so both streams reach one callback and a caller wanting only one branches on it. `exit_cb(code)` where `code` is `nil` if a signal killed the process rather than it exiting. |
-| `json.decode(text)` | *Pure function, no IPC.* Returns the decoded value, or `nil` plus a message string on malformed input (ADR-0057). <br>**Validation**: `text` is a string; non-UTF-8 bytes are reported as a decode error rather than raised. |
-| `tray:activate(id, x, y)` | `capability: "tray", action: "activate", arguments: [id, x, y]`<br>**Validation**: `id` is string, `x`/`y` are integers. No-ops (does not call the real `Activate`) when the item's `item_is_menu` is `true` (ADR-0031). |
-| `tray:activate_menu_item(id, menu_item_id)` | `capability: "tray", action: "activate_menu_item", arguments: [id, menu_item_id]`<br>**Validation**: `id` is string, `menu_item_id` is integer matching a `menu[].id` from `tray.items`. |
-| `tray:menu_will_show(id, submenu_id)` | `capability: "tray", action: "menu_will_show", arguments: [id, submenu_id]`<br>**Validation**: `id` is string, `submenu_id` is integer. Fires DBusMenu's `AboutToShow` and refreshes `tray.items[].menu` before Lua renders it, required for correctness with apps that populate submenus lazily (ADR-0031). |
+| `keyboard` | [Layout, lock LEDs and backlight](../supervisor/src/capabilities/keyboard/controller.rs) |
+| `battery` | [Composite battery and estimates](../supervisor/src/capabilities/battery/controller.rs) |
+| `brightness` | [Backlight percentage](../supervisor/src/capabilities/brightness/controller.rs) |
+| `audio` | [Devices, defaults and app mixer](../supervisor/src/capabilities/audio/mixer/state.rs) |
+| `network` | [Connection, scan and credential-request state](../supervisor/src/capabilities/network/mod.rs) |
+| `bluetooth` | [Adapter and device state](../supervisor/src/capabilities/bluetooth/mod.rs) |
+| `notifications` | [Feed, spans, actions and DND](../supervisor/src/capabilities/notifications/mod.rs) |
+| `mpris` | [Player metadata and position](../supervisor/src/capabilities/mpris/player.rs) |
+| `workspaces` | [Per-output workspaces and active client](../supervisor/src/capabilities/workspaces/controller.rs) |
+| `system` | [Clock](../supervisor/src/capabilities/system/controller.rs) |
+| `sysinfo` | [CPU, memory and temperatures](../supervisor/src/capabilities/sysinfo/controller.rs) |
+| `power` | [Profiles and energy state](../supervisor/src/capabilities/power/controller.rs) |
+| `tray` | [Items](../supervisor/src/capabilities/tray/item.rs) and [menus](../supervisor/src/capabilities/tray/menu.rs) |
+| `applications` | [Desktop entries and app-ID index](../supervisor/src/capabilities/applications/controller.rs) |
+| `files` | [Watched directory listings](../supervisor/src/capabilities/files/controller.rs) |
+| `storage` | [Declared JSON files](../supervisor/src/capabilities/storage/controller.rs) |
+| `privacy` | [Camera, microphone and screencast users](../supervisor/src/capabilities/privacy/controller.rs) |
+| `idle` | [Inhibition and external holders](../supervisor/src/capabilities/idle/state.rs) |
+| `lock` | [Lock/authentication state](../supervisor/src/capabilities/lock/mod.rs) |
+| `polkit` | [Authentication challenge](../supervisor/src/capabilities/polkit.rs) |
+| `updates` | [Checks, packages and install progress](../supervisor/src/capabilities/updates/controller.rs) |
 
-### 3.3 The non-blocking process control handle (`ProcessHandle`)
-`process.run` yields an opaque `ProcessHandle` to Lua:
-*   `process_handle:kill()`: Terminates the child process and its entire Unix process group cleanly (`SIGTERM`, escalating to `SIGKILL` if it persists). Prevents orphaned processes.
+Renderer-owned members are separate: `oblisk.rescue` carries `is_rescue` and `error_log` for reload
+failures; `oblisk.screens` carries output information. `oblisk.version` is a plain `{ major, minor, patch }`
+table; `oblisk.config_dir` is the loaded config directory path. See [namespace](../renderer/src/lua/namespace.rs)
+and [output state](../renderer/src/wayland/output.rs).
 
-> **`json.decode` is built (ADR-0057).** `out_cb` handed Lua a string Lua could not read, putting `nvtop -s`, `lsblk --json`, `busctl --json=short`, `niri msg -j`, and any `curl` fetch out of reach. A pure-Lua decoder in the config was rejected: the engine has converted JSON to Lua since Phase 19 item 16, since every capability payload arrives as a `serde_json::Value` and both `serde_json` and `mlua`'s `serde` feature were already compiled in, so a second decoder in Lua would just disagree with the first about `null`. `json.decode` is one function on that same mapping.
+## 3. Actions and I/O
 
-`json.decode(text)` returns the decoded value, or `nil` plus a message string. See ADR-0057 for the return convention and `json.decode`'s doc comment in `renderer/src/lua/json.rs` for what `null` maps to. Deliberately no `json.encode`.
+### 3.1 Calling a capability
 
-`out_cb` fires once per line with the newline stripped, so a pretty-printed document arrives in pieces: accumulate in `out_cb`, decode in `exit_cb`. Nothing in the shipped config decodes JSON today.
-
----
-
-## 4. The window surface lifecycle and input grab handshake
-
-`shell.lua` decides what surfaces exist. Every `surface` node it returns (§ 6.1) maps to one
-`zwlr_layer_surface_v1` per output it targets, with its own layer, anchors, namespace, exclusive
-zone, and keyboard interactivity. Surfaces are created, unmapped, and destroyed at runtime as the
-evaluated topology changes; the Renderer owns no surface the config did not ask for (ADR-0038).
-
-A config may still put every popup, OSD, and modal inside one fullscreen transparent surface (the
-default config does); that is a configuration idiom, not an engine rule. A launcher needing
-`keyboard_interactivity = "Exclusive"` while a volume OSD stays click-through needs two surfaces,
-since both fields are per surface in the layer-shell protocol.
-
-```text
-Renderer (Lua VM)                          Renderer (Rust Engine)                Wayland Compositor
-       │                                            │                                     │
-       │                                            │─── eglCreateWindowSurface() ───────▶│
-       │                                            │─── zwlr_layer_surface::set_size() ─▶│ (One per declared surface)
-       │                                            │                                     │
-       │─── Toggle Modal (visible=true) ───────────▶│                                     │
-       │                                            │─── Set Bounding Box Input Region ──▶│ (Updates input region)
-       │                                            │                                     │ (Captures click focus)
-       │─── Toggle Modal (visible=false) ──────────▶│                                     │
-       │                                            │─── Clear Input Region (Empty) ─────▶│ (Input passes through)
+```lua
+oblisk.audio:invoke("set_volume", 0.5)
+oblisk.applications:invoke("launch", app_id)
 ```
 
-1.  **Surface setup**: the Renderer evaluates `shell.lua`, reads the surface topology from the returned nodes, and registers one layer surface per `(surface, output)` pair with the compositor. Evaluation happens before binding, matching the Candidate's own ordering in `oblisk-supervisor-services-dbus.md` § 15.2.
-2.  **Input region manipulation**: applies to any surface whose visible content is smaller than the surface itself. Load-bearing for a fullscreen transparent surface, a no-op for a tightly-sized bar.
-    *   A surface with no visible content has an empty input region; pointer clicks bypass it entirely and reach background application windows.
-    *   When the Lua config toggles a child's visibility (a volume OSD, a dropdown notification card), the Renderer recomputes the region and calls `wl_surface::set_input_region` on that surface with only those bounds. The region is what the tree draws and what it can click (ADR-0109): a visible node with a background, a border, or any text, icon, image or field claims its box, as does a `button` with an `on_click`; a transparent container claims nothing of its own and its children are scanned instead. So a full-surface transparent `column` holding two cards yields the two cards, and the space between them is click-through.
-    *   Clicks inside the bounds route to Lua callbacks (`on_click`); clicks outside pass through.
+Arguments follow the action name. There is no `capability:action(...)` sugar and no synchronous
+result from `invoke`; observe capability state for outcomes. Unknown actions and malformed
+arguments are logged and dropped by dispatch.
 
----
+### 3.2 Action arguments
 
-## 5. Declarative UI node primitives (the AST contract)
+Positional arguments validated by capability dispatch. Read-only capabilities have no actions.
 
-The Rust scene-graph engine parses layout trees built from sugar constructors. To keep the engine product-neutral, **no visual compound components** are written in Rust; only the geometric nodes below are defined.
+| Capability | Actions |
+| :--- | :--- |
+| `audio` | `set_volume(volume)`, `set_muted(bool)`, `toggle_mute()`, `set_default_sink(id)`, `set_default_source(id)`, `set_source_volume(volume)`, `set_source_muted(bool)`, `toggle_source_mute()`, `set_app_volume(id, volume)`, `set_app_muted(id, bool)` |
+| `brightness` | `set(percent)` |
+| `keyboard` | `set_backlight(percent)`, `switch_layout(index)` |
+| `network` | `set_networking_enabled(bool)`, `set_wifi_enabled(bool)`, `set_ethernet_enabled(bool)`, `scan()`, `connect(ssid, hidden)`, `cancel_connect()`, `forget(ssid)` |
+| `bluetooth` | `set_enabled(bool)`, `start_discovery()`, `stop_discovery()`, `pair(mac)`, `connect(mac)`, `disconnect(mac)`, `forget(mac)` |
+| `notifications` | `dismiss(id)`, `invoke_action(id, key)`, `reply(id, text)`, `set_sound(urgency, path)`, `set_dnd(bool)`, `hold_expiry(seconds)` |
+| `mpris` | `control(id, command)`, `seek(id, position_us)`, `seek_relative(id, offset_us)` |
+| `workspaces` | `focus(id)`, `toggle_special(name)` |
+| `applications` | `refresh()`, `launch(id)`, `open_url(url)` |
+| `files` | `watch(path, extensions?)`, `unwatch(path)` |
+| `sysinfo` | `configure({ cpu_interval?, ram_interval?, temp_interval? })` |
+| `updates` | `check()`, `configure({ interval, checked_at? })`, `install()` |
+| `power` | `set_profile(name)` |
+| `tray` | `activate(id, x, y)`, `secondary_activate(id, x, y)`, `scroll(id, delta, orientation)`, `menu_will_show(id, submenu_id)`, `activate_menu_item(id, menu_item_id)` |
+| `lock` | `lock()` |
+| `polkit` | `cancel()` |
 
-### 5.1 The abstract node base class table
+Device, player, app, tray and notification targets use snapshot IDs.
+Volumes use 0–1; percentages use 0–100; layout indices are zero-based.
+MPRIS commands accept `play`, `pause`, `play_pause`, `next`, `previous`; seeks take microseconds.
+File watches take an absolute directory path and optional dot-free extensions.
+Authentication for `lock` and `polkit` uses native secure submission instead of action arguments.
 
-Every node schema contains the base layout properties below.
+### 3.3 Dedicated APIs
 
-A node takes the properties its kind has a row for, and no others; an unrecognized name is refused when the node is read, naming what that kind does accept (`aling_v = "Center"` used to be copied through and read by nothing, so the node silently failed to centre). The same rule puts § 6.1's `layer` out of reach of a `rect`. The four § 6 surface roles take every § 5.1 base property and paint like a `rect`, so they accept `background`, `radius`, `border_color`, and `border_width` too.
+| API | Contract |
+| :--- | :--- |
+| `oblisk.idle:register_threshold(seconds, on_idle, on_resume)` | Register inactivity callbacks; reset on re-evaluation |
+| `oblisk.idle:inhibit(reason)` / `release_inhibit()` | Acquire/release one generation-owned hold on logind idle inhibition |
+| `persistent_table { path, name, defaults }` | Absolute directory and filename; defaults fill missing keys |
+| `store.key` / `store:set(key, value)` | Live key signal / write; nil deletes a key; `set` is reserved |
+| `process.run(cmd, args, out_cb, exit_cb)` | Spawns a process group; streams lines to `out_cb(line, stream)`; calls `exit_cb(code)`; returns `{ kill() }` |
 
-Any property here or in § 5.2 accepts a `Signal` handle in place of a literal, except the structural ones § 1.2 lists and the `on_*`/`itemfn`/`key` callbacks, where a resolved `Signal` is refused for not being a function. The engine resolves the handle once per pass and applies that property's normal rules to the result, so a `Signal` returning `"Fill"` is a valid `width` and one returning a table is the same error a literal table would be (ADR-0044). The rows below name `Signal` on only some properties; `lua-meta` spells it on every union that takes one and is the authority, since that is what the language server checks a config against (ADR-0081).
+See [idle wrapper](../renderer/src/lua/idle.rs), [store wrapper](../renderer/src/lua/store.rs) and [process API](../renderer/src/lua/process.rs).
+Persistence debounce and process group reaping belong to [services](oblisk-supervisor-services-dbus.md).
 
-| Property Name | Type | Valid Range / Options | Layout Engine Interpretation |
-| :--- | :--- | :--- | :--- |
-| `width` | `integer` / `string` | `[0, 8192]` or `"Fill"` | Explicit width or fill maximum available space. |
-| `height` | `integer` / `string` | `[0, 8192]` or `"Fill"` | Explicit height or fill maximum available space. |
-| `margin` | `table` | `{ top, right, bottom, left }` | Outer spacing boundaries. |
-| `padding` | `table` | `{ top, right, bottom, left }` | Inner spacing boundaries. |
-| `align_h` | `string` | `"Start"`, `"Center"`, `"End"`, `"Stretch"` | Horizontal alignment distribution. |
-| `align_v` | `string` | `"Start"`, `"Center"`, `"End"`, `"Stretch"` | Vertical alignment distribution. |
-| `visible` | `boolean` / `Signal` | `true`, `false`, or binary signal | Determines if the node enters constraint and paint passes. |
-| `opacity` | `number` / `Signal` | `[0, 1]`, defaults to `1` | How much of this node and its subtree reaches the screen. Inherited multiplicatively: a child inside a node at `0.5` can be fainter but never more solid, so fading a whole panel is one property. Refused outside the range rather than clamped, so `opacity = 50` meaning percent fails the apply. Distinct from `visible = false`: a node at `0` still lays out, still occupies space in its parent's flow, and still takes pointer events. |
-| `cursor` | `string` / `Signal` | A CSS cursor name: `"default"`, `"pointer"`, `"text"`, `"not-allowed"`, `"grab"`, `"grabbing"`, `"move"`, `"crosshair"`, `"wait"`, `"progress"`, `"help"`, the resize edges (`"ew-resize"`, ...) | The shape the pointer takes over this node (ADR-0107). Omitted means the node decides by what it is: a `button` with an `on_click` and a link's own words are `"pointer"`, a `textfield` is `"text"`, everything else the arrow. The innermost node under the pointer that says anything wins, an explicit value ahead of an implied one, so a `cursor` on a card still yields to a link inside it. An unknown name fails the pass. Sent as `wp_cursor_shape_v1` when the compositor has it, painted from the XCursor theme through `wl_shm` otherwise. |
-| `id` | `string` | Unique among siblings | Optional reconciliation hint. Matches this node to its previous self across a re-resolve, so leases and named state follow the right node when siblings are inserted or removed. Scoped to the parent, so a reusable module may carry the same ids in every instantiation. Not addressable from Lua and has no effect on layout or paint (ADR-0045). |
+## 4. Surface lifecycle
 
-### 5.2 Specific geometric node schemas
+A config returns a surface declaration or an array of them. An empty return is valid.
+The declared set is fixed for a generation; `visible` toggles mapping without destroying surfaces.
+Topology changes, output hotplug and failure handling belong to
+[services](oblisk-supervisor-services-dbus.md#14-reload-lifecycle).
 
-#### 1. `rect`
-A flexible rectangular element: a containment box or a solid drawing shape, depending on whether it has children.
-*   `background`: `string` (Hex-color `#RRGGBB` or `#RRGGBBAA`. Strict: `#` required, only 6 or 8 hex digits, no 3-digit shorthand, no named colors. Omitted means no fill, distinct from `#00000000`: the first draws nothing, the second a fully transparent rectangle)
-*   `radius`: `integer` (Corner rounding radius. Defaults to `0`)
-*   `border_color`: `string` / `table` (Hex-color or `{ top, right, bottom, left }`. A bare string applies to all four edges. No default color: an edge paints only where both a color and a non-zero width say so, so `border_width` alone paints nothing, and so does a table omitting that edge; this is normal, not an error, for a shared style table that sets width and conditions color)
-*   `border_width`: `integer` / `table` (Thickness in logical pixels or `{ top, right, bottom, left }`. A bare number applies to all four edges. Defaults to `0`, so `border_color` alone paints nothing)
-*   `clip`: `string` (`"Box"` or `"Rounded"`, what this node cuts its children to. `"Box"` (default): its own rectangle, square corners, whatever `radius` says. `"Rounded"` uses `radius` instead, so an overflowing child is cut by the same arc the fill draws. Opt-in rather than implied by `radius`, since it costs an offscreen render pass where a square clip is a free GPU scissor rectangle; QML draws the same line, with `Item.clip` and a separate `ClippingRectangle` for the rounded case)
-*   `children`: `table` (Optional dense array of child nodes. Present: a layout parent container. Omitted: a static childless leaf shape, e.g. a progress bar or background spacer)
+## 5. UI nodes
 
-> **No gradient, no shadow.** `background` takes one flat colour. Both are cheap to add: femtovg 0.26, this workspace's only drawing dependency, already ships `Paint::linear_gradient`/`radial_gradient`/`box_gradient` and a Canvas-2D shadow model, so the work is parsers and rows, not rendering. Backdrop blur is separate and harder. Gradient came off the list, the reference config uses none across 129 files; shadow stands on 16 uses across 7. Blur is in `roadmap.md`.
+### 5.1 Shared properties
 
-#### 2. `row`
-Arranges children horizontally.
-*   `spacing`: `integer` (Pixels of space between siblings)
-*   `children`: `table`
+Only names in the [node allowlist](../renderer/src/lua/nodes.rs) are accepted.
+Properties can carry signals except structural identity/topology fields.
+The `hover` and `scroll` properties take dedicated handles; signals inside nested property
+tables do not resolve, so derive the whole table instead.
 
-#### 3. `column`
-Arranges children vertically.
-*   `spacing`: `integer`
-*   `children`: `table`
+| Property | Values / behavior |
+| :--- | :--- |
+| `width`, `height` | Number of logical pixels, `"Fill"`, or `"NN%"`; omit for content sizing. `"Content"` is not a literal |
+| `max_width`, `max_height` | Numeric size ceilings |
+| `padding`, `margin` | Number or `{ top, right, bottom, left }`; unspecified edges are zero |
+| `align_h`, `align_v` | `"Start"`, `"Center"`, `"End"`, `"Stretch"` |
+| `visible` | Boolean; false removes the node from layout and paint |
+| `opacity` | 0–1, default 1; inherited multiplicatively. Zero still occupies space and takes input |
+| `id` | Optional identity unique among siblings; unidentified siblings match positionally |
+| `cursor` | CSS cursor name; innermost explicit/default cursor wins |
+| `hover` | Handle from `hover(name)` |
+| `on_hover` | `function(inside)` on hover edges |
 
-#### 4. `text`
-Draws shaped unicode glyph text via `cosmic-text`.
-*   `elide`: `string` / `Signal` (`"None"` or `"End"`. `"End"` drops trailing characters until the run plus a single-character ellipsis fits the box; a no-op when it already fits or the box is `Content`-sized. Under `wrap = "Word"` it applies to the last line kept rather than to the whole run. Defaults to `"None"`, leaving the clip to cut the run mid-glyph. Only `"End"` exists: QML also elides head and middle, the reference config uses neither, and a middle elide splits a character budget across two runs)
-*   `wrap`: `string` / `Signal` (`"None"` or `"Word"`. `"Word"` breaks an over-wide run onto further lines at a word boundary, falling back to a glyph boundary for a single word wider than the box. Defaults to `"None"`: one line, however long. A `Content`-sized box has no width to break against, so wrapping needs an explicit `width`, a `"Fill"`, or a stretched cross axis. ADR-0089)
-*   `max_lines`: `integer` / `Signal` (How many lines `wrap = "Word"` may use, counted before `elide` rewrites the last one. `0` and absent both mean no limit, so an expander is `max_lines = expanded:map(function(e) return e and 0 or 2 end)`; a negative is an error. Ignored without `wrap`, since an unwrapped run has one line to begin with)
-*   `text_align`: `string` (`"Start"`, `"Center"`, or `"End"`: where the glyph run sits inside the box, distinct from `align_h`, where the node sits inside its parent. Defaults to `"Start"`. Only visible when the box is wider than the text)
-*   `content`: `string` / `TextRun[]` / `Signal` (Text to display. Defaults to `""`, so a `text` bound to a capability signal renders empty until that signal's first push rather than rejecting the tree at boot, ADR-0044. An array of runs `{ text, bold?, italic?, underline?, color? }` is joined into one paragraph that wraps and elides as a whole, each run drawn in its own face, rule and colour; the shape is a notification body span's minus `kind` and `href`, ADR-0104)
-*   `font_size`: `integer` (Defaults to `12`)
-*   `foreground`: `string` (Hex-color, same strict form as `rect.background`. Defaults to opaque white)
+Sizes and maximum sizes accept 0–8192 logical pixels. See
+[geometry parsing](../renderer/src/layout/node/style.rs).
 
-#### 5. `icon`
-Draws a system SVG/PNG icon.
-*   `name`: `string` / `Signal` (Theme name, e.g. `"audio-volume-high"`. An absolute path is used as that path instead, the same rule a `.desktop` file's `Icon=` follows, letting § 2.14's tray pass whichever of `icon_name`/`icon_path` it populated without branching. Resolved in the Renderer, ADR-0054)
-*   `size`: `integer` (Bounding box diameter. Defaults to `12`, matching `text`'s `font_size`, for the same boot reason as `content`)
+Boxes, rows, columns, buttons and surface roots also accept `background`, `radius`,
+`border_color`, `border_width` and `clip`.
+Colours use `#RRGGBB` or `#RRGGBBAA`. Borders may specify per-edge colours/widths;
+an edge needs both. `clip = "Box"` is the default; `"Rounded"` clips children with the radius.
+See [paint parsing](../renderer/src/layout/node/paint_style.rs).
 
-#### 5a. `image`
-Draws a file. Added by ADR-0054 decision 3: album art has an aspect ratio and a wallpaper is not an icon by any reading.
-*   `source`: `string` / `Signal` (Absolute path. Never a theme name; that is `icon`'s job)
-*   `fit`: `string` (`"cover"` scales to fill and crops, `"contain"` fits inside, `"stretch"` ignores aspect ratio. Defaults to `"cover"`)
-*   `async`: `boolean` / `Signal` (Default `false`: the file decodes inside the frame that first draws it, so that frame is whole. `true` decodes on a worker pool and draws nothing until the pixels land, then repaints, going through the freedesktop thumbnail cache on the way, reading a current thumbnail instead of the file and leaving one behind after a full decode, ADR-0122. For a grid of files, not for a wallpaper)
+### 5.2 Node-specific properties
 
-An `image` has no intrinsic size and takes the box § 5.1's `width`/`height` give it, unlike `icon`: knowing a file's own dimensions requires decoding it, and the layout pass has no canvas to decode against. Whatever the file's size, the texture is at most the box's: a raster is stored scaled down to cover it and never up (ADR-0122).
+| Node | Properties / behavior |
+| :--- | :--- |
+| `rect` | `children`; box painting |
+| `row` | `children`, `spacing`, `scroll`; horizontal flow |
+| `column` | `children`, `spacing`, `scroll`; vertical flow |
+| `text` | `content`, `font_size`, `foreground`, `text_align`, `elide`, `wrap`, `max_lines`, `on_link` |
+| `icon` | `name`, `size`, `foreground`; name is a theme name or absolute image path |
+| `image` | `source`, `fit`, `async`; fit is `"cover"` by default, `"contain"` or `"stretch"` |
+| `button` | `children`, `on_click`, `on_drag`, `on_wheel`, `submit` |
+| `list` | `source`, `itemfn`, optional `key`, `direction`, `spacing`, `scroll` |
+| `textfield` | `placeholder`, `font_size`, `foreground`, `text_align`, `autofocus`, `on_change`, `on_submit`, `on_cancel`, `on_navigate`, `secure_submit`, `mask_character` |
 
-#### 6. `button`
-Receives input focus and pointer events.
-*   `children`: `table` (Content elements nested inside the button boundary)
-*   `on_click`: `function(rect, button)` (Lua callback on mouse click or pointer tap. Fires for left, right, and middle buttons, on release, only when the release lands on the same node and button the press armed)
-    *   `rect`: `table` (Button's absolute rect, `{ x, y, width, height }`, surface logical coordinates, ADR-0050 decision 3)
-    *   `button`: `string` (`"left"`, `"right"`, or `"middle"`; any other evdev code arms and fires nothing. Added by ADR-0050's second amendment, which also covers why back/forward are excluded and why this is a name rather than a code)
+`text.content` is a string or runs `{ text, bold?, italic?, underline?, color?, href? }`.
+`on_link(url)` handles activation. `text_align` is Start/Center/End; `elide` is None/End;
+`wrap` is None/Word. `max_lines = 0` is unlimited; wrapping needs a bounded width.
+Text size and icon size default to 12. Text and icon content defaults can render empty before hydration.
 
-> A handler declaring one parameter still works, since Lua drops undeclared arguments; it now also runs on a right or middle click, where those events previously did nothing. `if button ~= "left" then return end` restores the old behavior.
+`image.async = true` decodes off-thread and draws nothing until ready; false is the default.
+Icons resolve in the Renderer. See [content parsing](../renderer/src/layout/node/content.rs).
 
-*   `on_drag`: `function(rect, pointer, phase)` (ADR-0116. A left press on this button holds a drag until its release. `"start"` on the press, `"move"` on every pointer motion while held, wherever the pointer has gone, `"end"` on the release or when the pointer leaves the surface. Left button only; a press that focused a `textfield` drags nothing, as it clicks nothing. The left `on_click` still fires on a release inside the rect, after the drag's `"end"`)
-    *   `rect`: `table` (The button's absolute rect, as `on_click`'s)
-    *   `pointer`: `table` (`{ x, y }` in the button's own coordinates, unclamped: past the right edge `x` exceeds `rect.width`, so `math.min(1, math.max(0, pointer.x / rect.width))` is a slider's fraction and the config owns the clamp)
-    *   `phase`: `string` (`"start"`, `"move"` or `"end"`)
-*   `on_wheel`: `function(rect, steps)` (ADR-0116. One wheel event over this button. `steps` is in notches, positive away from the user, so `value + steps * 0.05` is a control stepping up on a wheel up; a touchpad's swipe arrives as fractions of a notch. Vertical axis only. Innermost wins against a scrollable container: a wheel over a slider inside a scrolling list moves the slider, over the list beside it scrolls the list)
+A list calls `itemfn(element)` for every source element, including offscreen items.
+`key(element)` must return a unique sibling string; without it identity is positional.
+Direction is `"Vertical"` by default or `"Horizontal"`.
+See [list construction](../renderer/src/layout/node/spec.rs).
 
-> **What a slider is.** Not a node kind. `on_drag` plus `on_wheel` on a `button` holding a `rect` whose `width` is a `"NN%"` signal is the whole of one (`dev-config/oblisk/components/slider.lua`), and the same two hooks are a colour picker's pad, a seek bar, or a resize handle, which a `slider` node would each have needed its own kind for.
+### 5.3 Input and local state
 
-> **The pointer model is complete.** The frame handler in `renderer/src/wayland/input.rs` matches `Press`/`Release`/`Leave` for clicks, `Enter`/`Motion`/`Leave` for hover (`hover` below), and `Axis` for the wheel (`scroll` below); the match over `PointerEventKind` is exhaustive, with no swallowing `_ => {}` arm left. What a scrollable container *is* was ADR-0069's decision.
+| API | Contract |
+| :--- | :--- |
+| `on_click(rect, button)` | Rect is surface-local `{ x, y, width, height }`; button is left/right/middle |
+| `on_drag(rect, pointer, phase)` | Left drag; pointer is button-local and unclamped; phase is start/move/end |
+| `on_wheel(rect, steps)` | Vertical notches, including fractional touchpad steps; positive increases an upward-stepped control |
+| `hover(name)` | Read-only boolean handle; bind it to a node's `hover` |
+| `hover_rect(name)` | Surface-local rect signal; retains the last rect after leave |
+| `scroll(name)` | Read-only logical offset; bind it to a row, column or list |
+| `scroll(name):reveal(index)` | Request visibility of a 1-based child; layout clamps the offset |
+| `fonts { families... }` | Dense ordered family list, applied at generation startup; no per-node font family |
 
-#### Fonts (`fonts`)
-The font chain this shell measures and paints with, in fallback order (ADR-0043 decision 2).
+A click fires on release inside the pressed target. Drag ends on release or surface leave;
+a left click can also fire after drag end. The innermost wheel handler or scrolling container wins.
+A button with `submit = true` submits the scope's armed `secure_submit` field.
+See [input handling](../renderer/src/wayland/input.rs).
 
-*   `fonts(chain)` (Global, called at the top level of `shell.lua`. Takes an array of family-name strings; refused if any entry is not a string, naming which one, since Lua would otherwise coerce a number into a family nobody can find)
-    *   `chain`: `table` (Dense array of family names as fontconfig resolves them, e.g. `"CaskaydiaCove Nerd Font Propo"`. Refused if it has a hole or a named key, since `sequence_values` stops at the first `nil` and Lua's `#` is undefined on a sparse table. An entry no font matches is skipped with a diagnostic, so a typo costs that entry, not the chain)
+Ordinary text fields expose their full draft through `on_change(text)` and `on_submit(text)`.
+Submit empties the draft; losing focus preserves it. Escape clears it, and `on_cancel` also drops
+focus. Navigation callbacks receive up/down/page_up/page_down/tab/backtab.
 
-> **One chain; the codepoint picks the face.** Both readers fall back per glyph across the whole chain in order, so a Nerd Font first and a sans face second gives chrome and body text from one declaration. There is no per-node `font_family`. Declaring nothing keeps the default, `sans-serif`, `Noto Sans CJK JP`, `Noto Color Emoji`, none of which carry Nerd Font private-use glyphs, so chrome needs a declared chain or draws tofu. Read once, at startup: a chain change invalidates every measurement, closer to a topology change than an in-place restyle.
+`secure_submit = { capability, action }` selects the native secret path.
+`mask_character` alone does not make a field secure.
+The default mask is a bullet; an empty glyph hides length.
+Supported targets are lock/authenticate, polkit/authenticate and network/connect.
+Secrets never reach Lua callbacks. See [secure target parsing](../renderer/src/layout/node/spec.rs)
+and [authentication ownership](oblisk-supervisor-services-dbus.md#7-idle-lock-and-polkit).
 
-#### Named state (`state(name, initial)`)
-The one signal a config writes. Reactive state the config owns, keyed by a name that outlives any single evaluation, so an in-place reload hands back the signal the last one built (ADR-0044 decision 5).
+## 6. Surface declarations
 
-*   `state(name, initial)` -> `Signal` (Global. Writable: `signal:set(value)` stores a new value and marks the scene dirty, so the next pass re-resolves every node reading it)
-    *   `name`: `string` (The identity. Two calls with one name are one signal, so the writer and the reader need not be the same file)
-    *   `initial`: `any` (The value on the first evaluation naming it. Marshal-checked at § 1.1's boundary, the same check `:set()` applies)
+Each role has `id` and `child`; top-level IDs are unique. Declare at most one lock.
+Panels and locks have per-output instances; windows and popups have one instance each.
 
-> **An edit to `initial` wins; a reload alone does not.** A re-declaration whose `initial` differs from the seed re-seeds the signal, since editing the file is a later write than the `:set()` it lands on; one whose `initial` is unchanged keeps the live value, which is what leaves a dropdown open across an unrelated save (ADR-0044 decision 5's amendment). A table `initial` is never treated as an edit: tables compare by identity and every evaluation builds a fresh one. Numbers compare across integer/float the way Lua's `==` does; two scalars of different types are an edit. `state("t", os.time())` re-seeds on every reload, since the rule reads intent off the value and cannot detect a non-constant. Dies on a generation swap, since the map lives in the process being reaped.
+| Role | Protocol | Additional properties |
+| :--- | :--- | :--- |
+| `panel` | layer-shell | `layer`, `anchor`, `monitor`, `namespace`, `exclusive`, `keyboard_interactivity` |
+| `window` | xdg_toplevel | `title`, `app_id`, `min_size`, `max_size`, `on_close` |
+| `popup` | xdg_popup | `parent`, `anchor_rect`, `anchor`, `gravity`, `constraint_adjustment`, `offset`, `grab`, `on_dismiss` |
+| `lock` | ext_session_lock_surface_v1 | Output coverage and lifetime are protocol-controlled |
 
-#### Persisted tables (`persistent_table { path, name, defaults }`)
-A JSON file the config names, read as signals and written a key at a time (ADR-0136). The framework has no default location and no store exists until a config declares one.
+Panel layers are Background/Bottom/Top/Overlay; anchors are edge booleans.
+Monitor is a connector name or `"All"`. Exclusive is false, true, or `"Ignore"` to ignore
+others' reserved space. Keyboard interactivity is None/OnDemand/Exclusive.
+`child = function(output)` on panels/locks builds per-output content; nil yields an empty instance.
 
-*   `persistent_table(spec)` -> `PersistentTable` (Global. Two declarations of one file are one table, so a required module and `shell.lua` may both declare it and a reload re-declares it)
-    *   `spec.path`: `string` (An absolute directory. Refused if relative, since a relative path resolves against the Supervisor's working directory, which nothing sets)
-    *   `spec.name`: `string` (One file name. Refused if empty or if it contains `/`)
-    *   `spec.defaults`: `table` (Optional. Keys to seed the file with, filling only what it does not already have, so adding one is a new key rather than a reset. Also what creates the file on a first run)
-*   `store.<key>` -> `Signal` (Read-only, `nil` until the first push and `nil` for a key the file does not hold, so a property falls back to its documented default per § 3.1)
-*   `store:set(key, value)` (Any JSON value including a table; `nil` deletes the key. `set` is therefore the one key name a config cannot store)
+Windows/popups use `visible` to open/close. A window's `on_close` is a request the config handles;
+min/max sizes are compositor hints. Popup parent is a panel or window ID; anchor rect and
+width/height must be nonzero. Anchors/gravity accept edges, corners or Center.
+Constraint adjustments accept SlideX/Y, FlipX/Y, ResizeX/Y; default is FlipY and SlideX.
+`grab` defaults true and needs an input serial; use false for hover-opened tooltips.
 
-> **The file is the identity.** `path` and `name` are joined once, in the Renderer, and that string is what `oblisk.storage.files` is keyed by and what every write names. Saved 1 second after the last write, through a temporary file and a rename; a save still inside that window when the session ends is lost.
+See [surface parsing](../renderer/src/lua/surfaces.rs),
+[panel properties](../renderer/src/layout/node/surface.rs),
+[window/popup properties](../renderer/src/layout/node/toplevel.rs) and
+[instance expansion](../renderer/src/layout/instance.rs).
 
-#### Hover (`hover`, `hover(name)`, `hover_rect(name)`)
-A **hover slot** is engine-written reactive state naming one region of one surface: whether the pointer is inside it, and where. Declared on any node, read from anywhere (ADR-0062).
+## 7. Wire format envelope
 
-*   `hover`: `Signal` (A node property. Takes the signal `hover(name)` returns and marks that node's box as the slot's region. Structural: the handle is what is stored, so this property does not resolve to a value the way every other one does)
-*   `hover(name)` -> `Signal` (Global. Boolean, `false` until the pointer is inside the region. Read-only to Lua: `signal:set()` refuses it, since the engine is the writer)
-    *   `name`: `string` (The slot's identity, like `state(name, initial)`'s. Two calls with one name are one slot, so declarer and reactor need not be the same file, and an in-place reload keeps an open tooltip open)
-*   `hover_rect(name)` -> `Signal` (Global. The region's absolute rect, `{ x, y, width, height }`, surface logical coordinates, the same shape and space `on_click` hands a handler. Bind to a `popup`'s `anchor_rect` to put a tooltip over the node. Keeps the last rect given when the pointer leaves, so `anchor_rect` stays non-zero while the popup closes)
+Lua capability invocations serialize to a JSON-RPC 2.0 envelope over the control socket.
+See [wire format and dispatch limits](oblisk-supervisor-services-dbus.md#13-control-socket-and-wire-format).
 
-> **A node and every ancestor are hovered.** Hover uses `on_click`'s hit path (ADR-0050 decision 1), so a `pill` that is a `row` wrapping a `button` wrapping a `text` reports all three; a config binds the outermost. Overlapping siblings resolve like paint: the one drawn last is hovered.
+## 8. Tooling
 
-#### Scroll (`scroll`, `scroll(name)`)
-A **scroll offset** is engine-written reactive state naming how far one container has scrolled along its main axis, in logical pixels. Declared on any flowing container, read from anywhere (ADR-0069).
+| Command | Behavior |
+| :--- | :--- |
+| `oblisk init -c <dir>` | Config/editor setup; generates capability field and action stubs |
+| `oblisk check -c <dir>` | Evaluates config/surface declarations without Wayland, GPU or subprocess execution |
+| `oblisk set <name> <value>` | Writes declared named state; parses JSON, otherwise uses a string |
+| `oblisk toggle <name>` | Toggles declared boolean state |
 
-*   `scroll`: `Signal` (A node property on `row`, `column`, and `list`. Takes the signal `scroll(name)` returns and makes that node a viewport its children move inside. Structural, like `hover`: the layout pass both reads the offset and writes back the one it used)
-*   `scroll(name)` -> `Signal` (Global. A number, `0` at top/left. Read-only to Lua: `signal:set()` refuses it, since the engine is the writer)
-    *   `name`: `string` (The slot's identity, like `hover(name)`'s and `state(name, initial)`'s. An in-place reload finds the offset the user left)
-
-> A wheel event adds an unbounded distance to the offset; the layout pass then clamps against the content extent it just measured and writes back what it used, so the signal always reads where the container actually is. A `Content`-sized container's viewport equals its content, so the offset clamps to `0`, a no-op, not an error, same as `"Fill"` in a `Content` parent. No `on_scroll` and no content extent yet: nothing wants the wheel as an event or draws a scrollbar. A tooltip is a `popup` with `grab = false`; there is no tooltip role, and `grab = false` is what lets a hover open one at all, with no click to carry § 6.3's input serial. No callback on the edge and no keyboard equivalent: a hover is a condition bound to `visible`, not an event (ADR-0062 decision 1); the keyboard-equivalent signal, `focused`, does not exist.
-
-#### 7. `list`
-A fast-reconciling virtual repeater element.
-*   `source`: `Signal` (Must wrap a flat array table)
-*   `itemfn`: `function` (Lua builder executed for every index, returning child nodes)
-*   `key`: `function` (Maps a `source` element to a stable string, called on the element rather than the node `itemfn` builds. Items reconcile by key, so inserting one element rebuilds one item, not every item below it; duplicate keys are an error. Without `key`, items match by index and an insertion rebuilds everything after it, fine for a short static list, wrong for anything capability-driven. ADR-0045)
-*   `direction`: `string` (`"Vertical"` (default) or `"Horizontal"`, which way generated items stack. A `list` is a repeater, not a third layout: it reconciles by key then lays out through the `row`/`column` arm this names, so spacing, margins, `align_h`/`align_v`, and `Stretch` behave identically to a hand-built one)
-
-> A `list` scrolls: clipping cuts a subtree to its parent's box (`layout::paint::paint_tree` pushes `intersect_scissor` per node), and ADR-0069 added the offset the layout pass clamps and the wheel input driving it. Bind `scroll` on the `list` to make it a viewport. The rejected alternative to `direction` was splicing generated children into the *parent's* child list; it conflicts with ADR-0045's identity rule, a node is identified by its position in one parent's child list, and a spliced list has no single such list to hold a position in.
-
-#### 8. `textfield` (the engine security exception)
-An IME-aware native input field mapped directly to Rust-owned `wp-text-input-v3`.
-*   `placeholder`: `string`
-*   `mask_character`: `string` (Capped at 1 byte; if specified, hides typed input)
-*   `secure_submit`: `table` (`{ capability, action }`; see § 5's `textfield` glossary entry in `CONTEXT.md`. Only meaningful alongside `mask_character`, without it a masked field's value is unreadable from Lua entirely)
-*   The text typed into a plain field stays for as long as the node exists (ADR-0108): the keyboard leaving the surface, or a press elsewhere on it, stops the keys and hides the caret but keeps the draft; a press back into the same field resumes. Only Escape with `on_cancel`, a submit, or the node going away empties it.
-*   `on_change`: `function` (Lua callback carrying the field's whole text after each edit, not the delta. Per keystroke: this field reads `wl_keyboard` rather than `zwp_text_input_v3`, so there is no input method batching composition. ADR-0092)
-*   `on_submit`: `function` (Enter. Takes the whole text as its one argument and leaves the field focused and empty, so a reply box takes the next message without another click. Fires with *no* argument when both `mask_character` and `secure_submit` are set: the Renderer's IPC layer attaches the native input buffer directly to the named capability/action envelope instead, and no Lua value ever holds it. ADR-0005, ADR-0027, ADR-0092)
-
-Declaring `secure_submit` makes a field masked and declaring `on_change`/`on_submit` makes it plain; a field declaring both stays masked, and one declaring neither is never focused, since nothing could read what was typed into it. A press is what focuses a plain field, so its surface has to be able to take the keyboard while one is open (`panel.keyboard_interactivity`). Neither kind composes CJK or dead keys — see ADR-0092.
-
-## 6. Top-level surface nodes
-
-These nodes are returned at the root of `shell.lua` and define physical Wayland surface mappings. In Wayland a `wl_surface` is inert until a protocol assigns it a **role**; Oblisk exposes four, one constructor each (ADR-0040). The set of surfaces is whatever `shell.lua` returns, evaluated fresh on each reload; there is no fixed or engine-owned set (ADR-0038).
-
-| Constructor | Role | Protocol | Typical use |
-| :--- | :--- | :--- | :--- |
-| `panel` | Layer surface | `zwlr_layer_surface_v1` | Bar, dock, wallpaper, OSD, launcher |
-| `window` | Toplevel | `xdg_toplevel` | Settings window, standalone dialog |
-| `popup` | Popup | `xdg_popup` | Dropdown, context menu, tooltip |
-| `lock` | Lock surface | `ext_session_lock_surface_v1` | Lock screen |
-
-All four share the base node properties (§ 5.1) and take a `child` node tree. Adding or removing any of them is a topology change (`CONTEXT.md`); see ADR-0038 for what changes in place instead.
-
-### 6.1 `panel`
-A layer-shell surface container (`zwlr_layer_surface_v1`). Formerly named `surface`; renamed in ADR-0040 when "surface" became the umbrella term for all four roles.
-*   `id`: `string` (Unique window identifier. A surface targeting several outputs produces one Wayland surface per output, addressed as `"{id}@{output}"`)
-*   `layer`: `string` (`"Background"`, `"Bottom"`, `"Top"`, `"Overlay"`)
-*   `anchor`: `table` (`{ top, bottom, left, right }` edge booleans)
-*   `exclusive`: `boolean` / `string` (`true` reserves physical screen area along the anchored edge, sized from the surface. `false` (default) reserves none, but the compositor still keeps the surface inside the area other surfaces reserved. `"Ignore"` reserves none and ignores what others reserved, so the surface covers the whole output; a full-screen wallpaper needs it, since a surface anchored to all four edges has no single edge to reserve against and so gets nothing from `true`. Layer-shell's three exclusive-zone cases: a positive zone, `0`, and `-1`)
-*   `height`: `integer` / `string` (Explicit height or `"Fill"`)
-*   `width`: `integer` / `string` (Explicit width or `"Fill"`)
-*   `margin`: `table` (`{ top, right, bottom, left }` offsets from the anchored edges. Distinct from a node's `padding`, which is inside the surface: `margin` moves the surface itself, so a floating panel inset from a screen edge needs it)
-*   `monitor`: `string` (A specific output EDID, or `"All"` to spawn on all monitors)
-*   `namespace`: `string` (The layer-shell namespace the compositor sees; compositor rules match on it, e.g. Hyprland's `layerrule` for blur and animations. Defaults to `"oblisk-{id}"`)
-*   `keyboard_interactivity`: `string` (`"None"` (default), `"OnDemand"`, or `"Exclusive"`, mapping to layer-shell's own field. A launcher or any surface accepting typed input needs `"OnDemand"` or `"Exclusive"`; `"None"` never receives key events)
-*   `visible`: `boolean` / `Signal` (Unmaps the surface when false, without destroying it. How a config shows and hides a panel without churning Wayland objects)
-*   `child`: `node` / `function(output)` (The root visual primitive node inside this window. A function is called once per output instance with that output's connector name, per pass, and its return takes the child's place, so one `monitor = "All"` panel can show a different tree per screen; `nil` maps that instance empty. ADR-0121)
-
-### 6.2 `window`
-A standard toplevel window (`xdg_toplevel`), the kind the compositor tiles, stacks, and lists in a task switcher. For a settings window or standalone dialog, where a `panel` would be wrong.
-*   `id`: `string` (Unique identifier)
-*   `title`: `string` / `Signal` (Window title the compositor displays)
-*   `app_id`: `string` (Application identifier the compositor matches rules against, e.g. `"oblisk.settings"`)
-*   `min_size`: `table` (`{ width, height }`. Advisory: the spec states a client "should not rely on the compositor to obey" it)
-*   `max_size`: `table` (`{ width, height }`. Advisory, same as `min_size`)
-*   `on_close`: `function` (Fires when the compositor asks the window to close. A request, not a command: the callback may decline by doing nothing, and the window stays open until the config sets `visible = false`)
-*   `visible`: `boolean` / `Signal`
-*   `child`: `node`
-
-Decorations are not requested per window: Oblisk asks the compositor for server-side decorations once and accepts whatever mode it grants, drawing no titlebar of its own (ADR-0040).
-
-### 6.3 `popup`
-A real popup (`xdg_popup`), positioned by the compositor relative to its parent and dismissed by the compositor on click-outside. Parents to either a `panel` or a `window`, so a bar can own a genuine dropdown rather than a hand-positioned second panel.
-*   `id`: `string` (Unique identifier)
-*   `parent`: `string` (The `id` of the `panel` or `window` this popup anchors to)
-*   `anchor_rect`: `table` (`{ x, y, width, height }` in the parent surface's logical coordinates. Required, non-zero. Normally passed straight from the rect `button`'s `on_click` hands back, so a dropdown lands on the button that opened it)
-*   `width` / `height`: `integer` (Required and non-zero; a popup has no `"Fill"`)
-*   `anchor`: `string` (Which edge or corner of `anchor_rect` the popup hangs from: `"Top"`, `"Bottom"`, `"Left"`, `"Right"`, `"TopLeft"`, and so on, or `"Center"`)
-*   `gravity`: `string` (Which direction the popup extends from that point, same value set as `anchor`)
-*   `constraint_adjustment`: `table` (Array of `"SlideX"`, `"SlideY"`, `"FlipX"`, `"FlipY"`, `"ResizeX"`, `"ResizeY"` naming how the compositor may move the popup to keep it on screen. Defaults to `{ "FlipY", "SlideX" }`, dropdown behavior; the protocol's own default is no adjustment. Applied in fixed precedence: flip, then slide, then resize)
-*   `offset`: `table` (`{ x, y }` pixel nudge applied after anchor and gravity)
-*   `grab`: `boolean` (Default `true`. Takes an explicit grab, giving the popup keyboard focus and letting the compositor dismiss it on click-outside. A compositor may deny the grab, dismissing the popup immediately and firing `on_dismiss`; a normal outcome, not an error)
-*   `on_dismiss`: `function` (Fires when the compositor dismisses the popup)
-*   `child`: `node`
-
-A popup may only open in response to real user input, so `grab = true` outside an input callback is rejected. Nested popups close in reverse order of opening.
-
-### 6.4 `lock`
-A session-lock surface (`ext_session_lock_surface_v1`). One per output, created when the session locks and destroyed on unlock. While locked the compositor shows only these, so a `panel` cannot be part of a lock screen (ADR-0042).
-*   `id`: `string` (Unique identifier)
-*   `child`: `node` / `function(output)` (The lock screen's node tree, authored like any other. A function is called per output as a `panel`'s is, ADR-0121)
-
-No `visible`, `monitor`, `anchor`, or size: a lock surface covers its output, exists on every output, and its lifetime is the lock's, not the config's. Authentication runs through a `textfield` with `secure_submit` (§ 5.2 item 8), so the password reaches the Supervisor's PAM worker without entering the Lua VM (ADR-0005, ADR-0028, ADR-0042). Locking is triggered by the Supervisor, not by returning this node; declaring it says what the lock screen looks like, not when it appears.
-
----
-
-## 7. The generation-guarded command envelope contract
-
-To keep system state consistent during concurrent, overlapping hot-reloads, Oblisk applies a generational guard on the IPC command write channel.
-
-### 7.1 Seamless Lua integration (the mlua boundary)
-The Lua config never manages or appends generation-tracking parameters. The Rust `mlua` host intercepts all method invocations on exported singletons and transparently wraps them in a **generation-guarded envelope** before serializing to the control socket.
-
-### 7.2 Guarded JSON-RPC 2.0 envelope schema
-Every write transaction carries the sender's active **generation id** and the target capability's **revision sequence number**:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "ExecuteCommand",
-  "params": {
-    "generation_id": 4,
-    "capability": "audio",
-    "action": "set_volume",
-    "arguments": [0.75],
-    "expected_revision": 42
-  },
-  "id": 105
-}
-```
-
-### 7.3 Generational gating fields
-*   `generation_id`: `integer` (The chronological process epoch index the Supervisor assigns the Renderer instance on boot)
-*   `expected_revision`: `integer` (The logical revision index of the target capability's state snapshot this command is reacting to)
-*   **The guard rule**: the Supervisor keeps a chronological ledger of active Renderer generations. A command whose `generation_id` is less than the current active generation, or whose `expected_revision` is stale, is dropped instantly, preventing a dying process from racing or duplicating commands during a transition swap.
+`check` does not validate live service behavior or rendered layout.
+See [CLI](../supervisor/src/cli.rs) and [check implementation](../renderer/src/check.rs).

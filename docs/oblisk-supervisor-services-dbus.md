@@ -1,319 +1,236 @@
-# Oblisk Supervisor Services Specification
-## Durable system services, zero-polling monitors, and feature-complete backends
+# Supervisor services
 
-This spec defines the D-Bus interfaces and system services the long-lived **Oblisk Supervisor** process owns. Each runs off-thread in native Rust, giving the Lua VM event-driven, zero-polling state and command execution.
+Current ownership and backend behavior. Lua call syntax and schemas are in the
+[API specification](oblisk-idl-api-specs.md); proposed work is in the [roadmap](roadmap.md).
+[Decisions](decisions.md) records rationale and history.
 
-**Nothing is built until a config asks for it** (ADR-0070). The Renderer sends a `StartCapability` frame the first time an evaluation reads `oblisk.<name>`; that frame constructs the controller each section below describes. A config that reads nothing leaves the process idle after startup: connected to the system bus, control socket bound, Renderer spawned, no bus name claimed, no D-Bus subscription, no poll task, no authentication agent.
+The Supervisor owns durable platform connections and validates commands. Capabilities start on
+demand and remain started for the Supervisor's lifetime. State is event-driven where the backend
+supports it; the clock, hardware telemetry and update checks use their own schedules.
+Lua owns presentation and user policy.
 
-Registering the polkit authentication agent is gated on a config reading `oblisk.polkit` or declaring a `textfield` with `secure_submit = { capability = "polkit", ... }` (ADR-0114). Every registration failure logs rather than stopping the process; "An authentication agent already exists for the given subject" is the normal answer beside any other desktop.
+Capability commands use `oblisk.<name>:invoke("action", ...)`. The exceptions are the
+dedicated idle methods, `persistent_table` and `process.run`.
 
----
+## 1. Notifications
 
-## 1. Durable D-Bus notifications server (`org.freedesktop.Notifications`)
+The Supervisor claims `org.freedesktop.Notifications` on the session bus.
 
-The Supervisor claims and holds `org.freedesktop.Notifications` on the session bus, so notifications survive Renderer reloads.
+### 1.1 Queue and sanitation
 
-### 1.1 Memory-bounded queue and sanitation
+| Contract | Current behavior |
+| :--- | :--- |
+| Retention | 100-entry FIFO queue; `feed` exposes the most recent 20 |
+| Text bounds | App name 64 bytes, summary 128, body 512; truncation respects UTF-8 boundaries |
+| Body | Allowlisted text/image spans, not arbitrary HTML; supports bold, italic, underline, links and trusted image paths |
+| Pictures | `image_path` is separate from `app_icon`; raw pixels are validated and spooled as PNG |
+| Identity | ID, arrival timestamp, desktop entry, urgency and action/reply metadata accompany each entry |
+| Expiry | Marks a retained entry expired; expired transient entries are removed |
+| DND | Gates sound only; critical urgency bypasses DND and automatic expiry |
+| Sounds | Configured per urgency; a trusted client sound-file can override it, suppress-sound silences it; no sound-theme lookup |
 
-* **Queue cap**: 100 active notifications, FIFO.
-* **Field truncation**: `app_name` to 64 bytes, `summary` to 128 bytes, `body` to 512 bytes, each on a character boundary.
-* **Plain-text sanitation**: strips scripts, style tags, and image elements with a non-backtracking regex parser before the body reaches Lua's notifications signal feed.
-* **Icon spooling**: `image-data`/`icon_data` hints are bounds-checked, PNG-encoded, and written off-thread to `/dev/shm/oblisk-$UID/notifications/notif-{id}.png`. Lua gets the path, never raw pixel bytes; a hint that fails the bounds check is dropped.
-* **Picture and app icon are separate fields** (ADR-0091). `image_path` is what the sender attached — `image-data`/`image_data` > `image-path`/`image_path` > `icon_data`, the three spellings the spec accumulated for one thing — always an absolute path to a file that exists. `app_icon` is the positional `app_icon` argument: a theme name carried as a name, or an absolute path (or `file://` URI) run through the trusted-root check. A value holding a path separator that is not absolute is refused rather than passed off as a theme name.
-* **Arrival time** (ADR-0093). Every entry carries `timestamp`, Unix epoch seconds on the same clock and in the same unit as `oblisk.system`'s `time`, so a card's relative age is one subtraction. A `replaces_id` replacement is new content and gets a new timestamp.
-* **Expiry retires, it does not remove** (ADR-0100). When a notification's timeout runs out the entry stays in the queue with `expired = true` and the sender hears `NotificationClosed(id, reason=1)` as before; `dismiss`, an action, a reply or the FIFO cap are what remove it. A popup filters on `expired`, a history does not, which is what makes the history a record of what happened rather than of what is still on screen. `hints["transient"]` is the sender's opt-out and is carried as `transient`: an expired transient is removed outright.
-* **Sender identity and reply wording** (ADR-0101). `hints["desktop-entry"]` is carried as `desktop_entry`, capped at 128 bytes and refused if it holds a `/` (a desktop id never does), so a config can group and name by the `.desktop` id rather than by `app_name`. `hints["x-kde-reply-placeholder-text"]` is carried as `reply_placeholder`, capped at 64 bytes, for the empty reply field to show.
+Spooled files live under `$XDG_RUNTIME_DIR/oblisk/notifications/`.
+The [notification types and limits](../supervisor/src/capabilities/notifications/mod.rs)
+and [markup validator](../supervisor/src/capabilities/notifications/markup.rs) define the exact fields.
 
-### 1.2 Interactive inline replies and actions
+### 1.2 Actions and replies
 
-A client requesting an inline reply (`x-kde-reply` hint or actions carrying an `"inline-reply"` key) gets `has_reply = true` in the signal snapshot. `notifications:reply(id, text)` from the Renderer emits the two-argument `ActionInvoked(id, action_key)` signal with `action_key = "inline-reply::<text>"` (ADR-0033), then removes the notification.
+`invoke_action(id, key)` accepts a declared action and removes the entry unless it is resident.
+`reply(id, text)` emits `ActionInvoked(id, "inline-reply::<text>")` and removes the entry.
+`dismiss(id)` removes it explicitly. Removal signals and expiry are owned by the Supervisor.
 
-`Notify`'s `actions` array is otherwise split into `actions[]` and `has_default_action` (ADR-0090). Each entry carries the opaque `key` the sender will receive back, a `label` to draw (the key itself when the sender sent an empty one), and, when `hints["action-icons"]` is set, an `icon_name` -- a *theme name*, refused if it holds a path separator, since `icon` also accepts absolute paths. The two keys with meanings of their own never appear as entries: `"default"` becomes `has_default_action`, `"inline-reply"` becomes `has_reply`. At most 8 actions are kept and a label is truncated to 64 bytes, on the same reasoning §1.1 caps the text properties.
+`hold_expiry(seconds)` pauses pending expiry countdowns for up to 300 seconds; zero releases the
+hold. Popup filtering, history presentation and grouping belong to Lua.
 
-`notifications:hold_expiry(seconds)` stops every pending expiry countdown for that long (ADR-0094), which is what keeps a card from vanishing part-way through a reply. Time already served is banked, `0` releases, and the value is clamped to 300 seconds — it is a deadline rather than a paused/resumed flag precisely so a config that misses the release edge cannot pin the feed for the rest of the session.
+## 2. System tray
 
-`notifications:invoke_action(id, key)` emits `ActionInvoked(id, key)` and then removes the notification, which is the base spec's default; `hints["resident"]` is the spec's own exception and keeps it in the queue instead. A removal here also emits `NotificationClosed(id, reason=3)`, because an action-invoked close is a close and a sender tracking its own ids needs to hear about it.
+The Supervisor hosts `org.kde.StatusNotifierWatcher` and reads each item's own object path.
 
----
+### 2.1 Icons and menus
 
-## 2. System tray host (`StatusNotifierWatcher` & `StatusNotifierItem`)
+| Contract | Current behavior |
+| :--- | :--- |
+| Icon selection | Item-local theme path, then theme name, then validated pixmap fallback |
+| Pixmap validation | Positive square size, at most 128×128, exactly width × height × 4 ARGB bytes |
+| Spooling | PNG under `$XDG_RUNTIME_DIR/oblisk/tray/`; Lua receives names or paths |
+| Activation | `activate(id, x, y)`; menu-only items do not receive Activate; secondary activation and scroll are also supported |
+| Menus | Recursive DBusMenu data; `menu_will_show` refreshes lazy content; `activate_menu_item` selects an item |
 
-The Supervisor hosts `org.kde.StatusNotifierWatcher` at `/StatusNotifierWatcher` on the session bus, so Lua never marshals raw D-Bus for tray icons.
+See [tray](../supervisor/src/capabilities/tray/mod.rs) and
+[icon selection](../supervisor/src/capabilities/tray/icon.rs).
 
-### 2.1 Watcher mechanics and ARGB decoding security
+## 3. MPRIS
 
-* **Buffer bounds checks**: for each client item's (e.g. `nm-applet`, `discord`) raw ARGB pixmap, verifies `width == height` and `width * height * 4` matches the payload length.
-* **Size cap**: 128x128px; larger streams are rejected (ADR-0031).
-* **SHM spooling**: valid buffers are written as PNGs to `/dev/shm/oblisk-$UID/tray/{service_name}.png`.
-* **Lua surface**: `tray.items` carries only pre-decoded PNG paths.
-* **Activation**: `tray:activate(id, x, y)` from the Renderer invokes `Activate(x, y)` on the item's own D-Bus object path.
+Session-bus name changes discover `org.mpris.MediaPlayer2.*` players. Property changes and
+`Seeked` refresh cached metadata and position. The snapshot carries position in microseconds and
+its monotonic timestamp; it does not provide a config-side high-frequency clock.
 
----
+Supported controls are play, pause, play/pause, next, previous, absolute seek and relative seek.
+See [controller](../supervisor/src/capabilities/mpris/controller.rs) and
+[player state](../supervisor/src/capabilities/mpris/player.rs).
 
-## 3. Persistent media controls (Supervisor-owned MPRIS)
+## 4. NetworkManager
 
-MPRIS ownership lives in the long-lived Supervisor, not the Renderer, so media widgets don't flicker or drop track titles on hot-reload.
+The system-bus controller follows manager, device, wireless, active-access-point and active-connection
+changes, rebuilding published state from those events.
 
-### 3.1 D-Bus player discovery and properties caching
+Global networking toggles via `Enable`; Wi-Fi toggles via `WirelessEnabled`. Disabling Ethernet
+disconnects wired devices; enabling activates existing autoconnect profiles.
 
-* Listens to `org.freedesktop.DBus` name changes to discover sessions matching `org.mpris.MediaPlayer2.*` (Spotify, Audacious, MPV, Firefox, etc.).
-* Subscribes to `org.mpris.MediaPlayer2.Player` property changes: playback status, track metadata, volume.
-* **Zero-polling progress sync**: instead of polling for seek position, the Supervisor caches `position` (µs), `position_updated_at` (monotonic clock timestamp, µs), and `play_state` (`"Playing"`, `"Paused"`, `"Stopped"`). Lua computes the live position as `position + (now - position_updated_at)`, only while `play_state == "Playing"`, giving fluid progress updates with zero socket traffic.
-* **External seek tracking**: a `Seeked` D-Bus signal updates the cached position and timestamp immediately.
+Scanning is asynchronous. Results merge duplicate SSIDs and retain the connected AP plus the
+strongest alternatives, capped at 20. Frequency supplies the band. Scan progress is published.
 
----
+Saved profiles activate without duplication. Open networks need no credential. Secured connections
+request native secure submission; credentials never enter Lua.
+See [network](../supervisor/src/capabilities/network/mod.rs) and
+[connection handling](../supervisor/src/capabilities/network/connection.rs).
 
-## 4. Feature-complete NetworkManager D-Bus controller (`oblisk.network`)
+## 5. BlueZ
 
-Event-driven subscriptions to `org.freedesktop.NetworkManager`; zero polling.
+### 5.1 Discovery and pairing
 
-### 4.0 What is subscribed
+The system-bus ObjectManager and property changes maintain device state.
+Supported actions are enable, start/stop discovery, pair, connect, disconnect and forget.
+Stopping discovery preserves the last discovered list; starting it clears that list.
 
-Every §2.5 field is re-derived from scratch on each event (ADR-0029), so the subscription set is what decides how stale a panel can get, and it has to cover the association and not only the scan (ADR-0082):
+### 5.2 Battery and category
 
-* **`Device.Wireless`**: `AccessPointAdded`, `AccessPointRemoved`, `ActiveAccessPoint`, `LastScan`. The first two move the AP list, the third is the only one on this interface that moves when the radio joins or leaves a network, and the fourth ends a scan.
-* **`AccessPoint`**: `Strength`, on the associated access point only, re-targeted whenever `ActiveAccessPoint` moves. Every rebuild re-reads all strengths, so one subscription keeps the whole list fresh; subscribing to all of them costs three times the traffic for numbers that refresh anyway (ADR-0082).
-* **`Device`**: `State`, on the Wi-Fi device and every wired one. What `network.ethernet_enabled` reads, and how a Wi-Fi disconnect announces itself first.
-* **`NetworkManager`**: `WirelessEnabled`, `NetworkingEnabled`, `PrimaryConnection`. The two radio switches, plus whatever holds the default route — which can move between two devices that both stay activated, so no device subscription covers it.
-* **`Connection.Active`**: `StateChanged`, on one activation at a time and only while a `network:connect` is in flight. Where `network.connect_error` comes from: it is the only place NetworkManager says *why* a connection went down, and the activation call returns before the radio has tried anything (ADR-0084).
+Battery1 supplies accessory percentage; device class supplies the display category.
+Missing Bluetooth hardware/service degrades to an inert controller.
 
-### 4.1 Master switches and radio controls
+### 5.3 Codec coverage
 
-* **Global networking**: `network:set_networking_enabled(bool)` calls NetworkManager's `Enable(bool)` method. `NetworkingEnabled` itself is a read-only property; only `WirelessEnabled`/`WwanEnabled`/`WimaxEnabled` have setters, so `Enable` is the actual toggle.
-* **Wi-Fi radio**: `network:set_wifi_enabled(bool)` sets the read-write `WirelessEnabled` property.
-* **Ethernet**: `network:set_ethernet_enabled(bool)` targets Ethernet devices (type `1`); `false` disconnects every wired device, `true` activates each device's existing autoconnect profile if one exists (ADR-0029). There is no NM method that fabricates a carrier connection without a profile already present.
+`connected_devices[].codec` is currently nil. There is no accepted codec-selection action.
+See [Bluetooth dispatch](../supervisor/src/capabilities/bluetooth/mod.rs).
 
-### 4.2 Wi-Fi scanning and frequency band resolution
-
-* **Scan**: `network:scan()` dispatches `RequestScan({})` off-thread. `network.scanning` flips to `true` on initiation, `false` once `PropertiesChanged` on the wireless device reports completion.
-* **Band resolution**: an access point's `Frequency` property (MHz) maps to a `band` string: `[2400, 2500]` → `"2.4 GHz"`, `[4900, 5900]` → `"5 GHz"`, `[5925, 7125]` → `"6 GHz"`.
-* **Results**: duplicate SSIDs merge to the highest signal strength; the connected access point plus the strongest 19 serialize into `network.available_networks`, connected first, ties on strength broken by SSID so the order does not move between rebuilds (ADR-0083). Sorting `active` ahead of strength is what keeps the connected network inside the cut — `network.ssid`/`strength` are read off this list, so an association weaker than 20 neighbours would otherwise be truncated away and reported as no association at all (ADR-0082). `active` merges across the duplicates rather than riding on the strongest one: NetworkManager keeps more than one AP object per BSSID and `ActiveAccessPoint` routinely names the weaker, so carrying the flag with the winning object drops it (ADR-0082).
-* **Link state**: `network.connected` comes from `PrimaryConnection`, not from the AP list, and `network.ssid`/`strength`/`wifi_enabled`/`networking_enabled`/`ethernet_enabled` fill out §2.5 alongside it. The AP list cannot answer any of them: it has no wired entry, and a powered-down radio looks exactly like a powered one joined to nothing.
-
-### 4.3 Hidden, secure, and open network associations
-
-* **Saved**: a profile already stored for the SSID is activated with `ActivateConnection`, not duplicated, and it completes without waiting for a password — a saved network has one already, so `network:connect` finishes on its own rather than stashing an intent for a `secure_submit` that will never arrive (ADR-0084). Only an SSID this machine has never joined reaches `AddAndActivateConnection2` — NetworkManager stores a new profile per call and accepts duplicates of both `id` and SSID, so creating unconditionally left one behind per re-join (ADR-0083).
-* **Open**: no password, builds a minimal connection dict and calls `AddAndActivateConnection2`.
-* **Secure**: populates `802-11-wireless-security` with `key-mgmt = "wpa-psk"` and the credential. A password supplied for an SSID that is already saved is written back to that profile with `SettingsConnection.Update` before activating, so a stored key can be corrected from the panel; enterprise (`802-1x`) profiles are activated as-is instead, since `GetSettings` omits secrets and a rewrite would drop the stored 802.1X password (ADR-0083).
-* **Hidden**: `hidden = true` sets `hidden`/`scan-ssid` in the `802-11-wireless` dict to force active probe broadcasts.
-* **Forget**: `network:forget(ssid)` resolves every matching connection profile and calls `Delete()` on each one's object path.
-* **Outcome**: `AddAndActivateConnection2` and `ActivateConnection` both return an activation, not a verdict. `network.connecting_ssid` is set on the attempt and cleared when that activation reaches `ACTIVATED` or `DEACTIVATED`; the latter fills `network.connect_error` from the reason code, where `NO_SECRETS` is a wrong password (ADR-0084).
-
----
-
-## 5. Feature-complete BlueZ Bluetooth controller (`oblisk.bluetooth`)
-
-Binds to `org.bluez` on the system bus.
-
-### 5.1 ObjectManager monitoring and pairing
-
-* **Zero-polling status**: registers on `org.freedesktop.DBus.ObjectManager`, capturing `InterfacesAdded`/`InterfacesRemoved` for `org.bluez.Device1` to update discovered and connected pools instantly.
-* **Forget**: `bluetooth:forget(mac)` resolves the device's object path and calls `RemoveDevice(path)` on the active `org.bluez.Adapter1`.
-
-### 5.2 Device battery telemetry and categorization
-
-* **Battery**: monitors `org.bluez.Battery1`; on change, extracts `Percentage` into the device's signal entry.
-* **Categorization**: parses each device's `Class` property (32-bit integer) rather than trusting BlueZ's own `Icon` property, which comes back empty whenever `Class == 0` (common for BLE peripherals, ADR-0030). Maps to `category`: `"keyboard"`, `"mouse"`, `"headphones"`, `"headset"`, `"phone"`, `"computer"`, or `"generic"`.
-
-### 5.3 PipeWire audio codec control
-
-`bluetooth:set_audio_codec(mac, codec)` finds the matching BlueZ SPA audio node and issues a `SetParam` on `SPA_PARAM_Route` with the target codec (`"LDAC"`, `"AAC"`, or `"SBC"`). PipeWire tears down and renegotiates the link.
-
----
-
-## 6. Direct PipeWire audio & stream mixer controller (`oblisk.audio`)
-
-Oblisk is PipeWire-only, no ALSA/PulseAudio wrapper. A background thread binds natively to the PipeWire API.
-
-### 6.1 Event-driven stream and node monitoring
-
-Registers callbacks on the PipeWire registry (`pw_registry`).
-
-* **Mute & volume**: PipeWire's volume-property broadcasts update `audio.volume`/`audio.muted`.
-* **Default routing**: output sinks and input sources track reactively. `audio:set_default_sink(id)`/`set_default_source(id)` write to the default `Metadata` node.
-
-### 6.2 Application-specific audio mixer (app mixer)
-
-Tracks every playback node of class `Stream/Output/Audio`, exposed as `audio.apps`. `audio:set_app_volume(id, volume)`/`set_app_muted(id, bool)` target one node's PipeWire id without touching global volume.
-
-### 6.3 Capture detection for `oblisk.privacy` (ADR-0137)
-
-The same registry listener, one connection, serving a second capability. Two more node classes are tracked and published on the channel that already carried camera name-enrichment:
-
-* `Stream/Input/Audio` -> `privacy.microphone_users`. A stream reading a sink's monitor (`stream.capture.sink`, what a visualiser does) is excluded by that property, not by an app-name list.
-* `Stream/Output/Video` -> `privacy.screencast_users`. A camera is a `Video/Source` *device*; nothing else pushes a video *stream* into PipeWire, so this identifies screen capture without matching the portal or the compositor by name.
-
-Only a node PipeWire reports as `Running` is published. A browser tab holds a capture stream open between calls, and an indicator lit by mere existence would be lit permanently.
-
----
-
-## 7. Durable idle capability (`ext-idle-notifier-v1`)
-
-Oblisk has no hardcoded inactivity timeouts; the config sets its own.
-
-### 7.1 Dynamic, multiple threshold registration
-
-* The Supervisor binds once to the compositor's `ext_idle_notifier_v1`.
-* `idle:register_threshold(seconds, on_idle, on_resume)` from Lua dispatches a registration packet over the IPC; the Supervisor allocates a distinct `ext_idle_notification_v1` listener for that duration.
-* **Handoff loop**: on `ext_idle_notification_v1::idled`, the Supervisor pushes the matched threshold duration to the Renderer, which runs `on_idle()`; `resumed` runs `on_resume()`.
-* Lua can register unlimited custom thresholds (dim at 30s, lock at 5m, DPMS sleep at 10m) with zero active timers.
-* A registration arriving before the Wayland setup finishes is queued and replayed when it completes, not dropped (ADR-0139). Config evaluation reliably beats that setup, so without the queue every threshold registered at boot is lost.
-* Registrations do not outlive an evaluation: re-running `shell.lua` drops every callback the old tree registered, since the Supervisor's listener persists and re-registering the same duration is a no-op there.
-* Two registrations for the same duration are one Wayland listener and two callbacks; the Supervisor allocates per distinct duration and fans out, since the event names the threshold, not the registration.
-
-### 7.2 Idle inhibit
-
-* `idle:inhibit(reason)`/`idle:release_inhibit()` hold off auto-suspend through `org.freedesktop.login1.Manager.Inhibit(what="idle", mode="block")` on the system bus the Supervisor already has (ADR-0032). Not the Wayland `idle-inhibit-unstable-v1` protocol, which inhibits per surface and would need the Renderer to own it.
-* The hold is a counted, per-generation reference on one logind fd: it opens on the 0-to-1 transition and closes on 1-to-0, so a media player and a presentation mode can both hold it without either release killing the other.
-* logind closes the fd if the holding process dies, so a Supervisor crash cannot leak a stuck inhibit.
-* Notify degrading to inert (no `ext_idle_notifier_v1`, a failed dedicated connection, a setup timeout) does not disable inhibit. The two halves share a controller, not a transport.
-
-### 7.2.1 A held inhibitor stops the events (ADR-0139)
-
-Oblisk is the idle daemon: with `IdleAction=ignore`, nothing but this shell acts on idleness, so honouring an inhibitor is this shell's job. The Supervisor watches `Manager.BlockInhibited`, a colon-separated list of everything held in `block` mode with change notification, and while it names `idle` no threshold event is forwarded to any generation.
-
-That covers every holder at once: this shell's own `idle:inhibit(reason)`, and a `systemd-inhibit --what=idle` from anywhere else on the system. A config's manual inhibit toggle therefore needs no guard inside its own `on_idle`.
-
-An arriving inhibitor emits the `Resumed` for every threshold that had been told the session went idle, so a screen dimmed at 30 seconds undims when a film starts. Nothing is replayed on release: `ext-idle-notifier-v1` cannot be asked whether the seat is idle now, so a seat still idle when the inhibitor goes stays awake until the next idle period.
-
-Wayland surface inhibitors need none of this. §7.1's listeners use `get_idle_notification`, which already respects them, and this is the logind half of the same idea.
-
-
-### 7.3 logind session lock (ADR-0138)
-
-`loginctl lock-session` is how the platform asks whoever owns the screen to lock it: it calls `org.freedesktop.login1.Manager.LockSession`, and logind emits a `Lock` signal on this session's own object. The Supervisor subscribes to that signal on the system bus it already holds, resolving its session from `$XDG_SESSION_ID` and falling back to logind's `"auto"`. A `Lock` takes the same path a `lock:invoke("lock")` from the bar takes. There is no `systemctl --user lock`: `systemctl` manages units.
-
-`Session.SetLockedHint` is published back on every confirmed lock change, off the same `LockOutcome` the `$XDG_RUNTIME_DIR` marker is written from, so `loginctl show-session`'s `LockedHint` and the marker cannot disagree.
-
-`Unlock` is logged and refused. ADR-0042 makes a successful PAM authentication the only thing that lifts a lock, and honouring the signal would turn anyone who can reach the bus into an unlock.
-
-Both halves degrade to inert, logged once: a shell that cannot reach logind still locks from its own bar.
----
-
-## 8. High-performance wallpaper transition engine
-
-Wallpapers render on the GPU inside the Renderer, double-buffered for seamless animated transitions.
-
-### 8.1 GPU scaling, fit, and transition algorithms
-
-* **Fit**: `"Cover"`, `"Contain"`, `"Stretch"`, `"Tile"`, `"Center"`, `"ScaleDown"` are solved inside GLES3 fragment shaders, no CPU pixel resizing.
-* **Command**: `wallpaper:set(monitor, filepath, [fit], [transition], [duration])`.
-* **Transitions**: `"Crossfade"`, `"Slide"`, `"Sweep"`, `"Zoom"`, interpolated between old and new textures on the GPU.
-
----
-
-## 9. Active window tracking (niri only)
-
-The Renderer/Supervisor track the focused toplevel's class and title over niri's IPC event stream (ADR-0056), not a compositor-independent Wayland protocol. `oblisk.workspaces` stays `nil` on any other compositor; nothing here reaches for `ext-foreign-toplevel-list-v1` or `zwlr_foreign_toplevel_manager_v1`.
-
-### 9.1 `workspaces.active_client`
-
-`title`, `class` (niri's `app_id`; Wayland has no `WM_CLASS`), and `is_floating` are exposed to Lua. `is_fullscreen` is **not** exposed: niri-ipc 26.4.0 carries no fullscreen state to source it from (ADR-0056 decision 5).
-
-### 9.2 Icon resolution: superseded, not built
-
-§ 3.2's `system:find_icon(app_id, name, fallback)` was never built (ADR-0054 decision 5, amended by ADR-0061). The two halves it would have joined now live elsewhere. Theme-name-to-file resolution moved to the Renderer, reached through `icon.name` (ADR-0054), because the control socket carries one-way commands and snapshots only, with no request/response shape for a synchronous lookup to return a path over. The `app_id`-to-`.desktop`-to-`Icon=` half is served by the enumerated `oblisk.applications` capability instead of a per-`app_id` call (ADR-0061): a launcher wants the whole entry list, not one lookup at a time.
-
----
-
-## 10. Workspace state (niri only, no adaptor trait)
-
-Compositor identity is detected once, by env var (`$HYPRLAND_INSTANCE_SIGNATURE`, `$NIRI_SOCKET`, in that probe order). `oblisk.workspaces` has exactly one implementor, niri's IPC socket, and no `WorkspaceAdaptor` trait: ADR-0056 decision 1 treats a trait with one implementor as speculative generality, so the compositor-specific code is a module boundary (`workspaces::niri`) rather than a dynamically loaded driver. A session detected as anything but niri leaves `oblisk.workspaces` `nil` rather than guessing.
-
----
-
-## 11. Configurable telemetry scheduler (`sysinfo`)
-
-* **Intervals**: `sysinfo:configure({ cpu_interval, ram_interval, temp_interval })`.
-* **Suspension**: an interval of `0` halts and suspends that background task entirely.
-* **Sources**: CPU from `/proc/stat`'s aggregate line, RAM from `/proc/meminfo`, temperatures from `/sys/class/hwmon/` chip resolution by name preference. No shell-outs.
-
----
-
-## 12. Asynchronous non-blocking subprocess stream pipelines (`process`)
-
-Non-blocking subprocess spawning with line-buffered streams.
-
-* **No Lua blockage**: stdout/stderr lines feed Lua callbacks via a non-blocking select loop as they're emitted.
-* **Process group lifecycle**: every `process.run` child gets its own Unix process group (`process_group(0)`, not hand-rolled `setpgid`). On config reload the Supervisor sends `SIGTERM` to the group (`killpg`); if it hasn't exited within a 100ms grace window, it escalates to `SIGKILL`. No zombie or orphaned background processes survive a reload.
-
----
-
-## 13. Unified power & thermals (`oblisk.power`)
-
-Two unrelated sources under one capability: **UPower** (`org.freedesktop.UPower`) for `power.energy_rate` and battery state, **power-profiles-daemon** for `power.active_profile` and `power:set_profile(name)`. The daemon renamed its bus name from `net.hadess.PowerProfiles` to `org.freedesktop.UPower.PowerProfiles` in 0.20; the Supervisor tries the new name first and falls back to the old one.
-
----
-
-## 14. XDG directory layout & state manager
-
-| Path | XDG baseline | Write state | Content |
-| :--- | :--- | :--- | :--- |
-| `~/.config/oblisk/` | `$XDG_CONFIG_HOME` | Read-only to engine | `shell.lua` and every `.lua` file it `require`s (ADR-0047). |
-| Wherever a config says | none | Read-write | Every file a `persistent_table` declared (ADR-0136). |
-| `/dev/shm/oblisk-$UID/` | RAM memory-disk | Read-write (RAM) | Decoded notification images and icons. |
-
-### 14.1 Declared files: the config picks the path
-
-The Supervisor holds no state path of its own (ADR-0136). A config declares a file with `persistent_table { path, name, defaults }` and the Supervisor opens exactly that, keyed by the joined absolute path; `oblisk.storage` (§ 2.18) is every such file. A missing file is the ordinary first-run case, not a fault: it loads as an empty table, the declaration's `defaults` fill it, and the first save creates it.
-
-Writes land 1 second after the last one to that file, through a temporary file in the same directory and a rename, which is atomic on any single filesystem: a config writing on every keystroke must not be able to leave a half-written file behind a crash, since the next boot reads whatever is there. A save still inside that window when the session ends is lost, since nothing flushes on the way out.
-
-The one XDG path left is the config directory itself, which cannot be config-declared: something has to find `shell.lua` before any Lua runs. `-c <dir>`, then `$OBLISK_CONFIG_DIR`, then `$XDG_CONFIG_HOME/oblisk`, then `~/.config/oblisk`.
-
----
-
-## 15. Glitch-free Renderer hot-reload and overlapping handoff lifecycle
-
-An invisible hot-reload, no stutters, black frames, or desktop flashes, via the **Presentation Before Authority (PBA)** protocol. The compositor never sees a gap in frame commits; the active session stays interactive throughout.
-
-```
-                  [ Config Save (inotify) ]
-                             │
-            ┌────────────────┴────────────────┐
-            ▼                                 ▼
-[ Active Generation N ]            [ Spawn Candidate N+1 ]
-- Fully authoritative              - Evaluates AST (5ms)
-- Accept seat inputs               - Binds Wayland Protocols
-- Commit active buffers            - Staged in Null-Buffer State
-            │                                 │
-            │                      (Activate) │ (IPC Socket)
-            │                       ◄─────────┤
-            │                                 │
-            │                                 ▼
-            │                      [ GLES3 Rendering Frame ]
-            │                      - Commit physical textures
-            │                      - Request Presentation Feedback
-            │                                 │
-            │                     (Presented) │ (wp_presentation_feedback)
-            │                       ◄─────────┤
-            │                                 │
-            ▼                                 ▼
-[ De-authorize Input ] ────────────▶ [ Promote Generation N+1 ]
-- Clear input region                 - Activate Input Grab
-- Reaped via SIGTERM                 - Commits Authoritative buffers
+## 6. PipeWire and privacy
+
+Native PipeWire callbacks publish sinks, sources, default routing and stream volume/mute.
+Commands set defaults and control output/input volume and mute.
+Playback streams publish per-app volume and mute, targeting stream node IDs.
+
+Input audio streams report microphone users (excluding monitor capture); output video streams report
+screencast users. Camera detection combines video-device watching, process-fd inspection and
+PipeWire name enrichment.
+See [audio dispatch](../supervisor/src/capabilities/audio/mod.rs) and
+[privacy](../supervisor/src/capabilities/privacy/mod.rs).
+
+## 7. Idle, lock and Polkit
+
+The Supervisor owns `ext_idle_notifier_v1`. Lua registers idle/resume callbacks per duration;
+equal durations share a Wayland listener. Registrations reset on re-evaluation.
+
+`oblisk.idle:inhibit(reason)` and `release_inhibit()` refcount one logind
+`Inhibit(what="idle", mode="block")` fd across generation holds. Logind idle inhibition suppresses
+threshold events and resumes reported thresholds. `idle.inhibited` reflects shell holds;
+`idle.inhibitors` names external holders.
+
+Logind's session Lock signal and config lock commands request the session lock flow. The Supervisor
+owns lock decisions; the Renderer owns protocol surfaces. Only successful authentication authorizes
+unlock. Renderer crashes cannot unlock the compositor.
+
+Polkit agent registration is on-demand. Challenge state and cancel actions belong to the Supervisor;
+secrets route directly from native input to the authentication helper.
+See [idle](../supervisor/src/capabilities/idle/mod.rs),
+[lock](../supervisor/src/capabilities/lock/mod.rs) and
+[polkit](../supervisor/src/capabilities/polkit.rs).
+
+## 8. Workspaces and active window
+
+Compositor probing selects Niri or Hyprland modules. Workspace state includes per-output lists,
+focus, population, Hyprland special workspaces, and the focused active client (title, app ID,
+floating state, and Hyprland fullscreen). Actions focus a workspace or toggle special workspaces.
+No complete window list is exposed.
+
+`oblisk.screens` is Renderer-owned output state, not a display-configuration API.
+See [workspaces](../supervisor/src/capabilities/workspaces/mod.rs) and
+[output handling](../renderer/src/wayland/output.rs).
+
+## 9. Telemetry and clock
+
+`sysinfo` samples CPU (/proc/stat), RAM/swap (/proc/meminfo) and temperatures (/sys/class/hwmon/)
+with configurable intervals; zero disables that sample task. `system.time` ticks once a second.
+See [sysinfo](../supervisor/src/capabilities/sysinfo/mod.rs).
+
+## 10. Processes
+
+`process.run(cmd, args, out_cb, exit_cb)` spawns a separate process group and streams newline-stripped
+lines. `out_cb(line, stream)` identifies the stream; `exit_cb(code)` uses nil for a signal exit.
+The handle exposes `kill()`.
+
+Generation retirement and Supervisor shutdown reap managed children using SIGTERM and a 100 ms grace
+before SIGKILL. In-place reload preserves the generation without restarting processes.
+See [process registry](../supervisor/src/process/registry.rs).
+
+## 11. Other capabilities
+
+| Capability | Source / responsibility |
+| :--- | :--- |
+| `battery` | UPower DisplayDevice composite battery and time estimates |
+| `power` | UPower energy state and power-profiles-daemon profile selection |
+| `brightness` | Native backlight reading and control |
+| `keyboard` | Lock LEDs, keyboard backlight and compositor layout switching |
+| `applications` | Desktop entry indexing, app launching and URL opening |
+| `updates` | Package-manager checking and install progress via backend trait |
+| `files` | Config-requested directory listings followed through inotify |
+
+See [capability registry](../supervisor/src/capabilities/mod.rs).
+
+## 12. Paths and persistence
+
+| Data | Location |
+| :--- | :--- |
+| Config | CLI `-c`, then shared config-path resolver |
+| Declared JSON stores | Absolute path and filename chosen by `persistent_table` |
+| Control socket / lock marker | `$XDG_RUNTIME_DIR` |
+| Spooled images | `$XDG_RUNTIME_DIR/oblisk/<kind>/`; runtime fallback uses `/run/user/<uid>` |
+
+Declared files push immediately and write 1 second after the last edit via temporary file and rename.
+Pending saves do not flush at shutdown. See [storage](../supervisor/src/capabilities/storage/controller.rs).
+
+## 13. Control socket and wire format
+
+Communication between Renderer and Supervisor uses JSON-RPC 2.0 over a private Unix domain socket.
+Commands carry generation and revision metadata:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "ExecuteCommand",
+  "params": {
+    "generation_id": 4,
+    "capability": "audio",
+    "action": "set_volume",
+    "arguments": [0.5],
+    "expected_revision": 42
+  },
+  "id": 105
+}
 ```
 
-### 15.1 Concurrent overlapping lifetimes
+Inbound frames are tagged with the connection's generation ID.
+Ordinary command dispatch does not currently enforce sender authority or the envelope's
+generation/revision claims. These fields are not authorization guarantees.
+See [wire types](../shared/src/lib.rs), [socket](../supervisor/src/socket.rs) and
+[dispatch](../supervisor/src/supervisor.rs).
 
-On a config edit (via `inotify` watch on `~/.config/oblisk/`), the Supervisor does not terminate the active Renderer (Generation N). N stays fully authoritative: active Lua VM, layout, all seat input, while the Supervisor concurrently spawns the edited config as an isolated Candidate (Generation N+1).
+## 14. Reload lifecycle
 
-### 15.2 Null-buffer staging & nonce-bound handshake
+### 14.1 Evaluation
 
-1. **Fast AST evaluation**: the Candidate compiles and evaluates `shell.lua`. High-overhead system queries are skipped; it hydrates from a state snapshot the Supervisor pushes over the IPC instead.
-2. **Null-buffer registration**: the Candidate binds `zwlr_layer_surface_v1` [oblisk-idl-api-specs § 6.1], acknowledges the compositor's `configure`, but commits null buffers. It stays invisible, occupying no on-screen coordinates.
-3. **Nonce handshake**: once ready, the Candidate signals the Supervisor, which verifies process integrity and writes a nonce-bound `ActivateDraw` command over the private control socket.
+Config edits trigger evaluation in the current generation. Value changes reconcile in place;
+topology changes require a candidate generation. Evaluation failure preserves the active scene and
+reports via `oblisk.rescue`.
 
-### 15.3 Wayland presentation-feedback verification
+### 14.2 Candidate preparation and presentation
 
-On the activation nonce, the Candidate draws its initial layout on the GPU, commits the buffer with a `wp_presentation_feedback` request attached, and waits for the `presented` event, confirmation the pixels physically hit the screen on every target monitor, before reporting evidence back to the Supervisor.
+The candidate evaluates with dependency snapshots and prepares declared surfaces with null buffers.
+A nonce-bound `ActivateDraw` from the Supervisor permits drawing. The candidate commits buffers with
+`wp_presentation_feedback` and reports evidence back to the Supervisor upon display presentation.
 
-### 15.4 The swapping seam & instant reaping
+### 14.3 Promotion
 
-Only once presentation evidence is verified across every connected display does the Supervisor swap:
-
-1. **Input deselection**: Generation N calls `wl_surface::set_input_region` with empty bounds and drops focus.
-2. **Candidate promotion**: Generation N+1 claims pointer focus and begins receiving seat input.
-3. **Reaping**: `SIGTERM` to N's process group; `SIGKILL` after a 100ms grace window if it hasn't exited.
-
-Delaying N's destruction until N+1 has verified physical screen mapping eliminates black screens, flash boundaries, and coordinate-mapping delays during hot-reloads.
+Promotion waits for evidence from every expected surface within one shared timeout.
+Only then does authority transfer per surface, updating input focus and exclusive zones.
+The superseded generation's surfaces are unmapped, and its process group and managed children are reaped.
+See [reload](../supervisor/src/reload.rs) and [presentation handling](../renderer/src/wayland/output.rs).

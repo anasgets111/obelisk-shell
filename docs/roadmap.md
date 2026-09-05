@@ -1,87 +1,56 @@
-# What is not built
+# Framework gaps and scope
 
-Every spec in this repo was written from `oblisk-idl-api-specs.md`. A spec cannot list what it
-forgot, so this file works the other way round: it diffs the workspace against a Quickshell config
-that is already somebody's daily shell (`anasgets111/dotfiles`, `quickshell/.config/quickshell`).
+Source inspection compared the current implementation with the reference QML config and Quickshell C++ at
+`2d3b3e9`. This is a scope guide, not a commitment to full Qt/Quickshell parity or a live hardware validation.
+[API](oblisk-idl-api-specs.md) and [services](oblisk-supervisor-services-dbus.md) describe
+what exists; [decisions](decisions.md) holds history.
 
-Nothing here is scheduled. Several entries need a decision before a line of code.
+Rust owns platform connections, validation, secret handling, resource lifetimes, input and
+rendering. Lua owns composition, appearance, user preferences and orchestration. A feature absent
+from `dev-config` is not necessarily an engine gap.
 
-## The reference workload
+## Recommended engine work
 
-Nineteen bar modules across three zones, eight Wayland surfaces, about forty data sources. It drives
-PipeWire, UPower, BlueZ, MPRIS, NetworkManager, SystemTray, Polkit and PAM through native bindings,
-speaks niri's event stream on one socket and its request channel on another, shells out to more than
-twenty binaries, and renders a 256-bar audio spectrum through a GLSL fragment shader.
+Recommendations, not accepted API designs. Correctness comes before feature expansion.
 
-## By layer
+| Area | Current limit | What to do | Keep out of Rust |
+| :--- | :--- | :--- | :--- |
+| Command authority | Ordinary command dispatch does not enforce the envelope's generation/revision claims | Enforce sender/authority checks; settle stale-revision semantics before relying on them | Generation IDs and validation in Lua |
+| Text editing | Append/backspace input; no editing cursor, selection, clipboard, undo or IME composition | Native ordinary-field editing and composition; retain the separate secure input path | Form validation policy and SMS/search UI |
+| Keyboard and accessibility | Field navigation callbacks, no general focus traversal or accessibility tree | Focusable controls, keyboard activation and accessibility semantics | Widget appearance and panel navigation policy |
+| Timers | Clock updates at 1 Hz; no config-owned timer | Cancellable one-shot/repeating callbacks with reload cleanup; no idle redraw loop | Retry intervals, debounce delays and OSD duration |
+| Paths and drawing | Boxes, text and images; no dynamic paths, arcs, gradients or transforms | Add the smallest drawing operations needed by a real component; use SVG for static artwork | Dedicated notch, gauge or spectrum widgets |
 
-| Layer | State | Detail |
+## Needs discussion before implementation
+
+| Area | Gap | Decision needed |
 | :--- | :--- | :--- |
-| Capabilities, read | near complete | every native Quickshell service has a counterpart |
-| Capabilities, write | near complete | ahead in one place: that config reads the power profile, `power:set_profile` sets it |
-| Surface roles | complete | `panel` on four layers, `window`, `popup`, `lock`, all live-tested |
-| Pointer input | three of four events | click, hover and scroll are built; nothing reports the pointer's own shape |
-| Pointer input, acting on it | click and hover | `on_click` and `on_hover` (ADR-0095). Scroll is readable through `scroll(name)` and has no callback, which nothing has wanted yet. |
-| Paint vocabulary | five operations | fill, radius, per-edge border, blit, rounded clip |
-| Animation | absent | Lua's fastest clock is `system.time` at 1 Hz |
-| Text and layout | sufficient | shaping, clipping, alignment, keyed reconciliation |
-| Text metrics | built | `text_align`, `elide`, `wrap` and `max_lines` all land (ADR-0089); no per-line alignment and no hyphenation |
-| Fonts | declared | `fonts { ... }` picks the chain; no per-node family, and none is needed while fallback is per glyph |
+| Process control | Line output and kill only; no stdin writes, signal selection, explicit cwd/env or detached mode | Which caller needs each extension? Define reload ownership before allowing detached children |
+| External IPC | `oblisk set/toggle` writes named state; no callable methods or returned results | Are state writes sufficient, or do integrations need request/response commands? |
+| General I/O | No native HTTP, socket client/server or arbitrary watched file contents; JSON storage and folder watching exist | Prefer subprocess helpers first. Add native I/O only for demonstrated lifecycle, latency or data-volume needs |
+| KDE Connect | No native device/plugin model | Dedicated Supervisor capability versus a helper streaming state; do not expose unrestricted D-Bus just for parity |
+| Windows and displays | Workspace summaries and one active client; screens are read-only | Select the required window actions and output settings, then define Niri/Hyprland differences and apply/revert behavior |
+| Service depth | MPRIS lacks stop/shuffle/repeat/rate/volume and capability flags; PipeWire lacks channel/peak/link detail; UPower exposes a composite battery | Extend existing capabilities for concrete controls; do not mirror every upstream property |
+| Bluetooth codecs | `codec` is nil; no codec command is accepted | Whether codec selection is needed, and how the audio capability should own device profiles/routes |
+| Blur and effects | No blur, shadows, arbitrary masks or shaders | Separate blurring our own images from capturing content behind a surface; settle compositor support and GPU cost |
+| Capture | No screen/window image or live texture | Build for previews/screenshots only when requested; external recording does not require renderer capture |
+| Large collections | Every list item is constructed; no viewport delegate reuse or grid layout | Measure the target workload before adding virtualization or layout vocabulary |
+| Wayland/input extras | No shortcut inhibition, per-surface idle inhibition, touch gestures or cross-app drag/drop | Pick supported hardware/protocols and an actual consumer; logind inhibition is already available |
+| Runtime construction | Top-level declarations change through generation swaps | Keep current topology rules unless dynamic windows require a different lifetime model |
+| Fonts and localization | Global font chain; no per-node family or translation API; application names are unlocalized | Decide supported language/font requirements before expanding text and application metadata |
+| Animation | No animation API | Separate design track: retained-node interpolation, compositor frame gating and exit-resource lifetime; no full scene resolve per frame |
 
-The data layer is not the problem. Paint and animation are.
+## Keep in config or use existing tools
 
-## Ranked, by modules unblocked per unit of work
-
-1. **The animation model.** The largest item. `CONTEXT.md`'s Lease exists to hold a removed node's
-   GPU resource alive for a crossfade and has had no caller since it was written, because the
-   feature it serves was never specified. One constraint binds now: frame gating is written as
-   "repaint when the scene changed", and a running animation is a second, orthogonal reason to
-   wake. Build the gate so a reason can be added rather than replacing the condition.
-   ADR-0130 gives the item a decided shape, read off Noctalia's 364-line implementation: scalar
-   setters hung off the `NodeId` `Scene::apply` already keeps stable, progress taken from wall
-   time rather than an accumulated frame delta, and a `wl_surface.frame` callback armed only while
-   something is live -- so `wayland::run` keeps blocking in `poll` at rest and ADR-0124's idle cost
-   survives the feature. It also records what their model cannot do that ours would have to: their
-   declarative layer has no animation at all, because in this tree the config *is* that layer.
-   ADR-0131 measures the constraint that follows: one re-resolve costs 1.38ms median and 3.38ms
-   at p95, so an animation that re-resolves per frame spends a tenth of a core before it paints.
-   It must interpolate on the retained tree instead. `eglSwapInterval(0)` is already set
-   (ADR-0132), so the blocking swap that would stall this single-threaded loop once frames contend
-   is no longer in the way. `OBLISK_PROFILE_IDLE` is the instrument to build this against: turns
-   should rise to the frame rate with `idle` staying at zero, and a `SPIN` line means the frame
-   callback re-armed with nothing to do.
-   Quickshell's `Retainable` (refcounted `lock()`/`unlock()` plus a `dropped()` signal, so a config
-   can say "not yet" while an exit transition runs) is the shape to copy on the day exit
-   transitions exist.
-2. **Backdrop blur.** One decision, two bad options, and only the client-side one works on niri.
-3. **A `shape` node taking a path.** Closes the notch, the arcs and circular progress together, and
-   costs far less than exposing shaders.
-4. **Shaders.** The audio spectrum and the wallpaper transitions. Lowest value, and the only item
-   that puts the GPU in reach of config code.
-
-## Data no capability carries
-
-| Missing | Used for | Nearest path today |
+| Feature | Existing route | Do not build for parity alone |
 | :--- | :--- | :--- |
-| An HTTP client | weather, IP geolocation, currency | `process.run curl` then `json.decode`. Fine as a subprocess; a capability would be scope creep. |
-| Per-workspace window lists | a window switcher per workspace | § 2.9 carries one global `active_client` plus, per workspace, `populated` and one `app_id` (ADR-0117): enough for a strip's icon, not for a list. ADR-0056 chose that shape, so this is a decision, not an oversight. |
-| KDE Connect | SMS, ring, mount, remote commands | none. Lua cannot speak D-Bus, and this needs a live signal stream rather than one-shot calls. The only entry arguing for a general D-Bus escape hatch. |
-| Monitor configuration | the display-settings arrangement editor | § 2.15 `screens` reads and nothing writes. Writing output config is compositor-specific, so ADR-0056's reasoning applies unchanged. |
-
-## Judged and dropped
-
-- **Lazy surface creation.** ADR-0049 settled it. Creating `popup` and `window` objects on show is
-  forced by the protocol and delivers what Quickshell's `LazyLoader` delivers without one.
-  Asynchronous incubation has no analogue: this is one Wayland object per open, not a QML tree.
-- **Config-triggered reload.** `Quickshell.reload(hard)` is callable from QML. Here reload is
-  supervisor-only through inotify and has no caller. ADR-0047's recursive watch covers edits, and
-  ADR-0048 removed file reading from Lua, which was the last external change a config could have
-  noticed. Build it if a caller appears.
-
-## Known holes in the tooling
-
-- **`--validate` does not exist.** `renderer/src/main.rs` never reads `env::args`, so
-  `cargo run -p renderer -- --validate <path>` ignores the flag in full and starts a live renderer
-  over the running session. It exits `70` in a fraction of a second when no supervisor is up
-  (ADR-0059 decision 1), so it no longer holds the render node, but it still validates nothing.
-  A config that fails to load should say so at a shell prompt.
+| Weather and other HTTP data | `process.run` with an HTTP CLI, then `json.decode` | A weather/currency/geolocation capability |
+| Audio spectrum | Stream Cava output into Lua state; render with available drawing operations | A native FFT service merely to replace Cava |
+| Screen recording | Control an external recorder | Video encoding inside the shell |
+| Input display | Stream an external input backend | Global input capture inside the renderer |
+| Wallpaper UI | Background `panel`, `image`, watched folders and persisted preferences | A wallpaper service or fixed wallpaper surfaces |
+| Compound controls | Lua components over existing nodes | Rust sliders, calendars, launchers or settings panels |
+| Preferences | `persistent_table` with config-declared files | A framework-owned settings schema or fixed state file |
+| Simple keybinds | `oblisk set` / `oblisk toggle` | Dedicated IPC commands for each panel |
+| Lazy popups/windows | Wayland objects are created when shown | A QML-style loader just to defer surface creation |
+| Extra platforms/authentication | Current target is a Wayland session shell | X11/I3, Greetd or general PAM conversations without a product requirement |
