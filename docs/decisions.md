@@ -1,25 +1,14 @@
 # Decisions
 
-One entry per decision, numbered in the order they were taken. Numbers are permanent: 1,233
-comments across the Rust tree cite them as `ADR-0044`, and 406 of those cite a specific
-`decision N` inside an entry, so neither the entry numbers nor the decision numbers inside them
-may be reused or renumbered.
+Historical decisions, not current API documentation. Entries may describe proposals, deferred work
+or behavior superseded later. Current contracts live in [API](oblisk-idl-api-specs.md) and
+[services](oblisk-supervisor-services-dbus.md); open work lives in [roadmap](roadmap.md).
 
-These were 81 separate files running 8,635 lines, median 99 lines for one decision. The format
-they were written to (`.agents/skills/domain-modeling/ADR-FORMAT.md`) says an ADR can be a single
-paragraph and that the value is in recording *that* a decision was made and *why*. They had grown
-into essays, so they were compressed back to the decision. Git holds the long versions.
+Entry and internal decision numbers are permanent because code cites both. Keep the choice,
+constraints, rejected alternatives and amendments when shortening an entry. Add new decisions
+sequentially; do not rewrite an old decision to match later implementation.
 
-An entry records what a reader cannot get from the code: the alternative that was rejected, the
-constraint that is not visible at the call site, and the measured number that cost real work to
-produce. It does not restate what the code does.
-
-To add one, take the next number and write a paragraph. Do not edit an existing entry to match
-what shipped later. Add a line saying which entry superseded it, and leave the record alone.
-
-The early entries name numbered build phases. Those came from a roadmap that no longer exists,
-because every phase in it was built. Read a phase number as a date, not as a pointer.
-`docs/roadmap.md` holds what is still open.
+Early phase numbers and spec section references belong to the historical documents.
 
 ## 0001. Reload strategy splits on topology change
 
@@ -714,6233 +703,1760 @@ outputs.
 
 ## 0025. PBA orchestrator wired with atomic per-candidate promotion, not true per-output streaming
 
-Phase 14 gives `reload::run_pba` and its `CandidateLink` trait (ADR-0019) their first real
-transport, per-output evidence collection, and a real Renderer-side
-null-buffer/`ActivateDraw`/`wp_presentation_feedback` handshake.
+Promotion is atomic per candidate. Evidence is collected per surface, but every expected surface
+must report within one shared timeout before any swap occurs. Otherwise the candidate is aborted.
+Partial promotion was rejected because aborting after two of three outputs had transferred would
+black out those two outputs. This implements ADR-0019 item 5 only partially, not ADR-0003's
+independent output timing.
 
-Real wire types (`shared/src/lib.rs`): `ActivateDraw { nonce }`, `ReadySignal { surfaces }`,
-`PresentationEvidence { nonce, surface_id }`, `DeselectInput { surface_id }`, `PromoteGeneration {
-surface_id }`, adjacently tagged per ADR-0024's convention. `SocketCandidateLink`
-(`supervisor/src/reload_link.rs`) borrows the Supervisor's shared `inbound_frames` channel and a
-cloned `GenerationRegistry` for the duration of one in-flight handshake; a frame from the wrong
-`generation_id` or an unrelated type/nonce is logged and dropped, not routed elsewhere.
+The handshake stages null buffers, sends nonce-bound `ActivateDraw`, then collects
+`wp_presentation_feedback`. Wrong generation, type or nonce is dropped. The caller sends input
+deselection, candidate promotion and reap in that order because the candidate link owns only one
+connection. Timeouts were 2 seconds for readiness, 3 seconds for evidence and 100 ms reap grace.
 
-Promotion stays atomic per candidate, not streamed per output. `drive_handshake` collects evidence
-per `surface_id` (the wire-level granularity ADR-0019 item 5 asked for) but still gates the Swap
-(`DeselectInput`/`PromoteGeneration`) on all expected surface_ids reporting within one shared
-`evidence_timeout`. `PbaOutcome::promoted_surfaces` is always either every expected surface_id or
-the operation fails entirely; there is no partial-success shape. Streaming promotion per output
-while the whole candidate stays abortable on a global timeout is actively unsafe: if 2 of 3 surfaces
-promote and the 3rd times out, aborting the candidate now would black out the 2 already-transferred
-surfaces, exactly the failure PBA exists to prevent. `run_pba` stops right after evidence
-verification, dropping the `superseded: &mut Child` parameter; the caller (`main.rs`) sends the Swap
-messages, then reaps `superseded` directly, since § 15.4's ordering (Input Deselection, then
-Candidate Promotion, then Reap) needs two different connections and `CandidateLink` is scoped to
-only the candidate's.
+Rejected: hand-written presentation dispatch. SCTK 0.21.1 already supplied it; the Renderer only
+needed to correlate feedback. Discarded feedback falls through to the evidence timeout.
 
-Timings: `ready_timeout: 2s`, `evidence_timeout: 3s`, `reap_grace` reuses the existing
-`DEFAULT_REAP_GRACE` (100ms).
+Not built in this pass: scene-to-GPU rendering, arbitrary declared surfaces, real input/promotion
+effects, concurrent handshakes, immediate failure on discarded feedback, installed binary lookup,
+or NetworkManager/BlueZ hydration. The proof still used fixed surfaces and PipeWire or empty state.
 
-Renderer candidate mode (`renderer/src/wayland/mod.rs`): on first configure, a candidate commits a
-null buffer instead of binding EGL, and sends the full `ReadySignal` surface_id list once every
-tracked surface is null-buffered. `activate_draw` requests `wp_presentation_feedback` immediately
-before `swap_buffers`, so the request associates with that commit.
-
-Rejected: hand-written `Dispatch<WpPresentation, _>`/`Dispatch<WpPresentationFeedback, _>` impls, as
-the phase's own draft spec assumed. `smithay-client-toolkit` 0.21.1 already ships a tested
-`presentation_time` module (`PresentationTimeState`, `PresentationTimeHandler`); `App` implements
-that trait directly and correlates evidence itself, since the module's `feedback()` does not accept
-custom user data. `wp_presentation_feedback` has no `destroy` request: both `presented` and
-`discarded` are protocol-marked `type="destructor"`, so the object invalidates automatically once
-either fires.
-
-Not built: Scene-to-GPU rendering (`activate_draw` still draws Phase 3/4's static proof content, not
-Lua-authored `Scene` output; no later phase owns this gap either); a topology-driven arbitrary
-surface set (`surface_id` names today's fixed
-`main_bar`/`overlay_canvas`/one-`wallpaper_layer`-per-output set, not ADR-0003's full per-monitor
-model); real effects for `DeselectInput`/`PromoteGeneration` (logged and dropped, no per-surface
-input-region/focus machinery exists yet); concurrent PBA handshakes (the main loop blocks
-synchronously for one handshake, deliberate while swaps stay rare and nothing else is
-capability-routed over the socket, per ADR-0020); a distinct fast-fail for
-`wp_presentation_feedback`'s `discarded` event (the existing `evidence_timeout` already catches a
-surface that never presents); a packaging/install-path story (`current_exe()`'s sibling-binary
-assumption stands in); real NetworkManager/BlueZ state-hydration content (still reuses the last
-PipeWire `StateSnapshot` or an empty one, per ADR-0019 item 4's already-open gap).
-
-Closes ADR-0019 items 1, 3, 6, and 7 in full; item 5 (true multi-output fan-out) only partially,
-gated by the atomic-promotion decision above; item 4 (NetworkManager/BlueZ hydration) remains open.
+Closes ADR-0019 items 1, 3, 6 and 7; item 5 remains partial and item 4 remains open.
 
 ## 0026. `process.run`'s Lua binding and piped stream registry ship; `textfield`/PAM stay deferred
 
-Phase 15 implements only `process.run`'s Lua binding and non-blocking stdout/stderr piping, closing
-ADR-0018 items 1-2. `textfield`'s `secure_submit` and a real PAM conversation stay out of scope:
-`textfield` has no scene node yet (`ensure_supported_kind` rejects it as
-`LayoutError::UnsupportedNodeKind`, per ADR-0023) and no `wp-text-input-v3` crate in the dependency
-tree; a PAM crate choice is still unresearched and needs its own spike and ADR before being wired
-in.
+Phase 15 implements the Lua process binding and non-blocking stdout/stderr piping, closing
+ADR-0018 items 1–2. Textfield and PAM stay deferred. The claimed missing text-input dependency
+was corrected by ADR-0027; the scene node and PAM design were still missing.
 
-The Lua `Loader` and `dispatch_loop` share one thread (the socket-client thread), so a `process.run`
-closure needs no cross-thread bridge, unlike Phase 14's Wayland-thread work, only an in-thread
-`tokio::sync::mpsc` queue to hand its request to `dispatch_loop`'s `select!`. The wire protocol
-reuses `CommandEnvelope` (`capability: "process"`, `action: "run"`/`"kill"`) rather than a new
-request type. `CommandEnvelope.id` is assigned by the Renderer, a monotonic counter scoped to one
-`ProcessRegistry`, because `process.run` must return a `ProcessHandle` to Lua synchronously, before
-any socket round trip can complete.
+Commands reuse `CommandEnvelope` with capability `process` and actions `run`/`kill`.
+The Renderer assigns monotonic IDs so it can return a handle before a socket round trip.
+At this stage the loader and dispatch loop shared a thread and used an in-thread queue.
 
-The Supervisor-side registry is a channel-actor, not a shared mutex: `processes:
-HashMap<(generation_id, id), Child>` lives as a plain local in `main()`, mutated only from
-`main()`'s own `select!` arms, matching every other spawn-tracking piece of state in this codebase.
-A new `spawn_group_leader_piped` primitive is added alongside `spawn_group_leader` rather than
-changing it, since the boot Renderer spawn and every PBA candidate rely on inherited stdio.
+The Supervisor tracks children by generation and command ID in its event loop, without a
+spawn-registry mutex. Piped spawning is separate from inherited-stdio spawning because Renderer
+generations need the latter. Missing or already-exited kill targets are no-ops. Superseding a
+generation reaps its children without sending exit events to its closed connection.
 
-`ProcessStream` (`Stdout`/`Stderr`) is a real enum on the wire; `ProcessOutputLine { id, stream,
-line }` and `ProcessExited { id, code: Option<i32> }` join `SupervisorFrame`, `code` absent exactly
-when `ExitStatus::code()` itself would be `None` (signal death, or never spawned). Four Supervisor
-functions carry the logic: `spawn_and_register_process` (spawns, takes the piped streams off the
-`Child` before registering it); `stream_process_output` (a detached task reading both streams line
-by line, reporting completion once both hit EOF, without knowing the exit code);
-`kill_registered_process` (calls `reap_process_group`, this phase's promised real caller per
-ADR-0018); `reap_exited_process` (calls `child.wait()` inline once streams have closed). Both a
-missing registry entry on kill and a naturally-exited process are silent no-ops, the same
-`ESRCH`-as-success tolerance ADR-0018 established. On generation supersede, every `processes` entry
-for the superseded `generation_id` is reaped without sending `ProcessExited`, since that
-generation's connection is already torn down.
+Callbacks are `out_cb(line, stream)`, with `stdout`/`stderr`, and `exit_cb(code)`, with an
+integer or nil. Output and exit use separate wire events.
 
-Callback convention: `out_cb(line, stream)` with `stream` as the Lua string `"stdout"`/`"stderr"`
-(Lua has no enums, matching how other IDL fields already cross as strings); `exit_cb(code)` as a Lua
-integer or `nil`.
+Review fixes: EOF is not process exit. Waiting inline can wedge the Supervisor, so removal is
+synchronous and waiting/reporting is detached. Malformed runs and failed kills report nil exit
+codes so Renderer callback registrations do not leak.
 
-Two correctness fixes made during review: `stream_process_output`'s EOF does not mean the process
-exited (a daemonizing child can close stdio while continuing to run), and the original inline
-`child.wait()` inside `main()`'s single top-level `select!` would wedge the entire Supervisor, every
-inbound command and reload included, for as long as such a process kept running. Fixed by splitting
-completion handling into a sync `take_exited_process` and a detached `wait_and_report_exit` task. A
-malformed `process.run` command and `KillOutcome::ReapFailed` both previously leaked the
-Renderer-side pending callback pair forever by never sending `ProcessExited`; both now send
-`ProcessExited { code: None }`.
+Rejected: the broader claim that the codebase has no shared mutexes. The socket generation
+registry already uses one; only spawn tracking avoids it.
 
-Rejected: the claim "no `Arc<Mutex<...>>` anywhere in this codebase" (both in this ADR's draft and
-in doc comments) is false, `socket::GenerationRegistry`'s own `connections` map already is one,
-predating this phase. Narrowed to: no spawn-tracking state uses a shared mutex.
-
-Not automated: a real Supervisor and Renderer as two separate processes spawning a third
-`process.run`ed process together over a real socket, per ADR-0024/0025's own established ceiling.
+Not automated: the real three-process Supervisor/Renderer/child workflow over a socket.
 
 ## 0027. Textfield wire shape: secure submit frame and text-input bridge
 
-An ordinary `textfield` uses `zwp_text_input_v3`. A masked `secure_submit` field reads `wl_keyboard`
-directly instead and never binds text-input at all.
+This entry proposed the text-input wire shape, not a completed implementation. Ordinary fields
+were designed around `zwp_text_input_v3`; masked secure fields use `wl_keyboard` directly.
 
-1. **Correction to ADR-0026.** ADR-0026 claimed no `wp-text-input-v3` crate exists in this
-   dependency tree. It is wrong: `renderer/Cargo.toml`'s `wayland-protocols` unstable feature
-   already gates `text_input::zv3`. Only the `TextInputService`/scene-node code was missing, not the
-   Cargo dependency.
-2. **Seat binding.** One `wl_seat`, bound via SCTK's `seat` module (ADR-0009). No multi-seat support
-   exists anywhere in the codebase.
-3. **`on_submit` trigger, ordinary fields.** Triggered by `zwp_text_input_v3`'s protocol-native
-   `ACTION_SUBMIT` event, not a separate `wl_keyboard` listener. This is IME-correct: it works with
-   CJK composition, which raw keystroke detection does not.
-4. **Secret wire shape.** The secret crosses the supervisor/renderer boundary as a distinguished
-   `RendererFrame::SecureSubmit { generation_id, capability, action, secret: Vec<u8> }`, never
-   through `CommandEnvelope::arguments`. `arguments` is generic `serde_json::Value`; routing a
-   `SecureBuffer` through it would leave a plaintext copy `.zeroize()` can never reach, undermining
-   ADR-0014. `SecureSubmit` is built once from `SecureBuffer::expose_secret()`, sent, and the source
-   buffer is zeroized immediately after (ADR-0005).
-5. **Cross-thread bridge.** `on_change`/`on_submit` reuse the `std::sync::mpsc` (Wayland thread) to
-   `tokio::sync::mpsc` (socket thread) bridge already proven for `process.run` (ADR-0026), carrying
-   one keyed edit-diff struct: commit text, preedit text, delete-before/after lengths, and a
-   `submit` bool folded into the same diff rather than a separate event kind.
+1. **Correction to ADR-0026.** `wayland-protocols` already exposes `text_input::zv3` through its
+   unstable feature. The missing pieces were the service and scene node, not a dependency.
+2. **Seat binding.** One SCTK-bound `wl_seat`, no multi-seat support.
+3. **Ordinary submission.** The original proposal named a text-input `ACTION_SUBMIT` event
+   instead of a keyboard listener, intending IME-correct submission. This is the historical
+   proposal, not a claim that the protocol or current implementation supplies that event.
+4. **Secret wire shape.** A separate `RendererFrame::SecureSubmit` carries generation, capability,
+   action and secret bytes. Generic JSON arguments were rejected because they would retain a
+   plaintext copy outside `SecureBuffer` zeroization. Zeroize the source after building the frame.
+5. **Cross-thread bridge.** The proposed edit diff carried commit/preedit text, delete lengths and
+   a submit flag over the existing Wayland-to-socket channel pattern.
 
-Amendment: text-input-v3 needs a compositor-side IME bound. With none running, `commit_string` never
-arrives, so a password field built this way is unusable on a bare session, which keeps a lock screen
-that depends on it locked on purpose (ADR-0042, `ext-session-lock-v1`). So `secure_submit` reads
-`wl_keyboard` directly and the text-input binding is dropped for that field kind entirely, both
-because an IME must not see a password's candidate text, and because a masked field has no
-composition to be correct about: ADR-0005 already makes its value unreadable from Lua and its
-`on_submit` argument-free.
+Amendment: secure fields bypass text-input entirely. Without a compositor-side IME, no
+`commit_string` arrives; passwords must also stay out of IME candidate text. Their values remain
+unreadable from Lua and their submit callback is argument-free.
 
-Not built: `TextInputService`, the `textfield` scene-node kind, the seat binding,
-`RendererFrame::SecureSubmit` and its supervisor-side dispatch, and the cross-thread channel pair.
-This ADR records the wire shape; implementation is a later pass.
+Not built in this pass: `TextInputService`, the textfield scene node, seat binding, secure frame
+dispatch or the cross-thread channel pair.
 
 ## 0028. PAM: nonstick, a re-exec worker subprocess, one-shot protocol
 
-PAM authentication runs in a re-exec'd worker subprocess, driven by the `nonstick` crate, answering
-every PAM prompt with one password already known before the worker is spawned.
+PAM runs in a re-executed worker, using one password captured before spawning.
 
-1. **Crate: `nonstick`, not `pam-client`.** ADR-0015 named `pam-client` as a candidate, but its last
-   release was July 2022; `nonstick` covers both the PAM-application and PAM-module directions, is
-   actively maintained, and its application-side `Conversation` trait's `masked_prompt()` returns
-   `PamResult<OsString>` programmatically with no terminal I/O. `masked_prompt()`'s `OsString`
-   return is not zeroizable, PAM's own C `char*` boundary, not something any crate can avoid; the
-   `OsString` is built from `SecureBuffer`'s bytes at the last possible moment inside the
-   `Conversation` impl, and the source buffer is zeroized immediately after (ADR-0005, ADR-0014).
-   This system has no `/etc/pam.d/polkit-1`, so PAM falls back to the `"login"` service, matching
-   both Quickshell's and Noctalia's own default.
-2. **Isolation: a re-exec worker subprocess, not `fork()`, not a third binary crate.** Quickshell
-   and Noctalia both isolate the PAM conversation in a child process because PAM has no way to abort
-   a running module except by aborting the process (fingerprint scanners and hardware keys don't
-   abort otherwise). Both use bare `fork()`, unsafe to copy here: `supervisor` runs a multi-threaded
-   tokio runtime plus a raw `audio::mixer` OS thread, and `fork()` in a multi-threaded process only
-   duplicates the calling thread, so locks held by other threads stay locked forever. Instead,
-   `supervisor` re-execs its own binary via `std::env::current_exe()` (same resolution as
-   `renderer_binary_path()`) with `OBLISK_PAM_WORKER=1`, branching `main()` into a minimal PAM-only
-   path before any D-Bus/tokio/audio setup runs. No new binary crate is added; this reuses
-   `process::spawn_group_leader`/`reap_process_group` as a fourth real caller (ADR-0018's promised
-   upgrade path).
-3. **Protocol: one-shot, not interactive.** Quickshell's protocol is bidirectional and live,
-   relaying each PAM prompt back and waiting for an answer, built for conversations where answers
-   aren't known upfront. Oblisk's flow matches Noctalia's model instead: per ADR-0027, the password
-   is fully captured client-side and crosses as one complete `RendererFrame::SecureSubmit` frame
-   before the Supervisor spawns anything PAM-related, so there is no live prompt to relay. The
-   password is written to the worker's stdin once and the pipe closed immediately after;
-   `nonstick`'s `Conversation::masked_prompt()` answers every PAM message with that same value
-   inside the worker. The worker reports exactly one outcome frame over stdout when the conversation
-   ends, no request/response round trips, and does not reuse `RendererFrame`/`SupervisorFrame`
-   (wrong domain: those are Supervisor-Renderer wire types, this is Supervisor-to-its-own-worker).
-   The outcome uses an exit-code taxonomy, not a bare bool: `{Success, StartFailed, AuthFailed,
-   MaxTries, PamError, OtherError}`.
+1. **Crate: `nonstick`, not `pam-client`.** At selection time, `pam-client`'s last release was
+   July 2022; `nonstick` supplied a maintained, programmatic conversation API without terminal I/O.
+   Its `OsString` and PAM's C copies cannot be zeroized by the source buffer; construct that copy
+   at the last moment and zeroize the source. The observed machine lacked `polkit-1` PAM config,
+   so the chosen fallback service was `login`.
+2. **Isolation: re-exec, not fork or a third binary.** PAM modules cannot reliably be cancelled
+   without terminating their process. Forking the multithreaded Supervisor risks inheriting
+   permanently locked mutexes. Re-exec the Supervisor with `OBLISK_PAM_WORKER=1`, branching before
+   D-Bus/tokio/audio setup, and reuse process-group spawn/reap helpers.
+3. **Protocol: one-shot, not interactive.** Write the captured password once to stdin and close
+   the pipe. Every PAM prompt receives that same value. A worker-specific outcome frame on stdout
+   distinguishes Success, StartFailed, AuthFailed, MaxTries, PamError and OtherError.
+   Interactive prompt relaying and Supervisor/Renderer frame reuse were rejected as unnecessary
+   and belonging to a different protocol, respectively.
 
-Still open: `begin_authentication` currently discards `_identities: Vec<(String, HashMap<String,
-OwnedValue>)>`; `authentication_agent_response2(uid, cookie, identity)` needs a real uid/`Identity`
-parsed from that list, left to the implementation pass rather than designed here.
-
-Not built: the `OBLISK_PAM_WORKER` branch in `main()`, the worker's `pam_start`/`Conversation` loop,
-the one-shot stdin/stdout framing (reusing `shared::framing::write_json_frame`/`read_json_frame`
-rather than hand-rolling binary framing), and the `identities` parsing into
+Still open in this design pass: parse Polkit identities into the uid/Identity required by
 `authentication_agent_response2`.
+
+Not built in this pass: worker entry branch, PAM conversation, one-shot framing or identity parsing.
+Framing was to reuse the shared JSON-frame helpers.
 
 ## 0029. NetworkManager: capability-tagged state snapshot and secure connect flow
 
-NetworkManager state pushes ride a newly capability-tagged `StateSnapshot`, D-Bus access uses an
-existing crate rather than a hand-written proxy, and Wi-Fi passwords travel through `secure_submit`,
-not a plain IDL argument.
+NetworkManager introduced capability-tagged snapshots and a separate secure credential path.
 
-1. **Capability tagging.** `shared::StateSnapshot` gains `capability: String`; `main.rs`'s single
-   `audio_revision: u32` becomes `revisions: HashMap<String, u32>`; `apply_state_snapshot` looks up
-   or lazily creates the matching Lua signal by `capability` instead of hardcoding `audio`.
-   `payload: serde_json::Value` stays untyped, no per-capability payload struct, until a second
-   capability's shape actually needs distinguishing beyond its name. Closes ADR-0022 item 1 and
-   matches `CONTEXT.md`'s glossary definition of Revision as a capability's own state-version
-   counter.
-2. **D-Bus access: `rusty_network_manager`, not a hand-written proxy.** It exports
-   `NetworkManagerProxy`, `DeviceProxy`, `WiredProxy`, `WirelessProxy`, `AccessPointProxy`,
-   `SettingsProxy`, `SettingsConnectionProxy`, `ConnectionProxy`, covering the required interface
-   set, is MIT-licensed, and its `zbus = "5.11.0"` requirement is compatible with this workspace's
-   `zbus 5.19.0`. Adopted per ADR-0013's rule to reuse a maintained proxy crate before hand-writing
-   one.
-3. **Listener architecture: async in the existing `select!`, not a dedicated thread.**
-   `audio::mixer` needs its own `std::thread::spawn` because PipeWire's client API is
-   callback-driven; NetworkManager is D-Bus-native, so its `PropertiesChanged`/AP-added/AP-removed
-   signal streams merge into `main.rs`'s top-level `tokio::select!` instead, following
-   `dbus::polkit`'s precedent. Write actions (`scan`, `connect`, `forget`) are `tokio::spawn`ed
-   rather than awaited inline: ADR-0028 found that an inline-awaited call with no ceiling inside
-   this same `select!` can wedge the whole Supervisor if the far end hangs, and none of these three
-   actions need to hand a synchronous result back through the calling envelope.
-4. **Password via `secure_submit`, not the IDL's literal `connect(ssid, pwd, hid)`.** The IDL's
-   plain-argument signature contradicts ADR-0005, which names Wi-Fi password entry as
-   `secure_submit`'s own motivating case. `network:connect(ssid, hidden)` (a normal
-   `CommandEnvelope`, no password) stashes a single-slot pending connect intent, mirroring
-   `pending_challenge` from ADR-0028; a `textfield`'s `secure_submit = "network.connect"`
-   (capability `"network"`, action `"connect"`) always follows with the password bytes. An empty
-   secret means an open network: skip `802-11-wireless-security` and call
-   `AddAndActivateConnection2` with the minimal dict; a non-empty secret populates `wpa-psk`. One
-   code path serves both scanned and hidden networks, because a hidden network's AP security flags
-   are never broadcast and so can't be inspected the way a scanned network's can; the Lua widget
-   always renders a password field, left empty for open networks. `docs/oblisk-idl-api-specs.md`
-   §2.5's signature is corrected to `connect(ssid, hidden)`.
-5. **Ethernet toggle.** No NetworkManager method fabricates a carrier connection, since link carrier
-   is hardware-detected. `set_ethernet_enabled(false)` calls `Device.Disconnect()` on every type-1
-   device. `set_ethernet_enabled(true)` looks for the device's existing auto-connect profile and
-   calls `ActivateConnection` on it if one exists; a missing profile is a no-op, not an error.
-6. **Push cadence: no debounce.** A completed scan can fire a burst of AP-discovery signals. The
-   `NetworkState` accumulator (mirrors `audio::mixer`'s `Rc<RefCell<MixerState>>`) rebuilds and
-   pushes a fresh `StateSnapshot` on every relevant event; `revision` already makes intermediate
-   pushes harmless. Debounce is added later only if a real scan burst proves chatty enough to
-   matter.
+1. **Capability tagging.** Add a capability name to snapshots, track revisions per capability,
+   and hydrate the corresponding Lua signal. Payloads remain generic JSON until typed payloads
+   are needed. Closes ADR-0022 item 1.
+2. **D-Bus access.** Choose `rusty_network_manager` over hand-written proxies because it covered
+   the required interfaces with a compatible zbus dependency, following ADR-0013.
+3. **Listener architecture.** Merge D-Bus event streams into the existing async event loop.
+   Unlike PipeWire, no dedicated callback thread is needed. Spawn scan/connect/forget writes
+   rather than awaiting them inline, so a hung remote call cannot wedge the Supervisor.
+4. **Password via secure submit.** Reject the IDL's plaintext password argument. A normal
+   `connect(ssid, hidden)` command stores one pending intent, followed by native secret submission.
+   The design used one flow for scanned and hidden networks: an empty secret means open;
+   a nonempty secret populates WPA-PSK. It therefore required a password field even for open
+   networks, because hidden networks do not advertise security flags.
+5. **Ethernet toggle.** Disconnect wired devices when disabled; activate existing autoconnect
+   profiles when enabled. A missing profile is a no-op. Software cannot fabricate link carrier.
+6. **Push cadence.** No debounce. Rebuild on each relevant event; add coalescing only if measured
+   scan bursts justify it.
 
-Still open: the exact `NetworkState` struct shape, `forget()` looping over every matching connection
-profile (not just the first), and `RequestScan`'s options dict (empty by default). Left to the
-implementation pass.
+Still open in this pass: the exact state struct, forgetting every matching saved profile rather
+than only the first, and scan options, empty by default.
 
 ## 0030. BlueZ controller: hand-written proxies, Just-Works-only pairing, deferred codec control
 
-The BlueZ controller (`oblisk.bluetooth`) hand-writes its D-Bus proxies, enforces Just-Works-only
-pairing through its own agent, and defers PipeWire audio codec control to a later ADR.
+BlueZ uses hand-written zbus proxies, Just-Works-only pairing and deferred audio codec control.
 
-1. **Proxy crate: hand-written, not `bluer`.** `bluer` depends on the
-   `dbus`/`dbus-tokio`/`dbus-crossroads` family, not `zbus`; adopting it would mean two D-Bus client
-   stacks in one process. The only zbus-based alternatives (`blues`, `bluebus`) are unmaintained or
-   unreviewed. Same rung of ADR-0013's ladder as `dbus::polkit`: hand-written
-   `#[zbus::interface]`/proxy types against `Adapter1`, `Device1`, `Battery1`, `Agent1`,
-   `AgentManager1`, and `org.freedesktop.DBus.ObjectManager`.
-2. **Pairing is Just-Works-only, enforced by our own `Agent1`.** We register `Agent1` with
-   `AgentManager1` using capability `"NoInputNoOutput"` (forces Just Works for any SSP-capable peer)
-   and call `RequestDefaultAgent` at controller construction, not lazily on first `pair()`, so any
-   pairing attempt on the machine hits our policy instead of BlueZ's undocumented default agent.
-   `RequestPinCode`/`RequestPasskey`/`DisplayPinCode` return `org.bluez.Error.Rejected`: legacy
-   PIN-only devices cannot pair, intentional, since the IDL's `pair(mac)` takes no PIN/passkey
-   argument and defines no `secure_submit` target for bluetooth.
-   `RequestConfirmation`/`DisplayPasskey`/`AuthorizeService`/`RequestAuthorization` auto-accept
-   unconditionally, since there is no UI to ask a human and refusing would break `connect()` for
-   already-trusted or Just-Works devices. `Cancel`/`Release` are no-ops.
-3. **`set_audio_codec(mac, codec)` is deferred.** Codec switching needs a live PipeWire `Device`
-   proxy and `SPA_PARAM_Profile` switching (the spec's claim of `SPA_PARAM_Route` is wrong, verified
-   against PipeWire's `bluez5-device.c`: codecs are enumerable Profiles like `a2dp-sink-ldac`,
-   switched via `Device.SetParam`/`SPA_PARAM_Profile`). `audio::mixer`'s PipeWire thread has only
-   ever pushed `StateSnapshot` out; ADR-0017 deferred `set_app_volume`/`set_app_muted` for the same
-   reason, no inbound channel exists. Building it here would design that channel under `bluetooth`'s
-   name instead of the `audio` capability that owns it, so it waits for `audio`'s own
-   inbound-command design.
-4. **Device tracking is a dynamic per-object registry, not a scan-and-replace list.** BlueZ's
-   `Device1` set is unbounded and changes live via `ObjectManager` `InterfacesAdded`/`Removed`, and
-   `Battery1` can appear or disappear independently on an already-tracked device.
-   `HashMap<OwnedObjectPath, DeviceEntry>` keyed by object path, not MAC (path is what
-   `ObjectManager` events give natively; MAC is derived only for signal output and path lookup).
-   Hydrated once via `ObjectManager.GetManagedObjects()` at startup. Each `InterfacesAdded` carrying
-   `Device1` spawns one forwarder task, the same shape as ADR-0029's `spawn_wifi_signal_forwarder`
-   instantiated per device, listening to `PropertiesChanged` (`Connected`, `Paired`, `Name`, plus
-   `Battery1.Percentage` if present); its `JoinHandle` is stored and aborted on `InterfacesRemoved`.
-5. **Categorization parses `Class` ourselves, not BlueZ's `Icon`.** `Icon` is BlueZ's own derivation
-   of `Class`/`Appearance` and comes back empty whenever `Class == 0`, common for BLE peripherals
-   before GAP data is read. Bit layout: bits 8-12 Major Device Class, bits 2-7 Minor. Major
-   `0x01`→`"computer"`, `0x02`→`"phone"`, `0x04` (Audio/Video) minor `0x01`/`0x02`→`"headset"`,
-   minor `0x06`→`"headphones"`, other Audio/Video minors→`"generic"` (a wrong specific guess, e.g. a
-   car kit shown as headphones, is worse than neutral). Major `0x05` (Peripheral) minor top-2-bits
-   `01`→`"keyboard"`, `10`→`"mouse"`, `11` (combo)→`"keyboard"`. Everything else→`"generic"`.
-6. **Push cadence: no debounce**, matching ADR-0029. BlueZ property-change volume (human-scale
-   pairing/connect events, infrequent battery ticks) doesn't approach a rate where debounce pays for
-   itself.
-7. **`discovered_devices` clears on `start_discovery()`, not on `stop()`.** Matches NetworkManager's
-   scan-replace semantics for a fresh session; the last snapshot stays visible after
-   `stop_discovery()` so the UI doesn't blank immediately. No cap: discovery sessions are short and
-   human-driven.
-8. **Single adapter, first one found.** Same single-well-known-device assumption ADR-0029 makes for
-   Wi-Fi; the IDL exposes one flat `oblisk.bluetooth` signal with no adapter selector.
+1. **Proxy choice.** Reject `bluer` because it brings a second D-Bus stack. The zbus alternatives
+   reviewed were unmaintained or unreviewed. Hand-write Adapter1, Device1, Battery1, Agent1,
+   AgentManager1 and ObjectManager bindings.
+2. **Pairing policy.** Register a default `NoInputNoOutput` agent at construction. Reject PIN code,
+   passkey requests and PIN display; legacy PIN-only devices cannot pair. Confirmation, passkey
+   display and authorization auto-accept because no confirmation UI exists. Cancel/release are
+   no-ops. This does not provide a PIN/passkey UI.
+3. **Codec control deferred.** Switching needs PipeWire device profiles, `SPA_PARAM_Profile`,
+   not the spec's proposed route parameter. The audio thread lacked an inbound command channel;
+   that channel must be designed under audio ownership, not Bluetooth.
+4. **Device tracking.** An object-path-keyed registry follows ObjectManager additions/removals
+   and independent Battery1 changes. Hydrate once, then keep a property forwarder per device,
+   aborting it on removal. A scan-and-replace list cannot represent those lifetimes.
+5. **Category from Class, not Icon.** BlueZ Icon can be empty. Map computers, phones, headsets,
+   headphones and keyboard/mouse peripherals from major/minor class bits; keyboard/mouse combos
+   use keyboard. Unknown classes and other audio/video devices stay generic rather than guessed.
+6. **No debounce.** Human-scale connection and battery events do not justify it.
+7. **Discovery list lifetime.** Clear on start, preserve on stop. No cap for short, human-driven
+   discovery sessions.
+8. **One adapter.** Use the first found; the config model has no adapter selector.
 
-`StateSnapshot{capability: "bluetooth"}` needs no new plumbing in `shared`/`main.rs`/`socket.rs`,
-ADR-0029 already generalized the capability-tagging path.
+Reuse ADR-0029's capability snapshot plumbing.
 
-Not built: `set_audio_codec` (needs `audio`'s inbound PipeWire command channel, which also unblocks
-`set_app_volume`/`set_app_muted`), a PIN/passkey UI flow for legacy-device pairing, and
-multi-adapter support.
+Not built: codec selection, PIN/passkey UI or multiple adapters. Codec selection shares audio's
+missing inbound-channel prerequisite with app volume/mute controls.
 
 ## 0031. Tray controller: hand-written SNI/DBusMenu host, IconName preference, no cache-busting
 
-The tray controller hand-writes its own StatusNotifierWatcher/Item/DBusMenu proxies, prefers a tray
-item's `IconName` over decoding its pixmap, and skips PNG cache-busting on icon updates.
+The tray uses hand-written SNI/DBusMenu bindings, preferring icon names over pixmap decoding.
 
-1. **No crate reuse, hand-write the Watcher, Item, and DBusMenu proxies.** `system-tray` (the only
-   real candidate) always couples Watcher+Host registration with no way to run one without the
-   other, has a source-verified bug in `IconPixmap::from_array` (reads width and height from the
-   same field index twice, silently squaring every non-square pixmap's height), and its
-   `IconPixmap.pixels`/`MenuItem.icon_data` come back as raw undecoded bytes anyway, so it would not
-   save the security-critical bounds-checking/PNG-encoding work this controller must do regardless.
-   Same rung of ADR-0013's ladder as `dbus::polkit`/`dbus::bluetooth`: hand-written proxy/interface
-   types against `org.kde.StatusNotifierWatcher`, `org.kde.StatusNotifierItem`, and
-   `com.canonical.dbusmenu`, including DBusMenu layout parsing (four D-Bus calls, one recursive
-   struct).
-2. **Watcher/Host registration.** `RequestName("org.kde.StatusNotifierWatcher")` with no
-   `ReplaceExisting`/`DoNotQueue`; `NameTaken` is treated as success, deferring to a real
-   desktop-environment session already running one. Either way,
-   `RegisterStatusNotifierHost(our_unique_name)` is called against whichever process owns the name,
-   working standalone and coexisting with Plasma/GNOME on the same session bus.
-3. **Registry keys on the resolved D-Bus unique name, never the caller-supplied `service` string.**
-   The `service` argument (an object path or a bus name) is resolved once to a unique name (`:N.M`,
-   spec-guaranteed to contain only digits/colons/dots), which becomes both the registry key and,
-   with the leading `:` stripped, the PNG spool filename component. Using the raw `service` string
-   for either would be a path-traversal/filename-injection risk from any process on the session bus.
-   Spool path is `/dev/shm/oblisk-$UID/tray/{sanitized_unique_name}.png`, fixing a spec
-   inconsistency where the example paths omitted `$UID` and would collide across users on a shared
-   machine.
-4. **Icon source: prefer `IconName`, decode `IconPixmap` only as fallback.** IDL §5.2's `icon` node
-   already takes a raw theme name string and resolves it renderer-side, so pushing `icon_name`
-   through skips the bounds-check/decode/PNG-spool pipeline entirely. When `IconPixmap` is the only
-   source, take the largest available pixmap capped at 128px, with no assumed display-size floor:
-   Lua's `icon` node `size` field owns display size, not the D-Bus layer, and downscaling a large
-   source always beats upscaling a small one.
-5. **Menu tree: eager top-level fetch, `AboutToShow`-driven per-submenu refresh.** `GetLayout` is
-   fetched in full on item registration and re-fetched on `LayoutUpdated`, so `tray.items[].menu`
-   has no first-open latency. But some real DBusMenu apps (NetworkManager's applet menu is the
-   canonical example) leave a submenu's children empty until `AboutToShow(id)` fires, so a new write
-   command `tray:menu_will_show(id, submenu_id)` fires `AboutToShow` and re-fetches that submenu's
-   layout before Lua renders it.
-6. **Click semantics enforced in Rust, not left to Lua discipline.** `tray:activate(id, x, y)` calls
-   `Activate(x, y)` only when `item_is_menu` is false; when true it no-ops, per SNI's own documented
-   semantics, enforced once centrally rather than trusting every `shell.lua` author to gate on
-   `item_is_menu`. New `tray:activate_menu_item(id, menu_item_id)` calls DBusMenu's
-   `Event(menu_item_id, "clicked", ...)`.
-7. **`SecondaryActivate`/`ContextMenu`/`Scroll` deferred, not built.** No known real consumer needs
-   them; modern tray items overwhelmingly expose a `Menu` for right-click instead of `ContextMenu(x,
-   y)`.
-8. **PNG encoding: the `png` crate, not `image`.** Pure Rust, encode-only, minimal dependency tree;
-   `image` is already a transitive dependency but only carries decode/conversion machinery this
-   controller never touches, matching the same minimal-over-already-present preference as the
-   `bluer` disqualification in ADR-0030.
+1. **Proxy choice.** Reject the reviewed `system-tray` crate: coupled Watcher/Host registration,
+   a verified pixmap height-index bug, and raw image bytes that still require our validation and
+   encoding. Hand-write the small interface and recursive menu bindings.
+2. **Watcher/Host registration.** Request the watcher name without replacement or DoNotQueue.
+   Treat NameTaken as success and register our Host against the existing owner, allowing both
+   standalone operation and coexistence with a desktop environment.
+3. **Registry identity.** Resolve the caller's service to a D-Bus unique name before using it as
+   a key or spool filename. Raw service strings would permit filename injection/path traversal.
+   The historical spool path was `/dev/shm/oblisk-$UID/tray/{sanitized_unique_name}.png`.
+4. **Icon preference.** Pass IconName to the Renderer; decode only as fallback. Choose the largest
+   pixmap up to 128 px, with no minimum size, because Lua owns display size.
+5. **Menus.** Fetch the full layout at registration and on LayoutUpdated. Refresh lazy submenu
+   contents through AboutToShow before rendering, avoiding both first-open latency and empty menus.
+6. **Click semantics.** Enforce item-is-menu gating centrally: Activate no-ops for menu-only items.
+   Menu selection sends DBusMenu's clicked event.
+7. **Deferred actions.** SecondaryActivate, ContextMenu and Scroll were not built in this pass
+   because no known consumer needed them; modern items supplied a Menu instead.
+8. **PNG encoding.** Choose the encode-only `png` crate over `image`'s unused decoding machinery.
 
-`StateSnapshot{capability: "tray"}` needs no new plumbing in `shared`/`main.rs`/`socket.rs`,
-ADR-0029 already generalized the capability-tagging path.
+Reuse ADR-0029's capability snapshot plumbing.
 
-Amendment: cache-busting was deferred here and built later, in the Renderer, by ADR-0054. A
-path-keyed texture cache served an app's first tray icon forever, because the spool path is
-overwritten in place on every `NewIcon` with no revision suffix. This ADR's decision is unchanged,
-the spool still overwrites in place; the fix is entirely on the Renderer side, which keys its cache
-on the file's modification time and length as well as its path.
+Amendment, ADR-0054: the spool still overwrites in place, but the Renderer keys textures by path,
+modification time and length. That fixes stale icons without changing this entry's no-spool-suffix
+decision.
 
 ## 0032. Idle capability splits transport but keeps one controller
 
-`oblisk.idle` gets one controller (`dbus::idle` module) shared by two backends, Wayland idle-notify
-and D-Bus logind inhibit, rather than splitting ownership between them.
+One Supervisor controller owns both Wayland idle notification and logind inhibition.
 
-Notify allocates one `ext_idle_notification_v1` listener per distinct threshold duration, not per
-registration, fanned out through a `HashMap<Duration, Vec<registration>>`; two callers registering
-the same duration share a listener. There is no unregister command: idle threshold cleanup reuses
-the existing `reset_registrations` (ADR-0006), which already clears a generation's registrations on
-reload. Notify uses `get_idle_notification`, not `get_input_idle_notification`, because nothing
-needs presence-sensor exclusion. A new `SupervisorFrame::IdleEvent { generation_id, threshold_sec,
-state }` wire variant (`state: "idled" | "resumed"`) carries the event straight to the registered
-Lua callback, bypassing `StateSnapshot`'s revision-polling path, since idle is event-shaped rather
-than pollable state.
+Share one idle-notify listener per distinct duration and fan out to registrations. Reload cleanup
+reuses generation-scoped reset rather than adding unregister. Use get_idle_notification; no caller
+needs presence-sensor exclusion. Deliver idled/resumed through a dedicated IdleEvent frame because
+these are edges, not revisioned state.
 
-Inhibit uses `org.freedesktop.login1.Manager.Inhibit(what="idle", who="oblisk", why=reason,
-mode="block") -> fd` on the Supervisor's existing system-bus connection, not the Wayland
-`idle-inhibit-unstable-v1` protocol, which needs a `wl_surface` the Supervisor does not own. Lock
-lifetime is fd lifetime: released automatically if the holding process dies, so a Supervisor crash
-cannot leak a stuck inhibit. `what` is scoped to `"idle"` only, governing auto-suspend, not sleep,
-shutdown, or lid-switch. Inhibit is refcounted per generation rather than a boolean:
-`inhibit(reason)` opens the fd on 0->1, `release_inhibit()` closes it on 1->0, so two concurrent
-callers cannot clobber each other; `reset_registrations` zeros the count too.
+Use logind `Inhibit(what="idle", who="oblisk", why=reason, mode="block")` on the existing system
+bus. The fd lifetime releases the hold even after a crash. It covers automatic idle actions,
+not explicit sleep, shutdown or lid-switch. Refcount generation holds so callers cannot cancel
+one another; reset clears the count.
 
-Cargo: `supervisor`'s `wayland-protocols` dependency gets the `"staging"` feature, needed to expose
-`ext::idle_notify::v1`.
+Rejected: Wayland idle-inhibit. It would split ownership and requires a surface the Supervisor
+does not own.
 
-Graceful degradation matches every other controller: if `ext_idle_notifier_v1` isn't advertised, or
-the Supervisor's dedicated Wayland connection fails to establish, log once and construct an inert
-controller where `register_threshold` silently no-ops. Inhibit has no equivalent degrade path; it
-rides the system-bus connection already required for NetworkManager, BlueZ, and polkit, so only
-per-request `Inhibit` failures are possible.
-
-Rejected: `zwp_idle_inhibit_manager_v1`, because it would split inhibit's owner from notify's for no
-gain and require a `wl_surface` the Supervisor doesn't hold.
+Enable wayland-protocols' staging feature for idle-notify. Missing protocol or a failed dedicated
+Wayland connection yields a logged, inert notifier. Inhibition still uses the required system bus;
+individual inhibit requests may fail.
 
 ## 0033. Notifications advertises a real capability set, with Lua-configured sound and DND
 
-The notifications server advertises the real freedesktop capability set it implements, parses body
-markup into structured spans instead of stripping it, and gives Lua control over per-urgency sound
-and do-not-disturb.
+Advertise the implemented notification capabilities, sanitize body spans, and let Lua configure
+per-urgency sound and DND.
 
-`GetCapabilities` returns 10 strings: `action-icons`, `actions`, `body`, `body-hyperlinks`,
-`body-images`, `body-markup`, `icon-static`, `persistence`, `sound`, `inline-reply`. `icon-multi` is
-excluded because the base `Notify()` signature has no wire mechanism for multiple icon sizes.
-`inline-reply` is a KDE extension riding the `x-kde-reply` hint.
+The advertised set is action-icons, actions, body, body-hyperlinks, body-images, body-markup,
+icon-static, persistence, sound and inline-reply. Exclude icon-multi because Notify has no
+multi-size wire shape. Inline reply follows the KDE x-kde-reply extension.
 
-Body markup is allowlist-parsed into `Vec<NotificationSpan>`, not stripped to plain text: only
-`<b>`, `<i>`, `<u>`, `<a href="URL">`, `<img src="PATH" alt="ALT">` are accepted (text runs carry
-`{text, bold, italic, underline, href}`, image runs carry `{image_path}`); everything else,
-including scripts and style tags, is rejected as before. `<img src>`, `image-path`, and action-icon
-names resolve through one new path-trust validator: a sender-supplied path is accepted only as
-absolute, under `/usr/share/icons`, `/usr/share/pixmaps`, `$HOME/.local/share/icons`, or
-`$HOME/.icons`, confirmed to exist and be a regular file under the same size cap as `image-data`. A
-bare theme name degrades to no icon rather than resolving it; full XDG theme-name resolution is a
-separate, unbuilt `system:find_icon` IDL row. Span rendering (the FemtoVG/cosmic-text side) is out
-of scope this round: the supervisor delivers correct span data, the renderer draws it later.
+Keep allowlisted bold, italic, underline, link and image spans rather than flattening the body.
+Image paths and action icons share a validator: absolute regular files under the allowed system
+or user icon directories, within the image-data size cap. Bare theme names and arbitrary markup
+are not accepted. Renderer span support and full theme lookup were outside this pass.
 
-`ActionInvoked` emits the real 2-argument base-spec signature, `ActionInvoked(id: u32, action_key:
-string)`, not a 3-argument variant, since a 3-arg signal would break every real D-Bus client's
-introspection assumptions. Reply text rides inside `action_key` as `"inline-reply::<text>"`,
-confirmed against Noctalia's source; a bare `"inline-reply"` with no `::` is logged as malformed and
-not acted on.
+Keep the standard two-argument ActionInvoked signal. Encode reply text as
+`inline-reply::<text>`; a bare inline-reply key is malformed. A third signal argument was
+rejected because it breaks client introspection.
 
-Sound resolves in order per `Notify()` call: `hints["suppress-sound"] == true` forces silence; else
-a valid `hints["sound-file"]` (through the same path-trust validator) plays; else the urgency tier's
-`notifications:set_sound(urgency, path)` registration plays; else nothing. `hints["sound-name"]` is
-not honored, the same missing theme-resolution gap as icon names. Playback is a one-shot PipeWire
-stream triggered over an internal Rust channel, no Lua/wire round-trip.
+Sound priority is suppress-sound, trusted sound-file, configured urgency sound, then silence.
+Ignore sound-name without theme resolution. Playback uses an internal PipeWire channel, not a
+Lua round trip. DND is Supervisor-global, gates only sound and resets on Supervisor restart.
+Critical notifications bypass DND and automatic expiry; Lua owns popup policy.
 
-`notifications:set_dnd(bool)` toggles one Supervisor-held global boolean, not per-generation state.
-It gates sound playback only; `notifications.feed` keeps receiving everything, since there is no
-popup/toast concept to suppress. Critical urgency bypasses DND for sound and also ignores
-`expire_timeout`, persisting until explicitly dismissed. DND state lives in Supervisor memory only
-this round, pushed to Lua as `notifications.dnd: boolean` in the same `StateSnapshot` as the feed;
-it does not survive a full Supervisor restart.
+Use snapshots because each mutation changes feed or DND state, unlike idle's edge events.
+A 20-entry feed views a 100-entry FIFO so actions can still resolve entries outside the feed.
+Replacement without a fresh image deletes the old spool; eviction deletes the evicted image.
+The historical spool was `/dev/shm/oblisk-$UID/notifications/notif-{id}.png`.
 
-Wire shape reuses `StateSnapshot`, no new `SupervisorFrame` variant: unlike idle (ADR-0032's
-`IdleEvent`, genuinely edge-triggered), every notifications mutation changes the feed list or `dnd`
-flag directly, so a fresh `StateSnapshot` push after each mutation is enough.
-
-SHM icon storage uses `/dev/shm/oblisk-$UID/notifications/notif-{id}.png`, the same `$UID` fix
-ADR-0031 established for tray. `notifications.feed`'s 20-item view is a truncation over a 100-item
-backing FIFO, kept so `dismiss(id)`/`reply(id, text)` still resolve items scrolled out of the
-visible window. A `replaces_id` update with no fresh image clears and deletes the old spooled icon
-file; a FIFO eviction past the 100-item cap deletes the evicted item's file in the same step.
-
-New write rows: `notifications:reply(id, text)`, `notifications:set_sound(urgency, path)`,
-`notifications:set_dnd(enabled)`, alongside the existing `notifications:dismiss(id)`. Read shape
-gains `urgency: "low"|"normal"|"critical"`, `has_reply: boolean`, and a span-array `body`.
+Add reply, per-urgency sound and DND writes alongside dismiss; expose urgency, reply availability
+and structured body spans.
 
 ## 0034. Keyboard backlight, locks, layout, camera privacy, and Arch update checking
 
-Five hardware-fact capabilities the user asked for by name, following the proven
-D-Bus/hardware-controller pattern rather than waiting on spec docs. `oblisk.keyboard` (already
-declared) grows to hold `backlight_pct`, `caps_lock`/`num_lock`/`scroll_lock`, and
-`active_layout`/`active_layout_index`/`layout_count`, domain-split like every existing capability
-rather than lumped into one bucket. New `oblisk.privacy` (`camera_users: table`) and
-`oblisk.updates` (`count`, `packages`, progress fields). No new "adapter" trait unifies the five
-mechanisms (D-Bus, PipeWire, sysfs+evdev, subprocess+timer, compositor socket): they already share
-an identical convention (own connection/thread, push into a channel, `main.rs` `select!`s it)
-without one, and forcing a trait before any caller needs `Vec<Box<dyn Adapter>>` polymorphism would
-be speculative generality. A new `supervisor/src/hardware/` tree, sibling to `dbus/`, holds all
-five, since only backlight even touches D-Bus.
+Add domain-named hardware capabilities rather than one generic adapter abstraction before any
+caller needs polymorphic dispatch.
 
 ### 0034.1. Keyboard backlight rides UPower, not sysfs
 
-Uses `org.freedesktop.UPower.KbdBacklight`, verified live against this dev machine with `busctl
---system introspect`: a single fixed object at `/org/freedesktop/UPower/KbdBacklight` with
-`GetBrightness() -> i`, `GetMaxBrightness() -> i`, `SetBrightness(i)`, and signal
-`BrightnessChanged(i)`. No `EnumerateKbdBacklights`, `SetPercentage`, or
-`DeviceAdded`/`DeviceRemoved` exist on this UPower version, so there is nothing to enumerate or
-hotplug.
+Use the fixed UPower keyboard-backlight object, verified on the development machine.
 
-1. **Percent is derived, not native.** `GetMaxBrightness()` is read once at construction and cached,
-   since a keyboard's step count doesn't change at runtime. `backlight_pct = round(100 * brightness
-   / max)` (round-half-away-from-zero, matching ADR-0035's `round_milli_c`); the D-Bus interface
-   itself has only a raw `[0, max]` scale, and this machine reports `max = 3`.
-   `keyboard:set_backlight(pct)` converts back as `round(pct * max / 100)`, clamped to `[0, max]`.
-2. **No-backlight degrade.** A machine with no keyboard backlight fails the constructor's
-   `GetMaxBrightness()` call; the controller degrades to `backlight_pct = -1` (the same sentinel
-   convention as `temp_gpu`), logs once, and `set_backlight` becomes a no-op.
-3. **Connection reuse.** Rides the already-open system D-Bus connection shared with NetworkManager,
-   BlueZ, polkit, and idle-inhibit.
+1. Convert cached raw steps to rounded percentages and back, clamped to range.
+2. Missing hardware yields -1 and no-op writes, with one diagnostic.
+3. Reuse the system-bus connection.
 
 ### 0034.2. Keyboard lock state uses evdev, keyboard layout gets its own narrow compositor trait
 
-`§5`'s spec of `caps_lock` via compositor socket interception is wrong: Hyprland's `hyprctl devices
--j` has no `scrollLock` field at all. The next candidate, `wl_keyboard.modifiers`'s `mods_locked`
-bitmask, is gated by Wayland surface focus and would never fire for a background daemon like the
-Supervisor. A third candidate, sysfs LED nodes
-(`/sys/class/leds/*::{caps,num,scroll}lock/brightness`) as primary with inotify for live updates and
-evdev as fallback, was also backwards: live-tested on this dev machine (physically toggling Caps
-Lock twice, watched with `inotifywait -m`), the sysfs `brightness` value genuinely changed
-(`0`->`1`->`0`) but fired zero inotify `MODIFY` events, because this kernel's `input_leds` driver
-doesn't call `sysfs_notify()` when it drives the change itself.
-
-1. **Fixed design: evdev primary, sysfs a static fallback.** `evdev::Device::open` on the keyboard
-   selected by `supported_leds()` (whichever reports `LED_CAPSL`) gives both initial state
-   (`get_led_state()`) and every live change (`into_event_stream()`'s `EV_LED` events) in one
-   mechanism; Waybar's `keyboard_state.cpp` already does the same for the same reason. Sysfs is read
-   once at construction as a best-effort static value only if evdev can't be opened (permission
-   denied, or no LED-capable device found): this machine's LED `brightness` files are root-owned but
-   world-readable, while `/dev/input/eventN` needs `input` group or `uaccess`. If neither resolves,
-   all three lock fields default `false`, logged once.
-2. **Layout gets a real, deliberately narrow compositor trait now**, unlike the "no adapter trait"
-   call above, because the user asked for it ahead of the still-unbuilt workspace adaptor. Scope is
-   exactly `active_layout(&self) -> Signal<String>`, `switch_layout(&self, index: usize)`,
-   `kind(&self) -> CompositorKind`, not widened to guess workspace's eventual surface. Two
-   implementors: Hyprland (`.socket2.sock`'s `activelayout` event triggers a full resync via
-   `hyprctl -j devices`, write via `hyprctl switchxkblayout <device> <index>`) and Niri (JSON-RPC
-   `KeyboardLayouts` query, event-driven off `KeyboardLayoutSwitched`, write via
-   `{"SwitchLayout":{"layout":<index>}}`). The Supervisor picks an implementor at startup by probing
-   `$HYPRLAND_INSTANCE_SIGNATURE`/`$NIRI_SOCKET`; if neither is set, `active_layout` degrades to
-   unavailable.
-3. **Single primary device, index-based write only.** `keyboard:switch_layout(index)` is the only
-   write; `active_layout_index` + `layout_count` let Lua compute cycling itself, since both
-   compositors already support index-based write selection natively.
-4. **Correction (implementation round): `active_layout_index` read-back is not symmetric.** Niri's
-   `KeyboardLayouts` event gives a names list plus current index directly. Hyprland's `hyprctl -j
-   devices` gives only `active_keymap` (a human-readable name) and `layout` (a comma-separated
-   XKB-code list) with no code-to-name correlation, so `active_layout_index` cannot be derived on
-   Hyprland and stays at its last-known value (`0` until manually confirmed); `layout_count` stays
-   accurate, but Lua's index-based cycling silently cannot cycle correctly on Hyprland as shipped.
-   Disclosed structural gap, not fixed here.
+1. Evdev supplies initial/live lock LEDs; sysfs is a static fallback. Physical Caps Lock changes
+   updated sysfs but emitted no inotify events. Missing access defaults false with a diagnostic.
+2. Keep a narrow keyboard-layout trait for Hyprland/niri, not a guessed workspace abstraction.
+3. Select one primary keyboard and expose index-based switching; Lua computes cycling.
+4. Correction: niri reports layout index directly, Hyprland then lacked reliable name-to-code
+   correlation. Hyprland index read-back remained last-known, a disclosed cycling gap.
 
 ### 0034.3. Camera privacy: kernel-level detection primary, PipeWire supplementary
 
-The first proposal read Noctalia's PipeWire `Video/Source` node classification as strictly better
-than an `inotifywait`+`fuser` approach; the user corrected this from experience, and it checked out.
-PipeWire only sees camera access routed through the `xdg-desktop-portal` Camera portal or the opt-in
-`pw-v4l2` `LD_PRELOAD` shim; raw V4L2 opens (mpv, ffmpeg, OBS's native v4l2 source, most native
-Linux apps) never touch it, so the two mechanisms cover disjoint app populations.
-
-1. **Kernel-level detection is primary.** The `/sys/class/video4linux/video<n>/streaming` flag
-   (kernel 6.3+) was proposed but dropped: this dev machine's real UVC webcam doesn't expose the
-   attribute despite kernel 7.1, so it couldn't be verified live. Detection is an fd-scan over
-   `/dev/videoN` opens/closes plus a `fuser`-style confirm, since inotify alone can't tell "one
-   handle closed" from "device free"; this proves `camera_active` for every app regardless of
-   transport.
-2. **PipeWire is a name-enrichment layer only.** It extends the already-running `audio::mixer`
-   registry thread (no second PipeWire connection) to supply a real `application.name` for whichever
-   portal-routed app it can see; a raw v4l2 user with no matching PipeWire link falls back to a
-   `/proc/<pid>/comm` lookup off the `fuser`-reported PID. `privacy.camera_users: table` is an array
-   of `{app_name}`, empty when inactive.
+1. Detect raw V4L2 opens through device events plus fd inspection. The proposed streaming sysfs
+   flag was absent on the real webcam despite a recent kernel.
+2. Use PipeWire only for application-name enrichment; raw camera clients never appear there.
+   Fall back to process names.
 
 ### 0034.4. Arch update checking uses the `alpm` crate, not `checkupdates`/`expac` subprocesses
 
-Uses `alpm` (`github.com/archlinux/alpm.rs`, the Arch org's own `libalpm` binding, used in
-production by `paru`), replacing both subprocess calls. Whether `checkupdates`'s `fakeroot` wrapping
-is structurally required by the sync step itself, not just `pacman` CLI policy, was resolved by
-building and running the real thing: a throwaway program copied `/var/lib/pacman` to a user-owned
-temp dir, called `Alpm::new`, registered the `core`/`extra`/`multilib` sync repos, and ran
-`syncdbs_mut().update(force: true)` as `uid=1000`, no `fakeroot`, no root; it downloaded a real
-8.9MB `extra.db` from a live mirror and found the same 3 outdated packages the real `checkupdates`
-binary reports on the same machine. One honest gap: not independently confirmed against `libalpm`'s
-C source, only against this repo's real behavior.
+A user-owned database prototype synced as uid 1000 without fakeroot, downloading 8.9 MB and
+finding the same three updates as checkupdates. This was a behavior test, not an independent C-source audit.
 
-1. **Fully separate service from the sysinfo scheduler**, not a fourth metric on it: same
-   interval-suspend shape (`updates:configure({interval})`, suspend at `interval=0`) for
-   consistency, zero shared code, at the user's request.
-2. **Full signal shape, not count-only.** `updates.count`, `updates.packages` (`[{name, old_version,
-   new_version, download_size, installed_size}]`), `last_successful_check`, `check_error`.
-3. **The capability owns install and progress itself**, not bare Lua `process.run`.
-   `updates:install()` builds on the existing `process::spawn_group_leader_piped` primitive, with
-   its own progress fields (current step, current package, determinate flag, error, reboot-required
-   heuristic) riding the `updates` signal. Installing needs root and routes through Oblisk's
-   existing polkit agent (`dbus::polkit`, Phase 5), the first Phase-16-style write action that needs
-   privilege elevation.
+1. Keep updates separate from sysinfo scheduling; interval zero suspends it.
+2. Publish packages, versions, sizes, last success and errors, not only a count.
+3. The capability owns privileged installation and progress, reusing process helpers and Polkit.
 
-Rejected: a flat IDL bucket for all five mechanisms, because every existing capability
-(`oblisk.battery`, `oblisk.audio`) is domain-named, never lumped.
+Reject combining these unrelated hardware mechanisms into a flat capability bucket.
 
 ## 0035. Sysinfo capability: five IDL fields, two hwmon preference lists, watch-driven suspend
 
-`sysinfo` follows the wire-format IDL (five fields) over the looser prose specs (three metrics), the
-same precedent ADR-0033 set for notifications: `cpu_percent`, `ram_percent`, `swap_percent`,
-`temp_cores`, `temp_gpu`, but only three configurable intervals. Three tasks, not five:
-`swap_percent` rides `ram_interval` (computed alongside `ram_percent` from the same `/proc/meminfo`
-read); `temp_gpu` rides `temp_interval` (read alongside `temp_cores` from the same hwmon scan).
+Expose the IDL's five fields using three independently scheduled tasks. RAM and swap share one
+read/interval; CPU and GPU temperatures share one scan/interval.
 
-CPU% comes from `/proc/stat`'s first line (10-field layout: `user nice system idle iowait irq
-softirq steal guest guest_nice`): `percent = 100 * busy_delta / total_delta`, `busy = total - (idle
-+ iowait)`, the standard `top`/`htop` convention. The task keeps its previous sample in loop-local
-state and discards it on every dormant-to-ticking transition, not just cold start, so a
-freshly-resumed gauge never reports an hours-old averaged reading as its first value; the first
-implementation got this wrong and was caught in review. RAM/swap use `MemTotal`/`MemAvailable`
-(`used = total - available`, `percent = 100 * used / total`) and `SwapTotal`/`SwapFree` directly, no
-hand-rolled Buffers/Cached estimate since `MemAvailable` already is one.
+CPU uses busy/total deltas from procfs, counting idle and iowait as idle. Discard the prior sample
+on resume so the first result is not an average across the dormant period. RAM uses MemAvailable
+instead of reimplementing its estimate; swap uses SwapFree.
 
-Temperature resolves two independent hwmon chip-name preference lists once, at controller
-construction, not re-scanned per tick, since onboard sensors don't hotplug: `["k10temp",
-"coretemp"]` for `temp_cores`, `["amdgpu", "nouveau", "nvidia"]` for `temp_gpu`. `temp_cores` is
-every `tempN_input` on the winning CPU chip whose label matches `Core \d+`, sorted by trailing core
-index, excluding the package-level aggregate (`temp1_input`/"Package id 0" on `coretemp`); falls
-back to `acpitz`'s single sensor as a one-element array if neither `k10temp` nor `coretemp` is
-present. `temp_gpu` is the winning GPU chip's primary sensor, or the IDL's own `-1` sentinel if none
-of the three names match, verified live on a machine with no discrete-GPU hwmon chip. Wifi, NVMe,
-and battery hwmon chips are deliberately excluded from both lists.
+Resolve hwmon chips once because onboard sensors do not hotplug. CPU preference is k10temp,
+then coretemp, with acpitz fallback; GPU preference is amdgpu, nouveau, then nvidia.
+Core temperatures are sorted by core index and exclude package aggregates. No matching GPU
+returns -1, not a fabricated zero. Wi-Fi, NVMe and battery sensors are deliberately excluded.
 
-Suspend at `interval=0` is a real dormant await, not a polling no-op: each of the three tasks is
-driven by a `tokio::sync::watch<Duration>`, and at `Duration::ZERO` the loop awaits only
-`watch.changed()`, no `tokio::time::interval` armed, zero wakeups. All three start at
-`Duration::ZERO`; nothing polls until Lua calls `configure` at least once.
+Intervals start at zero. Zero awaits only configuration changes, with no timer and no wakeups.
+Three producers update their own fields under one shared state mutex and signal one push channel.
+Each push bumps the capability revision; no snapshot is sent before a real sample exists.
 
-This is the first capability where more than one independent task writes into the same shared state:
-one `Arc<Mutex<SysinfoState>>`, three producers, each updating only its own fields under the lock
-before signaling one shared unbounded `mpsc<()>`. `revision` bumps once per push regardless of which
-fields changed. Percent fields default to `0` pre-first-sample; no `StateSnapshot` pushes until at
-least one field has a real value.
+Configure takes a table of whole-second intervals. Missing keys preserve values; any wrong-typed
+present key rejects the whole call. Scheduling belongs to the Supervisor, not a generation.
 
-`configure(cfg)` takes a table, the first capability action in this codebase to do so:
-`arguments[0]` is a JSON object, not positional args. A present key overrides that task's interval,
-an absent key leaves it unchanged; a wrong-typed present key drops the whole call with one
-`eprintln!`, no partial-apply. Units are whole seconds. Config is Supervisor-global, not
-renderer-generation-scoped, same category as network/bluetooth/tray, since there is no
-per-generation cleanup to run on reload or crash.
-
-Sysfs/procfs paths are parameters, never hardcoded: `cpu.rs`/`ram.rs` take `proc_root: &Path`
-(default `"/proc"`); `temp.rs`'s chip-resolution and read functions take `hwmon_root: &Path`
-(default `"/sys/class/hwmon"`). Tests build real fake-root trees under `tempfile::tempdir()` rather
-than mocking strings. Module layout is
-`supervisor/src/hardware/sysinfo/{cpu,ram,temp,controller}.rs`, mirroring
-`hardware/idle/{notify,inhibit,controller}.rs`'s split-by-concern precedent (ADR-0032); no new
-cross-controller adapter trait, per ADR-0034's rejection of one.
-
-`temp_gpu` reading `-1` is the expected, documented outcome on any machine without a matching hwmon
-chip (most laptops with integrated-only graphics), not a bug to chase.
+Parameterize procfs and hwmon roots so tests use real temporary directory trees. Split CPU, RAM,
+temperature and controller modules by concern, without a speculative cross-controller trait.
 
 ## 0036. Mpris capability: playerctld excluded, track-identity caching, strict seek state
 
-Decided to build `oblisk.mpris` with `playerctld` filtered out of discovery, per-player
-track-identity caching for art and length, and seek state that only updates from the real D-Bus
-signal.
+MPRIS excludes duplicate/non-controllable players and keeps metadata and seek state tied to
+real player events.
 
-1. **Exclude `playerctld` and non-controllable sources, silently.** `playerctld` is filtered by
-   exact bus-name suffix (`org.mpris.MediaPlayer2.playerctld`), the only reliable signal since it
-   proxies every property, including `Identity`, from the player it mirrors (confirmed live via
-   `busctl`: identity strings are byte-for-byte identical on both). A source reporting `CanControl
-   == false` is excluded from tracking at registration, matching Quickshell's own filter. Both are
-   just absent from `mpris.players`; `playerctld` itself keeps working for anything that talks to it
-   directly (media keys, `playerctl` CLI).
-2. **No Supervisor-side "active player" selection.** `mpris.players` is a flat array with no
-   `active`/`primary` field; Lua owns any "which one to show" policy, matching every other
-   array-shaped capability (`notifications.feed`, `tray`'s item list).
-3. **Album art: trust-checked local path passed through, no SHM copy, no HTTP fetch.**
-   `album_art_path` is `artUrl` with the `file://` prefix stripped, canonicalized, and confirmed to
-   be a real existing file, with no directory allowlist (real players cache art in widely varying
-   locations). Empty string if the key is absent or non-`file://`; remote `http(s)://` art is
-   unsupported (no HTTP client exists in this workspace, and the renderer has no native
-   network-image loader).
-4. **Player `id` is the bus-name suffix**, reconstructed on every write and never cached separately.
-   **`length` defaults to `-1`** when `mpris:length` is absent or the wrong D-Bus type (a live
-   stream/radio case), matching this codebase's existing "genuine unavailable, not a fabricated
-   zero" pattern (ADR-0034/0035).
-5. **Seek: `SetPosition(trackid, target)` when trackid is known, `Seek(target - position)` fallback
-   otherwise; clamp `target` to `[0, cached length]` Supervisor-side before either call.** Does not
-   rely on the MPRIS spec's trackid-staleness guard on `SetPosition`, confirmed unreliable by live
-   testing against `mpv-mpris`, which honored a deliberately wrong `TrackId` anyway. Position state
-   updates only through the real `Seeked`/`PropertiesChanged` signal, never optimistically, keeping
-   this codebase's "state flows through the signal, not the write call" convention with zero
-   exceptions.
-6. **Track-identity caching for `album_art_path`/`length`, keyed by a composite of `trackid` +
-   `xesam:url` + `xesam:title`.** Any one field changing marks a track change. On an unchanged key,
-   a missing or malformed `artUrl`/`length` in a resync keeps the previous value instead of clearing
-   it, since some players omit these keys on some updates for the same still-playing track.
-7. **Degrade shape: keep the player entry, degrade only the affected field** on a transient
-   property-read failure, matching bluetooth/tray precedent. **Discovery:** `ListNames` scan at
-   startup, `NameOwnerChanged` filtered by the `org.mpris.MediaPlayer2.` prefix thereafter.
-8. **One capability, N producers, one shared `Arc<Mutex<Vec<PlayerState>>>`**, reusing ADR-0035's
-   multi-producer-capability mechanism. **Module layout:**
-   `supervisor/src/dbus/mpris/{watcher,player,controller}.rs`, session bus.
+1. **Discovery filter.** Exclude the exact playerctld bus suffix because its Identity duplicates
+   the proxied player, and exclude CanControl=false at registration. Other clients can still use
+   playerctld directly.
+2. **Selection policy.** Publish all players; Lua chooses which to display. No native active player.
+3. **Album art.** Accept canonicalized existing file URLs without a directory allowlist because
+   player caches vary. No spool copy, HTTP fetching or network image loader.
+4. **Identity and unavailable length.** Use the bus suffix as ID and reconstruct it on writes.
+   Missing or wrong-typed length is -1.
+5. **Seeking.** Use SetPosition with a known track ID, otherwise relative Seek. Clamp the target
+   to cached bounds in the Supervisor. Live mpv-mpris testing accepted a wrong track ID, so the
+   upstream staleness guard was insufficient. Update position only from real signals.
+6. **Metadata caching.** Track identity combines track ID, URL and title. Any change starts a new
+   track; unchanged identity preserves previous art/length when an update omits or malforms them.
+7. **Failure and discovery.** A transient read failure degrades the affected field, not the player
+   entry. Discover through startup ListNames and subsequent NameOwnerChanged.
+8. **Ownership.** One capability with per-player producers sharing a state mutex, following
+   ADR-0035. Split watcher, player and controller on the session bus.
 
 ## 0037. Capability roster: generic push, per-module dispatch, no merged channel
 
-Amended by ADR-0076: the roster moved from `CAPABILITIES: &[&str]` to the `shared::Capability` enum,
-turning decision 2's `push_snapshot` `debug_assert` into a type (deleting the assert) and routing
-decision 3's per-module `dispatch` through one exhaustive match in `supervisor/src/capabilities`
-instead of a literal `&str` match in `main.rs`. Every decision below still stands; the rejected
-merged channel is still rejected, since each capability's channel is still one typed single-variant
-enum and `idle`/the audio arm are still the two carve-outs (only the await site moved). The
-rejection rested on each capability's residue being "a one-line select arm"; ADR-0070's lazy-start
-`Option` wrapper later made each one six lines.
+The 2026-08-27 review found capability logic well-contained but snapshot and dispatch edges
+duplicated, with only four Renderer seeds for nine snapshot capabilities.
 
-A 2026-08-27 review found each capability's depth well-scoped in its own module but its edges
-hand-stamped across `main.rs`/`snapshot.rs`, with a renderer pre-seed list frozen at four names
-while nine snapshot capabilities existed.
+1. **Generic push.** Replace per-capability snapshot helpers with one Serialize-based helper.
+   The capability name selects the payload, following ADR-0029.
+2. **Shared roster.** Pre-seed one nil-valued Lua signal per roster entry. Assert roster membership
+   on Supervisor pushes to catch omissions before config boot. Unrostered names retain lazy lookup.
+3. **Module-owned dispatch.** Each capability parses arguments, selects actions and spawns work;
+   main keeps a literal capability match. Controllers own network/Bluetooth state and pending
+   network intent. Scan-start/discovery-clear events use their normal channels for FIFO ordering.
 
-1. **One generic `push_snapshot`** over `&impl Serialize` replaces nine per-capability
-   `push_*_snapshot` clones and the inlined audio copy. ADR-0029 already keeps payloads untyped; the
-   capability name is the only real datum.
-2. **The capability roster lives in `shared`.** The renderer seeds one live signal per rostered
-   name, so every rostered Lua global exists from a generation's first evaluation and reads `nil`
-   until its first snapshot, uniformly (including `sysinfo`, `nil` until configured).
-   `push_snapshot` asserted roster membership so a forgotten entry failed on the supervisor's first
-   push in development, not in a user's `shell.lua` at boot. Unrostered names still fall back to the
-   lazy signal path.
-3. **Each capability module owns its action dispatch** via one `dispatch(controller, envelope)`
-   adapter holding its action match, argument parse, and `tokio::spawn`; `main.rs` keeps a literal
-   match with one arm per capability, no registry, no trait. `NetworkState`/`BluetoothState`
-   ownership moved into their controllers behind `handle_signal(signal) -> State`; the immediate
-   `scanning` flip and clear-on-discovery (ADR-0029/0030) route through each controller's own signal
-   channel as new variants (`ScanStarted`, `DiscoveryCleared`) for FIFO ordering, and
-   `pending_network_connect` moved into `NetworkController`.
+Rejected: merge the single-variant capability channels. One select arm per capability was cheaper
+than controller-side serialization plus permanent idle/audio exceptions. Revisit only when a
+producer cannot reach the main loop's select.
 
-Rejected: merging the seven single-variant `Changed` channels into one `(capability, payload)`
-channel. Once decisions 1 and 3 land, each capability's residue is one channel and a one-line select
-arm; merging would trade that for serialize-in-controller indirection plus two permanent carve-outs
-(`idle` is event-shaped per ADR-0032, audio's mixer arm is bespoke). Do not re-propose unless a
-capability needs to push from a context that cannot reach the main loop's select.
+Amendment, ADR-0076: the shared Capability enum replaces the string roster and membership assert.
+One exhaustive capability-module match replaces main's string match. The channel rejection remains;
+ADR-0070's lazy-start wrappers had already grown each one-line select arm to six lines.
 
 ## 0038. Surfaces come from `shell.lua`, not a fixed role enum
 
-Decided that the evaluated Lua topology, not a closed Rust `SurfaceRole` enum, is the only source of
-Wayland surfaces; each `surface` node from `shell.lua` maps to one `zwlr_layer_surface_v1` per
-output it targets.
+Lua declarations replace the engine's fixed surfaces. This settles the model; delivery depends
+on sharing the scene and Wayland thread in ADR-0039.
 
-Amended: ADR-0078 gives `exclusive` a third value (`"Ignore"`, layer-shell's `-1`, reserve nothing
-and ignore other surfaces' reservations); decision 2's in-place-update list is unchanged. ADR-0049
-amends decision 2: "created once, at startup" still holds for the `panel` and `lock` roles, but not
-for the `popup`/`window` roles ADR-0040 added, since `xdg_popup` needs a real input-event serial for
-its grab and consumes its positioner at `get_popup` time; for those two roles `visible` creates and
-destroys the Wayland object rather than mapping and unmapping it. The declared set is still fixed
-for a generation's life, so ADR-0001's topology split is unchanged. ADR-0088 finishes that move:
-`visible` now creates and destroys a `panel`'s object too, because the layer-shell re-map the
-original decision rested on is not honoured in practice, so all three roles behave the same way.
+1. **Declarations are the source.** Remove the fixed SurfaceRole enum and creation calls.
+   Bar, overlay and wallpaper names become ordinary config IDs.
+2. **Fixed declared set per generation.** The original design creates objects at startup.
+   Adding/removing declarations or changing layer/anchor/monitor/namespace requires a swap.
+   Visibility and protocol-mutable margins, exclusive zones, keyboard interactivity and size
+   update in place. Object lifetime was later amended below.
+3. **Per-output instances.** Expand declarations to `{id}@{output}`. Monitor hotplug adjusts
+   instances without a generation swap because the declaration itself has not changed.
+4. **Role properties.** Add namespace for compositor rules, keyboard interactivity for typing,
+   and margin for edge offsets. Padding cannot replace margin.
+5. **Input regions.** Keep the bounding-box union per surface when content is smaller than it.
 
-1. **The evaluated topology is the only source of Wayland surfaces.** `SurfaceRole` and the three
-   `create_*` calls in `wayland::run` are deleted; `main_bar`/`overlay_canvas`/`wallpaper_layer`
-   survive only as ordinary ids in the default config, not as Rust constants.
-2. **A generation creates exactly the surfaces its own evaluation declared, once, at startup.**
-   Adding or removing a `surface`, or changing its `layer`/`anchor`/`monitor`/`namespace`, is a
-   topology change: the Supervisor spawns a candidate that builds its own surface set from its own
-   evaluation. Within a live generation, two things move without a swap: `visible` shows and hides a
-   surface, and the fields layer-shell lets a client change live (`margin`, exclusive zone,
-   `keyboard_interactivity`, size) apply in place. See the amendments above: "created once" is now
-   true only of a surface that has never been hidden, since ADR-0088 made hiding destroy the object
-   for every role.
-3. **A surface targeting multiple outputs produces one surface instance per output**, generalizing
-   the `"{id}@{output}"` surface-id convention (already used for wallpaper) to every surface.
-   Monitor hotplug adds and removes instances in place, no generation swap, since plugging in a
-   monitor is not a config edit: the declared surface set doesn't change, only how many instances a
-   `monitor = "All"` declaration expands to.
-4. **`surface` gains `namespace`, `keyboard_interactivity`, and `margin`.** `namespace` is the
-   layer-shell namespace string compositor rules key off (e.g. Hyprland's `layerrule`); hardcoded
-   per role today, it blocks per-panel compositor rules. `keyboard_interactivity`
-   (`None`/`OnDemand`/`Exclusive`) is required for any surface that must take typing, such as a
-   launcher. `margin` is the anchor offset, needed by a panel inset from a screen edge and not
-   obtainable from padding.
-5. **Input regions stay per surface.** The existing bounding-box union is generalized, not deleted:
-   it applies to any surface whose visible content is smaller than the surface itself.
+Rejected: put all popups in one fixed overlay. That cannot provide independent namespaces,
+keyboard focus, layering, per-output content or exclusive zones. The claimed zero-overhead
+advantage did not justify those restrictions.
 
-Rejected: keep the fixed roles, host every popup inside `overlay_canvas` (the shipped model). One
-shared surface cannot give per-panel namespace, per-panel `keyboard_interactivity`, correct
-paint-order layering (the same problem that already forced ADR-0007), per-output content, or a
-per-panel exclusive zone. The "zero-overhead footprint" counter-argument doesn't hold in practice:
-both checked reference toolkits (Quickshell, ashell) create layer surfaces at runtime with no
-reported cost, and a `wl_surface` plus `zwlr_layer_surface_v1` is one roundtrip.
+Amendments: ADR-0078 adds exclusive Ignore without changing the in-place property list.
+ADR-0049 makes popup/window visibility create and destroy protocol objects because popup creation
+needs an input serial and consumes its positioner. ADR-0088 applies create/destroy to panels too
+because layer-shell remapping did not work in practice. The declared set remains fixed.
 
-Not built at the time, later reversed: xdg-shell toplevels and xdg-popup were deferred as out of
-scope, then built as ADR-0040's `window` and `popup` roles (the popup cost estimate had been too
-high; PBA's staging generalizes to xdg-shell with no special case). Click-outside-to-dismiss was
-recorded as having no compositor-agnostic mechanism; wrong, `xdg_popup.grab` is exactly that
-(ADR-0040 decision 2). Session-lock surfaces were recorded as staying Supervisor-owned so a Renderer
-crash can't drop the lock; wrong, `ext-session-lock-v1` keeps the compositor locked independent of
-the lock client's life, and a locked session hides every non-lock surface anyway, so the original
-plan to keep painting the Lua lock UI from the Renderer could never have worked (ADR-0042).
-
-This settles the model, not the delivery: it cannot be implemented until the Renderer's scene and
-its Wayland objects share one thread (ADR-0039).
+Scope reversals: ADR-0040 adds the previously deferred window/popup roles and corrects the claim
+that click-outside dismissal has no portable answer, using popup grabs. ADR-0042 reverses the
+Supervisor-owned lock-client plan: the compositor stays locked after client death and hides
+non-lock surfaces, so an ordinary Renderer surface cannot paint the lock UI.
 
 ## 0039. The Lua VM, retained scene, and paint pass share the Wayland dispatch thread
 
-Decided that the Lua VM, the `Loader`, the retained `Scene`, and the paint pass all move onto the
-Wayland dispatch thread; the former socket thread is demoted to framed I/O only (reads
-`SupervisorFrame`s and forwards them over a channel, writes outbound frames it receives over
-another). `mlua::Lua` is `!Send` and must be built on the thread that runs it, and `Scene`'s nodes
-hold `mlua::Value` properties so `Scene` is also `!Send`; painting the retained scene therefore
-requires the scene and the VM on the same thread as the GL context, which is the Wayland thread.
-This is a hard constraint, not a preference.
+Move Lua, Loader, retained Scene and painting to the Wayland dispatch thread. Lua and its values
+make the scene non-Send; it must share the GL context's thread. The socket thread becomes framed
+I/O forwarding only.
 
-Amended: decision 4 was deferred to Phase 20, and its stated reason was wrong. Consolidating threads
-makes real per-surface sizes reachable but not attributable, since `Scene` keys surfaces by the
-config's own `id` while `wayland::mod` derives `TrackedSurface::surface_id` from
-`SurfaceRole::label()`, two id spaces that don't intersect; deleting `SurfaceRole` (ADR-0038) is
-what unifies them, so decision 4 lands with that work instead. Decisions 1, 2, 3, and 5 are
-unaffected; 1 through 3 shipped with the refactor. Also amended: the Consequences section's claim
-that ADR-0021's 5ms CPU cap "is enforced, not merely measured" was not true when written. The
-`Lua::set_hook` abort raises an ordinary Lua error a `pcall` inside the closure can catch, and
-`set_hook` installs per Lua thread so a closure running inside a coroutine is never hooked at all;
-both gaps were found in review and are being closed. The other two bounds below, shaping staying
-off-thread and full evaluation happening only on config edit, are unaffected.
+1. Construct Loader, signals, rescue state and Scene on the Wayland thread, not by cross-thread
+   handoff.
+2. Replace readiness/presentation/activation channels with direct calls; secure submission sends
+   an outbound frame.
+3. Share one ShapingHandle between sizing and painting, avoiding two roughly one-second
+   FontSystem startups. Shaping itself stays off-thread.
+4. Delete placeholder output sizes and use real per-surface sizes. Deferred as amended below.
+5. Give overlay input-region calculation its production caller, following ADR-0038 decision 5.
 
-1. `Loader`, the live-signal map, rescue state, and `Scene` are constructed inside `wayland::run`
-   rather than the socket thread; a move, not a hand-off.
-2. The four PBA channels collapse to two: `ready_tx`/`presented_tx`/`activate_tx` become direct
-   calls, since evaluation and buffer-commit are now the same loop; `secure_submit_tx` becomes an
-   outbound-frame send.
-3. One `ShapingHandle` survives, shared by content-sizing and painting (was two, one per thread,
-   each paying `FontSystem::new()`'s roughly one-second startup). Shaping itself stays off-thread as
-   a real bounded cost.
-4. `PLACEHOLDER_OUTPUT_SIZE` is deleted; layout resolves against each surface's real configured
-   size. (Deferred to Phase 20, see amendment above.)
-5. `overlay_input_regions` gets its production caller, per ADR-0038 decision 5.
+Amendment: decision 4 needed ADR-0038's unified surface IDs, not just shared-thread access, so it
+moved to Phase 20. Decisions 1–3 shipped with this refactor; 5 was unaffected. The claim that the
+5 ms Lua CPU cap was already enforced was also wrong: pcall could catch hook errors and coroutines
+escaped per-thread hooks. Those gaps were found in review and were being closed.
 
-The cost is real: a slow `shell.lua` evaluation now blocks Wayland dispatch instead of stalling only
-its own thread. It is bounded by the CPU-cap hook (see amendment on its actual enforcement gap), by
-text shaping staying off-thread, and by full re-evaluation happening only on config edit, which a
-`StateSnapshot` push does not trigger (ADR-0029). Both reference toolkits accept the same trade:
-Quickshell runs QML on Qt's own GUI/scenegraph thread, and Noctalia v5 dropped Qt specifically to
-own its whole stack, event loop and rendering, on one thread.
+Trade-off: slow config evaluation now blocks Wayland dispatch. Off-thread shaping and evaluating
+only on config edits limit that cost; snapshot pushes do not rerun the config. The CPU-cap
+qualification above remains part of that assessment.
 
-Rejected: keep the two-thread split, ship resolved trees over a channel. Rejected because it pays a
-crossing on every feature, in both directions, forever: a pointer click would cross Wayland thread
-to socket thread to Lua closure to re-evaluation to snapshot to Wayland thread, and ADR-0038's
-surface creation would become a request/response protocol instead of a method call. The snapshot
-itself isn't free either, since it must drop or resolve `mlua::Value` properties, reopening the
-cache-invalidation problem ADR-0023 item 2 deferred. The thread boundary wasn't protecting anything:
-a Lua evaluation failure was already caught and routed to rescue in-process.
+Rejected: ship resolved trees between threads. It adds bidirectional crossings to input and
+surface creation, must resolve/drop Lua values and reopens cache invalidation. Evaluation errors
+already reach rescue in-process. Moving EGL to the socket thread merely moves the same lifetime
+problem because configure events and EGL surface lifetime depend on Wayland dispatch.
 
-Rejected: move EGL and paint onto the socket thread instead. Worse in practice, since Wayland
-dispatch and EGL surface lifetime are coupled through `WlEglSurface`, whose `configure` events
-arrive on the dispatch queue; splitting them relocates the same defect instead of removing it.
-
-Scope: this ADR settles where the state lives, not the paint pass, surface manager, or input
-dispatch, which it unblocks but does not specify. Landing the refactor changes no observable
-behavior, same hardcoded surfaces and PBA handshake, on fewer threads.
+Scope: thread ownership only. Painting, declared-surface management and input remain separate work;
+the refactor initially retains the same fixed surfaces and handshake.
 
 ## 0040. Four surface roles: panel, window, popup, lock
 
-ADR-0038 had recorded xdg-shell toplevels and xdg-popup as non-goals. That scope was set aside: the
-target became Quickshell's freedom (floating windows, panels, popups, session lock, per-screen
-variants), so this ADR replaces those two non-goals with a design of four Lua-facing constructors
-matching Wayland's own four surface roles.
+Replace ADR-0038's window/popup non-goals with four Lua constructors matching Wayland roles.
 
-1. **Four constructors, not one `surface` with a `kind` field.** `panel` -> `zwlr_layer_surface_v1`,
-   `window` -> `xdg_toplevel`, `popup` -> `xdg_popup`, `lock` -> `ext_session_lock_surface_v1`,
-   mirroring the protocol directly. A single schema with a `kind` discriminant was rejected: the
-   property sets are mostly disjoint, so it would accept `layer` on a toplevel or `title` on a layer
-   surface, with validation reduced to a per-kind allowlist; four constructors give each role an
-   honest schema `layout::node` validates directly (Quickshell reached the same shape with four
-   separate window types). The old `surface` constructor is renamed to `panel`; `surface` stops
-   being Lua-callable and becomes the umbrella concept (a declared `wl_surface` plus its role).
-   Keeping `surface` as an alias was rejected: no users to migrate, and an alias would blur the
-   umbrella term against one of its own four members.
-2. **Popups parent to a panel or a window, and take a real grab.** A popup is created the same way
-   regardless of parent (`create_positioner`, then `get_popup` with a null parent) and is rooted
-   under an `xdg_surface` or a layer surface before its first commit; a bar's dropdown is a
-   first-class `xdg_popup` with full `configure`/`popup_done`/`grab`, not a second layer surface
-   with hand-computed coordinates. This corrects ADR-0038, which recorded click-outside-dismissal as
-   having no compositor-agnostic answer (true for layer surfaces, false for popups):
-   `xdg_popup.grab` gives the grabbing popup keyboard focus and delivers `popup_done` on
-   outside-click, keyboard dismissal, or screen lock. Three spec constraints bind the
-   implementation: a denied grab is a normal outcome (`popup_done` arriving immediately after `grab`
-   is expected, not an error); grab must answer a real input event and be requested before the popup
-   maps, or the protocol raises `invalid_grab`, making input routing a hard prerequisite for popups;
-   nested popups are destroyed in reverse creation order, owned by the engine, not the config.
-3. **A popup's anchor rect comes from the click that opened it.** `xdg_positioner` requires a
-   non-zero size and non-zero anchor rect (`get_popup` otherwise raises `invalid_positioner`), in
-   parent-surface-relative coordinates, which is exactly the space a resolved node already lives in.
-   `button`'s `on_click` gains an argument carrying the clicked node's resolved rect, passed
-   straight to `anchor_rect`; no new node-identity concept is needed, and it matches how ashell
-   derives menu positions from the triggering button's on-screen rect. `set_constraint_adjustment`
-   defaults to `flip_y | slide_x` rather than the spec default of `none` (no repositioning),
-   matching what a config author expects from a dropdown; the raw bitfield is still available for
-   configs that want to be specific. Spec precedence is fixed: flip, then slide, then resize.
-4. **Floating windows reuse the staging discipline already built.** `xdg_toplevel`'s initial-commit
-   rule (commit with no buffer, wait for `configure`, ack, then attach) is the same one layer-shell
-   already implements almost verbatim, so PBA's null-buffer staging generalizes across all four
-   roles with no protocol-specific special case. What differs: `xdg_toplevel`'s configure carries a
-   state array (`maximized`, `fullscreen`, `resizing`, `activated`, `tiled_*`) layer-shell has no
-   analogue for, and its ack goes through the wrapping `xdg_surface`, not the role object;
-   `set_min_size`/`set_max_size` are advisory, a fullscreen configure is binding. `window` gets
-   `title`, `app_id`, `min_size`, `max_size`, and `on_close`, a Lua callback that may decline, since
-   `xdg_toplevel.close` is a request the client may ignore. Decorations are not built: Oblisk
-   requests server-side decoration via `zxdg_decoration_manager_v1` and accepts whatever mode it
-   gets, with no client-side titlebar frame; revisit only if a window genuinely wants a system
-   titlebar.
-5. **`smithay-client-toolkit` covers this, with one escape hatch.** SCTK 0.21.1 wraps `XdgShell`,
-   `Window`/`WindowHandler`, `Popup`/`PopupHandler`, `XdgPositioner`, and `LayerSurface::get_popup`,
-   including the null-parent path this design uses. The one gap is `xdg_popup.grab`, which SCTK does
-   not wrap: reached directly via `popup.xdg_popup().grab(seat, serial)`, the engine owning the grab
-   bookkeeping, the same shape as ADR-0009's `wp-text-input-v3` handling (use SCTK where it wraps,
-   reach through where it doesn't, per ADR-0008).
+1. **Separate constructors.** Panel, window, popup and lock map to layer-shell, xdg_toplevel,
+   xdg_popup and session-lock surfaces. Reject a shared kind-discriminated schema because most
+   properties are disjoint. Rename the old surface constructor to panel without an alias;
+   surface remains the umbrella term, not one role.
+2. **Native popups.** Parent to a panel or window before first commit, using the null-parent
+   creation path. A real popup grab provides focus and click-outside dismissal, correcting
+   ADR-0038. Denied grabs are normal. Grabs require a real input serial before mapping;
+   the engine destroys nested popups in reverse order.
+3. **Click-derived positioning.** Pass the clicked node's parent-surface-relative rect to Lua.
+   Popup size and anchor rect must be nonzero. Default adjustments are flip-y and slide-x;
+   protocol precedence is flip, slide, then resize. No new node identity mechanism is needed.
+4. **Reuse staging.** Windows follow null-buffer commit, configure, ack and attach like panels.
+   Window state arrays and xdg_surface acknowledgments differ; min/max hints are advisory and
+   fullscreen configure is binding. Expose title, app ID, size hints and a declinable close callback.
+   Request server decoration but build no client frame; revisit only for a real titlebar need.
+5. **Use SCTK with one escape hatch.** SCTK 0.21.1 wraps the required shell/window/popup/positioner
+   operations. Reach through to xdg_popup.grab where it lacks a wrapper; the engine owns bookkeeping.
 
-Scope: `lock`'s role is named here; which process holds `ext_session_lock_v1` is a separate question
-revisiting ADR-0010. All four roles need the paint pass and the Lua-declared surface manager
-(ADR-0039) before any can receive content; `popup` additionally needs input routing for its grab and
-anchor rect. The reload model is unchanged: adding or removing a declared surface of any role is a
-topology change, and per-role instancing follows ADR-0038 decision 3.
+Lock-client process ownership is deferred to the ADR-0010 reconsideration. Content requires the
+paint pass and declared-surface manager; popups also need input routing. Adding/removing any role
+still requires a topology swap, with instancing following ADR-0038.
 
 ## 0041. `oblisk.screens` is Renderer-sourced; variants are a Lua loop
 
-Quickshell's per-monitor idiom (`Variants { model: Quickshell.screens; PanelWindow { screen:
-modelData } }`) splits into two separate questions: how to repeat a surface per screen, and where
-the screen list comes from. Only the second needs anything built.
+1. Lua loops already provide per-screen iteration; no variants/repeater constructor.
+2. Screens are a Renderer-local signal from existing output bindings, not a second Supervisor geometry source.
+3. Identity is the declared ID set. Monitor All changes instances in place; an explicit loop can change IDs and require a swap.
+4. Hotplug reuses evaluation, topology comparison and rollback from the file-edit reload path.
 
-1. **No `variants` primitive; Lua already has `for`.** QML needs `Variants`/`Repeater` because a
-   declarative markup language has no other way to say "one of these per element." A plain Lua `for`
-   loop over `oblisk.screens:get()` building a table of `panel {}` nodes does the same job; adding a
-   `variants` constructor would wrap a language feature the config language already has. Do not
-   re-propose a repeater primitive; a future need here would be about reload identity (decision 3),
-   not iteration.
-2. **`oblisk.screens` is a Renderer-local signal, not a Supervisor capability.** It carries what
-   `wl_output` reports per connected output: `name` (connector, e.g. `"DP-1"`), `width`, `height`,
-   `scale`, `refresh`, reactive to outputs appearing and disappearing. It is sourced from
-   `smithay_client_toolkit`'s `OutputState`, which the Renderer already maintains and already needs
-   for layout. This is a deliberate exception to ADR-0037's shape: every other Lua signal is a
-   capability the Supervisor owns, pushes as a `StateSnapshot`, and lists in `shared::CAPABILITIES`;
-   `screens` is a Renderer-local global seeded at VM construction and updated from output events on
-   the same thread instead. Routing it through the Supervisor was rejected: the Supervisor's own
-   Wayland connection exists only for idle-notify and lock authority (ADR-0010) and binds no
-   outputs, and making it bind `wl_output` and push snapshots would add a process hop plus a second
-   source of truth for geometry the Renderer must hold anyway to lay out against. ADR-0039 removes
-   the only reason this was ever awkward, since once the Lua VM shares the Wayland thread,
-   `OutputState` is a local read.
-3. **Identity is the `id` set, and it decides swap versus in-place.** `monitor = "All"` declares one
-   surface, which the engine expands to one instance per output (ADR-0038 decision 3); hotplug
-   changes the instance set, not the declared `id` set, so it is handled in place with no generation
-   swap. An explicit Lua loop declares N surfaces with N distinct ids; hotplug then changes the id
-   set, which is a topology change and therefore a generation swap (ADR-0001), a correct
-   classification since the config genuinely declares different surfaces before and after. Rule for
-   config authors: use `monitor = "All"` when every screen gets the same panel, and a loop when
-   screens get genuinely different content and a swap on hotplug is acceptable.
-4. **A hotplug reload reuses the file-edit reload path exactly.** A config looping over
-   `oblisk.screens` must re-evaluate when that list changes, or its per-screen panels go stale; this
-   reuses ADR-0024's existing machinery rather than adding a second reload path. On an output change
-   the Renderer re-evaluates, diffs its own topology, and reports
-   `Unchanged`/`TopologyChanged`/`Failed` to the Supervisor exactly as it does for a `Reevaluate`
-   frame, and the Supervisor stays the one authority deciding in-place versus swap. The only new
-   thing is the trigger: `inotify` on the config directory is one, a `wl_output` change is now
-   another. Rollback, rescue, and the topology diff are unchanged.
-
-Consequences: the IDL's `workspaces.outputs` currently duplicates `name`/`width`/`height`/`scale`
-from a worse source, the still-undesigned compositor workspace adaptor, rather than from
-`wl_output`, which would leave the Renderer laying out against one copy while Lua reads another.
-Split by what actually knows the answer: `oblisk.screens` owns geometry, scale, and connector names;
-`oblisk.workspaces` keeps workspace state and refers to screens by `name` instead of restating their
-geometry. Popups need `oblisk.screens` too, since an `xdg_positioner`'s constraint adjustment is
-resolved by the compositor against the output the popup lands on, so a config positioning its own
-popups needs to know which screen it is on.
+Screens own geometry; workspaces reference connector names without duplicating it.
 
 ## 0042. The Renderer holds `ext_session_lock_v1`; the Supervisor supervises the lock client
 
-Supersedes ADR-0010's session-lock half (its idle-notify half stands unchanged). The Renderer holds
-`ext_session_lock_v1` and creates one `ext_session_lock_surface_v1` per output; `lock` is the fourth
-surface role in ADR-0040, so the lock screen is an ordinary Lua-authored node tree.
+Supersedes ADR-0010's lock-client ownership, not its idle-notify ownership.
 
-ADR-0010 put the lock in the Supervisor to survive a Renderer crash, but `ext-session-lock-v1`
-already guarantees fail-secure: the compositor must not unlock when the client dies, so that risk
-does not exist for a real lock client. The decisive problem is that ADR-0010's design cannot render
-a Lua lock screen at all: the `locked` event hides all normal (layer-shell) content, and
-`get_lock_surface` is scoped to the connection that holds the lock, so the Supervisor cannot hand a
-lock surface to the Renderer. The process that holds the lock is the process that paints it.
+The Renderer must hold the lock to paint its connection-scoped lock surfaces. The compositor
+stays locked after client death. The Supervisor retains lock decisions, authentication and
+client supervision; secrets use secure submission to the PAM worker.
 
-The Supervisor keeps everything except the protocol object: it owns `ext_idle_notifier_v1` and
-decides when to lock (ADR-0010's idle half), issues the lock command, and, since it already tracks
-and reaps generations, detects and respawns a dead lock client.
+No overlapping generation swap while locked; topology edits queue until unlock, but in-place
+reloads continue. Maintain one lock surface per output. Handle denied and subsequently finished
+locks distinctly; only successful authentication permits unlock, with a display sync before exit.
 
-Authentication composes from existing pieces: the lock screen's `textfield` uses `secure_submit`, so
-keystrokes go into `shared::SecureBuffer` and never through Lua (ADR-0005, ADR-0027); the buffer
-crosses the control socket to the Supervisor, which runs PAM in its re-exec'd worker (ADR-0028); on
-success the Supervisor tells the Renderer to unlock and it calls `unlock_and_destroy`.
-
-Constraints: only one client may hold a session lock, so no generation swap can happen while locked
-(PBA's overlapping-generation handoff is blocked; a config edit queues until unlock; in-place
-reloads still work). Lock surfaces must track outputs (reusing ADR-0041's `oblisk.screens`); a
-second surface on one output is a `duplicate_output` error, and destroying a lock surface while its
-output is still active makes the compositor fall back to a solid color. `finished` means two
-different things and neither may be swallowed: on the initial `lock` request it means denial
-(surfaced via `oblisk.rescue`); later it means the compositor tore the lock down itself.
-`unlock_and_destroy` must only be called after successful authentication; a client that wants to
-exit right after unlocking must `wl_display.sync` first.
-
-If the Renderer dies while locked, the session stays locked under the compositor's own fallback;
-whether a respawned Renderer can retake the lock is compositor policy (Hyprland gates it behind
-`misc:allow_session_lock_restore`, off by default), so recovery is not portable. ADR-0010's
-`smithay-client-toolkit` `session_lock` dependency moves from the Supervisor to the Renderer; the
-Supervisor keeps its own Wayland connection for idle-notify alone.
+Recovery after client death depends on compositor lock-restore policy; respawning is not a
+portable guarantee of recovery.
 
 ## 0043. Memory budget: declared fonts, atlas eviction, and PSS as the measurement
 
-Noctalia's own published numbers are qualitative and use no stated measurement method, so they are a
-direction, not a reproducible benchmark. Oblisk adopts its own falsifiable target instead: **50 MB
-PSS per monitor for the shell's own processes at steady state**, matching the order of magnitude
-Noctalia claims.
+Target: 50 MB PSS per monitor for shell processes at steady state, not a measured achievement.
 
-1. **Measure PSS, not RSS, and report three numbers.** Summing RSS across the supervisor and
-   one-or-more-renderer processes double-counts shared pages (libc, GPU driver objects, mapped
-   fonts, and, during a PBA handoff, two renderers running the same binary), overstating pressure.
-   1. Steady state: sum PSS across supervisor and renderer via `/proc/[pid]/smaps_rollup`; this is
-      the number compared against the 50 MB/monitor budget.
-   2. Per-renderer USS (`Private_Clean + Private_Dirty`): what one generation uniquely costs.
-   3. Handoff peak, sampled only in the window where two renderers are alive, reported separately
-      from steady state, never folded into it.
-   GPU memory is excluded from all three; read it from DRM fdinfo (`/proc/[pid]/fdinfo/*`), not
-   `smaps`, since EGL/dmabuf buffers are GEM objects invisible to `VmRSS` on a real GPU (though not
-   under llvmpipe, where they land in RSS as ordinary heap).
+1. Report three measurements separately:
+   1. Steady-state summed PSS across Supervisor and Renderers, compared with the budget.
+   2. Per-Renderer USS, its private clean and dirty pages.
+   3. Handoff peak while both generations live, not folded into steady state.
+   GPU memory comes from DRM fdinfo, not smaps; deduplicate by device/client ID.
+2. Load only config-declared font families and fallbacks at startup. No per-node family or live
+   chain reload; missing coverage can render tofu. Lazy system discovery remains an upgrade option.
+3. Clear the whole glyph atlas above a page threshold while idle, then rebuild on demand.
+   Pages are 512×512 RGBA8, 1 MiB each; no per-glyph eviction API exists.
+4. Size buffers to surfaces. A 2560×1440 RGBA8 buffer costs about 14 MiB before double/triple buffering.
 
-2. **Fonts are declared in config, not discovered from the system.**
-   `cosmic_text::FontSystem::new()` eagerly parses metadata for every system font (commonly 1000+
-   faces; ADR-0023 item 8 measured this at roughly one second) with no API to scope it. Built: a
-   global `fonts { ui = ..., mono = ..., fallback = {...} }` table, recorded into `Lua::app_data`
-   and installed by `ShapingHandle::set_chain` before first paint; the renderer loads only the
-   declared families (roughly 10 to 20 faces) plus fallback, never calling `load_system_fonts()`.
-   Read once at startup; editing it live requires a restart (`renderer/src/lua/fonts.rs`). Per-node
-   `font_family` is deliberately not built, since both shaping and paint fall back per glyph across
-   one chain, and a node-level override would reintroduce the shaping/paint face-disagreement hazard
-   `text::shaping` already documents. Cost: an undeclared codepoint renders as tofu, which is why
-   the default fallback chain covers CJK and emoji. Upgrade path (not built): build the system
-   database lazily on a shaping miss, once a real config needs it.
+No allocator replacement before measurement.
 
-3. **The glyph atlas needs eviction, because femtovg has none.** Atlas pages are 512x512 RGBA8 (1
-   MiB each, not the 2048x2048 an earlier note claimed), held in an unbounded `Vec`, freed only on
-   an explicit `clear()`. Decision: clear the whole atlas (not an LRU, since femtovg exposes no
-   per-glyph eviction) when it exceeds a page-count threshold and the shell is idle, rebuilding on
-   demand.
-
-4. **Per-surface buffers are why the dynamic surface model helps here.** One RGBA8 buffer at
-   2560x1440 is about 14 MiB; double/triple-buffered, 28 to 42 MiB per surface, scaling with surface
-   area not surface count. ADR-0038/ADR-0040's per-popup and tightly-sized-panel surfaces beat the
-   old permanently-mapped fullscreen `overlay_canvas`, so the generality decision and the memory
-   target point the same way.
-
-Non-goal: no allocator swap, arena, or `jemalloc` until decision 1's measurement exists and says
-where the memory is.
-
-Amendments from Phase 24's first real measurement (niri, one 1920x1200 output, i915, Mesa 26.2.1),
-none changing the decisions: DRM fdinfo field is `drm-resident-<region>` (i915), not `drm-*-memory`;
-a DRM client's several fds repeat identical byte counts (one case: three fds each reporting 279968
-KiB), so the harness keys on `(drm-pdev, drm-client-id)` to avoid counting one client three times;
-the Supervisor cannot count monitors (ADR-0041 keeps `screens` Renderer-sourced), so the harness
-reports absolute totals and leaves division to the reader. The handoff sample is unconditional,
-taken once at the widest point of the window (after `run_pba` returns `Ok`, before the superseded
-generation is reaped); the steady-state sample stays opt-in behind `OBLISK_MEMORY_SAMPLE_SECS`.
-
-First reading: steady state totalled **149.7 MiB PSS** (supervisor 12.6 MiB; generation 0 pss 137.0
-MiB, uss 130.4 MiB, gpu 14.3 MiB) against the 50 MB/monitor budget, roughly 3x over. Handoff
-totalled 196.9 MiB (generation 0 pss 92.2 MiB uss 42.6 MiB gpu 14.3 MiB; generation 1 pss 92.1 MiB
-uss 42.4 MiB gpu 14.5 MiB) -- 1.32x for two renderers, not 2x, vindicating PSS (a naive RSS sum
-would show roughly 274 MiB). Attribution: 82.3 MiB `libLLVM.so` (59% of the renderer's PSS, 55% of
-the whole shell, pulled in by Mesa's gallium megadriver even though this machine renders on i915
-hardware, not llvmpipe), 25.0 MiB anonymous, 13.3 MiB `libgallium`, 12.4 MiB heap, 4.2 MiB the
-renderer binary, 0.1 MiB every mapped font. Decision 2 was right by four orders of magnitude more
-than this ADR estimated: the declared chain costs 137.0 MiB versus **2207.9 MiB** for
-`load_system_fonts()`'s full system set (2648 faces on this machine), a 16x multiplier on the whole
-shell; that also exceeds the 1.1 GB of font files on disk, showing `fontdb` 0.23 loads file contents
-rather than memory-mapping them as this ADR originally assumed. The `system_fallback` path (taken
-when fontconfig is unreachable) is shipped code that now measures at 2.2 GB, a live hazard this ADR
-surfaces but leaves for Phase 19 to bound. Decision 3's atlas eviction is untested by this reading,
-since unbounded growth is a days-long leak invisible seconds after boot. Open question, left
-unsettled: Oblisk's own pages (binary, heap, anonymous, fonts) come to roughly 41.7 MiB in the
-renderer plus 12.6 MiB in the supervisor; whether the 50 MB target should exclude the driver library
-is not decided here.
+First measurement, niri/i915, one 1920×1200 output, Mesa 26.2.1: 149.7 MiB steady PSS,
+196.9 MiB handoff, exceeding the target. Renderer PSS was 137.0 MiB with declared fonts versus
+2207.9 MiB with 2648 system faces. LLVM accounted for 82.3 MiB; mapped fonts only 0.1 MiB.
+The system-font fallback remained a hazard. Atlas growth was not tested by this short run.
+Whether to exclude driver libraries from the target remained undecided.
 
 ## 0044. Signals resolve at layout time, and a push marks the scene dirty
 
-Before this decision nothing connected a capability's pushed state to the screen:
-`apply_state_snapshot` only updated the handle, ADR-0039 confirmed re-evaluation runs only on config
-edit, and every property parser called `reject_signal`, contradicting the IDL's own
-`string/Signal`-style type unions. Signals now resolve at layout time instead of evaluation time,
-and a push marks the scene dirty so it re-resolves without re-running Lua.
+1. Resolve property signals at layout time; passing a handle is reactive, calling get during
+   evaluation is a snapshot. Nil uses the property default. Topology fields still reject signals.
+2. A push marks one scene-wide dirty bit and reapplies the retained tree without rerunning Lua.
+   Per-surface invalidation is an upgrade only if profiling justifies a dependency graph.
+3. No memoization or dependency graph. Value-cloned computed dependencies can grow exponentially;
+   shared identity would be needed for caching, and the evaluation CPU cap bounds the work.
+4. Keep one Lua VM per generation and drop retained values before it. In-place reload does not
+   reset it. The corrected reason is weak Lua references and invalid-state access, not a refcount leak.
+5. Named writable state survives in-place reload, not a generation swap. Changed scalar seeds
+   reseed it; unchanged seeds preserve runtime writes. Fresh table identities do not count as edits.
 
-1. **Property parsers resolve a `Signal` instead of rejecting it.** `reject_signal` is removed; a
-   parser finding `Value::UserData` holding a `Signal` calls `get()` and parses the result under the
-   same rules as a literal, making `marshal.rs`'s `check_number`/`check_integer`/`check_string`
-   load-bearing for the first time. `:get()` inside `shell.lua` still reads once at evaluation time
-   and never updates; passing the handle itself is what opts into reactivity. Carve-out: the
-   `SurfaceTopology` fields keep rejecting a `Signal`, because they are computed at evaluation time
-   so `handle_reevaluate` can diff them against `applied_topology` to choose a generation swap
-   versus an in-place reload (ADR-0001); a signal there would resolve once for that comparison and
-   then drift under the live generation. A signal
-   resolving to `nil` means the property is absent, so the parser's own default applies instead of
-   erroring on `nil` (a Lua table cannot itself hold `nil`, so this is the only way a signal-bound
-   property can be explicitly absent); every rostered signal reads `nil` until its first
-   `StateSnapshot`, and `run_startup_evaluation` runs before then, so without this rule a config
-   binding a bare capability signal cannot boot.
-
-2. **`LiveSignalHandle::set` marks the scene dirty; the dirty bit re-resolves, it does not
-   re-evaluate.** A push sets one flag. On the next loop turn a dirty scene re-runs `Scene::apply`
-   against the retained `LoadOutput` from the last evaluation; `shell.lua` does not run. The
-   retained `VirtualNode` tree still holds the `Signal` handles Lua put into it, so re-applying
-   reads current values through decision 1; reconciliation matches by position and preserves node
-   identity and leases (ADR-0023 §4). This is also the missing input to frame gating: a surface
-   whose re-resolve produces different geometry or paint properties needs a frame, one that produces
-   an identical result does not. `ponytail:` one flag covers the whole scene, so any push
-   re-resolves every surface; the ceiling is many surfaces plus a high-frequency capability where
-   most surfaces don't reference it. The upgrade path is per-surface flags, which needs the
-   dependency graph decision 3 declines to build.
-
-3. **No memoization and no dependency graph.** `computed` and `map` keep recomputing on every read
-   (ADR-0021); the dirty bit is a single boolean, not an invalidation set. This is the correct
-   baseline, not a placeholder: the graph buys skipping work that a 5ms-capped evaluation and a
-   per-surface layout pass already finish in well under a frame, and it should be built only when a
-   profile names the re-resolve as the cost. Memoization keyed on signal identity would not help
-   regardless: `SignalKind::Computed` holds `deps: Vec<Signal>` by value and `Signal` derives
-   `Clone`, so `computed({s, s}, f)` embeds two independent copies of `s` instead of referencing it
-   twice; twenty levels of that build a 2^20-node tree evaluated as 1,048,575 closure calls.
-   ADR-0021's 5ms cap, governing a whole evaluation rather than each leaf call, is what keeps that
-   survivable: the config gets an error instead of a wedged shell, measured firing after roughly
-   3,200 calls. A cache would need `Signal` to become a shared reference (`Rc`) before any shared
-   identity is left to key on.
-
-4. **A generation's Lua VM outlives its retained scene, so an in-place reload does not reset it.**
-   `ResolvedNode::properties`, `RetainedNode::properties`, and decision 2's retained `LoadOutput`
-   are all `HashMap<String, mlua::Value>`, and every value pins the `Lua` that created it.
-   `handle_reevaluate` calls `evaluate_file` on the same `Loader`; it does not reset the VM. One VM
-   per generation, created once and dropped only when the generation ends; resetting the VM is a
-   generation swap's job, and a swap gets a new process anyway. The reason is that reading a
-   retained value from a dead Lua state panics, since `ValueRef::to_pointer` locks the state, which
-   makes struct field order load-bearing: the `Loader` must be declared after anything holding
-   values derived from it, so Rust drops those fields first. (Not, as first stated, that a reset
-   would leak the old VM by refcount: mlua 0.12's `ValueRef` holds a `WeakLua`, not a strong
-   reference, so no such leak exists.)
-
-5. **Lua-authored state is named, and the name is what survives a reload.** Live signals are
-   read-only to Lua, so a config needs somewhere to keep runtime UI state nothing else watches.
-   `state(name, initial)` returns a writable `Signal` whose `:set()` marks dirty through decision 2.
-   A generation holds a `name -> Signal` map that outlives any evaluation; `state` returns the
-   existing signal when the name is already present and ignores `initial`, so an in-place reload
-   finds the same signal holding the same value and an open dropdown stays open across a save. Named
-   state dies on a generation swap, which is accepted: the map lives in the process being reaped,
-   and the upgrade path, if it matters, is serializing it into the PBA handshake. Amendment (found
-   by the wallpaper case, `state("wallpaper", path)` hand-edited in the config file and expected to
-   take effect): "a name already in the map wins" was too broad. A changed literal re-seeds the
-   signal; a value the config file doesn't touch keeps the live value. The registry stores the
-   literal it last seeded from; on re-evaluation, a new `initial` that differs from the stored one
-   means the author edited the file, so it is adopted (through the same `:set()` path, marking
-   dirty); one that matches keeps whatever the signal holds now, including a runtime write. Scalars
-   only: `mlua` compares tables by pointer and every evaluation builds a fresh table, so a table
-   `initial` (e.g. `popup_anchor`'s default) always keeps the original behavior rather than being
-   treated as changed. The rule assumes the literal is stable across evaluations; `state("t",
-   os.time())` would re-seed on every reload, which is an unrelated config bug.
-
-Rejected: re-evaluating `shell.lua` on every push. It puts a full Lua run in the path of every
-capability update, retracting ADR-0039's premise that full re-evaluation is rare; it is also wrong
-on identity, since a fresh evaluation gives every `on_click` closure a new identity, so the retained
-scene would reconcile against a tree that differs everywhere instead of only where state changed.
-
-Not built: `list` stays deferred. A `Signal` in `source` resolves under decision 1, but expanding it
-through `itemfn` is Lua execution during a resolve rather than during an evaluation, and
-`children_of` does not handle `list` yet (ADR-0023 item 1 still owns it).
+Rejected: rerun config on each push, which adds evaluation cost and changes callback identities.
+List expansion remained deferred in this pass.
 
 ## 0045. Nodes reconcile by scoped `id`, and `list` items by `key`
 
-ADR-0023 §4 matched a freshly evaluated node to its retained counterpart by position among its
-parent's children, which is correct only while child order never changes: inserting one node shifts
-every sibling below it, so leases and (once ADR-0044's named state exists) state transfer to the
-wrong subtree. Nodes now reconcile by an optional, per-parent-scoped `id`, and `list` items by a
-`key` function.
+1. Optional node IDs are parent-scoped reconciliation hints, not global addresses. Duplicate
+   sibling IDs are errors.
+2. Match explicit IDs only to the same ID; anonymous nodes match only anonymous nodes by position.
+   Never let unmatched IDs inherit positional nodes. Retire unclaimed subtrees child-first.
+3. List keys are optional functions of source elements returning strings. Duplicate keys are
+   errors; no key means index matching, with rebuild cost after insertion.
 
-1. **Any node may carry an `id`, scoped to its parent.** `id` becomes a base property in IDL §5.1,
-   available on every node kind, not only top-level surfaces. It is a reconciliation hint only: not
-   unique across the whole tree, not addressable from Lua, no effect on layout or paint. Scoping is
-   per parent, not global, so a reusable component (ADR-0047) can use internal ids and still be
-   instantiated twice under different parents. A duplicate `id` among siblings is a `LayoutError`
-   routed to rescue, not a warning, since the tree is already validated on every resolve.
-
-2. **Identified children pair first, then the rest pair by position.** Within one parent, match
-   every fresh child that has an `id` to the retained child with the same `id`; match the remaining
-   fresh children to the remaining retained children by order among themselves (ADR-0023's original
-   rule, applied to the leftover set). This degrades to today's behavior when a config uses no ids,
-   and lets ids be added only to the few nodes that hold a lease or named state. The matching rule
-   is exact and direction-matters: an `id` means "the same node, and only the same node," in both
-   directions. A fresh child with an `id` matches only a retained child with that same `id` (or is
-   new, never drawn from the positional pool); a fresh child with no `id` matches only a retained
-   child with no `id`; everything unclaimed is retired child-first. The first implementation read
-   "match the remaining fresh children to the remaining retained children" the wrong way: it let an
-   unmatched identified child adopt whatever positional retained node was next, and let an anonymous
-   child inherit a node that had declared an explicit `id`. Measured case: retained `[a, b, c]`
-   against fresh `[b, c, d]` produced `[3, 4, 2]` with nothing retired, so `d` silently inherited
-   `a`'s node and subtree, making a declared `id` a weaker guarantee than declaring none.
-
-3. **`list` takes a `key` function, and a duplicate key is an error.** `key` is a Lua function from
-   a `source` element to a string, called on the element itself rather than on the node `itemfn`
-   builds, so a key is computable without building anything; items reconcile by key. One shape, not
-   two: unlike Quickshell's `objectProp` (a property name, which can't key a list of plain strings),
-   a function covers both cases and is cheap enough at expected list sizes (tens of items per
-   resolve). Without `key`, items match by index and every item below an insertion rebuilds, a
-   documented cost, not a rejected configuration. A duplicate key is an error surfaced through
-   rescue, deliberately unlike `ScriptModel`, whose docs leave duplicate behavior undefined.
-
-`list` itself stays deferred (ADR-0023 item 1, restated by ADR-0044): it is registered as a Lua
-constructor in `NODE_KINDS` but rejected by `layout::scene::ensure_supported_kind`, so no config
-reaches reconciliation through it yet, and `key` has nothing to attach to until it does. Top-level
-surface ids are unchanged, already required and unique and already keying `Scene`'s `HashMap`;
-surfaces are the root scope, so decision 1's per-parent rule starts one level down.
+List implementation was still deferred. Top-level surface IDs remained required and unique.
 
 ## 0046. Rescue renders out of band when no scene survives
 
-`oblisk.rescue` (IDL §2.10) is a Lua signal a config reads and renders into its own tree, which
-works only while the config works. When `shell.lua` fails to evaluate at startup there is no tree to
-render through (ADR-0024 item 4: the shell stays blank), the same shape of mistake ADR-0042 found in
-ADR-0010, where a presentation path depended on the thing that had just failed.
+1. Reload failure retains the working scene and reports through oblisk.rescue. Startup failure
+   has no scene and needs an independent display path.
+2. The Supervisor re-execs a rescue process with hardcoded Rust drawing, no Lua, capabilities,
+   generation ID or authority. Reap it once a real generation presents.
+3. Display the error and config location only, not a fallback shell or recovery UI.
 
-1. **Split the two failures, because only one of them is recoverable.** A reload failure leaves a
-   working scene on screen: ADR-0024's rollback guarantee holds, the pre-edit config is still
-   running, and `oblisk.rescue` is the right mechanism, unchanged. A startup failure leaves nothing,
-   no prior scene and no Lua tree, and gets a separate out-of-band path. `oblisk.rescue` was never
-   wrong; it was load-bearing for a case it structurally cannot cover.
-
-2. **The Supervisor spawns a rescue process, which is not a generation.** On a startup evaluation
-   failure with no prior scene, the Supervisor re-execs itself (following ADR-0028's PAM-worker
-   mechanism) with a flag and the error text, into a process that binds one `Overlay` layer surface
-   per output and draws the error in hardcoded Rust: no Lua VM, no config, no capability
-   connections. It has no generation id, receives no dependency snapshots, takes no part in the PBA
-   handshake, and holds no authority over any output; the Supervisor reaps it as soon as a real
-   generation reaches presentation evidence.
-
-3. **It shows the error, not a shell.** Error text, the file and line `mlua::Error` already carries,
-   and the path it tried to load. No fallback bar, no default config, no recovery UI. The rescue
-   process has no reason to grow: it is killed the moment a working config exists, so any feature
-   added to it is a feature nobody sees while the shell works.
-
-Rejected: a built-in default config to fall back to. It still needs a working Lua VM, loader, layout
-pass, and paint pass to report that those are broken, so it fails at exactly the moments a fallback
-matters most, and it risks making a broken shell look like it is working.
-
-Rejected: exit with the error on stderr (near enough to current behavior). A shell launched from a
-session file or a compositor `exec-once` has nothing attached to stderr, so the user's whole
-experience is a screen that stays empty; the error is already in the journal, which is not the
-notification.
-
-No `inhibitReloadPopup` equivalent is needed: decision 1 routes the handleable case (reload failure)
-to `oblisk.rescue` and never spawns a rescue process for it, so there is nothing to inhibit.
+Rejected: a default Lua config depends on the failing machinery; stderr alone is invisible to
+users launching from a session.
 
 ## 0047. The config is a directory, not a file
 
-The loader and the watcher were reading and watching one `shell.lua`. The config becomes a
-directory: `require` resolves inside it, requires are cleared and re-evaluated on reload, and the
-whole tree is watched.
+1. Restrict require to the config directory's ?.lua and ?/init.lua paths, not system Lua modules.
+   Native module loading remains disabled.
+2. Clear required-module caches on re-evaluation because the generation's VM survives reload.
+3. Recursively watch Lua files and filter unchanged content hashes. Watching only successfully
+   loaded modules would prevent recovery from a broken first evaluation.
 
-1. **`package.path` points at the config directory and nothing else.** Set it to the config
-   directory's `?.lua` and `?/init.lua`, replacing mlua's default rather than prepending to it, so
-   `require "widgets.clock"` never picks up a same-named module from the system Lua tree. Installed
-   Lua libraries become unreachable by default; a user who wants luarocks gets a user-declared path
-   list appended later, not the system default restored. mlua's safe mode already replaces the C
-   searchers and makes `package.loadlib` raise, so no `Lua::unsafe_new` is needed for C modules, and
-   none should be reached for.
-2. **Clear `package.loaded` before every re-evaluation.** ADR-0044 decision 4 keeps one Lua VM per
-   generation without resetting it on reload, and `require` caches by module name in
-   `package.loaded`. Without clearing, editing a required module re-runs `shell.lua` against the old
-   cached module and changes nothing on screen, indistinguishable from a reload that silently failed
-   to happen.
-3. **Watch the directory tree, and gate on a content hash.** Watch the config directory recursively
-   instead of one filename, keep a path-to-hash map refreshed on every evaluation, and drop any
-   inotify event whose file hashes the same as last time (editors write-truncate-rewrite and produce
-   swap-file churn that debouncing alone does not filter). Tracking which files `require` actually
-   loaded was rejected: that set is only known after a successful evaluation, so a broken first
-   config would leave nothing watched and no way to recover by editing. Only `.lua` files trigger a
-   reload.
-
-Lua's own module cache gives per-module singletons for free, unlike Quickshell's
-`Singleton`/`SingletonRegistry`; decision 2 keeps that behavior correct across reloads. ADR-0045's
-per-parent `id` scoping is what makes a required module reusable across multiple instantiations
-without id collisions.
+Lua's module cache provides singletons; parent-scoped IDs make modules reusable.
 
 ## 0048. The config VM drops the blocking parts of the Lua stdlib
 
-mlua's default `StdLib::ALL_SAFE` gives a config `io` and `os` in full, including `io.open`,
-`os.execute`, and `os.exit`. Since ADR-0039 put the Lua VM on the Wayland thread, any of those calls
-blocks every surface on every monitor until it returns, and ADR-0021's 5ms CPU cap does not catch it
-because a thread parked in a blocking syscall executes no instructions. This is not about malicious
-configs; it is about a one-line mistake stalling the compositor's frame loop.
+Use an explicit Lua library set. Omit io and os, then restore only time, date, clock and getenv.
+Keep coroutine/string/table/math/utf8; debug, FFI and native module loading remain unavailable.
 
-Construct the VM with an explicit `StdLib` set instead of `ALL_SAFE`, dropping `IO` and `OS`
-entirely, then re-register only the four `os` functions that read process-local state and return
-immediately: `os.time`, `os.date`, `os.clock`, `os.getenv`. Everything else in `os` (`execute`,
-`exit`, `remove`, `rename`, `tmpname`, `setlocale`) and all of `io` is refused. `debug` and `ffi`
-were already absent under `ALL_SAFE` and stay absent; `coroutine`, `string`, `table`, `math`, and
-`utf8` are untouched because none of them block.
+Blocking syscalls stall Wayland dispatch and evade instruction-based CPU limits. Process commands
+must use the managed callback API; os.exit would terminate a generation outside its lifecycle.
+Direct file I/O is a deliberate loss, covered for now by require or subprocess helpers.
 
-`process.run` (ADR-0018, ADR-0026) is the supported way to run a command: non-blocking,
-callback-delivered, envelope-guarded, generation-stamped, reaped by the Supervisor. `os.execute`
-would give a config a second way that bypasses all of that and blocks the frame loop besides.
-`os.exit` is refused because it terminates the Renderer mid-generation with no PBA teardown, which
-the Supervisor would see and treat as a crash.
-
-This makes reading a file from Lua impossible, a real loss for theme files and cached tokens. The
-loss is accepted for now: the ten capabilities cover the hardware state a shell reads, `require`
-(ADR-0047) covers loading Lua data files, and `process.run "cat"` covers the rest adequately. A
-future non-blocking `oblisk.read_file` returning through the same callback path as `process.run` is
-the intended fix; building it now would add a second file-reading mechanism before the first has a
-caller.
-
-Rejected: keep the stdlib and document the hazard, because a config that blocks for 40ms produces no
-error and no log, and reads as compositor or driver stutter rather than as the two-line function
-that caused it.
-
-Rejected: put Lua back on its own thread to contain the blocking calls, because ADR-0039 weighed
-that exact cost deliberately and took it; reintroducing a thread boundary just to contain
-`os.execute` is a bad trade against deleting `os.execute` in one line.
-
-`Loader::new` calls `Lua::new_with(...)` with the explicit set and registers the four kept `os`
-functions before `register_node_constructors`. `oblisk-idl-api-specs.md` section 1 states what the
-config VM contains, since "Lua 5.4" alone no longer describes it.
+Rejected: merely document the hazard, or restore a separate Lua thread just to accommodate it.
+A native asynchronous file reader waits for a caller.
 
 ## 0049. Popups and windows are created when shown, not at generation startup
 
-ADR-0038 decision 2 ("a generation creates exactly the surfaces its own evaluation declared, once,
-at startup") and ADR-0040's grab rule (a grab must answer a real input event and be requested before
-mapping, or `xdg_popup` raises `invalid_grab`) contradict each other for popups: a popup created
-once at startup and later unmapped cannot request a grab from an event that has not happened yet,
-and `get_popup` consumes its positioner so it cannot re-anchor without `xdg_popup.reposition`, which
-ADR-0040 deferred. The protocol decides this, not preference: popups are per-open objects.
+1. Separate declaration lifetime from protocol objects: panels originally lasted a generation,
+   locks a lock session, and popups/windows only while shown.
+2. Visibility creates/destroys popup/window objects through dirty re-resolution.
+3. Opening a declared popup is a value change, not topology; unopened declarations allocate no
+   Wayland/EGL objects.
 
-1. **The role decides the lifetime.** `panel` surfaces exist for the generation's whole life,
-   created at startup (ADR-0038 decision 2, correct for the only role that existed when it was
-   written). `lock` exists while the session is locked (ADR-0042). `popup` and `window` exist only
-   while shown. What a config declares is still fixed for a generation's life and adding or removing
-   a declaration is still a topology change (ADR-0001); only the Wayland object's lifetime now
-   differs from the declaration's for these two roles.
-2. **`visible` creates and destroys, rather than mapping and unmapping.** When a `popup` or `window`
-   node's `visible` resolves true, the engine creates the Wayland object; when false, it destroys
-   it. This is driven by the existing re-resolve path (`on_click` writes named state per ADR-0044
-   decision 5, the write marks the scene dirty, the dirty re-resolve reads `visible` as true and
-   creates inside that pass), with no new machinery.
-3. **Opening a popup is a value change, never a topology change.** The declared set that ADR-0001
-   keys on does not change when a popup opens or closes, only when its declaration is added or
-   removed. This keeps ADR-0001's split intact: a config with twenty popups that are never opened
-   holds twenty retained-scene nodes and zero Wayland surfaces, buffers, or EGL surfaces, which
-   matters against ADR-0043's 50 MB per-monitor budget.
-
-Not built: `xdg_popup.reposition` (a popup following a moving anchor while open). Decision 2's
-fresh-popup-per-open already covers a dropdown opening under different buttons; only an anchor
-moving during an already-open popup's life would need it, and nothing needs that.
-
-Destruction order: nested popups are destroyed in reverse creation order (ADR-0040); a parent popup
-whose `visible` goes false destroys its children first.
-
-Amended: decision 2's original mechanism was wrong about where the re-resolve runs.
-`re_resolve_if_dirty` runs in the poll loop after `dispatch_pending` returns, not inside the
-dispatch callback, so no serial is left on the stack by the time a popup is created. The actual
-mechanism: a pointer press arms a serial field; the poll loop disarms it after re-resolve and apply
-have run for that turn. A popup created by a click finds an armed serial; a popup created by
-anything else (e.g. a D-Bus notification marking the scene dirty) finds none and its `grab = true`
-is refused, and refused means not created at all, not created without a grab. The anchor rect still
-reflects the button actually clicked because `on_click` receives that rect (ADR-0050 decision 3) and
-writes it to a `state` signal the popup reads, via the config rather than off the dispatch stack.
-
-Amended: a popup's `PopupSpec` is built from resolved properties, not from raw evaluation-time
-`VirtualNode::properties`. `socket.rs`'s `panel_specs` parses raw properties, which is correct for
-`panel` (whose topology fields like `layer` and `namespace` reject a `Signal` on purpose). A popup's
-`anchor_rect` is meant to change with each click, so parsing it at evaluation time would freeze it
-at the last reload. The authoritative spec is built from the resolved tree at the point the surface
-is reconciled, after `resolve_properties` has run once for that pass (ADR-0044 decision 1);
-evaluation-time parsing still validates literal properties early so typos land in ADR-0046's rescue
-log rather than surfacing as an `xdg_positioner` protocol error at first open.
+No live popup repositioning; recreate per open. Destroy nested popups child-first.
+Amendments: keep the input serial armed through the poll-loop apply, then disarm it.
+A requested grab without a serial refuses creation. Build PopupSpec from resolved properties so
+anchor signals follow clicks, while validating literal mistakes during evaluation.
 
 ## 0050. Pointer hit-testing walks a path, a click is press-and-release on one node, and focus attributes the secret
 
-`on_click` had been an inert property since ADR-0021 item 2; making it callable required deciding
-hit-testing shape, click semantics, what a handler receives, and how keyboard focus is tracked.
+1. Hit-testing returns the ancestor path. Half-open bounds and ancestor clipping must agree with
+   painting; accumulate parent-relative rects for surface-local coordinates.
+2. Press arms; release must match surface, rect and button. Moving the target cancels the click.
+   Support left/right/middle, not an ambiguous catch-all button.
+3. Call on_click(rect, button) with surface-local logical geometry and a button-name string.
+   Config routes the rect to its chosen popup; callback errors are logged, not fatal.
+4. Focus selects the secure submission target. No focused field means no secret frame; zeroize
+   either way. Leaving focus clears it. All supported pointer buttons qualify as real input.
 
-1. **Hit-testing returns the path, not the topmost node.** Returning "the deepest visible node" is
-   wrong for a `button` wrapping a `text`: the deepest node has no `on_click` and the button never
-   fires. Hit-testing instead returns the whole chain, root-first and deepest-last; each caller
-   (`on_click`, focus attribution) scans from the deep end for what it wants. Containment gates
-   descent (a node whose rect excludes the point, and its children, are not entered), which is what
-   makes the result a path. Bounds are half-open (`x <= point.x < x + width`) so two buttons sharing
-   an edge cannot both claim it. Hitting and painting agree exactly: containment-gated descent makes
-   a node's hittable region its intersection with every ancestor's rect, and `paint_node`'s scissor
-   chain (added Phase 19 item 17) makes its painted region the same intersection, without either
-   walk carrying an explicit clip rect, so a scroll offset or transform given to one walk must be
-   given to the other in the same commit. `ResolvedNode::rect` is parent-relative, not
-   surface-local; `layout::hit` exports `absolute_rect`, the sum along the path, for callers that
-   need the absolute position, which is a second reason the return type is the whole chain rather
-   than a node and a depth.
-2. **A click is a press and a release on the same node.** Firing on press removes the ability to
-   press, notice a mistake, and drag off before releasing, so a press arms and a release fires only
-   if it lands on the same node, identified by the pair of surface instance id and the armed node's
-   rect (a `ResolvedNode` carries no persistent identity). A re-resolve between press and release
-   that moves the button cancels the click. Arms for `left`, `right`, and `middle` (evdev codes),
-   not `left` only: refusing to hand the config the button is itself a policy the config cannot
-   override, and real configs assign different actions to the right button routinely. `ArmedClick`
-   also records which evdev code armed it, since a release must match surface, rect, and button, or
-   a right-press-then-left-release could wrongly complete as a right click. An unhandled button code
-   arms and fires nothing rather than mapping to a catch-all `"other"`, because a config handed
-   `"other"` cannot distinguish two different unnamed buttons. Back/forward buttons are left out
-   because their evdev-to-name mapping is ambiguous and unneeded so far.
-3. **`on_click` receives the button's rect and, as a second argument, the button name as a string.**
-   The callback signature is `function(rect, button)`, where `rect` is `{ x, y, width, height }` in
-   the surface's logical coordinates and `button` is `"left"`, `"right"`, or `"middle"`. The rect
-   travels from engine to config, not the reverse: "the popup's anchor rect comes from the rect
-   on_click returns" (ADR-0040, ADR-0049) describes the round trip through the config (`on_click =
-   function(rect) menu_anchor:set(rect) end`, with the popup's `anchor_rect` bound to that signal),
-   not a Rust-side return value, since the engine cannot know which popup a given click was meant to
-   open. `button` is a string, not a raw evdev code or a normalized small integer, matching every
-   other categorical value crossing this boundary (`fit`, `layer`, `anchor`, `align_h`); it is a
-   second argument rather than a fifth rect field, so a one-argument handler written before this
-   addition keeps working unchanged. A handler that raises is logged and swallowed, since a broken
-   `on_click` is a config bug and must not take down an otherwise-painting shell (ADR-0046 covers
-   evaluation failures, not one misbehaving handler).
-4. **Focus attributes the secret, and no focus means no frame.** A click whose path contains a
-   `textfield` focuses that node, and the engine remembers that field's `secure_submit` `{
-   capability, action }` (replacing the prior `PLACEHOLDER_SECURE_SUBMIT_CAPABILITY`/`"unknown"`
-   stand-in, which addressed no real Supervisor capability and put a password on the wire for
-   nobody). A completed `wp-text-input-v3` submit with no focused field sends nothing, rather than
-   the old `"unknown"/"unknown"`; the buffer is zeroized either way. Focus clears on a click landing
-   on no `textfield`, on `zwp_text_input_v3`'s `leave`, and on the keyboard leaving the surface: the
-   field stops being focused the moment anything indicates the user is elsewhere. A right or middle
-   press decides focus the same way a left press does (every toolkit agrees), and also arms the
-   `xdg_popup.grab` serial and counts toward `pointer_input_count` (ADR-0049's amendment, ADR-0051
-   decision 1), since both exist to answer "did real user input cause this" and a right-click
-   qualifies.
-
-Not built: click-outside-to-dismiss for a `panel`, because layer surfaces have no
-compositor-agnostic grab; a `popup` does not have the problem, which is why one is used instead of a
-second `panel`.
-
-A handler written with no `button` parameter now also runs on right and middle clicks, where before
-those events did nothing; a config that wants left-only behavior checks `if button ~= "left" then
-return end` explicitly.
+No portable panel click-outside grab. Existing button-agnostic callbacks now also receive
+right/middle clicks; left-only policy belongs to config.
 
 ## 0051. A popup anchors to one parent instance, and a compositor dismissal latches
 
-ADR-0049 settled when a popup's `xdg_popup` exists. Two things it left open block implementation:
-which parent instance a popup roots under when its `parent` names a multi-monitor panel, and what
-happens when the compositor, not the config, destroys the popup.
+1. Anchor to the parent instance receiving the arming click. A non-grabbing open without a click
+   uses the first parent instance. Never expand one popup across every monitor.
+2. Compositor dismissal drops the handle, calls on_dismiss and latches recreation until new
+   pointer input. A false/true visibility cycle may occur within one batch and cannot be the latch.
+3. A requested grab without a serial means no popup, not a silently ungrabbed popup. Compositor
+   denial follows normal dismissal handling.
 
-1. **A popup anchors to the parent instance the arming click landed on.** A `panel` with `monitor =
-   "All"` expands per output (ADR-0038 decision 3), so a `parent` name can refer to several
-   `zwlr_layer_surface_v1`s, but `xdg_surface.get_popup` takes exactly one parent. A popup does not
-   expand per output: it is opened by one click on one monitor and belongs there, so its instance id
-   is the bare declared `id` (like a `window`'s), and its parent is the instance whose surface the
-   arming click was delivered to, read off the same record that already tracks the grab serial's
-   originating surface. When no click armed it (a `grab = false` popup opened by, say, a D-Bus
-   notification), the first instance of the named parent is used. Rejected: expanding a popup per
-   parent instance (`click_menu@eDP-1`, `click_menu@DP-1`), because one shared `visible` signal
-   would then open the dropdown on every monitor from a single click.
-2. **A compositor dismissal latches until the user asks again.** `xdg_popup.popup_done` means the
-   compositor already destroyed the object, most commonly from click-outside. The engine destroys
-   its handle and fires `on_dismiss`, but cannot trust the config to write `visible = false`:
-   without a latch, the resolved tree still reading `visible = true` would recreate the popup on the
-   next re-resolve, which the same click-outside would dismiss again, forever, even for a config
-   with no `on_dismiss` at all. So a dismissed popup's declaration is latched against recreation.
-   The latch is keyed on pointer input, not on the value of `visible`: it records which
-   pointer-input count was current at dismissal, and stays latched only while no further pointer
-   input has arrived. Keying it on `visible` cycling false-then-true does not work in practice,
-   because niri (and any compositor) delivers the click that closes a grabbed popup to the parent
-   bar in the same event batch as `popup_done`, so `on_dismiss` writing false and the bar's
-   `on_click` writing true both land before the engine's single end-of-turn sample of `visible`,
-   which then only ever reads true and the false edge is never observed. This differs deliberately
-   from `WindowHandler::request_close`: a `close` request the client may ignore, so the engine
-   destroys nothing there, while `popup_done` means the object is already gone and the only question
-   is whether an unasked-for replacement appears.
-3. **A refused grab means no popup, not a popup without one.** `grab = true` with no armed serial
-   (ADR-0049's amendment) means the popup is never created, logged once. A compositor-side grab
-   denial reads the same way to the config (immediate `popup_done`, `on_dismiss` fires, treated as a
-   normal outcome per section 6.3) and goes through decision 2 unchanged; nothing distinguishes it
-   from click-outside on this side of the protocol.
-
-Nested popups close in reverse creation order (ADR-0040); a parent's `popup_done` means the
-compositor already destroyed its children, so the engine drops its handles in that order without
-sending anything. A popup's surface instance exists from generation startup even though its
-`xdg_popup` does not, same as a `window`, which is what lets `visible` be read off the resolved
-tree; twenty declared popups still cost twenty retained nodes and zero Wayland objects. The latch
-lives on the tracked surface and dies with the generation, so a PBA swap starts every popup
-unlatched.
-
-Not built: a popup shown on more than one monitor at once. A config that wants a dropdown on every
-bar declares one popup per monitor and drives them separately.
-
-Known limitation: a grabbing popup opened from `on_click` fails wlroots's
-`wlr_seat_validate_pointer_grab_serial` (button count and serial are both stale by release time, per
-ADR-0050 decision 2's press-then-release click), so it works on smithay-based niri but flashes open
-and shut on sway or Hyprland. The fix needs an `on_press` hook in the IDL, which does not exist yet;
-shipped as-is meanwhile.
+Drop nested handles child-first; latches die with the generation.
+Known limit at delivery: release-triggered grabs work on niri but fail wlroots serial validation
+on sway/Hyprland. An on-press hook was not yet available.
 
 ## 0052. The session lock is commanded through a capability, and its surfaces live for the lock
 
-ADR-0042 settled that the Renderer holds `ext_session_lock_v1` and the Supervisor supervises the
-client, but left four things open: what triggers the lock command, where a lock screen is declared,
-what happens with no declared lock screen, and which failures go where.
+1. Expose lock through generic capability invocation, with no Lua unlock action. Only PAM success
+   authorizes unlock; a script-callable unlock would bypass authentication.
+2. Declare one root lock node. Retain it from startup, but create per-output protocol surfaces
+   only for the lock. Visibility, monitor selection and geometry are protocol-owned.
+3. Refuse acquisition without a working lock tree and exactly one lock/authenticate secure field.
+   Veto in-place edits that remove that field while locked; otherwise the user can be stranded.
+4. Acquisition failures use rescue; authentication failures use lock state with an attempts
+   counter so repeated identical errors remain observable.
 
-1. **`oblisk.lock` is an ordinary capability, with `lock` but no `unlock` action.** A config
-   triggers it through ADR-0037's generic capability dispatch (`oblisk.lock:invoke("lock")`), the
-   same mechanism every other write action uses; no new mechanism or Rust-side policy is invented.
-   There is no `unlock` action: the lock screen's own node tree is Lua, its `button` callbacks run
-   while locked, and an `unlock` action would put a one-click bypass of PAM on the very surface PAM
-   guards. The unlock direction has exactly one caller by construction, the Supervisor's own
-   `PamOutcome::Success` arm, making ADR-0042's "never call `unlock_and_destroy` except on a
-   successful authentication" checkable by reading one match arm. Rejected: a Supervisor-owned lock
-   timeout applied regardless of what the config asks for, because it would lock a session whose
-   config never declared a lock screen, stranding the user at a black screen; decision 3 covers that
-   case directly instead. Since Lua could not write at all yet, this decision pulls Phase 25 item 1
-   (the generic `CommandEnvelope`-building method) forward into this phase; `expected_revision` is
-   `0` because a lock command is not a read-modify-write. The capability is seeded as `oblisk.lock`
-   rather than a bare `lock` global because section 6.4's `lock` node constructor already owns that
-   bare name.
-2. **A `lock` node is declared at the root of `shell.lua`, and its Wayland object's lifetime is the
-   lock, not the declaration.** This reverses a Phase 22 rejection of a root-level `lock`. ADR-0049
-   already separated where a declaration lives from when its Wayland object exists (for `window` and
-   `popup`); `lock` gets the same treatment: one retained node from generation start, with no
-   `ext_session_lock_surface_v1` until the compositor sends `locked`. `lock` joins `NODE_KINDS` as a
-   fourth constructor and expands to one instance per output, the way `monitor = "All"` does for
-   `panel`, because the protocol requires a lock surface on every currently-present output, not
-   because a config chooses it. A `lock` node has no `visible`, `monitor`, `anchor`, or size
-   property: the compositor alone decides when lock surfaces exist (created after `locked`,
-   destroyed by `unlock_and_destroy`), so a `visible = false` on one would either be ignored or
-   destroy a surface the compositor still expects, which is what makes the compositor "fall back to
-   rendering a solid color" per ADR-0042; there is no useful reading of the property, so none is
-   offered.
-3. **A config with no working lock screen refuses the lock rather than acquiring it blind.**
-   `oblisk.lock:invoke("lock")` against a config with no `lock` node, or a `lock` node that cannot
-   reach PAM, is refused before `SessionLockState::lock` is ever called, and the session stays
-   unlocked. Acquiring the lock and painting nothing would be a black screen with no password field
-   and, since the protocol guarantees the compositor will not unlock on client death, no way out
-   short of a VT switch; that is a denial of service, not fail-secure, since nothing was protected
-   by a lock never taken. "Can reach PAM" means exactly one `secure_submit` field targeting
-   `("lock", "authenticate")`, not "at least one": a lock surface must be typable the instant the
-   compositor gives it keyboard focus with no pointer click, so the field that arms the keyboard
-   must be identifiable without guessing, and two candidate fields would arm neither. An in-place
-   reload that would delete the only such field from a currently-held lock screen is vetoed and
-   rolled back, since a `child` edit is not topology and is normally left ungated (ADR-0042) but
-   this is the one in-place edit that strands the session; restyling a live lock screen still works.
-4. **Acquisition failures surface through `oblisk.rescue`; authentication failures surface through
-   the capability's own state.** The split follows whether a lock screen is on the glass to read the
-   message. A refused lock (decision 3), a denied lock request, an absent
-   `ext_session_lock_manager_v1`, or a compositor teardown (`finished` after `locked`) all leave the
-   ordinary scene showing, so `rescue` (rendered by the config's own surfaces) reaches the user. A
-   wrong password happens with lock surfaces mapped and everything else hidden, where `rescue` is
-   unreachable, so it reaches the config as `oblisk.lock` state instead: `{ active, authenticating,
-   attempts, error }`. `attempts` exists because capability state is sampled at layout time
-   (ADR-0044) rather than evented, so two consecutive identical failures would otherwise look like
-   one unchanged `error` string to a config trying to count them itself. The Renderer sets `rescue`
-   itself rather than round-tripping through the Supervisor, since it is the process that learns of
-   the refusal first.
-
-A masked field had to stop using `zwp_text_input_v3` and read `wl_keyboard` directly (amending
-ADR-0027), because text input delivers nothing without a bound input method and a password could
-otherwise never be typed. The Renderer never calls `unlock_and_destroy` on its own reading of a PAM
-outcome; the password crosses as a `SecureSubmit` for `("lock", "authenticate")`, the Supervisor's
-re-exec'd worker runs the PAM conversation (ADR-0028), and success comes back as the same
-`SetSessionLock { locked: false }` command. A compositor-initiated teardown (`finished` after
-`locked`) is answered with `unlock_and_destroy` because the protocol makes `destroy` a protocol
-error once `locked` was sent and there is no other legal teardown verb; ADR-0042's rule against
-calling it forbids the Renderer initiating an unlock, not ending an object the compositor already
-ended. Removing a declared `lock` node while locked is already blocked as an ordinary topology
-change queued behind ADR-0042 decision 4's swap gate. Nothing locks on idle yet:
-`SupervisorFrame::IdleEvent` reaches the Renderer with no Lua-side dispatch registry to deliver it
-to, so a config's only path to `lock()` today is an input callback.
-
-Not built: a fallback lock screen when no `lock` node is declared. ADR-0046's rescue renderer is not
-repurposed into one, since rescue exists for a config that failed to evaluate, and a config that
-evaluated fine but declared no lock screen has not failed at anything. A Supervisor-owned lock
-policy with a built-in lock tree is the upgrade path if a session ever needs to lock against the
-config's wishes, and neither half is built.
+Secure fields read the keyboard directly. The Supervisor returns an authenticated unlock command;
+the Renderer does not interpret PAM outcomes itself. Compositor-initiated teardown uses the
+protocol's legal unlock-and-destroy verb without initiating an unlock.
+Idle callback delivery and a built-in fallback lock screen were not built in this pass.
 
 ## 0053. Five specified capabilities were never given a phase, and a bar is what found them
 
-An audit triggered by trying to write a real bar config found that `oblisk-idl-api-specs.md` section
-2 specifies fifteen capabilities while `shared::CAPABILITIES` built eleven; `battery`, `brightness`,
-`workspaces`, `system`, `power`, and most of `audio` were missing or mismatched, and no build phase
-owned any of the gap (the phase that built the capability roster was scoped by the D-Bus services
-doc's section numbers, not the IDL's). Three unspecified capabilities (`privacy`, `updates`, `lock`)
-exist instead, each added deliberately by its own ADR.
+A real bar exposed capabilities specified without implementation phases.
 
-1. **Build `battery`, `system`, and audio's missing fields now; give `brightness`, `workspaces`, and
-   `power` a phase of their own.** The first three are small and are what the bar needs.
-   `workspaces` in particular is compositor-specific (`niri-ipc` is already a dependency) and
-   deciding whether it speaks one compositor's IPC or an abstraction over several is a design
-   question that a bar-fixing pass should not settle badly just to finish.
-2. **`system.time` pushes only when the epoch second it would report actually changes, not on every
-   scan tick.** A literal per-second `StateSnapshot` would mark the scene dirty and drive a full
-   re-resolve and repaint of every surface every second, forever. Comparing against the last emitted
-   second costs one comparison and gives the same steady-state cadence. This is a floor, not a fix:
-   a bar drawing `HH:MM` still repaints 60 times a minute to change once. A configurable interval is
-   the upgrade path (`sysinfo`'s per-task `watch` channel already has the shape) but needs the Phase
-   25 Lua write path first, so it is not built now.
-3. **`audio`'s payload moves to section 2.4's shape, and its existing fields are renamed.** The
-   built payload was a bare array of `{node_id, pid, app_name, process_name}`; adding master
-   `volume`/`muted` forces the outer shape to change regardless, so field names move to the spec's
-   spelling in the same commit rather than matching neither the old shape nor the new. `pid` is kept
-   alongside the spec's fields because finding the owning process was genuinely hard work (ADR-0016)
-   and dropping it to narrow the table would discard that. Master `volume`/`muted` are real; per-app
-   `volume`/`muted` ship as placeholders (`1.0`, `false`) because each stream node needs its own
-   `SPA_PARAM_Props` subscription, a separate slice of work, and a wrong-but-present number was
-   judged worse than an absent one, so the placeholder is named in the code rather than left to be
-   discovered. This breaks the one existing consumer config, rewritten in the same commit. The parse
-   has to distinguish two `ParamType::Props` objects a sink node advertises, the real mixer and an
-   unrelated ALSA device-settings object with no mixer keys, by the presence of `channelVolumes`;
-   misreading the second as the mixer produces a volume that is correct once per boot and zero
-   afterward, a bug no captured-pod unit test would catch since the captured pod is the one that
-   parses correctly.
+1. Build battery, system clock and missing audio fields first; schedule brightness, workspaces
+   and power separately rather than deciding compositor architecture incidentally.
+2. Push time only when the epoch second changes. Minute-only UI still causes excess work;
+   configurable cadence remains an upgrade.
+3. Align the audio payload with the spec while retaining PID attribution. Master volume/mute
+   are real; per-app fields were explicit placeholders pending subscriptions. Distinguish mixer
+   Props from unrelated ALSA Props by channelVolumes.
 
-`brightness`, built later: reads over the udev `backlight` subsystem, not inotify, since inotify
-does not fire on a sysfs attribute write (confirmed with `udevadm monitor`), with the same 30s poll
-fallback `battery` uses. Device selection ranks by the kernel's `type` attribute (`firmware`, then
-`platform`, then `raw`, tie-broken by sorted name, skipping any device with non-positive
-`max_brightness`), rather than first-in-readdir-order, because readdir order is wrong on a machine
-with both `acpi_video0` and a native device. Writes go through `login1.Session.SetBrightness` on
-`session/auto`, not a direct sysfs write, because the backlight node is root-owned `0644` and the
-Supervisor runs unprivileged; the cost is that logind silently refuses a `set` from a session that
-is not the seat's active one, which is accepted as correct behavior to inherit. With no backlight
-device, the capability never pushes at all rather than fabricating `0`, since section 2.3 gives no
-absence sentinel and a `0` would read as "screen off" rather than "no backlight hardware"; the
-signal stays nil under ADR-0037's nil-until-hydrated contract. This is the same gap `audio` left
-open, resolved the other way.
-
-`power`, built later: `active_profile`/`profiles` come from power-profiles-daemon and
-`on_battery`/`energy_rate` from UPower, two unrelated daemons that can each be missing
-independently, so every field is optional individually rather than the capability pushing nothing
-when any one source is absent; nothing is fabricated for a missing field, since section 2.13 gives
-no sentinel for any of the four. `on_battery`/`energy_rate` come from UPower rather than the sysfs
-paths `battery` already reads, because UPower's `OnBattery` is the system-wide answer across every
-power supply, correct on a docked laptop with two adapters where a hand-picked sysfs device would
-not be. The power-profiles-daemon half is built to the documented D-Bus API (trying both
-`net.hadess.PowerProfiles` and the post-0.20 `org.freedesktop.UPower.PowerProfiles` names) but not
-live-verified, since the daemon is not installed on the machine this was written on; the UPower half
-was verified live on this machine.
-
-Not decided: whether `oblisk.system.state` should ever be writable. Section 2.11 calls it read-only
-and the implementation loads `state.json` once at construction, so nothing currently writes that
-file and the read-only contract has no producer. Named here as a real gap, not filled by this ADR.
+Later brightness work uses udev plus a 30-second fallback, deterministic firmware/platform/raw
+device preference, and unprivileged logind writes. No hardware means no snapshot, not zero.
+Later power work makes fields independently optional across UPower and power-profiles-daemon;
+UPower was live-verified, profile-daemon support was not.
+Writable system.state and its producer remained undecided.
 
 ## 0054. The icon theme resolver lives in the renderer, and `image` is the node that draws a file
 
-The Renderer resolves icon theme names and draws image files. The Supervisor does not gain an
-icon-resolving capability.
+1. Resolve icon themes in the Renderer with freedesktop-icons; a synchronous Supervisor lookup
+   would block the dispatch thread and require a missing request/response protocol.
+2. Absolute icon names draw files directly; other names use theme resolution.
+3. Add image for non-square path-based content; icon adds square sizing and name resolution.
+4. Rasterize SVG with resvg and decode raster formats with femtovg's image dependency.
+   Cache by resolved path and pixel size.
+5. Defer app-ID/desktop-entry lookup; no separate Lua find_icon API.
+6. Include file mtime and length in cache keys so overwritten tray spools refresh.
+7. Queue texture deletion until before the next frame; recorded draws still reference IDs until flush.
 
-1. **Renderer-side resolution.** The Renderer resolves theme names synchronously through the
-   `freedesktop-icons` crate (0.4) with an in-process cache. The control socket carries one-way
-   commands and one-way `StateSnapshot`s only, with no request/response shape, so a synchronous
-   round trip to the Supervisor would block the render thread, which is also the Wayland dispatch
-   thread and the config VM thread (ADR-0039, ADR-0048).
-2. **An absolute-path name draws that file.** `icon { name = "/dev/shm/.../telegram.png" }` draws
-   the file directly; `icon { name = "audio-volume-high" }` goes through theme lookup, matching how
-   `Icon=` works in every `.desktop` file. Lets the tray collapse to `icon { name = item.icon_name
-   or item.icon_path }`.
-3. **`image` is a new node kind; `icon` is `image` plus the resolver.** `icon` is square and takes a
-   theme name. `image` takes `source` (a path), width/height, and `fit`, for non-square content such
-   as album art and wallpaper (ADR-0055). A departure from the IDL's node-kind list, recorded as
-   such rather than folded into `icon`.
-4. **SVG rasterizes through `resvg`; raster decodes through femtovg's bundled `image` crate.**
-   Needed because Adwaita ships SVG icons. The cache key is the resolved path plus the integer pixel
-   size, since the same SVG rasterized at two sizes is two different textures.
-5. **`system:find_icon`'s `app_id` to `.desktop`-file lookup is not built.** Only the theme-name
-   lookup has a caller. No Lua-facing `find_icon` is exposed, since `icon.name` already resolves
-   theme names.
-6. **The cache key also carries the file's mtime and length, not just path and size.** A path-only
-   key served stale pixels once a tray icon changed, because `dbus/shm_icons.rs` overwrites
-   `/dev/shm/oblisk-$UID/tray/{name}.png` in place on every `NewIcon` (ADR-0031 named this gap).
-   Costs one `stat` per image node per frame, hit or miss.
-7. **Eviction queues the texture id and frees it before the next frame is recorded**, not at
-   eviction time. femtovg resolves an `ImageId` to a texture at `flush`, not at `fill_path`, so
-   freeing immediately unbinds a texture an already-recorded draw call still names, and femtovg
-   silently substitutes default paint on a missing id rather than erroring.
-
-Rejected: resolving icons in the Supervisor with an LRU cache (`oblisk-supervisor-services-dbus.md`
-§ 9.2), because the control socket has no request/response shape to carry it and a late-resolving
-`icon.name` would make every icon in a `list` a two-pass lookup.
-
-Not built: byte-bounded LRU eviction (current cache is a count-bounded FIFO); off-thread resolution
-for cache misses (worker thread plus the scene dirty flag from ADR-0044 as wake-up).
+Byte-bounded LRU and off-thread misses were not built; the initial cache was count-bounded FIFO.
 
 ## 0055. Wallpaper is an `image` on a Background panel, not a capability
 
-Wallpaper is not a Supervisor capability. A config declares a `Background`-layer panel itself and
-puts an `image` node in it; the `wallpaper:set(mon, path, fit, anim, dur)` row is superseded.
+1. Remove the wallpaper capability. Config owns the Background panel, monitor and image source.
+2. Change wallpaper through named state, not IPC. Durable runtime selection was not implemented.
+3. Image fit modes are cover, contain and stretch. Cover is default; no tile without a caller.
+4. Keep ADR-0002's transitions deferred. Immediate texture replacement implements its
+   first-frame/reload branch, not an animation system.
+5. Expose config_dir from the actually loaded shell.lua location for bundled assets.
 
-1. **No `wallpaper` capability.** Every argument of the old `wallpaper:set` already has a home:
-   `mon` is `panel.monitor` (ADR-0038), `path` is `image.source`, `fit` is `image.fit` (decision 3).
-   `anim`/`dur` have none, because nothing in the engine animates anything (decision 4). A
-   capability here would relay a string the config already has to a surface the config already
-   declares, with a D-Bus connection attached for no reason. ADR-0007's placement on the
-   `Background` layer stands; only who declares the surface changed, and ADR-0038 already changed
-   that.
-2. **A runtime wallpaper change is a `state()` signal, not a command.** Binding `state(name,
-   initial)` to `image.source` lets a config change its own wallpaper with no IPC, and lets it read
-   back the current value, unlike a fire-and-forget command. It does not persist:
-   `oblisk.system.state` is read-only and nothing writes `state.json` (open hole per ADR-0053), so a
-   runtime-chosen wallpaper is lost on reload.
-3. **`fit` is a property of `image`, with three modes.** `cover` (default, scales to fill and
-   crops), `contain` (scales to fit, leaves remainder unpainted), `stretch` (ignores aspect ratio).
-   No `tile`, since nothing has asked for it. `cover` is the default because it is the only mode
-   that cannot leave bars down the side of a screen.
-4. **ADR-0002's transition semantics stay unbuilt.** There is no animation model (no easing, no
-   transition, no clock faster than `system.time`'s 1 Hz). What ships, an immediate texture swap
-   with no crossfade, is ADR-0002's first-frame/reload branch, not a contradiction of it; the
-   transition branch remains correct and unimplemented.
-5. **`oblisk.config_dir` is added as a static string on the `oblisk` table**, beside
-   `oblisk.version`, giving Lua a way to reference a file shipped beside `shell.lua`. It is the
-   parent directory of the `shell.lua` actually loaded, not a second call to `shared::config_dir()`,
-   so it cannot disagree with the file being read. Needed for a config to point `image.source` at
-   its own wallpaper file; applies equally to any shipped icon or sound.
-
-Not built: a file picker, directory scan, or `process.run` recipe for choosing a wallpaper path.
-Memory cost of a full-screen texture (a 3840x2160 wallpaper is 32 MB RGBA, the largest single entry
-ADR-0054's cache will hold) is left for Phase 24's harness to measure.
+No picker or folder scan in this pass. A 3840×2160 RGBA texture costs roughly 32 MB; measurement
+was left to the memory harness.
 
 ## 0056. `workspaces` speaks niri, and § 2.9 is wrong in three places
 
-`workspaces` is built against niri only, with no compositor trait, and corrects three errors in §
-2.9's shape. Amended by ADR-0075: every decision below still stands (one implementor, no trait), but
-the compositor probe decision 1 reuses moved into a top-level `compositor` module, and the niri
-types stay confined to `workspaces/niri.rs`.
+1. Implement niri first without a compositor trait. Missing niri leaves state nil; a second
+   tested implementation must justify abstraction.
+2. Use a separate event socket from keyboard to preserve controller lifetimes. A third consumer
+   could justify a shared owner; two did not.
+3. Publish ordered workspace entries with stable ID, display index and optional name.
+   Focus takes the stable ID, not the index.
+4. Focused-workspace is optional per output because global focus belongs to only one output.
+5. Omit unavailable niri fullscreen state rather than fabricate false; class maps to app_id.
 
-1. **One compositor, no trait.** `workspaces` has one implementor, niri, so no trait is built; a
-   trait with one implementor is Speculative Generality (ADR-0034 made the same call for
-   `keyboard`). Only `detect_compositor()`/`CompositorKind` (the
-   `$HYPRLAND_INSTANCE_SIGNATURE`/`$NIRI_SOCKET` probe) is shared with `keyboard`'s
-   `CompositorLink`; nothing else, because Hyprland's workspace model (one active workspace per
-   monitor, one globally focused monitor) does not map onto niri's (`is_active` per output,
-   `is_focused` global) by field renaming, and writing that mapping without a machine to test it on
-   risks a plausible but wrong implementation. A session with no `$NIRI_SOCKET` gets no `workspaces`
-   push and the signal stays `nil` (ADR-0053's missing-backlight posture, ADR-0037's
-   nil-until-hydrated contract). Extract a trait when a second compositor is implemented and
-   live-tested.
-2. **A second niri event-stream socket, not a shared one.** `keyboard` already holds one
-   `Request::EventStream` connection; `workspaces` opens its own rather than sharing, because
-   sharing would couple `keyboard` and `workspaces`' lifetimes and ordering, which no two
-   controllers in this codebase do today (each owns its connection, pushes into a channel, `main.rs`
-   `select!`s the receiver, ADR-0034). The duplicated startup replay costs a few kilobytes once per
-   boot. A third consumer would need a shared owner with per-capability subscribers; two does not.
-3. **Each output entry gains a `workspaces` array** of `{ id, idx, name }` ordered by `idx`, because
-   § 2.9's `active_workspace`/`focused_workspace` are opaque ids with no way to render a strip of
-   buttons. `id` is niri's stable, monitor-independent identity (what `workspaces:focus(id)` takes);
-   `idx` is the 1-based on-output position shown to the user and not stable across a reorder; `name`
-   is niri's optional named workspace, `nil` when unset. `is_urgent` is not carried, since nothing
-   draws it yet.
-4. **`focused_workspace` is optional, present only on the output that holds focus.** niri models
-   focus as one global fact (`Workspace.is_focused`) but § 2.9 puts the field inside the per-output
-   structure, which would be false everywhere but the true output if not made optional. Repeating
-   the global id on every output would claim every monitor has focus; hoisting it out of the array
-   would contradict the spec's structure. Optional costs nothing on a single-output machine (always
-   present, always equal to `active_workspace`) and gives a config an exact `out.focused_workspace
-   ~= nil` focus test.
-5. **`active_client.is_fullscreen` is omitted; `class` is `Window.app_id` renamed.** niri-ipc
-   26.4.0's `Window` has no fullscreen field anywhere (not in the struct, not in the event stream);
-   fullscreen exists only as actions, not as readable state. The field is left absent (reads `nil`
-   in Lua) rather than fabricated as `false`, which would be wrong for exactly the fullscreen
-   windows a check exists to find. `class` maps from `app_id` since Wayland toplevels have no X11
-   `WM_CLASS`; every shell makes the same substitution.
-
-Not built: a per-workspace window list (only the single focused `active_client` is reported);
-special workspaces are not modeled.
+No window list beyond the focused client, or special-workspace model.
+Amendment, ADR-0075: move compositor probing to a shared top-level module; keep niri types local.
 
 ## 0057. `json.decode` is one function on the engine's existing null mapping
 
-`json.decode` reuses `renderer/src/lua/json.rs`'s existing `to_lua` conversion rather than adding a
-second JSON-to-Lua path, so `process.run` output (`lsblk --json`, `busctl --json=short`, `niri msg
--j`, curl responses) becomes readable from Lua.
+1. Reuse the capability payload converter. JSON null becomes Lua nil, not a sentinel; null
+   array elements leave holes that stop ipairs.
+2. Decode failures return nil plus a message, including non-UTF-8 input and Lua conversion errors.
+3. Success returns one value, failure two; a trailing nil on success changes Lua call arity.
+4. No encoder until a caller needs it.
 
-1. **The decoder is `to_lua`, the same function every pushed capability payload already goes
-   through.** That function turns off mlua's `serialize_none_to_null`/`serialize_unit_to_null`, so
-   JSON `null` becomes an absent key rather than a truthy lightuserdata sentinel. A second decoder
-   (pure Lua, or a fresh `lua.to_value` call) would map `null` differently, so a config would meet
-   one rule on `oblisk.tray.items` and another on `lsblk --json` output. A `null` array element
-   leaves a hole, so `ipairs` stops at it, consistent with the existing mapping.
-2. **Failure returns `nil` plus a message, following `io.open`, not `cjson`'s raise.** A decode
-   failure is routine: `out_cb` fires once per line, so a config decodes a growing buffer or decodes
-   whatever a failing subprocess printed instead of JSON, and raising would force a `pcall` at every
-   call site. The input argument is `mlua::LuaString`, not `String`, so non-UTF-8 subprocess output
-   becomes a readable decode error instead of an mlua argument-conversion error. A failure
-   converting the parsed value into Lua is folded into the same `nil`-plus-message pair, with
-   wording distinguishing bad input (config author's problem) from a conversion failure (engine's
-   problem).
-3. **Success returns one value; failure returns two**, matching `io.open`'s variable arity rather
-   than `dkjson`'s fixed three. A trailing `nil` on success would break `table.insert(t, decoded,
-   nil)`, which Lua reads as an explicit position argument and raises on.
-4. **No `json.encode`.** Nothing calls it yet; a config wanting to send JSON as subprocess input
-   concatenates strings by hand. Add `encode` beside `decode`, through the same options in reverse,
-   once something needs it.
-
-Rejected: jq, because it needs a shell pipeline (quoting, an extra process, a hard jq dependency)
-and `jq -r` still returns text that Lua must then split on a delimiter, which breaks on the exact
-strings (window titles, track names) a bar displays. Rejected: a query crate (jql etc.), wrong
-shape, since Lua is already the query language and only a table-to-index conversion is needed.
-Rejected: a pure-Lua decoder in the config (the § 3.3 banner's original proposal), because it
-guarantees the null-mapping disagreement above and is a hand-written parser running on the Wayland
-dispatch thread against untrusted input.
-
-`json.decode("null")` succeeds and returns bare `nil`, indistinguishable from failure by the first
-return value alone; only the absent second return distinguishes them, and both mean "no data" so
-this is treated as harmless rather than fixed with a sentinel.
+Rejected: jq pipelines, query libraries or a second Lua parser. Lua already queries tables, and a
+second converter would disagree on null. Decoding null succeeds with nil and no error message.
 
 ## 0058. A crashed Renderer is detected and respawned, because a lock cannot be recovered otherwise
 
-The Supervisor watches the authoritative Renderer's exit, classifies it, and respawns it with a
-bounded restart brake; a respawn re-acquires the session lock if one was active. Measured against
-niri 26.04 (`v26.04-85-gdd75865f`) in a nested compositor: a second `ext-session-lock-v1` client can
-take over an orphaned lock and release it with `unlock_and_destroy`, so takeover-and-unlock works.
-Quickshell cannot do this (niri issue #2986, closed as working as intended: recovery is the shell's
-job) because the knowledge that the session was locked dies with the process that held it; Oblisk
-splits that knowledge into `supervisor/src/lock.rs`'s `LockState`, which outlives a Renderer crash.
+1. Watch the authoritative child's exit directly, not failed capability pushes.
+2. Classify clean/nonzero/signal exits and include lock state in the diagnostic.
+3. Bound restarts to prevent strobing failure loops: implementation uses three within 60 seconds.
+4. Reacquire an active lock on replacement, with a new acquisition identity, only if the on-disk
+   config still passes the single-authentication-field predicate. Log denied takeover.
 
-1. **The authoritative Renderer's exit is an event.** `main()`'s `select!` gains an arm on
-   `authoritative.child`, so a dead Renderer is learned immediately rather than inferred later from
-   failed pushes; a healthy idle Renderer and a dead one both send silence otherwise.
-2. **A departure is classified, and the lock state is part of the message.** Exit is reported as one
-   of clean exit, non-zero exit, or signal, as a pure function over the exit code and signal (tested
-   without a process, covering a SIGKILL from the OOM killer, a panic's non-zero exit, and a clean
-   `0` from a shutdown reap, which must never read as a crash). The log line also names whether a
-   lock was active, because an unlocked death costs a bar and a locked death costs the session.
-3. **The Supervisor respawns, with a brake.** The brake, not the respawn, is the decision: an
-   unbraked loop turns one dead bar into a strobing lock screen. The brake allows a bounded number
-   of restarts inside a time window and stops and says so once exceeded. The ADR named no figure;
-   `supervisor/src/generation.rs`'s `RESTART_LIMIT` and `RESTART_WINDOW` set it at 3 restarts
-   inside 60 seconds.
-4. **A respawn re-acquires the lock when `LockState.active` says one was active.** The Supervisor is
-   the only participant that can make this call: the compositor will not and should not unlock, the
-   dead Renderer's knowledge is gone, and the replacement starts with no history. `LockState`'s
-   `acquisition` counter gives the re-acquired lock its own identity. If the compositor refuses the
-   takeover, this degrades to today's outcome (locked session, VT switch) and must say so rather
-   than retry into the brake. Refined after initial writing: the replacement re-acquires only if the
-   on-disk config still passes ADR-0052 decision 3's acquisition predicate (exactly one `textfield`
-   with `secure_submit` for `("lock", "authenticate")`), since a crash destroys the four reload-time
-   protections (`defers_swap` on the `lock` node, `lock_stays_authenticatable`'s veto, rollback to
-   the prior scene, live restyling) that all depend on a live generation existing; a replacement
-   that fails the predicate must refuse the lock rather than present one with no way out.
-   `lock_stays_authenticatable`'s refusal wording ("the lock screen that is on screen still stands")
-   does not apply post-crash and must not be reused verbatim on this path.
-
-Rejected: pinning the last config that successfully took the lock and handing it to the replacement
-instead of what is on disk, because decision 4's predicate already catches the case this defends
-against, at the cost of silently running code the user has since edited on the one screen where a
-surprise is least recoverable.
-Rejected: letting a session manager restart the whole stack (Supervisor and Renderer both), because
-a restarted Supervisor's `LockState` resets to `Default` (`active = false`), reproducing the
-quickshell failure this ADR exists to fix.
-Rejected: having the Renderer re-acquire its own lock, because the process that would need to notice
-the crash is the process that died.
-
-Consequences: ADR-0042's swap gate (deferring a generation swap while a lock is requested or active)
-remains the primary defence against planned reaps; this ADR covers only an unscheduled crash. A
-respawned Renderer is a new generation: every `state` signal is lost, unlike an in-place reload
-(ADR-0044 decision 5). The Supervisor's own death is still unhandled and is now the larger remaining
-hole: killing the Supervisor leaves the Renderer reparented to `systemd --user`, spinning its 15ms
-poll at 17.8% of a core, because `try_recv`'s `Err` collapses `Disconnected` into `Empty` (see
-`renderer/src/wayland/mod.rs:634`).
+Nested niri takeover was measured working; other compositors may refuse it. Do not pin an older
+config silently, restart the whole stack and lose lock knowledge, or ask a dead client to recover
+itself. Replacement loses named state. Supervisor death remained unhandled in this pass.
 
 ## 0059. The Renderer exits when the Supervisor is gone, and a service manager reruns the pair
 
-A Renderer that loses its Supervisor connection exits rather than surviving as an inert shell;
-restarting the pair is a service manager's job, not either process's own.
+1. Treat inbound disconnection separately from an empty queue and exit the Renderer with code 70.
+2. Exit while locked without unlocking. Flush pending lock requests; avoid normal destructor
+   teardown that would send an illegal destroy for an acquired lock.
+3. A tripped Renderer restart brake exits the Supervisor with code 3; the service unit prevents
+   restarting that code.
+4. Let the service manager restart and collect the pair and its children, scoped to the graphical
+   session. Compositor startup commands alone do not supervise them.
 
-1. **Exit on disconnect.** `TryRecvError::Disconnected` from the inbound channel is now handled
-   instead of being read as `Empty` (which is what `try_recv`'s `Err` had collapsed it into), and
-   the Renderer exits `70`. A surviving Renderer painted and hit-tested normally but could reach
-   nothing behind it: every capability lives in the Supervisor, PAM is a Supervisor worker
-   (ADR-0028), and `process.run` wrote into a socket nobody read.
-2. **Exit while locked does not unlock.** A Renderer holding `ext_session_lock_v1` when its
-   Supervisor dies exits still holding it; unlocking first would make one `kill` a way past a lock
-   screen. The exit uses `std::process::exit`, not a loop break, because breaking drops `App` and
-   SCTK's `SessionLockInner::Drop` sends a bare `ext_session_lock_v1.destroy`, which is
-   `invalid_destroy` once `locked` was sent (ADR-0052). Any lock request already enqueued in the
-   same drain is flushed before exit, since SCTK's lock path only enqueues and does not round-trip;
-   skipping the flush let the exit message claim a locked session the compositor was never asked to
-   lock.
-3. **A tripped restart brake exits with a code that means do not restart.** ADR-0058's brake (three
-   Renderer deaths inside 60 seconds) returns `Shutdown` and exits `3`; ordinary Supervisor exit is
-   `0` or `1`. `RestartPreventExitStatus=3` in the unit file stops systemd from rerunning the whole
-   stack roughly once a minute forever, which a code-blind restart policy would do since the brake's
-   60-second window is looser than systemd's default start limit (5 starts in 10 seconds).
-4. **Rerun is a service manager's job.** `packaging/oblisk-shell.service` exists because niri's
-   `spawn-at-startup` does not restart what it spawns (niri issue #2986).
-   `PartOf=graphical-session.target` stops the unit at session end instead of letting the Supervisor
-   exit into a restart, and collects any Renderer or `process.run` child that outlived a Supervisor
-   which ran no cleanup of its own, since the whole control group goes with the unit.
-
-Rejected: reconnecting to a new Supervisor instead of exiting, because a new Supervisor means a new
-`LockState`, capability roster and generation id, so a reattached Renderer would hold signals
-hydrated from a process that no longer exists.
-
-Rejected: the Renderer respawning its own Supervisor, because it inverts ownership: the Supervisor
-holds capabilities and runs PAM (ADR-0042) precisely so the process on the glass cannot hand itself
-a fresh roster.
-
-Not built: a lock-survives-restart flag. A restart while the session is locked currently comes back
-believing it is unlocked, since the new Supervisor's `LockState` is `Default`, while the compositor
-is still locked from before.
+Rejected: reconnect to fresh Supervisor state or let the Renderer spawn its own authority.
+A persistent lock marker was not built yet.
 
 ## 0060. A restarted Supervisor learns the session was locked from a file in the runtime directory
 
-ADR-0059 left one hole: a restarted Supervisor's `LockState` starts `Default`, so it believes the
-session is unlocked while the compositor is still locked. This closes it with a marker file that
-survives the process.
+1. Keep the lock fact in $XDG_RUNTIME_DIR/oblisk-session-locked so it survives SIGKILL but not
+   the login session. Do not serialize transient attempts or acquisition state.
+2. Drive it from Renderer outcomes: Locked sets; Unlocked/Finished clear; Refused leaves it.
+   Renderer loss must not clear it, because the compositor remains locked.
+3. Feed a startup marker into the existing reacquisition path, still gated by a valid on-disk
+   authentication field. Distinguish restart from crash replacement in diagnostics.
 
-1. **The fact lives in a file, because it has to survive SIGKILL.**
-   `$XDG_RUNTIME_DIR/oblisk-session-locked` exists exactly while the compositor is locked. It must
-   survive the Supervisor being killed without running any of its own code, and must be readable
-   before anything else happens at startup, so nothing in-process or Renderer-dependent qualifies.
-   Using `$XDG_RUNTIME_DIR` rather than a config or state directory bounds staleness: the directory
-   dies with the user's last session, so a marker can only be read back inside the login that wrote
-   it.
-2. **It is written off the Renderer's report, never off `LockState.active`.** `active` means "this
-   shell holds the lock", and `LockEvent::RendererLost` clears it (ADR-0058 decision 4) even though
-   the compositor stays locked and is required by protocol not to unlock on client death; a marker
-   driven off `active` would erase itself in the exact case it exists for. The marker instead reads
-   `shared::LockOutcome`: `Locked` sets it, `Unlocked` and `Finished` clear it, `Refused` leaves it
-   alone, and `RendererLost` is not a `LockOutcome` at all so it cannot touch the marker.
-3. **A set marker at startup feeds the re-acquisition path that already exists.**
-   `relock_when_connected` (ADR-0058 decision 4's intent flag) now starts
-   `Some(SupervisorRestarted)` when the marker is set, instead of always `None`. The acquisition
-   predicate still gates it unchanged: a replacement re-acquires only if the on-disk config still
-   declares exactly one `textfield` with `secure_submit = { capability = "lock", action =
-   "authenticate" }`, checked in the Renderer rather than duplicated here. `RelockReason`
-   distinguishes a crash replacement from a restart so the log line reads correctly for each.
-
-Measured in a nested niri: the marker is absent before any lock, set the instant the lock is taken,
-still set after `SIGKILL`ing the Supervisor and watching the Renderer exit behind it (ADR-0059), and
-read by a second Supervisor which then asks generation 0 to take the lock over; the recovered
-Renderer gets `locked` and keyboard focus lands on `secure_submit`.
-
-An unreadable or unwritable marker file is logged and swallowed rather than treated as fatal, and
-`is_set` reads a missing file as "not locked": every ambiguity resolves toward locking, since a
-marker that should have been set costs the ADR-0059 hole (an unreachable lock screen), while a
-marker that should have been cleared costs only one password prompt. One sequence still produces a
-stale marker: kill the Supervisor while locked, unlock the session from outside oblisk entirely (VT
-login plus `loginctl unlock-session`), then restart the shell; the shell relocks an already-open
-session at the cost of one password prompt. `ext-session-lock-v1` has no request to ask the
-compositor whether it is locked, and a takeover of an existing lock returns `locked` identically to
-a fresh one, so nothing can settle these cases by asking.
-
-Rejected: serializing the whole `LockState` into the marker, because `attempts` and `acquisition`
-describe a lock screen and PAM worker that no longer exist after a restart; only the boolean means
-anything across the boundary.
-
-Rejected: clearing the marker on a clean Supervisor shutdown, because a clean shutdown does not
-unlock the compositor either (`SIGTERM` makes the Renderer exit without unlocking, ADR-0059 decision
-2), so clearing the marker there would show an unlocked-looking shell in front of a still-locked
-session.
+Nested niri verified recovery across Supervisor SIGKILL. File errors are logged; absence reads
+unlocked. An externally unlocked session can leave a stale marker and cause one extra prompt;
+the protocol cannot query lock state. Clean Supervisor shutdown must not clear the marker.
 
 ## 0061. Desktop entries are an enumerated capability, not a lookup call
 
-Desktop-entry lookup for the launcher, focused-window icon, and tray items is served by a new
-`applications` capability that snapshots the whole set, rather than by a synchronous per-`app_id`
-`find_icon` call. This amends ADR-0054 decision 5, which had left the `app_id` half of `find_icon`
-unbuilt.
+Amends ADR-0054 decision 5.
 
-1. **A snapshot capability, not the `find_icon` signature.** ADR-0054's objection to a synchronous
-   resolver still stands: the control socket carries one-way commands and one-way `StateSnapshot`s,
-   with no correlation id and no reply. It does not reach this data though, because desktop entries
-   are a set that changes only when packages install, snapshot-shaped like `tray`'s items.
-   `applications` joins `shared::CAPABILITIES` and pushes `{ entries, by_app_id }`; the Renderer
-   needs no change since `json::to_lua` already converts any payload.
-2. **`by_app_id` repeats the entries rather than indexing into them.** An index would be an array
-   index, and JSON arrays count from zero while the Lua table they become counts from one, so every
-   config reading it would carry an invisible off-by-one. `app_id` matching runs two passes, exact
-   `StartupWMClass`/desktop file id first, then case-folded spellings and the last dot-segment of a
-   reverse-DNS id, so one entry's fuzzy guess cannot displace another entry's exact match regardless
-   of directory scan order.
-3. **The argv never crosses into Lua.** `entries` carries `id`, `name`, `icon`, never `Exec`;
-   launching is `applications:launch(id)` and the parsed command line stays on the Supervisor's
-   side. A config that could read an argv could assemble a different one and run it with the
-   Supervisor's privileges. `process.run` is also the wrong lifecycle for a launched GUI app: it
-   pipes stdout/stderr and holds the `Child` for its exit code (ADR-0026), so a generation swap
-   would reap a still-running application.
-4. **Rescan on demand, not on a watch.** The scan runs at startup and on `applications:refresh()`;
-   nothing watches `/usr/share/applications`. Reusing `watcher.rs` would mean generalizing an
-   ADR-0047-governed, config-tree-specific file (recursive descent, content hashing, `.lua` filter)
-   for an event that fires a handful of times a month. The scan pushes only when the result differs
-   from the last one, since every `StateSnapshot` marks the scene dirty and drives a full re-resolve
-   and repaint (ADR-0044).
+1. Publish desktop entries as an applications snapshot, not a synchronous lookup.
+2. Repeat entries in by_app_id rather than exposing zero-based indices to Lua. Exact matches
+   precede case-folded and reverse-DNS fallback matches.
+3. Keep parsed argv Supervisor-side; launch by entry ID. Managed process.run has the wrong
+   lifetime because a generation swap would reap the GUI application.
+4. Rescan at startup and explicit refresh, pushing only changes. No watcher generalization for
+   infrequent package-install events.
 
-Not built: locale support (`Name[de]` is skipped; half-doing it risks preferring the wrong regional
-variant), `OnlyShowIn`/`NotShowIn` filtering, a `$TERMINAL` probe for `Terminal=true` entries
-(refuses without the variable set rather than guessing), field-code stripping inside a longer token
-(only a bare `%f`-style token is handled), and incremental scanning (every `refresh` re-reads every
-entry, currently 290 lines across two directories, on a `spawn_blocking` thread).
+Deferred: localization, OnlyShowIn/NotShowIn, terminal guessing, embedded field-code stripping and
+incremental scans. Terminal entries refuse without $TERMINAL; scans run off-thread.
 
 ## 0062. Hover is a signal the engine writes, not a callback it calls
 
-The engine computes hover from pointer input and writes it into a signal the config only reads,
-rather than calling an `on_hover` callback. This lets the Renderer itself own and publish reactive
-state, not just relay it.
+1. Hover is readable state, not only callbacks whose leave edge can be lost during reconciliation.
+   An action callback may be added separately.
+2. The Renderer owns named, read-only hover and hover_rect signals. Keep the last rect on leave
+   because a closing popup still needs a valid anchor.
+3. The hover property preserves its handle structurally rather than resolving it to a boolean.
+4. Write only on boundary changes, not each motion event, to avoid unnecessary scene resolution.
+5. Every node on the hit path is hovered, including composite ancestors.
 
-1. **A signal, not a callback.** A hover callback (`on_hover = function(entered) ... end`, mirroring
-   `on_click`) would make every config wanting a tooltip rebuild the same open/close state machine,
-   with a real bug class where the closing edge never arrives because the node was replaced by a
-   re-resolve in between. Instead `hover(name)` returns a boolean signal, bound directly to
-   `visible` or similar, so there is no edge to miss and no order to get wrong. A config wanting to
-   *act* on the entry edge still cannot; `on_hover` can be added beside this later without changing
-   it, but nothing in the reference shell's four measured hover affordances needs it, since all four
-   are conditions, not actions.
-2. **The engine writes it, and that makes the Renderer a source of signals.** Every signal before
-   this was fed from outside the Renderer, either a capability's `Live` signal off the control
-   socket (ADR-0029) or a `state(name, initial)` signal from Lua (ADR-0044 decision 5). Hover is
-   computed by the Renderer itself and pushed into a signal the config only reads, establishing that
-   the engine may own and publish reactive state, not just relay it, so the next signal of this
-   shape (`focused`, `pressed`, `maximized`) is a spec row rather than a re-argument. Routing hover
-   through the Supervisor and back as a capability was rejected: it would be a socket round trip to
-   answer a question already resolved from a rect the Renderer already had, at pointer-motion rates,
-   and hover has none of the long-lived-connection lifetime the process boundary (ADR-0020) exists
-   to keep out of the Renderer. A hover slot is two signals: `hover(name)` (boolean) and
-   `hover_rect(name)` (the node's absolute rect, ADR-0050 decision 3's coordinate space), kept as
-   two names rather than one record because they bind to different properties (`visible`,
-   `anchor_rect`). `hover_rect` keeps its last value when the pointer leaves rather than clearing,
-   because § 6.3 refuses a zero-sized `anchor_rect` and the popup is still resolving on the closing
-   turn. Identity is by name, one `name -> Signal` map per generation exactly as `state()` (ADR-0044
-   decision 5), so an in-place reload finds the same signal and a tooltip open across a config edit
-   stays open. `hover(name)` is its own signal kind rather than reusing the capability kind, so
-   `signal:set()` (which already refuses everything but a `state` signal, ADR-0044 decision 5)
-   rejects writes to it, and the engine's writer accepts only a hover signal, so a config cannot
-   point `hover` at a capability's snapshot.
-3. **The `hover` property carries the handle, so it does not resolve.** `resolve_properties`
-   normally replaces every `Signal` in a property map with its current value (ADR-0044 decision 1),
-   which would turn `hover` into a bare boolean with no way to recover which signal to write.
-   `hover` is a structural property instead, copied through raw by `is_structural_property` the same
-   way `id` and a panel's `layer`/`anchor`/`monitor`/`namespace` already are, since a property
-   naming a thing rather than carrying a value has nothing to resolve.
-4. **One write per boundary crossed, not one per motion event.** `wl_pointer` reports motion at
-   device rate, and every `LiveSignalHandle::set` marks the single scene-dirty flag (ADR-0044
-   decision 2), re-resolving the whole generation. The write compares against the current value
-   first, so a pointer sitting still inside one button re-resolves nothing, and crossing a button's
-   edge re-resolves twice (once per node). The hit test itself still runs every motion event, but it
-   is a bounded tree walk, the same one the click path already does.
-5. **Hovered means on the hit path, so ancestors are hovered too.** `hit_path` (ADR-0050 decision 1)
-   returns the whole root-first chain of nodes containing the point; every node on that chain is
-   hovered. Restricting hover to the innermost node would make it useless on composite widgets like
-   a `pill` (`row` wrapping `button` wrapping `text`) without restructuring them. The topmost-child
-   rule for overlapping siblings carries over unchanged from the click path.
-
-Not built: a dedicated tooltip node (§ 6.3's `popup` with `grab = false` already serves as one),
-`on_scroll` (a separate problem, ranked next), hover-driven animation (an expand-on-hover snaps), a
-cursor-shape change on hover (`wl_pointer.set_cursor` untouched), and a keyboard equivalent (a
-future `focused` signal, not this one).
+No separate tooltip node, scrolling, animation, cursor changes or keyboard-focus equivalent in
+this pass; a non-grabbing popup already supplies tooltip presentation.
 
 ## 0063. A display list is what makes a repaint skippable
 
-An idle bar repainted every mapped surface once a second because ADR-0044 decision 2's dirty flag is
-one flag for the whole scene, with no record of which surfaces actually changed. Painting now goes
-through a flat display list that can be compared frame to frame, so an unchanged surface skips its
-GPU work entirely.
+1. Build and execute one flat display list. Compare it with the last painted list before touching GL.
+   A parallel hash could drift from actual drawing.
+2. Compare plain Rust values, not Lua table identity. Exact float equality is sufficient for
+   repeated parsed inputs; NaN costs an extra paint rather than a missed one.
+3. Store precomputed ancestor-intersection clips per draw. Exclude fully clipped subtrees.
+4. Invalidate on new/undefined buffers and remember a list only after a successful swap.
 
-1. **Paint through a display list, not straight to the canvas.** `paint_tree` used to walk the
-   resolved tree and issue femtovg calls directly, with nothing in between to compare. The walk is
-   now two halves: `build(root, scale) -> DisplayList` flattens the tree into a `Vec<DrawCmd>` of
-   plain Rust data, and `execute(painter, images, list, scale)` turns that into femtovg calls.
-   `wayland::App::paint_surface` builds the list, compares it against the one that surface last
-   painted, and returns before touching the GL context on a match. The list is the sole source of
-   truth for what gets drawn, so equal lists cannot mean different pixels, unlike a hash computed
-   alongside the drawing that could silently drift out of sync.
-2. **Compare plain data, never `ResolvedNode`.** Deriving `PartialEq` on `ResolvedNode` cannot work:
-   a node's properties are a `HashMap<String, mlua::Value>`, and mlua compares tables by identity,
-   so a property resolving to a table would compare unequal every pass and repaint forever (proven
-   by the test `set_changed_cannot_dedupe_a_table_because_table_equality_is_identity`, written when
-   hover rects hit this). `DrawCmd` holds no Lua value; `Rgba`, `BorderColor`, `EdgeInsets`, `Fit`,
-   `LogicalRect` and `PhysicalRect` already derive `PartialEq`. Float equality is used deliberately:
-   both sides come from the same parsers over the same inputs, so an unchanged input is
-   bit-identical, and `NaN` comparing unequal to itself just means an extra repaint, never a stale
-   frame.
-3. **The clip is precomputed, not a save/restore nest.** A flat list has no nesting to hang scissor
-   save/restore on, so each `DrawCmd` carries the precomputed intersection of its own snapped box
-   with every ancestor's, and `execute` calls `scissor` directly. This is equivalent because every
-   clip is an axis-aligned rect, intersection is associative, and the crate applies no canvas
-   transform. A subtree whose clip is empty is left out of the list entirely, which also means
-   moving something fully off-screen produces no list change and no repaint.
-4. **Invalidate on anything that makes the buffer undefined.** `last_painted` holds `((width,
-   height), DisplayList)`; `None` means "must paint". It is cleared when the surface is bound (a
-   fresh `EGLSurface` holds no prior pixels) and written only after `eglSwapBuffers` returns
-   success, so a frame that never reached the compositor cannot let a later identical list skip a
-   paint the screen never got. Every branch that cannot prove the buffer still matches
-   `last_painted` clears it, since painting once too often costs a frame but skipping once too often
-   leaves a stale surface with nothing scheduled to correct it.
-
-Measured A/B on the same release binary, 25 second windows on an idle session: renderer CPU went
-from 0.80% of a core to 0.60%, niri's from 0.52% to 0.36%. The wallpaper's 2.23 repaints per second
-went to zero; the bar still repaints on the clock's seconds digit (1.20 paints against 1.03 skips
-per second).
-
-Not built: skipping resolution of invisible surfaces. The scene still re-resolves and deep-clones
-all eleven surfaces on every push, nine of them invisible, left separate because `lock.lua` and
-`popup.lua` both rely on a `:map` running whether or not the node it feeds is visible. The single
-scene-wide dirty flag also stays, so `build` still runs for every surface on every push.
+Measured 25-second A/B: Renderer CPU 0.80% to 0.60%, niri 0.52% to 0.36%; wallpaper repaints
+fell from 2.23/s to zero. Resolution and cloning still visit every surface on each dirty push.
+Skipping invisible resolution remained separate because config maps could have side effects.
 
 ## 0064. A masked field draws from a count the tree never holds
 
-`textfield` painted nothing at all, so typing an invisible password into a lock screen made a typo
-indistinguishable from a slow unlock; measured on this machine, `pam_unix`'s `pam_fail_delay` runs
-about 2 seconds nominal per wrong attempt and `pam_faillock`'s defaults lock the account for 10
-minutes after 3. The fix draws a masked character count that never enters the retained tree.
+1. Pass secure character count beside the scene into painting, never as a retained property.
+   Count Unicode characters, not bytes.
+2. Match the focused capability/action destination so another field cannot display its length.
+   Unfocused fields show placeholders; focus changes clear the buffer.
+3. A keystroke requests paint without scene resolution; display-list equality narrows GPU work.
+4. Probe the installed Oblisk PAM service per authentication, falling back to login when absent.
+   Naming a missing service would hit pam_deny on the observed system.
 
-1. **Paint takes the character count as an input, not from the tree.** Putting the masked value on
-   the node as a resolved property, the obvious route, is forbidden by ADR-0005: typed bytes live in
-   `shared::SecureBuffer`, deliberately outside the Lua VM and the scene, and anything derived from
-   them entering the retained tree would make the Renderer's clone/reconcile/retire machinery carry
-   it. Instead the count travels beside the tree: `build(root, scale, focus: Option<&SecureField>)`
-   takes an optional `SecureField { target, filled }`, and `SecureBuffer::char_count` (the only
-   non-`expose_secret` read on it) discloses only a length, the same thing a row of dots discloses
-   anyway. It counts characters, not `len()`'s bytes, since a non-ASCII character must draw one dot,
-   not two or three.
-2. **Focus is a destination, not a node.** `SecureField` carries the `{ capability, action }` pair
-   rather than a node id, matching what `wayland::input::FocusedField` already tracks (a surface id
-   plus a `SecureSubmitTarget`). This makes the routing rule fall out automatically: a field
-   addressed to a different capability/action than the focused one does not fill, so a Wi-Fi PSK's
-   length cannot leak onto the lock screen, the same rule `retarget_secure_submit` enforces for the
-   bytes themselves. An unfocused field draws its placeholder rather than a fallback, because
-   changing focus zeroizes the buffer and there is no typed state left anywhere to draw.
-3. **A keystroke repaints, it does not re-resolve.** Typing changes no property in the retained
-   tree, so `re_resolve_if_dirty` has nothing to notice. `App::secure_input_changed`, set by
-   `apply_secure_key` and `focus_secure_submit`, triggers a repaint without re-resolving; ADR-0063's
-   display-list comparison then narrows that repaint to the one surface holding the field, rather
-   than marking the scene dirty and re-resolving all eleven surfaces to move one glyph.
-4. **The PAM service is probed, and falls back.** `PAM_SERVICE` was hardcoded to `"login"`, the
-   console-login stack, which runs `pam_nologin` and `pam_shells` among others, neither of which
-   cares whether the person at the keyboard is the one who locked the screen.
-   `packaging/pam.d/oblisk` is the stack Oblisk wants: `auth` and `account`, both `include
-   system-auth`, no `session` or `password` chain since `run_conversation` only calls `authenticate`
-   and `account_management`. `pam_service_in` probes for the installed file (a `stat` per
-   authentication, deliberately uncached so installing the file does not require restarting the
-   shell) and falls back to `"login"` when absent, because a missing service falls through to
-   `/etc/pam.d/other`, which is `pam_deny` on a stock Arch install: naming `oblisk` unconditionally
-   would turn a missing packaging file into every correct password being refused.
-
-Not built: removing `pam_fail_delay`'s two-second wrong-password delay or `pam_faillock`'s lockout
-(both are the machine's own brute-force protection, left to `faillock.conf` to tune), a caret,
-placeholder styling, or a real text field beyond one `draw_line` of repeated glyphs.
+Leave the machine's PAM failure delay and lockout policy intact. No caret, placeholder styling
+or general text editor in this pass.
 
 ## 0065. A font file is mapped once and shared, not copied per reader
 
-Font bytes are mapped once via `fontdb::Database::make_shared_face_data` and shared by `Arc`,
-instead of each consumer holding its own copy. RSS is the wrong metric for judging this; private
-dirty is the number that reflects real cost.
+1. Map font files once and share their Arc-backed bytes across shaping, cosmic-text and femtovg.
+   Avoid Canvas's copying font API. Measured private dirty fell 49.7 to 26.4 MB, RSS 192.5 to
+   166.3 MB; deleting emoji entirely saved less than another 4 MB. Mapping accepts the existing
+   risk of a font file being modified in place.
+2. Keep femtovg/OpenGL ES. The measured Mesa pages were shared clean; removing their mapping did
+   not justify replacing the renderer. CPU wallpaper buffers would cost 18.4 MB private dirty
+   when double-buffered at 1920×1200. Judge physical/private cost, not RSS alone.
 
-1. **Map the font chain, don't copy it.** An 11MB `NotoColorEmoji.ttf` cost 27MB of private dirty
-   because it was held three times: the shaping worker's `chain_bytes: Vec<Vec<u8>>` (via
-   `data.to_vec()`), femtovg's internal copy in `Canvas::add_font_mem` (`data.to_owned()`), and
-   cosmic-text's own mapping. Calling `make_shared_face_data` before handing the `Database` to
-   `FontSystem` collapses all three onto one `Arc<dyn AsRef<[u8]> + Send + Sync>`: the worker holds
-   the `Arc`, femtovg receives it via `TextContext::add_shared_font_with_index`, and cosmic-text
-   finds the mapping already in the database. `add_shared_font_with_index` lives on `TextContext`,
-   not `Canvas`, so `TextPainter` builds the context first and passes it to
-   `Canvas::new_with_text_context`; `Canvas::add_font_mem` remains the only font route the canvas
-   exposes on its own, and it still copies. Measured on an idle 11-surface session: RSS 192.5MB to
-   166.3MB, private dirty 49.7MB to 26.4MB (deleting the emoji font entirely lands within 4MB of
-   this fix, so keeping it costs almost nothing). The `unsafe` in `make_shared_face_data` is
-   documented: its hazard is a font file rewritten on disk while mapped, a risk cosmic-text already
-   accepts for every font it renders. Rejected: a private copy per font per process, to defend
-   against a system font being edited in place, because the cost is paid on every process for a
-   threat that doesn't happen in practice.
-2. **Keep femtovg on OpenGL ES, not wgpu/Vulkan or a CPU rasterizer.** Mesa's GL stack (130MB,
-   mostly `libLLVM`/`libgallium`) is `Shared_Clean` and already mapped into niri and other
-   processes, so removing it frees no physical memory while the compositor runs. Switching to
-   wgpu/Vulkan (measured via `vkcube`: 24.8MB RSS, 2.7MB private dirty) would only move a number a
-   monitor prints, and femtovg has no wgpu backend, so it would mean replacing the whole 2D
-   renderer, the paint execute path, the image upload path, and the EGL surface binding. Dropping GL
-   for `wl_shm` plus `tiny-skia` would unmap Mesa but cost 9.2MB of private dirty per 1920x1200
-   buffer (18.4MB double-buffered) for the wallpaper alone, versus the current GPU buffer objects
-   costing this process nothing (`Rss=0` in smaps). Rejected: wgpu/Vulkan and `wl_shm`+tiny-skia,
-   because both trade shared-clean memory (free) for private dirty (not free), making RSS look
-   better while making the machine worse.
-
-Not built: shrinking `VmSize` (768MB, mostly unmapped glibc arena reservations, address space is
-free on 64-bit) and CJK font coverage (`"Noto Sans CJK JP"` resolves to nothing on this machine; a
-missing package, not a bug here).
+No effort to shrink reserved virtual address space or compensate for the missing CJK font package.
 
 ## 0066. The icon path lookup is the paint loop, not the GPU
 
-Following ADR-0063 (which stopped unneeded repaints), this measures what a repaint that does happen
-costs. The cost is CPU work recording draws, not GPU submission, and within that, icon name
-resolution dominates.
+Profile before replacing rendering machinery. In 30 seconds, recording draws cost 165.1 ms versus
+8.3 ms for flush; icon lookup alone took 1638 µs of each 1645 µs icon call.
 
-Instrumenting `paint_surface` on an idle 11-surface session showed `Canvas::flush` (actual GL
-submission) at 8.3ms against 165.1ms spent recording draws into femtovg, over a 30-second window;
-`eglSwapBuffers` at 0.04% of a core (it does not block, no `eglSwapInterval` call is made, default
-is 1); and the per-surface deep clone in `Scene::surface` at 1.6ms, negligible. Splitting recording
-by draw kind found icons at 62 calls totaling 102.0ms, 1645µs each, versus 1.7µs for a box and
-12.2µs for text. Of that 1645µs, 1638µs was `icons::resolve`, a `freedesktop-icons` search across
-the active theme and its inheritance chain, not drawing; the texture itself was already cached
-(`ImageCache`: 32 hits, 2 misses).
+Memoize (size, name) to path or absence for the process lifetime, matching the cached theme's
+lifetime. Negative results matter because misses search the whole inheritance chain.
+Parsed theme-index caching did not cache this lookup.
 
-`resolve` now memoizes `(size, name) -> Option<PathBuf>` for the life of the process. A `None` is
-memoized as carefully as a hit, because "not found" is the expensive answer: it means the whole
-inheritance chain was walked and every candidate stat'd. Process lifetime is the correct scope
-because `theme()` is already a `OnceLock` read once per process, documented as reflecting a theme
-change only at the next reload; the memo is exactly as stale as the theme it's keyed against, and
-the generation swap (ADR-0054) clears both. `with_cache` (on the `freedesktop-icons` call) still
-caches parsed theme indexes; it does not cache the per-name search, which is what was measured and
-fixed here.
-
-Measured after: per-icon resolve 1645µs to 79µs, recording draws 165.1ms to 39.1ms, bar per repaint
-3.9ms to 0.57ms, whole GL phase 0.64% to 0.19% of a core.
-
-Not built: `eglSwapInterval(0)` (nothing to win, swap is 0.04% of a core), removing the per-image
-`stat` (its cache key carries the file's revision so an edited icon appears without reload; the
-alternative is re-reading bytes to detect a change, and it doesn't show up against a 79µs icon), or
-removing the per-surface deep clone (0.00% of the window).
+Measured afterward: icon resolution 79 µs, recording 39.1 ms, bar repaint 3.9 to 0.57 ms,
+GL phase 0.64% to 0.19% of a core. Keep swap pacing, per-image revision stat and scene cloning;
+none was the measured bottleneck.
 
 ## 0067. The Wayland client addresses surfaces by position, the retained scene by identity
 
-`wayland::App::surfaces` stays keyed by `Vec` index (position); `layout::scene`'s top-level surfaces
-stay keyed by id (identity), per ADR-0038 (ADR-0023). These are not an inconsistency to reconcile.
+Keep Wayland protocol instances in a position-addressed vector and retained nodes identity-keyed.
+Their callers hold different information; rekeying protocol events would add scans or allocations.
+Indices also allow methods to borrow EGL, painting state and surfaces together.
 
-ADR-0038's "identified, not ordered" governs how `shell.lua` declares surfaces and how the retained
-scene matches a fresh evaluation against the one already applied, because node identity must survive
-a reload. It does not govern how the Wayland client stores protocol handles for one generation's
-live surface instances, a different problem.
-
-Every index in `wayland/` comes from one of three origins, none of which is a caller already holding
-an id: a protocol event carrying a `wl_surface` (rekeying would just make the callee scan again for
-the index it needs anyway); a bulk loop that iterates and mutates (rekeying costs a `Vec<String>`
-allocation plus a scan per element, on the Wayland dispatch thread in the paint and activate-draw
-paths); or a cross-module call where the caller already resolved the index two lines above. Where a
-caller genuinely holds an id instead of a position, the code already uses one:
-`App::destroy_surface_by_id` takes `&str`, called from output removal and instance reconciliation,
-not from a protocol object. The code uses identity where the caller holds identity and position
-where the caller holds position, the same answer reached twice, not one answer applied
-inconsistently.
-
-The index also serves a borrow-checker constraint (`surface.rs:1053`): these methods need `&mut
-self` for EGL state and `self.text_painter`, which a held `&mut TrackedSurface` would conflict with;
-`paint_surface` alone touches `client`, `egl`, `gl`, `image_cache`, `shaping`, `text_painter`,
-`exit` and `surfaces`.
-
-Rejected: folding the nine `map_state` assignments across four files into named transitions. Worth
-doing only if a transition carries an invariant; the candidate invariant, that `null_buffered` must
-move with `map_state`, does not hold. `null_buffered` is PBA-candidate staging set only inside
-`bind_and_clear`'s `is_pba_candidate` branch and cleared only where a `window` or `popup` object is
-destroyed; `App::unmap` leaves it alone because a panel's object survives unmap. With no invariant
-to enforce, the fold would say less than the assignment it replaces.
-
-Not built: rekeying `wayland::App::surfaces` to surface id. `wayland/` keeps 26 methods taking
-`index: usize` and roughly 123 `self.surfaces[index]` accesses; this is the intended shape.
+Rejected: named map-state transitions without a real invariant. Candidate null-buffer staging
+does not share map-state lifetime. Keep ID-taking entry points where callers actually hold IDs.
 
 ## 0068. Paint properties are parsed once at apply time, and a bad one fails the pass
 
-`node::paint_style` now parses all fourteen paint-property parsers once, while `Scene::apply`
-resolves the node, instead of `layout::paint::build` re-running them on every node of every mapped
-surface on every dirty turn. A malformed value now fails the apply pass instead of being treated as
-absent.
+Parse paint properties once during scene apply and reject malformed values through rollback,
+including on hidden nodes. Per-frame default substitution disagreed with geometry validation
+and could repeatedly log huge values.
 
-The old cadence was wrong because ADR-0063 decision 1 made the display list decide whether a surface
-repaints, so `build` had to run before a surface could decline a frame, and ADR-0044 decision 2's
-single scene-wide dirty flag meant any capability push re-resolved every surface. Properties already
-resolved once that pass were being reparsed at a cadence nobody chose.
-
-The failure rule was the bigger change. One resolved property map previously had three different
-opinions on a malformed value: `scene.rs` geometry used `?` (apply fails, scene rolls back,
-`oblisk.rescue`); `layout::paint` logged and substituted the absent-key default;
-`wayland::surface::apply_resolved_state` logged and kept the last applied value. Paint's lenient
-rule was meant to stop a bad paint property from blanking the surface around it, a defence that
-predates rescue and rollback: a bad `align_v` one line away already takes the tree down, so a
-non-numeric `background` is the same class of bug. The lenient rule also logged the rejected value's
-full `Debug` form every frame, forever, measured at 20MB in a hostile case. `apply_resolved_state`'s
-rule stays as is: it runs at configure cadence, not the frame path, and has a last-applied value
-worth keeping, which a paint pass does not.
-
-What still runs at paint time is only arithmetic over already-parsed data that needs an input the
-resolve pass lacks: physical scale for an `icon`/`image`'s pixel size, and keyboard focus for a
-`textfield`'s placeholder-vs-mask choice. `PaintStyle` holds no Lua value, per ADR-0063 decision 2
-(mlua compares tables by identity, so a table-valued signal would compare unequal every pass).
-
-Consequences: `wayland::input::focused_target` is now infallible and its malformed-`secure_submit`
-fallback branch is gone, because a tree with an unparseable `secure_submit` now fails apply before
-any pointer event reaches it; `layout::secure_submit::secure_submit_targets` lost its matching
-skip-malformed rule the same way. Coverage widened: `build_node` used to return early on invisible
-or zero-clipped nodes, so a malformed property under `visible = false` was never parsed until the
-node became visible; every resolved node is parsed now regardless of visibility, so such a config
-fails at boot instead of at reveal time. `layout::node` lost twelve `pub` parser functions
-(`parse_background`, `parse_radius`, `parse_border_color`, `parse_border_width`, `parse_font_size`,
-`parse_foreground`, `parse_icon_name`, `parse_image_source`, `parse_fit`, `parse_placeholder`,
-`parse_mask_character`, `parse_secure_submit`), now internal to `node`; asking what a node paints
-means asking for its `PaintStyle`. `layout::paint` names no property and imports no `mlua`;
-`ResolvedNode.properties` stays because `hover`, `on_close` and `on_dismiss` still want the raw
-`Value` at their own cadence.
-
-Not built: moving the geometry parsers too. They already run at apply time under the same `?`
-failure rule this ADR gives the paint properties, so there was no second half to move.
+Painting keeps only scale/focus-dependent arithmetic over typed data. Configure-time surface
+updates retain their separate last-good-value rule. Geometry already parsed at apply time;
+there was no second parser migration to build.
 
 ## 0069. A scroll offset is engine state the layout pass clamps
 
-A wheel event's scroll offset lives in the retained scene and is clamped by the layout pass, not
-kept beside the Wayland surface or handed to config code as a raw delta. (Note: ADR-0077 moved
-sizing/positioning to `taffy`, so the offset is now applied in the `finish` walk that reads solved
-geometry back, not in `position_children` as decision 1 below describes; the clamp itself, computed
-from visible children's border boxes plus margins plus `spacing`, is unchanged. Reading the extent
-from taffy's `scrollable_overflow_rect` instead was rejected: CSS scrollable overflow excludes
-children's margins, and this engine's footprint includes them.)
+1. Store and apply scroll offset in scene geometry so painting, hit-testing and hover agree.
+   Measured cached applies: 200 rows 2.19 ms, 500 rows 6.14 ms; virtualization stays an upgrade.
+2. The engine writes a named read-only scroll signal; Lua lacks the measured extents to clamp it.
+3. Add a property to flowing containers, not a duplicate node kind.
+4. Layout clamps to content minus viewport and writes back the value actually used.
+5. A content-sized viewport has no scroll remainder and no-ops.
+6. Prefer compositor pixel deltas; otherwise use value120 steps of three lines. Ignore deprecated discrete data.
 
-1. **The offset is in the scene, not beside the surface.** Keeping the offset on `wayland::App` next
-   to its surface, applied at paint and hit-test time, looks cheap but puts geometry in two places:
-   hit testing, hover, the clip stack and the display list all read `RetainedNode::rect`, and each
-   would have to re-apply the offset correctly, in the same direction, or paint and click disagree.
-   ADR-0067 had just separated what the Wayland client addresses by position from what the scene
-   addresses by identity; this would reintroduce that split one layer down. So the offset is applied
-   where `rect` is produced, and every reader gets it for free. The cost was measured, not assumed:
-   a wheel event marks the scene dirty and re-lays out, p50 over 100 applies of a 400x600 `list`
-   panel, release build: 200 rows 4.86ms (2.19ms after the shape cache landed), 500 rows 12.78ms
-   (6.14ms after). 2.19ms fits a 120Hz frame and 6.14ms fits 60Hz; the shipped launcher (50 entries)
-   costs about 1.2ms. Upgrade path if a list outgrows this: a narrower dirty flag or a virtualized
-   list building only near-viewport rows, both additive, neither requiring this decision reversed.
-2. **The engine owns the value, the config reads it.** An `on_scroll(delta)` callback cannot be made
-   correct in config code: clamping needs the content extent (known only after the pass resolves and
-   measures children) and the viewport extent (known only from surface config), neither available to
-   Lua. Instead the engine emits a signal, following ADR-0062's shape: `scroll(name)` is name-keyed
-   like `hover(name)` and `state(name, initial)`, so an in-place reload finds the offset the user
-   left. `on_scroll` is deliberately not built; nothing in the reference config wants the raw wheel
-   event, only a value to react to.
-3. **A property, not a node kind.** `scroll = <signal>` is a property on containers that already
-   flow (`column`, `list`), exactly like `hover`; a dedicated node kind would duplicate the whole
-   layout arm to add one field.
-4. **The layout pass clamps, and writes back what it used.** The clamp bound is `(total_main -
-   content_main).max(0.0)`, computed where `spare` already is in the row/column layout arms, using
-   values (`total_main`, `content_width`/`content_height`) already computed there, so no new
-   parameter is threaded. The clamped value is written back to the signal, not just used, so a
-   config reading `scroll("x")` after the pass sees where the list actually landed, not the last
-   wheel delta, and a scrollbar built on it cannot disagree with the rows.
-5. **A container with no stated extent on the scroll axis does not scroll.** A `Content`-sized
-   container's extent equals its viewport, so the clamp bound is zero: a no-op, not an error, the
-   same answer `Fill` gives in a `Content` parent (ADR-0023 item 10) and for the same reason, there
-   is no remainder.
-6. **Pixels when the compositor sends them, a step when it doesn't.** `AxisScroll` carries
-   `absolute` (logical pixels), `value120` (120 = one logical step), and a deprecated `discrete`.
-   Rule: use `absolute` when non-zero, otherwise `value120 / 120.0` steps of three lines each.
-   `discrete` is ignored entirely, it is deprecated and compositors that send it also send
-   `value120`.
-
-Consequences: § 5.2 gains its first container that owns a viewport (the larger half of this work).
-`input.rs`'s `_ => {}` arm for `PointerEventKind` is deleted; the match is now exhaustive. A surface
-whose offset changed produces a different display list and repaints; every other surface compares
-equal and does not (ADR-0063), so scrolling one panel does not repaint the bar.
-
-Not built: a scrollbar. Drawing one needs the content extent, which this ADR does not expose; the
-first config that wants one decides whether to expose it.
+Amendment, ADR-0077: apply the offset in the solved-geometry finish walk. Keep margins and spacing
+in scroll bounds; taffy's CSS overflow bounds omit margins. No scrollbar until extent exposure is needed.
 
 ## 0070. A capability starts when the config first reads it
 
-`run_supervisor` used to build every capability controller before reading the config at all, so an
-`oblisk` process whose config mentions nothing still claimed three session-wide bus roles, opened
-PipeWire, two niri IPC sockets and a dedicated Wayland connection, subscribed to every BlueZ and
-NetworkManager device, scanned `/dev/video*` and every `.desktop` file, and polled once a second
-forever. Capabilities now start lazily, on first config read.
-
-1. **Reading `oblisk.<name>` is what starts `<name>`.** The `oblisk` table no longer carries its
-   capability members directly; they live in a side table, and `oblisk`'s `__index` moves one across
-   on first read, sending `RendererFrame::StartCapability` as it goes. The second read finds the
-   member already on the table and the metamethod never fires again. Reading is the right trigger
-   because it's the only thing a config can do to a capability it uses that it cannot do to one it
-   doesn't: `oblisk.audio:invoke(...)`, `oblisk.audio:map(f)`, `computed({ oblisk.audio }, f)` and
-   `content = oblisk.audio` all index `oblisk` first, so one hook catches every spelling, including
-   ones a future IDL adds. Rejected: an explicit roster (`capabilities { "audio", "network" }`
-   beside `fonts { }`), because it's a second list to keep in sync with the first, and drifting
-   silently makes a config that reads `oblisk.network` without listing it get a signal that stays
-   `nil` forever, indistinguishable from a machine with no Wi-Fi.
-2. **Starting is one-way.** A started capability stays started for the life of the Supervisor
-   process; dropping the last reader of `oblisk.bluetooth` on reload does not stop the BlueZ
-   subscription. Stopping would require releasing a bus name another process may have taken
-   meanwhile, draining in-flight requests, deciding the fate of a `last_snapshots` entry and its
-   revision counter, and handling a `StateSnapshot` arriving after the stop, to buy back only what
-   the process already paid unconditionally before this ADR. YAGNI. Consequence: a config that reads
-   `oblisk.privacy` under a one-time-true `if` leaves the camera watch running until the session
-   ends.
-3. **A generation swap re-sends every start.** `StartCapability` is idempotent on the Supervisor
-   side (a name whose controller already exists is logged and dropped), because each generation is a
-   separate process with its own Lua VM and `__index`, so a candidate must not inherit the previous
-   generation's reads. A candidate reads a `nil` signal for the milliseconds between its first read
-   and the newly-started controller's first `StateSnapshot`; that is not new, ADR-0037 already seeds
-   every capability to `nil` until first push, and `last_snapshots` replays the current value to a
-   capability whose controller was already running.
-4. **Construction happens inline on the Supervisor's select loop.** `NetworkController::new` and
-   `BluetoothController::new` block on a full device enumeration; running that in the
-   `StartCapability` arm stalls the loop for its duration, but that is exactly what the Supervisor
-   already did today, unconditionally, before the loop started. Moving it into the loop changes when
-   it costs, not what it costs, and frames behind it are delayed, not dropped. The ceiling case is a
-   config reading eight capabilities in its first evaluation, paying for all eight serially before
-   any pushes. Upgrade path if that matters: `tokio::spawn` the construction and deliver the
-   controller back over a channel, at the cost of an `Option` transition per capability that the
-   inline form avoids.
-5. **`secure_submit` is a read too.** polkit is not a capability: it has no roster entry, no
-   `StateSnapshot`, no `oblisk.polkit` member, so decision 1's hook can't see it. A config declares
-   it via `secure_submit = { capability = "polkit", action = "authenticate" }` on a `textfield`
-   (ADR-0005: a secure submit targets a capability, not Lua). Every applied scene's
-   `secure_submit_targets` are started by name through the same deduplicating sender, so a config
-   with a polkit prompt registers the agent and one without does not.
-6. **Failing to register the polkit agent is not fatal.** `register_agent`, previously the fourth
-   statement of `run_supervisor` and propagated with `?`, would abort startup on "an authentication
-   agent already exists for the given subject", the normal case on any machine already running
-   another desktop; `current_session_subject` one line earlier was equally fatal on a
-   `$XDG_SESSION_ID` that pam_systemd hadn't set. Both now log and continue, matching what `tray`,
-   `notifications` and `mpris` already do when their name is taken; the agent that loses the race
-   simply issues no challenges.
-7. **A config may declare no surfaces.** `return {}` and an empty file were both previously refused,
-   making "run nothing" untestable and blocking end-to-end testing of decision 1. Zero surfaces is
-   now legal: nothing downstream needed changing to support it (`candidate_has_staged` is `all` over
-   an empty iterator, `run_pba`'s collection loop is `while collected.len() < expected.len()`,
-   `expand_instances` over no specs yields no instances), which is itself evidence the old refusal
-   was arbitrary. A zero-surface generation completes its PBA handshake immediately and waits on the
-   socket for a reload.
+1. First namespace access starts a capability, covering reads and invocations without a second
+   config-declared roster.
+2. Startup is one-way for the Supervisor lifetime. Stopping would require bus-name, in-flight
+   request and snapshot/revision lifecycle rules.
+3. Every generation resends idempotent starts; existing snapshots replay, new state begins nil.
+4. Construct inline in the Supervisor loop. Startup enumeration can delay queued frames;
+   asynchronous construction is an upgrade if measured startup cost warrants it.
+5. Secure-submit targets also start their backend; Polkit was then outside the snapshot roster.
+6. Polkit registration/session-subject failures log and continue, including an already-owned agent.
+7. Permit empty configs and zero surfaces; their presentation handshake completes without work.
 
 ## 0071. The GL context is built by the first surface that needs it
 
-`egl::init` used to run unconditionally near the start of `run`, before the config was known to
-declare any surface (a config declaring none is legal per ADR-0070 decision 7). `eglInitialize`
-loads Mesa's driver: 12.9-34.7 ms (median 26 ms), pulling in `libgallium` plus LLVM at 125 MB
-resident, so a `return {}` config still paid 151 MB RSS / 37 MB PSS for a context it never used.
+1. Make EGL optional and initialize on the first surface bind. Hold the Wayland connection so
+   its lifetime guarantees the raw display pointer.
+2. Candidates reach ready without loading GL; initialization moves after ActivateDraw.
+   Measured ready was 104 ms; first binding grew from about 2 to 30 ms.
+3. Accept initialization failure occurring later rather than eagerly allocating a context solely
+   to prove it works. The entry recorded the resulting later-failure/rollback limitation.
 
-1. **`App::egl` is an `Option`, built on the first bind.** `ensure_bound` calls `ensure_egl`, the
-   only caller of `egl::init`, after its two cheap bails and before `WlEglSurface::new`. `App` holds
-   the `Connection` rather than the raw `wl_display` pointer it passes on: the same pointer, but the
-   refcount now guarantees `egl::init`'s SAFETY precondition instead of a comment promising the
-   connection outlives the state built from it. `release_bound` and `paint_surface` reach `egl`
-   through a local and are unreachable for a surface that never bound, so the `Option` does not
-   spread further.
-2. **A Candidate reaches ready without a GL context.** `bind_and_clear` short-circuits on
-   `self.is_pba_candidate || !self.ensure_bound(index)`, since a Candidate stays invisible until
-   `ActivateDraw`, its only bind. It therefore never called `ensure_bound` before signalling ready,
-   so deferring `egl::init` moves Mesa's load out of the ready window: a Candidate now holds ready
-   (measured 104 ms, against a 2000 ms `ready_timeout`) with `libgallium` unmapped. The cost lands
-   after `ActivateDraw` instead, where the first bind grows from about 2 ms to about 30 ms, under
-   two frames at 60 Hz.
-3. **An EGL failure is now fatal later.** Before, `egl::init` failing was a `?` out of `run`, so the
-   process died before signalling ready and the Supervisor rolled back to the last generation with a
-   working context. Now the failure surfaces from `ensure_egl`, which sets `self.exit` like any
-   other bind failure in `ensure_bound`, after promotion, with no rollback left. Accepted: reaching
-   it needs a driver replaced or a GPU reset under a live process; the alternative, initializing
-   eagerly just to prove it works, is what this ADR removes.
-
-Results: `return {}` RSS fell from 151 MB to 16 MB (PSS 37 MB to 13 MB, the honest number since
-Mesa's pages are shared across processes). A 13-surface config runs 183 MB RSS / 59 MB PSS. No test
-in `cargo test` catches a regression here: constructing `App` needs a live Wayland connection and
-`egl::init` needs a live compositor, so the property is checked by running a real session and
-reading `/proc/<pid>/maps` for `libgallium`.
+Empty-config RSS fell 151 to 16 MB, PSS 37 to 13 MB. Verify with a real session and driver
+mappings; unit tests cannot establish lazy GL loading.
 
 ## 0072. A tray item is addressed by the name it registered
 
-Two tray items drew wrong for two unrelated reasons, both fixed together because the same screenshot
-found both.
+1. Keep registered destination separate from resolved owner identity. Chromium tray properties
+   accepted the well-known destination but rejected reads addressed to its unique owner.
+   The owner still keys cleanup and spool files; owner changes between lookup/read remain a risk.
+2. Icon foreground supplies SVG currentColor and participates in the texture cache key.
+   Rewrite before usvg resolves it; leave files without currentColor unchanged.
 
-1. **The registered name is the destination, the owner is the identity.** `resolve_registration`
-   used to resolve a well-known `service` argument to its owner via `GetNameOwner` and address every
-   later message there. Slack's Chromium D-Bus code dispatches property reads on the message's
-   destination field, not the owner, so `GetAll` and `Get Id` addressed to the owner (`:1.659`) both
-   errored while the same calls addressed to the registered name
-   (`org.freedesktop.StatusNotifierItem-1240273-1`) returned 14 properties including a valid 22x22
-   pixmap. `resolve_registration` now returns a `ResolvedRegistration` carrying both: `unique_name`
-   is the identity (registry key, what `NameOwnerChanged` reports on, what the spool filename is
-   built from), `destination` is the address every `Get`/`GetLayout` carries and stays the
-   well-known name for a well-known registration. The `GetNameOwner` call stays, since only the
-   owner answers the identity half and dropping it would leave an item nothing can ever clean up.
-   Accepted risk: a well-known name can move to another owner between the lookup and a later read;
-   against an item that is simply never readable, this is the better failure.
-2. **`foreground` on an `icon` is the value `currentColor` resolves to.** Telegram's
-   `org.telegram.desktop-mute-symbolic` resolves through the icon theme to a Breeze KDE
-   colour-scheme SVG using `currentColor`, which Plasma and Qt rewrite at load time but
-   `usvg::Options::default()` does not, so Oblisk rasterized Breeze Light's baked-in text colour
-   (`#232629`, mean opaque RGB 17/19/20 at 18px) on a dark bar. `icon` now takes a `foreground`,
-   meaning what CSS `color` means: `rasterize_svg` rewrites the SVG textually before `usvg` sees it
-   (every bare `color:` declaration repointed; the root `<svg>` gets a `color` attribute when the
-   file uses `currentColor` but never defines it), since `usvg` resolves `currentColor` while
-   building the tree and exposes no hook before that. A file with no `currentColor` is returned byte
-   for byte, so full-colour icons are untouched. `CacheKey` gains the colour, otherwise the first
-   tint drawn wins for the life of the process. ADR-0031's preference for `IconName` over
-   `IconPixmap` stands: Telegram also ships a 16x16 pixmap, and upscaling it to avoid recolouring a
-   vector is the wrong trade.
-
-Not built: a real CSS parser. `color:` is matched textually across the whole file, so one inside a
-comment or attribute value would be rewritten too; no theme file tested has one.
+No full CSS parser: textual color replacement can also match comments/attributes.
+Keep theme vectors preferred over undersized pixmap fallback.
 
 ## 0073. The tray host asks the bus what is already there
 
-A tray item registers with the watcher once, at application startup. Restarting Oblisk left the
-watcher new and empty, and applications that don't re-register on `StatusNotifierHostRegistered`
-(Slack does not) stayed invisible until restarted themselves, which a shell doesn't get to demand.
+At startup, enumerate both KDE and freedesktop StatusNotifierItem well-known names and adopt
+them through the existing registration path. Keep live registration signals; duplicate adoption
+overwrites the same identity.
 
-The decision: `TrayController::new` calls `ListNames` at startup, keeps names matching
-`org.{kde,freedesktop}.StatusNotifierItem-` (both spellings, since KDE's is the de-facto name and
-Chromium claims the freedesktop one), and runs each through the same `resolve_registration` plus
-`register_item` path a live `RegisterStatusNotifierItem` call takes, serially rather than joined (a
-session has a handful of tray items). The `StatusNotifierHostRegistered` signal stays; an
-application that does re-register overwrites its own entry at the same registry key.
-
-What this cannot find: an item that registered an object path without owning a well-known
-`StatusNotifierItem-*` name, since nothing on the bus says which connections export the interface
-without asking each one in turn. Vesktop is that shape but doesn't need the scan; it listens for the
-watcher and re-registers on its own. So the scan happens to cover the applications that need
-covering, which the ADR records as luck rather than design. Introspecting every connection at
-startup was rejected as dozens of round trips at startup looking for something usually not there.
-
-Adoption running before `spawn_name_owner_changed_forwarder` creates no new race: the forwarder
-subscribes inside its own spawned task regardless of ordering, and an item disconnecting
-mid-adoption is caught by `register_item`'s existing pre-insert liveness check, the same guard that
-already covers a live registration's identical window.
-
-`is_item_bus_name` carries the tests: both name spellings match, the watcher's own name and
-`StatusNotifierHost-1234` do not, and the trailing `-` is the whole guard against a name that merely
-starts the same way.
+This recovers apps that do not re-register after shell restart. Object-path-only registrations
+remain undiscoverable without probing every bus connection; reject that expensive scan.
+Existing liveness checks cover disconnects during adoption.
 
 ## 0074. The tray backend exposes what the spec defines
 
-An audit of the tray against `org.kde.StatusNotifierItem` found six gaps. Scoring them by whether
-`dev-config` used them marked four as YAGNI; that test is wrong because Oblisk is a framework and
-the Supervisor is its API, so the right test is whether the spec defines a feature and applications
-implement it. Rescored, five of six are in (Telegram, Vesktop and Slack all export the relevant
-methods and properties on a live session; only the values were empty).
+Framework coverage is judged against real application/protocol support, not only dev-config use.
 
-1. **Delete a spooled icon when its item goes.** `write_icon_png` wrote
-   `/dev/shm/oblisk-$UID/tray/{unique_name}.png` and nothing deleted one; since `/dev/shm` outlives
-   the process and a reconnecting app gets a new unique name, every restart left a file resident
-   until reboot. `NameOwnerChanged` removal now deletes an item's PNGs, and `TrayController::new`
-   sweeps the directory on startup. Accepted risk: two Supervisors running at once means the second
-   sweeps the first's live files (blank icons until re-spool), a debugging accident rather than a
-   mode, against a leak measured in kilobytes.
-2. **`Passive` is the config's call, not the backend's.** The spec's "likely that visualizations
-   will chose to hide it" is a presentation recommendation, not a data rule, so `TrayItem.status`
-   reaches Lua and `sys_tray.lua` filters while the backend carries every item. Deliberately the
-   opposite of ADR-0031's `should_call_activate`, which is centrally enforced because a wrong click
-   has a side effect on another process; hiding an icon has none.
-3. **All three icon variants are carried, none are composited.** `TrayItem` gains
-   `attention_icon_{name,path}` and `overlay_icon_{name,path}`, resolved through the same pipeline
-   as the base pair, each spooling to its own filename (`{name}.png`, `{name}-attention.png`,
-   `{name}-overlay.png`) so the three don't collide on one path. The Supervisor doesn't apply them:
-   whether `NeedsAttention` swaps the icon is a bar's presentation choice, and overlay compositing
-   needs a `stack` node, which is a canvas the Supervisor doesn't have.
-4. **`SecondaryActivate` and `Scroll` join `TrayAction`.** Middle-click and scroll-over-icon,
-   exported by Telegram, Chromium and Qt's own tray; without them no config can express either.
-   `SecondaryActivate` gets no `should_call_activate` gate, since `ItemIsMenu` governs only the
-   primary click. `Scroll` gets its own argument parser: its `[id, delta, orientation]` would
-   misread as `Activate`'s `[id, x, y]` if shared, silently dropping every scroll; the orientation
-   string passes through unvalidated since interpreting it is the application's job.
-5. **`IconThemePath` resolves in the Supervisor.** An application bundling artwork the session theme
-   doesn't know previously resolved to a name the renderer couldn't find. With a theme path set, the
-   Supervisor now tries `{path}/{icon_name}.png` and `.svg` and returns a hit as `icon_path`
-   (already an absolute path), needing no renderer or IDL change. It outranks `IconName` when it
-   hits. A name containing a path separator is refused rather than sanitized, since a themed icon
-   name never contains one.
+1. Remove spools with items and sweep on startup. Concurrent Supervisors may temporarily erase
+   each other's icons; that debugging-only risk was accepted.
+2. Publish Passive status; hiding is Lua policy, unlike side-effecting activation semantics.
+3. Carry base, attention and overlay icon variants separately; Lua chooses presentation.
+4. Add SecondaryActivate and Scroll. ItemIsMenu gates only primary activation; scrolling needs
+   its own parser rather than Activate's numeric coordinates.
+5. Resolve item-local IconThemePath before theme names; reject path separators in icon names.
 
-Not built: `AttentionMovieName` (KDE3-era, nothing sets it), `WindowId` (X11), `Category` (no bar
-here sorts by it).
-
-Correction recorded: the first audit pass rejected decisions 3-5 as speculative because
-`sys_tray.lua` calls no tray action, which measures one config rather than the surface every config
-gets. Worth remembering for any capability whose only in-repo consumer is `dev-config`.
+Deferred: unused legacy attention movies, X11 WindowId and category sorting.
 
 ## 0075. Compositor detection is session-level, and `workspaces`' seam is a file
 
-ADR-0034 put `CompositorKind` and the compositor probe inside
-`supervisor/src/hardware/keyboard/layout.rs`, alongside `CompositorLink`. ADR-0056 gave `workspaces`
-no trait, reusing that same probe, which left `workspaces/controller.rs` importing from a sibling
-capability and `niri_ipc`'s types as the input of the capability's one pure function. This ADR
-reverses neither prior decision; it is the preparation ADR-0056 named, done while there is still one
-implementor because it only gets more expensive with a second.
+1. Move session compositor detection out of keyboard; keep the keyboard-shaped CompositorLink
+   trait with keyboard.
+2. Use an explicit probe-precedence table and name unsupported sessions. XDG_CURRENT_DESKTOP
+   is diagnostic context, not evidence that a compositor is running.
+3. Reduce neutral workspace/window rows, not niri types. Keep protocol mapping local and share
+   publication/deduplication behavior.
+4. The extensibility boundary is a module, not a speculative trait. A second backend adds a
+   sibling and exhaustive match arms, retaining neutral reducer tests and wire fixtures.
 
-1. **The probe moves to `supervisor/src/compositor.rs`.** Which compositor is running is a
-   session-level fact, not something `hardware::keyboard` should own. `CompositorKind` and
-   `detect_compositor` move to a new top-level `compositor` module; `hardware/keyboard/layout.rs`
-   keeps `CompositorLink` and its two implementors. A pure move, behaviour unchanged.
-   `CompositorLink` deliberately does not move with it, since ADR-0056 settled that the trait is
-   keyboard-layout-shaped and putting it next to the probe would suggest otherwise.
-2. **The probe is a table, and an unsupported session gets named.** `detect_compositor` becomes a
-   `PROBES` table of `(kind, env var)` in probe order instead of an `if`/`else` chain, so precedence
-   is read rather than inferred; a test asserts every `CompositorKind` has an entry and vice versa,
-   with an exhaustive `match` that fails the build on an unmatched variant. `$XDG_CURRENT_DESKTOP`
-   is deliberately excluded: it's a name set by whatever launched the session even when the
-   compositor never came up, unlike every `PROBES` var, which its compositor sets because it is
-   running. A shared `unsupported_session_report()` now names the session ("this session is sway,
-   which has no implementor") instead of each capability printing its own unhelpful message.
-3. **`derive_state` takes rows, not `niri_ipc` types.** ADR-0056's "don't write a trait for one
-   implementor" is sound; that it also made `niri_ipc::Workspace`/`niri_ipc::Window` the reduction's
-   input type was a separate, costlier call, since none of `derive_state`'s judgement (grouping,
-   ordering, the optional `focused_workspace`, `app_id`-into-`class`) is niri-specific logic, only
-   niri-specific types. `derive_state` now takes `&[WorkspaceRow]` and `Option<&FocusedWindow>`;
-   `workspaces/niri.rs` is the only file naming `niri_ipc`, mapping niri's state onto those rows.
-   The split follows what varies: which window holds focus is the adaptor's question (niri flags it
-   per window; another compositor may query separately), what that window becomes is neutral and
-   stays in the reduction. `StatePublisher` (reduce, drop a no-op update, store, wake `main.rs`) is
-   the write half of the same seam, eight lines every adaptor would otherwise copy.
-4. **The seam is a module boundary, and stays one until a second implementor is live.**
-   `WorkspacesController` still matches `CompositorKind` rather than holding a `Box<dyn>`; a trait
-   with one implementor is still Speculative Generality, and Hyprland's per-monitor-active versus
-   niri's global-focus models still don't map by renaming fields. What changed is that the line a
-   trait would sit on is now a file boundary: a second compositor is a sibling module plus two
-   exhaustive-match arms, inheriting the reduction, the publish contract and their tests.
-   `derive_state`'s ten tests build rows directly and name no compositor; `niri.rs`'s tests keep
-   ADR-0056's wire-JSON fixtures, deserialized from a live `niri msg -j` rather than struct
-   literals, so a niri field rename breaks them.
-
-Not decided: whether the eventual trait is one trait or two, left for the commit that adds a second
-live-tested compositor.
+Whether a future abstraction needs one trait or two remains undecided.
 
 ## 0076. The capability roster is a type, and the module tree mirrors it
 
-Replaced the hand-kept `CAPABILITIES: &[&str]` list and sixteen separate controller locals in
-`main.rs` with a `shared::Capability` enum and a `Capabilities` struct, and reorganized the
-Renderer's capability modules to mirror the roster one-to-one.
+1. Replace the string roster with shared Capability and exhaustive matches. Typed snapshot
+   names replace runtime membership assertions. Idle/Polkit were then explicit non-roster cases.
+2. Capabilities owns controllers; main owns the loop. Race only receives, then process the winning
+   signal, so cancellation cannot discard an event during an awaited state rebuild.
+   Keep separate typed channels, not ADR-0037's rejected merged payload channel.
+3. Organize by capability rather than D-Bus/hardware transport. Lock remains boot-created for
+   restart recovery and is passed into dispatch.
 
-1. **`shared::Capability` replaces the string roster.** The roster is an enum generated by one
-   `roster!` macro (produces `ALL`, `as_str`, and the enum). Both `main.rs` matches became
-   exhaustive, so a new variant fails the build at exactly the two arms needing code.
-   `snapshot::push_snapshot` now takes `Capability`, replacing ADR-0037's `debug_assert` with a type
-   that makes an off-roster name unrepresentable. `idle` and `polkit` stay off the roster: `idle` is
-   event-shaped, not snapshot state (ADR-0032); `polkit` arrives via `secure_submit` naming it, not
-   a capability read (ADR-0070 decision 5).
-2. **`Capabilities` owns the sixteen controllers, `main.rs` owns the engine loop.**
-   `Capabilities::new` builds every channel and returns the receiving half as `Signals`; `start`,
-   `push`, and `dispatch` are the three things a capability does. `main.rs` drops from 1081 to about
-   760 lines. The split between `Signals::next` (only awaits `recv()`) and `Capabilities::push`
-   (runs in the winning `select!` arm's body) is load-bearing: `network` and `bluetooth` await while
-   building state, and folding that await into the raced future would let a busier branch drop a
-   signal mid-flight. This is not ADR-0037's rejected merged channel: channels stay sixteen typed
-   single-variant ones, and ADR-0037 decision 3's "static calls, no registry, no trait" dispatch is
-   unchanged.
-3. **One module per roster entry, flat, under `capabilities/`.** The old `dbus/` and `hardware/`
-   transport-based groupings are dissolved (`battery`/`power` were the same subject split by
-   transport, not something a config author can see). Shared helpers moved to `capabilities` itself
-   (`read_attr`, `parse_bool_arg`); `shm_icons` sits beside `tray` and `notifications`, its only two
-   users. `polkit` was never a capability and moved to top-level `crate::polkit`. `lock` keeps one
-   asymmetry: `LockController` is built at boot, not started on demand, because the Supervisor's
-   relock path (ADR-0060) commands it before any config is read, so `Capabilities::dispatch` is
-   handed it rather than owning it.
-
-A 2026-09-01 follow-up found the roster type still had a gap: adding a capability guarded the Lua
-namespace, stubs, and schema check, but not the channel wiring (`Signals`, `Senders`,
-`Signals::next`, and `Capabilities::new`'s pairs were four more hand-written lists).
-`capabilities::capability_channels!` now derives all four from one list and emits an
-exhaustive-match check so a roster variant with no channel and no stated exception fails to build.
-`lock` is the one stated exception (ADR-0060, ADR-0052). `Signal` itself stays hand-written: its
-variants document which payload each capability carries, and `push`'s exhaustive match already
-guards it.
-
-Not built: reorganizing the Renderer's largest files (`layout/scene.rs`, `wayland/surface.rs`,
-`wayland/input.rs`); each was judged cohesive on its own and left alone.
+Follow-up, 2026-09-01: derive channel senders, receivers, selection and construction from one
+macro list, exhaustively checked against the roster. Lock is the stated channel exception.
+Keep the signal payload enum hand-written and exhaustively dispatched.
+Do not reorganize unrelated cohesive Renderer files.
 
 ## 0077. The layout math is taffy's, not this crate's
 
-Supersedes ADR-0023's hand-written one-pass layout solver: taffy now owns sizing and positioning.
-ADR-0023 items 1-9 and 12 (what Phase 12 did not build) are untouched; this reverses item 4's
-arrangement formula, item 10's one-pass budget, item 11's un-repositioned descendants, and the "one
-recursive function doing all three passes" decision, because item 11 was a defect ADR-0023 itself
-named and no later ADR fixed.
+Supersedes ADR-0023's hand-written arrangement, one-pass and descendant-positioning choices,
+not its unrelated deferred features.
 
-1. **`taffy` 0.14 owns sizing and positioning; `layout::scene` owns everything else.** `scene.rs`
-   keeps node identity and reconcile (ADR-0045), the lease and child-first teardown, the depth cap,
-   once-per-node property resolution, the scroll clamp and writeback (ADR-0069), and text elision. A
-   pass is now `prepare` (resolve/parse each node once, build one taffy node per node), `solve` (run
-   taffy), `finish` (read geometry back, apply scroll offset, elide text). `taffy_style` is the only
-   place that knows what `row` or `Fill` means: `row`/`column` are `Display::Flex`; the stacking
-   model (ADR-0023 item 4) is `Display::Grid` with every child pinned to row 1/column 1, one
-   auto-sized cell, each child aligned independently, container sized to their bounding union;
-   `Fill` along the flow axis is `flex_grow: 1.0` over a zero basis, elsewhere it is a stretch;
-   `spacing`→`gap`, `visible = false`→`Display::None`. `flex_shrink` and `min_size` are forced to
-   zero (this engine has no shrink concept); rounding is disabled since `text::snap` handles pixel
-   snapping at paint time. Dependency count goes 151 to 152 (arrayvec/slotmap/smallvec were already
-   present); only `flexbox`, `grid`, `taffy_tree`, `std` features are on. `content_size` was tried
-   and dropped: taffy's `scrollable_overflow_rect` excludes children's margins but this engine's
-   footprint includes them (amendment on ADR-0069), so the scroll extent is summed here instead.
-   `scene.rs` loses 78 lines; the change is a net deletion. The measure callback answers only `text`
-   and `icon` sizing, memoized on `(text, size, wrap width)` via `ShapingHandle` so repeats never
-   cross the channel.
-2. **Item 11 is fixed, item 10 is not.** A `Stretch` child of a `Content`-sized parent now correctly
-   relayouts its descendants after the parent's size resolves (item 11's bug). A `Fill`/`Percent`
-   child of a `Content`-sized row still resolves to zero (item 10), because that is the same answer
-   CSS gives an indefinite container: no regression, and now backed by a specification rather than a
-   comment.
-3. **Two behaviours change deliberately; one that could have does not.** An invisible node
-   (`Display::None`) now leaves the layout entirely, with no size or no `spacing` gap reserved,
-   where the old pass resolved its geometry and then declined to place it; nothing outside
-   `layout::scene` can observe the difference. Property getters now fire in plain depth-first
-   declaration order (no more multi-round recursion), matching the existing guarantee that every
-   getter fires exactly once in config-write order. A `Stretch` alignment still outranks an explicit
-   size on the same axis, even though CSS would apply stretch only to an `auto` cross size, because
-   changing that is a config-facing question separate from the solver swap and was left alone.
-4. **The depth cap stays at 64, on a better measurement.** The old comment modeled worst-case stack
-   depth from this module's own recursion only, excluding mlua frames, and was optimistic. Measured
-   by shrinking a thread's stack to the crash point: the old hand-written pass needed about 1,400
-   KiB for the worst case (cap depth with a 31-deep computed `margin` chain), a 1.44x margin on the
-   2 MiB debug test thread, versus the 2.6x the old comment claimed. The solver's same worst case
-   peaks at about 1,040 KiB (1.97x margin); a 64-level tree with no signals costs about 590 KiB
-   (~8,960 B/level). A `taffy::Style` is 552 bytes, built and consumed in a frame that returns
-   before recursion descends, rather than multiplied across the cap.
+1. Taffy owns sizing/positioning; scene code retains identity, leases, parsing, scroll bounds and
+   elision. Prepare once, solve, then finish. Keep text measurement cached and pixel snapping in paint.
+2. Fix stretched descendants after content-size resolution. Fill/percent in an indefinite flow
+   container still resolves to zero.
+3. Hidden nodes leave layout; getters run once in declaration order. Preserve Stretch overriding
+   explicit size rather than introducing an unrelated config change.
+4. Keep depth 64. Measured worst-case stack fell about 1400 to 1040 KiB, including computed signals.
 
-Not built: reusing one `TaffyTree` across passes with dirty-node marking, which is what taffy's
-per-node cache is for. Currently a tree is built and dropped inside each `apply_one_instance` call
-(why a failed walk needs no extra rollback). Not built because nothing has measured a need, and
-because a tree that outlives a pass needs reconciliation against the retained tree, a second
-identity problem beyond the one ADR-0045 solved.
+Build a fresh solver tree per apply; persistent solver caching would need another reconciliation
+lifetime and waits for measurement.
 
 ## 0078. `exclusive` is three answers, not a boolean
 
-`exclusive` was typed `boolean`, but `zwlr_layer_surface_v1::set_exclusive_zone` has three distinct
-meanings (a positive zone reserves that much; `0` reserves nothing but still positions inside what
-others reserved; `-1` reserves nothing and ignores what others reserved, covering the output), and
-the boolean could reach only the first two.
+1. Add exclusive Ignore beside existing booleans: reserve, respect others' reservations, or
+   ignore them without reserving. This fixes backgrounds shrinking below bars.
+2. Use Respect for unresolved signal placeholders; temporary reserve/ignore would move other UI.
+3. Reject unknown strings instead of silently defaulting.
 
-This was caught live: `dev-config`'s wallpaper is a `panel` on `Background` anchored to all four
-edges with `exclusive = false`. At startup it filled the 1920x1200 output; once the bar mapped and
-claimed 39px, niri reconfigured it to 1920x1161 and it sat below the bar instead of behind it. No
-boolean value fixed this: `exclusive_zone_for` answers `0` for a surface anchored to all four edges
-(no single edge to reserve against), so `true` and `false` were the same request on exactly the
-surface that needed the third answer.
-
-1. **`exclusive` accepts `boolean` or `"Ignore"`.** `true` reserves along the anchored edge; `false`
-   (default) reserves nothing but stays inside what others reserved; `"Ignore"` reserves nothing and
-   ignores what others reserved. Parsed into `node::Exclusive { Reserve, Respect, Ignore }`, one
-   variant per protocol case, mapped by `apply_exclusive_zone` to the derived zone, `0`, and `-1`.
-   Additive, not a migration: `true`/`false` keep their existing meanings, so only `dev-config`'s
-   wallpaper needed editing. `boolean / string` rather than a pure enum matches this IDL's existing
-   shape for a scalar with one special case (`width`/`height` are `integer / string`, parsed by
-   `parse_size_mode`); spelling it as a three-way string enum would read more uniformly but breaks
-   every existing config for no gain. Named for what each does (`Reserve`/`Respect`/`Ignore`), not
-   for the number sent: `Reserve` and `Respect` are the two non-ignoring answers, and the pairing is
-   what makes `0`'s meaning legible.
-2. **The deferred placeholder stays `Respect`.** `exclusive` is not a structural property, so a
-   `Signal` in it resolves normally at layout time, but it is read twice: `socket::surface_specs`
-   reads the raw map before any getter runs (placeholder value), and `App::apply_resolved_state`
-   re-reads the resolved tree. `Respect` is the only one of the three invisible for the frame it
-   lasts: `Ignore` would paint a wallpaper over the bar until corrected; `Reserve` would shove every
-   window aside.
-3. **An unknown string fails the pass.** `exclusive = "ignore"` or `"None"` are refused by name
-   rather than silently read as `Respect`, the same protection `NODE_PROPERTIES` gives against key
-   typos (before it existed, `aling_v = "Center"` was silently accepted and read by nobody). A value
-   typo deserves the same treatment as a key typo.
-
-Rejected: a numeric zone like Quickshell's `exclusionMode` + integer `exclusiveZone` (where setting
-the integer implicitly flips the mode to `Normal`), because nothing needs a custom reserved amount
-and the implicit mode flip is the part worth not copying; renaming to match Quickshell's
-`Auto`/`Normal`/`Ignore` (`Auto`=`Reserve`, `Normal` with zone 0 = `Respect`, `Ignore`=`Ignore`
-exactly), because these names describe what the surface asked for rather than how the number was
-derived, only `Ignore` is shared since its meaning is the protocol's own.
-
-Not built: bumping the IDL minor version. The versioning rule only starts at the first push to
-origin (ADR-0069 set this precedent adding `scroll` to the same spec section); 0.1.0 is a
-placeholder until then.
+No numeric custom zone or wholesale enum migration without a caller. Versioning remained
+pre-release; the entry did not bump the placeholder minor version.
 
 ## 0079. A rounded clip is an offscreen pass, not a rounded scissor
 
-An earlier phase shipped only a rectangular clip, leaving femtovg's `intersect_rounded_scissor` as
-the intended upgrade path; that path does not work, and a real offscreen-composite pass replaced it.
-The bug it was left for: `dev-config`'s battery indicator is a pill whose fill child should be cut
-by the pill's rounded clip, but a rectangular clip cut it square, and the config's workaround
-(giving the fill the pill's own radius) rounded the fill's right edge too, drawing a lozenge instead
-of a filled arc.
+1. Rounded clipping renders children offscreen and composites through the rounded path, then
+   paints the border. The recursive display-list group remains comparable.
+2. Reject rounded-scissor intersection: femtovg's single rounded rect cannot represent the required
+   intersection. The measured pill test leaked 8% along a straight edge.
+3. Radius alone does not enable the extra pass. Box remains default; a childless rounded clip
+   requires no offscreen group.
 
-1. **`clip = "Rounded"` renders its subtree offscreen and composites it through the node's path.**
-   `layout::paint::build` emits a `Draw::Clipped` group holding the node's children; `execute`
-   allocates an offscreen image sized to the node's clip rectangle, draws the group into it, then
-   fills the node's rounded path with that image as the paint, so the path itself is the mask.
-   `Draw::Clipped` is the one recursive variant in the display list; every other clip is an
-   axis-aligned rectangle, which is what lets each `DrawCmd` carry one flattened `clip` instead of a
-   save/intersect/restore nest (ADR-0063 relies on the display list staying comparable, and
-   `Draw::Clipped` still derives `PartialEq`). The rounded case emits three commands where the
-   rectangular case emits one (fill, group, border), because the border must paint over the clipped
-   content, matching QML's `ClippingRectangle`.
-2. **femtovg's `intersect_rounded_scissor` is not a real alternative.** femtovg 0.26 keeps exactly
-   one scissor in its canvas state, a single rounded rectangle, so it cannot represent "this
-   rectangle intersected with that arc." Intersecting a rectangle into an existing rounded clip
-   takes one of three branches: keep the rounded clip, drop the radius, or re-round the intersection
-   with the old radius; a part-width child of a pill takes the third, which re-rounds the child's
-   own box into the same lozenge artefact. Measured on an 80x32 pill at radius 16 with a child
-   filling its left 30px: the scissor route bled the ground through at 8% along the pill's straight
-   top edge where the offscreen-composite route did not.
-3. **`radius` does not imply a rounded clip; a config asks for one.** `clip` takes `"Box"` (default,
-   a plain scissor rectangle the GPU applies for free) or `"Rounded"` (an offscreen render target
-   plus a composite per clipping node per repaint). Most rounded boxes on this bar have no
-   overflowing child, so charging all of them for a pass none of them need is the wrong default;
-   QML's own `Item.clip` is rectangular and ignores `radius` for the same reason. femtovg fills a
-   path directly with an image paint, so one render target suffices, versus Quickshell's
-   `ClippingRectangle`, which needs two because its mask must be a texture for a fragment shader to
-   sample. A childless node with `clip = "Rounded"` costs nothing: there is no group to render.
-
-Not built: hit testing does not know about the arc (`layout::hit` intersects the same rectangles, so
-a pill's corner, about 4px on a 34px control, is outside the fill but still clickable); the honest
-fix is hit testing sharing paint's walk rather than a second rounding rule, and nothing has asked
-for it. The offscreen image is allocated and freed per clipping node per repaint, after the flush
-that consumes it, since femtovg records draw calls and executes them at flush; a size-keyed pool
-next to `ImageCache` is the upgrade path once a config puts a rounded clip on something repainting
-at pointer rate. Today the bar only repaints on signal change (ADR-0063).
+Hit-testing remains rectangular, so rounded corners can still receive input. Allocate/free the
+target per repaint after consuming draws; a size-keyed pool waits for a high-frequency caller.
 
 ## 0080. The battery comes from UPower, not sysfs
 
-Replaces the earlier sysfs/udev-based battery watch and the `charging: boolean` field in § 2.2:
-`oblisk.battery` now reads UPower's `DisplayDevice` over D-Bus and follows its `PropertiesChanged`,
-with no sysfs, no udev, and no timer. Two separate bugs from the same bar drove this, and one source
-fixes both.
+Replace the stale sysfs/udev battery source and ambiguous charging boolean with UPower.
 
-The reading was stale: the pill's percentage sat still while the machine discharged, because
-`run_battery_task` read `/sys/class/power_supply` only when udev fired and fell back to a 30s poll
-only if the watch failed to build, wrongly assuming a watch that builds also fires. Measured
-alongside `udevadm monitor --udev --subsystem-match=power_supply`: `capacity` moved from 69 to 65
-over the window, but 0 `power_supply` uevents were delivered, while UPower's own view tracked every
-point. The ACPI driver on this hardware emits a uevent only on plug/unplug.
+1. Read DisplayDevice state names, presence and estimates in one property snapshot. Presence
+   requires battery type and IsPresent; unknown states remain Unknown and zero estimates become nil.
+2. No sysfs fallback: it misses observed capacity changes and cannot supply equivalent estimates
+   or pending-charge states. Missing UPower yields no data, not a fabricated answer.
 
-A boolean could not represent what was happening either: `charging` was `status == "Charging" ||
-status == "Full"`, but sysfs's five status words cover states a charge-threshold laptop actually
-visits, and three of them collapsed into `false` while one said `true` for a battery that was not
-charging (`Not charging` at the limit on mains, and `Discharging` while draining down to the limit
-on mains, both need the mains adapter's `online` bit read and combined with status, which is
-UPower's own `up-device-supply` logic reimplemented from the same files). On this machine
-`charge_control_end_threshold` is 70, so that misreported state is most of every day.
-
-1. **`DisplayDevice`, and the states by name.** `BatteryStatus` maps UPower's `Device.State`
-   numbering to names (`Charging`, `Discharging`, `PendingCharge`, `PendingDischarge`,
-   `FullyCharged`), serialized as a string so a config compares `b.state == "PendingCharge"`, the
-   same shape `mpris`'s `play_state` already uses. An unrecognized future state reads as `"Unknown"`
-   rather than failing the capability. `present` is `Type == Battery && IsPresent`, both halves
-   (matching Quickshell's `isLaptopBattery` check; `IsPresent` alone is true on non-battery
-   hardware). `time_to_empty`/`time_to_full` come from the same `GetAll` call and are `nil` when
-   UPower reports `0` (while charging or before it has estimated). The proxy addresses the
-   well-known fixed path `/org/freedesktop/UPower/devices/DisplayDevice` directly rather than
-   calling `GetDisplayDevice()`, and takes one `PropertiesChanged` subscription for the whole object
-   rather than one per property, so a percentage and a state flip that happen together arrive as one
-   message. Checked against Quickshell's own source (`core.cpp`/`device.cpp`): no timer anywhere,
-   because UPower does the polling and every client inherits it.
-2. **No sysfs fallback.** A host without UPower prints one line and reports nothing, the same
-   pattern § 2.13 uses for a missing power-profiles-daemon and ADR-0053 established for any
-   capability with no implementor. A sysfs fallback was considered and dropped: it cannot fill the
-   payload it would be falling back for (no `PendingDischarge` without also reading the mains
-   adapter, no `time_to_*` at all), and it is the same path measured above as blind to changes the
-   kernel does not announce. A fallback that reports a worse answer under the same field names is
-   harder to diagnose than no answer.
-
-Not built: 0% glitch suppression (holding the last percentage when UPower reports a spurious 0% on
-AC) is not written, because it has not been reproduced on this machine; the fix is known (about six
-lines, keyed on state not being `Discharging`) if it is seen. The charge threshold itself is not in
-the payload: `charge_control_end_threshold` is a sysfs file UPower does not expose, so a config can
-say "charge limit reached" but not the percentage; it is one `read_attr` away if needed.
-`brightness` keeps its udev watch unchanged since it was confirmed firing when written, and logind,
-not the kernel driver, is its write path.
+Measured capacity fell 69 to 65 with zero power-supply uevents while UPower tracked it.
+No speculative 0% glitch filter or charge-threshold field. Brightness's verified udev path stays.
 
 ## 0081. The stubs are checked against the config, not just parsed
 
-`just check` now runs `lua-language-server --check` over `dev-config/oblisk` and `share/starter`, so
-`lua-meta`'s declared types are checked against real config code instead of only being parsed. This
-amends `lua-meta/nodes.lua`'s header, which had argued that spelling `Signal` into every property
-union would drown the useful types.
+Check real configs against Lua stubs, not just parsing and field-name inventories.
+A probe found 21 useful missing Signal unions; add them while preserving structural restrictions.
 
-Three existing guards (`luac -p` proving a file parses; `meta_stub_tests` proving every node kind is
-declared, its `---@field` names match `accepted_properties`, and every parser-read property is
-accepted by some kind; `supervisor/src/stubs.rs` proving the generated half matches its payload
-types) all checked names, never a declared type. `.luarc.json` already pointed the language server
-at `lua-meta`, so editors were already running this check and discarding the answer.
+Use complementary checks: sample every declared type through real scene apply to catch promises
+the engine rejects; language-server checks catch omissions exercised by real configs.
+Check lua-meta as its own workspace so library diagnostics cannot be suppressed; use explicit
+LuaCATS prose markers on return annotations.
 
-That gap let a wrong type stand: the header claimed every property takes `Signal` whether or not its
-union said so, as a stated readability trade. A generated probe binding `Signal` to all 192
-kind/property pairs found 28 properties that reject a `Signal` the engine accepts (7 of those are
-callbacks where the union would be true but useless); 21 were fixed by spelling `|Signal` on
-`radius`, `spacing`, `font_size`, `align_h`, `align_v`, `clip`, `elide`, `fit`, `size`,
-`text_align`, `direction`, `exclusive`, `keyboard_interactivity`, `app_id`, `parent`, `grab`,
-`gravity`, `placeholder`, `mask_character`, and a popup's `width`/`height`. Since `lua-meta` is what
-the language server reads, an omitted union member was a red squiggle under working config code, and
-the cost fell on whoever wrote that code.
-
-Two sets still correctly name no `Signal`: structural properties (`id`, `hover`, `scroll`, a panel's
-`layer`/`anchor`/`monitor`/`namespace`) are copied raw rather than resolved because they are
-identities, so the engine truly refuses a `Signal` there; callback properties (`on_click`,
-`on_change`, `on_submit`, `on_close`, `on_dismiss`, `itemfn`, `key`) resolve normally and are then
-refused for not being a function, so `fun(...)|Signal` would be true but would only worsen
-completion.
-
-Generating `nodes.lua`/`surfaces.lua` from Rust was considered and rejected. The names are already
-data (`NODE_KINDS`, `COMMON_PROPERTIES`, `BOX_PROPERTIES`, `NODE_PROPERTIES`), but the types and
-prose live in 49 `parse_*` functions and 45 `properties.get` call sites across ten files, so
-generating would only move a hand-written claim from a `.lua` file to a `.rs` file. A genuinely
-derived version would need rewriting the parse layer to per-kind structs the parsers read fields
-off, trading this crate's per-property error messages for serde's; that rewrite was not undertaken.
-Instead, `every_type_the_stubs_declare_is_accepted_by_the_engine` builds `kind { property = <sample
-of the declared type> }` for all 408 declared type members and runs a real `Scene::apply`, so a type
-with no sample fails the test rather than passing quietly.
-
-The engine test and `just types` catch opposite gaps and neither subsumes the other: the engine test
-catches the stub promising what the engine refuses, by feeding each declared type to `Scene::apply`;
-`just types` catches the stub omitting what the engine accepts, by checking real config code. The
-engine test cannot do the second direction, since trying every undeclared sample and asserting
-refusal collapses on aliases (`width` is `Length|Signal` but accepts a bare `integer`; `content` is
-`string` but accepts a `Color` sample because a hex colour is a string).
-
-Measured value: `dev-config` returned six diagnostics, all in `components/icon_button.lua` and none
-a stub bug (three locals holding either a colour string or a `Signal`, disambiguated by a runtime
-`type(x) == "userdata"` test since LuaCATS has no user-defined type guards; fixed with four
-`---@type` and five `---@cast` annotations). The check earns more on the 174 generated payload
-fields than on node properties: a typo like `b.percentt` in a `:map` callback is now a build failure
-naming the field, where before it silently rendered a blank pill. The check is optional in `check`,
-since `lua-language-server` is not a build dependency and there is no CI installing it; if absent,
-it is skipped with a line saying so, never a silent pass.
-
-`lua-meta` is now checked as its own workspace rather than loaded as a `workspace.library` for
-`dev-config`/`share/starter`, because a library's own diagnostics are suppressed. That had hidden a
-real fault: LuaCATS' `---@return T a, b` declares two returns, so a comma inside single-return prose
-makes the next word a type, and `---@return Signal Read-only, like \`map\`.` had declared a return
-of type `like`, invisible because checking the config correctly found nothing wrong with the config.
-`lua-meta`'s files declare everything they reference, which is what lets them stand alone as a
-workspace; single-return prose now uses `---@return T # ...`, LuaCATS' explicit comment marker.
-
+Reject generating types from the current parser layer: it would relocate hand-written claims,
+not derive them. Language-server checking is optional when absent, but the skip is explicit.
 
 ## 0082. `oblisk.network` is subscribed to the association, not just to the scan
 
-`NetworkState` carries the whole of docs/oblisk-idl-api-specs.md §2.5, and the forwarders watch the
-NetworkManager properties that move when a link comes up. ADR-0029 left "the exact `NetworkState`
-struct shape" open and the first implementation answered it with `scanning` plus the AP list; this
-is the rest of the answer, forced by a bug that shape could not avoid.
+1. Connectivity comes from PrimaryConnection, not AP identity; AP lists cannot describe wired
+   routes, radio power or DHCP progress.
+2. Subscribe to association/device/manager changes, not only scan events. An observed 90-second
+   association emitted no old scan wakeups.
+3. Reduce all sources through one Changed event and full state rebuild.
+4. SSID names the association; connected names the default-route result. Wired default wins.
+5. Ethernet enabled reports activation state so disconnect has an observable read-back, not carrier.
+6. Property-stream cache hydration supplies startup state; avoid a duplicate explicit read.
+7. Watch strength on the associated AP only, retargeting/aborting with association changes.
+   Measured 26 versus 76 events over 180 seconds did not justify debounce.
+8. Retain AP proxies across rebuilds: 11.25 to 0.84 ms at ten APs. Sort the connected AP before
+   the top-20 cut so a weak but active connection cannot disappear.
 
-1. **The AP list is not a connectivity source.** `available_networks[].active` was the only thing
-   saying whether the machine was online, and it is wrong for that job three ways: a wired link
-   never appears in it at all, a powered-down radio is indistinguishable from a powered one joined
-   to nothing, and an association that has not yet won the default route reads the same as a working
-   one. `connected` now comes from NetworkManager's `PrimaryConnection`, which names the active
-   connection holding the default route (`/` when nothing does) — §2.5's "default gateway interface
-   is active", read literally off the one property that means it.
-2. **The wake-ups were the bug, not the dedup.** The forwarder subscribed to `AccessPointAdded`,
-   `AccessPointRemoved`, and `LastScan`. None of the three moves when the radio joins or leaves a
-   network, and on a connected idle machine none of them fires at all: measured on this hardware,
-   90 seconds of an established association produced zero. Associating after the bar started left
-   `active` false until the next scan happened along, minutes later. `Wireless.ActiveAccessPoint`,
-   each device's `Device.State`, and the manager's `WirelessEnabled`/`NetworkingEnabled`/
-   `PrimaryConnection` are now subscribed too. This is what Quickshell's own NM backend binds
-   (`src/network/nm/`: `Network.connected` tracks the active connection's state, never AP identity),
-   and the same conclusion arrived at from the other end.
-3. **One `Changed` variant, not one per source.** Every added subscription ends in the same full
-   re-derive, since ADR-0029 item 6 already refuses to keep incremental state. `NetworkSignal`'s
-   `AccessPointsChanged` became `Changed` rather than growing five siblings that all mean the same
-   thing to `handle_signal`.
-4. **`ssid` names the association; `connected` answers the route.** `"Ethernet"` when the default
-   route is wired, the joined SSID otherwise, `nil` when nothing is joined — so a network still
-   negotiating DHCP has an `ssid` and a `connected` of `false`. Wired wins over a simultaneous Wi-Fi
-   association, because `ssid` has to name the link `connected` is about, and a docked laptop stays
-   joined to Wi-Fi the whole time it is on a cable.
-5. **`ethernet_enabled` is device state, not link carrier.** §2.5 words it as the carrier, but the
-   carrier is up whenever a cable is seated, which would leave `set_ethernet_enabled(false)` (ADR-
-   0029 item 5: `Device.Disconnect()`) looking like it did nothing. Reporting `ACTIVATED` is the
-   read-back the setter's own toggle needs, the same kind of deviation §4.1 already documents for
-   `NetworkingEnabled` being read-only and `Enable()` being the real switch.
-6. **No startup read.** zbus emits a property stream's current value once when the cache first
-   fills, so the forwarders prime the first snapshot on their own; a separate build-and-push at
-   construction would only duplicate it.
-7. **`AccessPoint.Strength` is watched on the associated AP only, and needs no debounce.** Measured
-   over 180 seconds on this hardware: the associated AP emitted 26 times, a 6-second poll that stays
-   quiet while the number holds, against 76 emissions across all 17 APs in range — one every 2.4
-   seconds, indefinitely, for percentages behind a panel that is closed almost always. A rebuild
-   re-reads every AP's strength regardless, so the association's own clock refreshes the whole list
-   at a third of the traffic. One rebuild per ~7s is also the answer to ADR-0029 item 6, which said
-   to reconsider debounce only against real numbers: these are the numbers, and they do not justify
-   it. The watch is re-targeted on every `ActiveAccessPoint` change and the previous task aborted —
-   an orphan would go on asking for rebuilds for an AP nothing is connected to.
-
-8. **Access-point proxies are kept warm; the connected AP is sorted ahead of the cut.** Two things
-   the rebuild got wrong once it started running every ~7 seconds rather than once a scan.
-
-   Binding a fresh `AccessPointProxy` per access point per rebuild made zbus set up a property
-   cache each time — a match rule, a `GetAll`, an unsubscribe — and throw it away at the end of the
-   loop body. Measured at 10 access points: 11.25ms a rebuild for fresh-and-cached, 9.51ms for
-   fresh-and-uncached, 0.84ms for proxies held across rebuilds. 13x, and it is spent inline in
-   `main.rs`'s `select!` arm where ADR-0028 already warns about unbounded awaits. The proxies now
-   live in the controller keyed by object path, pruned against the live path list each rebuild
-   rather than by watching `AccessPointRemoved` — the same signal that asks for the rebuild anyway.
-
-   Separately, `build_state` reads `ssid` and `strength` out of the deduplicated list *after* it is
-   cut to 20, so an association weaker than 20 neighbours was truncated away and a plainly-online
-   machine reported as joined to nothing. Dense apartment RF reaches 20 SSIDs easily. `active` now
-   sorts ahead of strength, which keeps the connected network inside the cut and also makes the
-   payload order the one a panel wants, so `network_panel.lua` no longer copies and re-sorts the
-   list to arrive back where it started.
-
-Not built: multi-adapter selection and hot-plugged device discovery, both still open from ADR-0029's
-module header.
-
+Multi-adapter selection and hotplug discovery remained unbuilt.
 
 ## 0083. `network:connect` reuses a saved profile, and the AP order is deterministic
 
-A second pass over the same two references ADR-0082 came from — the Quickshell `NetworkService.qml`
-this shell mirrors and quickshell-mirror's `src/network` backend — against the finished
-implementation. Two of the differences were real defects on our side.
+1. Reuse saved SSID profiles with ActivateConnection; create only unknown profiles. The old
+   unconditional creation produced duplicate UUIDs on every rejoin.
+2. Update a retyped saved password without deleting/recreating other profile settings.
+   Skip enterprise updates because GetSettings omits secrets; a proper secret agent is required.
+3. Break equal-strength AP ties by SSID instead of inheriting HashMap order.
+4. Reject signal-tier ordering after measurement: neighbours held strength between scans and
+   the changing associated AP was already pinned first.
 
-1. **Connecting created a profile every time, saved or not.** `connect_inner` called
-   `AddAndActivateConnection2` unconditionally. NetworkManager does not deduplicate: it accepts a
-   second profile with the same `id` *and* the same SSID without complaint, confirmed by adding
-   `oblisk-dup-test` twice and getting two UUIDs back. So every re-join from the panel left another
-   copy behind, and autoconnect could later pick a stale one over the good one. The QML does not
-   have this bug because it asks `wifiNetworkForSsid(target)` first and only creates for an SSID
-   the machine has never seen.
-
-   `activate_intent` now takes the same shape: a saved profile for the SSID gets
-   `ActivateConnection`, and only an unknown SSID reaches `AddAndActivateConnection2`.
-
-2. **A password typed for a saved network is written back, not dropped.** Reusing the profile
-   raises a question creating one never had: what a re-typed password means. Ignoring it would make
-   a profile saved with the wrong key unfixable from the panel — forget-then-rejoin would be the
-   only route — so it goes to `SettingsConnection.Update` first.
-
-   Via `Update` rather than delete-and-recreate because `Update` replaces the whole profile and
-   every other section survives it. The three Wi-Fi profiles on the development machine each carry
-   `ipv4.address-data`, `route-data` and `802-11-wireless-security.auth-alg`; recreating would drop
-   all of it to fix a typo.
-
-   ponytail: skipped for enterprise profiles. `GetSettings` omits secrets, so rebuilding an 802.1X
-   profile from its own read-back would drop the stored password with it. NM's copy is the better
-   bet until there is a secret agent to answer for one, which ADR-0029 leaves out of scope.
-
-3. **The AP sort had no tiebreak, over an input with no order.** `dedup_and_top20` sorted on
-   `(active, strength)` with a stable sort, and its input is a `HashMap` drain whose order moves as
-   access points come and go. Two APs at one strength swapped rows between rebuilds for no reason,
-   and a tie across the 20th place decided arbitrarily which one was cut. The QML's comparator ends
-   in `localeCompare(ssid)` for exactly this; ours now ends in the SSID too.
-
-4. **Tier-based ordering was measured and rejected.** The QML sorts on `signalTier`, not raw
-   signal, and says why: "scan-to-scan jitter cannot reshuffle the list under the cursor." Worth
-   copying on its face, since ADR-0082 took rebuilds from once-a-scan to every ~7 seconds. Reading
-   `AccessPoint.Strength` off the bus eight times over 56 seconds says otherwise: every neighbour
-   held a single value (swing 0) and only the associated AP moved (swing 3, 60..63), because
-   NetworkManager refreshes a non-associated AP's `Strength` only at scan boundaries. The one that
-   does move is pinned to row 0 by `active` already. Tiering would trade a real ordering signal for
-   a stability problem this backend does not have, and would widen exactly the ties item 3 is
-   about.
-
-Closed by ADR-0084: nothing reported a failed association, because `AddAndActivateConnection2`
-returns before the radio has tried.
-
+Association failure reporting remained missing until ADR-0084.
 
 ## 0084. A connect attempt reports its own outcome
 
-`network:connect` returned as soon as NetworkManager accepted the request, which is before the radio
-has tried anything. A wrong password was an `eprintln!` and a panel that showed nothing, which is
-ADR-0083's one remaining item. `NetworkService.qml` answers it with `connectError`/`connectingSsid`
-properties; this is the same answer over D-Bus.
+1. Carry connecting_ssid and connect_error in snapshots as remembered attempt state, preserved
+   across backend re-derivation.
+2. Observe the activation object's StateChanged verdict and read current state after subscribing.
+   A failure in that gap loses its detailed reason, not the completion.
+3. Hand-write only the broken Active proxy: the dependency subscribed to lowercase state_changed,
+   which NM never emitted. Keep the proxy crate elsewhere.
+4. Accept replacement attempts; discard verdicts whose SSID is no longer current.
+5. Saved networks activate without waiting for a new secret. Unknown-network prompting remains
+   separate surface-policy work.
+6. The example panel reports the attempt in its header without copying/enriching every AP row.
 
-1. **Two fields, not a new channel.** `NetworkState` gains `connecting_ssid` and `connect_error`,
-   pushed on the snapshot the capability already sends. The pattern is `LockState`'s
-   `authenticating` + `error` and `UpdatesState`'s `installing` + `install_error`, down to the
-   naming and to `connect_error` holding prose rather than a machine code — "words fit to draw" is
-   already this codebase's convention for a failure a config has to render.
-
-   `connecting_ssid` names the network rather than being a bare flag because a list has to know
-   which row is in flight. Neither field is derivable from NetworkManager — they are a memory of an
-   attempt, not a reading of the stack — so `handle_signal` carries both across the full re-derive
-   exactly as it already carries `scanning`.
-
-2. **The verdict comes from `Connection.Active`'s `StateChanged(state, reason)`.** Both activation
-   calls hand back an activation object; `ACTIVATED` clears the attempt, `DEACTIVATED` maps its
-   reason through `connect_error_text`, and `NO_SECRETS` is the wrong password. Subscribing happens
-   after the call returned, so the current `State` is read once to close the gap. ponytail: a
-   failure landing inside that gap loses its reason and reports the generic line, since only the
-   signal carries one; success does not, which is the far likelier race.
-
-3. **`rusty_network_manager` 0.7.1's binding for that interface cannot work, so this one proxy is
-   hand-written.** The crate declares the signal `#[zbus(signal, name = "state_changed")]`, and zbus
-   takes an explicit `name` verbatim instead of PascalCasing it, so
-   `ActiveProxy::receive_active_state_changed` subscribes to a member NetworkManager never emits.
-   Found by measurement, not by reading: an activation that reached `ACTIVATED` in about a second
-   produced no signal in twenty. Its sibling `Device` proxy spells the same attribute
-   `name = "StateChanged"` and works, which makes it a typo upstream rather than a convention. The
-   local proxy declares only `StateChanged` and `State`, and ADR-0013's "go through the crate" rule
-   stands everywhere else.
-
-4. **No "one attempt at a time" refusal.** `lock:authenticate` and `updates:install` both refuse a
-   second while one runs, and the QML does the same. Here a verdict is simply dropped when its SSID
-   is no longer the one in flight, which fixes the same overlap — an older failure landing on a
-   newer attempt's spinner — without a rule that has to be explained to a config.
-
-5. **A saved network connects without a password.** Reaching any of the above needed the connect
-   path to be reachable at all, and it was not: `network:connect` only stashes an intent, the secret
-   that releases it can come only from a focused `secure_submit` field, and the bar cannot host one
-   — it is `keyboard_interactivity = "None"`, and a layer surface that takes focus on demand takes
-   it the moment it maps. So every click on a saved network stashed an intent nothing would ever
-   consume.
-
-   A profile that exists already has its key, so the intent completes itself. This is what
-   `NetworkService.qml` does for a `known` network too. An unknown SSID still waits for a password
-   and still has nowhere to type one; a prompt means giving a surface keyboard focus, which is a
-   surface-policy decision and not this ADR's.
-
-6. **The panel reports in its header, not per row.** A spinner on the row would mean mapping
-   `available_networks` into enriched items on every push, putting back the copy ADR-0082 removed
-   from this panel. `connecting_ssid` names the network in the header line instead, and
-   `connect_error` replaces it in `RED`, which is how `lock.lua` draws a failed attempt.
-
-Verified on real hardware, both branches: reusing the saved profile left the profile count at three
-and never dropped the link, and the activation reported `error=None` on success and
-`Some("device disconnected")` for an SSID that does not exist. The 45-second ceiling is a backstop
-for an activation object that stops answering, not the mechanism — NetworkManager reported both
-outcomes in seconds.
+Live tests confirmed profile reuse and success/failure reporting. The 45-second timeout is a
+backstop, not polling-based completion.
 
 ## 0085. The Wi-Fi password prompt, and what it cost to give a popup the keyboard
 
-ADR-0084 decision 5 left this open on purpose: an unsaved secured network stashed an intent nothing
-would consume, because a prompt "means giving a surface keyboard focus, which is a surface-policy
-decision and not this ADR's". It turned out the mechanism already existed and the policy was the
-whole problem.
+1. The Supervisor publishes password_ssid only when a new secured connection needs input.
+   Saved and open networks proceed; hidden/unknown security defaults to prompting.
+2. Cancellation is idempotent and centralized on panel close, without clearing unrelated errors.
+3. Keyboard focus includes shown child popups, allowing one secure field anywhere in the scope.
+4. Originally claim keyboard focus before mapping the popup; changing focus on the mapped parent
+   broke its grab. ADR-0087 supersedes this bar-wide focus workaround.
+5. Arm a newly visible sole secure field when focus already exists, but never steal an explicitly
+   selected field.
 
-1. **The Supervisor decides when to ask, not the config.** `NetworkState` gains `password_ssid`,
-   set by `resolve_connect_intent` for the one case that cannot proceed on the click alone: no saved
-   profile and the network is secured. A config could not derive it — whether a profile exists lives
-   in NetworkManager's settings (ADR-0037) — and the three branches are `NetworkPanel.qml`'s own.
-   An SSID that is hidden or out of range is treated as secured, the way `showPasswordInput`'s
-   `?? true` does, because nothing here can say otherwise. This also fixed a latent case the old
-   `connect_if_saved` never handled: an *open* unsaved network stashed an intent forever.
-
-2. **`network:cancel_connect` is the way out, and it is idempotent.** Escape inside a
-   `secure_submit` field clears the entry and stays in the field, so without a cancel a prompt
-   raised by a mis-click would hold the keyboard until something else took it. Being a no-op when
-   nothing is pending is what lets `panel_host` spend it unconditionally on every close — closing
-   the panel answers the prompt — without every panel close clearing `connect_error`.
-
-3. **Keyboard focus is a scope, not a surface.** *Still true, but no longer load-bearing for this
-   prompt: under ADR-0087 the field and the keyboard are on the same surface. The rule stays for
-   every other popup-hosted field.* The field lives on `panel_host`, an `xdg_popup`;
-   the compositor hands the keyboard to `bar`. niri gives a grabbing popup the keyboard only if its
-   parent held it when the popup mapped, which is never true here — the prompt is raised by a click
-   *inside* the already-open panel. So `wayland::input`'s `keyboard_focus_scope` is the focused
-   surface plus every popup shown under it, and `sole_secure_submit_in_scope` asks "exactly one"
-   across the whole scope. Before this the prompt was untypable until the panel was closed and
-   reopened, which worked by accident: the second map found the parent focused.
-
-4. **The bar claims the keyboard when a panel opens, not when the prompt appears.**
-   *Superseded by ADR-0087, which retires the popup this worked around.* Measured twice: raising
-   `keyboard_interactivity` on a *mapped* layer surface makes niri re-evaluate focus, which breaks
-   `panel_host`'s grab, and the panel is dismissed before the focus event even arrives — the prompt
-   appeared and vanished in the same frame. Bound to `panel_open` the change lands on the pass that
-   creates the popup instead, since `bar` precedes `panel_host` in the surface list. The cost is
-   that any open panel takes the keyboard; the alternatives looked like `grab = false` (which
-   retires ADR-0051's click-outside-to-close) or drawing the prompt outside the popup. The third
-   alternative, not seen at the time, was to stop being a popup.
-
-5. **A field that becomes visible under a focus that already arrived needs its own arming.**
-   Consequence of 4: there is no second `enter` when the prompt appears, so
-   `arm_secure_focus_if_the_scope_now_declares_one` runs once a turn beside the existing teardown
-   check. Only when nothing is armed, so it can never take a field from the press that chose one on
-   a surface declaring several — the guess ADR-0050 decision 4 refuses to make.
-
-Typed characters still never reach the Lua VM: `secure_submit` carries them from the Wayland thread
-to the capability and nowhere else (ADR-0005/ADR-0027), so the prompt has no `on_change` and no
-`on_submit`. It is the only such field on `panel_host` across all five panels, which the "exactly
-one in scope" rule makes load-bearing rather than incidental.
+ADR-0087 puts this prompt on its own focused surface; popup focus-scope behavior remains useful.
+Passwords never reach Lua callbacks.
 
 ## 0086. `lua-meta` types nothing unless a signal is `userdata`
 
-A notification's `body` is a `NotificationSpan[]` (ADR-0033) and two config sites read it as a
-string. The result was not a wrong label: `text.content` must be a string, so every re-resolve
-failed and the shell froze on its last good scene for as long as that notification was in the feed.
-The stub declared the field correctly and the language server said nothing, which is the part worth
-recording.
+1. Lua-language-server 3.19.1 treated class unions as accepting arbitrary tables. Use built-in
+   userdata via Bound for signal-valued property unions.
+2. Define generic Signal methods as fields so callback payload types bind. Map chains beyond one
+   hop and computed callbacks remain weakly typed.
+3. Promote mismatch diagnostics from Hint to the checked severity in both repo and generated configs.
+4. Find the editor-bundled language server when absent from PATH, and retain useful diagnostic
+   output instead of expecting an unrequested JSON report.
 
-1. **A `---@class` in a union accepts any table.** Measured against `lua-language-server` 3.19.1:
-   `string|Signal` accepts a `NotificationSpan[]`, and still does with a required `---@field` on the
-   class, and still does with `---@class Signal: userdata`. Only the built-in `userdata` refuses a
-   table. So every node property spelled `X|Signal` — all 46 of them — accepted every payload type
-   in the IDL. `Bound` is `---@alias Bound userdata`, and it is the honest spelling anyway:
-   `components/icon_button.lua`'s `is_signal` already tests `type(value) == "userdata"`.
-
-2. **`Signal<T>`, with its methods as `---@field`.** Written as `function Signal:map(fn)` with
-   `---@param fn fun(value: T)`, the class's own `T` does not bind and the annotation silently does
-   nothing — it reads correctly and checks nothing, which is worse than omitting it. As a
-   `---@field` it binds, so `oblisk.network:map(function(n) ... end)` types `n` and a misspelled
-   field is an `undefined-field`. `map` returns `Signal<any>` rather than the mapped type: a
-   `---@field` cannot introduce a second type parameter, so one hop is typed and a chain past it is
-   not. `computed`'s callback stays untyped for the same reason plus an overload per arity.
-
-3. **The diagnostics ship below the level anything reads them at.** `param-type-mismatch`,
-   `assign-type-mismatch` and friends carry **Hint** severity, and both `just types` and an editor's
-   default check run at `Warning`, so the whole IDL type-checked nothing regardless of 1 and 2.
-   `.luarc.json` promotes them, and `setup.rs`'s `luarc_json` writes the same promotion into every
-   config `oblisk init` creates.
-
-4. **`just types` had never run on the machine it was written on**, because `lua-language-server` is
-   not on `PATH` there — Zed's Lua extension downloads its own copy — and the recipe skips silently
-   when it is missing. It now falls back to that copy. It also printed nothing on failure: the
-   report block read a `check.json` that needs `--check_format=json`, which was never passed, so a
-   failure surfaced as `set -e` and a bare exit code. The human-readable output it was discarding is
-   better than the JSON anyway, because it carries the offending source line.
-
-What this does not buy: Lua is not Rust. `any` still flows out of any unannotated helper, a class
-stays permissive in the table direction, and `list`'s `itemfn` cannot infer its item type from
-`source`, so those five callbacks carry a hand-written `---@param`. The engine's own parsers remain
-the real gate; this moves the common mistakes to edit time.
+Lua any, permissive classes and list callback inference remain limits; runtime parsers are the gate.
 
 ## 0087. The panel host is a layer surface, and a staged layer request needs its own commit
 
-ADR-0085 decision 4 shipped a bar that took the whole keyboard for as long as any panel was open,
-to reach one password field. That was the honest cost of the design it was written under, and the
-design was the mistake: the constraint came entirely from `panel_host` being an `xdg_popup` with a
-grab, and the reference config this shell mirrors never took that path. `Modules/Shell/MainScreen.qml`
-is one screen-tall `PanelWindow` holding the bar and the panel host together with no `xdg_popup`
-anywhere, which is exactly why its `WlrLayershell.keyboardFocus` can follow a per-panel
-`needsKeyboardFocus` (`NetworkPanel.qml`'s is `showSsidInput || showPasswordInput || ...`).
+1. Make the example panel host a layer panel with a full-size outside-click catcher under the card.
+   Respect the bar's exclusive area so bar clicks remain reachable.
+2. Claim keyboard only while the password prompt needs it; restore the bar to None.
+3. Replace popup SlideX with config clamping; the example retains its single-output assumption.
+4. Explicitly commit changed layer-shell state when mapped and non-candidate. Paint deduplication
+   may skip swaps, otherwise nonvisual focus/margin/size/exclusive changes stay pending.
+5. Centralize panel toggle and prompt cancellation now that popup dismissal is no second writer.
 
-1. **`panel_host` becomes a `panel`.** Screen-tall under the bar, `visible` still bound to
-   `panel_open`, and its single root node holds a full-fill click-outside catcher with the panel
-   card stacked over it. `hit::descend` walks children in reverse and stops at the first that
-   contains the point, so the card shields itself from the catcher without a handler of its own.
-   Click-outside-to-close is now ours rather than the compositor's `popup_done`, which retires the
-   ambiguity `lib/ui_state.lua`'s `toggle_panel` was written around — `on_dismiss` carried no token
-   saying which popup it dismissed, so switching panels directly sometimes took a second click.
-   It is one click now, because the bar is left uncovered: `exclusive = false` reserves nothing but
-   still respects what the bar reserved, so niri configures this surface at 1920x1161 starting under
-   the bar rather than over it.
-
-2. **`keyboard_interactivity` binds to `network.password_ssid`, and the bar goes back to `"None"`.**
-   The whole point. There is no grab to break, so the claim can be as narrow as the fact that wants
-   it: this surface holds the keyboard exactly while a `network:connect` is waiting on a password,
-   and nothing else on the bar ever asks for it. `lua-meta/oblisk.lua`'s own field doc has said this
-   is what the shell binds focus to since ADR-0084; it is true now.
-
-3. **`constraint_adjustment` is the one thing paid for, and it is arithmetic.** A popup got
-   `"FlipY"` and `"SlideX"` from the compositor; a layer surface gets neither. `"FlipY"` needs no
-   equivalent, since this surface starts below the bar and extends down. `"SlideX"` is a `math.min`
-   against `oblisk.screens[1].width` in the `computed` that places the card — the same single-head
-   guess `config/theme.lua`'s `main_screen` already makes, except that this one follows the signal.
-
-4. **A staged layer-shell request needs its own commit, and did not have one.** Found while
-   measuring 2, and the reason the first attempt looked like a compositor refusal.
-   `apply_resolved_state` stages double-buffered `wl_surface` state and leaves the commit to
-   `paint_surface`'s `swap_buffers` — but `paint_surface` returns early when the display list is
-   byte-identical to the last one, which is the whole point of that check and true of most surfaces
-   on most passes. So `set_keyboard_interactivity` was sent and then sat pending: `panel_host`
-   raised itself to `Exclusive` over an already-drawn card and niri never gave it the keyboard,
-   while editing an unrelated border width delivered the focus change instantly. The bar never
-   showed the bug because its clock redraws it once a second. `apply_spec_change` now commits when
-   anything moved, guarded on `Mapped` (a bufferless commit on an unmapped surface is the protocol's
-   re-map) and skipped for a PBA Candidate. This was always a bug for `margin`, `size` and
-   `exclusive` too; nothing had bound them to a signal that moved without also changing the paint.
-
-5. **A bar indicator is a toggle now.** `open_panel` became `toggle_panel`: clicking the indicator
-   of the panel already showing closes it, clicking a different one replaces it, clicking any of
-   them with the host closed opens it. Set-only was not a style choice before — under the grab a
-   toggle would have closed the panel it was opening, since niri delivers the opening click to the
-   bar as the popup's own parent, and it would have fought `on_dismiss`, which already wrote false
-   on every click landing elsewhere. With no grab there is no second writer to fight. The pending
-   password prompt is answered by `close_panel` rather than by its callers, so the click-outside
-   catcher and a toggle-close cannot drift apart.
-
-Measured end to end on niri: a non-visual flip to `"Exclusive"` on the mapped surface now takes the
-keyboard and arms `network/connect` in the same turn, and the flip back releases it. The card lands
-at `bar_height + panel_gap` from the top and clamps to the output's right edge, both read off a
-pixel scan rather than believed.
+Live niri tests verified nonvisual focus acquisition/release and card placement.
+Supersedes ADR-0085's popup-driven bar-wide keyboard claim.
 
 ## 0088. Hiding a `panel` destroys it, because the layer-shell re-map is not honoured
 
-ADR-0038 decision 2 made `visible` on a `panel` a map or unmap of an object that lives for the
-generation, on the reasoning that toggling a launcher should cost a commit rather than a Wayland
-object. `zwlr_layer_surface_v1` supports exactly that: attach a null buffer to unmap, and "the
-client can re-map the surface by performing a commit without any buffer attached, waiting for a
-configure event and handling it as usual." niri does not bring such a surface back.
+Amends ADR-0038: protocol-correct layer remapping failed to show the surface on tested niri,
+despite configure, acknowledgment and fresh buffers. Cache, timing and missing-state-commit
+explanations were ruled out.
 
-Measured on the wire with `WAYLAND_DEBUG=1`, and the trace is the whole argument, because every
-request is the one the specification asks for:
+1. Hiding a panel destroys child popups, EGL resources and role objects; showing rebuilds them.
+2. A never-mapped hidden startup panel remains created for presentation staging; distinguish it
+   from a previously destroyed panel.
+3. Revalidate size/anchor constraints on every show because signals can change while hidden.
 
-```
--> wl_surface#19.attach(nil, 0, 0)                     unmap
--> wl_surface#19.commit()
--> zwlr_layer_surface_v1#20.set_anchor(9)              re-map: state is reset, so re-send it
--> zwlr_layer_surface_v1#20.set_size(355, 90)
--> zwlr_layer_surface_v1#20.set_keyboard_interactivity(0)
--> zwlr_layer_surface_v1#20.set_margin(50, 11, 0, 0)
--> wl_surface#19.commit()                              the bufferless commit
-   zwlr_layer_surface_v1#20.configure(9255, 355, 90)   the compositor answers
--> zwlr_layer_surface_v1#20.ack_configure(9255)
--> wl_surface#19.attach(wl_buffer#57, 0, 0)            a fresh dmabuf
--> wl_surface#19.damage_buffer(0, 0, INT_MAX, INT_MAX) full damage
--> wl_surface#19.commit()
-```
-
-Nothing is on screen afterwards, and nothing later brings it back: further repaints attach further
-buffers to the same surface and none of them appear. Ruled out along the way: a stale display-list
-cache (`last_painted` is cleared on hide), a race (an 80ms delay before the swap changes nothing),
-and a missing commit for the staged layer-shell state (ADR-0087 decision 4, fixed separately and
-still needed).
-
-1. **`visible = false` destroys the `zwlr_layer_surface_v1` and its `wl_surface`; `visible = true`
-   builds new ones.** `TrackedRole::Panel::layer` becomes an `Option`, the role keeps the
-   `wl_output` so the rebuild targets the same one, and the teardown order is `hide_window`'s:
-   child popups, then the EGL surface and `wl_egl_window`, then the role object. This is what the
-   `window` and `popup` roles have always done (ADR-0049 decision 1) and what the Qt shell this
-   config mirrors does for a `PanelWindow`, so it is one rule for all three roles rather than a
-   fourth behaviour.
-
-2. **A panel declared `visible = false` at startup is still created.** It has never been mapped, so
-   there is no compositor state to fail to restore, and keeping it means PBA staging still sees
-   every declared surface (§ 15.2). `show_panel` tells the two cases apart by whether the role still
-   holds a `LayerSurface`: if it does, the surface goes straight to `Mapped` and the next paint's
-   first buffer maps it; if not, it is rebuilt and waits for its initial configure.
-
-3. **The size guard runs again on every show.** `width`/`height` are `Signal`-bindable, so a spec
-   that has since resolved to a `Fill` on a singly anchored axis would be a protocol error that
-   kills the connection. `create_panel` already refuses that; `show_panel` refuses it the same way
-   and leaves the surface hidden.
-
-What this cost: an EGL surface and a `wl_egl_window` are rebuilt per toggle rather than reused, and
-the first frame after a show waits for a configure round trip instead of going out immediately.
-Both are per-toggle, both are what the other two roles already pay, and neither is measurable
-against a surface that does not appear at all.
-
-How long it had been broken: since panels could be hidden. The first notification of a session drew
-and every one after it was invisible, because `notification_area` is unmapped between notifications
-— nobody had noticed, because a shell is usually restarted more often than it is watched. ADR-0087
-made it constant rather than intermittent: opening and closing a bar panel is the most frequent
-hide/show in the shell, so the power menu opened once and never again.
+Accept per-toggle allocation and configure latency; reusing an object that never reappears is worse.
 
 ## 0089. A `text` can wrap, and an unwrapped one now measures the line it draws
 
-`text` shaped through cosmic-text, which wraps, and painted through femtovg, which does not. The
-measure callback handed the shaper the box width, counted the layout runs that came back, and
-returned `line_count * line_height` as the node's height. Paint then made one `fill_text` call with
-the whole string. So a fixed-width `text` reserved three lines of height and drew one clipped run
-into the top of it, and the two disagreed silently — the clip made it look like elision.
+1. Shaping returns shared visual lines, not just count. Slice by min/max glyph cluster bounds;
+   LayoutRun.text repeats the original paragraph and visual-order glyphs may be bidi.
+2. Wrap is opt-in; None measures without a width so reserved height matches single-line painting.
+3. Absent or zero max_lines means unlimited; negatives error.
+4. Elide the last retained line using the remaining text, not only that line. Rejoined dropped
+   lines may collapse whitespace inside an already-truncated remainder.
+5. Break lines after sizing, then paint one line at a time; femtovg does not perform line breaking.
 
-Everything a notification card wants is downstream of fixing that: a body over two lines, a summary
-that expands, a group whose rows are readable. It is also the reason every panel in this shell is
-one elided line per field.
-
-1. **The shaper returns the lines, not just their count.** `ShapeResult` gains
-   `lines: Arc<[String]>`, filled from the same `layout_runs()` walk that already produced the
-   height. Behind an `Arc` because `ShapingHandle::shape`'s memo hands a clone back on every hit and
-   a hit is the common case, so a clone has to be a refcount bump rather than a `Vec` copy.
-
-   The trap this walks into, worth recording because the first implementation fell in it:
-   cosmic-text's `LayoutRun::text` is *the original text line* — the whole source paragraph, handed
-   back again for every visual line the wrap broke it into. Collecting it directly yields the entire
-   string N times over. Only the glyphs delimit a run, via the `start`/`end` cluster indices, read
-   as min/max rather than first/last because a bidi run's glyphs are in visual order.
-
-2. **`wrap` is opt-in, so `"None"` measures one line.** This is the part that is not purely
-   additive. Measurement already wrapped unconditionally, so making wrapping the default would have
-   started *drawing* into height every fixed-width `text` was already reserving, changing the whole
-   shell at once. `wrap = "None"` now passes the shaper no width at all, so it measures the single
-   line it will paint, and the box matches the paint in both modes. A config that never says `wrap`
-   sees no change to what is drawn, and shorter boxes where it was over-reserving.
-
-3. **`max_lines = 0` means uncapped, and so does absent.** Zero is refused nowhere and clamped
-   nowhere: the property exists to be driven by a signal, an expander is
-   `max_lines = expanded:map(function(e) return e and 0 or 2 end)`, and a `Bound` has no way to
-   spell "absent". A negative is still an error — there is no reading of it, and clamping would
-   swallow a sign slip in a config's own arithmetic.
-
-4. **`elide` under `wrap` applies to the last line kept, over the text that did not fit.** Keeping
-   the lines allowed and ellipsizing the last one *as it stands* would read as a sentence that
-   happens to stop; the last kept line is rebuilt from everything below the cap so it reads as
-   truncated. That remainder is the dropped lines joined back with single spaces rather than sliced
-   out of the source, because cosmic-text hands back a line's text and not its byte range into the
-   original. The difference is a run of collapsed whitespace, inside text that is already being cut
-   off.
-
-5. **Line breaking stays in `Scene::finish`, next to elision.** Paint is a pure display-list build
-   with no shaping worker in reach, and the box width is not known until the node is sized, so
-   `finish` is the only place both are available. `PaintStyle::Text::content` therefore carries `\n`
-   by the time it reaches the display list, and `TextPainter::draw_text` walks `lines()` making one
-   `fill_text` per line. femtovg draws a `\n` as a glyph and has no line breaker, so splitting there
-   is not a convenience.
-
-What this does not do: no per-line alignment (each line is aligned by the node's own `text_align`),
-no hyphenation, and no `wrap` at a character boundary as its own mode — cosmic-text's word wrap
-already falls back to a glyph boundary for a word wider than the box, which is the case that
-motivates one.
-
-Left alone, and noted here because line advance now depends on it: `TextPainter` hands femtovg the
-*logical* font size against a canvas whose dpi is 1.0, while every box around it is snapped to
-physical pixels. On a 2x output that draws every glyph in this shell at half size, and has since
-text existed. Lines advance by the same unscaled step, so they are spaced correctly around whatever
-size the glyphs come out — wrong together rather than wrong apart. The fix is to scale the font
-size, and it needs a HiDPI output to verify against.
+No hyphenation or separate character-wrap mode. The existing unscaled HiDPI font-size defect
+was disclosed but left for hardware verification.
 
 ## 0090. A notification's actions are kept, and a config can invoke one
 
-`Notify`'s `actions` array — the flat `[key1, label1, key2, label2, ...]` list every notification
-button in every shell comes from — was read by one predicate, `actions_have_reply`, and dropped on
-the floor. `GetCapabilities` advertised `actions` and `action-icons` and neither was true, and
-`Notification`'s own doc comment said the array "is never stored, only the `has_reply` bool it
-collapses into". A config could draw a notification and never offer Archive, Snooze, Mark as read,
-or Reply-by-button.
+1. Store typed actions, separating default activation and inline reply from visible button rows.
+2. Action icons are theme names; reject path separators to prevent arbitrary file display.
+3. Accept only keys the sender declared.
+4. Invocation closes unless resident; emit the corresponding close signal.
+5. Cap at eight actions with 64-byte UTF-8-safe labels.
 
-1. **`actions` is a typed list, and the two keys that are not buttons are not in it.** `"default"`
-   is the whole notification's activation — clicking the card — and becomes `has_default_action`;
-   `"inline-reply"` becomes the `has_reply` that already existed. Both are real action keys on the
-   wire, and both draw as nonsense if a config repeats them in a button row, so the split happens
-   once here rather than in every config that renders a card.
-
-2. **An icon action carries a theme name, not a path.** Under `hints["action-icons"]` the base spec
-   says the key doubles as an icon name, so it is carried as one — but `icon` accepts an absolute
-   path as readily as a theme name (ADR-0054 decision 2), so a key holding a path separator is
-   refused as an icon rather than passed through. Without that, any application on the session bus
-   could name a file on this machine and have the shell draw its contents.
-
-3. **`invoke_action` checks the key against what the notification declared.** The same rule
-   `reply` already applies through `has_reply`, for the same reason: a key the sender never offered
-   means nothing to it, and forwarding one only produces a signal the application has to field and
-   ignore. An undeclared key is a logged no-op.
-
-4. **Invoking removes the notification unless the sender said otherwise.** That is the base spec's
-   default and matches what `reply` does. `hints["resident"]` is the spec's own exception and is
-   honoured, because a media notification whose prev/next buttons closed the card on first press
-   would be useless. A removal here also emits `NotificationClosed(id, reason=3)`: an action-invoked
-   close is a close, and a sender tracking its own ids has to hear about it.
-
-5. **Both caps are on the same footing as §1.1's text caps.** At most 8 actions, and a label
-   truncated to 64 bytes on a character boundary. The array arrives from an unprivileged sender and
-   a config draws every entry of it; eight is past anything real, and a label is a button rather
-   than a paragraph.
-
-Dropped from scope: `x-kde-reply-placeholder-text`. The placeholder is only worth carrying once
-something can type into the field it labels, and nothing can — `zwp_text_input_v3` is unwired, so
-the unmasked half of `textfield` has never received a keystroke. It belongs with that work.
-
-Verified against a live `Notify`: a notification declaring `default` and `archive` reaches Lua as
-one action plus `has_default_action = true`; invoking `archive` makes `notify-send -A` print
-`archive` and exit; invoking a key the sender never offered prints nothing and logs the refusal;
-and the same notification sent with `resident` stays mapped across repeated invocations where the
-plain one is gone after the first.
+Live tests verified normal/resident invocation and rejection. Reply-placeholder metadata waited
+for the then-unimplemented ordinary input path.
 
 ## 0091. The attached picture and the sending application's icon are two fields
 
-`Notify` offers four ways to say "here is a picture", and ADR-0033 collapsed all four into one
-`icon_path` on a single precedence chain: `image-data` > `image-path` > `app_icon` > `icon_data`.
-Three of those four are the same thing under the spellings the spec accumulated across 1.0, 1.1 and
-1.2. The fourth is not: `app_icon` is the *sending application's* icon, and it lost every race
-against a picture the sender attached.
+1. Split attachment image_path from sender app_icon instead of one competing precedence chain.
+2. Carry bare sender theme names to the Renderer; validate paths through trusted roots.
+3. Any slash makes the value a path candidate. Testing only is_absolute would let relative
+   traversal strings masquerade as theme names.
+4. Rename the misleading old icon_path without an alias before any release.
 
-Worse, it lost the races it won. The whole chain terminated in `validate_trusted_path`, which
-requires an absolute path to an existing file under a small allowlist. `app_icon`'s documented and
-overwhelmingly common form is a bare theme name — `"firefox"`, `"org.telegram.desktop"` — which is
-not an absolute path, so it resolved to nothing. Every notification in the shell that did not ship
-raw pixel data drew the same generic fallback, and had since notifications existed.
-
-1. **`image_path` is the picture, `app_icon` is the sender.** `image-data`/`image_data` >
-   `image-path`/`image_path` > `icon_data` feed the first; the positional argument feeds the second.
-   A card can now show both, which is what the Qt shell this config mirrors does: the app's mark in
-   the header, the attachment beside the summary.
-
-2. **`app_icon` may be a theme name, and is carried as one.** `icon { name = ... }` resolves theme
-   names in the renderer (ADR-0054 decision 2), so there is nothing to validate and nothing to
-   spool — the value travels as text and the renderer's own icon lookup decides. A path still goes
-   through the trusted-root check every other client-supplied path does.
-
-3. **The two forms are told apart by a path separator, not by `is_absolute`.** A relative path is
-   neither: `"../../etc/passwd"` is not absolute, so an `is_absolute` split would hand it to the
-   renderer as a "theme name" and let the icon lookup take it from there. Anything containing a `/`
-   must be an absolute, trusted path or it is refused.
-
-4. **`icon_path` is renamed rather than kept as an alias.** It has always held the picture, and
-   keeping a name that says "icon" for the field that is not the icon is the mistake this ADR is
-   fixing, not a compatibility surface worth preserving. Nothing outside this repo consumes the
-   payload yet (there is no released version — see `Cargo.toml`'s versioning note), so the rename
-   costs one line in `notification_history.lua`.
-
-Not done here: `hints["desktop-entry"]`. It is the better grouping key than `app_name` and a decent
-third icon source, and it is additive whenever a config wants it. Adding a field for a consumer that
-does not exist yet is how §2.7 got four picture sources in the first place.
+Desktop-entry metadata was deferred until a consumer needed it.
 
 ## 0092. An ordinary `textfield` reads the keyboard too, because text-input-v3 types nothing
 
-ADR-0027 decision 3 said an ordinary `textfield` fires `on_submit` from `zwp_text_input_v3`'s
-protocol-native submit action, "IME-correct: it works with CJK composition, which raw keystroke
-detection does not." Its own amendment then found the flaw and applied it only to the masked half:
-text-input-v3 needs a compositor-side input method bound, and with none running `commit_string`
-never arrives, so no byte ever reaches the client.
+Supersedes ADR-0027 decision 3.
 
-That is not a corner case. There is no input method on this session — no fcitx5, no ibus, no
-`XMODIFIERS` — which is the default state of a fresh Wayland desktop. A `textfield` built on
-text-input-v3 would take a click, draw a caret, and swallow every keystroke, and the config author
-would have no way to tell that from a bug in their own code.
+1. Ordinary and secure fields both read keyboard/xkb; text-input alone delivered nothing without an IME.
+2. Composition, dead keys and compose sequences remain unsupported. Later text-input integration
+   can augment raw keys when an input method exists.
+3. Plain fields initially require a click, without the secure field's sole-target auto-arming.
+4. Address plain focus by surface and rect, and explicitly exclude secure nodes from plain paint.
+   A retained NodeId is an upgrade; matching rect alone could expose plaintext on a password field.
+5. Change/submit callbacks receive full text. Submit empties but keeps focus; Escape originally
+   clears without dropping focus.
+6. Do not focus a field with no usable destination/callback.
+7. A textfield press arms no ancestor button click, preventing reply entry from activating its card.
 
-1. **Both field kinds read `wl_keyboard` and xkb.** The plain half now shares `key_action` with the
-   masked half, which already reads the keyboard for reasons of its own (a password must not route
-   through an input method — swaylock and hyprlock read xkb directly for the same reason). This
-   supersedes ADR-0027 decision 3.
-
-2. **What that costs is composition, and it is a real cost.** No CJK, no dead keys, no compose
-   sequences: `KeyEvent::utf8` is one character per key press. Latin text, including every accented
-   character a keyboard layout produces directly, works. The upgrade path is to bind text-input-v3
-   *alongside* this and let a `commit_string` win when an input method is actually present; that is
-   worth building when someone needs it, and it is strictly additive.
-
-3. **A press focuses a plain field; there is no arm-on-`enter` fallback.** The masked half has one,
-   because `sole_secure_submit_in_scope` can pick the single password prompt on a surface. A card
-   with one reply box per notification has no sole field, so that rule cannot serve this one, and
-   clicking into a text field is what every toolkit asks for anyway.
-
-4. **A plain focus is addressed by its box.** `ResolvedNode` carries no `NodeId` — `to_resolved`
-   drops it — so the field's absolute rect stands in, exactly as `input::ArmedClick` already does
-   for a press. A re-resolve that moves the field detaches the caret from it, which is what a real
-   identity would give for a field moved out from under the user. Upgrade: put the `NodeId` on
-   `ResolvedNode` and key both halves on it.
-
-   The rect is not sufficient on its own, and a test caught why: a plain focus and a *masked* node
-   can coexist on one surface, so paint's plain arm also requires the node to declare no
-   `secure_submit`. Without that, a password field whose box happened to match would have drawn
-   another field's plaintext.
-
-5. **Both callbacks carry the whole text, not the delta.** A config binding a `state` signal to a
-   reply box wants the value; reassembling a string from edits is work every caller would repeat.
-   `on_submit` leaves the field focused and empty, so a reply box takes the next message without
-   another click, and Escape clears and stays — the same answer the masked half gives. Dropping
-   focus on Escape is the more conventional behaviour and is not available: a config cannot observe
-   focus, so a field that silently stopped taking keys could not say so on the glass.
-
-6. **A field that can report nothing is never focused.** Masked with no destination has nowhere to
-   send a submit; plain with neither callback has nobody to tell. Focusing either takes the keyboard
-   away from a field that could have used it, in order to buffer keystrokes nothing will read.
-
-7. **A press that focuses a `textfield` arms no click.** `textfield` is a leaf -- § 5.2 gives it no
-   `children` -- so any `button` on the hit path is an ancestor of it, and clicking into a text
-   field inside a clickable row is not a click on the row. This is the notification card exactly:
-   its whole surface activates the sender's default action (ADR-0090) and its reply box sits inside
-   that, so without this rule every attempt to reply would fire the notification's default action
-   and take the card away. Found by trying it: the probe card dismissed itself on the click meant
-   to focus its field.
-
-A plain field's text lives in `App::focused_text_field`, outside the retained tree, for the same
-reason a masked field's bytes live in `secure_buffer`: typing marks no property dirty, so
-`field_input_changed` (renamed from `secure_input_changed`, since it is now both kinds) drives a
-repaint without a re-resolve.
+Plain draft state stays outside the retained tree; input repaints without forcing scene resolution.
 
 ## 0093. A notification carries when it arrived, because nothing else can work it out
 
-The Qt shell this config mirrors draws a relative age on every card — "5m ago" — off a `timestampText`
-its own wrapper records. § 2.7 has no such field, and until now the answer was "a config can note
-the clock the first time it sees an id."
+1. Record arrival in epoch seconds, using the same helper and units as system.time.
+2. Use wall time for human-readable age; clock adjustments can change it. No second monotonic field.
+3. Replacement content gets a fresh timestamp even when its ID is reused.
+4. Set it when Notify assembles content, not when a snapshot happens to push.
 
-It cannot. There is exactly one place in the Lua API that runs when the feed changes and does not
-need a click first, and that is a `computed`/`map` callback, which ADR-0021 requires to be
-side-effect-free and caps at 5ms across the whole graph. Recording arrival times there is writing
-to the world from inside a pure function, and a reload re-runs it against a feed that already has
-notifications in it, which would date all of them to the reload. So this is not a convenience field
-standing in for a workaround; there is no workaround.
-
-1. **Unix epoch seconds, matching `oblisk.system`'s `time` exactly.** Age is `system.time -
-   timestamp` and nothing has to reconcile two clocks or two units. § 2.11 already settled that
-   argument once — it calls its field "system time epoch" with no unit, and picked seconds because
-   `os.date` wants seconds and a millisecond reading is silently wrong by 1000×. A second field on
-   the same clock in a different unit would re-open it. `capabilities::system::controller::
-   epoch_seconds` is reused rather than reimplemented, which is what its own doc comment asks for.
-
-2. **Wall clock, not monotonic.** The consumer is a human-readable age rendered against
-   `system.time`, which is wall clock; a monotonic reading cannot be subtracted from it. The cost is
-   that stepping the system clock re-dates the feed, which is the same cost every "5 minutes ago" in
-   every application pays, and the alternative — carrying both — is a second field for a case
-   nobody has.
-
-3. **A replacement gets a fresh timestamp.** `replaces_id` reuses an id to put *new content* at it,
-   and the timestamp describes the content. "3 new messages" arriving now is not four minutes old
-   because "1 new message" was. This falls out of building a whole `Notification` per `Notify`
-   rather than patching the queued one, so it is a decision only in that it could have been
-   undone deliberately.
-
-4. **Set in `Notify`, not at push.** The two are microseconds apart and the difference is not
-   observable, but `Notify` is where the content is assembled and the field belongs with the content
-   it dates.
-
-Not done here: an expiry deadline alongside it. A card could draw a countdown ring from
-`resolve_expiry`'s answer, and the Qt shell does, but that number is the supervisor's own timer and
-publishing it invites a config to believe it — see ADR-0094, which makes the timer pausable and so
-makes any published deadline a lie the moment a pointer enters the card.
+Config maps cannot safely record arrivals, and reload would misdate existing entries.
+Do not publish a fixed expiry deadline when holds can move it.
 
 ## 0094. Expiry is held off by a deadline, not paused by a flag
 
-A notification with an inline reply arrives with a 5-second timeout, and typing a reply takes
-longer than that. The card goes away mid-sentence and the reply goes nowhere. The Qt shell this
-config mirrors solves it with `pauseTimers`/`resumeTimers` on the card's hover.
+1. Hold expiry for a self-releasing duration; zero releases early. Repeated activity can renew it
+   without requiring a matching resume from a config process that may disappear.
+2. Clamp holds to five minutes.
+3. Hold globally, not by notification ID.
+4. Preserve remaining countdown time; neither restart it nor expire immediately on release.
+5. Keep one task per notification and add a watch-driven hold, not a second shared deadline registry.
+6. Do not publish hold state to Lua; log transitions.
+7. Use tokio time for deterministic paused-clock tests.
 
-That shape does not survive being handed to a config. A paused/resumed pair needs both edges to
-arrive, and the config is a process that gets reloaded on every file save — a reload between the
-pause and the resume leaves the Supervisor paused with nobody left who knows it, and nothing can
-tell that state from a legitimately long one. The feed stops expiring for the rest of the session.
-
-1. **`hold_expiry(seconds)`, one call, self-releasing.** The config asserts "somebody is
-   interacting, don't expire anything for the next N seconds" and the assertion lapses on its own.
-   `0` releases early, so the both-edges shape is still available to a caller that has both edges;
-   it just is not required for correctness. The natural use is the opposite: re-place a short hold
-   from an event that is already repeating, which a reply field's `on_change` is — it fires per
-   keystroke (ADR-0092 decision 5), so typing holds expiry off for exactly as long as typing lasts
-   and no config state tracks it.
-
-2. **Clamped to five minutes.** The cap is what makes decision 1's guarantee real rather than
-   rhetorical: a config asking for a week gets five minutes. Five minutes of continuous
-   interaction with one notification is past anything real.
-
-3. **Global, not per-id.** A hold means "the user is looking at the shell", which is not a property
-   of one notification. Per-id would need the config to enumerate what is on screen and re-place a
-   hold per entry, and to do it again after every reload, which is the bookkeeping decision 1
-   exists to delete.
-
-4. **The clock stops; it does not restart, and it does not fire on release.** A notification held
-   at 2s of 5 has 3s left when the hold lapses. Restarting would make a passing pointer reset every
-   card in the stack. Expiring immediately is worse: the card would disappear at the instant the
-   pointer left it, which reads as the pointer having dismissed it.
-
-5. **The countdown stays one task per notification.** `Notify` already spawned a task that sleeps
-   and then re-checks; giving that sleep a `watch` receiver is the whole change. The alternative —
-   a deadline stored on the queue entry, decremented on hold and re-armed on release — adds shared
-   state and a second place that has to agree with `find_expiring_entry` about what is still
-   pending, to buy nothing.
-
-6. **Not readable from Lua.** `NotificationsState` gains no field. The config is the only writer
-   and already knows what it asked for; publishing it would invite a second reader to decide
-   things from a value that is stale the moment it is pushed. A transition is logged instead,
-   because a feed that has stopped expiring and a broken timer look identical from outside.
-
-7. **`tokio`'s clock, not `std`'s.** `tokio::time::pause` moves only the former, and the countdown
-   is the thing under test — the five tests here assert exact durations (5s served, 2 + 60 + 3,
-   an extension winning over the hold it replaced) and run in about ten milliseconds. Written
-   against `std::time::Instant` first, where they passed by sleeping through a real minute.
-
-Only half of what this unblocks is reachable today. A reply field can hold expiry off from
-`on_change`, which is the case where something is actually lost. Holding it off merely because the
-pointer is resting on a card needs a hover *callback*, and § 5.2 has only `hover(name)`, a
-read-only signal that a `computed` cannot act on — the same wall ADR-0093 hit. That is its own
-edit.
+Typing could renew holds immediately; resting-pointer holds still needed a hover callback.
 
 ## 0095. `on_hover`, because a config could see a hover but not act on one
 
-ADR-0094 gave the Supervisor a way to hold a notification's expiry off, and then could only wire
-half of it: a reply field can hold expiry from `on_change`, but holding it merely because the
-pointer is resting on a card had nothing to fire from. `on_click` was the only pointer callback in
-§ 5.2. `hover(name)` is a read-only signal, and the one place a config runs code when a signal
-moves is a `computed`, which ADR-0021 requires to be side-effect-free — so a config could *draw*
-differently on hover and could not *do* anything: no capability call, no `state` write.
+1. Fire hover callbacks only on boundary changes already detected by hover synchronization.
+2. Require a named hover slot on the same node. Rect/position identity can transfer state to a
+   replacement node; a silently inert callback is an error, not a fallback.
+3. Pass only the boolean. The paired hover_rect already supplies geometry.
+4. Log callback errors without aborting a working scene.
 
-1. **It fires on the crossing, not on the motion.** `wl_pointer` reports motion at device rate, so
-   a per-event callback would run a config handler a few hundred times for one pass across a
-   button. `sync_hover` already computes the exact edge — `set_changed` returns whether the value
-   moved (ADR-0062 decision 4) — so the callback rides on that answer and costs one branch.
-
-2. **It requires a `hover` slot on the same node, and is refused without one.** A callback has no
-   memory and a `ResolvedNode` has no identity to hang one off (`to_resolved` drops the `NodeId`),
-   so something has to remember whether this node was hovered last pass. The `hover` signal already
-   does, keyed by a name the config chose, which survives a reload and keeps working when a `list`
-   churns its cards underneath it. The alternatives were both worse: keying the memory by absolute
-   rect lets a new card inherit a dismissed card's state, and keying it by position in the walk
-   breaks the moment a notification leaves the middle of a stack.
-
-   Refused rather than left inert, in `resolve_properties` where the whole property map is in
-   reach. A silently unreachable handler is exactly the failure `deserialize_lua_table`'s
-   unknown-key rejection was added to end, and the message names the fix.
-
-3. **The argument is `hovered`, and nothing else.** `on_click` passes its rect because there is no
-   other way to get it; here there is — `hover_rect(name)`, which decision 2 already obliges the
-   config to have a slot for.
-
-4. **A raised error is logged and swallowed**, on `fire_on_click`'s terms: a broken handler is a
-   config bug and must not take down a shell that is otherwise painting fine. ADR-0046's rescue
-   path is for a failed evaluation, not a misbehaving callback.
-
-The pairing rule needed one seam in the type probe: `every_type_the_stubs_declare_is_accepted_by_
-the_engine` builds each property in isolation, so `on_hover` alone would have been testing decision
-2 rather than the type the stub declares. A per-field `companions` table supplies the slot, next to
-the per-kind `required` one that was already there.
-
-Verified live end to end, which also closed ADR-0094's open half: with `on_hover` holding expiry on
-a notification card, a 5-second notification that mapped under a resting pointer was still up at
-12 seconds, the log showed `expiry held for 60s`; moving the pointer off logged `expiry hold
-released` and the card went. Declaring `on_hover` without a slot fails the reload with the message
-from decision 2.
+Live expiry-hold tests closed ADR-0094's resting-pointer case; a callback without a slot fails reload.
 
 ## 0096. A theme name in `image-path` is the application's icon, not a picture
 
-ADR-0091 split the attached picture from the sending application's icon and routed
-`image-data` > `image-path` > `icon_data` into the first. `image-path` does not only carry
-pictures. §1.2 defines it as "an URI (file:// is the only URI schema supported right now) **or a
-name in a freedesktop.org-compliant icon theme**", and the picture chain ends in
-`validate_trusted_path`, which requires an absolute path to an existing file.
+1. A bare theme name in image-path feeds the sender app_icon fallback, not the attachment.
+2. Keep image_path as an existing absolute picture path; mixing forms recreates the original ambiguity.
+3. Positional app_icon takes precedence.
+4. Distinguish paths by any slash, then apply trusted-path validation; relative traversal is not
+   a theme name.
 
-So a theme name there was dropped on the floor. That is ADR-0091's own bug one field over, and it
-reaches far more notifications than the original did: `notify-send -i firefox` leaves the
-positional `app_icon` empty and puts `firefox` in this hint, which makes it the most common way
-anything on a desktop names a notification's icon. Found by building the card that draws it --
-every `notify-send -i` in testing came up with the generic fallback while a hand-written `Notify`
-carrying the same name in the positional argument drew correctly.
-
-1. **A bare name in the hint feeds `app_icon`, not `image_path`.** It is not an attachment. A
-   sender with a real picture sends `image-data` or an absolute path; a sender with a theme name is
-   saying what application this is, which is what `app_icon` means and where a card draws it -- the
-   small mark in the header rather than the large picture beside the summary.
-
-2. **`image_path`'s contract is unchanged**: still always an absolute path to a file that exists.
-   The alternative -- letting it hold either form, since `icon { name = ... }` accepts both -- would
-   put `notify-send -i firefox`'s icon in the picture slot, drawn at attachment size beside the
-   summary, which is not what the sender meant and would make the two fields mean the same thing
-   again.
-
-3. **The positional argument still wins.** A sender that sets both is making the specific statement
-   with `app_icon` and a fallback one with the hint.
-
-4. **Told apart by a path separator**, ADR-0091 decision 3's rule verbatim, and for its reason:
-   `"../../etc/passwd"` is not absolute either, and an `is_absolute` split would pass it off as a
-   theme name for the renderer's icon lookup to open. Anything holding a `/` stays in the picture
-   chain, where the trusted-root check refuses it.
-
-`split_image_path_hint` is a pure function beside `resolve_app_icon` rather than a match arm inside
-`Notify`, because `Notify` is a D-Bus method and nothing can call it in a test.
-
-Verified live, and it is the first time either half of ADR-0091 has been seen on the glass: a
-notification carrying `app_icon = "firefox"` and `image-path = <an absolute svg>` draws the Firefox
-mark in the card header and the attached picture beside the summary, and `notify-send -i telegram`
-now draws Telegram's icon where it drew a generic fallback.
+Live checks verified both separate picture/icon rendering and notify-send's hinted theme icon.
 
 ## 0097. The notification card, and the four things the config had to decide itself
 
-`components/notification_card.lua` is `Modules/Notification/NotificationCard.qml` in this engine's
-vocabulary: an application's notifications as one card, with a picture, an app mark, a wrapping
-summary and body that expand, an age, action buttons, an inline reply, and per-message and
-per-group dismissal. It is drawn in two places -- the popup stack and the history panel -- which is
-why it is a component and not two files that drift.
+Share one notification-card component between popup and history.
 
-Almost all of it is ADRs 0089-0096 arriving at once, and there is nothing to decide about using
-them. Four things were the config's own call.
+1. Initially group by app_name and order by newest content. Desktop-entry identity was still deferred.
+2. One hover region owns the stack's expiry hold; per-card leave/enter ordering could release
+   a hold just renewed by a sibling.
+3. A Reply button requests keyboard focus before showing the field; mapping notifications must
+   not steal focus unconditionally.
+4. Card activation invokes the sender's default action, otherwise dismisses.
 
-1. **Grouped on `app_name`, which is the only key § 2.7 carries.** `hints["desktop-entry"]` is the
-   better one -- two applications can share a name and one can change its own -- and ADR-0091 left
-   it unbuilt for want of a consumer. This is that consumer, and it still is not worth adding: the
-   grouping is not visibly wrong yet, and adding a field before it is is how § 2.7 got four picture
-   sources. Group order is by each app's newest notification, since the feed arrives newest-first
-   and an app that just spoke should not sit below one that spoke an hour ago.
-
-2. **One hover region for the whole stack, not one per card.** The expiry hold (ADR-0094) is placed
-   on enter and released on leave, and sibling cards are written in tree order within a single
-   `sync_hover` pass -- so a pointer moving from the second card to the first would fire the
-   first's *enter* before the second's *leave*, and the leave would release the hold the enter had
-   just placed. A region spanning every card has no interior crossings to get this wrong. Cards
-   still light up individually; that is a separate slot doing a job with no ordering hazard in it.
-
-3. **The reply field is opened by a button, not by clicking the field.** The surface must hold the
-   keyboard before a field in it can receive one, and it cannot hold it unconditionally: niri gives
-   an `on_demand` or `exclusive` layer surface focus the moment it *maps*, and this surface maps
-   every time anything notifies you -- a constant would take the keyboard away from whatever you
-   were typing in, on every notification. So `keyboard_interactivity` follows a signal, and that
-   signal needs an event. The field's own press cannot be it: a press that focuses a `textfield`
-   deliberately arms no click (ADR-0092 decision 7), which is the rule that stops a reply from
-   firing the notification's default action. A Reply button is the ask and the surface follows it.
-   The cost is one extra click, and it is the honest one.
-
-4. **Clicking a message activates the sender's default action where there is one, and dismisses
-   where there is not.** Both are what the freedesktop spec means by activating a notification, and
-   `invoke_action` removes it afterwards on its own unless the sender set `resident` (ADR-0090), so
-   the two paths agree about what happens next. The history panel used to only dismiss, with a
-   comment saying a row that quietly does something other than what it looks like is worse than one
-   that only dismisses -- that was right while the card drew no buttons, and the buttons are what
-   make the card's own click legible now.
-
-Two smaller ones. The popup stands down while the history panel is showing, because both anchor
-top-right and the overlap draws the same notification twice with the copy you opened the panel to
-read underneath. And expansion state lives in `lib/ui_state` as two tables rather than a signal per
-group, because a group's key is an application name and so is not known until it arrives:
-`state(name, initial)` is a name-keyed registry, and minting one per app at resolve time would grow
-it for the life of the session.
-
-What it does without, both waiting on Rust. The body's spans carry bold/italic/underline and an
-`href` and `text` has no weight, style or link, so `util.notification_body` still flattens them to
-one run. And there is no animation, so a group expands and a card leaves in one frame -- the
-roadmap's own first item, and the one thing that will keep this reading as static beside the Qt
-card it mirrors.
-
-Verified live, end to end: three notifications from one sender collapse to `Chat (3)` and expand to
-three; a body longer than three lines clips with the ellipsis on the last line and expands to its
-full six; `notify-send -i` icons and an attached picture both draw; a pointer resting on the stack
-logs `expiry held` and leaving logs `expiry hold released`; and Reply, click, type, Enter emits
-`ActionInvoked(10, "inline-reply::on my way")` and clears the card and the keyboard behind it.
+Suppress popup overlap while history is open. Keep expansion state in bounded shared tables,
+not a new named signal per arriving app. Rich spans and animations were still unavailable.
+Live tests covered grouping, wrapping, pictures, expiry holds and inline reply.
 
 ## 0098. A popup is retired, not hidden, and the config is what remembers
 
-ADR-0097 had the popup stand down while the history panel was showing, so the two would not draw
-the same notification twice on top of each other. That was the wrong shape and the bug was
-immediate: closing the panel brought the popup back. Something you had already read, in a panel you
-opened on purpose, returned to the corner of the screen as though it were new.
+1. Config owns a seen-set because popup retirement is presentation, not notification removal.
+2. Key by ID and timestamp so replacement content can pop up again.
+3. Mark on history open and close, including notifications arriving while history is visible.
+4. Replace the set with the current feed rather than merge forever.
 
-The reason there was no better answer available is that the Supervisor has two states and needs
-three. A notification is live or it is gone -- `dismiss` and expiry both remove it from the feed
-entirely, which is also its removal from the history. There is no "stop popping this up, keep it in
-the list", and there should not be: which of the live notifications this shell has already put in
-front of you is a fact about the shell's own presentation, not about the notification.
-
-1. **The config keeps the seen-set.** `lib/ui_state`'s `popup_seen`, beside the expansion tables
-   for the same reason they are there -- a view fact, shared by the two places the card is drawn.
-   Nothing crosses the socket for this and nothing needs to.
-
-2. **Keyed on id *and* timestamp, not id.** `replaces_id` reuses an id deliberately to put new
-   content at it, so an id-keyed note would suppress the replacement as though it were the thing it
-   replaced -- a chat app editing "1 new message" into "3 new messages" would go silent.
-   `timestamp` moves on every `Notify` and stays put otherwise (ADR-0093), which is exactly the
-   distinction wanted, and is the second thing that field has turned out to be load-bearing for.
-
-3. **Marked on the panel's open *and* its close.** Opening it is the obvious edge; closing it is
-   the one that matters, because anything that arrived while the panel was up was on screen the
-   whole time and is owed no second showing.
-
-4. **Replaced wholesale rather than merged**, which is what prunes it: the set becomes exactly the
-   feed as it stands, so an entry that has since expired or been dismissed is forgotten, and the
-   table cannot outgrow the feed's own cap of twenty (§ 2.7). A merge would accumulate keys for
-   notifications that no longer exist, for the life of the session.
-
-ADR-0097's stand-down survives as one clause inside the same filter, because it is still true that
-both surfaces anchor top-right and the overlap is worth avoiding while the panel is up. It is no
-longer what stops the popup returning.
-
-Not changed here: the card's own close button still calls `dismiss`, which removes the notification
-from the history too. Most desktops keep a dismissed popup in the list, and the machinery to do
-that now exists -- it is one call site away. It is left alone because "the X means get rid of this"
-is a defensible reading and the alternative makes the feed grow until something clears it, which is
-a behaviour change worth asking about rather than assuming.
-
-Verified live: with one notification popped up, opening the history panel destroys
-`notification_area` and closing it does not bring it back; the notification is still in the panel;
-and a notification arriving afterwards pops up normally with the retired one staying out of the
-stack.
+Keep overlap suppression while history is open. The card's X still dismisses from history too;
+changing that behavior was deliberately left for discussion.
 
 ## 0099. `ResolvedNode` carries its `NodeId`, and a plain field's focus is keyed on it
 
-`layout::paint::FieldFocus::Plain` named the focused `textfield` by its absolute rect, and
-`input::focused_field` and `paint::FieldFocus` both carried a `ponytail:` saying why -- `to_resolved`
-dropped the `NodeId`, so a box was the only handle either had -- and both named this as the fix.
+1. Carry retained NodeId into resolved nodes so plain focus survives movement and inserted siblings.
+2. This is the engine's scene-wide identity, not the optional parent-scoped config ID hint.
+3. Still require the node to be ordinary input; a node can gain secure_submit without changing identity.
+4. Keep rect-based click arming: a cancelled click is a different failure from invisibly retained typing.
 
-The bug it produces is narrower than "focus is lost" and worse than it sounds. `prune_text_field_focus`
-never checked the rect: it drops focus when the surface dies or leaves the keyboard scope, and
-neither happens here. So a re-resolve that moved the field left the focus, the buffer and the
-callbacks entirely intact, and only *paint* lost track -- the caret and the typed text disappeared
-and the field showed its placeholder again, while every keystroke kept landing in a buffer that
-`on_submit` would still have sent. In the notification card that is one notification arriving above
-the one being replied to. Found while testing the card, where the screenshots taken to check it were
-themselves posting the notification that triggered it.
-
-The other direction was already covered by a test and is the reason the arm also checks
-`target.is_none()`: a field that came to occupy the vacated box would have drawn text it never
-received.
-
-1. **`ResolvedNode` gains `pub id: NodeId`.** It is a `Copy` u64 and `to_resolved` already clones
-   far more than that per node, so the cost is nothing. `reconcile_node` keeps the retained node's
-   id and allocates only when there was nothing to match, which is what makes it a real identity:
-   it survives the node moving, resizing, and gaining siblings ahead of it -- the last being
-   exactly the notification case, since the `list` matches the card by its `key` and the subtree
-   below it reconciles by position within a card that did not change shape.
-
-2. **Not the § 5.1 `id` property.** That one is a reconciliation *hint* a config writes and is
-   documented as unique among siblings only; this is the answer the engine reached, unique across
-   the scene, and no config has to set anything for focus to work.
-
-3. **`target.is_none()` stays, alongside the id check.** An id says which node this is. It does not
-   say the node is still the kind of field the focus was taken on, and a `textfield` that gains a
-   `secure_submit` between passes is the same node with a new job. The check is free and it keeps
-   "a masked field never draws plaintext" local to the arm that would break it.
-
-4. **`ArmedClick` keeps its rect.** The same ponytail named it as the other user of the stand-in,
-   and it is not the same situation: a press and its release are one gesture, the tree rarely moves
-   between them, and the failure is a lost click rather than a sentence typed into a field that
-   stopped showing it. Left alone rather than changed alongside, because it is a well-covered path
-   and this ADR has no evidence against it.
-
-`NodeId::test` is `#[cfg(test)]`: production ids come from `Scene::alloc_id` and nothing else, which
-is what makes them unique, but a test that builds a `ResolvedNode` without a `Scene` still has to
-say which of its nodes are the same node.
-
-Verified live, reproducing the original: a reply typed into a notification card, then a second
-notification from another sender arriving above it. The card moves down and the field still reads
-`on my way|`, where before it reverted to `Reply`; Enter from the moved position emits
-`ActionInvoked(1, "inline-reply::on my way")`.
+Live testing confirmed a reply remained visible and submitted after a new notification moved it.
 
 ## 0100. Expiry retires a notification from the popup; it no longer removes it
 
-The history panel showed what was still popped up, not what had happened. A notification that
-timed out unread was gone from `notifications.feed` five seconds after it arrived, so "what was
-that?" -- the question a history exists to answer -- had no answer. The reference config keeps a
-timed-out notification in its list until the user clears it, and so does every desktop that has a
-notification list at all; what the sender's timeout ends is the popup, not the record.
+1. Expiry sets a flag in the existing queue rather than removing history or creating a second list.
+2. Still notify the sender of closure at expiry; later history actions may reach a sender that
+   no longer remembers the ID.
+3. Transient entries are the exception and are removed on expiry.
+4. Repeated or stale-incarnation expiry is a no-op.
+5. Keep the 100-entry queue and 20-entry feed cap.
+6. Replacements reset expired and receive a new timer.
 
-A config could not paper over this. Nothing fires a callback on a feed change and a `computed` is
-pure (ADR-0021), so once the Supervisor dropped the entry there was nowhere to keep a copy. It had
-to change on the Rust side, and the change is small: `expire` used to remove the entry from the
-queue and now flips a flag on it.
-
-1. **`expired: bool` on the entry, rather than a second list.** One list and a flag is what
-   `ui.popup_seen` (ADR-0098) already reads like from the config's side, and it keeps `dismiss`,
-   `invoke_action`, `reply` and the FIFO cap addressing one queue by id. A separate `history`
-   array would have meant every id-taking command deciding which list to search first.
-
-2. **The sender still hears `NotificationClosed(id, reason=1)` at the moment of expiry.** From its
-   side the notification has closed: an `ActionInvoked` from a history card may or may not reach a
-   process that still remembers the id, and a `replaces_id` at that id will be treated as new
-   content. That is the base spec's contract and the reference config keeps it too, calling
-   `expire()` on the notification while keeping its own wrapper. Nothing about the wire changes.
-
-3. **`hints["transient"]` is honoured, and it is the only reason expiry still removes anything.**
-   The spec's meaning of transient is "show this and do not keep it", which was the old behaviour
-   for everything. It is carried as `transient` so a history can also leave a live one to the
-   popup; the reference config does the same, never storing a transient wrapper.
-
-4. **A repeated or stale expiry is a no-op, checked in the pure half.** `expire_entry` returns
-   `None` for an entry that already expired, so the close cannot be announced twice, and for an
-   incarnation that has moved on, as `find_expiring_entry` always did.
-
-5. **The queue's caps are unchanged.** One hundred deep with the feed a view of twenty (ADR-0033).
-   The feed fills faster now that entries stay, and the oldest falls off the back with
-   `NotificationClosed(id, reason=4)` as before; the reference config caps at a hundred stored
-   too. Raising the view is a one-constant change if twenty proves short for a history and is
-   not made here on no evidence.
-
-6. **A replacement resets the flag.** A `replaces_id` update builds a fresh `Notification` with
-   `expired = false` and its own timer, so an updated history entry pops up again -- which is what
-   "3 new messages" landing on a retired "1 new message" should do.
-
-The popup filters on `expired` from this commit, since without that a retired entry would pop up
-forever. Everything else a config can do with the flag -- an absolute time in the history, a
-dimmer card for a read entry, retiring on the X rather than dismissing -- is left to the config
-pass that follows.
+Popup config filters expired entries; history appearance and X-button retirement policy remain config work.
 
 ## 0101. `desktop_entry` and `reply_placeholder` are carried from their hints
 
-Two more `Notify` hints read and carried, each because a consumer now exists.
+1. Carry desktop_entry for grouping/application lookup, capped at 128 bytes and rejecting slashes.
+   Unknown IDs simply miss and use config fallback.
+2. Carry the KDE reply placeholder, capped like a button label; empty means absent.
 
-1. **`hints["desktop-entry"]` becomes `desktop_entry: Option<String>`.** ADR-0091 left it unbuilt
-   for want of a consumer and `util.group_notifications` is that consumer: it groups on `app_name`
-   and says so is the wrong key. A desktop id is what `oblisk.applications`'s `by_app_id` is built
-   to be looked up by (ADR-0061), so a config can also draw the localised `Name=` and the `Icon=`
-   of the real application instead of trusting a sender's self-description. Carried as sent up to
-   `summary`'s 128-byte cap, and refused entirely when it holds a `/`: a desktop file id never
-   does -- the spec turns a subdirectory into a dash -- so one that does is not an id, and the only
-   thing it could do is aim a config's lookup at a path.
-
-2. **`hints["x-kde-reply-placeholder-text"]` becomes `reply_placeholder: Option<String>`.** KDE's
-   extension and the one Telegram, Fractal and friends actually send alongside `x-kde-reply`, which
-   `has_reply` already honours. Capped like a button label, which is roughly what it is. Empty is
-   carried as absent, since an empty placeholder is no placeholder and the config's own "Reply"
-   should win.
-
-Neither is validated further. A desktop id that names no installed application is a key that
-misses in `by_app_id`, and the config falls back to `app_name` exactly as it does today; a
-placeholder is text drawn in a field. Both are `nil` for the great majority of `notify-send`
-callers, which set neither.
+Both fields are added for existing consumers, not speculative metadata completeness.
 
 ## 0102. `textfield` gains `on_cancel`, and Escape gives the field up when it is declared
 
-ADR-0092 decision 6 made Escape clear a plain field and keep the focus, and gave the reason: a
-config cannot observe focus, so a field that silently stopped taking keys would have no way to say
-so on the glass. That reasoning is right and it is also exactly the gap. The reference config
-closes a reply on Escape (`Keys.onEscapePressed` on the `TextField`), and here Escape emptied the
-box and left the user in it, with the Reply button's row still open and the surface still holding
-the keyboard `Exclusive`ly -- so Escape, the key that means leave, left nothing.
+1. Add ordinary-field on_cancel; it alone does not make an unreadable field focusable.
+2. Escape clears the draft, emits a changed empty value when needed, drops focus, then calls cancel.
+   An already-empty field still cancels.
+3. Without the callback, preserve clear-and-stay behavior.
+4. Do not introduce a general key event or bare-surface Escape handling.
 
-1. **`on_cancel: fun()` on a plain `textfield`.** Declared alongside `on_change`/`on_submit`; it
-   does not on its own make a field focusable, since a field nothing can read is still not worth
-   the keyboard. Nothing changes for a masked field, whose Escape is the lock screen's and is
-   settled (ADR-0092).
-
-2. **Escape on a field that declared it clears, drops the focus, and then calls it.** In that
-   order. The buffer is emptied and `on_change("")` fires if there was text, so a bound draft
-   resets; the focus is released; and `on_cancel` runs last, because what it will usually do is
-   remove the field or drop the surface's `keyboard_interactivity`, and it must not find the focus
-   still pointing at a node about to go. Escape on an empty open field is still a cancel -- the
-   field was open and the user asked to leave it -- with no `on_change`, since nothing changed.
-
-3. **Escape on a field without it behaves as before.** Clear and stay. ADR-0092's argument holds
-   unchanged for a field that cannot be told; this ADR only adds the way to be told.
-
-4. **Not a general key event.** The reference config also dismisses a bare popup card on Escape,
-   which needs a surface-level key handler and a keyboard-holding surface with no field in it.
-   Nothing here has asked for that and `keyboard_interactivity` is deliberately bound to "a reply
-   is open" (popup.lua), so a bare card never has the keyboard to receive an Escape on. Left for
-   whoever first needs a keyboard-driven surface that is not a text field.
-
-`edit_plain_buffer` is the pure half, split out so the rule is tested without a seat: the four
-outcomes -- clear-and-stay, clear-and-cancel, cancel-on-empty, and typing/submitting never
-cancelling.
-
-In the notification card, `on_cancel` is `ui.close_reply()`: the row goes, `reply_id` returns to
-zero, and the surface's `keyboard_interactivity` follows it to `"None"`, which is the same path the
-Send button already takes. Verified live: Reply, type, Escape -- the field and the Send button are
-gone, the popup no longer holds the keyboard, and nothing was sent.
+Secure-field behavior is unchanged. Live reply cancellation removed the row and released keyboard focus.
 
 ## 0103. `applications:open_url(url)`, so a link in a notification body can be opened
 
-A notification body's spans carry an `href` and the field's own doc said "carried as text, not
-opened: launching it is a config's decision". It was not a decision a config could make. Nothing in
-the Lua surface runs a program: `applications:launch` takes a desktop file id and nothing else
-(ADR-0061 decision 3, deliberately), and `process.run` pipes and holds a child the shell then owns.
-A link a config could draw but not follow is a link, and the reference config opens them with
-`Qt.openUrlExternally`.
+1. Add open_url to applications, using detached xdg-open rather than generation-owned process.run.
+2. Allow only http, https and mailto. Reject local files and application-specific schemes from
+   untrusted notification text unless a concrete future use justifies them.
+3. Reject whitespace/control characters and URLs at or above 2048 bytes.
+4. Refuse invalid input rather than guess by sanitizing it.
 
-1. **On `applications`, not a new capability.** It is the capability for running things the user
-   asked for, and "open this in whatever handles it" is a launch with the desktop deciding the
-   program. `xdg-open`, detached in its own process group like `launch`, so a generation swap does
-   not reap the browser it started.
-
-2. **Allowlisted schemes: `http`, `https`, `mailto`.** Not `file:`. Every path a notification hands
-   this shell runs through a trusted-root check precisely because a body is untrusted text, and
-   "open this local file" is the one thing it must not be able to say -- the reference config's
-   `safeUrl` lets `file:` through, and that is the one place this does not follow it. Not
-   application schemes (`tg:`, `spotify:`, `steam:`) either: each names a program the URL's author
-   chooses, and a body should not choose programs. Extending the list is one constant, when a
-   specific scheme is wanted for a specific reason.
-
-3. **No whitespace or control character, and under 2048 bytes.** Nothing legitimate carries them,
-   and an argument holding a newline is how one log line becomes two. The cap is far above what a
-   512-byte body can hold and exists for a URL a config built itself.
-
-4. **Refused, not sanitised.** A URL that fails is logged with the reason and nothing runs. Fixing
-   it up -- prepending a scheme, stripping a space -- would be this shell guessing what the sender
-   meant, on the input it trusts least.
-
-The card side, where a link gets a button or an underlined run to press, is the config pass; this
-is what that pass presses.
+Config decides which affordance calls the action.
 
 ## 0104. `text.content` takes styled runs, drawn in the family's own bold and italic faces
 
-A notification body arrives as spans carrying `bold`, `italic`, `underline` and `href` (ADR-0033),
-and `text` took one string, so `util.notification_body` flattened them and every `<b>Alice</b>:
-hi` drew as `Alice: hi`. A link was a stretch of body text that looked like the rest. The reference
-config renders the body as Qt rich text and this was the largest gap left between the two.
+1. Accept styled text runs beside strings; reject image spans rather than silently ignore them.
+2. Represent runs as byte ranges over joined text so wrapping/elision can rebase styles.
+   The ellipsis inherits the replaced character's style.
+3. Send only measurement-affecting bold/italic ranges to shaping; color/underline share cached metrics.
+4. Resolve actual primary-family variants once; fallbacks remain regular. Missing variants use
+   regular on both measure and paint.
+5. Track faces, not just files, so collection face indices and weights agree across renderers.
+6. Paint styled segments with accumulated measured advances and explicit underlines.
+7. Multiply run color by opacity like the node foreground.
 
-Node-level styling -- a `bold` on the whole `text` -- was considered and does nothing for the body:
-the mixing is inside one wrapping paragraph, and a paragraph cannot be a row of nodes because a
-`row` does not wrap. So the runs had to go through the pipeline, and the pipeline was a `String`
-end to end: parsed as one, measured as one, rewritten by wrap and elide as one, painted as one.
-
-1. **`content` accepts an array of runs beside the string it always took.** `{ text, bold?,
-   italic?, underline?, color? }` is a `NotificationSpan` minus `kind` and `href`, on purpose: a
-   body's text spans can be handed over as they arrive, with `href` mapped to an underline and a
-   colour by the config, which is where "what does a link look like" belongs. An image span has
-   no `text` and is refused with a message saying to leave it out, rather than drawn as nothing.
-
-2. **Internally the runs are byte ranges over one string, not a list of strings.** `StyleRun` is a
-   range plus the four style fields; `content` stays the joined `String`. Wrapping, eliding and
-   `\n`-joining were already string surgery in one place, `fit_text_to_box`, and a range is what
-   survives surgery: `Fitted` appends slices of the *source* and re-bases whichever runs overlap
-   each slice. `ShapeResult` grew `line_ranges`, parallel to `lines`, because cosmic-text hands back
-   a line's text and the ranges are what let a run follow it across the break. An ellipsis takes
-   the style of the character it replaced, so a truncated bold sentence ends in a bold ellipsis.
-
-3. **The shaper sees only the half that changes a measurement.** `FontRun` is range, bold, italic;
-   an underline or a colour never reaches the worker, so two contents differing only in colour
-   share one memo entry. Runs are part of the memo key for the same reason `line_height` is: a
-   bold prefix measures wider and a hit that ignored it would return another request's answer.
-
-4. **Real faces, resolved once, for the primary family only.** `fonts::resolve_chain` asks
-   fontconfig for `family:weight=bold`, `:slant=italic` and both, and loads each file that comes
-   back as the same family; a family shipped as one `.ttc` resolves every variant to the file
-   already loaded and costs nothing more. Fallback entries stay regular: they are there for
-   codepoint coverage, nothing asks CJK for a weight, and a `Noto Sans CJK` bold is another 16MB
-   mapping for no visible glyph. A variant the family does not ship draws in the regular face, on
-   both sides, so measurement and paint still agree.
-
-5. **`font_chain_data` is per face, not per file, and picks by weight.** femtovg was handed face 0
-   of every file; for a `.ttc` whose face 0 is a Thin, that was a latent disagreement with
-   cosmic-text's own weight-400 pick that no installed chain happened to trigger. The painter now
-   holds one chain per variant -- the primary's face for it, then every fallback -- so per-glyph
-   fallback works the same in bold as in regular. `fonts[0]` is still the regular face.
-
-6. **A styled line is painted piece by piece, advanced by femtovg's own measurement.** femtovg's
-   `set_text_align` can place one run; a line of several is anchored from its pieces' total width
-   instead, and each piece drawn `Align::Left` at the running x. An underline is a filled rect one
-   pixel or `font_size / 16` thick, whichever is more, just under the baseline. A plain line takes
-   exactly the path it always did.
-
-7. **Colour fades with `opacity` like the node's own.** A run's colour goes through the same `fade`
-   as `foreground`, so a card fading out does not leave its links at full strength.
-
-The stub probe learned to split `string|TextRun[]|Bound` into three members -- it treated any
-bracket as an unsplittable spelling, which was right for `("SlideX"|...)[]` and wrong for an
-array suffix -- so `TextRun[]` is probed like every other type rather than skipped.
-
-Tests: the parser's joins and refusals; `segments` splitting a line at run boundaries, including a
-run that crosses a wrap; runs following their text across a wrap and an elided bold prefix ending
-in a bold ellipsis, through the real `Scene`; `line_ranges` slicing the source to each line past an
-explicit newline; a bold run measuring wider than the same text regular; and cosmic-text and
-femtovg agreeing on a bold run's width to 2%, the same divergence test that guards the regular
-chain, with the bold chain confirmed to lead with a face of its own.
-
-Verified live in the config commit that follows: a body sent as `<b>Alice</b>: see <a
-href="https://example.org">this</a>` draws the name in bold and the link underlined in the accent.
+Tests cover parser, wrap/elision ranges and shaping/paint width agreement. Live notification
+rendering verified bold and link styling; hyperlink activation was still separate.
 
 ## 0105. The notification config pass: what the four Rust changes let the cards do
 
-ADR-0100 through ADR-0104 added `expired`, `transient`, `desktop_entry`, `reply_placeholder`,
-`on_cancel`, `open_url` and styled runs. This is the config pass that spends them, together with
-the things the payload already carried and the cards did not read: `urgency`, `actions[].icon_name`,
-`dnd`, `oblisk.lock`, and a timestamp that `os.date` can format. All Lua; nothing here changed the
-engine.
+Config-only use of ADR-0100 through ADR-0104.
 
-1. **The body is drawn as it arrived.** `util.notification_body` maps text spans to `TextRun`s and
-   a link to an underlined run in the accent -- the config decides what a link looks like, the
-   engine draws runs. Each distinct `href` also gets a button labelled with its host, which calls
-   `applications:open_url`. A button rather than a tap on the underlined words, because the engine
-   hit-tests nodes and not glyphs, and the whole message is already a button whose click is the
-   sender's default action; a link tap that also fired that would open the page and take the card.
-   Inline images are drawn under the text, small.
+1. Preserve text styles and inline images; provide URL buttons while glyph hit-testing is absent.
+2. Group by desktop ID with app-name fallback and installed metadata; omit transients from history.
+3. Order critical, newest, then key for deterministic ties.
+4. Derive urgency borders from the group's newest entry.
+5. Render action icons where offered.
+6. Wire DND to backend sound suppression and config popup filtering, with critical bypass.
+7. Suppress popups while locked without marking them seen; expired pings remain retired on unlock.
+8. Section and date history rather than showing only relative ages.
 
-2. **Grouped by desktop id, named and iconed by the installed application.** `group_notifications`
-   keys on `desktop_entry` when the sender set one and falls back to `app_name`; the id is looked
-   up in `applications.by_app_id`, so a Telegram notification is headed "Telegram Desktop" with
-   Telegram's own icon rather than whatever string the sender chose. Transients are left out of the
-   history's grouping and kept in the popup's.
-
-3. **Critical first, then newest, then key.** The mirror's `_compareGroups`, and the tiebreak on
-   the key is not decoration: two groups with the same second would otherwise swap places from one
-   pass to the next, since `table.sort` is not stable.
-
-4. **The border says the urgency.** Low fades into the glass, normal carries the accent, critical is
-   red, read off the group's newest notification. The mirror's `_urgencyConfig`, at border opacity.
-
-5. **Icon-only actions.** A sender that set `action-icons` gets its glyphs drawn from the theme
-   beside, or instead of, the label -- a media notification's prev/pause/next is three glyphs.
-
-6. **Do-not-disturb is wired.** `set_dnd` exists since ADR-0033 and no config file called it. The
-   history panel's header has the toggle; the bell shows the off glyph while it is on; the popup
-   stands down for everything but a critical notification, which is the one urgency the mirror lets
-   through DND. The Supervisor's flag already muted the sound, so one toggle now quiets both.
-
-7. **No popups while locked.** `oblisk.lock.active` empties the stack. Not marked seen, so what
-   arrived while locked pops up on unlock -- except what expired meanwhile, since the Supervisor's
-   countdowns keep running and a five-second notification is `expired` long before the unlock.
-   That is the right split without any code deciding it: a critical alert waits, a chat ping does
-   not.
-
-8. **The history is sectioned and dated.** "urgent", "today", "yesterday", "earlier" -- the mirror's
-   buckets -- as heading items in the one array the `list` draws, since a heading is an item; and
-   each card shows "Thu 16:32" where the popup shows "5m", because a history is about when.
-
-Not changed: the card's X still dismisses rather than retires, awaiting an answer (ADR-0098); the
-popup does not stand down for an open launcher; and there is still no animation.
-
-Verified live: a critical notification with `desktop-entry: zen` and a body of `<b>Alice</b>: see
-<a href="https://example.org/some/page">this page</a> and <i>call me</i>` draws under "Zen Browser"
-with Zen's icon, a red border, "Alice" bold, "this page" underlined in the accent, "call me" italic,
-and Reply / Archive / example.org buttons; a low-urgency media notification with `action-icons`
-beneath it draws three glyph buttons and a dim border. The history shows both under "urgent" and
-"today" with clock readings.
+X still dismisses, launcher overlap and animation remain unchanged. Live cards verified styles,
+metadata, urgency, actions and history buckets.
 
 ## 0106. A press on a link's own words opens it: `href` on a run, `on_link` on `text`
 
-ADR-0105 gave a body's links a button each and said why not the words themselves: the engine
-hit-tests nodes, not glyphs, and the message is already a button whose click is the default action.
-Then the words were underlined in the accent, which is the one affordance every reader knows, and
-pressing them dismissed the notification. An underline that does not open is worse than no
-underline; the button was right to exist and wrong to be the only way.
+1. Carry href on runs and report it through text.on_link; URL-opening policy remains Lua-owned.
+2. Share segment splitting with painting and rederive hit geometry through cached shaping.
+   Existing measure/paint divergence tests bound the difference to 2%.
+3. A hit link wins over ancestor buttons; ordinary words remain transparent to them.
+4. Release must match the armed href as well as the paragraph rect.
 
-1. **`href` is a field of a run, `on_link(href)` a property of the node.** The run shape is now a
-   notification span's exactly, `kind` aside, so `util.notification_body` copies `href` through and
-   nothing else changes. The engine carries the string and reports which run was pressed; what to
-   do with a URL stays the config's (`applications:open_url`, ADR-0103).
-
-2. **The run under a point is found by re-deriving paint's geometry with the shaper.** `\n` splits
-   the fitted content into lines a `line_height` apart, each line is cut at its run boundaries
-   (`segments`, moved out of the painter so both sides read one function), the pieces are measured
-   by the shaping worker and laid from the alignment's anchor. femtovg measures paint and cosmic-text
-   measures this; the two agree to 2% (the divergence tests), well inside the slack a press on a
-   word has. Measured with the worker rather than on the GL thread because input has no canvas, and
-   every measurement is a memo hit after the first frame anyway.
-
-3. **A link beats the buttons above it, a plain word does not.** The same rule as a `textfield`
-   press arming no click (ADR-0092 decision 7): a link inside a card whose whole face is the
-   default action opens the page and does not also take the card. A `text` with `on_link` whose
-   plain words were pressed is transparent, so the message still activates on a press to its body.
-
-4. **The release must land on the same link.** `ArmedClick` carries the `href` beside the rect: a
-   paragraph with two links is one rect, and pressing one then releasing over the other is not a
-   click on either. The handler takes the `href` and nothing else -- the rect is the paragraph's,
-   and a link is not a mouse button.
-
-The link buttons stay. A three-line elide can cut a link's words off before they are drawn, and the
-button is the one control that says where a link goes before it is pressed.
-
-Verified live: pressing "this page" in a body of `see <a href="https://example.org/some/page">this
-page</a> when you get a moment` opens the page in the running browser and the notification stays;
-pressing "when" beside it dismisses the card as before.
+Keep URL buttons for links elided out of the text. Live checks confirmed link activation without
+card dismissal and ordinary body activation beside it.
 
 ## 0107. The pointer takes a shape over what it is on: `cursor` on every node, a default in Rust
 
-Nothing set a cursor before this. The Renderer bound a bare `wl_pointer` and never called
-`set_cursor`, so the pointer kept whatever shape the compositor was showing when it crossed onto a
-surface. The reference config gives every `MouseArea` a `cursorShape`, and a bar whose buttons never
-say they are buttons reads as a picture of one.
+1. Accept CSS cursor names on every node and reject unknown names.
+2. Native defaults follow behavior: links/clickable buttons use pointer, fields text, otherwise arrow.
+3. Walk innermost first; at each node explicit cursor overrides its default, not deeper children.
+4. Use SCTK ThemedPointer for cursor-shape protocol with XCursor/shm fallback. Send on changes
+   and reset on leave because shapes belong to enter serials.
 
-1. **`cursor` is a § 5.1 property, on every kind, by CSS name.** `"pointer"`, `"text"`,
-   `"not-allowed"`, `"grab"`, the resize edges: `cursor_icon`'s names, which are also
-   `wp_cursor_shape_v1`'s, so the string a config writes is the string the compositor reads. An
-   unknown name fails the pass like any other property (`node::parse_cursor`, called from
-   `LayoutStyle::parse` and kept nowhere: the pointer path re-reads the name off `properties`).
-
-2. **The default lives in Rust, not in the Lua components.** The reference sets `cursorShape` on
-   each component because Qt's `MouseArea` has none of its own. Here the decision has to be made at
-   hit-test time anyway, on the pointer path, where only the Renderer knows which node the point is
-   on; and the three questions it asks on a press are the three that decide the shape. So
-   `layout::hit::cursor_under` walks the hit path innermost-first and at each node takes an explicit
-   `cursor` if there is one, else what the node is: a `text` with `on_link` whose link words are
-   under the point is `pointer`, a `textfield` is `text`, a `button` with a callable `on_click` is
-   `pointer`. Nothing else says anything and the arrow is what is left. A `button` with no handler
-   is transparent to the shape as it is to a press, so what the cursor promises is what a click does.
-   `dev-config` changes nothing: its components already build a `row` rather than a `button` when
-   there is nothing to click, so the default already covers them. The property is for the exceptions
-   that do not exist yet: a control that is off, a drag handle, something refused.
-
-3. **Innermost wins, explicit ahead of implied, at each node.** A `cursor = "grab"` on a card still
-   yields to a link in its body because the walk meets the link first; a `cursor = "not-allowed"` on
-   a `button` beats the button's own `pointer` because the explicit check runs before the kind
-   check at the same node.
-
-4. **`ThemedPointer` in place of the bare `wl_pointer`.** SCTK's type speaks `wp_cursor_shape_v1`
-   when the compositor advertises it (niri does) and paints from the XCursor theme through `wl_shm`
-   when it does not, so `wl_shm` is bound for the first time, for that fallback alone; this process
-   still draws through EGL. The shape is sent from the `Enter`/`Motion` arm beside `sync_hover`, and
-   only when it differs from the last one sent, since a motion arrives per pixel. `Leave` forgets
-   the last shape, so the first event after an `Enter` always sends, which is what the protocol
-   asks for: the shape is bound to the enter serial.
-
-Cost: one `hit_path` walk per motion event on top of `hover_writes`'s, and a `link_under` shaping
-call only when the pointer is on a `text` that declares `on_link`. Not measured; nothing on the
-pointer path has needed to be yet.
+The extra hit walk and link measurement cost were not measured in this pass.
 
 ## 0108. A reply's keyboard is on demand, and a plain field keeps its draft while it exists
 
-Three reports from one afternoon of using the reply box, all one design: the popup's open reply
-held every key on the desktop until Escape or Send, clicking anywhere else changed nothing; the
-pointer drifting off the card emptied the field; and once a draft existed, the card's X stopped
-working. The first two were the design as written (ADR-0092's `Exclusive`, ADR-0050's clear on
-`leave`); the third was a bug this ADR's first cut introduced and its second removed.
+1. Replies request OnDemand rather than Exclusive; network prompts retain Exclusive with an
+   outside-click closer.
+2. Keep a plain draft while its node lives, separate from whether it currently receives keys.
+   Losing keyboard focus hides the caret but preserves text; node removal/cancel clears it.
+3. Suppress ancestor clicks only when the press actually landed on a field, not whenever a draft exists.
+4. Request keyboard only for a reply still represented in the feed, not a stale reply ID.
+5. Disable card body activation while replying; explicit X still works.
 
-1. **`OnDemand`, not `Exclusive`, for a reply.** Exclusive is the lock screen's word: the compositor
-   keeps the keyboard on the surface whatever is clicked, and a 355-pixel popup has nowhere for a
-   click-outside to land, so nothing could ever release it. On demand, niri moves the keyboard with
-   the user -- to whatever is clicked, and under `focus-follows-mouse` to wherever the pointer goes.
-   That second half is the compositor's rule and applies to this surface as to any window: while the
-   pointer rests on the popup, keys go to it, and a card vanishing under a resting pointer
-   re-evaluates pointer focus the same way. Measured: the flip to `OnDemand` on a mapped surface is
-   honoured (the `enter` arrives on the same pass when niri chooses to give it), and a click into the
-   field takes the keyboard when it did not. The network password keeps `Exclusive`; it is raised by
-   a click on the panel and the panel's own click-outside catcher ends it.
-
-2. **A plain field holds its text for as long as its node exists.** `FocusedTextField` was the
-   field *receiving keys* and was dropped on the keyboard's `leave`, which made every pointer drift
-   a discard. It is now the field *holding the draft*, with a `typing` flag a press sets and a press
-   elsewhere clears; whether keys reach it is asked at the moment one arrives -- `typing`, and its
-   surface in the keyboard scope -- and the caret is drawn by the same question, so what looks live
-   is what a key would land in. Keys with the keyboard elsewhere go nowhere; the draft stays. A press
-   back into the same node keeps the buffer, a press into another field replaces it, and the draft
-   is dropped when the node is gone from the tree (`hit::contains_node`, checked before each key)
-   or its surface is dead. Escape with `on_cancel` still drops it, since that is what Escape means.
-   `keyboard_interactivity` moving no longer touches the field at all.
-
-3. **The press that arms no click is the one that landed on a field.** The first cut computed
-   "focused a field" from "a plain field is held after this press", which the held draft made true
-   for every press on the surface: the X, the Send button, the body. It is `hit.field.is_some()`,
-   read before the match consumes it. Verified by the bus: the X on a card with a draft dismisses it
-   (`NotificationClosed`, reason 2) where it did nothing a build earlier.
-
-4. **The keyboard is asked for while the field is on screen, not while an id is set.**
-   `ui.reply_open` is `reply_id` names a notification still in the feed; both surfaces bind to it.
-   `reply_id` goes stale by every door but the field's own -- the X, an action, the sender
-   withdrawing -- and a surface bound to the bare id mapped on the next notification asking for the
-   keyboard for a field it was not drawing. `close_panel` also closes the reply, so the panel's
-   click-outside catcher closes both, which is what a click outside a panel means.
-
-5. **The card's body is inert while its reply is open.** The field is one row of a card whose whole
-   face otherwise dismisses (or activates), and a click a few pixels off the field took the card and
-   the draft with it. The X is still there for someone who meant it.
-
-Not done: shrinking the popup's input region to its cards. The surface is `notification_stack_height`
-tall and its `column` fills it, so under focus-follows-mouse the empty space below the cards also
-takes the keyboard while a reply is open. The fix is the column sizing to its content and the list
-losing its scroll, which is a trade the mirror's popup also makes; deferred until it is felt.
+Empty popup space still claimed input/focus; narrowing that region remained deferred.
 
 ## 0109. The reply field is always there, the keyboard is asked for on hover, and the input region is what is drawn
 
-ADR-0108 left two things: pressing Reply opened a field you then had to click into, and the popup's
-empty space below its cards took the keyboard under focus-follows-mouse. Both had one cause and the
-mirror had already avoided it.
+1. Always draw available reply fields; remove the extra Reply-button state. Stamp drafts by card
+   so another card's Send cannot submit them.
+2. Request OnDemand on hover or while a valid draft is pending; the actual click acquires keyboard
+   on tested niri. Network prompts remain Exclusive.
+3. Recurse through transparent containers when building input regions. Claim painted content and
+   intentional invisible click handlers, not empty layout boxes.
+4. Disable body activation while a draft is pending, not while an obsolete open flag is set.
 
-1. **Every inline-reply card draws its field. There is no Reply button.** `NotificationCard.qml`'s
-   `Loader { active: hasInlineReply }` is exactly this, and it removes the problem rather than
-   solving it: the one click the user makes is the click into the field, and that click is the one
-   that focuses it. `reply_id` and `open_reply`/`close_reply` are gone with the button. What remains
-   is the draft, stamped with the card it was typed into (`reply_draft_id`, `reply_draft`), so a
-   Send button on card A cannot send a sentence typed into card B. `send_reply(id)` checks the stamp.
-
-2. **The surface asks `OnDemand` while the pointer is on it, or while a draft is pending.** Measured
-   twice: niri does not hand the keyboard to a mapped layer surface on the flip to `OnDemand` (three
-   seconds, nothing), and drops it at once on the flip from `Exclusive` to `OnDemand`, so acquiring
-   through `Exclusive` is out. What niri does honour is a *click* on a surface that is already on
-   demand. So the popup's binding is its own hover signal, which is true before the click into the
-   field lands, plus `ui.reply_pending` (non-empty draft, card still in the feed), which keeps the
-   ask alive after the pointer leaves for a click-to-focus compositor that would otherwise drop the
-   keyboard mid-sentence; under focus-follows-mouse the keyboard has left with the pointer anyway.
-   The panel host asks on demand for as long as the notifications panel is showing, since the panel
-   itself is the thing hovered; the network password keeps `Exclusive`. A surface that is `OnDemand`
-   and not clicked takes nothing, which is why the hover binding is safe against the "a notification
-   arrived and stole my keyboard" case ADR-0108's comment guards.
-
-3. **The input region is what the tree draws and what it can click.** `overlay_input_regions` was
-   the root's visible direct children, which made a full-surface transparent `column` claim the
-   whole 523-pixel box. It now walks into a transparent container and claims a node's box when it
-   is solid: a background, a border, any text/icon/image/field, or a `button` with an `on_click`
-   (the panel host's catcher is invisible by design and must stay pressable). Everything else is
-   click-through, and under focus-follows-mouse focus-through, so the space below the cards no
-   longer takes the keyboard, and no longer holds expiry either -- the hover column is unchanged,
-   but pointer events simply stop arriving there. This is the docstring's own stated upgrade path,
-   and it is the mask the mirror sets (`maskItem: popupColumn`) expressed the way this engine
-   already computes regions. The scroll is kept: the list still fills the surface, only the region
-   shrank.
-
-4. **The body is inert while a draft is pending, not while a field is "open".** Same rule as
-   ADR-0108's, re-keyed to the draft since there is no open state left.
-
-Verified live on niri: a card arrives; the pointer parked in the empty box below it holds nothing
-and asks for nothing; on the card it holds expiry and flips to `OnDemand`; one click into the field
-brings `keyboard focus entered` and typing lands; the pointer leaving takes the keyboard and keeps
-the text; returning brings both back; Send removes the card.
-
-Not taken: a `focus` property on `textfield` for focusing a field the pass just created. It would
-have set the field typing without the surface having the keyboard, since on niri only the click
-brings that, and the click is now the one into the field.
+Live tests verified empty space no longer takes input, one-click typing and draft preservation.
+A focus property alone would not acquire the compositor keyboard and was rejected.
 
 ## 0110. A panel is as tall as its content, up to a cap: `max_width`/`max_height`, and the host card centres under its indicator
 
-Every bar panel shared one card height, `theme.panel_height`, sized for the tallest body and worn by
-all of them. Four networks in range sat over 200px of empty glass; the notification history needed
-a second, taller number and a rule in `panel_host.lua` for when to switch to it; and the two states
-of that rule were both wrong for a feed of one card. `PanelHost.qml` has none of this: its surface is
-`panelItem.preferredHeight`, and each panel's list is `Math.min(contentHeight, Theme.itemHeight * 7)`.
-The engine could not say that. `Content` is always the content and `Fill` is always the box, and a
-`Content` column holding a `Fill` list gave the list nothing (ADR-0077's one-pass reasoning).
+1. Add numeric max_width/max_height, 0–8192, for content-sized nodes. Capped content leaves a
+   real scroll remainder; the decision treated fixed/Fill sizing separately.
+2. Let the example host card size to content and cap each list instead of selecting fixed panel heights.
+3. Center beneath the triggering indicator, then clamp inside screen edges in Lua.
+4. Recompose network/Bluetooth panels from Lua controls. Empty Bluetooth names fall back to MAC,
+   because empty strings are truthy.
 
-1. **`max_width` and `max_height` are base properties.** Pixels only, `[0, 8192]`, on any node; they
-   are taffy's own `max_size`, so a `Content` node measures its children and is then capped, while
-   the children keep the size they were given. That is what leaves `finish`'s `extent_along` a
-   remainder for `scroll_offset` to clamp to: a `list` with `max_height` and a `scroll` is exactly
-   the mirror's capped `ListView`. Beside a fixed or `Fill` size the cap is inert, which is the right
-   reading -- those already say how big. `a_max_height_caps_a_content_sized_column_and_leaves_the_rest_to_scroll`
-   pins both halves.
-
-2. **The host card has no `height`.** It is its content; every panel's list carries a `max_height`
-   (`theme.panel_list_height`, or `theme.notification_list_height` for the history), and the
-   `height = "Fill"` that every body and section wore is gone, because there is no box left to
-   fill. `theme.panel_height` and `theme.notification_panel_height` are deleted with the two-step
-   rule. `socket.rs`'s panel measurement now asks the one question that remains -- does the card end
-   above the bottom of the surface -- rather than comparing fixed rows against a card height that
-   the sections, all invisible at startup, never reached anyway.
-
-3. **The card is centred under the indicator that opened it,** the mirror's `calculateX`, then clamped
-   a `spacing.sm` inside either screen edge by hand (`SlideX`, since a layer surface has no
-   `constraint_adjustment`). It hung off the indicator's left edge before, which under a bar button
-   read as belonging to the button to its right.
-
-4. **The network and bluetooth panels are laid out as the mirror's.** A `panel_header` with the
-   radio's master switch (the glyph on a plate that goes dim when the radio is off), `panel_toggle_card`
-   as the mirror's tile rather than a settings row, `panel_row` with `selected` (accent ring and
-   ground) and a composed `leading`, `panel_action_icon` for a row's quiet red actions, and
-   `panel_empty_state` with a glyph. A network row draws what it used to spell: the glyph's bars are
-   the strength, a coloured "5G"/"2.4" is the band, a lock badge is the security, the ring is the
-   connection. A bluetooth device with an empty `name` is now titled by its address (`name or mac`
-   was the bug: `""` is true in Lua). Not carried over, each for a stated reason in the file: the
-   hidden-network row, the IP address, Saved/Available sections, the Visible tile, the codec picker.
+Hidden-network entry, IP display, sectioning, visibility and codec controls were not all copied;
+their omissions stayed explicit config scope, not proof of framework gaps.
 
 ## 0111. A flex item's cross-axis minimum is `auto`, because taffy 0.14 adds the container's margin to it
 
-The first content-sized panel (ADR-0110) came up a line short: the last notification card in the
-history had its bottom border and the card's padding under it cut off, and only in a session.
-`socket.rs`'s harness built the same tree from the same config and measured it right. The difference
-was where the card sat. The harness anchors at `x = 0`; the session centres the card under the bell,
-a `margin.left` of 1521 on a 1920 output. `OBLISK_DUMP_LAYOUT` (below) showed the body column 13.2px
-shorter than its own children -- one line of `font.sm` -- and a probe on the measure callback showed
-why: the wrapped body was measured once at a known width of exactly 1521 (one line), and then laid
-out at 378 (two lines). The card's height was taken from the first answer.
+1. Use auto for flex-item cross-axis minimum, zero on the main axis and stacking axes.
+   This avoids taffy 0.14 adding the container's margin to an explicit child minimum.
+   A standalone reproduction and the anchored notification-card test justify the mapping, not a fork.
+2. Add opt-in per-instance layout dumps so session geometry can be compared with test assumptions.
 
-That is a taffy 0.14.0 bug, reproducible against taffy alone. In `determine_flex_base_size` and in
-`determine_container_main_size`, a flex container measuring its children clamps the cross space it
-offers each child to `child.min_size.cross + constants.margin.cross_axis_sum` -- the *container's*
-margin, where the child's was meant. With `min_size` written as `Some(0)` that is a floor equal to
-the margin; with `min_size` `None` the `maybe_add` is nothing. This engine wrote the zero on both
-axes, so that `Fill` items collapse instead of being floored at their content (the comment on
-`taffy_style`'s `min_size`), and so every stretched child of a column with a left margin was offered
-that margin as its width.
-
-1. **`min_size` is zero on the parent's main axis and on both axes of a stacking cell, `auto` on a
-   flex item's cross axis.** CSS gives the cross axis no automatic minimum, so `auto` there is the
-   zero that was being written out, and the bad sum has nothing to add to. The main-axis zero stays,
-   since that is the floor the comment exists to remove. Not a `[patch]` of taffy: one line of
-   mapping against a fork to carry. `a_containers_own_margin_does_not_widen_what_its_children_are_measured_at`
-   pins it at the margin that showed it, and
-   `the_shipped_dev_configs_history_card_is_as_tall_as_the_notifications_in_it` pins the panel that
-   showed it, anchored where the bell is, at the output the session ran on.
-
-2. **`OBLISK_DUMP_LAYOUT=<instance id>` prints that surface's resolved tree after every pass.** Kind,
-   rect and a `text`'s content per visible node, to stderr, off unless asked. The harness reproduces
-   what it was told to build; the layout that is wrong in a session is the one it was not told
-   about -- here the anchor, the output's scale, and a feed the Supervisor had by then. Reading the
-   live answer took one relaunch; guessing at it took an hour.
+The observed card was measured at its 1521 px left margin rather than its 378 px content width,
+underestimating wrapped height by 13.2 px.
 
 ## 0112. A launcher's four missing primitives: `autofocus`, `on_navigate`, `scroll:reveal`, and `oblisk set`
 
-`modules/global/launcher.lua` was a scrolling list of every application, opened from one bar
-button. Against `Modules/Global/AppLauncher.qml` it lacked the half that makes a launcher: a
-search box that is typable the instant it opens, arrow keys that walk the results, a list that
-follows the selection, a subtitle under each name, and a way for a compositor keybind to open it.
-Each of those was blocked in the engine, not in the config, and this is a framework the config is
-one example for -- so the engine grew the primitives and the config then used them.
+1. Autofocus arms an ordinary field on a live focused surface when nothing already owns typing.
+   It opens empty; multiple candidates choose document order, unlike secure-target refusal.
+2. Navigation callbacks receive up/down/page_up/page_down/tab/backtab without editing the draft.
+   Repeats work; this is not a general key handler.
+3. Scroll reveal is a one-shot request for minimum movement to show a child, then normal clamping.
+   It must not hold selection against subsequent wheel input.
+4. Carry application Comment for subtitles/search; localization, Keywords and GenericName stay out.
+5. External set/toggle forwards named-state writes to the authoritative generation. Parse JSON
+   or use a string; reject undeclared state and nonboolean toggles. No arbitrary function IPC.
+6. The example launcher becomes a keyboard-owning layer panel. Calculator/currency copy actions
+   wait for clipboard support; web opening already exists.
 
-1. **`textfield.autofocus = true` takes the keyboard without a press, and takes it empty.**
-   ADR-0092 decision 3 declined an arm-on-`enter` for plain fields because the notification card
-   has several and the sole-field rule cannot pick one. A property says which. It arms on
-   `KeyboardHandler::enter` when no masked field armed and no plain field is already typing in the
-   scope, and again from the once-a-turn hook beside `arm_secure_focus_if_the_scope_now_declares_one`
-   when the tree changed under a focus already held -- but never to re-take the very field a press
-   elsewhere just stopped, since that press was the answer. It arms only on a surface that is still
-   a live `wl_surface`: a closed launcher keeps its tree and, with no `leave` owed for a destroyed
-   surface, its focus id, and without the check every turn armed and the next prune dropped.
-   *Empty* is a deliberate exception to ADR-0108's draft-keeping: that rule is for a field the
-   user left and returns to by hand; a field the engine hands over unasked must not open on last
-   week's word. `on_change("")` fires when there was text, so a bound `state` follows.
-   Two `autofocus` fields on one surface: first in document order, since that is a config mistake
-   to pick through rather than a secret to refuse routing (`autofocus_field_in_scope`).
+Same-day amendment:
 
-2. **`textfield.on_navigate(key)`, for the keys a single-line field has no edit for.** `key_action`
-   now names Up, Down, Page Up, Page Down, Tab and Shift-Tab (`"up"`, `"down"`, `"page_up"`,
-   `"page_down"`, `"tab"`, `"backtab"`) as `KeyAction::Navigate`, ahead of the `utf8` arm that had
-   been dropping Tab as a control character. A plain field with the callback hears the name; the
-   buffer and caret do not move and `on_change` does not fire; repeats fire, so a held Down keeps
-   walking. A masked field ignores them, as before. This is still not `on_key` (§ 5.2, ADR-0050):
-   the set is closed, the keys carry no text, and a field has to be typing for any of them to
-   reach Lua. Tab meaning "down" is the config's call, not the engine's -- the mirror makes it, and
-   `launcher.lua` follows, in one line.
-
-3. **`scroll(name):reveal(index)` is the one thing a config may say to a scroll signal.** ADR-0069
-   decision 2 keeps the offset engine-owned because the config cannot clamp what it cannot measure,
-   and that still holds; what the config *can* know is which child it wants to see. `reveal` stores a
-   one-shot ask on the `Scroll` kind and marks the scene dirty; `finish` takes it on the pass that
-   positions the viewport, moves the asked offset the least distance that puts the `index`-th visible
-   child's border box inside `content_main`, writes it quietly, and lets `scroll_offset` clamp it as
-   it would a wheel ask. Already in view moves nothing; past the end lands on the end; no such child
-   changes nothing. One-shot, so the wheel is free the moment the pass is done -- a reveal that held
-   would snap the list back under a user scrolling away from the selection.
-   `a_reveal_scrolls_the_least_distance_that_shows_the_child` pins the four cases.
-
-4. **`AppSummary.comment`.** `Comment=` is the one-line description a launcher draws under a name
-   and matches against, and the scan was already holding the parsed group it lives in. `None` when
-   absent, which is common, so the config hides the line. Still unlocalized, on ADR-0061's terms.
-   `Keywords=` and `GenericName=` are not carried: the mirror matches name and comment, and nothing
-   here asked for more.
-
-5. **`oblisk set <name> <value>` and `oblisk toggle <name>` write a `state` from outside.** The
-   Supervisor's socket only knew Renderer generations, so the bar button was the launcher's one way
-   in and a keybind had none. The CLI connects with `CONTROL_CLIENT_GENERATION` (`u32::MAX`), which
-   `handle_connection` neither registers nor replays snapshots to, sends one
-   `RendererFrame::SetState` and hangs up; the Supervisor forwards it as `SupervisorFrame::SetState`
-   to the authoritative generation, the one fact the client cannot know; `lua::signal::write_state`
-   applies it through `Signal::reseed`, the same marshal check and dirty mark as `:set()`, and
-   refuses by name to stderr when no evaluation declared that state or a toggle finds no boolean.
-   `state(name, initial)` is already name-keyed and already the config's one writable signal
-   (ADR-0044 decision 5), so this adds no Lua surface at all: a keybind writes exactly what an
-   `on_click` may. A value is JSON when it parses and a string otherwise, so
-   `oblisk set panel_kind notifications` needs no quoting inside a compositor config. Rejected: an
-   `IpcHandler`-style table of named functions -- a function can do anything, a state write can do
-   only what the config already wired to that state.
-
-6. **The launcher is a layer surface, and the example of all five.** A screen-sized `panel` with a
-   scrim, a catcher, and `keyboard_interactivity` bound to `launcher_open`, so it takes the keyboard
-   on map and gives it back on unmap; the `window` it was is what niri tiled into the layout. The
-   ring is one `computed` over the chosen id and the results, which every row asks one `map` of,
-   so three hundred rows stay inside the graph's 5ms budget. Not carried from the mirror: the
-   calculator and currency rows, since both end in "Enter to copy" and this engine has no
-   clipboard; a result that can be read but not taken is half a feature. The web row is kept,
-   `applications:open_url` being already there.
-
-**Amendment (same day), after checking the launcher against `AppLauncher.qml`'s pointer handling.**
-The mirror forwards every pointer motion to the launcher and lets hover move the selection only once
-a motion with a *different* position has arrived since the last open, keypress or query change
-(`hoverSelectionArmed`). Ours had no per-motion events by design (ADR-0062), and a live check showed
-the one case that mattered: opened from a keybind under a parked mouse, the row under the cursor took
-the ring before anything moved, because the compositor's pointer `Enter` on map was treated as a
-crossing. The same check found the launcher reopening on its old selection and scroll. Four changes:
-
-7. **`on_hover` fires for a pointer that moved, not for a tree that moved.** `sync_hover` takes a
-   `fire` flag: `Motion` and `Leave` fire, `Enter` does not, and neither does the new
-   `refresh_hover_after_layout`. An `Enter` with no motion behind it is a surface appearing under a
-   resting pointer; a pointer that enters by moving sends a `Motion` a few milliseconds later, and
-   that one fires. Hover *signals* still update on every one of them, so what is drawn as hovered is
-   always what is under the pointer. The notification stack's expiry hold stops arming when the popup
-   appears under a parked cursor, which is the right answer there too.
-
-8. **After a re-resolve, the hover signals are rewritten at the pointer's last position, silently.**
-   `App::pointer_at` remembers the surface and position from `Enter`/`Motion` and forgets on `Leave`;
-   `refresh_hover_after_layout` runs after each `re_resolve_if_dirty` that did work. A `reveal` or a
-   filter change slides rows under a still pointer, and without this the row that slid away kept its
-   tint off the viewport while the one now under the pointer had none. No callback, since nothing
-   crossed anything.
-
-9. **Every `autofocus` arm calls `on_change("")`,** not only when the field held text. It is the one
-   moment a config can call "the field just opened", and the launcher resets its selection and
-   scroll in it -- the mirror's `processInput("")` on `active`. A config-side reset had no other
-   hook: a launcher closed by a row click or the scrim never saw Escape's clear.
-
-10. **Two-stage Escape is the config's, and costs it two locals.** With text, Escape clears and
-    stays; empty, it closes. The engine already clears and lets go of the keyboard before
-    `on_cancel` runs, and the autofocus arm takes it straight back, so "stay" is free.
+7. Hover callbacks fire for Motion/Leave, not Enter or layout movement under a resting pointer.
+8. Refresh hover signals silently after layout at the remembered pointer position.
+9. Every autofocus arm emits an empty change callback, allowing selection/scroll reset even when empty.
+10. Two-stage Escape is config policy: clear first, close when empty.
 
 ## 0113. What a code review is worth: four fixes out of two hundred findings, and the two that were the review's own doc drift
 
-An outside pass over the whole tree (`reviews/pass1`, twelve files, roughly 240 findings) was
-verified finding by finding (`reviews/pass2_confirmed`). Most of it held up as description and
-almost none of it was worth acting on: the single largest category quotes a `ponytail:` comment and
-reports its content back as a discovery, which is what those comments are for. Its `[DEAD_CODE]`
-label was wrong three times in five, its one P0 self-heals in about a second, and one of its P3s
-was a few thousand file copies per update check. Four things came out of it worth doing, and two of
-them turned out to be one bug wearing two hats.
+Verify review claims against behavior rather than counting findings.
 
-1. **`updates` links the pacman `local/` db in, rather than copying it.** `checkupdates` itself is
-   `ln -s "${DBPath}/local" "$CHECKUPDATES_DB"`, because `syncdbs_mut().update()` only reads that
-   directory. The copy came from ADR-0034's own throwaway prototype -- the program written to prove
-   the sync needs no `fakeroot` copied `/var/lib/pacman` wholesale, and the copy shipped with the
-   answer. It walked ~1,500 package directories off disk on every scheduled check. What the copy
-   did buy is now stated where it was only implicit: a check reads the live directory, so a
-   concurrent real install can be seen mid-write, the same window `checkupdates` lives with. The
-   link is refused when `local/` is not a directory: a dangling link is not an error to `alpm`, it
-   is an empty installed set, and every package on the mirror would read as an update.
+1. Link the live pacman local database instead of copying roughly 1500 package directories per
+   check. Require a real directory; accept the same concurrent-install window as checkupdates.
+2. Let the consuming module configure sysinfo; unused temperatures stay dormant. Periodic update
+   checks were initially left to explicit config policy.
+3. Widen stubs to actual accepted scalar edges, border colors/signals, list arrays and optional offsets.
+4. Correct integer output-scale documentation and remove the config's second division of geometry.
 
-2. **`sysinfo` is configured by the module that reads it.** All three pollers start dormant and
-   wait for an interval (ADR-0035), and no file in `dev-config` ever named one, so the settings
-   panel's two readouts sat at their pre-first-sample `0%` for the life of the process: wired,
-   started, and never asked for a number. The call goes in `system_info.lua`, not `shell.lua` --
-   the module that wants the samples is the one that says how often. `temp_interval` stays at zero
-   on purpose, since nothing reads `temp_cores` or `temp_gpu`. **`updates` has the identical gap**
-   and is deliberately left alone: starting periodic pacman network checks is a decision a config
-   author makes, not a default a framework example should smuggle in.
+Also fix the starter's nil-before-hydration clock access.
 
-3. **`lua-meta` stopped refusing code the engine accepts.** Six types were narrower than the parser:
-   `margin`/`padding` took `Edges` but not the bare number `parse_edge_insets` broadcasts;
-   `border_color` took `Edges`, which is integers, where the engine wants per-edge hex *strings*
-   (now `BorderColors`); `border_color`/`border_width` took no `Bound`; `list.source` took only
-   `Bound` where a literal array is legal; `PanelProps` redeclared `margin` and dropped both;
-   `PopupProps.offset` demanded both axes where each defaults to `0`. All latent, because
-   `dev-config` happens not to write any of those forms, so `lua-language-server --check` stayed
-   green over a stub that would have failed the next person to try one.
+Same-day amendment, retaining the original decision numbers:
 
-4. **`Screen.scale` is an integer scale factor, and `theme.lua` believed the stub instead of the
-   engine.** The stub called it "the fractional output scale, e.g. `1.25`. Divide by it once", and
-   `dev-config/oblisk/config/theme.lua` dutifully divided -- by a `screen.height` that
-   `wayland/output.rs` had already divided, as its own test says in as many words ("a 3840x2160
-   panel driven at scale 2 is 1920x1080 of compositor space"). A 4K HiDPI panel therefore read as a
-   540px-tall desktop, which floors the responsive factor at `0.75`, so every HiDPI session drew the
-   entire shell at its smallest tokens. Invisible on the 1x display this is developed on. This is
-   the one finding in the whole review that was worth the exercise, and the review only got halfway
-   to it: it caught the wrong stub and not the config that had already acted on it.
-
-Also fixed: `share/starter/shell.lua` indexed `s.time` in a `map` closure that runs once against a
-nil `s`, so a new user's first boot printed a Lua error and "no scene was applied at startup;
-surfaces still bind, and paint nothing" before recovering a second later on the first `system`
-push. The file's own header already teaches the nil rule the body broke.
-
-### Amendment, same day: `updates` is wired up, and the bar button stops installing
-
-Decision 2 left `updates` dormant on the argument that starting network checks is the config
-author's call. Asked for it, so: `updates.lua` invokes `configure({ interval = 3600 })`, and two
-things fell out of switching it on.
-
-11. **The first check runs when one is due, not one interval later.** `run_check_task` consumed
-    `tokio::time::interval`'s immediate first tick with the comment "consume it unused", copied from
-    the CPU sampler, where it is needed because a percentage is a delta between two reads. An update
-    check is a point query. Consuming it meant an hour of blindness after every login -- and worse,
-    because the controller outlives the generation that configured it, every config reload
-    reconfigured the interval and restarted that hour, so a day of editing never checked at all.
-    `first_check_is_due` now decides: nothing checked yet in this process, or the last success is at
-    least an interval old. A fresh boot checks now; a reload inside the hour does not re-sync. This
-    is `sysinfo`'s SYS-03 in another file, and the reason `sysinfo`'s own copies of that line stay
-    is that they are the same bug -- to be fixed when someone reads those numbers.
-
-12. **The bar button is a readout, because installing belongs in front of the package list.** It was
-    an `icon_button` whose click invoked `install`, guarded only by `count == 0` -- which is `false`
-    when `count` is nil, so the one case the guard existed for was the one it let through. That was
-    unreachable while the module was invisible. Switching the module on made it reachable, and the
-    first click on the new badge launched a real `pkexec pacman -Syu`; it died at "Error creating
-    textual authentication agent" with nothing upgraded, which is luck, not design.
-
-    `ArchChecker.qml` never installs from the bar: a left click with nothing pending re-checks, and a
-    left click with something pending -- or any right click -- opens `UpdatePanel.qml`, which lists
-    every package with its old and new version, the total download size, the last check time, and an
-    "Update" button under all of it. `UpdateService.qml` polls every 15 minutes, persists
-    `lastSuccessfulCheck` so a restart resumes the remainder rather than re-syncing, and notifies
-    only when a package appears that was not in the last set.
-
-    Neither of the mirror's two click paths is reachable here: the capability has `configure` and
-    `install` and no `check` (so nothing to re-poll with), and there is no panel to open. Passing
-    `nil` where `icon_button` takes an `on_activate` returns a `row` instead of a `button`, so there
-    is no click to land at all, and the `slot` goes with it -- a readout that lights up under the
-    pointer is a button that is lying. The badge says how many; installing waits for the panel.
-
-13. **`check`, and the facts a panel needs.** Wiring the module up (decisions 11-12) left it with no
-    way to ask a question and no way to describe an answer, so: `updates:check()` runs one check
-    now, answered under a schedule *and* while dormant -- a config wanting the button and never the
-    timer is a shape to allow, not to work around. It is refused while a check is running, the way
-    `install` refuses a second transaction, and the ticker arm and the manual arm now share one
-    `run_one_check` that raises `checking` with a push before the sync and lowers it with another
-    after, because a "checking" that is only visible afterwards is not visible at all.
-
-    `install_error` used to be `"pkexec pacman exited with exit status: 1"`, which is the engine
-    writing English into a config-facing field: unreadable to a user, unrewordable by a config,
-    untranslatable. It is now two facts. `install_exit_code` is what pacman answered.
-    `install_log` is the last 200 lines of both streams, which is where pacman says *why*.
-    `install_error` keeps only the case where the Supervisor never got an answer at all -- it could
-    not spawn `pkexec`, or could not wait on it. The mirror's `_detectErrorMessage`, which maps
-    those lines to "Network error" / "Insufficient disk space" / "Authentication failed", is
-    wording, and stays in the config where it can be changed and translated.
-
-    The same line puts `consecutive_check_failures` here as a count and leaves "warn after five" in
-    the config; leaves "completed until dismissed" to a Lua `state()` rather than the service, which
-    is where `UpdateService.qml` keeps `dismissResult()` only because QML has no seam there; and
-    keeps `pkexec pacman -Syu` fixed rather than taking a command from the config, because the
-    capability owns what is privileged and `process.run` already owns what is not. The log push
-    rides the progress lines rather than every line: one `Changed` re-resolves every surface in the
-    generation, and pacman writes a download meter.
-
-14. **`system:write_state`, and where a remembered value can and cannot come from.** The IDL row
-    existed and nothing implemented it. It stores one scalar under one key, rewrites `state.json`
-    through a temp file and a rename, and pushes so the config reads back what it stored. §3.2 says
-    a key is "alphanumeric", which forbids `updates.last_check` and would push every config with two
-    modules towards `updateslastcheck`; widened to allow `_`, `-` and `.`, since namespacing is the
-    actual use and none of the three is any less safe as a JSON object key. Values stay §3.2's three
-    scalars: a config wanting structure has `json.encode` and a string to put it in, and `state.json`
-    stays a file a person can hand-edit.
-
-    `updates:configure({ interval, checked_at })` takes the remembered time beside the interval, as
-    a seed and never an override -- a check this session ran is fresher than anything a config can
-    say, and this must not move `last_successful_check` backwards.
-
-    **The loop does not close yet, and the missing piece is a hook, not a field.** A config can only
-    cause a side effect from an input callback (ADR-0044: a config is a pure function of state), so
-    nothing can write `state.json` when a *check succeeds* -- there is no "on change". And the read
-    fails from the other end too: `configure` runs at module load, which is the first evaluation,
-    where `oblisk.system` is still nil and the remembered value cannot be read at all. Both halves
-    want the same thing, a way to run a side effect once after a capability's first push, and that is
-    a design decision about purity rather than a field to add, so it is not taken here. `write_state`
-    is useful today for what is already input-driven -- a launcher's frecency counter is written on a
-    click, which is exactly the shape that works.
-
-15. **The panel, and what it proved about the split.** `modules/bar/panels/update_panel.lua` is the
-    sixth panel in the host and is entirely wording, formatting and thresholds over facts the
-    capability publishes unchanged. The mirror's `_detectErrorMessage` is a table of eight phrases
-    matched against `install_log`; its `_failureCount >= 5` is one comparison; `dismissResult()` is a
-    Lua `state()`; the install duration is `install_finished_at` minus a start the *click* stamped,
-    which is the one moment a config is allowed to write anything at all (ADR-0044). None of that
-    needed a line of Rust, and none of it should have had one.
-
-    Two things the mirror has are absent rather than faked: a spinner, because nothing animates
-    without a per-frame property (ADR-0021), and a copy-the-log button, because there is no
-    clipboard primitive. The bar badge opens the panel and the panel header re-checks, which is
-    `ArchChecker.qml`'s split minus its click-to-recheck -- that one needs the button to exist while
-    nothing is pending, and this bar hides it (decision 12).
-
-    `components/action_button.lua` came out of `notification_card.lua`, whose own comment said one
-    call site is a local and two in agreement are a component. The second caller agreed about all of
-    it but the ground, so the component took one option: an action being offered is accent, and a
-    "close" that tidies away a result already read is quiet.
+11. Run update checks when due, including first startup; reload inside the interval must not
+    restart an hour-long delay.
+12. Remove direct install from the bar badge. Installation belongs beside a package list and
+    deliberate confirmation control, not behind a nil-sensitive count guard.
+13. Add manual check, live checking state, exit code, last 200 log lines and failure count.
+    Keep privileged install command fixed; interpretation, thresholds and result dismissal are Lua policy.
+14. Add scalar system-state writes through temp/rename and allow namespaced keys. Remembered
+    checked_at seeds but never overrides fresher checks. Automatic persistence still needed a push hook.
+15. Build the update panel in Lua over those facts. No spinner or copy-log without animation/
+    clipboard support; reuse the existing action-button pattern.
 
 ## 0114. `polkit` joins the roster, and the agent holds its reply until the prompt is answered
 
-The polkit agent registered, received `BeginAuthentication`, and returned from it at once, forwarding
-the challenge to a log line. polkit's own docs for that method say the agent "should not return
-until after authentication is complete" and must return `org.freedesktop.PolicyKit1.Error.Cancelled`
-when the user dismisses the dialog; polkitd reads an early return with no
-`AuthenticationAgentResponse2` as a finished, failed authentication. Nothing could have authorised
-through this agent, and nothing in Lua could have drawn the prompt: there was no `oblisk.polkit`.
+1. Put Polkit prompt state and cancel in the roster, retaining secure-target lazy startup.
+2. Hold BeginAuthentication's reply until success or cancellation; returning early means failure.
+3. Reject concurrent challenges rather than invent a queue before one is needed.
+4. Wrong passwords keep the prompt open; PAM owns lockout policy.
+5. Use Polkit's setuid helper for authentication/response. The unprivileged lock worker cannot
+   call the root-only response method; it remains the lock path only.
+6. A submit button sends the scope's armed native secret on release, without exposing it to Lua.
+7. Destroyed surfaces clear focus and cannot auto-arm; the compositor owes no leave for them.
+8. Clicking non-fields preserves secure focus; another field, leave or unmap still scrubs it.
 
-1. **`polkit` is a roster capability.** `PolkitState { active, message, action_id, icon_name,
-   authenticating, error }` and one action, `cancel`. ADR-0070 decision 5 kept it off the roster
-   because it pushed nothing; now it pushes what a dialog is made of, and the roster is what gives it
-   a Lua member, stubs, a schema and hydration for free. The `secure_submit` start path stays, so a
-   prompt registers the agent whether or not the config reads the member. Built in `main.rs` and
-   pushed from its loop like `lock` (`without_channel`), since all three of its inputs land there.
-2. **The reply is held.** `begin_authentication` awaits a `oneshot` the controller answers: `Ok(())`
-   on a success, `Err(Cancelled)` on the dialog's cancel or polkitd's `CancelAuthentication`. zbus
-   spawns a task per method call, so the cancel is delivered while the begin is still waiting.
-3. **One challenge at a time.** A second `BeginAuthentication` while one is open is answered
-   `Cancelled` on the spot; one password field cannot be typing for two callers, and the refused
-   caller retries or fails on its own. ponytail: a queue is the upgrade if two mechanisms ask at once
-   in practice.
-4. **A failed password keeps the prompt open.** `error` carries the lock screen's words for the same
-   `PamOutcome`, the field stays, polkitd keeps waiting. Cancel is the way out; there is no attempt
-   cap here because `pam_faillock` already has one.
-5. **PAM runs in polkit's setuid helper, not this crate's worker.** The first cut ran
-   `pam_worker`'s re-exec'd worker and then called `AuthenticationAgentResponse2` itself; polkitd
-   answered "Only uid 0 may invoke this method". That is the whole reason libpolkit-agent ships
-   `/usr/lib/polkit-1/polkit-agent-helper-1`: it runs PAM as root and makes that call before printing
-   `SUCCESS`. `pam_worker::run_polkit_helper` speaks its line protocol (cookie in, every
-   `PAM_PROMPT_*` answered with the one password, `SUCCESS`/`FAILURE` out), spawned like the lock's
-   worker with the same `Drop` backstop, so a wrong password no longer stalls the loop for
-   `pam_unix`'s delay. The Supervisor no longer needs polkitd's Authority proxy for anything but
-   registration. The re-exec'd worker stays for `oblisk.lock`, which has no polkitd to satisfy.
-
-6. **`button { submit = true }`.** The mirror's Authenticate button. A click cannot hand a password
-   to Lua (ADR-0005), so the button does what Enter does: the release sends the scope's armed
-   `secure_submit` field. Clickable with or without `on_click`.
-7. **A destroyed surface gives up the keyboard focus it held.** The compositor sends no `leave` for
-   a surface its client destroyed, so after the prompt closed `keyboard_focus` still named it, the
-   tree still declared its field, and every pass re-armed the field and pruned it again -- a log
-   line and a scrub per frame. `unmap` clears the focus; arming also refuses a surface that is not
-   live. A `textfield`'s one line is drawn in the middle of its box while here, which it was not.
-8. **Only a field takes a masked field's focus.** ADR-0050 decision 4 had a press anywhere but
-   the field clear it, which scrubbed the buffer, so a click on the dialog's scrim or card threw the
-   password away, and the Authenticate button first needed a carve-out. QtQuick moves focus only to
-   something focusable, and the prompt has three controls: the field and two buttons. A press on
-   no field now leaves the masked focus alone; the field still draws its dots, so nothing is hidden,
-   and a secret still cannot reach another field without the scrub the A-to-B retarget does. The
-   `leave` and `unmap` clears stand: those are the user demonstrably elsewhere.
-
-Not mirrored from `PolkitDialog.qml`: Escape-to-cancel (a masked field's Escape clears and stays,
-ADR-0092; the Cancel button is the way out) and the `●` mask (`mask_character` is one byte).
-`isResponseRequired`/`inputPrompt` have no equivalent under ADR-0028's one-shot protocol, where a
-password is always the answer.
+Masked Escape-to-cancel, multibyte mask support and interactive prompt metadata were not
+implemented in this pass.
 
 ## 0115. A capability push can run a handler: `on_change`, and the five things it unblocked
 
-ADR-0044 made a config a pure function of pushed state: a `map` callback runs during scene
-resolution, may rerun on the same inputs after a rollback, and so may not act. Input callbacks
-(`on_click`, `on_hover`, `on_submit`) were the only place a side effect could start. That left a class
-of thing the reference shell does that no amount of Lua here could: BatteryService.qml's low-battery
-`notify-send`, OSDService.qml's "charger connected", PowerManagementService.qml's suspend at 8%,
-UpdateService.qml's "Updates Available", and the `state.json` write ADR-0113 decision 14 stopped short
-of. All five wait for a *push*, not a click. ADR-0113 named the gap ("a hook, not a field") and
-declined to take it there; this takes it.
+1. Capability on_change runs after each pushed value, before layout, with current and previous.
+   It may act; derived maps remain pure and rollbackable.
+2. Deliver every push; Lua defines thresholds and edge comparisons.
+3. Clear handlers before re-evaluation to avoid accumulating registrations. During a topology
+   handoff, old and candidate handlers may briefly both fire.
+4. Budget each handler at 5 ms; log failure and continue without undoing the received value.
+5. Config uses pushes for power notifications/actions, persisted check times and package announcements.
+6. Share battery thresholds between pills and notifications.
+7. Hold a spurious zero battery reading on mains after a nonzero value; pass genuine draining zero.
+8. Drive OSD from state changes, including external commands, not only bar clicks. Lower-priority
+   entries drop while a higher one is visible; equal/higher replace it.
 
-1. **`oblisk.<capability>:on_change(fn)`.** The handler runs once per `StateSnapshot`, from
-   `apply_state_snapshot` right after the value lands and before any layout pass, with
-   `(current, previous)`. `previous` is `nil` on the first push and nothing else. It is not a `map`:
-   it is not called during resolution, cannot be rolled back, and so may do what an input callback may
-   do, `invoke`, `process.run`, write a `state` signal. Purity in the tree is untouched; side effects
-   moved from "on input" to "on input or on push", which is where they already lived in the mirror.
-2. **Every push, no filtering; the config finds its edge.** The engine hands over each snapshot and
-   the one it replaced, and Lua compares them. A threshold ("low is 20%") is an opinion, and ADR-0113
-   decision 15 already put opinions in the config. `util.battery_at_most(b, percent)` is the
-   comparison the four battery edges share; `previous == nil` is the mirror's `initialized` guard.
-3. **Each evaluation re-registers, so each evaluation first clears.** `shell.lua`'s module-level
-   code registers the handlers, and an in-place reload re-runs it on the same VM (ADR-0044 decision
-   4). Without a clear, one config save would double every notification. `clear_change_handlers` runs
-   before both `evaluate_and_specs` calls. Known cost: an evaluation whose topology changed leaves the
-   new config's handlers in the old generation until the swap, so a push in that window fires in
-   both processes. Short, and a duplicate OSD line is the worst of it.
-4. **A handler runs under a `map` callback's 5ms budget and cannot break the push.** `CpuBudget`
-   wraps each call; a raise or an overrun is logged with the capability's name and the next handler
-   still runs. The value is already in the signal by then, so the screen is right whatever the
-   handler did.
-5. **What it unblocked, all in `dev-config`.** `modules/global/power_events.lua` (new): the charger
-   OSD off `oblisk.power`'s `on_battery` edge plus the mirror's 10/100 brightness step, the charge
-   limit and fully charged OSD lines, the low and critical `notify-send`s, and `systemctl suspend`
-   at 8%. `modules/bar/indicators/updates.lua`: `configure` moves from load time to
-   `oblisk.system`'s first push, which is what carries `state.json`, so `checked_at` is finally read
-   back and a restart inside the hour does not re-check (verified: a second start touched neither the
-   file nor the network); the time of a successful check is written when it differs from the file's;
-   and "Updates Available" fires for names not in the remembered `updates_notified` key, the
-   mirror's `notifiedPackagesKey` (verified: six new packages announced once, not again on restart).
-6. **The pill's thresholds moved to match.** The bar coloured at 30/15 while the notifications
-   would have fired at 20/10. `util.battery_thresholds` is now the one table both read, at the
-   mirror's values.
-7. **UPower's zero-percent glitch is held in Rust.** Unrelated to the hook and found on the same
-   review: UPower reports a spurious `Percentage` of 0 on mains for one push, and only
-   BatteryService.qml, not Quickshell's C++ layer, guards it. `hold_through_glitch` keeps the previous
-   percent when a zero arrives with the battery not draining after a non-zero reading; on battery a
-   zero passes through, as it does there.
-
-8. **The OSD is push-driven, and is the mirror's card.** `modules/osd/service.lua` replaces
-   `ui_state.arm_osd`: the card used to be armed by the bar click that changed a level, so a volume
-   key or a `wpctl` in a terminal showed nothing, and the bar button showed you your own click. Now
-   `on_change` handlers on audio, brightness, network, bluetooth, notifications and keyboard call
-   `osd.show(kind, entry)`, and `power_events.lua` does for the charger. Two layouts decided by
-   whether the entry carries a `level`, `OSDCard.qml`'s slider and toggle rows at its sizes (80 tall,
-   300 wide, a 48 tile, a 12 track). Not the mirror's queue: a card that arrives while a more
-   important one is up is dropped, one as important or more replaces it, which is what its suppress
-   list was for (the brightness step the charger edge triggers, under "charger connected"). Verified
-   live: a terminal `wpctl` and a layout switch each raised the right card, centred, for two seconds.
-
-Not mirrored: keyboard backlight on the charger edge (no capability), the `--wait -A` actionable
-update notification (a config could read the action from `process.run`'s stdout callback; not worth
-it until someone wants the button), the mirror's 15-second notification dedupe, which an edge does
-not need, and three OSD kinds with no fact to read: the Wi-Fi radio toggle (`NetworkState` has no
-`wifi_enabled`), microphone mute (`AudioDevice` has no `muted`) and screen recording.
+Actionable update notifications, timer-based dedupe and OSDs without backend facts remained out of scope.
 
 ## ADR-0116: Pointer drags and wheels on a button, and the microphone's volume
 
-**Status**: Accepted (2026-09-04)
+1. Buttons receive left-drag start/move/end with local unclamped pointer coordinates. Hold through
+   release/leave; field presses do not drag. An inside release may still click after drag end.
+2. Wheel callbacks receive vertical fractional notches, positive for increase. The innermost
+   wheel handler or scroll container wins, with no chaining.
+3. Drag/wheel handlers make invisible button boxes input-active.
+4. Add default-source volume/mute and matching actions through the shared device write path.
+5. Carry PipeWire device icon hints without resolving them in the Supervisor.
+6. Retain volume's 0–1 clamp; no 150% headroom.
+7. Implement quantized sliders and device/app controls in Lua, committing held drag values on release.
 
-**Context**: Reviewing `Volume.qml`/`AudioPanel.qml` against the bar's volume pill found the mirror
-is mostly a slider: drag the pill to set the volume, roll the wheel over it to step, and a panel of
-four more sliders (output, microphone, one per stream) with device pickers. None of it could be
-written. The pointer model (ADR-0050) hands a config a click's rect and button name and nothing
-else; the wheel (ADR-0069) writes `scroll()` signals and reaches no handler. On the Supervisor side
-`AudioState` carried the default sink's volume and mute and nothing of the default source's, a hole
-§ 3.2 had noted beside `set_muted` since ADR-0053, and an `AudioDevice` had no way to say it is a
-headset.
-
-**Decision**:
-
-1. **`button` takes `on_drag(rect, pointer, phase)`.** A left press on the innermost `button`
-   declaring it holds the drag until the release or a `Leave`; every `Motion` while held calls the
-   handler with `"move"`, the press with `"start"`, the release with `"end"`. `pointer` is `{ x, y }`
-   in the button's own coordinates and unclamped, since every handler divides by the rect and the
-   config's own `min`/`max` is the clamp; a drag past the end stays pinned at the end because the
-   handler keeps hearing about it. Left only: a drag is one gesture and carries no button name, and
-   the other two buttons stay free for a click on the same control, which is what the pill wants
-   (middle mutes, right opens the panel). A press that focused a `textfield` drags nothing, as it
-   clicks nothing (ADR-0092). The left `on_click` still fires on a release inside the rect, after the
-   drag's `"end"`, so a control taking both sees its value committed first. Not a `slider` node: the
-   same two hooks are a seek bar, a colour pad or a resize handle, and a kind per shape is what a
-   general engine must not grow.
-2. **`button` takes `on_wheel(rect, steps)`.** `steps` in notches, positive away from the user, the
-   direction every volume and brightness control reads as "more" and the opposite of Wayland's axis
-   sign; a touchpad swipe arrives as fractions of a notch through the same `wheel_delta` a scroll
-   uses. Vertical axis only. Against a scrollable container the innermost of the two under the
-   pointer wins and nothing chains, ADR-0069's rule extended to a second kind of taker. The
-   "no `scroll()` registered" early-out is gone with it: the wheel handler now walks the tree
-   unconditionally, since a button's handler is not in any registry, and a wheel event is rare
-   beside a motion event.
-3. **A button with either handler is solid to input** (`takes_input_as_a_box`), as one with
-   `on_click` is: invisible by design and still has to be pressable.
-4. **`AudioState` gains `source_volume` and `source_muted`, and three actions.** An `Audio/Source`
-   node is bound exactly as an `Audio/Sink` is, `Props` param and `device.id`/`card.profile.device`
-   route, since PipeWire gives it the same shape (this machine's mic is device 51 route 0 beside the
-   speaker's route 7); `SinkEntry` became `DeviceEntry` and the write path takes a direction.
-   `set_source_volume(vol)`, `set_source_muted(bool)`, `toggle_source_mute()` mirror their sink
-   twins through one `set_default_volume`/`set_default_muted` pair. Verified live: the panel's
-   microphone card read 15% off the source's own `Props`.
-5. **`AudioDevice` gains `icon`**, the node's `device.icon-name` as PipeWire spells it, absent when
-   the node carries none. A hint for a glyph (`AudioService.deviceIconFor`'s `headset`/`headphone`
-   words), not an icon lookup this side performs.
-6. **No headroom.** The mirror allows 150% with a marker at 100%; `set_volume` keeps its `[0, 1]`
-   clamp. It complicates every meter for a feature few use, and can be lifted in one place.
-7. **In `dev-config`**: `components/slider.lua` (a `button` with the two hooks over a `"NN%"`-wide
-   fill; a held drag draws from a `pending` `state()` and commits once on release, `Slider.qml`'s
-   `committed`; drags and notches quantise to `steps`, default 20, the mirror's 5%), the volume pill
-   rebuilt on it with the mirror's bindings, and `panels/audio_panel.lua`: output and microphone
-   cards with device pickers, and the application mixer. Verified live by hand on the pill and by
-   screenshot on the panel.
-
-**Consequences**: A config can build any drag-set control without an engine change. Snap-back:
-between a drag's commit and the capability's next snapshot the fill reads the old value for a frame
-or two; the PipeWire round trip is milliseconds and it has not been visible. Not built: a
-`source_volume` OSD line (the OSD service could add one in three lines when wanted) and the mixer
-stream's desktop-entry icon lookup beyond `oblisk.applications`' `app_id` heuristics.
+A brief old-snapshot snap-back remains possible. Microphone OSD and deeper app-icon lookup were
+not built; live tests covered the pill and microphone reading.
 
 ## ADR-0117: A workspace knows whether it is empty and what runs on it
 
-**Status**: Accepted (2026-09-04)
+1. Add populated and one representative app ID per workspace: focused window first, otherwise
+   lowest window ID. Empty IDs become absent; keep reduction compositor-neutral.
+2. Still no per-workspace window list; a switcher is a separate caller.
+3. The example strip collapses on row hover and resolves installed application icons, otherwise
+   showing workspace numbers.
 
-**Context**: Reviewing `WorkspaceStrip.qml` against the bar's strip. The mirror is an `ExpandingPill`
-of full-size circles, collapsed to the focused workspace and widened on hover, each circle drawing
-the app icon of what runs on that workspace, or its number when nothing does, and dimmed when
-empty. § 2.9's `WorkspaceEntry` was `{ id, idx, name }`, which draws numbers and nothing else;
-ADR-0056 had kept window lists out on purpose and the spec noted `Window.workspace_id` as the
-additive path. The strip itself had been written as always-open dots, with a note that a pill
-needed a collapse timer the engine lacks; the power menu (`f38051b`) since showed it does not,
-because a `hover` region on the row answers containment and a pointer crossing the gap between two
-circles never leaves the row.
-
-**Decision**:
-
-1. **`WorkspaceEntry` gains `populated: bool` and `app_id: string?`.** One window, not the list:
-   the window that stands for the workspace is the focused one when focus is there, else the one
-   with the lowest window id, since niri's map has no order and "first tile" is not on the wire. An
-   empty `app_id` on the wire becomes an absent key, so `entry.app_id == nil` and "draw the number"
-   are one test. The reduction stays compositor-neutral: `WorkspaceRow` carries the two fields and
-   `workspaces::niri` fills them from `Window.workspace_id`.
-2. **Still no per-workspace window list.** The roadmap row narrows to what it is now for: a window
-   switcher. A strip has one circle per workspace and one icon fits in it.
-3. **In `dev-config`**, `workspace_strip.lua` becomes the mirror's pill: `item_width` circles on the
-   power menu's pattern, a `hover` on the row, every circle but the active one `visible` only while
-   hovered, the focused ground accent, a populated one glass and an empty one `DISABLED` at
-   `opacity.disabled`, an `icon` from `oblisk.applications` over the number when the `app_id` maps
-   to a desktop entry. The old strip's reasons for small dots (twelve bordered circles too wide)
-   are answered by the collapse, which is what the mirror answers them with.
-
-**Consequences**: A third field a niri upgrade could rename (`workspace_id`), covered by the
-adaptor's wire-JSON fixtures. A workspace whose only window has no `app_id` is populated with no
-icon, drawn as its number at full strength, which is what the mirror does too. No width animation
-and no opacity fade; the engine has neither.
+A populated window without app ID remains populated. No width animation or opacity fade.
 
 ## ADR-0118: `workspaces` speaks Hyprland, as a module behind the same publisher
 
-**Status**: Accepted (2026-09-04)
+1. Add a Hyprland module behind the existing publisher and exhaustive dispatch, still no trait.
+   It uses documented IPC and synthetic fixtures, not live-verified captures.
+2. Re-read workspace/monitor/client/active-window JSON on relevant event-socket lines using direct
+   command sockets, not four subprocesses. Coalescing waits for measurement.
+3. Regular workspace number is both ID and index. Nonpositive/special IDs were initially omitted.
+4. Active/focused follow monitor state; use activewindow rather than stale client focus history.
+   Representative app selection uses workspace focus-history order.
+5. Share socket-path resolution with keyboard and fix both callers' missing leading dots.
 
-**Context**: `oblisk.workspaces` was niri-only (ADR-0056 decision 1), and on a Hyprland session
-printed "no implementor yet" and never pushed. ADR-0075 had already moved the reduction onto
-compositor-neutral rows and named the line a second implementor would sit on: a sibling module plus
-two match arms. The reference config's `Impl/Hyprland/WorkspaceImpl.qml` shows the whole of what
-Hyprland needs: no state on its event socket, so re-read `hyprctl -j`'s three lists on every event;
-the workspace number as the id; a `windows` count for populated; the activated toplevel's class.
-`keyboard` already had a `HyprlandLink` over the same two sockets, built to the protocol without a
-Hyprland machine to test on, which is the position this ADR is in too.
-
-**Decision**:
-
-1. **`workspaces::hyprland` is the second implementor, and there is still no trait.** It plugs
-   into `StatePublisher` for reads and two exhaustive-match arms for writes, which is everything a
-   trait would give two implementors, and ADR-0075 decision 4 tied the trait to a *live-tested*
-   second compositor. This one is built to Hyprland's documented IPC with hand-written fixtures in
-   `hyprctl -j`'s shape; replacing them with a capture is the first job on a Hyprland machine.
-2. **The loop is re-read on trigger.** `.socket2.sock` is listened to on one blocking OS thread,
-   like niri's reader; a line whose event name (before `>>`, `v2` suffix dropped) is in a `TRIGGERS`
-   table causes `workspaces`, `monitors`, `clients` and `activewindow` to be read over
-   `.socket.sock` as `j/<name>`, one connection per request, then reduced and published. No
-   `hyprctl` subprocess, unlike `keyboard`'s link: the socket takes the same command and spawning
-   four processes per window event is the wrong cost. A burst re-reads once per event and the
-   publisher drops the equal results; coalescing waits for a measurement.
-3. **The number is both `id` and `idx`; `name` only when it is not the number.** Hyprland has no
-   per-monitor position, and the number is what a keybind and `dispatch workspace N` mean, so
-   `focus(id)` keeps § 2.9's meaning and focusing a number with no workspace creates one. Workspaces
-   with a non-positive id, specials and Hyprland's named ones, are dropped: neither fits a `u64` id
-   or a number-keyed focus, and neither is modelled. A special showing on the focused monitor
-   leaves that monitor's regular active workspace the focused row.
-4. **Active is the monitor's `activeWorkspace`, focused is that of the monitor with `focused`,
-   the focused window is `activewindow`.** The first two are niri's per-output/global split by
-   another name. `activewindow` rather than `clients[].focusHistoryID == 0`, because the history
-   still names the last toplevel while a layer surface holds focus and the reply is `{}` then.
-   `app_id` is the class of the lowest `focusHistoryID` on the workspace, ADR-0117's "focused, else
-   first" with a real order behind "first".
-5. **`hyprland_socket_path` moves to `compositor.rs`**, the one thing beyond the probe both
-   capabilities genuinely share; ADR-0075's "detection only" widens to "detection and where
-   Hyprland's sockets are". Moving it found the names wrong: the link opened `socket2.sock` and
-   `socket.sock`, and Hyprland's files are `.socket2.sock` and `.socket.sock`, so `keyboard`'s
-   Hyprland layout reporting could never have connected. Fixed in both callers.
-
-**Consequences**: A Hyprland session now pushes `oblisk.workspaces` and the shipped strip draws it
-sparse, one circle per existing workspace, with numbers as labels. Padding empty slots to ten, the
-optional `special` list, `is_fullscreen` when known and a session-level `compositor` field are the
-next ADR, since they are payload and display policy, not the adaptor. Until a capture replaces the
-fixtures, a Hyprland field rename is caught by the "reply did not parse" log line and nothing else.
+Padding, specials, fullscreen and compositor metadata were deferred to the next payload decision.
 
 ## ADR-0119: What one compositor has and the other does not is an absent key
 
-**Status**: Accepted (2026-09-04)
+1. Unsupported compositor features are absent keys, not a parallel supports table. Empty means
+   supported with no current entries.
+2. Specials are top-level, name-keyed, with optional shown-on output; they do not belong to one
+   regular output list.
+3. Publish compositor name so Lua can choose display policy, such as padding Hyprland slots.
+4. Toggle specials by name on Hyprland; niri logs unsupported calls.
+5. The example draws specials separately without a dynamic tooltip per entry.
 
-**Context**: With two implementors (ADR-0118) the payload met the first features one compositor has
-and the other lacks: Hyprland's special workspaces and its fullscreen flag, niri's unbounded
-workspace count against Hyprland's create-on-focus numbering. The reference config answers these
-with capability flags on each backend (`supportsSpecialWorkspaces`, `fillsEmptyWorkspaceSlots`,
-`hasOverview`) and a service layer that pads display slots to ten when the flag says so. § 2.9
-already had a convention for a fact one compositor cannot state: `focused_workspace` is present only
-where it is true, `is_fullscreen` was left out rather than fabricated (ADR-0056 decisions 4 and 5).
-
-**Decision**:
-
-1. **A feature the compositor lacks is a key the payload lacks.** No flag table. `special` is
-   present on Hyprland, an empty list when none exist, and absent on niri, so `w.special == nil`
-   is the "has scratchpads" test and `#w.special == 0` is "none right now". `active_client.
-   is_fullscreen` is present when Hyprland says and absent on niri, which turns decision 5's
-   omission into "absent means unknown" without fabricating anything. The same shape a config
-   already reads `focused_workspace` by.
-2. **`special` is a top-level list keyed by name.** `{ name, populated, app_id?, shown_on? }`:
-   Hyprland addresses specials by name and gives them negative ids, so the name is the identity and
-   `toggle_special(name)` takes it. `shown_on` is the output currently showing it, since a special
-   is shown on one output at a time, and the payload's per-output structure is for what an output
-   *has*; a special belongs to none. `name` is the compositor's full `special:term`, and the
-   adaptor strips the prefix the dispatcher would double.
-3. **The payload names its compositor.** `compositor: "niri" | "hyprland"`, because one policy is
-   display, not state: a Hyprland strip pads empty slots to ten and a niri strip must not, and no
-   key carries "focusing a missing number creates it". The adaptor still fabricates nothing; the
-   padding is `workspace_strip.lua`'s, in Lua, keyed on this string, with the padded slot shaped as
-   an entry (`{ id = n, idx = n, populated = false }`) so the button reads it as one and
-   `focus(n)` is the click. niri's trailing empty workspace gives the same picture unpadded.
-4. **`toggle_special` is the second action**, dispatched to Hyprland and logged on niri, where a
-   config that checked `special` never calls it.
-5. **In `dev-config`**, `special_workspaces.lua` is the mirror's `SpecialWorkspaces.qml`: a circle
-   per special, accent while shown, the standing app's icon or the name's first two letters, the row
-   absent when there are none. No tooltip: one popup per dynamic special is more `shell.lua` than
-   two letters are worth.
-
-Not built: an overview action (niri only, nothing asks) and urgency (both have it, nothing draws
-it). Rejected: a `supports` table on the payload, because a config then has two things to check
-where the key's presence already answers; and padding in the adaptor, because the payload lists
-what exists and a strip's slot count is not the compositor's fact.
-
-**Consequences**: A config written against niri sees one new string field and nothing else changes.
-The Hyprland half is built to the documented IPC and not live-tested, as ADR-0118. § 2.9's "two
-gaps" note is now one, the window list.
-
+No overview or urgency without a consumer. Keep synthetic display slots out of backend facts.
+Hyprland remained documented-IPC-only, not live-tested.
 
 ## 0120. A watched folder is a capability, `oblisk.files`
 
-A config that wants a folder's contents asks the Supervisor to follow it: `files:watch(path,
-extensions?)` lists it once and re-lists it after every settled burst of inotify events, and
-`oblisk.files.folders[path]` is the result. The first caller is the wallpaper picker; the shape
-is a folder watcher, not a wallpaper scanner.
+1. Watch requested folders in the Supervisor, not blocking Lua reads or parsed ls output.
+2. Key by the requested path with trailing slashes removed; readiness/errors belong to each folder.
+3. List one level of nonhidden files, filtered by extensions and sorted case-insensitively.
+4. Same-filter watches reuse and replay; changed filters replace. Unwatch aborts and removes the key.
+5. Debounce settled writes for 200 ms using CLOSE_WRITE, not chunk-level MODIFY. Self deletion/
+   movement reports a final result then stops; reappearance tracking is deferred.
 
-1. **Supervisor-side, through inotify, not a Lua read.** ADR-0048 took `io` out of the config VM
-   so no evaluation can block Wayland dispatch on a filesystem, and `process.run("ls")` would put
-   a line parser in the config for a listing the Supervisor can hand over as a table. `watcher.rs`
-   already follows the config directory the same way; this is that shape for a folder the config
-   names.
-2. **Keyed by the path the config wrote**, trailing slashes stripped, so `folders[folder]` reads
-   back with the string that went in. `ready` is false until the first listing lands, `error`
-   carries a listing failure in words, and both are on the folder rather than the capability,
-   since two folders can be in two states.
-3. **One level, files only, hidden skipped, sorted by name folded**, filtered to the extensions
-   `watch` named so a `Downloads` folder does not ship five thousand entries per push. A
-   subfolder is not listed and not descended; a picker that wants a tree has not been asked for.
-4. **A repeat `watch` with the same filter re-pushes and starts nothing.** A generation swap
-   re-evaluates the config, which calls `watch` again, and the new generation reads the snapshot
-   it already has. A different filter replaces the watch, since the held listing was made under
-   the old one. `unwatch` aborts the task and drops the key.
-5. **`MODIFY` is not in the mask.** A copy in progress fires it per chunk; `CLOSE_WRITE` marks the
-   end and the 200ms debounce folds a forty-file copy into one listing. `DELETE_SELF`/`MOVE_SELF`
-   list once more (recording the error) and stop; watching the parent for the folder to reappear
-   is the upgrade, unasked for.
-
-Rejected: a `system:list_dir` returning through `system.state` (a listing is not user state, and
-it would not follow changes); a per-file `stat` payload with size and permissions (the picker
-reads name, path and mtime; the rest waits for a caller).
-
-**Consequences**: `shared::Capability` gains `Files`, the stubs gain `FilesState`, `Folder` and
-`FileEntry`, § 2.17 and two § 3.2 rows describe it. `applications` still scans on `refresh`
-rather than watching, per ADR-0061 decision 4; nothing here changes that.
+No user-state overload or unnecessary stat fields. Application indexing keeps explicit refresh.
 
 ## 0121. A `panel` or `lock` may build its child per output
 
-`child` on a `panel` or `lock` may be a function of the output's connector name. `Scene::apply`
-calls it once per surface instance, per pass, and the node table it returns takes `child`'s
-place before the walk begins. A `window` or `popup` has one instance wherever the compositor
-places it and no output to hand over, so a function there is refused.
+1. Panel/lock child functions receive the connector at per-instance apply, where output identity is known.
+2. Invoke every pass and reconcile their results like list items; named state survives by its key.
+3. Nil yields an empty instance.
+4. Evaluation probes use the fake connector PROBE.
 
-1. **Per instance, where the instance is known.** ADR-0038 decision 3 made one `monitor =
-   "All"` declaration one surface per output, all resolving the same tree against their own
-   `available`. Nothing in that tree could tell which output it was on, so a wallpaper that
-   differs per screen had to be one `panel` per screen, declared from `oblisk.screens` at
-   evaluation, and a monitor plugged in later got nothing until a reload. The function is called
-   in `apply_one_instance`, the one place the instance id, the output and the tree meet.
-2. **Per pass, on `list.itemfn`'s terms.** The function runs on every apply, and its return is
-   reconciled by id and position like any child. A `state("wallpaper_" .. output)` inside it is
-   registry-stable by name (ADR-0044), so the retained tree survives; the cost is the same
-   rebuild-and-throw-away `itemfn` already pays (§ 5.2's "fast-reconciling virtual repeater").
-3. **`nil` maps the instance empty**, the same as no `child`, so a function may decline an output.
-4. **The eval-time probe calls it with `"PROBE"`.** `lua::nodes`' validation applies every surface
-   once against a single fake output, and a function child is validated on that output's return.
-
-Rejected: an `oblisk.output` signal resolved per instance (a signal is one value; resolution
-reads it once per property with no instance in scope); a `child` table keyed by output name (a
-function is the general form and a table is one line of Lua inside it).
-
-**Consequences**: `lua-meta/surfaces.lua` types `child` as `Node|fun(output: string): Node?` on
-`panel` and `lock`; § 6.1 and § 6.4 say so. `dev-config`'s wallpaper is one panel again, with
-per-output source and fit, and its choice persists through `system:write_state`, which closes
-ADR-0055 decision 2's "does not persist".
+Reject functions on window/popup, which have no fixed output, and a global output signal with
+ambiguous per-instance meaning. Config now implements per-output wallpaper and persistence.
 
 ## 0122. Images decode to their box, and off the frame through the thumbnail cache when asked
 
-Three changes to the Renderer's image path, for a grid of files where the old path was a second
-of frozen shell and a gigabyte of textures.
+1. Downscale raster textures to cover their physical box, never upscale storage; include the box
+   in every image cache key.
+2. Opt-in async uses up to four workers and paints empty until completion. Upload on the GL thread
+   and invalidate only lists naming the completed files. Inline remains default for complete first frames.
+3. Async work uses/writes the freedesktop thumbnail cache, validating source mtime and URI and
+   writing private temp files followed by rename.
+4. Enable WebP decoding.
 
-1. **A raster is stored scaled down to cover its box, never up**, and the cache key carries the
-   box in physical pixels for every file, where before it did for SVG alone (ADR-0054 decision
-   4's key). A 4K file drawn as a 230px tile is a 230px texture; the same file drawn full-screen
-   is a screen's worth. The `image` crate's `thumbnail` (a triangle filter) does the scale. The
-   same rule for every `fit`: `contain` could go smaller, but one rule keeps one slot per box.
-2. **`image.async = true` decodes on a pool and draws nothing until it lands.** The pool is
-   `available_parallelism` capped at four threads, fed from one queue, answering on one channel.
-   The main loop polls it once per turn (the same drain-then-act turn as ADR-0044 decision 2's
-   dirty flag) and repaints; the texture is created at the start of the next paint, where
-   `release_evicted` already runs, since only the Wayland thread holds the context (ADR-0039).
-   The default stays inline, since a wallpaper's first frame must be whole for the candidate's
-   presentation evidence (ADR-0003) and an icon's decode is microseconds. A landing changes no
-   display list, since a list names the file and not the texture, so the landing names its files
-   and only the surfaces whose last list draws one forget it: `DisplayList::draws_any_of` is what
-   keeps the wallpaper from repainting for a tile.
-3. **A pool decode goes through the freedesktop thumbnail cache.** For a box a spec size covers
-   (`normal` 128, `large` 256, `x-large` 512, `xx-large` 1024 on the longest edge), a current
-   thumbnail at `$XDG_CACHE_HOME/thumbnails/<size>/<md5 of the file URI>.png` is decoded instead
-   of the file, current meaning its `Thumb::MTime` is the source's mtime and its `Thumb::URI`,
-   if present, is this file. A file decoded in full leaves a thumbnail behind when it was larger
-   than one, written the spec's way (temp file beside the final name, `0600`, directory `0700`,
-   rename). Nautilus and every GTK file chooser keep the same cache, so a folder the file manager
-   has shown opens with no full decode, and one the picker decoded shows in the file manager
-   likewise. The URI is escaped as GLib escapes it, since GLib hashed what is already there.
-4. **WebP decodes**, one feature flag on the `image` crate, because a wallpaper folder is full of it.
-
-Not built: the spec's `fail/` directory (a file that does not decode is `Slot::Failed` for the
-generation); `Thumb::Size`; the shared repository under `/usr/share/thumbnails`; a byte budget
-for the cache (ADR-0054's entry count stands, and an entry is now at most its box); a crossfade
-when an inline `source` changes (ADR-0002's transition branch, still waiting on an animation
-model, so a wallpaper change is a stalled frame rather than a flash of the ground).
-
-Rejected: thumbnails for inline decodes too (a tray pixmap in `/dev/shm` or a notification image
-is not a user file, and would litter the cache); a separate `thumbnail = true` property beside
-`async` (nothing wants one without the other, and QML's `asynchronous` is the one switch a
-picker sets).
-
-**Consequences**: `Draw::Image` and the cache key carry a box, `ImageCache::image` takes a `Load`,
-`renderer/src/image/thumbnails.rs` is new, `md-5` and `png` are direct dependencies. § 5a gains
-`async`; `CONTEXT.md`'s Image cache term says what the key is now.
+No fail-directory cache, shared thumbnail repository, byte budget or crossfade in this pass.
+Do not cache transient inline spools as user thumbnails or add a redundant thumbnail switch.
 
 ## 0123. Idle textures have a byte budget, and the allocator's mmap threshold is pinned
 
-Measured after ADR-0122, on the 1920x1200 laptop output, debug build: the Renderer booted at 89
-MB resident and reached 132 MB after six wallpaper changes, with 123 MB of GPU memory charged to
-the process by then (`drm-total-system0` in the DRM fd's `fdinfo`) and climbing 12 MB per change.
-Two causes, two changes.
+1. Evict least-recently-used unshown textures above a 16 MB idle budget. Pin displayed images;
+   an oversized working set stays over budget rather than thrashing. Icons are not pinned.
+   Six wallpaper changes used 79 instead of 123 MB GPU memory without continued growth.
+2. Pin glibc's mmap threshold at 1 MB so freed large decode buffers return to the kernel rather
+   than raising the adaptive threshold and stranding future buffers on the heap.
+   The measured heap stayed near 23 MB instead of growing to 64 MB.
 
-1. **A texture no mapped surface is showing is evicted once the idle total passes 16 MB.**
-   ADR-0054's cache evicted by entry count alone, oldest insert first, so every wallpaper a user
-   left behind stayed for the next 128 inserts: 12 MB each here, 33 MB on a 4K output, invisible
-   to `ps` because a GEM buffer is not in the process's RSS and is system RAM all the same. Now
-   each `Ready` slot carries its byte size and the tick of its last ask; after every paint
-   `wayland::App` hands the cache the `(path, box)` pairs its surfaces' last display lists draw
-   (`DisplayList::drawn_images`, the walk `draws_any_of` already does), and `ImageCache::trim`
-   evicts the least recently asked-for unpinned textures until under budget. Pinned means shown:
-   a texture some mapped surface last painted is never evicted, whatever the total, so a working
-   set larger than the budget is over budget rather than thrashing through inline decodes. 16 MB
-   holds a closed picker's tiles (54 files at a tile's size, 6.5 MB) and the last wallpaper on
-   this output, and nothing older. Measured: the same six changes end at 79 MB of GPU memory
-   instead of 123 and no longer climb. Icons are not pinned, since a list carries a theme name
-   where the cache has a path; one is a few kilobytes and, evicted, one inline re-raster.
-2. **`mallopt(M_MMAP_THRESHOLD, 1 MB)` at Renderer startup.** glibc serves an allocation over
-   the threshold from its own mapping, returned to the kernel on free, and one under it from
-   the heap, which shrinks only from the top. The threshold is dynamic by default: freeing a
-   mapped 10 MB decode buffer raises it to 10 MB, so the next change's buffers (the decoded file,
-   the cover-sized copy, the RGBA copy) land on the heap and stay resident after they are freed,
-   trapped under whatever small allocation came after. The six changes grew the heap from 22 MB
-   to 64 MB that way; with the threshold pinned it stays at 23 MB, and the process at 90 MB
-   resident. The cost is one `mmap` per allocation over a megabyte, which nothing here does per
-   frame. `libc` becomes a direct dependency for the one call.
-
-Not changed: the wallpaper's texture size, which is already the cover of its output (2133x1200
-here, 10 MB) and the least that draws sharp; the decode's transient peak, which is the whole
-file at once (a 6024x3401 PNG is 82 MB of RGBA for the second it takes) because the `image`
-crate decodes whole and downscales after, so a row-streaming decode that scales as it reads is
-the next step if that peak matters; the Supervisor's allocator; ADR-0043's 50 MB per-monitor
-figure, which this is the first measurement against.
-
-**Consequences**: `Slot::Ready` carries bytes, `ImageCache::trim` and `DisplayList::drawn_images`
-are new, `App::paint_surface` calls `trim` after recording its list, `main.rs` opens with the
-`mallopt`. `CONTEXT.md`'s Image cache term says what is evicted when.
+Do not shrink displayed wallpaper textures, change the Supervisor allocator or hide whole-image
+decode peaks. Streaming downscale remains an upgrade if peak memory matters.
 
 ## 0124. A hidden subtree is frozen, the loop wakes on an fd, and an idle turn does nothing
 
-Measured on the dev config, debug build, one 1920x1200 output, nothing open: the Renderer's main
-thread used 8% of a core and woke 64 times a second. Two pushes a second reach it (`system`'s
-clock tick every second, `sysinfo` every second and a half), and each cost a 45 ms re-resolve of
-the whole scene, 37 ms of it in three surfaces that were closed: the wallpaper picker (17 ms,
-fifty-four tiles), the panel host (11 ms) and the launcher (9 ms). The rest of the wakeups were
-the 15 ms poll finding nothing to do, and on an open picker each of those turns copied the
-focused surface's whole tree out of the scene to look for an `autofocus` field.
+1. Freeze hidden subtrees without retiring their identity/geometry. Skip child resolution,
+   list expansion and measurement; keep hover clearing correct.
+2. Block on Wayland and eventfd instead of a 15 ms timer. Frames, decode results and socket-thread
+   termination wake the loop, including Supervisor disconnection.
+3. Run focus housekeeping only on turns with relevant work.
+4. Use two Supervisor async workers instead of one per CPU; the blocking pool remains separate.
 
-1. **A node that is not `visible` keeps its subtree frozen.** `prepare` stops at it: no child
-   resolved, no signal read, no `list` item function called, no text measured. The retained
-   children it had come through `finish` untouched, ids and last geometry included, so showing it
-   again pairs the fresh children against them the way ADR-0001's reconciliation always did. Not
-   retired: retiring would free the ids and rebuild from nothing on every open. Nothing outside
-   `layout` ever read a hidden subtree's geometry (`taffy_style` already gave it `Display::None`;
-   `paint`, `hit` and `overlay_input_regions` stop at a hidden node), and `hover_writes` still
-   walks the frozen nodes, so a slot under a closed panel is written false the way it was. The
-   three closed surfaces now cost 20 µs each; a push is a 5 ms re-resolve, all of it the bar.
-2. **The loop blocks in `poll` with no timeout, on the connection fd and one eventfd.** The
-   socket thread writes the eventfd after every frame it hands over (`wake::Waker`), a decode
-   worker after every result, and a guard on the socket thread writes it when the thread ends
-   however it ends, so a dead Supervisor is still read as `Disconnected` (ADR-0059) and not
-   waited for forever. Nothing in the loop body keeps time: every check it makes reads state that
-   only a Wayland event, a frame, a keystroke or a landed decode can change. Sixty-four wakeups a
-   second become two, the pushes.
-3. **An idle turn skips the focus housekeeping.** The three once-a-turn checks (a secure field
-   whose surface went, a secure field that became typable under a held focus, an `autofocus`
-   field to arm) run only on a turn that dispatched an event, drained a frame, took a keystroke
-   or landed a decode. With decision 2 there are no idle turns left, but a Wayland event that
-   changed nothing is still most turns, and `arm_autofocus_if_nothing_is_typing` copies a tree.
-4. **The Supervisor's runtime has two worker threads.** `Runtime::new` gave it one per core,
-   twenty here, for tasks that every one wait on a socket, a D-Bus signal, inotify or a timer;
-   the blocking pool is separate. Twenty-six threads become eight.
-
-Measured after: 1.3% of a core and two wakeups a second, the same debug build. What remains is
-the bar's 4 ms per push, which a release build makes a fraction of a millisecond.
-
-Not built: per-surface dirtiness (a push re-resolves every visible surface, and only the bar
-reads what `sysinfo` pushes), which needs each surface to record the signals its resolve read
-and the clock's fresh `map` on every resolve defeats until computeds compare values; a
-row-streaming image decode (ADR-0123). Both wait on a measurement that says they matter, which
-this one does not.
-
-**Consequences**: `PreparedNode` carries `frozen`, `renderer/src/wake.rs` is new and
-`main.rs` threads its `Waker` into `socket::spawn_client`, `wayland::run` and
-`ImageCache::with_waker`; `wayland::run`'s poll has no timeout; `supervisor/src/main.rs` builds
-its runtime by hand.
+Measured debug idle cost fell 8% to 1.3% of a core and 64 to two wakeups/s; closed surfaces fell
+from milliseconds to about 20 µs each. No per-surface dirtiness or streaming image decode without
+further evidence.
 
 ## 0125. A panel shown in the turn that created it waits for its first configure
 
-The dev config's `osd` shows itself during boot, and roughly one boot in four died there: niri
-answered the first buffer with `zwlr_layer_surface_v1: must ack the initial configure before
-attaching buffer`, which takes the connection down, and the next `eglCreateWindowSurface` failed
-with no EGL error for `khronos-egl` to report, so it panicked on its own `get_error().unwrap()`.
-The Supervisor restarted the generation and the shell came up, which is why this read as a slow
-boot rather than a crash.
+A kept but never-shown panel may still lack its first configure when a startup signal reveals it.
+Choose AwaitingConfigure versus Mapped from the acknowledged configured size, not object existence.
 
-`App::show_panel` had two paths and the wrong one ran. A panel hidden after being shown rebuilds
-its `zwlr_layer_surface_v1` and waits in `MapState::AwaitingConfigure`; a panel that never showed
-still holds the object `create_panel` made and went straight to `MapState::Mapped`, on the
-reasoning that a surface committed at startup has long since been configured. True for a panel
-shown by a click, and false for one shown in the same dispatch turn it was created in.
-
-**Decision**: which state a kept layer surface goes to is read from `configured_size`, in
-`map_state_for_kept_layer`. `bind_and_clear` is the only writer of a real one and runs on the ack,
-`unbind` resets it, and no configure carries a zero on both axes, so `(0, 0)` is exactly "not
-acked yet". Waiting costs nothing: the configure is already on its way and `bind_and_clear`
-finishes the show when it lands. Fourteen consecutive boots clean afterwards, against three
-crashes in the twelve logged before it; the `osd` now comes up at its configured 280x75 instead
-of the 1x1 an unconfigured surface binds at.
-
-**Not changed**: the panic itself. `khronos-egl` unwrapping an absent error is its bug, and the
-only way to reach it is a connection already dead, which is not a state to keep running in.
-
-**Consequences**: `map_state_for_kept_layer` in `wayland/layer.rs`, read by `show_panel`.
+The old path attached before acknowledgment and killed the Wayland connection. Fourteen clean
+boots followed, versus three crashes in twelve beforehand. Leave the downstream EGL panic alone;
+the root failure was using an already-dead connection.
 
 ## 0126. The release build is the optimisation, and `target-cpu=native` is not
 
-ADR-0124 left the bar's 4 ms re-resolve as the remaining cost and said a release build would make
-it a fraction of a millisecond. Measured on the dev config, one 1920x1200 output, the same commit
-built both ways:
+Use the existing release profile before further optimization. On one 1920×1200 output, debug
+versus release measured: first frame 799 versus 198 ms, boot CPU 0.91 versus 0.12 s,
+picker CPU 0.73 versus 0.13 s, idle 1.6% versus 0.4%, Renderer RSS 82.7 versus 69.4 MB,
+Supervisor RSS 38.2 versus 23.3 MB, binaries 238 versus 7 MB each.
 
-| | debug | release |
-| --- | --- | --- |
-| launch to the bar's first frame | 799 ms | 198 ms |
-| CPU to boot (Renderer) | 0.91 s | 0.12 s |
-| CPU to open the picker, 54 tiles | 0.73 s | 0.13 s |
-| idle, both processes | 1.6% of a core | 0.4% |
-| Renderer RSS at rest | 82.7 MB | 69.4 MB |
-| Supervisor RSS | 38.2 MB | 23.3 MB |
-| binary, each | 238 MB | 7 MB |
-
-Four to seven times on every axis of speed, and 28 MB across the two processes. Nothing in the
-tree changed to get it.
-
-**Measured and rejected**: `-C target-cpu=native`, built into its own `--target-dir` (hence
-`/target-*` in `.gitignore`). Boot 198 ms against 198 ms, 12 ticks of boot CPU against 13, the
-picker 11 against 14, memory identical -- inside the noise of a two-tick counter, for a binary
-that only runs on the machine that built it. Also `malloc_trim(0)` after an eviction, for the
-3.6 MB the picker leaves on the heap: it returned nothing, so that memory is fragmentation below
-the top of the heap rather than free pages waiting to be handed back.
-
-**Where the Renderer's 69 MB is**, by mapping, after a picker cycle: 19 MB heap, 19 MB
-`libLLVM`, 15 MB `libgallium`, 7 MB the binary, 6 MB anonymous, the rest fonts and small
-libraries. Half of it is Mesa's, and the shell's own share is the heap and the binary.
-
-**Consequences**: none in the tree. The release profile was already tuned (`lto`,
-`codegen-units = 1`, `panic = "abort"`, `strip`, `overflow-checks`); this is the measurement that
-says to use it.
+Reject target-cpu=native: no measured gain beyond noise, less portable binaries.
+malloc_trim returned none of the picker's retained 3.6 MB. No code change; the profile already
+enabled LTO, one codegen unit, aborting panics, stripping and overflow checks.
 
 ## 0127. The update check hands its pages back, and the rest of the memory is where it should be
 
-ADR-0126 measured the release build and stopped at RSS. RSS is the wrong number to stop at: it
-counts a shared page in full in every process that maps it, and half the Renderer's is Mesa's
-`libLLVM` and `libgallium`, mapped by the compositor and every other GL client on the machine.
-By PSS, which divides a shared page among its mappers, the release shell at rest is **33.7 MiB
-Renderer plus 13.3 MiB Supervisor**, against RSS's 69 and 23 -- inside ADR-0043's 50
-MiB-per-monitor budget rather than doubling it. Mesa's 33 MB of Renderer RSS is 6.8 MB of PSS.
-Read PSS here; RSS is the number to quote at a stranger who wants to know how big the process
-looks, not the number that says what the shell costs the machine.
+Release steady state measured 33.7 MiB Renderer plus 13.3 MiB Supervisor PSS on one output,
+within the 50 MiB target; RSS overstated shared Mesa pages.
 
-**The one real find, and the change**: the hourly `updates` check runs `libalpm` against a
-throwaway copy of the pacman database inside `spawn_blocking`, and parsing the whole sync set
-costs about 52 MB. All of it is dead the moment the diff is built, and none of it came back:
-the Supervisor sat at its 84 MB peak until tokio reaped the idle blocking thread ten-odd seconds
-later, and settled 10 MB above where it started. glibc had it, not us -- a per-thread arena is
-never trimmed on its own. One `malloc_trim(0)` at the end of the blocking closure, which is
-`memory::return_free_pages_to_the_kernel`:
+Trim glibc once after libalpm's blocking check releases its roughly 52 MB parse data.
+Supervisor RSS three seconds after checking fell 84 to 32 MB; the legitimate 84 MB peak stays.
 
-| after the check | before | after |
-| --- | --- | --- |
-| Supervisor RSS while the check runs | 84 MB | 84 MB |
-| ... 3 s after it finishes | 84 MB | 32 MB |
-| ... steady state | 33.4 MB | 31.9 MB |
-
-The peak is `libalpm`'s and stays: it holds the parsed database while it diffs, and that is the
-work. What goes is the plateau after it, which was the peak held for no reason at all.
-
-**Measured and rejected**, all three on the Renderer:
-
-- *A full Lua GC after every evaluation.* The whole dev config's VM is **675 KiB** and a
-  `gc_collect` recovers 93 of them. The 16 MB heap is not Lua, so there was nothing to collect.
-- *`M_ARENA_MAX = 2`*, to stop the eleven threads spreading slack across eleven arenas: 330 KiB
-  of anonymous memory, 380 KiB of PSS. Noise, for a non-obvious allocator knob.
-- *A smaller texture budget.* Not measured against, because the number it would trade against is
-  ADR-0123's, and the picker's thumbnails are the thing it exists to keep.
-
-**Where the rest of it is**, so the next person does not re-derive it: the wallpaper is **27.5 MB
-of the Renderer's 41 MB of GPU memory** -- one fullscreen `Background` surface, its swapchain and
-its texture, measured by booting the same config with the wallpaper declaration removed (13.9 MB
-left). That is what a wallpaper costs, not a defect. The Renderer's 16 MB heap is femtovg,
-cosmic-text and the retained scene, and no single allocation in it; the fonts are `mmap`ed by
-`fontdb`, not on the heap (NotoColorEmoji alone is a 10 MB file and almost none of it is
-resident). Neither is worth chasing without an allocation profiler, and this machine has none.
-
-**Consequences**: `memory.rs` acts as well as reports now, which its module doc says. Every
-future memory claim in this tree quotes PSS.
+Reject forced Lua GC, which recovered only 93 KiB, and arena limiting, about 380 KiB PSS.
+Do not shrink the useful thumbnail budget. Wallpaper accounted for 27.5 MB of 41 MB GPU memory;
+other retained allocations required profiling rather than guesses.
 
 ## 0128. The camera scan runs when a camera opens, not when PipeWire renames one
 
-Cloudflare's DNS-cache write-up (`blog.cloudflare.com/dns-cache-memory-optimization-1111`) is mostly
-about shrinking a struct that exists ten million times over, which is not a shape this tree has --
-its per-entry techniques (`Box<[T]>` over `Vec<T>`, one list with offsets over three, boxing the
-big enum variant) buy bytes per instance, and the instances here are counted in hundreds. What does
-transfer is the first thing they did: they wrapped the allocator and measured, rather than guessing.
+Allocation profiling found only 3.2–4.7 MiB of live Rust allocations in the Renderer's 16 MB
+heap. DHAT required relaxing the CPU cap under emulation and never reached a steady GL frame.
 
-Done both ways here, on the Renderer:
+The real fix was Supervisor camera-scan cadence. An fd scan consumed 19.4 MiB of allocations
+and 37,364 readlinks at boot; PipeWire name updates were needlessly rerunning it.
+Scan device openers on startup/inotify only, then apply name enrichment on either source.
 
-- **A `GlobalAlloc` shim keeping a live-bytes histogram by size class.** The Renderer's live Rust
-  allocation is **3.2-4.7 MiB**, against 16 MB of `[heap]` in `/proc`. The shell's own data is a
-  fifth of its heap; the rest belongs to Mesa, LLVM and fontconfig, which allocate through the same
-  `malloc` and answer to nobody here. That closes ADR-0127's open question, and it closes the
-  Cloudflare-style question with it: there is no struct in this process worth 64 bytes a copy.
-- **DHAT** (`valgrind --tool=dhat --trace-children=yes`), which needs `CPU_CAP` raised to survive
-  emulation -- a 5 ms budget on an emulator that runs 20x slow refuses every `computed`, and the
-  scene never applies. Worth knowing before the next person tries. Under it, evaluating the whole
-  dev config allocates 2.36 MB with an 843 KiB peak, and the Renderer never reaches a steady frame
-  in four minutes, so the GL side stays unprofiled by this route.
-
-**What DHAT found, in the Supervisor**: `privacy::video::find_device_openers` was **58% of
-everything the Supervisor allocates during a boot** -- 19.4 MiB of `opendir` buffers and 37,364
-`readlink` calls, a `fuser`-equivalent walk of every process's every fd. The walk itself is right;
-it is how you learn who holds `/dev/videoN` without a kernel interface for the question. What was
-wrong is when it ran: the camera task rescanned on *every* arm of its `select!`, including the
-PipeWire one, and a `Video/Source` node appearing says an app registered with PipeWire, not that
-the set of processes holding the device changed. PipeWire's snapshot is used for one thing --
-turning a pid into a name -- so it was spending an 11,000-syscall scan to relabel a string.
-
-Split into `scan_camera_pids` (inotify's arm, and startup) and `name_camera_users` (both arms,
-against the pid set that stands). Openers still come from inotify `OPEN`/`CLOSE` on the device
-node, which is the only event that can change them, so nothing is detected later than before.
-
-**Consequences**: the Supervisor's boot allocation drops by roughly the PipeWire-triggered scans,
-which on this machine is the pair that fire as PipeWire enumerates its existing globals at startup.
-Idle is unaffected -- it was never scanning at idle, and this ADR is not a claim that it was.
+Idle never scanned continuously; this reduces redundant startup/event scans, not an idle leak.
 
 ## 0129. Measured against the mirror and against Noctalia, and what their renderer has that this one does not
 
-Two comparisons, both asked for and both worth writing down before the numbers rot.
+Historical comparison on the same 1920×1200 machine, both shells running during a 35.5-second
+idle window: Quickshell/reference config used 169.0 MB PSS plus 9.8 MB helpers, 214.2 MB GPU,
+and 4.65% CPU plus 1.30% cava. Oblisk used 47.5 MB PSS, 51.5 MB GPU and 0.34% CPU.
+Not feature-identical: the reference also ran a visualizer and animations.
 
-**The mirror.** `~/.config/quickshell` is the QML config this tree's `dev-config` is written from, so
-Quickshell running it is the closest thing to a like-for-like there is. Same machine, same
-1920x1200 output, both shells at rest, PSS (ADR-0127's rule) and one 35.5 s window for idle CPU:
+The inspected native Noctalia renderer provided comparison ideas, not grounds for a rewrite.
+Oblisk already shared one context and used a byte-budgeted image cache. Dedicated shaders and
+in-process context recovery did not justify replacing femtovg/process recovery without evidence.
 
-| | Quickshell + the QML config | oblisk + `dev-config` |
-| --- | --- | --- |
-| PSS | 169.0 MB, plus 9.8 MB of helpers | 11.0 MB Supervisor + 36.5 MB Renderer |
-| RSS | 243.6 MB, plus 24.1 MB | 21.2 MB + 72.7 MB |
-| GPU (DRM resident) | 214.2 MB | 51.5 MB |
-| threads | 34, plus 6 | 8 + 11 |
-| idle CPU | 4.65%, plus 1.30% for `cava` | 0.34% |
-| helper processes at rest | `inotifywait`, `bluetoothctl`, `cava` | none |
-
-Roughly a quarter of the memory, a quarter of the GPU, a fifteenth of the idle CPU. **Not
-feature-identical**, and the gap is not all architecture: the QML config runs an audio visualiser,
-which is real animation work nothing here does, and its `cava` is a process this shell has no
-equivalent of. Both shells were up together during the CPU window, which taxes both. The honest
-claim is the order of magnitude, not the digits.
-
-**Noctalia** (`github.com/noctalia-dev/noctalia`) is no longer a Quickshell config: it is 11.8 MB of
-C++ on Wayland and OpenGL ES with no Qt or GTK, configured in TOML. That makes it a peer of this
-tree rather than of the mirror, and its `src/render/` is the first outside renderer worth reading
-against ours. What it has:
-
-- `GlSharedContext`: a root surfaceless `EGLContext` that is the share parent of every other
-  context, so a texture uploaded in one is usable in all -- their lock screen reuses the wallpaper
-  already in VRAM. **We have the stronger form by construction**: `wayland::egl::init` builds one
-  context for the whole Renderer and every window surface is made current against it, so the glyph
-  atlas and the image cache are shared without a share group, and the lock surface is in the same
-  process. Their machinery exists because they run several renderers; the process boundary is where
-  this tree splits instead (ADR-0006).
-- `SharedTextureCache`: path-keyed and refcounted, decoded and uploaded once. Ours is keyed on path
-  *and* box, pins what a mapped surface shows, and bounds the rest by bytes (ADR-0123). Refcounting
-  answers "is anyone using this"; a byte budget answers "how much may sleep here", and the second is
-  the question a shell with a wallpaper picker actually has.
-- `CachedLayer`: an FBO plus a scratch FBO and a dirty flag, rendered through a callback and
-  re-blitted while it is unchanged. Read at a distance this looked like a general subtree cache and
-  ADR-0130's line-by-line pass corrected that: its only two callers are `blur_cache` and
-  `backdrop_surface`, so it is the blur pipeline's scratch buffer and not a way to skip re-painting
-  arbitrary subtrees.
-- `blur_cache`, its one real caller: nothing here blurs, so neither has anything to cache. The pair
-  is the shape to copy on the day `roadmap.md`'s backdrop-blur item lands, and nothing before then.
-- A shader program per primitive (rect, glyph, image, gradient, spinner, ring) instead of a general
-  canvas. Leaner per draw than femtovg's path pipeline, and every primitive is yours to write. No
-  evidence femtovg is a bottleneck at 0.34%; not a rewrite this tree has earned.
-- Context-loss handling (`resetNotificationEnabled`, `videoMemoryPurgeNotificationEnabled`,
-  `abandonGpuResources`, `recreateRootContext`): the in-process answer to a GPU reset or a
-  suspend-time VRAM purge. Ours is a generation that dies and a Supervisor that swaps a fresh one
-  in, which is the same recovery without the bookkeeping.
-
-**An idea neither shell appears to use**: real damage regions. Both post the whole surface every
-paint, so a compositor re-composites a full-width bar for one clock digit.
-`eglSwapBuffersWithDamageKHR` would narrow it. It spends the *compositor's* GPU, not ours, which is
-why it has stayed unmeasured -- an upgrade path, not a finding.
-
-**Consequences**: none in the tree. Nothing here says to change the renderer; two of the four ideas
-we already have in a stronger form, and the other two would spend what this shell is short of.
+Correction from ADR-0130: CachedLayer serves blur/backdrop scratch buffers, not general subtree
+caching. Blur has no caller here yet. Damage-region submission remains an unmeasured upgrade.
 
 ## 0130. Noctalia read line by line: their animation model, and the two pieces of it this tree already has
 
-**Status**: accepted
+Adopt animation's elapsed-time and idle-frame-loop rules, not an implementation in this pass.
 
-**Context**: ADR-0129 compared the two shells from the outside and skimmed four headers. This is
-the pass that cloned the tree (`noctalia-dev/noctalia`, shallow, 307k lines of C++ across 1,837
-files) and read the render, animation, scripting and reconcile layers against ours, prompted by
-`roadmap.md` ranking the animation model as the largest unbuilt item. Two of ADR-0129's claims did
-not survive the closer look and are corrected there.
+1. The inspected animator is a small scalar-setter collection, not a binding/property framework.
+2. Derive progress from elapsed time since start, not accumulated callback deltas; sparse startup
+   callbacks must not slow the animation.
+3. Arm compositor callbacks only while active. Keep the callback chain alive without drawing
+   when pixels are unchanged.
+4. The inspected declarative plugin layer cannot request arbitrary animations; native widgets own
+   them. Oblisk cannot use that shortcut because config authors its UI.
+5. Retained node identity and leases already provide the lifetime basis; interpolation must survive
+   reconciliation under that identity.
 
-**Decision**: take the frame-loop shape and the wall-clock rule. Take nothing else yet.
-
-1. **Their animation system is 364 lines, and its core is a `float` setter closure.**
-   `animate(from, to, durationMs, easing, setter, onComplete, owner)` pushes an entry onto a
-   `std::vector`; `tick` walks it, interpolates, and calls each setter. Seven easings. No property
-   system, no binding graph, no interpolation of anything but a scalar -- a colour fade or a slide
-   is a scalar the setter spends. That is the whole model, and it is worth noticing how small the
-   thing at the top of our roadmap is when someone else builds it.
-
-2. **Progress comes from wall time, not from an accumulated delta.** `tick(deltaMs)` takes a delta
-   and deliberately ignores it, computing `now - startedAt` instead. Their comment gives the
-   reason: a Wayland compositor delivers `wl_surface.frame` sparsely right after a cold boot, so a
-   delta-accumulated animation runs visibly slow exactly when the shell is being watched hardest.
-   This is a correctness rule, not a preference, and it is the cheapest thing on this list to get
-   wrong. Adopted as written.
-
-3. **The frame loop stops when idle, and animating does not mean repainting.**
-   `queueRenderIfNeeded` splits two cases: something is dirty, so render; or nothing is dirty but
-   an animation is live, so `continueAnimationFrameLoop` commits *only* the frame-callback state
-   and retains the current buffer. The callback chain stays alive with no pixels drawn. Combined
-   with `hasActive()` gating whether the callback is re-armed at all, this is how a shell gets a
-   vsync clock without paying for one at rest.
-
-   This is the answer to the constraint `roadmap.md` already names -- "build the gate so a reason
-   can be added rather than replacing the condition". Ours is stricter than theirs to begin with:
-   `wayland::run` polls two fds with `PollTimeout::NONE` and has no time source anywhere in the
-   loop (ADR-0124), which is why idle costs 0.34% of a core. `CompositorHandler::frame` is a stub
-   in `wayland/output.rs`. So the animation clock is an addition to that loop and not a rewrite of
-   it: arm a frame callback while an animation is live, let `poll` keep blocking when none is, and
-   the idle number survives the feature.
-
-4. **Their declarative layer cannot animate, and ours would not have that excuse.** This is the
-   finding that matters most. `luau_host.cpp` and `ui_tree_reconciler.cpp` contain no reference to
-   animation at all: every `animate()` caller is imperative C++ inside a control (`toggle.cpp`,
-   `collapsible.cpp`, `button.cpp`) or a shell surface. A plugin author gets controls that happen
-   to animate themselves and no way to animate anything else. They sidestepped the hard question --
-   where an interpolated value lives when the tree that declared it is rebuilt -- by never letting
-   the declarative layer ask it. In this tree the config *is* the declarative layer, so that
-   sidestep is not available and the question has to be answered.
-
-5. **We already own the mechanism their answer would need.** Their reconciler matches children by
-   `(type, key)`, updates a match in place, and drops the subtree on a mismatch -- so a control's
-   `m_animId` survives a declarative update precisely because the C++ object does.
-   `Scene::apply`'s `pair_children_by_id_then_position` is the same mechanism and a stricter one:
-   an explicit `id` pairs only against that `id`, id-less children fall back to position
-   (ADR-0023, amended by ADR-0045), and an `id` appearing or vanishing is an honest change of
-   identity rather than a silent reuse. We built it to key GPU resources on `NodeId`; it is also
-   exactly the stable identity an animated value needs to be hung off. `CONTEXT.md`'s Lease, which
-   has had no caller since it was written, is the other half.
-
-**Rejected, with the measurement or the reading that rejects it**:
-
-- **`mallopt(M_ARENA_MAX, 2)`**, which they set unconditionally in `main`. Tested here before
-  reading their tree and it recovered 330 KiB, because the Renderer runs 11 threads and they run
-  many more. The knob is right in principle and does not pay at our thread count.
-- **jemalloc** (`background_thread:true,narenas:2,dirty_decay_ms:1000,muzzy_decay_ms:5000`), auto-on
-  for their glibc builds. It is the systematic form of what ADR-0127 does with one `malloc_trim`
-  call: a background thread returning pages on a decay schedule instead of one trim after one known
-  spike. Declined for now on two grounds -- our measured problem was a single transient the one
-  line already fixed, and a permanent background thread spends the idle CPU that is this shell's
-  best number against every peer.
-
-**What the read confirmed rather than changed**:
-
-- **They call `malloc_trim(0)` too**, as a named `allocator_trim` startup phase after the last
-  init phase, for the same reason ADR-0127 landed it after the update check: glibc keeps what a
-  transient spike touched. Two trees arriving at the same one-line fix from separate measurements
-  is the strongest evidence either has that the fix is the right one. (Theirs also covers startup;
-  ours does not yet, and their placement is worth copying if boot ever shows a spike.)
-- **Neither shell tracks damage.** Their `wl_surface_damage_buffer` calls are two one-pixel pokes
-  in an output probe and a click shield; nothing in their render path narrows a commit. ADR-0129's
-  note stands unchanged.
-
-**Consequences**: nothing changes in the tree today. `roadmap.md`'s item 1 gains a decided shape --
-scalar setters keyed on `NodeId`, wall-clock progress, a frame callback armed only while something
-is live -- so the work starts from a design rather than from a survey. ADR-0129's `CachedLayer`
-paragraph is corrected there: it is the blur pipeline's scratch buffer, its only callers being
-`blur_cache` and `backdrop_surface`, not the general subtree cache a distant reading suggested.
-
-**Not a claim about size**: their 11 MB binary and our 6.8 MB Renderer are not comparable numbers.
-`meson.build` names 39 shared dependencies -- pango, cairo, glib/gobject/gio, harfbuzz, freetype,
-librsvg, libjxl, libwebp, curl, libxml2, libical, polkit, pipewire, wireplumber, sdbus-c++ -- so
-their text stack, image codecs and D-Bus layer live in `.so` files outside that 11 MB. Our Renderer
-links ten shared objects, none of them a text stack, an image codec or a D-Bus library, and carries
-all three inside its own 6.8 MB. Per-binary we are already smaller; the interesting comparison was
-never the file size.
+Reject arena limiting and background allocator machinery for gains not supported by our measurements.
+Neither compared renderer implemented general damage tracking. Correct ADR-0129's CachedLayer
+claim; binary sizes are not comparable without their shared dependencies.
 
 ## 0131. What Noctalia has that is worth taking for memory, CPU and latency, measured
 
-**Status**: accepted
+Measured release resolution: median 1.38 ms, p95 3.38 ms, max 5.48 ms over 62 samples.
+At a 1.74 ms mean, 60 resolves/s would consume 10.4% of a core before paint.
+Animation must interpolate retained state and repaint, not resolve Lua every frame.
 
-**Context**: ADR-0130 read their render and animation layers and concluded "nothing changes in the
-tree today", which answered the animation question and not the one that prompted the comparison.
-This is the sweep for memory, CPU and latency technique specifically, with the numbers that decide
-each item. Measurements are on this machine, `dev-config`, one 1920x1200 output, release build
-unless stated.
+Proposed work, not shipped by this entry:
 
-**The measurement that reframes the animation work**: a temporary probe around
-`RendererClient::re_resolve_if_dirty` puts one re-resolve at **median 1.38 ms, p95 3.38 ms, max
-5.48 ms** (n=62, release; the same probe in debug reads 5.12/16.70/21.25). At the 1 Hz `system.time`
-push that is 0.17% of a core, which is most of the 0.34% idle this tree quotes, and it is fine.
+1. Add an opt-in idle profiler with wake/work attribution and spin detection.
+2. Use nonblocking EGL swap alongside compositor frame pacing when animation arrives.
+3. Virtualize visible list rows plus overscan.
+4. Investigate keeping alpha out of text raster keys.
+5. Consider bounded shape-memo LRU if the working set outgrows the cap.
 
-At 60 Hz it is not: 1.74 ms mean x 60 is **10.4% of a core spent re-resolving before anything is
-painted**, and p95 alone is a fifth of a 16.7 ms frame budget -- measured with the wallpaper picker
-*closed*. `lua/signal.rs` says why: `computed`/`map` recompute fresh on every `:get()`, with no
-memoization and no dependency-invalidation graph, so any push re-runs every `computed` in the tree.
-
-So the rule for ADR-0130's animation work is now a measured one rather than a matter of taste:
-**an animation must interpolate on the retained tree and repaint, never by re-resolving per frame.**
-Noctalia gets this for free -- a setter writes a float into a node and nothing reconciles -- and
-this tree does not, because here the config *is* the declarative layer. Routing animation through
-re-resolved Lua properties would spend a tenth of a core before drawing a pixel. Memoizing
-`computed` is the alternative and a much larger change; it is not needed for animation if the
-retained-tree rule holds, and it is worth revisiting only if a push cadence ever rises on its own.
-
-**Taken, in the order they are worth doing**:
-
-1. **An env-gated idle profiler in the poll loop.** Their `app/main_loop.cpp` reports, on an
-   interval: loop iterations, CPU split process/thread/background, poll wakeups by cause
-   (fd/timeout/immediate), per-source wake and dispatch counts with total and max dispatch time,
-   and a spin detector that names a source which "keeps voting timeout=0". Every number this
-   session cost a day of ad-hoc probes, scratch scripts and a DHAT run, and they read theirs off a
-   log line. Ours has two fds and no self-measurement. This is the highest-value item here and the
-   cheapest, and a spin detector becomes load-bearing the moment a frame callback can re-arm
-   itself forever.
-2. **`eglSwapInterval(0)`, on the day animation lands and not before.** EGL defaults to 1, which
-   blocks `eglSwapBuffers` until the compositor releases the buffer; this Renderer is
-   single-threaded, so a blocking swap stalls Wayland dispatch, Supervisor frames and input
-   together. Probed today it costs nothing -- swaps measured 0.24, 0.30, 0.37, 0.44, 0.89 ms, five
-   of them in 25 s, because a shell that paints this rarely never contends for a buffer. At 60 Hz
-   it contends every frame. Their comment gives the same reasoning and pairs it with pacing from
-   `wl_surface.frame`, which is ADR-0130's item 3.
-3. **List virtualisation.** `ui/controls/virtual_grid_view.h` materialises a pool sized to the
-   visible rows plus overscan and recycles tiles through `bindTile` as the data or scroll offset
-   moves. `wallpaper_picker.lua` builds every row for every file in the folder, and each tile
-   carries a `computed` that the 1 Hz push re-runs. Their header notes the adapter was shaped so a
-   script-side "tile template" callback could drive it, which is the same API this tree would need.
-4. **Alpha out of the text cache key.** They pack rgb into the top 24 bits and force alpha to
-   `0xFF`, applying the caller's alpha at draw time through `u_opacity`, explicitly so an opacity
-   animation on one string reuses one raster instead of allocating a fresh one per frame. A
-   fade-out at 60 Hz with alpha in the key churns 60 rasters a second. Worth knowing before the
-   first fade exists rather than after.
-5. **A real LRU on the shape memo.** Theirs is doubly bounded (entry count *and* bytes) with one
-   sharp detail: never evict the LRU front, or a single entry larger than the whole budget walks
-   the list, evicts everything including itself, and returns a dangling pointer.
-   `ShapingHandle::shape` clears the map wholesale at `SHAPE_CACHE_CAPACITY`, which its own comment
-   already flags as the thing to replace if lists grow past 500 rows.
-
-**Rejected, each with the reason**:
-
-- **`mallopt(M_ARENA_MAX, 2)`** (they set it unconditionally in `main`): measured 330 KiB here.
-  Right knob, wrong thread count -- the Renderer runs 11 threads and they run far more.
-- **jemalloc with `background_thread:true,dirty_decay_ms:1000`**: the systematic form of ADR-0127's
-  single `malloc_trim`. A permanent background thread spends the idle CPU that is this tree's best
-  number against every peer, to solve a transient one line already solves.
-- **Redundant-GL-state elimination**: they cache only blend mode, not program or texture binding,
-  so there is no technique here to take.
-- **A whole-run text raster cache**: theirs exists because Pango/Cairo rasterises on the CPU and
-  uploads. femtovg keeps glyphs in a GPU atlas and a draw is quads, so the same cache would buy
-  much less and cost a texture per unique string, size and colour.
-
-**Where this tree is already ahead, so the sweep is not one-directional**: capabilities start
-lazily on first config read, where their tray and polkit are merely staggered behind 500 ms and
-1000 ms timers; the emoji font is mapped shared rather than read (49.7 MB to 22.7 MB private-dirty);
-the image cache is byte-budgeted with pinning where theirs is refcounted; and
-`pair_children_by_id_then_position` is a stricter reconcile than matching on `(type, key)`.
-
-**Consequences**: no code changes in this commit. Items 1 and 3 are independently useful now; items
-2 and 4 are prerequisites filed against ADR-0130's animation work, and item 5 is filed against the
-500-row ceiling `text/shaping.rs` already names. The re-resolve figures are the baseline any of it
-should be measured against.
+Reject unmeasured allocator changes, GL-state tricks absent from the reference, and a whole-run
+CPU text cache over an existing GPU glyph atlas. ADR-0132 verifies and revises these proposals.
 
 ## 0132. Checking ADR-0131's five items against the tree, and building the two that survived
 
-**Status**: accepted
+Verify ADR-0131 rather than treating its survey as implementation authority.
 
-**Context**: ADR-0131 named five things worth taking from Noctalia and filed all five as future
-work without touching code. This is the verification pass: each item read against what this tree
-actually does, with the ones that survive built. One did not survive contact, and two measured out
-smaller than the survey implied. Measurements are on this machine, `dev-config`, one 1920x1200
-output, release build.
+Item 4 is already satisfied: glyph and shaping keys exclude color/alpha.
+Item 5 remains unjustified: roughly twenty live text nodes do not warrant per-hit LRU bookkeeping
+to avoid an approximately hourly wholesale cache clear.
 
-**Item 4, alpha out of the text cache key: refuted.** femtovg already does structurally what their
-Cairo path needs a trick for. `femtovg-0.26.0/src/text.rs:88`'s `RenderedGlyphId` keys a rasterised
-glyph on `glyph_index`, `font_id`, `size`, `line_width`, `render_mode`, `subpixel_location` and
-`variation_hash`, and on nothing else: no colour, no alpha. A glyph rasterises once as coverage and
-the `Paint` tints it at draw time, so a fade over a string reuses one atlas entry per glyph with no
-work on our side. `ShapingHandle`'s own key is a measurement key with no colour in it either. The
-item existed because their renderer rasterises full-colour surfaces on the CPU; ours does not, so
-there is nothing here to take.
+Item 3 needs viewport virtualization, not just delegate memoization. Fifty tiles measured
+0.916 ms versus 0.783 ms with literal children; delegate work is about 19%, the remaining
+resolution/layout/measurement about 81%.
 
-**Item 5, an LRU on the shape memo: real, and still not worth it.** `ShapingHandle::shape` does
-clear wholesale at `SHAPE_CACHE_CAPACITY`, as ADR-0131 said. What that costs is one full re-shape
-of the live working set, and the working set is about twenty text nodes; the clock is what fills
-the map, at one dead entry a second, so the clear lands roughly hourly and costs on the order of
-the 6.64 ms `ShapingHandle::shape`'s own comment measures for 500 rows. An LRU trades that for
-recency bookkeeping on every hit, which is the path the memo exists to make cheap. The comment
-already names the condition that would change this -- a working set genuinely larger than the cap
--- and it is not met. Left alone deliberately, not by omission.
+Build items 1 and 2: an opt-in idle profiler and swap interval zero per bound surface.
+Log a refused swap hint; retain fallback behavior. The profiler touches no clock when disabled.
 
-**Item 3, list virtualisation: real, but the cheap half of it is worth a fifth of what the survey
-implied.** ADR-0124 already froze hidden subtrees, so a closed picker costs nothing and only a
-visible list is in question. A fixture of fifty tiles (a `column` per tile, each holding a `rect`
-with an `image` and a `text`) re-resolves in 0.916 ms median. The same tree written as literal
-children, which is what a perfect memo of `itemfn` would leave behind, re-resolves in 0.783 ms:
-`itemfn` plus `deserialize_lua_table` is 19% of the pass, and `resolve_properties`, `LayoutStyle`,
-taffy node creation and text measurement are the other 81%. Adding two derived signals per tile
-takes the list to 1.153 ms and moves the split to roughly a third, since a `:map()` per tile
-allocates on both sides of it. So the fix `node/spec.rs`'s ponytail note describes -- compute keys
-first, skip `itemfn` for unchanged ones -- buys 20-30% of a visible list, not the bulk of it,
-because the signals behind every property must be re-read each pass whatever happens to `itemfn`.
-Viewport virtualisation is the item that takes the other 81%, by never resolving an off-screen row
-at all, and it needs the scroll offset to reach `prepare`, which today it does not. Filed as the
-real shape of this work; the memo alone is not worth building first.
-
-**Item 2, `eglSwapInterval(0)`: built.** `wayland/egl.rs` never called it, so every surface carried
-EGL's default of 1 and every `eglSwapBuffers` was free to wait on the compositor. This thread also
-dispatches Wayland, drains Supervisor frames and services input, so that wait is not confined to
-painting. Set once per surface in `bind_surface`, immediately after the `eglMakeCurrent` that first
-makes it current, because `EGL_SWAP_INTERVAL` is state on the current context's draw surface. A
-driver that refuses the hint logs and keeps the blocking default. Nothing paces the loop in its
-place because nothing needs to yet: it paints only when `re_resolve_if_dirty` reports a change, so
-the push is the pacing, and `wl_surface.frame` becomes the pacer when ADR-0130's animation work
-gives it frames to run ahead of. Measured today it changes nothing, as ADR-0131 predicted.
-
-**Item 1, an env-gated idle profiler: built**, as `wayland/idle_profile.rs` behind
-`OBLISK_PROFILE_IDLE=<seconds>`. It reports, per window: loop turns; turns that woke and did
-nothing; process and main-thread CPU as a percentage of one core, from `getrusage(RUSAGE_SELF)` and
-`RUSAGE_THREAD`, whose gap is the shaping worker, the socket thread and tokio; wakes attributed to
-the Wayland fd, the waker fd, both, or neither; and per-kind work counts. A `SPIN` marker is
-appended when most turns of a busy window did nothing, which since ADR-0124 is the only shape a
-runaway can take in a loop that polls without a timeout. Off costs two branch tests a turn and
-touches no clock. `render` is a pure function of one window's counters so its thresholds are tested
-rather than eyeballed in a log.
-
-Its first run answered a question nobody had asked. Three windows on an idle bar:
-
-```
-idle 10.1s: turns=34 idle=11 cpu proc=1.37% main=1.30% | wake wl=10 wake=20 both=2 none=0 | work dispatch=2 resolve=23 type=0 decode=0 draw=0 paint=23
-idle 10.4s: turns=18 idle=0  cpu proc=0.24% main=0.23% | wake wl=0  wake=18 both=0 none=0 | work dispatch=0 resolve=18 type=0 decode=0 draw=0 paint=18
-idle 10.0s: turns=18 idle=1  cpu proc=0.25% main=0.24% | wake wl=0  wake=18 both=0 none=0 | work dispatch=0 resolve=17 type=0 decode=0 draw=0 paint=17
-```
-
-Steady state is 18 turns per 10 s, not the 10 a 1 Hz clock would explain, and every one of them is a
-waker wake that re-resolves and repaints. The arithmetic is exact rather than mysterious:
-`system_info.lua` configures `cpu_interval = 2` and `ram_interval = 5`, so 10 clock plus 5 CPU plus
-2 RAM is 17 pushes per window against `resolve=17`. No spin, no bug -- but it makes the cost
-visible, because each of those 17 re-resolves the whole tree at ADR-0131's 1.38 ms median, and a
-CPU-percentage push re-resolves the clock, the battery and the workspaces along with it. That is
-`lua/signal.rs`'s missing dependency graph seen from the other end, and it corroborates ADR-0131's
-rule for animation from a direction that did not assume it. Idle CPU reads 0.24-0.25% of a core,
-consistent with the 0.34% measured by other means in ADR-0129.
-
-**Decision**: build items 1 and 2. Drop item 4 as already satisfied by femtovg. Leave item 5 where
-its own comment leaves it. Re-file item 3 as viewport virtualisation with the scroll offset reaching
-`prepare`, not as an `itemfn` memo, and record the 19/81 split as the reason.
-
-**Consequences**: `nix` gains the `resource` feature for `getrusage`, read only when the profile is
-on. The profiler is the instrument the next performance question gets answered with instead of a
-temporary `eprintln!`, and its per-window counters are the baseline for ADR-0130's animation work:
-turns should rise to the frame rate while `idle` stays at zero, and any `SPIN` line means the frame
-callback is re-arming without work to do. Live-verified: the bar renders under non-blocking swap
-with a correct clock.
+Live idle windows showed about 17 resolves per ten seconds, explained by clock/CPU/RAM schedules,
+not spinning, at roughly 0.24–0.25% CPU. Nonblocking swap alone had no measured idle speed gain.
 
 ## ADR-0133: `oblisk.battery` reads UPower uncached, because its wake-up races zbus's cache
 
-**Status**: accepted
+Battery wakeups and zbus's property cache consumed the same change independently. Reading before
+cache refresh compared equal, dropped the push and left state one event behind for minutes.
 
-**Context**: the battery glyph showed `Discharging` with the charger physically connected, while
-`upower -i` on the same device already read `pending-charge`. It then corrected itself minutes
-later, with no cable event in between.
+Disable caching on DisplayDevice reads while keeping one whole-object subscription.
+Five reads on infrequent changes cost less complexity than five property streams.
+The power capability's cache-driven property streams were already ordered correctly.
 
-The first explanation offered for this was hardware: EC charge qualification, the fuel gauge's ADC
-sample window, and `drivers/acpi/battery.c`'s `cache_time` (which is indeed `1000` on this machine).
-That explanation reads the Lua and the controller correctly and is wrong about the cause. It
-predicts a *slow* reading. What we had was a *stale* one, and the difference is the whole bug.
-
-`battery::controller` woke on a `zbus::fdo::PropertiesProxy` signal stream and then re-read the
-payload off `DisplayDeviceProxy`. zbus caches proxy properties by default (`CacheProperties::Lazily`
--- see `zbus-5.19.0/src/proxy/builder.rs`), and refreshes that cache from a task of its own
-listening to the very same `PropertiesChanged`. Two independent consumers, one broadcast message,
-and no ordering between them: when our stream won the race, `read_state` read the cache as it stood
-*before* the change and returned the old state.
-
-The lost push is the part that makes it last. `run_battery_task` only pushes when
-`current != previous`, so a stale re-read compares equal and pushes *nothing*. The reading then
-stands until the next `PropertiesChanged` drags it along one change behind. On a battery parked at
-its charge limit there may not be one for minutes: a 40-second `dbus-monitor` capture of every
-UPower `PropertiesChanged` on this machine, at `pending-charge` and 0 W, caught zero signals.
-
-`power::controller` never had this, and the asymmetry is the proof. It wakes on
-`receive_on_battery_changed()`, and zbus drives a `PropertyStream` off an `EventListener` on the
-cache entry itself (`proxy/mod.rs:225`), so by the time that stream yields, the cache already holds
-the new value -- ordered by construction. That is exactly why the charger OSD in
-`modules/global/power_events.lua` was instant and correct while the bar's own glyph sat behind it,
-and why the symptom looked like two different subsystems disagreeing about the same cable.
-
-`mpris/proxies.rs:48` already carries a note about this caching hazard for `Position`, so the tree
-knew the shape of it in one place and not the other.
-
-**Decision**: build the `DisplayDeviceProxy` with `CacheProperties::No`. Each `read_state` is then a
-real `Get`, which is what the function's own doc comment always claimed it was. Five round trips on
-an event that fires a few times an hour is the cheap side of this trade, and it keeps the single
-whole-object subscription the wake-up was written around rather than splitting into five property
-streams the way `power::controller` did.
-
-The alternative -- wake on `receive_state_changed()` and friends -- is also correct and is the
-in-tree precedent, but it trades one subscription for five and gives up the property that
-`org.freedesktop.DBus.Properties` batches a device's simultaneous changes into one message.
-
-**Consequences**: verified live by physically unplugging and reconnecting the adapter; the glyph now
-tracks the cable, and the pill reads `69%` against UPower's `Percentage=69, State=5`.
-
-Everything the hardware explanation said about *latency* remains true and unmeasured -- once the
-state does change, some of the delay to the fuel gauge is real. It was simply never the reason the
-icon was wrong.
-
-One sibling is unfixed and deliberately left so. `tray/registry.rs`'s
-`spawn_item_signal_forwarder` wakes on StatusNotifierItem's custom `NewTitle`/`NewIcon`/`NewStatus`
-signals and then re-reads a cached `StatusNotifierItemProxy` whose properties are declared plain
-`#[zbus(property)]`. That is the same race in a worse form: an SNI implementation that emits only
-the custom signal and no `PropertiesChanged` would never refresh the cache at all, and the item's
-title and icon would be frozen at their first read. Unconfirmed against a real tray application, so
-it is recorded here rather than fixed blind.
+Live unplug/replug confirmed the fix. Hardware latency was not the cause.
+A similar tray custom-signal/cache risk remained unconfirmed and deliberately unfixed.
 
 ## ADR-0134: `oblisk.updates` is a schedule with a package manager behind a trait, and says which one
 
-**Status.** Accepted.
+1. Put manager-specific name, check, install command, progress parsing and reboot detection behind
+   a backend trait; the scheduler should not know pacman.
+2. Detect executable availability in PATH once at capability start, not distribution branding.
+3. Move pacman code and its libalpm allocator cleanup into that backend.
+4. Publish optional package_manager so absence is a fact, not a misleading path error.
+5. Push initial state even with no backend, when no later scheduler event will arrive.
+6. Refuse check/install without a backend; configure quietly no-ops.
+7. Show the example indicator whenever supported, and let its idle click check for updates.
 
-**Context.** `updates` was written against `pacman` and never pretended otherwise. `UpdatesController::new`
-took `/etc/pacman.conf` and `/var/lib/pacman` as arguments; `run_install` hardcoded
-`pkexec pacman -Syu --noconfirm`; `run_one_check` called `check_against_a_throwaway_copy`, which
-symlinks `local/` and syncs through `libalpm`; `needs_reboot` matched `linux` and `linux-*`. That is
-four different places knowing which distribution this is, none of them next to each other, in a
-capability whose Lua-facing surface -- `check`, `configure`, `install`, a count and a package list --
-has nothing distribution-specific in it at all.
-
-The second problem was what a machine without `pacman` was told. Nothing detected one. `Capability::Updates`
-built the controller unconditionally; the first scheduled check then failed inside `link_local_db`
-with `/var/lib/pacman/local is not a directory`, and that sentence -- a path error, phrased as if
-something were broken -- was the whole of the answer. A config could not distinguish it from a
-mirror being down. `UpdatesState` had no field for "this machine has no package manager", the way
-`BatteryState` has `present`.
-
-That gap reached the bar. `dev-config`'s `updates.lua` hid itself whenever its state read `idle`,
-and `idle` covered three different situations: no updates pending, no check ever run, and no
-package manager at all. So did the argument written into the file for hiding it, which was sound as
-far as it went -- a permanent circle whose one meaning is "no action available" is a control that
-never does anything, and its idle click was a no-op that proved it.
-
-**The mirror.** `~/.config/quickshell` gates the whole module on the answer to this question and has
-from the start. `Services/MainService.qml` runs one shell probe at startup whose first line is
-`isArchBased "$(yn command -v pacman)"`. `UpdateService.ready` is `MainService.isArchBased &&
-_checkUpdatesAvailable && Settings.isStateLoaded`, where the middle term is a second probe,
-`command -v checkupdates`. `Modules/Bar/LeftSide.qml` then wraps `ArchChecker` in a
-`Loader { active: UpdateService.ready }`, which is the same shape it uses for
-`BatteryService.isLaptopBattery` -- a module that does not exist on a machine it does not apply to.
-`ArchChecker.qml` itself carries no such test, because by the time it is instantiated the question
-is settled.
-
-Two things follow from reading it. The detection is a binary probe, not `/etc/os-release` parsing --
-`ID=arch` was never consulted, because what the code needs is the command, not the distribution's
-name. And once the indicator is unconditionally present whenever the manager exists, its idle click
-has somewhere to go: `ArchChecker.qml`'s `onClicked` falls through to `UpdateService.doPoll()` when
-nothing is pending. That is the half this tree was missing, and the reason its own comment gave for
-hiding the button ("the idle click was already a no-op") was true only because the re-check had
-never been wired to it.
-
-**Decision.**
-
-1. **`backend::Backend`, a trait with five methods**: `name`, `check`, `install_command`,
-   `parse_install_step`, `needs_reboot`. Everything a package manager knows and the scheduler does
-   not. `controller.rs` holds `Option<Arc<dyn Backend>>` and no longer contains the strings
-   `pacman`, `alpm`, or `pkexec` outside prose.
-
-2. **`backend::detect()` picks the implementation, once, at capability start.** `command -v pacman`
-   without the shell: a walk of `PATH` looking for an executable file, which is the same question
-   the mirror asks and costs no subprocess on the path to the first frame. Ordered, so a second
-   entry is a line rather than a redesign.
-
-3. **`pacman/` is one backend, not the capability.** `check.rs`, `install.rs` and `pacman_conf.rs`
-   move under it (the last renamed `conf.rs`, since its parent now says which conf), and
-   `check_against_a_throwaway_copy` and `link_local_db` move out of `controller.rs` into it. The
-   `libalpm` arena release (`memory::return_free_pages_to_the_kernel`) goes with them: it is a fact
-   about `libalpm`'s allocation, not about checking for updates.
-
-4. **`UpdatesState.package_manager: Option<String>`**, the name of the command, `nil` when this
-   Supervisor speaks none of what is installed. A name rather than a boolean, because a config that
-   wants to say "pacman" in a panel header now can, and `nil` is a better "not here" than `false`.
-
-5. **The controller pushes once at construction**, which no other capability's does. On a machine
-   with no manager there is no later event to carry the answer -- the scheduler is not even spawned --
-   so a config would wait forever to be told it should not be drawing. `last_snapshots` seeds a
-   promoted PBA candidate, so the one push survives a reload rather than needing a resend.
-
-6. **Every action refuses with no backend.** `check_now` and `install` log and return;
-   `configure` returns silently, because a config naming an interval on a machine with no manager
-   has done nothing wrong and does not need a line per reload.
-
-7. **`updates.lua` is present whenever `package_manager` is**, and its idle click re-checks --
-   `ArchChecker.qml`'s own fallthrough. It also finally draws `checking`: `UpdatesState.checking`
-   has existed since ADR-0034 and `update_panel.lua` has read it all along; the indicator was the
-   one place still treating a check in flight and a check never run as the same thing.
-
-**Rejected.** *An enum over backends rather than a trait.* One variant today, and the dispatch would
-sit in `controller.rs` -- which is the file whose whole point here is not knowing. *Parsing
-`/etc/os-release`.* It answers a different question: `ID_LIKE=arch` on a derivative says nothing
-about whether `pacman` is the binary in `PATH`, and a container or a chroot can be Arch with no
-package manager reachable. The mirror never consulted it either. *Writing `apt` and `dnf` backends
-now.* Neither is testable on this machine, and a backend written blind against a package manager
-nobody here runs is a guess with tests that only assert the guess.
-
-**Consequences.** The updates indicator is now on the bar at all times on this machine, dim while
-there is nothing pending and accent once there is, and clicking it while idle runs a real check --
-which is the one interaction the mirror had that this did not. On a machine with no `pacman`, the
-capability starts, says `package_manager = nil`, spawns no scheduler, and the indicator is absent:
-the same outcome as before, reached deliberately and explained, rather than through a failed check
-reporting a missing directory.
-
-The trait is one implementation wide, and that is the honest state of it. What it buys today is not
-`apt` -- it is that the four places that knew about `pacman` are now one file, and that the
-capability can answer "not on this machine" as a fact rather than as an error.
+One backend exists. Do not invent untestable apt/dnf implementations; the immediate gain is
+ownership and explicit unsupported-host behavior.
 
 ## ADR-0135: an empty `textfield` shows its placeholder even with the keyboard, because `autofocus` made the alternative unreachable
 
-**Status.** Accepted. Amends ADR-0092's plain-field drawing and supersedes the reasoning recorded in
-`paint.rs`'s `PaintStyle::TextField` arm.
+An empty ordinary field shows its placeholder even while focused, so autofocus cannot make the
+prompt permanently unreachable. With no placeholder, retain the bare caret fallback; nonempty
+draft/caret behavior stays unchanged.
 
-**Context.** `textfield` has a `placeholder` property and two arms that decide when it is drawn. The
-masked arm draws it whenever nothing has been typed, focused or not -- its guard is `filled > 0`, so
-a focused, empty password field falls through to the placeholder, which is what `lock.lua` and
-`polkit.lua` show. The plain arm did the opposite: focused with the keyboard, an empty field drew
-`format!("{text}\u{2502}")`, and with `text` empty that is a bare caret and nothing else.
-
-That asymmetry was deliberate and argued in a comment: the caret is what says a field is live, an
-empty focused field showing the same prompt as an idle one answers "am I typing into this?" with
-nothing, and a plain field has to answer it. A unit test asserted the behaviour by name.
-
-The argument had a hole, and `autofocus` is the whole of it. `caret` is not a blink -- it is
-`input::text_field_takes_keys(focused)`, whether this surface actually holds the Wayland keyboard.
-`launcher.lua:355` and `wallpaper_picker.lua:375` both declare `autofocus = true`, so their fields
-take the keyboard on the frame they open and hold it until the surface closes. `caret` is therefore
-true from the first frame to the last, `text` is empty until the user types, and the branch that
-draws the placeholder was never reached. `placeholder = "Search apps, or type a link"` and
-`placeholder = "Search wallpapers…"` were text the engine could not display. The only path to
-`caret == false` is the keyboard leaving, and for the launcher `on_cancel` closes the surface
-instead.
-
-So the property was live in three plain fields, dead in the two that most obviously wanted it, and
-the state the comment was protecting against confusion with -- an idle empty field -- is a state
-those two surfaces do not have.
-
-**Decision.** An empty plain field draws its placeholder whether or not it has the keyboard, exactly
-as the masked arm already does. The caret alone remains the fallback for a field that declared no
-placeholder, so a field with nothing to say still says it is live. A non-empty field is unchanged:
-caret after the text with the keyboard, the bare draft without it (ADR-0108).
-
-**Rejected.** *Fixing it in `dev-config` with a layered `cell` under the field and manual signal
-wiring.* Three call sites would each grow the same overlay boilerplate to work around a property
-that exists, and the fourth would be written wrong. *Drawing placeholder and caret together
-(`"Reply\u{2502}"` or `"\u{2502}Reply"`).* It keeps the liveness cue, and it is worse:
-`PaintStyle::TextField` carries one `color`, so a placeholder is drawn in the same ink as typed
-text. Today that is harmless because nothing next to it claims otherwise; put a caret beside it and
-the field reads as though somebody typed the prompt.
-
-**Consequences.** The launcher and the wallpaper picker show their prompts on open, which is what
-every search field in the mirror does and what these two were written to do.
-
-The cost lands in one place and is real: `notification_card.lua` puts a reply field on every
-notification that takes one, always (ADR-0109), so a stack of chat notifications now shows several
-identical "Reply" prompts with nothing marking which one holds the keyboard. Previously the caret
-marked it. This is accepted rather than solved, because the click that focuses a reply field is the
-user's own and a moment old (ADR-0092 decision 7 keeps that press from firing the card's action), so
-the question "which one am I typing into?" has a recent answer.
-
-If it does bite, the fix is a placeholder colour on `PaintStyle::TextField` -- a real gap, since a
-placeholder is currently indistinguishable from typed text in every field including the masked ones
--- and not a return to a caret that hides three prompts to disambiguate a fourth.
+Reject per-config overlay workarounds and placeholder-plus-caret in identical ink, which looks
+like typed text. Accept the weaker focus cue among multiple empty replies for now.
+A distinct placeholder color is the upgrade, not hiding search prompts again.
 
 ## 0136. Persistence is a JSON file the config names, and the framework names no path
 
-`oblisk.system.state` was the whole of persistence: one file at
-`$XDG_STATE_HOME/oblisk/state.json`, a flat map of string to scalar, read once at
-`SystemController::new` and rewritten whole by every `system:write_state`. Four things about it
-lived in Rust that are not Rust's to decide. The directory (`system/paths.rs`). The file name. The
-schema, since a value had to be a string, a number or a boolean, which is what made
-`lib/wallpaper.lua` flatten structure into key names (`wallpaper.<output>`, `wallpaper_fit.<output>`)
-instead of storing a table. And the category itself: the framework decided this was *state*, so a
-config that wanted a settings file, a cache, or two of either had nowhere to put them.
+1. Let Lua declare every store's absolute directory, filename and defaults, with no framework-owned
+   settings/state split or default file.
+2. Reads are signals; writes update/push immediately and save one second after the last edit.
+3. A storage capability owns files by joined path across generation swaps.
+4. Defaults fill missing keys without overwriting existing values; removed defaults do not delete data.
+5. Support nested JSON values; nil deletes.
+6. Accept any user-writable absolute path, not a home-directory or extension sandbox.
+7. Remove system.state/write_state and their fixed path; system becomes the clock.
 
-The config mirrored here does not work that way. `Config/Settings.qml` declares its own paths
-(`Quickshell.env("OBELISK_SETTINGS_FILE")` with an XDG fallback), declares its own defaults inside a
-`JsonAdapter`, and gets two files because it asked for two. Nothing in Quickshell knows what
-"settings" means.
-
-Everything needed to do the same here already exists. `oblisk.config_dir` is on the namespace
-(`lua::namespace::build`) and `os.getenv` is one of the four `os` calls ADR-0048 kept, so a config
-can compute any path it likes without a new Rust helper.
-
-1. **`persistent_table { path, name, defaults }`, all three declared in Lua.** `path` is an absolute
-   directory, `name` a file name, `defaults` a table. The framework has no default for any of them
-   and no store exists until a config declares one. A config wanting the old location writes it out;
-   a config wanting `$XDG_CACHE_HOME`, or a file beside `shell.lua`, or three files, writes that
-   instead. `path` and `name` stay two arguments rather than one joined string because that is how
-   the mirror spells it and because the directory is the part a config computes.
-2. **Reads are signals, writes are debounced.** `store.theme` is a signal over that key, so it
-   resolves in a node property like any capability field, and `store:set(key, value)` queues a
-   command. The Supervisor updates memory, pushes immediately so the config sees its own write on
-   the next resolve, and saves 1 second after the last write. Without the debounce a scroll offset
-   or a search draft is one serialize, one write and one rename per keystroke, plus a full snapshot
-   push. The mirror debounces at the same interval and for the same reason.
-3. **One new capability, `oblisk.storage`, keyed by absolute path.** `storage.files[path]` is the
-   whole table. Not a field on `system`: `system` is a clock, and hanging a file registry off it is
-   what produced the hardcoded path in the first place. Keyed by the joined absolute path so two
-   declarations of one file are one store, which is also what makes the store survive a generation
-   swap: the map lives in the Supervisor, which outlives the Renderer being reaped.
-4. **`defaults` fills missing keys and never overwrites.** A key present on disk wins, so adding a
-   default to a config that has already run is a new key and not a reset. A key removed from
-   `defaults` stays in the file until something deletes it, which is the same trade
-   `state(name, initial)` makes.
-5. **Any JSON value, and `nil` deletes.** Nested tables are the point of decision 1's `defaults`, so
-   the scalar rule goes. `store:set(key, nil)` removes the key, which the old store could not do at
-   all.
-6. **Any absolute path the user can write.** No sandbox to `$HOME`, no extension check. This is the
-   user's own config running as the user, and a shell that refuses to write where its author said is
-   a shell with a worse `process.run` bolted on. The path must be absolute, because a relative one
-   resolves against the Supervisor's working directory, which nothing sets.
-7. **`system:write_state` and `system.state` are deleted**, with `system/paths.rs` and
-   `system/state.rs`. `oblisk.system` keeps `time` and nothing else. § 2.11 loses its first bullet
-   and § 3.2 loses its row.
-
-**Rejected.** *TOML.* The file is machine-written and rewritten whole, so the one thing TOML offers
-over JSON, comments, is deleted by the first write. The hand-authored layer here is Lua, which beats
-TOML at comments, expressions and hot reload (ADR-0047). Machine-written is JSON, human-written is
-Lua, and there is no third format. *A framework settings/state split like the mirror's two files.*
-Decision 1 makes it a config's choice: two `persistent_table` calls, two files, no opinion from here
-about which is a cache. *A `FileView` equivalent that reads arbitrary file content.* Of the fourteen
-`FileView` declarations in the mirror, eleven read sysfs, procfs or a `/run` marker
-(`/proc/meminfo`, `platform_profile`, `scaling_governor`, `/sys/class/leds/*/brightness`), all of
-which are native capabilities here and one of which reaches power-profiles-daemon over D-Bus rather
-than polling a file; one reads a colour scheme inside its own config directory, which is `require`
-here; two are the pair this ADR replaces. Copying `FileView` would trade signals for polls. ADR-0048
-still names `oblisk.read_file` as the fix for reading a file the config did not author, and it still
-has no caller.
-
-**Consequences.** `shared::Capability` gains `Storage`. `lib/wallpaper.lua` stores one table per
-output rather than two flattened key families. What stays hardcoded in Rust is what cannot be
-anything else: the control socket and session-lock flag under `$XDG_RUNTIME_DIR` (protocol, not user
-data), the config directory itself (`-c`, `$OBLISK_CONFIG_DIR`, `$XDG_CONFIG_HOME/oblisk`, `$HOME`,
-since something has to find the Lua before any Lua runs), and the thumbnail cache, which is a
-freedesktop location other applications read and write.
+Reject machine-written TOML, whose comments would be lost, and a broad FileView clone without
+a caller. Protocol/runtime files and interoperable thumbnail locations remain framework-owned.
 
 ## 0137. Privacy reports every capture; telling a video from a song stays in Lua
 
-`oblisk.privacy` answered one question, "is a camera open", and `oblisk.mpris` could not tell a film
-from an album. Both are wanted by an idle module that must not blank the screen during a call.
+1. Add microphone and screencast user lists beside cameras, sharing one user type.
+2. Use the existing PipeWire connection's stream classes, not a second connection.
+3. Publish only Running nodes; allocated but inactive browser streams are not capture.
+4. Exclude sink-monitor capture from microphones by stream.capture.sink, not app names.
+5. Carry all lists through one mixer channel to avoid inconsistent ordering.
+6. A missing camera watch must not terminate microphone/screencast reporting.
+7. Publish MPRIS URL and desktop entry; config decides whether media is video.
 
-**Decisions.**
-
-1. **`PrivacyState` gains `microphone_users` and `screencast_users`,** alongside `camera_users`,
-   each a `PrivacyUser` list. `CameraUser` is renamed to `PrivacyUser` and shared by all three: they
-   answer the same question, "who", and three identical structs would only suggest they differ.
-2. **Both come off `media.class` on the PipeWire connection `oblisk.audio` already holds.**
-   `Stream/Input/Audio` is an app reading a microphone. `Stream/Output/Video` is an app pushing
-   video into PipeWire, which on a desktop is screen capture, because a camera is a `Video/Source`
-   *device* rather than a stream. No second connection, no new thread.
-3. **Only a node PipeWire reports as `Running` is published.** A browser tab holds a capture stream
-   open between calls; an indicator lit by mere existence would be lit permanently. The node's
-   `state` field is on every `info` event, so this costs nothing beyond reading it.
-4. **A monitor capture is not a microphone.** PipeWire sets `stream.capture.sink` on a stream
-   reading a sink's monitor, which is what cava and every other visualiser does. Filtering on that
-   property rather than on a name list is the difference between a rule and a growing list of
-   exceptions.
-5. **One channel from the mixer thread, carrying all three lists as `PrivacySources`.** Three
-   senders would only add orderings where one list is a push behind the other two, and a config
-   draws them together.
-6. **The camera watch became optional and the task did not.** A desktop with no `/dev/videoN` used
-   to return from the task outright, which was right when a camera was all this answered and would
-   now take microphone detection down with it. A missing device, a failed `Inotify`, and a stream
-   that ends all now leave `camera_users` empty and keep serving the other two.
-7. **`PlayerState` gains `url` (`xesam:url`) and `desktop_entry` (`MediaPlayer2.DesktopEntry`).**
-   `url` was already parsed for `TrackIdentity` and simply not published. These are the facts a
-   config cannot reach; what it does with them is its own.
-
-**Rejected.** *A `mpris.is_video` or `privacy.video_playing` field.* The mirror's answer is a list of
-video applications, a list of video hostnames, a list of music hostnames and a list of file
-extensions. Every one of those is taste, every one of them goes stale, and the correct list for one
-user is wrong for another. Rust publishes `url` and `desktop_entry`; `dev-config/oblisk/lib/media.lua`
-holds the lists, where the rest of this user's taste already lives (ADR-0037). *Link-based detection,
-which is what `PrivacyService.qml` does.* It needs every PipeWire link group bound and tracked to
-answer a question the node's own `state` already answers, on a listener that is already attached.
-*Matching screencast nodes by name against a regex of portals and compositors, also from the mirror.*
-`media.class` separates a produced video stream from a camera device without naming anyone, and a
-list containing `niri` is a list that is wrong on the next machine.
-
-**Consequences.** `screencast_users` names the portal rather than the requesting app when the portal
-created the node, since that is whose identity the node carries. Screen recorders on wlr-screencopy
-(`wf-recorder`, `grim`) never reach PipeWire and never appear; catching those needs the compositor
-to report its own screencopy clients, which niri-ipc does not. `microphone_users` is not
-`oblisk.audio`'s `source_muted`, which is a device setting: a muted microphone with a running
-capture stream appears in both, and that is the honest answer.
+Reject hardcoded video-app lists and unnecessary PipeWire link tracking.
+Portal-owned streams may identify the portal, not the app. Direct compositor screencopy is invisible
+to this backend; device mute and a running capture stream are distinct facts.
 
 ## 0138. `loginctl lock-session` locks the screen; `loginctl unlock-session` does not unlock it
 
-A shell holding `ext_session_lock_v1` and ignoring logind's `Lock` signal breaks
-`systemd-lock-handler`, `xdg-desktop-portal`, `swayidle -l`, and every keybind anyone has bound to
-`loginctl lock-session`. This is protocol compliance, not policy, so it is not a config's choice.
+1. Subscribe to this logind session's Lock signal and route it through the guarded lock path.
+2. Log/refuse Unlock; authentication remains required.
+3. Serialize SetLockedHint updates from confirmed Renderer outcomes, matching the runtime marker.
+4. Subscribe at boot, not after config reads.
+5. Missing logind degrades with a diagnostic; native shell locking remains available.
 
-**Decisions.**
-
-1. **The Supervisor subscribes to `org.freedesktop.login1.Session`'s `Lock` signal** on this
-   process's own session, resolved from `$XDG_SESSION_ID` and falling back to logind's `"auto"`.
-   A `Lock` takes the same path `lock:invoke("lock")` takes, guard included. There is no
-   `systemctl --user lock`: `systemctl` manages units, and the lock request is a logind call.
-2. **`Unlock` is logged and refused.** ADR-0042 makes a successful PAM authentication the only
-   thing that lifts a lock, and `LockController::unlock` bypasses PAM entirely, so honouring the
-   signal would turn anyone who can reach the bus into an unlock. The way back in stays the prompt
-   or a VT switch.
-3. **`Session.SetLockedHint` is published on every confirmed lock change,** off the same
-   `LockOutcome` the `$XDG_RUNTIME_DIR` marker is written from, so `loginctl show-session` and the
-   marker cannot disagree. Serialized on one task: two calls in flight could land out of order.
-4. **Built at boot, not lazily.** The signal has to be subscribed before anyone presses the key,
-   not after a config happens to read a member (ADR-0070 does not apply: this is not a capability).
-5. **Both halves degrade to inert, logged once.** A shell that cannot reach logind still locks from
-   its own bar.
-
-**Rejected.** *Exposing the `Lock` signal to Lua as an event to be handled.* A shell that ignores
-`lock-session` is broken, not configurable, and a config that forgot to wire it would be a shell
-whose lock key silently does nothing. *`Inhibit(what="sleep", mode="delay")` to lock before suspend.*
-Real, and separate: without it a lid close reaches the screen before the lock does. Deferred until
-something asks for it, because it needs a held fd, a bounded window and a `PrepareForSleep`
-subscription, none of which the `Lock` path needs.
+Reject making lock-session compliance optional Lua wiring.
+Lock-before-suspend delay inhibition is separate work requiring its own fd/window/subscription.
 
 ## 0139. A held logind idle inhibitor stops idle events, because Oblisk is the idle daemon
 
-Amends ADR-0032, which gave `oblisk.idle` a write half and no read half. The capability could ask
-logind not to let the session idle and then get the `on_idle` that dims the screen anyway, because
-nothing was reading the inhibitor back. `systemd-inhibit --what=idle mpv film.mkv` from any other
-application had the same problem from the outside.
+Amends ADR-0032: a session running its own idle daemon must honor logind inhibitors itself.
 
-This machine's `logind.conf` has `IdleAction=ignore`, which is the usual configuration for a session
-running its own idle daemon: nothing but this shell acts on idleness. That is what makes honouring
-an inhibitor this shell's job rather than logind's, and what makes ignoring one a bug rather than a
-division of labour.
+1. Watch BlockInhibited and match idle as a complete colon-separated token.
+2. Suppress threshold forwarding while idle is blocked.
+3. Emit sorted Resumed events for previously announced idle thresholds when inhibition arrives.
+4. Replay nothing on release; without an idle-state query, wait for the next idle period rather
+   than restart thresholds from an invented time.
+5. Watch independently of Wayland notify; logind failure leaves the gate open with a diagnostic.
+6. Queue registrations arriving before notify becomes live, and clear queued/live entries together on reset.
 
-**Decisions.**
-
-1. **The Supervisor watches `Manager.BlockInhibited`.** A colon-separated list of everything held in
-   `block` mode, with change notification, so one property watch answers "is anything holding an
-   idle inhibitor" for every holder at once, including this shell's own `idle:inhibit`. `"idle"`
-   must match a whole entry: a substring test reads `handle-lid-switch` as an idle block.
-2. **While it names `idle`, no threshold event is forwarded.** `idle:inhibit(reason)` becomes the
-   mechanism it always read like rather than a flag set and then ignored, and a config's manual
-   inhibit toggle needs no guard inside its own `on_idle`.
-3. **An arriving inhibitor takes back every `Idled` it had announced.** The gate tracks which
-   `(generation, threshold)` pairs are open and emits their `Resumed`, so a screen dimmed at 30
-   seconds undims when a film starts rather than staying dim until the keyboard is touched. Sorted,
-   because they reach Lua callbacks and a `HashSet` drain order is arbitrary.
-4. **Nothing is replayed on release.** `ext-idle-notifier-v1` has no call for "is the seat idle
-   now", and re-creating the notifications would restart every threshold from zero rather than from
-   when the user actually stopped. A seat still idle when the inhibitor goes stays awake until the
-   next idle period, which is the safe direction to fail and is marked as such in `idle/gate.rs`.
-5. **Watched on the system bus, independently of notify.** A held inhibitor is worth knowing about
-   on a run where the Wayland half degraded to inert, and the watch is cheap. Failure to reach
-   logind leaves the gate permanently open, logged once: the behaviour this replaces.
-
-6. **A registration that arrives before notify is live is queued, not dropped.** Found by the live
-   probe for this ADR: a config registers its thresholds during evaluation, which reliably beats
-   the Wayland setup `IdleController::new` spawns, so `register_threshold(generation 0, 20s)
-   ignored: notify is inert for this run` was printed on *every* start and every threshold a config
-   asked for at boot was silently lost. The queue replays the moment notify goes `Live`, and
-   `reset_registrations` drops a generation's queued entries along with its live ones so a reload
-   cannot resurrect callbacks belonging to a replaced tree.
-
-**Rejected.** *Promoting `oblisk.idle` to a roster capability so a config could read the inhibitor
-list.* ADR-0032's structural claim still holds: `register_threshold` takes Lua callbacks, which
-cannot cross the wire as an `:invoke`, so `oblisk.idle` stays a bespoke member either way and the
-roster would buy only the push machinery. The reasons a config wants for a tooltip are its own
-(`manual`, `fullscreen`, `video` are all config-side state in the mirror too); the only thing it
-cannot see is a foreign application's inhibitor, and the framework now acts on that without being
-asked to draw it. Revisit when something wants to draw it. *Polling `ListInhibitors`.* The property
-is signalled; a poll would cost a round trip per tick to learn nothing. *`Session.SetIdleHint`, the
-reciprocal of ADR-0138's `SetLockedHint`.* Correct and unclaimed here (`IdleHint=false`,
-`IdleSinceHint=0`, nothing publishes it), but nothing on this machine reads it either, and which
-threshold means "the session is idle" is a config's decision, not this module's. Deferred until a
-config asks, as `idle:set_idle_hint(bool)`.
+Initially reject roster promotion until a UI wants foreign-holder state; ADR-0141 later supplies
+that consumer. Keep inhibitor polling and unrequested idle-hint policy out.
 
 ## 0140. The config's idle module runs one threshold and a clock, and its settings are a modal
 
-The Lua half of ADR-0139, and the first module to use `oblisk.idle` for anything. `IdleService.qml`,
-`IdleInhibitor.qml` and `IdleSettingsPanel.qml` are the prior art; all three are mirrored, two of
-them structurally rather than literally.
+Config-side idle policy over ADR-0139.
 
-**Decisions.**
+1. Register one one-second threshold and use the existing clock for editable delays; there is no
+   unregister API to safely replace separate threshold registrations.
+2. Arm each stage after predecessors report done, timing from that moment. Unlocking unwinds
+   later timers; a terminal stage cannot accidentally enable a successor. Validate shared order.
+3. Rely on native inhibitor gating/resume instead of duplicating inhibitor guards in Lua.
+4. Separate settings/facts from clock-driven actions and centralize inhibition writes.
+5. Show AC/battery settings together in a modal rather than squeeze the matrix into a bar panel.
+6. Draw equal-width stage chambers from their own armed delay, not a cumulative timeline.
+7. Default idle actions off so first launch cannot unexpectedly blank the user's display.
+8. Cycle the small timeout option list rather than build a new combo-box control.
 
-1. **One threshold, at one second, and every stage is arithmetic on `oblisk.system.time`.** The
-   mirror is three `IdleMonitor`s with a lattice of `enabled` bindings keeping them in order. The
-   forcing constraint is that `register_threshold` has no counterpart that removes one (§ 3.2), so a
-   settings panel that changes the lock timeout from five to ten minutes would leave both registered
-   and lock at five. With one registration the timeouts are plain Lua numbers a panel can edit, and
-   the ordering between stages is the numbers instead of a condition lattice. It costs a one-second
-   clock the bar's own readouts already run on.
-2. **A stage is armed by the one before it finishing, and its delay runs from there.** Two wrong
-   models shipped before this one, both of them a single clock with absolute times. The first
-   implied the order from the numbers; the second added an explicit `order` and relative delays but
-   still measured them off one running total. Both had the same fatal property: nothing could undo
-   a stage that had already fired, so locking at 30 seconds and then *unlocking* left the screen due
-   to blank a minute later regardless -- reported live as "I unlocked and it's continuing to count
-   toward dpms".
-   `IdleService.qml` does not have this failure mode, and reading it again is what found the fix.
-   Its stages are `IdleMonitor`s whose `enabled` is a gate on the stage before them (`_lockDone` is
-   `!lockActionEnabled || LockService.locked`), and a monitor's timer starts when `enabled` flips
-   true. So the chain is relative *and* it unwinds: unlocking makes `_lockDone` false, the pending
-   DPMS monitor is torn down, and the sequence starts over. Nothing handles the unlock; it falls out
-   of the gates.
-   So a stage carries a `done` predicate -- the lock's is `oblisk.lock.active`, DPMS's is whether
-   this module blanked the displays -- and `idle.armed` is `enabled` generalised to any `order`: the
-   first stage whose predecessors have all reported done. The clock handler stamps the moment a
-   stage arms, fires it its own delay after that stamp, and clears the stamp of every stage that is
-   not the armed one, which is what tears a timer down. A stage with no `done` is terminal and never
-   satisfies a successor, which is the safe default for any stage added later.
-   `order` is one list shared by both profiles, not one each: which stage precedes which is a policy
-   and does not change because a cable came out, and the delays are what change. It is validated on
-   read -- unknown names dropped, missing stages appended -- so a hand-edited `state.json` cannot
-   leave a stage that never runs.
-   `ACTIONS.lock` needs no "already locked?" guard as a result: `idle.armed` cannot hand back a
-   stage whose own `done` is true.
-3. **No `armed` guard anywhere in the config.** ADR-0139's gate means a held inhibitor -- ours, or
-   `systemd-inhibit`'s -- stops the events and hands back a `Resumed`, so `idle.since` goes to zero
-   on the way in and the clock handler returns on its first line. The manual toggle is an inhibitor,
-   not a flag the handler re-reads. The one thing the framework cannot know is the master switch,
-   which is the one thing checked.
-4. **Split `lib/idle.lua` (facts and settings) from `modules/global/idle.lua` (the clock).** The bar
-   circle and the modal read the first without pulling in a file whose whole purpose is side
-   effects, which is `lib/media.lua`'s shape. `sync_inhibit` is a capability call inside `lib/`, for
-   `lib/ui_state.lua`'s stated reason: one writer per edge beats three callers each remembering to
-   count `inhibit`/`release_inhibit` correctly.
-5. **The settings are a modal, not a bar panel.** Built as a panel first, and it was wrong: the panel
-   host's card is 340px and this is a matrix -- three actions down, AC and battery across -- so
-   fitting it there cost the ability to see both profiles at once, which is the mirror's own best
-   idea. It is now the surface `modules/global/launcher.lua` and `modules/global/wallpaper_picker.lua`
-   are, at `Theme.idleModalWidth`'s own 820px, and the bar circle's right click opens it exactly as
-   `IdleInhibitor.qml` opens its `OModal`.
-6. **The flow gets a timeline.** `FlowSummary` is a static line saying what you configured; this is
-   the same flow as a track that moves, one chamber per stage that will run. A chamber fills over
-   its own delay once that stage is the armed one, reads full once it has run, and empty while it is
-   somebody else's turn -- off `idle.arming` alone, never off a position in a running total, which
-   is what drew a stage as part-done before its clock had started. It prints its own delay, the same
-   number the matrix row edits, because printing the running total instead read as a bug: the row
-   said "1m" and the chamber beside it said "1m 30s" for the same stage. Chambers are equal width rather than proportional: proportional is honest until DPMS
-   is 30 seconds against a 15-minute lock, at which point the first chamber is 3% of the card and
-   its glyph does not fit. Every chamber prints its timeout, so the proportions are readable without
-   being drawn to scale.
-7. **Settings live in `lib/store.lua` with `enabled` shipping `false`.** The mirror ships `true`.
-   These defaults are written into a real `state.json` on a real machine the first time the config
-   runs, and the first thing a `true` would do is blank somebody's screen while they were reading.
-   The modal's master switch is one click and says so until it is thrown.
-8. **A timeout is a plate that cycles its option list, with a chevron.** `OComboBox` has no
-   counterpart here and one list of seven values is not enough to justify building one. The chevron
-   is a small lie about the mechanism -- it advances rather than dropping down -- and the truth about
-   the affordance, which is the half that has to be legible: without it the plate is a number nobody
-   knows is a control.
-
-**Rejected.** *A "respect inhibitors" switch.* The mirror has one; here the Supervisor honours a
-foreign inhibitor unconditionally (ADR-0139), so the switch would be one that ignores
-`systemd-inhibit`, which is not a preference worth offering. *Registering each configured threshold
-and filtering in the callback.* Same registration leak as decision 1, with a guard in every callback
-instead of none. *`fullscreenInhibitorActive`.* `oblisk.workspaces.active_client` carries no
-fullscreen flag on niri; a film in a fullscreen player is caught by the video rule or not at all.
-Marked as a TODO in `lib/idle.lua` where the reason list is built.
+Reject ignoring foreign inhibitors and leaking replacement registrations. Fullscreen inhibition
+on niri remains unavailable where the backend has no fullscreen fact.
 
 ## 0141. `oblisk.idle` joins the roster, because there is idle state worth reading after all
 
-Amends ADR-0032 and ADR-0139's rejection. Both said the same thing: a threshold crossing is an
-event, not state, so `oblisk.idle` is methods only and a roster entry would hand a config a signal
-reading `nil` forever. ADR-0139 added the gate that honours a logind idle inhibitor and kept the
-rejection, on the narrower ground that `register_threshold` takes Lua callbacks which cannot cross
-the wire as an `:invoke`, so the roster would buy only push machinery.
+Amends ADR-0032 and ADR-0139: the bar now needs foreign-inhibitor state.
 
-Push machinery was the missing piece. Observed live with `systemd-inhibit --what=idle --who=mpv`:
-the Supervisor logged that it was holding every threshold event, the config's countdown stopped, and
-the bar drew "nothing is holding this awake" the whole time, because the one fact it needed was the
-one fact it could not reach. A shell that lies about why it is not doing something is worse than one
-that cannot see the reason at all.
+1. Add IdleState with inhibited plus external who/why holders, excluding the shell's own hold.
+2. Read ListInhibitors on BlockInhibited changes, not a timer, and publish holder changes even
+   when the blocked boolean stays true.
+3. Keep bespoke threshold/inhibit methods alongside capability read/change methods; each path
+   must request lazy startup.
+4. Remove the off-roster dispatch/start exceptions; retain hand-written stub signatures for callbacks.
+5. Replay current state on lazy start so a quiet machine does not leave the member nil.
 
-**Decisions.**
-
-1. **`Idle` is a roster capability with an `IdleState` payload.** `inhibited` is the gate's own
-   answer off `Manager.BlockInhibited`; `inhibitors` names the holders as `who`/`why`. Not
-   redundant: this shell's own hold is excluded, so `inhibited` true with an empty list means "the
-   only thing holding this awake is you", which the config already explains in better words than
-   the `why` it passed down.
-2. **One `ListInhibitors` per `BlockInhibited` change, never on a timer.** ADR-0139 rejected polling
-   and still does; what changed is that there is a signalled edge to hang a single call off. Skipped
-   entirely while nothing blocks idle, where the answer is empty by construction. The state is
-   published on every change rather than only on the `blocked` transition, because the list moves
-   without the answer moving -- mpv releasing while Firefox still holds one.
-3. **The three methods stay, on the same member.** `oblisk.idle` is a `Capability` wrapped in
-   `lua::idle`'s own userdata, which forwards `get`/`map`/`on_change` and adds
-   `register_threshold`/`inhibit`/`release_inhibit`. It is the one member that is both, and the only
-   one not parked behind `oblisk`'s `__index`, so each method sends `start_capability` by hand --
-   including the read methods, or a config that only ever `:map`s it would get a capability the
-   Supervisor never started.
-4. **This deletes machinery rather than adding it.** `Startable`, `Capabilities::start_idle` and
-   `Capabilities::dispatch_idle` existed only to name the one capability off the roster, and all
-   three are gone; `main.rs`'s command match loses its `"idle"` arm. The stub generator grew one
-   `hand_written_methods` hook, for the three signatures no action schema can describe.
-5. **The lazy start pushes the current state.** The watch only speaks when something changes, and on
-   a quiet machine that is never, so `Capabilities::start` sends the controller's last published
-   value the moment a config first reads the member. Without it the member reads `nil` until the
-   next inhibitor appears, which is the "reads `nil` forever" failure ADR-0076 exists to prevent.
-
-**Rejected.** *A bare `inhibited` boolean with no list.* It fixes the lie but not the question:
-"something is keeping this awake" and "mpv is keeping this awake" are different amounts of use, and
-`ListInhibitors` already has the second for one call. *Publishing our own hold in the list too.* The
-config's own reasons are richer than the joined string it passed to logind, and counting it would
-double-report every manual toggle. *Leaving `idle` off the roster and adding a second
-Renderer-sourced signal beside `screens` and `rescue`.* Those two are Renderer state; this is
-Supervisor state arriving as a `StateSnapshot`, which is exactly what a roster entry is.
+Reject a boolean-only answer, double-reporting local reasons, or a Renderer-local signal for
+Supervisor-owned state.
 
 ## 0142. The icon spool moves out of `/dev/shm`, which is world-writable
 
-Amends ADR-0031 and ADR-0033. Both spool decoded, bounds-checked PNGs to
-`/dev/shm/oblisk-$UID/{tray,notifications}`, where the `$UID` suffix was doing the work of keeping
-two users' spools apart. It does not do the work of keeping one user out of the other's.
+Amends ADR-0031/0033: a UID-named directory under world-writable /dev/shm does not establish
+ownership. Precreated symlinks could redirect startup sweeping or PNG writes.
 
-`/dev/shm` is mode 1777. Any other local user can create `oblisk-$UID` before the Supervisor does,
-and two things then go wrong at once: `sweep`'s startup pass walks `read_dir` and deletes every
-regular file it finds, so a symlink there aims that delete at a directory of the attacker's
-choosing; and `write_png` follows an existing symlink, so a spooled icon overwrites whatever it
-points at. Both run before anything checks who owns the directory, and the sweep runs unprompted at
-every boot.
+1. Move spools to the user's private runtime directory under oblisk/{subdir}.
+2. Fall back only to /run/user/$UID, never /dev/shm. Missing runtime storage degrades to no icon.
+3. Keep removal's prefix check based on the same directory helper.
 
-`icon_dir` now returns `$XDG_RUNTIME_DIR/oblisk/{subdir}`.
-
-1. **This is the property the `$UID` suffix was reaching for.** The runtime directory is 0700 and
-   owned by us, enforced by the kernel rather than by a name nobody else happens to have picked.
-   Both are tmpfs, both are wiped between sessions, and the spool is read only by our own Renderer
-   through a path string, so nothing else changes.
-2. **The fallback is `/run/user/$UID`, never `/dev/shm`.** A spool that silently reverts to a
-   world-writable directory when one environment variable is missing is the hole, not the repair.
-   If the runtime directory does not exist, `write_png` fails and the item draws without an icon,
-   which is what already happens when the write fails for any other reason.
-3. **`remove_png`'s prefix check follows for free**, since it compares against `icon_dir`.
-
-**Rejected.** *Keeping `/dev/shm` and hardening around it -- `O_NOFOLLOW`, an ownership check on
-the directory, a lockfile.* Three checks to make a shared directory behave like a private one, when
-a private one is one `join` away. *Sweeping by mtime instead of deleting whatever is there.* It
-narrows the blast radius of the symlink and fixes nothing about `write_png`. *Treating this as
-out of scope because a single-user desktop has no second local user.* Unlike every same-UID finding
-against the control socket, this one crosses a real kernel boundary, and the fix is one line.
+Reject extra shared-directory hardening and mtime sweeping when a private directory solves the
+ownership problem directly. This is a cross-user boundary, not a same-UID threat.
