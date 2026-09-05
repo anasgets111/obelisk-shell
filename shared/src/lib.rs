@@ -283,12 +283,29 @@ pub struct ProcessExited {
 /// wire write completes (`pump`, `renderer/src/socket.rs`). `Zeroize`/`ZeroizeOnDrop` back that
 /// up: the frame crosses an unbounded, unwrapped channel, so a dropped-not-written path (a failed
 /// send, or buffered when `outbound_rx` drops) must scrub `secret` too.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct SecureSubmit {
     pub generation_id: u32,
     pub capability: String,
     pub action: String,
     pub secret: Vec<u8>,
+}
+
+/// Hand-written so `secret` prints as its length and never its bytes. `RendererFrame` derives
+/// `Debug` and two log lines print a whole rejected frame (`SocketCandidateLink::recv_matching`,
+/// `supervisor/src/reload_link.rs`), so a derive here puts a plaintext password in the journal
+/// whenever a submission lands mid-swap-handshake. The type is `ZeroizeOnDrop` precisely because
+/// the plaintext must not outlive its one read; a formatter that copies it into a log defeats
+/// that, and the next `{:?}` anyone adds would defeat it again.
+impl std::fmt::Debug for SecureSubmit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecureSubmit")
+            .field("generation_id", &self.generation_id)
+            .field("capability", &self.capability)
+            .field("action", &self.action)
+            .field("secret", &format_args!("<{} bytes redacted>", self.secret.len()))
+            .finish()
+    }
 }
 
 /// Supervisor -> Renderer: take or release the `ext_session_lock_v1` session lock (ADR-0042,
@@ -397,6 +414,23 @@ pub enum PamOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_secure_submit_never_formats_its_secret() {
+        let submit = SecureSubmit {
+            generation_id: 3,
+            capability: "polkit".into(),
+            action: "authenticate".into(),
+            secret: b"hunter2".to_vec(),
+        };
+
+        // Through the enum too: the log lines that print a whole rejected frame go via this Debug.
+        let rendered = format!("{:?}", RendererFrame::SecureSubmit(submit));
+
+        assert!(rendered.contains("<7 bytes redacted>"), "the length is the only thing worth logging: {rendered}");
+        assert!(!rendered.contains("104"), "a byte of the plaintext reached the formatter: {rendered}");
+        assert!(rendered.contains("polkit"), "everything that is not the secret still prints: {rendered}");
+    }
 
     #[test]
     fn command_envelope_matches_idl_wire_format() {
