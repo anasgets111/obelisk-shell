@@ -1,12 +1,7 @@
-//! What `oblisk.updates` needs from a package manager, and nothing about which one it is
-//! (ADR-0134). `controller.rs` owns the schedule, the state and the install log; everything
-//! below the trait -- how a check is run, which binary upgrades the system, how its output
-//! spells progress, which package names owe a reboot -- belongs to whichever manager this
-//! machine actually has.
+//! Package manager abstraction for `oblisk.updates` (ADR-0134).
 //!
-//! One implementation today, `pacman`. The trait is not speculation about a second: it is where
-//! the pacman-specific paths already had to be named, and naming them in one place is what lets
-//! this capability answer "not on this machine" instead of failing a check to say so.
+//! Separates the check schedule and state handling in `controller.rs` from
+//! package manager execution, output parsing, and reboot requirements.
 
 use std::path::PathBuf;
 

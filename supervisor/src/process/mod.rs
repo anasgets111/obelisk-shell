@@ -52,7 +52,7 @@ fn signal_group_best_effort(pgid: Pid, signal: Signal) -> io::Result<()> {
     }
 }
 
-/// The 100ms grace window `docs/oblisk-supervisor-services-dbus.md` § 12 specifies between
+/// The 100ms grace window `docs/oblisk-supervisor-services-dbus.md` § 10 specifies between
 /// `SIGTERM` and `SIGKILL`. A parameter, not baked in, so tests can use a faster reap.
 pub const DEFAULT_REAP_GRACE: Duration = Duration::from_millis(100);
 

@@ -1,12 +1,8 @@
-//! Keyboard layout half of `oblisk.keyboard` (ADR-0034): a deliberately narrow
-//! [`CompositorLink`] trait, with an implementor picked at startup by `crate::compositor`'s
-//! probe. Niri's implementor is live-tested on this dev machine; Hyprland's is built to its
-//! documented IPC protocol but not independently live-verified (ADR-0034 defers that to the
-//! user's own Hyprland machine). No supported compositor: `active_layout` degrades to
-//! unavailable (empty string, index/count at `0`).
+//! Keyboard layout integration for `oblisk.keyboard` (ADR-0034).
 //!
-//! `CompositorKind` and the probe itself moved to `crate::compositor` once `workspaces` became
-//! their second caller. This module owns the trait, not the detection.
+//! Provides the [`CompositorLink`] trait. Implementors are selected at startup
+//! via `crate::compositor` detection. If no supported compositor is running,
+//! `active_layout` degrades to unavailable (empty string, count 0, ADR-0034).
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
@@ -19,10 +15,9 @@ use crate::compositor::{CompositorKind, hyprland_socket_path};
 
 use super::controller::{KeyboardSignal, KeyboardState};
 
-/// Methods are synchronous, fire-and-forget for `switch_layout` -- the real state update
-/// flows back through the implementor's own event stream, not a return value here. Not
-/// `async fn` (would make `Box<dyn CompositorLink>` non-object-safe without a new
-/// dependency): each implementor spawns its own background thread/task for the real I/O.
+/// Methods are synchronous and fire-and-forget for `switch_layout`. State updates
+/// flow back through the implementor's event stream rather than a return value. Not
+/// `async fn` to preserve object safety for `Box<dyn CompositorLink>`.
 pub trait CompositorLink: Send + Sync {
     fn kind(&self) -> CompositorKind;
     fn switch_layout(&self, index: usize);
@@ -38,10 +33,10 @@ fn apply_niri_layout(state: &Arc<Mutex<KeyboardState>>, names: &[String], idx: u
 pub struct NiriLink;
 
 impl NiriLink {
-    /// Connects to `$NIRI_SOCKET` and spawns the event-stream reader on its own OS thread --
-    /// `Socket` is a blocking `std::net::UnixStream` wrapper, not tokio-aware. The first
-    /// `EventStream` event already carries the full initial state, so no separate startup
-    /// query is needed. Degrades to `None` (logged) if the socket can't connect.
+    /// Connects to `$NIRI_SOCKET` and spawns the event-stream reader on its own thread.
+    /// `Socket` is a blocking Unix stream wrapper. The first event carries the full
+    /// initial state; no separate startup query is required. Degrades to `None` if connecting
+    /// fails.
     pub fn new(state: Arc<Mutex<KeyboardState>>, events: UnboundedSender<KeyboardSignal>) -> Option<Self> {
         let mut socket = match niri_ipc::socket::Socket::connect() {
             Ok(socket) => socket,

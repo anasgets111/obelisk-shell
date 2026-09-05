@@ -1,5 +1,5 @@
 //! Presentation-Before-Authority (PBA) hot-reload orchestration
-//! (`docs/oblisk-supervisor-services-dbus.md` § 15.1-15.4).
+//! (`docs/oblisk-supervisor-services-dbus.md` § 14).
 //!
 //! Ordering/gating state machine only, for six steps (Overlapping Spawn, State Hydration,
 //! Null-Buffer Staging, Activate Draw, Evidence Verification, Swap & Reap): [`process::
@@ -28,41 +28,44 @@ use tokio::time::timeout;
 
 use crate::process;
 
-/// The control-socket operations § 15.2-15.3 describe, crossing from the Supervisor to the
+/// The control-socket operations § 14.2 describes, crossing from the Supervisor to the
 /// Candidate generation.
 pub trait CandidateLink {
     /// What a control-link call can fail with.
     type Error: std::fmt::Debug;
 
-    /// § 15.2 point 1 / step 2 ("State Hydration"): push every pre-cached per-capability state
-    /// snapshot to the Candidate, so it can hydrate without querying the system itself (ADR-0029).
+    /// Supervisor services § 14.2 step 2 ("State Hydration"): push every pre-cached per-capability
+    /// state snapshot to the Candidate, so it can hydrate without querying the system itself
+    /// (ADR-0029).
     async fn push_state_snapshot(&mut self, snapshots: &[shared::StateSnapshot]) -> Result<(), Self::Error>;
 
-    /// § 15.2 points 2-3 / step 3 ("Null-Buffer Staging"): block until the Candidate's Wayland
-    /// layer-shell handshake and null-buffer commit are done, i.e. it's ready for `ActivateDraw`.
-    /// Returns the surface_ids it staged, the expected set `run_pba` uses for evidence (ADR-0025).
+    /// Supervisor services § 14.2 step 3 ("Null-Buffer Staging"): block until the Candidate's
+    /// Wayland layer-shell handshake and null-buffer commit are done, i.e. it's ready for
+    /// `ActivateDraw`. Returns the surface_ids it staged, the expected set `run_pba` uses for
+    /// evidence (ADR-0025).
     async fn recv_ready_signal(&mut self) -> Result<Vec<String>, Self::Error>;
 
-    /// § 15.2 point 3 / step 4 ("Activate Draw"): write the unique, nonce-bound `ActivateDraw`
-    /// command telling the Candidate to compile its layout and draw its first GPU frame.
+    /// Supervisor services § 14.2 step 4 ("Activate Draw"): write the unique, nonce-bound
+    /// `ActivateDraw` command telling the Candidate to compile its layout and draw its first GPU
+    /// frame.
     async fn send_activate_draw(&mut self, nonce: u64) -> Result<(), Self::Error>;
 
-    /// § 15.3 point 4 / step 5 ("Evidence Verification"): block until the Candidate reports
-    /// evidence for `nonce` (`wp_presentation_feedback`'s `presented` fired for a surface).
+    /// Supervisor services § 14.2 step 5 ("Evidence Verification"): block until the Candidate
+    /// reports evidence for `nonce` (`wp_presentation_feedback`'s `presented` fired for a surface).
     /// Returns that surface_id; called once per surface.
     async fn recv_presentation_evidence(&mut self, nonce: u64) -> Result<String, Self::Error>;
 }
 
-/// Which step of § 15.2-15.3's sequence a [`PbaFailure`] happened during.
+/// Which step of § 14.2-14.3's sequence a [`PbaFailure`] happened during.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
-    /// § 15.2 point 1 / step 2.
+    /// § 14.2 step 2.
     StateHydration,
-    /// § 15.2 points 2-3 / step 3.
+    /// § 14.2 step 3.
     NullBufferStaging,
-    /// § 15.2 point 3 / step 4.
+    /// § 14.2 step 4.
     ActivateDraw,
-    /// § 15.3 / step 5.
+    /// § 14.3 step 5: the barrier over every expected surface, not one surface's receipt.
     EvidenceVerification,
 }
 
@@ -103,7 +106,7 @@ impl<E: fmt::Display> fmt::Display for PbaFailure<E> {
 
 /// A completed PBA reload: Generation `N+1` (`candidate`) is confirmed presented on every
 /// expected surface, with `promoted_surfaces` listing each verified surface_id in
-/// `ReadySignal`'s order. `run_pba` never reaps or takes Generation `N` (`superseded`): § 15.4
+/// `ReadySignal`'s order. `run_pba` never reaps or takes Generation `N` (`superseded`): § 14.3
 /// orders Deselection, Promotion, then Reap, and the Swap messages go to two different
 /// connections while `CandidateLink` reaches only the candidate's. [`swap_and_reap`] sends those
 /// messages, then reaps `superseded` via [`process::reap_process_group`].
@@ -173,9 +176,9 @@ async fn abort_candidate<E>(candidate: &mut Child, grace: Duration, failure: Pba
 /// The three durations [`run_pba`] gates on: how long to wait for ready signal and presentation
 /// evidence before failing, and how long a process group gets `SIGTERM` before `SIGKILL` (passed
 /// to [`process::reap_process_group`]). `ready_timeout`/`evidence_timeout` each bound two
-/// handshake steps: § 15.2's hydration+ready-wait and § 15.3's activate+evidence-wait are one
-/// stage each (see [`drive_handshake`]). Grouped only for `run_pba`'s parameter count; the three
-/// share no invariant.
+/// handshake steps: § 14.2's hydration+ready-wait and its activate step through § 14.3's evidence
+/// barrier are one stage each (see [`drive_handshake`]). Grouped only for `run_pba`'s parameter
+/// count; the three share no invariant.
 #[derive(Debug, Clone, Copy)]
 pub struct PbaTimings {
     pub ready_timeout: Duration,
@@ -183,7 +186,7 @@ pub struct PbaTimings {
     pub reap_grace: Duration,
 }
 
-/// Runs one full PBA reload (§ 15.1-15.4, steps 1-5):
+/// Runs one full PBA reload (dbus spec § 14, steps 1-5):
 ///
 /// 1. **Overlapping Spawn**: spawns the Candidate via [`process::spawn_group_leader`], passing
 ///    `candidate_envs` through unchanged (e.g. `OBLISK_GENERATION_ID`/`OBLISK_PBA_CANDIDATE`).
@@ -210,11 +213,11 @@ pub async fn run_pba<L: CandidateLink>(
     }
 }
 
-/// § 15.4's Swap messages, in the order they go on the wire: for each promoted surface, the
-/// superseded generation stops taking input before the candidate starts. Split out so that
-/// order is a value a test can assert on: inside [`swap_and_reap`] the two sends are
-/// indistinguishable to anything observable, since `send_frame_logged` to a disconnected
-/// generation just logs and drops, proving nothing about which went first.
+/// Supervisor services § 14.3's Swap messages, in the order they go on the wire: for each promoted
+/// surface, the superseded generation stops taking input before the candidate starts. Split out so
+/// that order is a value a test can assert on: inside [`swap_and_reap`] the two sends are
+/// indistinguishable to anything observable, since `send_frame_logged` to a disconnected generation
+/// just logs and drops, proving nothing about which went first.
 fn swap_frames(
     superseded_generation_id: u32,
     candidate_generation_id: u32,
@@ -239,16 +242,16 @@ fn swap_frames(
         .collect()
 }
 
-/// § 15.4's Swap & Reap, the sixth step this module names but does not hold: [`run_pba`] stops
-/// at verified evidence; everything after lived in `main.rs`'s `TopologyChanged` arm. Two rules,
-/// only one obvious from the code: (1) input deselection before promotion, per surface (§ 15.4),
-/// an order [`swap_frames`] holds so it's checkable without a live connection; (2) the
-/// reassignment last. `PromoteGeneration` carries `candidate_generation_id` and is unaffected,
-/// but the `DeselectInput` frames and both reaps read `authoritative.generation_id`, so promoting
-/// first would deselect input on the candidate and sweep its own `process.run` children while the
-/// superseded generation kept both. The two reaps aren't ordered against each other: each
-/// generation's `process.run` children are their own process group leaders (§ 12, ADR-0026), so
-/// the Renderer's group reap never reaches them, and `reap_generations_processes` collects them
+/// Supervisor services § 14.3's Swap & Reap, the sixth step this module names but does not hold:
+/// [`run_pba`] stops at verified evidence; everything after lived in `main.rs`'s `TopologyChanged`
+/// arm. Two rules, only one obvious from the code: (1) input deselection before promotion, per
+/// surface (§ 14.3), an order [`swap_frames`] holds so it's checkable without a live connection;
+/// (2) the reassignment last. `PromoteGeneration` carries `candidate_generation_id` and is
+/// unaffected, but the `DeselectInput` frames and both reaps read `authoritative.generation_id`, so
+/// promoting first would deselect input on the candidate and sweep its own `process.run` children
+/// while the superseded generation kept both. The two reaps aren't ordered against each other: each
+/// generation's `process.run` children are their own process group leaders (§ 10, ADR-0026), so the
+/// Renderer's group reap never reaches them, and `reap_generations_processes` collects them
 /// whichever side runs first. Takes the whole [`PbaOutcome`] by value: promoting it consumes it,
 /// since `candidate` becomes the new authoritative child and nothing may hold it afterwards.
 pub(crate) async fn swap_and_reap(
@@ -290,10 +293,10 @@ mod tests {
         vec!["-c".to_string(), script.to_string()]
     }
 
-    /// § 15.4's rule 1, the one the process reaps cannot show: on every surface the superseded
-    /// generation is deselected before the candidate is promoted, so no surface is live on two
-    /// generations at once. Both frames per surface, in that order, addressed to opposite
-    /// generations.
+    /// Supervisor services § 14.3's rule 1, the one the process reaps cannot show: on every surface
+    /// the superseded generation is deselected before the candidate is promoted, so no surface is
+    /// live on two generations at once. Both frames per surface, in that order, addressed to
+    /// opposite generations.
     #[test]
     fn every_surface_is_deselected_on_the_superseded_generation_before_the_candidate_is_promoted() {
         let surfaces = vec!["bar@DP-1".to_string(), "bar@HDMI-A-1".to_string()];
@@ -335,13 +338,13 @@ mod tests {
         assert!(swap_frames(1, 2, &[]).is_empty());
     }
 
-    /// § 15.4's step 6, end to end: after a swap nothing of the superseded generation is left
-    /// running, and `authoritative` names the candidate.
+    /// Supervisor services § 14.3's step 6, end to end: after a swap nothing of the superseded
+    /// generation is left running, and `authoritative` names the candidate.
     ///
     /// The rule it actually pins is the reassignment coming last. Promoting first makes
-    /// `reap_generations_processes` sweep generation 2's children instead of generation 1's, so
-    /// the registered `sleep` outlives the reload with nothing left owning it. Verified by
-    /// mutation: hoisting the reassignment above the reaps fails this test.
+    /// `reap_generations_processes` sweep generation 2's children instead of generation 1's, so the
+    /// registered `sleep` outlives the reload with nothing left owning it. Verified by mutation:
+    /// hoisting the reassignment above the reaps fails this test.
     #[tokio::test]
     async fn a_swap_leaves_nothing_of_the_superseded_generation_running() {
         let registry = GenerationRegistry::default();

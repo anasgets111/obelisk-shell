@@ -1,12 +1,13 @@
-//! Theme name to file path, in the Renderer (ADR-0054).
+//! Theme name to file path, in the Renderer (ADR-0054 decision 1).
 //!
-//! ADR-0054 settles the resolver here rather than in the Supervisor (`oblisk-supervisor-
-//! services-dbus.md` § 9.2's original plan): § 3.2 calls `system:find_icon` a synchronous lookup
-//! returning a path, and the control socket has no request/response shape to make that true over
-//! -- only one-way commands and one-way `StateSnapshot`s.
+//! The resolver was originally planned for the Supervisor, and the plan could not be built: a
+//! synchronous lookup would have to block the dispatch thread on a round trip the control socket
+//! has no shape for -- it carries one-way commands and one-way `StateSnapshot`s, no
+//! request/response. So it resolves here, in-process, where the answer is already local.
 //!
-//! § 9.2's second half, `app_id` to `.desktop` file to `Icon=` key, is not built and has no
-//! caller: with `name` resolving theme names here, nothing is left to ask a `find_icon` for.
+//! `app_id` to `.desktop` file to `Icon=` key is deferred and has no caller, and no Lua
+//! `find_icon` exists to ask for one (ADR-0054 decision 5): with `name` resolving theme names
+//! here, nothing is left for such a call to do.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,9 +16,9 @@ use std::sync::{Mutex, OnceLock};
 /// The file for `name` at `size` pixels, or `None` if the active theme and its inheritance chain
 /// have nothing under that name.
 ///
-/// An absolute `name` is that path -- the `Icon=` key in every `.desktop` file accepts either
-/// spelling. This lets § 2.5's tray collapse to `icon { name = item.icon_name or item.icon_path }`
-/// instead of a branch between two node kinds.
+/// An absolute `name` is returned directly. The `Icon=` key in every `.desktop` file accepts either
+/// spelling. This lets the tray collapse to `icon { name = item.icon_name or item.icon_path }`
+/// instead of branching between two node kinds.
 ///
 /// Existence is not checked for the absolute case: `ImageCache::image` is about to open the file
 /// anyway, and already logs once and caches the failure.

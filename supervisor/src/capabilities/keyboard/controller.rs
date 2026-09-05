@@ -1,7 +1,7 @@
-//! [`KeyboardController`]: the `oblisk.keyboard` write-action dispatcher and state owner.
-//! Backlight, lock state, and layout are all wired in (ADR-0034), sharing one
-//! `Arc<Mutex<KeyboardState>>` and one signal channel. Split from `hardware::keyboard` --
-//! see `hardware/keyboard/mod.rs` for the module-level doc.
+//! [`KeyboardController`]: `oblisk.keyboard` write-action dispatcher and state owner.
+//!
+//! Backlight, lock state, and layout share one `Arc<Mutex<KeyboardState>>`
+//! and one signal channel (ADR-0034).
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};

@@ -6,7 +6,7 @@
 -- reports the error rather than hiding it behind a spinner. First match wins and the order is what
 -- makes that right.
 --
--- "checking" is the state this could not draw until ADR-0134: `UpdatesState` always carried the
+-- "checking" is the state this could not draw until ADR-0134. `UpdatesState` always carried the
 -- in-flight flag, and the panel header has been reading it all along -- this file was the one place
 -- still treating a check in flight and a check never run as the same thing.
 --

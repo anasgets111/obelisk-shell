@@ -109,7 +109,8 @@ pub struct App {
     client: RendererClient,
     surfaces: Vec<TrackedSurface>,
     exit: bool,
-    /// `OBLISK_PBA_CANDIDATE` is set (§ 15.2), read once in [`run`], not re-read per configure.
+    /// `OBLISK_PBA_CANDIDATE` is set (Supervisor services § 14.2), read once in [`run`], not
+    /// re-read per configure.
     is_pba_candidate: bool,
     /// Set once [`App::maybe_send_ready_signal`] has sent `ReadySignal`: a one-time signal, never
     /// resent even if a later spurious configure re-triggers the check.
@@ -143,9 +144,9 @@ pub struct App {
     /// so `Leave` clears this and the next `Enter` always sends.
     cursor_shown: Option<cursor_icon::CursorIcon>,
     /// Where the pointer last was, and on which of this process's surfaces (ADR-0112 amendment):
-    /// set by `Enter` and `Motion`, cleared by `Leave`. What a re-resolve rewrites the hover signals
-    /// against, since a list that scrolled under a still pointer moved other rows under it and no
-    /// `Motion` is coming to say so.
+    /// set by `Enter` and `Motion`, cleared by `Leave`. What a re-resolve rewrites the hover
+    /// signals against, since a list that scrolled under a still pointer moved other rows under it
+    /// and no `Motion` is coming to say so.
     pointer_at: Option<(String, (f64, f64))>,
     /// `wl_shm`, bound only so a compositor without `wp_cursor_shape_v1` can still be handed a
     /// cursor image from the XCursor theme. This process draws through EGL and puts nothing else
@@ -300,7 +301,7 @@ pub fn run(
     event_queue.roundtrip(&mut app)?;
     event_queue.roundtrip(&mut app)?;
 
-    // `oblisk-supervisor-services-dbus.md` § 15.2's Candidate order made literal: evaluate
+    // `oblisk-supervisor-services-dbus.md` § 14.2's Candidate order made literal: evaluate
     // shell.lua, bind the layer-shell surfaces it declared (ADR-0038 decision 1), commit null
     // buffers (`bind_and_clear`'s candidate branch), signal ready (`maybe_send_ready_signal`).
     //
@@ -338,11 +339,11 @@ pub fn run(
         }
     }
     app.client.set_instances(instances.clone());
-    // The first resolve is validation, not anything anyone sees. § 15.2 forces evaluate-before-
-    // bind, so no surface is configured yet; each instance resolves against its output's logical
-    // size instead, never painted. Both failure modes (evaluation, apply) already logged their
-    // own error and set `oblisk.rescue` inside `RendererClient`; this line only adds the
-    // consequence.
+    // The first resolve is validation, not anything anyone sees. Supervisor services § 14.2 forces
+    // evaluate-before- bind, so no surface is configured yet; each instance resolves against its
+    // output's logical size instead, never painted. Both failure modes (evaluation, apply) already
+    // logged their own error and set `oblisk.rescue` inside `RendererClient`; this line only adds
+    // the consequence.
     if !app.client.apply_instances() {
         eprintln!(
             "[oblisk-renderer] no scene was applied at startup; surfaces still bind, and paint nothing until a reload or a push produces one"

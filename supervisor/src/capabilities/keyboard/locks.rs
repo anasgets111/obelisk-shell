@@ -1,13 +1,15 @@
-//! Lock-state (caps/num/scroll) half of `oblisk.keyboard` (ADR-0034): sysfs LED `brightness`
-//! files do NOT fire inotify `MODIFY` events on this kernel when `input_leds` changes them
-//! itself (confirmed live: toggling Caps Lock under `inotifywait -m` shows zero events). evdev's
-//! `EV_LED` stream is therefore primary; sysfs is a permission-independent, read-once fallback.
+//! Lock-state (caps/num/scroll) monitoring for `oblisk.keyboard` (ADR-0034).
+//!
+//! Kernel sysfs LED `brightness` files do not fire inotify `MODIFY` events when
+//! `input_leds` changes them. evdev `EV_LED` events are primary; sysfs provides a
+//! read-once fallback.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 /// Resolved sysfs LED node paths for all three lock indicators. All-or-nothing: if any one is
-/// missing, [`resolve_lock_leds`] returns `None` for the whole triple -- real hardware exposes all three as siblings, or none at all.
+/// missing, [`resolve_lock_leds`] returns `None` for the triple. Hardware exposes either all three
+/// as siblings, or none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockLeds {
     pub caps: PathBuf,
@@ -15,8 +17,8 @@ pub struct LockLeds {
     pub scroll: PathBuf,
 }
 
-/// Scans `leds_root` for a subdirectory whose name ends with `::<suffix>` -- kernel LED-class
-/// naming is `<device>::<function>`, so matching only the suffix is robust to any `<device>` prefix.
+/// Scans `leds_root` for a subdirectory whose name ends with `::<suffix>`. Kernel LED-class
+/// naming is `<device>::<function>`, so matching the suffix accommodates any device prefix.
 fn find_led(leds_root: &Path, suffix: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(leds_root).ok()?;
     for entry in entries.flatten() {

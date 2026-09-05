@@ -85,7 +85,7 @@ pub(crate) struct Supervisor {
     /// Every capability's state-version counter, keyed by name (ADR-0004).
     revisions: HashMap<String, u32>,
     /// The last StateSnapshot pushed per capability, keyed by name: hydrates a fresh Candidate's
-    /// first evaluation (§ 15.2 point 1; ADR-0029).
+    /// first evaluation (Supervisor services § 14.2; ADR-0029).
     last_snapshots: HashMap<String, shared::StateSnapshot>,
     /// The most recently sent `Reevaluate`'s sequence (ADR-0024).
     next_sequence: u64,
@@ -447,8 +447,8 @@ impl Supervisor {
             (shared::GENERATION_ID_ENV.to_string(), candidate_generation_id.to_string()),
             ("OBLISK_PBA_CANDIDATE".to_string(), "1".to_string()),
         ];
-        // Every capability's latest snapshot hydrates the Candidate's first evaluation (§ 15.2
-        // point 1; ADR-0029), not just audio's.
+        // Every capability's latest snapshot hydrates the Candidate's first evaluation (Supervisor
+        // services § 14.2; ADR-0029), not just audio's.
         let snapshots: Vec<shared::StateSnapshot> = self.last_snapshots.values().cloned().collect();
         let mut link = SocketCandidateLink { registry: self.registry.clone(), candidate_generation_id, inbound };
 

@@ -1,13 +1,10 @@
-//! `oblisk check`: evaluate the config, report what it declares, and exit.
+//! `oblisk check`: evaluate config, report declared surfaces, and exit.
 //!
-//! Lives here because the Lua loader does. The Supervisor cannot evaluate a config -- it has no
-//! `mlua` -- so `oblisk check` re-execs this binary with `shared::CHECK_ENV` set and forwards the exit
-//! code. That keeps one evaluation path rather than a second, weaker one that only checks the file
-//! is readable.
+//! Evaluates via the Renderer's Lua loader. The Supervisor has no `mlua` runtime, so it re-execs
+//! the renderer binary with `shared::CHECK_ENV` set and forwards the exit code.
 //!
-//! No Wayland connection, no surfaces, no GPU. This is the same evaluation a boot performs before
-//! the first `StateSnapshot` arrives: every capability signal reads `nil`, which is why a config
-//! binding a bare capability has to survive it (ADR-0044).
+//! Runs without Wayland, surfaces, or GPU. Matches the cold evaluation before the first
+//! `StateSnapshot` arrives: every capability signal reads `nil` (ADR-0044).
 
 use std::path::Path;
 

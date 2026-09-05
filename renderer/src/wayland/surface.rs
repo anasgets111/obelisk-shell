@@ -170,14 +170,14 @@ pub(super) enum PopupParent {
 pub(super) struct TrackedSurface {
     pub(super) role: TrackedRole,
     pub(super) bound: Option<BoundSurface>,
-    /// § 15's "surface_id", the instance id: `"{id}@{output}"` for a panel, bare `id` for a
-    /// window. The one id space Lua, the retained `Scene`, this `wl_surface` and the PBA
-    /// handshake all share.
+    /// Supervisor services § 14's "surface_id", the instance id: `"{id}@{output}"` for a panel,
+    /// bare `id` for a window. The one id space Lua, the retained `Scene`, this `wl_surface` and
+    /// the PBA handshake all share.
     pub(super) surface_id: String,
     pub(super) map_state: MapState,
-    /// Set once this surface's null buffer is committed (PBA candidate mode only, § 15.2 points
-    /// 2-3); always `false` outside candidate mode. Never set for a `window` not shown: staging
-    /// happens on a configure it will never get. See [`candidate_has_staged`].
+    /// Set once this surface's null buffer is committed (PBA candidate mode only, Supervisor
+    /// services § 14.2); always `false` outside candidate mode. Never set for a `window` not shown:
+    /// staging happens on a configure it will never get. See [`candidate_has_staged`].
     pub(super) null_buffered: bool,
     /// The most recent `configure` size, so [`App::activate_draw`] has a real size to bind EGL
     /// to: in candidate mode the first configure doesn't bind EGL (see [`App::bind_and_clear`]).
@@ -238,17 +238,17 @@ fn presenting_surface_ids<'a>(surfaces: impl Iterator<Item = (&'a str, MapState)
     surfaces.filter(|(_, state)| state.presents()).map(|(id, _)| id.to_string()).collect()
 }
 /// Whether every tracked surface has staged everything a PBA Candidate owes it, which is
-/// [`App::maybe_send_ready_signal`]'s gate (§ 15.2 points 2-3). Takes `(null_buffered, exists)`
-/// per surface, where `exists` is whether it currently has a Wayland object at all: a gate, not a
-/// staging difference, since xdg-shell's initial-commit discipline is layer-shell's, so a shown
-/// `window` attaches a null buffer on its first configure too.
-/// What does not generalize is a plain `all(null_buffered)`: a `panel` always gets a configure,
-/// created at startup even when `visible` is false, but a `window` declared `visible = false` has
-/// no `xdg_toplevel` (ADR-0049 decision 1), so `null_buffered` stays false forever and the
-/// Candidate never sends `ReadySignal`, a `ready_timeout` hang. A `popup` widens that further: a
-/// Candidate freezes `visible` ([`App::apply_visibility`]), so its `xdg_popup` never exists during
-/// a handshake. A surface with no object has nothing to stage, complete by construction;
-/// [`presenting_surface_ids`] filters it on the same `MapState::Unmapped`, keeping the two in step.
+/// [`App::maybe_send_ready_signal`]'s gate (Supervisor services § 14.2). Takes `(null_buffered,
+/// exists)` per surface, where `exists` is whether it currently has a Wayland object at all: a
+/// gate, not a staging difference, since xdg-shell's initial-commit discipline is layer-shell's, so
+/// a shown `window` attaches a null buffer on its first configure too. What does not generalize is
+/// a plain `all(null_buffered)`: a `panel` always gets a configure, created at startup even when
+/// `visible` is false, but a `window` declared `visible = false` has no `xdg_toplevel` (ADR-0049
+/// decision 1), so `null_buffered` stays false forever and the Candidate never sends `ReadySignal`,
+/// a `ready_timeout` hang. A `popup` widens that further: a Candidate freezes `visible`
+/// ([`App::apply_visibility`]), so its `xdg_popup` never exists during a handshake. A surface with
+/// no object has nothing to stage, complete by construction; [`presenting_surface_ids`] filters it
+/// on the same `MapState::Unmapped`, keeping the two in step.
 fn candidate_has_staged(surfaces: impl Iterator<Item = (bool, bool)>) -> bool {
     surfaces.into_iter().all(|(null_buffered, exists)| null_buffered || !exists)
 }
@@ -385,14 +385,14 @@ impl App {
 
     /// One `configure`: record the size the compositor chose, tell the retained scene about it,
     /// derive the exclusive zone from it, bind EGL if this surface has not been bound yet, and
-    /// paint.
-    /// PBA candidate mode (`self.is_pba_candidate`, § 15.2 points 2-3) stops after the null buffer
-    /// instead: a first configure commits it directly on the raw `wl_surface` rather than binding
-    /// EGL, so the Candidate stays invisible until [`App::activate_draw`] does the real bind later.
-    /// Role-agnostic: xdg-shell's initial-commit discipline is `zwlr_layer_surface_v1`'s (ADR-0040
-    /// decision 4), so an `xdg_toplevel` configure lands here through the same path. The two
-    /// callers differ only in where the size comes from: layer-shell hands one over, a toplevel's
-    /// may be the client's to pick (see `xdg_shell::toplevel_size_for`).
+    /// paint. PBA candidate mode (`self.is_pba_candidate`, Supervisor services § 14.2) stops after
+    /// the null buffer instead: a first configure commits it directly on the raw `wl_surface`
+    /// rather than binding EGL, so the Candidate stays invisible until [`App::activate_draw`] does
+    /// the real bind later. Role-agnostic: xdg-shell's initial-commit discipline is
+    /// `zwlr_layer_surface_v1`'s (ADR-0040 decision 4), so an `xdg_toplevel` configure lands here
+    /// through the same path. The two callers differ only in where the size comes from: layer-shell
+    /// hands one over, a toplevel's may be the client's to pick (see
+    /// `xdg_shell::toplevel_size_for`).
     pub(super) fn bind_and_clear(&mut self, index: usize, width: u32, height: u32) {
         self.surfaces[index].configured_size = (width, height);
         // Only here does a real size for this instance exist: the startup resolve used the whole
@@ -434,8 +434,9 @@ impl App {
                 surface.commit();
             } else {
                 // `visible = false`: no buffer was ever attached, so this surface is already the
-                // invisible state § 15.2 point 3 asks a Candidate to reach. Marked staged without
-                // touching the wire; `presenting_surface_ids` filters it from the announced set.
+                // invisible state Supervisor services § 14.2 asks a Candidate to reach. Marked
+                // staged without touching the wire; `presenting_surface_ids` filters it from the
+                // announced set.
                 self.surfaces[index].null_buffered = true;
             }
             self.maybe_send_ready_signal();
@@ -575,18 +576,18 @@ impl App {
         // its contents, so the object has no reason to outlive the request.
     }
 
-    /// Applies § 5.1's `visible` to a live surface: a create or a destroy, for every role
-    /// (ADR-0049 decision 1, ADR-0088). A `panel` used to be the exception, mapping and unmapping
-    /// an object that outlived the flip, until the layer-shell re-map that rested on turned out
-    /// not to be honoured -- see [`TrackedRole::Panel`]'s `layer`.
-    /// Frozen for a PBA Candidate: this is the one line in this file where a mistake hangs the
-    /// shell instead of failing a test. `maybe_send_ready_signal` announces the surfaces this
-    /// process will present, and `activate_draw` draws exactly that set. § 15.2 point 2 hydrates a
-    /// Candidate with cached capability state precisely in the window between those two points, so
-    /// if `visible` could move there, the announced and drawn sets would disagree: an
-    /// `evidence_timeout` hang or a `PbaFailure::UnexpectedEvidence` abort (see
-    /// [`presenting_surface_ids`]). Freezing makes them agree by construction; the deferred change
-    /// applies on the first re-resolve after promotion clears `is_pba_candidate`.
+    /// Applies § 5.1's `visible` to a live surface: a create or a destroy, for every role (ADR-0049
+    /// decision 1, ADR-0088). A `panel` used to be the exception, mapping and unmapping an object
+    /// that outlived the flip, until the layer-shell re-map that rested on turned out not to be
+    /// honoured -- see [`TrackedRole::Panel`]'s `layer`. Frozen for a PBA Candidate: this is the
+    /// one line in this file where a mistake hangs the shell instead of failing a test.
+    /// `maybe_send_ready_signal` announces the surfaces this process will present, and
+    /// `activate_draw` draws exactly that set. Supervisor services § 14.2 hydrates a Candidate with
+    /// cached capability state precisely in the window between those two points, so if `visible`
+    /// could move there, the announced and drawn sets would disagree: an `evidence_timeout` hang or
+    /// a `PbaFailure::UnexpectedEvidence` abort (see [`presenting_surface_ids`]). Freezing makes
+    /// them agree by construction; the deferred change applies on the first re-resolve after
+    /// promotion clears `is_pba_candidate`.
     fn apply_visibility(&mut self, index: usize, visible: bool) {
         if self.is_pba_candidate {
             return;
@@ -944,10 +945,10 @@ impl App {
             if self.surfaces[index].bound.is_none() {
                 // A panel that started `visible = false` and has just been mapped by a `visible`
                 // flip has no EGL surface yet: it was created and configured, but the configure
-                // path returned before `ensure_bound` since there was nothing to draw into. This
-                // is the one place that bind can happen, since no further configure is coming
-                // (see [`App::remap`]). Never for a Candidate: § 15.2 point 3 keeps it invisible
-                // until `ActivateDraw`, whose `activate_draw_one` is its only bind.
+                // path returned before `ensure_bound` since there was nothing to draw into. This is
+                // the one place that bind can happen, since no further configure is coming (see
+                // [`App::remap`]). Never for a Candidate: Supervisor services § 14.2 keeps it
+                // invisible until `ActivateDraw`, whose `activate_draw_one` is its only bind.
                 if self.is_pba_candidate || !self.ensure_bound(index) {
                     continue;
                 }
@@ -959,13 +960,13 @@ impl App {
         }
     }
 
-    /// § 15.2 points 2-3: once every tracked surface has staged, computes the surface_id list the
-    /// Supervisor will expect presentation evidence from and queues it once as a `ReadySignal`. A
-    /// no-op if already sent or some surface hasn't staged, called on every candidate-mode
-    /// configure since any of them might complete the set.
-    /// Two different sets, deliberately: the gate is every surface, since a Candidate is not
-    /// ready until each has been dealt with, but the payload is only the surfaces that will
-    /// present. See [`presenting_surface_ids`] for what each direction of a mismatch costs.
+    /// Supervisor services § 14.2: once every tracked surface has staged, computes the surface_id
+    /// list the Supervisor will expect presentation evidence from and queues it once as a
+    /// `ReadySignal`. A no-op if already sent or some surface hasn't staged, called on every
+    /// candidate-mode configure since any of them might complete the set. Two different sets,
+    /// deliberately: the gate is every surface, since a Candidate is not ready until each has been
+    /// dealt with, but the payload is only the surfaces that will present. See
+    /// [`presenting_surface_ids`] for what each direction of a mismatch costs.
     pub(super) fn maybe_send_ready_signal(&mut self) {
         let staged =
             candidate_has_staged(self.surfaces.iter().map(|s| (s.null_buffered, s.role.wl_surface().is_some())));
@@ -979,10 +980,10 @@ impl App {
         }
     }
 
-    /// § 15.3: draws the first real frame in response to `ActivateDraw`, requesting
-    /// `wp_presentation_feedback` for each surface drawn. `nonce` is remembered as `active_nonce`
-    /// so the later `presented` callback knows which handshake attempt to tag its evidence with.
-    /// Draws the surfaces that present, not every tracked surface: exactly the set
+    /// Supervisor services § 14.2: draws the first real frame in response to `ActivateDraw`,
+    /// requesting `wp_presentation_feedback` for each surface drawn. `nonce` is remembered as
+    /// `active_nonce` so the later `presented` callback knows which handshake attempt to tag its
+    /// evidence with. Draws the surfaces that present, not every tracked surface: exactly the set
     /// `maybe_send_ready_signal` announced, filtered by the same [`MapState::presents`] predicate
     /// over a `map_state` [`App::apply_visibility`] holds still for a Candidate's whole life, so
     /// the announced and drawn sets are identical, not merely similar. See
@@ -1018,9 +1019,9 @@ impl App {
             return;
         }
 
-        // § 15.3 point 2: request presentation feedback before `paint_surface`'s `swap_buffers`
-        // commit, so the request associates with it (verify with `WAYLAND_DEBUG=1` that
-        // `feedback` appears on the wire before the corresponding `commit`).
+        // Supervisor services § 14.2: request presentation feedback before `paint_surface`'s
+        // `swap_buffers` commit, so the request associates with it (verify with `WAYLAND_DEBUG=1`
+        // that `feedback` appears on the wire before the corresponding `commit`).
         if let Some(surface) = self.surfaces[index].role.wl_surface().cloned()
             && let Err(e) = self.presentation_time.feedback(&surface, &self.queue_handle)
         {
@@ -1064,10 +1065,10 @@ mod tests {
 
     #[test]
     fn a_declared_but_unlocked_lock_instance_neither_hangs_nor_joins_the_pba_ready_set() {
-        // A `lock` instance owns zero Wayland objects until `locked` arrives, so it reaches both PBA
-        // gates as `(null_buffered: false, exists: false)` and `MapState::Unmapped` -- complete by
-        // construction for the staging gate, absent from the announced set. Getting either wrong is
-        // a `ready_timeout` hang or an `UnexpectedEvidence` abort.
+        // A `lock` instance owns zero Wayland objects until `locked` arrives, so it reaches both
+        // PBA gates as `(null_buffered: false, exists: false)` and `MapState::Unmapped` -- complete
+        // by construction for the staging gate, absent from the announced set. Getting either wrong
+        // is a `ready_timeout` hang or an `UnexpectedEvidence` abort.
         assert!(candidate_has_staged([(false, false)].into_iter()));
         assert!(presenting_surface_ids([("screen-lock@eDP-1", MapState::Unmapped)].into_iter()).is_empty());
     }

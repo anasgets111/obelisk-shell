@@ -192,37 +192,40 @@ pub struct ApplyPendingReload {
     pub sequence: u64,
 }
 
-/// § 15.2 point 3 ("Activate Draw"). Not a `CommandEnvelope`: wrong direction/shape (ADR-0019).
+/// Supervisor services § 14.2, step 4 ("Activate Draw"). Not a `CommandEnvelope`: wrong
+/// direction/shape (ADR-0019).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActivateDraw {
     pub nonce: u64,
 }
 
-/// § 15.2 points 2-3 ("Null-Buffer Staging"): the Candidate's one-time report that every tracked
-/// Wayland surface staged its null buffer and awaits `ActivateDraw`. `surfaces` is a surface_id
-/// list, not a monitor id list (ADR-0025).
+/// Supervisor services § 14.2, step 3 ("Null-Buffer Staging"): the Candidate's one-time report
+/// that every tracked Wayland surface staged its null buffer and awaits `ActivateDraw`.
+/// `surfaces` is a surface_id list, not a monitor id list (ADR-0025).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReadySignal {
     pub surfaces: Vec<String>,
 }
 
-/// § 15.3 point 4 ("Evidence Verification"): one message per surface_id that received its
-/// `wp_presentation_feedback` `presented` event (ADR-0019).
+/// Supervisor services § 14.2, step 5 ("Evidence Verification"): one message per surface_id that
+/// received its `wp_presentation_feedback` `presented` event (ADR-0019). The Candidate's report;
+/// the barrier that waits for every expected surface is § 14.3's, in `reload::run_pba`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PresentationEvidence {
     pub nonce: u64,
     pub surface_id: String,
 }
 
-/// § 15.4 point 1 ("Input Deselection"): tells the superseded generation to stop treating
-/// `surface_id` as authoritative. No per-surface input-region/focus wiring exists yet (ADR-0025).
+/// Supervisor services § 14.3, step 6 ("Input Deselection"): tells the superseded generation to
+/// stop treating `surface_id` as authoritative. No per-surface input-region/focus wiring exists
+/// yet (ADR-0025).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeselectInput {
     pub surface_id: String,
 }
 
-/// § 15.4 point 2 ("Candidate Promotion"): tells the newly-promoted generation it now owns
-/// `surface_id`. Currently inert for the same reason as `DeselectInput`.
+/// Supervisor services § 14.3, step 6 ("Candidate Promotion"): tells the newly-promoted
+/// generation it now owns `surface_id`. Currently inert for the same reason as `DeselectInput`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromoteGeneration {
     pub surface_id: String,

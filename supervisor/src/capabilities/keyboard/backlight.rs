@@ -1,7 +1,6 @@
-//! Backlight half of `oblisk.keyboard` (ADR-0034, corrected against this machine's real
-//! `org.freedesktop.UPower.KbdBacklight` introspection): the hand-written `KbdBacklight` proxy.
-//! Raw-brightness/percent conversion lives in `hardware::scale` (ADR-0053), shared with
-//! `brightness`. Split from `hardware::keyboard` -- see `hardware/keyboard/mod.rs`.
+//! Keyboard backlight proxy for `oblisk.keyboard` (ADR-0034).
+//!
+//! Raw-to-percentage scaling is handled in `crate::capabilities::scale` (ADR-0053).
 
 #[zbus::proxy(
     interface = "org.freedesktop.UPower.KbdBacklight",

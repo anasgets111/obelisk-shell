@@ -348,8 +348,8 @@ impl App {
     ///
     /// Guarded on `Mapped`, because a bufferless commit on an unmapped surface is the protocol's
     /// re-map procedure (see [`App::unmap`]), and skipped for a PBA Candidate on the same terms as
-    /// [`App::apply_visibility`]: § 15.2 point 3 keeps a Candidate's surfaces invisible until
-    /// `ActivateDraw`.
+    /// [`App::apply_visibility`]: Supervisor services § 14.2 keeps a Candidate's surfaces invisible
+    /// until `ActivateDraw`.
     pub(super) fn apply_spec_change(&mut self, index: usize, mut fresh: PanelSpec) {
         let TrackedRole::Panel { layer: Some(layer), spec: applied, output_size, .. } = &self.surfaces[index].role
         else {
@@ -645,9 +645,9 @@ mod tests {
 
     #[test]
     fn a_size_change_a_signal_could_make_is_refused_by_the_same_guard_creation_uses() {
-        // A `Signal` can turn a fixed 32 into `"Fill"` at runtime, and `set_size(_, 0)` on a surface
-        // anchored to one vertical edge is a protocol error that kills the shell. The guard has to
-        // run on the update path, not only at creation.
+        // A `Signal` can turn a fixed 32 into `"Fill"` at runtime, and `set_size(_, 0)` on a
+        // surface anchored to one vertical edge is a protocol error that kills the shell. The guard
+        // has to run on the update path, not only at creation.
         let applied = panel("bar");
         let mut filled = applied.clone();
         filled.height = SizeMode::Fill;

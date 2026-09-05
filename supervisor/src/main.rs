@@ -36,10 +36,10 @@ use supervisor::Supervisor;
 /// reload -- coalesces a multi-event save into one round trip. Fixed (ADR-0024).
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 
-/// § 15.2/15.3's ready-signal and evidence-verification deadlines (`reload::PbaTimings`), scaled
-/// up from `reload.rs`'s own test constants for a real Candidate that has to bind Wayland/EGL.
-/// Generous enough a healthy Candidate never trips them, tight enough a wedged one doesn't hang a
-/// config edit.
+/// Supervisor services § 14.2's ready-signal and § 14.3's evidence-verification deadlines
+/// (`reload::PbaTimings`), scaled up from `reload.rs`'s own test constants for a real Candidate
+/// that has to bind Wayland/EGL. Generous enough a healthy Candidate never trips them, tight enough
+/// a wedged one doesn't hang a config edit.
 const PBA_TIMINGS: reload::PbaTimings = reload::PbaTimings {
     ready_timeout: Duration::from_secs(2),
     evidence_timeout: Duration::from_secs(3),
@@ -116,14 +116,14 @@ pub(crate) fn parse_action<A: serde::de::DeserializeOwned>(params: &shared::Comm
 enum Shutdown {
     /// `SIGINT`, `SIGTERM`, or every channel closing. Rerunning the shell is recovery.
     Requested,
-    /// `generation::RestartBrake` refused another respawn. Rerunning would hand the same config to a fresh
-    /// Renderer, which dies the same way, forever.
+    /// `generation::RestartBrake` refused another respawn. Rerunning would hand the same config to
+    /// a fresh Renderer, which dies the same way, forever.
     RestartBrakeTripped,
 }
 
 impl Shutdown {
-    /// `3` is arbitrary except for what it isn't: not `0` (a clean exit), not `1` (`main`'s own
-    /// `?` failure), and not a code shell conventions reserve for signals (128+) or "not found" (127).
+    /// `3` is arbitrary except for what it isn't: not `0` (a clean exit), not `1` (`main`'s own `?`
+    /// failure), and not a code shell conventions reserve for signals (128+) or "not found" (127).
     fn exit_code(self) -> i32 {
         match self {
             Shutdown::Requested => 0,

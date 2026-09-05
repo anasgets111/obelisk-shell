@@ -78,14 +78,14 @@ pub fn spawn_client(
     });
 }
 
-/// One connection's reload bookkeeping. `applied_topology` is this generation's surface
-/// topology, `None` only when nothing has evaluated yet (module doc comment). `pending` holds
-/// the evaluated-but-unapplied output/topology between an `Unchanged` `Reevaluate` and its
-/// `ApplyPendingReload`. `applied_output` is ADR-0044 decision 2's re-resolve target (§ 15.2),
-/// outliving its evaluation so a later push skips re-running `shell.lua`. mlua 0.12's `ValueRef`
-/// holds a `WeakLua`, so a retained `mlua::Value` doesn't keep the VM alive and panics via
-/// `ValueRef::to_pointer` on a dead state; `Lua` must outlive it, per Rust's field-drop order
-/// (see [`RendererClient`]).
+/// One connection's reload bookkeeping. `applied_topology` is this generation's surface topology,
+/// `None` only when nothing has evaluated yet (module doc comment). `pending` holds the
+/// evaluated-but-unapplied output/topology between an `Unchanged` `Reevaluate` and its
+/// `ApplyPendingReload`. `applied_output` is ADR-0044 decision 2's re-resolve target (Supervisor
+/// services § 14.2), outliving its evaluation so a later push skips re-running `shell.lua`. mlua
+/// 0.12's `ValueRef` holds a `WeakLua`, so a retained `mlua::Value` doesn't keep the VM alive and
+/// panics via `ValueRef::to_pointer` on a dead state; `Lua` must outlive it, per Rust's field-drop
+/// order (see [`RendererClient`]).
 struct ReloadState {
     applied_topology: Option<Vec<SurfaceFingerprint>>,
     applied_output: Option<lua::LoadOutput>,
@@ -101,8 +101,8 @@ struct ReloadState {
 pub enum FrameOutcome {
     /// Fully serviced inside [`RendererClient::handle_frame`].
     Handled,
-    /// § 15.3's `ActivateDraw`: draw the surface set, request presentation feedback per surface,
-    /// tagged with this nonce (`crate::wayland::App::activate_draw`).
+    /// Supervisor services § 14.2's `ActivateDraw`: draw the surface set, request presentation
+    /// feedback per surface, tagged with this nonce (`crate::wayland::App::activate_draw`).
     ActivateDraw(u64),
     /// ADR-0042/ADR-0052's `SetSessionLock`: match the session lock to this flag
     /// (`crate::wayland::App::set_session_lock`).
@@ -291,12 +291,13 @@ impl RendererClient {
         Ok(handle)
     }
 
-    /// Evaluates `shell.lua` once at startup; no Supervisor round trip needed yet (ADR-0024,
-    /// "safe to apply" per the module doc comment). `state.applied_topology` stays `None` only
-    /// when the *evaluation* fails; a failed *apply* leaves it, since the caller has already
-    /// bound the declared surfaces and a later topology change needs a new generation (ADR-0038).
-    /// Runs before any layer surface is bound (§ 15.2's order), split so the caller can expand
-    /// the returned [`SurfaceSpec`](layout::node::SurfaceSpec)s via [`Self::apply_instances`].
+    /// Evaluates `shell.lua` once at startup; no Supervisor round trip needed yet (ADR-0024, "safe
+    /// to apply" per the module doc comment). `state.applied_topology` stays `None` only when the
+    /// *evaluation* fails; a failed *apply* leaves it, since the caller has already bound the
+    /// declared surfaces and a later topology change needs a new generation (ADR-0038). Runs before
+    /// any layer surface is bound (Supervisor services § 14.2's order), split so the caller can
+    /// expand the returned [`SurfaceSpec`](layout::node::SurfaceSpec)s via
+    /// [`Self::apply_instances`].
     pub fn run_startup_evaluation(&mut self) -> Option<Vec<SurfaceSpec>> {
         self.clear_change_handlers();
         match evaluate_and_specs(&self.loader, &self.shell_lua_path) {
@@ -449,7 +450,8 @@ impl RendererClient {
 
     /// Handles one inbound `SupervisorFrame`, decoded by [`pump`]. Returns [`FrameOutcome`]:
     /// `Handled`, or a hand-back needing `crate::wayland::App` state: EGL/surface for a draw
-    /// (§ 15.3), or SCTK's `SessionLockState`/lock surfaces for `SetSessionLock` (ADR-0042).
+    /// (Supervisor services § 14.2), or SCTK's `SessionLockState`/lock surfaces for
+    /// `SetSessionLock` (ADR-0042).
     #[must_use]
     pub fn handle_frame(&mut self, frame: SupervisorFrame) -> FrameOutcome {
         match frame {
@@ -848,8 +850,8 @@ mod tests {
         vec![OutputGeometry { name: "TEST".to_string(), size: layout::LogicalSize { width: 1920.0, height: 1080.0 } }]
     }
 
-    /// `crate::wayland::run`'s whole startup sequence in one call (§ 15.2's Candidate order):
-    /// evaluate, expand the specs into instances, store them, apply.
+    /// `crate::wayland::run`'s whole startup sequence in one call (Supervisor services § 14.2's
+    /// Candidate order): evaluate, expand the specs into instances, store them, apply.
     fn run_startup(client: &mut RendererClient) -> bool {
         let Some(specs) = client.run_startup_evaluation() else {
             return false;
@@ -3172,7 +3174,8 @@ mod tests {
     #[tokio::test]
     async fn pump_writes_a_secure_submit_frames_secret_to_the_wire_intact() {
         // ADR-0005/ADR-0027: the wire frame carries the exact secret read out of the accumulated
-        // `SecureBuffer`. `pump` zeroizes the frame's plaintext copy the instant the write completes.
+        // `SecureBuffer`. `pump` zeroizes the frame's plaintext copy the instant the write
+        // completes.
         let written = pumped_to_the_wire(RendererFrame::SecureSubmit(SecureSubmit {
             generation_id: 4,
             capability: "polkit".to_string(),

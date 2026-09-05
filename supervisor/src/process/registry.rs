@@ -199,8 +199,8 @@ pub(crate) async fn kill_registered_process(processes: &mut LiveProcesses, gener
 }
 
 /// `process_done`'s handler, fast half: `stream_process_output` reported that `(generation_id,
-/// id)`'s streams closed. Only removes the registry entry -- never awaits -- so it's safe to
-/// call directly inside `main()`'s `select!` (see [`wait_and_report_exit`] for the actual `wait()`).
+/// id)`'s streams closed. Only removes the registry entry -- never awaits -- so it's safe to call
+/// directly inside `main()`'s `select!` (see [`wait_and_report_exit`] for the actual `wait()`).
 pub(crate) fn take_exited_process(processes: &mut LiveProcesses, generation_id: u32, id: u64) -> Option<Child> {
     processes.remove(&(generation_id, id))
 }
@@ -225,9 +225,10 @@ pub(crate) async fn wait_and_report_exit(
     }
 }
 
-/// § 12's SIGTERM-then-SIGKILL group reap, applied to every process the superseded generation's
-/// Lua spawned -- not just its own Renderer process (`CONTEXT.md`'s Generation swap). No
-/// `ProcessExited` is sent: the superseded generation's own connection is torn down in the same swap.
+/// Supervisor services § 10's SIGTERM-then-SIGKILL group reap, applied to every process the
+/// superseded generation's Lua spawned -- not just its own Renderer process (`CONTEXT.md`'s
+/// Generation swap). No `ProcessExited` is sent: the superseded generation's own connection is torn
+/// down in the same swap.
 pub(crate) async fn reap_generations_processes(processes: &mut LiveProcesses, generation_id: u32) {
     let stale_ids: Vec<(u32, u64)> =
         processes.keys().filter(|(entry_generation_id, _)| *entry_generation_id == generation_id).copied().collect();

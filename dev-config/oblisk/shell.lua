@@ -12,13 +12,12 @@
 --
 -- Laid out like a bar people actually run, because it is copied from one: the zones and the order
 -- of the modules in them are `~/.config/quickshell`'s, down to the clock sitting last on the right
--- rather than centred. That shape is not decoration. It is what found ADR-0053: writing it
--- required a clock, a battery and a volume readout, and none of the three had a data source until
--- that ADR.
+-- rather than centred. That shape is not decoration. It is what found ADR-0053: writing it required
+-- a clock, a battery and a volume readout, and none of the three had a data source until that ADR.
 --
 -- Editing this file while the stack runs drives a reload. Changing `id`/`layer`/`anchor`/`monitor`/
--- `namespace` on a surface is a topology change and drives a full PBA generation swap (§ 15.2);
--- anything else reloads in place on the same Lua VM.
+-- `namespace` on a surface is a topology change and drives a full PBA generation swap (dbus spec §
+-- 14); anything else reloads in place on the same Lua VM.
 
 -- What this file imports, and where each thing lives. The tree mirrors the Quickshell config this
 -- shell is written to replace, directory for directory: `config/` holds design tokens,
@@ -38,16 +37,16 @@
 
 -- Bound to locals first, and that is load-bearing rather than style. Lua 5.4's `require` returns
 -- *two* values, the module and the loader data (the file path), where 5.3 returned one. A call in
--- the last position of a table constructor expands to all of its values, so the obvious
--- `return { require(...), require(...) }` puts one more element in this list than it has surfaces,
--- a string like "/path/to/lock.lua", and the engine then reports `error converting Lua string to
--- table` with no clue which entry is wrong. `local x = require(...)` takes the first value and nothing else.
+-- the last position of a table constructor expands to all of its values, so the obvious `return {
+-- require(...), require(...) }` puts one more element in this list than it has surfaces, a string
+-- like "/path/to/lock.lua", and the engine then reports `error converting Lua string to table` with
+-- no clue which entry is wrong. `local x = require(...)` takes the first value and nothing else.
 -- The font chain, in fallback order, and it has to be declared before anything measures text.
 -- `femtovg` and `cosmic-text` both fall back across it per glyph, so one chain covers body text and
 -- the Nerd Font private-use glyphs the Quickshell config draws its whole chrome with: the codepoint
 -- picks the face, not the node. Without this the engine resolves `sans-serif` and those glyphs
--- render as tofu, which is what they did until the `fonts` declaration existed (ADR-0043
--- decision 2).
+-- render as tofu, which is what they did until the `fonts` declaration existed (ADR-0043 decision
+-- 2).
 --
 -- Read once, at startup. Editing this list re-evaluates and changes nothing until the shell is
 -- restarted; `renderer/src/lua/fonts.rs` says why.

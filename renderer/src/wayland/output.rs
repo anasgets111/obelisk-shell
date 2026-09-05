@@ -174,8 +174,9 @@ impl PresentationTimeHandler for App {
         &mut self.presentation_time
     }
 
-    /// § 15.3 point 4: the compositor confirmed `surface`'s committed frame physically hit the
-    /// screen. Queues a `shared::PresentationEvidence` frame for the socket thread to write.
+    /// Supervisor services § 14.2: the compositor confirmed `surface`'s committed frame physically
+    /// hit the screen. Queues a `shared::PresentationEvidence` frame for the socket thread to
+    /// write.
     fn presented(
         &mut self,
         _conn: &Connection,

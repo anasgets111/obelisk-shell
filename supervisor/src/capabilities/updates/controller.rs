@@ -1,5 +1,4 @@
-//! [`UpdatesController`]: the `oblisk.updates` write-action dispatcher and state owner
-//! (ADR-0034). Split from `updates` -- see `updates/mod.rs` for the module-level doc.
+//! [`UpdatesController`]: `oblisk.updates` write-action dispatcher and state owner (ADR-0034).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

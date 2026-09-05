@@ -1,10 +1,8 @@
-//! `oblisk.updates` capability: package update checking and installation (ADR-0034), split into
-//! a schedule that knows nothing about package managers and a backend that is nothing but one
-//! (ADR-0134). `backend.rs` holds the trait and picks this machine's implementation; `pacman/`
-//! is the one implementation shipped, and `controller.rs` never names it.
+//! `oblisk.updates` capability: package update checking and installation (ADR-0034).
 //!
-//! Fully separate from `oblisk.sysinfo`'s scheduler -- same shape, zero shared code, per
-//! ADR-0034's own instruction. Top-level, sibling to `hardware`/`dbus`/`audio`/`privacy`.
+//! Separated into a schedule component and a backend abstraction (ADR-0134).
+//! `backend.rs` defines the backend trait; `pacman/` implements it for Arch Linux.
+//! Separate from `oblisk.sysinfo` scheduler with no shared code (ADR-0034).
 
 pub mod backend;
 pub mod controller;
@@ -22,9 +20,9 @@ pub enum UpdatesAction {
     Install,
 }
 
-/// `oblisk.updates`'s action dispatch (ADR-0037): `check` and `configure` are synchronous (each
-/// only nudges the scheduler through a channel -- ADR-0034); `install` runs a real `pacman` child
-/// and gets `tokio::spawn`ed.
+/// `oblisk.updates` action dispatch (ADR-0037): `check` and `configure` are synchronous,
+/// sending scheduler channel requests (ADR-0034). `install` runs a package manager child
+/// and is spawned asynchronously.
 pub fn dispatch(controller: &UpdatesController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     let Some(action) = crate::parse_action::<UpdatesAction>(params) else { return };
