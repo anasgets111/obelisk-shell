@@ -899,6 +899,7 @@ impl App {
         // Only after the swap committed: recording a frame that never reached the compositor
         // would let the next identical list skip a paint the screen never got.
         self.surfaces[index].last_painted = Some(((width, height), list));
+        self.surfaces_drawn += 1;
         // With every surface's last list current, the textures none of them draws are the idle
         // ones (ADR-0123). The eviction itself is queued, and freed at the next paint's start.
         let surfaces = &self.surfaces;

@@ -5,7 +5,10 @@
 //! much of a core it costs, and whether a turn that woke did any work at all. That last one is the
 //! bug shape this exists to catch. Since ADR-0124 the loop polls with no timeout, so a turn that
 //! wakes and finds nothing to do means something re-armed a wakeup for no reason -- a spin, and
-//! the difference between the 0.34% of a core this process costs idle and a hot laptop.
+//! the difference between the 0.34% of a core this process costs idle and a hot laptop. That
+//! figure, and every other number here, is a release build: a `dev` build resolves roughly four
+//! times slower, so a debug reading compared against a release one invents a regression that is
+//! not there. Compare like with like, or the profile lies to you.
 //!
 //! Off unless `OBLISK_PROFILE_IDLE` is set, and off is genuinely free: the whole struct is behind
 //! an `Option` the loop checks with `if let`, so a build with it unset does two branch-predicted
@@ -39,12 +42,62 @@ pub struct Turn {
     pub draws: usize,
     /// The turn reached `repaint_mapped_surfaces`.
     pub painted: bool,
+    /// How many surfaces that repaint actually drew and swapped. The gap between this and
+    /// `painted` is the point: `App::paint_surface` builds a display list for every mapped
+    /// surface and then declines the ones whose list is unchanged, so a window reporting
+    /// `resolve=18 drawn=0` is eighteen whole-scene re-resolves that moved not one pixel --
+    /// ADR-0044 decision 2's single global dirty flag, costing exactly what it was always going
+    /// to cost. Still a count the paint path decides for its own reasons, not for this one's.
+    pub drawn: usize,
 }
 
 impl Turn {
     /// Whether this turn did anything. A woken turn that answers `false` is the spin signature.
     fn did_work(self) -> bool {
         self.dispatched || self.re_resolved || self.typed || self.decoded || self.draws > 0
+    }
+}
+
+/// Where a turn's time went. Unlike [`Turn`], these *are* measured for the profile's sake -- three
+/// `clock_gettime` calls a turn -- which is why [`Phases::start`] takes the switch: with the
+/// profile off every `mark` below is a branch on a `None` and nothing else, and the loop touches
+/// no clock. The split is the answer to what a `drawn=0` window provokes, so it is deliberately
+/// not a second environment variable: nobody has ever wanted one of these two without the other.
+#[derive(Clone, Copy, Default)]
+pub struct Phases {
+    /// Start of the phase currently being timed, or `None` when the profile is off.
+    at: Option<Instant>,
+    resolve: Duration,
+    surface_state: Duration,
+    repaint: Duration,
+}
+
+impl Phases {
+    /// Begins a turn's timing, or doesn't. Pass `profile.is_some()`.
+    pub fn start(on: bool) -> Self {
+        Self { at: on.then(Instant::now), ..Self::default() }
+    }
+
+    /// Closes the current phase and opens the next. Called unconditionally after each phase's
+    /// block, including a block that didn't run: a skipped phase reporting zero is the truth, and
+    /// it keeps the next phase from being credited with time it didn't spend.
+    fn split(&mut self) -> Duration {
+        let Some(at) = self.at else { return Duration::ZERO };
+        let now = Instant::now();
+        self.at = Some(now);
+        now.duration_since(at)
+    }
+
+    pub fn mark_resolve(&mut self) {
+        self.resolve = self.split();
+    }
+
+    pub fn mark_surface_state(&mut self) {
+        self.surface_state = self.split();
+    }
+
+    pub fn mark_repaint(&mut self) {
+        self.repaint = self.split();
     }
 }
 
@@ -73,6 +126,10 @@ pub struct Counters {
     decoded: u64,
     draws: u64,
     painted: u64,
+    drawn: u64,
+    resolve: Duration,
+    surface_state: Duration,
+    repaint: Duration,
 }
 
 /// CPU consumed over a window, in seconds: the whole process against this one thread. The gap
@@ -141,7 +198,7 @@ impl IdleProfile {
     }
 
     /// Records one turn's work and prints the report when the window is up.
-    pub fn turn(&mut self, turn: Turn) {
+    pub fn turn(&mut self, turn: Turn, phases: Phases) {
         let c = &mut self.counters;
         c.turns += 1;
         if !turn.did_work() {
@@ -153,6 +210,10 @@ impl IdleProfile {
         c.decoded += u64::from(turn.decoded);
         c.draws += turn.draws as u64;
         c.painted += u64::from(turn.painted);
+        c.drawn += turn.drawn as u64;
+        c.resolve += phases.resolve;
+        c.surface_state += phases.surface_state;
+        c.repaint += phases.repaint;
 
         let elapsed = self.window_started.elapsed();
         if elapsed < self.interval {
@@ -176,7 +237,8 @@ fn render(window: Duration, c: &Counters, cpu: Cpu) -> String {
     let spinning = c.turns >= 100 && c.idle_turns * 2 > c.turns;
     format!(
         "idle {:.1}s: turns={} idle={} cpu proc={:.2}% main={:.2}% | wake wl={} wake={} both={} none={} \
-         | work dispatch={} resolve={} type={} decode={} draw={} paint={}{}",
+         | work dispatch={} resolve={} type={} decode={} draw={} paint={} drawn={} \
+         | ms resolve={:.1} surfstate={:.1} repaint={:.1}{}",
         secs,
         c.turns,
         c.idle_turns,
@@ -192,6 +254,10 @@ fn render(window: Duration, c: &Counters, cpu: Cpu) -> String {
         c.decoded,
         c.draws,
         c.painted,
+        c.drawn,
+        c.resolve.as_secs_f64() * 1000.0,
+        c.surface_state.as_secs_f64() * 1000.0,
+        c.repaint.as_secs_f64() * 1000.0,
         if spinning { " SPIN" } else { "" },
     )
 }
@@ -225,6 +291,47 @@ mod tests {
         assert!(!render(Duration::from_secs(10), &counters(10, 9), Cpu::default()).contains("SPIN"));
         // The same ratio at a hundred times the rate is the loop eating a core for nothing.
         assert!(render(Duration::from_secs(10), &counters(1000, 900), Cpu::default()).contains("SPIN"));
+    }
+
+    #[test]
+    fn a_window_that_resolved_without_drawing_says_so_in_both_columns() {
+        // The shape the whole phase split exists to make visible: every turn re-resolved the
+        // scene, the resolve was nearly all of the time, and not one surface reached the GPU.
+        let c = Counters {
+            turns: 18,
+            re_resolved: 18,
+            painted: 18,
+            drawn: 0,
+            resolve: Duration::from_micros(21_600),
+            surface_state: Duration::from_micros(1_400),
+            repaint: Duration::from_micros(500),
+            ..Counters::default()
+        };
+        let line = render(Duration::from_secs(10), &c, Cpu::default());
+        assert!(line.contains("paint=18 drawn=0"), "{line}");
+        assert!(line.contains("ms resolve=21.6 surfstate=1.4 repaint=0.5"), "{line}");
+    }
+
+    #[test]
+    fn phases_with_the_profile_off_read_no_clock_and_report_nothing() {
+        let mut phases = Phases::start(false);
+        phases.mark_resolve();
+        phases.mark_surface_state();
+        phases.mark_repaint();
+        assert!(phases.at.is_none());
+        assert_eq!((phases.resolve, phases.surface_state, phases.repaint), Default::default());
+    }
+
+    #[test]
+    fn each_phase_is_credited_only_with_its_own_span() {
+        // A skipped phase reports zero rather than handing its neighbour the time, which is what
+        // makes `surfstate=0.0` on a turn that took the `re_resolved` branch a real signal.
+        let mut phases = Phases::start(true);
+        std::thread::sleep(Duration::from_millis(5));
+        phases.mark_resolve();
+        phases.mark_surface_state();
+        assert!(phases.resolve >= Duration::from_millis(5), "{:?}", phases.resolve);
+        assert!(phases.surface_state < Duration::from_millis(5), "{:?}", phases.surface_state);
     }
 
     #[test]

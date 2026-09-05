@@ -202,6 +202,11 @@ pub struct App {
     /// list differs (`layout::paint::FieldFocus` is an input to `build`, not part of the tree),
     /// narrowed by `App::paint_surface`'s comparison to the one surface holding the field.
     field_input_changed: bool,
+    /// How many surfaces `App::paint_surface` actually drew and swapped since the loop last took
+    /// this, for `OBLISK_PROFILE_IDLE`. Counted here rather than returned because the paint walks
+    /// every mapped surface and declines most of them, so the interesting number is the count
+    /// across the walk, not any one surface's answer; taken and reset like `field_input_changed`.
+    surfaces_drawn: usize,
 }
 
 /// The Renderer's main thread: Wayland dispatch, EGL, and (since ADR-0039) the Lua VM, the
@@ -285,6 +290,7 @@ pub fn run(
         focused_text_field: None,
         secure_buffer: shared::SecureBuffer::new(),
         field_input_changed: false,
+        surfaces_drawn: 0,
     };
 
     // Outputs (and the seat) arrive as a burst of registry + wl_seat/wl_output events after
@@ -456,7 +462,12 @@ pub fn run(
         // changed (layer-shell fields, the input region, whether mapped, ADR-0038 decision 2),
         // double-buffered `wl_surface` state the second statement's `swap_buffers` commits;
         // per-field commits would show the compositor a half-updated surface.
+        // Off unless the profile is on, in which case three `clock_gettime` calls a turn buy the
+        // split between re-resolving the tree and drawing it -- the difference between knowing the
+        // loop woke and knowing what it spent the wake on.
+        let mut phases = idle_profile::Phases::start(profile.is_some());
         let re_resolved = app.client.re_resolve_if_dirty();
+        phases.mark_resolve();
         // Taken unconditionally so a keystroke that arrived alongside a capability push does not
         // stay pending: the repaint below covers both, and leaving the flag set would repaint
         // again next turn for nothing.
@@ -475,9 +486,11 @@ pub fn run(
             // signals follow the layout, `on_hover` follows the pointer (ADR-0112 amendment).
             app.refresh_hover_after_layout();
         }
+        phases.mark_surface_state();
         if re_resolved || typed || !landed.is_empty() {
             app.repaint_mapped_surfaces();
         }
+        phases.mark_repaint();
         // Whether anything at all happened this turn. A turn with no Wayland event, no frame, no
         // keystroke and no landed decode changed nothing the three checks below read, so they are
         // skipped (ADR-0124): `arm_autofocus_if_nothing_is_typing` in particular copies the
@@ -487,14 +500,18 @@ pub fn run(
         if let Some(profile) = profile.as_mut() {
             // Before the `draw_nonces` loop below consumes the `Vec`, and before any `break`, so a
             // turn that exits still reports the work it did.
-            profile.turn(idle_profile::Turn {
-                dispatched,
-                re_resolved,
-                typed,
-                decoded: !landed.is_empty(),
-                draws: draw_nonces.len(),
-                painted: re_resolved || typed || !landed.is_empty(),
-            });
+            profile.turn(
+                idle_profile::Turn {
+                    dispatched,
+                    re_resolved,
+                    typed,
+                    decoded: !landed.is_empty(),
+                    draws: draw_nonces.len(),
+                    painted: re_resolved || typed || !landed.is_empty(),
+                    drawn: std::mem::take(&mut app.surfaces_drawn),
+                },
+                phases,
+            );
         }
         // The disarm half of ADR-0049's amendment; must be here, not inside the `if` above.
         // `dispatch_pending` armed `input_serial` on a `BTN_LEFT` press or release this turn, and
