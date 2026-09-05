@@ -43,7 +43,7 @@ pub struct CommandSender {
 
 impl CommandSender {
     /// `generation_id` is this Renderer's own generation id (`socket::generation_id_from_env`),
-    /// the same value `ProcessRegistry` stamps and the field § 7.3's guard rule drops a packet on.
+    /// the same value `ProcessRegistry` stamps into every command envelope.
     pub fn new(generation_id: u32, outbound_tx: UnboundedSender<RendererFrame>) -> Self {
         CommandSender {
             generation_id,
@@ -73,7 +73,7 @@ impl CommandSender {
     }
 
     /// § 7's envelope, queued rather than written: see the module doc comment.
-    /// `expected_revision` is the revision of the last `StateSnapshot` hydrated, § 7.3's staleness
+    /// `expected_revision` is the revision of the last `StateSnapshot` hydrated; its staleness
     /// half ([`CapabilityHandle`] keeps it current). `0` is not a revision any push can produce
     /// (`bump_revision` starts at `1`), so it means "never hydrated": honest before the first
     /// snapshot, and permanently correct for a capability with no state to be stale about (`lock`,
@@ -129,7 +129,9 @@ pub struct Capability {
 impl Capability {
     /// Builds one `oblisk.<name>` member and the handle `socket::RendererClient` hydrates it
     /// through: returned together since value and revision must move as one, or a `set` missing its
-    /// bump could stamp a stale read onto the current write, the race § 7.3 exists to drop.
+    /// bump could stamp a stale read onto the current write. Nothing downstream catches that:
+    /// ordinary dispatch does not enforce the envelope's revision claims (Supervisor services
+    /// § 13), so pairing them here is the only guard there is.
     pub fn new(name: &str, dirty: DirtyFlag, commands: CommandSender) -> (Self, CapabilityHandle) {
         // `nil` until the Supervisor's first push (ADR-0037), paired with revision `0`, which no
         // push can produce.

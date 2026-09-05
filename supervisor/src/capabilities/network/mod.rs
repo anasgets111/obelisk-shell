@@ -697,9 +697,9 @@ impl NetworkController {
         paths.iter().filter_map(|path| Some((path.clone(), held.get(path)?.clone()))).collect()
     }
 
-    /// § 4.3: `pending`'s SSID/hidden flag plus `secret` (empty means open, non-empty means
-    /// WPA-PSK) become `AddAndActivateConnection2`'s connection dict. `secret` is zeroized
-    /// immediately after use regardless of outcome (ADR-0005/ADR-0014): the caller already
+    /// Supervisor services § 4: `pending`'s SSID/hidden flag plus `secret` (empty means open,
+    /// non-empty means WPA-PSK) become `AddAndActivateConnection2`'s connection dict.
+    /// `secret` is zeroized on every outcome (ADR-0005/ADR-0014): the caller already
     /// `mem::take`s it out of the wire `SecureSubmit` frame, making this that plaintext's owner.
     pub async fn connect(&self, pending: PendingNetworkConnect, mut secret: Vec<u8>) {
         self.begin_connect(&pending.ssid);
@@ -897,8 +897,8 @@ impl NetworkController {
         matches
     }
 
-    /// § 4.3: deletes every connection profile matching `ssid` (plural, per spec, not just the
-    /// first match).
+    /// Supervisor services § 4: deletes every connection profile matching `ssid` (plural, per
+    /// spec, not just the first match).
     pub async fn forget(&self, ssid: &str) {
         for profile in self.saved_profiles_for_ssid(ssid, "forget").await {
             if let Err(err) = profile.connection.delete().await {

@@ -184,7 +184,8 @@ impl RendererClient {
         loader
             .register_process(process_registry.clone())
             .map_err(|err| format!("failed to register the process global: {err}"))?;
-        // Same generation id `ProcessRegistry` stamps, so § 7.3's guard can't disagree with it.
+        // Same generation id `ProcessRegistry` keys its children by, so a `process.kill` cannot
+        // reach a child of another generation.
         // § 3.2's commands all take this one write path.
         let commands = CommandSender::new(generation_id, outbound_tx);
         let client = Self::new(loader, shell_lua_path, shaping, commands, process_registry, dirty)
@@ -253,7 +254,8 @@ impl RendererClient {
     /// anyway.
     fn apply_state_snapshot(&self, snapshot: StateSnapshot) -> mlua::Result<()> {
         let value = self.loader.to_lua_value(&snapshot.payload)?;
-        // The revision is what a later `oblisk.<name>:invoke(...)` stamps for § 7.3's guard.
+        // The revision a later `oblisk.<name>:invoke(...)` stamps into its command; advisory,
+        // since dispatch does not enforce it (Supervisor services § 13).
         let handle = self.capability_handle(&snapshot.capability)?;
         let previous = handle.hydrate(value, snapshot.revision);
         // The `on_change` handlers (ADR-0115) run here, after the value landed and before any
