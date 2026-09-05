@@ -213,7 +213,7 @@ impl RetainedNode {
 /// 4K external need two resolved trees; one tree per declared surface can't serve both, since
 /// whichever output resolved last would decide the geometry the other painted.
 ///
-/// This *refines* ADR-0045 decision 5 rather than replacing it: the surface `id` is still the
+/// This *refines* ADR-0045 decision 1 rather than replacing it: the surface `id` is still the
 /// reconcile identity (`apply` finds a fresh `VirtualNode` by `node::parse_surface_id` as before),
 /// and the key adds the output half, stable for an instance's whole life. Everything below a
 /// surface's root reconciles through `pair_children_by_id_then_position`: an optional,
@@ -338,7 +338,7 @@ impl Scene {
         shaping: &ShapingHandle,
         lua: &Lua,
     ) -> Result<(), LayoutError> {
-        // Matched by the declared `id`, keyed by the instance id: ADR-0045 decision 5's
+        // Matched by the declared `id`, keyed by the instance id: ADR-0045 decision 1's
         // reconcile identity, resolved per output (see this type's doc comment).
         let mut fresh = None;
         for candidate in fresh_surfaces {

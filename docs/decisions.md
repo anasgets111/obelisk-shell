@@ -2106,7 +2106,7 @@ implemented in this pass.
 
 Actionable update notifications, timer-based dedupe and OSDs without backend facts remained out of scope.
 
-## ADR-0116: Pointer drags and wheels on a button, and the microphone's volume
+## 0116. Pointer drags and wheels on a button, and the microphone's volume
 
 1. Buttons receive left-drag start/move/end with local unclamped pointer coordinates. Hold through
    release/leave; field presses do not drag. An inside release may still click after drag end.
@@ -2121,7 +2121,7 @@ Actionable update notifications, timer-based dedupe and OSDs without backend fac
 A brief old-snapshot snap-back remains possible. Microphone OSD and deeper app-icon lookup were
 not built; live tests covered the pill and microphone reading.
 
-## ADR-0117: A workspace knows whether it is empty and what runs on it
+## 0117. A workspace knows whether it is empty and what runs on it
 
 1. Add populated and one representative app ID per workspace: focused window first, otherwise
    lowest window ID. Empty IDs become absent; keep reduction compositor-neutral.
@@ -2131,7 +2131,7 @@ not built; live tests covered the pill and microphone reading.
 
 A populated window without app ID remains populated. No width animation or opacity fade.
 
-## ADR-0118: `workspaces` speaks Hyprland, as a module behind the same publisher
+## 0118. `workspaces` speaks Hyprland, as a module behind the same publisher
 
 1. Add a Hyprland module behind the existing publisher and exhaustive dispatch, still no trait.
    It uses documented IPC and synthetic fixtures, not live-verified captures.
@@ -2144,7 +2144,7 @@ A populated window without app ID remains populated. No width animation or opaci
 
 Padding, specials, fullscreen and compositor metadata were deferred to the next payload decision.
 
-## ADR-0119: What one compositor has and the other does not is an absent key
+## 0119. What one compositor has and the other does not is an absent key
 
 1. Unsupported compositor features are absent keys, not a parallel supports table. Empty means
    supported with no current entries.
@@ -2326,19 +2326,17 @@ Log a refused swap hint; retain fallback behavior. The profiler touches no clock
 Live idle windows showed about 17 resolves per ten seconds, explained by clock/CPU/RAM schedules,
 not spinning, at roughly 0.24–0.25% CPU. Nonblocking swap alone had no measured idle speed gain.
 
-## ADR-0133: `oblisk.battery` reads UPower uncached, because its wake-up races zbus's cache
+## 0133. `oblisk.battery` reads UPower uncached, because its wake-up races zbus's cache
 
-Battery wakeups and zbus's property cache consumed the same change independently. Reading before
-cache refresh compared equal, dropped the push and left state one event behind for minutes.
-
-Disable caching on DisplayDevice reads while keeping one whole-object subscription.
-Five reads on infrequent changes cost less complexity than five property streams.
-The power capability's cache-driven property streams were already ordered correctly.
+1. Disable caching on DisplayDevice reads while keeping one whole-object subscription. Reading
+   before cache refresh compared equal, dropped the push and left state one event behind for minutes.
+2. Five reads on infrequent changes cost less complexity than five property streams.
+3. The power capability's cache-driven property streams remain unchanged (ordered correctly).
 
 Live unplug/replug confirmed the fix. Hardware latency was not the cause.
 A similar tray custom-signal/cache risk remained unconfirmed and deliberately unfixed.
 
-## ADR-0134: `oblisk.updates` is a schedule with a package manager behind a trait, and says which one
+## 0134. `oblisk.updates` is a schedule with a package manager behind a trait, and says which one
 
 1. Put manager-specific name, check, install command, progress parsing and reboot detection behind
    a backend trait; the scheduler should not know pacman.
@@ -2352,15 +2350,15 @@ A similar tray custom-signal/cache risk remained unconfirmed and deliberately un
 One backend exists. Do not invent untestable apt/dnf implementations; the immediate gain is
 ownership and explicit unsupported-host behavior.
 
-## ADR-0135: an empty `textfield` shows its placeholder even with the keyboard, because `autofocus` made the alternative unreachable
+## 0135. An empty `textfield` shows its placeholder even with the keyboard, because `autofocus` made the alternative unreachable
 
-An empty ordinary field shows its placeholder even while focused, so autofocus cannot make the
-prompt permanently unreachable. With no placeholder, retain the bare caret fallback; nonempty
-draft/caret behavior stays unchanged.
+1. An empty ordinary field shows its placeholder even while focused, matching masked fields, so
+   autofocus cannot make the prompt unreachable.
+2. With no placeholder, retain the bare caret fallback. Nonempty draft/caret behavior
+   stays unchanged.
 
-Reject per-config overlay workarounds and placeholder-plus-caret in identical ink, which looks
-like typed text. Accept the weaker focus cue among multiple empty replies for now.
-A distinct placeholder color is the upgrade, not hiding search prompts again.
+Reject per-config overlay workarounds and placeholder-plus-caret in identical ink. A distinct
+placeholder color is the upgrade path, not hiding search prompts again.
 
 ## 0136. Persistence is a JSON file the config names, and the framework names no path
 
