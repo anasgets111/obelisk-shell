@@ -20,7 +20,7 @@ pub struct TrayItem {
     /// A theme icon name, for `icon { name = ... }`. Exactly one of this and [`TrayItem::icon_path`]
     /// is ever set, so a config draws whichever is present.
     pub icon_name: Option<String>,
-    /// A decoded, bounds-checked PNG spooled to `/dev/shm`, for `image { source = ... }`.
+    /// A decoded, bounds-checked PNG spooled to the runtime directory, for `image { source = ... }`.
     /// Set when the item sent pixels rather than a theme name.
     pub icon_path: Option<String>,
     /// The `NeedsAttention` artwork, resolved the same way as `icon_name`/`icon_path`. Draw these

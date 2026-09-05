@@ -299,7 +299,7 @@ pub struct Notification {
     pub body: Vec<NotificationSpan>,
     /// The picture the sender attached -- album art, an avatar, a screenshot thumbnail -- as an
     /// absolute path to a file that exists: either a decoded, bounds-checked image spooled to
-    /// `/dev/shm`, or a path it sent that passed the trusted-root check. `nil` when it attached
+    /// the runtime directory, or a path it sent that passed the trusted-root check. `nil` when it attached
     /// none. Never a theme name (ADR-0091).
     ///
     /// Was called `icon_path` and held this *and* the sending application's icon, whichever

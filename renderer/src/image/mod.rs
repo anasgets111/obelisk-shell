@@ -73,7 +73,7 @@ struct CacheKey {
 }
 
 /// What tells one revision of a file from the next, at a path that keeps its name (ADR-0031's
-/// deferred item: the tray spools every icon update over `/dev/shm/oblisk-$UID/tray/{name}.png`,
+/// deferred item: the tray spools every icon update over `$XDG_RUNTIME_DIR/oblisk/tray/{name}.png`,
 /// no revision suffix). Mtime and length, not a content hash: tmpfs mtime is nanosecond-precise,
 /// length is free, and hashing would mean reading the file to decide whether to read it. A file
 /// that cannot be stat'd takes the default, so a *missing* file retries instead of staying cached

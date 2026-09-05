@@ -176,7 +176,7 @@ pub(super) fn encode_image_data_to_png(image: &RawImageData) -> Result<Vec<u8>, 
     Ok(buffer)
 }
 
-/// `/dev/shm/oblisk-$UID/notifications` (ADR-0033: "gets the `$UID` fix ADR-0031 already
+/// `$XDG_RUNTIME_DIR/oblisk/notifications` (ADR-0033: "gets the `$UID` fix ADR-0031 already
 /// established for tray"): our own icon spool root, the only directory [`delete_icon_file`] may
 /// ever delete from (finding 1).
 fn notifications_icon_dir() -> PathBuf {

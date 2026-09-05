@@ -6912,3 +6912,35 @@ config's own reasons are richer than the joined string it passed to logind, and 
 double-report every manual toggle. *Leaving `idle` off the roster and adding a second
 Renderer-sourced signal beside `screens` and `rescue`.* Those two are Renderer state; this is
 Supervisor state arriving as a `StateSnapshot`, which is exactly what a roster entry is.
+
+## 0142. The icon spool moves out of `/dev/shm`, which is world-writable
+
+Amends ADR-0031 and ADR-0033. Both spool decoded, bounds-checked PNGs to
+`/dev/shm/oblisk-$UID/{tray,notifications}`, where the `$UID` suffix was doing the work of keeping
+two users' spools apart. It does not do the work of keeping one user out of the other's.
+
+`/dev/shm` is mode 1777. Any other local user can create `oblisk-$UID` before the Supervisor does,
+and two things then go wrong at once: `sweep`'s startup pass walks `read_dir` and deletes every
+regular file it finds, so a symlink there aims that delete at a directory of the attacker's
+choosing; and `write_png` follows an existing symlink, so a spooled icon overwrites whatever it
+points at. Both run before anything checks who owns the directory, and the sweep runs unprompted at
+every boot.
+
+`icon_dir` now returns `$XDG_RUNTIME_DIR/oblisk/{subdir}`.
+
+1. **This is the property the `$UID` suffix was reaching for.** The runtime directory is 0700 and
+   owned by us, enforced by the kernel rather than by a name nobody else happens to have picked.
+   Both are tmpfs, both are wiped between sessions, and the spool is read only by our own Renderer
+   through a path string, so nothing else changes.
+2. **The fallback is `/run/user/$UID`, never `/dev/shm`.** A spool that silently reverts to a
+   world-writable directory when one environment variable is missing is the hole, not the repair.
+   If the runtime directory does not exist, `write_png` fails and the item draws without an icon,
+   which is what already happens when the write fails for any other reason.
+3. **`remove_png`'s prefix check follows for free**, since it compares against `icon_dir`.
+
+**Rejected.** *Keeping `/dev/shm` and hardening around it -- `O_NOFOLLOW`, an ownership check on
+the directory, a lockfile.* Three checks to make a shared directory behave like a private one, when
+a private one is one `join` away. *Sweeping by mtime instead of deleting whatever is there.* It
+narrows the blast radius of the symlink and fixes nothing about `write_png`. *Treating this as
+out of scope because a single-user desktop has no second local user.* Unlike every same-UID finding
+against the control socket, this one crosses a real kernel boundary, and the fix is one line.
