@@ -647,9 +647,30 @@ fn decode_raster(path: &Path, box_px: (u32, u32), thumbnails: Option<&Path>) -> 
 /// allocates more than that however large the file turns out to be.
 fn read_capped(path: &Path, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read;
+    refuse_irregular(path)?;
     let mut data = Vec::new();
     std::fs::File::open(path)?.take(cap + 1).read_to_end(&mut data)?;
     Ok((data.len() as u64 <= cap).then_some(data))
+}
+
+/// Refuses anything that is not a regular file, before anything tries to open it.
+///
+/// `File::open` on a FIFO with no writer blocks until one appears, and [`Load::Inline`] -- the
+/// default -- opens on the Wayland dispatch thread. One such path is therefore not a failed image
+/// but a shell frozen with no way back, which is a far worse outcome than any decode error this
+/// module already handles.
+///
+/// `icons::resolve` returns an absolute name as a path without looking at it, and a config may name
+/// any path at all, so the check belongs at the open rather than at one of the callers.
+///
+/// Stat-then-open leaves a TOCTOU window, the same one
+/// `capabilities::notifications::icon::validate_trusted_path` already accepts. It turns "hangs
+/// forever" into "hangs only if something wins a race", without an `O_NONBLOCK` fd dance.
+fn refuse_irregular(path: &Path) -> std::io::Result<()> {
+    if std::fs::metadata(path)?.is_file() {
+        return Ok(());
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"))
 }
 
 /// Decodes one raster file under [`MAX_DECODE_EDGE`] and [`MAX_DECODE_ALLOC_BYTES`].
@@ -659,6 +680,7 @@ fn read_capped(path: &Path, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
 /// [`MAX_DECODE_WORKERS`] of those at once is most of a gigabyte. `ImageReader` applies the limits
 /// during decoding, so an oversized source is refused rather than allocated for.
 pub(super) fn decode_within_limits(path: &Path) -> Result<::image::DynamicImage, String> {
+    refuse_irregular(path).map_err(|err| format!("{}: {err}", path.display()))?;
     let mut reader = ::image::ImageReader::open(path)
         .map_err(|err| err.to_string())?
         .with_guessed_format()
@@ -1209,5 +1231,26 @@ mod tests {
         assert_eq!(Fit::from_str("Cover"), None);
         assert_eq!(Fit::from_str("fill"), None);
         assert_eq!(Fit::default(), Fit::Cover);
+    }
+
+    /// The failure this prevents is not a bad image but a frozen shell: `File::open` on a FIFO with
+    /// no writer blocks forever, and `Load::Inline` opens on the Wayland dispatch thread.
+    #[test]
+    fn a_fifo_is_refused_rather_than_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("icon.png");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `mkfifo` takes a NUL-terminated path and a mode; `path` outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0, "the test needs a real FIFO");
+
+        // Both open paths must refuse it. Neither call may block, which is what this asserts by
+        // returning at all.
+        assert!(decode_within_limits(&fifo).is_err(), "a FIFO must not reach the decoder");
+        assert!(read_capped(&fifo, 1024).is_err(), "nor the SVG reader");
+
+        // A regular file at the same name still works, so the guard refuses the type, not the path.
+        let real = dir.path().join("real.svg");
+        std::fs::write(&real, b"<svg/>").unwrap();
+        assert!(read_capped(&real, 1024).unwrap().is_some());
     }
 }
