@@ -13,6 +13,12 @@
 //! closure the report interval gates. Set a positive interval in seconds
 //! (`OBLISK_PROFILE_MEMORY=60`); invalid input uses [`DEFAULT_INTERVAL_SECS`] rather than
 //! preventing startup, matching `idle_profile`.
+//!
+//! `OBLISK_PROFILE_MEMORY_TRIM=1` additionally calls `malloc_trim` after each report and prints
+//! what it returned. That answers a question the counters raise but cannot settle: ADR-0126
+//! measured a trim returning none of the picker's retained 3.6 MB, so whether the free lists this
+//! reports are actually returnable has to be measured, not assumed. Diagnostic only -- it walks
+//! and locks every arena, which is why nothing here trims unless asked.
 
 use std::time::{Duration, Instant};
 
@@ -97,6 +103,8 @@ pub struct Surfaces(pub Vec<(String, usize)>);
 /// every counter here is a level rather than a rate.
 pub struct MemoryProfile {
     interval: Duration,
+    /// Whether to trim after reporting; see the module docs.
+    trim: bool,
     started: Instant,
     window_started: Instant,
     /// The reading this one is diffed against, and the first one taken, so a report shows both
@@ -112,8 +120,13 @@ impl MemoryProfile {
         let secs = raw.trim().parse::<u64>().ok().filter(|s| *s > 0).unwrap_or(DEFAULT_INTERVAL_SECS);
         eprintln!("[oblisk-renderer] memory profile on, reporting every {secs}s");
         let now = Instant::now();
+        let trim = std::env::var("OBLISK_PROFILE_MEMORY_TRIM").is_ok_and(|value| value.trim() != "0");
+        if trim {
+            eprintln!("[oblisk-renderer] memory profile will malloc_trim after each report");
+        }
         Some(Self {
             interval: Duration::from_secs(secs),
+            trim,
             started: now,
             window_started: now,
             previous: None,
@@ -135,6 +148,14 @@ impl MemoryProfile {
             render(self.started.elapsed(), &census, self.previous.as_ref(), self.first.as_ref())
         );
         eprintln!("[oblisk-renderer] {}", render_surfaces(self.started.elapsed(), &surfaces));
+        if self.trim {
+            // SAFETY: plain one-integer FFI. `malloc_trim` locks arenas itself, is thread-safe,
+            // and only `madvise`s pages the allocator already holds free.
+            unsafe {
+                libc::malloc_trim(0);
+            }
+            eprintln!("[oblisk-renderer] {}", render_trim(self.started.elapsed(), malloc, Malloc::now()));
+        }
         self.first.get_or_insert(census);
         self.previous = Some(census);
         self.window_started = Instant::now();
@@ -176,6 +197,21 @@ fn render(uptime: Duration, now: &Census, previous: Option<&Census>, first: Opti
         line.push_str(&format!(" | since_start {}", deltas(now, first)));
     }
     line
+}
+
+/// What one `malloc_trim` actually returned. `arena` shrinking is the only line that means pages
+/// went back to the kernel; `free` falling by the same amount without `arena` moving means glibc
+/// merely reshuffled its own lists, which is the outcome ADR-0126 measured.
+fn render_trim(uptime: Duration, before: Malloc, after: Malloc) -> String {
+    let kib = |now: u64, earlier: u64| (now as i64 - earlier as i64) as f64 / 1024.0;
+    format!(
+        "memory t={:.0}s: trim arena={:+.0} free={:+.0} in_use={:+.0} KiB (arena now {:.1} MiB)",
+        uptime.as_secs_f64(),
+        kib(after.arena, before.arena),
+        kib(after.free, before.free),
+        kib(after.in_use, before.in_use),
+        after.arena as f64 / (1024.0 * 1024.0),
+    )
 }
 
 /// The heaviest trees on their own line, so a growing total can be attributed without re-running.
@@ -238,6 +274,23 @@ mod tests {
         // Subtracting `u64`s directly would make a freed megabyte read as 16 exabytes.
         let line = deltas(&census(1024 * 1024, 0), &census(3 * 1024 * 1024, 0));
         assert!(line.contains("in_use=-2048"), "{line}");
+    }
+
+    #[test]
+    fn a_trim_that_only_reshuffled_the_free_lists_reports_no_arena_change() {
+        // ADR-0126's outcome: the free list shrinks, the process gives nothing back.
+        let before = Malloc { arena: 30 * 1024 * 1024, mmapped: 0, in_use: 24 * 1024 * 1024, free: 6 * 1024 * 1024 };
+        let after = Malloc { free: 2 * 1024 * 1024, ..before };
+        let line = render_trim(Duration::from_secs(60), before, after);
+        assert!(line.contains("trim arena=+0 free=-4096"), "{line}");
+        assert!(line.contains("arena now 30.0 MiB"), "{line}");
+    }
+
+    #[test]
+    fn a_trim_that_returned_pages_shows_the_arena_shrinking() {
+        let before = Malloc { arena: 30 * 1024 * 1024, mmapped: 0, in_use: 24 * 1024 * 1024, free: 6 * 1024 * 1024 };
+        let after = Malloc { arena: 25 * 1024 * 1024, free: 1024 * 1024, ..before };
+        assert!(render_trim(Duration::from_secs(60), before, after).contains("trim arena=-5120"));
     }
 
     #[test]
