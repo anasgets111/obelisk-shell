@@ -527,6 +527,19 @@ impl App {
         scope
     }
 
+    /// Shadow-gate key: the scope, in [`App::shown_popups_under`] order because
+    /// [`autofocus_field_in_scope`] takes the first match, plus whether the focused root still has
+    /// a live `wl_surface`.
+    ///
+    /// The liveness bit is separate because [`App::keyboard_focus_scope`] admits a tracked root
+    /// without one, while popup membership already requires `popup: Some(_)`. Without it, a root
+    /// whose surface died and returned reads as unchanged.
+    pub(super) fn focus_key(&self) -> (Vec<String>, bool) {
+        let scope = self.keyboard_focus_scope();
+        let root_live = scope.first().is_some_and(|id| self.surface_is_live(id));
+        (scope, root_live)
+    }
+
     /// Ask [`focus_on_enter`] over scoped trees; called both on `enter` and when trees change under
     /// an existing focus.
     fn field_the_scope_declares(&self, scope: &[String], current: Option<FocusedField>) -> Option<FocusedField> {

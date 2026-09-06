@@ -71,6 +71,12 @@ impl StorageController {
     /// next resolve, and saves after writes stop.
     ///
     /// JSON `null` deletes the key; this is how Lua `nil` arrives.
+    ///
+    /// A write that changes nothing publishes nothing, sparing a whole-store snapshot and the
+    /// renderer it would dirty; configs need no equality guard of their own around each write.
+    ///
+    /// The save stays unconditional: rewriting is the only repair for the missing, unreadable or
+    /// malformed file [`load`] represented as empty.
     pub fn set(&self, path: &str, key: &str, value: serde_json::Value) {
         let Some(path) = absolute_path(path) else {
             eprintln!("storage: refused a write to {path:?}; a store's path must be absolute");
@@ -81,7 +87,7 @@ impl StorageController {
             return;
         }
 
-        {
+        let changed = {
             let mut guard = self.state.lock().expect("storage state mutex poisoned");
             let Some(stored) = guard.files.get_mut(&*path.to_string_lossy()) else {
                 eprintln!("storage: refused a write to {}; no persistent_table declared it", path.display());
@@ -92,13 +98,19 @@ impl StorageController {
                 return;
             };
             match value {
-                serde_json::Value::Null => map.remove(key),
-                value => map.insert(key.to_string(), value),
-            };
-        }
+                serde_json::Value::Null => map.remove(key).is_some(),
+                value if map.get(key) == Some(&value) => false,
+                value => {
+                    map.insert(key.to_string(), value);
+                    true
+                }
+            }
+        };
 
         self.schedule_save(&path);
-        let _ = self.signal_tx.send(StorageSignal::Changed);
+        if changed {
+            let _ = self.signal_tx.send(StorageSignal::Changed);
+        }
     }
 
     /// Replaces this file's pending save with one [`SAVE_DEBOUNCE`] away.
@@ -248,6 +260,32 @@ mod tests {
 
         controller.set(&path, "wallpaper", serde_json::Value::Null);
         assert_eq!(controller.snapshot().files[&path], json!({}));
+    }
+
+    #[tokio::test]
+    async fn a_write_that_changes_nothing_pushes_nothing_and_still_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json").to_string_lossy().into_owned();
+        // Read an existing file with no defaults to merge, so `open` schedules no save of its own
+        // and only the writes below can recreate the file removed here.
+        std::fs::write(&path, r#"{"fit":"cover"}"#).unwrap();
+        let (controller, mut rx) = controller();
+        controller.open(&path, &json!({}));
+        while rx.try_recv().is_ok() {}
+        std::fs::remove_file(&path).unwrap();
+
+        controller.set(&path, "fit", json!("cover"));
+        controller.set(&path, "never-stored", serde_json::Value::Null);
+        assert!(rx.try_recv().is_err(), "a write that edits nothing must not push the whole store");
+
+        tokio::time::sleep(SAVE_DEBOUNCE + Duration::from_millis(150)).await;
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("an unchanged write still repairs the file"))
+                .unwrap();
+        assert_eq!(written["fit"], json!("cover"));
+
+        controller.set(&path, "fit", json!("fill"));
+        assert!(rx.try_recv().is_ok(), "a real edit still pushes");
     }
 
     #[tokio::test]

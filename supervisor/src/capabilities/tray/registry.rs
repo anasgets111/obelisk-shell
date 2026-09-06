@@ -104,14 +104,8 @@ pub(super) async fn register_item(
         }
     }
 
-    let properties_forwarder = spawn_item_signal_forwarder(
-        item.clone(),
-        unique_name.clone(),
-        menu.clone(),
-        key.clone(),
-        registry.clone(),
-        events.clone(),
-    );
+    let properties_forwarder =
+        spawn_item_signal_forwarder(item.clone(), unique_name.clone(), key.clone(), registry.clone(), events.clone());
     let menu_forwarder =
         menu.clone().map(|menu| spawn_menu_signal_forwarder(menu, key.clone(), registry.clone(), events.clone()));
 
@@ -137,13 +131,25 @@ pub(super) async fn register_item(
     Ok(())
 }
 
-/// Re-fetches the full [`TrayItem`] on every `NewX` signal, including its menu through the bound
-/// proxy, and updates the entry in place without debounce or per-property patching. One task per
-/// item; its handle lives in [`ItemEntry`] and is aborted on unregistration.
+/// Stores refreshed SNI properties under the menu the entry already holds.
+///
+/// `fetch_tray_item_base` reads properties only and leaves `menu` unset, so the menu has to move
+/// across; assigning `refreshed` on its own blanks the menu on every title or icon change.
+fn keep_menu_across(entry: &mut ItemEntry, mut refreshed: TrayItem) {
+    refreshed.menu = entry.last_known.menu.take();
+    entry.last_known = refreshed;
+}
+
+/// Re-fetches the [`TrayItem`] properties on every `NewX` signal and updates the entry in place
+/// without debounce or per-property patching. One task per item; its handle lives in
+/// [`ItemEntry`] and is aborted on unregistration.
+///
+/// The menu is carried across rather than refetched: `spawn_menu_signal_forwarder` refreshes it on
+/// `LayoutUpdated` and `controller::menu_will_show` refreshes it on open. Fetching it here too
+/// would put a full `GetLayout` round trip behind every frame of an animated icon.
 fn spawn_item_signal_forwarder(
     item: StatusNotifierItemProxy<'static>,
     unique_name: OwnedUniqueName,
-    menu: Option<DBusMenuProxy<'static>>,
     key: ItemKey,
     registry: ItemRegistry,
     events: UnboundedSender<TraySignal>,
@@ -170,14 +176,11 @@ fn spawn_item_signal_forwarder(
                 break;
             }
 
-            let mut refreshed = fetch_tray_item_base(&item, &unique_name).await;
-            if let Some(menu) = &menu {
-                refreshed.menu = fetch_menu_via(menu).await.ok();
-            }
+            let refreshed = fetch_tray_item_base(&item, &unique_name).await;
 
             let mut guard = registry.lock().unwrap();
             let Some(entry) = guard.get_mut(&key) else { break };
-            entry.last_known = refreshed;
+            keep_menu_across(entry, refreshed);
             drop(guard);
 
             if events.send(TraySignal::RegistryChanged).is_err() {
@@ -270,6 +273,7 @@ pub(super) fn spawn_name_owner_changed_forwarder(
 mod tests {
     use super::*;
     use crate::capabilities::test_support::p2p_pair;
+    use crate::capabilities::tray::menu::MenuItem;
 
     /// Minimal entry for ordering tests. A p2p proxy bind makes no call, so no answering peer is
     /// needed.
@@ -328,6 +332,24 @@ mod tests {
         }
         let ids: Vec<String> = ordered_items(&registry).into_iter().map(|item| item.id).collect();
         assert_eq!(ids, ["1.9", "1.100"], "a lexicographic sort would put 1.100 first");
+    }
+
+    /// A property signal carries no menu, so assigning the refreshed item on its own would blank a
+    /// menu that only `LayoutUpdated` and opening the menu ever refill.
+    #[tokio::test]
+    async fn refreshing_properties_keeps_the_menu_the_entry_already_has() {
+        let (connection, _peer) = p2p_pair().await;
+        let mut entry = entry(&connection, "item", 0).await;
+        entry.last_known.menu = Some(vec![MenuItem { label: Some("Quit".to_string()), ..MenuItem::default() }]);
+
+        keep_menu_across(
+            &mut entry,
+            TrayItem { id: "item".to_string(), name: "renamed".to_string(), ..TrayItem::default() },
+        );
+
+        assert_eq!(entry.last_known.name, "renamed", "the refreshed properties must land");
+        let menu = entry.last_known.menu.as_ref().expect("a property refresh must not blank the menu");
+        assert_eq!(menu[0].label.as_deref(), Some("Quit"));
     }
 
     /// In-place updates must not move an item.

@@ -530,6 +530,14 @@ impl NotificationsController {
         let _ = self.events.send(NotificationsSignal::Changed);
 
         if let ExpiryPolicy::After(duration) = resolve_expiry(urgency, expire_timeout) {
+            // ponytail: replacing or dismissing a notification leaves this task sleeping rather
+            // than aborting it; the `(id, incarnation)` recheck in `expire_entry` is what makes
+            // that correct, and the queue stays the only authority on what is live. Ceiling: an
+            // obsolete task holds a controller `Arc` and a hold subscription until its own
+            // captured duration elapses, which `expire_timeout` can set to 24.9 days and
+            // `hold_expiry` can extend further. Upgrade path is to re-check `find_expiring_entry`
+            // on an interval inside `sleep_past_holds`, not a second registry of abort handles
+            // that has to agree with the incarnation check forever.
             let controller = self.clone();
             let holds = self.expiry_hold.subscribe();
             tokio::spawn(async move {

@@ -46,6 +46,7 @@ use crate::layout::node::{
     self, ConstraintAdjustment, LayerKind, PanelSpec, PopupAnchor, PopupSpec, SizeHint, SizeMode, SurfaceSpec,
     WindowSpec,
 };
+use crate::lua::signal::thread_cpu_time;
 use crate::socket::{FrameOutcome, RendererClient};
 use crate::text::atlas::TextPainter;
 use crate::text::shaping::ShapingHandle;
@@ -163,6 +164,12 @@ pub struct App {
     /// keyboard focus (ADR-0050 decision 4). `None` means no frame; writes go through
     /// [`App::focus_secure_submit`].
     focused_secure_submit: Option<FocusedField>,
+    /// [`App::focus_key`] as end-of-turn arming last examined it, for the profiler's `redundant`
+    /// column. Written only while `OBLISK_PROFILE_IDLE` is set; nothing gates on it yet.
+    ///
+    /// Starts as an empty dead scope rather than the first key observed, so the first focused turn
+    /// reads as a change and is not silently classed as removable.
+    last_focus_key: (Vec<String>, bool),
     /// Focused plain `textfield` and its draft, the unmasked § 5.2 item 8 half (ADR-0092). Only a
     /// press selects it; sole-field `enter` fallback cannot serve multiple reply boxes.
     ///
@@ -257,6 +264,7 @@ pub fn run(
         input_serial: None,
         pointer_input_count: 0,
         focused_secure_submit: None,
+        last_focus_key: (Vec::new(), false),
         focused_text_field: None,
         secure_buffer: shared::SecureBuffer::new(),
         field_input_changed: false,
@@ -330,7 +338,15 @@ pub fn run(
     // `inbound_rx` with bounded latency instead of blocking on the Wayland fd. Non-Candidates still
     // draw synchronously in the first configure handler.
     loop {
+        // `then` leaves the clock unread while the profile is off, as `idle_profile` promises.
+        let dispatch_started = profile.is_some().then(thread_cpu_time).flatten();
         let dispatched = event_queue.dispatch_pending(&mut app)? > 0;
+        if let Some(started) = dispatch_started
+            && let Some(ended) = thread_cpu_time()
+            && let Some(profile) = profile.as_mut()
+        {
+            profile.dispatch(ended.saturating_sub(started));
+        }
         if app.exit {
             break;
         }
@@ -418,8 +434,41 @@ pub fn run(
         // Skip focus maintenance on a truly idle turn (ADR-0124). It clones the focused tree to
         // find fields; at 66 turns/s on an open picker, that was most of the process's work.
         let active = dispatched || re_resolved || typed || !landed.is_empty() || !draw_nonces.is_empty();
+        // Disarm after the turn, not only when active: `dispatch_pending` armed this serial and
+        // `apply_resolved_surface_state` is its only reader. This enforces ADR-0049's one-turn
+        // real-input window.
+        app.input_serial = None;
+        // Once per active turn, scrub a secure field whose surface was torn down before a later
+        // keystroke notices. `App::apply_secure_key` remains the load-bearing check.
+        if active {
+            let focus_started = profile.is_some().then(thread_cpu_time).flatten();
+            app.drop_secure_focus_if_its_surface_is_gone();
+            // Sample after the cleanup above: clearing secure focus can enable a search. Failing
+            // these guards excludes the turn from `searched`, not from `focus_turns` or its CPU.
+            let searched = app.keyboard_focus.is_some() && app.focused_secure_submit.is_none();
+            // Shadow the candidate gate rather than apply it: sample what it would compare, before
+            // arming runs, and let the `redundant` column say how many turns it would have skipped.
+            // Sampling pre-arm is what makes the stored key mean "what maintenance examined".
+            let unchanged = focus_started.is_some_and(|_| {
+                let key = app.focus_key();
+                let same = key == app.last_focus_key;
+                app.last_focus_key = key;
+                same
+            });
+            // Also arm fields that appeared under already-arrived keyboard focus.
+            app.arm_secure_focus_if_the_scope_now_declares_one();
+            app.arm_autofocus_if_nothing_is_typing();
+            if let Some(started) = focus_started
+                && let Some(ended) = thread_cpu_time()
+                && let Some(profile) = profile.as_mut()
+            {
+                let removable = searched && unchanged && !re_resolved && !typed;
+                profile.focus(ended.saturating_sub(started), searched, removable);
+            }
+        }
         if let Some(profile) = profile.as_mut() {
-            // Sample before consuming nonces or breaking, so an exiting turn is reported.
+            // After focus maintenance so a turn's focus cost reports in its own window, and
+            // still before consuming nonces or breaking, so an exiting turn is reported.
             profile.turn(
                 idle_profile::Turn {
                     dispatched,
@@ -437,18 +486,6 @@ pub fn run(
             // The closure keeps the scene walk and the cache locks off every turn but the one
             // that reports; see `memory_profile`.
             memory.maybe_report(|| census(&app));
-        }
-        // Disarm after the turn, not only when active: `dispatch_pending` armed this serial and
-        // `apply_resolved_surface_state` is its only reader. This enforces ADR-0049's one-turn
-        // real-input window.
-        app.input_serial = None;
-        // Once per active turn, scrub a secure field whose surface was torn down before a later
-        // keystroke notices. `App::apply_secure_key` remains the load-bearing check.
-        if active {
-            app.drop_secure_focus_if_its_surface_is_gone();
-            // Also arm fields that appeared under already-arrived keyboard focus.
-            app.arm_secure_focus_if_the_scope_now_declares_one();
-            app.arm_autofocus_if_nothing_is_typing();
         }
         for nonce in draw_nonces {
             app.activate_draw(nonce);

@@ -59,7 +59,8 @@ impl Deadline {
 
 /// CPU used by the calling thread, as § 1.2 requires. Per thread, not process: Lua runs start to
 /// finish on the entering Wayland thread (ADR-0039); process-wide time would charge shaping.
-fn thread_cpu_time() -> Option<Duration> {
+/// `crate::wayland::idle_profile` charges blocks of its loop against the same per-thread scope.
+pub(crate) fn thread_cpu_time() -> Option<Duration> {
     let spent = nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID).ok()?;
     Some(Duration::new(spent.tv_sec().try_into().ok()?, spent.tv_nsec().try_into().ok()?))
 }
@@ -89,7 +90,7 @@ enum SignalKind {
     #[allow(dead_code)]
     Direct(Value),
     Computed {
-        deps: Vec<Signal>,
+        deps: Rc<Vec<Signal>>,
         func: Function,
     },
     /// Rust-overwritable value (`Signal::new_live`/`LiveSignalHandle`). `Rc<RefCell<_>>` because
@@ -320,7 +321,7 @@ impl Signal {
     /// Lua and Rust so `lua::capability::Capability` makes `oblisk.lock` read like bare
     /// capabilities.
     pub(crate) fn mapped(&self, func: Function) -> Signal {
-        Signal(SignalKind::Computed { deps: vec![self.clone()], func })
+        Signal(SignalKind::Computed { deps: Rc::new(vec![self.clone()]), func })
     }
 
     /// Reads current value (ADR-0044 decision 1). `layout::node` uses it to resolve signal
@@ -343,7 +344,7 @@ impl Signal {
                 // `s` 2^N
                 // times, 1,048,575 calls at N=20. Upgrade by memoizing each dependency per get.
                 let mut args = Vec::with_capacity(deps.len());
-                for dep in deps {
+                for dep in deps.iter() {
                     args.push(dep.get_value(lua)?);
                 }
                 let value = func.call::<Value>(MultiValue::from_vec(args))?;
@@ -669,6 +670,11 @@ fn expired_budget(lua: &Lua) -> Option<&'static str> {
 /// Shared answer for signal-like userdata and the `Signal` to resolve. It accepts [`Signal`],
 /// `capability::Capability`, and wrapped `IdleMember`; every § 2 capability uses one, so live
 /// bindings stay live instead of becoming literals.
+///
+/// This clone runs for every signal-valued property of every node, on every whole-scene resolve,
+/// which is why `SignalKind::Computed` holds its dependencies behind an `Rc`: owning them outright
+/// would make the clone recursive, copying a vector per link of every `map`/`computed` chain.
+/// Dependencies never change after construction and the Loader stays on one thread (ADR-0039).
 pub fn from_userdata(ud: &mlua::AnyUserData) -> Option<Signal> {
     if let Ok(signal) = ud.borrow::<Signal>() {
         return Some(signal.clone());
@@ -709,7 +715,7 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
                 })?;
                 collected.push(signal);
             }
-            Ok(Signal(SignalKind::Computed { deps: collected, func }))
+            Ok(Signal(SignalKind::Computed { deps: Rc::new(collected), func }))
         })?,
     )?;
     lua.globals().set(
