@@ -289,6 +289,9 @@ impl App {
         self.release_bound(index);
         let TrackedSurface { role, surface_id, .. } = self.surfaces.remove(index);
         drop(role);
+        // `App::surfaces` and `Scene::surfaces` are different maps; dropping the tracked surface
+        // leaves the retained tree behind unless it is dropped here too.
+        self.client.forget_surface(&surface_id);
         eprintln!("[oblisk-renderer] {surface_id} destroyed: its output is gone");
     }
 

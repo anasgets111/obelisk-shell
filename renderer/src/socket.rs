@@ -436,6 +436,12 @@ impl RendererClient {
         &self.scene
     }
 
+    /// Drops a departed instance's retained tree. Called by topology handling when an output goes
+    /// away, which is the one path that removes a surface without a reload replacing the process.
+    pub fn forget_surface(&mut self, instance_id: &str) {
+        self.scene.forget(instance_id);
+    }
+
     /// This generation's `Lua` builds the `button` `on_click` argument (ADR-0050 decision 3):
     /// `crate::wayland::App` holds the `mlua::Function`, not a VM. Do not hold the borrow across
     /// the call; see [`crate::wayland::App::fire_on_click`].

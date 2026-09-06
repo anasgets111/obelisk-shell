@@ -363,6 +363,21 @@ impl Scene {
         self.surfaces.get(instance_id).map(RetainedNode::to_resolved)
     }
 
+    /// Drops the retained tree for an instance that no longer exists.
+    ///
+    /// [`Self::apply_admitting`] visits only the instances it is given, and says so: retained
+    /// instances absent from a cycle "stay for topology handling". This is that handling, called
+    /// from `crate::wayland::App::destroy_surface_by_id`, and it is the only thing that removes a
+    /// surface from this map. Without it an unplugged output stays resident for the life of the
+    /// process, one tree per output name ever seen.
+    ///
+    /// Dropped rather than retired: [`Self::release_all_retired`] empties the lease bag after every
+    /// apply and no animation consumer extends it (`CONTEXT.md`, Lease), so a whole surface on its
+    /// way out has nothing to lease it to.
+    pub fn forget(&mut self, instance_id: &str) {
+        self.surfaces.remove(instance_id);
+    }
+
     /// Finalizes the drop of one retired subtree. Returns `false` if `id` isn't currently
     /// retiring (already released, or never retired).
     ///
@@ -4377,6 +4392,35 @@ pub(super) mod tests {
         assert_eq!(inner, lines, "the column is as tall as its two texts, one of them wrapped");
         assert_eq!(card, inner + 14.0, "and the card is that plus its padding");
         assert_eq!((card, inner), (heights(0).0, heights(0).1), "the margin moves the card, it does not resize it");
+    }
+
+    /// The leak this closes: `apply` visits only the instances it is handed, so an instance that
+    /// stops existing is never revisited and its tree is never dropped. Nothing but `forget`
+    /// removes one, which is why an unplugged output used to stay resident for the life of the
+    /// process.
+    #[test]
+    fn a_departed_instance_is_forgotten_rather_than_left_resident() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+
+        let declared: mlua::Table =
+            lua.load(r#"return panel { id = "bar", child = rect { width = 40, height = 10 } }"#).eval().unwrap();
+        apply_at(&mut scene, &[deserialize_lua_table(&declared).unwrap()], full(), &shaping, &lua).unwrap();
+        assert!(scene.surface("bar@TEST").is_some(), "the tree must exist before it can be forgotten");
+
+        // An apply carrying no instances is what an unplugged output produces, and it must NOT be
+        // what drops the tree: `apply` cannot tell an instance that departed from one simply absent
+        // this cycle, which is why it leaves the question to topology handling.
+        scene.apply(&[deserialize_lua_table(&declared).unwrap()], &[], &shaping, &lua).unwrap();
+        assert!(scene.surface("bar@TEST").is_some(), "apply must leave it for topology handling");
+
+        scene.forget("bar@TEST");
+        assert!(scene.surface("bar@TEST").is_none(), "topology handling is what drops it");
+        scene.forget("bar@TEST");
+        assert!(scene.surface("bar@TEST").is_none(), "and forgetting one twice is not an error");
     }
 }
 
