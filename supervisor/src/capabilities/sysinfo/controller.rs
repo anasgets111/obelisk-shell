@@ -137,6 +137,29 @@ impl SysinfoController {
     }
 }
 
+/// Writes one task's fields and publishes only if that changed something.
+///
+/// Every send hydrates a `StateSnapshot`, which marks the scene dirty and costs a whole re-resolve
+/// (ADR-0044 decision 2). A machine at rest reports the same rounded percentage and the same whole
+/// Celsius for minutes together, so the unconditional send was buying a re-resolve per tick for no
+/// new information. The sample itself is still taken and still stored: `cpu_percent` needs the
+/// counters for the next delta whether or not the rounded result moved.
+fn publish_if_changed(
+    state: &std::sync::Mutex<SysinfoState>,
+    signal_tx: &tokio::sync::mpsc::UnboundedSender<SysinfoSignal>,
+    write: impl FnOnce(&mut SysinfoState) -> bool,
+) {
+    // Drop the lock before sending: the receiver hydrates a snapshot and must never wait on a
+    // poll task's mutex to do it.
+    let changed = {
+        let mut state = state.lock().expect("sysinfo state mutex poisoned");
+        write(&mut state)
+    };
+    if changed {
+        let _ = signal_tx.send(SysinfoSignal::Changed);
+    }
+}
+
 /// `cpu_percent` task. Keeps the previous `/proc/stat` sample across ticks; the first tick after
 /// cold start or resume stores only a sample. The three similar loops stay separate because a
 /// closure returning a future borrowing its own state cannot escape stable Rust's plain `FnMut`.
@@ -168,8 +191,11 @@ async fn run_cpu_task(
                                 Ok(sample) => {
                                     if let Some(prev) = previous.take() {
                                         let percent = super::cpu::delta_percent(&prev, &sample);
-                                        state.lock().expect("sysinfo state mutex poisoned").cpu_percent = percent;
-                                        let _ = signal_tx.send(SysinfoSignal::Changed);
+                                        publish_if_changed(&state, &signal_tx, |state| {
+                                            let changed = state.cpu_percent != percent;
+                                            state.cpu_percent = percent;
+                                            changed
+                                        });
                                     }
                                     previous = Some(sample);
                                 }
@@ -214,12 +240,13 @@ async fn run_ram_task(
                             match super::ram::read_meminfo(&proc_root) {
                                 Ok(info) => {
                                     let (ram_percent, swap_percent) = super::ram::compute_percentages(&info);
-                                    {
-                                        let mut state = state.lock().expect("sysinfo state mutex poisoned");
+                                    publish_if_changed(&state, &signal_tx, |state| {
+                                        let changed =
+                                            state.ram_percent != ram_percent || state.swap_percent != swap_percent;
                                         state.ram_percent = ram_percent;
                                         state.swap_percent = swap_percent;
-                                    }
-                                    let _ = signal_tx.send(SysinfoSignal::Changed);
+                                        changed
+                                    });
                                 }
                                 Err(err) => eprintln!("sysinfo: failed to read /proc/meminfo: {err}"),
                             }
@@ -263,12 +290,12 @@ async fn run_temp_task(
                         _ = ticker.tick() => {
                             let temp_cores = super::temp::read_temp_cores_from(&core_source);
                             let temp_gpu = super::temp::read_temp_gpu_from(gpu_chip.as_deref());
-                            {
-                                let mut state = state.lock().expect("sysinfo state mutex poisoned");
+                            publish_if_changed(&state, &signal_tx, |state| {
+                                let changed = state.temp_cores != temp_cores || state.temp_gpu != temp_gpu;
                                 state.temp_cores = temp_cores;
                                 state.temp_gpu = temp_gpu;
-                            }
-                            let _ = signal_tx.send(SysinfoSignal::Changed);
+                                changed
+                            });
                         }
                         changed = interval_rx.changed() => {
                             if changed.is_err() {
@@ -332,6 +359,43 @@ mod tests {
             super::poll_mode(std::time::Duration::from_secs(5)),
             super::PollMode::Ticking(std::time::Duration::from_secs(5))
         );
+    }
+
+    /// `publish_if_changed` needs a state and a channel; both tasks and this test build them the
+    /// same way, so a helper keeps the four cases below to their point.
+    fn state_and_channel() -> (
+        std::sync::Arc<std::sync::Mutex<super::SysinfoState>>,
+        tokio::sync::mpsc::UnboundedSender<super::SysinfoSignal>,
+        tokio::sync::mpsc::UnboundedReceiver<super::SysinfoSignal>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (std::sync::Arc::new(std::sync::Mutex::new(super::SysinfoState::default())), tx, rx)
+    }
+
+    #[test]
+    fn a_sample_that_moved_a_field_publishes() {
+        let (state, tx, mut rx) = state_and_channel();
+        super::publish_if_changed(&state, &tx, |state| {
+            let changed = state.cpu_percent != 42;
+            state.cpu_percent = 42;
+            changed
+        });
+        assert_eq!(rx.try_recv(), Ok(super::SysinfoSignal::Changed));
+        assert_eq!(state.lock().unwrap().cpu_percent, 42);
+    }
+
+    #[test]
+    fn a_sample_that_measured_the_same_number_publishes_nothing() {
+        // The whole point: an idle machine reports the same rounded percentage tick after tick,
+        // and each publish would cost a scene re-resolve (ADR-0044 decision 2).
+        let (state, tx, mut rx) = state_and_channel();
+        state.lock().unwrap().cpu_percent = 7;
+        super::publish_if_changed(&state, &tx, |state| {
+            let changed = state.cpu_percent != 7;
+            state.cpu_percent = 7;
+            changed
+        });
+        assert!(rx.try_recv().is_err(), "an unchanged sample must not hydrate a snapshot");
     }
 
     #[test]

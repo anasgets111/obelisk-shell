@@ -328,6 +328,11 @@ impl Supervisor {
             &[(shared::GENERATION_ID_ENV.to_string(), replacement_generation_id.to_string())],
         ) {
             Ok(child) => {
+                if let Some(pid) = child.id() {
+                    self.registry.expect_generation(replacement_generation_id, pid);
+                }
+                // The departed generation's id must not stay claimable by whatever inherits its pid.
+                self.registry.forget_generation(self.authoritative.generation_id);
                 self.authoritative = Authoritative { generation_id: replacement_generation_id, child };
                 self.renderer_departed = false;
                 eprintln!("spawned generation {replacement_generation_id} to replace it");
@@ -417,7 +422,7 @@ impl Supervisor {
     pub(crate) async fn swap_generation(
         &mut self,
         sequence: u64,
-        inbound: &mut tokio::sync::mpsc::UnboundedReceiver<InboundFrame>,
+        inbound: &mut tokio::sync::mpsc::Receiver<InboundFrame>,
     ) {
         let candidate_generation_id = self.take_generation_id();
         let candidate_envs = vec![

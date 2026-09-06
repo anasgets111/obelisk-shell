@@ -187,7 +187,7 @@ pub struct App {
 /// thread sends back, including replies, readiness, presentation evidence, and lock reports.
 pub fn run(
     generation_id: u32,
-    inbound_rx: std::sync::mpsc::Receiver<SupervisorFrame>,
+    mut inbound_rx: tokio::sync::mpsc::Receiver<SupervisorFrame>,
     outbound_tx: tokio::sync::mpsc::UnboundedSender<RendererFrame>,
     waker: crate::wake::Waker,
 ) -> Result<(), Box<dyn Error>> {
@@ -342,13 +342,13 @@ pub fn run(
         loop {
             let frame = match inbound_rx.try_recv() {
                 Ok(frame) => frame,
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 // `std::process::exit` skips `SessionLockInner::Drop`, whose bare destroy is
                 // `invalid_destroy` after `locked`; skipping the destructor closes the connection
                 // instead, logged as an ordinary lock client death. Dropping `App` would kill it.
                 // Use `is_some()`, not SCTK's dispatch-lagging `is_locked()`: over-reporting a VT
                 // is safer than claiming the shell died behind an inaccessible lock screen.
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     // Flush decided requests before exit: `lock` only enqueues, and the normal
                     // flush is below this drain. Otherwise `session_lock = Some` could outlive an
                     // unsent request. `std::process::exit` skips SCTK's destructor.

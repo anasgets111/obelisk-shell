@@ -95,7 +95,10 @@ impl Slot {
             return None;
         }
         drop(reader);
-        let decoded = ::image::open(&self.path).ok()?.into_rgba8();
+        // Under the same ceiling as any other decode. These files are ours, but they live in a
+        // shared `$XDG_CACHE_HOME` any process of this user can write, so their headers are not
+        // evidence of their size (`image::MAX_DECODE_EDGE`).
+        let decoded = super::decode_within_limits(&self.path).ok()?.into_rgba8();
         let (width, height) = decoded.dimensions();
         Ok::<_, ()>((decoded.into_raw(), width, height)).ok()
     }

@@ -35,6 +35,16 @@ use crate::lua::surfaces::{evaluate_and_specs, surface_specs};
 use crate::lua::{self, Loader};
 use crate::text::shaping::ShapingHandle;
 
+/// `SupervisorFrame`s held for the Wayland thread before the socket reader is parked.
+///
+/// The queue was unbounded, so Supervisor's own bounded outbound simply moved the growth here: a
+/// Renderer slow to drain (a long paint, a blocking decode) accumulated frames in its own heap
+/// instead. Backpressure rather than a drop policy, for the same reason it is backpressure on the
+/// Supervisor side: these carry lock and reload traffic, and a dropped one is a protocol failure
+/// rather than a lost log line. Sized to absorb a full snapshot replay at reconnection without
+/// parking, which is the largest legitimate burst.
+pub const INBOUND_CAPACITY: usize = 1024;
+
 /// This Renderer's generation id (`OBLISK_GENERATION_ID`, default `0`), stamped into the handshake
 /// and every outbound `CommandEnvelope`/`SecureSubmit`.
 pub fn generation_id_from_env() -> u32 {
@@ -56,7 +66,7 @@ async fn connect_and_handshake(
 /// there is no startup race.
 pub fn spawn_client(
     generation_id: u32,
-    inbound_tx: std::sync::mpsc::Sender<SupervisorFrame>,
+    inbound_tx: tokio::sync::mpsc::Sender<SupervisorFrame>,
     outbound_rx: mpsc::UnboundedReceiver<RendererFrame>,
     waker: crate::wake::Waker,
 ) {
@@ -144,6 +154,15 @@ pub struct RendererClient {
     dirty: DirtyFlag,
     state: ReloadState,
     /// `ReevaluateReport` destination; socket-thread [`pump`] drains it to the wire.
+    /// Renderer -> Supervisor frames.
+    ///
+    /// ponytail: unbounded, and deliberately so for now. `send` is called from synchronous Wayland
+    /// dispatch callbacks, which cannot await, so backpressure is not available here; and
+    /// `try_send` dropping a `SecureSubmit` would lose a password mid-unlock rather than delay it.
+    /// The ceiling is therefore a config that produces frames faster than the socket drains.
+    /// Upgrade path: give the callbacks a non-blocking handoff to an async sender that can park,
+    /// so the bound lands on the queue instead of on the callback. Bounding this channel as it
+    /// stands would trade a memory bug for a correctness one.
     outbound_tx: mpsc::UnboundedSender<RendererFrame>,
     /// `oblisk` table for lazy members. Above `loader` for drop order.
     oblisk: mlua::Table,
@@ -600,7 +619,7 @@ fn dump_layout_if_asked(scene: &Scene) {
 
 async fn run(
     generation_id: u32,
-    inbound_tx: std::sync::mpsc::Sender<SupervisorFrame>,
+    inbound_tx: tokio::sync::mpsc::Sender<SupervisorFrame>,
     mut outbound_rx: mpsc::UnboundedReceiver<RendererFrame>,
     waker: crate::wake::Waker,
 ) {
@@ -632,7 +651,7 @@ async fn run(
 async fn pump<R, W>(
     read_half: &mut R,
     write_half: &mut W,
-    inbound_tx: &std::sync::mpsc::Sender<SupervisorFrame>,
+    inbound_tx: &tokio::sync::mpsc::Sender<SupervisorFrame>,
     outbound_rx: &mut mpsc::UnboundedReceiver<RendererFrame>,
     waker: Option<&crate::wake::Waker>,
 ) where
@@ -643,7 +662,11 @@ async fn pump<R, W>(
         loop {
             match framing::read_json_frame::<_, SupervisorFrame>(read_half).await {
                 Ok(frame) => {
-                    if let Err(err) = inbound_tx.send(frame) {
+                    // Awaited, so a Supervisor pushing faster than the Wayland thread drains parks
+                    // this reader rather than growing the queue. `Sender::send` is cancel-safe --
+                    // if the `select!` below drops this future, the frame was not delivered and
+                    // nothing half-arrives -- which is why the backpressure is safe to take here.
+                    if let Err(err) = inbound_tx.send(frame).await {
                         eprintln!("control-socket client: the Wayland thread is gone; stopping the socket loop: {err}");
                         break;
                     }
@@ -663,9 +686,8 @@ async fn pump<R, W>(
             if let Err(err) = write_json_frame(write_half, &frame).await {
                 eprintln!("control-socket client: failed to send a {} frame: {err}", frame_label(&frame));
             }
-            // Scrub immediately after write, not at `Drop` (ADR-0005/ADR-0027).
-            // ponytail: only copies this site controls; `write_json_frame`'s
-            // `serde_json::to_vec` buffer is not scrubbed. Upgrade: non-JSON wire path.
+            // Scrub immediately after write, not at `Drop` (ADR-0005/ADR-0027). The serialized
+            // copy is `write_json_frame`'s to scrub and it does; this is the frame's own bytes.
             if let RendererFrame::SecureSubmit(inner) = &mut frame {
                 inner.secret.zeroize();
             }
@@ -2994,7 +3016,7 @@ mod tests {
         let (mut wire, server) = tokio::io::duplex(4096);
         let (mut server_read, mut server_write) = tokio::io::split(server);
 
-        let (inbound_tx, _inbound_rx) = std::sync::mpsc::channel();
+        let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel(INBOUND_CAPACITY);
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
         outbound_tx.send(frame).unwrap();
 
@@ -3081,7 +3103,7 @@ mod tests {
         write_json_frame(&mut wire, &SupervisorFrame::ActivateDraw(ActivateDraw { nonce: 42 })).await.unwrap();
         wire.shutdown().await.unwrap();
 
-        let (inbound_tx, inbound_rx) = std::sync::mpsc::channel();
+        let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel(INBOUND_CAPACITY);
         let (_outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
 
         pump(&mut server_read, &mut server_write, &inbound_tx, &mut outbound_rx, None).await;
@@ -3111,7 +3133,7 @@ mod tests {
         let (mut wire, server) = tokio::io::duplex(4096);
         let (mut server_read, mut server_write) = tokio::io::split(server);
 
-        let (inbound_tx, inbound_rx) = std::sync::mpsc::channel();
+        let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel(INBOUND_CAPACITY);
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
 
         let inbound_frame = SupervisorFrame::ActivateDraw(ActivateDraw { nonce: 42 });

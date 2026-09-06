@@ -56,7 +56,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(2);
     }
 
-    let (inbound_tx, inbound_rx) = std::sync::mpsc::channel::<shared::SupervisorFrame>();
+    // Bounded, so a Supervisor pushing faster than the Wayland thread can drain cannot grow this
+    // process's heap instead of Supervisor's; see `socket::INBOUND_CAPACITY`.
+    let (inbound_tx, inbound_rx) =
+        tokio::sync::mpsc::channel::<shared::SupervisorFrame>(crate::socket::INBOUND_CAPACITY);
     let (outbound_tx, outbound_rx) = tokio::sync::mpsc::unbounded_channel::<shared::RendererFrame>();
 
     // Read once for both threads: stamp the handshake and every outbound

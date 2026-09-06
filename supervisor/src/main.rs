@@ -229,6 +229,11 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
         &[],
         &[(shared::GENERATION_ID_ENV.to_string(), "0".to_string())],
     )?;
+    // Immediately, and before the child can have finished starting: generation 0 belongs to this
+    // pid, and the listener refuses any other process claiming it (`socket::GenerationRegistry`).
+    if let Some(pid) = boot_child.id() {
+        registry.expect_generation(0, pid);
+    }
 
     let mut supervisor = Supervisor::new(
         registry,
@@ -483,8 +488,8 @@ mod tests {
     #[test]
     fn begin_reload_bumps_the_supervisor_owned_sequence_and_sends_the_reevaluate_carrying_it() {
         let registry = socket::GenerationRegistry::default();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.register(7, tx);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        registry.register(7, tx, std::sync::Arc::new(tokio::sync::Notify::new()));
         let mut next_sequence = 0;
 
         // Watcher file changes and `RequestReload` (ADR-0041 decision 4) share this call, so both

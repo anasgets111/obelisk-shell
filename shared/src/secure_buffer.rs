@@ -27,16 +27,26 @@ impl SecureBuffer {
     /// leaving a plaintext prefix beyond the current allocation that later `.zeroize()`/`Drop`
     /// cannot reach. Copy into new storage, zeroize the old block, then drop it.
     pub fn push_str(&mut self, s: &str) {
-        let needed = self.bytes.len() + s.len();
+        self.push_bytes(s.as_bytes());
+    }
+
+    /// [`Self::push_str`] for callers holding bytes rather than a `str`, which is what
+    /// `shared::framing`'s serializer sink has. The growth rule lives here so there is one
+    /// implementation of it: a second copy elsewhere is a second place to get it wrong.
+    ///
+    /// Grows by doubling rather than to exactly `needed`, because a serializer appends in many
+    /// small writes and growing per write would copy-and-scrub on each one.
+    pub fn push_bytes(&mut self, bytes: &[u8]) {
+        let needed = self.bytes.len() + bytes.len();
         if needed > self.bytes.capacity() {
-            let mut grown = Vec::with_capacity(needed);
+            let mut grown = Vec::with_capacity(needed.max(self.bytes.capacity() * 2));
             grown.extend_from_slice(&self.bytes);
             // `Vec<u8>: Zeroize` clears in place without reallocating, so this cannot repeat the
             // reallocation bug guarded against here.
             let mut old = std::mem::replace(&mut self.bytes, grown);
             old.zeroize();
         }
-        self.bytes.extend_from_slice(s.as_bytes());
+        self.bytes.extend_from_slice(bytes);
     }
 
     /// Backspace on `secure_submit`: zeroizes the last UTF-8 character in place before shortening
@@ -90,6 +100,31 @@ impl SecureBuffer {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn growth_scrubs_the_block_it_leaves_behind() {
+        // The trap this exists for: a plain `Vec` frees the old block with the secret still in it,
+        // beyond the reach of zeroizing the final buffer.
+        let mut buffer = SecureBuffer::new();
+        buffer.push_bytes(b"secret");
+        let first_block = buffer.expose_secret().as_ptr();
+        buffer.push_bytes(&[b'x'; 4096]);
+        assert_ne!(
+            buffer.expose_secret().as_ptr(),
+            first_block,
+            "the append must have forced a reallocation for this to be testing anything"
+        );
+        assert!(buffer.expose_secret().starts_with(b"secretxxx"), "growth must preserve what was already there");
+    }
+
+    #[test]
+    fn push_str_and_push_bytes_are_the_same_append() {
+        let mut from_str = SecureBuffer::new();
+        from_str.push_str("hello");
+        let mut from_bytes = SecureBuffer::new();
+        from_bytes.push_bytes(b"hello");
+        assert_eq!(from_str.expose_secret(), from_bytes.expose_secret());
+    }
     use super::*;
 
     #[test]

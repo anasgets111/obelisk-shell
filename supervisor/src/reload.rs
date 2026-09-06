@@ -29,6 +29,13 @@ pub trait CandidateLink {
     /// Control-link failure.
     type Error: std::fmt::Debug;
 
+    /// § 14.2 step 1: names the pid the just-spawned Candidate will connect from, so the listener
+    /// can refuse anyone else claiming its generation id (`socket::GenerationRegistry`). Called
+    /// before the Candidate can have connected. `None` releases the binding instead, for a
+    /// Candidate that is about to be aborted or whose pid could not be read; either way the id is
+    /// left unclaimable rather than open.
+    fn expect_candidate_pid(&mut self, pid: Option<u32>);
+
     /// § 14.2 step 2: push every cached capability snapshot so Candidate hydration needs no system
     /// query (ADR-0029).
     async fn push_state_snapshot(&mut self, snapshots: &[shared::StateSnapshot]) -> Result<(), Self::Error>;
@@ -185,10 +192,16 @@ pub async fn run_pba<L: CandidateLink>(
 ) -> Result<PbaOutcome, PbaFailure<L::Error>> {
     let mut candidate =
         process::spawn_group_leader(candidate_cmd, candidate_args, candidate_envs).map_err(PbaFailure::SpawnFailed)?;
+    // Before step 2 pushes it anything: the Candidate's generation id is bound to this pid.
+    link.expect_candidate_pid(candidate.id());
 
     match drive_handshake(link, snapshots, nonce, timings.ready_timeout, timings.evidence_timeout).await {
         Ok(promoted_surfaces) => Ok(PbaOutcome { candidate, promoted_surfaces }),
-        Err(failure) => Err(abort_candidate(&mut candidate, timings.reap_grace, failure).await),
+        Err(failure) => {
+            // About to be reaped, so release the id it was holding.
+            link.expect_candidate_pid(None);
+            Err(abort_candidate(&mut candidate, timings.reap_grace, failure).await)
+        }
     }
 }
 
@@ -250,6 +263,9 @@ pub(crate) async fn swap_and_reap(
             eprintln!("failed to reap superseded generation {}: {err}", authoritative.generation_id);
         }
     }
+    // Reaped, so its id must stop being claimable before the kernel hands that pid to something
+    // else (`socket::GenerationRegistry`).
+    registry.forget_generation(authoritative.generation_id);
     *authoritative = Authoritative { generation_id: candidate_generation_id, child: outcome.candidate };
 }
 
@@ -447,6 +463,11 @@ mod tests {
     impl CandidateLink for FakeCandidateLink {
         type Error = FakeLinkError;
 
+        fn expect_candidate_pid(&mut self, _pid: Option<u32>) {
+            // No registry behind this link; the recorded call order is what these tests assert on.
+            self.record("expect_candidate_pid");
+        }
+
         async fn push_state_snapshot(&mut self, _snapshots: &[shared::StateSnapshot]) -> Result<(), Self::Error> {
             self.record("push_state_snapshot");
             self.run_step(&self.hydration).await
@@ -501,8 +522,15 @@ mod tests {
         assert_eq!(outcome.promoted_surfaces, vec!["main_bar".to_string()]);
         assert_eq!(
             *link.calls.lock().unwrap(),
-            vec!["push_state_snapshot", "recv_ready_signal", "send_activate_draw", "recv_presentation_evidence"],
-            "the handshake must run in § 15.2-15.3's order"
+            vec![
+                "expect_candidate_pid",
+                "push_state_snapshot",
+                "recv_ready_signal",
+                "send_activate_draw",
+                "recv_presentation_evidence"
+            ],
+            "the handshake must run in § 15.2-15.3's order, and the Candidate's generation id must be bound to its \
+             pid before step 2 pushes it anything"
         );
 
         // Clean up the newly-promoted candidate rather than leaking the sleep.

@@ -41,7 +41,7 @@ pub struct SocketCandidateLink<'a> {
     pub registry: GenerationRegistry,
     pub candidate_generation_id: u32,
     /// Borrowed for one in-flight handshake; see the module comment.
-    pub inbound: &'a mut mpsc::UnboundedReceiver<InboundFrame>,
+    pub inbound: &'a mut mpsc::Receiver<InboundFrame>,
 }
 
 impl SocketCandidateLink<'_> {
@@ -80,6 +80,13 @@ const CONNECTION_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
 impl CandidateLink for SocketCandidateLink<'_> {
     type Error = SocketLinkError;
+
+    fn expect_candidate_pid(&mut self, pid: Option<u32>) {
+        match pid {
+            Some(pid) => self.registry.expect_generation(self.candidate_generation_id, pid),
+            None => self.registry.forget_generation(self.candidate_generation_id),
+        }
+    }
 
     /// Retries `NoConnection`: the just-spawned Candidate needs real process/Wayland/EGL/Lua
     /// startup and socket-connect time. The loop is unbounded alone but `drive_handshake` wraps it
@@ -154,17 +161,17 @@ mod tests {
     }
 
     /// Registry with a fake connection and receiver for asserting `send_frame` output.
-    fn registry_with_connection(generation_id: u32) -> (GenerationRegistry, mpsc::UnboundedReceiver<Vec<u8>>) {
+    fn registry_with_connection(generation_id: u32) -> (GenerationRegistry, mpsc::Receiver<Vec<u8>>) {
         let registry = GenerationRegistry::default();
-        let (tx, rx) = mpsc::unbounded_channel();
-        registry.register(generation_id, tx);
+        let (tx, rx) = mpsc::channel(16);
+        registry.register(generation_id, tx, std::sync::Arc::new(tokio::sync::Notify::new()));
         (registry, rx)
     }
 
     #[tokio::test]
     async fn push_state_snapshot_sends_a_state_snapshot_frame_to_the_candidate_generation() {
         let (registry, mut rx) = registry_with_connection(9);
-        let (_inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        let (_inbound_tx, mut inbound_rx) = mpsc::channel(16);
         let mut link = SocketCandidateLink { registry, candidate_generation_id: 9, inbound: &mut inbound_rx };
 
         link.push_state_snapshot(&[snapshot()]).await.expect("send must succeed");
@@ -179,15 +186,15 @@ mod tests {
     #[tokio::test]
     async fn push_state_snapshot_retries_until_the_candidate_connection_registers() {
         let registry = GenerationRegistry::default();
-        let (_inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        let (_inbound_tx, mut inbound_rx) = mpsc::channel(16);
         let mut link =
             SocketCandidateLink { registry: registry.clone(), candidate_generation_id: 9, inbound: &mut inbound_rx };
 
         let late_registry = registry.clone();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(16);
         tokio::spawn(async move {
             tokio::time::sleep(CONNECTION_RETRY_INTERVAL * 3).await;
-            late_registry.register(9, tx);
+            late_registry.register(9, tx, std::sync::Arc::new(tokio::sync::Notify::new()));
         });
 
         tokio::time::timeout(Duration::from_secs(2), link.push_state_snapshot(&[snapshot()]))
@@ -203,7 +210,7 @@ mod tests {
     #[tokio::test]
     async fn send_activate_draw_sends_an_activate_draw_frame_with_the_given_nonce() {
         let (registry, mut rx) = registry_with_connection(9);
-        let (_inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        let (_inbound_tx, mut inbound_rx) = mpsc::channel(16);
         let mut link = SocketCandidateLink { registry, candidate_generation_id: 9, inbound: &mut inbound_rx };
 
         link.send_activate_draw(42).await.expect("send must succeed");
@@ -216,7 +223,7 @@ mod tests {
     #[tokio::test]
     async fn recv_ready_signal_returns_the_surfaces_from_the_matching_generation() {
         let (registry, _rx) = registry_with_connection(9);
-        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(16);
         let mut link = SocketCandidateLink { registry, candidate_generation_id: 9, inbound: &mut inbound_rx };
 
         inbound_tx
@@ -224,6 +231,7 @@ mod tests {
                 generation_id: 9,
                 frame: RendererFrame::ReadySignal(ReadySignal { surfaces: vec!["main_bar".to_string()] }),
             })
+            .await
             .unwrap();
 
         let surfaces = link.recv_ready_signal().await.expect("ready signal must resolve");
@@ -233,7 +241,7 @@ mod tests {
     #[tokio::test]
     async fn recv_ready_signal_skips_an_irrelevant_frame_arriving_before_the_relevant_one() {
         let (registry, _rx) = registry_with_connection(9);
-        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(16);
         let mut link = SocketCandidateLink { registry, candidate_generation_id: 9, inbound: &mut inbound_rx };
 
         // Wrong generation, still authoritative, reporting something unrelated.
@@ -242,14 +250,16 @@ mod tests {
                 generation_id: 0,
                 frame: RendererFrame::ReevaluateReport(shared::ReevaluateReport::Unchanged { sequence: 1 }),
             })
+            .await
             .unwrap();
         // Right generation, wrong frame type.
-        inbound_tx.send(InboundFrame { generation_id: 9, frame: command_frame() }).unwrap();
+        inbound_tx.send(InboundFrame { generation_id: 9, frame: command_frame() }).await.unwrap();
         inbound_tx
             .send(InboundFrame {
                 generation_id: 9,
                 frame: RendererFrame::ReadySignal(ReadySignal { surfaces: vec!["overlay_canvas".to_string()] }),
             })
+            .await
             .unwrap();
 
         let surfaces =
@@ -260,7 +270,7 @@ mod tests {
     #[tokio::test]
     async fn recv_presentation_evidence_skips_a_mismatched_nonce_then_matches() {
         let (registry, _rx) = registry_with_connection(9);
-        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(16);
         let mut link = SocketCandidateLink { registry, candidate_generation_id: 9, inbound: &mut inbound_rx };
 
         inbound_tx
@@ -271,6 +281,7 @@ mod tests {
                     surface_id: "stale".to_string(),
                 }),
             })
+            .await
             .unwrap();
         inbound_tx
             .send(InboundFrame {
@@ -280,6 +291,7 @@ mod tests {
                     surface_id: "main_bar".to_string(),
                 }),
             })
+            .await
             .unwrap();
 
         let surface_id = link.recv_presentation_evidence(2).await.expect("evidence for nonce 2 must resolve");
@@ -289,7 +301,7 @@ mod tests {
     #[tokio::test]
     async fn recv_ready_signal_reports_connection_closed_when_the_channel_ends() {
         let (registry, _rx) = registry_with_connection(9);
-        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(16);
         drop(inbound_tx);
         let mut link = SocketCandidateLink { registry, candidate_generation_id: 9, inbound: &mut inbound_rx };
 

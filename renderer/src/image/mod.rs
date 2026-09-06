@@ -22,9 +22,9 @@ pub mod icons;
 pub mod thumbnails;
 
 use crate::layout::node::Rgba;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 
 use femtovg::renderer::OpenGl;
@@ -47,6 +47,40 @@ const TEXTURE_BUDGET: usize = 16 << 20;
 /// Decode workers: machine parallelism capped so forty wallpapers arriving together do not take
 /// every compositor core.
 const MAX_DECODE_WORKERS: usize = 4;
+
+/// Background decodes in flight at once, counted until their pixels are *consumed*.
+///
+/// Bounding the job channel alone does not bound the pipeline: a worker frees its queue slot the
+/// moment it dequeues, so more jobs enqueue while finished results pile up in the result channel
+/// waiting for [`ImageCache::poll`]. Queued, decoding and decoded-but-unconsumed all have to be
+/// one number, which is what the pool's `wanted` set already counts -- a key joins it at enqueue
+/// and leaves when `poll` takes its result or the entry is evicted.
+///
+/// Past this the request is refused without recording a slot, so the next paint asks again: one
+/// retry per frame is its own backoff, and unlike `Slot::Failed` it does not remember a busy
+/// moment as a permanently broken file.
+const MAX_INFLIGHT_DECODES: usize = 64;
+
+/// Longest edge a raster source may declare before it is refused unread.
+///
+/// `image::open` decodes the whole file before anything downscales it, so a thumbnail-sized
+/// request still paid for the full surface: one 8000x6000 photo is roughly 192 MB of RGBA. The
+/// limit is checked from the header, before the pixels are read. 8192 is twice a 4K display's
+/// width, which is past anything this shell has to show.
+const MAX_DECODE_EDGE: u32 = 8_192;
+
+/// Bytes one decode may allocate.
+///
+/// Sized so the *pool* stays within reach of ADR-0043's budget rather than one decoder: this times
+/// [`MAX_DECODE_WORKERS`] is the real ceiling, and at 64 MiB that is 256 MiB of transient decode
+/// against a 50 MiB steady state. A per-decoder figure that ignored the multiplier is how the
+/// crate's own 512 MiB default reads, and it is a courtesy rather than a budget.
+const MAX_DECODE_ALLOC_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Bytes an SVG source may occupy before it is refused unparsed. `usvg` parses the whole document
+/// into a tree with no ceiling of its own, and an icon that is not a few hundred kilobytes is not
+/// an icon.
+const MAX_SVG_BYTES: u64 = 8 * 1024 * 1024;
 
 /// One cache slot. `box_px` is the physical-pixel target: SVGs use their longest edge; rasters
 /// downscale to cover it (see the module docs).
@@ -154,15 +188,20 @@ struct Job {
 /// Shared decode queue and result channel, at most `MAX_DECODE_WORKERS` threads. Spawned with the
 /// cache before Lua reads anything, so a failed spawn is a startup failure, not a later blank tile.
 struct Pool {
-    jobs: Sender<Job>,
+    jobs: SyncSender<Job>,
     results: Receiver<(CacheKey, Result<Decoded, String>)>,
+    /// Keys whose decode is still wanted. A worker checks this before spending anything on a job,
+    /// so closing the picker stops the queued tiles rather than decoding all of them into slots
+    /// that were evicted while they waited.
+    wanted: Arc<Mutex<HashSet<CacheKey>>>,
 }
 
 impl Pool {
     fn spawn(waker: Option<crate::wake::Waker>) -> Self {
-        let (jobs, job_rx) = std::sync::mpsc::channel::<Job>();
+        let (jobs, job_rx) = std::sync::mpsc::sync_channel::<Job>(MAX_INFLIGHT_DECODES);
         let job_rx = Arc::new(Mutex::new(job_rx));
         let (result_tx, results) = std::sync::mpsc::channel();
+        let wanted: Arc<Mutex<HashSet<CacheKey>>> = Arc::new(Mutex::new(HashSet::new()));
         let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, MAX_DECODE_WORKERS);
         let cache_root = thumbnails::cache_dir();
         for index in 0..workers {
@@ -170,6 +209,7 @@ impl Pool {
             let result_tx = result_tx.clone();
             let cache_root = cache_root.clone();
             let waker = waker.clone();
+            let wanted = Arc::clone(&wanted);
             std::thread::Builder::new()
                 .name(format!("oblisk-image-decode-{index}"))
                 .spawn(move || {
@@ -180,6 +220,12 @@ impl Pool {
                             Err(_) => return,
                         };
                         let Ok(job) = job else { return };
+                        // Nobody is waiting for this any more: the entry was evicted, or the
+                        // surface that asked went away. Decoding it would cost a full raster and
+                        // land in a slot that `upload_landed` then skips.
+                        if !wanted.lock().is_ok_and(|wanted| wanted.contains(&job.key)) {
+                            continue;
+                        }
                         let result = decode(&job.key.path, job.key.box_px, job.tint, cache_root.as_deref());
                         if result_tx.send((job.key, result)).is_err() {
                             return;
@@ -192,7 +238,7 @@ impl Pool {
                 })
                 .expect("failed to spawn an oblisk-image-decode thread");
         }
-        Pool { jobs, results }
+        Pool { jobs, results, wanted }
     }
 }
 
@@ -276,6 +322,13 @@ impl ImageCache {
         loop {
             match self.pool.results.try_recv() {
                 Ok(result) => {
+                    // A decode that finished just as its entry was evicted has nowhere to go.
+                    // `upload_landed` would skip it anyway; dropping it here also keeps its path
+                    // out of the repaint cue, which would otherwise redraw for nothing.
+                    self.unwant(&result.0);
+                    if !matches!(self.entries.get(&result.0).map(|entry| &entry.slot), Some(Slot::Pending)) {
+                        continue;
+                    }
                     files.push(result.0.path.clone());
                     self.landed.push(result);
                 }
@@ -370,14 +423,47 @@ impl ImageCache {
                 id
             }
             Load::Background => {
-                if self.pool.jobs.send(Job { key: key.clone(), tint }).is_err() {
-                    eprintln!("[oblisk-renderer] image: {}: no decode worker left to take it", key.path.display());
-                    self.insert(key, Slot::Failed);
-                    return None;
+                // One gate for the whole pipeline, not just the queue: see `MAX_INFLIGHT_DECODES`.
+                // Marked before the send, because a worker that takes the job immediately must
+                // find it in the set.
+                match self.pool.wanted.lock() {
+                    Ok(mut wanted) if wanted.len() < MAX_INFLIGHT_DECODES => {
+                        wanted.insert(key.clone());
+                    }
+                    // At the ceiling, or the set is poisoned and cannot be reasoned about. Record
+                    // no slot, so the next paint asks again.
+                    _ => return None,
                 }
-                self.insert(key, Slot::Pending);
+                match self.pool.jobs.try_send(Job { key: key.clone(), tint }) {
+                    Ok(()) => {
+                        self.insert(key, Slot::Pending);
+                    }
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                        // The set has room but the channel does not, which the workers will clear.
+                        self.unwant(&key);
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        eprintln!("[oblisk-renderer] image: {}: no decode worker left to take it", key.path.display());
+                        self.unwant(&key);
+                        self.insert(key, Slot::Failed);
+                    }
+                }
                 None
             }
+        }
+    }
+
+    /// Drops `key` from the pool's wanted set, so a queued job for it is skipped rather than
+    /// decoded. A poisoned lock is ignored: the worst case is one wasted decode.
+    ///
+    /// ponytail: eviction is the only thing that cancels today, so hiding a surface leaves its
+    /// tiles decoding until the budget or the capacity evicts them. Bounded waste, not unbounded:
+    /// [`MAX_INFLIGHT_DECODES`] caps how much can be in flight at all. Upgrade path: cancel
+    /// against the pin set `wayland::App` already computes after paint, which names exactly the
+    /// path/box pairs a mapped surface still shows.
+    fn unwant(&self, key: &CacheKey) {
+        if let Ok(mut wanted) = self.pool.wanted.lock() {
+            wanted.remove(key);
         }
     }
 
@@ -402,9 +488,15 @@ impl ImageCache {
     /// bytes. Scanning `order` is the [`CACHE_CAPACITY`]-bounded eviction cost, paid off-frame.
     fn evict(&mut self, key: &CacheKey) {
         if let Some(entry) = self.entries.remove(key) {
-            if let Slot::Ready(id, bytes) = entry.slot {
-                self.evicted.push(id);
-                self.resident_bytes -= bytes;
+            match &entry.slot {
+                Slot::Ready(id, bytes) => {
+                    self.evicted.push(*id);
+                    self.resident_bytes -= *bytes;
+                }
+                // Its decode is still queued or running; stop it being spent on a slot that has
+                // just gone away.
+                Slot::Pending => self.unwant(key),
+                Slot::Failed => {}
             }
             if let Some(at) = self.order.iter().position(|k| k == key) {
                 self.order.remove(at);
@@ -523,7 +615,7 @@ fn decode_raster(path: &Path, box_px: (u32, u32), thumbnails: Option<&Path>) -> 
         let (width, height) = scaled.dimensions();
         return Ok((scaled.into_raw(), width, height));
     }
-    let decoded = ::image::open(path).map_err(|err| err.to_string())?;
+    let decoded = decode_within_limits(path)?;
     let (width, height) = (decoded.width(), decoded.height());
     if let Some(slot) = &slot
         && width.max(height) > slot.px
@@ -549,8 +641,43 @@ fn decode_raster(path: &Path, box_px: (u32, u32), thumbnails: Option<&Path>) -> 
 /// ponytail: `resvg` has no default features, so SVG text and gzipped `.svgz` are unsupported. An
 /// absolute `.svgz` path logs once and draws blank. Upgrade: `resvg/svgz` and `resvg/text`; `text`
 /// adds a second `fontdb` that could disagree with `text::shaping`'s declared font chain.
+/// Reads at most `cap` bytes, or `None` if the file has more than that.
+///
+/// Reads `cap + 1` so "exactly at the limit" and "over it" are distinguishable, and never
+/// allocates more than that however large the file turns out to be.
+fn read_capped(path: &Path, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut data = Vec::new();
+    std::fs::File::open(path)?.take(cap + 1).read_to_end(&mut data)?;
+    Ok((data.len() as u64 <= cap).then_some(data))
+}
+
+/// Decodes one raster file under [`MAX_DECODE_EDGE`] and [`MAX_DECODE_ALLOC_BYTES`].
+///
+/// `image::open` reads the header and then the whole surface, so the size the caller wanted never
+/// entered into it: a thumbnail request for a 8000x6000 photo still allocated ~192 MB, and
+/// [`MAX_DECODE_WORKERS`] of those at once is most of a gigabyte. `ImageReader` applies the limits
+/// during decoding, so an oversized source is refused rather than allocated for.
+pub(super) fn decode_within_limits(path: &Path) -> Result<::image::DynamicImage, String> {
+    let mut reader = ::image::ImageReader::open(path)
+        .map_err(|err| err.to_string())?
+        .with_guessed_format()
+        .map_err(|err| err.to_string())?;
+    let mut limits = ::image::Limits::no_limits();
+    limits.max_image_width = Some(MAX_DECODE_EDGE);
+    limits.max_image_height = Some(MAX_DECODE_EDGE);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
+    reader.limits(limits);
+    reader.decode().map_err(|err| err.to_string())
+}
+
 fn rasterize_svg(path: &Path, box_px: u32, tint: Option<Rgba>) -> Result<(Vec<u8>, u32, u32), String> {
-    let data = std::fs::read(path).map_err(|err| err.to_string())?;
+    // Read through a limited reader rather than checking `metadata` and then reading: the file can
+    // grow between the two, and the read is what allocates. `usvg` parses whatever it is handed
+    // into a tree with no ceiling of its own (see `MAX_SVG_BYTES`).
+    let data = read_capped(path, MAX_SVG_BYTES)
+        .map_err(|err| format!("{}: {err}", path.display()))?
+        .ok_or_else(|| format!("svg is over the {MAX_SVG_BYTES}-byte limit and was not parsed"))?;
     let data = match tint {
         Some(tint) => tinted_svg(&data, tint),
         None => data,
@@ -918,6 +1045,74 @@ mod tests {
     }
 
     #[test]
+    fn a_source_wider_than_the_decode_limit_is_refused_rather_than_allocated_for() {
+        // The point of the limit: a thumbnail-sized request used to pay for the whole surface
+        // first, four workers at a time. One pixel tall keeps this test cheap while still being
+        // genuinely over the edge limit, which is what the decoder checks.
+        let dir = tempfile::tempdir().unwrap();
+        let wide = dir.path().join("wide.png");
+        ::image::RgbaImage::from_pixel(MAX_DECODE_EDGE + 1, 1, ::image::Rgba([1, 2, 3, 255])).save(&wide).unwrap();
+        assert!(decode_within_limits(&wide).is_err(), "a source past MAX_DECODE_EDGE must not be decoded");
+
+        let ordinary = dir.path().join("ordinary.png");
+        ::image::RgbaImage::from_pixel(4, 4, ::image::Rgba([1, 2, 3, 255])).save(&ordinary).unwrap();
+        assert!(decode_within_limits(&ordinary).is_ok(), "an ordinary file must still decode");
+    }
+
+    #[test]
+    fn an_oversized_svg_is_refused_before_it_is_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let bloated = dir.path().join("huge.svg");
+        // One byte over, so the refusal is the size check and not a parse failure.
+        std::fs::write(&bloated, vec![b' '; MAX_SVG_BYTES as usize + 1]).unwrap();
+        let err = rasterize_svg(&bloated, 24, None).expect_err("an oversized svg must be refused");
+        assert!(err.contains("over the"), "the refusal should say why: {err}");
+    }
+
+    #[test]
+    fn the_inflight_gate_counts_decodes_until_their_results_are_consumed() {
+        // The hole a queue-depth bound leaves: a worker frees its slot the moment it dequeues, so
+        // more jobs enqueue while finished results wait for `poll`. The `wanted` set is the count
+        // that spans queued, decoding and decoded-but-unconsumed.
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("fixture.png");
+        std::fs::write(&png, PIL_2X2_RGBA_PNG).unwrap();
+        let cache = ImageCache::new();
+        let key = |n: u32| CacheKey { path: png.clone(), box_px: (n, n), version: FileVersion::read(&png), tint: None };
+        {
+            let mut wanted = cache.pool.wanted.lock().unwrap();
+            for n in 0..MAX_INFLIGHT_DECODES as u32 {
+                wanted.insert(key(n + 1));
+            }
+            assert_eq!(wanted.len(), MAX_INFLIGHT_DECODES, "the pipeline is now full");
+        }
+        // At the ceiling nothing new may join, however much room the channel has.
+        assert!(
+            cache.pool.wanted.lock().unwrap().len() >= MAX_INFLIGHT_DECODES,
+            "a request arriving here must be refused rather than queued"
+        );
+        // Consuming one frees exactly one.
+        cache.unwant(&key(1));
+        assert_eq!(cache.pool.wanted.lock().unwrap().len(), MAX_INFLIGHT_DECODES - 1);
+    }
+
+    #[test]
+    fn evicting_a_pending_entry_stops_its_queued_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("fixture.png");
+        std::fs::write(&png, PIL_2X2_RGBA_PNG).unwrap();
+        let mut cache = ImageCache::new();
+        let key = CacheKey { path: png.clone(), box_px: (8, 8), version: FileVersion::read(&png), tint: None };
+        cache.insert(key.clone(), Slot::Pending);
+        cache.pool.wanted.lock().unwrap().insert(key.clone());
+        cache.evict(&key);
+        assert!(
+            !cache.pool.wanted.lock().unwrap().contains(&key),
+            "a worker must be able to see that this decode is no longer wanted"
+        );
+    }
+
+    #[test]
     fn a_large_png_decodes_to_its_box_and_a_small_one_to_itself() {
         let dir = tempfile::tempdir().unwrap();
         let big = dir.path().join("big.png");
@@ -964,6 +1159,9 @@ mod tests {
         let mut cache = ImageCache::new();
         let key = CacheKey { path: png.clone(), box_px: (8, 8), version: FileVersion::read(&png), tint: None };
         cache.insert(key.clone(), Slot::Pending);
+        // A worker skips a job nobody wants, so this stands in for what `image` records when it
+        // queues one.
+        cache.pool.wanted.lock().unwrap().insert(key.clone());
         cache.pool.jobs.send(Job { key: key.clone(), tint: None }).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut files = cache.poll();

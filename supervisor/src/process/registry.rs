@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::io;
 
 use shared::{ProcessExited, ProcessOutputLine, ProcessStream, SupervisorFrame};
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::process::{Child, ChildStderr, ChildStdout};
 
 use crate::send_frame_logged;
@@ -109,6 +109,109 @@ pub(crate) fn spawn_and_register_process(
     }
 }
 
+/// The most bytes one child output line contributes to a `ProcessOutput` frame.
+///
+/// `tokio::io::Lines` grows one `String` until it meets a newline, and a child that never writes
+/// one -- `yes | tr -d '\n'` is the whole recipe -- grows it without limit. That growth happens
+/// inside Supervisor, before framing's `MAX_FRAME_LEN` ever sees a frame to reject, so the frame
+/// limit does not bound it. Past this the line is delivered cut, its tail is dropped, and the next
+/// line starts clean: a diagnostic stream is worth truncating, never worth an OOM.
+const MAX_LINE_BYTES: u64 = 64 * 1024;
+
+/// `tokio::io::Lines` with a ceiling.
+///
+/// Each read is bounded by a fresh `take`, so `read_until` stops at the newline or the remaining
+/// room, whichever comes first. `next_line` keeps `Lines`'s contract: `Ok(None)` only at EOF, and a
+/// final unterminated line is still delivered.
+///
+/// **The partial line lives on `self`, not in `next_line`'s frame, and that is load-bearing.**
+/// `read_until` is not cancellation safe -- it can consume bytes from the reader and then be
+/// dropped when the other arm of the `select!` below wins. Those bytes are already gone from the
+/// stream, so a buffer local to the call would lose them and silently corrupt the line. Holding it
+/// here means a cancelled call resumes into the same buffer on the next one, which is what makes
+/// this usable in a `select!` at all.
+///
+/// Unlike `Lines` this decodes lossily rather than failing the stream on invalid UTF-8. A child
+/// that wrote one stray byte used to end its own output reporting; a replacement character is the
+/// better answer for a diagnostic feed.
+struct BoundedLines<R> {
+    reader: tokio::io::BufReader<R>,
+    /// The line being accumulated, never longer than [`MAX_LINE_BYTES`]. See the type docs: this
+    /// is here so a cancelled `next_line` loses nothing.
+    line: Vec<u8>,
+    /// Names the stream in the one truncation warning it may log.
+    label: String,
+    /// Whether that warning has been logged, so a runaway child says it once, not once per line.
+    warned: bool,
+    /// Set while the tail of an over-long line is being dropped. On `self` for the same reason
+    /// `line` is: a cancelled discard must resume discarding, not start emitting the tail it was
+    /// halfway through throwing away.
+    discarding: bool,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> BoundedLines<R> {
+    fn new(inner: R, label: String) -> Self {
+        Self { reader: tokio::io::BufReader::new(inner), line: Vec::new(), label, warned: false, discarding: false }
+    }
+
+    /// The next line, truncated to [`MAX_LINE_BYTES`], or `Ok(None)` at EOF.
+    async fn next_line(&mut self) -> io::Result<Option<String>> {
+        loop {
+            // One discard-and-return path, reached both when this call fills the line and when a
+            // previous call was cancelled midway through discarding. Two separate discards here
+            // would run a second one after the resumed one finished, eating the *next* line.
+            if self.discarding {
+                self.discard_to_newline().await?;
+                return Ok(Some(self.take_line()));
+            }
+            if self.line.len() as u64 == MAX_LINE_BYTES {
+                // Full without a newline: keep the head, drop the rest on the next turn.
+                self.discarding = true;
+                continue;
+            }
+            let room = MAX_LINE_BYTES - self.line.len() as u64;
+            let read = (&mut self.reader).take(room).read_until(b'\n', &mut self.line).await?;
+            if read == 0 {
+                // EOF. A child that exits without a trailing newline still wrote a line.
+                return Ok((!self.line.is_empty()).then(|| self.take_line()));
+            }
+            if self.line.last() == Some(&b'\n') {
+                self.line.pop();
+                return Ok(Some(self.take_line()));
+            }
+            // Read stopped at the `take` limit rather than a newline, so go round: either there is
+            // still room, or the branch above truncates.
+        }
+    }
+
+    /// Takes the accumulated bytes, leaving the buffer ready for the next line.
+    fn take_line(&mut self) -> String {
+        String::from_utf8_lossy(&std::mem::take(&mut self.line)).into_owned()
+    }
+
+    /// Reads and drops the rest of an over-long line, so the next one starts clean.
+    async fn discard_to_newline(&mut self) -> io::Result<()> {
+        self.discarding = true;
+        if !self.warned {
+            self.warned = true;
+            eprintln!(
+                "{}: a line exceeded {MAX_LINE_BYTES} bytes and was truncated; further truncations \
+                 on this stream are not reported",
+                self.label
+            );
+        }
+        let mut dropped = Vec::new();
+        loop {
+            dropped.clear();
+            let read = (&mut self.reader).take(MAX_LINE_BYTES).read_until(b'\n', &mut dropped).await?;
+            if read == 0 || dropped.last() == Some(&b'\n') {
+                self.discarding = false;
+                return Ok(());
+            }
+        }
+    }
+}
+
 /// Reads stdout/stderr concurrently by line, forwarding `SupervisorFrame::ProcessOutput` through
 /// `registry`. After both EOFs, reports `(generation_id, id)` on `process_done_tx`; it does not own
 /// the `Child`, so it cannot `wait()` for the exit code.
@@ -119,8 +222,8 @@ pub(crate) async fn stream_process_output(
     stdout: ChildStdout,
     stderr: ChildStderr,
 ) {
-    let mut stdout_lines = tokio::io::BufReader::new(stdout).lines();
-    let mut stderr_lines = tokio::io::BufReader::new(stderr).lines();
+    let mut stdout_lines = BoundedLines::new(stdout, format!("process {id} (generation {generation_id}) stdout"));
+    let mut stderr_lines = BoundedLines::new(stderr, format!("process {id} (generation {generation_id}) stderr"));
     let mut stdout_done = false;
     let mut stderr_done = false;
 
@@ -250,6 +353,117 @@ mod tests {
 
     use super::*;
 
+    /// Drains a `BoundedLines` over an in-memory reader, so the cap is exercised without a child.
+    async fn lines_of(input: &[u8]) -> Vec<String> {
+        let mut reader = BoundedLines::new(input, "test".to_string());
+        let mut out = Vec::new();
+        while let Some(line) = reader.next_line().await.expect("reading a slice cannot fail") {
+            out.push(line);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn ordinary_lines_come_back_split_and_without_their_newlines() {
+        assert_eq!(lines_of(b"one\ntwo\nthree\n").await, vec!["one", "two", "three"]);
+    }
+
+    #[tokio::test]
+    async fn a_final_line_without_a_newline_is_still_delivered() {
+        assert_eq!(lines_of(b"first\nno trailing newline").await, vec!["first", "no trailing newline"]);
+    }
+
+    #[tokio::test]
+    async fn a_child_that_never_writes_a_newline_is_cut_at_the_cap_not_buffered_forever() {
+        // The failure this bounds: `Lines` would hold all of it in one `String`, inside Supervisor,
+        // where framing's frame limit never sees it.
+        let flood = vec![b'x'; MAX_LINE_BYTES as usize * 3];
+        let lines = lines_of(&flood).await;
+        assert_eq!(lines.len(), 1, "one unterminated line, however long, is one line");
+        assert_eq!(lines[0].len(), MAX_LINE_BYTES as usize);
+    }
+
+    #[tokio::test]
+    async fn the_line_after_an_over_long_one_starts_clean() {
+        let mut input = vec![b'x'; MAX_LINE_BYTES as usize + 500];
+        input.extend_from_slice(b"\nshort\n");
+        let lines = lines_of(&input).await;
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].len(), MAX_LINE_BYTES as usize, "the head is kept and the tail dropped");
+        assert_eq!(lines[1], "short", "the dropped tail must not bleed into the next line");
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_is_replaced_rather_than_ending_the_stream() {
+        // `tokio::io::Lines` returns `InvalidData` here, which stopped a child reporting anything
+        // further over one stray byte.
+        let lines = lines_of(b"ok\n\xff\nafter\n").await;
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "ok");
+        assert_eq!(lines[2], "after");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_read_keeps_the_bytes_it_had_already_taken() {
+        // `read_until` is not cancellation safe: it can consume from the reader and then be
+        // dropped when the other arm of `stream_process_output`'s `select!` wins. The partial line
+        // lives on `self` so the next call resumes into it; a buffer local to the call would drop
+        // these bytes and splice the line back together wrong.
+        let (mut client, server) = tokio::io::duplex(64);
+        let mut reader = BoundedLines::new(server, "test".to_string());
+
+        tokio::io::AsyncWriteExt::write_all(&mut client, b"partial").await.unwrap();
+        // No newline yet, so this cannot complete; dropping the future is the cancellation.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), reader.next_line()).await.is_err(),
+            "the line is unterminated, so the read must still be pending when it is cancelled"
+        );
+
+        tokio::io::AsyncWriteExt::write_all(&mut client, b" rest\n").await.unwrap();
+        let line = reader.next_line().await.unwrap();
+        assert_eq!(line, Some("partial rest".to_string()), "the cancelled read must not have eaten `partial`");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_discard_resumes_and_does_not_eat_the_next_line() {
+        // The bug this pins: resuming a cancelled discard and then discarding a *second* time,
+        // which throws away the line after the over-long one.
+        let (mut client, server) = tokio::io::duplex(1024);
+        let mut reader = BoundedLines::new(server, "test".to_string());
+
+        let writer = tokio::spawn(async move {
+            let over_long = vec![b'x'; MAX_LINE_BYTES as usize + 64];
+            tokio::io::AsyncWriteExt::write_all(&mut client, &over_long).await.unwrap();
+            // Held back so the reader is parked mid-discard when it is cancelled below.
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            tokio::io::AsyncWriteExt::write_all(&mut client, b"\nkeep me\n").await.unwrap();
+            client
+        });
+
+        // Cancelled while discarding the tail of the over-long line.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(40), reader.next_line()).await.is_err(),
+            "the discard cannot finish yet, so this call must be cancelled mid-discard"
+        );
+
+        let _client = writer.await.unwrap();
+        assert_eq!(
+            reader.next_line().await.unwrap().map(|line| line.len()),
+            Some(MAX_LINE_BYTES as usize),
+            "the resumed call owes the truncated head"
+        );
+        assert_eq!(
+            reader.next_line().await.unwrap(),
+            Some("keep me".to_string()),
+            "the line after the over-long one must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_output_is_no_lines_at_all() {
+        assert!(lines_of(b"").await.is_empty());
+    }
+
     #[test]
     fn process_run_args_parses_cmd_and_args_from_arguments() {
         let arguments = vec![serde_json::json!("echo"), serde_json::json!(["hello", "world"])];
@@ -277,10 +491,10 @@ mod tests {
 
     fn registry_with_connection(
         generation_id: u32,
-    ) -> (socket::GenerationRegistry, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+    ) -> (socket::GenerationRegistry, tokio::sync::mpsc::Receiver<Vec<u8>>) {
         let registry = socket::GenerationRegistry::default();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.register(generation_id, tx);
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        registry.register(generation_id, tx, std::sync::Arc::new(tokio::sync::Notify::new()));
         (registry, rx)
     }
 
