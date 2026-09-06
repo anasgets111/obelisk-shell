@@ -155,11 +155,29 @@ pub(super) fn settings_match_ssid(settings: &HashMap<String, HashMap<String, Own
 /// wrapping, keeping this unit-testable without D-Bus. Empty means open (ADR-0029); non-empty
 /// bytes must be UTF-8 for NM's string-valued `802-11-wireless-security.psk`, or fail as
 /// [`ConnectError::InvalidSecret`] instead of being mangled.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(super) struct ConnectionIntent {
     pub(super) ssid: String,
     pub(super) hidden: bool,
-    pub(super) psk: Option<String>,
+    /// Scrubbed when the intent drops, on every path including an error return (ADR-0005), matching
+    /// what [`connection_intent`]'s invalid-UTF-8 arm does for the bytes it rejects. This is the
+    /// Supervisor, which never restarts, on a heap measured never to return its pages.
+    ///
+    /// It does not reach the copy `zbus` makes inside the `Value` [`build_connection_dict`] builds;
+    /// that allocation is the D-Bus layer's and not ours to scrub, and is shorter-lived than this.
+    pub(super) psk: Option<shared::Zeroizing<String>>,
+}
+
+/// Hand-written so a password cannot reach a log line through `{:?}`, following
+/// `shared::SecureSubmit`'s `Debug`. The derive would have printed it in full.
+impl std::fmt::Debug for ConnectionIntent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionIntent")
+            .field("ssid", &self.ssid)
+            .field("hidden", &self.hidden)
+            .field("psk", &format_args!("{}", if self.psk.is_some() { "<redacted>" } else { "none" }))
+            .finish()
+    }
 }
 
 pub(super) fn connection_intent(ssid: &str, hidden: bool, secret: &[u8]) -> Result<ConnectionIntent, ConnectError> {
@@ -167,7 +185,7 @@ pub(super) fn connection_intent(ssid: &str, hidden: bool, secret: &[u8]) -> Resu
         None
     } else {
         match String::from_utf8(secret.to_vec()) {
-            Ok(psk) => Some(psk),
+            Ok(psk) => Some(shared::Zeroizing::new(psk)),
             Err(err) => {
                 // Zeroize the invalid UTF-8 password copy before propagating (ADR-0005/ADR-0014).
                 // Capture the message first because `into_bytes` consumes the error.
@@ -462,7 +480,7 @@ mod tests {
     #[test]
     fn connection_intent_carries_a_non_empty_secret_as_the_psk() {
         let intent = connection_intent("HomeWifi", false, b"hunter2").unwrap();
-        assert_eq!(intent.psk, Some("hunter2".to_string()));
+        assert_eq!(intent.psk.as_ref().map(|psk| psk.as_str()), Some("hunter2"));
     }
 
     #[test]
@@ -595,5 +613,19 @@ mod tests {
     fn parse_ssid_arg_reads_the_first_argument() {
         assert_eq!(parse_ssid_arg(&[serde_json::json!("HomeWifi")]), Some("HomeWifi".to_string()));
         assert_eq!(parse_ssid_arg(&[]), None);
+    }
+
+    /// The derive would have printed the password in full the first time an intent reached a log
+    /// line or an `unwrap` panic message.
+    #[test]
+    fn debug_redacts_the_password_but_still_says_whether_there_is_one() {
+        let secured = connection_intent("net", false, b"hunter2").unwrap();
+        let rendered = format!("{secured:?}");
+        assert!(!rendered.contains("hunter2"), "the password must not survive formatting: {rendered}");
+        assert!(rendered.contains("<redacted>"), "but the field is still reported: {rendered}");
+        assert!(rendered.contains("net"), "and everything that is not the password still prints");
+
+        let open = connection_intent("net", false, b"").unwrap();
+        assert!(format!("{open:?}").contains("none"), "an open network is distinguishable from a secured one");
     }
 }
